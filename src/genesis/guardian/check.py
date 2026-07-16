@@ -206,33 +206,36 @@ def _build_provisioning_adapter(config: GuardianConfig):
         )
         return None
 
-    def _from_env() -> tuple[str, str]:
+    def _from_env() -> tuple[str, str, str]:
         return (
             os.environ.get("PROXMOX_AUDIT_TOKEN", ""),
             os.environ.get("PROXMOX_PROVISION_TOKEN", ""),
+            os.environ.get("PROXMOX_BACKUP_TOKEN", ""),
         )
 
-    def _from_bridge() -> tuple[str, str]:
+    def _from_bridge() -> tuple[str, str, str]:
         from genesis.guardian.credential_bridge import load_provisioning_credentials
         creds = load_provisioning_credentials(config.state_dir)
         return (
             creds.get("PROXMOX_AUDIT_TOKEN", ""),
             creds.get("PROXMOX_PROVISION_TOKEN", ""),
+            creds.get("PROXMOX_BACKUP_TOKEN", ""),
         )
 
-    def _from_legacy() -> tuple[str, str]:
+    def _from_legacy() -> tuple[str, str, str]:
         secrets = load_secrets()
         return (
             secrets.get("PROXMOX_AUDIT_TOKEN", ""),
             secrets.get("PROXMOX_PROVISION_TOKEN", ""),
+            secrets.get("PROXMOX_BACKUP_TOKEN", ""),
         )
 
-    audit = provision = ""
+    audit = provision = backup = ""
     for source in (_from_env, _from_bridge, _from_legacy):
-        a, p = source()
-        a, p = a.strip(), p.strip()
-        if a:  # all-or-nothing: this source owns both tokens
-            audit, provision = a, p
+        a, p, b = source()
+        a, p, b = a.strip(), p.strip(), b.strip()
+        if a:  # all-or-nothing: this source owns all its tokens
+            audit, provision, backup = a, p, b
             break
 
     if not audit:
@@ -242,7 +245,9 @@ def _build_provisioning_adapter(config: GuardianConfig):
         return None
 
     from genesis.guardian.provisioning.proxmox import ProxmoxAdapter
-    return ProxmoxAdapter(pc, audit_token=audit, provision_token=provision)
+    return ProxmoxAdapter(
+        pc, audit_token=audit, provision_token=provision, backup_token=backup,
+    )
 
 
 async def _maybe_propose_provisioning(

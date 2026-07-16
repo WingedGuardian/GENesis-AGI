@@ -7,6 +7,7 @@ from genesis.guardian.provisioning.base import HostCapacity
 from genesis.guardian.provisioning.gate import (
     evaluate_disk_grow,
     evaluate_memory_grow,
+    evaluate_vzdump,
 )
 
 _GIB = 1024**3
@@ -130,3 +131,80 @@ def test_report_as_lines_render():
     lines = r.as_lines()
     assert len(lines) == len(r.checks)
     assert all(line.startswith(("✅", "❌")) for line in lines)
+
+
+# ── evaluate_vzdump (backup start gate) ───────────────────────────────────
+
+def _backup_cap(**kw):
+    defaults = dict(
+        detected=True, vm_memory_mib=21500, cores=5,
+        disks={"scsi0": 32 * _GIB, "scsi1": 64 * _GIB},
+        storage_free_bytes=574 * _GIB,
+        backup_storage_free_bytes=150 * _GIB,
+        backup_storage_total_bytes=500 * _GIB,
+        vm_agent_enabled=False, detail="ok",
+    )
+    defaults.update(kw)
+    return HostCapacity(**defaults)
+
+
+def _bcfg(**kw):
+    return ProvisioningConfig(
+        enabled=True, vmid=100, storage="local-lvm", backup_storage="backup", **kw,
+    )
+
+
+def test_vzdump_passes_with_headroom_and_reports_consistency():
+    rep = evaluate_vzdump(_backup_cap(), _bcfg(), backups_in_window=0)
+    assert rep.passed and rep.action == "vzdump"
+    assert rep.failed_names() == []
+    consistency = next(c for c in rep.checks if c.name == "consistency class")
+    assert consistency.passed and "crash-consistent" in consistency.detail
+
+
+def test_vzdump_checks_backup_storage_not_grow_storage():
+    """S2: 96G alloc, grow storage has plenty, but the BACKUP storage has 50G
+    — the gate must refuse on the backup storage's headroom."""
+    cap = _backup_cap(backup_storage_free_bytes=50 * _GIB)
+    rep = evaluate_vzdump(cap, _bcfg(), backups_in_window=0)
+    assert not rep.passed
+    assert rep.failed_names() == ["backup storage headroom"]
+
+
+def test_vzdump_refuses_on_unknown_backup_storage_space():
+    cap = _backup_cap(backup_storage_free_bytes=None)
+    rep = evaluate_vzdump(cap, _bcfg(), backups_in_window=0)
+    assert not rep.passed
+    assert "backup storage headroom" in rep.failed_names()
+
+
+def test_vzdump_size_multiplier_scales_the_estimate():
+    # 96G alloc × 0.5 = 48G est → 50G free passes
+    cap = _backup_cap(backup_storage_free_bytes=50 * _GIB)
+    rep = evaluate_vzdump(cap, _bcfg(backup_size_multiplier=0.5), backups_in_window=0)
+    assert rep.passed, rep.as_lines()
+
+
+def test_vzdump_backup_rate_cap_is_its_own_class():
+    rep = evaluate_vzdump(_backup_cap(), _bcfg(max_backups_per_week=2), backups_in_window=2)
+    assert not rep.passed
+    assert rep.failed_names() == ["rate cap"]
+    rate = next(c for c in rep.checks if c.name == "rate cap")
+    assert "backups" in rate.detail, "the detail must name the class"
+
+
+def test_vzdump_in_flight_latch_refuses():
+    rep = evaluate_vzdump(
+        _backup_cap(), _bcfg(), backups_in_window=0,
+        in_flight_upid="UPID:pve:0A:0B:68765432:vzdump:100:u@pve!t:",
+    )
+    assert not rep.passed
+    assert rep.failed_names() == ["no backup in flight"]
+
+
+def test_grow_rate_check_names_its_class():
+    rep = evaluate_disk_grow(
+        _backup_cap(), _bcfg(), "scsi1", 8, actions_in_window=0, backup_age_days=1.0,
+    )
+    rate = next(c for c in rep.checks if c.name == "rate cap")
+    assert "grows" in rate.detail

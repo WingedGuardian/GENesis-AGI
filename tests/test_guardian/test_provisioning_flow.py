@@ -8,12 +8,19 @@ import pytest
 import genesis.guardian.provisioning.flow as flow_mod
 from genesis.guardian.alert.telegram import CONFLICT_SENTINEL, TelegramAlertChannel
 from genesis.guardian.config import GuardianConfig
-from genesis.guardian.provisioning.base import HostCapacity, ProvisionResult
+from genesis.guardian.provisioning.base import (
+    BackupStartResult,
+    BackupStatus,
+    HostCapacity,
+    ProvisionResult,
+)
 from genesis.guardian.provisioning.flow import (
     ProvisionRequest,
     execute_provisioning_action,
+    execute_vzdump_start,
     maybe_propose_pool_grow,
     run_provisioning_flow,
+    verify_vzdump_step,
 )
 from genesis.guardian.provisioning.ledger import ProvisioningLedger
 
@@ -69,6 +76,24 @@ class FakeAdapter:
 
     async def newest_backup_age_days(self):
         return self._backup
+
+    # ── backup verbs (vzdump slice) — knob-driven ──
+    start_result = None      # BackupStartResult to return
+    status_results = None    # list of BackupStatus, popped per probe
+    prune_result = (True, "pruned to keep-last=2")
+
+    async def vzdump_start(self):
+        self.vzdump_start_calls = getattr(self, "vzdump_start_calls", 0) + 1
+        return self.start_result
+
+    async def vzdump_status(self, upid):
+        self.status_upids = getattr(self, "status_upids", [])
+        self.status_upids.append(upid)
+        return self.status_results.pop(0)
+
+    async def prune_backups(self):
+        self.prune_calls = getattr(self, "prune_calls", 0) + 1
+        return self.prune_result
 
 
 def _cfg(**prov):
@@ -326,3 +351,196 @@ async def test_propose_fires_when_stale(tmp_path):
     assert res is not None and res["stage"] == "denied"
     assert ch.sent, "proposal was sent"
     assert led.hours_since_last_proposal("pool_grow") is not None  # marked
+
+
+# ── two-phase vzdump flow (start ledgers immediately; verify flips) ───────
+
+_UPID = "UPID:pve:000A1B2C:001122DD:68765432:vzdump:100:user@pve!backup:"
+
+
+def _backup_cap(**kw):
+    defaults = dict(
+        detected=True, vm_memory_mib=21500, cores=5,
+        disks={"scsi0": 32 * _GIB, "scsi1": 64 * _GIB},
+        storage_free_bytes=574 * _GIB,
+        node_mem_total_bytes=141 * _GIB, node_mem_available_bytes=65 * _GIB,
+        backup_storage_free_bytes=150 * _GIB,
+        backup_storage_total_bytes=500 * _GIB,
+        vm_agent_enabled=False, detail="ok",
+    )
+    defaults.update(kw)
+    return HostCapacity(**defaults)
+
+
+async def test_vzdump_start_ledgers_at_start_even_before_any_verify(tmp_path):
+    """B1: the start row is written the moment the POST is accepted — the
+    rate-cap entry, in-flight latch, and restart-resume handle in one row."""
+    adapter = FakeAdapter(_backup_cap())
+    adapter.start_result = BackupStartResult(
+        ok=True, upid=_UPID, requested="vzdump vmid 100 -> backup", attempted=True,
+    )
+    disp = FakeDispatcher()
+    ledger = ProvisioningLedger(tmp_path)
+    res = await execute_vzdump_start(_cfg(), adapter, disp, ledger)
+    assert res["ok"] and res["stage"] == "started" and res["upid"] == _UPID
+    entry = ledger.latest_backup()
+    assert entry is not None and entry["upid"] == _UPID
+    assert entry["verified"] is False
+    assert ledger.actions_in_window(action_prefix="vzdump") == 1
+    assert disp.alerts == [], "a clean start is not an alert"
+
+
+async def test_vzdump_start_gate_refusal_writes_nothing(tmp_path):
+    adapter = FakeAdapter(_backup_cap(backup_storage_free_bytes=None))
+    disp = FakeDispatcher()
+    ledger = ProvisioningLedger(tmp_path)
+    res = await execute_vzdump_start(_cfg(), adapter, disp, ledger)
+    assert not res["ok"] and res["stage"] == "recheck_failed"
+    assert "backup storage headroom" in res["failed_checks"]
+    assert ledger.latest_backup() is None, "refusals are never ledgered"
+    assert getattr(adapter, "vzdump_start_calls", 0) == 0
+
+
+async def test_vzdump_start_failed_post_is_ledgered_but_never_latches(tmp_path):
+    """A sent-but-failed POST counts against the cap (conservative) but a
+    upid-less row must not latch — there is nothing to resume."""
+    adapter = FakeAdapter(_backup_cap())
+    adapter.start_result = BackupStartResult(
+        ok=False, requested="vzdump vmid 100 -> backup", attempted=True,
+        error="HTTP 403: denied",
+    )
+    disp = FakeDispatcher()
+    ledger = ProvisioningLedger(tmp_path)
+    res = await execute_vzdump_start(_cfg(), adapter, disp, ledger)
+    assert not res["ok"] and res["stage"] == "start_failed"
+    assert ledger.actions_in_window(action_prefix="vzdump") == 1
+    assert _sev(disp.alerts) == ["critical"]
+    # and the latch is NOT set: a second start passes the in-flight check
+    adapter2 = FakeAdapter(_backup_cap())
+    adapter2.start_result = BackupStartResult(
+        ok=True, upid=_UPID, requested="x", attempted=True,
+    )
+    res2 = await execute_vzdump_start(_cfg(max_backups_per_week=5), adapter2, disp, ledger)
+    assert res2["ok"], f"upid-less failure must not latch: {res2}"
+
+
+async def test_vzdump_second_start_refused_while_latched(tmp_path):
+    adapter = FakeAdapter(_backup_cap())
+    adapter.start_result = BackupStartResult(
+        ok=True, upid=_UPID, requested="x", attempted=True,
+    )
+    disp = FakeDispatcher()
+    ledger = ProvisioningLedger(tmp_path)
+    assert (await execute_vzdump_start(_cfg(max_backups_per_week=5), adapter, disp, ledger))["ok"]
+    res2 = await execute_vzdump_start(_cfg(max_backups_per_week=5), adapter, disp, ledger)
+    assert not res2["ok"] and "no backup in flight" in res2["failed_checks"]
+    assert getattr(adapter, "vzdump_start_calls", 0) == 1
+
+
+async def test_verify_no_arg_resumes_latest_inflight_and_flips_prunes(tmp_path):
+    """S1: restart-safe resume — a fresh process verifies the ledger's UPID."""
+    adapter = FakeAdapter(_backup_cap())
+    adapter.status_results = [BackupStatus(
+        state="verified", volid="backup:backup/vzdump-qemu-100-x.vma.zst",
+        age_days=0.01, detail="task OK; new backup visible",
+    )]
+    disp = FakeDispatcher()
+    ledger = ProvisioningLedger(tmp_path)
+    ledger.record_action("vzdump", "vmid 100", ok=True, verified=False, upid=_UPID)
+    res = await verify_vzdump_step(_cfg(), adapter, disp, ledger)  # NO upid arg
+    assert res["ok"] and res["state"] == "verified"
+    assert adapter.status_upids == [_UPID], "must probe the ledger's own UPID"
+    assert ledger.latest_backup()["verified"] is True
+    assert getattr(adapter, "prune_calls", 0) == 1, "rotation runs on verify"
+    assert _sev(disp.alerts) == ["info"]
+
+
+async def test_verify_terminal_failure_flips_and_alerts_critical(tmp_path):
+    adapter = FakeAdapter(_backup_cap())
+    adapter.status_results = [BackupStatus(state="failed", detail="task exitstatus: job errors")]
+    disp = FakeDispatcher()
+    ledger = ProvisioningLedger(tmp_path)
+    ledger.record_action("vzdump", "vmid 100", ok=True, verified=False, upid=_UPID)
+    res = await verify_vzdump_step(_cfg(), adapter, disp, ledger, upid=_UPID)
+    assert not res["ok"] and res["state"] == "failed"
+    entry = ledger.latest_backup()
+    assert entry["ok"] is False, "terminal failure is recorded"
+    assert getattr(adapter, "prune_calls", 0) == 0, "never rotate on failure"
+    assert _sev(disp.alerts) == ["critical"]
+
+
+async def test_verify_transient_states_change_nothing(tmp_path):
+    """S7: running/unknown are TRANSIENT — no ledger flip, no alert, latch intact."""
+    adapter = FakeAdapter(_backup_cap())
+    adapter.status_results = [
+        BackupStatus(state="running", detail="task still running"),
+        BackupStatus(state="unknown", detail="status read 500"),
+    ]
+    disp = FakeDispatcher()
+    ledger = ProvisioningLedger(tmp_path)
+    ledger.record_action("vzdump", "vmid 100", ok=True, verified=False, upid=_UPID)
+    for expected in ("running", "unknown"):
+        res = await verify_vzdump_step(_cfg(), adapter, disp, ledger, upid=_UPID)
+        assert res["ok"] and res["state"] == expected
+    assert ledger.latest_backup()["verified"] is False
+    assert disp.alerts == []
+
+
+async def test_verify_with_nothing_in_flight_errors(tmp_path):
+    adapter = FakeAdapter(_backup_cap())
+    disp = FakeDispatcher()
+    res = await verify_vzdump_step(_cfg(), adapter, disp, ProvisioningLedger(tmp_path))
+    assert not res["ok"] and res["stage"] == "no_backup_in_flight"
+
+
+async def test_grow_rate_cap_ignores_backups(tmp_path):
+    """N3/the collision the due-diligence round found: a backup must not
+    consume the grow budget."""
+    ledger = ProvisioningLedger(tmp_path)
+    ledger.record_action("vzdump", "vmid 100", ok=True, verified=True, upid=_UPID)
+    ledger.record_action("vzdump", "vmid 100 again", ok=True, verified=True,
+                         upid=_UPID.replace("68765432", "68765433"))
+    adapter = FakeAdapter(
+        _good_cap(),
+        disk_result=ProvisionResult(
+            ok=True, action="grow_vm_disk", requested="scsi1 +32G",
+            before="32.0G", after="64.0G", verified=True,
+        ),
+    )
+    disp = FakeDispatcher()
+    res = await execute_provisioning_action(
+        _cfg(max_actions_per_week=2), _disk_req(), adapter, disp, ledger,
+    )
+    assert res["ok"], f"two prior backups must not trip the 2-grow cap: {res}"
+
+
+# ── P2 fixes: failed backup releases the latch; terminal state is usable ───
+
+async def test_failed_backup_releases_in_flight_latch(tmp_path):
+    """Codex P2: after a terminally-failed backup the task is OVER — the row
+    stays verified:false but carries resolved_ts, and must NOT keep latching
+    (which would block a retry/grow chain for up to vzdump_timeout_s)."""
+    from genesis.guardian.provisioning.flow import _vzdump_in_flight_upid
+    ledger = ProvisioningLedger(tmp_path)
+    ledger.record_action("vzdump", "vmid 100", ok=True, verified=False, upid=_UPID)
+    assert _vzdump_in_flight_upid(_cfg(), ledger) == _UPID  # in flight while running
+    ledger.mark_latest_backup_verified(_UPID, ok=False)      # terminal failure
+    assert _vzdump_in_flight_upid(_cfg(), ledger) == "", (
+        "a resolved (failed) backup must not keep latching"
+    )
+
+
+async def test_new_backup_allowed_after_failure(tmp_path):
+    """End-to-end of the latch fix: a fresh start passes the in-flight check
+    once the prior backup has terminally failed."""
+    ledger = ProvisioningLedger(tmp_path)
+    ledger.record_action("vzdump", "vmid 100", ok=True, verified=False, upid=_UPID)
+    ledger.mark_latest_backup_verified(_UPID, ok=False)
+    adapter = FakeAdapter(_backup_cap())
+    adapter.start_result = BackupStartResult(
+        ok=True, upid=_UPID.replace("68765432", "68765499"), requested="x", attempted=True,
+    )
+    res = await execute_vzdump_start(
+        _cfg(max_backups_per_week=5), adapter, FakeDispatcher(), ledger,
+    )
+    assert res["ok"], f"a fresh backup must be allowed after a failed one: {res}"

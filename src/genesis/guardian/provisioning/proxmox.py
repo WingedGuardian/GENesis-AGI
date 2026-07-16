@@ -1,10 +1,20 @@
 """Proxmox VE provisioning adapter (stdlib urllib, never-raise).
 
-Talks to the PVE API (``/api2/json``) with two privilege-separated tokens:
-an AUDIT token for all reads (get_capacity, connectivity, verify re-reads) and
-a PROVISION token — scoped to VM.Config.Disk/Memory on this one VM only — for
-the two mutating PUTs. Code never parses the token's user/realm; the whole
-token string goes into the ``PVEAPIToken=`` header verbatim.
+Talks to the PVE API (``/api2/json``) with three privilege-separated tokens:
+an AUDIT token for all reads (get_capacity, connectivity, verify re-reads,
+backup-age/status), a PROVISION token — scoped to VM.Config.Disk/Memory on this
+one VM only — for the two grow PUTs, and a BACKUP token — VM.Backup on this VM
++ Datastore.AllocateSpace on the backup storage only — for vzdump-start and
+prune. Code never parses a token's user/realm; the whole token string goes into
+the ``PVEAPIToken=`` header verbatim. Absent backup token ⇒ backup verbs refuse
+pre-flight (safe degradation, never a crash, nothing ledgered).
+
+Backups are TWO-PHASE: ``vzdump_start`` only launches the task (a full-VM dump
+runs for tens of minutes+, far past ``_await_task``'s resize-sized default) and
+returns the UPID; ``vzdump_status`` is a single verify probe the caller polls.
+Verification anchors on the UPID's own embedded starttime — restart-safe with
+zero persisted adapter state — and requires the task's ``exitstatus == OK``
+AND a datastore content entry for this vmid with ``ctime >= starttime``.
 
 Response shapes were captured live from PVE 9.1.4 (2026-07-06):
 - ``/nodes/N/status`` → ``.data.memory{total,free,used,available}``, ``.data.cpuinfo.cpus``
@@ -21,6 +31,7 @@ import json
 import logging
 import re
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +39,8 @@ from typing import Any
 
 from genesis.guardian.config import ProvisioningConfig
 from genesis.guardian.provisioning.base import (
+    BackupStartResult,
+    BackupStatus,
     HostCapacity,
     ProvisioningAdapter,
     ProvisionResult,
@@ -65,11 +78,13 @@ class ProxmoxAdapter(ProvisioningAdapter):
         config: ProvisioningConfig,
         audit_token: str,
         provision_token: str,
+        backup_token: str = "",
         request_timeout: float = 30.0,
     ) -> None:
         self._config = config
         self._audit = audit_token
         self._provision = provision_token
+        self._backup = backup_token
         self._timeout = request_timeout
         self._base = (
             f"https://{config.api_host}:{config.api_port}/api2/json"
@@ -205,6 +220,41 @@ class ProxmoxAdapter(ProvisioningAdapter):
                     break
         return out
 
+    @staticmethod
+    def _agent_enabled(vm_cfg: dict[str, Any]) -> bool | None:
+        """Parse the qemu ``agent`` config key ("1", "0", "enabled=1,...").
+
+        Absent key = agent not enabled (PVE default). Present-but-unparseable
+        = None (unknown) — informational only, never gates anything.
+        """
+        raw = vm_cfg.get("agent")
+        if raw is None:
+            return False
+        for part in str(raw).split(","):
+            part = part.strip()
+            if part in ("1", "0"):
+                return part == "1"
+            if part.startswith("enabled="):
+                return part[len("enabled="):] == "1"
+        return None
+
+    @staticmethod
+    def _upid_starttime(upid: str) -> int | None:
+        """The task's own start epoch, parsed from the UPID's hex field.
+
+        ``UPID:node:pid:pstart:starttime:type:id:user@realm!token:`` — field 4
+        is the start time in hex. This is what makes verify restart-safe with
+        no persisted state: "a backup newer than THIS task's start" is
+        well-defined even hours later, unlike any "age ≈ 0" heuristic.
+        """
+        parts = upid.split(":")
+        if len(parts) < 6 or parts[0] != "UPID":
+            return None
+        try:
+            return int(parts[4], 16)
+        except ValueError:
+            return None
+
     # ── capacity (audit token, read-only) ────────────────────────────────
     async def get_capacity(self) -> HostCapacity:
         cfg = self._config
@@ -236,11 +286,19 @@ class ProxmoxAdapter(ProvisioningAdapter):
         node_mem_available = mem.get("available")
 
         storage_free = storage_total = None
+        backup_free = backup_total = None
+        backup_storage = cfg.backup_storage or cfg.storage
         for s in storages:
-            if isinstance(s, dict) and s.get("storage") == cfg.storage:
+            if not isinstance(s, dict):
+                continue
+            if s.get("storage") == cfg.storage:
                 storage_free = s.get("avail")
                 storage_total = s.get("total")
-                break
+            if s.get("storage") == backup_storage:
+                # May be the same entry as ``storage`` — that's fine, the gate
+                # then checks the one shared datastore's headroom.
+                backup_free = s.get("avail")
+                backup_total = s.get("total")
 
         vm_mem_mib: int | None = None
         raw_mem = vm_cfg.get("memory")
@@ -260,6 +318,9 @@ class ProxmoxAdapter(ProvisioningAdapter):
             storage_total_bytes=storage_total,
             node_mem_total_bytes=node_mem_total,
             node_mem_available_bytes=node_mem_available,
+            backup_storage_free_bytes=backup_free,
+            backup_storage_total_bytes=backup_total,
+            vm_agent_enabled=self._agent_enabled(vm_cfg),
             detail="ok",
         )
 
@@ -421,3 +482,174 @@ class ProxmoxAdapter(ProvisioningAdapter):
             verified=verified, requires_reboot=requires_reboot,
             error="" if verified else "memory PUT issued but re-read did not confirm",
         )
+
+    # ── backups: two-phase vzdump + age + rotation ─────────────────────────
+    def _backup_storage(self) -> str:
+        return self._config.backup_storage or self._config.storage
+
+    async def newest_backup_age_days(self) -> float | None:
+        """Age in days of this VM's newest backup on the backup storage.
+
+        Audit token (Datastore.Audit). None on any read failure or when no
+        backup exists — the gate refuses on None when a recent backup is
+        required, never assumes. Filters on the content entry's ``vmid``
+        FIELD, never by volid substring (vmid-100 vs vmid-1000 collisions).
+        """
+        cfg = self._config
+        st, items, _err = await self._request(
+            "GET",
+            f"/nodes/{cfg.node}/storage/{self._backup_storage()}/content",
+            params={"content": "backup"},
+            token=self._audit,
+        )
+        if st != 200 or not isinstance(items, list):
+            return None
+        newest: int | None = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                if int(item.get("vmid", -1)) != int(cfg.vmid):
+                    continue
+                ctime = int(item["ctime"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if newest is None or ctime > newest:
+                newest = ctime
+        if newest is None:
+            return None
+        return max(0.0, (time.time() - newest) / 86400.0)
+
+    async def vzdump_start(self) -> BackupStartResult:
+        """Launch a vzdump of this VM (backup token). Returns the UPID only.
+
+        Deliberately NOT awaited here: a full-VM dump runs for tens of
+        minutes+. ``prune-backups`` is NOT passed inline — that parameter
+        requires Datastore.Allocate; rotation uses the standalone prunebackups
+        endpoint (owner semantics) after verification instead.
+        """
+        cfg = self._config
+        requested = f"vzdump vmid {cfg.vmid} -> {self._backup_storage()}"
+        if not self._backup:
+            return BackupStartResult(
+                ok=False, requested=requested, attempted=False,
+                error="no backup token configured (PROXMOX_BACKUP_TOKEN)",
+            )
+        st, data, err = await self._request(
+            "POST", f"/nodes/{cfg.node}/vzdump",
+            params={
+                "vmid": cfg.vmid,
+                "storage": self._backup_storage(),
+                "mode": "snapshot",
+                "compress": "zstd",
+            },
+            token=self._backup,
+        )
+        if st != 200 or not (isinstance(data, str) and data.startswith("UPID:")):
+            return BackupStartResult(
+                ok=False, requested=requested, attempted=True,
+                error=f"vzdump POST failed: {err or st}",
+            )
+        return BackupStartResult(ok=True, upid=data, requested=requested, attempted=True)
+
+    async def vzdump_status(self, upid: str) -> BackupStatus:
+        """Single verify probe for a started vzdump (audit token, no loop).
+
+        verified = task ``exitstatus == OK`` AND a content entry for this vmid
+        with ``ctime >= `` the UPID's own starttime (corroboration that the
+        backup actually landed on the datastore). A probe that cannot tell
+        returns ``unknown`` — the CALLER treats that as transient and retries;
+        only the task's own terminal non-OK exitstatus is ``failed``.
+        """
+        cfg = self._config
+        encoded = urllib.parse.quote(upid, safe="")
+        st, data, err = await self._request(
+            "GET", f"/nodes/{cfg.node}/tasks/{encoded}/status", token=self._audit,
+        )
+        if st != 200 or not isinstance(data, dict):
+            return BackupStatus(state="unknown", detail=err or f"status read {st}")
+        if data.get("status") != "stopped":
+            return BackupStatus(state="running", detail="task still running")
+        exitstatus = str(data.get("exitstatus") or "").strip()
+        if exitstatus != "OK":
+            return BackupStatus(
+                state="failed", detail=f"task exitstatus: {exitstatus or 'unreported'}",
+            )
+        # Task says OK — corroborate on the datastore, anchored to the task's
+        # own start time (restart-safe; no persisted state, no age heuristic).
+        started = self._upid_starttime(upid)
+        if started is None:
+            raw = data.get("starttime")
+            started = raw if isinstance(raw, int) else None
+        stc, items, cerr = await self._request(
+            "GET",
+            f"/nodes/{cfg.node}/storage/{self._backup_storage()}/content",
+            params={"content": "backup"},
+            token=self._audit,
+        )
+        if stc != 200 or not isinstance(items, list):
+            # Task finished OK but this probe can't see the datastore — let the
+            # caller retry rather than declaring either outcome.
+            return BackupStatus(
+                state="unknown",
+                detail=f"task OK; content corroboration unavailable ({cerr or stc})",
+            )
+        best_volid, best_ctime = "", None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                if int(item.get("vmid", -1)) != int(cfg.vmid):
+                    continue
+                ctime = int(item["ctime"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if started is not None and ctime < started:
+                continue
+            if best_ctime is None or ctime > best_ctime:
+                best_ctime, best_volid = ctime, str(item.get("volid", ""))
+        if best_ctime is None:
+            # OK task but no new backup visible yet (listing lag is possible) —
+            # transient for the caller; a persistent mismatch ends UNVERIFIED
+            # at the wall bound, which is the honest outcome.
+            return BackupStatus(
+                state="unknown", detail="task OK but no new backup visible for this vmid yet",
+            )
+        return BackupStatus(
+            state="verified", volid=best_volid,
+            age_days=max(0.0, (time.time() - best_ctime) / 86400.0),
+            detail="task OK; new backup visible",
+        )
+
+    async def prune_backups(self) -> tuple[bool, str]:
+        """Rotate this VM's backups to ``backup_keep_last`` (backup token).
+
+        Standalone prunebackups endpoint — owner semantics (VM.Backup +
+        Datastore.AllocateSpace), unlike the inline vzdump ``prune-backups``
+        param which would demand Datastore.Allocate. Dry-run GET first for the
+        log, then the pruning POST, awaited (pruning is seconds, not minutes).
+        """
+        cfg = self._config
+        if not self._backup:
+            return False, "no backup token configured (PROXMOX_BACKUP_TOKEN)"
+        keep = max(1, int(cfg.backup_keep_last))
+        params = {
+            "prune-backups": f"keep-last={keep}",
+            "type": "qemu",
+            "vmid": cfg.vmid,
+        }
+        path = f"/nodes/{cfg.node}/storage/{self._backup_storage()}/prunebackups"
+        std, dry, _derr = await self._request("GET", path, params=params, token=self._audit)
+        if std == 200 and isinstance(dry, list):
+            doomed = [d.get("volid") for d in dry
+                      if isinstance(d, dict) and d.get("mark") == "remove"]
+            logger.info("prune dry-run (keep-last=%d): removing %s", keep, doomed or "nothing")
+        stp, data, err = await self._request("POST", path, params=params, token=self._backup)
+        if stp != 200:
+            return False, f"prune POST failed: {err or stp}"
+        if isinstance(data, str) and data.startswith("UPID:"):
+            task_ok, exitstatus = await self._await_task(data)
+            if not task_ok:
+                return False, f"prune task failed: {exitstatus}"
+        return True, f"pruned to keep-last={keep}"
+

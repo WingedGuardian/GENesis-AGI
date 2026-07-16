@@ -57,7 +57,10 @@ async def test_grow_via_pipeline_disk_asks_then_executes():
     assert out == {"ok": True, "stage": "executed"}
     # coordinate_grow_disk(remote, _ask, disk=..., add_gib=...)
     assert coord.call_args.args[0] is remote
-    assert coord.call_args.kwargs == {"disk": "scsi1", "add_gib": 2}
+    kwargs = dict(coord.call_args.kwargs)
+    notify = kwargs.pop("notify")
+    assert callable(notify), "chain outcomes need the fire-and-forget notifier"
+    assert kwargs == {"disk": "scsi1", "add_gib": 2}
 
 
 @pytest.mark.asyncio

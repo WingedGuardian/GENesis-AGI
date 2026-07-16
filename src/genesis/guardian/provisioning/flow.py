@@ -34,6 +34,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from html import escape as html_escape
 
 from genesis.guardian.alert.base import Alert, AlertSeverity
@@ -46,6 +47,7 @@ from genesis.guardian.provisioning.gate import (
     DueDiligenceReport,
     evaluate_disk_grow,
     evaluate_memory_grow,
+    evaluate_vzdump,
 )
 from genesis.guardian.provisioning.ledger import ProvisioningLedger
 
@@ -177,7 +179,7 @@ async def execute_provisioning_action(
     # 1. Fresh re-check (capacity + backup + rate cap) — no mutation on failure.
     cap = await adapter.get_capacity()
     report = _evaluate(
-        request, cap, config, ledger.actions_in_window(),
+        request, cap, config, ledger.actions_in_window(action_prefix="grow_"),
         await adapter.newest_backup_age_days(),
     )
     if not report.passed:
@@ -188,7 +190,8 @@ async def execute_provisioning_action(
                  + "\n".join(report.as_lines()),
         ))
         return {"ok": False, "stage": "recheck_failed", "requested": report.requested,
-                "checks": report.as_lines()}
+                "checks": report.as_lines(),
+                "failed_checks": report.failed_names()}
 
     # 1b. Anti-stack guard (disk only): a RELATIVE disk grow is non-idempotent.
     # If a prior grow of this disk was recorded unverified but the live size has
@@ -281,16 +284,31 @@ async def run_provisioning_flow(
     # 1-2. Capacity + due-diligence gate — fail ⇒ refuse + alert, NEVER propose.
     cap = await adapter.get_capacity()
     backup_age = await adapter.newest_backup_age_days()
-    report = _evaluate(request, cap, config, ledger.actions_in_window(), backup_age)
+    report = _evaluate(
+        request, cap, config,
+        ledger.actions_in_window(action_prefix="grow_"), backup_age,
+    )
 
     if not report.passed:
+        body = "Due-diligence gate failed:\n" + "\n".join(report.as_lines())
+        if "recent backup" in report.failed_names():
+            # Deliberate, audited escape hatch — named, not hidden. This path
+            # runs when Genesis is DOWN (host likely degraded); an hour-scale
+            # vzdump is NOT chained here in that state.
+            body += (
+                "\nBackup is stale/unknown. Take one from Genesis when it is "
+                "up (provision vzdump), or for THIS emergency only: gateway "
+                "verb `configure-provisioning require_recent_backup=false` "
+                "(audited; re-enable after)."
+            )
         await dispatcher.send(Alert(
             severity=AlertSeverity.WARNING,
             title=f"Provisioning refused: {report.requested}",
-            body="Due-diligence gate failed:\n" + "\n".join(report.as_lines()),
+            body=body,
         ))
         return {"ok": False, "stage": "refused_gate", "requested": report.requested,
-                "checks": report.as_lines()}
+                "checks": report.as_lines(),
+                "failed_checks": report.failed_names()}
 
     # 3. No channel ⇒ we cannot obtain approval ⇒ never mutate.
     channel = _find_telegram_channel(dispatcher)
@@ -346,3 +364,139 @@ async def maybe_propose_pool_grow(
         absorb_after=True, origin="autonomous (pool critical)",
     )
     return await run_provisioning_flow(config, request, adapter, dispatcher, ledger)
+
+
+def _vzdump_in_flight_upid(config: GuardianConfig, ledger: ProvisioningLedger) -> str:
+    """The UPID of a still-latched backup, or "".
+
+    Latch = the latest vzdump ledger entry is unverified, HAS a upid (an entry
+    without one is a failed start — nothing to resume, must never latch), is
+    NOT yet resolved (a terminal-failed row carries ``resolved_ts`` while
+    staying ``verified: false`` — the task is over, so it must not latch), and
+    is younger than the vzdump wall bound. Past the wall bound the latch
+    self-expires: the operation ends as UNVERIFIED, never blocks forever.
+    """
+    entry = ledger.latest_backup()
+    if (not entry or entry.get("verified") or entry.get("resolved_ts")
+            or not entry.get("upid")):
+        return ""
+    try:
+        started = datetime.fromisoformat(str(entry.get("ts")))
+    except (TypeError, ValueError):
+        return ""
+    age_s = (datetime.now(UTC) - started).total_seconds()
+    if age_s >= config.provisioning.vzdump_timeout_s:
+        return ""
+    return str(entry.get("upid"))
+
+
+async def execute_vzdump_start(
+    config: GuardianConfig,
+    adapter: ProvisioningAdapter,
+    dispatcher: AlertDispatcher,
+    ledger: ProvisioningLedger,
+) -> dict:
+    """START an ALREADY-APPROVED vzdump (phase 1 of 2). No approval gate here.
+
+    Mirrors :func:`execute_provisioning_action`'s execute-only contract: fresh
+    gate re-check → launch once → ledger AT START (the POST consumed real
+    hypervisor work whether or not verification ever runs — the start row is
+    the rate-cap entry, the in-flight latch, and the restart-resume handle).
+    Returns immediately with the UPID; verification is
+    :func:`verify_vzdump_step`, driven on the caller's cadence.
+    """
+    cap = await adapter.get_capacity()
+    report = evaluate_vzdump(
+        cap, config.provisioning,
+        ledger.actions_in_window(action_prefix="vzdump"),
+        in_flight_upid=_vzdump_in_flight_upid(config, ledger),
+    )
+    if not report.passed:
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.WARNING,
+            title=f"Backup aborted before start: {report.requested}",
+            body="Due-diligence re-check failed at start time:\n"
+                 + "\n".join(report.as_lines()),
+        ))
+        return {"ok": False, "stage": "recheck_failed", "requested": report.requested,
+                "checks": report.as_lines(),
+                "failed_checks": report.failed_names()}
+
+    res = await adapter.vzdump_start()
+    if res.attempted:
+        # B1: ledger at start, even on a failed launch (conservative — the
+        # hypervisor may have begun work). A upid-less failure never latches.
+        ledger.record_action(
+            "vzdump", res.requested, ok=res.ok, verified=False, upid=res.upid,
+        )
+    if not res.ok:
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.CRITICAL,
+            title=f"Backup start FAILED: {res.requested}",
+            body=f"{res.error or 'unknown'}\nNo auto-retry — manual check needed.",
+        ))
+        return {"ok": False, "stage": "start_failed", "requested": res.requested,
+                "error": res.error}
+    logger.info("vzdump started: %s (%s)", res.requested, res.upid)
+    return {"ok": True, "stage": "started", "requested": res.requested,
+            "upid": res.upid}
+
+
+async def verify_vzdump_step(
+    config: GuardianConfig,
+    adapter: ProvisioningAdapter,
+    dispatcher: AlertDispatcher,
+    ledger: ProvisioningLedger,
+    upid: str = "",
+) -> dict:
+    """One verification probe for a started vzdump (phase 2 of 2).
+
+    No ``upid`` = resume the latest unverified ledger entry (restart-safe: a
+    new process can pick up an in-flight backup with zero extra state). The
+    result's ``state`` is the caller's contract — running/unknown are
+    TRANSIENT (retry to the wall bound), only ``failed`` is terminal;
+    ``ok`` only means "this probe reached a usable answer".
+
+    On ``verified``: flip the start row, rotate (prune to keep-last), alert.
+    On ``failed``: flip the row terminally, alert CRITICAL. Never auto-retries
+    the backup itself.
+    """
+    if not upid:
+        entry = ledger.latest_backup()
+        if not entry or entry.get("verified") or not entry.get("upid"):
+            return {"ok": False, "stage": "no_backup_in_flight",
+                    "error": "no unverified backup with a task handle in the ledger"}
+        upid = str(entry["upid"])
+
+    status = await adapter.vzdump_status(upid)
+
+    if status.state == "verified":
+        ledger.mark_latest_backup_verified(upid, ok=True)
+        prune_ok, prune_detail = await adapter.prune_backups()
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.INFO,
+            title="Backup verified",
+            body=(f"{status.volid or 'backup'} is on the datastore "
+                  f"(age {status.age_days:.2f}d).\n"
+                  f"Rotation: {'ok' if prune_ok else 'FAILED'} — {prune_detail}"
+                  if status.age_days is not None else
+                  f"{status.volid or 'backup'} is on the datastore.\n"
+                  f"Rotation: {'ok' if prune_ok else 'FAILED'} — {prune_detail}"),
+        ))
+        return {"ok": True, "stage": "verified", "state": "verified",
+                "upid": upid, "volid": status.volid,
+                "prune_ok": prune_ok, "prune": prune_detail}
+
+    if status.state == "failed":
+        ledger.mark_latest_backup_verified(upid, ok=False)
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.CRITICAL,
+            title="Backup task FAILED",
+            body=f"{upid}\n{status.detail}\nNo auto-retry — manual check needed.",
+        ))
+        return {"ok": False, "stage": "task_failed", "state": "failed",
+                "upid": upid, "error": status.detail}
+
+    # running / unknown — transient by contract; no ledger change, no alert.
+    return {"ok": True, "stage": "pending", "state": status.state,
+            "upid": upid, "detail": status.detail}

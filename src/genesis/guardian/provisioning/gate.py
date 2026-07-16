@@ -38,6 +38,11 @@ class DueDiligenceReport:
             for c in self.checks
         ]
 
+    def failed_names(self) -> list[str]:
+        """Machine-readable failure surface — callers (e.g. the JIT
+        backup→grow chain) must branch on THIS, never parse as_lines()."""
+        return [c.name for c in self.checks if not c.passed]
+
 
 def _backup_check(
     config: ProvisioningConfig, backup_age_days: float | None,
@@ -53,11 +58,12 @@ def _backup_check(
     )
 
 
-def _rate_check(config: ProvisioningConfig, actions_in_window: int) -> Check:
-    ok = actions_in_window < config.max_actions_per_week
+def _rate_check(count: int, cap: int, label: str) -> Check:
+    """Per-action-CLASS rate cap (grows and backups have separate budgets)."""
+    ok = count < cap
     return Check(
         "rate cap", ok,
-        f"{actions_in_window} executed in last 7d (cap {config.max_actions_per_week})",
+        f"{count} {label} executed in last 7d (cap {cap})",
     )
 
 
@@ -95,7 +101,7 @@ def evaluate_disk_grow(
         if free is not None else "storage free unknown",
     ))
 
-    checks.append(_rate_check(config, actions_in_window))
+    checks.append(_rate_check(actions_in_window, config.max_actions_per_week, "grows"))
     checks.append(_backup_check(config, backup_age_days))
 
     return DueDiligenceReport(
@@ -123,7 +129,7 @@ def evaluate_memory_grow(
         checks.append(Check("grow-only", False, "cannot verify (current unknown)"))
         checks.append(Check("step within cap", False, "cannot verify (current unknown)"))
         checks.append(Check("node RAM headroom", False, "cannot verify (current unknown)"))
-        checks.append(_rate_check(config, actions_in_window))
+        checks.append(_rate_check(actions_in_window, config.max_actions_per_week, "grows"))
         checks.append(_backup_check(config, backup_age_days))
         return DueDiligenceReport(
             passed=False, action="grow_vm_memory", requested=requested, checks=checks,
@@ -153,10 +159,75 @@ def evaluate_memory_grow(
         if avail is not None else "node available memory unknown",
     ))
 
-    checks.append(_rate_check(config, actions_in_window))
+    checks.append(_rate_check(actions_in_window, config.max_actions_per_week, "grows"))
     checks.append(_backup_check(config, backup_age_days))
 
     return DueDiligenceReport(
         passed=all(c.passed for c in checks),
         action="grow_vm_memory", requested=requested, checks=checks,
+    )
+
+
+def evaluate_vzdump(
+    cap: HostCapacity,
+    config: ProvisioningConfig,
+    backups_in_window: int,
+    in_flight_upid: str = "",
+) -> DueDiligenceReport:
+    """Due diligence for STARTING a vzdump (non-destructive, but not free:
+    it reads the whole live VM disk and lands multi-GB on the datastore).
+
+    ``in_flight_upid``: a still-latched earlier backup (unverified, younger
+    than the vzdump wall bound) — a second start is refused while one may be
+    running; PVE would reject it anyway, but only as an opaque task failure
+    after another approval round.
+    """
+    storage_name = config.backup_storage or config.storage
+    requested = f"vzdump vmid {config.vmid} -> {storage_name}"
+    checks: list[Check] = []
+
+    checks.append(Check("capacity detected", cap.detected, cap.detail or ""))
+
+    # Estimated worst-case dump size = the VM's total disk allocation ×
+    # the configured multiplier (1.0 default = incompressible worst case).
+    # NOTE: prune runs AFTER the new backup lands, so the datastore
+    # transiently holds keep_last+1 backups — live avail self-enforces this;
+    # the detail names it so a post-rotation refusal reads as policy, not bug.
+    alloc = sum(cap.disks.values()) if cap.disks else 0
+    est = int(alloc * config.backup_size_multiplier)
+    avail = cap.backup_storage_free_bytes
+    space_ok = alloc > 0 and avail is not None and avail >= est
+    if avail is None:
+        space_detail = f"backup storage '{storage_name}' free space unknown — refusing"
+    elif alloc <= 0:
+        space_detail = "VM disk allocation unknown — cannot estimate dump size"
+    else:
+        space_detail = (
+            f"{avail / _GIB:.0f}G free ≥ ~{est / _GIB:.0f}G est. dump "
+            f"(alloc {alloc / _GIB:.0f}G × {config.backup_size_multiplier}; "
+            f"store holds keep-last+1 until rotation)"
+        )
+    checks.append(Check("backup storage headroom", space_ok, space_detail))
+
+    checks.append(_rate_check(backups_in_window, config.max_backups_per_week, "backups"))
+
+    checks.append(Check(
+        "no backup in flight", not in_flight_upid,
+        f"unverified backup still in flight ({in_flight_upid}) — "
+        "run provision-vzdump-status first" if in_flight_upid else "none in flight",
+    ))
+
+    # Informational only (always passes): which consistency class this buys.
+    if cap.vm_agent_enabled is True:
+        agent_detail = "guest agent enabled → filesystem-consistent (fsfreeze)"
+    elif cap.vm_agent_enabled is False:
+        agent_detail = ("no guest agent → crash-consistent "
+                        "(like a power cut: journaled fs + SQLite WAL recover)")
+    else:
+        agent_detail = "guest agent state unknown"
+    checks.append(Check("consistency class", True, agent_detail))
+
+    return DueDiligenceReport(
+        passed=all(c.passed for c in checks),
+        action="vzdump", requested=requested, checks=checks,
     )

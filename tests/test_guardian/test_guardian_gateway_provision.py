@@ -133,3 +133,79 @@ def test_unknown_verb_denied(sandbox):
     r = _run(sandbox, "provision-nuke-everything")
     assert r.returncode == 1
     assert "denied" in r.stderr
+
+
+# ── vzdump verbs (two-phase) + UPID transit parity ────────────────────────
+
+# Synthetic UPID in the real PVE shape (node:pid:pstart:starttime:type:id:user):
+_UPID = "UPID:pve:000A1B2C:001122DD:68765432:vzdump:100:user@pve!backup:"
+
+
+@_needs_bash
+class TestProvisionVzdump:
+    def test_start_runs_the_cli(self, sandbox):
+        r = _run(sandbox, "provision-vzdump")
+        assert r.returncode == 0
+        argv = json.loads(r.stdout)["argv"]
+        assert argv[-1] == "--provision-vzdump"
+
+    def test_start_takes_no_args(self, sandbox):
+        r = _run(sandbox, "provision-vzdump --help; id")
+        assert r.returncode != 0, "argful start must fall through to denied"
+
+    def test_status_no_arg_resumes(self, sandbox):
+        r = _run(sandbox, "provision-vzdump-status")
+        assert r.returncode == 0
+        argv = json.loads(r.stdout)["argv"]
+        assert argv[-1] == "--provision-vzdump-status"
+
+    def test_status_forwards_valid_upid_quoted(self, sandbox):
+        r = _run(sandbox, f"provision-vzdump-status {_UPID}")
+        assert r.returncode == 0
+        argv = json.loads(r.stdout)["argv"]
+        assert argv[-2:] == ["--provision-vzdump-status", _UPID]
+
+    @pytest.mark.parametrize("bad", [
+        "provision-vzdump-status $(reboot)",
+        "provision-vzdump-status UPID:pve:1:1:1:vzdump:100:u@p!t: ; id",
+        "provision-vzdump-status UPID:pve:1:1:1:vzdump:100:u'@p!t:",
+        'provision-vzdump-status UPID:pve:1:1:1:vzdump:100:u"@p!t:',
+        "provision-vzdump-status notaupid",
+        "provision-vzdump-status UPID:x",  # below min length
+    ])
+    def test_status_rejects_shell_active_or_malformed(self, sandbox, bad):
+        r = _run(sandbox, bad)
+        assert r.returncode != 0, f"must reject: {bad!r}"
+        assert "invalid UPID" in (r.stderr + r.stdout) or "denied" in (r.stderr + r.stdout)
+
+
+class TestUpidThreeHopParity:
+    """S5: the same UPID must pass the remote-client regex, the gateway bash
+    regex, and the URL-encoding hop — drift between them = dead feature."""
+
+    def test_remote_client_regex_accepts_real_shape(self):
+        from genesis.guardian.remote import _UPID_RE
+        assert _UPID_RE.fullmatch(_UPID)
+
+    @_needs_bash
+    def test_gateway_and_client_agree(self, sandbox):
+        from genesis.guardian.remote import _UPID_RE
+        cases = [
+            (_UPID, True),
+            ("UPID:pve-node2:0000F00D:00000001:698A0001:vzdump:1002:root@pam!tok:", True),
+            ("UPID:pve:1:1:1:vzdump:100:u p!t:", False),   # space
+            ("UPID:pve:1:1:1:vzdump:100:u;p!t:", False),   # semicolon
+            ("upid:pve:000A1B2C:001122DD:68765432:vzdump:100:u@p!t:", False),  # case
+        ]
+        for upid, expect in cases:
+            client_ok = _UPID_RE.fullmatch(upid) is not None
+            r = _run(sandbox, f"provision-vzdump-status {upid}")
+            gateway_ok = r.returncode == 0
+            assert client_ok == expect, f"client regex drift on {upid!r}"
+            assert gateway_ok == expect, f"gateway regex drift on {upid!r}"
+
+    def test_url_encoding_round_trip(self):
+        import urllib.parse
+        encoded = urllib.parse.quote(_UPID, safe="")
+        assert "!" not in encoded and "@" not in encoded and ":" not in encoded
+        assert urllib.parse.unquote(encoded) == _UPID

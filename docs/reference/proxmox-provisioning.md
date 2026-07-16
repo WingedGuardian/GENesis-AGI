@@ -100,9 +100,11 @@ pveum acl modify /vms/<VMID>       -user genesis@pve -role GenesisProvision
 # 4. Provision role ALSO on the storage (disk grow allocates space there)
 pveum acl modify /storage/<STORAGE> -user genesis@pve -role GenesisProvision
 
-# 5. Two privilege-separated tokens (privsep=1). Save the printed secrets.
+# 5. Privilege-separated tokens (privsep=1). Save the printed secrets.
 pveum user token add genesis@pve ro       --privsep 1
 pveum user token add genesis@pve provision --privsep 1
+# Optional third token — only if you enable vzdump backups (see "Backups"):
+pveum user token add genesis@pve backup    --privsep 1
 ```
 
 ### ⚠ The ACL gotcha (this WILL bite you)
@@ -224,12 +226,88 @@ curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d
   `<state_dir>/provisioning/ledger.json`; the gate refuses once
   `max_actions_per_week` is reached. Autonomous pool-crit re-proposals are
   damped by `min_repropose_hours` (`proposal_state.json`).
-- **`require_recent_backup`:** the backup-age check is not yet implemented for
-  Proxmox (`newest_backup_age_days()` returns `None`), and the gate treats an
-  unknown age as a refusal. So **setting `require_recent_backup: true` today
-  refuses every grow.** Leave it `false` until the backup-age query lands; a
-  grow is additive/grow-only and the container keeps a ≤24h healthy incus
-  snapshot lifeline, so a corrupting rollback risk from the grow itself is nil.
+- **`require_recent_backup`:** the backup-age query IS implemented
+  (`newest_backup_age_days()` reads the backup storage's `content=backup`
+  listing with the audit token — no extra privileges). The gate still treats an
+  unknown age as a refusal, so only flip this to `true` once a first verified
+  vzdump exists (see "Backups (vzdump)" below); with the JIT chain in place a
+  stale backup then turns a grow proposal into a backup→verify→grow chain
+  instead of a dead end.
+
+## Backups (vzdump) — two-phase, JIT + rotation
+
+Genesis can take a hypervisor backup of the host VM (`vzdump`), which both
+creates a real VM-level restore point and unblocks the grow gate's
+`require_recent_backup` check. Design properties:
+
+- **Just-in-time, not scheduled.** A backup is proposed as the precondition
+  step of a grow (when the gate would refuse on backup age, the grow proposal
+  becomes a backup→verify→grow **chain under one approval**, with the time gap
+  and auto-execute disclosed in the approval text) or on explicit ask
+  (`provision_vzdump` MCP tool). There is no cron and no recurring proposal.
+- **Two-phase.** `provision-vzdump` only STARTS the task and returns the PVE
+  UPID (a full-VM dump runs for tens of minutes+); `provision-vzdump-status
+  [UPID]` is a single verify probe (no arg = resume the latest in-flight
+  backup — restart-safe). The start is ledgered immediately: the row is the
+  rate-cap entry (`max_backups_per_week`, separate from the grow budget), the
+  in-flight latch, and the resume handle.
+- **Rotation is the only cleanup.** After a VERIFIED new backup, old ones are
+  pruned to `backup_keep_last` via the standalone `prunebackups` endpoint
+  (owner semantics — `Datastore.AllocateSpace` + `VM.Backup` suffice; the
+  inline vzdump `prune-backups` parameter would demand `Datastore.Allocate`
+  and is deliberately NOT used). There is no delete verb. Note the store
+  transiently holds `keep_last + 1` backups until rotation runs — size the
+  storage (or `backup_size_multiplier`) accordingly.
+- **Consistency class:** without a QEMU guest agent the backup is
+  crash-consistent (like a power cut — journaled fs + SQLite WAL recover);
+  with an agent, filesystem-consistent. The gate report shows which one you
+  are buying. **A backup you have never restored is unproven DR** — restore is
+  deliberately NOT implemented in this slice (it is a destructive verb with
+  its own review); treat these backups as a rollback point of last resort
+  until a restore path ships.
+
+Config fields (all generic; land per-install values via the audited
+`configure-provisioning` gateway verb): `backup_storage` (empty = same as
+`storage`), `backup_keep_last` (default 2), `max_backups_per_week` (default
+2), `backup_size_multiplier` (default 1.0 — worst-case incompressible
+estimate against the backup storage's free space), `vzdump_timeout_s`
+(default 7200 — the verify poller's wall bound; the backup itself is never
+killed).
+
+### The backup token
+
+The third token keeps the privsep model honest: `provision` stays grow-only
+(no `VM.Backup`), and `backup` cannot resize anything.
+
+```sh
+# Role: backup + the space to write it
+pveum role add GenesisBackup -privs "VM.Backup,Datastore.AllocateSpace"
+
+# ACLs — the same replacement gotcha as above applies: granting ANY ACL on a
+# path replaces what that path inherited, so re-grant audit alongside.
+pveum acl modify /vms/<VMID>              -token 'genesis@pve!backup' -role GenesisBackup
+pveum acl modify /storage/<BACKUP_STORE>  -token 'genesis@pve!backup' -role GenesisBackup
+pveum acl modify /storage/<BACKUP_STORE>  -user  genesis@pve          -role GenesisAudit
+pveum acl modify /storage/<BACKUP_STORE>  -token 'genesis@pve!ro'     -role GenesisAudit
+```
+
+Land the secret as `PROXMOX_BACKUP_TOKEN` next to the other two (container
+`secrets.env` → credential bridge, or the host guardian's own secrets file).
+An absent backup token degrades safely: backup verbs refuse pre-flight,
+grows are unaffected.
+
+Validate — positive AND negative (the boundary only exists if you probe it):
+
+```sh
+BAK='PVEAPIToken=genesis@pve!backup=<BACKUP_SECRET>'
+# Positive: token sees its own permissions on the two granted paths
+pveum user token permissions genesis@pve backup /vms/<VMID>            | grep -i VM.Backup
+pveum user token permissions genesis@pve backup /storage/<BACKUP_STORE> | grep -i AllocateSpace
+# Negative: the backup token must be REFUSED a resize (expect 403)
+curl -sk -X PUT -H "Authorization: $BAK" "$H/nodes/<NODE>/qemu/<VMID>/resize" -d 'disk=scsi1' -d 'size=+1G'
+# Negative: the provision token must be REFUSED a vzdump (expect 403)
+curl -sk -X POST -H "Authorization: $PRV" "$H/nodes/<NODE>/vzdump" -d 'vmid=<VMID>' -d 'storage=<BACKUP_STORE>'
+```
 
 ## `verify_tls: false`
 

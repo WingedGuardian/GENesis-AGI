@@ -50,6 +50,8 @@ _PROVISIONING_FILENAME = "proxmox_creds.env"
 _KEY_MAP_PROVISIONING = {
     "PROXMOX_AUDIT_TOKEN": "PROXMOX_AUDIT_TOKEN",
     "PROXMOX_PROVISION_TOKEN": "PROXMOX_PROVISION_TOKEN",
+    # vzdump verbs: VM.Backup + Datastore.AllocateSpace(backup storage) only.
+    "PROXMOX_BACKUP_TOKEN": "PROXMOX_BACKUP_TOKEN",
 }
 
 # Backup-passphrase escrow. GENESIS_BACKUP_PASSPHRASE lives ONLY inside

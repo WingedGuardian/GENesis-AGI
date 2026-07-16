@@ -12,6 +12,8 @@ Usage:
     python -m genesis.guardian --provision-status              # host capacity (read-only)
     python -m genesis.guardian --provision-grow-disk <disk> <GiB>  # EXECUTE (pre-approved)
     python -m genesis.guardian --provision-grow-memory <MiB>       # EXECUTE (pre-approved)
+    python -m genesis.guardian --provision-vzdump                   # EXECUTE (pre-approved) START a backup, returns UPID
+    python -m genesis.guardian --provision-vzdump-status [UPID]     # verify probe (read-only + ledger flip); no arg = latest in-flight
     python -m genesis.guardian --storage-expand               # absorb a grown disk
     python -m genesis.guardian --grow-root <GB>               # EXECUTE (pre-approved) grow container root
     python -m genesis.guardian --set-container-limits <mem_mib|-> <cpu|->  # EXECUTE (pre-approved) raise cgroup caps
@@ -70,6 +72,12 @@ def main() -> None:
 
     if "--provision-grow-memory" in sys.argv:
         sys.exit(asyncio.run(_provision_grow_memory(sys.argv)))
+
+    if "--provision-vzdump-status" in sys.argv:
+        sys.exit(asyncio.run(_provision_vzdump_status(sys.argv)))
+
+    if "--provision-vzdump" in sys.argv:
+        sys.exit(asyncio.run(_provision_vzdump()))
 
     if "--storage-expand" in sys.argv:
         sys.exit(asyncio.run(_storage_expand()))
@@ -299,7 +307,12 @@ def _configure_provisioning(argv: list[str]) -> int:
                                    "api_port": p.api_port, "node": p.node, "vmid": p.vmid,
                                    "target_disk": p.target_disk, "storage": p.storage,
                                    "verify_tls": p.verify_tls,
-                                   "require_recent_backup": p.require_recent_backup}})
+                                   "require_recent_backup": p.require_recent_backup,
+                                   "backup_storage": p.backup_storage,
+                                   "backup_keep_last": p.backup_keep_last,
+                                   "max_backups_per_week": p.max_backups_per_week,
+                                   "backup_size_multiplier": p.backup_size_multiplier,
+                                   "vzdump_timeout_s": p.vzdump_timeout_s}})
 
 
 async def _provision_status() -> int:
@@ -309,14 +322,28 @@ async def _provision_status() -> int:
 
     from genesis.guardian.check import _build_provisioning_adapter
     from genesis.guardian.config import load_config
+    from genesis.guardian.provisioning.flow import _vzdump_in_flight_upid
+    from genesis.guardian.provisioning.ledger import ProvisioningLedger
 
-    adapter = _build_provisioning_adapter(load_config())
+    config = load_config()
+    adapter = _build_provisioning_adapter(config)
     if adapter is None:
         return _emit({"ok": False, "action": "provision-status",
                       "error": "provisioning disabled or unconfigured"})
     cap = await adapter.get_capacity()
+    pc = config.provisioning
+    # Backup context: lets the container decide the JIT backup→grow chain
+    # BEFORE proposing, so ONE approval can truthfully cover the whole chain.
+    backup = {
+        "age_days": await adapter.newest_backup_age_days(),
+        "require_recent_backup": pc.require_recent_backup,
+        "backup_max_age_days": pc.backup_max_age_days,
+        "in_flight_upid": _vzdump_in_flight_upid(
+            config, ProvisioningLedger(config.state_dir),
+        ),
+    }
     return _emit({"ok": cap.detected, "action": "provision-status",
-                  "capacity": dataclasses.asdict(cap)})
+                  "capacity": dataclasses.asdict(cap), "backup": backup})
 
 
 async def _provision_grow_disk(argv: list[str]) -> int:
@@ -385,6 +412,60 @@ async def _provision_grow_memory(argv: list[str]) -> int:
         config, request, adapter, _build_dispatcher(config),
         ProvisioningLedger(config.state_dir),
     )
+    return _emit(result)
+
+
+async def _provision_vzdump() -> int:
+    """EXECUTE (pre-approved) phase 1: START a vzdump, return its UPID.
+
+    Two-phase: this only launches (a full-VM dump runs for tens of minutes+).
+    The start is ledgered immediately — rate-cap entry, in-flight latch, and
+    restart-resume handle in one row. Verify via --provision-vzdump-status.
+    """
+    from genesis.guardian.check import _build_dispatcher, _build_provisioning_adapter
+    from genesis.guardian.config import load_config
+    from genesis.guardian.provisioning.flow import execute_vzdump_start
+    from genesis.guardian.provisioning.ledger import ProvisioningLedger
+
+    config = load_config()
+    adapter = _build_provisioning_adapter(config)
+    if adapter is None:
+        return _emit({"ok": False, "action": "provision-vzdump",
+                      "error": "provisioning disabled or unconfigured"})
+    result = await execute_vzdump_start(
+        config, adapter, _build_dispatcher(config),
+        ProvisioningLedger(config.state_dir),
+    )
+    result.setdefault("action", "provision-vzdump")
+    return _emit(result)
+
+
+async def _provision_vzdump_status(argv: list[str]) -> int:
+    """One verify probe for a started vzdump (phase 2; read-only + ledger flip).
+
+    Optional UPID arg; without it, resumes the latest unverified ledger entry
+    (restart-safe). ``state`` in the JSON is the caller's contract: running/
+    unknown = transient (retry), verified/failed = terminal. Exit 0 for any
+    usable probe answer; non-zero only for terminal failure / nothing in flight.
+    """
+    from genesis.guardian.check import _build_dispatcher, _build_provisioning_adapter
+    from genesis.guardian.config import load_config
+    from genesis.guardian.provisioning.flow import verify_vzdump_step
+    from genesis.guardian.provisioning.ledger import ProvisioningLedger
+
+    args = _args_after(argv, "--provision-vzdump-status", 1)
+    upid = args[0] if args else ""
+
+    config = load_config()
+    adapter = _build_provisioning_adapter(config)
+    if adapter is None:
+        return _emit({"ok": False, "action": "provision-vzdump-status",
+                      "error": "provisioning disabled or unconfigured"})
+    result = await verify_vzdump_step(
+        config, adapter, _build_dispatcher(config),
+        ProvisioningLedger(config.state_dir), upid=upid,
+    )
+    result.setdefault("action", "provision-vzdump-status")
     return _emit(result)
 
 

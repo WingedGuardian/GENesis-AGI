@@ -34,6 +34,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis can now take a hypervisor backup of its own host VM — and grows
+  finally get their safety net.** The provisioning gate has always wanted a
+  recent backup before an irreversible grow, but nothing could take one, so
+  the check sat disabled. Now a stale backup turns a grow proposal into a
+  backup→verify→grow chain under one clearly-worded approval: the backup
+  starts immediately (vzdump, on a third API token that can back up but never
+  resize), verification runs in the background for however long the dump
+  takes, old backups rotate away automatically (keep-last, configurable), and
+  the grow executes only after the backup verifies and a fresh safety
+  re-check passes. Backups can also be taken on demand (`provision_vzdump`),
+  have their own weekly budget separate from grows (note: the existing
+  `max_actions_per_week` cap now counts grows only), and an interrupted
+  verification resumes after a restart with no state lost. Restore is
+  deliberately not included — that is a destructive operation with its own
+  upcoming review.
+
 - **The guardian now keeps container swap enabled on its own.** Swap is what
   turns a memory spike into graceful slowdown instead of a machine-wedging
   thrash, but the setting only got applied when host setup ran — an install

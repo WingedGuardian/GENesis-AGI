@@ -99,3 +99,40 @@ def test_native_yaml_types_accepted(tmp_path):
     cfg = load_config(cfg_path)
     assert cfg.provisioning.enabled is True
     assert cfg.provisioning.vmid == 42
+
+
+# ── vzdump slice: new backup fields + float coercion ──────────────────────
+
+
+def test_backup_fields_have_generic_defaults():
+    """Nothing install-specific: empty backup_storage falls back to `storage`
+    at the consumer; caps/multiplier/wall-bound are generic defaults."""
+    pc = ProvisioningConfig()
+    assert pc.backup_storage == ""
+    assert pc.backup_keep_last == 2
+    assert pc.max_backups_per_week == 2
+    assert pc.backup_size_multiplier == 1.0
+    assert pc.vzdump_timeout_s == 7200
+
+
+def test_float_field_coerces_through_override(tmp_path):
+    """configure-provisioning sends strings — float fields must coerce (the
+    pre-existing coercer only knew bool/int/str)."""
+    state = tmp_path / "state"
+    dest = write_provisioning_override(str(state), {
+        "backup_storage": "backup",
+        "backup_keep_last": "3",
+        "backup_size_multiplier": "0.7",
+        "vzdump_timeout_s": "10800",
+    })
+    written = yaml.safe_load(dest.read_text())["provisioning"]
+    assert written["backup_storage"] == "backup"
+    assert written["backup_keep_last"] == 3
+    assert written["backup_size_multiplier"] == pytest.approx(0.7)
+    assert written["vzdump_timeout_s"] == 10800
+
+
+def test_bad_float_value_raises_value_error(tmp_path):
+    state = tmp_path / "state"
+    with pytest.raises(ValueError):
+        write_provisioning_override(str(state), {"backup_size_multiplier": "fast"})

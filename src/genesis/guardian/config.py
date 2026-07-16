@@ -298,6 +298,23 @@ class ProvisioningConfig:
     # A recent successful backup is a precondition for an irreversible grow.
     require_recent_backup: bool = True
     backup_max_age_days: int = 14
+    # vzdump backups (JIT + rotation): taken as the precondition step of a grow
+    # (or on explicit ask), never on a schedule. Empty backup_storage = use
+    # ``storage``. Rotation (prune to keep_last via the standalone prunebackups
+    # endpoint) is the only cleanup path — deliberately no delete verb.
+    backup_storage: str = ""
+    backup_keep_last: int = 2
+    # Backups have their own weekly cap — they never consume the grow budget
+    # (and a runaway backup loop can fill a datastore just as surely as grows).
+    max_backups_per_week: int = 2
+    # Space check: refuse a vzdump unless the backup storage has at least
+    # (sum of VM disk allocation × this multiplier) free. 1.0 = incompressible
+    # worst case; zstd normally does far better.
+    backup_size_multiplier: float = 1.0
+    # Wall bound for the whole vzdump task (start → stopped). Scales with disk
+    # size and storage speed — a full-VM dump can legitimately run well over an
+    # hour, so this is the project's 2h timeout floor, not a "safety" value.
+    vzdump_timeout_s: int = 7200
     # Bounded wait for the Telegram APPROVE/DENY reply (guardian is oneshot).
     approval_timeout_s: int = 1800
     # Damper: don't re-propose the same autonomous pool-grow more than this often.
@@ -503,6 +520,8 @@ def _coerce_provisioning_value(default: object, value: object) -> object:
         return str(value).strip().lower() in ("1", "true", "yes", "on")
     if isinstance(default, int):
         return int(value)
+    if isinstance(default, float):
+        return float(value)
     return str(value)
 
 

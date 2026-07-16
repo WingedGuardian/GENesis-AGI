@@ -99,8 +99,19 @@ async def grow_via_pipeline(
         )
         return reply
 
+    async def _notify(text: str) -> None:
+        # Fire-and-forget outcome message (chain results, wall-bound). Raw for
+        # the same reason as _ask: these carry exact operational state.
+        req = OutreachRequest(
+            category=OutreachCategory("blocker"), topic=text[:100], context=text,
+            salience_score=1.0, signal_type="provision_outcome", channel="telegram",
+        )
+        await pipeline.submit_raw(text, req)
+
     if kind == "disk":
-        return await coordinate_grow_disk(remote, _ask, disk=disk, add_gib=gib)
+        return await coordinate_grow_disk(
+            remote, _ask, disk=disk, add_gib=gib, notify=_notify,
+        )
     if kind == "memory":
         return await coordinate_grow_memory(remote, _ask, new_mib=mib)
     if kind == "root":
@@ -110,3 +121,43 @@ async def grow_via_pipeline(
             remote, _ask, mem_mib=(mib or None), cpu=(cpu or None),
         )
     return {"ok": False, "error": f"invalid kind {kind!r} (disk|memory|root|limits)"}
+
+
+async def vzdump_via_pipeline(
+    pipeline: OutreachPipeline,
+    *,
+    timeout_s: float,
+    wall_s: float = 7200.0,
+) -> dict:
+    """Approval-gated hypervisor backup (vzdump): ask the owner, on APPROVE
+    START the backup and return immediately (two-phase — the dump runs for
+    tens of minutes+); a tracked background task polls it to a terminal state
+    and messages the outcome. Never mutates without an APPROVE reply.
+    """
+    from genesis.guardian.provisioning.container import coordinate_vzdump
+    from genesis.observability.health import _load_guardian_remote_from_config
+
+    remote = _load_guardian_remote_from_config()
+    if remote is None:
+        return {"ok": False, "error": "guardian remote not configured (no guardian_remote.yaml)"}
+
+    async def _ask(text: str) -> str | None:
+        req = OutreachRequest(
+            category=OutreachCategory("blocker"), topic=text[:100], context=text,
+            salience_score=1.0, signal_type="provision_approval", channel="telegram",
+        )
+        _result, reply = await pipeline.submit_raw_and_wait(
+            text, req, timeout_s=float(timeout_s),
+        )
+        return reply
+
+    async def _notify(text: str) -> None:
+        req = OutreachRequest(
+            category=OutreachCategory("blocker"), topic=text[:100], context=text,
+            salience_score=1.0, signal_type="provision_outcome", channel="telegram",
+        )
+        await pipeline.submit_raw(text, req)
+
+    return await coordinate_vzdump(
+        remote, _ask, notify=_notify, vzdump_wall_s=float(wall_s),
+    )

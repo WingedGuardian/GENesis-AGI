@@ -27,6 +27,10 @@
 #   provision-grow-disk <disk> <GiB> — EXECUTE a pre-approved VM disk grow +
 #                     absorb (execute-only: NO Telegram gate; caller approves)
 #   provision-grow-memory <MiB>      — EXECUTE a pre-approved VM memory grow
+#   provision-vzdump          — EXECUTE a pre-approved backup START (two-phase:
+#                     launches vzdump, ledgers at start, returns the UPID)
+#   provision-vzdump-status [UPID]   — verify probe for a started backup (no
+#                     arg = resume latest in-flight; flips ledger + rotates)
 #   storage-expand            — absorb an already-grown disk into the storage
 #                     pool (LVM-thin: pvresize; btrfs-on-LVM: + lvextend/resize)
 #   configure-provisioning <k=v ...> — land host provisioning config as a
@@ -939,6 +943,57 @@ PYEOF
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
         GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
             timeout 120 "$VENV_PY" -m genesis.guardian --provision-grow-memory "$MIB"
+        ;;
+    provision-vzdump)
+        # EXECUTE-ONLY (approval is the CALLER's job — see provision-grow-disk).
+        # Phase 1 of 2: fresh gate re-check + ONE vzdump POST + ledger-at-start,
+        # returns the UPID immediately (a full-VM dump runs for tens of
+        # minutes+; verification is the separate status verb). Timeout covers
+        # only gate reads + the POST + alerts, never the backup itself.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "provision-vzdump", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+        GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+            timeout 300 "$VENV_PY" -m genesis.guardian --provision-vzdump
+        ;;
+    provision-vzdump-status|provision-vzdump-status\ *)
+        # Phase 2 of 2: one verify probe (read-only + ledger flip + rotation on
+        # verified). Optional UPID arg — whole-string bash regex; a real UPID
+        # carries ':' '@' '!' so this charset is deliberately wider than other
+        # verbs' but still excludes whitespace/quotes/;/$ (no injection
+        # surface: always expanded quoted). No arg = resume latest in-flight.
+        # Timeout covers probe reads + on-verify prune task + alerts.
+        UPID=""
+        if [ "$SSH_ORIGINAL_COMMAND" != "provision-vzdump-status" ]; then
+            UPID="${SSH_ORIGINAL_COMMAND#provision-vzdump-status }"
+            UPID_RE='^UPID:[A-Za-z0-9:@!._-]{10,220}$'
+            if [[ ! "$UPID" =~ $UPID_RE ]]; then
+                echo '{"ok": false, "action": "provision-vzdump-status", "error": "invalid UPID"}' >&2
+                exit 1
+            fi
+        fi
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "provision-vzdump-status", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        if [ -n "$UPID" ]; then
+            PYTHONPATH="$INSTALL_DIR/src" \
+            GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+                timeout 300 "$VENV_PY" -m genesis.guardian --provision-vzdump-status "$UPID"
+        else
+            PYTHONPATH="$INSTALL_DIR/src" \
+            GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
+                timeout 300 "$VENV_PY" -m genesis.guardian --provision-vzdump-status
+        fi
         ;;
     storage-expand)
         # Absorb an already-grown virtual disk into the LVM-thin pool

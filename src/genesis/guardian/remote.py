@@ -11,7 +11,8 @@ enforces this restriction, not our code.
 Gateway allowlist: restart-timer, pause, resume, status, reset-state, version,
 update, sync-gateway, redeploy, update-cc, update-node, test-approval,
 disk-status, host-profile, reharden-key, ping, provision-status,
-provision-grow-disk, provision-grow-memory, storage-expand, grow-root,
+provision-grow-disk, provision-grow-memory, provision-vzdump,
+provision-vzdump-status, storage-expand, grow-root,
 set-container-limits.
 """
 
@@ -27,6 +28,11 @@ logger = logging.getLogger(__name__)
 
 # Client-side validation (defense in depth — the gateway re-validates too).
 _DISK_RE = re.compile(r"(scsi|virtio|sata)[0-9]{1,2}")
+# One shared strict UPID charset, mirrored byte-for-byte by the gateway's
+# bash regex (parity-tested): ':' '@' '!' are real UPID bytes, but nothing
+# shell-active (whitespace/quotes/;/$) is admitted, and it is always expanded
+# quoted on the host side.
+_UPID_RE = re.compile(r"UPID:[A-Za-z0-9:@!._\-]{10,220}")
 
 # Per-verb SSH wait timeouts. The grow/expand verbs run long host-side (a disk
 # grow + LVM absorb), so the client waits slightly LONGER than the gateway's own
@@ -41,6 +47,9 @@ _VERSION_TIMEOUT = 30.0      # gateway version verb: auth-status probe + version
 _HOST_PROFILE_TIMEOUT = 50.0  # gateway: timeout 45 (pool lvs + incus probes)
 _GROW_DISK_TIMEOUT = 660.0   # gateway: timeout 600 (PVE resize + storage-expand)
 _GROW_MEM_TIMEOUT = 180.0    # gateway: timeout 120 (config PUT + pending check)
+_VZDUMP_TIMEOUT = 330.0      # gateway: timeout 300 (start: gate+POST / status:
+                             # probe + on-verify prune task) — NEVER the backup
+                             # itself; that runs host-side under its own UPID
 _EXPAND_TIMEOUT = 660.0      # gateway: timeout 600 (pvresize + autoextend profile)
 _GROW_ROOT_TIMEOUT = 330.0   # gateway: timeout 300 (incus LV + fs online resize)
 _SET_LIMITS_TIMEOUT = 70.0   # gateway: timeout 60 (incus config set + verify)
@@ -337,6 +346,43 @@ class GuardianRemote:
             f"provision-grow-memory {new_mib}", timeout=_GROW_MEM_TIMEOUT,
         )
         return self._as_json(ok, out, "provision-grow-memory")
+
+    async def request_vzdump_start(self) -> dict:
+        """EXECUTE a pre-approved backup START (phase 1 — returns the UPID).
+
+        The gateway verb only launches the vzdump (ledger-at-start host-side);
+        the backup itself runs for tens of minutes+ under PVE. Poll
+        :meth:`request_vzdump_status` to verify.
+        """
+        ok, out = await self._ssh_command("provision-vzdump", timeout=_VZDUMP_TIMEOUT)
+        return self._as_json(ok, out, "provision-vzdump")
+
+    async def request_vzdump_status(self, upid: str = "") -> dict:
+        """One verify probe (phase 2). No upid = resume latest in-flight.
+
+        The JSON's ``state`` is the contract: running/unknown = transient
+        (retry on the caller's cadence), verified/failed = terminal. Transport
+        failures surface as ``{"ok": False, "error": ...}`` — treat those as
+        transient too (S7 discipline), never as a failed backup.
+        """
+        if upid and not _UPID_RE.fullmatch(upid):
+            return {"ok": False, "action": "provision-vzdump-status",
+                    "error": f"invalid UPID {upid[:60]!r}"}
+        cmd = f"provision-vzdump-status {upid}" if upid else "provision-vzdump-status"
+        ok, out = await self._ssh_command(cmd, timeout=_VZDUMP_TIMEOUT)
+        # A terminally-FAILED task makes the host verb emit ok:false → SSH exits
+        # nonzero. But its JSON body still carries the authoritative ``state``
+        # ("failed"), and the poller keys on that to STOP + notify once. Parse
+        # the body regardless of exit code so a determined terminal state is
+        # never mistaken for a transient transport error (a real SSH/timeout
+        # failure yields non-JSON and falls through to the transient form).
+        try:
+            parsed = json.loads(out)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and "state" in parsed:
+            return parsed
+        return self._as_json(ok, out, "provision-vzdump-status")
 
     async def storage_expand(self) -> dict:
         """Absorb an already-grown virtual disk into the LVM-thin pool."""

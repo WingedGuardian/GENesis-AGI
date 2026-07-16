@@ -54,3 +54,30 @@ async def provision_grow_rpc():
         timeout_s=float(data.get("timeout_seconds", 1800)),
     )
     return jsonify(result)
+
+
+@blueprint.route("/api/genesis/provision/vzdump", methods=["POST"])
+@_async_route
+async def provision_vzdump_rpc():
+    """Take a hypervisor backup (vzdump) — approval-gated, two-phase.
+
+    Body: {timeout_seconds, wall_seconds}. Blocks only for the APPROVE/DENY
+    reply + the start verb, then returns {stage: "started", upid}; a tracked
+    background task on the runtime loop polls verification and messages the
+    outcome. Same access posture as /provision/grow above: intrinsically
+    owner-approval-gated; a LAN caller can at worst prompt the owner.
+    """
+    from genesis.outreach.rpc import vzdump_via_pipeline
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.outreach_pipeline is None:
+        return jsonify({"ok": False, "error": "outreach pipeline not ready"}), 503
+
+    data = request.get_json(silent=True) or {}
+    result = await vzdump_via_pipeline(
+        rt.outreach_pipeline,
+        timeout_s=float(data.get("timeout_seconds", 1800)),
+        wall_s=float(data.get("wall_seconds", 7200)),
+    )
+    return jsonify(result)

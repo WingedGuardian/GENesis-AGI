@@ -1,10 +1,12 @@
 """Provisioning ledger + proposal state (atomic, 0600, never-raise).
 
-``ledger.json`` records every EXECUTED mutation (a PUT was issued) — verified or
-not — so the weekly rate cap counts real hypervisor changes, including ones that
-didn't verify (an unverified mutation may well have landed). ``proposal_state.json``
-holds the autonomous-propose damper timestamp so a sustained pool-crit doesn't
-re-propose every tick.
+``ledger.json`` records every EXECUTED mutation (a PUT/POST was issued) —
+verified or not — so the weekly rate caps count real hypervisor changes,
+including ones that didn't verify (an unverified mutation may well have landed).
+Rate caps are per action CLASS (``actions_in_window(action_prefix=...)``):
+grows and backups have separate budgets so neither starves the other.
+``proposal_state.json`` holds the autonomous-propose damper timestamp so a
+sustained pool-crit doesn't re-propose every tick.
 """
 
 from __future__ import annotations
@@ -49,25 +51,33 @@ class ProvisioningLedger:
     # ── mutations ledger ──────────────────────────────────────────────────
     def record_action(
         self, action: str, requested: str, ok: bool, verified: bool,
-        target_bytes: int | None = None,
+        target_bytes: int | None = None, upid: str = "",
     ) -> None:
-        """Append an executed mutation. Called only after a PUT was issued.
+        """Append an executed mutation. Called only after a PUT/POST was issued.
 
         ``target_bytes`` records the absolute size the mutation aimed for (disk
         grows only) so an unverified-but-landed grow can be detected later and
         not stacked with a second relative grow.
+
+        ``upid`` (two-phase actions, e.g. vzdump) is the PVE task handle. The
+        start-time record IS the operation's durable state: the rate-cap entry,
+        the in-flight latch, and the restart-resume handle all in one row —
+        verification later flips ``verified`` in place, never appends.
         """
         entries = self._read_json(self._ledger, [])
         if not isinstance(entries, list):
             entries = []
-        entries.append({
+        entry: dict[str, Any] = {
             "ts": datetime.now(UTC).isoformat(),
             "action": action,
             "requested": requested,
             "ok": ok,
             "verified": verified,
             "target_bytes": target_bytes,
-        })
+        }
+        if upid:
+            entry["upid"] = upid
+        entries.append(entry)
         self._atomic_write(self._ledger, entries)
 
     def latest_unverified_disk(self, disk: str) -> dict | None:
@@ -106,14 +116,21 @@ class ProvisioningLedger:
                     self._atomic_write(self._ledger, entries)
                 return
 
-    def actions_in_window(self, days: int = 7) -> int:
-        """Count executed mutations within the rolling window."""
+    def actions_in_window(self, days: int = 7, action_prefix: str = "") -> int:
+        """Count executed mutations within the rolling window.
+
+        ``action_prefix`` scopes the count to one action class ("grow_" for the
+        grow budget, "vzdump" for the backup budget) so the classes never
+        consume each other's weekly cap. Empty prefix = all entries (legacy).
+        """
         entries = self._read_json(self._ledger, [])
         if not isinstance(entries, list):
             return 0
         cutoff = datetime.now(UTC) - timedelta(days=days)
         count = 0
         for e in entries:
+            if action_prefix and not str(e.get("action", "")).startswith(action_prefix):
+                continue
             try:
                 ts = datetime.fromisoformat(e["ts"])
             except (KeyError, TypeError, ValueError):
@@ -121,6 +138,43 @@ class ProvisioningLedger:
             if ts >= cutoff:
                 count += 1
         return count
+
+    def latest_backup(self) -> dict | None:
+        """The most recent vzdump entry, verified or not (None if none exist).
+
+        The unverified case is the two-phase state machine's whole state: the
+        in-flight latch (a second start must be refused while it is younger
+        than the vzdump wall-bound) and the restart-resume handle (a no-arg
+        status verb verifies THIS entry's upid).
+        """
+        entries = self._read_json(self._ledger, [])
+        if not isinstance(entries, list):
+            return None
+        for e in reversed(entries):
+            if str(e.get("action", "")).startswith("vzdump"):
+                return e
+        return None
+
+    def mark_latest_backup_verified(self, upid: str, ok: bool = True) -> bool:
+        """Flip the latest vzdump entry matching ``upid`` in place.
+
+        ``ok=True`` marks it verified (clears the in-flight latch); ``ok=False``
+        records the task terminally failed (also clears the latch — the work is
+        over either way, and the entry keeps counting against the backup cap).
+        Records NO new mutation. Returns True iff an entry was updated.
+        """
+        entries = self._read_json(self._ledger, [])
+        if not isinstance(entries, list):
+            return False
+        for e in reversed(entries):
+            if (str(e.get("action", "")).startswith("vzdump")
+                    and e.get("upid") == upid):
+                e["verified"] = bool(ok)
+                e["ok"] = bool(ok)
+                e["resolved_ts"] = datetime.now(UTC).isoformat()
+                self._atomic_write(self._ledger, entries)
+                return True
+        return False
 
     # ── proposal damper ───────────────────────────────────────────────────
     def load_proposal_state(self) -> dict:
