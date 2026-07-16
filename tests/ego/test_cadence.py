@@ -1266,6 +1266,24 @@ class TestGoalStaleness:
         assert sig.metadata["executed_proposals"] == 1
 
 
+    async def test_genesis_origin_goal_not_scanned(self, goal_cadence, goal_db):
+        """PR-3a: the user-ego scanner reviews USER goals only — a stale
+        origin='genesis_ego' goal must not generate a user-facing goal_review
+        signal (the genesis ego reviews its own lane separately)."""
+        twenty_days_ago = (datetime.now(UTC) - timedelta(days=20)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, origin, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("goal-ego", "Ego Ops Goal", "project", "high", "active",
+             "genesis_ego", twenty_days_ago, twenty_days_ago),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+        assert goal_cadence._signal_queue.empty()
+
+
 class TestJobHealthKeyPerEgo:
     """Each ego records job health under its OWN key, never a shared 'ego_cycle'.
 

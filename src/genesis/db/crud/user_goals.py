@@ -86,11 +86,26 @@ async def list_active(
     db: aiosqlite.Connection,
     *,
     limit: int = 20,
+    origin: str | None = None,
 ) -> list[dict]:
-    """List active goals ordered by priority (critical first)."""
+    """List active goals ordered by priority (critical first).
+
+    ``origin`` filters by provenance ('user' | 'genesis_ego'). User-facing
+    surfaces (user-ego context, morning report, dispatch prompts, world
+    snapshot) pass ``origin="user"`` so ego-owned goals never render as user
+    directives; ``None`` keeps the unfiltered view for provenance-aware
+    callers.
+    """
+    params: list[object] = []
+    origin_clause = ""
+    if origin is not None:
+        origin_clause = "AND origin = ? "
+        params.append(origin)
+    params.append(limit)
     cursor = await db.execute(
-        """SELECT * FROM user_goals
+        f"""SELECT * FROM user_goals
            WHERE status = 'active'
+           {origin_clause}
            ORDER BY
              CASE priority
                WHEN 'critical' THEN 0
@@ -99,10 +114,30 @@ async def list_active(
                WHEN 'low' THEN 3
              END,
              created_at DESC
-           LIMIT ?""",
-        (limit,),
+           LIMIT ?""",  # noqa: S608 — clause is a fixed literal, values bound
+        params,
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def count_by_status(
+    db: aiosqlite.Connection,
+    *,
+    origin: str | None = None,
+) -> dict[str, int]:
+    """Count goals grouped by status, optionally filtered by provenance.
+
+    Unbounded (no LIMIT) — the cap check for autonomous ego-goal creation
+    uses this, so it must never silently truncate.
+    """
+    if origin is not None:
+        cursor = await db.execute(
+            "SELECT status, COUNT(*) FROM user_goals WHERE origin = ? GROUP BY status",
+            (origin,),
+        )
+    else:
+        cursor = await db.execute("SELECT status, COUNT(*) FROM user_goals GROUP BY status")
+    return {r[0]: r[1] for r in await cursor.fetchall()}
 
 
 async def list_by_category(
@@ -113,8 +148,7 @@ async def list_by_category(
 ) -> list[dict]:
     """List goals by category."""
     cursor = await db.execute(
-        "SELECT * FROM user_goals WHERE category = ? "
-        "ORDER BY created_at DESC LIMIT ?",
+        "SELECT * FROM user_goals WHERE category = ? ORDER BY created_at DESC LIMIT ?",
         (category, limit),
     )
     return [dict(r) for r in await cursor.fetchall()]
@@ -125,9 +159,7 @@ async def get_by_id(
     goal_id: str,
 ) -> dict | None:
     """Get a single goal by ID."""
-    cursor = await db.execute(
-        "SELECT * FROM user_goals WHERE id = ?", (goal_id,)
-    )
+    cursor = await db.execute("SELECT * FROM user_goals WHERE id = ?", (goal_id,))
     row = await cursor.fetchone()
     return dict(row) if row else None
 
@@ -162,10 +194,12 @@ async def add_progress_note(
         notes = json.loads(goal.get("progress_notes") or "[]")
     except (json.JSONDecodeError, TypeError):
         notes = []
-    notes.append({
-        "date": datetime.now(UTC).isoformat()[:10],
-        "note": note,
-    })
+    notes.append(
+        {
+            "date": datetime.now(UTC).isoformat()[:10],
+            "note": note,
+        }
+    )
     now = datetime.now(UTC).isoformat()
     cursor = await db.execute(
         "UPDATE user_goals SET progress_notes = ?, updated_at = ? WHERE id = ?",
@@ -180,12 +214,33 @@ async def find_similar(
     title: str,
     *,
     threshold: float = 0.6,
+    statuses: tuple[str, ...] = ("active",),
+    origin: str | None = None,
 ) -> dict | None:
     """Find an existing goal with a similar title (simple word overlap).
 
     Returns the best match above the threshold, or None.
+
+    ``statuses`` scopes the search (default preserves the original
+    active-only behavior). The autonomous ego-goal creation path passes
+    ``("active", "paused")`` so pausing a goal doesn't reopen the door to
+    recreating it; achieved/abandoned are deliberately never matched — a
+    finished title stays re-openable. ``origin`` scopes by provenance
+    (the extraction path passes "user" so conversation-derived signals
+    never reinforce ego-owned goals).
     """
-    goals = await list_active(db, limit=50)
+    placeholders = ", ".join("?" for _ in statuses)
+    params: list[object] = list(statuses)
+    origin_clause = ""
+    if origin is not None:
+        origin_clause = "AND origin = ? "
+        params.append(origin)
+    cursor = await db.execute(
+        f"SELECT * FROM user_goals WHERE status IN ({placeholders}) "  # noqa: S608
+        f"{origin_clause}ORDER BY created_at DESC LIMIT 50",
+        params,
+    )
+    goals = [dict(r) for r in await cursor.fetchall()]
     if not goals:
         return None
 
@@ -271,9 +326,7 @@ async def check_completion_cascade(
     if not children:
         return None
 
-    live_children = [
-        c for c in children if c.get("status") != "abandoned"
-    ]
+    live_children = [c for c in children if c.get("status") != "abandoned"]
     if not live_children:
         return None
 

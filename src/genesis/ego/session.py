@@ -83,6 +83,21 @@ _NEVER_DISPATCH_ACTION_TYPES = (
     "gauntlet_regression",
 )
 
+# MCP tools the ego CYCLE session must never call directly. In-cycle goal
+# mutation goes through the parsed-output path (source_tag-gated, validated,
+# audited) — never the foreground goal tools: ego_goal_create stamps
+# origin='user' (masquerading as a user directive), ego_goal_update can
+# mutate ANY goal with no approval gate, and ego_goal_progress writes
+# progress_notes AND refreshes updated_at — silently resetting the user's
+# staleness-review clock (Codex P1, PR #1093). Foreground CC sessions keep
+# all of them (user-authorized surface). Only truly read-only goal tools
+# (ego_goal_list) stay available in-cycle.
+_EGO_CYCLE_DISALLOWED_TOOLS = (
+    "mcp__genesis-health__ego_goal_create",
+    "mcp__genesis-health__ego_goal_update",
+    "mcp__genesis-health__ego_goal_progress",
+)
+
 
 class CycleBlockedError(Exception):
     """Raised when the ego cycle is blocked by an approval gate.
@@ -313,6 +328,7 @@ class EgoSession:
             skip_permissions=True,
             working_dir=background_session_dir(),
             mcp_config=self._mcp_config_path,
+            disallowed_tools=list(_EGO_CYCLE_DISALLOWED_TOOLS),
         )
 
         # Autonomous dispatch check
@@ -534,7 +550,9 @@ class EgoSession:
             await obs_crud.create(
                 self._db,
                 id=str(uuid.uuid4()),
-                source="user_ego",
+                # Provenance: whichever ego cycle produced the review —
+                # hardcoding "user_ego" misattributed genesis-cycle output.
+                source=self._source_tag,
                 type="goal_recommendation",
                 content=content,
                 priority="medium",
@@ -2170,7 +2188,10 @@ class EgoSession:
             try:
                 from genesis.db.crud import user_goals
 
-                goals = await user_goals.list_active(self._db)
+                # origin="user": dispatched-session prompts label these as
+                # the user's goals — ego-authored text must never masquerade
+                # as a user directive downstream (injection surface).
+                goals = await user_goals.list_active(self._db, origin="user")
                 if goals:
                     goal_lines = [
                         f"- {g['title']} ({g['category']}, {g['priority']})" for g in goals[:5]

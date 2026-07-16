@@ -430,12 +430,30 @@ class MorningReportGenerator:
             for t in topics:
                 lines.append(f"  - {t[:120]}")
 
-        # Active user goals — enables the LLM to note priority alignment/drift
-        goal_rows = await goals_crud.list_active(self._db, limit=10)
+        # Active user goals — enables the LLM to note priority alignment/drift.
+        # origin="user": ego-owned goals are not user goals (counted below).
+        goal_rows = await goals_crud.list_active(self._db, limit=10, origin="user")
         if goal_rows:
             lines.append("- Active user goals:")
             for g in goal_rows:
                 lines.append(f"  - [{g['priority']}] ({g['category']}) {g['title']}")
+
+        # Genesis's own goals (origin='genesis_ego', additive ego autonomy) —
+        # ambient visibility + the paused-tail watch surface. Compact count
+        # only; autonomous actions get their own report lines via the
+        # goal_autonomous_action observation surfacing.
+        try:
+            ego_goal_counts = await goals_crud.count_by_status(
+                self._db, origin="genesis_ego",
+            )
+            n_active = ego_goal_counts.get("active", 0)
+            n_paused = ego_goal_counts.get("paused", 0)
+            if n_active or n_paused:
+                lines.append(
+                    f"- Genesis's own goals: {n_active} active, {n_paused} paused"
+                )
+        except Exception:
+            logger.warning("Failed to count Genesis-ego goals", exc_info=True)
 
         # Inbox items — only report genuinely pending DB items
         pending_inbox = await inbox_crud.count_pending(self._db)

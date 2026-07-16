@@ -1090,3 +1090,30 @@ async def test_j9_eval_status_reports_new_snapshot_dimensions(db, monkeypatch):
     for dim in ("approvals", "goals", "noise"):
         assert dim in res["latest_snapshots"], f"missing {dim}"
         assert res["latest_snapshots"][dim] is not None
+
+
+async def test_compute_goal_completion_excludes_ego_goals(db):
+    """PR-3a: origin='genesis_ego' goals must not contaminate the user-goal
+    eval signal — neither the status ratios nor the achieved window."""
+    from genesis.db.crud import user_goals
+    from genesis.eval.j9_aggregator import _compute_goal_completion
+
+    u1 = await user_goals.create(db, title="user g", category="project")
+    e1 = await user_goals.create(
+        db, title="ego g", category="project", origin="genesis_ego",
+    )
+    await user_goals.create(
+        db, title="ego g2", category="project", origin="genesis_ego",
+    )
+    await user_goals.mark_achieved(db, u1)
+    await user_goals.mark_achieved(db, e1)
+
+    metrics, sample = await _compute_goal_completion(
+        db, since="2000-01-01", until="2100-01-01",
+    )
+    assert sample == 1  # the user goal only
+    assert metrics["total_goals"] == 1
+    assert metrics["by_status"] == {
+        "active": 0, "paused": 0, "achieved": 1, "abandoned": 0,
+    }
+    assert metrics["achieved_count"] == 1

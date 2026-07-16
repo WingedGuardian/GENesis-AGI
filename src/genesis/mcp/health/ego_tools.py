@@ -11,6 +11,15 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+from genesis.ego.goal_actions import (
+    VALID_GOAL_CATEGORIES as _VALID_GOAL_CATEGORIES,
+)
+from genesis.ego.goal_actions import (
+    VALID_GOAL_PRIORITIES as _VALID_GOAL_PRIORITIES,
+)
+from genesis.ego.goal_actions import (
+    VALID_GOAL_TYPES as _VALID_GOAL_TYPES,
+)
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -18,9 +27,8 @@ logger = logging.getLogger(__name__)
 # Validation sets matching DB CHECK constraints
 _VALID_DIRECTIVE_PRIORITIES = frozenset({"low", "normal", "high", "critical"})
 _VALID_EGO_TARGETS = frozenset({"user_ego", "genesis_ego"})
-_VALID_GOAL_CATEGORIES = frozenset({"career", "project", "learning", "relationship", "financial", "other"})
-_VALID_GOAL_PRIORITIES = frozenset({"low", "medium", "high", "critical"})
-_VALID_GOAL_TYPES = frozenset({"milestone", "continuous"})
+# Goal-field sets now live in genesis.ego.goal_actions (shared with the ego
+# session's own-goal creation path) — imported above.
 
 
 def _get_db_path():
@@ -283,6 +291,9 @@ async def ego_goal_list() -> dict:
                 "category": g.get("category", ""),
                 "priority": g.get("priority", "medium"),
                 "status": g.get("status", "active"),
+                # Provenance display: 'user' vs 'genesis_ego' (ego-owned) —
+                # the user must always be able to tell whose goal is whose.
+                "origin": g.get("origin", "user"),
             }
             for g in goals
         ],

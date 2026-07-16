@@ -267,7 +267,11 @@ class UserEgoContextBuilder:
 
         try:
             from genesis.db.crud import user_goals
-            goals = await user_goals.list_active(self._db, limit=20)
+            # origin="user": ego-owned goals must never render as user
+            # directives in the user ego's world model.
+            goals = await user_goals.list_active(
+                self._db, limit=20, origin="user",
+            )
         except Exception:
             logger.debug("Failed to query user goals", exc_info=True)
             lines.append("*Goal tracking not yet populated.*\n")

@@ -731,10 +731,14 @@ async def _compute_goal_completion(
     criteria (a ``success_criteria`` column + population wiring) are
     deliberately deferred; until then any non-null rate is unvalidated.
 
+    Scoped to origin='user' — ego-owned (genesis_ego) goals must not
+    contaminate the user-goal eval signal.
+
     Snapshot-only dimension (writes no eval_events).
     """
     cursor = await db.execute(
-        "SELECT status, COUNT(*) FROM user_goals GROUP BY status"
+        "SELECT status, COUNT(*) FROM user_goals "
+        "WHERE origin = 'user' GROUP BY status"
     )
     by_status = {r[0]: r[1] for r in await cursor.fetchall()}
     total_goals = sum(by_status.values())
@@ -744,7 +748,7 @@ async def _compute_goal_completion(
 
     cursor = await db.execute(
         "SELECT COUNT(*) FROM user_goals "
-        "WHERE achieved_at >= ? AND achieved_at < ?",
+        "WHERE origin = 'user' AND achieved_at >= ? AND achieved_at < ?",
         (since, until),
     )
     achieved_in_period = (await cursor.fetchone())[0]

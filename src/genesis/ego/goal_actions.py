@@ -38,6 +38,17 @@ GOAL_STATUS_CHANGE_ACTION_TYPE = "goal_status_change"
 _VALID_STATUS = frozenset({"paused"})
 _VALID_PRIORITY = frozenset({"low", "medium", "high", "critical"})
 
+# Shared goal-field validation sets — single source of truth for BOTH the MCP
+# tool surface (mcp/health/ego_tools.py imports these) and the ego session's
+# own-goal creation path. They mirror the user_goals CHECK constraints in
+# db/schema/_tables.py; change them together. Import direction is always INTO
+# the MCP layer — the runtime ego must never import MCP server modules.
+VALID_GOAL_CATEGORIES = frozenset(
+    {"career", "project", "learning", "relationship", "financial", "other"}
+)
+VALID_GOAL_PRIORITIES = _VALID_PRIORITY
+VALID_GOAL_TYPES = frozenset({"milestone", "continuous"})
+
 
 def _parse_expected_outputs(expected_outputs: object) -> dict | None:
     """Extract the ``{change, value}`` spec from a proposal's expected_outputs.

@@ -359,3 +359,89 @@ class TestMemoryEventsExtended:
         )
         deadlines = await memory_events.approaching_deadlines(db, days=365*100)
         assert len(deadlines) == 1
+
+
+# -- Goal origin scoping (PR-3a: origin-aware surfaces) --
+
+
+class TestGoalOriginScoping:
+    """Origin-aware queries: user-facing surfaces filter to origin='user';
+    the ego's own lane queries origin='genesis_ego'."""
+
+    async def _seed(self, db):
+        await user_goals.create(
+            db, title="User goal", category="career", priority="high",
+        )
+        await user_goals.create(
+            db, title="Ego ops goal", category="project",
+            priority="medium", origin="genesis_ego",
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_active_origin_filter(self, db):
+        await self._seed(db)
+        both = {g["title"] for g in await user_goals.list_active(db)}
+        assert both == {"User goal", "Ego ops goal"}
+        users = [g["title"] for g in await user_goals.list_active(db, origin="user")]
+        assert users == ["User goal"]
+        ego = [g["title"] for g in await user_goals.list_active(db, origin="genesis_ego")]
+        assert ego == ["Ego ops goal"]
+
+    @pytest.mark.asyncio
+    async def test_count_by_status(self, db):
+        await self._seed(db)
+        gid = await user_goals.create(
+            db, title="Paused ego goal", category="other", origin="genesis_ego",
+        )
+        await user_goals.update(db, gid, status="paused")
+        counts = await user_goals.count_by_status(db, origin="genesis_ego")
+        assert counts == {"active": 1, "paused": 1}
+        all_counts = await user_goals.count_by_status(db)
+        assert all_counts["active"] == 2
+        assert all_counts["paused"] == 1
+
+    @pytest.mark.asyncio
+    async def test_find_similar_matches_paused_when_scoped(self, db):
+        """The autonomous-creation dedupe passes ("active", "paused") so
+        pausing an ego goal doesn't reopen the door to recreating it."""
+        gid = await user_goals.create(
+            db, title="Reduce nightly maintenance backlog",
+            category="project", origin="genesis_ego",
+        )
+        await user_goals.update(db, gid, status="paused")
+        assert await user_goals.find_similar(
+            db, "Reduce nightly maintenance backlog",
+        ) is None  # default active-only behavior preserved
+        match = await user_goals.find_similar(
+            db, "Reduce nightly maintenance backlog",
+            statuses=("active", "paused"),
+        )
+        assert match is not None
+        assert match["id"] == gid
+
+    @pytest.mark.asyncio
+    async def test_find_similar_never_matches_achieved(self, db):
+        """A finished title stays re-openable — terminal goals never block."""
+        gid = await user_goals.create(
+            db, title="Ship the quarterly report pipeline", category="project",
+        )
+        await user_goals.mark_achieved(db, gid)
+        assert await user_goals.find_similar(
+            db, "Ship the quarterly report pipeline",
+            statuses=("active", "paused"),
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_find_similar_origin_scope(self, db):
+        """Extraction dedupe (origin='user') must never match an ego goal —
+        conversation-derived signals only speak for the user's lane."""
+        await user_goals.create(
+            db, title="Improve memory recall quality",
+            category="project", origin="genesis_ego",
+        )
+        assert await user_goals.find_similar(
+            db, "Improve memory recall quality", origin="user",
+        ) is None
+        assert await user_goals.find_similar(
+            db, "Improve memory recall quality",
+        ) is not None
