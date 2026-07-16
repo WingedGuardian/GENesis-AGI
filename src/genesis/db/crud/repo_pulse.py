@@ -152,6 +152,27 @@ async def record_run(
     return True
 
 
+async def annotation_exists(
+    db: aiosqlite.Connection, tier: str, item_id: str, pr_number: int
+) -> bool:
+    """True when this (tier, item_id, pr_number) match was already recorded.
+
+    The worker's re-absorb guard: a re-covered enumeration window (or a
+    deliberately reopened item) must not be acted on twice for the same
+    PR. Any status counts — a rejected proposal is still a decision made.
+    """
+    if tier not in TIERS:
+        raise ValueError(f"invalid annotation tier: {tier!r}")
+    if not await _tables_available(db):
+        return False
+    cursor = await db.execute(
+        "SELECT 1 FROM repo_pulse_annotations "
+        "WHERE tier = ? AND item_id = ? AND pr_number = ? LIMIT 1",
+        (tier, item_id, pr_number),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def resolve_annotation(
     db: aiosqlite.Connection,
     annotation_id: str,
