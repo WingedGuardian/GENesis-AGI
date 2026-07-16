@@ -182,6 +182,9 @@ async def test_rows_carry_wing_and_room(tmp_path) -> None:
         by_id = {r["memory_id"]: r for r in rows}
         assert by_id["user-1"]["wing"] == "routing"
         assert by_id["user-1"]["room"] == "fallback"
+        # FTS tag string is projected too (empty for these seed rows) — the
+        # scope filter reads it to honor explicit life_domain overrides.
+        assert by_id["user-1"]["tags"] == ""
         # Unclassified rows project NULL wing/room, not a missing key.
         assert by_id["ego-1"]["wing"] is None
         assert by_id["ego-1"]["room"] is None

@@ -168,9 +168,15 @@ def apply_resync(
 
     written = 0
     for (wing, room), point_ids in groups.items():
-        payload: dict = {"wing": wing, "life_domain": classify_life_domain(wing)}
-        if room:
-            payload["room"] = room
+        # Always write room (null when SQLite has none). set_payload MERGES, so
+        # omitting a null room would leave a STALE Qdrant room in place and let
+        # `wing=X & room=stale` vector recall false-match a memory whose SQLite
+        # room is null — overwrite it to match the authoritative record.
+        payload: dict = {
+            "wing": wing,
+            "room": room,
+            "life_domain": classify_life_domain(wing),
+        }
         if apply:
             set_payload_batch(client, collection=collection, point_ids=point_ids, payload=payload)
         written += len(point_ids)

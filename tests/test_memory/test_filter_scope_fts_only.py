@@ -15,9 +15,9 @@ from genesis.memory.retrieval import _filter_scope_fts_only
 from genesis.memory.taxonomy import classify_life_domain
 
 
-def _fts(wing=None, room=None):
-    """A search_ranked-shaped FTS row carrying the projected wing/room."""
-    return {"wing": wing, "room": room}
+def _fts(wing=None, room=None, tags=None):
+    """A search_ranked-shaped FTS row carrying the projected wing/room/tags."""
+    return {"wing": wing, "room": room, "tags": tags}
 
 
 def test_no_filter_is_noop():
@@ -129,6 +129,25 @@ def test_life_domain_derived_from_authoritative_wing():
         life_domain=other,
     )
     assert dropped == []
+
+
+def test_life_domain_explicit_tag_overrides_wing():
+    # An explicit life_domain: tag (set at write time, carried in the FTS tags
+    # string) must win over the wing-inferred domain — matching the Qdrant path
+    # which filters on the stored payload value.
+    wing = "employment"
+    inferred = classify_life_domain(wing)
+    override = next(d for d in ("personal", "employment", "genesis") if d != inferred)
+    fhit = _fts(wing=wing, tags=f"some_tag wing:{wing} life_domain:{override}")
+    # Reachable under its EXPLICIT domain...
+    assert _filter_scope_fts_only(
+        ["m1"], {}, {"m1": fhit}, wing=None, room=None, life_domain=override
+    ) == ["m1"]
+    # ...and NOT under the wing-inferred one.
+    assert (
+        _filter_scope_fts_only(["m1"], {}, {"m1": fhit}, wing=None, room=None, life_domain=inferred)
+        == []
+    )
 
 
 def test_order_preserved_across_mixed_candidates():

@@ -360,12 +360,16 @@ def _filter_scope_fts_only(
         if room and fhit.get("room") != room:
             continue
         if life_domain:
-            # No life_domain column on memory_metadata; derive from the
-            # authoritative wing (explicit life_domain: tag overrides at
-            # store time aren't visible here, so this is wing-inferred).
+            # No life_domain column on memory_metadata; derive it the same way
+            # the write path does — classify_life_domain honors an explicit
+            # ``life_domain:`` tag (carried in the FTS ``tags`` string) and
+            # otherwise infers from wing. This keeps the FTS path consistent
+            # with the stored payload the Qdrant path filters on.
             from genesis.memory.taxonomy import classify_life_domain
 
-            if classify_life_domain(row_wing or "general") != life_domain:
+            tags_str = fhit.get("tags") or ""
+            tag_list = tags_str.split() if tags_str else None
+            if classify_life_domain(row_wing or "general", tags=tag_list) != life_domain:
                 continue
         filtered.append(mid)
     return filtered

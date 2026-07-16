@@ -81,13 +81,18 @@ def test_apply_resync_writes_expected_payload():
     }
 
 
-def test_apply_resync_omits_room_when_null():
+def test_apply_resync_writes_null_room_to_overwrite_stale():
+    # set_payload MERGES, so a null SQLite room must be written explicitly
+    # (room=None) to overwrite any stale Qdrant room — not omitted.
     client = MagicMock()
     groups = {("memory", None): ["p1"]}
     wr.apply_resync(client, "episodic_memory", groups, apply=True)
     _, kwargs = client.set_payload.call_args
-    assert "room" not in kwargs["payload"]
-    assert kwargs["payload"]["wing"] == "memory"
+    assert kwargs["payload"] == {
+        "wing": "memory",
+        "room": None,
+        "life_domain": classify_life_domain("memory"),
+    }
 
 
 def test_apply_resync_dry_run_no_write_but_counts():
