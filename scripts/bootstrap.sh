@@ -768,7 +768,9 @@ if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
     # present) and degrades to a warning on failure; memory_resilience_apply
     # still guards on PSI/systemd independently, so this never forces oomd on a
     # kernel that can't support it.
-    install_pkg systemd-oomd || echo "  WARNING: Could not install systemd-oomd — pressure-kill protection will be skipped."
+    # (dnf arg: Fedora ships oomd inside the main systemd package; the
+    # installable subpackage there is systemd-oomd-defaults.)
+    install_pkg systemd-oomd systemd-oomd-defaults || echo "  WARNING: Could not install systemd-oomd — if the next step reports 'systemd-oomd not available', pressure-kill protection is off."
     # shellcheck source=lib/memory_resilience.sh
     source "$SCRIPT_DIR/lib/memory_resilience.sh"
     memory_resilience_apply
