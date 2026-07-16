@@ -87,6 +87,62 @@ async def relieve_io_max(container: str) -> bool:
         return False
 
 
+async def read_swap_max(container: str) -> str | None:
+    """Read memory.swap.max from the container's cgroup via sudo.
+
+    Read through sudo rather than directly: cgroup-delegation ownership of the
+    lxc.payload subtree varies, and a perm-denied plain read would be
+    indistinguishable from "knob absent" (the same reason
+    scripts/lib/container_swap.sh reads with ``sudo cat``). Returns the trimmed
+    value ("0", "max", or a byte count) or None when unreadable/absent
+    (container stopped, cgroup v1, non-standard layout) — None means
+    "no signal", never "healthy".
+    """
+    swap_path = _cgroup_path(container) / "memory.swap.max"
+    try:
+        rc, stdout, _stderr = await _run_subprocess(
+            "sudo", "cat", str(swap_path), timeout=10.0,
+        )
+        if rc != 0:
+            return None
+        return stdout.strip() or None
+    except Exception as exc:
+        logger.warning("Failed to read memory.swap.max for %s: %s", container, exc)
+        return None
+
+
+async def activate_swap_max(container: str) -> bool:
+    """Write 'max' to memory.swap.max — live-activate swap on a RUNNING container.
+
+    incus applies ``limits.memory.swap`` only when the container STARTS, so on
+    an already-running container the live cgroup keeps ``memory.swap.max=0``
+    until the next restart and every memory spike becomes the load-100 D-state
+    OOM-thrash wedge instead of degrading into swap. Writing ``max`` mirrors
+    what incus does at start (scripts/lib/container_swap.sh does the same from
+    host-setup); this is the guardian-side equivalent for installs that never
+    re-run host-setup.
+
+    Requires sudo because the cgroup is owned by root. Returns True on success.
+    """
+    swap_path = _cgroup_path(container) / "memory.swap.max"
+    try:
+        import shlex
+        rc, _stdout, stderr = await _run_subprocess(
+            "sudo", "sh", "-c", f"echo max > {shlex.quote(str(swap_path))}",
+            timeout=10.0,
+        )
+        if rc != 0:
+            logger.error(
+                "Failed to activate memory.swap.max for %s: %s", container, stderr,
+            )
+            return False
+        logger.info("Activated swap live for %s (memory.swap.max=max)", container)
+        return True
+    except Exception as exc:
+        logger.error("Failed to activate memory.swap.max for %s: %s", container, exc)
+        return False
+
+
 def list_container_pids(container: str) -> list[int]:
     """List all PIDs in the container's cgroup.
 

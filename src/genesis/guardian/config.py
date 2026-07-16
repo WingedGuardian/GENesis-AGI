@@ -317,6 +317,10 @@ class GuardianConfig:
     check_interval_s: int = 30
     state_dir: str = "~/.local/state/genesis-guardian"
     maintenance_file: str = "/var/lib/guardian-snapshots/.guardian-maintenance"
+    # Container-swap invariant reconciler (swap_watch): re-assert
+    # limits.memory.swap=true + live cgroup activation each tick. Kill switch
+    # for hosts where swap-off is a deliberate operator choice.
+    swap_reconcile_enabled: bool = True
 
     # Host VM details — used by container for bidirectional monitoring (SSH → gateway)
     host_ip: str = ""      # Auto-detected by installer; empty = not installed
@@ -582,6 +586,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         "container_name", "container_ip", "container_user",
         "health_api_port", "check_interval_s", "state_dir",
         "host_ip", "host_user", "maintenance_file",
+        "swap_reconcile_enabled",
     }
     top_kwargs = {k: v for k, v in raw.items() if k in top_fields}
 

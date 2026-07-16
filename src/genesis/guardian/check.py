@@ -369,6 +369,17 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # block on an APPROVE for up to approval_timeout_s — liveness must not
         # hinge on that optional, bounded wait completing.
         await _write_guardian_heartbeat(config)
+        # Container-swap invariant (silent-skip class): host-setup sets
+        # limits.memory.swap at creation, but an install that advances via bare
+        # git pull never re-runs host-setup — reconcile the knob (persistent
+        # config + live cgroup) on observed state so a memory spike degrades
+        # into swap pressure instead of the D-state OOM-thrash wedge. Runs
+        # BEFORE the storage-pool block: that path can wait up to
+        # approval_timeout_s on a Telegram APPROVE, and a box wedging on
+        # missing swap (the pool-crit + genesis_down case) must get the live
+        # cgroup fix at the START of the tick, not after a 30-minute wait. Two
+        # cheap reads on the healthy path.
+        await _check_container_swap_and_alert(config, dispatcher)
         # Storage-pool monitoring runs every cycle regardless of state — a
         # filling thin pool is the exact silent failure that caused the outage.
         # genesis_down gates the autonomous provisioning propose: only when
@@ -583,6 +594,22 @@ async def _check_credential_integrity_and_alert(
         await check_credential_integrity_and_alert(config, dispatcher)
     except Exception:
         logger.warning("credential-integrity watch failed", exc_info=True)
+
+
+async def _check_container_swap_and_alert(
+    config: GuardianConfig, dispatcher: AlertDispatcher,
+) -> None:
+    """Guardian-side container-swap invariant reconciler (delegates to swap_watch).
+
+    host-setup sets limits.memory.swap at creation, but an install that
+    advances via bare git pull never re-runs host-setup — the guardian
+    re-asserts the knob (persistent config + live cgroup) on observed state.
+    Never raises into the tick."""
+    try:
+        from genesis.guardian.swap_watch import check_container_swap_and_alert
+        await check_container_swap_and_alert(config, dispatcher)
+    except Exception:
+        logger.warning("container-swap watch failed", exc_info=True)
 
 
 async def _check_container_git_and_alert(
