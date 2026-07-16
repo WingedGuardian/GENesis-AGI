@@ -92,35 +92,66 @@ async def test_all_tables_exist(db):
 async def test_no_unexpected_tables(db):
     tables = await _get_tables(db)
     known = set(EXPECTED_TABLES) | {
-        "memory_fts", "memory_fts_data", "memory_fts_idx",
-        "memory_fts_content", "memory_fts_docsize", "memory_fts_config",
-        "knowledge_fts", "knowledge_fts_data", "knowledge_fts_idx",
-        "knowledge_fts_content", "knowledge_fts_docsize", "knowledge_fts_config",
-        "call_site_last_run", "resolved_errors", "job_health",
-        "processed_emails", "task_steps",
-        "ego_cycles", "ego_cycle_outcomes", "ego_proposals", "ego_state", "intervention_journal", "capability_map",
-        "behavioral_corrections", "behavioral_themes", "behavioral_treatments",
+        "memory_fts",
+        "memory_fts_data",
+        "memory_fts_idx",
+        "memory_fts_content",
+        "memory_fts_docsize",
+        "memory_fts_config",
+        "knowledge_fts",
+        "knowledge_fts_data",
+        "knowledge_fts_idx",
+        "knowledge_fts_content",
+        "knowledge_fts_docsize",
+        "knowledge_fts_config",
+        "call_site_last_run",
+        "resolved_errors",
+        "job_health",
+        "processed_emails",
+        "task_steps",
+        "ego_cycles",
+        "ego_cycle_outcomes",
+        "ego_proposals",
+        "ego_state",
+        "intervention_journal",
+        "capability_map",
+        "behavioral_corrections",
+        "behavioral_themes",
+        "behavioral_treatments",
         "memory_metadata",
-        "code_modules", "code_symbols", "code_imports",
-        "follow_ups", "surplus_tasks", "surplus_insights",
+        "code_modules",
+        "code_symbols",
+        "code_imports",
+        "follow_ups",
+        "surplus_tasks",
+        "surplus_insights",
         "knowledge_uploads",
         "file_modifications",
         "direct_session_queue",
-        "eval_events", "eval_snapshots",
+        "eval_events",
+        "eval_snapshots",
         "memory_events",
-        "user_goals", "user_contacts", "ego_directives",
+        "user_goals",
+        "user_contacts",
+        "ego_directives",
         "tool_call_outcomes",
-        "user_jobs", "user_job_runs",
+        "user_jobs",
+        "user_job_runs",
         "task_type_watermarks",
         "prompt_versions",
         "eval_subsystem_grades",
         "reflection_corpus",
-        "email_threads", "email_thread_messages",
+        "email_threads",
+        "email_thread_messages",
         "outcome_events",  # self-improvement outcome bus
         "ego_calibration_snapshots",  # measure-only ego calibration
         "otel_spans",  # tracing/spans backbone
         "cognitive_file_modifications",  # cognitive self-mod rollback ledger
-        "entities", "entity_mentions", "entity_links",  # entity layer (WS-H P2)
+        "entities",
+        "entity_mentions",
+        "entity_links",  # entity layer (WS-H P2)
+        "job_run_events",
+        "alert_events",  # WS-2 sensor fabric (M9/M10)
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"
@@ -173,8 +204,7 @@ async def test_unprocessed_memory_backlog_migration_removes_existing_row(db):
 
     # Sanity check: row exists before migration runs.
     cur = await db.execute(
-        "SELECT COUNT(*) FROM signal_weights "
-        "WHERE signal_name = 'unprocessed_memory_backlog'"
+        "SELECT COUNT(*) FROM signal_weights WHERE signal_name = 'unprocessed_memory_backlog'"
     )
     assert (await cur.fetchone())[0] == 1
 
@@ -182,8 +212,7 @@ async def test_unprocessed_memory_backlog_migration_removes_existing_row(db):
     await _migrate_add_columns(db)
     await db.commit()
     cur = await db.execute(
-        "SELECT COUNT(*) FROM signal_weights "
-        "WHERE signal_name = 'unprocessed_memory_backlog'"
+        "SELECT COUNT(*) FROM signal_weights WHERE signal_name = 'unprocessed_memory_backlog'"
     )
     assert (await cur.fetchone())[0] == 0
 
@@ -191,8 +220,7 @@ async def test_unprocessed_memory_backlog_migration_removes_existing_row(db):
     await _migrate_add_columns(db)
     await db.commit()
     cur = await db.execute(
-        "SELECT COUNT(*) FROM signal_weights "
-        "WHERE signal_name = 'unprocessed_memory_backlog'"
+        "SELECT COUNT(*) FROM signal_weights WHERE signal_name = 'unprocessed_memory_backlog'"
     )
     assert (await cur.fetchone())[0] == 0
 
@@ -337,9 +365,7 @@ async def test_build_candidates_one_open_per_item_key(db):
             "VALUES ('c2', 'k1', 'title', 'notepad.md', 'build')"
         )
     # Close c1 with a decision — a fresh open candidate is then allowed.
-    await db.execute(
-        "UPDATE build_candidates SET user_decision = 'rejected' WHERE id = 'c1'"
-    )
+    await db.execute("UPDATE build_candidates SET user_decision = 'rejected' WHERE id = 'c1'")
     await db.execute(
         "INSERT INTO build_candidates (id, item_key, item_title, source_file, verdict) "
         "VALUES ('c3', 'k1', 'title', 'notepad.md', 'build')"
@@ -356,9 +382,7 @@ async def test_task_states_source_defaults_to_user(db):
         "INSERT INTO task_states (task_id, description, intake_token) "
         "VALUES ('t-x', 'd', 'tok-src')"
     )
-    cursor = await db.execute(
-        "SELECT source FROM task_states WHERE task_id = 't-x'"
-    )
+    cursor = await db.execute("SELECT source FROM task_states WHERE task_id = 't-x'")
     row = await cursor.fetchone()
     assert row[0] == "user"
 
@@ -465,8 +489,15 @@ async def test_dead_letter_table_columns(db):
     cursor = await db.execute("PRAGMA table_info(dead_letter)")
     cols = {row[1] for row in await cursor.fetchall()}
     expected = {
-        "id", "operation_type", "payload", "target_provider",
-        "failure_reason", "created_at", "retry_count", "last_retry_at", "status",
+        "id",
+        "operation_type",
+        "payload",
+        "target_provider",
+        "failure_reason",
+        "created_at",
+        "retry_count",
+        "last_retry_at",
+        "status",
     }
     assert expected == cols
 
@@ -531,6 +562,7 @@ async def test_migration_creates_all_indexed_columns():
         # 2. Run migrations (on a fresh DB this is a no-op, but it exercises
         #    all _try_alter paths to ensure they don't error)
         from genesis.db.schema._migrations import _migrate_add_columns
+
         await _migrate_add_columns(conn)
         await conn.commit()
 
