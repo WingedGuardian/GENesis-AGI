@@ -188,20 +188,23 @@ async def _record_run(db_path: Path | str, **kwargs) -> bool:
         return False
 
 
-async def _load_open_items(db_path: Path | str) -> list[dict]:
+async def _load_open_items(db_path: Path | str) -> list[dict] | None:
     """Open/in_progress ledger rows across ALL sessions, newest first.
 
-    Best-effort: on any failure the run proceeds with zero items (recorded
-    honestly as n_open_items=0 — the exact tier then has nothing to match,
-    which is degraded, not wrong)."""
+    Returns None on ANY read failure — a failed snapshot is NOT an empty
+    one. Proceeding with [] would record an ok run and advance the cursor
+    past PRs whose matches were never computed, skipping those closures
+    forever; the caller must fail the run and keep the cursor instead
+    (Codex P2 on #1081). The limit is pinned at ledger_all's ceiling so
+    truncation can't silently hide newer open rows either."""
     import aiosqlite
 
     try:
         async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as db:
             db.row_factory = aiosqlite.Row
-            rows = await ledger_all(db)
+            rows = await ledger_all(db, limit=100_000)
     except Exception:
-        return []
+        return None
     open_rows = [r for r in rows if r.get("status") in OPEN_STATUSES]
     open_rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
     return open_rows
@@ -474,6 +477,18 @@ async def _run_locked(
     new_max_merged = max(str(p["mergedAt"]) for p in prs)
 
     open_items = await _load_open_items(db_path)
+    if open_items is None:
+        # A failed ledger snapshot is not an empty one: recording ok here
+        # would advance the cursor past PRs whose matches were never
+        # computed. Fail, keep the cursor, replay the window next run.
+        detail_notes.append("ledger_read_failed")
+        recorded = await _record_run(
+            db_path, **_base_row(status="failed", repo=repo, n_prs=len(prs))
+        )
+        if recorded:
+            _write_cursor(root, cursor, merged_at=None)
+        await _record_telemetry(db_path, "failed", "ledger_read_failed")
+        return {"status": "failed", "detail": "ledger_read_failed"}
 
     annotations: list[dict] = []
     absorbed: list[str] = []
@@ -503,6 +518,22 @@ async def _run_locked(
                     continue
                 exact_pairs.add((item["id"], pr["number"]))
                 n_exact += 1
+                if via == "marker" and item["id"] in absorbed:
+                    # A second PR in the SAME window citing an item already
+                    # absorbed this run must not re-absorb and overwrite the
+                    # first PR's evidence (attribution corruption). Record a
+                    # proposal instead — the reconcile sweep supersedes it
+                    # under the same-PR attribution guard.
+                    annotations.append(
+                        _annotation(
+                            "exact",
+                            "proposed",
+                            item,
+                            pr,
+                            rationale="ledger-marker (item absorbed earlier this run)",
+                        )
+                    )
+                    continue
                 if via == "marker" and mode == "live":
                     evidence = (
                         f"PR #{pr['number']}: {str(pr.get('title') or '')[:120]} "

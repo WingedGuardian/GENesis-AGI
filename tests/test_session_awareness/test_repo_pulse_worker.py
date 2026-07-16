@@ -448,6 +448,56 @@ async def test_pre_migration_never_absorbs_ledger(pulse_root, tmp_path, monkeypa
     assert (await _item_row(bare))["status"] == "absorbed"
 
 
+@pytest.mark.asyncio
+async def test_ledger_read_failure_fails_run_and_keeps_cursor(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    """A transient ledger-read failure must FAIL the run, not masquerade as
+    'no open items' — recording ok would advance the cursor past PRs whose
+    matches were never computed (Codex P2 round 2 on #1081)."""
+    _write_cursor_file(pulse_root, last_merged_at=MERGED_OLD)
+
+    async def boom(*a, **kw):
+        raise sqlite_err()
+
+    def sqlite_err():
+        import sqlite3
+
+        return sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(rpw, "ledger_all", boom)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr()]))
+    assert out["status"] == "failed"
+    run = (await _runs(db_path))[0]
+    assert run["status"] == "failed"
+    assert "ledger_read_failed" in run["detail"]
+    assert _cursor(pulse_root)["last_merged_at"] == MERGED_OLD
+
+
+@pytest.mark.asyncio
+async def test_second_marker_pr_same_item_does_not_overwrite_evidence(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    """Two PRs in ONE window citing the same item: the first (oldest) absorbs;
+    the second becomes a proposal — never a second absorb that overwrites the
+    first PR's evidence (Codex P2 round 2 on #1081)."""
+    await _seed_item(db_path)
+    prs = [
+        _pr(number=1080, merged="2026-07-16T09:00:00Z", body=f"Ledger: {ITEM}"),
+        _pr(number=1081, merged="2026-07-16T10:00:00Z", body=f"Ledger: {ITEM}"),
+    ]
+    out = await _run(db_path, monkeypatch, gh=_gh(prs))
+    assert out["status"] == "ok"
+    assert out["absorbed"] == [ITEM]
+    row = await _item_row(db_path)
+    assert "PR #1080" in row["evidence"]  # the first absorber's attribution survives
+    assert "PR #1081" not in row["evidence"]
+    by_pr = {a["pr_number"]: a for a in await _anns(db_path)}
+    assert by_pr[1080]["status"] == "applied"
+    assert by_pr[1081]["status"] == "proposed"
+    assert "absorbed earlier this run" in by_pr[1081]["rationale"]
+
+
 # ── re-absorb guard ──────────────────────────────────────────────────────
 
 
