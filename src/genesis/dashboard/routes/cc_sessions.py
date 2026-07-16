@@ -276,12 +276,21 @@ async def _collect_session_detail(
     """Assemble the cockpit payload for one CC session, or None (→ 404) when
     neither a cc_sessions row nor a charter exists for the id."""
     from genesis.db.crud import session_charters as charter_crud
-    from genesis.db.crud.cc_sessions import list_by_cc_session_id
+    from genesis.db.crud.cc_sessions import get_by_id, list_by_cc_session_id
 
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
 
     rows = await list_by_cc_session_id(db, cc_session_id)
+    if not rows:
+        # A row registered before its transcript id is known (NULL
+        # cc_session_id — startup/stale-recovery window) is addressable
+        # only by DB row id; the tab's fallback click path sends that.
+        # Charter/waypoint/pulse lookups under a row id simply find
+        # nothing — the cockpit still shows the DB session details.
+        by_row_id = await get_by_id(db, cc_session_id)
+        if by_row_id is not None:
+            rows = [by_row_id]
     session = None
     if rows:
         newest = rows[0]
@@ -368,8 +377,21 @@ async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int
         row = await get_annotation(db, annotation_id)
         if row is None or row["status"] != "proposed":
             return {"error": "unknown or already-resolved annotation"}, 404
+        # Resolve the annotation FIRST: its conditional proposed→terminal
+        # UPDATE is the race arbiter. Two concurrent resolutions can't both
+        # win it, so the ledger absorb below only ever runs for the winner —
+        # never an absorbed item under a rejected annotation. (The inverse
+        # residue — confirmed annotation, absorb missed — is visible and
+        # human-fixable via the injected hint.)
+        ok = await resolve_annotation(
+            db,
+            annotation_id,
+            status=status,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_ref="dashboard",
+        )
         absorbed = False
-        if status == "confirmed":
+        if ok and status == "confirmed":
             item = await get_ledger_item(db, row["item_id"])
             if item is not None and item.get("status") in ("open", "in_progress"):
                 absorbed = await ledger_update(
@@ -379,13 +401,6 @@ async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int
                     evidence=f"PR #{row['pr_number']}: {row['pr_title'] or ''} "
                     f"[pulse confirm via dashboard]",
                 )
-        ok = await resolve_annotation(
-            db,
-            annotation_id,
-            status=status,
-            resolved_at=datetime.now(UTC).isoformat(),
-            resolution_ref="dashboard",
-        )
     except (sqlite3.Error, aiosqlite.Error) as exc:
         logger.error("pulse resolve failed: %s", exc)
         return {"error": "pulse store unavailable"}, 503

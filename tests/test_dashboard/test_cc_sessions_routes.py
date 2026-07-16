@@ -507,3 +507,41 @@ async def test_pulse_confirm_on_closed_item_still_confirms_annotation(db):
     assert payload["item_absorbed"] is False
     assert await _ann_status(db) == "confirmed"
     assert (await _ledger_row(db))["status"] == "done"
+
+
+async def test_cockpit_falls_back_to_db_row_id(db, tmp_path):
+    """Rows registered before their transcript id is known (NULL
+    cc_session_id) are addressable by DB row id — the tab's fallback click
+    path must open a cockpit, not a 404 (Codex P2 on #1089)."""
+    from genesis.dashboard.routes.cc_sessions import _collect_session_detail
+
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="row-only", cc_session_id=None)
+    detail = await _collect_session_detail(
+        db, "row-only", sessions_dir=tmp_path / "sessions", now=_NOW
+    )
+    assert detail is not None
+    assert detail["session"]["id"] == "row-only"
+    assert detail["charter"] is None  # no charter under a row id — fine
+
+
+async def test_pulse_confirm_resolves_annotation_before_ledger_write(db, monkeypatch):
+    """Ordering lock (Codex P2 on #1089): the conditional proposed→confirmed
+    flip must WIN before the ledger absorb fires, so a concurrent reject can
+    never leave an absorbed item under a rejected annotation."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+    from genesis.db.crud import session_charters as sc
+
+    await _seed_charter_tables(db, with_rows=True)
+    await _seed_pulse_proposal(db)
+    order: list[str] = []
+    real_ledger_update = sc.ledger_update
+
+    async def probing_ledger_update(db_, item_id, **kw):
+        order.append(await _ann_status(db_, "a1"))
+        return await real_ledger_update(db_, item_id, **kw)
+
+    monkeypatch.setattr(sc, "ledger_update", probing_ledger_update)
+    payload, code = await _resolve_pulse(db, "a1", "confirmed")
+    assert code == 200 and payload["item_absorbed"] is True
+    assert order == ["confirmed"]  # annotation resolved BEFORE the ledger mutate
