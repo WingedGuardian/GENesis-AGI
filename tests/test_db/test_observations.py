@@ -389,3 +389,32 @@ async def test_resolve_by_source_and_type_unscoped_clears_all_categories(db):
     assert n == 3
     for oid in ("g4", "g5", "g6"):
         assert (await observations.get_by_id(db, oid))["resolved"] == 1
+
+
+async def test_skip_if_duplicate_is_atomic_single_statement(db):
+    """The dedup INSERT must be one INSERT…WHERE NOT EXISTS statement, not a
+    SELECT-then-INSERT — two processes can both pass a separate pre-check
+    before either commits (Codex P2, PR #1085). With the atomic form, the
+    second insert is a no-op regardless of interleaving."""
+    r1 = await observations.create(
+        db, id="atomic1", skip_if_duplicate=True, **_GIT_ALERT
+    )
+    r2 = await observations.create(
+        db, id="atomic2", skip_if_duplicate=True, **_GIT_ALERT
+    )
+    assert r1 == "atomic1"
+    assert r2 is None  # duplicate skipped
+    cur = await db.execute(
+        "SELECT count(*) FROM observations WHERE source = 'git_health_monitor'"
+    )
+    assert (await cur.fetchone())[0] == 1
+
+    # After the first is resolved, an identical alert may be created again
+    # (a recurrence after recovery is a NEW incident, not a duplicate).
+    await observations.resolve(
+        db, "atomic1", resolved_at="2026-01-02", resolution_notes="recovered"
+    )
+    r3 = await observations.create(
+        db, id="atomic3", skip_if_duplicate=True, **_GIT_ALERT
+    )
+    assert r3 == "atomic3"

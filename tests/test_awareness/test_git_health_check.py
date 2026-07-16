@@ -277,15 +277,16 @@ async def test_cheap_resolve_error_never_raises(monkeypatch):
 
 
 class TestDeepSelfHeal:
-    """Deep-scan pass resolves ALL open git alerts (deep verifies content)."""
+    """Deep-scan pass resolves open DEEP alerts only (fsck verifies content;
+    it proves nothing about cheap-probe failures like rootfs_readonly)."""
 
     @pytest.mark.asyncio
-    async def test_deep_pass_auto_resolves_all_git_alerts(self, monkeypatch):
+    async def test_deep_pass_auto_resolves_deep_alerts_only(self, monkeypatch):
         monkeypatch.setattr(
             git_health, "check_git_deep", AsyncMock(return_value=_deep_report(True))
         )
         monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
-        resolve = AsyncMock(return_value=2)
+        resolve = AsyncMock(return_value=1)
         monkeypatch.setattr(loop.observations, "resolve_by_source_and_type", resolve)
 
         await loop._check_git_health_deep(object())
@@ -294,9 +295,9 @@ class TestDeepSelfHeal:
         kw = resolve.call_args.kwargs
         assert kw["source"] == "git_health_monitor"
         assert kw["type"] == "infrastructure_alert"
-        # Unscoped: a content-verifying pass clears cheap + deep + legacy
-        # (pre-category) alerts alike.
-        assert "category" not in kw
+        # Scoped: fsck only READS the object store — a passing fsck must not
+        # clear a live rootfs_readonly / structural cheap alert (Codex P1).
+        assert kw["category"] == "git_deep"
 
     @pytest.mark.asyncio
     async def test_deep_pass_none_db_skips_resolve(self, monkeypatch):

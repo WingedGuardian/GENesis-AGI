@@ -227,17 +227,6 @@ async def create(
     if content_hash is None and content and content.strip():
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-    # Dedup gate: skip if identical unresolved observation exists
-    if (
-        skip_if_duplicate
-        and content_hash is not None
-        and await exists_by_hash(db, source=source, content_hash=content_hash, unresolved_only=True)
-    ):
-        logger.debug(
-            "Observation dedup: skipping duplicate (source=%s, hash=%s)", source, content_hash[:12]
-        )
-        return None
-
     # Auto-TTL: compute expires_at if not explicitly provided
     if expires_at is None:
         ttl = _compute_ttl(type)
@@ -251,25 +240,54 @@ async def create(
             except (ValueError, TypeError):
                 pass  # Invalid created_at — skip TTL, don't fail the write
 
+    params = (
+        id,
+        person_id,
+        source,
+        type,
+        category,
+        content,
+        priority,
+        speculative,
+        created_at,
+        expires_at,
+        content_hash,
+        origin_class,
+    )
+
+    if skip_if_duplicate and content_hash is not None:
+        # Atomic dedup: one INSERT … WHERE NOT EXISTS statement. A separate
+        # SELECT-then-INSERT is NOT a cross-process guard — two writers can
+        # both pass the check before either commits. SQLite serializes
+        # writers, so a single statement is race-free without needing a
+        # schema-level unique index (which would change semantics for every
+        # other observation writer).
+        cursor = await db.execute(
+            """INSERT INTO observations
+               (id, person_id, source, type, category, content, priority,
+                speculative, created_at, expires_at, content_hash, origin_class)
+               SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM observations
+                   WHERE source = ? AND content_hash = ? AND resolved = 0
+               )""",
+            (*params, source, content_hash),
+        )
+        await db.commit()
+        if cursor.rowcount == 0:
+            logger.debug(
+                "Observation dedup: skipping duplicate (source=%s, hash=%s)",
+                source, content_hash[:12],
+            )
+            return None
+        return id
+
     await db.execute(
         """INSERT INTO observations
            (id, person_id, source, type, category, content, priority,
             speculative, created_at, expires_at, content_hash, origin_class)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            id,
-            person_id,
-            source,
-            type,
-            category,
-            content,
-            priority,
-            speculative,
-            created_at,
-            expires_at,
-            content_hash,
-            origin_class,
-        ),
+        params,
     )
     await db.commit()
     return id

@@ -974,18 +974,23 @@ async def _check_git_health_deep(db) -> None:
         return
 
     if report.ok:
-        # Self-heal: a passing content-verifying fsck clears EVERY open git
-        # alert — cheap, deep, and legacy pre-category rows alike (unscoped
-        # resolve). The verdict file already self-heals per slot; without
-        # this, the observations outlive recovery as stale criticals and get
-        # amplified into false actions (2026-07-16 "git corruption" alarm,
-        # seeded by a transient fsck race across ~112 worktrees).
+        # Self-heal: a passing content-verifying fsck clears open DEEP alerts
+        # (category="git_deep" only). The verdict file already self-heals per
+        # slot; without this, the observations outlive recovery as stale
+        # criticals and get amplified into false actions (2026-07-16 "git
+        # corruption" alarm, seeded by a transient fsck race across ~112
+        # worktrees). Deliberately NOT unscoped: fsck only READS the object
+        # store, so a passing fsck proves nothing about cheap-probe failures
+        # like rootfs_readonly — clearing those here would silence a live
+        # incident for the 6h cheap cooldown (Codex P1, PR #1085). Cheap
+        # alerts self-heal via the per-tick cheap probe instead.
         if db is not None:
             try:
                 healed = await observations.resolve_by_source_and_type(
                     db,
                     source="git_health_monitor",
                     type="infrastructure_alert",
+                    category="git_deep",
                     resolved_at=datetime.now(UTC).isoformat(),
                     resolution_notes="auto-resolved: git fsck --full passed",
                 )
