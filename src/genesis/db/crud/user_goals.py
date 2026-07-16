@@ -23,20 +23,29 @@ async def create(
     confidence: float = 0.5,
     goal_type: str = "milestone",
     cadence_days: int | None = None,
+    origin: str = "user",
 ) -> str:
-    """Create a new goal. Returns the goal ID."""
+    """Create a new goal. Returns the goal ID.
+
+    ``origin`` is the goal's provenance ('user' | 'genesis_ego') and is
+    IMMUTABLE after create — deliberately absent from ``update()``'s
+    allow-list, because the additive-autonomy branch in the ego's goal
+    review trusts it (an ego that could relabel a user goal would gain
+    autonomous control over it). Defaults to 'user': fail-safe — an
+    unstamped goal is a user directive.
+    """
     goal_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
     await db.execute(
         """INSERT INTO user_goals
            (id, title, category, description, priority, status,
             timeline, parent_goal_id, evidence_source, confidence,
-            goal_type, cadence_days, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            goal_type, cadence_days, origin, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             goal_id, title, category, description, priority, status,
             timeline, parent_goal_id, evidence_source, confidence,
-            goal_type, cadence_days, now, now,
+            goal_type, cadence_days, origin, now, now,
         ),
     )
     await db.commit()
@@ -48,7 +57,12 @@ async def update(
     goal_id: str,
     **fields: object,
 ) -> bool:
-    """Update goal fields. Returns True if row was updated."""
+    """Update goal fields. Returns True if row was updated.
+
+    ``origin`` is deliberately NOT in the allow-list: provenance is stamped
+    at create and immutable — it is the security boundary for additive ego
+    autonomy (see ``create``). Do not add it.
+    """
     allowed = {
         "title", "description", "category", "priority", "status",
         "timeline", "parent_goal_id", "evidence_source", "confidence",

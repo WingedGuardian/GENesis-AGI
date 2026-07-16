@@ -21,6 +21,8 @@ _VALID_EGO_TARGETS = frozenset({"user_ego", "genesis_ego"})
 _VALID_GOAL_CATEGORIES = frozenset({"career", "project", "learning", "relationship", "financial", "other"})
 _VALID_GOAL_PRIORITIES = frozenset({"low", "medium", "high", "critical"})
 _VALID_GOAL_TYPES = frozenset({"milestone", "continuous"})
+# Goal provenance — the security boundary for additive ego autonomy.
+_VALID_GOAL_ORIGINS = frozenset({"user", "genesis_ego"})
 
 
 def _get_db_path():
@@ -144,8 +146,7 @@ async def ego_directive(
     }
 
 
-@mcp.tool()
-async def ego_goal_create(
+async def _impl_ego_goal_create(
     title: str,
     category: str = "project",
     priority: str = "medium",
@@ -154,6 +155,7 @@ async def ego_goal_create(
     parent_goal_id: str = "",
     goal_type: str = "milestone",
     cadence_days: int = 0,
+    origin: str = "user",
 ) -> dict:
     """Create a new user goal for the ego system.
 
@@ -170,6 +172,12 @@ async def ego_goal_create(
         parent_goal_id: ID of the parent goal (for subgoals)
         goal_type: milestone (achievable) or continuous (ongoing)
         cadence_days: Review frequency in days (0 = use global default)
+        origin: Goal provenance — who owns it. "user" (default) for any goal
+            created on the user's behalf or direction. "genesis_ego" ONLY when
+            the Genesis ego creates a goal for its own agenda: ego-owned goals
+            may later be paused/deprioritized by the ego autonomously (no
+            proposal), so NEVER set genesis_ego for a user-directed goal.
+            Immutable after create.
     """
     if category not in _VALID_GOAL_CATEGORIES:
         return {"status": "error", "reason": f"Invalid category: {category!r}. Must be one of: {sorted(_VALID_GOAL_CATEGORIES)}"}
@@ -177,6 +185,8 @@ async def ego_goal_create(
         return {"status": "error", "reason": f"Invalid priority: {priority!r}. Must be one of: {sorted(_VALID_GOAL_PRIORITIES)}"}
     if goal_type not in _VALID_GOAL_TYPES:
         return {"status": "error", "reason": f"Invalid goal_type: {goal_type!r}. Must be 'milestone' or 'continuous'"}
+    if origin not in _VALID_GOAL_ORIGINS:
+        return {"status": "error", "reason": f"Invalid origin: {origin!r}. Must be one of: {sorted(_VALID_GOAL_ORIGINS)}"}
 
     from genesis.db.connection import get_raw_db
     from genesis.db.crud import user_goals
@@ -201,6 +211,7 @@ async def ego_goal_create(
             goal_type=goal_type,
             cadence_days=cadence_days if cadence_days > 0 else None,
             confidence=0.9,
+            origin=origin,
         )
 
     return {
@@ -211,7 +222,50 @@ async def ego_goal_create(
         "priority": priority,
         "parent_goal_id": parent_goal_id or None,
         "goal_type": goal_type,
+        "origin": origin,
     }
+
+
+@mcp.tool()
+async def ego_goal_create(
+    title: str,
+    category: str = "project",
+    priority: str = "medium",
+    description: str = "",
+    timeline: str = "",
+    parent_goal_id: str = "",
+    goal_type: str = "milestone",
+    cadence_days: int = 0,
+    origin: str = "user",
+) -> dict:
+    """Create a new user goal for the ego system.
+
+    Goals are visible to the ego in its thinking cycles. The ego considers
+    goals when deciding what to propose. Use parent_goal_id to create
+    subgoals under an existing goal.
+
+    Args:
+        title: Goal title (concise, actionable)
+        category: career, project, learning, relationship, financial, other
+        priority: low, medium, high, or critical
+        description: Detailed description of the goal
+        timeline: Expected timeline (e.g., "Q2 2026")
+        parent_goal_id: ID of the parent goal (for subgoals)
+        goal_type: milestone (achievable) or continuous (ongoing)
+        cadence_days: Review frequency in days (0 = use global default)
+        origin: Goal provenance — who owns it. "user" (default) for any goal
+            created on the user's behalf or direction. "genesis_ego" ONLY when
+            the Genesis ego creates a goal for its own agenda: ego-owned goals
+            may later be paused/deprioritized by the ego autonomously (no
+            proposal), so NEVER set genesis_ego for a user-directed goal.
+            Immutable after create.
+    """
+    return await _impl_ego_goal_create(
+        title=title, category=category, priority=priority,
+        description=description, timeline=timeline,
+        parent_goal_id=parent_goal_id, goal_type=goal_type,
+        cadence_days=cadence_days, origin=origin,
+    )
 
 
 @mcp.tool()

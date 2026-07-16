@@ -105,13 +105,15 @@ async def process_extraction(
         )
         return True
 
-    # Create new goal
+    # Create new goal. origin="user": extraction goals are machine-INFERRED
+    # from user conversation — they are user directives, never ego-owned.
     await user_goals.create(
         db,
         title=signal["title"],
         category=signal["category"],
         confidence=signal["confidence"],
         evidence_source=f"extraction:{source_session_id or 'unknown'}",
+        origin="user",
     )
     logger.info(
         "New goal detected from extraction: %s (%s, conf=%.2f)",

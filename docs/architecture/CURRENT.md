@@ -315,7 +315,7 @@ them.
 ```yaml subsystem-map
 entry: ego-self-model
 modules: [ego, identity, deliberation]
-verified: 9037d45b 2026-07-07
+verified: 7968d85a 2026-07-16
 ```
 
 - **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)
@@ -332,6 +332,18 @@ verified: 9037d45b 2026-07-07
   `_NEVER_DISPATCH_ACTION_TYPES` blocklist lives in `session.py`. Dispatches
   record `follow_ups` rows for accountability. `integrity.py` chain-verify is
   GROUNDWORK, explicitly NOT wired.
+- **Goal provenance + additive autonomy (2026-07-16)**: `user_goals.origin`
+  ('user' | 'genesis_ego', immutable after create — excluded from `update()`'s
+  allow-list; CHECK-constrained; migration 0063). A `genesis_ego`-origin goal
+  reviewed from the genesis ego cycle is paused/deprioritized DIRECTLY
+  (`session._apply_own_goal_change`: no proposal, audit observation
+  `goal_autonomous_action`); everything else — user-origin goals, the user-ego
+  cycle, close/priority-increase/delete — keeps the recommend-only proposal
+  path (`goal_actions.py`). The approval gates (proposal + autonomous-CLI) are
+  untouched: the ego skips proposal CREATION only for its own additive
+  artifacts. Autonomous goal CREATION (caps + ego-prompt wiring) is a staged
+  follow-on (PR-3), not yet built — `ego_goal_create(origin=…)` exists but no
+  autonomous path calls it.
 - **identity/**: SOUL/USER/VOICE/STEERING CAPS-markdown + `IdentityLoader`
   (wired via perception). `cc/session_config` reads SOUL+VOICE directly, not
   via the loader. **USER.md auto-synthesis is PERMANENTLY DISABLED** — the

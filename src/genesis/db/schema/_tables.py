@@ -1371,6 +1371,12 @@ TABLES = {
             confidence      REAL NOT NULL DEFAULT 0.5,
             goal_type       TEXT NOT NULL DEFAULT 'milestone'
                             CHECK (goal_type IN ('milestone', 'continuous')),
+            -- Provenance: who owns this goal. 'user' = a user directive
+            -- (NEVER autonomously mutable); 'genesis_ego' = ego-created
+            -- (the ego may pause/deprioritize it without a proposal).
+            -- Immutable after create — update() excludes it (migration 0063).
+            origin          TEXT NOT NULL DEFAULT 'user'
+                            CHECK (origin IN ('user', 'genesis_ego')),
             cadence_days    INTEGER,              -- per-goal review cadence override (NULL = global default)
             created_at      TEXT NOT NULL
                             DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
