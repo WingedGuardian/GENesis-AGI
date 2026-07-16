@@ -137,3 +137,14 @@ class TestValidateEgoConfig:
 
     def test_empty_changes_valid(self):
         assert validate_ego_config({}) == []
+
+
+class TestMaxActiveEgoGoalsValidation:
+    def test_valid(self):
+        assert validate_ego_config({"max_active_ego_goals": 3}) == []
+        assert validate_ego_config({"max_active_ego_goals": 0}) == []
+
+    def test_invalid(self):
+        assert validate_ego_config({"max_active_ego_goals": -1})
+        assert validate_ego_config({"max_active_ego_goals": 2.5})
+        assert validate_ego_config({"max_active_ego_goals": "5"})

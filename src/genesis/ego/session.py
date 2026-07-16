@@ -98,6 +98,11 @@ _EGO_CYCLE_DISALLOWED_TOOLS = (
     "mcp__genesis-health__ego_goal_progress",
 )
 
+# Per-cycle cap on autonomous own-goal creations (genesis ego). One per cycle
+# keeps the lane's growth rate bounded and reviewable; the global bound is
+# config.max_active_ego_goals (active own goals).
+_MAX_OWN_GOAL_CREATIONS_PER_CYCLE = 1
+
 
 class CycleBlockedError(Exception):
     """Raised when the ego cycle is blocked by an approval gate.
@@ -505,6 +510,178 @@ class EgoSession:
                 exc_info=True,
             )
 
+    async def _process_own_goal_creations(
+        self, creations: list[dict], cycle_id: str,
+    ) -> None:
+        """Create genesis_ego-owned goals from the cycle's parsed output.
+
+        THE trusted creation path (PR-3b) — the only code that stamps
+        ``origin='genesis_ego'``. Trust argument: the input is the genesis
+        ego cycle's own LLM output (single construction site in
+        runtime/init/ego.py, single run_unified_cycle caller under the
+        cadence lock), never caller/tool input — the MCP surface refuses an
+        origin argument by design. Guards, in order:
+
+        1. source_tag gate — only the genesis ego cycle owns this lane.
+        2. Per-cycle cap (_MAX_OWN_GOAL_CREATIONS_PER_CYCLE) and global
+           active cap (config.max_active_ego_goals).
+        3. Similarity dedupe across active+paused goals of BOTH origins —
+           an own goal must never shadow-duplicate a user goal, and pausing
+           an own goal doesn't reopen the door to recreating it.
+
+        Every creation is audited via a goal_autonomous_action observation —
+        user-visible by default (the type is deliberately NOT in
+        INTERNAL_OBS_TYPES) — and counted in the morning report's own-goals
+        line. Dropped entries are logged, never silent.
+        """
+        if self._source_tag != "genesis_ego_cycle":
+            logger.warning(
+                "own_goal_creations ignored: emitted by %s, not the genesis "
+                "ego cycle (%d entr%s dropped)",
+                self._source_tag, len(creations),
+                "y" if len(creations) == 1 else "ies",
+            )
+            return
+
+        import uuid
+
+        from genesis.db.crud import observations as obs_crud
+        from genesis.db.crud import user_goals as goals_crud
+
+        try:
+            counts = await goals_crud.count_by_status(
+                self._db, origin="genesis_ego",
+            )
+            active = counts.get("active", 0)
+            cap = getattr(self._config, "max_active_ego_goals", 5)
+            created = 0
+            for entry in creations:
+                title = entry.get("title") or "?"
+                if created >= _MAX_OWN_GOAL_CREATIONS_PER_CYCLE:
+                    logger.info(
+                        "own_goal_creations: per-cycle cap (%d) reached — "
+                        "'%s' dropped (re-emit next cycle if still needed)",
+                        _MAX_OWN_GOAL_CREATIONS_PER_CYCLE, title[:60],
+                    )
+                    continue
+                if active + created >= cap:
+                    logger.info(
+                        "own_goal_creations: active own-goal cap (%d) "
+                        "reached — '%s' dropped", cap, title[:60],
+                    )
+                    continue
+                duplicate = await goals_crud.find_similar(
+                    self._db, title, statuses=("active", "paused"),
+                    # Shadow-duplicate protection must see the WHOLE live
+                    # goal set, not the 50 newest (Codex P2, PR #1094).
+                    limit=1000,
+                )
+                if duplicate:
+                    logger.info(
+                        "own_goal_creations: '%s' too similar to existing "
+                        "goal %s ('%s') — dropped", title[:60],
+                        duplicate["id"][:12],
+                        (duplicate.get("title") or "?")[:60],
+                    )
+                    continue
+
+                goal_id = await goals_crud.create(
+                    self._db,
+                    title=title,
+                    category=entry["category"],
+                    description=entry.get("description"),
+                    priority=entry.get("priority", "medium"),
+                    goal_type=entry.get("goal_type", "milestone"),
+                    cadence_days=entry.get("cadence_days"),
+                    evidence_source=f"ego_cycle:{cycle_id}",
+                    origin="genesis_ego",
+                )
+                created += 1
+                logger.info(
+                    "Autonomously created own goal %s: '%s' (%s, %s)",
+                    goal_id[:12], title[:60], entry["category"],
+                    entry.get("priority", "medium"),
+                )
+                try:
+                    desc = entry.get("description")
+                    await obs_crud.create(
+                        self._db,
+                        id=str(uuid.uuid4()),
+                        source=self._source_tag,
+                        type="goal_autonomous_action",
+                        content=(
+                            f"Autonomously created own goal '{title}' "
+                            f"({entry['category']}, priority "
+                            f"{entry.get('priority', 'medium')}). Ego-created "
+                            f"(origin=genesis_ego) — user goals are never "
+                            f"touched autonomously."
+                            + (f" Description: {desc[:300]}" if desc else "")
+                        ),
+                        priority="medium",
+                        category="goal_review",
+                        created_at=datetime.now(UTC).isoformat(),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to write own-goal-creation audit observation",
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.warning(
+                "own_goal_creations processing failed", exc_info=True,
+            )
+
+    async def _process_own_goal_reviews(self, reviews: list[dict]) -> None:
+        """Apply the genesis ego's review verdicts on its OWN goals.
+
+        Own-lane only: an entry referencing a non-genesis_ego goal is
+        skipped and logged — this channel never converts into a user-facing
+        proposal (user goals keep their own goal_review pipeline).
+        pause/deprioritize route through _propose_goal_status_change, whose
+        origin+source_tag double gate direct-applies for genuine own goals
+        (#1086); ``continue`` is a no-op; ``close`` surfaces a passive
+        observation — terminal calls stay the user's, for every goal.
+        """
+        if self._source_tag != "genesis_ego_cycle":
+            logger.warning(
+                "own_goal_reviews ignored: emitted by %s, not the genesis "
+                "ego cycle (%d entr%s dropped)",
+                self._source_tag, len(reviews),
+                "y" if len(reviews) == 1 else "ies",
+            )
+            return
+
+        from genesis.db.crud import user_goals as goals_crud
+
+        for entry in reviews:
+            goal_id = entry["goal_id"]
+            recommendation = entry["recommendation"]
+            if recommendation == "continue":
+                continue
+            try:
+                goal = await goals_crud.get_by_id(self._db, goal_id)
+                if not goal or (goal.get("origin") or "user") != "genesis_ego":
+                    logger.warning(
+                        "own_goal_reviews: %s is not an ego-owned goal — "
+                        "skipped (user goals keep the goal_review pipeline)",
+                        goal_id[:12],
+                    )
+                    continue
+                assessment = entry.get("assessment")
+                assessment = (
+                    assessment[:500] if isinstance(assessment, str) else ""
+                )
+                await self._surface_goal_recommendation(
+                    goal_id=goal_id,
+                    recommendation=recommendation,
+                    assessment=assessment,
+                )
+            except Exception:
+                logger.warning(
+                    "own_goal_reviews: failed for %s", goal_id[:12],
+                    exc_info=True,
+                )
+
     async def _surface_goal_recommendation(
         self,
         *,
@@ -676,8 +853,9 @@ class EgoSession:
 
         The additive-autonomy path (2026-07-16): no proposal is created, but
         the action is audited — an observation records what was applied and
-        why, and surfaces to the user through the normal awareness digest
-        (visibility, NOT an approval prompt). Reuses goal_actions' validated
+        why, and surfaces to the user via the morning report's unsurfaced-
+        observation pipeline (the type is deliberately NOT in
+        INTERNAL_OBS_TYPES — visibility, NOT an approval prompt). Reuses goal_actions' validated
         value sets so the autonomous path can never apply a value the gated
         path couldn't. Reversible by the user at any time (resume/re-raise
         via ego_goal_update).
@@ -986,6 +1164,16 @@ class EgoSession:
             intentions_data = parsed.get("intentions")
             if intentions_data and isinstance(intentions_data, dict):
                 await self._process_intentions(intentions_data)
+
+            # 10e. Additive ego autonomy — the genesis ego's OWN goal lane
+            # (origin='genesis_ego'). Both handlers hard-gate on source_tag
+            # internally; for any other session the keys are ignored+logged.
+            own_creations = parsed.get("own_goal_creations", [])
+            if isinstance(own_creations, list) and own_creations:
+                await self._process_own_goal_creations(own_creations, cycle.id)
+            own_reviews = parsed.get("own_goal_reviews", [])
+            if isinstance(own_reviews, list) and own_reviews:
+                await self._process_own_goal_reviews(own_reviews)
 
             # 11. Compute and store factual focus summary.
             # The ego's authored focus is already logged in ego_cycles
@@ -2654,5 +2842,62 @@ def _validate_output(data: dict) -> dict | None:
         and data["goal_status_recommendation"] not in _VALID_GOAL_RECS
     ):
         del data["goal_status_recommendation"]
+
+    # Sanitize own_goal_creations / own_goal_reviews — the genesis ego's
+    # additive-autonomy keys (PR-3b). Structural validation only (types,
+    # enums, length clamps mirroring the user_goals CHECK constraints);
+    # jurisdiction (source_tag), caps, and dedupe are enforced by the
+    # handlers in _process_cycle_output.
+    if "own_goal_creations" in data:
+        raw = data["own_goal_creations"]
+        cleaned: list[dict] = []
+        if isinstance(raw, list):
+            from genesis.ego.goal_actions import (
+                VALID_GOAL_TYPES,
+                VALID_OWN_GOAL_CATEGORIES,
+            )
+
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                title = entry.get("title")
+                if not isinstance(title, str) or not title.strip():
+                    continue
+                # Operational lanes only — career/financial/relationship are
+                # user-life categories, out of the genesis ego's jurisdiction
+                # even for its own goals.
+                if entry.get("category") not in VALID_OWN_GOAL_CATEGORIES:
+                    continue
+                # 'critical' is reserved for the user's goals — an own goal
+                # never outranks a user directive by construction.
+                if entry.get("priority", "medium") not in ("low", "medium", "high"):
+                    entry["priority"] = "medium"
+                if entry.get("goal_type", "milestone") not in VALID_GOAL_TYPES:
+                    entry["goal_type"] = "milestone"
+                entry["title"] = title.strip()[:120]
+                desc = entry.get("description")
+                entry["description"] = (
+                    desc.strip()[:1000] if isinstance(desc, str) else None
+                )
+                cd = entry.get("cadence_days")
+                if isinstance(cd, bool) or not isinstance(cd, int):
+                    entry["cadence_days"] = None
+                else:
+                    # 3–60d: no self-assigned daily review churn, and never
+                    # an unreviewable-forever horizon.
+                    entry["cadence_days"] = max(3, min(60, cd))
+                cleaned.append(entry)
+        data["own_goal_creations"] = cleaned
+
+    if "own_goal_reviews" in data:
+        raw = data["own_goal_reviews"]
+        data["own_goal_reviews"] = [
+            r
+            for r in (raw if isinstance(raw, list) else [])
+            if isinstance(r, dict)
+            and isinstance(r.get("goal_id"), str)
+            and r["goal_id"]
+            and r.get("recommendation") in _VALID_GOAL_RECS
+        ]
 
     return data

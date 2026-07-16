@@ -570,3 +570,13 @@ async def test_activity_summary_no_ego_goal_line_when_none(db, mock_health, mock
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     summary = await gen._get_activity_summary()
     assert "Genesis's own goals" not in summary
+
+
+def test_goal_autonomous_action_is_user_visible():
+    """Lock: autonomous goal actions surface through the generic morning-
+    report observation pipeline — adding the type to INTERNAL_OBS_TYPES
+    would silently remove the user's visibility into ego autonomy."""
+    from genesis.db.crud.observations import INTERNAL_OBS_TYPES
+
+    assert "goal_autonomous_action" not in INTERNAL_OBS_TYPES
+    assert "goal_recommendation" not in INTERNAL_OBS_TYPES

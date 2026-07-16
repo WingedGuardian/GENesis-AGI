@@ -62,6 +62,9 @@ async def db():
                 created_at       TEXT NOT NULL
             )
         """)
+        from genesis.db.schema import TABLES
+
+        await conn.execute(TABLES["user_goals"])
         await conn.execute("""
             CREATE TABLE ego_cycles (
                 id              TEXT PRIMARY KEY,
@@ -662,3 +665,74 @@ class TestGenesisEgoContextBuilder:
         )
         result = await builder.build()
         assert "repo/branch/status" in result
+
+
+class TestOwnGoalsSection:
+    """PR-3b: the genesis ego's own-goal lane rendering — what makes
+    own-goal review non-blind."""
+
+    def _builder(self, db):
+        return GenesisEgoContextBuilder(db=db, health_data=None, capabilities={})
+
+    async def _insert_goal(self, db, *, gid, title, origin, status="active",
+                           updated="2026-01-01T00:00:00+00:00", cadence_days=None):
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, status, priority, origin, cadence_days, "
+            " created_at, updated_at) "
+            "VALUES (?, ?, 'project', ?, 'medium', ?, ?, ?, ?)",
+            (gid, title, status, origin, cadence_days, updated, updated),
+        )
+        await db.commit()
+
+    async def test_empty_lane_shows_affordance(self, db):
+        section = await self._builder(db)._own_goals_section()
+        assert "## Your Own Goals" in section
+        assert "own_goal_creations" in section
+
+    async def test_lists_own_goals_with_staleness(self, db):
+        await self._insert_goal(
+            db, gid="og1", title="Retire legacy bridge", origin="genesis_ego",
+        )
+        section = await self._builder(db)._own_goals_section()
+        assert "Retire legacy bridge" in section
+        assert "og1" in section  # id present — reviews reference it
+        assert "STALE, review due" in section  # updated in 2026-01 → stale
+
+    async def test_fresh_goal_not_stale(self, db):
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        await self._insert_goal(
+            db, gid="og2", title="Fresh objective", origin="genesis_ego",
+            updated=now,
+        )
+        section = await self._builder(db)._own_goals_section()
+        assert "Fresh objective" in section
+        assert "STALE" not in section
+
+    async def test_paused_listed_user_goals_absent(self, db):
+        await self._insert_goal(
+            db, gid="og3", title="Paused own goal", origin="genesis_ego",
+            status="paused",
+        )
+        await self._insert_goal(
+            db, gid="ug1", title="User career goal", origin="user",
+        )
+        section = await self._builder(db)._own_goals_section()
+        assert "Paused own goal" in section
+        assert "[PAUSED]" in section
+        assert "User career goal" not in section
+        # a PAUSED goal is never marked review-due
+        assert "STALE" not in section
+
+    async def test_build_includes_section_and_contract_keys(
+        self, db, mock_health_data, capabilities,
+    ):
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        context = await builder.build()
+        assert "## Your Own Goals" in context
+        assert "own_goal_creations" in context   # output contract
+        assert "own_goal_reviews" in context

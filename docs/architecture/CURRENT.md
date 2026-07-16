@@ -348,13 +348,28 @@ verified: 7968d85a 2026-07-16
   cycle, close/priority-increase/delete — keeps the recommend-only proposal
   path (`goal_actions.py`). The approval gates (proposal + autonomous-CLI) are
   untouched: the ego skips proposal CREATION only for its own additive
-  artifacts. **Dormant until PR-3**, which must wire BOTH halves: (1) a
-  trusted genesis-ego creation path — the `ego_goal_create` MCP tool has NO
-  origin argument (Codex P1: caller input must never stamp provenance); only
-  the CRUD accepts `origin`, for trusted code — and (2) a genesis-cycle goal
-  review: today's staleness scan (`cadence._check_stale_goals`) is
-  user-ego-only, so no scheduled path reaches the direct-apply branch yet
-  (Codex P2).
+  artifacts. **ACTIVE since PR-3 (2026-07-16)** — two parsed output keys on
+  the genesis ego cycle, both source_tag-gated in `_process_cycle_output`:
+  `own_goal_creations` (`session._process_own_goal_creations` — THE only code
+  stamping `origin='genesis_ego'`; validated in `_validate_output`; caps: 1
+  per cycle + `config.max_active_ego_goals` active; `find_similar` dedupe
+  across active+paused of both origins) and `own_goal_reviews`
+  (`_process_own_goal_reviews` — own-lane only, non-ego goals skipped never
+  proposed; routes into the #1086 double-gated direct-apply). The
+  `ego_goal_create` MCP tool still has NO origin argument (provenance is
+  never caller input) and all three goal-mutation MCP tools (create/update/
+  progress — the last resets the staleness clock via updated_at) are
+  DISALLOWED in ego cycle sessions (`_EGO_CYCLE_DISALLOWED_TOOLS` →
+  `--disallowedTools`).
+  Every user-facing goal surface (user-ego scanner/context, morning report,
+  world snapshot, dispatch prompts, computed focus, j9 metric, extraction
+  dedupe) filters `origin='user'`; the genesis context renders the own-goal
+  lane (`genesis_context._own_goals_section`, staleness-annotated — what
+  makes own-goal review non-blind). Visibility: `goal_autonomous_action`
+  observations are user-visible by default (NOT in INTERNAL_OBS_TYPES,
+  locked by test) + a morning-report own-goals count line. Paused own-goal
+  tail is deliberately unbounded (user decision 2026-07-16), watched via
+  that count line.
 - **identity/**: SOUL/USER/VOICE/STEERING CAPS-markdown + `IdentityLoader`
   (wired via perception). `cc/session_config` reads SOUL+VOICE directly, not
   via the loader. **USER.md auto-synthesis is PERMANENTLY DISABLED** — the

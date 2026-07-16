@@ -49,6 +49,13 @@ VALID_GOAL_CATEGORIES = frozenset(
 VALID_GOAL_PRIORITIES = _VALID_PRIORITY
 VALID_GOAL_TYPES = frozenset({"milestone", "continuous"})
 
+# The genesis ego's OWN goals are restricted to operational lanes — a strict
+# subset of the full category set. career/financial/relationship are
+# user-life lanes; an ego-owned goal there would breach the jurisdiction
+# boundary in GENESIS_EGO_SESSION.md even with correct provenance (Codex P2,
+# PR #1094). Keep in sync with the output contract + prompt doc.
+VALID_OWN_GOAL_CATEGORIES = frozenset({"project", "learning", "other"})
+
 
 def _parse_expected_outputs(expected_outputs: object) -> dict | None:
     """Extract the ``{change, value}`` spec from a proposal's expected_outputs.
