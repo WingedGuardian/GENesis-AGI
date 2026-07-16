@@ -584,7 +584,16 @@ async def ego_proposal_resolve(
         # pending proposals, newest first, capped at 10 — so a position here
         # matches the number shown to the user, not a position within one
         # batch (the source of prior wrong-target resolutions).
-        board = await ego_crud.list_proposals(db, status="pending", limit=10)
+        # Scope to the user ego (with the pre-migration NULL fallback),
+        # exactly like the Telegram parser and UserEgoContextBuilder:
+        # Genesis-ego proposals are a separate surface and must not be
+        # resolved from the user proposal board. proposal_ids stays
+        # unscoped for precise cross-ego access.
+        board = await ego_crud.list_proposals(
+            db, status="pending", limit=10, ego_source="user_ego_cycle",
+        )
+        if not board:
+            board = await ego_crud.list_proposals(db, status="pending", limit=10)
 
         if not board:
             # No pending — check for recently withdrawn (re-validate path).

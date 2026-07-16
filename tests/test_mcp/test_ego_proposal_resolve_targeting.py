@@ -47,6 +47,7 @@ async def _mk(
     created_at: str,
     action_type: str = "investigate",
     status: str = "pending",
+    ego_source: str | None = None,
 ) -> None:
     await ego_crud.create_proposal(
         conn,
@@ -56,6 +57,7 @@ async def _mk(
         batch_id=batch,
         created_at=created_at,
         status=status,
+        ego_source=ego_source,
     )
 
 
@@ -244,6 +246,76 @@ class TestBoardAlignedNumbers:
         with _patch_path(db_path):
             res = await RESOLVE(action="approve", proposal_numbers="all")
         assert res["status"] == "error"
+
+
+class TestEgoScoping:
+    """The number/board path is user-ego scoped (Genesis-ego proposals are a
+    separate surface); proposal_ids stays unscoped for precise access."""
+
+    async def test_genesis_ego_excluded_from_board_numbers(self, db):
+        conn, db_path = db
+        await _mk(
+            conn,
+            id="u1",
+            content="user board item",
+            batch="ub",
+            created_at="2026-07-15T00:00:00+00:00",
+            ego_source="user_ego_cycle",
+        )
+        await _mk(
+            conn,
+            id="g1",
+            content="genesis board item",
+            batch="gb",
+            created_at="2026-07-15T02:00:00+00:00",
+            ego_source="genesis_ego_cycle",
+        )
+        with _patch_path(db_path):
+            res = await RESOLVE(action="approve", proposal_numbers="all")
+        # Only the user-ego proposal is on the board.
+        assert res["board_size"] == 1
+        assert res["resolved"] == 1
+        assert await _status(db_path, "u1") == "approved"
+        assert await _status(db_path, "g1") == "pending"
+
+    async def test_genesis_ego_still_reachable_by_id(self, db):
+        conn, db_path = db
+        await _mk(
+            conn,
+            id="u1",
+            content="user",
+            batch="ub",
+            created_at="2026-07-15T00:00:00+00:00",
+            ego_source="user_ego_cycle",
+        )
+        await _mk(
+            conn,
+            id="g1",
+            content="genesis",
+            batch="gb",
+            created_at="2026-07-15T02:00:00+00:00",
+            ego_source="genesis_ego_cycle",
+        )
+        with _patch_path(db_path):
+            res = await RESOLVE(action="reject", proposal_ids="g1")
+        assert res["details"]["g1"] == "rejected"
+        assert await _status(db_path, "g1") == "rejected"
+
+    async def test_null_ego_source_included_via_fallback(self, db):
+        """Pre-migration NULL ego_source proposals still appear on the board."""
+        conn, db_path = db
+        await _mk(
+            conn,
+            id="n1",
+            content="legacy null",
+            batch="b",
+            created_at="2026-07-15T00:00:00+00:00",
+            ego_source=None,
+        )
+        with _patch_path(db_path):
+            res = await RESOLVE(action="approve", proposal_numbers="all")
+        assert res["board_size"] == 1
+        assert await _status(db_path, "n1") == "approved"
 
 
 class TestHookParity:

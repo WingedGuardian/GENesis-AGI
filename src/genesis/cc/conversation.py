@@ -1037,9 +1037,16 @@ class ConversationLoop:
             # Fetch pending proposals
             from genesis.db.crud import ego as ego_crud
 
+            # User-ego scoped (with pre-migration NULL fallback) so
+            # Genesis-ego proposals stay off the user board — matches the
+            # resolver (ego_proposal_resolve) and UserEgoContextBuilder.
             pending = await ego_crud.list_proposals(
-                self._db, status="pending", limit=10,
+                self._db, status="pending", limit=10, ego_source="user_ego_cycle",
             )
+            if not pending:
+                pending = await ego_crud.list_proposals(
+                    self._db, status="pending", limit=10,
+                )
 
             lines = ["\n\n## You Are in the Ego Proposals Topic\n"]
             lines.append(
