@@ -2076,10 +2076,6 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_jre_job_time ON job_run_events(job_name, recorded_at)",
     "CREATE INDEX IF NOT EXISTS idx_jre_recorded ON job_run_events(recorded_at)",
     "CREATE INDEX IF NOT EXISTS idx_jre_status ON job_run_events(status, recorded_at)",
-    # one open row per alert_id — makes the open-set reconcile idempotent
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ae_open_alert ON alert_events(alert_id) WHERE resolved_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_ae_created ON alert_events(created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_ae_alert ON alert_events(alert_id, created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
@@ -2120,9 +2116,9 @@ DEPTH_THRESHOLDS_SEED = [
     # Thresholds tuned 2026-03-21: originals (0.5/0.8/0.55) were too conservative,
     # producing only ~12 reflections across 6800 ticks.  Deep lowered to 0.45 to
     # encourage more frequent consolidation (design doc says 48-72h floor).
-    ("Micro", 0.50, 1800, 2, 3600),  # floor 30min, max 2/hr
-    ("Light", 0.60, 10800, 1, 3600),  # floor 3h, max 1/hr
-    ("Deep", 0.45, 172800, 1, 86400),  # floor 48h, max 1/day
+    ("Micro", 0.50, 1800, 2, 3600),         # floor 30min, max 2/hr
+    ("Light", 0.60, 10800, 1, 3600),         # floor 3h, max 1/hr
+    ("Deep", 0.45, 172800, 1, 86400),        # floor 48h, max 1/day
     ("Strategic", 0.40, 604800, 1, 604800),  # floor 7d, max 1/wk
 ]
 
@@ -2138,3 +2134,4 @@ DRIVE_WEIGHTS_SEED = [
     ("cooperation", 0.25, 0.25, 0.10, 0.50),
     ("competence", 0.15, 0.15, 0.10, 0.50),
 ]
+

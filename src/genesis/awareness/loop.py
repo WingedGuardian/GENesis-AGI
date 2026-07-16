@@ -77,10 +77,10 @@ async def _sqlite_wal_truncate(db) -> None:
 # a read snapshot from an unclosed/cancelled cursor) makes the WAL file grow
 # unbounded. Alert on abnormal WAL size so a stuck reader is caught in minutes,
 # not days. Surfaces via the critical-observations job (Telegram) + morning report.
-_WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024  # 100 MB → "high" (morning report)
-_WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024  # 500 MB → "critical" (Telegram now)
-_WAL_ALERT_COOLDOWN_S = 3600  # one alert per hour max
-_WAL_TRUNCATE_EVERY_N_TICKS = 12  # hourly TRUNCATE (tick ≈ 5 min)
+_WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024   # 100 MB → "high" (morning report)
+_WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024   # 500 MB → "critical" (Telegram now)
+_WAL_ALERT_COOLDOWN_S = 3600               # one alert per hour max
+_WAL_TRUNCATE_EVERY_N_TICKS = 12           # hourly TRUNCATE (tick ≈ 5 min)
 # None = "never alerted". Must NOT be 0.0: time.monotonic() is since boot, so on a
 # freshly-booted host `now - 0.0` is small and would wrongly suppress the first alert.
 _last_wal_alert_at: float | None = None
@@ -95,7 +95,6 @@ async def _check_wal_health(db) -> None:
         from pathlib import Path
 
         from genesis.env import genesis_db_path
-
         wal_path = Path(f"{genesis_db_path()}-wal")
         if not wal_path.exists():
             return
@@ -183,9 +182,9 @@ async def _persist_health_alerts(db) -> None:
 # tunable module constants. NOTE: 'pending' (self-healing) is context in the
 # alert text only; a sustained-pending stuck-worker signal is a separate
 # recovery-worker health concern, tracked as a follow-up, not alerted here.
-_EMBED_BACKLOG_LOW = 50  # below this: quiet (+ resolve any prior alert)
-_EMBED_BACKLOG_HIGH = 1000  # at/above this: 'critical' (pages); else 'high'
-_EMBED_BACKLOG_COOLDOWN_S = 3600  # one alert per band per hour max
+_EMBED_BACKLOG_LOW = 50            # below this: quiet (+ resolve any prior alert)
+_EMBED_BACKLOG_HIGH = 1000         # at/above this: 'critical' (pages); else 'high'
+_EMBED_BACKLOG_COOLDOWN_S = 3600   # one alert per band per hour max
 # Safe as 0.0/"" (unlike _check_wal_health): the band guard below means a fresh
 # boot never matches the empty band, so the first real backlog always alerts.
 _last_embed_backlog_alert_at: float = 0.0
@@ -252,7 +251,9 @@ async def _check_embedding_backlog(db) -> None:
 
         priority = "critical" if failed >= _EMBED_BACKLOG_HIGH else "high"
         pending = counts.get("pending", 0)
-        content_hash = hashlib.sha256(f"embedding_backlog:{band}".encode()).hexdigest()
+        content_hash = hashlib.sha256(
+            f"embedding_backlog:{band}".encode()
+        ).hexdigest()
         # Keep exactly ONE active alert = the current band. Resolve any
         # stale other-band rows so a worsening (high->critical) OR a partial
         # recovery (critical->high) transition leaves only the current-band
@@ -321,7 +322,8 @@ async def _resolve_embedding_backlog(db) -> None:
             type="infrastructure_alert",
             resolved_at=datetime.now(UTC).isoformat(),
             resolution_notes=(
-                f"auto-resolved: failed-embedding backlog back under {_EMBED_BACKLOG_LOW}"
+                f"auto-resolved: failed-embedding backlog back under "
+                f"{_EMBED_BACKLOG_LOW}"
             ),
         )
         if resolved:
@@ -791,9 +793,7 @@ def _fs_type_for(path) -> str | None:
                 if len(parts) < 3:
                     continue
                 mnt, typ = parts[1], parts[2]
-                if (target == mnt or target.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(
-                    best
-                ):
+                if (target == mnt or target.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best):
                     best, fstype = mnt, typ
         return fstype
     except OSError:
@@ -811,7 +811,6 @@ async def _check_db_nodatacow(db) -> None:
         import struct
 
         from genesis.env import genesis_db_path
-
         db_path = genesis_db_path()
         if not db_path.exists() or _fs_type_for(db_path) != "btrfs":
             return
@@ -1023,7 +1022,6 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
             SLOT_RSS_WARN_MB,
             enumerate_cc_slots,
         )
-
         if slots is None:
             slots = enumerate_cc_slots()
     except Exception:
@@ -1073,9 +1071,9 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
 # CCInvocation.expect_output; see runtime/init/cc_relay._on_cc_empty_output). This
 # check aggregates a run of them into a single critical alert. Same monotonic-
 # since-boot caveat as WAL/slot: None = "never alerted", never 0.0.
-_CAP_EMPTY_WINDOW_MIN = 60  # look back this many minutes for empties
-_CAP_EMPTY_THRESHOLD = 3  # ≥ this many empties in the window → alert
-_CAP_ALERT_COOLDOWN_S = 3600  # one alert per hour max
+_CAP_EMPTY_WINDOW_MIN = 60          # look back this many minutes for empties
+_CAP_EMPTY_THRESHOLD = 3           # ≥ this many empties in the window → alert
+_CAP_ALERT_COOLDOWN_S = 3600       # one alert per hour max
 _last_cap_alert_at: float | None = None
 
 
@@ -1100,10 +1098,7 @@ async def _check_cc_cap_detection(db) -> None:
     try:
         cutoff = (datetime.now(UTC) - timedelta(minutes=_CAP_EMPTY_WINDOW_MIN)).isoformat()
         count = await observations.count_recent_unresolved_by_type_and_source(
-            db,
-            type="cc_cap_empty_event",
-            source="cc_cap_monitor",
-            since=cutoff,
+            db, type="cc_cap_empty_event", source="cc_cap_monitor", since=cutoff,
         )
 
         if count < _CAP_EMPTY_THRESHOLD:
@@ -1155,8 +1150,7 @@ async def _check_cc_cap_detection(db) -> None:
             return  # an unresolved cap alert already exists — don't duplicate
         logger.warning(
             "CC cap detection alert: %d empty cognitive completions in %d min",
-            count,
-            _CAP_EMPTY_WINDOW_MIN,
+            count, _CAP_EMPTY_WINDOW_MIN,
         )
     except Exception:
         logger.debug("cc_cap detection failed — skipping this tick", exc_info=True)
@@ -1225,10 +1219,7 @@ async def perform_tick(
                 # Fix 3A: expire stale escalations (>8h) before checking
                 _STALE_ESCALATION_HOURS = 8
                 all_pending = await observations.query(
-                    db,
-                    type="light_escalation_pending",
-                    resolved=False,
-                    limit=10,
+                    db, type="light_escalation_pending", resolved=False, limit=10,
                 )
                 for stale in all_pending:
                     stale_created = stale.get("created_at", "")
@@ -1240,21 +1231,15 @@ async def perform_tick(
                         stale_age = 999
                     if stale_age >= _STALE_ESCALATION_HOURS:
                         await observations.resolve(
-                            db,
-                            stale["id"],
+                            db, stale["id"],
                             resolved_at=now,
                             resolution_notes=f"Expired (age {stale_age:.1f}h > {_STALE_ESCALATION_HOURS}h TTL)",
                         )
-                        logger.info(
-                            "Auto-resolved stale escalation %s (%.1fh old)", stale["id"], stale_age
-                        )
+                        logger.info("Auto-resolved stale escalation %s (%.1fh old)", stale["id"], stale_age)
 
                 # Re-query after cleanup
                 pending_escalations = await observations.query(
-                    db,
-                    type="light_escalation_pending",
-                    resolved=False,
-                    limit=1,
+                    db, type="light_escalation_pending", resolved=False, limit=1,
                 )
                 if pending_escalations:
                     esc_created = pending_escalations[0].get("created_at", "")
@@ -1269,9 +1254,7 @@ async def perform_tick(
                         # Fix 2A: daily escalation budget (max 2 per 24h)
                         _ESCALATION_BUDGET_PER_DAY = 2
                         resolved_recent = await observations.query(
-                            db,
-                            type="light_escalation_resolved",
-                            limit=20,
+                            db, type="light_escalation_resolved", limit=20,
                         )
                         resolved_24h_count = 0
                         resolved_2h_count = 0
@@ -1290,30 +1273,21 @@ async def perform_tick(
 
                         # Check emergency bypass -- critical signals override budget
                         esc_content = pending_escalations[0].get("content", "").lower()
-                        is_emergency = any(
-                            kw in esc_content
-                            for kw in (
-                                "critical_failure",
-                                "data_loss",
-                                "security_breach",
-                                "all providers",
-                                "container memory critical",
-                            )
-                        )
+                        is_emergency = any(kw in esc_content for kw in (
+                            "critical_failure", "data_loss", "security_breach",
+                            "all providers", "container memory critical",
+                        ))
 
                         if resolved_2h_count >= 1 and not is_emergency:
                             logger.info("Light escalation cooldown active (2h), skipping")
                         elif resolved_24h_count >= _ESCALATION_BUDGET_PER_DAY and not is_emergency:
                             logger.info(
                                 "Escalation budget exhausted (%d/%d in 24h), skipping",
-                                resolved_24h_count,
-                                _ESCALATION_BUDGET_PER_DAY,
+                                resolved_24h_count, _ESCALATION_BUDGET_PER_DAY,
                             )
                         else:
                             if is_emergency:
-                                logger.warning(
-                                    "Emergency escalation bypassing budget: %s", esc_content[:100]
-                                )
+                                logger.warning("Emergency escalation bypassing budget: %s", esc_content[:100])
                             classified_depth = Depth.DEEP
                             escalation_source = "light_escalation"
                             trigger_reason = f"light escalation: {pending_escalations[0].get('content', 'unknown')}"
@@ -1329,30 +1303,17 @@ async def perform_tick(
             db,
             id=tick_id,
             source=source,
-            signals_json=json.dumps(
-                [
-                    {
-                        "name": s.name,
-                        "value": s.value,
-                        "source": s.source,
-                        "collected_at": s.collected_at,
-                    }
-                    for s in signals
-                ]
-            ),
-            scores_json=json.dumps(
-                [
-                    {
-                        "depth": s.depth.value,
-                        "raw_score": s.raw_score,
-                        "time_multiplier": s.time_multiplier,
-                        "final_score": s.final_score,
-                        "threshold": s.threshold,
-                        "triggered": s.triggered,
-                    }
-                    for s in scores
-                ]
-            ),
+            signals_json=json.dumps([
+                {"name": s.name, "value": s.value, "source": s.source,
+                 "collected_at": s.collected_at}
+                for s in signals
+            ]),
+            scores_json=json.dumps([
+                {"depth": s.depth.value, "raw_score": s.raw_score,
+                 "time_multiplier": s.time_multiplier, "final_score": s.final_score,
+                 "threshold": s.threshold, "triggered": s.triggered}
+                for s in scores
+            ]),
             classified_depth=classified_depth.value if classified_depth else None,
             trigger_reason=trigger_reason,
             created_at=now,
@@ -1360,21 +1321,15 @@ async def perform_tick(
 
         # 5. If triggered, also create an observation (with content-hash dedup)
         if decision is not None:
-            obs_content = json.dumps(
-                {
-                    "tick_id": tick_id,
-                    "depth": classified_depth.value,
-                    "reason": trigger_reason,
-                    "scores": {s.depth.value: s.final_score for s in scores},
-                },
-                sort_keys=True,
-            )
+            obs_content = json.dumps({
+                "tick_id": tick_id,
+                "depth": classified_depth.value,
+                "reason": trigger_reason,
+                "scores": {s.depth.value: s.final_score for s in scores},
+            }, sort_keys=True)
             content_hash = hashlib.sha256(obs_content.encode()).hexdigest()
             is_dup = await observations.exists_by_hash(
-                db,
-                source="awareness_loop",
-                content_hash=content_hash,
-                unresolved_only=True,
+                db, source="awareness_loop", content_hash=content_hash, unresolved_only=True,
             )
             if not is_dup:
                 obs_id = str(uuid.uuid4())
@@ -1384,9 +1339,7 @@ async def perform_tick(
                     source="awareness_loop",
                     type="awareness_tick",
                     content=obs_content,
-                    priority="high"
-                    if classified_depth in (Depth.DEEP, Depth.STRATEGIC)
-                    else "medium",
+                    priority="high" if classified_depth in (Depth.DEEP, Depth.STRATEGIC) else "medium",
                     created_at=now,
                     content_hash=content_hash,
                     skip_if_duplicate=True,
@@ -1396,8 +1349,7 @@ async def perform_tick(
         db_available = False
         logger.warning(
             "Tick DB operations failed — degraded tick (signals collected, "
-            "scoring/persistence skipped): %s",
-            db_exc,
+            "scoring/persistence skipped): %s", db_exc,
         )
 
     result = TickResult(
@@ -1438,11 +1390,7 @@ async def perform_tick(
             except Exception:
                 logger.warning("Failed to enqueue deferred reflection")
 
-    if (
-        classified_depth == Depth.LIGHT
-        and cc_reflection_bridge is None
-        and reflection_engine is not None
-    ):
+    if classified_depth == Depth.LIGHT and cc_reflection_bridge is None and reflection_engine is not None:
         try:
             await reflection_engine.reflect(classified_depth, result, db=db)
         except Exception:
@@ -1460,11 +1408,7 @@ async def perform_tick(
                     )
                 except Exception:
                     logger.warning("Failed to enqueue deferred reflection")
-    elif cc_reflection_bridge is not None and classified_depth in (
-        Depth.LIGHT,
-        Depth.DEEP,
-        Depth.STRATEGIC,
-    ):
+    elif cc_reflection_bridge is not None and classified_depth in (Depth.LIGHT, Depth.DEEP, Depth.STRATEGIC):
         try:
             ref_result = await cc_reflection_bridge.reflect(
                 classified_depth,
@@ -1479,16 +1423,14 @@ async def perform_tick(
             if ref_result is not None and not ref_result.success:
                 logger.info(
                     "%s reflection deferred for tick %s: %s",
-                    classified_depth.value,
-                    tick_id,
+                    classified_depth.value, tick_id,
                     ref_result.reason or "unknown",
                 )
             # Resolve escalation after successful dispatch
             if escalation_pending_id and classified_depth == Depth.DEEP:
                 try:
                     await observations.resolve(
-                        db,
-                        escalation_pending_id,
+                        db, escalation_pending_id,
                         resolved_at=now,
                         resolution_notes="Escalation consumed by deep reflection",
                     )
@@ -1502,9 +1444,7 @@ async def perform_tick(
                         created_at=now,
                     )
                 except Exception:
-                    logger.warning(
-                        "Failed to resolve escalation %s", escalation_pending_id, exc_info=True
-                    )
+                    logger.warning("Failed to resolve escalation %s", escalation_pending_id, exc_info=True)
         except Exception:
             logger.exception("CC reflection failed for tick %s", tick_id)
             if deferred_queue and classified_depth:
@@ -1608,8 +1548,7 @@ class AwarenessLoop:
                 down = []
                 if self._circuit_breakers:
                     down = [
-                        name
-                        for name, cb in self._circuit_breakers._breakers.items()
+                        name for name, cb in self._circuit_breakers._breakers.items()
                         if not cb.is_available()
                     ]
                 detail = f"Providers down: {', '.join(sorted(down))}" if down else ""
@@ -1623,9 +1562,7 @@ class AwarenessLoop:
                 generated_by="awareness_loop",
                 created_at=now,
             )
-            logger.info(
-                "Resilience cognitive state updated: %s → %s", self._last_degradation_level, level
-            )
+            logger.info("Resilience cognitive state updated: %s → %s", self._last_degradation_level, level)
         except Exception:
             logger.warning("Failed to update resilience cognitive state", exc_info=True)
 
@@ -1655,8 +1592,7 @@ class AwarenessLoop:
             )
         except Exception:
             logger.warning(
-                "Failed to register scheduler job-event listener",
-                exc_info=True,
+                "Failed to register scheduler job-event listener", exc_info=True,
             )
         self._scheduler.start()
         logger.info("Awareness Loop started (interval=%dm, immediate first tick)", self._interval)
@@ -1685,7 +1621,10 @@ class AwarenessLoop:
             return
         if event_code == EVENT_JOB_MAX_INSTANCES:
             event_type = "tick.max_instances"
-            message = "Awareness tick dropped: previous tick still running (max_instances=1)"
+            message = (
+                "Awareness tick dropped: previous tick still running "
+                "(max_instances=1)"
+            )
         elif event_code == EVENT_JOB_MISSED:
             event_type = "tick.missed"
             message = "Awareness tick missed (past misfire grace time)"
@@ -1713,10 +1652,8 @@ class AwarenessLoop:
         async with self._tick_lock:
             logger.info("Force tick triggered: %s", reason)
             result = await perform_tick(
-                self._db,
-                self._collectors,
-                source="critical_bypass",
-                reason=reason,
+                self._db, self._collectors,
+                source="critical_bypass", reason=reason,
                 reflection_engine=self._reflection_engine,
                 cc_reflection_bridge=self._cc_reflection_bridge,
                 deferred_queue=self._deferred_queue,
@@ -1740,9 +1677,7 @@ class AwarenessLoop:
         async with self._tick_lock:
             try:
                 result = await perform_tick(
-                    self._db,
-                    self._collectors,
-                    source="scheduled",
+                    self._db, self._collectors, source="scheduled",
                     reflection_engine=self._reflection_engine,
                     cc_reflection_bridge=self._cc_reflection_bridge,
                     deferred_queue=self._deferred_queue,
@@ -1757,14 +1692,12 @@ class AwarenessLoop:
                 logger.exception("Awareness tick failed unexpectedly")
                 if self._event_bus:
                     await self._event_bus.emit(
-                        Subsystem.AWARENESS,
-                        Severity.ERROR,
+                        Subsystem.AWARENESS, Severity.ERROR,
                         "tick.failed",
                         "Awareness tick failed with exception",
                     )
                 try:
                     from genesis.runtime import GenesisRuntime
-
                     GenesisRuntime.instance().record_job_failure("awareness_tick", str(exc))
                 except Exception:
                     pass
@@ -1781,8 +1714,7 @@ class AwarenessLoop:
                 if result.classified_depth:
                     logger.info(
                         "Tick triggered %s: %s",
-                        result.classified_depth.value,
-                        result.trigger_reason,
+                        result.classified_depth.value, result.trigger_reason,
                     )
 
                 if not result.db_available:
@@ -1794,28 +1726,24 @@ class AwarenessLoop:
                 # Heartbeat — lets health MCP detect silent death
                 if self._event_bus:
                     await self._event_bus.emit(
-                        Subsystem.AWARENESS,
-                        Severity.DEBUG,
+                        Subsystem.AWARENESS, Severity.DEBUG,
                         "heartbeat",
                         "awareness_loop tick completed"
                         + (" (degraded)" if not result.db_available else ""),
                     )
                 try:
                     from genesis.runtime import GenesisRuntime
-
                     if result.db_available:
                         GenesisRuntime.instance().record_job_success("awareness_tick")
                     else:
                         GenesisRuntime.instance().record_job_failure(
-                            "awareness_tick", "DB unavailable (degraded tick)"
-                        )
+                            "awareness_tick", "DB unavailable (degraded tick)")
                 except Exception:
                     pass  # Runtime may not be available in tests
 
             # Update resilience memory axis based on DB availability
             if self._resilience_state_machine and result is not None:
                 from genesis.resilience.state import MemoryStatus
-
                 if result.db_available:
                     self._resilience_state_machine.update_memory(MemoryStatus.NORMAL)
                 else:
@@ -1941,7 +1869,6 @@ class AwarenessLoop:
             if self._remediation_registry:
                 try:
                     from genesis.observability.health import collect_probe_results
-
                     probe_results = await collect_probe_results(self._db)
                     outcomes = await self._remediation_registry.check_and_remediate(
                         probe_results,
@@ -2035,7 +1962,6 @@ class AwarenessLoop:
         # Kill switch — tick/heartbeats still run but no dispatches when paused
         try:
             from genesis.runtime import GenesisRuntime
-
             if GenesisRuntime.instance().paused:
                 logger.debug("Skipping reflection dispatch (Genesis paused)")
                 return
@@ -2093,8 +2019,7 @@ class AwarenessLoop:
                 if obs_result and obs_result.notes_stored > 0:
                     logger.info(
                         "Session observer: %d notes from %d observations",
-                        obs_result.notes_stored,
-                        obs_result.observations_read,
+                        obs_result.notes_stored, obs_result.observations_read,
                     )
             except Exception:
                 logger.warning("Session observer processing failed", exc_info=True)
@@ -2118,10 +2043,8 @@ class AwarenessLoop:
             return
         with contextlib.suppress(Exception):
             await self._event_bus.emit(
-                Subsystem.REFLECTION,
-                Severity.DEBUG,
-                "heartbeat",
-                "reflection idle (no depth triggered)",
+                Subsystem.REFLECTION, Severity.DEBUG,
+                "heartbeat", "reflection idle (no depth triggered)",
             )
 
     async def _dispatch_reflection(self, result: TickResult) -> None:
@@ -2133,8 +2056,7 @@ class AwarenessLoop:
         db = self._db
         logger.info(
             "Dispatch reflection: depth=%s, tick=%s, bridge=%s, engine=%s",
-            depth.value,
-            tick_id[:8],
+            depth.value, tick_id[:8],
             self._cc_reflection_bridge is not None,
             self._reflection_engine is not None,
         )
@@ -2143,10 +2065,10 @@ class AwarenessLoop:
             # Check for critical operational signals that warrant LLM analysis.
             # Routine micro ticks are silent (counted for escalation cascade only).
             critical_active = any(
-                s.value > 0 for s in result.signals if s.name in _MICRO_CRITICAL_SIGNALS
+                s.value > 0 for s in result.signals
+                if s.name in _MICRO_CRITICAL_SIGNALS
             ) or any(
-                s.value >= _SENTINEL_ANOMALY_THRESHOLD
-                for s in result.signals
+                s.value >= _SENTINEL_ANOMALY_THRESHOLD for s in result.signals
                 if s.name == "sentinel_activity"
             )
 
@@ -2161,10 +2083,8 @@ class AwarenessLoop:
                 if ref_result and ref_result.success and self._event_bus:
                     try:
                         await self._event_bus.emit(
-                            Subsystem.REFLECTION,
-                            Severity.DEBUG,
-                            "heartbeat",
-                            "micro-reflection completed",
+                            Subsystem.REFLECTION, Severity.DEBUG,
+                            "heartbeat", "micro-reflection completed",
                         )
                     except Exception:
                         logger.warning("Failed to emit reflection heartbeat", exc_info=True)
@@ -2183,8 +2103,7 @@ class AwarenessLoop:
                         await self._topic_manager.send_to_category("reflection_micro", text)
                         logger.info(
                             "Posted micro reflection to Telegram (tick=%s, salience=%.2f)",
-                            tick_id[:8],
-                            micro.salience,
+                            tick_id[:8], micro.salience,
                         )
                     except Exception:
                         logger.warning("Failed to post micro reflection to topic", exc_info=True)
@@ -2216,10 +2135,8 @@ class AwarenessLoop:
                 if self._event_bus:
                     with contextlib.suppress(Exception):
                         await self._event_bus.emit(
-                            Subsystem.REFLECTION,
-                            Severity.DEBUG,
-                            "heartbeat",
-                            "reflection idle (no critical signals)",
+                            Subsystem.REFLECTION, Severity.DEBUG,
+                            "heartbeat", "reflection idle (no critical signals)",
                         )
 
             # Always mark dispatched — cascade counting works on ticks
@@ -2229,11 +2146,7 @@ class AwarenessLoop:
                 logger.warning("Failed to mark tick %s dispatched", tick_id[:8])
             return
 
-        if (
-            depth == Depth.LIGHT
-            and self._cc_reflection_bridge is None
-            and self._reflection_engine is not None
-        ):
+        if depth == Depth.LIGHT and self._cc_reflection_bridge is None and self._reflection_engine is not None:
             try:
                 await self._reflection_engine.reflect(depth, result, db=db)
                 # Emit reflection heartbeat so subsystem_heartbeats doesn't
@@ -2241,10 +2154,8 @@ class AwarenessLoop:
                 if self._event_bus:
                     with contextlib.suppress(Exception):
                         await self._event_bus.emit(
-                            Subsystem.REFLECTION,
-                            Severity.DEBUG,
-                            "heartbeat",
-                            "light-reflection completed (API)",
+                            Subsystem.REFLECTION, Severity.DEBUG,
+                            "heartbeat", "light-reflection completed (API)",
                         )
             except Exception:
                 logger.exception("Light reflection fallback (API) failed for tick %s", tick_id)
@@ -2263,11 +2174,7 @@ class AwarenessLoop:
                         logger.warning("Failed to enqueue deferred reflection")
             return
 
-        if self._cc_reflection_bridge is not None and depth in (
-            Depth.LIGHT,
-            Depth.DEEP,
-            Depth.STRATEGIC,
-        ):
+        if self._cc_reflection_bridge is not None and depth in (Depth.LIGHT, Depth.DEEP, Depth.STRATEGIC):
             try:
                 ref_result = await self._cc_reflection_bridge.reflect(
                     depth,
@@ -2291,8 +2198,7 @@ class AwarenessLoop:
                     if self._event_bus:
                         with contextlib.suppress(Exception):
                             await self._event_bus.emit(
-                                Subsystem.REFLECTION,
-                                Severity.DEBUG,
+                                Subsystem.REFLECTION, Severity.DEBUG,
                                 "heartbeat",
                                 f"{depth.value.lower()}-reflection completed",
                             )
@@ -2377,20 +2283,14 @@ class AwarenessLoop:
                     continue  # Another tick already consumed it
                 logger.info(
                     "Resuming %s reflection from approved request %s",
-                    depth_name,
-                    approved["id"][:8],
+                    depth_name, approved["id"][:8],
                 )
                 await self._cc_reflection_bridge.reflect(
-                    depth,
-                    tick,
-                    db=self._db,
-                    skip_approval=True,
+                    depth, tick, db=self._db, skip_approval=True,
                 )
             except Exception:
                 logger.error(
-                    "Failed to resume %s reflection",
-                    depth_name,
-                    exc_info=True,
+                    "Failed to resume %s reflection", depth_name, exc_info=True,
                 )
 
     async def _resume_approved_sentinel_dispatches(self) -> None:
@@ -2462,9 +2362,7 @@ class AwarenessLoop:
         await self._deferred_queue.mark_processing(item_id)
         logger.info(
             "Retrying deferred reflection: id=%s depth=%s attempt=%d",
-            item_id,
-            depth.value,
-            attempts + 1,
+            item_id, depth.value, attempts + 1,
         )
 
         try:
@@ -2474,8 +2372,7 @@ class AwarenessLoop:
                 result = await self._reflection_engine.reflect(depth, current_tick, db=self._db)
             else:
                 logger.warning(
-                    "No reflection handler for depth=%s — leaving pending",
-                    depth.value,
+                    "No reflection handler for depth=%s — leaving pending", depth.value,
                 )
                 await self._deferred_queue.reset_to_pending(item_id)
                 return
@@ -2489,18 +2386,13 @@ class AwarenessLoop:
                 await self._deferred_queue.reset_to_pending(item_id)
                 logger.info(
                     "Deferred reflection not ready: id=%s depth=%s reason=%s — will retry",
-                    item_id,
-                    depth.value,
-                    result.reason or "unknown",
+                    item_id, depth.value, result.reason or "unknown",
                 )
         except Exception:
             new_attempts = attempts + 1  # mark_processing already incremented in DB
             logger.warning(
                 "Deferred reflection retry failed: id=%s depth=%s attempt=%d",
-                item_id,
-                depth.value,
-                new_attempts,
-                exc_info=True,
+                item_id, depth.value, new_attempts, exc_info=True,
             )
             if new_attempts >= 3:
                 await self._deferred_queue.mark_discarded(
@@ -2509,8 +2401,7 @@ class AwarenessLoop:
                 )
                 if self._event_bus:
                     await self._event_bus.emit(
-                        Subsystem.AWARENESS,
-                        Severity.WARNING,
+                        Subsystem.AWARENESS, Severity.WARNING,
                         "deferred.max_attempts",
                         f"Deferred {depth.value} reflection failed after {new_attempts} attempts",
                     )
@@ -2524,8 +2415,7 @@ class AwarenessLoop:
 
         try:
             await observations.resolve(
-                self._db,
-                pending_id,
+                self._db, pending_id,
                 resolved_at=now,
                 resolution_notes="Escalation consumed by deep reflection",
             )

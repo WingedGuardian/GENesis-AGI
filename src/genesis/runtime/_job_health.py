@@ -164,9 +164,7 @@ def clear_stale_job_failures(rt: GenesisRuntime) -> int:
             continue
         logger.info(
             "Cleared stale failures for job %s (last_failure=%s, was=%d)",
-            job_name,
-            last_failure,
-            entry["consecutive_failures"],
+            job_name, last_failure, entry["consecutive_failures"],
         )
         entry["consecutive_failures"] = 0
         entry.pop("last_failure", None)
@@ -388,6 +386,7 @@ def register_channel(
         rt._outreach_pipeline._channels[name] = adapter
         if recipient:
             rt._outreach_pipeline._recipients[name] = recipient
-    if rt._outreach_scheduler is not None and not rt._outreach_scheduler.is_running:
+    if (rt._outreach_scheduler is not None
+            and not rt._outreach_scheduler.is_running):
         logger.info("First outreach channel '%s' registered — starting scheduler", name)
         rt._outreach_scheduler.start()
