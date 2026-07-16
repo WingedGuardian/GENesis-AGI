@@ -171,16 +171,24 @@ def _backups_enabled() -> bool:
         return True
 
 
-async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
+async def _compute_alerts() -> tuple[list[dict], set[str]]:
+    """Pure alert computation — recompute the firing alert set from live health.
+
+    Returns ``(alerts, current_ids)`` and carries NO ``_alert_history`` state.
+    Two consumers: ``_impl_health_alerts`` (adds the in-memory one-generation
+    resolved rendering, unchanged read contract) and the awareness-tick writer
+    (persists the DURABLE open-set into ``alert_events`` — WS-2 M10). Keeping this
+    a pure function is what lets a single designated writer own persistence
+    without the multi-caller / cross-process double-write the read path causes.
+    """
     import genesis.mcp.health_mcp as health_mcp_mod
 
     _service = health_mcp_mod._service
     _activity_tracker = health_mcp_mod._activity_tracker
     _job_retry_registry = health_mcp_mod._job_retry_registry
-    _alert_history = health_mcp_mod._alert_history
 
     if _service is None:
-        return [{"id": "service:health_data_uninitialized", "severity": "CRITICAL", "message": "HealthDataService not initialized"}]
+        return [{"id": "service:health_data_uninitialized", "severity": "CRITICAL", "message": "HealthDataService not initialized"}], set()
 
     snap = await _service.snapshot()
     alerts: list[dict] = []
@@ -868,6 +876,22 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 current_ids.add(alert_id)
         except (json.JSONDecodeError, OSError):
             pass
+
+    return alerts, current_ids
+
+
+async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
+    """Live alert list + the in-memory one-generation resolved rendering.
+
+    Read path — contract unchanged for all existing callers (sentinel, morning
+    report, dashboard, the health_alerts MCP tool). Durable persistence is NOT
+    done here (that would multi-write across the runtime + health-MCP processes);
+    it lives in the single awareness-tick ``alert_events`` writer (WS-2 M10).
+    """
+    import genesis.mcp.health_mcp as health_mcp_mod
+
+    alerts, current_ids = await _compute_alerts()
+    _alert_history = health_mcp_mod._alert_history
 
     now = datetime.now(UTC).isoformat()
     for old_id in list(_alert_history.keys()):

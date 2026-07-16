@@ -96,6 +96,50 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         misfire_grace_time=3600,
     )
 
+    async def _prune_job_run_events() -> None:
+        if rt._db is None:
+            return
+        try:
+            from genesis.db.crud import job_run_events as _jre
+
+            removed = await _jre.prune_older_than(rt._db, days=90)
+            rt.record_job_success("job_run_events_prune")
+            if removed:
+                logger.info("job_run_events prune: removed %d rows (>90d)", removed)
+        except Exception as exc:
+            rt.record_job_failure("job_run_events_prune", str(exc))
+            logger.exception("job_run_events prune failed")
+
+    scheduler.add_job(
+        _prune_job_run_events,
+        CronTrigger(hour=5, minute=10, timezone=user_timezone()),
+        id="job_run_events_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    async def _prune_alert_events() -> None:
+        if rt._db is None:
+            return
+        try:
+            from genesis.db.crud import alert_events as _ae
+
+            removed = await _ae.prune_older_than(rt._db, days=90)
+            rt.record_job_success("alert_events_prune")
+            if removed:
+                logger.info("alert_events prune: removed %d resolved rows (>90d)", removed)
+        except Exception as exc:
+            rt.record_job_failure("alert_events_prune", str(exc))
+            logger.exception("alert_events prune failed")
+
+    scheduler.add_job(
+        _prune_alert_events,
+        CronTrigger(hour=5, minute=20, timezone=user_timezone()),
+        id="alert_events_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
 
 async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""

@@ -11,6 +11,29 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now remembers how its background jobs actually ran, not just a
+  running tally.** Until now each scheduled job kept only a single cumulative
+  row, so a job that failed for a week and then recovered looked identical to
+  one that never failed — the history was gone. Genesis now keeps a per-run
+  record (with real durations where a job marks its own start), so a bad patch
+  or an intermittent outage leaves a visible trace instead of vanishing into an
+  average. It stays cheap on purpose: a healthy or a stuck high-frequency job is
+  recorded at most hourly, so the log captures every distinct episode without
+  drowning in routine ticks.
+
+- **Alert history survives a restart.** The list of what's currently wrong used
+  to live only in memory and reset every time Genesis restarted, so an incident
+  that opened and closed while you weren't looking left no record. Alerts are now
+  written to a durable incident log — each one opened when it starts firing and
+  stamped resolved when it clears — so you can see what happened overnight, not
+  just what's broken right now.
+
+- **Genesis notices when it stops learning about you.** The stream that updates
+  Genesis's model of you from its own reflections had gone quiet for months with
+  nothing flagging it. Genesis now watches that stream and raises a (non-paging)
+  alert if it goes silent for more than two weeks, and clears it automatically
+  once fresh learning resumes.
+
 - **Data backfills now heal themselves on update.** Some upgrades need more than
   a schema change — they need existing data reshaped (e.g. tagging every stored
   memory's vector with its provenance class). Those backfills used to be

@@ -1736,6 +1736,41 @@ TABLES = {
             mode            TEXT NOT NULL DEFAULT 'shadow'
         )
     """,
+    # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
+    # Per-run scheduled-job history. job_health is cumulative-only (one row
+    # per job_name); this is the era-attribution time series the ledger
+    # grades scheduled_job predictions against. Writes are debounced at the
+    # source (runtime/_job_health.py): successes only when ≥1h since the last
+    # success; failures on streak onset + hourly heartbeat — so a stuck 60s
+    # poll costs ~24 rows/day, not ~1440. 90-day self-prune (drip retention).
+    "job_run_events": """
+        CREATE TABLE IF NOT EXISTS job_run_events (
+            id             TEXT PRIMARY KEY,          -- uuid4 hex
+            job_name       TEXT NOT NULL,
+            status         TEXT NOT NULL CHECK (status IN ('success', 'failed')),
+            run_started_at TEXT,                      -- NULL unless record_job_start ran
+            duration_ms    INTEGER,                   -- NULL unless run_started_at present
+            error          TEXT,                      -- failure detail (NULL on success)
+            recorded_at    TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
+    # Persisted alert/incident store. Replaces the in-memory one-generation
+    # _alert_history dict (mcp/health/__init__.py). One designated writer (the
+    # awareness tick) reconciles the durable open-set: an open row (resolved_at
+    # IS NULL) exists per currently-firing alert_id; resolution stamps
+    # resolved_at. The partial UNIQUE INDEX on (alert_id) WHERE resolved_at IS
+    # NULL makes INSERT OR IGNORE idempotent even under the cross-process race.
+    "alert_events": """
+        CREATE TABLE IF NOT EXISTS alert_events (
+            id           TEXT PRIMARY KEY,            -- uuid4 hex
+            alert_id     TEXT NOT NULL,               -- stable alert key (e.g. 'creds:corrupt')
+            source       TEXT NOT NULL,               -- component that raised it
+            severity     TEXT NOT NULL,               -- CRITICAL / WARNING / ... (computed)
+            message      TEXT NOT NULL,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            resolved_at  TEXT                         -- NULL = still open
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2037,6 +2072,14 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_slsr_started ON session_ledger_shadow_runs(started_at)",
     "CREATE INDEX IF NOT EXISTS idx_slse_session ON session_ledger_shadow_events(session_id, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_slse_observed ON session_ledger_shadow_events(observed_at)",
+    # WS-2 sensor fabric (M9/M10)
+    "CREATE INDEX IF NOT EXISTS idx_jre_job_time ON job_run_events(job_name, recorded_at)",
+    "CREATE INDEX IF NOT EXISTS idx_jre_recorded ON job_run_events(recorded_at)",
+    "CREATE INDEX IF NOT EXISTS idx_jre_status ON job_run_events(status, recorded_at)",
+    # one open row per alert_id — makes the open-set reconcile idempotent
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ae_open_alert ON alert_events(alert_id) WHERE resolved_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_ae_created ON alert_events(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ae_alert ON alert_events(alert_id, created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
@@ -2095,4 +2138,3 @@ DRIVE_WEIGHTS_SEED = [
     ("cooperation", 0.25, 0.25, 0.10, 0.50),
     ("competence", 0.15, 0.15, 0.10, 0.50),
 ]
-

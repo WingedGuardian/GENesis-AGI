@@ -121,6 +121,7 @@ async def test_no_unexpected_tables(db):
         "otel_spans",  # tracing/spans backbone
         "cognitive_file_modifications",  # cognitive self-mod rollback ledger
         "entities", "entity_mentions", "entity_links",  # entity layer (WS-H P2)
+        "job_run_events", "alert_events",  # WS-2 sensor fabric (M9/M10)
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"
