@@ -1114,3 +1114,242 @@ class TestEgoCycleDisallowedTools:
 
         src = inspect.getsource(session_mod)
         assert "disallowed_tools=list(_EGO_CYCLE_DISALLOWED_TOOLS)" in src
+
+
+class TestValidateOwnGoalKeys:
+    """_validate_output sanitization for the additive-autonomy keys."""
+
+    @staticmethod
+    def _base(**extra):
+        data = {"proposals": [], "focus_summary": "x"}
+        data.update(extra)
+        return data
+
+    def test_creations_sanitized(self):
+        from genesis.ego.session import _validate_output
+
+        out = _validate_output(self._base(own_goal_creations=[
+            {"title": "  Fix dead-letter backlog  ", "category": "project",
+             "priority": "critical", "goal_type": "bogus",
+             "cadence_days": 1, "description": "d" * 2000},
+            {"title": "T" * 300, "category": "learning", "cadence_days": 999},
+            {"title": "No category"},                      # dropped
+            {"category": "project"},                       # dropped (no title)
+            {"title": "Bad category", "category": "career-ops"},  # dropped
+            "not a dict",                                  # dropped
+        ]))
+        cleaned = out["own_goal_creations"]
+        assert len(cleaned) == 2
+        first, second = cleaned
+        assert first["title"] == "Fix dead-letter backlog"
+        assert first["priority"] == "medium"      # critical reserved for user
+        assert first["goal_type"] == "milestone"  # invalid → default
+        assert first["cadence_days"] == 3         # clamped up
+        assert len(first["description"]) == 1000  # clamped
+        assert len(second["title"]) == 120        # clamped
+        assert second["cadence_days"] == 60       # clamped down
+
+    def test_reviews_sanitized(self):
+        from genesis.ego.session import _validate_output
+
+        out = _validate_output(self._base(own_goal_reviews=[
+            {"goal_id": "g1", "recommendation": "pause", "assessment": "a"},
+            {"goal_id": "g2", "recommendation": "resume"},  # invalid rec
+            {"recommendation": "pause"},                     # no goal_id
+            {"goal_id": "", "recommendation": "close"},      # empty id
+            "not a dict",
+        ]))
+        assert out["own_goal_reviews"] == [
+            {"goal_id": "g1", "recommendation": "pause", "assessment": "a"},
+        ]
+
+
+class TestOwnGoalCreations:
+    """_process_own_goal_creations — THE trusted origin='genesis_ego' path."""
+
+    @pytest.fixture
+    async def goals_db(self, db):
+        await db.execute(TABLES["user_goals"])
+        await db.execute(TABLES["observations"])
+        await db.commit()
+        return db
+
+    @staticmethod
+    def _entry(title="Drive dead-letter backlog to zero", **extra):
+        entry = {"title": title, "category": "project", "priority": "medium",
+                 "goal_type": "milestone", "description": None,
+                 "cadence_days": None}
+        entry.update(extra)
+        return entry
+
+    @staticmethod
+    async def _ego_goals(conn):
+        cur = await conn.execute(
+            "SELECT title, origin, status FROM user_goals "
+            "WHERE origin = 'genesis_ego'",
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def test_source_tag_gate(self, ego_session, goals_db):
+        """The key is inert for any session but the genesis ego cycle."""
+        ego_session._source_tag = "user_ego_cycle"
+        await ego_session._process_own_goal_creations([self._entry()], "c1")
+        assert await self._ego_goals(goals_db) == []
+
+    async def test_creates_with_origin_and_audit(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await ego_session._process_own_goal_creations([self._entry()], "c1")
+
+        goals = await self._ego_goals(goals_db)
+        assert len(goals) == 1
+        assert goals[0]["origin"] == "genesis_ego"
+        cur = await goals_db.execute(
+            "SELECT source, content FROM observations "
+            "WHERE type = 'goal_autonomous_action'",
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row["source"] == "genesis_ego_cycle"
+        assert "created own goal" in row["content"]
+
+    async def test_per_cycle_cap(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await ego_session._process_own_goal_creations(
+            [self._entry(), self._entry(title="Second unrelated objective")],
+            "c1",
+        )
+        assert len(await self._ego_goals(goals_db)) == 1
+
+    async def test_global_active_cap(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        from genesis.db.crud import user_goals as goals_crud
+
+        for i in range(5):
+            await goals_crud.create(
+                goals_db, title=f"Existing lane occupant {i} {'x' * i}",
+                category="project", origin="genesis_ego",
+            )
+        await ego_session._process_own_goal_creations([self._entry()], "c1")
+        assert len(await self._ego_goals(goals_db)) == 5  # unchanged
+
+    async def test_paused_frees_a_slot(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        from genesis.db.crud import user_goals as goals_crud
+
+        for i in range(5):
+            gid = await goals_crud.create(
+                goals_db, title=f"Existing lane occupant {i} {'y' * i}",
+                category="project", origin="genesis_ego",
+            )
+        await goals_crud.update(goals_db, gid, status="paused")
+        await ego_session._process_own_goal_creations([self._entry()], "c1")
+        assert len(await self._ego_goals(goals_db)) == 6  # 4 active + paused + new
+
+    async def test_dedupe_against_paused_own_goal(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        from genesis.db.crud import user_goals as goals_crud
+
+        gid = await goals_crud.create(
+            goals_db, title="Drive dead-letter backlog to zero",
+            category="project", origin="genesis_ego",
+        )
+        await goals_crud.update(goals_db, gid, status="paused")
+        await ego_session._process_own_goal_creations([self._entry()], "c1")
+        assert len(await self._ego_goals(goals_db)) == 1  # only the paused one
+
+    async def test_dedupe_against_user_goal(self, ego_session, goals_db):
+        """An own goal must never shadow-duplicate a USER goal."""
+        ego_session._source_tag = "genesis_ego_cycle"
+        from genesis.db.crud import user_goals as goals_crud
+
+        await goals_crud.create(
+            goals_db, title="Drive dead-letter backlog to zero",
+            category="project",  # origin defaults to 'user'
+        )
+        await ego_session._process_own_goal_creations([self._entry()], "c1")
+        assert await self._ego_goals(goals_db) == []
+
+
+class TestOwnGoalReviews:
+    """_process_own_goal_reviews — own-lane review verdicts."""
+
+    @pytest.fixture
+    async def goals_db(self, db):
+        await db.execute(TABLES["user_goals"])
+        await db.execute(TABLES["observations"])
+        await db.execute(TABLES["ego_proposals"])
+        await db.commit()
+        return db
+
+    @staticmethod
+    async def _insert_goal(conn, *, gid, origin, status="active"):
+        await conn.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, status, priority, origin, created_at, updated_at) "
+            "VALUES (?, 'Own Goal', 'project', ?, 'medium', ?, "
+            "'2026-06-01', '2026-06-01')",
+            (gid, status, origin),
+        )
+        await conn.commit()
+
+    @staticmethod
+    async def _status(conn, gid):
+        cur = await conn.execute(
+            "SELECT status FROM user_goals WHERE id = ?", (gid,),
+        )
+        return (await cur.fetchone())["status"]
+
+    async def test_pause_own_goal_direct_applies(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="og1", origin="genesis_ego")
+
+        await ego_session._process_own_goal_reviews([
+            {"goal_id": "og1", "recommendation": "pause", "assessment": "idle"},
+        ])
+
+        assert await self._status(goals_db, "og1") == "paused"
+        ego_session._proposals.create_batch.assert_not_awaited()
+        cur = await goals_db.execute(
+            "SELECT source FROM observations WHERE type = 'goal_autonomous_action'",
+        )
+        row = await cur.fetchone()
+        assert row is not None and row["source"] == "genesis_ego_cycle"
+
+    async def test_user_goal_is_skipped_not_proposed(self, ego_session, goals_db):
+        """This channel never converts into a user-facing proposal."""
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="ug1", origin="user")
+
+        await ego_session._process_own_goal_reviews([
+            {"goal_id": "ug1", "recommendation": "pause", "assessment": "x"},
+        ])
+
+        assert await self._status(goals_db, "ug1") == "active"
+        ego_session._proposals.create_batch.assert_not_awaited()
+
+    async def test_close_surfaces_observation_only(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="og2", origin="genesis_ego")
+
+        await ego_session._process_own_goal_reviews([
+            {"goal_id": "og2", "recommendation": "close", "assessment": "done"},
+        ])
+
+        assert await self._status(goals_db, "og2") == "active"
+        ego_session._proposals.create_batch.assert_not_awaited()
+        cur = await goals_db.execute(
+            "SELECT source FROM observations WHERE type = 'goal_recommendation'",
+        )
+        row = await cur.fetchone()
+        assert row is not None and row["source"] == "genesis_ego_cycle"
+
+    async def test_source_tag_gate(self, ego_session, goals_db):
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="og3", origin="genesis_ego")
+
+        await ego_session._process_own_goal_reviews([
+            {"goal_id": "og3", "recommendation": "pause", "assessment": "x"},
+        ])
+
+        assert await self._status(goals_db, "og3") == "active"
+        ego_session._proposals.create_batch.assert_not_awaited()

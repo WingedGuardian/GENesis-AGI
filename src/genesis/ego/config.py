@@ -137,6 +137,10 @@ def validate_ego_config(changes: dict) -> list[str]:
         v = changes["genesis_max_interval_minutes"]
         if not isinstance(v, (int, float)) or v < 60:
             errors.append("genesis_max_interval_minutes must be >= 60")
+    if "max_active_ego_goals" in changes:
+        v = changes["max_active_ego_goals"]
+        if not isinstance(v, int) or v < 0:
+            errors.append("max_active_ego_goals must be integer >= 0")
     if "dispatch_model_overrides" in changes:
         v = changes["dispatch_model_overrides"]
         valid_models = VALID_MODEL_NAMES

@@ -140,6 +140,11 @@ class EgoConfig:
     genesis_cadence_minutes: int = 90  # base interval for genesis ego
     genesis_max_interval_minutes: int = 240  # backoff ceiling for genesis ego
     max_pending_proposals: int = 15  # auto-table oldest unranked when exceeded
+    # Additive ego autonomy — cap on ACTIVE goals in the genesis ego's OWN
+    # lane (origin='genesis_ego'). Pausing frees a slot; the paused tail is
+    # deliberately unbounded (user decision 2026-07-16) and reported in the
+    # morning report's own-goals count line.
+    max_active_ego_goals: int = 5
     # Per-action-type model overrides for proposal dispatch.
     # Keys are action_type strings (e.g. "investigate"), values are model
     # names ("opus", "sonnet", "haiku").  Falls back to profile-based

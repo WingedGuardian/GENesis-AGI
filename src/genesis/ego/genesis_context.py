@@ -84,6 +84,7 @@ class GenesisEgoContextBuilder:
             ("signals", self._signals_section),
             ("observations", self._observations_section),
             ("follow_ups", self._follow_ups_section),
+            ("own_goals", self._own_goals_section),
             # Cost section removed — the genesis ego's identity doc says
             # "Do NOT opine on config values... budget caps... are user
             # decisions."  Feeding cost data every cycle caused a 10+
@@ -666,6 +667,77 @@ class GenesisEgoContextBuilder:
         return "\n".join(lines)
 
 
+    async def _own_goals_section(self, *, depth: str = "deep") -> str:
+        """The genesis ego's OWN goal lane (origin='genesis_ego').
+
+        Renders active + paused own goals with staleness annotations. This
+        section is what makes own-goal review non-blind — the ego only ever
+        reviews goals it can see here — and doubles as the dedupe context
+        for own_goal_creations. User goals are deliberately absent: they are
+        user-ego jurisdiction (user_context renders those, filtered to
+        origin='user').
+        """
+        try:
+            cursor = await self._db.execute(
+                "SELECT * FROM user_goals WHERE origin = 'genesis_ego' "
+                "AND status IN ('active', 'paused') "
+                "ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, "
+                "updated_at ASC LIMIT 30",
+            )
+            goals = [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            logger.error("Failed to query own goals", exc_info=True)
+            return "## Your Own Goals\n\n*Could not query own goals.*\n"
+
+        lines = ["## Your Own Goals\n"]
+        if not goals:
+            lines.append(
+                "*None yet. When an operational objective needs tracking "
+                "across cycles, you may create one via `own_goal_creations` "
+                "(see Output Contract).*\n"
+            )
+            return "\n".join(lines)
+
+        n_active = sum(1 for g in goals if g["status"] == "active")
+        n_paused = len(goals) - n_active
+        lines.append(f"*{n_active} active, {n_paused} paused.*\n")
+        if depth == "light":
+            return "\n".join(lines)
+
+        # Staleness threshold mirrors the goal-review default: per-goal
+        # cadence_days override, else the EgoConfig dataclass default.
+        from genesis.ego.types import EgoConfig
+
+        default_days = EgoConfig.goal_review_staleness_days
+        now = datetime.now(UTC)
+        for g in goals:
+            updated_at = g.get("updated_at") or g.get("created_at") or ""
+            days: int | str = "?"
+            stale_tag = ""
+            try:
+                updated = datetime.fromisoformat(updated_at)
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=UTC)
+                days = (now - updated).days
+                per_goal = g.get("cadence_days")
+                threshold = (
+                    per_goal
+                    if isinstance(per_goal, int) and per_goal > 0
+                    else default_days
+                )
+                if g["status"] == "active" and days >= threshold:
+                    stale_tag = " — STALE, review due (own_goal_reviews)"
+            except (ValueError, TypeError):
+                pass
+            lines.append(
+                f"- [{g['status'].upper()}] "
+                f"**{(g.get('title') or '?')[:100]}** "
+                f"(id: {g['id']}, {g.get('priority', 'medium')}, "
+                f"{g.get('category', '?')}, updated {days}d ago){stale_tag}"
+            )
+        lines.append("")
+        return "\n".join(lines)
+
     @staticmethod
     def _output_contract_section(*, depth: str = "deep") -> str:
         """Remind the Genesis ego of its output format.
@@ -705,10 +777,21 @@ class GenesisEgoContextBuilder:
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
             '  "intentions": {"review": [{"id": "...", "action": "keep|fire|withdraw|renew"}], '
             '"new": [{"content": "...", "trigger_condition": "...", "reasoning": "..."}]},\n'
-            '  "communication_decision": "send_digest|urgent_notify|stay_quiet"\n'
+            '  "communication_decision": "send_digest|urgent_notify|stay_quiet",\n'
+            '  "own_goal_creations": [{"title": "...", "description": "...", '
+            '"category": "project|learning|other", "priority": "low|medium|high", '
+            '"goal_type": "milestone|continuous", "cadence_days": 14}],\n'
+            '  "own_goal_reviews": [{"goal_id": "...", '
+            '"recommendation": "continue|pause|deprioritize|close", '
+            '"assessment": "..."}]\n'
             "}\n"
             "```\n\n"
             "If you cannot resolve an issue, add it to escalations — "
             "the user ego will see it and decide what the user needs to know.\n\n"
-            "No morning_report — that belongs to the user ego.\n"
+            "No morning_report — that belongs to the user ego.\n\n"
+            "own_goal_creations / own_goal_reviews touch ONLY your own lane "
+            "(origin=genesis_ego, listed under 'Your Own Goals'): max 1 "
+            "creation per cycle and a cap on active own goals; reviews of "
+            "anything not in that list are ignored. Omit both keys when "
+            "nothing changes.\n"
         )
