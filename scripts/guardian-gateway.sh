@@ -814,6 +814,28 @@ PYEOF
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 30 "$VENV_PY" -m genesis.guardian --disk-status
         ;;
+    ram-status)
+        # Read-only: print the guardian's RAM view JSON (container cgroup +
+        # host-VM axes + worst-of tier). Genesis's window onto the out-of-band
+        # RAM alert. No mutation, no secrets, no sudo.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "ram-status", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        # Skew guard (see host-profile): sync-gateway redeploys THIS script
+        # independently of the src tree. An old checkout has no --ram-status
+        # branch — the flag would fall through main()'s if-chain into run_check(),
+        # i.e. a FULL guardian recovery cycle triggered by a routine read-only poll.
+        if [ ! -f "$INSTALL_DIR/src/genesis/guardian/memory_watch.py" ]; then
+            echo '{"ok": false, "action": "ram-status", "error": "guardian src predates ram-status — run update to redeploy"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 30 "$VENV_PY" -m genesis.guardian --ram-status
+        ;;
     host-profile)
         # Read-only: print the host body-schema JSON (system identity, storage
         # pool, virtualization stack + this container's limits.*). Consumed by
