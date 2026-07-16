@@ -13,7 +13,13 @@ from genesis.runtime.init.learning import _wire_drip_retention_jobs
 
 pytestmark = pytest.mark.asyncio
 
-_EXPECTED = ("execution_traces_prune", "cost_events_prune", "file_modifications_prune")
+_EXPECTED = (
+    "execution_traces_prune",
+    "cost_events_prune",
+    "file_modifications_prune",
+    "job_run_events_prune",
+    "alert_events_prune",
+)
 
 
 class _StubRT:
@@ -26,7 +32,7 @@ class _StubRT:
         pass
 
 
-async def test_wire_drip_retention_jobs_registers_all_three():
+async def test_wire_drip_retention_jobs_registers_all():
     sched = AsyncIOScheduler()
     _wire_drip_retention_jobs(sched, _StubRT())
     sched.start(paused=True)  # flush pending jobs into the jobstore without firing them
