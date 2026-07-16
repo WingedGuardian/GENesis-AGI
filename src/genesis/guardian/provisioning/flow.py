@@ -370,12 +370,15 @@ def _vzdump_in_flight_upid(config: GuardianConfig, ledger: ProvisioningLedger) -
     """The UPID of a still-latched backup, or "".
 
     Latch = the latest vzdump ledger entry is unverified, HAS a upid (an entry
-    without one is a failed start — nothing to resume, must never latch), and
+    without one is a failed start — nothing to resume, must never latch), is
+    NOT yet resolved (a terminal-failed row carries ``resolved_ts`` while
+    staying ``verified: false`` — the task is over, so it must not latch), and
     is younger than the vzdump wall bound. Past the wall bound the latch
     self-expires: the operation ends as UNVERIFIED, never blocks forever.
     """
     entry = ledger.latest_backup()
-    if not entry or entry.get("verified") or not entry.get("upid"):
+    if (not entry or entry.get("verified") or entry.get("resolved_ts")
+            or not entry.get("upid")):
         return ""
     try:
         started = datetime.fromisoformat(str(entry.get("ts")))

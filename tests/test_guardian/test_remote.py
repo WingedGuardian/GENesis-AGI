@@ -417,3 +417,55 @@ class TestContainerCapacityExecutors:
             assert (await remote.request_set_container_limits(None, 0))["ok"] is False
             assert (await remote.request_set_container_limits(None, 1000))["ok"] is False
         m.assert_not_called()
+
+
+class TestVzdumpStatus:
+    """The verify probe must not lose a terminal state across the SSH boundary."""
+
+    @pytest.mark.asyncio
+    async def test_failed_state_survives_nonzero_exit(self, remote):
+        """Regression (Codex P2): a terminally-FAILED backup makes the host verb
+        emit ok:false → SSH exits nonzero. The JSON body still carries
+        state="failed"; the client must parse it, not discard it as transient
+        (which would make the poller wait the full wall bound instead of
+        stopping)."""
+        body = ('{"ok": false, "stage": "task_failed", "state": "failed", '
+                '"upid": "UPID:pve:1:1:1:vzdump:100:u@p!t:", "error": "job errors"}')
+        with patch.object(remote, "_ssh_command",
+                          return_value=(False, body)):  # nonzero exit
+            res = await remote.request_vzdump_status(
+                "UPID:pve:1:1:1:vzdump:100:u@p!t:",
+            )
+        assert res["state"] == "failed", "terminal state must survive nonzero exit"
+        assert res["error"] == "job errors"
+
+    @pytest.mark.asyncio
+    async def test_verified_and_running_states_parse(self, remote):
+        for state, exit_ok in [("verified", True), ("running", True)]:
+            with patch.object(remote, "_ssh_command",
+                              return_value=(exit_ok, f'{{"ok": true, "state": "{state}"}}')):
+                res = await remote.request_vzdump_status()
+            assert res["state"] == state
+
+    @pytest.mark.asyncio
+    async def test_real_transport_failure_is_transient_no_state(self, remote):
+        """A genuine SSH/timeout failure yields non-JSON → transient form with
+        no state, so the poller keeps retrying (never a false 'failed')."""
+        with patch.object(remote, "_ssh_command", return_value=(False, "timeout")):
+            res = await remote.request_vzdump_status()
+        assert res["ok"] is False
+        assert "state" not in res
+
+    @pytest.mark.asyncio
+    async def test_invalid_upid_rejected_before_ssh(self, remote):
+        called = False
+
+        async def _spy(*a, **k):
+            nonlocal called
+            called = True
+            return (True, "{}")
+
+        with patch.object(remote, "_ssh_command", new=_spy):
+            res = await remote.request_vzdump_status("not-a-upid")
+        assert not res["ok"] and "invalid UPID" in res["error"]
+        assert not called, "malformed UPID must never reach the gateway"

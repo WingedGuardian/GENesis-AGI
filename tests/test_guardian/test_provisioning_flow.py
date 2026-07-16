@@ -512,3 +512,35 @@ async def test_grow_rate_cap_ignores_backups(tmp_path):
         _cfg(max_actions_per_week=2), _disk_req(), adapter, disp, ledger,
     )
     assert res["ok"], f"two prior backups must not trip the 2-grow cap: {res}"
+
+
+# ── P2 fixes: failed backup releases the latch; terminal state is usable ───
+
+async def test_failed_backup_releases_in_flight_latch(tmp_path):
+    """Codex P2: after a terminally-failed backup the task is OVER — the row
+    stays verified:false but carries resolved_ts, and must NOT keep latching
+    (which would block a retry/grow chain for up to vzdump_timeout_s)."""
+    from genesis.guardian.provisioning.flow import _vzdump_in_flight_upid
+    ledger = ProvisioningLedger(tmp_path)
+    ledger.record_action("vzdump", "vmid 100", ok=True, verified=False, upid=_UPID)
+    assert _vzdump_in_flight_upid(_cfg(), ledger) == _UPID  # in flight while running
+    ledger.mark_latest_backup_verified(_UPID, ok=False)      # terminal failure
+    assert _vzdump_in_flight_upid(_cfg(), ledger) == "", (
+        "a resolved (failed) backup must not keep latching"
+    )
+
+
+async def test_new_backup_allowed_after_failure(tmp_path):
+    """End-to-end of the latch fix: a fresh start passes the in-flight check
+    once the prior backup has terminally failed."""
+    ledger = ProvisioningLedger(tmp_path)
+    ledger.record_action("vzdump", "vmid 100", ok=True, verified=False, upid=_UPID)
+    ledger.mark_latest_backup_verified(_UPID, ok=False)
+    adapter = FakeAdapter(_backup_cap())
+    adapter.start_result = BackupStartResult(
+        ok=True, upid=_UPID.replace("68765432", "68765499"), requested="x", attempted=True,
+    )
+    res = await execute_vzdump_start(
+        _cfg(max_backups_per_week=5), adapter, FakeDispatcher(), ledger,
+    )
+    assert res["ok"], f"a fresh backup must be allowed after a failed one: {res}"

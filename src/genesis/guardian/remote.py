@@ -370,6 +370,18 @@ class GuardianRemote:
                     "error": f"invalid UPID {upid[:60]!r}"}
         cmd = f"provision-vzdump-status {upid}" if upid else "provision-vzdump-status"
         ok, out = await self._ssh_command(cmd, timeout=_VZDUMP_TIMEOUT)
+        # A terminally-FAILED task makes the host verb emit ok:false → SSH exits
+        # nonzero. But its JSON body still carries the authoritative ``state``
+        # ("failed"), and the poller keys on that to STOP + notify once. Parse
+        # the body regardless of exit code so a determined terminal state is
+        # never mistaken for a transient transport error (a real SSH/timeout
+        # failure yields non-JSON and falls through to the transient form).
+        try:
+            parsed = json.loads(out)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and "state" in parsed:
+            return parsed
         return self._as_json(ok, out, "provision-vzdump-status")
 
     async def storage_expand(self) -> dict:
