@@ -374,6 +374,12 @@ verified: 4e483381 2026-07-15
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
   `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
   the same measurement to the container.
+- **Container-swap invariant reconciler** (`swap_watch.py`) runs every tick:
+  re-asserts `limits.memory.swap=true` (incus config) and live-activates the
+  cgroup `memory.swap.max` (via `cgroup_ops`) when observed at `0` — the
+  self-heal for installs that advance via bare `git pull` and never re-run
+  host-setup. Heals page INFO; failures page WARNING (24h throttle); kill
+  switch `swap_reconcile_enabled: false`.
 - **sentinel/** is LIVE-wired but **shadow-only autonomy**: config mode
   `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
   action requires human approval. `InfrastructureMonitor` (call site 37, free

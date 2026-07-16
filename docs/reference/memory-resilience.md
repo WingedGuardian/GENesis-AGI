@@ -52,7 +52,14 @@ remediation for the detected vantage — because the knob is never local:
 - **Inside a container** (LXC/Incus): swap capability is granted by the host.
   Fix on the host: `incus config set <container> limits.memory.swap true`,
   and make sure the host itself has swap. `host-setup.sh` does both for
-  managed installs (and warns if the host is swapless).
+  managed installs (and warns if the host is swapless). On guardian-managed
+  hosts the invariant is also **self-healing**: the guardian's swap
+  reconciler (`guardian/swap_watch.py`) re-asserts the config knob *and*
+  live-activates the cgroup (`memory.swap.max`) each tick — covering installs
+  that advance via bare `git pull` and never re-run host-setup. A heal pages
+  an INFO alert; opt a host out with `swap_reconcile_enabled: false` in the
+  guardian config (an explicitly-false knob is otherwise reconciled back to
+  true — swap-on is the install invariant).
 - **Bare metal / VM**: create a swapfile or LV sized to taste. Even a few
   GiB turns the OOM cliff into a ramp.
 

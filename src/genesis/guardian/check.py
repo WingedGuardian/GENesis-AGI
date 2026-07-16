@@ -396,6 +396,12 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # published bundle to a host-only dir + WARN if the archived bundle goes
         # stale. Host-side file ops only, independent of the container verdict.
         await _check_repo_bundle_and_alert(config, dispatcher)
+        # Container-swap invariant (silent-skip class): host-setup sets
+        # limits.memory.swap at creation, but an install that advances via bare
+        # git pull never re-runs host-setup — reconcile the knob (persistent
+        # config + live cgroup) on observed state so a memory spike degrades
+        # into swap pressure instead of the D-state OOM-thrash wedge.
+        await _check_container_swap_and_alert(config, dispatcher)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)
@@ -583,6 +589,22 @@ async def _check_credential_integrity_and_alert(
         await check_credential_integrity_and_alert(config, dispatcher)
     except Exception:
         logger.warning("credential-integrity watch failed", exc_info=True)
+
+
+async def _check_container_swap_and_alert(
+    config: GuardianConfig, dispatcher: AlertDispatcher,
+) -> None:
+    """Guardian-side container-swap invariant reconciler (delegates to swap_watch).
+
+    host-setup sets limits.memory.swap at creation, but an install that
+    advances via bare git pull never re-runs host-setup — the guardian
+    re-asserts the knob (persistent config + live cgroup) on observed state.
+    Never raises into the tick."""
+    try:
+        from genesis.guardian.swap_watch import check_container_swap_and_alert
+        await check_container_swap_and_alert(config, dispatcher)
+    except Exception:
+        logger.warning("container-swap watch failed", exc_info=True)
 
 
 async def _check_container_git_and_alert(

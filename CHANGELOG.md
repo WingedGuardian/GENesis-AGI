@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The guardian now keeps container swap enabled on its own.** Swap is what
+  turns a memory spike into graceful slowdown instead of a machine-wedging
+  thrash, but the setting only got applied when host setup ran — an install
+  that just pulls code updates could sit unprotected indefinitely (observed
+  live: a second install ran for weeks one memory spike away from the wedge).
+  The guardian now re-checks the setting every tick and repairs both halves
+  when drifted: the persistent config (so future restarts have it) and the
+  live cgroup (so protection is immediate, no restart needed). Repairs page an
+  INFO note; a repair that can't complete pages a warning at most daily. Hosts
+  where swap-off is deliberate can opt out (`swap_reconcile_enabled: false`).
+
 - **Genesis now remembers how its background jobs actually ran, not just a
   running tally.** Until now each scheduled job kept only a single cumulative
   row, so a job that failed for a week and then recovered looked identical to
