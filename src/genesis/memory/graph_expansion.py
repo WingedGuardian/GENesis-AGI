@@ -183,26 +183,12 @@ async def expand_neighbors(
         return []
 
     neighbor_ids = [n["memory_id"] for n in neighbors]
-    # Visibility parity with normal recall (Codex #1069 P2): `get_by_id`
-    # applies neither the bitemporal expiry nor the deprecated predicate that
-    # `search_ranked`/`_expired_candidate_ids` enforce — without this, live
-    # expansion would resurface superseded facts that recall deliberately
-    # hides. NULL invalid_at = valid forever; NULL deprecated = legacy row,
-    # not deprecated (same semantics as the recall pipeline).
-    _ph = ",".join("?" * len(neighbor_ids))
-    hidden_rows = await db.execute_fetchall(
-        f"SELECT memory_id FROM memory_metadata "  # noqa: S608 - literal fragments; values bound
-        f"WHERE memory_id IN ({_ph}) AND "
-        f"((invalid_at IS NOT NULL AND invalid_at <= ?) OR deprecated = 1)",
-        [*neighbor_ids, datetime.now(UTC).isoformat()],
-    )
-    hidden = {r[0] for r in hidden_rows}
-    if hidden:
-        neighbors = [n for n in neighbors if n["memory_id"] not in hidden]
-        if not neighbors:
-            return []
-        neighbor_ids = [n["memory_id"] for n in neighbors]
-    origins = await memory_crud.origin_class_by_ids(db, neighbor_ids)
+    # ONE batched FTS⋈metadata fetch hydrates content + provenance + the
+    # visibility fields (was an N+1 get_by_id loop + a separate
+    # origin_class_by_ids + a separate visibility query — the latency the flip
+    # surfaced). Neighbor lists are cap-bounded (≤25), so no chunking needed.
+    hydrated = await memory_crud.hydrate_for_expansion(db, neighbor_ids)
+
     # Which seed(s) reach each neighbor — one bounded query over the
     # seed∪neighbor id set (direction-agnostic pair list).
     seed_set = set(seed_ids)
@@ -216,12 +202,19 @@ async def expand_neighbors(
         elif tgt in seed_set and src not in seed_set:
             linked_from.setdefault(src, set()).add(tgt)
 
+    now_iso = datetime.now(UTC).isoformat()
     results: list[RetrievalResult] = []
     for n in neighbors:
         mid = n["memory_id"]
-        row = await memory_crud.get_by_id(db, mid)
+        row = hydrated.get(mid)
         if not row or not row.get("content"):
             continue  # dangling link — edge outlived the memory
+        # Visibility parity with normal recall (Codex #1069 P2): skip rows
+        # normal recall hides — bitemporally expired (NULL invalid_at = valid
+        # forever) or deprecated/superseded (search_ranked filters these).
+        invalid_at = row.get("invalid_at")
+        if (invalid_at is not None and invalid_at <= now_iso) or row.get("deprecated"):
+            continue
         strength = float(n.get("strength") or 0.0)
         collection = row.get("collection") or "episodic_memory"
         results.append(
@@ -242,7 +235,7 @@ async def expand_neighbors(
                     },
                 },
                 source_pipeline=None,
-                origin_class=origins.get(mid),
+                origin_class=row.get("origin_class"),
                 collection=collection,
             ),
         )

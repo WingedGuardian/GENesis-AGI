@@ -144,6 +144,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   context is unaffected by design: it never ingested these reflections in
   the first place.
 
+- **Recall-time graph expansion got ~5x faster.** The just-shipped 1-hop
+  expansion hydrated each linked neighbor with its own database query — and
+  because the memory content table is a full-text index (no plain lookup on
+  the id column), every one of those was a full scan. On a typical 10-neighbor
+  expansion that measured ~750-940ms of pure overhead on the recall path. It
+  now hydrates every neighbor in a single batched query (~80-130ms), returning
+  identical results. Purely a performance fix — same neighbors, same order,
+  same provenance and visibility filtering.
+
 - **A dashboard request during startup can no longer crash the server.** The
   async-route bridge falls back to a throwaway event loop when the runtime
   loop isn't available — but shared database connections are bound to the
