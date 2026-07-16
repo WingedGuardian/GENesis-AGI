@@ -333,3 +333,88 @@ def test_process_reaper_would_kill_ttl_registered(caplog):
     assert not any("Unknown observation type" in r.getMessage() for r in caplog.records), (
         "a registered type must not trigger the unknown-type warning"
     )
+
+
+_GIT_ALERT = dict(
+    source="git_health_monitor",
+    type="infrastructure_alert",
+    content="git alert",
+    priority="critical",
+    created_at="2026-01-01T00:00:00",
+)
+
+
+async def test_resolve_by_source_and_type_category_scoped(db):
+    # cheap-scan alert, deep-scan alert, and a legacy row with NULL category
+    await observations.create(db, id="g1", **{**_GIT_ALERT, "category": "git_cheap"})
+    await observations.create(
+        db, id="g2", **{**_GIT_ALERT, "category": "git_deep", "content": "deep alert"}
+    )
+    await observations.create(db, id="g3", **{**_GIT_ALERT, "content": "legacy alert"})
+
+    n = await observations.resolve_by_source_and_type(
+        db,
+        source="git_health_monitor",
+        type="infrastructure_alert",
+        category="git_cheap",
+        resolved_at="2026-01-02T00:00:00",
+        resolution_notes="cheap probe passed",
+    )
+
+    # Only the matching-category row resolves; deep + legacy NULL stay open
+    # (a passing structural probe must never clear a content-corruption alert).
+    assert n == 1
+    assert (await observations.get_by_id(db, "g1"))["resolved"] == 1
+    assert (await observations.get_by_id(db, "g2"))["resolved"] == 0
+    assert (await observations.get_by_id(db, "g3"))["resolved"] == 0
+
+
+async def test_resolve_by_source_and_type_unscoped_clears_all_categories(db):
+    await observations.create(db, id="g4", **{**_GIT_ALERT, "category": "git_cheap"})
+    await observations.create(
+        db, id="g5", **{**_GIT_ALERT, "category": "git_deep", "content": "deep alert"}
+    )
+    await observations.create(db, id="g6", **{**_GIT_ALERT, "content": "legacy alert"})
+
+    n = await observations.resolve_by_source_and_type(
+        db,
+        source="git_health_monitor",
+        type="infrastructure_alert",
+        resolved_at="2026-01-02T00:00:00",
+        resolution_notes="deep fsck passed",
+    )
+
+    # Unscoped (deep-verified) resolve clears every open git alert,
+    # including pre-category legacy rows.
+    assert n == 3
+    for oid in ("g4", "g5", "g6"):
+        assert (await observations.get_by_id(db, oid))["resolved"] == 1
+
+
+async def test_skip_if_duplicate_is_atomic_single_statement(db):
+    """The dedup INSERT must be one INSERT…WHERE NOT EXISTS statement, not a
+    SELECT-then-INSERT — two processes can both pass a separate pre-check
+    before either commits (Codex P2, PR #1085). With the atomic form, the
+    second insert is a no-op regardless of interleaving."""
+    r1 = await observations.create(
+        db, id="atomic1", skip_if_duplicate=True, **_GIT_ALERT
+    )
+    r2 = await observations.create(
+        db, id="atomic2", skip_if_duplicate=True, **_GIT_ALERT
+    )
+    assert r1 == "atomic1"
+    assert r2 is None  # duplicate skipped
+    cur = await db.execute(
+        "SELECT count(*) FROM observations WHERE source = 'git_health_monitor'"
+    )
+    assert (await cur.fetchone())[0] == 1
+
+    # After the first is resolved, an identical alert may be created again
+    # (a recurrence after recovery is a NEW incident, not a duplicate).
+    await observations.resolve(
+        db, "atomic1", resolved_at="2026-01-02", resolution_notes="recovered"
+    )
+    r3 = await observations.create(
+        db, id="atomic3", skip_if_duplicate=True, **_GIT_ALERT
+    )
+    assert r3 == "atomic3"
