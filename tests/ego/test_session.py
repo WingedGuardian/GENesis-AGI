@@ -917,3 +917,148 @@ class TestPromptLoading:
                 db=db,
             )
             assert session._static_prompt.strip()
+
+
+# ---------------------------------------------------------------------------
+# Additive ego autonomy — genesis_ego-owned goals self-manage (PR-2, 2026-07-16)
+# ---------------------------------------------------------------------------
+
+
+class TestAutonomousOwnGoalManagement:
+    """A genesis_ego-origin goal reviewed by the GENESIS ego cycle is paused/
+    deprioritized directly (no proposal) with an audit observation. Everything
+    else — user-origin goals, the user-ego cycle, non-reversible recs — keeps
+    the recommend-only proposal path. The approval gates are untouched: this
+    is the ego skipping proposal CREATION for its own additive artifacts, not
+    a gate bypass."""
+
+    @pytest.fixture
+    async def goals_db(self, db):
+        await db.execute(TABLES["user_goals"])
+        await db.execute(TABLES["observations"])
+        await db.commit()
+        return db
+
+    @staticmethod
+    async def _insert_goal(conn, *, gid, origin="user", status="active", priority="high"):
+        await conn.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, status, priority, origin, created_at, updated_at) "
+            "VALUES (?, 'My Goal', 'project', ?, ?, ?, '2026-06-01', '2026-06-01')",
+            (gid, status, priority, origin),
+        )
+        await conn.commit()
+
+    @staticmethod
+    async def _goal_row(conn, gid):
+        cursor = await conn.execute(
+            "SELECT status, priority, origin FROM user_goals WHERE id = ?", (gid,)
+        )
+        return await cursor.fetchone()
+
+    async def test_ego_goal_pause_applies_directly(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="eg1", origin="genesis_ego")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="eg1", recommendation="pause", assessment="stale for weeks",
+        )
+
+        row = await self._goal_row(goals_db, "eg1")
+        assert row["status"] == "paused"
+        ego_session._proposals.create_batch.assert_not_awaited()
+
+    async def test_ego_goal_pause_writes_audit_observation(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="eg2", origin="genesis_ego")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="eg2", recommendation="pause", assessment="done exploring",
+        )
+
+        cursor = await goals_db.execute(
+            "SELECT type, source, content FROM observations "
+            "WHERE type = 'goal_autonomous_action'",
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["source"] == "genesis_ego_cycle"
+        assert "My Goal" in row["content"]
+
+    async def test_ego_goal_deprioritize_applies_directly(self, ego_session, goals_db):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="eg3", origin="genesis_ego", priority="high")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="eg3", recommendation="deprioritize", assessment="lower it",
+        )
+
+        row = await self._goal_row(goals_db, "eg3")
+        assert row["priority"] == "medium"  # one notch down, applied directly
+        ego_session._proposals.create_batch.assert_not_awaited()
+
+    async def test_user_goal_still_requires_proposal(self, ego_session, goals_db):
+        """The hard invariant: an origin='user' goal is NEVER mutated
+        autonomously — even by the genesis ego cycle."""
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="ug1", origin="user")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="ug1", recommendation="pause", assessment="stuck",
+        )
+
+        row = await self._goal_row(goals_db, "ug1")
+        assert row["status"] == "active"  # untouched
+        ego_session._proposals.create_batch.assert_awaited_once()  # proposal path
+
+    async def test_user_ego_cycle_never_direct_applies(self, ego_session, goals_db):
+        """Ego-owned goals self-manage only from the GENESIS ego cycle; a
+        user-ego recommendation on an ego goal still goes through a proposal."""
+        ego_session._source_tag = "user_ego_cycle"
+        await self._insert_goal(goals_db, gid="eg4", origin="genesis_ego")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="eg4", recommendation="pause", assessment="from user ego",
+        )
+
+        row = await self._goal_row(goals_db, "eg4")
+        assert row["status"] == "active"
+        ego_session._proposals.create_batch.assert_awaited_once()
+
+    async def test_default_origin_goal_requires_proposal(self, ego_session, goals_db):
+        """A goal inserted without an explicit origin defaults to 'user' via
+        the schema — and therefore stays proposal-gated."""
+        ego_session._source_tag = "genesis_ego_cycle"
+        await goals_db.execute(
+            "INSERT INTO user_goals (id, title, category, created_at, updated_at) "
+            "VALUES ('dg1', 'Default Goal', 'project', '2026-06-01', '2026-06-01')",
+        )
+        await goals_db.commit()
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="dg1", recommendation="pause", assessment="stale",
+        )
+
+        row = await self._goal_row(goals_db, "dg1")
+        assert row["status"] == "active"
+        ego_session._proposals.create_batch.assert_awaited_once()
+
+    async def test_close_recommendation_still_observation_even_for_ego_goal(
+        self, ego_session, goals_db,
+    ):
+        """close (achieve-vs-abandon) is terminal — never auto-applied, even
+        on an ego-owned goal. Only pause/deprioritize are additive-safe."""
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="eg5", origin="genesis_ego")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="eg5", recommendation="close", assessment="looks finished",
+        )
+
+        row = await self._goal_row(goals_db, "eg5")
+        assert row["status"] == "active"
+        ego_session._proposals.create_batch.assert_not_awaited()
+        cursor = await goals_db.execute(
+            "SELECT type FROM observations WHERE type = 'goal_recommendation'",
+        )
+        assert await cursor.fetchone() is not None

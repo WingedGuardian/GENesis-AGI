@@ -144,8 +144,7 @@ async def ego_directive(
     }
 
 
-@mcp.tool()
-async def ego_goal_create(
+async def _impl_ego_goal_create(
     title: str,
     category: str = "project",
     priority: str = "medium",
@@ -170,6 +169,11 @@ async def ego_goal_create(
         parent_goal_id: ID of the parent goal (for subgoals)
         goal_type: milestone (achievable) or continuous (ongoing)
         cadence_days: Review frequency in days (0 = use global default)
+    Provenance: every goal created through this tool is stamped
+    origin='user' in code. The MCP surface deliberately does NOT accept an
+    origin argument — 'genesis_ego' (which unlocks additive autonomous
+    pause/deprioritize) may only ever be stamped by a trusted Genesis-ego
+    code path (PR-3), never by caller input (Codex P1, PR #1086).
     """
     if category not in _VALID_GOAL_CATEGORIES:
         return {"status": "error", "reason": f"Invalid category: {category!r}. Must be one of: {sorted(_VALID_GOAL_CATEGORIES)}"}
@@ -201,6 +205,10 @@ async def ego_goal_create(
             goal_type=goal_type,
             cadence_days=cadence_days if cadence_days > 0 else None,
             confidence=0.9,
+            # NEVER caller-controlled: the tool surface has no origin arg —
+            # genesis_ego provenance requires a trusted code path (see
+            # docstring). This hardcode IS the security property.
+            origin="user",
         )
 
     return {
@@ -211,7 +219,48 @@ async def ego_goal_create(
         "priority": priority,
         "parent_goal_id": parent_goal_id or None,
         "goal_type": goal_type,
+        "origin": "user",
     }
+
+
+@mcp.tool()
+async def ego_goal_create(
+    title: str,
+    category: str = "project",
+    priority: str = "medium",
+    description: str = "",
+    timeline: str = "",
+    parent_goal_id: str = "",
+    goal_type: str = "milestone",
+    cadence_days: int = 0,
+) -> dict:
+    """Create a new user goal for the ego system.
+
+    Goals are visible to the ego in its thinking cycles. The ego considers
+    goals when deciding what to propose. Use parent_goal_id to create
+    subgoals under an existing goal.
+
+    Args:
+        title: Goal title (concise, actionable)
+        category: career, project, learning, relationship, financial, other
+        priority: low, medium, high, or critical
+        description: Detailed description of the goal
+        timeline: Expected timeline (e.g., "Q2 2026")
+        parent_goal_id: ID of the parent goal (for subgoals)
+        goal_type: milestone (achievable) or continuous (ongoing)
+        cadence_days: Review frequency in days (0 = use global default)
+
+    All goals created here are stamped origin='user' (a user directive).
+    There is deliberately no origin argument — ego-owned provenance
+    ('genesis_ego') can only be stamped by trusted Genesis-ego code, never
+    caller input.
+    """
+    return await _impl_ego_goal_create(
+        title=title, category=category, priority=priority,
+        description=description, timeline=timeline,
+        parent_goal_id=parent_goal_id, goal_type=goal_type,
+        cadence_days=cadence_days,
+    )
 
 
 @mcp.tool()

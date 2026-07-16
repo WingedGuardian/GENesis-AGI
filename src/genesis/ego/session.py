@@ -498,12 +498,16 @@ class EgoSession:
     ) -> None:
         """Route the ego's goal status recommendation to the user.
 
-        Recommend-only — nothing is applied autonomously. The reversible
-        recommendations (``pause`` / ``deprioritize``) become an *approvable*
-        ``goal_status_change`` proposal applied ONLY on user approval (see
-        ``ego/goal_actions.py``). Terminal/other recommendations (``close`` →
-        achieve vs abandon) stay a passive observation — that call is genuinely
-        the user's. The ego assesses; the user decides.
+        The reversible recommendations (``pause`` / ``deprioritize``) become
+        an *approvable* ``goal_status_change`` proposal applied ONLY on user
+        approval (see ``ego/goal_actions.py``) — with ONE additive-autonomy
+        exception: a goal the genesis ego itself created
+        (``origin='genesis_ego'``), reviewed from the genesis ego cycle, is
+        paused/deprioritized directly with an audit observation instead of a
+        proposal (see ``_propose_goal_status_change``). User-origin goals are
+        NEVER mutated autonomously. Terminal/other recommendations (``close``
+        → achieve vs abandon) stay a passive observation — that call is
+        genuinely the user's, for every goal.
         """
         if recommendation in ("pause", "deprioritize"):
             await self._propose_goal_status_change(
@@ -559,7 +563,12 @@ class EgoSession:
         Delivered out-of-band via the proposal workflow (``create_batch`` +
         ``send_digest``), bypassing the realist gate — mirrors how autonomy
         earn-back proposals are surfaced. The change is applied ONLY when the
-        user approves the proposal (``ego/goal_actions.py``), never here.
+        user approves the proposal (``ego/goal_actions.py``) — except for the
+        additive-autonomy case: a ``genesis_ego``-origin goal reviewed from
+        the genesis ego cycle is applied directly (``_apply_own_goal_change``)
+        with an audit observation, no proposal. The approval gates themselves
+        are untouched; the ego skips proposal CREATION only for its own
+        additive artifacts, and only for reversible changes.
         """
         try:
             from genesis.db.crud import user_goals
@@ -585,6 +594,21 @@ class EgoSession:
                     "medium": "low", "low": "low",
                 }
                 value, change, verb = lower.get(current, "low"), "priority", "Deprioritize"
+
+            # Additive autonomy (2026-07-16): the genesis ego pauses/
+            # deprioritizes a goal IT created without a proposal. Both gates
+            # must hold: goal.origin='genesis_ego' (never a user directive —
+            # origin is immutable, stamped at create) AND this is the genesis
+            # ego cycle ("its OWN goals" — a user-ego recommendation on an
+            # ego goal still proposes). Reversible changes only; close/
+            # priority-increase/delete have no autonomous path.
+            origin = ((goal.get("origin") if goal else None) or "user")
+            if origin == "genesis_ego" and self._source_tag == "genesis_ego_cycle":
+                await self._apply_own_goal_change(
+                    goal_id=goal_id, title=title, change=change,
+                    value=value, verb=verb, assessment=assessment,
+                )
+                return
 
             prop = {
                 "action_type": "goal_status_change",
@@ -618,6 +642,73 @@ class EgoSession:
         except Exception:
             logger.warning(
                 "Failed to surface goal status-change proposal", exc_info=True,
+            )
+
+    async def _apply_own_goal_change(
+        self,
+        *,
+        goal_id: str,
+        title: str,
+        change: str,
+        value: str,
+        verb: str,
+        assessment: str,
+    ) -> None:
+        """Directly apply a pause/deprioritize to a genesis_ego-owned goal.
+
+        The additive-autonomy path (2026-07-16): no proposal is created, but
+        the action is audited — an observation records what was applied and
+        why, and surfaces to the user through the normal awareness digest
+        (visibility, NOT an approval prompt). Reuses goal_actions' validated
+        value sets so the autonomous path can never apply a value the gated
+        path couldn't. Reversible by the user at any time (resume/re-raise
+        via ego_goal_update).
+        """
+        import uuid
+
+        from genesis.db.crud import observations as obs_crud
+        from genesis.db.crud import user_goals as goals_crud
+        from genesis.ego.goal_actions import _VALID_PRIORITY, _VALID_STATUS
+
+        valid = _VALID_STATUS if change == "status" else _VALID_PRIORITY
+        if change not in ("status", "priority") or value not in valid:
+            logger.warning(
+                "Autonomous goal change rejected (invalid %s=%r) for %s",
+                change, value, goal_id[:12],
+            )
+            return
+
+        applied = await goals_crud.update(self._db, goal_id, **{change: value})
+        if not applied:
+            logger.warning(
+                "Autonomous goal change: update failed for %s", goal_id[:12],
+            )
+            return
+
+        logger.info(
+            "Autonomously applied %s to own goal %s (%s → %s)",
+            verb.lower(), goal_id[:12], change, value,
+        )
+        try:
+            await obs_crud.create(
+                self._db,
+                id=str(uuid.uuid4()),
+                source=self._source_tag,
+                type="goal_autonomous_action",
+                content=(
+                    f"Autonomously applied {verb.lower()} to own goal "
+                    f"'{title}' ({change} → {value}). The goal is ego-created "
+                    f"(origin=genesis_ego); user goals are never touched "
+                    f"autonomously. Assessment: {assessment[:400]}"
+                ),
+                priority="medium",
+                category="goal_review",
+                created_at=datetime.now(UTC).isoformat(),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to write autonomous goal-change audit observation",
+                exc_info=True,
             )
 
     # -- Output processing --------------------------------------------------
