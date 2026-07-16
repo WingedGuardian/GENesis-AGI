@@ -768,10 +768,16 @@ class SurplusLLMExecutor:
                     parts.append("\n## User Profile")
                     parts.append(user_model)
 
-        # For analytical tasks: recent observations + basic stats
+        # For analytical tasks: recent observations + basic stats.
+        # infrastructure_alert is excluded: operational infra criticals have
+        # their own handling paths (guardian, health alerts, morning report)
+        # and must never be amplified by a generator into an autonomous
+        # "self-unblock" action — a stale git-corruption alert did exactly
+        # that on 2026-07-16 (false alarm, messaged to the user as fact).
         try:
             recent_obs = await observations.query(
                 self._db, resolved=False, limit=10,
+                exclude_types=("infrastructure_alert",),
             )
             if recent_obs:
                 parts.append("## Recent Unresolved Observations")

@@ -586,3 +586,32 @@ async def test_graceful_fallback_when_both_sources_fail():
     assert "test observation" in prompt
     assert "System Context" not in prompt
     assert "User Profile" not in prompt
+
+
+# 11. Infra alerts are excluded from surplus context — unverified/stale
+# infrastructure criticals must never be amplified into autonomous
+# "self-unblock" actions (2026-07-16 git-corruption false alarm).
+@pytest.mark.asyncio
+async def test_gather_context_excludes_infrastructure_alerts():
+    executor = _make_llm_executor()
+    task = _make_task(task_type=TaskType.SELF_UNBLOCK)
+
+    with patch(
+        "genesis.surplus.executor.observations.query",
+        new_callable=AsyncMock,
+        return_value=[],
+    ) as q:
+        await executor._gather_context(task)
+
+    # The recent-unresolved-observations query (the one without a type filter)
+    # must exclude infrastructure_alert.
+    recent_calls = [c for c in q.call_args_list if "type" not in c.kwargs]
+    assert recent_calls, "recent-observations query not issued"
+    for c in recent_calls:
+        assert "infrastructure_alert" in (c.kwargs.get("exclude_types") or ())
+
+    # ...and the typed past-findings query is NOT excluded (its type filter is
+    # the surplus task type, never infrastructure_alert — no exclusion needed).
+    typed_calls = [c for c in q.call_args_list if "type" in c.kwargs]
+    for c in typed_calls:
+        assert "exclude_types" not in c.kwargs

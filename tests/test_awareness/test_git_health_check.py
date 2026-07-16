@@ -209,3 +209,135 @@ class TestDeepCheck:
             git_health, "check_git_deep", AsyncMock(side_effect=RuntimeError("boom"))
         )
         await loop._check_git_health_deep(object())  # swallowed — never breaks the tick
+
+
+# ── Self-healing + dedup (git false-alarm fix) ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cheap_pass_auto_resolves_cheap_alerts_only(monkeypatch):
+    monkeypatch.setattr(git_health, "check_git_cheap", AsyncMock(return_value=_report(True)))
+    monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+    resolve = AsyncMock(return_value=1)
+    monkeypatch.setattr(loop.observations, "resolve_by_source_and_type", resolve)
+
+    await loop._check_git_health(object())
+
+    resolve.assert_awaited_once()
+    kw = resolve.call_args.kwargs
+    assert kw["source"] == "git_health_monitor"
+    assert kw["type"] == "infrastructure_alert"
+    # A passing structural probe clears ONLY cheap-scan alerts — it cannot
+    # verify content integrity, so deep alerts must survive it.
+    assert kw["category"] == "git_cheap"
+
+
+@pytest.mark.asyncio
+async def test_cheap_pass_none_db_skips_resolve(monkeypatch):
+    monkeypatch.setattr(git_health, "check_git_cheap", AsyncMock(return_value=_report(True)))
+    monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+    resolve = AsyncMock()
+    monkeypatch.setattr(loop.observations, "resolve_by_source_and_type", resolve)
+
+    await loop._check_git_health(None)
+
+    resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cheap_alert_carries_category_and_dedup(monkeypatch):
+    monkeypatch.setattr(
+        git_health, "check_git_cheap", AsyncMock(return_value=_report(False, ["config_invalid"]))
+    )
+    monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+    obs = AsyncMock()
+    monkeypatch.setattr(loop.observations, "create", obs)
+
+    await loop._check_git_health(object())
+
+    kw = obs.call_args.kwargs
+    assert kw["category"] == "git_cheap"
+    # DB-level dedup: identical unresolved alerts must not stack (also the
+    # only cross-process guard — two concurrent loops share the DB).
+    assert kw["skip_if_duplicate"] is True
+
+
+@pytest.mark.asyncio
+async def test_cheap_resolve_error_never_raises(monkeypatch):
+    monkeypatch.setattr(git_health, "check_git_cheap", AsyncMock(return_value=_report(True)))
+    monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+    monkeypatch.setattr(
+        loop.observations,
+        "resolve_by_source_and_type",
+        AsyncMock(side_effect=RuntimeError("db locked")),
+    )
+
+    # Auto-resolve failure must never break the tick.
+    await loop._check_git_health(object())
+
+
+class TestDeepSelfHeal:
+    """Deep-scan pass resolves ALL open git alerts (deep verifies content)."""
+
+    @pytest.mark.asyncio
+    async def test_deep_pass_auto_resolves_all_git_alerts(self, monkeypatch):
+        monkeypatch.setattr(
+            git_health, "check_git_deep", AsyncMock(return_value=_deep_report(True))
+        )
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+        resolve = AsyncMock(return_value=2)
+        monkeypatch.setattr(loop.observations, "resolve_by_source_and_type", resolve)
+
+        await loop._check_git_health_deep(object())
+
+        resolve.assert_awaited_once()
+        kw = resolve.call_args.kwargs
+        assert kw["source"] == "git_health_monitor"
+        assert kw["type"] == "infrastructure_alert"
+        # Unscoped: a content-verifying pass clears cheap + deep + legacy
+        # (pre-category) alerts alike.
+        assert "category" not in kw
+
+    @pytest.mark.asyncio
+    async def test_deep_pass_none_db_skips_resolve(self, monkeypatch):
+        monkeypatch.setattr(
+            git_health, "check_git_deep", AsyncMock(return_value=_deep_report(True))
+        )
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+        resolve = AsyncMock()
+        monkeypatch.setattr(loop.observations, "resolve_by_source_and_type", resolve)
+
+        await loop._check_git_health_deep(None)
+
+        resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deep_alert_carries_category_and_dedup(self, monkeypatch):
+        monkeypatch.setattr(
+            git_health,
+            "check_git_deep",
+            AsyncMock(return_value=_deep_report(False, ["fsck_failed"])),
+        )
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+        obs = AsyncMock()
+        monkeypatch.setattr(loop.observations, "create", obs)
+
+        await loop._check_git_health_deep(object())
+
+        kw = obs.call_args.kwargs
+        assert kw["category"] == "git_deep"
+        assert kw["skip_if_duplicate"] is True
+
+    @pytest.mark.asyncio
+    async def test_deep_resolve_error_never_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            git_health, "check_git_deep", AsyncMock(return_value=_deep_report(True))
+        )
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+        monkeypatch.setattr(
+            loop.observations,
+            "resolve_by_source_and_type",
+            AsyncMock(side_effect=RuntimeError("db locked")),
+        )
+
+        await loop._check_git_health_deep(object())

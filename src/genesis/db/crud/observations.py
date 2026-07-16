@@ -625,17 +625,29 @@ async def resolve_by_source_and_type(
     type: str,
     resolved_at: str,
     resolution_notes: str,
+    category: str | None = None,
 ) -> int:
     """Resolve all unresolved observations matching a source + type pair.
 
+    ``category`` optionally narrows the resolve to rows with that exact
+    category (rows with a NULL/other category are left open). Used for
+    slot-scoped self-healing — e.g. a passing cheap git probe clears only
+    ``git_cheap`` alerts, never a deep content-corruption alert. Omit it to
+    clear every matching row regardless of category (including legacy
+    NULL-category rows).
+
     Returns the number of rows resolved.
     """
-    cursor = await db.execute(
+    sql = (
         "UPDATE observations SET resolved = 1, resolved_at = ?, "
         "resolution_notes = ? "
-        "WHERE source = ? AND type = ? AND resolved = 0",
-        (resolved_at, resolution_notes, source, type),
+        "WHERE source = ? AND type = ? AND resolved = 0"
     )
+    params: list[str] = [resolved_at, resolution_notes, source, type]
+    if category is not None:
+        sql += " AND category = ?"
+        params.append(category)
+    cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount
 

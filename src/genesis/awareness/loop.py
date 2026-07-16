@@ -877,7 +877,28 @@ async def _check_git_health(db) -> None:
         logger.debug("git health probe failed", exc_info=True)
         return
 
-    if report.ok or db is None:
+    if report.ok:
+        # Self-heal: a passing structural probe clears any open cheap-scan
+        # alert so a transient failure can't sit as a stale critical and be
+        # amplified later (the 2026-07-16 false "git corruption" alarm).
+        # Scoped to category="git_cheap" — a structural pass says nothing
+        # about content integrity, so deep (fsck) alerts must survive it.
+        if db is not None:
+            try:
+                healed = await observations.resolve_by_source_and_type(
+                    db,
+                    source="git_health_monitor",
+                    type="infrastructure_alert",
+                    category="git_cheap",
+                    resolved_at=datetime.now(UTC).isoformat(),
+                    resolution_notes="auto-resolved: cheap git probe passed",
+                )
+                if healed:
+                    logger.info("git health recovered: resolved %d cheap alert(s)", healed)
+            except Exception:
+                logger.debug("git health auto-resolve failed", exc_info=True)
+        return
+    if db is None:
         return
     now = time.monotonic()
     if _last_git_alert_at is not None and now - _last_git_alert_at < _GIT_ALERT_COOLDOWN_S:
@@ -887,11 +908,18 @@ async def _check_git_health(db) -> None:
     _last_git_alert_at = now
     failures = ", ".join(report.failures)
     try:
-        await observations.create(
+        created = await observations.create(
             db,
             id=str(uuid.uuid4()),
             source="git_health_monitor",
             type="infrastructure_alert",
+            # category tags the scan slot so recovery is slot-scoped (see the
+            # report.ok branch above); skip_if_duplicate is the DB-level dedup
+            # AND the only cross-process guard — two concurrent awareness
+            # loops share the DB, so an in-memory cooldown can't stop the
+            # second one (it double-fired 12 min apart on 2026-07-15).
+            category="git_cheap",
+            skip_if_duplicate=True,
             content=(
                 f"Local git repository is UNHEALTHY ({failures}). This disables the "
                 f"guardian's REVERT_CODE recovery lever, which needs a healthy local "
@@ -903,7 +931,10 @@ async def _check_git_health(db) -> None:
             priority="critical",
             created_at=datetime.now(UTC).isoformat(),
         )
-        logger.error("git health alert: %s", failures)
+        if created:
+            logger.error("git health alert: %s", failures)
+        else:
+            logger.debug("git health alert suppressed (duplicate unresolved): %s", failures)
     except Exception:
         logger.debug("Failed to create git health alert observation", exc_info=True)
 
@@ -942,15 +973,43 @@ async def _check_git_health_deep(db) -> None:
         logger.debug("git deep-health scan failed", exc_info=True)
         return
 
-    if report.ok or db is None:
+    if report.ok:
+        # Self-heal: a passing content-verifying fsck clears EVERY open git
+        # alert — cheap, deep, and legacy pre-category rows alike (unscoped
+        # resolve). The verdict file already self-heals per slot; without
+        # this, the observations outlive recovery as stale criticals and get
+        # amplified into false actions (2026-07-16 "git corruption" alarm,
+        # seeded by a transient fsck race across ~112 worktrees).
+        if db is not None:
+            try:
+                healed = await observations.resolve_by_source_and_type(
+                    db,
+                    source="git_health_monitor",
+                    type="infrastructure_alert",
+                    resolved_at=datetime.now(UTC).isoformat(),
+                    resolution_notes="auto-resolved: git fsck --full passed",
+                )
+                if healed:
+                    logger.info("git deep-health recovered: resolved %d alert(s)", healed)
+            except Exception:
+                logger.debug("git deep-health auto-resolve failed", exc_info=True)
+        return
+    if db is None:
         return
     failures = ", ".join(report.failures)
     try:
-        await observations.create(
+        created = await observations.create(
             db,
             id=str(uuid.uuid4()),
             source="git_health_monitor",
             type="infrastructure_alert",
+            # Slot tag + DB-level dedup (the only cross-process guard; see
+            # the cheap-probe counterpart above). NOTE deliberately NO extra
+            # alert cooldown here: the 24h run-interval already bounds this
+            # path to one alert per process-day, and probe sensitivity must
+            # stay unchanged — recovery hygiene, not detection damping.
+            category="git_deep",
+            skip_if_duplicate=True,
             content=(
                 f"`git fsck --full` reported problems ({failures}) — objects are "
                 "missing or corrupt (incl. zeroed-but-present blobs), which disables "
@@ -960,7 +1019,10 @@ async def _check_git_health_deep(db) -> None:
             priority="critical",
             created_at=datetime.now(UTC).isoformat(),
         )
-        logger.error("git deep-health alert: %s", failures)
+        if created:
+            logger.error("git deep-health alert: %s", failures)
+        else:
+            logger.debug("git deep-health alert suppressed (duplicate unresolved): %s", failures)
     except Exception:
         logger.debug("Failed to create git deep-health observation", exc_info=True)
 
