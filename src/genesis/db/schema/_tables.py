@@ -2076,6 +2076,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_jre_job_time ON job_run_events(job_name, recorded_at)",
     "CREATE INDEX IF NOT EXISTS idx_jre_recorded ON job_run_events(recorded_at)",
     "CREATE INDEX IF NOT EXISTS idx_jre_status ON job_run_events(status, recorded_at)",
+    # one open row per alert_id — makes the open-set reconcile idempotent
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ae_open_alert ON alert_events(alert_id) WHERE resolved_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_ae_created ON alert_events(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ae_alert ON alert_events(alert_id, created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
@@ -2134,4 +2138,3 @@ DRIVE_WEIGHTS_SEED = [
     ("cooperation", 0.25, 0.25, 0.10, 0.50),
     ("competence", 0.15, 0.15, 0.10, 0.50),
 ]
-
