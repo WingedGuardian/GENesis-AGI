@@ -1,5 +1,6 @@
-#!/usr/bin/env bash
 # Live-activate container memory swap on a RUNNING incus/LXC container.
+# Sourced, not executed (no shebang) — host-setup.sh dot-sources it and its
+# caller runs under `set -euo pipefail`, so every step here must be errexit-safe.
 #
 # incus applies `limits.memory.swap` only when the container STARTS, so on an
 # already-running container — including one just created above, and every
@@ -28,9 +29,14 @@ container_swap_activate_live() {
     # the persisted `limits.memory.swap=true` still applies on the next start.
     [ -e "$swap_max" ] || return 0
 
-    # Already permitting swap (non-zero, e.g. "max") → idempotent no-op.
-    local cur
-    cur="$(cat "$swap_max" 2>/dev/null)"
+    # Already permitting swap (non-zero, e.g. "max") → idempotent no-op. The
+    # cgroup knob is root-owned, so read it with sudo (host-setup runs as root
+    # or with passwordless sudo). The `|| cur=""` keeps a failed read — perm
+    # denied, or the container stopping between the -e check and the read — from
+    # tripping the caller's `set -e`; an unreadable knob falls through to a safe
+    # no-op rather than aborting the whole host-setup run.
+    local cur=""
+    cur="$(sudo cat "$swap_max" 2>/dev/null)" || cur=""
     [ "$cur" = "0" ] || return 0
 
     if echo max | sudo tee "$swap_max" >/dev/null 2>&1; then

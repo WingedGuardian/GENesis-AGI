@@ -563,6 +563,7 @@ echo "  + limits.memory.swap enabled (memory spikes degrade into swap, not thras
 # container (freshly created above, or an existing one being retrofitted) still
 # has memory.swap.max=0 until a restart — the setting silently no-ops meanwhile.
 # Activate it live now so swap works without a disruptive restart.
+# shellcheck source=lib/container_swap.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib/container_swap.sh"
 container_swap_activate_live "$CONTAINER_NAME"
 if [ -z "$(swapon --noheadings --show 2>/dev/null)" ]; then
