@@ -1317,6 +1317,9 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
             # already-resolved waiter.
             if ctx.engagement_tracker and ctx.db:
                 try:
+                    # Deferred import — matches this module's established
+                    # idiom for db.crud (8 sites incl. the quote-reply block
+                    # above): keeps db.crud off the handler's import path.
                     from genesis.db.crud.outreach import find_by_delivery_id
 
                     for key in resolved_keys:
