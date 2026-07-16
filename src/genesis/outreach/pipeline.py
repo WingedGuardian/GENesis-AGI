@@ -303,6 +303,13 @@ class OutreachPipeline:
         if result.status != OutreachStatus.DELIVERED or not result.delivery_id:
             return result, None
 
+        # Register BEFORE attaching context: set_context drops keys with no
+        # registered waiter, so the old order (context first, registration
+        # deferred to wait_for_reply) left every waiter on this path
+        # contextless — standalone replies were structurally unresolvable
+        # (observed live 2026-07-16; every reply degraded to
+        # implicit_activity).
+        self._reply_waiter.register(result.delivery_id)
         self._attach_waiter_context(result, result.delivery_id)
         reply = await self._reply_waiter.wait_for_reply(
             result.delivery_id, timeout_s=timeout_s,
@@ -318,7 +325,13 @@ class OutreachPipeline:
         thread_key = f"{result.chat_id}:{result.thread_id if result.thread_id is not None else 'dm'}"
         for key in keys:
             try:
-                self._reply_waiter.set_context(key, thread_key)
+                if not self._reply_waiter.set_context(key, thread_key):
+                    # Tripwire: a dropped context means an ordering bug —
+                    # the waiter must be registered before context attach.
+                    logger.warning(
+                        "set_context dropped for unregistered waiter %s — "
+                        "standalone replies will not resolve it", key,
+                    )
             except Exception:
                 logger.debug("set_context failed for %s", key, exc_info=True)
 
@@ -357,6 +370,12 @@ class OutreachPipeline:
         actual_key = waiter_key or result.delivery_id
         if waiter_key and result.delivery_id != waiter_key:
             self._reply_waiter.add_alias(result.delivery_id, waiter_key)
+        elif not waiter_key:
+            # No pre-registered button key: register the delivery_id NOW,
+            # before attaching context — same ordering trap as
+            # submit_and_wait (set_context silently drops unregistered
+            # keys, leaving the waiter ineligible for standalone replies).
+            self._reply_waiter.register(result.delivery_id)
         self._attach_waiter_context(result, actual_key, result.delivery_id)
 
         try:

@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Answering Genesis's questions with a plain message now actually works.**
+  When Genesis asked something and waited for your answer (approvals,
+  provision prompts, send-and-wait questions), an internal ordering bug left
+  the waiting mechanism blind to where the question had been delivered — so
+  a plain (non-quote) reply never matched it. Your answer instead spawned an
+  unrelated conversation turn, and the question sat unanswered until it
+  timed out. The delivery context is now attached in the right order, plain
+  replies match the question they answer, and a tripwire warning fires if
+  this ordering ever regresses.
+
 - **Replying to Genesis without quote-replying now counts.** When Genesis
   asked you something on Telegram and you answered with a plain message
   (no quote-reply), your answer reached the waiting conversation but the
