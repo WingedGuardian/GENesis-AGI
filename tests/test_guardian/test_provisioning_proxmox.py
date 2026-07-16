@@ -71,6 +71,16 @@ class FakePVE:
         self.task_never_stops = False  # True → always 'running' (poll timeout)
         self.task_status_code = 200  # non-200 → task-status read failure
         self._task_polls = 0
+        # Backup (vzdump slice) knobs — synthetic identifiers only.
+        self.backups: list = []  # content=backup items ({volid, vmid, ctime})
+        self.content_status = 200  # non-200 → content list read failure
+        self.vzdump_status_code = 200
+        self.vzdump_upid = (
+            "UPID:pve:000A1B2C:001122DD:68765432:vzdump:100:user@pve!backup:"
+        )
+        self.prune_status = 200
+        self.prune_upid = None  # str → prune POST returns a task UPID
+        self.prune_dry: list = []  # GET prunebackups dry-run rows
 
     def __call__(self, method, path, params=None, token=""):
         self.calls.append((method, path, params, token))
@@ -83,6 +93,20 @@ class FakePVE:
             if self.task_never_stops or self._task_polls <= self.task_running_polls:
                 return 200, {"status": "running"}, ""
             return 200, {"status": "stopped", "exitstatus": self.task_exitstatus}, ""
+        if path.endswith("/prunebackups"):
+            if method == "GET":
+                return 200, list(self.prune_dry), ""
+            if self.prune_status != 200:
+                return self.prune_status, None, f"HTTP {self.prune_status}: denied"
+            return 200, self.prune_upid, ""
+        if method == "GET" and path.endswith("/content"):
+            if self.content_status != 200:
+                return self.content_status, None, f"HTTP {self.content_status}: denied"
+            return 200, [dict(b) for b in self.backups], ""
+        if method == "POST" and path.endswith("/vzdump"):
+            if self.vzdump_status_code != 200:
+                return self.vzdump_status_code, None, f"HTTP {self.vzdump_status_code}: denied"
+            return 200, self.vzdump_upid, ""
         if method == "GET" and path.endswith("/status"):
             return 200, self.status, ""
         if method == "GET" and path.endswith("/storage"):
@@ -116,7 +140,10 @@ def _adapter(fake: FakePVE) -> ProxmoxAdapter:
         enabled=True, api_host="10.0.0.9", api_port=8006, verify_tls=False,
         node="pve", vmid=100, target_disk="scsi1", storage="local-lvm",
     )
-    a = ProxmoxAdapter(cfg, audit_token="AUDIT", provision_token="PROVISION")
+    a = ProxmoxAdapter(
+        cfg, audit_token="AUDIT", provision_token="PROVISION",
+        backup_token="BACKUP",
+    )
     a._request_sync = fake  # type: ignore[assignment]
     return a
 
@@ -337,3 +364,217 @@ async def test_connectivity_true():
 def test_auth_header_prefix_idempotent():
     assert ProxmoxAdapter._auth_header("genesis@pve!ro=uuid") == "PVEAPIToken=genesis@pve!ro=uuid"
     assert ProxmoxAdapter._auth_header("PVEAPIToken=x") == "PVEAPIToken=x"
+
+
+# ── backups: two-phase vzdump + age + rotation (all identifiers synthetic) ─
+
+# The FakePVE default UPID's starttime field (index 4) in hex.
+_UPID_STARTTIME = int("68765432", 16)
+
+
+def _backup_item(ctime: int, vmid: int = 100, volid: str | None = None) -> dict:
+    return {
+        "volid": volid or f"backup:backup/vzdump-qemu-{vmid}-x.vma.zst",
+        "vmid": vmid,
+        "ctime": ctime,
+        "content": "backup",
+    }
+
+
+async def test_backup_age_picks_newest_for_this_vmid_only():
+    fake = FakePVE()
+    fake.backups = [
+        _backup_item(1000),
+        _backup_item(5000),
+        _backup_item(9000, vmid=1000),  # vmid FIELD filter — not volid substring
+    ]
+    a = _adapter(fake)
+    age = await a.newest_backup_age_days()
+    assert age is not None
+    import time as _t
+    assert age == pytest.approx((_t.time() - 5000) / 86400.0, rel=0.01)
+    # audit token on the content read
+    method, path, params, token = fake.calls[-1]
+    assert token == "AUDIT" and path.endswith("/content") and params == {"content": "backup"}
+
+
+async def test_backup_age_none_when_no_backups_or_read_fails():
+    fake = FakePVE()
+    a = _adapter(fake)
+    assert await a.newest_backup_age_days() is None  # empty list
+    fake.content_status = 500
+    assert await a.newest_backup_age_days() is None  # read failure
+    fake.transport_dead = True
+    assert await a.newest_backup_age_days() is None  # never raises
+
+
+async def test_backup_age_reads_configured_backup_storage():
+    fake = FakePVE()
+    cfg = ProvisioningConfig(
+        enabled=True, api_host="10.0.0.9", node="pve", vmid=100,
+        storage="local-lvm", backup_storage="backup", verify_tls=False,
+    )
+    a = ProxmoxAdapter(cfg, "AUDIT", "PROVISION", backup_token="BACKUP")
+    a._request_sync = fake  # type: ignore[assignment]
+    await a.newest_backup_age_days()
+    _m, path, _p, _t = fake.calls[-1]
+    assert "/storage/backup/content" in path
+
+
+async def test_vzdump_start_happy_returns_upid_with_backup_token():
+    fake = FakePVE()
+    a = _adapter(fake)
+    res = await a.vzdump_start()
+    assert res.ok and res.attempted
+    assert res.upid.startswith("UPID:")
+    method, path, params, token = fake.calls[-1]
+    assert (method, token) == ("POST", "BACKUP")
+    assert path.endswith("/vzdump")
+    assert params["mode"] == "snapshot" and params["compress"] == "zstd"
+    assert "prune-backups" not in params, (
+        "inline prune-backups needs Datastore.Allocate — rotation must use the "
+        "standalone endpoint instead"
+    )
+
+
+async def test_vzdump_start_without_token_is_preflight_refusal():
+    fake = FakePVE()
+    cfg = ProvisioningConfig(
+        enabled=True, api_host="10.0.0.9", node="pve", vmid=100, verify_tls=False,
+    )
+    a = ProxmoxAdapter(cfg, "AUDIT", "PROVISION")  # no backup token
+    a._request_sync = fake  # type: ignore[assignment]
+    res = await a.vzdump_start()
+    assert not res.ok and not res.attempted, "pre-flight refusal must not be ledgered"
+    assert fake.calls == [], "no request may leave the process without a token"
+
+
+async def test_vzdump_start_post_failure_is_attempted():
+    fake = FakePVE()
+    fake.vzdump_status_code = 403
+    a = _adapter(fake)
+    res = await a.vzdump_start()
+    assert not res.ok and res.attempted, "a sent-but-failed POST still counts (ledger it)"
+
+
+async def test_vzdump_status_running_then_verified_anchored_to_upid_starttime():
+    fake = FakePVE()
+    a = _adapter(fake)
+    upid = fake.vzdump_upid
+    # still running
+    fake.task_never_stops = True
+    assert (await a.vzdump_status(upid)).state == "running"
+    # stopped OK + a backup NEWER than the task start → verified
+    fake.task_never_stops = False
+    fake._task_polls = 0
+    fake.backups = [
+        _backup_item(_UPID_STARTTIME - 500),   # pre-existing backup: ignored
+        _backup_item(_UPID_STARTTIME + 120),   # the new one
+    ]
+    st = await a.vzdump_status(upid)
+    assert st.state == "verified"
+    assert st.volid and st.age_days is not None
+
+
+async def test_vzdump_status_task_ok_but_only_old_backups_is_unknown():
+    """An OLD backup must never verify THIS task (restart-safe anchor)."""
+    fake = FakePVE()
+    a = _adapter(fake)
+    fake.backups = [_backup_item(_UPID_STARTTIME - 500)]
+    st = await a.vzdump_status(fake.vzdump_upid)
+    assert st.state == "unknown"
+
+
+async def test_vzdump_status_terminal_failure_and_transient_reads():
+    fake = FakePVE()
+    a = _adapter(fake)
+    # terminal task failure
+    fake.task_exitstatus = "job errors"
+    assert (await a.vzdump_status(fake.vzdump_upid)).state == "failed"
+    # status endpoint unreadable → unknown (caller retries), never failed
+    fake.task_status_code = 500
+    assert (await a.vzdump_status(fake.vzdump_upid)).state == "unknown"
+    # task OK but content list unreadable → unknown
+    fake.task_status_code = 200
+    fake.task_exitstatus = "OK"
+    fake._task_polls = 0
+    fake.content_status = 500
+    assert (await a.vzdump_status(fake.vzdump_upid)).state == "unknown"
+
+
+async def test_prune_dry_runs_then_posts_with_backup_token():
+    fake = FakePVE()
+    fake.prune_dry = [
+        {"volid": "backup:backup/vzdump-qemu-100-old.vma.zst", "mark": "remove"},
+    ]
+    a = _adapter(fake)
+    ok, detail = await a.prune_backups()
+    assert ok and "keep-last=2" in detail
+    prune_calls = [c for c in fake.calls if c[1].endswith("/prunebackups")]
+    assert [(m, t) for m, _p, _pa, t in prune_calls] == [
+        ("GET", "AUDIT"), ("POST", "BACKUP"),
+    ]
+    _m, _p, params, _t = prune_calls[1]
+    assert params == {"prune-backups": "keep-last=2", "type": "qemu", "vmid": 100}
+
+
+async def test_prune_awaits_task_upid_and_reports_failure():
+    fake = FakePVE()
+    fake.prune_upid = "UPID:pve:000A1B2C:001122DD:68765433:imgdel:100:user@pve!backup:"
+    fake.task_exitstatus = "removal failed"
+    a = _adapter(fake)
+    ok, detail = await a.prune_backups()
+    assert not ok and "removal failed" in detail
+
+
+async def test_prune_without_token_refuses():
+    fake = FakePVE()
+    cfg = ProvisioningConfig(
+        enabled=True, api_host="10.0.0.9", node="pve", vmid=100, verify_tls=False,
+    )
+    a = ProxmoxAdapter(cfg, "AUDIT", "PROVISION")
+    a._request_sync = fake  # type: ignore[assignment]
+    ok, _detail = await a.prune_backups()
+    assert not ok and fake.calls == []
+
+
+async def test_capacity_carries_backup_storage_headroom_and_agent_flag():
+    fake = FakePVE()
+    fake.storage.append(
+        {"storage": "backup", "total": 500 * _GIB, "avail": 150 * _GIB, "used": 1},
+    )
+    cfg = ProvisioningConfig(
+        enabled=True, api_host="10.0.0.9", node="pve", vmid=100,
+        storage="local-lvm", backup_storage="backup", verify_tls=False,
+    )
+    a = ProxmoxAdapter(cfg, "AUDIT", "PROVISION", backup_token="BACKUP")
+    a._request_sync = fake  # type: ignore[assignment]
+    cap = await a.get_capacity()
+    assert cap.backup_storage_free_bytes == 150 * _GIB
+    assert cap.backup_storage_total_bytes == 500 * _GIB
+    assert cap.storage_free_bytes == 616384222882, "grow storage unchanged"
+    assert cap.vm_agent_enabled is False, "no agent key = not enabled"
+
+
+async def test_capacity_backup_storage_defaults_to_grow_storage():
+    fake = FakePVE()
+    a = _adapter(fake)  # backup_storage unset
+    cap = await a.get_capacity()
+    assert cap.backup_storage_free_bytes == cap.storage_free_bytes
+
+
+def test_agent_flag_parsing():
+    parse = ProxmoxAdapter._agent_enabled
+    assert parse({}) is False
+    assert parse({"agent": "1"}) is True
+    assert parse({"agent": "0"}) is False
+    assert parse({"agent": "enabled=1,fstrim_cloned_disks=1"}) is True
+    assert parse({"agent": "enabled=0"}) is False
+    assert parse({"agent": "weird"}) is None
+
+
+def test_upid_starttime_parses_hex_field():
+    parse = ProxmoxAdapter._upid_starttime
+    assert parse("UPID:pve:000A1B2C:001122DD:68765432:vzdump:100:u@pve!t:") == _UPID_STARTTIME
+    assert parse("not-a-upid") is None
+    assert parse("UPID:pve:x:y:GGGG:vzdump:100:u@pve!t:") is None

@@ -240,7 +240,7 @@ class TestRoundTrip:
 
 
 class TestProvisioningCredentials:
-    """Proxmox token propagation — only the two token keys ever cross."""
+    """Proxmox token propagation — only the three token keys ever cross."""
 
     def test_writes_only_proxmox_tokens(self, tmp_path: Path) -> None:
         from genesis.guardian.credential_bridge import (
@@ -253,6 +253,7 @@ class TestProvisioningCredentials:
             "ANTHROPIC_API_KEY=should-not-appear\n"
             "PROXMOX_AUDIT_TOKEN=genesis@pve!ro=aaa\n"
             "PROXMOX_PROVISION_TOKEN=genesis@pve!provision=bbb\n"
+            "PROXMOX_BACKUP_TOKEN=genesis@pve!backup=ccc\n"
             "TELEGRAM_BOT_TOKEN=should-not-appear-here\n"
         )
         shared = tmp_path / "state" / "shared"
@@ -262,6 +263,7 @@ class TestProvisioningCredentials:
         result = load_provisioning_credentials(str(tmp_path / "state"))
         assert result["PROXMOX_AUDIT_TOKEN"] == "genesis@pve!ro=aaa"
         assert result["PROXMOX_PROVISION_TOKEN"] == "genesis@pve!provision=bbb"
+        assert result["PROXMOX_BACKUP_TOKEN"] == "genesis@pve!backup=ccc"
         assert "ANTHROPIC_API_KEY" not in result
         assert "TELEGRAM_BOT_TOKEN" not in result
 

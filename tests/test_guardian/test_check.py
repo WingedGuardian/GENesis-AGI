@@ -228,10 +228,26 @@ class TestBuildProvisioningAdapter:
         _prov_cfg(config)
         monkeypatch.setenv("PROXMOX_AUDIT_TOKEN", "aud-tok")
         monkeypatch.setenv("PROXMOX_PROVISION_TOKEN", "prov-tok")
+        monkeypatch.setenv("PROXMOX_BACKUP_TOKEN", "bak-tok")
         adapter = _build_provisioning_adapter(config)
         assert adapter is not None
         assert adapter._audit == "aud-tok"
         assert adapter._provision == "prov-tok"
+        assert adapter._backup == "bak-tok"
+
+    def test_missing_backup_token_degrades_not_fails(
+        self,
+        config: GuardianConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No backup token → adapter still builds; only backup verbs refuse."""
+        _prov_cfg(config)
+        monkeypatch.setenv("PROXMOX_AUDIT_TOKEN", "aud-tok")
+        monkeypatch.setenv("PROXMOX_PROVISION_TOKEN", "prov-tok")
+        monkeypatch.delenv("PROXMOX_BACKUP_TOKEN", raising=False)
+        adapter = _build_provisioning_adapter(config)
+        assert adapter is not None
+        assert adapter._backup == ""
 
     def test_audit_only_is_readonly_adapter(
         self,
