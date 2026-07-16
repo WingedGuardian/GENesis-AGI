@@ -241,9 +241,27 @@ def test_bootstrap_wires_the_lib():
     assert "memory_resilience_apply" in text
 
 
+def test_bootstrap_provisions_the_oomd_package():
+    """The oomd layer is dead unless bootstrap installs the systemd-oomd package.
+
+    memory_resilience_apply SKIPS pressure-kill setup when systemd-oomd is
+    absent (a separate apt/dnf package on minimal installs), leaving the box
+    silently unprotected — the exact gap a sibling install exposed. bootstrap
+    must provision it, and BEFORE it applies the lib (install → apply order),
+    so the same run that would otherwise skip now succeeds.
+    """
+    text = BOOTSTRAP.read_text()
+    assert "install_pkg systemd-oomd" in text
+    # Ordering: the install must precede sourcing/applying the lib, or the first
+    # run still skips. Anchor to the `source` code line (unambiguous — the string
+    # "memory_resilience_apply" also appears in the explanatory comment above).
+    source_line = 'source "$SCRIPT_DIR/lib/memory_resilience.sh"'
+    assert text.index("install_pkg systemd-oomd") < text.index(source_line)
+
+
 def test_update_sh_wires_the_lib_visibly():
     # update.sh pipes bootstrap through `tail -10`, which eats the swap
     # warning — the retrofit path re-runs the (idempotent) apply unpiped.
     text = (REPO_ROOT / "scripts" / "update.sh").read_text()
-    assert 'lib/memory_resilience.sh' in text
+    assert "lib/memory_resilience.sh" in text
     assert text.count("memory_resilience_apply") >= 1

@@ -759,6 +759,16 @@ echo
 # Guarded: a tree mid-update/partial checkout without the lib must degrade,
 # not abort bootstrap under set -e (the lib's own never-abort contract).
 if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
+    # systemd-oomd is a SEPARATE apt/dnf package, absent on minimal installs.
+    # memory_resilience_apply *silently skips* pressure-kill setup when it's
+    # missing (it only warns to setup output), so a box can look bootstrapped
+    # while sitting unprotected against the OOM-thrash wedge — the exact
+    # silent-skip gap a sibling install exposed. Provision it here so the oomd
+    # layer self-deploys everywhere. install_pkg is idempotent (no-op when
+    # present) and degrades to a warning on failure; memory_resilience_apply
+    # still guards on PSI/systemd independently, so this never forces oomd on a
+    # kernel that can't support it.
+    install_pkg systemd-oomd || echo "  WARNING: Could not install systemd-oomd — pressure-kill protection will be skipped."
     # shellcheck source=lib/memory_resilience.sh
     source "$SCRIPT_DIR/lib/memory_resilience.sh"
     memory_resilience_apply

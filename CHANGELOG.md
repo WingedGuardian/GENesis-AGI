@@ -131,6 +131,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Setup now installs the package its OOM protection depends on.** Genesis's
+  memory-pressure protection (systemd-oomd) was applied by setup but only *if*
+  the `systemd-oomd` package already happened to be installed — on a minimal
+  install where it wasn't, setup quietly skipped the whole layer and left the
+  box exposed to the exact OOM-thrash wedge the protection exists to prevent,
+  with no signal beyond a line in setup output nobody reads. Bootstrap now
+  provisions the package before applying the layer, so the protection actually
+  deploys everywhere. Idempotent (a no-op when already present) and it never
+  forces oomd on a kernel that can't support it.
+
 - **Wing-filtered memory recall stops missing memories it should return.**
   Asking for memories in a specific wing (e.g. `infrastructure`) silently
   under-returned two kinds of rows: memories with no vector (FTS-only) were
