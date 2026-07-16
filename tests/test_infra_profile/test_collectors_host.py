@@ -49,6 +49,16 @@ _LIVE_BLOB = {
         "pve_version": None,
         "smartctl_present": False,
     },
+    "host_time": {
+        "ntp_service": "systemd-timesyncd",
+        "timezone": "Etc/UTC",
+        "ntp_enabled": "yes",
+        "ntp_synchronized_flag": "yes",
+        "ntp_sync_state": "synced",
+        "ntp_server_name": "ntp.ubuntu.com",
+        "ntp_server_address": "185.125.190.56",
+        "ntp_poll_interval": "34min 8s",
+    },
 }
 
 
@@ -76,11 +86,13 @@ async def test_no_guardian_is_unavailable() -> None:
 async def test_denied_gateway_is_unavailable_with_friendly_reason() -> None:
     # Realistic contract: _as_json embeds the gateway's RAW stderr JSON in the
     # error field on rc=1 — the quoted "denied" sentinel lives inside it.
-    remote = _FakeRemote({
-        "ok": False,
-        "action": "host-profile",
-        "error": '{"ok": false, "error": "denied"}',
-    })
+    remote = _FakeRemote(
+        {
+            "ok": False,
+            "action": "host-profile",
+            "error": '{"ok": false, "error": "denied"}',
+        }
+    )
     available, reason, sections = await collect_host(remote)
     assert available is False
     assert "not deployed" in reason
@@ -91,11 +103,13 @@ async def test_ssh_auth_failure_not_masked_as_not_deployed() -> None:
     # 'Permission denied (publickey)' contains bare 'denied' but NOT the
     # quoted gateway sentinel — it must surface as itself, not as a benign
     # not-deployed message (review 2026-07-13).
-    remote = _FakeRemote({
-        "ok": False,
-        "action": "host-profile",
-        "error": "Permission denied (publickey,password)",
-    })
+    remote = _FakeRemote(
+        {
+            "ok": False,
+            "action": "host-profile",
+            "error": "Permission denied (publickey,password)",
+        }
+    )
     available, reason, sections = await collect_host(remote)
     assert available is False
     assert "Permission denied" in reason
@@ -155,6 +169,19 @@ async def test_live_blob_splits_facts_and_metrics() -> None:
     assert virt.facts["container_limits"] == {"limits.cpu": "8", "limits.memory": "16GiB"}
     assert virt.facts["detect_virt"] == "kvm"
     assert virt.metrics == {}
+
+    time_section = by_name["host_time"]
+    assert time_section.facts == {
+        "ntp_service": "systemd-timesyncd",
+        "timezone": "Etc/UTC",
+        "ntp_enabled": "yes",
+        "ntp_sync_state": "synced",
+    }
+    # The raw kernel flag can lie (stays 'yes' after the daemon dies) and the
+    # server/poll details vary per refresh — none may churn the fact hash.
+    assert "ntp_synchronized_flag" in time_section.metrics
+    assert "ntp_server_name" in time_section.metrics
+    assert "ntp_poll_interval" in time_section.metrics
 
 
 async def test_unknown_host_field_lands_in_metrics_not_facts() -> None:

@@ -21,7 +21,7 @@ from genesis.infra_profile.types import PLANE_HOST, SectionResult
 
 logger = logging.getLogger(__name__)
 
-HOST_SECTIONS = ("host_system", "host_storage_pool", "host_virt")
+HOST_SECTIONS = ("host_system", "host_storage_pool", "host_virt", "host_time")
 
 
 def _unavailable(reason: str) -> tuple[bool, str, list[SectionResult]]:
@@ -88,10 +88,26 @@ _VIRT_FACTS = frozenset(
     }
 )
 
+# Host clock sync health. The bucketed `ntp_sync_state` (synced/degraded/
+# unsynced — composited host-side from daemon liveness + the kernel flag) is
+# the drift signal: a flip means the host stopped disciplining the clock the
+# container shares. The raw `ntp_synchronized_flag` stays a metric — it
+# mirrors the kernel STA_UNSYNC bit, which flaps independently of daemon
+# health and can lie for hours after a daemon dies.
+_TIME_FACTS = frozenset(
+    {
+        "timezone",
+        "ntp_service",
+        "ntp_enabled",
+        "ntp_sync_state",
+    }
+)
+
 _FACT_KEYS = {
     "host_system": _SYSTEM_FACTS,
     "host_storage_pool": _STORAGE_FACTS,
     "host_virt": _VIRT_FACTS,
+    "host_time": _TIME_FACTS,
 }
 
 

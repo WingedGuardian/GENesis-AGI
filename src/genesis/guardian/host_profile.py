@@ -1,7 +1,7 @@
 """Host-plane profile gather — the guardian's answer to ``host-profile``.
 
 Runs HOST-SIDE (via the gateway verb, ``python -m genesis.guardian
---host-profile``) and emits one JSON blob with three raw sub-dicts. The
+--host-profile``) and emits one JSON blob of raw per-section sub-dicts. The
 container's ``infra_profile.collectors.host`` owns the facts/metrics split —
 this module is a dumb, dependency-light data source and must never import
 beyond the guardian package (the guardian venv has no full Genesis install;
@@ -183,8 +183,78 @@ async def _host_virt(config) -> dict:
     return section
 
 
+# Daemons that can discipline the host clock, probed in preference order —
+# the first ACTIVE unit names the section's `ntp_service` fact. timesyncd
+# first (the stock Ubuntu/Debian daemon, and what the reference host runs —
+# verified live 2026-07-16); chrony/chronyd cover RHEL-family and opt-in
+# installs; ntp/ntpsec the legacy tail.
+_NTP_UNITS = ("systemd-timesyncd", "chrony", "chronyd", "ntp", "ntpsec")
+
+
+async def _host_time() -> dict:
+    """Host clock sync health: which daemon disciplines the clock, and is it working.
+
+    The container shares the host's kernel clock but its ``timedatectl`` view
+    (container collector's ``time`` section) cannot see the HOST daemon's
+    health. ``NTPSynchronized`` alone is not a liveness signal — it mirrors
+    the kernel sync flag, which can stay ``yes`` long after the daemon dies —
+    so ``ntp_sync_state`` composites unit-liveness AND the flag:
+
+    - ``unsynced``  — no known NTP daemon active
+    - ``synced``    — a daemon is active and the kernel flag confirms sync
+    - ``degraded``  — a daemon is active but the kernel flag says not synced
+
+    The bucket is the drift-worthy FACT; the raw flag and server details stay
+    volatile metrics (container-side allowlist in ``collectors/host.py``).
+    """
+
+    async def _active(unit: str) -> str | None:
+        # rc=0 ⇔ "active" (inactive/failed/absent all exit nonzero → None).
+        out = await _run("systemctl", "is-active", unit)
+        return unit if out is not None else None
+
+    def _props(output: str | None) -> dict:
+        if not output:
+            return {}
+        return dict(line.partition("=")[::2] for line in output.splitlines() if "=" in line)
+
+    show, timesync, *units = await asyncio.gather(
+        _run("timedatectl", "show"),
+        _run("timedatectl", "show-timesync"),
+        *[_active(unit) for unit in _NTP_UNITS],
+    )
+    active = next((u for u in units if u), None)
+    props = _props(show)
+
+    section: dict = {"ntp_service": active or "none"}
+    if "Timezone" in props:
+        section["timezone"] = props["Timezone"]
+    if "NTP" in props:
+        section["ntp_enabled"] = props["NTP"]
+    if "NTPSynchronized" in props:
+        section["ntp_synchronized_flag"] = props["NTPSynchronized"]
+
+    if active is None:
+        section["ntp_sync_state"] = "unsynced"
+    elif props.get("NTPSynchronized") == "yes":
+        section["ntp_sync_state"] = "synced"
+    else:
+        section["ntp_sync_state"] = "degraded"
+
+    # timesyncd-only detail (chrony hosts return nothing here — best-effort).
+    ts = _props(timesync)
+    for src, dst in (
+        ("ServerName", "ntp_server_name"),
+        ("ServerAddress", "ntp_server_address"),
+        ("PollIntervalUSec", "ntp_poll_interval"),
+    ):
+        if ts.get(src):
+            section[dst] = ts[src]
+    return section
+
+
 async def gather_host_profile(config) -> dict:
-    """Gather all three host sections; per-section failures degrade, not raise.
+    """Gather all host sections; per-section failures degrade, not raise.
 
     Sections run concurrently (they share no state) so the gather's worst case
     is its slowest section, not the sum — the gateway kills the process at 45s
@@ -206,18 +276,20 @@ async def gather_host_profile(config) -> dict:
     async def _system() -> dict:
         return _host_system()
 
-    host_system, host_storage_pool, host_virt = await asyncio.gather(
+    host_system, host_storage_pool, host_virt, host_time = await asyncio.gather(
         _guarded("host_system", _system()),
         _guarded(
             "host_storage_pool",
             asyncio.wait_for(_host_storage_pool(config), _POOL_TIMEOUT),
         ),
         _guarded("host_virt", _host_virt(config)),
+        _guarded("host_time", _host_time()),
     )
     sections = {
         "host_system": host_system,
         "host_storage_pool": host_storage_pool,
         "host_virt": host_virt,
+        "host_time": host_time,
     }
     all_failed = all(set(s) == {"error"} for s in sections.values())
     result: dict = {"ok": not all_failed, "action": "host-profile", **sections}
