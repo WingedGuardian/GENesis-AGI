@@ -26,6 +26,13 @@ DEFAULT_DB_PATH = genesis_db_path()
 
 BUSY_TIMEOUT_MS = 5000
 
+# Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
+# 256 MiB. SQLite's default is ~2 MiB, which forces hot read paths to keep
+# re-fetching pages instead of holding Genesis's working set resident. This is
+# per *connection*, so the long-lived server + MCP connections each hold up to
+# this much — a few GiB total against a 36 GiB budget, comfortably within range.
+CACHE_SIZE_KIB = -262144
+
 # Schema migrations run rarely (deploy / server startup) but must win the write
 # lock even when other processes (concurrent CC-session MCP servers) are writing.
 # A generous timeout lets the migration's BEGIN IMMEDIATE and its COMMIT-time
@@ -256,6 +263,13 @@ async def get_db(
             await conn.execute("PRAGMA foreign_keys=ON")
         await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         await conn.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+        # synchronous=NORMAL is the safe, standard setting under WAL (no
+        # corruption risk; at most the last txn is lost on power loss). get_db
+        # previously relied on the default FULL, so the hot serialized
+        # connection fsynced on every commit for durability get_raw_db already
+        # forgoes — align them.
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        await conn.execute(f"PRAGMA cache_size={CACHE_SIZE_KIB}")  # 256 MiB page cache
 
     db = await aiosqlite.connect(str(path))
     await _configure(db)
@@ -295,6 +309,7 @@ async def get_raw_db(
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
+        await db.execute(f"PRAGMA cache_size={CACHE_SIZE_KIB}")  # 256 MiB page cache
         # NOTE: intentionally NOT setting `foreign_keys=ON` here (get_db does).
         # These standalone sites never enforced FKs before, and none touch
         # FK-cascading tables. If a future caller needs cascade deletes, enable
