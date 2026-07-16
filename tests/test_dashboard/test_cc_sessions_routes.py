@@ -103,7 +103,7 @@ async def _seed_charter_tables(db, *, with_rows: bool = False):
                 "INSERT INTO session_ledger (id, session_id, text, status,"
                 " added_by, created_at)"
                 f" VALUES ('l{i}', 'cc-abc', 'item {i}', ?, 'foreground',"
-                " '2026-07-13T00:00:00+00:00')",
+                f" '2026-07-13T00:00:0{i}+00:00')",
                 (status,),
             )
     await db.commit()
@@ -228,3 +228,167 @@ async def test_empty_state(db):
         "completed_24h": 0,
         "failed_24h": 0,
     }
+
+
+# ── Per-session cockpit endpoint (session-manager PR-4b) ─────────────────────
+
+
+def test_charter_route_registered(app):
+    rules = {rule.rule for rule in app.url_map.iter_rules()}
+    assert "/api/genesis/cc-sessions/<cc_session_id>/charter" in rules
+
+
+def test_charter_route_503_when_not_bootstrapped(client):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = False
+    mock_rt.db = None
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/cc-sessions/cc-abc/charter")
+    assert resp.status_code == 503
+
+
+def test_charter_route_traversal_id_rejected(client):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/cc-sessions/../charter")
+    assert resp.status_code in (400, 404)  # our guard or Flask routing — never a read
+    assert mock_rt.db.execute.call_count == 0
+
+
+async def _seed_cockpit(db, tmp_path, *, waypoint_lines=None):
+    """cc_sessions row + charter + ledger + waypoints + pulse annotation."""
+    from genesis.dashboard.routes.cc_sessions import _collect_session_detail
+
+    await _seed_charter_tables(db, with_rows=True)
+    await _seed_session(db, sid="cc-abc", cc_session_id="cc-abc")
+    sessions_dir = tmp_path / "sessions"
+    (sessions_dir / "cc-abc").mkdir(parents=True)
+    lines = (
+        waypoint_lines
+        if waypoint_lines is not None
+        else [
+            '{"ts": "2026-07-13T00:00:00+00:00", "trigger": "auto", "transcript_bytes": 100}',
+            "{corrupt json",
+            '{"ts": "2026-07-14T00:00:00+00:00", "trigger": "manual", "transcript_bytes": 200}',
+        ]
+    )
+    (sessions_dir / "cc-abc" / "waypoints.jsonl").write_text("\n".join(lines) + "\n")
+    await db.execute(
+        "INSERT INTO repo_pulse_runs (run_id, started_at, trigger, status)"
+        " VALUES ('r1', '2026-07-14T00:00:00+00:00', 'manual', 'ok')"
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_annotations (id, run_id, observed_at, tier,"
+        " item_id, item_session_id, item_text, pr_number, status, confidence)"
+        " VALUES ('a1', 'r1', '2026-07-14T00:00:00+00:00', 'fuzzy', 'l0',"
+        " 'cc-abc', 'item 0', 1081, 'proposed', 0.9)"
+    )
+    await db.commit()
+    return _collect_session_detail, sessions_dir
+
+
+async def test_cockpit_full_payload(db, tmp_path):
+    collect, sessions_dir = await _seed_cockpit(db, tmp_path)
+    detail = await collect(db, "cc-abc", sessions_dir=sessions_dir, now=_NOW)
+    assert detail["session"]["cc_session_id"] == "cc-abc"
+    assert detail["session"]["session_row_count"] == 1
+    assert detail["charters_available"] is True
+    assert detail["charter"]["origin_prompt"] == "the origin"
+    assert detail["charter"]["origin_truncated"] is False
+    assert detail["charter"]["mission"] == "ship it"
+    assert detail["charter"]["pointers"] == []
+    items = detail["ledger"]["items"]
+    assert [i["id"] for i in items] == ["l0", "l1", "l2"]
+    assert {"added_by", "source_ref", "evidence"} <= set(items[0])
+    assert detail["ledger"]["counts"] == {"open": 1, "in_progress": 1, "done": 1}
+    # waypoints: corrupt line skipped, others parsed in order
+    wp = detail["waypoints"]
+    assert wp["available"] is True and wp["truncated"] is False
+    assert [w["trigger"] for w in wp["items"]] == ["auto", "manual"]
+    # pulse panel live
+    pulse = detail["pulse"]
+    assert pulse["available"] is True
+    assert pulse["annotations"][0]["pr_number"] == 1081
+    assert pulse["health"]["runs"] == {"ok": 1}
+
+
+async def test_cockpit_unknown_session_is_none(db, tmp_path):
+    from genesis.dashboard.routes.cc_sessions import _collect_session_detail
+
+    await _seed_charter_tables(db)
+    assert (
+        await _collect_session_detail(db, "nope", sessions_dir=tmp_path / "sessions", now=_NOW)
+        is None
+    )
+
+
+async def test_cockpit_charter_only_session(db, tmp_path):
+    """A chartered session with no cc_sessions row (pre-registration) still
+    renders — session block None, charter present."""
+    from genesis.dashboard.routes.cc_sessions import _collect_session_detail
+
+    await _seed_charter_tables(db, with_rows=True)
+    detail = await _collect_session_detail(
+        db, "cc-abc", sessions_dir=tmp_path / "sessions", now=_NOW
+    )
+    assert detail["session"] is None
+    assert detail["charter"]["origin_prompt"] == "the origin"
+    assert detail["waypoints"]["available"] is False
+
+
+async def test_cockpit_origin_cap_and_truncated_flag(db, tmp_path):
+    from genesis.dashboard.routes.cc_sessions import (
+        ORIGIN_PROMPT_CAP,
+        _collect_session_detail,
+    )
+
+    await _seed_charter_tables(db)
+    await db.execute(
+        "INSERT INTO session_charters (session_id, origin_prompt, pointers, created_at)"
+        " VALUES ('cc-big', ?, '[\"a\"]', '2026-07-13T00:00:00+00:00')",
+        ("x" * (ORIGIN_PROMPT_CAP + 500),),
+    )
+    await db.commit()
+    detail = await _collect_session_detail(
+        db, "cc-big", sessions_dir=tmp_path / "sessions", now=_NOW
+    )
+    assert len(detail["charter"]["origin_prompt"]) == ORIGIN_PROMPT_CAP
+    assert detail["charter"]["origin_truncated"] is True
+    assert detail["charter"]["pointers"] == ["a"]
+
+
+async def test_cockpit_waypoint_tail_truncation(db, tmp_path):
+    from genesis.dashboard.routes.cc_sessions import WAYPOINT_TAIL
+
+    lines = [
+        f'{{"ts": "2026-07-13T00:00:{i % 60:02d}+00:00", "trigger": "auto", "transcript_bytes": {i}}}'
+        for i in range(WAYPOINT_TAIL + 5)
+    ]
+    collect, sessions_dir = await _seed_cockpit(db, tmp_path, waypoint_lines=lines)
+    detail = await collect(db, "cc-abc", sessions_dir=sessions_dir, now=_NOW)
+    wp = detail["waypoints"]
+    assert wp["truncated"] is True
+    assert len(wp["items"]) == WAYPOINT_TAIL
+    assert wp["items"][-1]["transcript_bytes"] == WAYPOINT_TAIL + 4  # newest kept
+
+
+async def test_cockpit_pulse_degrades_without_tables(db, tmp_path):
+    """Pre-0062 installs: the pulse panel degrades to available=False —
+    the independent-mergeability regression contract, kept forever."""
+    from genesis.dashboard.routes.cc_sessions import _collect_session_detail
+    from genesis.db.crud import repo_pulse as pulse_crud
+
+    await _seed_charter_tables(db, with_rows=True)
+    await db.execute("DROP TABLE repo_pulse_annotations")
+    await db.execute("DROP TABLE repo_pulse_runs")
+    await db.commit()
+    pulse_crud._tables_verified = False
+    detail = await _collect_session_detail(
+        db, "cc-abc", sessions_dir=tmp_path / "sessions", now=_NOW
+    )
+    pulse_crud._tables_verified = False
+    assert detail["pulse"] == {"available": False, "annotations": [], "health": None}
+    assert detail["charter"]["origin_prompt"] == "the origin"  # rest unaffected
