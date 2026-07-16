@@ -132,6 +132,17 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   server restarts more frequently than the interval, the job never
   fires. Use `CronTrigger` for anything longer than a few hours.
   Bit us with `user_model_evolution` (48h interval, daily restarts).
+- **Silent skips are banned (provision-or-surface).** A setup/resilience
+  feature that gracefully skips on a missing prerequisite (a package, a
+  host knob) must either PROVISION the prerequisite (bootstrap.sh /
+  host-setup.sh / a guardian reconciler) or register an effective-fact in
+  `infra_profile` that the awareness posture check
+  (`awareness/loop.py::_check_infra_protection_posture`) reads — so an
+  unprotected box raises a standing alert instead of staying silent. A
+  graceful skip with neither = a box that runs unprotected with zero
+  signal (a sibling install ran weeks without swap/systemd-oomd until a
+  memory spike wedged it, 2026-07). Guardrail:
+  `tests/test_awareness/test_infra_protection_posture.py`.
 - **Modules are NEVER subsystems.** A capability *module*
   (`src/genesis/modules/**`, an external pluggable capability — "hands,
   not brain", see `modules/base.py`) is not an internal Genesis

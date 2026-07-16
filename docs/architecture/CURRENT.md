@@ -424,8 +424,21 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 3403599d 2026-07-16
+verified: 159698d4 2026-07-16
 ```
+
+- **Infra protection posture (2026-07-16)**: hourly
+  `_check_infra_protection_posture` reads the infra profile's effective facts
+  and raises one `high` `infrastructure_alert` when a memory-plane protection
+  is missing (container `memory.swap.max=0`, oomd pressure-kill off, host swap
+  absent, incus swap knob explicitly `"false"`) or the profile is stale (>3d =
+  refresh broken → distinct "posture UNKNOWN" alert). Only EXPLICIT defect
+  values alert — absent/`None` facts stay silent (no guardian plane, cgroup
+  v1, fresh install). One open row per source via `supersede_except_hash`;
+  auto-resolves on recovery. Completes the silent-skip closure: provision
+  (bootstrap, #1082) → reconcile (guardian, #1083) → alert (this). The
+  provision-or-surface convention: a resilience feature that skips on a
+  missing prereq must either provision it or register a fact this check reads.
 
 - **Git-health alerts self-heal, slot-scoped (2026-07-16)**: the per-tick cheap
   probe auto-resolves open `git_cheap` observations on pass; the daily deep
