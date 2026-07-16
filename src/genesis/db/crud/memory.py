@@ -181,7 +181,9 @@ async def search_ranked(
     sql = (
         "SELECT memory_fts.memory_id, memory_fts.content, "
         "memory_fts.source_type, memory_fts.collection, memory_fts.rank, "
-        "memory_metadata.origin_class "
+        "memory_metadata.origin_class, "
+        "memory_metadata.wing, memory_metadata.room, "
+        "memory_fts.tags "
         "FROM memory_fts LEFT JOIN memory_metadata "
         "ON memory_fts.memory_id = memory_metadata.memory_id "
         "WHERE memory_fts MATCH ?"
@@ -223,6 +225,18 @@ async def search_ranked(
             # WS-3 stored provenance — from the (already-joined)
             # memory_metadata row; NULL for pre-0054 rows.
             "origin_class": r[5],
+            # Authoritative structural taxonomy from the already-joined
+            # memory_metadata row — lets the FTS path scope-filter FTS-only
+            # candidates by wing/room without depending on the denormalized
+            # FTS tag token (which can drift from metadata). NULL for rows
+            # never classified.
+            "wing": r[6],
+            "room": r[7],
+            # FTS tag string (space-separated). Carries the explicit
+            # ``life_domain:``/``project_type:`` tokens set at store time, so
+            # the scope filter can honor an explicit life_domain override
+            # rather than inferring solely from wing.
+            "tags": r[8],
         }
         for r in rows
     ]

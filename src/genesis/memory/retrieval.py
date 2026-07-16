@@ -329,28 +329,50 @@ def _filter_scope_fts_only(
     """Filter FTS5-only candidates by wing/room/life_domain (Qdrant results
     are already filtered at query time; this catches FTS5-only candidates
     that don't match the requested filters). No-op when no filter is set.
+
+    FTS5-only candidates carry no vector, so they never appear in Qdrant's
+    already-filtered results. We verify their membership against the
+    AUTHORITATIVE ``wing``/``room`` now projected onto the FTS row by
+    ``search_ranked`` (from the joined ``memory_metadata``) — not the
+    denormalized FTS ``tags`` token, which can drift from metadata (that
+    stale-token dependence is exactly why fts5_only rows were previously
+    unreachable by wing-filtered recall). ``life_domain`` has no metadata
+    column, so it is derived from the authoritative wing via the same
+    mapping the write path uses.
     """
-    if wing or room or life_domain:
-        filtered: list[str] = []
-        for mid in candidates:
-            qhit = qdrant_by_id.get(mid)
-            if qhit:
-                # Qdrant already filtered — guaranteed match
-                filtered.append(mid)
-            elif life_domain and not wing and not room:
-                # FTS5-only + life_domain filter: check the tag string
-                fhit = fts_by_id.get(mid)
-                if fhit:
-                    tags_str = fhit.get("tags", "")
-                    if f"life_domain:{life_domain}" in tags_str:
-                        filtered.append(mid)
-            else:
-                # FTS5-only candidate with wing/room filter — no
-                # wing/room data in FTS5, exclude since we can't
-                # verify membership.
-                pass
-        candidates = filtered
-    return candidates
+    if not (wing or room or life_domain):
+        return candidates
+
+    filtered: list[str] = []
+    for mid in candidates:
+        if qdrant_by_id.get(mid):
+            # Qdrant already applied wing/room/life_domain at query time —
+            # a returned hit is a guaranteed match.
+            filtered.append(mid)
+            continue
+        fhit = fts_by_id.get(mid)
+        if fhit is None:
+            # No FTS row to verify against — can't confirm membership, exclude.
+            continue
+        row_wing = fhit.get("wing")
+        if wing and row_wing != wing:
+            continue
+        if room and fhit.get("room") != room:
+            continue
+        if life_domain:
+            # No life_domain column on memory_metadata; derive it the same way
+            # the write path does — classify_life_domain honors an explicit
+            # ``life_domain:`` tag (carried in the FTS ``tags`` string) and
+            # otherwise infers from wing. This keeps the FTS path consistent
+            # with the stored payload the Qdrant path filters on.
+            from genesis.memory.taxonomy import classify_life_domain
+
+            tags_str = fhit.get("tags") or ""
+            tag_list = tags_str.split() if tags_str else None
+            if classify_life_domain(row_wing or "general", tags=tag_list) != life_domain:
+                continue
+        filtered.append(mid)
+    return filtered
 
 
 def _assemble_results(

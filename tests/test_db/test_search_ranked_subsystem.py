@@ -163,3 +163,30 @@ async def test_rows_carry_origin_class(tmp_path) -> None:
         assert by_id["ego-1"]["origin_class"] is None
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_rows_carry_wing_and_room(tmp_path) -> None:
+    """search_ranked projects the authoritative memory_metadata.wing/room so
+    the FTS path can scope-filter fts5_only candidates (follow-up 0a3741c4)."""
+    conn = await _build_db(str(tmp_path / "fts.db"))
+    try:
+        await conn.execute(
+            "UPDATE memory_metadata SET wing = 'routing', room = 'fallback' "
+            "WHERE memory_id = 'user-1'"
+        )
+        await conn.commit()
+        rows = await memory_crud.search_ranked(
+            conn, query="decision recovery", include_only_subsystems=None,
+        )
+        by_id = {r["memory_id"]: r for r in rows}
+        assert by_id["user-1"]["wing"] == "routing"
+        assert by_id["user-1"]["room"] == "fallback"
+        # FTS tag string is projected too (empty for these seed rows) — the
+        # scope filter reads it to honor explicit life_domain overrides.
+        assert by_id["user-1"]["tags"] == ""
+        # Unclassified rows project NULL wing/room, not a missing key.
+        assert by_id["ego-1"]["wing"] is None
+        assert by_id["ego-1"]["room"] is None
+    finally:
+        await conn.close()

@@ -208,21 +208,14 @@ async def _local_drilldown(
                 include_only_subsystems=include_only_subsystems,
             ))
         fts_rows.sort(key=lambda r: r["rank"])
-        # Rank order preserved; drop cross-collection duplicates
-        fts_ids = list(dict.fromkeys(r["memory_id"] for r in fts_rows))
-        # Filter results by wing in post-processing (FTS5 doesn't support wing filter)
-        if fts_ids:
-            # Verify wing membership. Filter as a SET and keep the ranked
-            # order — the IN-clause SELECT returns rows in table-scan
-            # order, which would rescramble the rank merge above.
-            placeholders = ",".join("?" * len(fts_ids))
-            wing_query = f"""
-                SELECT memory_id FROM memory_metadata
-                WHERE memory_id IN ({placeholders}) AND wing = ?
-            """  # noqa: S608 - literal SQL fragments; values bound as parameters
-            async with db.execute(wing_query, [*fts_ids, wing]) as cursor:
-                wing_members = {row[0] async for row in cursor}
-            fts_ids = [mid for mid in fts_ids if mid in wing_members]
+        # Verify wing membership against the authoritative wing now projected
+        # by search_ranked (from the joined memory_metadata) — no separate
+        # query needed. Rank order preserved; drop cross-collection duplicates.
+        fts_ids = list(
+            dict.fromkeys(
+                r["memory_id"] for r in fts_rows if r.get("wing") == wing
+            )
+        )
         local_ids.extend(fts_ids)
 
     # Scoped vector search with wing filter
