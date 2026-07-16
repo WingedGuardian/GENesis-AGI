@@ -389,10 +389,10 @@ async def _check_user_model_staleness(db) -> None:
                 f"The user-model learning stream is stale: {detail}. Reflection "
                 f"user-impact deltas (observations type='user_model_delta') feed the "
                 f"user-model evolution job, so a silent stream means Genesis has stopped "
-                f"updating its model of the user. Likely throttle (diagnosed 2026-07-15): "
-                f"the 0.90 per-delta confidence gate in reflection_bridge/_output.py sits "
-                f"above the light-reflection model's median output confidence, so almost "
-                f"no delta passes — a behavioral fix tracked separately."
+                f"updating its model of the user. Check the per-delta confidence gate "
+                f"(MIN_DELTA_CONFIDENCE, perception/types.py) against the light model's "
+                f"actual output confidence, and the user_impact rotation's emission "
+                f"volume (how many deltas reflections propose at all)."
             ),
             priority="high",
             created_at=now_dt.isoformat(),

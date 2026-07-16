@@ -82,7 +82,7 @@ LIGHT_FOCUS_INSTRUCTIONS: dict[str, str] = {
         "## Focus: User Impact Analysis\n"
         "Analyze how current conditions affect the user's goals and work.\n"
         "This is the ONLY rotation that produces user_model_updates.\n"
-        "Each delta MUST have confidence >= 0.9 and cite specific evidence.\n"
+        "Each delta MUST have confidence >= 0.85 and cite specific evidence.\n"
         "Do NOT produce surplus_candidates (set to empty list).\n"
         "Focus on: assessment, user_model_updates, recommendations."
     ),
