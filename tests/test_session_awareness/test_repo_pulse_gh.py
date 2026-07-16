@@ -46,6 +46,17 @@ async def test_resolves_slug_live_and_lists(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_until_date_bounds_the_search_window():
+    """Pagination support: an until_date turns the qualifier into a closed
+    merged:since..until range (the worker pages down on limit_hit)."""
+    run = _fake_runner({"pr": (0, "[]", "")})
+    await gh.list_merged_prs(
+        since_date="2026-07-09", until_date="2026-07-14", repo="o/r", runner=run
+    )
+    assert "merged:2026-07-09..2026-07-14" in " ".join(run.calls[0])
+
+
+@pytest.mark.asyncio
 async def test_explicit_repo_skips_resolve():
     run = _fake_runner({"pr": (0, "[]", "")})
     out = await gh.list_merged_prs(since_date="2026-07-09", repo="o/r", runner=run)

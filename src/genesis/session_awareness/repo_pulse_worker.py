@@ -407,25 +407,64 @@ async def _run_locked(
         return row
 
     since = _since_date(cursor_before, lookback_days or knob_int(cfg, "lookback_days"))
-    listing = await list_merged_prs(since_date=since, limit=knob_int(cfg, "max_prs"))
-    if "error" in listing:
-        detail_notes.append(str(listing["error"])[:300])
-        recorded = await _record_run(db_path, **_base_row(status="failed"))
+    max_prs = knob_int(cfg, "max_prs")
+    # Pagination on capped windows: GitHub search can't sort by mergedAt
+    # ascending, so a single capped call may silently drop OLDER PRs in the
+    # window — advancing the cursor past them would strand them forever
+    # (Codex P1 on #1081). On limit_hit, page DOWN with a closed
+    # merged:since..until range bounded by the oldest returned date, until
+    # a page comes back uncapped. If the window can't shrink (>limit PRs
+    # merged on one day), the run FAILS loudly and the cursor stays put —
+    # retryable, never a silent hole.
+    prs_by_number: dict[int, dict] = {}
+    repo: str | None = None
+    until: str | None = None
+    pages = 0
+    limit_hit_unresolved = True
+    for _page in range(5):
+        listing = await list_merged_prs(
+            since_date=since, until_date=until, limit=max_prs, repo=repo
+        )
+        if "error" in listing:
+            detail_notes.append(str(listing["error"])[:300])
+            recorded = await _record_run(db_path, **_base_row(status="failed", repo=repo))
+            if recorded:
+                _write_cursor(root, cursor, merged_at=None)
+            await _record_telemetry(db_path, "failed", str(listing["error"])[:120])
+            return {"status": "failed", "detail": listing["error"]}
+        repo = listing["repo"]
+        pages += 1
+        for p in listing["prs"]:
+            prs_by_number.setdefault(p["number"], p)
+        if not listing["limit_hit"]:
+            limit_hit_unresolved = False
+            break
+        if not listing["prs"]:
+            # capped yet empty after row-validation drops — cannot bound
+            break
+        oldest = min(str(p["mergedAt"]) for p in listing["prs"])[:10]
+        if oldest == until:
+            break  # window can't shrink further
+        until = oldest
+    if pages > 1:
+        detail_notes.append(f"limit_hit paged={pages}")
+    if limit_hit_unresolved:
+        detail_notes.append("limit_hit_unresolved")
+        recorded = await _record_run(
+            db_path, **_base_row(status="failed", repo=repo, n_prs=len(prs_by_number))
+        )
         if recorded:
             _write_cursor(root, cursor, merged_at=None)
-        await _record_telemetry(db_path, "failed", str(listing["error"])[:120])
-        return {"status": "failed", "detail": listing["error"]}
-
-    repo = listing["repo"]
-    if listing["limit_hit"]:
-        # LOUD: GitHub search can't sort by mergedAt ascending, so a capped
-        # window may have dropped older PRs — visible on the run row, and
-        # the un-advanced tail re-covers next run via the date-granular
-        # search once the cursor reaches it.
-        detail_notes.append("limit_hit")
-    prs = [
-        p for p in listing["prs"] if not cursor_before or str(p["mergedAt"]) > str(cursor_before)
-    ]
+        await _record_telemetry(db_path, "failed", "limit_hit_unresolved")
+        return {"status": "failed", "detail": "limit_hit_unresolved"}
+    prs = sorted(
+        (
+            p
+            for p in prs_by_number.values()
+            if not cursor_before or str(p["mergedAt"]) > str(cursor_before)
+        ),
+        key=lambda p: str(p["mergedAt"]),
+    )
     if not prs:
         recorded = await _record_run(db_path, **_base_row(status="no_new_prs", repo=repo, n_prs=0))
         if recorded:
@@ -447,6 +486,14 @@ async def _run_locked(
         async with aiosqlite.connect(str(db_path), timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
+            if not await pulse_crud.tables_available(db):
+                # Pre-migration window (Codex P1 on #1081): the annotation
+                # record for an absorb could not land, leaving an invisible,
+                # replay-unguarded ledger mutation. Verify storage BEFORE
+                # touching the live ledger — the run fails at record_run
+                # below, the cursor stays put, and the window replays
+                # normally once migration 0062 lands.
+                exact_matches = []
             for m in exact_matches:
                 item, pr, via = m["item"], m["pr"], m["via"]
                 if await pulse_crud.annotation_exists(db, "exact", item["id"], pr["number"]):

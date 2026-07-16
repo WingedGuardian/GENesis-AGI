@@ -78,12 +78,15 @@ async def resolve_repo(runner: Runner | None = None) -> str | None:
 async def list_merged_prs(
     *,
     since_date: str,
+    until_date: str | None = None,
     limit: int = 200,
     repo: str | None = None,
     runner: Runner | None = None,
 ) -> dict:
     """Enumerate PRs merged on/after ``since_date`` (YYYY-MM-DD, date-granular).
 
+    ``until_date`` closes the window (``merged:since..until``) — the worker's
+    pagination bound when a capped result forces paging down (hardening 2).
     Returns ``{"repo", "prs", "limit_hit"}`` with prs sorted by mergedAt
     ASCENDING (cursor math processes oldest-first), or ``{"error": ...}``.
     Rows missing an int ``number`` or a ``mergedAt`` are dropped — gh's
@@ -96,6 +99,7 @@ async def list_merged_prs(
         repo = await resolve_repo(run)
         if repo is None:
             return {"error": "repo slug resolve failed"}
+    qualifier = f"merged:{since_date}..{until_date}" if until_date else f"merged:>={since_date}"
     rc, out, err = await run(
         [
             "gh",
@@ -106,7 +110,7 @@ async def list_merged_prs(
             "--state",
             "merged",
             "--search",
-            f"merged:>={since_date}",
+            qualifier,
             "--json",
             PR_FIELDS,
             "--limit",

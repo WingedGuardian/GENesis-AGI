@@ -982,11 +982,14 @@ def _charter_emission_block(
         # evidence column tells the story.
         lines += ["", "**Pulse (proposed — confirm or ignore):**"]
         for p in proposals:
+            # The hint carries the PR as evidence so a user-confirmed absorb
+            # reconciles to 'confirmed' (same-PR attribution guard) instead
+            # of 'superseded' — confirmed proposals ARE the precision metric.
             lines.append(
                 f"- ~ '{str(p.get('item_text') or '')[:60]}' looks shipped by"
                 f" PR #{p.get('pr_number')} '{str(p.get('pr_title') or '')[:50]}'"
                 f" — confirm: session_ledger_update('{p.get('item_id') or ''}',"
-                f" status='absorbed')"
+                f" status='absorbed', evidence='PR #{p.get('pr_number')}')"
             )
     count = charter.get("compaction_count", 0)
     counts = charter.get("_ledger_counts") or {}

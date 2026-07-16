@@ -346,10 +346,51 @@ async def test_no_new_prs_records_and_keeps_cursor(pulse_root, db_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_limit_hit_is_recorded_loudly(pulse_root, db_path, monkeypatch, live_mode):
-    out = await _run(db_path, monkeypatch, gh=_gh([_pr()], limit_hit=True))
+async def test_limit_hit_paginates_to_full_coverage(pulse_root, db_path, monkeypatch, live_mode):
+    """A capped window must page DOWN (merged:since..until) until complete —
+    advancing the cursor past silently-dropped older PRs strands them forever
+    (Codex P1 on #1081)."""
+    newest = [_pr(number=1090 + i, merged=f"2026-07-16T10:00:{i:02d}Z") for i in range(3)]
+    older = [_pr(number=1080 + i, merged=f"2026-07-15T10:00:{i:02d}Z") for i in range(2)]
+    calls: list[dict] = []
+
+    async def paged_gh(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("until_date") is None:
+            return {
+                "repo": "o/r",
+                "prs": sorted(newest, key=lambda p: p["mergedAt"]),
+                "limit_hit": True,
+            }
+        return {
+            "repo": "o/r",
+            "prs": sorted(older, key=lambda p: p["mergedAt"]),
+            "limit_hit": False,
+        }
+
+    out = await _run(db_path, monkeypatch, gh=paged_gh)
     assert out["status"] == "ok"
-    assert "limit_hit" in (await _runs(db_path))[0]["detail"]
+    assert out["n_prs"] == 5  # full coverage: both pages
+    assert calls[1]["until_date"] == "2026-07-16"  # oldest returned date, page 2 bound
+    run = (await _runs(db_path))[0]
+    assert "limit_hit" in run["detail"]
+    assert _cursor(pulse_root)["last_merged_at"] == "2026-07-16T10:00:02Z"
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_limit_hit_fails_without_cursor_advance(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    """If paging can't shrink the window (>limit PRs merged on one day), the
+    run records failed and the cursor stays put — loud and retryable, never
+    a silent hole behind an advanced cursor."""
+    _write_cursor_file(pulse_root, last_merged_at=MERGED_OLD)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr()], limit_hit=True))
+    assert out["status"] == "failed"
+    run = (await _runs(db_path))[0]
+    assert run["status"] == "failed"
+    assert "limit_hit_unresolved" in run["detail"]
+    assert _cursor(pulse_root)["last_merged_at"] == MERGED_OLD
 
 
 @pytest.mark.asyncio
@@ -379,6 +420,32 @@ async def test_pre_migration_write_miss_preserves_cursor(
     out = await _run(bare, monkeypatch, gh=_gh([_pr()]))
     assert out["status"] == "failed"
     assert not (pulse_root / rpw.CURSOR_FILENAME).exists()
+
+
+@pytest.mark.asyncio
+async def test_pre_migration_never_absorbs_ledger(pulse_root, tmp_path, monkeypatch, live_mode):
+    """A marker PR against an un-migrated DB must NOT absorb the ledger row:
+    the annotation record could not land, so the action would be invisible
+    and unguarded on replay (Codex P1 on #1081). Verify storage BEFORE
+    mutating the live ledger."""
+    bare = tmp_path / "bare.db"
+    async with aiosqlite.connect(str(bare)) as db:
+        await M58.up(db)  # ledger exists, pulse tables don't
+        await db.commit()
+    pulse_crud._tables_verified = False
+    await _seed_item(bare)
+    out = await _run(bare, monkeypatch, gh=_gh([_pr(body=f"Ledger: {ITEM}")]))
+    assert out["status"] == "failed"
+    assert out.get("absorbed", []) == []
+    assert (await _item_row(bare))["status"] == "open"  # untouched
+    # once the migration lands, the replayed window absorbs normally
+    async with aiosqlite.connect(str(bare)) as db:
+        await M62.up(db)
+        await db.commit()
+    pulse_crud._tables_verified = False
+    out2 = await _run(bare, monkeypatch, gh=_gh([_pr(body=f"Ledger: {ITEM}")]))
+    assert out2["status"] == "ok"
+    assert (await _item_row(bare))["status"] == "absorbed"
 
 
 # ── re-absorb guard ──────────────────────────────────────────────────────

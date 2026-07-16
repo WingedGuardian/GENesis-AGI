@@ -152,6 +152,14 @@ async def record_run(
     return True
 
 
+async def tables_available(db: aiosqlite.Connection) -> bool:
+    """Public existence check for callers that must verify storage BEFORE
+    taking a side effect elsewhere (the worker gates live-ledger absorbs on
+    this — an absorb whose annotation record cannot land would be invisible
+    and unguarded on window replay)."""
+    return await _tables_available(db)
+
+
 async def annotation_exists(
     db: aiosqlite.Connection, tier: str, item_id: str, pr_number: int
 ) -> bool:

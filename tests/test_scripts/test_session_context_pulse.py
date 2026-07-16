@@ -84,7 +84,9 @@ def test_proposal_renders_with_confirm_hint(tmp_path):
     block = _block(db_file)
     assert "**Pulse (proposed — confirm or ignore):**" in block
     assert "'ship the annotator' looks shipped by PR #1080" in block
-    assert "session_ledger_update('item-a1', status='absorbed')" in block
+    # the hint carries the PR evidence so a user-confirmed absorb reconciles
+    # to 'confirmed' (same-PR attribution guard), not 'superseded'
+    assert "session_ledger_update('item-a1', status='absorbed', evidence='PR #1080')" in block
 
 
 def test_missing_pulse_tables_block_byte_identical(tmp_path):
