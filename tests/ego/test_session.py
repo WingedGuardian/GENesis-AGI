@@ -1096,10 +1096,12 @@ class TestEgoCycleDisallowedTools:
 
         assert "mcp__genesis-health__ego_goal_create" in _EGO_CYCLE_DISALLOWED_TOOLS
         assert "mcp__genesis-health__ego_goal_update" in _EGO_CYCLE_DISALLOWED_TOOLS
-        # Read-only goal tools stay available in-cycle.
+        # ego_goal_progress mutates too: add_progress_note() refreshes
+        # updated_at, silently resetting the staleness-review clock.
+        assert "mcp__genesis-health__ego_goal_progress" in _EGO_CYCLE_DISALLOWED_TOOLS
+        # The truly read-only goal tool stays available in-cycle.
         assert not any(
-            "ego_goal_list" in t or "ego_goal_progress" in t
-            for t in _EGO_CYCLE_DISALLOWED_TOOLS
+            "ego_goal_list" in t for t in _EGO_CYCLE_DISALLOWED_TOOLS
         )
 
     def test_cycle_invocation_wires_the_disallow_list(self):

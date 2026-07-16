@@ -86,12 +86,16 @@ _NEVER_DISPATCH_ACTION_TYPES = (
 # MCP tools the ego CYCLE session must never call directly. In-cycle goal
 # mutation goes through the parsed-output path (source_tag-gated, validated,
 # audited) — never the foreground goal tools: ego_goal_create stamps
-# origin='user' (masquerading as a user directive) and ego_goal_update can
-# mutate ANY goal with no approval gate. Foreground CC sessions keep both
-# (user-authorized surface). Read-only goal tools stay available.
+# origin='user' (masquerading as a user directive), ego_goal_update can
+# mutate ANY goal with no approval gate, and ego_goal_progress writes
+# progress_notes AND refreshes updated_at — silently resetting the user's
+# staleness-review clock (Codex P1, PR #1093). Foreground CC sessions keep
+# all of them (user-authorized surface). Only truly read-only goal tools
+# (ego_goal_list) stay available in-cycle.
 _EGO_CYCLE_DISALLOWED_TOOLS = (
     "mcp__genesis-health__ego_goal_create",
     "mcp__genesis-health__ego_goal_update",
+    "mcp__genesis-health__ego_goal_progress",
 )
 
 
