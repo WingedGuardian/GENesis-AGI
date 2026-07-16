@@ -65,6 +65,7 @@ def _profile(
     profile: dict = {
         "sections": {
             "memory": {
+                "status": "ok",
                 "facts": {
                     "cgroup_memory_swap_max": swap_max,
                     "oomd_user_slice_kill": oomd,
@@ -72,10 +73,13 @@ def _profile(
                     # container (verified live 2026-07-16) — the check must
                     # never key on it.
                     "swap_total": 0,
-                }
+                },
             },
-            "host_system": {"facts": {"swap_total_kb": host_swap_kb}},
-            "host_virt": {"facts": {"container_limits": {"limits.memory.swap": knob}}},
+            "host_system": {"status": "ok", "facts": {"swap_total_kb": host_swap_kb}},
+            "host_virt": {
+                "status": "ok",
+                "facts": {"container_limits": {"limits.memory.swap": knob}},
+            },
         }
     }
     if collected_at is not None:
@@ -118,8 +122,23 @@ def test_healthy_profile_no_defects():
 def test_absent_facts_are_silent():
     # No guardian host plane, no host_virt, empty memory facts — a public
     # install missing optional planes must never false-alarm.
-    assert _infra_missing_protections({"sections": {"memory": {"facts": {}}}}) == []
+    assert (
+        _infra_missing_protections(
+            {"sections": {"memory": {"status": "ok", "facts": {}}}}
+        )
+        == []
+    )
     assert _infra_missing_protections({}) == []
+
+
+def test_not_ok_section_facts_are_ignored():
+    # Codex P2 (PR #1096): a per-section collector failure RETAINS the
+    # previous facts (status=error/unavailable) while the top-level
+    # collected_at still bumps — rules must never assert from those.
+    profile = _profile(swap_max=0, oomd=False, host_swap_kb=0, knob="false")
+    for plane in ("memory", "host_system", "host_virt"):
+        profile["sections"][plane]["status"] = "error"
+    assert _infra_missing_protections(profile) == []
 
 
 def test_cgroup_v1_gates_oomd_rule():
@@ -309,6 +328,65 @@ async def test_load_profile_error_never_raises(monkeypatch):
         monkeypatch.setattr(_loop, "load_profile", _boom)
         await _check_infra_protection_posture(db)  # must not raise into the tick
         assert await _alerts(db) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_plane_holds_resolve(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0))
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+
+        # The memory collector starts failing: facts retained, status=error.
+        # We can neither verify the defect nor the recovery — the alert must
+        # HOLD (no false all-clear from stale facts), not resolve.
+        broken = _profile(swap_max=0)
+        broken["sections"]["memory"]["status"] = "error"
+        _use_profile(monkeypatch, broken)
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_empty_section_does_not_block_resolve(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0))
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+
+        # Guardian-less install: host planes permanently "unavailable" with
+        # EMPTY facts. They never contributed a rule and must not hold a
+        # container-plane recovery hostage.
+        healed = _profile()
+        for plane in ("host_system", "host_virt"):
+            healed["sections"][plane]["status"] = "unavailable"
+            healed["sections"][plane]["facts"] = {}
+        _use_profile(monkeypatch, healed)
+        await _check_infra_protection_posture(db)
+        assert _open(await _alerts(db)) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_alert_notes_unverifiable_planes(monkeypatch):
+    db = await _setup()
+    try:
+        # A real defect in an ok section still alerts even while another
+        # plane is unverifiable — and the content names the failing plane.
+        profile = _profile(swap_max=0)
+        profile["sections"]["host_system"]["status"] = "error"
+        _use_profile(monkeypatch, profile)
+        await _check_infra_protection_posture(db)
+        open_rows = _open(await _alerts(db))
+        assert len(open_rows) == 1
+        assert "host_system" in open_rows[0]["content"]
     finally:
         await db.close()
 

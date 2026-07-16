@@ -502,8 +502,15 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     sections = profile.get("sections") or {}
 
     def _facts(plane: str) -> dict:
+        # Only a status=="ok" section is trusted: on a per-section collector
+        # failure _merge_section RETAINS the previous facts (status=error/
+        # unavailable) while still bumping the top-level collected_at, so
+        # without this gate the rules would assert posture from stale facts
+        # that the >3d staleness check cannot see (Codex P2, PR #1096).
         section = sections.get(plane)
-        facts = section.get("facts") if isinstance(section, dict) else None
+        if not isinstance(section, dict) or section.get("status") != "ok":
+            return {}
+        facts = section.get("facts")
         return facts if isinstance(facts, dict) else {}
 
     def _explicit_zero(value: object) -> bool:
@@ -532,6 +539,29 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     if isinstance(limits, dict) and limits.get("limits.memory.swap") == "false":
         missing.append("container_swap_knob_off")
     return sorted(missing)
+
+
+_POSTURE_PLANES = ("memory", "host_system", "host_virt")
+
+
+def _infra_unverifiable_planes(profile: dict) -> list[str]:
+    """Posture planes whose section is present but NOT ok while carrying
+    retained (stale) facts — we previously knew something there and currently
+    cannot verify it, so an all-clear must be held. A not-ok section with
+    EMPTY facts (e.g. host planes on a guardian-less install, permanently
+    "unavailable") never contributed a rule and blocks nothing."""
+    sections = profile.get("sections") or {}
+    unverifiable: list[str] = []
+    for plane in _POSTURE_PLANES:
+        section = sections.get(plane)
+        if (
+            isinstance(section, dict)
+            and section.get("status") != "ok"
+            and isinstance(section.get("facts"), dict)
+            and section.get("facts")
+        ):
+            unverifiable.append(plane)
+    return unverifiable
 
 
 async def _check_infra_protection_posture(db) -> None:
@@ -569,7 +599,13 @@ async def _check_infra_protection_posture(db) -> None:
             )
         else:
             missing = _infra_missing_protections(profile)
+            unverifiable = _infra_unverifiable_planes(profile)
             if not missing:
+                if unverifiable:
+                    # A plane with retained-but-unverifiable facts: neither
+                    # alarm nor all-clear — hold the current state until the
+                    # section collector recovers.
+                    return
                 await _resolve_infra_protection_posture(db)
                 return
             key = ",".join(missing)
@@ -581,6 +617,11 @@ async def _check_infra_protection_posture(db) -> None:
                 f"wedge the container instead of being absorbed (2026-07 "
                 f"incident class)."
             )
+            if unverifiable:
+                content += (
+                    f" Additionally unverifiable (section collector failing, "
+                    f"facts retained but stale): {', '.join(unverifiable)}."
+                )
 
         now = time.monotonic()
         if (
