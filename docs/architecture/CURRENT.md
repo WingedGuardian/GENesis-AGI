@@ -371,7 +371,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 8bd0a52b 2026-07-15
+verified: 159698d4 2026-07-16
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -409,6 +409,15 @@ verified: 8bd0a52b 2026-07-15
   self-heal for installs that advance via bare `git pull` and never re-run
   host-setup. Heals page INFO; failures page WARNING (24h throttle); kill
   switch `swap_reconcile_enabled: false`.
+- **Host zram swap** (`scripts/lib/host_swap.sh`, E-rest E3): a
+  compressed-RAM-first swap tier on the host VM — `zram-swap.service` at swap
+  priority 100, sized `min(MemTotal/2, 4GiB)` (`HOSTSWAP_CAP_GIB` override).
+  Applied by `install_guardian.sh` Step 9c (fresh) and the gateway `redeploy`
+  verb (existing installs retrofit on next update; output to stderr, never
+  fails a redeploy). Degrades to one-line skips (container vantage, no
+  zram.ko/zramctl, external zram, no sudo); durable opt-out = `sudo systemctl
+  mask zram-swap.service`. Completes the swap story `memory_resilience.sh`
+  leaves as a warning — see `docs/reference/memory-resilience.md`.
 - **sentinel/** is LIVE-wired but **shadow-only autonomy**: config mode
   `"live"` is NOT implemented (dispatcher warns + downgrades); every proposed
   action requires human approval. `InfrastructureMonitor` (call site 37, free

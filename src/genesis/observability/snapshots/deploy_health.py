@@ -70,6 +70,7 @@ GUARDIAN_HOST_PATHS = (
     "pyproject.toml",
     "scripts/install_guardian.sh",
     "scripts/guardian-gateway.sh",
+    "scripts/lib/host_swap.sh",
 )
 
 _HOST_STATE_FILE = "host_gateway_state.json"

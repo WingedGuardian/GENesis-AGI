@@ -669,6 +669,17 @@ else
     echo "  SKIP  I/O tuning (no passwordless sudo). See config/99-container-host.conf"
 fi
 
+# ── Step 9c: Host zram swap (compressed-RAM-first tier) ─────────────────
+# Completes the swap story memory_resilience.sh leaves as a warning: creates
+# a modest zram device (min(MemTotal/2, 4GiB), priority 100 over disk swap)
+# via a self-contained system unit. The lib degrades to a one-line skip on
+# hosts that can't or shouldn't (no zram.ko, container vantage, external
+# zram already active, masked unit, no sudo). Opt out permanently with:
+# sudo systemctl mask zram-swap.service
+# shellcheck source=lib/host_swap.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/host_swap.sh"
+host_swap_apply
+
 # ── Step 10: Install gateway script ────────────────────────────────────
 
 echo ""
