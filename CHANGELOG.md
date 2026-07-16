@@ -21,6 +21,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   outreach record exactly like a quote-reply, so Genesis's picture of what
   you actually respond to stops being systematically wrong.
 
+- **Genesis resumes learning about you.** The stream of "user model deltas" —
+  the small observations reflections make about your preferences, constraints,
+  and working style — had been effectively dead since the v3 release: the
+  quality gate demanded more certainty (0.90) than the reflection model ever
+  expresses (its honest "high certainty" sits at 0.85), so almost nothing
+  passed — 2 deltas in 3.5 months. The gate now matches the model's real
+  confidence scale, and the reflection prompt no longer contradicts itself
+  about the bar (it demanded 0.9, called 0.85 "high certainty", and showed a
+  0.8 example all at once). If the stream stays silent anyway, the staleness
+  alarm shipped in the sensor-fabric release will say so within two weeks.
+
 ### Added
 
 - **The guardian now keeps container swap enabled on its own.** Swap is what
@@ -33,6 +44,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   live cgroup (so protection is immediate, no restart needed). Repairs page an
   INFO note; a repair that can't complete pages a warning at most daily. Hosts
   where swap-off is deliberate can opt out (`swap_reconcile_enabled: false`).
+
+- **The dashboard has a Sessions cockpit.** A new Sessions tab shows every
+  CC session next to what it's actually FOR: the immutable origin prompt it
+  was born from, its living mission, the full TODO-ledger with status and
+  evidence, a compaction-waypoint timeline, and the repo-pulse panel —
+  "looks shipped by PR #N" proposals you can confirm (closes the item with
+  the PR as evidence) or reject with one click. The overview card's
+  quick-glance modal stays and links through to the full cockpit.
 
 - **Your session TODO ledger now notices when a merged PR ships an item.** N
   parallel sessions each carry open ledger rows, and until now closing them

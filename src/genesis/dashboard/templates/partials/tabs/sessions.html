@@ -1,0 +1,257 @@
+
+
+    <!-- Sessions tab — CC sessions cockpit (session-manager PR-4b).
+         List pane consumes the SAME /api/genesis/cc-sessions/detail payload as
+         the overview modal (drift bounded by construction); the detail pane is
+         the per-session cockpit: charter, ledger rows, waypoints, pulse. -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'sessions'" style="overflow-y: auto; max-height: calc(100vh - 180px);">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">terminal</span>
+        CC Sessions
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.modalStateColor($store.genesisDashboard.sessionsTab)}`"></span>
+          <span x-text="$store.genesisDashboard.modalStateLabel($store.genesisDashboard.sessionsTab)"></span>
+        </span>
+      </div>
+      <div style="padding: 1rem;">
+        <div x-show="$store.genesisDashboard.sessionsTab.fetch.state === 'loading' && !$store.genesisDashboard.sessionsTab.data"
+             style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading...</div>
+        <div x-show="$store.genesisDashboard.sessionsTab.fetch.state === 'error' && !$store.genesisDashboard.sessionsTab.data"
+             class="empty-state">CC session detail unavailable.</div>
+        <template x-if="$store.genesisDashboard.sessionsTab.data">
+          <div style="display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap;">
+
+            <!-- ── List pane ── -->
+            <div style="flex: 1 1 460px; min-width: 420px;">
+              <!-- Summary stats (clickable filters — ported from the overview modal) -->
+              <div style="display: flex; gap: 0.5rem; margin-bottom: 0.6rem; flex-wrap: wrap;">
+                <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
+                     :style="`background: rgba(76,175,80,${$store.genesisDashboard.sessionsTab.filter === 'active' ? '0.3' : '0.12'}); color: #4caf50; opacity: ${!$store.genesisDashboard.sessionsTab.filter || $store.genesisDashboard.sessionsTab.filter === 'active' ? '1' : '0.5'}`"
+                     title="Sessions marked active in the DB"
+                     @click="$store.genesisDashboard.sessionsTab.filter = $store.genesisDashboard.sessionsTab.filter === 'active' ? null : 'active'">
+                  <span x-text="($store.genesisDashboard.sessionsTab.data.stats?.db_active || 0)"></span> db-active
+                </div>
+                <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px;"
+                     :style="`background: rgba(59,130,246,0.12); color: #3b82f6;`"
+                     title="Live claude processes carrying GENESIS_SLOT (from /proc) — informational, not a filter">
+                  <span x-text="($store.genesisDashboard.sessionsTab.data.stats?.live_procs || 0)"></span> live procs
+                </div>
+                <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
+                     :style="`background: rgba(217,83,79,${$store.genesisDashboard.sessionsTab.filter === 'discrepant' ? '0.3' : '0.12'}); color: #d9534f; opacity: ${!$store.genesisDashboard.sessionsTab.filter || $store.genesisDashboard.sessionsTab.filter === 'discrepant' ? '1' : '0.5'}`"
+                     title="Rows where DB state and live processes disagree — count includes live processes with no DB row (listed below the table)"
+                     @click="$store.genesisDashboard.sessionsTab.filter = $store.genesisDashboard.sessionsTab.filter === 'discrepant' ? null : 'discrepant'">
+                  <span x-text="($store.genesisDashboard.sessionsTab.data.stats?.discrepant || 0)"></span> discrepant
+                </div>
+                <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
+                     :style="`background: rgba(100,116,139,${$store.genesisDashboard.sessionsTab.filter === 'completed' ? '0.3' : '0.12'}); color: #94a3b8; opacity: ${!$store.genesisDashboard.sessionsTab.filter || $store.genesisDashboard.sessionsTab.filter === 'completed' ? '1' : '0.5'}`"
+                     @click="$store.genesisDashboard.sessionsTab.filter = $store.genesisDashboard.sessionsTab.filter === 'completed' ? null : 'completed'">
+                  <span x-text="($store.genesisDashboard.sessionsTab.data.stats?.completed_24h || 0)"></span> completed (24h)
+                </div>
+              </div>
+
+              <div style="font-size: 0.74rem; color: var(--color-text-secondary); margin-bottom: 1rem;"
+                   x-text="'Hourly budget: ' + ($store.genesisDashboard.health.cc_sessions?.background?.hourly_budget || '—') + ' sessions started this hour (a rate cap — not a session count)'"></div>
+
+              <template x-if="($store.genesisDashboard.sessionsTab.data.sessions || []).length === 0">
+                <div style="font-size: 0.78rem; color: var(--color-text-secondary); padding: 1rem; text-align: center;">
+                  No CC sessions in the last 24 hours.
+                </div>
+              </template>
+              <div style="max-height: 480px; overflow-y: auto;">
+                <template x-for="s in ($store.genesisDashboard.sessionsTab.data.sessions || []).filter(s => {
+                  const f = $store.genesisDashboard.sessionsTab.filter;
+                  if (!f) return true;
+                  if (f === 'discrepant') return (s.flags || []).length > 0;
+                  return s.status === f;
+                })" :key="s.id">
+                  <div style="font-size: 0.78rem; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--color-border); display: flex; align-items: center; gap: 0.5rem; cursor: pointer;"
+                       :style="$store.genesisDashboard.sessionsTab.selectedId === (s.cc_session_id || s.id) ? 'background: rgba(59,130,246,0.10);' : ''"
+                       @click="$store.genesisDashboard.openSessionRow(s)">
+                    <span class="status-dot" :style="`background: ${s.status === 'active' ? '#4caf50' : s.status === 'failed' ? '#d9534f' : s.status === 'completed' ? '#64748b' : '#f0ad4e'}`"></span>
+                    <span style="font-family: monospace; min-width: 74px;" :title="s.cc_session_id || s.id"
+                          x-text="(s.cc_session_id || s.id).slice(0, 8)"></span>
+                    <span style="min-width: 52px; color: var(--color-text-secondary);"
+                          x-text="s.session_type === 'foreground' ? 'fg' : s.session_type === 'background_reflection' ? 'bg-refl' : 'bg-task'"></span>
+                    <span style="min-width: 90px; color: var(--color-text-secondary); text-overflow: ellipsis; overflow: hidden; white-space: nowrap;"
+                          x-text="s.model || '-'" :title="s.model || ''"></span>
+                    <span style="min-width: 74px; color: var(--color-text-secondary);"
+                          x-text="s.idle_s != null ? $store.genesisDashboard.formatAgeSeconds(s.idle_s) + ' idle' : '-'"></span>
+                    <span style="min-width: 90px;" :style="`color: ${s.live ? '#3b82f6' : 'var(--color-text-secondary)'}`"
+                          x-text="s.live ? ('#' + s.live.slot + ' pid ' + s.live.pid) : '—'"></span>
+                    <template x-if="$store.genesisDashboard.sessionsTab.data.charters_available">
+                      <span style="min-width: 110px; flex: 1; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;"
+                            :title="s.charter ? ((s.charter.mission || 'no mission') + ' · ' + s.charter.compaction_count + ' compactions · ' + s.charter.ledger_open + ' open of ' + s.charter.ledger_total) : 'no charter'"
+                            x-text="s.charter ? ((s.charter.mission || '(no mission)').slice(0, 32) + ' ⟳' + s.charter.compaction_count + ' · ' + s.charter.ledger_open + ' open') : '—'"></span>
+                    </template>
+                    <template x-if="(s.flags || []).includes('db_active_no_proc')">
+                      <span style="font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: rgba(217,83,79,0.15); color: #d9534f; white-space: nowrap;">db-active, no proc</span>
+                    </template>
+                    <template x-if="(s.flags || []).includes('proc_but_db_inactive')">
+                      <span style="font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: rgba(240,173,78,0.15); color: #f0ad4e; white-space: nowrap;"
+                            x-text="'proc alive, db says ' + s.status"></span>
+                    </template>
+                  </div>
+                </template>
+              </div>
+
+              <template x-if="($store.genesisDashboard.sessionsTab.data.unmatched_slots || []).length > 0">
+                <div style="margin-top: 1rem; padding: 0.5rem 0.8rem; background: rgba(217,83,79,0.08); border-radius: 6px; border: 1px solid rgba(217,83,79,0.2);">
+                  <div style="font-size: 0.78rem; font-weight: 600; color: #d9534f; margin-bottom: 0.3rem;">Live processes with no DB session row</div>
+                  <template x-for="u in $store.genesisDashboard.sessionsTab.data.unmatched_slots" :key="u.pid">
+                    <div style="font-size: 0.75rem; color: #f87171;"
+                         x-text="'#' + u.slot + ' pid ' + u.pid + ' ' + (u.rss_mb / 1024).toFixed(1) + 'G (' + u.status + ')'"></div>
+                  </template>
+                </div>
+              </template>
+            </div>
+
+            <!-- ── Detail pane (cockpit) ── -->
+            <div style="flex: 1 1 480px; min-width: 420px;">
+              <template x-if="!$store.genesisDashboard.sessionsTab.selectedId">
+                <div class="empty-state" style="padding: 3rem 1rem;">Select a session to open its cockpit — charter, ledger, waypoints, pulse.</div>
+              </template>
+              <template x-if="$store.genesisDashboard.sessionsTab.detailError">
+                <div class="empty-state" x-text="$store.genesisDashboard.sessionsTab.detailError"></div>
+              </template>
+              <template x-if="$store.genesisDashboard.sessionsTab.selectedId && !$store.genesisDashboard.sessionsTab.detail && !$store.genesisDashboard.sessionsTab.detailError">
+                <div style="text-align: center; padding: 2rem; color: var(--color-text-secondary);">Loading cockpit...</div>
+              </template>
+              <template x-if="$store.genesisDashboard.sessionsTab.detail">
+                <div>
+                  <!-- Session header -->
+                  <div style="display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.8rem; flex-wrap: wrap;">
+                    <span style="font-family: monospace; font-size: 0.9rem; font-weight: 700;"
+                          x-text="$store.genesisDashboard.sessionsTab.selectedId.slice(0, 8)"
+                          :title="$store.genesisDashboard.sessionsTab.selectedId"></span>
+                    <template x-if="$store.genesisDashboard.sessionsTab.detail.session">
+                      <span style="font-size: 0.75rem; color: var(--color-text-secondary);"
+                            x-text="($store.genesisDashboard.sessionsTab.detail.session.session_type || '?') + ' · ' + ($store.genesisDashboard.sessionsTab.detail.session.status || '?') + ' · ' + ($store.genesisDashboard.sessionsTab.detail.session.model || '-') + ($store.genesisDashboard.sessionsTab.detail.session.session_row_count > 1 ? ' · ' + $store.genesisDashboard.sessionsTab.detail.session.session_row_count + ' db rows' : '')"></span>
+                    </template>
+                  </div>
+
+                  <!-- Charter: immutable origin + living mission/pointers -->
+                  <template x-if="$store.genesisDashboard.sessionsTab.detail.charter">
+                    <div style="margin-bottom: 1rem;">
+                      <div style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-secondary); margin-bottom: 0.3rem;">
+                        Origin <span style="font-style: italic;">(immutable — the prompt this session was born from,
+                        <span x-text="$store.genesisDashboard.sessionsTab.detail.charter.origin_ts || 'time unknown'"></span>)</span>
+                      </div>
+                      <div style="font-size: 0.8rem; background: var(--color-background); border-left: 3px solid #64748b; border-radius: 4px; padding: 0.6rem 0.8rem; white-space: pre-wrap; max-height: 180px; overflow-y: auto;"
+                           x-text="($store.genesisDashboard.sessionsTab.detail.charter.origin_prompt || '(origin not yet chartered)') + ($store.genesisDashboard.sessionsTab.detail.charter.origin_truncated ? ' …[truncated]' : '')"></div>
+                      <div style="display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.78rem; flex-wrap: wrap;">
+                        <div><span style="color: var(--color-text-secondary);">Mission:</span>
+                          <span x-text="$store.genesisDashboard.sessionsTab.detail.charter.mission || '(unset)'"></span></div>
+                        <div><span style="color: var(--color-text-secondary);">Compactions:</span>
+                          <span x-text="$store.genesisDashboard.sessionsTab.detail.charter.compaction_count ?? 0"></span></div>
+                      </div>
+                      <template x-if="($store.genesisDashboard.sessionsTab.detail.charter.pointers || []).length > 0">
+                        <div style="font-size: 0.75rem; margin-top: 0.3rem;">
+                          <span style="color: var(--color-text-secondary);">Pointers:</span>
+                          <template x-for="p in $store.genesisDashboard.sessionsTab.detail.charter.pointers" :key="p">
+                            <div style="font-family: monospace; margin-left: 0.8rem;" x-text="p"></div>
+                          </template>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                  <template x-if="!$store.genesisDashboard.sessionsTab.detail.charter && $store.genesisDashboard.sessionsTab.detail.charters_available">
+                    <div style="font-size: 0.78rem; color: var(--color-text-secondary); margin-bottom: 1rem;">No charter yet — it persists at this session's first compaction.</div>
+                  </template>
+
+                  <!-- Ledger rows -->
+                  <div style="margin-bottom: 1rem;">
+                    <div style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-secondary); margin-bottom: 0.3rem;"
+                         x-text="'Ledger (' + Object.entries($store.genesisDashboard.sessionsTab.detail.ledger?.counts || {}).map(([k, v]) => v + ' ' + k).join(' · ') + ')' ">
+                    </div>
+                    <template x-if="($store.genesisDashboard.sessionsTab.detail.ledger?.items || []).length === 0">
+                      <div style="font-size: 0.78rem; color: var(--color-text-secondary);">No ledger rows.</div>
+                    </template>
+                    <template x-for="item in ($store.genesisDashboard.sessionsTab.detail.ledger?.items || [])" :key="item.id">
+                      <div style="font-size: 0.78rem; padding: 0.35rem 0.4rem; border-bottom: 1px solid var(--color-border);">
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                          <span style="font-size: 0.68rem; padding: 0.08rem 0.4rem; border-radius: 8px; white-space: nowrap;"
+                                :style="`background: ${item.status === 'open' ? 'rgba(76,175,80,0.15)' : item.status === 'in_progress' ? 'rgba(240,173,78,0.15)' : item.status === 'absorbed' ? 'rgba(59,130,246,0.15)' : item.status === 'dropped' ? 'rgba(217,83,79,0.15)' : 'rgba(100,116,139,0.15)'}; color: ${item.status === 'open' ? '#4caf50' : item.status === 'in_progress' ? '#f0ad4e' : item.status === 'absorbed' ? '#3b82f6' : item.status === 'dropped' ? '#d9534f' : '#94a3b8'}`"
+                                x-text="item.status"></span>
+                          <span style="font-size: 0.68rem; padding: 0.08rem 0.4rem; border-radius: 8px; white-space: nowrap;"
+                                :style="`background: ${item.added_by === 'pulse' ? 'rgba(168,85,247,0.15)' : 'rgba(100,116,139,0.10)'}; color: ${item.added_by === 'pulse' ? '#a855f7' : 'var(--color-text-secondary)'}`"
+                                x-text="item.added_by"></span>
+                          <span style="flex: 1;" x-text="item.text" :title="'id: ' + item.id + (item.source_ref ? ' · ref: ' + item.source_ref : '')"></span>
+                        </div>
+                        <template x-if="item.evidence">
+                          <details style="margin: 0.15rem 0 0 0.5rem;">
+                            <summary style="font-size: 0.72rem; color: var(--color-text-secondary); cursor: pointer;">evidence</summary>
+                            <div style="font-size: 0.74rem; color: var(--color-text-secondary); white-space: pre-wrap;" x-text="item.evidence"></div>
+                          </details>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+
+                  <!-- Waypoints timeline (first reader of the deterministic spine) -->
+                  <div style="margin-bottom: 1rem;">
+                    <div style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-secondary); margin-bottom: 0.3rem;">
+                      Waypoints <span x-show="$store.genesisDashboard.sessionsTab.detail.waypoints?.truncated" style="font-style: italic;">(newest 200)</span>
+                    </div>
+                    <template x-if="!$store.genesisDashboard.sessionsTab.detail.waypoints?.available || ($store.genesisDashboard.sessionsTab.detail.waypoints?.items || []).length === 0">
+                      <div style="font-size: 0.78rem; color: var(--color-text-secondary);">No waypoints — none recorded before the first compaction.</div>
+                    </template>
+                    <div style="max-height: 160px; overflow-y: auto;">
+                      <template x-for="(w, wi) in ($store.genesisDashboard.sessionsTab.detail.waypoints?.items || [])" :key="wi">
+                        <div style="font-size: 0.75rem; display: flex; gap: 0.6rem; padding: 0.15rem 0.3rem; color: var(--color-text-secondary);">
+                          <span style="min-width: 140px;" x-text="w.ts ? $store.genesisDashboard.formatDateTime(w.ts) : '?'"></span>
+                          <span style="font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: 8px; background: rgba(59,130,246,0.12); color: #3b82f6;"
+                                x-text="w.trigger || '?'"></span>
+                          <span x-text="w.transcript_bytes != null ? (w.transcript_bytes / 1048576).toFixed(1) + ' MB' : '—'"></span>
+                          <span x-show="wi > 0 && w.transcript_bytes != null && $store.genesisDashboard.sessionsTab.detail.waypoints.items[wi-1].transcript_bytes != null"
+                                x-text="'(+' + ((w.transcript_bytes - ($store.genesisDashboard.sessionsTab.detail.waypoints.items[wi-1].transcript_bytes || 0)) / 1048576).toFixed(1) + ' MB)'"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+
+                  <!-- Pulse panel (repo-pulse annotations; actions land with the resolve endpoint) -->
+                  <div>
+                    <div style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-secondary); margin-bottom: 0.3rem;">Pulse</div>
+                    <template x-if="!$store.genesisDashboard.sessionsTab.detail.pulse?.available">
+                      <div style="font-size: 0.78rem; color: var(--color-text-secondary);">Pulse store unavailable (pre-0062 install).</div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.sessionsTab.detail.pulse?.available">
+                      <div>
+                        <div style="font-size: 0.74rem; color: var(--color-text-secondary); margin-bottom: 0.3rem;"
+                             x-text="'Runs: ' + Object.entries($store.genesisDashboard.sessionsTab.detail.pulse.health?.runs || {}).map(([k, v]) => v + ' ' + k).join(' · ') + ($store.genesisDashboard.sessionsTab.detail.pulse.health?.precision != null ? ' · fuzzy precision ' + $store.genesisDashboard.sessionsTab.detail.pulse.health.precision : '')"></div>
+                        <template x-if="($store.genesisDashboard.sessionsTab.detail.pulse.annotations || []).length === 0">
+                          <div style="font-size: 0.78rem; color: var(--color-text-secondary);">No PR matches for this session's ledger items yet.</div>
+                        </template>
+                        <template x-for="a in ($store.genesisDashboard.sessionsTab.detail.pulse.annotations || [])" :key="a.id">
+                          <div style="font-size: 0.78rem; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--color-border); display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                            <span style="font-size: 0.68rem; padding: 0.08rem 0.4rem; border-radius: 8px; white-space: nowrap;"
+                                  :style="`background: ${a.status === 'applied' ? 'rgba(59,130,246,0.15)' : a.status === 'proposed' ? 'rgba(240,173,78,0.15)' : a.status === 'confirmed' ? 'rgba(76,175,80,0.15)' : a.status === 'rejected' ? 'rgba(217,83,79,0.15)' : 'rgba(100,116,139,0.15)'}; color: ${a.status === 'applied' ? '#3b82f6' : a.status === 'proposed' ? '#f0ad4e' : a.status === 'confirmed' ? '#4caf50' : a.status === 'rejected' ? '#d9534f' : '#94a3b8'}`"
+                                  x-text="a.tier + ' · ' + a.status"></span>
+                            <span style="flex: 1; min-width: 200px;"
+                                  :title="(a.rationale || '') + (a.resolution_ref ? ' · resolved: ' + a.resolution_ref : '')"
+                                  x-text="'“' + (a.item_text || a.item_id).slice(0, 44) + '” ↔ PR #' + a.pr_number + (a.confidence != null ? ' @' + a.confidence : '')"></span>
+                            <template x-if="a.status === 'proposed'">
+                              <span style="display: flex; gap: 0.3rem;">
+                                <button style="font-size: 0.7rem; padding: 0.1rem 0.5rem; border-radius: 4px; border: 1px solid rgba(76,175,80,0.4); background: rgba(76,175,80,0.12); color: #4caf50; cursor: pointer;"
+                                        :disabled="$store.genesisDashboard.sessionsTab.resolvingId === a.id"
+                                        title="Absorb the ledger item with this PR as evidence and count the match as confirmed"
+                                        @click="$store.genesisDashboard.resolvePulseAnnotation(a, 'confirmed')">confirm</button>
+                                <button style="font-size: 0.7rem; padding: 0.1rem 0.5rem; border-radius: 4px; border: 1px solid rgba(217,83,79,0.4); background: rgba(217,83,79,0.12); color: #d9534f; cursor: pointer;"
+                                        :disabled="$store.genesisDashboard.sessionsTab.resolvingId === a.id"
+                                        title="Not a real match — the ledger item stays open"
+                                        @click="$store.genesisDashboard.resolvePulseAnnotation(a, 'rejected')">reject</button>
+                              </span>
+                            </template>
+                          </div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+
+          </div>
+        </template>
+      </div>
+    </div>

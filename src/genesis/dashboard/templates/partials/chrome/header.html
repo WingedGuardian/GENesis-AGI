@@ -69,6 +69,8 @@
               @click="location.hash = 'chat'">Comms</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'work' }"
               @click="location.hash = 'work'">Work</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'sessions' }"
+              @click="location.hash = 'sessions'">Sessions</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'follow-ups' }"
               @click="location.hash = 'follow-ups'">Follow-ups</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'observations' }"

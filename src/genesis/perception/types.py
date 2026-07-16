@@ -8,7 +8,10 @@ from dataclasses import dataclass, field  # noqa: F401 — field used by downstr
 # Used by both perception engine (context.py, writer.py) and CC bridge
 # (reflection_bridge.py). Defined once to prevent drift.
 LIGHT_FOCUS_ROTATION: list[str] = ["situation", "user_impact", "anomaly"]
-MIN_DELTA_CONFIDENCE: float = 0.90
+# 0.85 admits the model's "high certainty" clusters (0.85/0.90/0.95) while still
+# dropping the 0.80 filler tier. The original 0.90 sat above the light model's
+# median output confidence and starved the stream (2 deltas in 3.5 months).
+MIN_DELTA_CONFIDENCE: float = 0.85
 
 
 @dataclass(frozen=True)

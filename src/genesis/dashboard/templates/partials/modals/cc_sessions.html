@@ -107,6 +107,12 @@
                 </template>
               </div>
             </template>
+
+            <!-- Bridge to the Sessions tab cockpit (session-manager PR-4b) -->
+            <div style="margin-top: 1rem; text-align: right;">
+              <a href="#sessions" style="font-size: 0.8rem; color: #3b82f6; cursor: pointer; text-decoration: none;"
+                 @click="$store.genesisDashboard.ccSessionsModal.open = false; $store.genesisDashboard.navigateTo('sessions')">full cockpit →</a>
+            </div>
           </div>
         </template>
       </div>
