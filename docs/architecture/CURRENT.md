@@ -382,7 +382,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: bca86011 2026-07-15
+verified: 47e7a132 2026-07-15
 ```
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
@@ -403,8 +403,21 @@ verified: bca86011 2026-07-15
   deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
   `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
   only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
-  It does NOT drive the ego cadence (ego has its own
+  Also per-tick (WS-2 M10) the SINGLE designated `alert_events` writer:
+  `_persist_health_alerts` recomputes the firing set via the pure
+  `mcp/health/errors.py::_compute_alerts()` and reconciles a durable open-set
+  (open row per firing alert, `resolved_at` stamped on clear) — replacing the
+  in-memory, per-process, one-generation `_alert_history` dict so incident
+  history survives restart. It does NOT drive the ego cadence (ego has its own
   scheduler). Trap: PEP 562 lazy `__init__` — don't eager-import `loop.py`.
+- **scheduled-job telemetry (WS-2 M9)**: `runtime/_job_health.py` keeps the
+  cumulative `job_health` row AND now appends per-run `job_run_events` (era
+  attribution the cumulative row can't give). Writes are debounced off the
+  persisted `job_health` anchors — a success only when ≥1h since the last, a
+  failure on streak onset + hourly heartbeat — so a stuck sub-hourly poll costs
+  ~24 rows/day. `duration_ms` is honest-or-NULL (only from an explicit
+  `record_job_start` marker; never derived from `last_run`). 90-day prune via
+  `_wire_drip_retention_jobs`.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
   reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate
