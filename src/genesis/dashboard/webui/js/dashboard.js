@@ -3988,8 +3988,13 @@
             if (resp?.ok && this.sessionsTab.selectedId) {
               await this.fetchSessionCharter(this.sessionsTab.selectedId, { silent: true });
               this.fetchSessionsTab();
+            } else if (resp && !resp.ok) {
+              const body = await resp.json().catch(() => ({}));
+              alert(`Pulse resolve failed: ${body.error || resp.status}`);
             }
-          } catch { /* panel refresh shows the truth either way */ }
+          } catch {
+            alert("Pulse resolve failed: network error");
+          }
           this.sessionsTab.resolvingId = null;
         },
 
