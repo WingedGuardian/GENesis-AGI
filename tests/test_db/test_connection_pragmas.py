@@ -14,6 +14,7 @@ from genesis.awareness import loop
 from genesis.db.connection import get_db, get_raw_db
 
 _LIMIT = 67108864  # 64 MB
+_CACHE_SIZE = -262144  # 256 MiB page cache (negative = KiB), matches CACHE_SIZE_KIB
 
 
 @pytest.mark.asyncio
@@ -31,6 +32,35 @@ async def test_get_raw_db_sets_journal_size_limit(tmp_path):
     async with get_raw_db(tmp_path / "g.db") as db:
         rows = await db.execute_fetchall("PRAGMA journal_size_limit")
         assert rows[0][0] == _LIMIT
+
+
+@pytest.mark.asyncio
+async def test_get_db_sets_cache_size(tmp_path):
+    db = await get_db(tmp_path / "g.db")
+    try:
+        rows = await db.execute_fetchall("PRAGMA cache_size")
+        assert rows[0][0] == _CACHE_SIZE
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_raw_db_sets_cache_size(tmp_path):
+    async with get_raw_db(tmp_path / "g.db") as db:
+        rows = await db.execute_fetchall("PRAGMA cache_size")
+        assert rows[0][0] == _CACHE_SIZE
+
+
+@pytest.mark.asyncio
+async def test_get_db_sets_synchronous_normal(tmp_path):
+    """get_db previously relied on the SQLite default FULL(2); it now aligns to
+    NORMAL(1) like get_raw_db — safe + standard under WAL, fewer fsyncs."""
+    db = await get_db(tmp_path / "g.db")
+    try:
+        rows = await db.execute_fetchall("PRAGMA synchronous")
+        assert rows[0][0] == 1  # 1 == NORMAL
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
