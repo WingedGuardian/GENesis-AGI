@@ -1736,6 +1736,54 @@ TABLES = {
             mode            TEXT NOT NULL DEFAULT 'shadow'
         )
     """,
+    # ── Repo-pulse annotator (session-manager PR-4a) ─────────────────────
+    # Merged-PR ↔ open-ledger-item matches from the detached pulse worker.
+    # Exact tier (explicit `Ledger: <id>` marker) auto-absorbs via
+    # session_charters.ledger_update and records status='applied' here;
+    # fuzzy tier (headless Haiku judge) is proposal-only in every mode.
+    "repo_pulse_runs": """
+        CREATE TABLE IF NOT EXISTS repo_pulse_runs (
+            run_id         TEXT PRIMARY KEY,
+            started_at     TEXT NOT NULL,
+            finished_at    TEXT,
+            trigger        TEXT NOT NULL,
+            repo           TEXT,
+            cursor_before  TEXT,
+            cursor_after   TEXT,
+            status         TEXT NOT NULL
+                           CHECK(status IN ('ok','failed','timeout','lock_busy','no_new_prs')),
+            n_prs          INTEGER NOT NULL DEFAULT 0,
+            n_open_items   INTEGER NOT NULL DEFAULT 0,
+            n_exact        INTEGER NOT NULL DEFAULT 0,
+            n_fuzzy        INTEGER NOT NULL DEFAULT 0,
+            latency_ms     INTEGER,
+            prompt_version TEXT,
+            model          TEXT,
+            mode           TEXT NOT NULL DEFAULT 'live',
+            detail         TEXT
+        )
+    """,
+    "repo_pulse_annotations": """
+        CREATE TABLE IF NOT EXISTS repo_pulse_annotations (
+            id              TEXT PRIMARY KEY,
+            run_id          TEXT NOT NULL,
+            observed_at     TEXT NOT NULL,
+            tier            TEXT NOT NULL CHECK(tier IN ('exact','fuzzy')),
+            item_id         TEXT NOT NULL,
+            item_session_id TEXT,
+            item_text       TEXT,
+            pr_number       INTEGER NOT NULL,
+            pr_title        TEXT,
+            pr_merged_at    TEXT,
+            confidence      REAL,
+            rationale       TEXT,
+            status          TEXT NOT NULL
+                            CHECK(status IN ('applied','proposed','confirmed',
+                                             'rejected','superseded')),
+            resolved_at     TEXT,
+            resolution_ref  TEXT
+        )
+    """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
     # Per-run scheduled-job history. job_health is cumulative-only (one row
     # per job_name); this is the era-attribution time series the ledger
@@ -2072,6 +2120,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_slsr_started ON session_ledger_shadow_runs(started_at)",
     "CREATE INDEX IF NOT EXISTS idx_slse_session ON session_ledger_shadow_events(session_id, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_slse_observed ON session_ledger_shadow_events(observed_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
+    "ON repo_pulse_annotations(tier, item_id, pr_number)",
+    "CREATE INDEX IF NOT EXISTS idx_rpa_status ON repo_pulse_annotations(status, observed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_rpa_session ON repo_pulse_annotations(item_session_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_rpr_started ON repo_pulse_runs(started_at)",
     # WS-2 sensor fabric (M9/M10)
     "CREATE INDEX IF NOT EXISTS idx_jre_job_time ON job_run_events(job_name, recorded_at)",
     "CREATE INDEX IF NOT EXISTS idx_jre_recorded ON job_run_events(recorded_at)",
@@ -2120,9 +2173,9 @@ DEPTH_THRESHOLDS_SEED = [
     # Thresholds tuned 2026-03-21: originals (0.5/0.8/0.55) were too conservative,
     # producing only ~12 reflections across 6800 ticks.  Deep lowered to 0.45 to
     # encourage more frequent consolidation (design doc says 48-72h floor).
-    ("Micro", 0.50, 1800, 2, 3600),         # floor 30min, max 2/hr
-    ("Light", 0.60, 10800, 1, 3600),         # floor 3h, max 1/hr
-    ("Deep", 0.45, 172800, 1, 86400),        # floor 48h, max 1/day
+    ("Micro", 0.50, 1800, 2, 3600),  # floor 30min, max 2/hr
+    ("Light", 0.60, 10800, 1, 3600),  # floor 3h, max 1/hr
+    ("Deep", 0.45, 172800, 1, 86400),  # floor 48h, max 1/day
     ("Strategic", 0.40, 604800, 1, 604800),  # floor 7d, max 1/wk
 ]
 

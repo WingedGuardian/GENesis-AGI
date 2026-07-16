@@ -156,7 +156,12 @@ def test_load_full_yaml(monkeypatch):
     # 2026-07-14: 54 → 55 after ambient_ledger_extractor added (session-manager
     # PR-3 shadow extractor neural-monitor registration).
     # 2026-07-15: 55 → 56 after wing_backfill added (one-shot legacy wing backfill).
-    assert len(cfg.call_sites) == 56
+    # 2026-07-16: 56 → 57 after repo_pulse added (session-manager PR-4a fuzzy
+    # matcher neural-monitor registration).
+    assert len(cfg.call_sites) == 57
+    assert cfg.call_sites["repo_pulse"].dispatch == "cli"
+    assert cfg.call_sites["repo_pulse"].chain == []
+    assert cfg.call_sites["repo_pulse"].never_pays is True
     assert "wing_backfill" in cfg.call_sites  # legacy wing backfill (2026-07-15)
     assert "crag_grade" in cfg.call_sites  # W-CRAG runtime grader (2026-06-20)
     assert "38a_procedure_novelty_llm" in cfg.call_sites  # C2b cross-type dedup (2026-06-30)
@@ -176,9 +181,13 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["ambient_ledger_extractor"].never_pays is True
     assert "models_md_synthesis" not in cfg.call_sites  # removed 2026-05-24
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
-    assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
+    assert (
+        "7_task_retrospective" not in cfg.call_sites
+    )  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
     assert "7_ego_cycle" not in cfg.call_sites  # removed 2026-07-13 (→ 7_user/7_genesis_ego_cycle)
-    assert "8_ego_compaction" not in cfg.call_sites  # removed 2026-07-13 (ego went ephemeral; no LLM compaction)
+    assert (
+        "8_ego_compaction" not in cfg.call_sites
+    )  # removed 2026-07-13 (ego went ephemeral; no LLM compaction)
     assert "background" in cfg.retry_profiles
     assert cfg.call_sites["12_surplus_brainstorm"].never_pays is True
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
@@ -187,20 +196,25 @@ def test_load_full_yaml(monkeypatch):
     # judge: LLM-as-judge eval primitive — free NIM v4-pro first, then paid v4-pro,
     # then v4-flash; paid-by-default
     assert cfg.call_sites["judge"].chain == [
-        "nvidia-nim-deepseek", "openrouter-deepseek-v4", "openrouter-deepseek-v4-flash"
+        "nvidia-nim-deepseek",
+        "openrouter-deepseek-v4",
+        "openrouter-deepseek-v4-flash",
     ]
     assert cfg.call_sites["judge"].default_paid is True
     assert cfg.call_sites["judge"].dispatch == "api"
 
     # Phase 6 learning call sites
     assert cfg.call_sites["29_retrospective_triage"].chain == [
-        "groq-free", "mistral-large-free", "openrouter-nemo",
+        "groq-free",
+        "mistral-large-free",
+        "openrouter-nemo",
     ]
     assert cfg.call_sites["30_triage_calibration"].default_paid is True
     # lmstudio-30b filtered out, only mistral-large-free remains
     assert cfg.call_sites["30_triage_calibration"].chain == ["mistral-large-free"]
     assert cfg.call_sites["31_outcome_classification"].chain == [
-        "glm51", "mistral-large-free",
+        "glm51",
+        "mistral-large-free",
     ]
 
     # mistral-large-free provider (consolidated from mistral-free + mistral-large)
@@ -338,7 +352,8 @@ def test_keyless_provider_stays_registered_as_down(monkeypatch):
         "genesis.observability.snapshots.api_keys.has_api_key",
         side_effect=_real_has_api_key,
     ):
-        cfg = load_config_from_string("""\
+        cfg = load_config_from_string(
+            """\
 providers:
   keyless:
     type: anthropic
@@ -351,7 +366,9 @@ providers:
 call_sites:
   site:
     chain: [keyless, keyed]
-""", check_api_keys=True)
+""",
+            check_api_keys=True,
+        )
 
     assert "keyless" in cfg.providers
     assert cfg.providers["keyless"].has_api_key is False
@@ -377,7 +394,8 @@ def test_mixed_disabled_and_keyless_chain():
         "genesis.observability.snapshots.api_keys.has_api_key",
         side_effect=_has_key,
     ):
-        cfg = load_config_from_string("""\
+        cfg = load_config_from_string(
+            """\
 providers:
   off:
     type: anthropic
@@ -395,7 +413,9 @@ providers:
 call_sites:
   s:
     chain: [off, keyless, keyed]
-""", check_api_keys=True)
+""",
+            check_api_keys=True,
+        )
 
     # `off` is removed from cfg.providers (explicit enabled:false)
     assert "off" not in cfg.providers
@@ -415,7 +435,8 @@ def test_keyless_chain_preserves_site():
 
     # All providers come back as keyless
     with patch("genesis.observability.snapshots.api_keys.has_api_key", return_value=False):
-        cfg = load_config_from_string("""\
+        cfg = load_config_from_string(
+            """\
 providers:
   p1:
     type: anthropic
@@ -428,7 +449,9 @@ providers:
 call_sites:
   only_keyless:
     chain: [p1, p2]
-""", check_api_keys=True)
+""",
+            check_api_keys=True,
+        )
 
     assert "only_keyless" in cfg.call_sites
     assert cfg.call_sites["only_keyless"].chain == ["p1", "p2"]

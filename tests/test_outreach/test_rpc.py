@@ -69,3 +69,31 @@ async def test_grow_via_pipeline_invalid_kind():
         )
     assert out["ok"] is False
     assert "invalid kind" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_grow_via_pipeline_root_asks_then_executes():
+    remote = MagicMock()
+    coord = AsyncMock(return_value={"ok": True, "verified": True})
+    with patch("genesis.observability.health._load_guardian_remote_from_config",
+               return_value=remote), \
+         patch("genesis.guardian.provisioning.container.coordinate_grow_root", coord):
+        out = await grow_via_pipeline(
+            AsyncMock(), kind="root", disk="scsi1", gib=40, mib=0, timeout_s=5,
+        )
+    assert out["ok"] is True
+    assert coord.call_args.kwargs == {"new_gb": 40}
+
+
+@pytest.mark.asyncio
+async def test_grow_via_pipeline_limits_passes_mem_and_cpu():
+    remote = MagicMock()
+    coord = AsyncMock(return_value={"ok": True})
+    with patch("genesis.observability.health._load_guardian_remote_from_config",
+               return_value=remote), \
+         patch("genesis.guardian.provisioning.container.coordinate_set_container_limits", coord):
+        out = await grow_via_pipeline(
+            AsyncMock(), kind="limits", disk="scsi1", gib=0, mib=20480, cpu=4, timeout_s=5,
+        )
+    assert out["ok"] is True
+    assert coord.call_args.kwargs == {"mem_mib": 20480, "cpu": 4}

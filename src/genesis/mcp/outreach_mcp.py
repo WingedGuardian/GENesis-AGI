@@ -392,9 +392,10 @@ async def provision_grow(
     disk: str = "scsi1",
     gib: int = 0,
     mib: int = 0,
+    cpu: int = 0,
     timeout_seconds: int = 1800,
 ) -> dict:
-    """Grow this VM's disk or RAM from the hypervisor — approval-gated.
+    """Grow this VM's or container's capacity — approval-gated.
 
     The container-owned approval path (used while Genesis is up): sends an
     APPROVE/DENY request to your own channel and, only on APPROVE, executes
@@ -402,7 +403,11 @@ async def provision_grow(
     Disabled or unconfigured installs return a clean error and never mutate.
 
     kind="disk" grows <disk> by <gib> GiB and absorbs it into the thin pool;
-    kind="memory" grows configured RAM to <mib> MiB (needs a later VM reboot).
+    kind="memory" grows configured VM RAM to <mib> MiB (needs a later VM reboot);
+    kind="root" grows the CONTAINER root volume to <gib> GB total (incus resizes
+      the thin LV + filesystem online, no restart);
+    kind="limits" raises the CONTAINER cgroup caps to <mib> MiB memory and/or
+      <cpu> cores (grow-only, applied live) — the VM↔container coupling.
     """
     if not _pipeline:
         # Standalone MCP subprocess → bridge to genesis-server (owner-approval is
@@ -410,14 +415,14 @@ async def provision_grow(
         # post-approval host execute verb.
         return await _server_rpc(
             "/api/genesis/provision/grow",
-            {"kind": kind, "disk": disk, "gib": gib, "mib": mib,
+            {"kind": kind, "disk": disk, "gib": gib, "mib": mib, "cpu": cpu,
              "timeout_seconds": timeout_seconds},
             read_timeout_s=float(timeout_seconds) + 180.0,
         )
     from genesis.outreach.rpc import grow_via_pipeline
 
     return await grow_via_pipeline(
-        _pipeline, kind=kind, disk=disk, gib=gib, mib=mib,
+        _pipeline, kind=kind, disk=disk, gib=gib, mib=mib, cpu=cpu,
         timeout_s=float(timeout_seconds),
     )
 

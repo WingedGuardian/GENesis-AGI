@@ -101,7 +101,13 @@ class AutonomousDispatchRouter:
         dispatch_mode = self._resolve_dispatch_mode(request)
 
         # CLI-only: skip the API chain entirely and go straight to the
-        # approval gate + CLI fallback.
+        # approval gate + CLI fallback. "Forced to CLI" skips only the API
+        # provider chain — NOT approval: _cli_fallback_decision still runs the
+        # MANDATORY autonomous-CLI approval gate (manual_approval_required). The
+        # per-tick approvals this produces for CC-dispatched cognition (ego
+        # cycles, reflection) are the gate working as designed, not friction to
+        # remove — reduce their volume via approval-key stability / re-ask
+        # cadence only. See cli_policy.py and CC memory `cli_gate_not_negotiable`.
         if dispatch_mode == "cli":
             if not request.cli_fallback_allowed:
                 return AutonomousDispatchDecision(

@@ -348,7 +348,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 4e483381 2026-07-15
+verified: 8bd0a52b 2026-07-15
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -362,7 +362,13 @@ verified: 4e483381 2026-07-15
   skill). Known wart: the watchdog's stale-alert wording inverts when the
   deployed script is NEWER than the host checkout.
 - Provisioning verbs are EXECUTE-ONLY — approval is the CALLER's
-  responsibility (container obtains it via Telegram before invoking).
+  responsibility (container obtains it via Telegram before invoking). Two
+  families: Proxmox VM grows (`provision-grow-disk/-memory`, hypervisor API) and
+  LOCAL container-capacity grows (`grow-root`, `set-container-limits` in
+  `guardian/grow_capacity.py` — incus resizes the thin LV+fs / cgroup caps ONLINE,
+  grow-only, spike-proven). Both flow through `provision_grow(kind=disk|memory|
+  root|limits)` → owner-approval → the execute verb. The limits verb closes the
+  VM↔container coupling (a grown VM's RAM/cores reach the container).
 - Read-only `host-profile` verb (`guardian/host_profile.py`) feeds the
   `infra_profile` host plane; the CC diagnosis prompt inlines the shared-mount
   `INFRASTRUCTURE.md` (truncated) so the diagnostician starts with the body
@@ -486,7 +492,8 @@ verified: 47e7a132 2026-07-15
   startup/resume/compact (NOT clear), and `genesis_urgent_alerts.py` emits a
   per-turn `[Charter: <mission> | open: N]` drift tag (both mode=ro,
   fail-open). Ledger statuses: open/in_progress/done/absorbed/dropped —
-  `absorbed` + `evidence` is the repo-pulse (PR-4) seam. Dispatched sessions
+  `absorbed` + `evidence` is written by the repo-pulse exact tier (below)
+  as well as the MCP tools. Dispatched sessions
   (GENESIS_CC_SESSION=1) are skipped — task_states is their continuity spine.
 - **Ambient ledger extractor** (session-manager stage 3) — **SHADOW**. At
   each PreCompact snapshot the hook fire-and-forgets
@@ -515,6 +522,35 @@ verified: 47e7a132 2026-07-15
   `scripts/prune_ledger_shadow.py` (disk-hygiene step 8). Telemetry:
   `call_site_last_run` row `ambient_ledger_extractor` (deliberately not a
   critical site).
+- **Repo-pulse annotator** (session-manager stage 4) — **LIVE (exact tier)**.
+  At SessionStart boundaries (startup/resume/compact, never clear; foreground
+  only) `genesis_session_context.py` fire-and-forgets
+  `scripts/repo_pulse_worker.py` (home-anchored `--db-path`;
+  `GENESIS_REPO_PULSE_DISABLED=1` kill switch). The detached worker
+  (`session_awareness/repo_pulse_worker.py`) takes a GLOBAL flock + 30-min
+  silent debounce (`~/.genesis/repo_pulse/`), reconciles prior proposals
+  against current ledger state (confirmed ONLY with same-PR evidence — the
+  attribution guard; dropped→rejected; done/stale/missing→superseded),
+  enumerates merged PRs since its cursor (`repo_pulse_gh.py`: slug resolved
+  LIVE via `gh repo view` — config slugs return plausible-stale data; capped
+  windows record `limit_hit` loudly), then matches against OPEN ledger rows
+  across ALL sessions (`repo_pulse.py`): the **exact tier** auto-absorbs only
+  on an explicit `Ledger: <32-hex>` PR-body marker (ledger UPDATE with PR
+  evidence via `ledger_update`; bare hex → proposal; `annotation_exists`
+  re-absorb guard protects reopened items), the **fuzzy tier** (headless
+  Haiku, echo-numbers-only fail-closed parse) is proposal-only in EVERY mode.
+  Store: `repo_pulse_runs`/`_annotations` (migration 0062,
+  `UNIQUE(tier,item_id,pr_number)` dedupe; CRUD `db/crud/repo_pulse.py`).
+  Cursor (`cursor.json`, gh-format mergedAt watermark) advances monotonically
+  ONLY on recorded ok. Proposals surface in the charter injection block
+  (≥ `inject_confidence_floor`, cap 3, confirm-hint) and resolve via
+  `session_ledger_update` → next reconcile sweep;
+  confirmed/(confirmed+rejected) is the fuzzy precision metric. Levers:
+  settings domain `repo_pulse` (off|propose_only|live, default live — the
+  lever gates only the reversible exact absorb; invalid degrades to
+  propose_only). Retention 45d via `scripts/prune_repo_pulse.py`
+  (disk-hygiene). Telemetry: `call_site_last_run` row `repo_pulse` (not a
+  critical site — failed runs self-heal by re-covering their window).
 
 ## 10. Learning & evaluation
 

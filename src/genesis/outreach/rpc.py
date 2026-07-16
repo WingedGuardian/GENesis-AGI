@@ -64,6 +64,7 @@ async def grow_via_pipeline(
     gib: int,
     mib: int,
     timeout_s: float,
+    cpu: int = 0,
 ) -> dict:
     """Approval-gated disk/RAM grow: ask the owner, and on APPROVE run the host
     guardian execute verb (which re-checks the due-diligence gate). Returns the
@@ -75,6 +76,8 @@ async def grow_via_pipeline(
     from genesis.guardian.provisioning.container import (
         coordinate_grow_disk,
         coordinate_grow_memory,
+        coordinate_grow_root,
+        coordinate_set_container_limits,
     )
     from genesis.observability.health import _load_guardian_remote_from_config
 
@@ -100,4 +103,10 @@ async def grow_via_pipeline(
         return await coordinate_grow_disk(remote, _ask, disk=disk, add_gib=gib)
     if kind == "memory":
         return await coordinate_grow_memory(remote, _ask, new_mib=mib)
-    return {"ok": False, "error": f"invalid kind {kind!r} (disk|memory)"}
+    if kind == "root":
+        return await coordinate_grow_root(remote, _ask, new_gb=gib)
+    if kind == "limits":
+        return await coordinate_set_container_limits(
+            remote, _ask, mem_mib=(mib or None), cpu=(cpu or None),
+        )
+    return {"ok": False, "error": f"invalid kind {kind!r} (disk|memory|root|limits)"}

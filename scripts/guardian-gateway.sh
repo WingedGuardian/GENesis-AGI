@@ -958,6 +958,58 @@ PYEOF
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 600 "$VENV_PY" -m genesis.guardian --storage-expand
         ;;
+    grow-root\ *)
+        # EXECUTE-ONLY (approval is the CALLER's job — the container approves via
+        # its own bot BEFORE calling). Local incus op: grow the container root
+        # device to <GB> total (incus resizes the thin LV + filesystem online).
+        # Whole-string bash regex (NOT grep) rejects anything but exactly "<GB>";
+        # a digits-only arg can never word-split into a flag-shaped argv token.
+        GB="${SSH_ORIGINAL_COMMAND#grow-root }"
+        if [[ ! "$GB" =~ ^[1-9][0-9]{0,3}$ ]]; then
+            echo '{"ok": false, "action": "grow-root", "error": "invalid arg (expected <GB total 1-9999>)"}' >&2
+            exit 1
+        fi
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "grow-root", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        # Skew guard (see host-profile): an old checkout has no --grow-root branch
+        # — the flag would fall through main()'s if-chain into run_check().
+        if [ ! -f "$INSTALL_DIR/src/genesis/guardian/grow_capacity.py" ]; then
+            echo '{"ok": false, "action": "grow-root", "error": "guardian src predates grow-root — run update to redeploy"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 300 "$VENV_PY" -m genesis.guardian --grow-root "$GB"
+        ;;
+    set-container-limits\ *)
+        # EXECUTE-ONLY (see grow-root). Raise the container cgroup caps
+        # (limits.memory / limits.cpu), grow-only, applied live. Whole-string
+        # regex: two tokens, each digits-or-'-' (no flag-shaped token can match).
+        ARGS="${SSH_ORIGINAL_COMMAND#set-container-limits }"
+        if [[ ! "$ARGS" =~ ^([1-9][0-9]{2,6}|-)\ ([1-9][0-9]{0,2}|-)$ ]]; then
+            echo '{"ok": false, "action": "set-container-limits", "error": "invalid args (expected <mem_mib|-> <cpu|->)"}' >&2
+            exit 1
+        fi
+        MEM="${ARGS%% *}"
+        CPU="${ARGS##* }"
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "set-container-limits", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        if [ ! -f "$INSTALL_DIR/src/genesis/guardian/grow_capacity.py" ]; then
+            echo '{"ok": false, "action": "set-container-limits", "error": "guardian src predates set-container-limits — run update to redeploy"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 60 "$VENV_PY" -m genesis.guardian --set-container-limits "$MEM" "$CPU"
+        ;;
     configure-provisioning\ *)
         # Land/refresh host provisioning config as a state-dir override
         # (provisioning.local.yaml — survives redeploys, never edits the tracked

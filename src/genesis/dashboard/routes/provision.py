@@ -50,6 +50,7 @@ async def provision_grow_rpc():
         disk=data.get("disk", "scsi1"),
         gib=int(data.get("gib", 0)),
         mib=int(data.get("mib", 0)),
+        cpu=int(data.get("cpu", 0)),
         timeout_s=float(data.get("timeout_seconds", 1800)),
     )
     return jsonify(result)

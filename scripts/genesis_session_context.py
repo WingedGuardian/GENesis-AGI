@@ -35,6 +35,7 @@ _SECRETS_PATH = Path(__file__).resolve().parent.parent / "secrets.env"
 if _SECRETS_PATH.is_file():
     try:
         from dotenv import load_dotenv
+
         load_dotenv(str(_SECRETS_PATH), override=False)
     except ImportError:
         pass
@@ -227,7 +228,7 @@ def main() -> None:
             f"- Thinking effort: {effort}\n\n"
             "Begin your first reply of this session with a one-line status header "
             f"on its own line — `[<model> / {effort}]` — then your normal reply. "
-            'Derive <model> from your environment\'s "You are powered by the model '
+            "Derive <model> from your environment's \"You are powered by the model "
             'named …" line (e.g. `Opus 4.8`), per CONVERSATION.md → Session Start. '
             "No emoji, no explanation.\n"
         )
@@ -317,9 +318,7 @@ def main() -> None:
         # the non-genesis-session branch). Writer: genesis.memory.open_loops.
         try:
             _inflight = _load_inflight_block()
-            for _chunk in _inflight_emission_chunks(
-                _inflight, ek_emitted=_ek_emitted, first=first
-            ):
+            for _chunk in _inflight_emission_chunks(_inflight, ek_emitted=_ek_emitted, first=first):
                 _emit(_chunk)
             if _inflight:
                 first = False
@@ -340,11 +339,20 @@ def main() -> None:
         except Exception:
             pass  # Charter is advisory — never block session start
 
+        # Repo-pulse worker (advisory): fire-and-forget the global merged-PR
+        # ↔ open-ledger matcher (PR-4a). The charter block above surfaces the
+        # PREVIOUS completed pulse's proposals — one boundary behind at
+        # worst, by design (a pulse takes ~1 gh round-trip + 1 Haiku call).
+        # The helper is fail-open end-to-end; pulse must never block session
+        # start.
+        _spawn_repo_pulse_worker(_hook_source)
+
         # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
         _status_file = Path.home() / ".genesis" / "status.json"
         if _status_file.exists():
             try:
                 import json as _json_status
+
                 status = _json_status.loads(_status_file.read_text())
                 resilience = status.get("resilience_state", "")
                 if resilience in ("critical", "degraded_critical"):
@@ -372,6 +380,7 @@ def main() -> None:
         if _fallback_file.exists():
             try:
                 import json as _json_fb
+
                 fb = _json_fb.loads(_fallback_file.read_text())
                 if isinstance(fb, dict) and fb.get("is_fallback"):
                     peer = fb.get("fallback") or "a roster peer"
@@ -405,14 +414,17 @@ def main() -> None:
     # 2.5. Active procedures (advisory, silent failure is correct)
     try:
         from genesis.learning.procedural.session_inject import load_active_procedures
+
         _db_path = Path.home() / "genesis" / "data" / "genesis.db"
         procedures = asyncio.run(load_active_procedures(_db_path))
         if procedures:
             if not first:
                 _emit("\n\n---\n\n")
-            _emit("## Active Procedures\n\n"
-                  "Learned procedures — follow these before inventing new approaches.\n\n"
-                  + procedures)
+            _emit(
+                "## Active Procedures\n\n"
+                "Learned procedures — follow these before inventing new approaches.\n\n"
+                + procedures
+            )
             first = False
     except Exception:
         pass  # Procedures are advisory; silent failure is correct
@@ -421,8 +433,10 @@ def main() -> None:
     if not is_genesis_session:
         try:
             import aiosqlite
+
             _db_path_l0 = Path.home() / "genesis" / "data" / "genesis.db"
             if _db_path_l0.exists():
+
                 async def _load_l0():
                     async with aiosqlite.connect(str(_db_path_l0), timeout=2) as db:
                         db.row_factory = aiosqlite.Row
@@ -431,6 +445,7 @@ def main() -> None:
                             "FROM code_modules GROUP BY package ORDER BY loc DESC"
                         )
                         return await cursor.fetchall()
+
                 rows = asyncio.run(_load_l0())
                 if rows:
                     lines = ["## Codebase\n"]
@@ -438,11 +453,15 @@ def main() -> None:
                     top = rows[:15]
                     rest = rows[15:]
                     for r in top:
-                        lines.append(f"- **{r['package']}**: {r['modules']} modules, {r['loc']} LOC")
+                        lines.append(
+                            f"- **{r['package']}**: {r['modules']} modules, {r['loc']} LOC"
+                        )
                     if rest:
-                        rest_mods = sum(r['modules'] for r in rest)
-                        rest_loc = sum(r['loc'] for r in rest)
-                        lines.append(f"- *{len(rest)} more packages*: {rest_mods} modules, {rest_loc} LOC")
+                        rest_mods = sum(r["modules"] for r in rest)
+                        rest_loc = sum(r["loc"] for r in rest)
+                        lines.append(
+                            f"- *{len(rest)} more packages*: {rest_mods} modules, {rest_loc} LOC"
+                        )
                     lines.append(
                         "\nUse `codebase_navigate` MCP tool for drill-down "
                         "(L1: modules in a package, L2: symbols in a module)."
@@ -494,6 +513,7 @@ def main() -> None:
     if _cap_file.exists():
         try:
             import json
+
             caps = json.loads(_cap_file.read_text())
             lines = ["## Genesis Capabilities\n"]
             for cname, cinfo in caps.items():
@@ -534,7 +554,9 @@ def main() -> None:
                     info = _json.loads(crash_file.read_text())
                     crash_entries.append(info)
                 except (ValueError, OSError):
-                    crash_entries.append({"server": crash_file.stem, "error": "unreadable crash file"})
+                    crash_entries.append(
+                        {"server": crash_file.stem, "error": "unreadable crash file"}
+                    )
             if crash_entries:
                 _emit("\n\n---\n\n")
                 _emit("## GENESIS ALERT: MCP Server Crashes\n\n")
@@ -647,10 +669,11 @@ def _load_resume_signal() -> str | None:
 
     # Clear the signal file so it doesn't repeat
     import contextlib
+
     with contextlib.suppress(OSError):
         signal_file.unlink()
 
-    msg = f"You signaled you wanted to return to a previous session (\"{signal}\")."
+    msg = f'You signaled you wanted to return to a previous session ("{signal}").'
     if session_id:
         msg += f" Session ID: {session_id}"
     msg += " Use bookmark_unshelve to find it, or `claude --resume <id>` to resume directly."
@@ -684,9 +707,7 @@ async def _load_cognitive_state(last_session_data: dict | None = None) -> str | 
         await db.close()
 
 
-def _inflight_emission_chunks(
-    inflight: str, *, ek_emitted: bool, first: bool
-) -> list[str]:
+def _inflight_emission_chunks(inflight: str, *, ek_emitted: bool, first: bool) -> list[str]:
     """Emission chunks for the in-flight block (pure — drives the foreground branch).
 
     Folds directly under Essential Knowledge with NO "---" divider when EK was
@@ -725,11 +746,10 @@ def _load_inflight_block() -> str:
 
         async def _run() -> str:
             from genesis.memory.open_loops import build_inflight_block
+
             async with aiosqlite.connect(str(db_path), timeout=2) as db:
                 db.row_factory = aiosqlite.Row
-                return await build_inflight_block(
-                    db, repo_root=repo_root, plans_dir=plans_dir
-                )
+                return await build_inflight_block(db, repo_root=repo_root, plans_dir=plans_dir)
 
         return asyncio.run(_run())
     except Exception:
@@ -746,9 +766,82 @@ def _charter_db_path() -> Path:
     return base / "data" / "genesis.db"
 
 
-def _load_charter_db(
-    session_id: str, db_path: Path | None
-) -> tuple[dict | None, list[dict]]:
+def _spawn_repo_pulse_worker(source: str) -> None:
+    """Fire-and-forget the detached repo-pulse worker (session-manager PR-4a).
+
+    GLOBAL, not per-session: the worker enumerates merged PRs since its own
+    cursor and matches them against open ledger rows across ALL sessions;
+    its internal 30-minute debounce makes redundant spawns exit in ~100ms
+    (spawn-then-exit, the ledger-shadow settings posture). Foreground
+    boundaries only, never on clear (/clear is a fresh start). Fail-open
+    end-to-end — cost to this hook is one Popen; a pulse cannot run in-hook
+    because one gh round-trip (30s budget) exceeds the hook's whole budget.
+    """
+    import subprocess
+
+    try:
+        if os.environ.get("GENESIS_REPO_PULSE_DISABLED") == "1":
+            return
+        if source == "clear":
+            return
+        script = Path(__file__).resolve().parent / "repo_pulse_worker.py"
+        err_log = Path.home() / ".genesis" / "session_awareness" / "repo_pulse_err.log"
+        err_log.parent.mkdir(parents=True, exist_ok=True)
+        with err_log.open("ab") as err_fh:
+            subprocess.Popen(  # noqa: S603 — fixed argv, sys.executable
+                [
+                    sys.executable,
+                    str(script),
+                    "--trigger",
+                    "session_start",
+                    # The hook's home-anchored DB resolution is the source of
+                    # truth: a worktree session's worker must not fall back
+                    # to genesis.env's repo-anchored default (worktree/data/
+                    # is a void — silent no-op coverage loss).
+                    "--db-path",
+                    str(_charter_db_path()),
+                ],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err_fh,
+            )
+    except Exception:
+        pass  # fail-open: pulse is advisory, session start is not
+
+
+def _pulse_floor() -> float:
+    """``inject_confidence_floor`` from the merged repo_pulse config (base
+    yaml ← ``~/.genesis/config/repo_pulse.local.yaml`` overlay), defaulting
+    to 0.7 on any damage. Flat local merge — this hook stays free of
+    genesis imports by design (dependency-light session start).
+    """
+    floor = 0.7
+    try:
+        import yaml
+
+        root = os.environ.get("GENESIS_REPO_ROOT", "")
+        base_dir = Path(root) if root else Path.home() / "genesis"
+        merged: dict = {}
+        for path in (
+            base_dir / "config" / "repo_pulse.yaml",
+            Path.home() / ".genesis" / "config" / "repo_pulse.local.yaml",
+        ):
+            try:
+                loaded = yaml.safe_load(path.read_text())
+                if isinstance(loaded, dict):
+                    merged.update(loaded)
+            except Exception:
+                continue
+        value = merged.get("inject_confidence_floor", floor)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1:
+            floor = float(value)
+    except Exception:
+        pass
+    return floor
+
+
+def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None, list[dict]]:
     """Charter row + open/in_progress ledger items from the canonical DB.
 
     Read-only WAL-aware connection (mode=ro — never immutable=1, which would
@@ -766,9 +859,7 @@ def _load_charter_db(
             return None, []
 
         async def _run() -> tuple[dict | None, list[dict]]:
-            async with aiosqlite.connect(
-                f"file:{db_file}?mode=ro", uri=True, timeout=2
-            ) as db:
+            async with aiosqlite.connect(f"file:{db_file}?mode=ro", uri=True, timeout=2) as db:
                 db.row_factory = aiosqlite.Row
                 cur = await db.execute(
                     "SELECT * FROM session_charters WHERE session_id = ?",
@@ -794,9 +885,22 @@ def _load_charter_db(
                     " WHERE session_id = ? GROUP BY status",
                     (session_id,),
                 )
-                charter["_ledger_counts"] = {
-                    r[0]: r[1] for r in await cur.fetchall()
-                }
+                charter["_ledger_counts"] = {r[0]: r[1] for r in await cur.fetchall()}
+                try:
+                    # Repo-pulse proposals (PR-4a) — own guard: pre-0062
+                    # installs have no pulse tables and the charter block
+                    # must render byte-identically without them.
+                    cur = await db.execute(
+                        "SELECT item_id, item_text, pr_number, pr_title"
+                        " FROM repo_pulse_annotations"
+                        " WHERE item_session_id = ? AND status = 'proposed'"
+                        " AND (confidence IS NULL OR confidence >= ?)"
+                        " ORDER BY observed_at DESC LIMIT 3",
+                        (session_id, _pulse_floor()),
+                    )
+                    charter["_pulse_proposals"] = [dict(r) for r in await cur.fetchall()]
+                except Exception:
+                    charter["_pulse_proposals"] = []
                 return charter, items
 
         return asyncio.run(_run())
@@ -871,6 +975,22 @@ def _charter_emission_block(
         for item in ledger:
             mark = "~" if item.get("status") == "in_progress" else " "
             lines.append(f"- [{mark}] {str(item.get('text', ''))[:120]} (id: {item.get('id', '')})")
+    proposals = charter.get("_pulse_proposals") or []
+    if proposals:
+        # Repo-pulse fuzzy/bare-hex proposals (PR-4a): the exact marker tier
+        # needs no line here — an absorb shrinks the open list above and its
+        # evidence column tells the story.
+        lines += ["", "**Pulse (proposed — confirm or ignore):**"]
+        for p in proposals:
+            # The hint carries the PR as evidence so a user-confirmed absorb
+            # reconciles to 'confirmed' (same-PR attribution guard) instead
+            # of 'superseded' — confirmed proposals ARE the precision metric.
+            lines.append(
+                f"- ~ '{str(p.get('item_text') or '')[:60]}' looks shipped by"
+                f" PR #{p.get('pr_number')} '{str(p.get('pr_title') or '')[:50]}'"
+                f" — confirm: session_ledger_update('{p.get('item_id') or ''}',"
+                f" status='absorbed', evidence='PR #{p.get('pr_number')}')"
+            )
     count = charter.get("compaction_count", 0)
     counts = charter.get("_ledger_counts") or {}
     footer = f"_Compactions: {count}"

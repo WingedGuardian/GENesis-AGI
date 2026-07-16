@@ -1,0 +1,49 @@
+# Repo-pulse annotator (session-manager PR-4a) — writable + LIVE.
+#
+# The detached worker spawned at SessionStart boundaries re-reads the merged
+# config (this file + ~/.genesis/config/repo_pulse.local.yaml) at startup,
+# so a settings_update("repo_pulse", {...}) or a hand edit takes effect at
+# the next session boundary — no restart.
+#
+# Master switch: false stops the worker before any lock/gh/DB work.
+enabled: true
+
+# Mode: off | propose_only | live
+#   off          — the worker exits immediately (no run row, cursor untouched)
+#   propose_only — de-escalation lever: exact `Ledger: <id>` marker hits are
+#                  recorded as PROPOSALS instead of auto-absorbed
+#   live         — (default) exact marker hits auto-absorb the cited open
+#                  ledger row (session_ledger UPDATE with PR evidence,
+#                  reversible via session_ledger_update)
+#
+# The FUZZY tier (Haiku judge over open items x merged PRs) is proposal-only
+# BY CONSTRUCTION in every mode — this lever never grants it write authority.
+#
+# Hook-level kill switch (separate lever): GENESIS_REPO_PULSE_DISABLED=1
+# stops the SessionStart hook from spawning the worker at all.
+mode: live
+
+# Global debounce: a worker exits silently (no run row) when the last pulse
+# finished under this many minutes ago. --force bypasses (manual/E2E runs).
+min_interval_minutes: 30
+
+# Enumeration window when no cursor exists yet (first run / cursor reset).
+# Never all-history: 7 days bounds the first fuzzy prompt to recent work.
+lookback_days: 7
+
+# gh pr list --limit. PR velocity is ~100/week here, so 200 covers ~2 weeks
+# of catch-up; hitting the limit records detail='limit_hit' LOUDLY on the
+# run row (GitHub search cannot sort by mergedAt ascending, so a capped
+# window is visible-and-recoverable, never a silent hole behind the cursor).
+max_prs: 200
+
+# Open ledger rows fed to the fuzzy judge (newest first). The exact tier
+# scans ALL open rows against ALL enumerated PRs regardless.
+max_items: 40
+
+# Fuzzy annotations stored per run (highest-confidence first).
+max_proposals_per_run: 10
+
+# Proposals below this confidence are stored but never surfaced at charter
+# injection (the dashboard still shows them).
+inject_confidence_floor: 0.7

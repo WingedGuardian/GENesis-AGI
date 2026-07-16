@@ -101,6 +101,20 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "repo_pulse": SettingsDomain(
+        name="repo_pulse",
+        description=(
+            "Repo-pulse annotator (session-manager PR-4a) — master `enabled` "
+            "+ `mode` off/propose_only/live plus debounce/enumeration knobs. "
+            "Live (default) lets exact `Ledger: <id>` marker hits auto-absorb "
+            "open ledger rows; propose_only de-escalates them to proposals. "
+            "The fuzzy tier is proposal-only in every mode. Read at worker "
+            "startup — takes effect next session boundary."
+        ),
+        config_filename="repo_pulse.yaml",
+        readonly=False,
+        needs_restart=False,  # each worker run is a fresh process
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -782,6 +796,34 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_repo_pulse(changes: dict) -> list[str]:
+    """Validate repo-pulse lever changes (see
+    genesis.session_awareness.repo_pulse_config)."""
+    from genesis.session_awareness.repo_pulse_config import _INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", *_INT_KNOBS, "inject_confidence_floor")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "inject_confidence_floor":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 <= value <= 1
+            ):
+                errors.append("'inject_confidence_floor' must be a number in 0..1")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 def _validate_memory_recall(changes: dict) -> list[str]:
     """Validate memory_recall changes (see genesis.memory.graph_expansion).
 
@@ -839,6 +881,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,
     "session_ledger_shadow": _validate_session_ledger_shadow,
+    "repo_pulse": _validate_repo_pulse,
     "cc_roster": _validate_cc_roster,
     "resilience": _validate_resilience,
     "inbox_monitor": _validate_inbox_monitor,

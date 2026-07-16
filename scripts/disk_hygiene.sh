@@ -93,6 +93,10 @@ main() {
     "$VENV_PY" "$REPO_DIR/scripts/prune_ledger_shadow.py" --days 45 \
         || echo "prune_ledger_shadow exited $?"
 
+    echo "--- repo pulse retention prune (>45d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
+        || echo "prune_repo_pulse exited $?"
+
     echo "=== genesis-disk-hygiene done ==="
 }
 

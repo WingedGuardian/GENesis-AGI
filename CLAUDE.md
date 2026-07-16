@@ -291,6 +291,12 @@ crystallizes or pivots. You are the first line of defense; ambient
 extraction (session-manager PR-3) is only the safety net. Plan files stay
 the working documents — ledger rows are the durable index, not a duplicate.
 
+**PR-body convention:** a PR that completes a ledger item cites
+`Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
+the repo-pulse worker auto-absorbs the row with PR evidence at the next
+session boundary. A bare id without the marker reads as context, not
+completion (proposal only).
+
 ## Knowledge Ingestion (Conversational Path)
 
 When a user shares a file path or URL in conversation:
@@ -306,6 +312,14 @@ When a user shares a file path or URL in conversation:
 - **Ego** (`src/genesis/ego/`) — Live. Two egos: user (CEO/Opus) and
   Genesis (COO/Sonnet). Review cadence manager and budget controls
   before adding call sites.
+- **Autonomous-CLI approval gate is MANDATORY & non-negotiable.** The gate
+  (`autonomy/cli_policy.py` `manual_approval_required` +
+  `AutonomousCliApprovalGate`) requires explicit user approval before ANY
+  autonomous background Claude Code session runs. Never remove, bypass,
+  auto-approve, or default-off it — and never *propose* doing so. Approval
+  friction is a lifecycle-hygiene bug to fix around the gate (re-ask cadence,
+  key stability), never a reason to weaken it. Same for ego-proposal approvals.
+  Standing user directive.
 - **GROUNDWORK tags** — `# GROUNDWORK(id): why` is intentional. Never delete.
 - **IntervalTrigger** — Resets on restart. Use `CronTrigger` for intervals >1h.
 
