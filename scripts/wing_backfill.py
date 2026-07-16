@@ -20,10 +20,11 @@ Writes go to BOTH stores or neither (cross-store mirror discipline):
 on the Qdrant payload for embedded rows (``fts5_only`` rows have no point).
 On a Qdrant failure the SQLite row is reverted and the id logged.
 
-NOTE: ``fts5_only`` rows get their SQLite metadata classified but are NOT yet
-reachable by wing-filtered recall — retrieval's ``_filter_scope_fts_only``
-checks only ``life_domain:`` in the FTS tag string, never ``wing:``. Those
-rows are reported separately so the outcome is not overstated.
+NOTE: ``fts5_only`` rows have no Qdrant point, so their wing lives only in
+SQLite metadata. As of the 2026-07-15 retrieval fix, wing-filtered recall
+reaches them via the authoritative ``memory_metadata.wing`` (retrieval's
+``_filter_scope_fts_only`` reads the wing projected by ``search_ranked``).
+They are still reported separately since they are metadata-only writes.
 
 Dry-run by default; ``--apply`` performs the writes. Idempotent: reclassified
 rows drop out of the backlog WHERE clause.
@@ -393,10 +394,10 @@ async def main(args: argparse.Namespace) -> int:
         qdrant = QdrantClient(url=qdrant_url(), timeout=10)
         result = await apply_updates(db, qdrant, rows_by_id, classifications)
         print(
-            f"APPLIED: {result['embedded']} rows updated in BOTH stores "
-            f"(wing-filter-reachable); {result['metadata_only']} fts5_only rows "
-            f"updated in metadata ONLY (not yet wing-filter-reachable — see "
-            f"follow-up); {result['failed']} reverted on Qdrant failure"
+            f"APPLIED: {result['embedded']} rows updated in BOTH stores; "
+            f"{result['metadata_only']} fts5_only rows updated in metadata "
+            f"(reachable via authoritative wing); "
+            f"{result['failed']} reverted on Qdrant failure"
         )
         return 0 if result["failed"] == 0 else 1
     finally:

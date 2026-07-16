@@ -29,10 +29,8 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   batch pass through a new `wing_backfill` routing call site for the rows
   keywords can't reach — and writes wing/room/life-domain to both SQLite
   metadata and the Qdrant payload (with revert-on-failure so the stores never
-  diverge). Embedded rows become reachable by wing-filtered recall; fts5_only
-  rows get their metadata classified but remain wing-unreachable until the
-  retrieval-side gap is closed (reported separately, not overstated). Dry-run
-  by default; the bulk write is gated on a human-reviewed sample.
+  diverge), making them reachable by wing-filtered recall. Dry-run by default;
+  the bulk write is gated on a human-reviewed sample.
 
 - **Genesis survives — and now auto-recovers from — a wedged network.** Under
   heavy memory pressure the container's networking daemon can hit kernel
@@ -132,6 +130,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   live processes with no session row at all.
 
 ### Fixed
+
+- **Wing-filtered memory recall stops missing memories it should return.**
+  Asking for memories in a specific wing (e.g. `infrastructure`) silently
+  under-returned two kinds of rows: memories with no vector (FTS-only) were
+  dropped outright because the wing filter had no wing to check against them,
+  and thousands of older embedded memories were excluded because their vector
+  carried no wing tag even though their record did. Recall now checks each
+  memory's authoritative wing (from its stored record) rather than a
+  denormalized copy, so FTS-only rows are reachable; and a one-shot supervised
+  re-sync (`scripts/wing_payload_resync.py`) backfills the missing wing tag
+  onto ~5.3K older vectors so vector-based wing recall returns them too.
+  Dry-run by default; the bulk re-sync is gated on a human-reviewed sample.
 
 - **Genesis's inner monologue now knows who each thought is about.** Every
   ambient micro-reflection used to be tagged as relevant to "both" the user
