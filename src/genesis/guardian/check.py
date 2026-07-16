@@ -83,7 +83,7 @@ def _setup_logging() -> None:
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
             log_dir / "guardian.log",
-            maxBytes=1_000_000,   # 1 MB
+            maxBytes=1_000_000,  # 1 MB
             backupCount=3,
             encoding="utf-8",
         )
@@ -111,6 +111,7 @@ def _build_dispatcher(config: GuardianConfig) -> AlertDispatcher:
     # Treat each source as atomic — all-or-nothing, never mix sources
     if not token or not chat_id:
         from genesis.guardian.credential_bridge import load_telegram_credentials
+
         creds = load_telegram_credentials(config.state_dir)
         bridge_token = creds.get("TELEGRAM_BOT_TOKEN", "")
         bridge_chat = creds.get("TELEGRAM_CHAT_ID", "")
@@ -130,11 +131,13 @@ def _build_dispatcher(config: GuardianConfig) -> AlertDispatcher:
             thread_id = thread_id or secrets.get("TELEGRAM_THREAD_ID", "")
 
     if token and chat_id:
-        dispatcher.add_channel(TelegramAlertChannel(
-            bot_token=token,
-            chat_id=chat_id,
-            thread_id=thread_id or None,
-        ))
+        dispatcher.add_channel(
+            TelegramAlertChannel(
+                bot_token=token,
+                chat_id=chat_id,
+                thread_id=thread_id or None,
+            )
+        )
     else:
         logger.warning("No Telegram credentials — alerts will only go to journal")
 
@@ -159,7 +162,8 @@ def _alert_from_queue_entry(entry: dict) -> Alert:
 
 
 async def _drain_host_alert_queue(
-    config: GuardianConfig, dispatcher: AlertDispatcher,
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
 ) -> None:
     """Replay queued host alerts through the dispatcher, then bound the queue.
 
@@ -175,7 +179,8 @@ async def _drain_host_alert_queue(
         # Host has no dedup layer: dispatcher.send returns True iff a channel
         # delivered → terminal (unlink); False → still down → keep + stop.
         return await dispatcher.send(
-            _alert_from_queue_entry(entry), allow_queue_fallback=False,
+            _alert_from_queue_entry(entry),
+            allow_queue_fallback=False,
         )
 
     try:
@@ -214,6 +219,7 @@ def _build_provisioning_adapter(config: GuardianConfig):
 
     def _from_bridge() -> tuple[str, str]:
         from genesis.guardian.credential_bridge import load_provisioning_credentials
+
         creds = load_provisioning_credentials(config.state_dir)
         return (
             creds.get("PROXMOX_AUDIT_TOKEN", ""),
@@ -242,6 +248,7 @@ def _build_provisioning_adapter(config: GuardianConfig):
         return None
 
     from genesis.guardian.provisioning.proxmox import ProxmoxAdapter
+
     return ProxmoxAdapter(pc, audit_token=audit, provision_token=provision)
 
 
@@ -267,7 +274,10 @@ async def _maybe_propose_provisioning(
 
     try:
         await maybe_propose_pool_grow(
-            config, adapter, dispatcher, ProvisioningLedger(config.state_dir),
+            config,
+            adapter,
+            dispatcher,
+            ProvisioningLedger(config.state_dir),
         )
     except Exception:
         logger.warning("autonomous pool-grow proposal failed", exc_info=True)
@@ -279,17 +289,25 @@ async def _write_guardian_heartbeat(config: GuardianConfig) -> None:
     Uses stdin pipe instead of heredoc to avoid shell injection.
     """
     uptime_s = (datetime.now(UTC) - _STARTED_AT).total_seconds()
-    heartbeat = json.dumps({
-        "guardian_alive": True,
-        "timestamp": datetime.now(UTC).isoformat(),
-        "uptime_s": round(uptime_s),
-    })
+    heartbeat = json.dumps(
+        {
+            "guardian_alive": True,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "uptime_s": round(uptime_s),
+        }
+    )
 
     try:
         # Use stdin pipe — avoids heredoc injection risk
         proc = await asyncio.create_subprocess_exec(
-            "incus", "exec", config.container_name, "--",
-            "su", "-", "ubuntu", "-c",
+            "incus",
+            "exec",
+            config.container_name,
+            "--",
+            "su",
+            "-",
+            "ubuntu",
+            "-c",
             "mkdir -p ~/.genesis && cat > ~/.genesis/guardian_heartbeat.json",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -369,13 +387,25 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # block on an APPROVE for up to approval_timeout_s — liveness must not
         # hinge on that optional, bounded wait completing.
         await _write_guardian_heartbeat(config)
+        # Container-swap invariant (silent-skip class): host-setup sets
+        # limits.memory.swap at creation, but an install that advances via bare
+        # git pull never re-runs host-setup — reconcile the knob (persistent
+        # config + live cgroup) on observed state so a memory spike degrades
+        # into swap pressure instead of the D-state OOM-thrash wedge. Runs
+        # BEFORE the storage-pool block: that path can wait up to
+        # approval_timeout_s on a Telegram APPROVE, and a box wedging on
+        # missing swap (the pool-crit + genesis_down case) must get the live
+        # cgroup fix at the START of the tick, not after a 30-minute wait. Two
+        # cheap reads on the healthy path.
+        await _check_container_swap_and_alert(config, dispatcher)
         # Storage-pool monitoring runs every cycle regardless of state — a
         # filling thin pool is the exact silent failure that caused the outage.
         # genesis_down gates the autonomous provisioning propose: only when
         # Genesis is CONFIRMED_DEAD is the main bot not polling, so only then
         # can the guardian read an APPROVE via getUpdates without a 409.
         await _check_storage_pool_and_alert(
-            config, dispatcher,
+            config,
+            dispatcher,
             genesis_down=(sm.current_state == GuardianState.CONFIRMED_DEAD),
         )
         # Guardian-side RAM tiered alert (E-rest PR-E1). The container's own RAM
@@ -396,12 +426,6 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         # published bundle to a host-only dir + WARN if the archived bundle goes
         # stale. Host-side file ops only, independent of the container verdict.
         await _check_repo_bundle_and_alert(config, dispatcher)
-        # Container-swap invariant (silent-skip class): host-setup sets
-        # limits.memory.swap at creation, but an install that advances via bare
-        # git pull never re-runs host-setup — reconcile the knob (persistent
-        # config + live cgroup) on observed state so a memory spike degrades
-        # into swap pressure instead of the D-state OOM-thrash wedge.
-        await _check_container_swap_and_alert(config, dispatcher)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)
@@ -424,7 +448,9 @@ async def _check_cycle(
 
     logger.info(
         "State: %s → %s (%s)",
-        transition.old_state, transition.new_state, transition.reason,
+        transition.old_state,
+        transition.new_state,
+        transition.reason,
     )
 
     state = sm.current_state
@@ -442,11 +468,13 @@ async def _check_cycle(
                 # approval / self-heal paths clear the flag at their own
                 # recovery point + emit their own success alert, so
                 # down_alert_sent is already False here for them — no double-ping.
-                await dispatcher.send(Alert(
-                    severity=AlertSeverity.INFO,
-                    title="Genesis recovered",
-                    body="Genesis is back online — all health signals passing.",
-                ))
+                await dispatcher.send(
+                    Alert(
+                        severity=AlertSeverity.INFO,
+                        title="Genesis recovered",
+                        body="Genesis is back online — all health signals passing.",
+                    )
+                )
             sm.clear_down_alert_sent()
         await _handle_healthy(config, snapshots)
 
@@ -461,7 +489,12 @@ async def _check_cycle(
 
     elif state == GuardianState.SURVEYING:
         await _handle_surveying(
-            config, sm, dispatcher, diagnosis_engine, recovery_engine, snapshot,
+            config,
+            sm,
+            dispatcher,
+            diagnosis_engine,
+            recovery_engine,
+            snapshot,
         )
 
     elif state == GuardianState.CONTACTING_GENESIS:
@@ -471,24 +504,34 @@ async def _check_cycle(
 
     elif state == GuardianState.AWAITING_SELF_HEAL:
         await _handle_awaiting_self_heal(
-            config, sm, dispatcher, diagnosis_engine, recovery_engine,
+            config,
+            sm,
+            dispatcher,
+            diagnosis_engine,
+            recovery_engine,
             snapshot,
         )
 
     elif state == GuardianState.CONFIRMED_DEAD:
         if transition.action_needed:
             await _handle_confirmed_dead(
-                config, sm, dispatcher, diagnosis_engine, recovery_engine,
+                config,
+                sm,
+                dispatcher,
+                diagnosis_engine,
+                recovery_engine,
             )
 
     elif state == GuardianState.PAUSED:
         if transition.action_needed:
             # Pause reminder or infrastructure failure while paused
-            await dispatcher.send(Alert(
-                severity=AlertSeverity.INFO,
-                title="Genesis pause reminder",
-                body=transition.reason,
-            ))
+            await dispatcher.send(
+                Alert(
+                    severity=AlertSeverity.INFO,
+                    title="Genesis pause reminder",
+                    body=transition.reason,
+                )
+            )
 
     elif state in (GuardianState.RECOVERING, GuardianState.RECOVERED):
         # These are transient states managed by the recovery engine
@@ -578,7 +621,8 @@ _POOL_TIER_SEVERITY = {
 
 
 async def _check_credential_integrity_and_alert(
-    config: GuardianConfig, dispatcher: AlertDispatcher,
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
 ) -> None:
     """Guardian-side credential-integrity backstop (delegates to cred_watch).
 
@@ -586,13 +630,15 @@ async def _check_credential_integrity_and_alert(
     alert (container-down is the state machine's job)."""
     try:
         from genesis.guardian.cred_watch import check_credential_integrity_and_alert
+
         await check_credential_integrity_and_alert(config, dispatcher)
     except Exception:
         logger.warning("credential-integrity watch failed", exc_info=True)
 
 
 async def _check_container_swap_and_alert(
-    config: GuardianConfig, dispatcher: AlertDispatcher,
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
 ) -> None:
     """Guardian-side container-swap invariant reconciler (delegates to swap_watch).
 
@@ -602,13 +648,15 @@ async def _check_container_swap_and_alert(
     Never raises into the tick."""
     try:
         from genesis.guardian.swap_watch import check_container_swap_and_alert
+
         await check_container_swap_and_alert(config, dispatcher)
     except Exception:
         logger.warning("container-swap watch failed", exc_info=True)
 
 
 async def _check_container_git_and_alert(
-    config: GuardianConfig, dispatcher: AlertDispatcher,
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
 ) -> None:
     """Guardian-side git-health watch (delegates to git_watch).
 
@@ -617,13 +665,15 @@ async def _check_container_git_and_alert(
     awareness-loop alerting down. Never raises into the tick."""
     try:
         from genesis.guardian.git_watch import check_container_git_and_alert
+
         await check_container_git_and_alert(config, dispatcher)
     except Exception:
         logger.warning("git-health watch failed", exc_info=True)
 
 
 async def _check_repo_bundle_and_alert(
-    config: GuardianConfig, dispatcher: AlertDispatcher,
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
 ) -> None:
     """Guardian-side offline-bundle archive + freshness watch (delegates to
     bundle_watch). Pure host-side file ops — archives the newest container-
@@ -631,6 +681,7 @@ async def _check_repo_bundle_and_alert(
     raises into the tick."""
     try:
         from genesis.guardian.bundle_watch import check_repo_bundle_and_alert
+
         await check_repo_bundle_and_alert(config, dispatcher)
     except Exception:
         logger.warning("repo-bundle watch failed", exc_info=True)
@@ -645,6 +696,7 @@ async def _check_memory_and_alert(
     pressure it detects. Never raises into the tick."""
     try:
         from genesis.guardian.memory_watch import check_memory_and_alert
+
         await check_memory_and_alert(config, dispatcher)
     except Exception:
         logger.warning("RAM watch failed", exc_info=True)
@@ -726,10 +778,14 @@ async def _check_storage_pool_and_alert(
     new_alert_at = now if decision.should_alert else last_alert_at
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps({
-            "tier": tier,
-            "last_alert_at": new_alert_at.isoformat() if new_alert_at else None,
-        }))
+        state_file.write_text(
+            json.dumps(
+                {
+                    "tier": tier,
+                    "last_alert_at": new_alert_at.isoformat() if new_alert_at else None,
+                }
+            )
+        )
     except OSError:
         logger.warning("failed to persist pool alert state", exc_info=True)
 
@@ -757,7 +813,9 @@ async def _handle_confirming(
 
     logger.info(
         "Recheck: %s → %s (%s)",
-        transition.old_state, transition.new_state, transition.reason,
+        transition.old_state,
+        transition.new_state,
+        transition.reason,
     )
 
 
@@ -800,7 +858,10 @@ async def _handle_surveying(
     if response.acknowledged:
         logger.info(
             "Genesis responded: status=%s action=%s eta=%ds context=%s",
-            response.status, response.action, response.eta_s, response.context,
+            response.status,
+            response.action,
+            response.eta_s,
+            response.context,
         )
 
         if response.status == DialogueStatus.HANDLING:
@@ -811,7 +872,8 @@ async def _handle_surveying(
             )
             logger.info(
                 "Genesis is handling it: %s (ETA: %ds)",
-                response.action, response.eta_s,
+                response.action,
+                response.eta_s,
             )
             return
 
@@ -826,12 +888,17 @@ async def _handle_surveying(
 
     else:
         logger.warning(
-            "Genesis unreachable or errored: %s", response.context,
+            "Genesis unreachable or errored: %s",
+            response.context,
         )
 
     # Step 2: Genesis can't help — full diagnosis and recovery pipeline
     await _proceed_to_diagnosis(
-        config, sm, dispatcher, diagnosis_engine, recovery_engine,
+        config,
+        sm,
+        dispatcher,
+        diagnosis_engine,
+        recovery_engine,
     )
 
 
@@ -861,11 +928,13 @@ async def _handle_awaiting_self_heal(
 
     if current == GuardianState.HEALTHY:
         logger.info("Genesis self-healed successfully")
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.INFO,
-            title="Genesis self-healed",
-            body=f"Genesis fixed itself: {sm.state.dialogue_action}",
-        ))
+        await dispatcher.send(
+            Alert(
+                severity=AlertSeverity.INFO,
+                title="Genesis self-healed",
+                body=f"Genesis fixed itself: {sm.state.dialogue_action}",
+            )
+        )
         return
 
     # Re-query Genesis for updated Sentinel state on each tick.
@@ -899,7 +968,11 @@ async def _handle_awaiting_self_heal(
             sm.state.dialogue_action,
         )
         await _proceed_to_diagnosis(
-            config, sm, dispatcher, diagnosis_engine, recovery_engine,
+            config,
+            sm,
+            dispatcher,
+            diagnosis_engine,
+            recovery_engine,
         )
         return
 
@@ -919,12 +992,14 @@ async def _proceed_to_diagnosis(
     recovery_engine: RecoveryEngine,
 ) -> None:
     """Full diagnosis and recovery pipeline — Genesis is truly down."""
-    await dispatcher.send(Alert(
-        severity=AlertSeverity.CRITICAL,
-        title="Genesis down — running diagnostics",
-        body="Genesis could not be contacted or could not self-heal. "
-             "Running full diagnostics...",
-    ))
+    await dispatcher.send(
+        Alert(
+            severity=AlertSeverity.CRITICAL,
+            title="Genesis down — running diagnostics",
+            body="Genesis could not be contacted or could not self-heal. "
+            "Running full diagnostics...",
+        )
+    )
     # GUARD-R2-01: this episode's "down" alert has now fired — subsequent
     # CONFIRMED_DEAD ticks must NOT re-diagnose/re-alert (no 30s storm).
     sm.mark_down_alert_sent()
@@ -969,7 +1044,11 @@ async def _proceed_to_diagnosis(
     sm.set_confirmed_dead()
 
     await _execute_recovery_with_approval(
-        config, sm, dispatcher, recovery_engine, diagnosis,
+        config,
+        sm,
+        dispatcher,
+        recovery_engine,
+        diagnosis,
     )
 
 
@@ -1001,32 +1080,36 @@ async def _handle_cc_resolved(
         if sm.current_state != GuardianState.CONFIRMED_DEAD:
             sm.set_confirmed_dead()
         await _execute_recovery_with_approval(
-            config, sm, dispatcher, recovery_engine, diagnosis,
+            config,
+            sm,
+            dispatcher,
+            recovery_engine,
+            diagnosis,
         )
         return
 
     # Defensive: callers always pass recovery_engine, but never exit passively.
-    actions_str = (
-        ", ".join(diagnosis.actions_taken) if diagnosis.actions_taken else "unknown"
-    )
+    actions_str = ", ".join(diagnosis.actions_taken) if diagnosis.actions_taken else "unknown"
     cname = config.container_name
-    await dispatcher.send(Alert(
-        severity=AlertSeverity.CRITICAL,
-        title="Genesis down — CC claimed resolved (no approval pipeline)",
-        body=(
-            f"CC diagnosed: {diagnosis.likely_cause}\n"
-            f"CC reported steps: {actions_str}\n"
-            "CC claimed 'resolved' under propose-only mode — NOT trusted.\n"
-            "Approval-gated recovery pipeline unavailable.\n\n"
-            "IMMEDIATE ACTION REQUIRED:\n"
-            "1. SSH to host VM\n"
-            "2. Check Guardian log: ~/.local/state/genesis-guardian/guardian.log\n"
-            "3. Review latest diagnosis: ls -t "
-            "~/.local/state/genesis-guardian/shared/findings/ | head -1\n"
-            f"4. Manual restart: incus exec {cname} -- "
-            f"su - ubuntu -c 'systemctl --user restart genesis-server'"
-        ),
-    ))
+    await dispatcher.send(
+        Alert(
+            severity=AlertSeverity.CRITICAL,
+            title="Genesis down — CC claimed resolved (no approval pipeline)",
+            body=(
+                f"CC diagnosed: {diagnosis.likely_cause}\n"
+                f"CC reported steps: {actions_str}\n"
+                "CC claimed 'resolved' under propose-only mode — NOT trusted.\n"
+                "Approval-gated recovery pipeline unavailable.\n\n"
+                "IMMEDIATE ACTION REQUIRED:\n"
+                "1. SSH to host VM\n"
+                "2. Check Guardian log: ~/.local/state/genesis-guardian/guardian.log\n"
+                "3. Review latest diagnosis: ls -t "
+                "~/.local/state/genesis-guardian/shared/findings/ | head -1\n"
+                f"4. Manual restart: incus exec {cname} -- "
+                f"su - ubuntu -c 'systemctl --user restart genesis-server'"
+            ),
+        )
+    )
 
 
 async def _handle_confirmed_dead(
@@ -1103,13 +1186,17 @@ async def _handle_confirmed_dead(
             actions_taken=diagnosis.actions_taken,
             outcome=diagnosis.outcome,
             reasoning=f"Max recovery attempts ({sm.state.recovery_attempts}) exceeded. "
-                      + diagnosis.reasoning,
+            + diagnosis.reasoning,
             source=diagnosis.source,
             cc_failure_reason=diagnosis.cc_failure_reason,
         )
 
     await _execute_recovery_with_approval(
-        config, sm, dispatcher, recovery_engine, diagnosis,
+        config,
+        sm,
+        dispatcher,
+        recovery_engine,
+        diagnosis,
     )
 
 
@@ -1181,20 +1268,23 @@ async def _wait_for_gate_keyword(
             logger.warning(
                 "getUpdates 409 Conflict at %s gate (consecutive=%d) — main bot "
                 "is polling the same token",
-                gate_label, consecutive_conflicts,
+                gate_label,
+                consecutive_conflicts,
             )
             if consecutive_conflicts >= _APPROVAL_CONFLICT_ALERT_THRESHOLD:
-                await dispatcher.send(Alert(
-                    severity=AlertSeverity.WARNING,
-                    title="Cannot confirm main bot is down (getUpdates conflict)",
-                    body=(
-                        "Guardian is trying to read your APPROVE/DENY reply, but "
-                        "the main Genesis Telegram bot is actively polling the "
-                        "same token — which means it may still be alive. Manual "
-                        "check needed: verify whether Genesis is actually down "
-                        "before approving recovery."
-                    ),
-                ))
+                await dispatcher.send(
+                    Alert(
+                        severity=AlertSeverity.WARNING,
+                        title="Cannot confirm main bot is down (getUpdates conflict)",
+                        body=(
+                            "Guardian is trying to read your APPROVE/DENY reply, but "
+                            "the main Genesis Telegram bot is actively polling the "
+                            "same token — which means it may still be alive. Manual "
+                            "check needed: verify whether Genesis is actually down "
+                            "before approving recovery."
+                        ),
+                    )
+                )
                 consecutive_conflicts = 0  # re-arm; don't spam every loop
             await asyncio.sleep(_APPROVAL_CONFLICT_BACKOFF_S)
             waited_s += _APPROVAL_CONFLICT_BACKOFF_S
@@ -1209,9 +1299,9 @@ async def _wait_for_gate_keyword(
         waited_s += 25.0
         if waited_s - last_liveness_log >= _APPROVAL_LIVENESS_LOG_S:
             logger.info(
-                "Still awaiting %s approval reply (~%.0f min elapsed, Genesis "
-                "still down)",
-                gate_label, waited_s / 60.0,
+                "Still awaiting %s approval reply (~%.0f min elapsed, Genesis still down)",
+                gate_label,
+                waited_s / 60.0,
             )
             last_liveness_log = waited_s
 
@@ -1254,21 +1344,23 @@ async def _execute_recovery_with_approval(
             "alerting for manual intervention instead of auto-recovering",
         )
         cname = config.container_name
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.CRITICAL,
-            title="Genesis down — approval gate unavailable (no Telegram)",
-            body=(
-                f"Proposed action: {diagnosis.recommended_action.value}\n"
-                f"Cause: {diagnosis.likely_cause}\n"
-                f"Confidence: {diagnosis.confidence_pct}%\n\n"
-                "Guardian cannot read an approval reply (no Telegram channel "
-                "configured) and will NOT auto-recover. Manual action:\n"
-                f"1. incus exec {cname} -- su - ubuntu -c "
-                f"'systemctl --user restart genesis-server'\n"
-                "2. Or re-trigger Guardian: systemctl --user restart "
-                "genesis-guardian.timer"
-            ),
-        ))
+        await dispatcher.send(
+            Alert(
+                severity=AlertSeverity.CRITICAL,
+                title="Genesis down — approval gate unavailable (no Telegram)",
+                body=(
+                    f"Proposed action: {diagnosis.recommended_action.value}\n"
+                    f"Cause: {diagnosis.likely_cause}\n"
+                    f"Confidence: {diagnosis.confidence_pct}%\n\n"
+                    "Guardian cannot read an approval reply (no Telegram channel "
+                    "configured) and will NOT auto-recover. Manual action:\n"
+                    f"1. incus exec {cname} -- su - ubuntu -c "
+                    f"'systemctl --user restart genesis-server'\n"
+                    "2. Or re-trigger Guardian: systemctl --user restart "
+                    "genesis-guardian.timer"
+                ),
+            )
+        )
         return
 
     failed_signals = [s.name for s in (await collect_all_signals(config)).failed_signals]
@@ -1285,15 +1377,17 @@ async def _execute_recovery_with_approval(
     gate1_msg_id = await telegram_channel.send_text(gate1_text)
     if gate1_msg_id is None:
         logger.error("Failed to send Gate 1 prompt — cannot run approval gate")
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.CRITICAL,
-            title="Genesis down — could not send approval prompt",
-            body=(
-                "Guardian could not send the Telegram approval prompt. "
-                f"Proposed action: {diagnosis.recommended_action.value}. "
-                "No automated recovery performed."
-            ),
-        ))
+        await dispatcher.send(
+            Alert(
+                severity=AlertSeverity.CRITICAL,
+                title="Genesis down — could not send approval prompt",
+                body=(
+                    "Guardian could not send the Telegram approval prompt. "
+                    f"Proposed action: {diagnosis.recommended_action.value}. "
+                    "No automated recovery performed."
+                ),
+            )
+        )
         # A FAILED send is not a successful "alert once" — the user never saw a
         # prompt. Clear the episode flag so the next cycle retries delivery
         # rather than going permanently silent on a transient Telegram failure.
@@ -1301,7 +1395,12 @@ async def _execute_recovery_with_approval(
         return
 
     kw = await _wait_for_gate_keyword(
-        config, sm, dispatcher, telegram_channel, gate1_msg_id, "Gate 1 (investigate)",
+        config,
+        sm,
+        dispatcher,
+        telegram_channel,
+        gate1_msg_id,
+        "Gate 1 (investigate)",
     )
 
     if kw == "__RECOVERED__":
@@ -1366,8 +1465,10 @@ async def _execute_recovery_with_approval(
 
     logger.info(
         "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
-        diagnosis.likely_cause, diagnosis.confidence_pct,
-        diagnosis.recommended_action.value, diagnosis.source,
+        diagnosis.likely_cause,
+        diagnosis.confidence_pct,
+        diagnosis.recommended_action.value,
+        diagnosis.source,
     )
 
     # Persist the proposed diagnosis to the shared mount for Genesis to ingest.
@@ -1398,20 +1499,27 @@ async def _execute_recovery_with_approval(
     gate2_msg_id = await telegram_channel.send_text(gate2_text)
     if gate2_msg_id is None:
         logger.error("Failed to send Gate 2 prompt — no recovery executed")
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.CRITICAL,
-            title="Genesis down — could not send action-approval prompt",
-            body=(
-                f"Proposed action: {diagnosis.recommended_action.value}. "
-                "Guardian could not send the Telegram prompt. No recovery performed."
-            ),
-        ))
+        await dispatcher.send(
+            Alert(
+                severity=AlertSeverity.CRITICAL,
+                title="Genesis down — could not send action-approval prompt",
+                body=(
+                    f"Proposed action: {diagnosis.recommended_action.value}. "
+                    "Guardian could not send the Telegram prompt. No recovery performed."
+                ),
+            )
+        )
         # Failed delivery ≠ "already alerted" — let the next cycle retry.
         sm.clear_down_alert_sent()
         return
 
     kw2 = await _wait_for_gate_keyword(
-        config, sm, dispatcher, telegram_channel, gate2_msg_id, "Gate 2 (action)",
+        config,
+        sm,
+        dispatcher,
+        telegram_channel,
+        gate2_msg_id,
+        "Gate 2 (action)",
     )
 
     if kw2 == "__RECOVERED__":

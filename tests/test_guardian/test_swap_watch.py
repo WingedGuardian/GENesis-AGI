@@ -132,6 +132,26 @@ async def test_live_zero_activates_and_info_alerts(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_live_heal_with_unverified_config_warns_not_info(tmp_path):
+    """config read fails but the cgroup is still writable and at 0: activating
+    live must NOT claim a clean reconcile — the persistent knob is unverified
+    and a restart can revert swap to off, so this pages a WARNING, not INFO."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (1, "", "socket error")})  # config read fails
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(return_value=True)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]  # no set attempted (read failed)
+    assert _sent_severities(d) == [AlertSeverity.WARNING]
+    body = d.send.call_args.args[0].body
+    assert "persistent" in body and "revert" in body
+
+
+@pytest.mark.asyncio
 async def test_live_write_failure_warns_once_then_throttles(tmp_path):
     """A failed heal pages WARNING, but not again inside the throttle window."""
     cfg = _Cfg(tmp_path)

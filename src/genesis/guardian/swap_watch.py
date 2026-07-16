@@ -113,6 +113,7 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     except Exception:
         logger.warning("swap_watch: incus config get failed", exc_info=True)
         rc, stdout = 1, ""
+    config_verified = rc == 0
     if rc == 0:
         value = stdout.strip().lower()
         if value != "true":
@@ -144,11 +145,25 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     current = await read_swap_max(container)
     if current == "0":
         if await activate_swap_max(container):
-            healed.append("memory.swap.max: 0 → max (live, no restart needed)")
+            if config_verified:
+                healed.append("memory.swap.max: 0 → max (live, no restart needed)")
+            else:
+                # Live-healed, but the config read failed so the PERSISTENT knob
+                # was never verified/set — a restart can revert memory.swap.max
+                # to 0. Don't declare a clean "reconciled"; surface it so the
+                # persistent half gets fixed. (Config set failing outright
+                # already lands in problems above; this covers the read failing
+                # while the cgroup was still writable — e.g. an incus socket
+                # hiccup with the container running.)
+                problems.append(
+                    "activated swap live (memory.swap.max 0 → max) but could NOT "
+                    "verify the persistent limits.memory.swap knob (incus config "
+                    "read failed) — a container restart may revert swap to off",
+                )
         else:
             problems.append(
                 "live cgroup write failed — swap stays off until the next "
-                "container start (config is set, so a restart will apply it)",
+                "container start (set the persistent knob and restart to apply)",
             )
 
     if healed:
