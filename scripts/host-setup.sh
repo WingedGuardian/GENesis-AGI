@@ -559,6 +559,12 @@ echo "  + boot.autostart enabled (container survives host reboots)"
 # block so re-running host-setup retrofits existing containers too.
 incus config set "$CONTAINER_NAME" limits.memory.swap true
 echo "  + limits.memory.swap enabled (memory spikes degrade into swap, not thrash)"
+# incus applies limits.memory.swap only at container START, so the running
+# container (freshly created above, or an existing one being retrofitted) still
+# has memory.swap.max=0 until a restart — the setting silently no-ops meanwhile.
+# Activate it live now so swap works without a disruptive restart.
+. "$(cd "$(dirname "$0")" && pwd)/lib/container_swap.sh"
+container_swap_activate_live "$CONTAINER_NAME"
 if [ -z "$(swapon --noheadings --show 2>/dev/null)" ]; then
     echo "  WARNING: this host has NO swap — limits.memory.swap has nothing to swap to."
     echo "           Add host swap (swapfile or LV); even a few GiB turns the container's"

@@ -133,6 +133,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Enabling container swap no longer waits for a restart to take effect.**
+  Host setup lets the container's memory cgroup spill into host swap under
+  pressure, so a memory spike degrades into swapping instead of thrashing the
+  whole box into a wedge. But that setting only took effect the next time the
+  container *started*, so retrofitting an already-running install looked done
+  while swap stayed off until a reboot — leaving the box exposed to the exact
+  OOM wedge the setting exists to prevent. Setup now activates it live on the
+  running container, so the protection is real immediately.
+
 - **Genesis's inner monologue now knows who each thought is about.** Every
   ambient micro-reflection used to be tagged as relevant to "both" the user
   and Genesis — the tag was computed from which sensors *ran* (all of them,
