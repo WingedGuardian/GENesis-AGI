@@ -338,7 +338,7 @@ async def test_user_model_delta_dedup(db):
 
 
 async def test_delta_confidence_gate(db):
-    """Deltas below MIN_DELTA_CONFIDENCE (0.90) are filtered out."""
+    """Deltas below MIN_DELTA_CONFIDENCE (0.85) are filtered out; 0.85 is admitted."""
     from genesis.db.crud import observations
     from genesis.perception.writer import ResultWriter
 
@@ -349,8 +349,9 @@ async def test_delta_confidence_gate(db):
         patterns=[],
         user_model_updates=[
             UserModelDelta(field="role", value="engineer", evidence="mentioned", confidence=0.92),
-            UserModelDelta(field="lang", value="Python", evidence="guessed", confidence=0.85),
-            UserModelDelta(field="os", value="Linux", evidence="weak", confidence=0.89),
+            UserModelDelta(field="lang", value="Python", evidence="stated", confidence=0.85),
+            UserModelDelta(field="os", value="Linux", evidence="weak", confidence=0.84),
+            UserModelDelta(field="editor", value="vim", evidence="filler", confidence=0.80),
         ],
         recommendations=[],
         confidence=0.8,
@@ -360,10 +361,9 @@ async def test_delta_confidence_gate(db):
     await writer.write(output, Depth.LIGHT, tick, db=db)
 
     rows = await observations.query(db, type="user_model_delta")
-    assert len(rows) == 1
-    content = json.loads(rows[0]["content"])
-    assert content["field"] == "role"
-    assert content["confidence"] == 0.92
+    stored = {json.loads(r["content"])["field"] for r in rows}
+    # 0.85 boundary passes; 0.84 and the 0.80 filler tier are filtered.
+    assert stored == {"role", "lang"}
 
 
 async def test_delta_field_value_dedup(db):

@@ -9,6 +9,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Genesis resumes learning about you.** The stream of "user model deltas" —
+  the small observations reflections make about your preferences, constraints,
+  and working style — had been effectively dead since the v3 release: the
+  quality gate demanded more certainty (0.90) than the reflection model ever
+  expresses (its honest "high certainty" sits at 0.85), so almost nothing
+  passed — 2 deltas in 3.5 months. The gate now matches the model's real
+  confidence scale, and the reflection prompt no longer contradicts itself
+  about the bar (it demanded 0.9, called 0.85 "high certainty", and showed a
+  0.8 example all at once). If the stream stays silent anyway, the staleness
+  alarm shipped in the sensor-fabric release will say so within two weeks.
+
 ### Added
 
 - **The guardian now keeps container swap enabled on its own.** Swap is what

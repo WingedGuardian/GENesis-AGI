@@ -403,8 +403,9 @@ class ResultWriter:
             db, end_iso=tick.timestamp,
         )
         for delta in output.user_model_updates:
-            # Confidence gate: LLM clusters at 0.80/0.85/0.90/0.95; gate at 0.90
-            # filters ~60% of overconfident filler deltas.
+            # Confidence gate: LLM clusters at 0.80/0.85/0.90/0.95; gate at 0.85
+            # keeps the "high certainty" clusters and drops the 0.80 filler tier
+            # (0.90 starved the stream — 2 deltas in 3.5 months).
             if delta.confidence < MIN_DELTA_CONFIDENCE:
                 logger.debug(
                     "Skipping delta below confidence gate: %s (%.2f < %.2f)",
