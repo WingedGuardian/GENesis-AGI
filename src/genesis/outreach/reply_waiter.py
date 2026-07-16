@@ -43,15 +43,22 @@ class ReplyWaiter:
         logger.info("Registered reply waiter for delivery %s", delivery_id)
         return future
 
-    def set_context(self, delivery_id: str, thread_key: str) -> None:
+    def set_context(self, delivery_id: str, thread_key: str) -> bool:
         """Attach the delivered message's "chat_id:thread_id" to a waiter.
 
         Called by the pipeline after delivery, when the destination is
         known. Waiters without a context are never eligible for
         standalone-text resolution (quote-reply and buttons still work).
+
+        Returns False when *delivery_id* has no registered waiter — the
+        context is DROPPED in that case, so callers must register first
+        (the silent drop is exactly the bug that left send-and-wait
+        waiters unresolvable by standalone replies).
         """
         if delivery_id in self._waiters:
             self._contexts[delivery_id] = thread_key
+            return True
+        return False
 
     def resolve(self, delivery_id: str, reply_text: str) -> bool:
         """Resolve a waiter with reply text. Returns True if waiter existed."""

@@ -156,3 +156,13 @@ async def test_context_cleared_on_resolve_and_cancel():
     w.set_context("d2", "123:45")
     w.cancel("d2")
     assert "d2" not in w._contexts
+
+
+async def test_set_context_reports_unregistered_drop():
+    """set_context returns False (context DROPPED) for unregistered keys —
+    the silent version of this drop is the ordering bug that left
+    send-and-wait waiters unresolvable by standalone replies."""
+    w = ReplyWaiter()
+    assert w.set_context("ghost", "123:45") is False
+    w.register("d1")
+    assert w.set_context("d1", "123:45") is True

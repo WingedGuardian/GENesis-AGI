@@ -760,3 +760,95 @@ async def test_voice_falls_back_to_full_text_without_voice_text(config, db, mock
 
     voice_channel.send_message.assert_called_once()
     assert voice_channel.send_message.call_args.args[1] == "Task completed: build a thing"
+
+
+# ── send-and-wait waiter ordering (context must attach to a REGISTERED waiter) ──
+#
+# Live failure 2026-07-16: submit_and_wait attached context before any waiter
+# existed (registration happened later, inside wait_for_reply). set_context
+# silently drops unregistered keys, so every waiter on this path was born
+# contextless and standalone replies could never resolve it — they all
+# degraded to implicit_activity. These tests drive the REAL ReplyWaiter
+# through both send-and-wait paths and assert a standalone reply arriving
+# mid-wait resolves the waiter.
+
+
+def _delivered_result():
+    from genesis.outreach.types import OutreachResult
+
+    return OutreachResult(
+        outreach_id="o-1", status=OutreachStatus.DELIVERED, channel="telegram",
+        message_content="hi", delivery_id="555", chat_id="-100123", thread_id=42,
+    )
+
+
+async def _resolve_when_pending(waiter, text, thread_key):
+    for _ in range(200):
+        if waiter.pending_count:
+            keys = waiter.resolve_scoped_pending(text, thread_key=thread_key)
+            if keys:
+                return keys
+        await asyncio.sleep(0.005)
+    return []
+
+
+@pytest.mark.asyncio
+async def test_submit_and_wait_standalone_reply_resolves(config):
+    from genesis.outreach.reply_waiter import ReplyWaiter
+
+    pipeline = OutreachPipeline.__new__(OutreachPipeline)
+    pipeline._reply_waiter = ReplyWaiter()
+    pipeline.submit = AsyncMock(return_value=_delivered_result())
+
+    task = asyncio.ensure_future(
+        pipeline.submit_and_wait(MagicMock(), timeout_s=5.0),
+    )
+    keys = await _resolve_when_pending(
+        pipeline._reply_waiter, "ok", "-100123:42",
+    )
+    assert keys == ["555"], "standalone reply did not resolve the waiter"
+    result, reply = await task
+    assert reply == "ok"
+    assert pipeline._reply_waiter.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_raw_and_wait_no_key_standalone_reply_resolves(config):
+    from genesis.outreach.reply_waiter import ReplyWaiter
+
+    pipeline = OutreachPipeline.__new__(OutreachPipeline)
+    pipeline._reply_waiter = ReplyWaiter()
+    pipeline.submit_raw = AsyncMock(return_value=_delivered_result())
+
+    task = asyncio.ensure_future(
+        pipeline.submit_raw_and_wait("txt", MagicMock(), timeout_s=5.0),
+    )
+    keys = await _resolve_when_pending(
+        pipeline._reply_waiter, "approve", "-100123:42",
+    )
+    assert keys == ["555"]
+    result, reply = await task
+    assert reply == "approve"
+
+
+@pytest.mark.asyncio
+async def test_submit_raw_and_wait_with_key_still_resolves(config):
+    """The pre-registered button-key path keeps working (context on both
+    the uuid key and the delivery_id alias)."""
+    from genesis.outreach.reply_waiter import ReplyWaiter
+
+    pipeline = OutreachPipeline.__new__(OutreachPipeline)
+    pipeline._reply_waiter = ReplyWaiter()
+    pipeline.submit_raw = AsyncMock(return_value=_delivered_result())
+
+    task = asyncio.ensure_future(
+        pipeline.submit_raw_and_wait(
+            "txt", MagicMock(), timeout_s=5.0, waiter_key="uuid-1",
+        ),
+    )
+    keys = await _resolve_when_pending(
+        pipeline._reply_waiter, "go", "-100123:42",
+    )
+    assert set(keys) == {"uuid-1", "555"}
+    result, reply = await task
+    assert reply == "go"
