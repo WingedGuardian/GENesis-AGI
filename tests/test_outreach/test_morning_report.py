@@ -537,3 +537,36 @@ async def test_checkpoint_question_rows_never_closed(db, mock_health, mock_draft
 
     row = await _mq_row(db, "q1")
     assert row["responded_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_activity_summary_scopes_goals_by_origin(db, mock_health, mock_drafter):
+    """PR-3a: 'Active user goals' excludes ego-owned goals; Genesis's own
+    goals appear only as the compact count line (active + paused)."""
+    from genesis.db.crud import user_goals
+
+    await user_goals.create(
+        db, title="User career goal", category="career", priority="high",
+    )
+    await user_goals.create(
+        db, title="Ego ops goal", category="project", origin="genesis_ego",
+    )
+    paused = await user_goals.create(
+        db, title="Paused ego goal", category="other", origin="genesis_ego",
+    )
+    await user_goals.update(db, paused, status="paused")
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    summary = await gen._get_activity_summary()
+
+    assert "User career goal" in summary
+    assert "Ego ops goal" not in summary
+    assert "Genesis's own goals: 1 active, 1 paused" in summary
+
+
+@pytest.mark.asyncio
+async def test_activity_summary_no_ego_goal_line_when_none(db, mock_health, mock_drafter):
+    """No ego goals → no count line (the section stays user-pure)."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    summary = await gen._get_activity_summary()
+    assert "Genesis's own goals" not in summary

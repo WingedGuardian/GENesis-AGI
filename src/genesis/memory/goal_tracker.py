@@ -89,8 +89,10 @@ async def process_extraction(
 
     from genesis.db.crud import user_goals
 
-    # Check for existing similar goal
-    existing = await user_goals.find_similar(db, signal["title"])
+    # Check for existing similar goal. origin="user": a conversation-derived
+    # signal must never reinforce (mutate confidence/notes of) an ego-owned
+    # goal — extraction only ever speaks for the user's lane.
+    existing = await user_goals.find_similar(db, signal["title"], origin="user")
     if existing:
         # Update confidence and add progress note
         new_conf = max(existing["confidence"], signal["confidence"])

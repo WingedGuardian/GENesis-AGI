@@ -809,7 +809,9 @@ class TestGoalStatusRecommendationRouting:
 
         ego_session._proposals.create_batch.assert_not_awaited()
         cursor = await goals_db.execute(
-            "SELECT type, category FROM observations WHERE source = 'user_ego'",
+            # source carries the producing cycle's source_tag (PR-3a fixed
+            # the hardcoded "user_ego" misattribution).
+            "SELECT type, category FROM observations WHERE source = 'user_ego_cycle'",
         )
         row = await cursor.fetchone()
         assert row is not None
@@ -1062,3 +1064,51 @@ class TestAutonomousOwnGoalManagement:
             "SELECT type FROM observations WHERE type = 'goal_recommendation'",
         )
         assert await cursor.fetchone() is not None
+
+    async def test_close_observation_source_is_genesis_cycle(
+        self, ego_session, goals_db,
+    ):
+        """The passive goal_recommendation observation carries the cycle that
+        produced it — a genesis-cycle review must not masquerade as user_ego
+        (pre-PR-3a the source was hardcoded)."""
+        ego_session._source_tag = "genesis_ego_cycle"
+        await self._insert_goal(goals_db, gid="eg6", origin="genesis_ego")
+
+        await ego_session._surface_goal_recommendation(
+            goal_id="eg6", recommendation="close", assessment="likely done",
+        )
+
+        cursor = await goals_db.execute(
+            "SELECT source FROM observations WHERE type = 'goal_recommendation'",
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["source"] == "genesis_ego_cycle"
+
+
+class TestEgoCycleDisallowedTools:
+    """Side-door closure: the ego CYCLE session must not see the foreground
+    goal-mutation MCP tools — in-cycle goal changes go through the parsed-
+    output path (gated, validated, audited) only."""
+
+    def test_constant_contents(self):
+        from genesis.ego.session import _EGO_CYCLE_DISALLOWED_TOOLS
+
+        assert "mcp__genesis-health__ego_goal_create" in _EGO_CYCLE_DISALLOWED_TOOLS
+        assert "mcp__genesis-health__ego_goal_update" in _EGO_CYCLE_DISALLOWED_TOOLS
+        # Read-only goal tools stay available in-cycle.
+        assert not any(
+            "ego_goal_list" in t or "ego_goal_progress" in t
+            for t in _EGO_CYCLE_DISALLOWED_TOOLS
+        )
+
+    def test_cycle_invocation_wires_the_disallow_list(self):
+        """Wiring lock: the CCInvocation the cycle builds must carry the
+        constant (module-source assertion; E2E verifies the actual tool-list
+        shrink on a live cycle)."""
+        import inspect
+
+        import genesis.ego.session as session_mod
+
+        src = inspect.getsource(session_mod)
+        assert "disallowed_tools=list(_EGO_CYCLE_DISALLOWED_TOOLS)" in src

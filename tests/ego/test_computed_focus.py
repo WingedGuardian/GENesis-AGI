@@ -37,16 +37,12 @@ async def db():
             user_response TEXT
         )
     """)
-    await conn.execute("""
-        CREATE TABLE user_goals (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active',
-            priority TEXT NOT NULL DEFAULT 'medium',
-            category TEXT DEFAULT 'project',
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
+    # Canonical schema (not a hand-rolled subset): compute_focus_summary
+    # filters on columns like origin, so a drifted inline DDL breaks silently
+    # behind the function's fallback path.
+    from genesis.db.schema import TABLES
+
+    await conn.execute(TABLES["user_goals"])
     await conn.commit()
     yield conn
     await conn.close()
@@ -87,8 +83,8 @@ async def test_with_board_proposals(db):
 async def test_with_goals(db):
     """User goals appear for user ego but not genesis ego."""
     await db.execute(
-        "INSERT INTO user_goals (id, title, status, priority) "
-        "VALUES ('g1', 'Suki AI application', 'active', 'high')"
+        "INSERT INTO user_goals (id, title, category, status, priority) "
+        "VALUES ('g1', 'Suki AI application', 'career', 'active', 'high')"
     )
     await db.commit()
 
@@ -125,8 +121,8 @@ async def test_combined_state(db):
         "VALUES ('p1', 'Research infrastructure costs', 'pending')"
     )
     await db.execute(
-        "INSERT INTO user_goals (id, title, status, priority) "
-        "VALUES ('g1', 'Panel preparation', 'active', 'high')"
+        "INSERT INTO user_goals (id, title, category, status, priority) "
+        "VALUES ('g1', 'Panel preparation', 'project', 'active', 'high')"
     )
     await db.commit()
 

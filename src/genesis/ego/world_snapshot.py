@@ -135,7 +135,9 @@ async def build(db: aiosqlite.Connection) -> WorldSnapshot:
     # 1. Active goals
     try:
         from genesis.db.crud import user_goals
-        snapshot.goals = await user_goals.list_active(db, limit=10)
+        # origin="user": the world snapshot feeds user-facing context —
+        # ego-owned goals are not part of the user's world model.
+        snapshot.goals = await user_goals.list_active(db, limit=10, origin="user")
     except Exception:
         logger.debug("Failed to query goals for world snapshot", exc_info=True)
 

@@ -71,7 +71,7 @@ async def compute_focus_summary(
         if "genesis" not in ego_key:
             from genesis.db.crud import user_goals
 
-            goals = await user_goals.list_active(db, limit=5)
+            goals = await user_goals.list_active(db, limit=5, origin="user")
             if goals:
                 titles = [g.get("title", "")[:40] for g in goals[:3]]
                 suffix = f" (+{len(goals) - 3} more)" if len(goals) > 3 else ""

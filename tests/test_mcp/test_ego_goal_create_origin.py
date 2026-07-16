@@ -108,3 +108,25 @@ class TestOriginImmutable:
         conn, _db_path = db
         gid = await user_goals.create(conn, title="ego's", category="project", origin="genesis_ego")
         assert await _origin_of(conn, gid) == "genesis_ego"
+
+
+class TestEgoGoalListShowsOrigin:
+    async def test_list_includes_origin_field(self, db):
+        """PR-3a display fix: every row carries its provenance so the user
+        can always tell whose goal is whose."""
+        conn, db_path = db
+        await user_goals.create(conn, title="User goal", category="career")
+        await user_goals.create(
+            conn, title="Ego goal", category="project", origin="genesis_ego",
+        )
+        await conn.commit()
+
+        from genesis.mcp.health import ego_tools
+
+        fn = getattr(ego_tools.ego_goal_list, "fn", ego_tools.ego_goal_list)
+        with patch("genesis.mcp.health.ego_tools._get_db_path", return_value=db_path):
+            result = await fn()
+
+        assert result["status"] == "ok"
+        origins = {g["title"]: g["origin"] for g in result["goals"]}
+        assert origins == {"User goal": "user", "Ego goal": "genesis_ego"}

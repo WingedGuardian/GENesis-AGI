@@ -197,8 +197,11 @@ class EgoCadenceManager:
             misfire_grace_time=60,
         )
         # Goal staleness scanner: push goal_review signals for stale goals.
-        # User ego only — genesis ego has no goal jurisdiction. Skipped at
-        # runtime via source_tag check but also gate registration for clarity.
+        # User ego only — USER goals are user-ego jurisdiction. (The genesis
+        # ego reviews its own origin='genesis_ego' goals through a separate
+        # path: an own-goals context section + parsed output keys, never this
+        # scanner.) Skipped at runtime via source_tag check but also gate
+        # registration for clarity.
         if self._session._source_tag == "user_ego_cycle":
             self._scheduler.add_job(
                 self._check_stale_goals,
@@ -404,9 +407,11 @@ class EgoCadenceManager:
         """Push goal_review signals for goals stale beyond threshold.
 
         Queries user_goals.updated_at and pushes one signal per stale goal.
-        Only meaningful for the user ego — the genesis ego has no goal
-        jurisdiction.  Registration is gated in start() but we double-check
-        source_tag here as defense-in-depth.
+        User ego only, USER goals only (origin='user') — ego-owned goals are
+        reviewed by the genesis ego's own path, and a user-ego review of an
+        ego goal would surface approval proposals for internal ops goals.
+        Registration is gated in start() but we double-check source_tag here
+        as defense-in-depth.
         """
         if self._session._source_tag != "user_ego_cycle":
             return
@@ -418,7 +423,9 @@ class EgoCadenceManager:
             from genesis.db.crud import user_goals
             from genesis.ego.types import GOAL_STUCK_EXECUTED_THRESHOLD
 
-            goals = await user_goals.list_active(self._session._db)
+            goals = await user_goals.list_active(
+                self._session._db, origin="user",
+            )
             if not goals:
                 return
 
