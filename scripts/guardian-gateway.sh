@@ -603,6 +603,23 @@ PYEOF
         systemctl --user restart genesis-guardian.timer 2>/dev/null || true
         _TIMER_STOPPED=0  # cleanly restarted — don't let the EXIT trap re-start
 
+        # Host zram swap retrofit (E3): existing installs only ever receive
+        # code via this verb — installer steps never re-run — so apply the
+        # swap layer here. Runs AFTER the success JSON (this verb's stdout is
+        # a parsed contract; all lib output goes to stderr), whole-block
+        # best-effort so it can NEVER fail a redeploy, [ -f ] guarded for
+        # transition-deploys from pre-E3 archives, and time-bounded
+        # (`systemctl enable --now` could block on a wedged device; a stalled
+        # redeploy SSH would stall update.sh — 60s is ~10x the observed apply
+        # time and the block is best-effort by contract). The lib itself
+        # degrades to a one-line skip on hosts that can't or shouldn't
+        # (container vantage, no zram.ko, external zram, masked unit).
+        if [ -f "$INSTALL_DIR/scripts/lib/host_swap.sh" ]; then
+            timeout 60 bash -c \
+                ". '$INSTALL_DIR/scripts/lib/host_swap.sh' && host_swap_apply" \
+                1>&2 || true
+        fi
+
         # Clean up backup on success
         rm -rf "$BACKUP_DIR"
         ;;

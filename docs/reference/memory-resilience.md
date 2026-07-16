@@ -61,7 +61,37 @@ remediation for the detected vantage — because the knob is never local:
   guardian config (an explicitly-false knob is otherwise reconciled back to
   true — swap-on is the install invariant).
 - **Bare metal / VM**: create a swapfile or LV sized to taste. Even a few
-  GiB turns the OOM cliff into a ramp.
+  GiB turns the OOM cliff into a ramp. **On guardian hosts this is now
+  mechanical** — see the zram layer below.
+
+## The zram layer (guardian hosts)
+
+`scripts/lib/host_swap.sh` gives guardian host VMs a **compressed-RAM-first
+swap tier**: a zram device at swap priority 100, so memory pressure compresses
+into fast RAM before touching disk swap (which stays as the lower-priority
+fallback). On a host with *no* swap at all, this closes the wedge-defect gap
+mechanically instead of leaving the warning above as the only output.
+
+- **Size**: `min(MemTotal/2, 4 GiB)` — zram-generator's own upstream default
+  formula, computed per machine at apply time (a 2 GiB VPS gets 1 GiB, big
+  hosts cap at 4 GiB). Override the cap with `HOSTSWAP_CAP_GIB`.
+- **Unit**: a self-contained root-level `zram-swap.service` (oneshot,
+  `RemainAfterExit`) written to `/etc/systemd/system/` — fixed `/dev/zram0`,
+  zstd compression with automatic fallback to the kernel default, no
+  genesis-path dependencies. Idempotent: an unchanged unit produces no
+  systemd churn; a RAM change re-renders it.
+- **Applied from**: `install_guardian.sh` Step 9c (fresh installs) and the
+  gateway `redeploy` verb (existing installs retrofit on their next update).
+- **Degrades to a one-line skip** when the machine can't or shouldn't:
+  not-systemd, container vantage (zram needs the real host kernel), no
+  `zramctl`/`zram.ko`, no non-interactive sudo, `HOSTSWAP_DISABLE=1`, an
+  external zram setup already active (never shadows zram-generator or an
+  operator's own device), or a masked unit.
+- **Opt out permanently**: `sudo systemctl mask zram-swap.service` — apply
+  skips masked units. Remove cleanly with
+  `sudo bash -c 'source scripts/lib/host_swap.sh && host_swap_remove'`.
+- The host-plane `swap_total_kb` fact (table above) picks the device up
+  automatically, and `_memres_swap_check` stops warning once it's active.
 
 ## How the body schema surfaces it
 
