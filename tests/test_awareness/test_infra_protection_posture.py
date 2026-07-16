@@ -1,0 +1,349 @@
+"""Silent-skip closure Phase 3 — infra protection posture alarm.
+
+#1082 provisions systemd-oomd and #1083 reconciles the container swap knob,
+but a STABLE unprotected box still produced no signal anywhere (infra_profile
+only fires infrastructure_drift on a fact-hash CHANGE — observed live: a
+sibling install ran for weeks with swap disabled and no systemd-oomd until a
+memory spike wedged it). The posture check un-blinds that: missing memory-plane
+protections raise one non-paging 'high' infrastructure_alert that supersedes on
+posture change and auto-resolves on recovery; a stale profile (>3d) raises a
+distinct posture-UNKNOWN alert instead of asserting from dead facts.
+"""
+
+from __future__ import annotations
+
+import inspect
+from datetime import UTC, datetime, timedelta
+
+import aiosqlite
+import pytest
+
+from genesis.awareness import loop as _loop
+from genesis.awareness.loop import (
+    _check_infra_protection_posture,
+    _infra_missing_protections,
+    _resolve_infra_protection_posture,
+)
+from genesis.db.schema._tables import TABLES
+
+SOURCE = "infra_protection_posture_monitor"
+
+
+async def _setup() -> aiosqlite.Connection:
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.execute(TABLES["observations"])
+    await db.commit()
+    return db
+
+
+async def _alerts(db) -> list[dict]:
+    async with db.execute(
+        "SELECT id, priority, resolved, content, content_hash, resolution_notes "
+        "FROM observations WHERE source = ? AND type = 'infrastructure_alert'",
+        (SOURCE,),
+    ) as cur:
+        return [dict(r) for r in await cur.fetchall()]
+
+
+def _open(alerts: list[dict]) -> list[dict]:
+    return [a for a in alerts if a["resolved"] == 0]
+
+
+def _profile(
+    *,
+    swap_max: object = "max",
+    oomd: object = True,
+    host_swap_kb: object = 8_000_000,
+    knob: object = "true",
+    age_days: float = 0.0,
+    collected_at: object = "auto",
+) -> dict:
+    """Fabricate a profile in the real on-disk shape (sections.<plane>.facts)."""
+    if collected_at == "auto":
+        collected_at = (datetime.now(UTC) - timedelta(days=age_days)).isoformat()
+    profile: dict = {
+        "sections": {
+            "memory": {
+                "facts": {
+                    "cgroup_memory_swap_max": swap_max,
+                    "oomd_user_slice_kill": oomd,
+                    # meminfo swap is NOT virtualized: 0 here on a HEALTHY
+                    # container (verified live 2026-07-16) — the check must
+                    # never key on it.
+                    "swap_total": 0,
+                }
+            },
+            "host_system": {"facts": {"swap_total_kb": host_swap_kb}},
+            "host_virt": {"facts": {"container_limits": {"limits.memory.swap": knob}}},
+        }
+    }
+    if collected_at is not None:
+        profile["collected_at"] = collected_at
+    return profile
+
+
+def _use_profile(monkeypatch, profile: dict) -> None:
+    monkeypatch.setattr(_loop, "load_profile", lambda: profile)
+
+
+@pytest.fixture(autouse=True)
+def _reset_cooldown():
+    _loop._last_infra_posture_alert_at = 0.0
+    _loop._last_infra_posture_key = ""
+    yield
+    _loop._last_infra_posture_alert_at = 0.0
+    _loop._last_infra_posture_key = ""
+
+
+# ── rule semantics ──────────────────────────────────────────────────────────
+
+
+def test_all_defects_detected():
+    missing = _infra_missing_protections(
+        _profile(swap_max=0, oomd=False, host_swap_kb=0, knob="false")
+    )
+    assert missing == [
+        "container_swap_disabled",
+        "container_swap_knob_off",
+        "host_swap_absent",
+        "oomd_pressure_kill_off",
+    ]
+
+
+def test_healthy_profile_no_defects():
+    assert _infra_missing_protections(_profile()) == []
+
+
+def test_absent_facts_are_silent():
+    # No guardian host plane, no host_virt, empty memory facts — a public
+    # install missing optional planes must never false-alarm.
+    assert _infra_missing_protections({"sections": {"memory": {"facts": {}}}}) == []
+    assert _infra_missing_protections({}) == []
+
+
+def test_cgroup_v1_gates_oomd_rule():
+    # swap knob unreadable (None = cgroup v1) → oomd pressure-kill cannot work
+    # there, so oomd=False must not alert.
+    assert _infra_missing_protections(_profile(swap_max=None, oomd=False)) == []
+
+
+def test_bool_false_is_not_explicit_zero():
+    # bool is an int subclass (False == 0); a malformed bool fact must not
+    # read as "explicitly zero".
+    assert "container_swap_disabled" not in _infra_missing_protections(_profile(swap_max=False))
+    assert "host_swap_absent" not in _infra_missing_protections(_profile(host_swap_kb=False))
+
+
+def test_nonzero_swap_limit_is_healthy():
+    # A numeric limit is a SET limit, not the wedge state.
+    assert _infra_missing_protections(_profile(swap_max=1_073_741_824)) == []
+
+
+def test_absent_knob_is_healthy():
+    # incus default is true — only an explicit "false" alerts.
+    profile = _profile()
+    del profile["sections"]["host_virt"]["facts"]["container_limits"]
+    assert _infra_missing_protections(profile) == []
+
+
+# ── alert lifecycle ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unprotected_profile_raises_high_alert(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0, oomd=False))
+        await _check_infra_protection_posture(db)
+        alerts = await _alerts(db)
+        assert len(alerts) == 1
+        assert alerts[0]["priority"] == "high"  # non-paging by design
+        assert alerts[0]["resolved"] == 0
+        assert "container_swap_disabled" in alerts[0]["content"]
+        assert "oomd_pressure_kill_off" in alerts[0]["content"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_healthy_profile_is_silent(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile())
+        await _check_infra_protection_posture(db)
+        assert await _alerts(db) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_profile_is_silent(monkeypatch):
+    # Pre-first-refresh (fresh install): load_profile() returns {}.
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, {})
+        await _check_infra_protection_posture(db)
+        assert await _alerts(db) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_collected_at_is_silent(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0, collected_at=None))
+        await _check_infra_protection_posture(db)
+        assert await _alerts(db) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_stable_state_keeps_one_open_row(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0))
+        await _check_infra_protection_posture(db)
+        # Same state within the cooldown → early return.
+        await _check_infra_protection_posture(db)
+        # Same state past the cooldown (simulated by reset) → atomic dedup
+        # (source + content_hash + resolved=0) still keeps one row.
+        _loop._last_infra_posture_alert_at = 0.0
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_posture_change_supersedes_old_row(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0, oomd=False))
+        await _check_infra_protection_posture(db)
+        # oomd healed, swap still bad — a NEW key bypasses the cooldown and
+        # supersedes the old row: exactly one open row = the current state.
+        _use_profile(monkeypatch, _profile(swap_max=0))
+        await _check_infra_protection_posture(db)
+
+        alerts = await _alerts(db)
+        assert len(alerts) == 2
+        open_rows = _open(alerts)
+        assert len(open_rows) == 1
+        assert "oomd_pressure_kill_off" not in open_rows[0]["content"]
+        superseded = [a for a in alerts if a["resolved"] == 1]
+        assert superseded[0]["resolution_notes"] == _loop._INFRA_POSTURE_SUPERSEDED_NOTE
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_resolves_alert(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0))
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+
+        _use_profile(monkeypatch, _profile())
+        await _check_infra_protection_posture(db)
+        alerts = await _alerts(db)
+        assert all(a["resolved"] == 1 for a in alerts)
+        # Cooldown cleared → a re-degradation re-alerts promptly.
+        assert _loop._last_infra_posture_alert_at == 0.0
+        _use_profile(monkeypatch, _profile(swap_max=0))
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_profile_alerts_unknown_not_posture(monkeypatch):
+    db = await _setup()
+    try:
+        # Defect facts present, but the profile is 10 days old — the refresh
+        # pipeline is broken; posture must NOT be asserted from dead facts.
+        _use_profile(monkeypatch, _profile(swap_max=0, age_days=10))
+        await _check_infra_protection_posture(db)
+        alerts = await _alerts(db)
+        assert len(alerts) == 1
+        assert "UNKNOWN" in alerts[0]["content"]
+        assert "container_swap_disabled" not in alerts[0]["content"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_profile_supersedes_stale_alert(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(age_days=10))
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+
+        # A fresh, healthy profile lands → the stale-UNKNOWN row resolves.
+        _use_profile(monkeypatch, _profile())
+        await _check_infra_protection_posture(db)
+        assert _open(await _alerts(db)) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_none_db_and_resolve_are_noops():
+    await _check_infra_protection_posture(None)  # must not raise
+    await _resolve_infra_protection_posture(None)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_load_profile_error_never_raises(monkeypatch):
+    db = await _setup()
+    try:
+
+        def _boom():
+            raise OSError("disk gone")
+
+        monkeypatch.setattr(_loop, "load_profile", _boom)
+        await _check_infra_protection_posture(db)  # must not raise into the tick
+        assert await _alerts(db) == []
+    finally:
+        await db.close()
+
+
+# ── coverage guardrails (provision-or-surface convention) ──────────────────
+
+
+def test_every_rule_slug_has_detail_text():
+    # The alert content is built via _INFRA_POSTURE_DETAIL[slug] — a rule slug
+    # without detail text would KeyError inside the (swallowed) check. Derive
+    # the producible set from the rules themselves.
+    producible = set(
+        _infra_missing_protections(_profile(swap_max=0, oomd=False, host_swap_kb=0, knob="false"))
+    )
+    assert producible == set(_loop._INFRA_POSTURE_DETAIL)
+
+
+def test_memory_resilience_facts_are_covered():
+    # Provision-or-surface: every memory-resilience effective-fact must be
+    # read by the posture rules, so a protection can't silently lose its
+    # surfacing signal in a refactor. (Adding a NEW protection fact requires
+    # extending both the rules and this list — that is the point.)
+    src = inspect.getsource(_infra_missing_protections)
+    for fact in (
+        "cgroup_memory_swap_max",
+        "oomd_user_slice_kill",
+        "swap_total_kb",
+        "limits.memory.swap",
+    ):
+        assert fact in src, f"posture rules no longer read {fact!r}"
+
+
+def test_check_is_wired_into_the_tick():
+    # Level-3 wiring proof: the check must have a live call site in the tick
+    # pipeline, not just exist as a function.
+    src = inspect.getsource(_loop)
+    assert "await _check_infra_protection_posture(self._db)" in src
+
