@@ -87,6 +87,15 @@
           filter: null,
           fetch: { state: "idle", lastSuccess: null, error: null },
         },
+        sessionsTab: {
+          data: null,
+          filter: null,
+          selectedId: null,
+          detail: null,
+          detailError: null,
+          resolvingId: null,
+          fetch: { state: "idle", lastSuccess: null, error: null },
+        },
         outreachModal: {
           open: false,
           messages: [],
@@ -302,6 +311,7 @@
         _activityInterval: null,
 
         _sessionsInterval: null,
+        _ccSessionsTabInterval: null,
         _modulesInterval: null,
         _routingInterval: null,
         _approvalsInterval: null,
@@ -372,6 +382,7 @@
           knowledge: [],
           campaigns: ["_campaignsInterval"],
           backup:    [],
+          sessions:  ["_ccSessionsTabInterval"],
         },
 
         // ── Campaigns ──
@@ -447,7 +458,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "backup"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "backup", "sessions"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -539,6 +550,13 @@
               break;
             case "backup":
               if (first) { this.fetchBackupStatus(); this.fetchBackupConfig(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
+              break;
+            case "sessions":
+              if (first) { this.fetchSessionsTab(); }
+              this._ccSessionsTabInterval = setInterval(() => {
+                this.fetchSessionsTab();
+                if (this.sessionsTab.selectedId) this.fetchSessionCharter(this.sessionsTab.selectedId, { silent: true });
+              }, 15000);
               break;
           }
         },
@@ -3929,6 +3947,51 @@
             }
           } catch {
             this.failModalFetch("ccSessionsModal", "CC session detail unavailable");
+          }
+        },
+
+        // ── Sessions tab (session-manager PR-4b cockpit) ──
+        // List pane shares /cc-sessions/detail with the overview modal — one
+        // payload, drift bounded by construction.
+        async fetchSessionsTab() {
+          this.startModalFetch("sessionsTab");
+          try {
+            const resp = await fetchApi("/api/genesis/cc-sessions/detail");
+            if (resp?.ok) {
+              this.sessionsTab.data = await resp.json();
+              this.finishModalFetch("sessionsTab");
+            } else {
+              this.failModalFetch("sessionsTab", "CC session detail unavailable");
+            }
+          } catch {
+            this.failModalFetch("sessionsTab", "CC session detail unavailable");
+          }
+        },
+
+        openSessionRow(s) {
+          const id = s.cc_session_id || s.id;
+          this.sessionsTab.selectedId = id;
+          this.sessionsTab.detail = null;
+          this.sessionsTab.detailError = null;
+          this.fetchSessionCharter(id);
+        },
+
+        async fetchSessionCharter(ccSessionId, opts = {}) {
+          try {
+            const resp = await fetchApi(`/api/genesis/cc-sessions/${encodeURIComponent(ccSessionId)}/charter`);
+            if (resp?.ok) {
+              // Discard a stale response if the user clicked another row meanwhile
+              if (this.sessionsTab.selectedId === ccSessionId) {
+                this.sessionsTab.detail = await resp.json();
+                this.sessionsTab.detailError = null;
+              }
+            } else if (!opts.silent && this.sessionsTab.selectedId === ccSessionId) {
+              this.sessionsTab.detailError = resp?.status === 404 ? "No charter or session row for this id." : "Session detail unavailable.";
+            }
+          } catch {
+            if (!opts.silent && this.sessionsTab.selectedId === ccSessionId) {
+              this.sessionsTab.detailError = "Session detail unavailable.";
+            }
           }
         },
 
