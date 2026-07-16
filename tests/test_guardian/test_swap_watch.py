@@ -41,6 +41,10 @@ def _subproc(responses):
 
     async def fake(*cmd, timeout=None):
         assert cmd[0] == "incus" and cmd[1] == "config"
+        if cmd[2] == "get":
+            # The get must read the EXPANDED config (profile-inherited true
+            # must not be treated as unset).
+            assert cmd[3] == "--expanded"
         fake.calls.append(cmd)
         return responses[cmd[2]]
 

@@ -66,7 +66,10 @@ def _failure_alert_due(state_file, now: datetime) -> bool:
             return True
         last = datetime.fromisoformat(raw_at)
         return (now - last).total_seconds() >= _REALERT_HOURS * 3600
-    except (ValueError, OSError):
+    except (ValueError, OSError, TypeError, AttributeError):
+        # TypeError: aware-vs-naive timestamp; AttributeError: valid JSON that
+        # isn't a dict. Both mean "state unusable" -> alert is due, and neither
+        # may escape (module contract: never raises into the tick).
         return True
 
 
@@ -95,10 +98,14 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     # 1. Persistent knob. `incus config get` on an unset key returns rc=0 with
     # empty output, so unset and explicit-false both land in the set branch.
     try:
+        # --expanded so a profile-inherited true reads as true (a plain get is
+        # local-only and would trigger a redundant local override + a false
+        # "was off" heal alert). Verified supported on live incus.
         rc, stdout, _stderr = await _run_subprocess(
             "incus",
             "config",
             "get",
+            "--expanded",
             container,
             "limits.memory.swap",
             timeout=_INCUS_TIMEOUT,
