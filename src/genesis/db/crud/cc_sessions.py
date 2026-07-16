@@ -32,9 +32,22 @@ async def create(
             pid, started_at, last_activity_at, source_tag, metadata, thread_id,
             origin_class)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, session_type, user_id, channel, model, effort, status,
-         pid, started_at, last_activity_at, source_tag, metadata, thread_id,
-         origin_class),
+        (
+            id,
+            session_type,
+            user_id,
+            channel,
+            model,
+            effort,
+            status,
+            pid,
+            started_at,
+            last_activity_at,
+            source_tag,
+            metadata,
+            thread_id,
+            origin_class,
+        ),
     )
     await db.commit()
     return id
@@ -44,6 +57,19 @@ async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
     cursor = await db.execute("SELECT * FROM cc_sessions WHERE id = ?", (id,))
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+async def list_by_cc_session_id(db: aiosqlite.Connection, cc_session_id: str) -> list[dict]:
+    """All rows sharing one CC transcript session id, newest started first.
+
+    A conversation can accumulate multiple lifecycle rows (restarts,
+    re-registrations) — the dashboard cockpit shows the newest and the count.
+    """
+    cursor = await db.execute(
+        "SELECT * FROM cc_sessions WHERE cc_session_id = ? ORDER BY datetime(started_at) DESC",
+        (cc_session_id,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def get_active_foreground(
@@ -144,7 +170,8 @@ async def query_stale(
 async def set_pid(db: aiosqlite.Connection, id: str, pid: int) -> bool:
     """Write the subprocess PID to an existing cc_sessions row."""
     cursor = await db.execute(
-        "UPDATE cc_sessions SET pid = ? WHERE id = ?", (pid, id),
+        "UPDATE cc_sessions SET pid = ? WHERE id = ?",
+        (pid, id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -189,7 +216,8 @@ async def merge_metadata(
     Returns True if the row exists and was updated.
     """
     cursor = await db.execute(
-        "SELECT metadata FROM cc_sessions WHERE id = ?", (id,),
+        "SELECT metadata FROM cc_sessions WHERE id = ?",
+        (id,),
     )
     row = await cursor.fetchone()
     if row is None:
@@ -392,8 +420,7 @@ async def update_extraction_watermark(
 ) -> bool:
     """Update the extraction watermark for a session."""
     cursor = await db.execute(
-        "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? "
-        "WHERE id = ?",
+        "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? WHERE id = ?",
         (last_extracted_at, last_extracted_line, id),
     )
     await db.commit()
@@ -403,7 +430,8 @@ async def update_extraction_watermark(
 async def get_keywords(db: aiosqlite.Connection, id: str) -> str | None:
     """Get the keywords string for a session."""
     cursor = await db.execute(
-        "SELECT keywords FROM cc_sessions WHERE id = ?", (id,),
+        "SELECT keywords FROM cc_sessions WHERE id = ?",
+        (id,),
     )
     row = await cursor.fetchone()
     return row[0] if row else None
@@ -520,15 +548,10 @@ async def reflection_window_origin(db: aiosqlite.Connection, *, end_iso: str) ->
         from datetime import datetime, timedelta
 
         since = (
-            datetime.fromisoformat(end_iso)
-            - timedelta(minutes=REFLECTION_ORIGIN_WINDOW_MINUTES)
+            datetime.fromisoformat(end_iso) - timedelta(minutes=REFLECTION_ORIGIN_WINDOW_MINUTES)
         ).isoformat()
-        if await any_external_session_overlapping(
-            db, since_iso=since, end_iso=end_iso
-        ):
+        if await any_external_session_overlapping(db, since_iso=since, end_iso=end_iso):
             return "external_untrusted"
     except Exception:
-        _logger.debug(
-            "reflection_window_origin failed; defaulting first_party", exc_info=True
-        )
+        _logger.debug("reflection_window_origin failed; defaulting first_party", exc_info=True)
     return "first_party"

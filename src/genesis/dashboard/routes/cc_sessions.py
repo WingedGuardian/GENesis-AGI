@@ -1,25 +1,36 @@
-"""CC Sessions dashboard routes — the modal behind the CC Sessions health card.
+"""CC Sessions dashboard routes — list detail + the per-session cockpit.
 
-One endpoint joining the three views of "what CC sessions exist" that today
-never meet: cc_sessions DB rows (registered lifecycle state), the live /proc
-slot scan (actual claude processes), and session charters (what each session
-is FOR — session-manager tables, migration 0058). Their disagreements are the
-point: per-row discrepancy flags surface the divergence the overview card can
-only hint at.
+The list endpoint joins the three views of "what CC sessions exist" that
+otherwise never meet: cc_sessions DB rows (registered lifecycle state), the
+live /proc slot scan (actual claude processes), and session charters (what
+each session is FOR — session-manager tables, migration 0058). Their
+disagreements are the point: per-row discrepancy flags surface the
+divergence the overview card can only hint at. It feeds BOTH the overview
+modal and the Sessions tab list pane (session-manager PR-4b) — one payload,
+drift bounded by construction.
+
+The per-session endpoint is the cockpit detail: full charter (immutable
+origin + living mission/pointers), full ledger rows, the deterministic
+waypoint spine (this is its first reader), and repo-pulse annotations.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
-from flask import jsonify
+from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 
 logger = logging.getLogger(__name__)
+
+ORIGIN_PROMPT_CAP = 4000  # chars — origins are typically short; a pasted wall is truncated
+WAYPOINT_TAIL = 200  # newest waypoint lines returned (compaction cadence makes this ~weeks)
 
 # Sessions shown in the modal: everything active plus recent history. The
 # cutoff arrives as a parameter (derived from the same `now` as the age
@@ -202,3 +213,218 @@ async def cc_sessions_detail():
 
     slots = enumerate_cc_slots()
     return jsonify(await _collect_detail(rt.db, slots))
+
+
+# ── per-session cockpit detail (session-manager PR-4b) ──────────────────────
+
+
+def _load_waypoints(cc_session_id: str, sessions_dir: Path | None = None) -> dict:
+    """Deterministic waypoint spine from ~/.genesis/sessions/<sid>/waypoints.jsonl.
+
+    This is the file's FIRST reader (the PreCompact hook only appends).
+    Newest WAYPOINT_TAIL lines, per-line corrupt-skip — one torn line must
+    not hide the rest of the spine.
+    """
+    base = sessions_dir or (Path.home() / ".genesis" / "sessions")
+    path = base / cc_session_id / "waypoints.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {"available": False, "truncated": False, "items": []}
+    items = []
+    for line in lines[-WAYPOINT_TAIL:]:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            items.append(
+                {
+                    "ts": entry.get("ts"),
+                    "trigger": entry.get("trigger"),
+                    "transcript_bytes": entry.get("transcript_bytes"),
+                }
+            )
+    return {"available": True, "truncated": len(lines) > WAYPOINT_TAIL, "items": items}
+
+
+async def _pulse_lookup(db, cc_session_id: str) -> dict:
+    """Repo-pulse annotations for this session's ledger items (PR-4a store).
+
+    Defensive like _charter_lookup: pre-0062 installs have no pulse tables —
+    the panel then shows available=False instead of erroring. This degrade
+    path must survive forever (independent-mergeability regression contract).
+    """
+    try:
+        from genesis.db.crud.repo_pulse import list_annotations, summary
+
+        annotations = await list_annotations(db, session_id=cc_session_id, limit=100)
+        health = await summary(db)
+    except Exception as exc:
+        logger.debug("pulse tables unavailable (pre-0062 install?): %s", exc)
+        return {"available": False, "annotations": [], "health": None}
+    return {"available": True, "annotations": annotations, "health": health}
+
+
+async def _collect_session_detail(
+    db,
+    cc_session_id: str,
+    *,
+    sessions_dir: Path | None = None,
+    now: datetime | None = None,
+) -> dict | None:
+    """Assemble the cockpit payload for one CC session, or None (→ 404) when
+    neither a cc_sessions row nor a charter exists for the id."""
+    from genesis.db.crud import session_charters as charter_crud
+    from genesis.db.crud.cc_sessions import get_by_id, list_by_cc_session_id
+
+    now = now or datetime.now(UTC)
+    db.row_factory = aiosqlite.Row
+
+    rows = await list_by_cc_session_id(db, cc_session_id)
+    if not rows:
+        # A row registered before its transcript id is known (NULL
+        # cc_session_id — startup/stale-recovery window) is addressable
+        # only by DB row id; the tab's fallback click path sends that.
+        # Charter/waypoint/pulse lookups under a row id simply find
+        # nothing — the cockpit still shows the DB session details.
+        by_row_id = await get_by_id(db, cc_session_id)
+        if by_row_id is not None:
+            rows = [by_row_id]
+    session = None
+    if rows:
+        newest = rows[0]
+        session = {
+            "id": newest["id"],
+            "cc_session_id": cc_session_id,
+            "session_type": newest.get("session_type"),
+            "status": newest.get("status"),
+            "model": newest.get("model"),
+            "channel": newest.get("channel"),
+            "started_at": newest.get("started_at"),
+            "last_activity_at": newest.get("last_activity_at"),
+            "age_s": _age_seconds(newest.get("started_at"), now),
+            "idle_s": _age_seconds(newest.get("last_activity_at"), now),
+            "cost_usd": newest.get("cost_usd"),
+            "session_row_count": len(rows),
+        }
+
+    charter = None
+    ledger: dict = {"items": [], "counts": {}}
+    charters_available = True
+    try:
+        charter_row = await charter_crud.get(db, cc_session_id)
+        if charter_row is not None:
+            charter = dict(charter_row)
+            # crud.get already JSON-decodes pointers; guard the shape only.
+            if not isinstance(charter.get("pointers"), list):
+                charter["pointers"] = []
+            origin = str(charter.get("origin_prompt") or "")
+            charter["origin_truncated"] = len(origin) > ORIGIN_PROMPT_CAP
+            charter["origin_prompt"] = origin[:ORIGIN_PROMPT_CAP]
+        ledger["items"] = await charter_crud.ledger_list(db, cc_session_id)
+        ledger["counts"] = await charter_crud.ledger_counts(db, cc_session_id)
+    except (sqlite3.Error, aiosqlite.Error) as exc:
+        logger.debug("charter tables unavailable (pre-0058 install?): %s", exc)
+        charters_available = False
+
+    if session is None and charter is None:
+        return None
+
+    return {
+        "session": session,
+        "charters_available": charters_available,
+        "charter": charter,
+        "ledger": ledger,
+        "waypoints": _load_waypoints(cc_session_id, sessions_dir),
+        "pulse": await _pulse_lookup(db, cc_session_id),
+    }
+
+
+@blueprint.route("/api/genesis/cc-sessions/pulse/<annotation_id>/resolve", methods=["POST"])
+@_async_route
+async def cc_sessions_pulse_resolve(annotation_id: str):
+    """Resolve a proposed pulse annotation from the cockpit (comms resolve-
+    proposal contract: 400 bad status / 404 unknown / 503 unbootstrapped).
+
+    Confirm carries the SAME semantics as the injected in-session hint —
+    absorb the ledger item with PR evidence, then mark the annotation
+    confirmed — so both resolution paths teach the precision metric the same
+    lesson. Reject touches only the annotation; the ledger item stays open.
+    """
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        return jsonify({"error": "not bootstrapped"}), 503
+
+    data = request.get_json(silent=True) or {}
+    status = str(data.get("status", "")).strip().lower()
+    if status not in ("confirmed", "rejected"):
+        return jsonify({"error": "status must be 'confirmed' or 'rejected'"}), 400
+
+    payload, code = await _resolve_pulse(rt.db, annotation_id, status)
+    return jsonify(payload), code
+
+
+async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int]:
+    """Resolve core (extracted so tests exercise it on the fixture loop)."""
+    from genesis.db.crud.repo_pulse import get_annotation, resolve_annotation
+    from genesis.db.crud.session_charters import get_ledger_item, ledger_update
+
+    try:
+        db.row_factory = aiosqlite.Row
+        row = await get_annotation(db, annotation_id)
+        if row is None or row["status"] != "proposed":
+            return {"error": "unknown or already-resolved annotation"}, 404
+        # Resolve the annotation FIRST: its conditional proposed→terminal
+        # UPDATE is the race arbiter. Two concurrent resolutions can't both
+        # win it, so the ledger absorb below only ever runs for the winner —
+        # never an absorbed item under a rejected annotation. (The inverse
+        # residue — confirmed annotation, absorb missed — is visible and
+        # human-fixable via the injected hint.)
+        ok = await resolve_annotation(
+            db,
+            annotation_id,
+            status=status,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_ref="dashboard",
+        )
+        absorbed = False
+        if ok and status == "confirmed":
+            item = await get_ledger_item(db, row["item_id"])
+            if item is not None and item.get("status") in ("open", "in_progress"):
+                absorbed = await ledger_update(
+                    db,
+                    row["item_id"],
+                    status="absorbed",
+                    evidence=f"PR #{row['pr_number']}: {row['pr_title'] or ''} "
+                    f"[pulse confirm via dashboard]",
+                )
+    except (sqlite3.Error, aiosqlite.Error) as exc:
+        logger.error("pulse resolve failed: %s", exc)
+        return {"error": "pulse store unavailable"}, 503
+    if not ok:
+        return {"error": "unknown or already-resolved annotation"}, 404
+    return {"ok": True, "status": status, "item_absorbed": absorbed}, 200
+
+
+@blueprint.route("/api/genesis/cc-sessions/<cc_session_id>/charter")
+@_async_route
+async def cc_session_charter(cc_session_id: str):
+    """Full cockpit detail for one CC session: charter (immutable origin +
+    living mission/pointers), ledger rows, waypoint timeline, pulse panel."""
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        return jsonify({"error": "not bootstrapped"}), 503
+    # Traversal guard (mirrors the PreCompact hook): the id names a directory
+    # under ~/.genesis/sessions.
+    if "/" in cc_session_id or ".." in cc_session_id:
+        return jsonify({"error": "invalid session id"}), 400
+
+    detail = await _collect_session_detail(rt.db, cc_session_id)
+    if detail is None:
+        return jsonify({"error": "unknown session"}), 404
+    return jsonify(detail)

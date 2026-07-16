@@ -575,8 +575,12 @@ verified: 3403599d 2026-07-16
   Cursor (`cursor.json`, gh-format mergedAt watermark) advances monotonically
   ONLY on recorded ok. Proposals surface in the charter injection block
   (≥ `inject_confidence_floor`, cap 3, confirm-hint) and resolve via
-  `session_ledger_update` → next reconcile sweep;
-  confirmed/(confirmed+rejected) is the fuzzy precision metric. Levers:
+  `session_ledger_update` → next reconcile sweep — or via the dashboard
+  Sessions tab cockpit (PR-4b: per-session charter/ledger/waypoints/pulse
+  detail at `/api/genesis/cc-sessions/<id>/charter`, confirm/reject POST
+  with hint-identical semantics; the waypoints.jsonl spine gets its first
+  reader here); confirmed/(confirmed+rejected) is the fuzzy precision
+  metric. Levers:
   settings domain `repo_pulse` (off|propose_only|live, default live — the
   lever gates only the reversible exact absorb; invalid degrades to
   propose_only). Retention 45d via `scripts/prune_repo_pulse.py`
