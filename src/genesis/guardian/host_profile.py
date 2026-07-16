@@ -186,9 +186,10 @@ async def _host_virt(config) -> dict:
 # Daemons that can discipline the host clock, probed in preference order —
 # the first ACTIVE unit names the section's `ntp_service` fact. timesyncd
 # first (the stock Ubuntu/Debian daemon, and what the reference host runs —
-# verified live 2026-07-16); chrony/chronyd cover RHEL-family and opt-in
-# installs; ntp/ntpsec the legacy tail.
-_NTP_UNITS = ("systemd-timesyncd", "chrony", "chronyd", "ntp", "ntpsec")
+# verified live 2026-07-16); chrony/chronyd cover Debian-/RHEL-family unit
+# names for chrony; ntp/ntpd/ntpsec the classic-ntpd tail (Debian ships
+# ntp.service / ntpsec.service, RHEL ships ntpd.service — Codex P2 #1087).
+_NTP_UNITS = ("systemd-timesyncd", "chrony", "chronyd", "ntp", "ntpd", "ntpsec")
 
 
 async def _host_time() -> dict:

@@ -138,5 +138,23 @@ async def collect_host(guardian_remote=None) -> tuple[bool, str | None, list[Sec
             error = "host-profile gateway verb not deployed on host yet"
         return _unavailable(error[:200])
 
-    sections = [_split(name, blob.get(name, {}), _FACT_KEYS[name]) for name in HOST_SECTIONS]
+    sections = []
+    for name in HOST_SECTIONS:
+        raw = blob.get(name)
+        if raw is None:
+            # Key absent from an ok blob ⇔ the deployed guardian predates this
+            # section (every gathered section is emitted, even on failure).
+            # Unavailable — NOT empty-ok — so the persisted hash stays None and
+            # the facts arriving after the guardian redeploy read as a new
+            # section, not drift (Codex P2 #1087: hashing {} here turned the
+            # rollout itself into a phantom infrastructure_drift observation).
+            sections.append(
+                SectionResult.unavailable(
+                    name,
+                    "missing from host profile — guardian predates this section",
+                    plane=PLANE_HOST,
+                )
+            )
+            continue
+        sections.append(_split(name, raw, _FACT_KEYS[name]))
     return (True, None, sections)

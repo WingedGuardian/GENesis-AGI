@@ -217,9 +217,19 @@ async def test_partial_section_with_error_key_is_failed() -> None:
     assert "incus flaked" in virt.error
 
 
-async def test_missing_section_in_blob_is_empty_ok() -> None:
+async def test_missing_section_in_blob_is_unavailable_not_empty_ok() -> None:
+    """A key absent from an ok blob means the deployed guardian predates that
+    section (version skew). It must surface as UNAVAILABLE, never empty-ok:
+    an empty-ok section persists hash({}), so the facts arriving after the
+    guardian redeploys would read as drift — the rollout itself would page a
+    phantom infrastructure_drift observation (Codex P2 #1087). Unavailable
+    persists hash=None, and compute_drift skips hash-less sections."""
     blob = {k: v for k, v in _LIVE_BLOB.items() if k != "host_virt"}
-    _, _, sections = await collect_host(_FakeRemote(blob))
+    available, _, sections = await collect_host(_FakeRemote(blob))
+    assert available is True  # plane is up; one section predates the guardian
     virt = next(s for s in sections if s.name == "host_virt")
-    assert virt.status == STATUS_OK
+    assert virt.status == STATUS_UNAVAILABLE
+    assert "guardian predates" in virt.error
     assert virt.facts == {} and virt.metrics == {}
+    others = [s for s in sections if s.name != "host_virt"]
+    assert all(s.status == STATUS_OK for s in others)
