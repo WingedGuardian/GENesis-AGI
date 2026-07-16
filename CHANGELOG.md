@@ -22,6 +22,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   INFO note; a repair that can't complete pages a warning at most daily. Hosts
   where swap-off is deliberate can opt out (`swap_reconcile_enabled: false`).
 
+- **The dashboard has a Sessions cockpit.** A new Sessions tab shows every
+  CC session next to what it's actually FOR: the immutable origin prompt it
+  was born from, its living mission, the full TODO-ledger with status and
+  evidence, a compaction-waypoint timeline, and the repo-pulse panel —
+  "looks shipped by PR #N" proposals you can confirm (closes the item with
+  the PR as evidence) or reject with one click. The overview card's
+  quick-glance modal stays and links through to the full cockpit.
+
 - **Your session TODO ledger now notices when a merged PR ships an item.** N
   parallel sessions each carry open ledger rows, and until now closing them
   meant remembering to do it by hand — work shipped in one session left stale
