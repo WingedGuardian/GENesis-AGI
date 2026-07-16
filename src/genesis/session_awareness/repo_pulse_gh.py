@@ -47,12 +47,20 @@ async def _default_runner(argv: list[str]) -> tuple[int, str, str]:
     THIS repo's git remote regardless of where the detached worker was
     spawned from (hardening 1 above).
     """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(repo_root()),
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(repo_root()),
+        )
+    except Exception as exc:
+        # gh missing from PATH / non-executable / bad cwd: a raised
+        # FileNotFoundError here would bypass the {"error": ...} path and
+        # escape to the worker's outer catch — no run row, no telemetry,
+        # no debounce. Convert to a nonzero runner result instead so the
+        # normal failed-run recording path handles it.
+        return 127, "", f"gh spawn failed: {exc}"
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_GH_TIMEOUT_S)
     except TimeoutError:

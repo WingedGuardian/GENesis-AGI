@@ -46,6 +46,17 @@ async def test_resolves_slug_live_and_lists(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_default_runner_spawn_failure_returns_error_tuple():
+    """gh missing from PATH must surface as a nonzero runner result — a
+    raised FileNotFoundError would bypass the error-dict path and leave no
+    run row, no telemetry, no debounce (Codex P2 round 3 on #1081)."""
+    rc, out, err = await gh._default_runner(["definitely-not-a-real-binary-xyz"])
+    assert rc != 0
+    assert out == ""
+    assert "spawn failed" in err
+
+
+@pytest.mark.asyncio
 async def test_until_date_bounds_the_search_window():
     """Pagination support: an until_date turns the qualifier into a closed
     merged:since..until range (the worker pages down on limit_hit)."""
