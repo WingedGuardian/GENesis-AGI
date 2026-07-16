@@ -392,7 +392,7 @@ async def test_reopened_item_not_reabsorbed_on_recovered_window(
     gh = _gh([_pr(body=f"Ledger: {ITEM}")])
     out = await _run(db_path, monkeypatch, gh=gh)
     assert out["absorbed"] == [ITEM]
-    # Jay reopens the item; a later run re-covers the same window
+    # the user reopens the item; a later run re-covers the same window
     async with aiosqlite.connect(str(db_path)) as db:
         await db.execute("UPDATE session_ledger SET status = 'open' WHERE id = ?", (ITEM,))
         await db.commit()
