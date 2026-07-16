@@ -28,7 +28,12 @@ import json
 import re
 
 PULSE_MODEL = "claude-haiku-4-5-20251001"  # arbiter/extractor smoke-tested contract
-PULSE_TIMEOUT_S = 120.0  # extractor precedent: ~24k-ch prompt ran 101s worst-case
+# 240s (was 120): live E2E measured 67s/122s/84s per call with TTFT alone
+# hitting 70s — 1 of 3 runs died at the old ceiling. The failure self-heals
+# (window re-covers) but wastes the Haiku call and delays proposals by a
+# boundary. 240s ≈ 2× observed worst case while still bounding the global
+# pulse.lock hold (user-approved 2026-07-16).
+PULSE_TIMEOUT_S = 240.0
 PROMPT_VERSION = "v2"  # v2: list-position-only PR lines (v1's #NNNN got echoed as 'pr')
 
 MAX_ITEMS = 40  # open ledger rows in the fuzzy prompt (live scale today: ~1)
