@@ -349,3 +349,71 @@ class TestVersionTimeout:
             got = await remote.version()
         assert got["cc_logged_in"] is True
         assert got["cc_token_age_days"] == -1
+
+
+class TestContainerCapacityExecutors:
+    """EXECUTE-only container-capacity executors (PR-C): client-side range
+    validation, exact command + `-` sentinel token construction, per-call
+    timeout override. Approval is NOT done here (the caller obtains it)."""
+
+    @pytest.mark.asyncio
+    async def test_grow_root_valid_sends_exact_command(self, remote):
+        from genesis.guardian.remote import _GROW_ROOT_TIMEOUT
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, '{"ok": true, "verified": true}'))) as m:
+            res = await remote.request_grow_root(40)
+        assert res["ok"] is True
+        assert m.call_args.args[0] == "grow-root 40"
+        assert m.call_args.kwargs["timeout"] == _GROW_ROOT_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_grow_root_out_of_range_never_dials(self, remote):
+        with patch.object(remote, "_ssh_command", AsyncMock()) as m:
+            assert (await remote.request_grow_root(0))["ok"] is False
+            assert (await remote.request_grow_root(10000))["ok"] is False
+        m.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_limits_both_axes_sends_exact_command(self, remote):
+        from genesis.guardian.remote import _SET_LIMITS_TIMEOUT
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, '{"ok": true}'))) as m:
+            res = await remote.request_set_container_limits(20480, 4)
+        assert res["ok"] is True
+        assert m.call_args.args[0] == "set-container-limits 20480 4"
+        assert m.call_args.kwargs["timeout"] == _SET_LIMITS_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_set_limits_mem_only_uses_dash_sentinel(self, remote):
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, '{"ok": true}'))) as m:
+            await remote.request_set_container_limits(20480, None)
+        assert m.call_args.args[0] == "set-container-limits 20480 -"
+
+    @pytest.mark.asyncio
+    async def test_set_limits_cpu_only_uses_dash_sentinel(self, remote):
+        with patch.object(remote, "_ssh_command",
+                          AsyncMock(return_value=(True, '{"ok": true}'))) as m:
+            await remote.request_set_container_limits(None, 4)
+        assert m.call_args.args[0] == "set-container-limits - 4"
+
+    @pytest.mark.asyncio
+    async def test_set_limits_both_none_never_dials(self, remote):
+        with patch.object(remote, "_ssh_command", AsyncMock()) as m:
+            res = await remote.request_set_container_limits(None, None)
+        assert res["ok"] is False and "nothing to do" in res["error"]
+        m.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_limits_bad_mem_never_dials(self, remote):
+        with patch.object(remote, "_ssh_command", AsyncMock()) as m:
+            assert (await remote.request_set_container_limits(99, None))["ok"] is False
+            assert (await remote.request_set_container_limits(10_000_000, None))["ok"] is False
+        m.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_limits_bad_cpu_never_dials(self, remote):
+        with patch.object(remote, "_ssh_command", AsyncMock()) as m:
+            assert (await remote.request_set_container_limits(None, 0))["ok"] is False
+            assert (await remote.request_set_container_limits(None, 1000))["ok"] is False
+        m.assert_not_called()

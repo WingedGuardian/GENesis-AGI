@@ -105,6 +105,10 @@ async def coordinate_set_container_limits(
     The VM<->container coupling: after a Proxmox VM grow, this makes the grown
     RAM/cores reach the container. The host verb caps memory below MemTotal-reserve.
     """
+    if mem_mib is None and cpu is None:
+        # Fail before asking the user to approve a no-op (empty proposal).
+        return {"ok": False, "stage": "invalid",
+                "error": "nothing to do (both axes None)"}
     parts = []
     if mem_mib is not None:
         parts.append(f"memory->{mem_mib}MiB")

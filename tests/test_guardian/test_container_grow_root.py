@@ -66,3 +66,14 @@ async def test_set_limits_deny_no_execute():
     res = await coordinate_set_container_limits(remote, _ask("DENY"), mem_mib=20480, cpu=None)
     assert res["ok"] is False and res["stage"] == "denied"
     assert remote.set_limits_args is None
+
+
+async def test_set_limits_both_none_short_circuits_before_asking():
+    """NOTE fix: a no-op request must fail before sending an empty-parens
+    approval proposal to the user (and before dispatching the verb)."""
+    remote = FakeRemote()
+    ask = _ask("APPROVE")
+    res = await coordinate_set_container_limits(remote, ask, mem_mib=None, cpu=None)
+    assert res["ok"] is False and res["stage"] == "invalid"
+    assert remote.set_limits_args is None
+    assert getattr(ask, "prompt", None) is None  # user was never prompted
