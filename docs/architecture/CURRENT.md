@@ -191,8 +191,15 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: d8d9b5e4 2026-07-09
+verified: 3403599d 2026-07-16
 ```
+
+- **Surplus generators are deliberately BLIND to `infrastructure_alert`
+  observations (2026-07-16)**: `_gather_context` excludes them so a stale/
+  unverified infra critical can never be amplified into an autonomous
+  "self-unblock" action (the git-corruption false alarm). Infra problems
+  reach the user via guardian/health-alerts/morning-report — not surplus
+  brainstorming. Don't "fix" the missing context.
 
 - `surplus/scheduler.py` (~790 LOC) is the system-job hub (dream cycle, recon,
   pipeline cycles, maintenance, code index, model evals…); job bodies
@@ -395,8 +402,16 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 47e7a132 2026-07-15
+verified: 3403599d 2026-07-16
 ```
+
+- **Git-health alerts self-heal, slot-scoped (2026-07-16)**: the per-tick cheap
+  probe auto-resolves open `git_cheap` observations on pass; the daily deep
+  fsck auto-resolves `git_deep` only (fsck READS — a passing fsck must never
+  clear a live `rootfs_readonly` cheap alert). Creates carry
+  `skip_if_duplicate=True` (atomic INSERT…WHERE NOT EXISTS — the only guard
+  that works across concurrent loops). Probe sensitivity is deliberately
+  single-failure; do not add consecutive-failure gating.
 
 - **awareness/**: the 5-min heartbeat. ~23 signal collectors (the richer
   `learning/signals/*` set REPLACES the bootstrap placeholders in
