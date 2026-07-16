@@ -19,7 +19,7 @@ that produces user model updates.
 
 **User model updates:** Only propose a delta if:
 1. You have specific signal or observation evidence (cite it)
-2. Confidence >= 0.9
+2. Confidence >= 0.85
 3. The delta is genuinely NEW information not already established
 
 Do NOT produce surplus_candidates — set to empty list.
@@ -35,7 +35,7 @@ Respond in JSON:
   "assessment": "2-4 sentences on user impact, citing evidence.",
   "patterns": ["user-relevant pattern (max 3)"],
   "user_model_updates": [
-    {{"field": "field_name", "value": "observed_value", "evidence": "specific signal/observation citation", "confidence": 0.8}}
+    {{"field": "field_name", "value": "observed_value", "evidence": "specific signal/observation citation", "confidence": 0.85}}
   ],
   "recommendations": ["actionable for user (max 3)"],
   "confidence": 0.7,

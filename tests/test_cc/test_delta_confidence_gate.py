@@ -58,3 +58,39 @@ async def test_gate_boundary_admits_085_drops_below(db):
     )
     stored = {json.loads(r[0])["field"] for r in rows}
     assert stored == {"at_boundary"}
+
+
+def test_prompt_sources_agree_with_gate():
+    """Every prompt source that states a delta-confidence bar states the SAME
+    bar as the enforcing constant, and no exemplar shows a delta the gate
+    would drop. Prompts cannot import constants, so this test is the drift
+    lock. Locks the full class (Codex P2 on #1088: the identity override
+    template — the one PromptBuilder actually prefers — was still at 0.9
+    after the fallback template was fixed)."""
+    import re
+    from pathlib import Path
+
+    import genesis
+    from genesis.cc.reflection_bridge._prompts import LIGHT_FOCUS_INSTRUCTIONS
+
+    root = Path(genesis.__file__).parent
+    sources = {
+        "cc_bridge": LIGHT_FOCUS_INSTRUCTIONS["user_impact"],
+        "fallback_template": (
+            root / "perception/templates/light/user_impact.txt"
+        ).read_text(encoding="utf-8"),
+        "identity_override": (
+            root / "identity/LIGHT_TEMPLATE_USER_IMPACT.md"
+        ).read_text(encoding="utf-8"),
+    }
+    for name, text in sources.items():
+        stated = re.search(r"[Cc]onfidence >= (0\.\d+)", text)
+        assert stated, f"{name} lost its confidence instruction"
+        assert float(stated.group(1)) == MIN_DELTA_CONFIDENCE, (
+            f"{name} states {stated.group(1)}, gate enforces {MIN_DELTA_CONFIDENCE}"
+        )
+        exemplar = re.search(r'"confidence": (0\.\d+)\}', text)
+        if exemplar:
+            assert float(exemplar.group(1)) >= MIN_DELTA_CONFIDENCE, (
+                f"{name} exemplar delta would be dropped by the gate"
+            )
