@@ -20,6 +20,10 @@ class MicroOutput:
     anomaly: bool
     summary: str
     signals_examined: int
+    # Signal names (from the tick roster) the LLM cites as driving its
+    # assessment. Optional in the LLM contract — empty means the writer
+    # falls back to full-roster relevance classification.
+    driving_signals: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

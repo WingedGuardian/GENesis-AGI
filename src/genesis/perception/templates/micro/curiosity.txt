@@ -8,11 +8,14 @@ Look for patterns, connections, or implications that aren't obvious at first gla
 
 Signals marked "-- baseline:" include what's normal for this system. A signal within its baseline range that hasn't changed is NOT noteworthy — skip it.
 
+In "driving_signals", name the exact signals (as listed above, the part before the colon) that materially drove your summary and salience — an empty list if nothing stood out.
+
 Respond in JSON:
 {{
   "tags": ["tag1", "tag2"],
   "salience": 0.3,
   "anomaly": false,
   "summary": "One or two sentences about what's most interesting or notable.",
-  "signals_examined": {signals_examined}
+  "signals_examined": {signals_examined},
+  "driving_signals": ["signal_name_from_the_list_above"]
 }}

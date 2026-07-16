@@ -10,11 +10,14 @@ Signals marked "-- baseline:" include what's normal for this system. A signal wi
 
 Assess overall salience (0.0-1.0). Flag any anomalies.
 
+In "driving_signals", name the exact signals (as listed above, the part before the colon) that materially drove your summary and salience — an empty list if nothing stood out.
+
 Respond in JSON:
 {{
   "tags": ["tag1", "tag2"],
   "salience": 0.3,
   "anomaly": false,
   "summary": "One or two sentences describing what you see.",
-  "signals_examined": {signals_examined}
+  "signals_examined": {signals_examined},
+  "driving_signals": ["signal_name_from_the_list_above"]
 }}

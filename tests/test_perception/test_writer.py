@@ -25,6 +25,28 @@ def _make_tick() -> TickResult:
     )
 
 
+def _make_mixed_tick() -> TickResult:
+    """Tick whose roster mixes a user-facing and a genesis-infra signal."""
+    return TickResult(
+        tick_id="tick-mixed",
+        timestamp="2026-03-05T10:00:00+00:00",
+        source="scheduled",
+        signals=[
+            SignalReading(
+                name="task_completion_quality", value=0.9, source="genesis",
+                collected_at="2026-03-05T10:00:00+00:00",
+            ),
+            SignalReading(
+                name="cpu_usage", value=0.3, source="system",
+                collected_at="2026-03-05T10:00:00+00:00",
+            ),
+        ],
+        scores=[],
+        classified_depth=Depth.MICRO,
+        trigger_reason="threshold_exceeded",
+    )
+
+
 async def test_write_micro_creates_observation(db):
     from genesis.db.crud import observations
     from genesis.perception.writer import ResultWriter
@@ -462,13 +484,15 @@ async def test_micro_cooldown_blocks_rapid_non_anomaly(db):
 
     writer = ResultWriter()
 
-    # Insert a recent micro_reflection with current timestamp
+    # Insert a recent micro_reflection with current timestamp.  _make_tick()
+    # (cpu_usage only) classifies as :genesis, so seed a matching category.
     now = datetime.now(UTC).isoformat()
     await observations.create(
         db,
         id="recent-micro",
         source="reflection",
         type="micro_reflection",
+        category="routine:genesis",
         content='{"summary": "prior"}',
         priority="low",
         created_at=now,
@@ -481,7 +505,7 @@ async def test_micro_cooldown_blocks_rapid_non_anomaly(db):
     )
     stored = await writer.write(output, Depth.MICRO, _make_tick(), db=db)
 
-    assert not stored, "Cooldown should block non-anomaly within 20 min"
+    assert not stored, "Cooldown should block same-relevance non-anomaly within 20 min"
 
 
 async def test_micro_cooldown_allows_anomaly(db):
@@ -640,3 +664,436 @@ async def test_write_micro_dedup_ignores_tag_variation(db):
 
     obs = await observations.query(db, source="reflection")
     assert len(obs) == 1, f"Expected 1 (tag variation should dedup), got {len(obs)}"
+
+
+# ── Relevance from driving_signals (idx 17) ─────────────────────────────
+
+
+async def test_write_micro_relevance_user_from_driving_signals(db):
+    """Mixed roster, but the LLM says only the user signal drove it → :user."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["user_activity"],
+        salience=0.7,
+        anomaly=False,
+        summary="Task completion quality shifted noticeably.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality"],
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:user"
+
+
+async def test_write_micro_relevance_genesis_from_driving_signals(db):
+    """Mixed roster, driving signal is genesis-infra → :genesis."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["cpu"],
+        salience=0.7,
+        anomaly=False,
+        summary="CPU trending up across ticks.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:genesis"
+
+
+async def test_write_micro_relevance_mixed_driving_signals_both(db):
+    """Driving signals span both audiences → :both."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["mixed"],
+        salience=0.7,
+        anomaly=False,
+        summary="User activity and CPU both moved.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality", "cpu_usage"],
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:both"
+
+
+async def test_write_micro_relevance_empty_driving_signals_falls_back(db):
+    """LLM omitted driving_signals → full-roster fallback (pre-fix behavior)."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["idle"],
+        salience=0.7,
+        anomaly=False,
+        summary="Broad routine sweep.",
+        signals_examined=2,
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:both"
+
+
+async def test_write_micro_relevance_hallucinated_driving_signals_fall_back(db):
+    """Names not in the tick roster are discarded → full-roster fallback."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["ghost"],
+        salience=0.7,
+        anomaly=False,
+        summary="Phantom signal cited.",
+        signals_examined=2,
+        driving_signals=["signal_that_does_not_exist"],
+    )
+    await writer.write(output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+    assert obs[0]["category"] == "routine:both"
+
+
+async def test_write_micro_dedup_distinguishes_relevance(db):
+    """Same roster/band/anomaly but different driving_signals -> different
+    relevance -> both persist (dedup must not collapse distinct partitions)."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    # anomaly=True bypasses the cooldown gate, isolating the dedup path.
+    user_output = MicroOutput(
+        tags=["user"],
+        salience=0.8,
+        anomaly=True,
+        summary="Task completion quality anomaly.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality"],
+    )
+    genesis_output = MicroOutput(
+        tags=["genesis"],
+        salience=0.8,
+        anomaly=True,
+        summary="CPU usage anomaly.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored_user = await writer.write(user_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    stored_genesis = await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    assert stored_user is True
+    assert stored_genesis is True
+    obs = await observations.query(db, source="reflection")
+    cats = sorted(o["category"] for o in obs)
+    assert cats == ["anomaly:genesis", "anomaly:user"]
+
+
+async def test_micro_cooldown_scoped_by_relevance(db):
+    """A recent :user micro must NOT block a :genesis micro (different ego
+    partition), but a recent same-relevance micro still hits the cooldown."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-user-micro",
+        source="reflection",
+        type="micro_reflection",
+        category="routine:user",
+        content='{"summary": "prior user-relevant"}',
+        priority="low",
+        created_at=now,
+    )
+
+    # genesis-driven micro on a mixed roster -> routine:genesis; the recent
+    # :user micro is a different partition and must not suppress it.
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.6, anomaly=False,
+        summary="Disk usage creeping upward.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored_genesis = await writer.write(
+        genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored_genesis is True, "cross-relevance cooldown must not block"
+
+    # a recent same-relevance (:genesis) micro DOES suppress the next one.
+    await observations.create(
+        db,
+        id="recent-genesis-micro",
+        source="reflection",
+        type="micro_reflection",
+        category="routine:genesis",
+        content='{"summary": "prior genesis-relevant"}',
+        priority="low",
+        created_at=now,
+    )
+    genesis_output2 = MicroOutput(
+        tags=["cpu2"], salience=0.7, anomaly=False,
+        summary="Disk usage still creeping.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored_genesis2 = await writer.write(
+        genesis_output2, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored_genesis2 is False, "same-relevance cooldown must still block"
+
+
+async def test_micro_cooldown_both_suppresses_genesis(db):
+    """A recent :both micro shares the Genesis-visible partition, so it must
+    suppress a subsequent :genesis micro (P2: :both overlaps :genesis)."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-both-micro",
+        source="reflection",
+        type="micro_reflection",
+        category="routine:both",
+        content='{"summary": "prior both-relevant"}',
+        priority="low",
+        created_at=now,
+    )
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.6, anomaly=False,
+        summary="Disk usage creeping.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored = await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored is False, ":both must suppress a Genesis-visible :genesis micro"
+
+
+async def test_micro_cooldown_both_not_blocked_by_user(db):
+    """A recent :user micro (Genesis-invisible) must NOT block a :both micro
+    (Genesis-visible) — no cross-partition starvation."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-user-micro2",
+        source="reflection",
+        type="micro_reflection",
+        category="routine:user",
+        content='{"summary": "prior user"}',
+        priority="low",
+        created_at=now,
+    )
+    both_output = MicroOutput(
+        tags=["mixed"], salience=0.6, anomaly=False,
+        summary="User activity and disk both moved.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality", "cpu_usage"],
+    )
+    stored = await writer.write(both_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored is True, ":user must not block a Genesis-visible :both micro"
+
+
+async def test_micro_dedup_both_and_genesis_share_partition(db):
+    """Anomaly path (cooldown bypassed): structurally-identical :both and
+    :genesis micros share the Genesis-visible partition, so the second is a
+    duplicate and must be deduped (only one persists)."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    # both anomaly (bypass cooldown), same salience band + same mixed roster
+    both_output = MicroOutput(
+        tags=["mixed"], salience=0.8, anomaly=True,
+        summary="Everything moved.", signals_examined=2,
+        driving_signals=["task_completion_quality", "cpu_usage"],  # -> both
+    )
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.8, anomaly=True,
+        summary="CPU moved.", signals_examined=2,
+        driving_signals=["cpu_usage"],  # -> genesis
+    )
+    stored_both = await writer.write(both_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    stored_genesis = await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    assert stored_both is True
+    assert stored_genesis is False, ":genesis dups a recent Genesis-visible :both"
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
+
+
+async def test_micro_dedup_user_and_genesis_still_distinct(db):
+    """The P2#1 guarantee holds: :user and :genesis are different partitions
+    and must both persist (a :user must never drop a :genesis)."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    user_output = MicroOutput(
+        tags=["user"], salience=0.8, anomaly=True,
+        summary="Task quality moved.", signals_examined=2,
+        driving_signals=["task_completion_quality"],  # -> user
+    )
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.8, anomaly=True,
+        summary="CPU moved.", signals_examined=2,
+        driving_signals=["cpu_usage"],  # -> genesis
+    )
+    await writer.write(user_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+
+    obs = await observations.query(db, source="reflection")
+    cats = sorted(o["category"] for o in obs)
+    assert cats == ["anomaly:genesis", "anomaly:user"]
+
+
+async def test_micro_cooldown_null_category_is_genesis_visible(db):
+    """A recent NULL-category micro is Genesis-visible (genesis_context
+    includes ``category IS NULL``), so it must suppress a subsequent genesis
+    micro -- the cooldown NOT-LIKE branch must treat NULL as visible."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-null-micro",
+        source="reflection",
+        type="micro_reflection",
+        content='{"summary": "prior, no category"}',
+        priority="low",
+        created_at=now,
+    )
+    genesis_output = MicroOutput(
+        tags=["cpu"], salience=0.6, anomaly=False,
+        summary="Disk usage creeping.",
+        signals_examined=2,
+        driving_signals=["cpu_usage"],
+    )
+    stored = await writer.write(genesis_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored is False, "NULL-category prior (Genesis-visible) must suppress a genesis micro"
+
+
+async def test_micro_cooldown_null_category_does_not_block_user(db):
+    """A NULL-category (Genesis-visible) prior must NOT block a :user micro."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-null-micro2",
+        source="reflection",
+        type="micro_reflection",
+        content='{"summary": "prior, no category"}',
+        priority="low",
+        created_at=now,
+    )
+    user_output = MicroOutput(
+        tags=["user"], salience=0.6, anomaly=False,
+        summary="Task quality shifted.",
+        signals_examined=2,
+        driving_signals=["task_completion_quality"],
+    )
+    stored = await writer.write(user_output, Depth.MICRO, _make_mixed_tick(), db=db)
+    assert stored is True, "Genesis-visible NULL prior must not block a :user micro"
+
+
+def _tick_with(*names: str) -> TickResult:
+    return TickResult(
+        tick_id="tick-scope",
+        timestamp="2026-03-05T10:00:00+00:00",
+        source="scheduled",
+        signals=[
+            SignalReading(
+                name=n, value=0.5, source="test",
+                collected_at="2026-03-05T10:00:00+00:00",
+            )
+            for n in names
+        ],
+        scores=[],
+        classified_depth=Depth.MICRO,
+        trigger_reason="test",
+    )
+
+
+def test_relevance_discards_out_of_scope_driving_signal():
+    """An LLM citing an out-of-Micro-scope user signal it was never shown must
+    not flip relevance to :user — it is discarded and the safe :both fallback
+    (full roster) applies, so a genesis micro is not over-excluded."""
+    from genesis.perception.writer import ResultWriter
+
+    tick = _tick_with("user_goal_staleness", "cpu_usage")
+    rel = ResultWriter._relevance_from_signals(
+        tick, ["user_goal_staleness"], excluded_signals={"user_goal_staleness"},
+    )
+    assert rel == "both"  # NOT "user"
+
+
+def test_relevance_in_scope_driving_signal_still_classifies():
+    """A cited signal that IS in Micro scope still drives classification."""
+    from genesis.perception.writer import ResultWriter
+
+    tick = _tick_with("user_goal_staleness", "cpu_usage")
+    rel = ResultWriter._relevance_from_signals(
+        tick, ["cpu_usage"], excluded_signals={"user_goal_staleness"},
+    )
+    assert rel == "genesis"
+
+
+def test_relevance_mixed_scope_keeps_only_in_scope():
+    """When a citation mixes in-scope and out-of-scope names, only the
+    in-scope one counts."""
+    from genesis.perception.writer import ResultWriter
+
+    tick = _tick_with("user_goal_staleness", "cpu_usage")
+    rel = ResultWriter._relevance_from_signals(
+        tick, ["user_goal_staleness", "cpu_usage"],
+        excluded_signals={"user_goal_staleness"},
+    )
+    assert rel == "genesis"
+
+
+def test_relevance_outreach_engagement_is_user_facing():
+    """outreach_engagement_data is user-world (matching _USER_WORLD_CATEGORIES'
+    treatment of outreach/marketing/networking): an outreach-driven micro must
+    classify :user so it is kept out of the Genesis/COO ego context."""
+    from genesis.perception.writer import ResultWriter
+
+    tick = _tick_with("outreach_engagement_data", "cpu_usage")
+    rel = ResultWriter._relevance_from_signals(tick, ["outreach_engagement_data"])
+    assert rel == "user"

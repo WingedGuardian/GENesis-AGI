@@ -93,3 +93,24 @@ def test_llm_response():
     )
     assert resp.cost_usd == 0.0
     assert resp.model == "groq-free"
+
+
+def test_micro_output_driving_signals_default_empty():
+    from genesis.perception.types import MicroOutput
+
+    output = MicroOutput(
+        tags=["idle"], salience=0.1, anomaly=False,
+        summary="Normal.", signals_examined=5,
+    )
+    assert output.driving_signals == []
+
+
+def test_micro_output_driving_signals_explicit():
+    from genesis.perception.types import MicroOutput
+
+    output = MicroOutput(
+        tags=["activity"], salience=0.6, anomaly=False,
+        summary="User activity elevated.", signals_examined=5,
+        driving_signals=["task_completion_quality"],
+    )
+    assert output.driving_signals == ["task_completion_quality"]

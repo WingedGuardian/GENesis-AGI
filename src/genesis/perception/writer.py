@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
-from genesis.awareness.types import Depth, TickResult
+from genesis.awareness.types import USER_FACING_SIGNALS, Depth, TickResult
 from genesis.db.crud import observations
 from genesis.db.crud import surplus as surplus_crud
 from genesis.observability.events import GenesisEventBus
@@ -25,16 +25,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Signals that track user activity/outcomes (vs Genesis infrastructure).
-# Used to determine relevance tagging on micro reflections.
-_USER_FACING_SIGNALS = frozenset({
-    "conversations_since_reflection",
-    "task_completion_quality",
-    "recon_findings_pending",
-    "stale_pending_items",
-    "user_goal_staleness",
-    "user_session_pattern",
-})
+# User-vs-genesis audience attribution for relevance tagging.  Single source
+# of truth lives in genesis.awareness.types (shared with the user ego's
+# activity pulse); aliased here for module-local readability.
+_USER_FACING_SIGNALS = USER_FACING_SIGNALS
 
 # Light reflection focus_area → relevance mapping
 _LIGHT_FOCUS_RELEVANCE: dict[str, str] = {
@@ -78,10 +72,28 @@ class ResultWriter:
         return hashlib.sha256(content.encode()).hexdigest()
 
     @staticmethod
-    def _relevance_from_signals(tick: TickResult) -> str:
-        """Determine relevance tag from tick signals: 'user', 'genesis', or 'both'."""
-        has_user = any(s.name in _USER_FACING_SIGNALS for s in tick.signals)
-        has_genesis = any(s.name not in _USER_FACING_SIGNALS for s in tick.signals)
+    def _relevance_from_signals(
+        tick: TickResult,
+        driving_signals: list[str] | None = None,
+        excluded_signals: set[str] | None = None,
+    ) -> str:
+        """Determine relevance tag: 'user', 'genesis', or 'both'.
+
+        Classifies from the signals the LLM cited as driving its assessment,
+        validated against the roster the LLM was actually SHOWN — i.e. the tick
+        roster minus ``excluded_signals`` (names filtered out of the Micro
+        prompt by feeds_depths).  A cited name that is out of Micro scope (or
+        otherwise hallucinated) is discarded, so it cannot flip relevance to a
+        signal the LLM never saw.  When nothing valid remains, falls back to
+        the full roster — the safe, Genesis-visible default (a mixed roster
+        classifies as 'both'), never over-excluding a genesis micro.
+        """
+        full_roster = {s.name for s in tick.signals}
+        scoped = full_roster - (excluded_signals or set())
+        valid = [n for n in (driving_signals or []) if n in scoped]
+        basis = valid or full_roster
+        has_user = any(n in _USER_FACING_SIGNALS for n in basis)
+        has_genesis = any(n not in _USER_FACING_SIGNALS for n in basis)
         if has_user and has_genesis:
             return "both"
         if has_user:
@@ -126,13 +138,37 @@ class ResultWriter:
             logger.debug("Micro observation below salience threshold (%.2f), skipping", output.salience)
             return False
 
-        # Cooldown gate: skip if a micro_reflection was created within the last
-        # 20 minutes. Anomalies bypass — same pattern as light reflections (30 min).
-        if not output.anomaly and await observations.exists_recent_by_type(
-            db, source="reflection", type="micro_reflection", window_minutes=20,
-        ):
-            logger.debug("Micro reflection cooldown: skipping (recent exists within 20m)")
-            return False
+        from genesis.perception.context import micro_excluded_signals
+
+        excluded = await micro_excluded_signals(db)
+        base_category = "anomaly" if output.anomaly else "routine"
+        relevance = self._relevance_from_signals(tick, output.driving_signals, excluded)
+        category = f"{base_category}:{relevance}"
+
+        # Cooldown gate: skip if a recently-created micro shares this one's
+        # ego-visibility partition, mirroring the Genesis ego's own filter
+        # (`category NOT LIKE '%:user'`).  A user-relevant micro is invisible
+        # to the Genesis ego and must not suppress a genesis/both micro (and
+        # vice-versa); `:both` overlaps the Genesis-visible set, so it both
+        # suppresses and is suppressed by `:genesis`.  Anomalies bypass — same
+        # pattern as light reflections (30 min).
+        if not output.anomaly:
+            if relevance == "user":
+                recent = await observations.exists_recent_by_type(
+                    db, source="reflection", type="micro_reflection",
+                    window_minutes=20, category_like="%:user",
+                )
+            else:
+                recent = await observations.exists_recent_by_type(
+                    db, source="reflection", type="micro_reflection",
+                    window_minutes=20, category_not_like="%:user",
+                )
+            if recent:
+                logger.debug(
+                    "Micro reflection cooldown: skipping (recent %s-visible exists within 20m)",
+                    "user" if relevance == "user" else "genesis",
+                )
+                return False
 
         # Low-information gate: skip observations with no actionable content.
         # The normalization fix (observation_writer) is the primary dedup fix;
@@ -148,18 +184,22 @@ class ResultWriter:
             "anomaly": output.anomaly,
             "summary": output.summary,
             "signals_examined": output.signals_examined,
+            "driving_signals": output.driving_signals,
         }, sort_keys=True)
-        base_category = "anomaly" if output.anomaly else "routine"
-        relevance = self._relevance_from_signals(tick)
-        category = f"{base_category}:{relevance}"
-
-        # Structural dedup: hash on salience band + anomaly flag + signal
-        # names.  Tags are excluded — they are LLM-generated and vary wildly
-        # across ticks even for identical underlying conditions (61 distinct
-        # tag combos for 72 observations in one week of staleness noise).
+        # Structural dedup: hash on salience band + anomaly flag + ego
+        # visibility + signal names.  Tags are excluded — they are
+        # LLM-generated and vary wildly across ticks even for identical
+        # underlying conditions (61 distinct tag combos for 72 observations in
+        # one week of staleness noise).  Visibility (not exact relevance) is
+        # keyed to mirror the Genesis ego's partition: `:genesis` and `:both`
+        # share the Genesis-visible view, so structurally-identical ones dedup
+        # together (avoiding duplicate Genesis-visible micros on the
+        # cooldown-bypassing anomaly path), while `:user` stays a distinct
+        # partition so it can never drop a genesis/both micro.
+        visibility = "user" if relevance == "user" else "genesis"
         signal_names = ",".join(sorted(s.name for s in tick.signals))
         salience_band = round(output.salience, 1)
-        norm_key = f"micro:|{salience_band}|{output.anomaly}|{signal_names}"
+        norm_key = f"micro:|{salience_band}|{output.anomaly}|{visibility}|{signal_names}"
         chash = self._content_hash(norm_key)
 
         if await observations.exists_by_hash(db, source="reflection", content_hash=chash, unresolved_only=True):

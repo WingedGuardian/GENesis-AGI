@@ -413,6 +413,39 @@ class TestGenesisEgoContextBuilder:
         assert "User email digest" not in result
 
     @pytest.mark.asyncio
+    async def test_observations_relevance_suffix_partition(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Perception relevance suffix: ':user' excluded; ':both'/':genesis' kept.
+
+        Locks the producer→consumer contract (writer emits
+        '<base>:<relevance>'; this builder filters `NOT LIKE '%:user'`),
+        which was previously untested end-to-end.
+        """
+        rows = [
+            ("rel1", "reflection", "micro_reflection", "routine:user",
+             "User task quality shifted", "low"),
+            ("rel2", "reflection", "micro_reflection", "anomaly:both",
+             "CPU and user activity anomaly", "high"),
+            ("rel3", "reflection", "micro_reflection", "routine:genesis",
+             "Disk usage creeping", "low"),
+        ]
+        for row in rows:
+            await db.execute(
+                "INSERT INTO observations "
+                "(id, source, type, category, content, priority, resolved, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, datetime('now'))",
+                row,
+            )
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "User task quality shifted" not in result
+        assert "CPU and user activity anomaly" in result
+        assert "Disk usage creeping" in result
+
+    @pytest.mark.asyncio
     async def test_observations_excludes_escalations(
         self, db, mock_health_data, capabilities,
     ):

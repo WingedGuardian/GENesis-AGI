@@ -558,23 +558,39 @@ async def exists_recent_by_type(
     source: str,
     type: str,
     window_minutes: int = 30,
+    category_like: str | None = None,
+    category_not_like: str | None = None,
 ) -> bool:
     """Check if an unresolved observation of this source+type was created recently.
 
     Used as a cooldown gate to prevent near-duplicate observations from
     LLM reflections that produce different wording for the same system state.
+    ``category_like`` / ``category_not_like`` scope the check to categories
+    matching (or not matching) a SQL LIKE pattern (e.g. ``"%:user"``) so
+    cooldowns can mirror an ego-visibility partition — a reflection visible to
+    one ego does not suppress one visible to a different ego.
 
     Uses Python-side ISO cutoff (not SQLite ``datetime('now')``) so the
     comparison works correctly with ISO 8601 timestamps stored in created_at.
     """
     cutoff = (datetime.now(UTC) - timedelta(minutes=window_minutes)).isoformat()
-    rows = await db.execute_fetchall(
+    query = (
         "SELECT 1 FROM observations "
         "WHERE source = ? AND type = ? AND resolved = 0 "
         "AND created_at > ? "
-        "LIMIT 1",
-        (source, type, cutoff),
     )
+    params: list = [source, type, cutoff]
+    if category_like is not None:
+        query += "AND category LIKE ? "
+        params.append(category_like)
+    if category_not_like is not None:
+        # NULL categories are treated as matching (i.e. NOT the excluded
+        # pattern) — this mirrors GenesisEgoContextBuilder, which counts a
+        # NULL-category observation as Genesis-visible via `category IS NULL`.
+        query += "AND (category IS NULL OR category NOT LIKE ?) "
+        params.append(category_not_like)
+    query += "LIMIT 1"
+    rows = await db.execute_fetchall(query, tuple(params))
     return len(rows) > 0
 
 

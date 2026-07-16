@@ -16,6 +16,28 @@ from genesis.perception.types import LIGHT_FOCUS_ROTATION, PromptContext
 
 logger = logging.getLogger(__name__)
 
+
+async def micro_excluded_signals(db: aiosqlite.Connection) -> set[str]:
+    """Signal names registered in signal_weights but NOT scoped to Micro.
+
+    A signal is only shown in a reflection prompt at the depths listed in its
+    ``feeds_depths``; Micro-excluded signals (e.g. ``user_goal_staleness``) are
+    therefore filtered out of the Micro prompt and must not be treated as
+    signals the Micro LLM examined.  Returns an empty set on error or when
+    signal_weights is empty (unregistered signals pass through).
+    """
+    try:
+        all_rows = await signal_weights.list_all(db)
+        if not all_rows:
+            return set()
+        micro_rows = await signal_weights.list_by_depth(db, "Micro")
+        all_names = {r["signal_name"] for r in all_rows}
+        micro_names = {r["signal_name"] for r in micro_rows}
+        return all_names - micro_names
+    except Exception:
+        logger.debug("Could not load signal_weights for Micro filtering")
+        return set()
+
 # Minimum sample count per domain before injecting calibration feedback
 _DEFAULT_MIN_SAMPLES = 10
 
@@ -150,15 +172,7 @@ class ContextAssembler:
         # tests and future signal collectors not yet in signal_weights).
         excluded_signals: set[str] | None = None
         if depth == Depth.MICRO:
-            try:
-                all_rows = await signal_weights.list_all(db)
-                micro_rows = await signal_weights.list_by_depth(db, "Micro")
-                if all_rows:
-                    all_names = {r["signal_name"] for r in all_rows}
-                    micro_names = {r["signal_name"] for r in micro_rows}
-                    excluded_signals = all_names - micro_names or None
-            except Exception:
-                logger.debug("Could not load signal_weights for Micro filtering")
+            excluded_signals = await micro_excluded_signals(db) or None
 
         # For Light reflections, filter out zero-value bootstrap placeholder signals
         _min_val = 0.001 if depth == Depth.LIGHT else 0.0
