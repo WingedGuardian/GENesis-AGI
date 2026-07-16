@@ -6,6 +6,7 @@ raised a thread-bound ProgrammingError that a bare except swallowed → no-op).
 """
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -81,5 +82,33 @@ async def test_wal_checkpoint_helpers_actually_run(tmp_path):
         await loop._sqlite_wal_truncate(db)
 
         assert (not wal.exists()) or wal.stat().st_size == 0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_pragmas_survive_reconnect(tmp_path):
+    """The reconnect closure reuses _configure, so a recovered connection must
+    keep cache_size + synchronous — guards against a future refactor inlining the
+    pragmas and dropping them on the reconnect path."""
+    db = await get_db(tmp_path / "g.db")
+    try:
+        orig_conn = db._conn
+
+        async def _raise_locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        # Force lock errors until the SerializedConnection trips its reconnect
+        # threshold and swaps in a fresh connection built by the REAL closure.
+        orig_conn.execute = _raise_locked
+        for _ in range(db._MAX_LOCK_ERRORS):
+            with pytest.raises(sqlite3.OperationalError):
+                await db.execute("SELECT 1")
+
+        assert db._conn is not orig_conn  # actually reconnected
+        rows = await db.execute_fetchall("PRAGMA cache_size")
+        assert rows[0][0] == _CACHE_SIZE
+        rows = await db.execute_fetchall("PRAGMA synchronous")
+        assert rows[0][0] == 1  # NORMAL
     finally:
         await db.close()
