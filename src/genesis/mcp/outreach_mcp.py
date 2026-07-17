@@ -485,8 +485,12 @@ async def outreach_engagement(
             signal, outreach_id,
         )
         return False
+    # Normalize the signal too: the ledger's reply_received resolver treats
+    # only engagement_signal='user_reply' as an actual reply — a stored
+    # 'replied' would grade as no-reply at deadline (Codex P2, #1109).
+    normalized_signal = "user_reply" if signal == "replied" else signal
     await crud.record_engagement(
-        _db, outreach_id, engagement_outcome=outcome, engagement_signal=signal
+        _db, outreach_id, engagement_outcome=outcome, engagement_signal=normalized_signal
     )
     return True
 
