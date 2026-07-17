@@ -159,7 +159,9 @@ def test_detects_anthropic_key_with_underscore():
         "gho_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",  # pragma: allowlist secret
         "ghs_0123456789abcdefghijklmnopqrstuvwxyz",  # pragma: allowlist secret
         "ghu_abcdEFGH1234567890ijklMNOP567890qrst",  # pragma: allowlist secret
-        "github_pat_ABCdef012345_abcdefghijklmnopqrstuvwxyz012",  # pragma: allowlist secret
+        "ghr_zyxwvutsrqponmlkjihgfedcba9876543210",  # pragma: allowlist secret
+        # fine-grained: github_pat_ + 22 + '_' + 59 (realistic 82-char body)
+        "github_pat_11ABCDEFGH0123456789AB_cdefghijklmnopqrstuvwxyz0123456789ABCDEFG",  # pragma: allowlist secret
     ],
 )
 def test_detects_github_tokens(token):
@@ -170,10 +172,11 @@ def test_detects_github_tokens(token):
 
 
 # --- False-positive guardrails ---
-# Benign strings that superficially resemble a key prefix. A permissive
-# charset with too low a length floor flags these; the shipped floor of 20
-# (real keys are 40-165 chars) keeps them safe. Each was verified against
-# the candidate regexes before the fix landed.
+# Benign strings that superficially resemble a key prefix. The length floors
+# (sk-* keeps 20; GitHub tracks the real 36/82 bodies) and the exact GitHub
+# prefix set keep these safe — real keys are far longer. The ghi_/short-ghp_
+# cases guard the specific false positive Codex flagged (a non-token
+# gh[a-z]_ prefix or a too-short body must not quarantine).
 
 
 @pytest.mark.parametrize(
@@ -187,6 +190,8 @@ def test_detects_github_tokens(token):
         "the sk-marketing-plan-q3 launch is set",
         "query the ghi_data_warehouse_table_name view",
         "ugh_oh that was a rough deploy",
+        "the ghi_abcdefghijklmnopqrstuv identifier",  # not a real gh prefix
+        "commit ghp_abc123 is too short to be a token",
     ],
 )
 def test_benign_lookalikes_not_flagged(text):
