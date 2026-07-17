@@ -493,3 +493,46 @@ class TestReconcile:
         await lane.poll_pending()
         row = await build_candidates.get_by_id(db, cid)
         assert row["outcome"] == "pr_opened"
+
+
+# --------------------------------------------------------------------------
+# WS-2 P1b: ledger prediction hook fires from BOTH create sites
+# --------------------------------------------------------------------------
+
+
+class TestLedgerHookWiring:
+    async def _ledger_rows(self, db, candidate_id):
+        from genesis.db.crud import ledger_predictions
+
+        return await ledger_predictions.list_by_subject(
+            db, action_class="build_verdict", subject_ref_id=candidate_id,
+        )
+
+    async def test_handle_build_carded_path_writes_prediction(
+        self, db, monkeypatch, tmp_path,
+    ):
+        gate, disp = FakeGate(), FakeDispatcher()
+        _lane_obj, cid, _rid = await _card(db, monkeypatch, tmp_path, gate, disp)
+
+        (row,) = await self._ledger_rows(db, cid)
+        # _eval_text stamps "confidence: high" -> stated 0.85 on a build verdict
+        assert (row["metric"], row["provenance"], row["confidence"]) == (
+            "user_greenlights", "stated", 0.85,
+        )
+
+    async def test_record_calibration_path_writes_complement_prediction(self, db):
+        lane = _lane(db)
+        await lane.handle_eval(
+            evaluation_text=_eval_text("Meh Skill", "dont_build"),
+            batch_id="b2", item=FakeItem(),
+        )
+        key = BuildLane.item_key("Meh Skill")
+        cur = await db.execute(
+            "SELECT id FROM build_candidates WHERE item_key = ?", (key,),
+        )
+        cid = (await cur.fetchone())[0]
+
+        (row,) = await self._ledger_rows(db, cid)
+        # dont_build predicts NO greenlight: "high" label inverts to 0.15
+        assert (row["metric"], row["provenance"]) == ("user_greenlights", "stated")
+        assert abs(row["confidence"] - 0.15) < 1e-9
