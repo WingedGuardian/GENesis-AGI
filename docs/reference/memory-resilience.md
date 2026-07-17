@@ -76,7 +76,9 @@ mechanically instead of leaving the warning above as the only output.
   formula, computed per machine at apply time (a 2 GiB VPS gets 1 GiB, big
   hosts cap at 4 GiB). Override the cap with `HOSTSWAP_CAP_GIB`.
 - **Unit**: a self-contained root-level `zram-swap.service` (oneshot,
-  `RemainAfterExit`) written to `/etc/systemd/system/` — fixed `/dev/zram0`,
+  `RemainAfterExit`) written to `/usr/local/lib/systemd/system/` (NOT /etc —
+  `systemctl mask` needs the /etc path free to plant its /dev/null symlink,
+  so the documented opt-out actually works) — fixed `/dev/zram0`,
   zstd compression with automatic fallback to the kernel default, no
   genesis-path dependencies. Idempotent: an unchanged unit produces no
   systemd churn; a RAM change re-renders it.

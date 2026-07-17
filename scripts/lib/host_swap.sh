@@ -30,6 +30,12 @@
 # Test seams (defaults are the real system paths; pytest overrides these and
 # stubs sudo/systemctl/systemd-detect-virt/modinfo/zramctl on PATH):
 HOSTSWAP_ETC_ROOT="${HOSTSWAP_ETC_ROOT:-/etc}"
+# The unit lives in /usr/local/lib/systemd/system (the locally-installed-unit
+# layer), NOT /etc/systemd/system: `systemctl mask` works by symlinking the
+# /etc path to /dev/null, so a unit file OCCUPYING that path makes mask refuse
+# ("File ... already exists") — the documented opt-out would be non-functional
+# (live-E2E finding 2026-07-16). /etc stays free for the operator's mask.
+HOSTSWAP_UNIT_DIR="${HOSTSWAP_UNIT_DIR:-/usr/local/lib/systemd/system}"
 HOSTSWAP_SYSTEMD_RUNTIME_DIR="${HOSTSWAP_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
 HOSTSWAP_MEMINFO="${HOSTSWAP_MEMINFO:-/proc/meminfo}"
 HOSTSWAP_PROC_SWAPS="${HOSTSWAP_PROC_SWAPS:-/proc/swaps}"
@@ -98,7 +104,7 @@ _hostswap_unit_content() {
 # "already in place". Never fails the caller.
 _hostswap_install_unit() {
     local content="$1"
-    local path="$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME"
+    local path="$HOSTSWAP_UNIT_DIR/$_HOSTSWAP_UNIT_NAME"
     if [[ "$(sudo cat "$path" 2>/dev/null)" == "$content" ]]; then
         return 0
     fi
@@ -136,13 +142,14 @@ host_swap_apply() {
         echo "  Skipped: zram kernel module not available on this kernel."
         return 0
     fi
-    local unit_path="$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME"
+    local unit_path="$HOSTSWAP_UNIT_DIR/$_HOSTSWAP_UNIT_NAME"
+    local legacy_unit="$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME"
     # Never shadow or DESTROY an external zram consumer (zram-generator,
     # Fedora defaults, a zram-backed mount, an operator's own unit): any
     # configured zram device — swap OR non-swap (a zram mount never appears
     # in /proc/swaps, but our unit's reset would wipe it) — while OUR unit
     # was never installed → leave it alone.
-    if [[ ! -f "$unit_path" ]]; then
+    if [[ ! -f "$unit_path" && ! -f "$legacy_unit" ]]; then
         if grep -q '^/dev/zram' "$HOSTSWAP_PROC_SWAPS" 2>/dev/null \
             || [[ -n "$(zramctl --noheadings 2>/dev/null || true)" ]]; then
             echo "  Skipped: external zram device already configured — not touching it."
@@ -170,6 +177,22 @@ host_swap_apply() {
     _HOSTSWAP_CHANGED=""
     _HOSTSWAP_FAILED=""
     _hostswap_install_unit "$(_hostswap_unit_content "$size_mib")"
+
+    # Migrate a legacy /etc-installed unit (pre-2026-07-16 installs): it would
+    # SHADOW the /usr/local unit by precedence and keep mask broken. Removed
+    # only AFTER the replacement write succeeded (Codex P2: deleting the
+    # working unit first + a failed write would leave the host with NO unit);
+    # on a failed write the legacy copy stays and keeps the host protected.
+    # A first migration is always a CHANGED write (new path was empty), so
+    # daemon-reload + restart below relocate atomically.
+    if [[ -f "$legacy_unit" ]]; then
+        if [[ -z "$_HOSTSWAP_FAILED" ]]; then
+            sudo rm -f "$legacy_unit" 2>/dev/null || true
+            echo "  migrated: removed legacy $legacy_unit (unit now lives in $HOSTSWAP_UNIT_DIR)"
+        else
+            echo "  keeping legacy $legacy_unit (replacement write failed — still protected)."
+        fi
+    fi
 
     if [[ -n "$_HOSTSWAP_FAILED" ]]; then
         return 0
@@ -226,7 +249,15 @@ host_swap_remove() {
     # hot_remove fully frees the device (a bare --reset leaves a stale node);
     # ExecStop already ran on disable --now, so this is the belt to its braces.
     sudo sh -c 'test -b /dev/zram0 && echo 0 > /sys/class/zram-control/hot_remove' 2>/dev/null || true
-    sudo rm -f "$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+    sudo rm -f "$HOSTSWAP_UNIT_DIR/$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+    # The /etc path is removed only when it is a REGULAR file (a legacy
+    # pre-relocation unit). After `systemctl mask` it is the operator's
+    # /dev/null SYMLINK — deleting it would silently destroy the opt-out and
+    # the next apply would reinstall (Codex P2). mask survives remove.
+    local _legacy="$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME"
+    if [[ -f "$_legacy" && ! -L "$_legacy" ]]; then
+        sudo rm -f "$_legacy" 2>/dev/null || true
+    fi
     sudo systemctl daemon-reload 2>/dev/null || true
     echo "  + zram swap removed (mask the unit to prevent re-apply on update)."
     return 0
