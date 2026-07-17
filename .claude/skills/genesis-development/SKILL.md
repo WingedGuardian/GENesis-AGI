@@ -330,9 +330,11 @@ assumptions:
 - Workload scale varies (PR velocity, table sizes, transcript sizes):
   enumerate with pagination/bounds and LOUD truncation markers, never
   silent caps (precedent: repo-pulse `limit_hit`).
-- Optional dependencies (Ollama, GPU, individual API keys) must degrade
-  gracefully behind detection/config — presence is never assumed
-  (precedent: Ollama-optional, `API_KEY_VOYAGE`-gated reranker).
+- Optional dependencies AND optional infrastructure (Ollama, GPU,
+  individual API keys, a host VM/guardian, Tailscale, voice/edge hardware)
+  must degrade gracefully behind detection/config — presence is never
+  assumed (precedent: Ollama-optional, `API_KEY_VOYAGE`-gated reranker,
+  guardian features no-op without `guardian_remote.yaml`).
 
 **No install-specific values in code.** IPs, hostnames, usernames, absolute
 `/home/<user>` paths, GitHub slugs, timezones: these belong in generated
@@ -366,6 +368,49 @@ opt-out flag), or (b) an explicit, documented operator step in CHANGELOG +
 install docs. Silent "works here because I hand-fixed it" divergence is the
 failure mode this gate exists to kill — it bites hardest on guardian/host
 changes.
+
+**Empty-state correctness — a fresh install is state zero.** Every feature
+must behave correctly with NO accumulated state: empty tables, no history,
+no cursor files, first run ever. First runs bound their own work
+(precedent: repo-pulse `lookback_days` — never "all history"); readers of
+possibly-absent tables degrade explicitly (precedents: dashboard
+`charters_available: false`; charter injection byte-identical when the
+migration hasn't applied yet). Test the zero state, not just the populated
+one — "works here" often means "works with two years of accumulated state."
+
+**External-tool version drift.** Other installs run different versions of
+`gh`, GitNexus, Node, and Claude Code — and upgrade on their own schedule.
+Never key logic on one version's observed behavior without a fallback:
+prefer first-class config over output-patching, and keep the patch as a
+safety net when older versions ignore the config (precedent: `.gitnexusrc`
++ the strip job for rc-unaware versions); parse external-tool output
+fail-closed against the LIVE stream, never assumed semantics; pin versions
+only where the system owns the pin (`cc_version.sh` + cc-align).
+
+**A settings lever for every autonomous behavior.** Anything that acts
+without a user in the loop — detached workers, scheduled jobs, auto-writes
+— ships its operator lever in the SAME PR: a settings domain
+(`off | propose_only | live` or equivalent) plus an env kill switch, with
+invalid values degrading toward LESS write authority (precedents:
+`repo_pulse` domain + `GENESIS_REPO_PULSE_DISABLED`;
+`session_ledger_shadow` live-coerced to shadow). Another operator must be
+able to turn your feature off — or cap its authority — without editing
+code. This is "the user decides tradeoffs" applied to every install.
+
+**Retention for every unbounded store.** Any table, log, or directory that
+grows without bound ships its prune path in the SAME PR, wired into
+`disk_hygiene.sh` or an existing retention tick (precedents: repo-pulse
+45d prune; ledger-shadow 45d prune; label-aware attention-snapshot GC).
+An unbounded store is a slow disk-leak on someone else's smaller disk —
+retention is part of the feature, not a follow-up.
+
+**Install-agnostic tests.** Tests must pass on a fresh clone with no
+Genesis services, no live DB, no network, no `gh` auth, no local config:
+synthetic fixtures only (never real usernames/slugs/IPs — doubles as the
+privacy gate), injectable runners for external commands, `tmp_path` over
+real paths, no wall-clock dependence. CI on GitHub's runners IS the
+reference "different install" — anything a test can't exercise there needs
+an injectable seam, not a skip-on-my-machine guard.
 
 ## Host-Deploy Gate (merged ≠ deployed)
 
