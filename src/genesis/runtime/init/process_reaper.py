@@ -188,13 +188,22 @@ def _attached_pane_ttys(listing: str) -> set[str]:
     """Pane ttys of CLIENT-ATTACHED tmux sessions from ``list-panes -a -F
     '#{session_attached} #{pane_tty}'`` output. Pure — unit-tested directly.
 
-    A malformed line (no leading integer) is treated as attached: on parse
-    drift the reaper must fail toward sparing, never toward reaping.
+    A malformed line is treated as attached: on ANY parse drift the reaper
+    must fail toward sparing, never toward reaping. That covers both a
+    non-integer first field and a tty-only line (e.g. output shaped like
+    the pre-WS-D2 ``#{pane_tty}`` format).
     """
     ttys: set[str] = set()
     for line in listing.splitlines():
         fields = line.split(None, 1)
-        if len(fields) != 2:
+        if not fields:
+            continue
+        if len(fields) == 1:
+            # Single-field line: format drift back to tty-only. Fail-spare —
+            # count it as attached (adding junk can only ever spare).
+            norm = _normalize_tty(fields[0])
+            if norm:
+                ttys.add(norm)
             continue
         attached_raw, tty_raw = fields
         try:

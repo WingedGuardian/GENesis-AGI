@@ -120,8 +120,14 @@ def test_attached_panes_malformed_line_fails_toward_sparing():
     assert pr._attached_pane_ttys("wat /dev/pts/7\n") == {"pts/7"}
 
 
+def test_attached_panes_tty_only_line_fails_toward_sparing():
+    # Format drift back to bare '#{pane_tty}' output: a tty-only line must
+    # read as attached, not silently vanish from the live set.
+    assert pr._attached_pane_ttys("/dev/pts/9\npts/3\n") == {"pts/9", "pts/3"}
+
+
 def test_attached_panes_garbage_and_blanks_ignored():
-    assert pr._attached_pane_ttys("\n?\n1 ?\n0\n") == set()
+    assert pr._attached_pane_ttys("\n?\n1 ?\n") == set()
 
 
 # ── Orchestrator harness ────────────────────────────────────────────────
