@@ -103,6 +103,27 @@ def test_normalize_tty(raw, expected):
     assert _normalize_tty(raw) == expected
 
 
+# ── Attached-pane parsing (WS-D2: detached slots are reapable) ──────────
+def test_attached_panes_included_detached_excluded():
+    listing = "1 /dev/pts/5\n0 /dev/pts/9\n2 /dev/pts/2\n"
+    assert pr._attached_pane_ttys(listing) == {"pts/5", "pts/2"}
+
+
+def test_attached_panes_all_detached_yields_empty():
+    # The persistent-slot regression: bare pane existence must NOT read as
+    # live — an idle detached cc-N slot has to be reapable.
+    assert pr._attached_pane_ttys("0 /dev/pts/4\n0 /dev/pts/8\n") == set()
+
+
+def test_attached_panes_malformed_line_fails_toward_sparing():
+    # Unknown format → treated as attached (never reap on parse drift).
+    assert pr._attached_pane_ttys("wat /dev/pts/7\n") == {"pts/7"}
+
+
+def test_attached_panes_garbage_and_blanks_ignored():
+    assert pr._attached_pane_ttys("\n?\n1 ?\n0\n") == set()
+
+
 # ── Orchestrator harness ────────────────────────────────────────────────
 class _FakeRT:
     def __init__(self, *, pipeline=None):

@@ -10,7 +10,11 @@ IDLE policy instead:
     2. idle beyond the activity window (no per-PID activity marker written
        by the session-activity hook within the last 7 days), AND
     3. detached from any live terminal (its controlling tty is not in the
-       union of tmux pane ttys and utmp login ttys).
+       union of CLIENT-ATTACHED tmux pane ttys and utmp login ttys —
+       WS-D2 2026-07-16: a detached tmux session's panes no longer count
+       as live, else the persistent cc-N slot model would make every slot
+       claude unreapable forever; an attached slot is spared indefinitely,
+       and a detached one stays spared while its activity marker is fresh).
 
 This is a strict subset of the old age-only rule (kill if age >= 7d),
 so arming the new logic can never reap something the current production
@@ -180,30 +184,58 @@ async def _process_tty(pid: int) -> str | None:
     return _normalize_tty(stdout.decode())
 
 
-async def _live_ttys() -> set[str]:
-    """Union of tmux pane ttys and utmp (``who``) login ttys, normalised.
+def _attached_pane_ttys(listing: str) -> set[str]:
+    """Pane ttys of CLIENT-ATTACHED tmux sessions from ``list-panes -a -F
+    '#{session_attached} #{pane_tty}'`` output. Pure — unit-tested directly.
 
-    This is the live-terminal discriminator: a process whose controlling
-    tty is in this set is attached to a real session (verified 2026-07-11 —
-    interactive sessions in-set, reparented zombies out-of-set).
+    A malformed line (no leading integer) is treated as attached: on parse
+    drift the reaper must fail toward sparing, never toward reaping.
     """
     ttys: set[str] = set()
-    # tmux panes
+    for line in listing.splitlines():
+        fields = line.split(None, 1)
+        if len(fields) != 2:
+            continue
+        attached_raw, tty_raw = fields
+        try:
+            attached = int(attached_raw)
+        except ValueError:
+            attached = 1  # fail-spare: unknown format counts as attached
+        if attached < 1:
+            continue
+        norm = _normalize_tty(tty_raw)
+        if norm:
+            ttys.add(norm)
+    return ttys
+
+
+async def _live_ttys() -> set[str]:
+    """Union of ATTACHED tmux pane ttys and utmp (``who``) login ttys.
+
+    This is the live-terminal discriminator: a process whose controlling
+    tty is in this set has a human plausibly looking at it (verified
+    2026-07-11 — interactive sessions in-set, reparented zombies
+    out-of-set). WS-D2 (2026-07-16): a tmux pane counts only while its
+    session has an attached client — under the persistent cc-N slot model
+    every interactive claude lives in tmux forever, so bare pane existence
+    spared everything and idle detached slots could never be reaped. A
+    detached slot mid-long-turn is still spared by its fresh activity
+    marker (checked before the tty guard).
+    """
+    ttys: set[str] = set()
+    # tmux panes of attached sessions only
     with contextlib.suppress(Exception):
         proc = await asyncio.create_subprocess_exec(
             "tmux",
             "list-panes",
             "-a",
             "-F",
-            "#{pane_tty}",
+            "#{session_attached} #{pane_tty}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
         stdout, _ = await proc.communicate()
-        for line in stdout.decode().splitlines():
-            norm = _normalize_tty(line)
-            if norm:
-                ttys.add(norm)
+        ttys |= _attached_pane_ttys(stdout.decode())
     # utmp login ttys
     with contextlib.suppress(Exception):
         proc = await asyncio.create_subprocess_exec(
