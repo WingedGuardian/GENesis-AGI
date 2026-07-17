@@ -617,7 +617,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 
 ```yaml subsystem-map
 entry: learning-evaluation
-modules: [learning, eval, experimentation, feedback, calibration]
+modules: [learning, eval, experimentation, feedback, calibration, ledger]
 verified: fe5d0945 2026-07-10
 ```
 
@@ -684,7 +684,16 @@ verified: fe5d0945 2026-07-10
   wired via outreach (engagement reconciliation). **Four distinct
   "calibration" surfaces exist** (this package, `learning/triage/calibration`,
   `feedback/calibration` ego-ECE, `eval/calibration` golden-set loader) —
-  don't conflate.
+  don't conflate. Slated for WS-2 sunset (P5) once the ledger's unified
+  calibration table bakes.
+- **ledger/** (WS-2 P1a): the cognitive ledger — falsifiable predictions in
+  `ledger_predictions` (migration 0064), written only through the validating
+  CRUD (`db/crud/ledger_predictions.py`) against the code registry
+  (`ledger/metrics.py`: 9 v1 metrics, each with a pure-SQL resolver; NO
+  import path to `genesis.routing`, locked by test). Substrate only so far:
+  writer hooks = P1b, grader = P2. Outreach metrics resolve off
+  `outreach_history.engagement_signal` (spike-measured 99.5% mechanical);
+  task/ego resolvers read state tables until the T1 bus emits mature.
 
 ## 11. Routing & providers
 

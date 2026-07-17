@@ -72,6 +72,7 @@ EXPECTED_TABLES = [
     "data_migrations",  # WS-C: data-migration framework ledger
     "repo_pulse_runs",  # session-manager PR-4a: pulse worker run telemetry
     "repo_pulse_annotations",  # session-manager PR-4a: PR ↔ ledger-item matches
+    "ledger_predictions",  # WS-2 P1a: cognitive-ledger falsifiable prediction rows
 ]
 
 

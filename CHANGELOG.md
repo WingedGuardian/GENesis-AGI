@@ -9,6 +9,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Genesis now writes down its predictions before acting — the substrate.**
+  A new cognitive ledger stores falsifiable predictions ("this outreach will
+  get a reply within 72 hours, confidence 0.02") behind a hard validation
+  gate: a prediction that doesn't name a registered, mechanically-checkable
+  metric with a deadline literally cannot be written. Nine starter metrics
+  ship with their grading rules implemented and tested (replies, task
+  completion, clean job days, build greenlights, ego-proposal execution).
+  This is the foundation; the hooks that write predictions on every action
+  and the grader that scores them land next.
+
 ### Fixed
 
 - **Answering Genesis's questions with a plain message now actually works.**
