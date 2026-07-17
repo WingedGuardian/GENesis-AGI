@@ -108,6 +108,7 @@ def _sandbox(
     return {
         "PATH": f"{bindir}:/usr/bin:/bin",
         "HOSTSWAP_ETC_ROOT": str(tmp_path / "etc"),
+        "HOSTSWAP_UNIT_DIR": str(tmp_path / "unitdir"),
         "HOSTSWAP_SYSTEMD_RUNTIME_DIR": str(tmp_path / "run-systemd"),
         "HOSTSWAP_MEMINFO": str(tmp_path / "meminfo"),
         "HOSTSWAP_PROC_SWAPS": str(tmp_path / "swaps"),
@@ -124,6 +125,10 @@ def _run(env, fn="host_swap_apply", extra_env=None):
 
 
 def _unit(tmp_path) -> Path:
+    return tmp_path / "unitdir" / "zram-swap.service"
+
+
+def _legacy_unit(tmp_path) -> Path:
     return tmp_path / "etc" / "systemd" / "system" / "zram-swap.service"
 
 
@@ -375,6 +380,47 @@ def test_remove_cleans_up(tmp_path):
     assert "__DONE__" in res.stdout
     assert not _unit(tmp_path).exists()
     assert "disable --now zram-swap.service" in _log(tmp_path)
+
+
+# ── unit location (mask must WORK) + legacy migration ──────────────────────
+
+
+def test_unit_installed_outside_etc(tmp_path):
+    """`systemctl mask` symlinks /etc/systemd/system/<unit> → /dev/null; a unit
+    file OCCUPYING that path makes mask refuse (live-E2E finding) — so the unit
+    must live in the /usr/local/lib layer, leaving /etc free for the opt-out."""
+    env = _sandbox(tmp_path)
+    _run(env)
+    assert _unit(tmp_path).is_file()
+    assert not _legacy_unit(tmp_path).exists()
+
+
+def test_legacy_etc_unit_migrated(tmp_path):
+    """A pre-relocation install has the unit in /etc — it would SHADOW the new
+    location by precedence. Apply must remove it and treat the run as changed."""
+    env = _sandbox(tmp_path)
+    legacy = _legacy_unit(tmp_path)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("[Unit]\n# old etc-resident unit\n")
+    res = _run(env)
+    assert res.returncode == 0
+    assert "migrated: removed legacy" in res.stdout
+    assert not legacy.exists()
+    assert _unit(tmp_path).is_file()
+    assert "restart zram-swap.service" in _log(tmp_path)  # changed → restarted
+
+
+def test_legacy_unit_counts_as_ours_for_foreign_guard(tmp_path):
+    """Active zram + unit only at the LEGACY path is OUR install mid-migration,
+    not an external consumer — the foreign guard must not skip it."""
+    env = _sandbox(tmp_path, swaps="/dev/zram0 partition 4194304 0 100\n")
+    legacy = _legacy_unit(tmp_path)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("[Unit]\n# old etc-resident unit\n")
+    res = _run(env)
+    assert res.returncode == 0
+    assert "external zram" not in res.stdout
+    assert _unit(tmp_path).is_file()  # migrated + reinstalled
 
 
 # ── parse + wiring ──────────────────────────────────────────────────────────
