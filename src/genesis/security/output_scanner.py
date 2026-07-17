@@ -28,16 +28,34 @@ class ScanResult:
 # leakage. Intentionally conservative to minimize false positives.
 _OUTPUT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
+        # Covers the whole modern sk-* family: legacy, sk-proj-, sk-svcacct-,
+        # sk-admin- (OpenAI) and sk-or- (OpenRouter). The charset includes
+        # '_' and '-' because current keys embed them; the shipped
+        # [a-zA-Z0-9] charset silently missed every hyphen/underscore key
+        # shape. Floor stays 20 (real keys are 40-165 chars) — a lower floor
+        # false-positives on benign hyphenated slugs like "sk-learn-pipeline".
         "api_key_openai",
-        re.compile(r"\bsk-[a-zA-Z0-9]{20,}\b"),
+        re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     ),
     (
+        # Anthropic key bodies contain underscores — the shipped charset
+        # (no '_') could truncate a real key below the length floor.
         "api_key_anthropic",
-        re.compile(r"\bsk-ant-[a-zA-Z0-9\-]{20,}\b"),
+        re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
     ),
     (
         "api_key_groq",
         re.compile(r"\bgsk_[a-zA-Z0-9]{20,}\b"),
+    ),
+    (
+        # GitHub tokens, constrained to the real token shapes (high-confidence
+        # contract): classic ghp_/gho_/ghu_/ghs_/ghr_ + 36 base62, and
+        # fine-grained github_pat_ + 82. Prefixes are the exact {p,o,u,s,r}
+        # set (not any gh[a-z]_) and lengths track the real bodies, so a
+        # non-token like "ghi_abcdef…" cannot false-positive. The '_'
+        # separator is GitHub's own anti-base64-collision design.
+        "api_key_github",
+        re.compile(r"\b(?:gh[posur]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})\b"),
     ),
     (
         "credential_assignment",
@@ -73,12 +91,15 @@ _OUTPUT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # Patterns that indicate critical leakage (immediate quarantine).
 # credential_assignment is intentionally NOT critical — it matches
 # natural prose ("secret to our approach:", "token expiry is 86400s").
-_CRITICAL_PATTERNS = frozenset({
-    "api_key_openai",
-    "api_key_anthropic",
-    "api_key_groq",
-    "env_variable_secret",
-})
+_CRITICAL_PATTERNS = frozenset(
+    {
+        "api_key_openai",
+        "api_key_anthropic",
+        "api_key_groq",
+        "api_key_github",
+        "env_variable_secret",
+    }
+)
 
 
 def scan_outbound(content: str) -> ScanResult:
@@ -101,7 +122,9 @@ def scan_outbound(content: str) -> ScanResult:
 
     logger.warning(
         "Outbound content scan: %s patterns detected (%s): %s",
-        risk_level, len(detected), detected,
+        risk_level,
+        len(detected),
+        detected,
     )
 
     return ScanResult(safe=False, detected=detected, risk_level=risk_level)
