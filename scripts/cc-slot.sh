@@ -89,8 +89,11 @@ max_sessions=$ram_cap
 [[ $max_sessions -lt 1 ]] && max_sessions=1
 [[ $max_sessions -gt $CPU_CAP ]] && max_sessions=$CPU_CAP
 
+# Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old
+# wrapper (and any other cc-* stray) must not consume cap headroom — manual
+# allocation can only ever probe/create cc-<N>.
 existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-           | grep -c "^${SESSION_PREFIX}-" || true)
+           | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
 
 # Reattaching to existing session — always allow ('=' = exact-name match)
 if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then

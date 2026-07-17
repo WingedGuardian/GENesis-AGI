@@ -41,8 +41,15 @@ if [[ "$args" == *has-session* ]]; then
     exit 1
 fi
 if [[ "$args" == *list-sessions* ]]; then
-    [[ -f "$FAKE_TMUX_LIST" ]] && cat "$FAKE_TMUX_LIST" && exit 0
-    exit 1
+    # The listing file stores 'name|attached|activity' lines; emit the shape
+    # the requested -F format would produce.
+    [[ -f "$FAKE_TMUX_LIST" ]] || exit 1
+    if [[ "$args" == *session_attached* || "$args" == *session_activity* ]]; then
+        cat "$FAKE_TMUX_LIST"
+    else
+        cut -d'|' -f1 "$FAKE_TMUX_LIST"
+    fi
+    exit 0
 fi
 exit 0
 """
@@ -147,6 +154,22 @@ class TestManualMode:
         line = _new_session_line(log)
         assert "--permission-mode=plan" in line
         assert "--permission-mode auto" not in line
+
+    def test_retired_manual_sessions_do_not_consume_cap(self, door):
+        # Legacy cc-manual-<ts>-<pid> sessions from the old wrapper must not
+        # count toward the slot cap: manual allocation can only ever create
+        # numeric cc-N, so counting strays would falsely lock installs out.
+        run, log, sessions, listing = door
+        sessions.write_text("cc-1\n")
+        listing.write_text(
+            "cc-1|1|Thu Jul 16 20:00:00 2026\n"
+            "cc-manual-1784246386-1229981|0|Thu Jul 16 19:59:46 2026\n"
+        )
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        assert "-s cc-2" in _new_session_line(log)
+        # Only the numeric slot counts: cap line reads 1/<max>, not 2/<max>.
+        assert "cap: 1/" in result.stderr
 
     def test_exotic_arg_survives_quoting(self, door):
         run, log, _sessions, _listing = door
