@@ -448,7 +448,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 159698d4 2026-07-16
+verified: 71703f2d 2026-07-16
 ```
 
 - **Infra protection posture (2026-07-16)**: hourly
@@ -478,11 +478,7 @@ verified: 159698d4 2026-07-16
   collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
   reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
   watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
-  liveness heartbeat, duplicate-CC-executor paging (two live `claude` processes
-  on ONE transcript — hook layer `scripts/hooks/duplicate_session_guard.py`
-  writes `~/.genesis/session-owners/*.conflict`, this check pages `critical`
-  and GCs stale registry files; newest executor wins, older one's repo-mutating
-  tools are denied), and (hourly) embedding-backlog degradation — counts
+  liveness heartbeat, and (hourly) embedding-backlog degradation — counts
   `memory_metadata.embedding_status='failed'` (permanently keyword-only rows the
   rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band —
   plus (hourly) deploy staleness: merged-vs-deployed drift (update.sh age,

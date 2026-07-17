@@ -9,6 +9,36 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Every terminal door now leads to the same persistent session.** Running
+  `claude` by hand over SSH or in the dashboard web terminal now lands in a
+  persistent numbered tmux slot (`cc-N`, lowest free — the same pool the SSH
+  slot hostnames use), with a printed map of your existing slots and how to
+  reattach. A dropped connection or closed browser tab just detaches the
+  session; walking back in can never spawn a second copy. Previously, manual
+  launches got a uniquely-named throwaway tmux session that nothing ever
+  reattached to — abandoned launches quietly accumulated as orphaned
+  processes. Extra arguments (e.g. `--resume <id>`) are forwarded into the
+  slot; opt out per-shell with `GENESIS_NO_TMUX_WRAP=1`. The wrapper updates
+  itself on your next `update.sh` run.
+
+### Removed
+
+- **The duplicate-session guard is gone — it fought the wrong enemy.** The
+  guard (July 14) keyed "who owns this conversation" on process liveness, but
+  a slot session lives for days and serves many conversations, so reopening
+  any conversation in a different slot manufactured a phantom "duplicate
+  executor" — denying legitimate work and paging critical alerts for
+  incidents that weren't happening. With every door now attach-or-create
+  (above), the accidental-twin scenario the guard existed for can no longer
+  occur; deliberately resuming one conversation in two terminals at once is
+  allowed and left to your judgment. Removed: the PreToolUse deny hook, the
+  session-owner registry (leftover `~/.genesis/session-owners` data is
+  cleaned up on next bootstrap), the session-start warning, and the paging
+  check. The fast dead-SSH-client detection (sshd ClientAlive) stays — it
+  makes dropped connections detach cleanly.
+
 ### Added
 
 - **An unprotected box now tells you.** If a memory-crash protection is

@@ -687,24 +687,27 @@ else
 fi
 echo
 
-# --- tmux-first interactive claude ---
-# Interactive `claude` on a bare SSH tty is one dropped connection away from
-# the headless-orphan incident above. This ~/.bashrc block wraps interactive
-# launches in a uniquely-named tmux session: a dropped SSH then leaves a
-# detached tmux (reattach = the SAME process finishes its turn safely; no
-# resume-fork, no second executor). Opt out per-shell with
-# GENESIS_NO_TMUX_WRAP=1. Non-tty and print-mode (-p) invocations are never
-# wrapped. Exit status of the wrapped claude is NOT propagated (tmux's own
-# status is returned) — irrelevant for interactive use, and scripts hit the
-# unwrapped branches.
-echo "--- tmux-first interactive claude (bashrc) ---"
+# --- slot-first interactive claude ---
+# Interactive `claude` outside tmux joins the persistent cc-N slot pool
+# (scripts/cc-slot.sh manual mode) instead of running on a bare tty. Every
+# door — SSH slot hostnames, manual SSH, the dashboard web terminal — then
+# converges on the same attach-or-create tmux sessions: a dropped SSH or a
+# closed browser tab just detaches (same process, reattachable), and walking
+# in twice can never spawn a second claude for one slot. This replaces the
+# 2026-07-14 uniquely-named tmux-wrap (cc-manual-<ts>-<pid>), whose
+# never-reattach design manufactured orphans; the sentinel refresh below
+# swaps existing installs to this wrapper automatically. Opt out per-shell
+# with GENESIS_NO_TMUX_WRAP=1. Non-tty and print-mode (-p) invocations are
+# never wrapped.
+echo "--- slot-first interactive claude (bashrc) ---"
 BASHRC="$HOME/.bashrc"
 read -r -d '' TMUX_WRAP_BLOCK <<'WRAPEOF' || true
 # >>> genesis tmux-wrap >>>
 # Managed by Genesis bootstrap.sh — edits inside this block are overwritten.
-# Wraps interactive `claude` in a uniquely-named tmux session so a dropped
-# SSH leaves a detached tmux (same process, reattachable) instead of a
-# headless orphan executing the turn. Opt out: GENESIS_NO_TMUX_WRAP=1.
+# Interactive `claude` outside tmux lands in a persistent cc-N tmux slot
+# (lowest free; attach-or-create via scripts/cc-slot.sh manual). A dropped
+# SSH or closed browser tab just detaches the session — reattach with
+# `tmux attach -t cc-N`. Opt out: GENESIS_NO_TMUX_WRAP=1.
 claude() {
     local arg
     for arg in "$@"; do
@@ -713,10 +716,9 @@ claude() {
         esac
     done
     if [ -t 0 ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ] \
+        && [ -x "$HOME/genesis/scripts/cc-slot.sh" ] \
         && command -v tmux >/dev/null 2>&1; then
-        local session="cc-manual-$(date +%s)-$$"
-        printf 'genesis: tmux session %s (after a drop: tmux attach -t %s | opt out: GENESIS_NO_TMUX_WRAP=1)\n' "$session" "$session" >&2
-        tmux new-session -s "$session" -- claude "$@"
+        "$HOME/genesis/scripts/cc-slot.sh" manual "$@"
     else
         command claude "$@"
     fi
@@ -753,6 +755,14 @@ else
     printf '\n%s\n' "$TMUX_WRAP_BLOCK" >> "$BASHRC"
     echo "  tmux-wrap block installed in ~/.bashrc"
 fi
+
+# Retired duplicate-session guard (2026-07-16): its session-owner registry is
+# dead data on every install — the guard proved false-positive by construction
+# under persistent slots (a slot claude serves many conversations over days;
+# pid liveness ≠ still-executing-that-transcript). Clean up leftovers so stale
+# conflict files can't mislead anyone reading ~/.genesis.
+rm -rf "$HOME/.genesis/session-owners"
+rm -f "$HOME/.genesis/session-guard.disabled"
 echo
 
 # --- Memory resilience (systemd-oomd pressure-kill + swap invariant) ---
