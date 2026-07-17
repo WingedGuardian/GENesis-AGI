@@ -1825,6 +1825,48 @@ TABLES = {
             resolved_at  TEXT                         -- NULL = still open
         )
     """,
+    # ── WS-2 Cognitive Ledger (P1a) ──────────────────────────────────────
+    # One row per falsifiable prediction ("P about subject S is TRUE by
+    # deadline D, probability c"). Three-gate falsifiability: the CRUD writer
+    # (db/crud/ledger_predictions.py) validates against the code registry
+    # (genesis/ledger/metrics.py); these CHECKs are defense-in-depth against
+    # raw-SQL writers; the grader (P2) alarms on registry-vanished metrics.
+    # rationale is prose for humans, NEVER graded. The UNIQUE key makes the
+    # commit-path writer hooks idempotent under retries/resends.
+    "ledger_predictions": """
+        CREATE TABLE IF NOT EXISTS ledger_predictions (
+            id               TEXT PRIMARY KEY,                     -- uuid4 hex16
+            created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            action_class     TEXT NOT NULL CHECK (action_class IN
+                               ('outreach_send','task_execution','scheduled_job',
+                                'build_verdict','ego_proposal')),
+            subject_ref_type TEXT NOT NULL,      -- 'outreach' | 'task' | 'job_day' | ...
+            subject_ref_id   TEXT NOT NULL,      -- outreach_history.id / task_id / '<job>:<YYYY-MM-DD>' / ...
+            domain           TEXT NOT NULL,      -- dotted coarse domain: 'outreach.<category>', 'task.<type>', 'job.<name>'
+            metric           TEXT NOT NULL,      -- MUST exist in the code registry; grader refuses unknown metrics
+            comparator       TEXT NOT NULL DEFAULT 'is_true'
+                               CHECK (comparator IN ('is_true','le','ge')),
+            threshold        REAL,               -- required iff comparator != 'is_true'
+            confidence       REAL NOT NULL CHECK (confidence >= 0.01 AND confidence <= 0.99),
+            deadline_at      TEXT NOT NULL,      -- ISO-8601 UTC; writer enforces now < deadline <= now + horizon cap
+            provenance       TEXT NOT NULL CHECK (provenance IN ('stated','policy_prior')),
+            predictor        TEXT NOT NULL,      -- component id: 'outreach_pipeline','task_executor',...
+            source_session   TEXT,
+            rationale        TEXT,               -- optional prose; NEVER graded
+            status           TEXT NOT NULL DEFAULT 'open'
+                               CHECK (status IN ('open','resolved','fuzzy_pending',
+                                                 'fuzzy_resolved','void','unresolvable')),
+            outcome_value    INTEGER CHECK (outcome_value IN (0,1)),
+            resolved_at      TEXT,
+            resolver         TEXT CHECK (resolver IN ('mechanical','mechanical_absence',
+                                                      'llm_fallback','user')),
+            evidence_ref     TEXT,               -- 'table:rowid' of the grading evidence
+            brier            REAL,               -- (confidence - outcome_value)^2, set at grade time
+            metadata         TEXT,               -- JSON
+            CHECK ((comparator = 'is_true') = (threshold IS NULL)),
+            UNIQUE (action_class, subject_ref_id, metric)
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2139,6 +2181,12 @@ INDEXES = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_ae_open_alert ON alert_events(alert_id) WHERE resolved_at IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_ae_created ON alert_events(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_ae_alert ON alert_events(alert_id, created_at)",
+    # WS-2 Cognitive Ledger (P1a) — the partial index carries the grader's
+    # hot query (open rows past deadline)
+    "CREATE INDEX IF NOT EXISTS idx_lp_open_deadline ON ledger_predictions(deadline_at) WHERE status = 'open'",
+    "CREATE INDEX IF NOT EXISTS idx_lp_domain ON ledger_predictions(domain, action_class, metric)",
+    "CREATE INDEX IF NOT EXISTS idx_lp_status ON ledger_predictions(status)",
+    "CREATE INDEX IF NOT EXISTS idx_lp_subject ON ledger_predictions(subject_ref_type, subject_ref_id)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
