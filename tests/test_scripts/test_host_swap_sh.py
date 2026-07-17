@@ -166,19 +166,23 @@ def test_fresh_apply_installs_unit_and_enables(tmp_path):
     content = unit.read_text()
     # Size baked in from the formula; fixed device; zstd with fallback; prio 100.
     assert "--size 4096MiB --algorithm zstd" in content
-    assert "|| { zramctl --reset /dev/zram0" in content  # fallback chain
+    assert "|| zramctl /dev/zram0 --size 4096MiB" in content  # zstd fallback
     assert "swapon -p 100 /dev/zram0" in content
-    # Ubuntu 6.8 ships the module with ZERO static devices (live-E2E finding):
-    # the hot_add read must create /dev/zram0 when modprobe alone doesn't.
-    assert "test -b /dev/zram0 || cat /sys/class/zram-control/hot_add" in content
-    # hot_add is async — udev must CREATE the node before zramctl touches it.
-    assert "udevadm settle" in content
-    # P1 belt: never reset a zram0 carrying someone's filesystem.
-    assert 'grep -q \"^/dev/zram0 \" /proc/mounts && exit 1' in content
+    # Always-fresh device (live-E2E findings): Ubuntu 6.8 ships ZERO static
+    # devices → hot_add creates one; a stale device is hot_removed first
+    # (--reset makes udev DELETE the node → "No such device" on configure).
+    assert "cat /sys/class/zram-control/hot_add" in content
+    assert "echo 0 > /sys/class/zram-control/hot_remove" in content
+    assert "zramctl --reset" not in content  # reset is the bug — never in the unit
+    # hot_add/hot_remove are async — udev must settle before zramctl touches it.
+    assert content.count("udevadm settle") >= 2
+    # never touch a zram0 carrying someone's filesystem.
+    assert 'grep -q "^/dev/zram0 " /proc/mounts && exit 1' in content
     assert "$" not in content  # NO command substitution → no systemd escaping
     log = _log(tmp_path)
     assert "daemon-reload" in log
-    assert "enable --now zram-swap.service" in log
+    assert "restart zram-swap.service" in log
+    assert "enable zram-swap.service" in log
     assert "zram swap unit installed" in res.stdout
 
 
@@ -212,13 +216,14 @@ def test_idempotent_rerun_no_systemd_churn(tmp_path):
     (tmp_path / "swaps").write_text(
         "Filename Type Size Used Priority\n/dev/zram0 partition 4194304 0 100\n"
     )
+
     # Mutating verbs only — the read-only `is-enabled` mask-check runs per
     # apply by design and must not count as churn.
     def _churn():
         return [
             line
             for line in _log(tmp_path).splitlines()
-            if "daemon-reload" in line or "enable --now" in line
+            if "daemon-reload" in line or "restart" in line
         ]
 
     churn_before = _churn()
@@ -297,7 +302,7 @@ def test_skip_foreign_nonswap_zram_not_destroyed(tmp_path):
     """Codex P1: a zram-backed MOUNT never appears in /proc/swaps — the guard
     must also see a configured device via zramctl, or the unit's reset would
     destroy it."""
-    busy_zramctl = "#!/bin/bash\nif [ \"$1\" = \"--noheadings\" ]; then echo \"/dev/zram0 lzo-rle 512M\"; fi\nexit 0\n"
+    busy_zramctl = '#!/bin/bash\nif [ "$1" = "--noheadings" ]; then echo "/dev/zram0 lzo-rle 512M"; fi\nexit 0\n'
     env = _sandbox(tmp_path, zramctl=busy_zramctl)  # swaps stays empty
     res = _run(env)
     assert res.returncode == 0
@@ -311,11 +316,11 @@ def test_unchanged_unit_inactive_retries_enable(tmp_path):
     only durable opt-out."""
     env = _sandbox(tmp_path)
     _run(env)  # install; stubbed systemctl never actually starts the device
-    enables_before = _log(tmp_path).count("enable --now")
+    restarts_before = _log(tmp_path).count("restart")
     res = _run(env)  # unchanged unit, swaps still empty → retry branch
     assert res.returncode == 0
-    assert "re-enabled (was inactive)" in res.stdout
-    assert _log(tmp_path).count("enable --now") == enables_before + 1
+    assert "restarted (was inactive)" in res.stdout
+    assert _log(tmp_path).count("restart") == restarts_before + 1
 
 
 def test_skip_without_sudo(tmp_path):
@@ -355,7 +360,7 @@ def test_write_failure_warns_and_skips_systemd(tmp_path):
     assert "NOT installed" in res.stdout
     log = _log(tmp_path)
     assert "daemon-reload" not in log
-    assert "enable --now" not in log
+    assert "restart" not in log
 
 
 # ── remove ──────────────────────────────────────────────────────────────────
