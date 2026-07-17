@@ -116,8 +116,7 @@ def proc_starttime_ticks(pid: int) -> int | None:
 
     ``(pid, starttime)`` is a reuse-proof process identity: starttime never
     changes for a live process, so a matching pair proves the pid was not
-    recycled. Hook-world twin of this parse: scripts/hooks/proc_ident.py
-    (hooks cannot import genesis.*) — keep the parsing rules in sync.
+    recycled.
     """
     stat_path = Path(f"/proc/{pid}/stat")
     if not stat_path.exists():
