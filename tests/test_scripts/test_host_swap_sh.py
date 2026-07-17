@@ -168,6 +168,9 @@ def test_fresh_apply_installs_unit_and_enables(tmp_path):
     assert "--size 4096MiB --algorithm zstd" in content
     assert "|| { zramctl --reset /dev/zram0" in content  # fallback chain
     assert "swapon -p 100 /dev/zram0" in content
+    # Ubuntu 6.8 ships the module with ZERO static devices (live-E2E finding):
+    # the hot_add read must create /dev/zram0 when modprobe alone doesn't.
+    assert "test -b /dev/zram0 || cat /sys/class/zram-control/hot_add" in content
     # P1 belt: never reset a zram0 carrying someone's filesystem.
     assert 'grep -q \"^/dev/zram0 \" /proc/mounts && exit 1' in content
     assert "$" not in content  # NO command substitution → no systemd escaping
