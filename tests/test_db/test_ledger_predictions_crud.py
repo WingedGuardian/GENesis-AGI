@@ -87,7 +87,9 @@ async def test_get_by_id_missing(db):
         ({"deadline_at": (NOW - timedelta(hours=1)).isoformat()}, "deadline_at"),
         ({"deadline_at": NOW.isoformat()}, "deadline_at"),
         ({"deadline_at": (NOW + timedelta(days=31)).isoformat()}, "deadline_at"),
-        ({"deadline_at": "not-a-date"}, "unparseable"),
+        ({"deadline_at": "not-a-date"}, "full ISO timestamp"),
+        # bare date is valid for bitemporal valid_at fields, NOT for a deadline
+        ({"deadline_at": "2026-07-20"}, "full ISO timestamp"),
         ({"provenance": "vibes"}, "provenance"),
     ],
 )
@@ -175,6 +177,26 @@ async def test_resolve_via_fuzzy_queue(db):
         db, row["id"], status="fuzzy_resolved", outcome_value=0, resolver="llm_fallback"
     )
     assert (await lp.get_by_id(db, row["id"]))["status"] == "fuzzy_resolved"
+
+
+async def test_resolve_status_outcome_pairing(db):
+    """Codex P2 (#1104): a scored status without a grade would silently drop
+    the row from the grader's queue ungraded; non-scored statuses must never
+    carry a grade."""
+    row = await _mk(db)
+    with pytest.raises(ValueError, match="requires an outcome_value"):
+        await lp.resolve(db, row["id"], status="resolved")
+    with pytest.raises(ValueError, match="requires an outcome_value"):
+        await lp.resolve(db, row["id"], status="fuzzy_resolved", resolver="llm_fallback")
+    with pytest.raises(ValueError, match="must not carry an outcome_value"):
+        await lp.resolve(db, row["id"], status="void", outcome_value=0, resolver="mechanical")
+    with pytest.raises(ValueError, match="must not carry an outcome_value"):
+        await lp.resolve(
+            db, row["id"], status="unresolvable", outcome_value=1, resolver="mechanical"
+        )
+    # non-scored terminal states without a grade are the legitimate form
+    assert await lp.resolve(db, row["id"], status="void")
+    assert (await lp.get_by_id(db, row["id"]))["status"] == "void"
 
 
 async def test_resolve_validation(db):

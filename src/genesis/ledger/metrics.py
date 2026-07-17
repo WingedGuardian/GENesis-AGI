@@ -12,8 +12,9 @@ on schedule. Each resolver takes the shared DB connection, the prediction row
 - ``outcome_value`` 1/0 — mechanically graded; ``None`` — not resolvable yet
   (lane ``open``), premise absent (lane ``void:*``), needs the LLM fallback
   (lane ``fuzzy_pending``), or broken evidence (lane ``unresolvable:*``).
-- ``lane`` names the mechanical rule that fired — persisted as grading
-  provenance so calibration can be audited per rule.
+- ``lane`` names the mechanical rule that fired — returned to the grader as
+  grading provenance (the P2 grader persists it with the grade so calibration
+  can be audited per rule).
 
 Evidence sources (locked in the design doc §2.3.1): outreach metrics resolve
 off ``outreach_history.engagement_signal`` (exists today, measured 99.5%

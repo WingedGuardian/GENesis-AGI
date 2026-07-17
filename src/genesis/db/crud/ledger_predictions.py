@@ -31,6 +31,8 @@ _PROVENANCES = frozenset({"stated", "policy_prior"})
 # Target statuses resolve() may set; 'open' is birth-only.
 _TERMINAL_STATUSES = frozenset({"resolved", "fuzzy_resolved", "void", "unresolvable"})
 _QUEUE_STATUSES = frozenset({"fuzzy_pending"})
+# Statuses that MUST carry an outcome_value (everything else must not).
+_SCORED_STATUSES = frozenset({"resolved", "fuzzy_resolved"})
 _RESOLVERS = frozenset({"mechanical", "mechanical_absence", "llm_fallback", "user"})
 
 _COLUMNS = (
@@ -88,8 +90,13 @@ async def create(
         raise ValueError(f"provenance must be one of {sorted(_PROVENANCES)}, got {provenance!r}")
 
     canonical_deadline = canonical_iso(deadline_at)
-    if canonical_deadline is None:
-        raise ValueError(f"unparseable deadline_at {deadline_at!r}")
+    # canonical_iso passes bare YYYY-MM-DD through unchanged (a valid form for
+    # bitemporal valid_at fields, NOT for a deadline) — reject it here or the
+    # naive datetime would raise TypeError below instead of the gate's
+    # contractual ValueError. Everything else canonical_iso returns is
+    # tz-aware (+00:00).
+    if canonical_deadline is None or len(canonical_deadline) == 10:
+        raise ValueError(f"deadline_at must be a full ISO timestamp, got {deadline_at!r}")
     deadline = datetime.fromisoformat(canonical_deadline)
     if not now < deadline <= now + HORIZON_CAP:
         raise ValueError(
@@ -186,8 +193,16 @@ async def resolve(
         raise ValueError(f"outcome_value must be 0, 1 or None, got {outcome_value!r}")
     if resolver is not None and resolver not in _RESOLVERS:
         raise ValueError(f"invalid resolver {resolver!r}")
-    if outcome_value is not None and resolver is None:
-        raise ValueError("resolver is required when outcome_value is set")
+    # Status/outcome pairing: a scored status without a grade would silently
+    # drop the row from the grader's queue ungraded; a non-scored status
+    # (void/unresolvable/fuzzy_pending) must never carry a grade.
+    if status in _SCORED_STATUSES:
+        if outcome_value is None:
+            raise ValueError(f"status {status!r} requires an outcome_value")
+        if resolver is None:
+            raise ValueError("resolver is required when outcome_value is set")
+    elif outcome_value is not None:
+        raise ValueError(f"status {status!r} must not carry an outcome_value")
 
     now = now or datetime.now(UTC)
     cursor = await db.execute(
