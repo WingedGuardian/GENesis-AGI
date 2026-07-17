@@ -55,20 +55,23 @@ _hostswap_size_mib() {
 }
 
 # _hostswap_unit_content <size_mib> — render the self-contained unit.
-# Fixed /dev/zram0 (modprobe creates it by default) means NO command
-# substitution inside ExecStart — no systemd `$`-escaping hazard. The
-# swaps early-exit keeps restarts idempotent (a second swapon would fail);
-# the hot_add read creates the device when the module ships ZERO static
-# devices (Ubuntu 6.8 does — live-E2E finding 2026-07-16; reading
-# /sys/class/zram-control/hot_add allocates the lowest free device, then
-# `udevadm settle` waits for udev to CREATE the /dev/zram0 node — hot_add is
-# async and back-to-back zramctl otherwise races the node into existence,
-# failing with "No such device" (live-E2E finding 2026-07-16));
-# the mounts guard refuses to touch a zram0 that carries someone's
-# FILESYSTEM (a zram-backed mount never shows in /proc/swaps — resetting it
-# would destroy data); the --reset before configure clears any stale
-# half-configured state; the fallback chain drops --algorithm zstd on
-# kernels without it.
+# Fixed /dev/zram0 with NO command substitution in ExecStart — no systemd
+# `$`-escaping hazard. Three live-E2E findings on a real Ubuntu 6.8 host shaped
+# this (2026-07-16):
+#   1. `modprobe zram` ships ZERO static devices — /dev/zram0 must be created
+#      by reading /sys/class/zram-control/hot_add (allocates the lowest free).
+#   2. hot_add is ASYNC — udev creates the node a beat later, so `udevadm
+#      settle` must follow before any userspace tool touches /dev/zram0.
+#   3. `zramctl --reset` on a device makes udev REMOVE the node (not merely
+#      deconfigure it), and a following configure then fails "No such device".
+# So we NEVER reset: instead we always start from a fresh device — hot_remove
+# a stale zram0 if one is present (the only way to resize/reconfigure safely),
+# then hot_add + settle + configure. This normalizes every non-swapping case
+# (cold, stale-configured, half-configured) to the one path proven to work.
+# The swaps early-exit keeps restarts idempotent; the mounts guard refuses to
+# touch a zram0 carrying someone's FILESYSTEM (never shows in /proc/swaps —
+# a reset/remove would destroy data); the zstd fallback drops --algorithm on
+# kernels without it (a fresh device has disksize 0, so --size retries cleanly).
 _hostswap_unit_content() {
     local size_mib="$1"
     printf '%s\n' \
@@ -80,8 +83,8 @@ _hostswap_unit_content() {
         '[Service]' \
         'Type=oneshot' \
         'RemainAfterExit=yes' \
-        "ExecStart=/bin/sh -c 'grep -q \"^/dev/zram\" /proc/swaps && exit 0; grep -q \"^/dev/zram0 \" /proc/mounts && exit 1; modprobe zram; test -b /dev/zram0 || cat /sys/class/zram-control/hot_add >/dev/null; udevadm settle --timeout=10 2>/dev/null || true; zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB --algorithm zstd 2>/dev/null || { zramctl --reset /dev/zram0 2>/dev/null; zramctl /dev/zram0 --size ${size_mib}MiB; }; mkswap /dev/zram0 && swapon -p 100 /dev/zram0'" \
-        "ExecStop=/bin/sh -c 'swapoff /dev/zram0 2>/dev/null; zramctl --reset /dev/zram0 2>/dev/null; true'" \
+        "ExecStart=/bin/sh -c 'grep -q \"^/dev/zram\" /proc/swaps && exit 0; grep -q \"^/dev/zram0 \" /proc/mounts && exit 1; modprobe zram; if [ -b /dev/zram0 ]; then echo 0 > /sys/class/zram-control/hot_remove 2>/dev/null; udevadm settle --timeout=10 2>/dev/null || true; fi; cat /sys/class/zram-control/hot_add >/dev/null; udevadm settle --timeout=10 2>/dev/null || true; zramctl /dev/zram0 --size ${size_mib}MiB --algorithm zstd || zramctl /dev/zram0 --size ${size_mib}MiB; mkswap /dev/zram0 && swapon -p 100 /dev/zram0'" \
+        "ExecStop=/bin/sh -c 'swapoff /dev/zram0 2>/dev/null; [ -b /dev/zram0 ] && echo 0 > /sys/class/zram-control/hot_remove 2>/dev/null; true'" \
         '' \
         '[Install]' \
         'WantedBy=multi-user.target'
@@ -171,27 +174,35 @@ host_swap_apply() {
     if [[ -n "$_HOSTSWAP_FAILED" ]]; then
         return 0
     fi
+    # `restart` (not `enable --now`) is deliberate: the unit is a
+    # RemainAfterExit oneshot, so once it has succeeded it stays "active" and
+    # `enable --now`/`start` become no-ops — they would NOT apply changed unit
+    # content, nor recover a device that was swapped off out from under an
+    # "active" unit. `restart` always re-runs ExecStop (frees the old device)
+    # then ExecStart (fresh device), which is what actually applies/heals.
+    # `enable` (without --now) just sets boot persistence.
     if [[ -n "$_HOSTSWAP_CHANGED" ]]; then
         # Best-effort: a hiccup here must never abort the caller — the unit is
         # on disk and the next boot applies it regardless.
         sudo systemctl daemon-reload 2>/dev/null || true
-        sudo systemctl enable --now "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+        sudo systemctl enable "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+        sudo systemctl restart "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
         echo "  + zram swap unit installed (size ${size_mib}MiB, priority 100)."
     elif ! grep -q '^/dev/zram' "$HOSTSWAP_PROC_SWAPS" 2>/dev/null; then
-        # Unchanged unit but no active zram swap: a previous enable failed, or
-        # an operator `disable`d without masking. The durable opt-out is MASK
-        # (guarded above) — a merely-disabled unit gets re-enabled, and a
-        # transient enable failure retries on the next apply instead of
-        # sticking forever. (No churn on healthy hosts: an active device
-        # skips this branch.)
-        sudo systemctl enable --now "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
-        echo "  zram swap unit already in place (size ${size_mib}MiB) — re-enabled (was inactive)."
+        # Unchanged unit but no active zram swap: a previous start failed, or
+        # swap was removed from under the "active" unit. The durable opt-out is
+        # MASK (guarded above) — a merely-disabled/failed unit is re-started,
+        # so a transient failure heals on the next apply instead of sticking.
+        # (No churn on healthy hosts: an active device skips this branch.)
+        sudo systemctl enable "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+        sudo systemctl restart "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+        echo "  zram swap unit already in place (size ${size_mib}MiB) — restarted (was inactive)."
     else
         echo "  zram swap unit already in place (size ${size_mib}MiB)."
     fi
 
     # Verify the OUTCOME, not just the unit state: is a zram device actually
-    # swapping? (oneshot ExecStart runs synchronously under enable --now.)
+    # swapping? (oneshot ExecStart runs synchronously under restart.)
     if grep -q '^/dev/zram' "$HOSTSWAP_PROC_SWAPS" 2>/dev/null; then
         echo "  + zram swap active: $(grep '^/dev/zram' "$HOSTSWAP_PROC_SWAPS" 2>/dev/null | awk '{print $1, "prio", $5}' | head -1)"
     else
@@ -212,7 +223,9 @@ host_swap_remove() {
     fi
     sudo systemctl disable --now "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
     sudo swapoff /dev/zram0 2>/dev/null || true
-    sudo zramctl --reset /dev/zram0 2>/dev/null || true
+    # hot_remove fully frees the device (a bare --reset leaves a stale node);
+    # ExecStop already ran on disable --now, so this is the belt to its braces.
+    sudo sh -c 'test -b /dev/zram0 && echo 0 > /sys/class/zram-control/hot_remove' 2>/dev/null || true
     sudo rm -f "$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
     sudo systemctl daemon-reload 2>/dev/null || true
     echo "  + zram swap removed (mask the unit to prevent re-apply on update)."

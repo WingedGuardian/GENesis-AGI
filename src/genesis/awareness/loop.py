@@ -31,6 +31,7 @@ from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.db.crud import awareness_ticks, observations
+from genesis.infra_profile.store import load_profile
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.types import Severity, Subsystem
 from genesis.resilience.state import CloudStatus
@@ -428,6 +429,263 @@ async def _resolve_user_model_staleness(db) -> None:
             logger.info("Auto-resolved %d user-model staleness alert(s)", resolved)
     except Exception:
         logger.debug("Failed to resolve user-model staleness alerts", exc_info=True)
+
+
+# Infra protection posture (silent-skip closure, Phase 3): a memory-plane
+# protection that is MISSING must raise a visible alert. infra_profile records
+# the effective facts but only emits infrastructure_drift on a fact-hash
+# CHANGE (diff.py) — a STABLE unprotected box produced no signal at all
+# (observed live: a sibling install ran for weeks with container swap disabled
+# and no systemd-oomd, silently, until a memory spike wedged it — the 2026-07
+# incident class). Rules read the profile's effective facts; only an EXPLICIT
+# defect value alerts — absent/None facts are silence (no guardian host plane,
+# cgroup v1, pre-first-refresh), never a false alarm on a public install.
+_INFRA_POSTURE_SOURCE = "infra_protection_posture_monitor"
+_INFRA_PROFILE_STALE_DAYS = 3.0  # refresh is boot + daily; >3d = refresh broken
+# Same-state re-alert bound; the atomic dedup + daily profile-refresh cadence
+# are the real guards, this only saves no-op writes (deploy-staleness idiom:
+# a CHANGED state bypasses the cooldown via the key comparison).
+_INFRA_POSTURE_COOLDOWN_S = 86400.0
+_INFRA_POSTURE_SUPERSEDED_NOTE = "superseded: protection posture changed"
+_last_infra_posture_alert_at: float = 0.0
+_last_infra_posture_key: str = ""
+
+# Human-readable defect + remediation per rule slug (alert content).
+_INFRA_POSTURE_DETAIL = {
+    "container_swap_disabled": (
+        "container cgroup memory.swap.max is 0 — memory spikes thrash in D-state "
+        "instead of spilling to swap (the 2026-07 wedge state). The host "
+        "guardian's swap reconciler normally heals this within a tick: check "
+        "guardian health on the host, or re-run scripts/host-setup.sh"
+    ),
+    "oomd_pressure_kill_off": (
+        "systemd-oomd pressure-kill is not enforced for user.slice — nothing "
+        "gracefully kills the memory hog before a hard OOM wedge. Re-run "
+        "scripts/bootstrap.sh (installs systemd-oomd and lays the user.slice "
+        "drop-in via lib/memory_resilience.sh)"
+    ),
+    "host_swap_absent": (
+        "the host has no swap — the container's swap allowance has nowhere to "
+        "spill, so it is protection on paper only. Add host swap "
+        "(scripts/host-setup.sh prints the swapfile recipe)"
+    ),
+    "container_swap_knob_off": (
+        "incus limits.memory.swap is explicitly false — swap stays disabled "
+        "across container restarts. On the host: incus config set <container> "
+        "limits.memory.swap true (scripts/host-setup.sh sets this; the host "
+        "guardian also reconciles it when healthy)"
+    ),
+}
+
+
+def _infra_profile_age_days(profile: dict) -> float | None:
+    """Age of the profile snapshot in days; None = missing/unparseable stamp."""
+    collected_at = profile.get("collected_at")
+    if not collected_at:
+        return None
+    try:
+        collected = datetime.fromisoformat(collected_at)
+    except (TypeError, ValueError):
+        return None
+    if collected.tzinfo is None:
+        collected = collected.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - collected).total_seconds() / 86400.0
+
+
+def _infra_missing_protections(profile: dict) -> list[str]:
+    """Evaluate the memory-plane protection rules against profile facts.
+
+    Only an EXPLICIT defect value counts — absent/None facts stay silent.
+    Tri-state contract for cgroup_memory_swap_max (collectors/container.py):
+    int 0 = the wedge state, "max"/nonzero int = healthy, None = unreadable
+    (cgroup v1). Returns sorted rule slugs (keys of _INFRA_POSTURE_DETAIL)."""
+    sections = profile.get("sections") or {}
+
+    def _facts(plane: str) -> dict:
+        # Only a status=="ok" section is trusted: on a per-section collector
+        # failure _merge_section RETAINS the previous facts (status=error/
+        # unavailable) while still bumping the top-level collected_at, so
+        # without this gate the rules would assert posture from stale facts
+        # that the >3d staleness check cannot see (Codex P2, PR #1096).
+        section = sections.get(plane)
+        if not isinstance(section, dict) or section.get("status") != "ok":
+            return {}
+        facts = section.get("facts")
+        return facts if isinstance(facts, dict) else {}
+
+    def _explicit_zero(value: object) -> bool:
+        # bool is an int subclass (False == 0), so a malformed bool fact must
+        # never read as "explicitly zero".
+        return isinstance(value, int) and not isinstance(value, bool) and value == 0
+
+    missing: list[str] = []
+    memory = _facts("memory")
+    swap_max = memory.get("cgroup_memory_swap_max")
+    if _explicit_zero(swap_max):
+        missing.append("container_swap_disabled")
+    # Gated on a readable cgroup swap knob (a cgroup-v2 proxy): on v1 the
+    # pressure-kill policy cannot work, so False there is not actionable.
+    if swap_max is not None and memory.get("oomd_user_slice_kill") is False:
+        missing.append("oomd_pressure_kill_off")
+    # host_system comes from the guardian host plane; absent = no guardian =
+    # no signal. NOT memory.facts.swap_total — that reads 0 on a HEALTHY
+    # container (meminfo swap isn't virtualized; verified live 2026-07-16).
+    if _explicit_zero(_facts("host_system").get("swap_total_kb")):
+        missing.append("host_swap_absent")
+    # Persistent incus knob, visible container-side. Explicit "false" only —
+    # the incus default is true, so absent/unset is healthy. Covers installs
+    # WITHOUT a working guardian (the guardian reconciles this knob itself).
+    limits = _facts("host_virt").get("container_limits")
+    if isinstance(limits, dict) and limits.get("limits.memory.swap") == "false":
+        missing.append("container_swap_knob_off")
+    return sorted(missing)
+
+
+_POSTURE_PLANES = ("memory", "host_system", "host_virt")
+
+
+def _infra_unverifiable_planes(profile: dict) -> list[str]:
+    """Posture planes whose section is present but NOT ok while carrying
+    retained (stale) facts — we previously knew something there and currently
+    cannot verify it, so an all-clear must be held. A not-ok section with
+    EMPTY facts (e.g. host planes on a guardian-less install, permanently
+    "unavailable") never contributed a rule and blocks nothing."""
+    sections = profile.get("sections") or {}
+    unverifiable: list[str] = []
+    for plane in _POSTURE_PLANES:
+        section = sections.get(plane)
+        if (
+            isinstance(section, dict)
+            and section.get("status") != "ok"
+            and isinstance(section.get("facts"), dict)
+            and section.get("facts")
+        ):
+            unverifiable.append(plane)
+    return unverifiable
+
+
+async def _check_infra_protection_posture(db) -> None:
+    """Alert when a memory-plane protection is missing or the profile is stale.
+
+    One 'high' infrastructure_alert (dashboard + morning report; the WS-2 M10
+    reconciler absorbs it into the durable open-set) describing the CURRENT
+    posture. Invariant: at most one open row for this source — a posture
+    change supersedes the previous row (same "exactly one active alert = the
+    current state" pattern as deploy staleness). A stale profile (>3d; refresh
+    is boot + daily) raises its own distinct alert INSTEAD of asserting
+    posture from dead facts. Auto-resolves when the profile is fresh and no
+    protection is missing. Best-effort; never raises into the tick."""
+    global _last_infra_posture_alert_at, _last_infra_posture_key
+    if db is None:
+        return
+    try:
+        profile = await asyncio.to_thread(load_profile)
+        if not profile:
+            return  # pre-first-refresh (fresh install) — nothing to assert
+        age_days = _infra_profile_age_days(profile)
+        if age_days is None:
+            return  # no usable collected_at stamp — cannot assert anything
+        collected_at = profile.get("collected_at")
+
+        if age_days > _INFRA_PROFILE_STALE_DAYS:
+            key = "profile_stale"
+            content = (
+                f"Infra protection posture is UNKNOWN — the infrastructure "
+                f"profile is stale (collected {collected_at}, {age_days:.1f}d "
+                f"ago; the refresh runs at boot + daily). The refresh pipeline "
+                f"is broken — check genesis-server logs for infra_profile "
+                f"refresh errors. Posture rules were skipped; any prior "
+                f"posture findings are unverifiable until a fresh profile lands."
+            )
+        else:
+            missing = _infra_missing_protections(profile)
+            unverifiable = _infra_unverifiable_planes(profile)
+            if not missing:
+                if unverifiable:
+                    # A plane with retained-but-unverifiable facts: neither
+                    # alarm nor all-clear — hold the current state until the
+                    # section collector recovers.
+                    return
+                await _resolve_infra_protection_posture(db)
+                return
+            key = ",".join(missing)
+            details = "; ".join(f"[{slug}] {_INFRA_POSTURE_DETAIL[slug]}" for slug in missing)
+            content = (
+                f"Memory-protection posture: {len(missing)} protection(s) "
+                f"missing on this install (profile collected {collected_at}): "
+                f"{details}. A missing protection means a memory spike can "
+                f"wedge the container instead of being absorbed (2026-07 "
+                f"incident class)."
+            )
+            if unverifiable:
+                content += (
+                    f" Additionally unverifiable (section collector failing, "
+                    f"facts retained but stale): {', '.join(unverifiable)}."
+                )
+
+        now = time.monotonic()
+        if (
+            _last_infra_posture_alert_at
+            and now - _last_infra_posture_alert_at < _INFRA_POSTURE_COOLDOWN_S
+            and key == _last_infra_posture_key
+        ):
+            return
+        content_hash = hashlib.sha256(f"infra_posture:{key}".encode()).hexdigest()
+        # Keep exactly ONE active alert = the current state (deploy-staleness
+        # pattern): retire any other-state sibling — including a prior
+        # stale-profile row once fresh facts arrive, and vice versa.
+        await observations.supersede_except_hash(
+            db,
+            source=_INFRA_POSTURE_SOURCE,
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=_INFRA_POSTURE_SUPERSEDED_NOTE,
+        )
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source=_INFRA_POSTURE_SOURCE,
+            type="infrastructure_alert",
+            content=content,
+            priority="high",
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        _last_infra_posture_alert_at = now
+        _last_infra_posture_key = key
+        if created is not None:
+            logger.warning("Infra protection posture alert: %s", key)
+    except Exception:
+        logger.debug("Failed infra protection posture check", exc_info=True)
+
+
+async def _resolve_infra_protection_posture(db) -> None:
+    """Resolve standing posture alerts once the profile is fresh and complete.
+
+    Unconditional (no in-memory guard) so it survives restart; a cheap no-op
+    when nothing matches. Clears the cooldown key so recovery → re-degradation
+    re-alerts promptly."""
+    global _last_infra_posture_alert_at, _last_infra_posture_key
+    if db is None:
+        return
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source=_INFRA_POSTURE_SOURCE,
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=(
+                "auto-resolved: all memory-plane protections present and the profile is fresh"
+            ),
+        )
+        if resolved:
+            _last_infra_posture_alert_at = 0.0
+            _last_infra_posture_key = ""
+            logger.info("Auto-resolved %d infra protection posture alert(s)", resolved)
+    except Exception:
+        logger.debug("Failed to resolve infra posture alerts", exc_info=True)
 
 
 # Deploy staleness (WS-B): merged ≠ deployed. A bare git-merge between
@@ -1905,6 +2163,12 @@ class AwarenessLoop:
                     # stream means Genesis stopped updating its model of the user.
                     # Slow (14d) signal → hourly; self-resolves on a fresh delta.
                     await _check_user_model_staleness(self._db)
+                    # Infra protection posture (silent-skip closure, Phase 3) —
+                    # a stable-unprotected box must never be silent: a missing
+                    # memory-plane protection (or a stale profile) raises one
+                    # 'high' infrastructure_alert; self-resolves on recovery.
+                    # Facts change at most ~daily (profile refresh) → hourly.
+                    await _check_infra_protection_posture(self._db)
                 await _check_wal_health(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires

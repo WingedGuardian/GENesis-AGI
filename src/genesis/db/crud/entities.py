@@ -425,6 +425,15 @@ async def delete_entities_cascade(
     return {"entities": deleted, "mentions": mentions, "links": links}
 
 
+# Dormant until a consumer exists. `enqueue_adjudication` writes
+# `entity_adjudication` rows to `deferred_work_queue` for an "entity_maintenance
+# job" that was never built — so the rows were a pure producer-with-no-consumer
+# leak (263 orphans in ~6 days, 0 ever drained). Gated OFF to stop the bleed
+# (follow-up 9127e8ed); the enqueue machinery is preserved GROUNDWORK for the
+# adjudication drainer, which flips this True when it lands. Do NOT delete.
+_ADJUDICATION_ENQUEUE_ENABLED = False
+
+
 async def enqueue_adjudication(
     db: aiosqlite.Connection,
     *,
@@ -437,7 +446,13 @@ async def enqueue_adjudication(
     Inline INSERT rather than ``deferred_work.create`` — that helper
     commits unconditionally, which would break callers batching under
     ``_commit=False`` (extraction transaction discipline).
+
+    No-op while ``_ADJUDICATION_ENQUEUE_ENABLED`` is False (no drainer exists —
+    see the module-level note). The caller's entity create + AMBIGUOUS status
+    are unaffected; only the orphan queue row is skipped.
     """
+    if not _ADJUDICATION_ENQUEUE_ENABLED:
+        return
     now = datetime.now(UTC).isoformat()
     await db.execute(
         """INSERT INTO deferred_work_queue

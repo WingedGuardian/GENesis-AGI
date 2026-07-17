@@ -21,6 +21,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   This is the foundation; the hooks that write predictions on every action
   and the grader that scores them land next.
 
+- **An unprotected box now tells you.** If a memory-crash protection is
+  missing on your install — container swap disabled, systemd-oomd
+  pressure-kill not configured, no host swap, or the container's swap
+  allowance switched off — Genesis now raises a standing alert (dashboard +
+  morning report) naming what's missing and how to fix it, and clears it
+  automatically once the protection is restored. Previously a box that was
+  *always* unprotected produced no signal at all; only a *change* was
+  detected. If the infrastructure self-profile stops refreshing (>3 days
+  old), you get a distinct "posture unknown" alert instead of stale claims.
+
 ### Fixed
 
 - **Answering Genesis's questions with a plain message now actually works.**

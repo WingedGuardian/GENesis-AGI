@@ -104,6 +104,21 @@ flags unprotected installs:
 | `cgroup_memory_swap_max` | container | `"max"` (or an int) | `0` |
 | `oomd_user_slice_kill` | container | `true` | `false` |
 | `swap_total_kb` | host | > 0 | `0` |
+| `container_limits["limits.memory.swap"]` | host_virt | `"true"`/absent | `"false"` |
+
+**The posture alert (active signal).** Facts and annotations alone proved
+insufficient — `infra_profile` only emits `infrastructure_drift` on a fact
+*change*, so a box that was *always* unprotected produced no signal at all
+(observed live: a sibling install ran for weeks with swap disabled and no
+systemd-oomd until a memory spike wedged it). The awareness loop's hourly
+`_check_infra_protection_posture` (`awareness/loop.py`) closes that: any
+wedge-defect value in the table above raises one non-paging `high`
+`infrastructure_alert` (dashboard + morning report) naming the missing
+protections and their remediation, auto-resolving when the profile shows them
+restored. Only *explicit* defect values alert — absent/`None` facts stay
+silent (no guardian host plane, cgroup v1, fresh install), so partial installs
+never false-alarm. A profile older than 3 days raises a distinct
+"posture UNKNOWN — refresh broken" alert instead of asserting from dead facts.
 
 ## Notes
 

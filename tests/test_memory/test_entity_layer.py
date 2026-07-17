@@ -182,7 +182,32 @@ class TestRegistry:
         assert prov == "EXTRACTED"
 
     @pytest.mark.asyncio
-    async def test_fuzzy_creates_ambiguous_and_enqueues(self, db):
+    async def test_fuzzy_ambiguous_but_no_enqueue_while_gated(self, db):
+        """Gate OFF (default): a fuzzy match still creates the entity and
+        returns AMBIGUOUS, but writes NO adjudication row — the enqueue is a
+        no-op until a drainer exists (stop-the-bleed, follow-up 9127e8ed)."""
+        await entity_registry.resolve_entity(
+            db, name="GENesis-Voice", entity_type="repo", aliases=_NO_ALIASES,
+        )
+        eid, prov = await entity_registry.resolve_entity(
+            db, name="GENesis-Voices", entity_type="repo", aliases=_NO_ALIASES,
+        )
+        assert prov == "AMBIGUOUS"
+        # Entity was still created (the fuzzy pair exists, just un-adjudicated).
+        assert await entities_crud.get_entity(db, eid) is not None
+        rows = await db.execute_fetchall(
+            "SELECT work_type FROM deferred_work_queue "
+            "WHERE work_type = 'entity_adjudication'"
+        )
+        assert rows == []  # no orphan row
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_enqueues_when_gate_enabled(self, db, monkeypatch):
+        """The enqueue machinery is intact GROUNDWORK — flipping the gate on
+        (what the drainer/A will do) restores the adjudication row."""
+        monkeypatch.setattr(
+            entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", True,
+        )
         await entity_registry.resolve_entity(
             db, name="GENesis-Voice", entity_type="repo", aliases=_NO_ALIASES,
         )
