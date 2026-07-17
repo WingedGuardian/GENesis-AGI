@@ -221,7 +221,17 @@ host_swap_apply() {
         sudo systemctl restart "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
         echo "  zram swap unit already in place (size ${size_mib}MiB) — restarted (was inactive)."
     else
-        echo "  zram swap unit already in place (size ${size_mib}MiB)."
+        # Healthy device but boot persistence may have been lost: `systemctl
+        # unmask` sweeps the multi-user.target.wants symlink along with the
+        # mask (live-E2E finding 2026-07-16), leaving the unit active-but-
+        # disabled — zram would silently not start on the next boot. Re-enable
+        # when needed; a no-op (read-only is-enabled) on healthy hosts.
+        if [[ "$(systemctl is-enabled "$_HOSTSWAP_UNIT_NAME" 2>/dev/null)" != "enabled" ]]; then
+            sudo systemctl enable "$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+            echo "  zram swap unit already in place (size ${size_mib}MiB) — re-enabled for boot."
+        else
+            echo "  zram swap unit already in place (size ${size_mib}MiB)."
+        fi
     fi
 
     # Verify the OUTCOME, not just the unit state: is a zram device actually

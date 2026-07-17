@@ -382,6 +382,34 @@ def test_remove_cleans_up(tmp_path):
     assert "disable --now zram-swap.service" in _log(tmp_path)
 
 
+def test_active_but_disabled_restores_boot_persistence(tmp_path):
+    """`systemctl unmask` sweeps the wants symlink with the mask (live-E2E
+    finding): an active-but-disabled unit must be re-enabled by apply, or zram
+    silently doesn't start on the next boot."""
+    env = _sandbox(tmp_path)
+    _run(env)  # install
+    (tmp_path / "swaps").write_text(
+        "Filename Type Size Used Priority\n/dev/zram0 partition 4194304 0 100\n"
+    )
+    res = _run(env, extra_env={"SYSTEMCTL_IS_ENABLED": "disabled"})
+    assert res.returncode == 0
+    assert "re-enabled for boot" in res.stdout
+    assert "enable zram-swap.service" in _log(tmp_path)
+
+
+def test_active_and_enabled_stays_quiet(tmp_path):
+    """Healthy steady state (active + enabled) must not churn systemctl."""
+    env = _sandbox(tmp_path)
+    _run(env)
+    (tmp_path / "swaps").write_text(
+        "Filename Type Size Used Priority\n/dev/zram0 partition 4194304 0 100\n"
+    )
+    before = _log(tmp_path).count("enable zram-swap.service")
+    res = _run(env, extra_env={"SYSTEMCTL_IS_ENABLED": "enabled"})
+    assert "already in place" in res.stdout and "re-enabled" not in res.stdout
+    assert _log(tmp_path).count("enable zram-swap.service") == before
+
+
 # ── unit location (mask must WORK) + legacy migration ──────────────────────
 
 
