@@ -74,6 +74,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and benign look-alikes (hyphenated slugs such as "sk-learn-pipeline") stay
   unflagged.
 
+- **Idle abandoned sessions can now actually be cleaned up.** The process
+  reaper's "is anyone looking at this terminal?" check counted every tmux
+  pane as live — including sessions nothing is attached to. Under
+  persistent slot sessions that meant an abandoned session could never be
+  reclaimed, no matter how long it sat idle. A tmux pane now counts as live
+  only while its session has a client attached; a detached session is still
+  spared as long as it shows recent activity (so a dropped connection
+  mid-work is never at risk), and only one that is BOTH detached and idle
+  past the 7-day window becomes a cleanup candidate. The reaper remains in
+  observe-only mode — it reports what it would clean up and touches nothing
+  until explicitly armed.
+
 - **Answering Genesis's questions with a plain message now actually works.**
   When Genesis asked something and waited for your answer (approvals,
   provision prompts, send-and-wait questions), an internal ordering bug left
