@@ -8,6 +8,7 @@ from enum import StrEnum
 
 class OutreachCategory(StrEnum):
     """Outreach message categories. Must match DB CHECK constraint on outreach_history."""
+
     BLOCKER = "blocker"
     ALERT = "alert"
     SURPLUS = "surplus"
@@ -56,9 +57,22 @@ POSITIVE_ENGAGEMENT_OUTCOMES: frozenset[str] = frozenset(
 # SQL IN-list rendering of the positive set, sorted for deterministic queries.
 # Values are trusted module constants (no user input) — safe to inline into a
 # query string. Every SQL consumer references this instead of re-deriving it.
-POSITIVE_ENGAGEMENT_SQL_IN: str = ", ".join(
-    f"'{o}'" for o in sorted(POSITIVE_ENGAGEMENT_OUTCOMES)
+POSITIVE_ENGAGEMENT_SQL_IN: str = ", ".join(f"'{o}'" for o in sorted(POSITIVE_ENGAGEMENT_OUTCOMES))
+
+# The FULL engagement_outcome vocabulary — must match the enforcing CHECK on
+# outreach_history (WS-2 P1b rebuild; NULL is allowed via column nullability,
+# not membership). Every writer that accepts an outcome from outside
+# (MCP tool, dashboard endpoint) validates against THIS set before writing;
+# with the CHECK now enforcing, an unvalidated passthrough would surface as
+# an IntegrityError instead of a polite rejection.
+ENGAGEMENT_OUTCOMES: frozenset[str] = POSITIVE_ENGAGEMENT_OUTCOMES | frozenset(
+    {"not_useful", "ambivalent", "ignored"}
 )
+
+# Legacy/foreign outcome spellings accepted at the edges and normalized to
+# the canonical vocabulary ('replied' predates the signal column; lifecycle
+# values like 'delivered'/'opened' are NOT outcomes and are rejected).
+ENGAGEMENT_OUTCOME_ALIASES: dict[str, str] = {"replied": "useful"}
 
 
 class GovernanceVerdict(StrEnum):
@@ -100,6 +114,11 @@ class OutreachRequest:
     # the text channel keeps full detail. None → voice speaks the full text
     # (unchanged behavior for every existing caller).
     voice_text: str | None = None
+    # WS-2 P1b: the originating pipeline's stated confidence that this send
+    # gets a reply, in [0.01, 0.99]. Carried into the ledger prediction hook
+    # at delivery; None → the prediction rides the policy_prior lane (a
+    # measured base-rate seed, NOT 0.5 — see ledger/writers.py).
+    stated_confidence: float | None = None
 
 
 @dataclass(frozen=True)

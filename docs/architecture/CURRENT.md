@@ -689,8 +689,9 @@ verified: fe5d0945 2026-07-10
   `standalone_router.StandaloneLiteLLMRouter` is the ONE offline Router shim
   (calibration + bench both use it — don't add inline copies).
 - **feedback/**: the Outcome Bus (`outcome_events`) — **write-path LIVE
-  (harvest 8:45/20:45), read-path DARK** (nothing consumes the ledger yet).
-  Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
+  (harvest 8:45/20:45 + the first real-time emits: task executor COMPLETED/
+  FAILED, WS-2 P1b), read-path DARK** until the P2 grader lands. Tier
+  taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
   `record_outcome` must never raise. Deliberately "observation, not
   reinforcement" — don't rename toward RL.
 - **calibration/**: Bayesian prediction-calibration primitives, currently
@@ -699,14 +700,23 @@ verified: fe5d0945 2026-07-10
   `feedback/calibration` ego-ECE, `eval/calibration` golden-set loader) —
   don't conflate. Slated for WS-2 sunset (P5) once the ledger's unified
   calibration table bakes.
-- **ledger/** (WS-2 P1a): the cognitive ledger — falsifiable predictions in
-  `ledger_predictions` (migration 0064), written only through the validating
-  CRUD (`db/crud/ledger_predictions.py`) against the code registry
+- **ledger/** (WS-2 P1a+P1b): the cognitive ledger — falsifiable predictions
+  in `ledger_predictions` (migration 0064), written only through the
+  validating CRUD (`db/crud/ledger_predictions.py`) against the code registry
   (`ledger/metrics.py`: 9 v1 metrics, each with a pure-SQL resolver; NO
-  import path to `genesis.routing`, locked by test). Substrate only so far:
-  writer hooks = P1b, grader = P2. Outreach metrics resolve off
-  `outreach_history.engagement_signal` (spike-measured 99.5% mechanical);
-  task/ego resolvers read state tables until the T1 bus emits mature.
+  import path to `genesis.routing`, locked by test). **Writer hooks LIVE
+  (P1b)**: `ledger/writers.py` fires fire-and-forget from four commit paths —
+  outreach `_deliver`, executor pending-claim, BOTH build-lane create sites,
+  ego `create_batch` — with measured base-rate prior seeds (reply ≈0.02, not
+  0.5) and stated-confidence seams (`OutreachRequest.stated_confidence`;
+  `task_submit` optional field → outputs JSON envelope). Hook failures
+  increment a counter surfaced as `ledger:write_failed:<class>` via
+  `_compute_alerts` (never block the action). Grader = P2 (read side still
+  dark). Outreach metrics resolve off `outreach_history.engagement_signal`
+  (spike-measured 99.5% mechanical); the engagement_outcome CHECK now
+  ENFORCES the canonical vocabulary (rebuild #4 in the
+  `_migrate_add_columns` chain — its DDL must preserve the three older
+  probe fragments, locked by test).
 
 ## 11. Routing & providers
 

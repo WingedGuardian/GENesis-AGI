@@ -629,6 +629,23 @@ class OutreachPipeline:
             )
             await outreach_crud.record_delivery(self._db, outreach_id, delivered_at=now)
 
+            # WS-2 P1b: ledger prediction hook — write reply_received +
+            # positive_engagement predictions for the send that just committed.
+            # The hook is fire-and-forget by contract (never raises, counts
+            # its own failures); wrapped anyway so even an import failure can
+            # never break the completed send (uniform with the shadow door).
+            try:
+                from genesis.ledger import writers as ledger_writers
+
+                await ledger_writers.on_outreach_delivered(
+                    self._db,
+                    outreach_id=outreach_id,
+                    category=request.category.value,
+                    stated_confidence=request.stated_confidence,
+                )
+            except Exception:  # noqa: BLE001 — ledger is best-effort; never break the send
+                logger.debug("ledger prediction hook failed", exc_info=True)
+
             # WS5 Discord capability SHADOW-gate: observe (never hold) autonomous Discord
             # sends AFTER the post is already out, so the community-facing send is NEVER
             # delayed by the shadow write (any WAL contention only defers the internal

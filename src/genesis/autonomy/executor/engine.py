@@ -36,6 +36,7 @@ from genesis.autonomy.executor.types import (
     TaskPhase,
     validate_transition,
 )
+from genesis.feedback.bus import SignalType, record_outcome
 
 if TYPE_CHECKING:
     # Runtime import stays lazy inside _run_scope_gate (executor/__init__ ->
@@ -152,11 +153,13 @@ class CCSessionExecutor:
         # Resolve plan path from outputs (may be plain string or JSON)
         raw_outputs = task.get("outputs") or ""
         plan_path = raw_outputs
+        stated_confidence = None  # WS-2 P1b: optional seam via the outputs envelope
         if raw_outputs:
             try:
                 parsed = json.loads(raw_outputs)
                 if isinstance(parsed, dict):
                     plan_path = parsed.get("plan_path", raw_outputs)
+                    stated_confidence = parsed.get("stated_confidence")
             except (json.JSONDecodeError, ValueError):
                 pass  # plain string, use as-is
 
@@ -203,6 +206,22 @@ class CCSessionExecutor:
                 return False
             resuming = False
             self._active_tasks[task_id] = TaskPhase.DISPATCHING
+
+            # WS-2 P1b: prediction hook on the pending-path claim ONLY —
+            # resume/restart re-entries rely on the ledger's dedupe key (the
+            # original claim already wrote the rows). Wrapped so even an
+            # import failure can never affect the claimed task.
+            try:
+                from genesis.ledger.writers import on_task_claimed
+
+                await on_task_claimed(
+                    self._db,
+                    task_id=task_id,
+                    source=task.get("source", "user"),
+                    stated_confidence=stated_confidence,
+                )
+            except Exception:  # noqa: BLE001 — ledger is best-effort; never break the claim
+                logger.debug("ledger prediction hook failed", exc_info=True)
         elif db_phase_str in _RESUMABLE_PHASES:
             resuming = True
             self._active_tasks[task_id] = TaskPhase(db_phase_str)
@@ -720,6 +739,20 @@ class CCSessionExecutor:
 
             # --- COMPLETED ---
             await self._transition(task_id, TaskPhase.COMPLETED)
+            # WS-2 P1b: first live T1 emit on the outcome bus (record_outcome
+            # is itself fire-and-forget — never raises; the harvester's
+            # sources are ego/outreach/surplus, so 'autonomy' cannot collide
+            # on the idempotent unique key).
+            await record_outcome(
+                self._db,
+                source="autonomy",
+                ref_type="task",
+                ref_id=task_id,
+                signal_type=SignalType.EXECUTION_OUTCOME,
+                signal_tier=1,
+                polarity="positive",
+                value=1.0,
+            )
             self._append_to_plan(
                 plan_path, "COMPLETED",
                 f"Task completed. {len(step_results)} steps executed.",
@@ -809,6 +842,21 @@ class CCSessionExecutor:
 
         with contextlib.suppress(InvalidTransitionError):
             await self._transition(task_id, TaskPhase.FAILED)
+
+        # WS-2 P1b: negative T1 emit. The terminal-state guard above plus the
+        # bus's idempotent unique key make the known double-invoke path
+        # (direct call + unhandled-exception handler) a safe no-op.
+        await record_outcome(
+            self._db,
+            source="autonomy",
+            ref_type="task",
+            ref_id=task_id,
+            signal_type=SignalType.EXECUTION_OUTCOME,
+            signal_tier=1,
+            polarity="negative",
+            value=0.0,
+            reason=reason,
+        )
 
         from genesis.db.crud import task_states
         await task_states.update(

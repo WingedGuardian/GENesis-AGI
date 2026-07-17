@@ -237,7 +237,7 @@ TABLES = {
             topic               TEXT NOT NULL,
             category            TEXT NOT NULL CHECK (category IN (
                 'blocker', 'alert', 'finding', 'insight', 'opportunity',
-                'digest', 'surplus', 'approval'
+                'digest', 'surplus', 'approval', 'content', 'notification'
             )),
             salience_score      REAL NOT NULL,
             channel             TEXT NOT NULL,
@@ -250,8 +250,15 @@ TABLES = {
             opened_at           TEXT,
             user_response       TEXT,
             action_taken        TEXT,
-            engagement_outcome  TEXT CHECK (engagement_outcome IN (
-                'useful', 'not_useful', 'ambivalent', 'ignored', NULL
+            -- NULL allowed via nullability (never via NULL-in-IN-list — that
+            -- makes the CHECK a no-op under SQL three-valued logic, the
+            -- 54e0fa72 bug). Vocabulary = POSITIVE_ENGAGEMENT_OUTCOMES ∪
+            -- negatives; the _migrate_add_columns 'engaged' rebuild is the
+            -- upgrade path and probes on the 'engaged' fragment.
+            engagement_outcome  TEXT CHECK (
+                engagement_outcome IS NULL OR engagement_outcome IN (
+                'useful', 'engaged', 'acted_on', 'acknowledged',
+                'not_useful', 'ambivalent', 'ignored'
             )),
             engagement_signal   TEXT,
             prediction_error    REAL,

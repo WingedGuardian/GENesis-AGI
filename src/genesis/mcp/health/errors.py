@@ -187,12 +187,40 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     _activity_tracker = health_mcp_mod._activity_tracker
     _job_retry_registry = health_mcp_mod._job_retry_registry
 
-    if _service is None:
-        return [{"id": "service:health_data_uninitialized", "severity": "CRITICAL", "message": "HealthDataService not initialized"}], set()
 
-    snap = await _service.snapshot()
+    # WS-2 P1b: ledger writer-hook failures — checked BEFORE the
+    # uninitialized-service early return because the counter needs no health
+    # snapshot (and a dropping commit path must surface even then). The
+    # counter is per-process: in the runtime process (where the hooks run AND
+    # where the awareness-tick alert writer lives) nonzero means predictions
+    # are being dropped; the health-MCP process always computes zero here and
+    # stays read-only — consistent with the single-designated-writer rule.
     alerts: list[dict] = []
     current_ids: set[str] = set()
+    try:
+        from genesis.ledger.writers import write_failure_counts
+
+        for action_class, count in sorted(write_failure_counts().items()):
+            if count > 0:
+                alert_id = f"ledger:write_failed:{action_class}"
+                alerts.append({
+                    "id": alert_id,
+                    "severity": "WARNING",
+                    "message": (
+                        f"{count} ledger prediction write(s) failed for "
+                        f"{action_class} since process start — the commit-path "
+                        "hook is dropping predictions (coverage gap)"
+                    ),
+                })
+                current_ids.add(alert_id)
+    except Exception:
+        logger.debug("ledger write-failure alert check failed", exc_info=True)
+
+    if _service is None:
+        alerts.append({"id": "service:health_data_uninitialized", "severity": "CRITICAL", "message": "HealthDataService not initialized"})
+        return alerts, current_ids
+
+    snap = await _service.snapshot()
 
     # Import lazily to avoid circular imports in hook/test paths
     from genesis.observability._call_site_meta import _CALL_SITE_META

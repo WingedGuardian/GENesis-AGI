@@ -11,6 +11,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Every significant action now commits with a falsifiable prediction.**
+  Outreach sends, autonomous task claims, build-lane verdicts, and ego
+  proposals each write their prediction rows the moment they commit — code
+  in the commit path, not discipline. Priors seed from measured base rates
+  (a reply prediction starts at the real ~2%, not an optimistic 50%), stated
+  confidence threads through where it genuinely exists (task submissions
+  gained an optional confidence field), and a failing hook can never block
+  or slow the action itself — failures surface as a health alert instead.
+  Task completions and failures also now land on the outcome bus in real
+  time (the first live emits), instead of waiting for the twice-daily
+  harvester.
+
 - **Genesis now writes down its predictions before acting — the substrate.**
   A new cognitive ledger stores falsifiable predictions ("this outreach will
   get a reply within 72 hours, confidence 0.02") behind a hard validation
@@ -32,6 +44,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   old), you get a distinct "posture unknown" alert instead of stale claims.
 
 ### Fixed
+
+- **The engagement-outcome vocabulary is now actually enforced.** The
+  database rule meant to constrain how outreach engagement gets labeled was
+  silently toothless (a SQL quirk made every value pass), so labels drifted
+  for months and anything could be written. The table now enforces the
+  canonical vocabulary, historical stragglers were normalized, and the two
+  doors that passed raw client strings straight through (an MCP tool and a
+  dashboard endpoint) validate first — a bogus value gets a polite rejection
+  instead of a crash.
 
 - **Answering Genesis's questions with a plain message now actually works.**
   When Genesis asked something and waited for your answer (approvals,
