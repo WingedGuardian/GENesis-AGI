@@ -423,6 +423,34 @@ def test_legacy_unit_counts_as_ours_for_foreign_guard(tmp_path):
     assert _unit(tmp_path).is_file()  # migrated + reinstalled
 
 
+def test_failed_write_keeps_legacy_unit(tmp_path):
+    """Codex P2: never delete the working legacy unit before the replacement
+    write has succeeded — a failed write must leave the host protected."""
+    env = _sandbox(tmp_path, sudo=_SUDO_TEE_FAIL)
+    legacy = _legacy_unit(tmp_path)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("[Unit]\n# old etc-resident unit\n")
+    res = _run(env)
+    assert res.returncode == 0
+    assert "keeping legacy" in res.stdout
+    assert legacy.exists()  # still protected
+    assert not _unit(tmp_path).exists()
+
+
+def test_remove_preserves_mask_symlink(tmp_path):
+    """Codex P2: after mask, the /etc path is the operator's /dev/null symlink
+    — remove() must not delete it (else the opt-out is silently destroyed)."""
+    env = _sandbox(tmp_path)
+    _run(env)  # install to the new location
+    mask = _legacy_unit(tmp_path)
+    mask.parent.mkdir(parents=True, exist_ok=True)
+    mask.symlink_to("/dev/null")
+    res = _run(env, fn="host_swap_remove")
+    assert res.returncode == 0
+    assert not _unit(tmp_path).exists()  # our unit removed
+    assert mask.is_symlink()  # the operator's mask survives
+
+
 # ── parse + wiring ──────────────────────────────────────────────────────────
 
 

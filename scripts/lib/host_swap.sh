@@ -174,18 +174,25 @@ host_swap_apply() {
         return 0
     fi
 
-    # Migrate a legacy /etc-installed unit (pre-2026-07-16 installs): it would
-    # SHADOW the /usr/local unit by precedence and keep mask broken. Removing
-    # it forces the write-if-different below to treat this as CHANGED →
-    # daemon-reload + restart pick up the relocated unit atomically.
-    if [[ -f "$legacy_unit" ]]; then
-        sudo rm -f "$legacy_unit" 2>/dev/null || true
-        echo "  migrated: removed legacy $legacy_unit (unit now lives in $HOSTSWAP_UNIT_DIR)"
-    fi
-
     _HOSTSWAP_CHANGED=""
     _HOSTSWAP_FAILED=""
     _hostswap_install_unit "$(_hostswap_unit_content "$size_mib")"
+
+    # Migrate a legacy /etc-installed unit (pre-2026-07-16 installs): it would
+    # SHADOW the /usr/local unit by precedence and keep mask broken. Removed
+    # only AFTER the replacement write succeeded (Codex P2: deleting the
+    # working unit first + a failed write would leave the host with NO unit);
+    # on a failed write the legacy copy stays and keeps the host protected.
+    # A first migration is always a CHANGED write (new path was empty), so
+    # daemon-reload + restart below relocate atomically.
+    if [[ -f "$legacy_unit" ]]; then
+        if [[ -z "$_HOSTSWAP_FAILED" ]]; then
+            sudo rm -f "$legacy_unit" 2>/dev/null || true
+            echo "  migrated: removed legacy $legacy_unit (unit now lives in $HOSTSWAP_UNIT_DIR)"
+        else
+            echo "  keeping legacy $legacy_unit (replacement write failed — still protected)."
+        fi
+    fi
 
     if [[ -n "$_HOSTSWAP_FAILED" ]]; then
         return 0
@@ -243,7 +250,14 @@ host_swap_remove() {
     # ExecStop already ran on disable --now, so this is the belt to its braces.
     sudo sh -c 'test -b /dev/zram0 && echo 0 > /sys/class/zram-control/hot_remove' 2>/dev/null || true
     sudo rm -f "$HOSTSWAP_UNIT_DIR/$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
-    sudo rm -f "$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME" 2>/dev/null || true
+    # The /etc path is removed only when it is a REGULAR file (a legacy
+    # pre-relocation unit). After `systemctl mask` it is the operator's
+    # /dev/null SYMLINK — deleting it would silently destroy the opt-out and
+    # the next apply would reinstall (Codex P2). mask survives remove.
+    local _legacy="$HOSTSWAP_ETC_ROOT/systemd/system/$_HOSTSWAP_UNIT_NAME"
+    if [[ -f "$_legacy" && ! -L "$_legacy" ]]; then
+        sudo rm -f "$_legacy" 2>/dev/null || true
+    fi
     sudo systemctl daemon-reload 2>/dev/null || true
     echo "  + zram swap removed (mask the unit to prevent re-apply on update)."
     return 0
