@@ -1,8 +1,11 @@
 """Tests for the output content scanner."""
 
+import pytest
+
 from genesis.security.output_scanner import scan_outbound
 
 # --- Safe content ---
+
 
 def test_safe_plain_text():
     result = scan_outbound("Thanks for your interest in Genesis! Check out the repo.")
@@ -27,6 +30,7 @@ def test_safe_public_url():
 
 # --- API key detection ---
 
+
 def test_detects_openai_key():
     result = scan_outbound("My key is sk-abc123def456ghi789jkl012mno")
     assert not result.safe
@@ -49,6 +53,7 @@ def test_detects_groq_key():
 
 # --- Credential patterns ---
 
+
 def test_detects_credential_assignment():
     result = scan_outbound("Set password=MyS3cretP@ssw0rd123 in config")
     assert not result.safe
@@ -64,8 +69,9 @@ def test_detects_env_variable():
 
 # --- IP addresses ---
 
+
 def test_detects_rfc1918_ip():
-    result = scan_outbound("Connect to 192.168.50.77 for the dashboard")
+    result = scan_outbound("Connect to 192.168.1.100 for the dashboard")
     assert not result.safe
     assert "rfc1918_ip" in result.detected
     assert result.risk_level == "medium"
@@ -78,6 +84,7 @@ def test_ignores_public_ip():
 
 
 # --- File paths ---
+
 
 def test_detects_internal_file_path():
     result = scan_outbound("The config is at ~/.genesis/config/genesis.yaml")
@@ -93,6 +100,7 @@ def test_detects_home_path():
 
 # --- Localhost ---
 
+
 def test_detects_localhost_port():
     result = scan_outbound("Qdrant runs on localhost:6333")
     assert not result.safe
@@ -101,11 +109,87 @@ def test_detects_localhost_port():
 
 # --- Multiple patterns ---
 
+
 def test_multiple_patterns_detected():
     result = scan_outbound(
-        "Connect to 192.168.50.77 and use sk-ant-api03-testkey123456789xyz "
+        "Connect to 192.168.1.100 and use sk-ant-api03-testkey123456789xyz "
         "with password=admin123456"
     )
     assert not result.safe
     assert len(result.detected) >= 3
     assert result.risk_level == "high"
+
+
+# --- Modern key shapes the shipped [a-zA-Z0-9]{20,} charset MISSED ---
+# Regression guard: every one of these returned safe=True before the fix
+# because the prefix embeds '-'/'_' that the old charset excluded.
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "sk-proj-abc_defGHI-jklMNO123456789xyz",  # pragma: allowlist secret
+        "sk-svcacct-abcDEF123456_ghiJKL789mno",  # pragma: allowlist secret
+        "sk-admin-abcDEF123456789ghiJKL0mnop",  # pragma: allowlist secret
+        "sk-or-v1-0123456789abcdef0123456789abcdef",  # pragma: allowlist secret
+        "sk-test_abc123XYZ7890defghijk",  # pragma: allowlist secret
+    ],
+)
+def test_detects_modern_openai_family(key):
+    result = scan_outbound(f"here it is: {key}")
+    assert not result.safe
+    assert "api_key_openai" in result.detected
+    assert result.risk_level == "high"
+
+
+def test_detects_anthropic_key_with_underscore():
+    # Real Anthropic key bodies contain underscores — the old charset stopped
+    # at the first '_' and could truncate below the length floor.
+    key = "sk-ant-api03-abc_def-ghijklmnopqrstuvwxyz012345"  # pragma: allowlist secret
+    result = scan_outbound(f"key: {key}")
+    assert not result.safe
+    assert "api_key_anthropic" in result.detected
+    assert result.risk_level == "high"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789",  # pragma: allowlist secret
+        "gho_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",  # pragma: allowlist secret
+        "ghs_0123456789abcdefghijklmnopqrstuvwxyz",  # pragma: allowlist secret
+        "ghu_abcdEFGH1234567890ijklMNOP567890qrst",  # pragma: allowlist secret
+        "github_pat_ABCdef012345_abcdefghijklmnopqrstuvwxyz012",  # pragma: allowlist secret
+    ],
+)
+def test_detects_github_tokens(token):
+    result = scan_outbound(f"token = {token}")
+    assert not result.safe
+    assert "api_key_github" in result.detected
+    assert result.risk_level == "high"
+
+
+# --- False-positive guardrails ---
+# Benign strings that superficially resemble a key prefix. A permissive
+# charset with too low a length floor flags these; the shipped floor of 20
+# (real keys are 40-165 chars) keeps them safe. Each was verified against
+# the candidate regexes before the fix landed.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a risk-averse mindset pays off",
+        "let's have a desk-side chat about it",
+        "the SK-1024 model is deprecated",
+        "join the ask-me-anything session",
+        "see the sk-learn-pipeline notes",
+        "the sk-marketing-plan-q3 launch is set",
+        "query the ghi_data_warehouse_table_name view",
+        "ugh_oh that was a rough deploy",
+    ],
+)
+def test_benign_lookalikes_not_flagged(text):
+    result = scan_outbound(text)
+    assert result.safe is True
+    assert result.detected == []

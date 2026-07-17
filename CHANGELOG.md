@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The outbound secret scanner now catches modern API-key formats.** Before
+  sending on external channels (email, chat), Genesis scans messages and
+  quarantines anything that looks like a leaked credential. Its API-key
+  patterns predated today's key formats, so newer shapes slipped through
+  unflagged — OpenAI project and service-account keys (`sk-proj-…`,
+  `sk-svcacct-…`, `sk-admin-…`), OpenRouter keys (`sk-or-…`), and underscored
+  key bodies. The patterns now cover the full modern `sk-*` family, GitHub
+  tokens (`ghp_…`/`gho_…`/`github_pat_…`) are recognized for the first time,
+  and benign look-alikes (hyphenated slugs such as "sk-learn-pipeline") stay
+  unflagged.
+
 - **Answering Genesis's questions with a plain message now actually works.**
   When Genesis asked something and waited for your answer (approvals,
   provision prompts, send-and-wait questions), an internal ordering bug left
