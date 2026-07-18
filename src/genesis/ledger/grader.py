@@ -146,8 +146,8 @@ async def _feed_autonomy(
         return  # slowness / cancellation / anything else — no autonomy signal
     if autonomy_feed == "off":
         return
-    report.autonomy[f"{autonomy_feed}:{kind}"] += 1
     if autonomy_feed == "shadow":
+        report.autonomy[f"shadow:{kind}"] += 1  # what live WOULD fire
         logger.info(
             "[ledger-autonomy shadow] WOULD record_%s(direct_session) for task %s (lane=%s)",
             kind,
@@ -157,6 +157,11 @@ async def _feed_autonomy(
         return
     if autonomy_manager is None:  # live but no manager wired — nothing to fire
         return
+    # Count only once we know a manager exists to fire into — otherwise the
+    # report would claim a live fire that never happened (hiding a wiring
+    # regression). A raise below still counts as fired-then-failed via
+    # _autonomy_feed_failures, which is the honest record.
+    report.autonomy[f"live:{kind}"] += 1
     try:
         if kind == "success":
             await autonomy_manager.record_success("direct_session")

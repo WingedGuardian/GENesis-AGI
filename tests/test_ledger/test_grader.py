@@ -459,6 +459,17 @@ async def test_autonomy_only_completed_metric_not_first_attempt(db, monkeypatch)
     mgr.record_success.assert_not_awaited()
 
 
+async def test_autonomy_live_no_manager_does_not_overcount(db, monkeypatch):
+    # live mode but no manager wired: nothing fires AND report.autonomy must not
+    # claim a fire (else it hides a wiring regression — architect NOTE-1).
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
+    await _seed_task(db, "t-nomgr", "completed")
+    await _task_pred(db, "t-nomgr")
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=None)
+    assert report.mechanical == 1  # graded fine
+    assert not report.autonomy  # but nothing counted as fired
+
+
 async def test_autonomy_exactly_once_across_regrade(db, monkeypatch):
     monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
     await _seed_task(db, "t-once", "completed")
