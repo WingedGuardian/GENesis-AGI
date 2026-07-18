@@ -170,20 +170,11 @@ def build_triage_pipeline(
             else:
                 delta = await delta_assessor.assess(summary)
 
-            # Log prediction for calibration (fire-and-forget)
-            if outcome and runtime is not None:
-                try:
-                    prediction_logger = getattr(runtime, "_prediction_logger", None)
-                    if prediction_logger is not None:
-                        await prediction_logger.log(
-                            action_id=f"triage-{summary.session_id or 'unknown'}",
-                            prediction=f"Outcome classified as {outcome.value}",
-                            confidence=0.7 if outcome.value == "success" else 0.5,
-                            domain="triage",
-                            reasoning=triage.rationale or "pipeline classification",
-                        )
-                except Exception:
-                    logger.debug("Prediction logging failed (non-fatal)", exc_info=True)
+            # Proto-ledger prediction logging REMOVED (WS-2 P2b, Sunset S1). It
+            # wrote unfalsifiable domain='triage' rows (a restatement of the
+            # classifier's own verdict, no deadline, hard-coded confidence) that
+            # nothing ever graded. The real ledger (ledger_predictions + the P2
+            # grader) supersedes it.
 
         # 6. Observation + attribution routing (depth >= FULL_ANALYSIS)
         if triage.depth >= TriageDepth.FULL_ANALYSIS and outcome and delta:
@@ -203,25 +194,15 @@ def build_triage_pipeline(
             except Exception:
                 logger.error("Drive adaptation failed (non-fatal)", exc_info=True)
 
-            # 6.2. Autonomy calibration — wire Bayesian regression to live outcomes
-            if runtime is not None:
-                try:
-                    mgr = getattr(runtime, "_autonomy_manager", None)
-                    if mgr is not None:
-                        from datetime import UTC, datetime
-
-                        if outcome == OutcomeClass.SUCCESS:
-                            await mgr.record_success("direct_session")
-                        elif outcome in (
-                            OutcomeClass.APPROACH_FAILURE,
-                            OutcomeClass.CAPABILITY_GAP,
-                        ):
-                            await mgr.record_correction(
-                                "direct_session",
-                                corrected_at=datetime.now(UTC).isoformat(),
-                            )
-                except Exception:
-                    logger.error("Autonomy calibration failed (non-fatal)", exc_info=True)
+            # 6.2. Autonomy calibration — REMOVED (WS-2 P2b, the A1 harm-removal).
+            # direct_session earn-back evidence no longer eats the LLM
+            # classifier's SUCCESS/APPROACH_FAILURE/CAPABILITY_GAP self-verdict
+            # (Genesis grading its own state — the dominant WS-0 failure class).
+            # The P2 grader now feeds direct_session record_success/correction
+            # from *mechanically graded* task_execution rows (ledger/grader.py:
+            # failure-only — lane 'completed'→success, 'phase:failed'→correction,
+            # nothing on slowness/cancel — behind the shadow-first ws2_ledger
+            # settings gate).
 
         # 6.5. Procedure extraction — DEPRECATED (30-day grace period)
         #

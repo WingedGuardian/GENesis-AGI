@@ -123,6 +123,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Autonomy stops grading its own homework.** Genesis's autonomy earn-back
+  evidence used to be fed by the LLM classifier's own verdict on each
+  interaction — it decided it "succeeded", and that counted toward earning more
+  autonomy (a system grading itself). That self-grade feed is removed. In its
+  place the mechanical grader feeds earn-back evidence from *actually completed
+  vs. actually failed* autonomous tasks, and only a genuine failure counts
+  against a category — a task that was merely slow or got cancelled never does.
+  Ships in shadow mode by default (it logs what it would record, changes no
+  autonomy levels); an operator flips it to live via the new `ws2_ledger`
+  setting after watching the real pattern.
+
 - **Those predictions now get graded.** A mechanical grader runs twice daily
   and settles every prediction whose deadline has passed — reading the actual
   outcome straight from the system's own records (did the reply arrive, did the

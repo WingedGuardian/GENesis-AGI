@@ -652,7 +652,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 1828ee2f 2026-07-18
+verified: b1163dd5 2026-07-18
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -740,9 +740,16 @@ verified: 1828ee2f 2026-07-18
   through the CRUD's idempotent `resolve()`; ZERO LLM calls (own no-`routing`
   import lock). Registry drift / resolver faults alarm
   `ledger:metric_vanished:<class>` / `ledger:grade_failed:<class>` via the same
-  counter→`_compute_alerts` path. The autonomy-evidence rewire (demote the LLM
-  self-grade feed) and calibration-cell aggregation are later PRs; the fuzzy
-  LLM-fallback lane is deferred (no `acceptance_pass` writer yet). Outreach
+  counter→`_compute_alerts` path. **Autonomy-evidence rewire LIVE (P2b)**: the
+  `learning/pipeline.py` self-grade feed (autonomy `record_success/correction`
+  off the LLM classifier verdict — the A1 harm) is REMOVED; the grader now feeds
+  `direct_session` earn-back from mechanically-graded `task_execution/completed`
+  rows — FAILURE-ONLY (lane `completed`→success, `phase:failed`→correction,
+  nothing on slowness/cancel) and SHADOW-FIRST behind `ws2_ledger.autonomy_feed`
+  (off/shadow/live, default shadow, read live via `ledger/ws2_ledger_config.py`;
+  live feeds the same seam #1119's `autonomy_events` windowed ledger consumes).
+  Calibration-cell aggregation is a later PR; the fuzzy LLM-fallback lane is
+  deferred (no `acceptance_pass` writer yet). Outreach
   metrics resolve off `outreach_history.engagement_signal`
   (spike-measured 99.5% mechanical); the engagement_outcome CHECK now
   ENFORCES the canonical vocabulary (rebuild #4 in the

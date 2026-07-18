@@ -37,6 +37,7 @@ from typing import Any
 
 from genesis.db.crud import ledger_predictions as lp_crud
 from genesis.ledger.metrics import REGISTRY
+from genesis.ledger.ws2_ledger_config import autonomy_feed_mode
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,11 @@ logger = logging.getLogger(__name__)
 # consistent with the single-designated-writer rule.
 _metric_vanished: Counter[str] = Counter()
 _grade_failed: Counter[str] = Counter()
+# WS-2 P2b: live autonomy-feed side-effect failures (record_success/correction
+# raised). Non-critical — the grade itself landed; only the earn-back evidence
+# didn't propagate — so log+count, no health alert (matches the removed
+# pipeline block's non-fatal posture).
+_autonomy_feed_failures: Counter[str] = Counter()
 
 
 def grade_failure_counts() -> dict[str, dict[str, int]]:
@@ -61,9 +67,15 @@ def grade_failure_counts() -> dict[str, dict[str, int]]:
     }
 
 
+def autonomy_feed_failure_counts() -> dict[str, int]:
+    """Live autonomy-feed side-effect failures since process start (observability)."""
+    return dict(_autonomy_feed_failures)
+
+
 def _reset_grade_failure_counts_for_tests() -> None:
     _metric_vanished.clear()
     _grade_failed.clear()
+    _autonomy_feed_failures.clear()
 
 
 @dataclass
@@ -79,6 +91,9 @@ class GradeReport:
     fuzzy_pending: int = 0
     left_open: int = 0
     per_class: dict[str, Counter[str]] = field(default_factory=dict)
+    # WS-2 P2b autonomy feed, keyed "<mode>:<kind>" (e.g. "shadow:success",
+    # "live:correction") — what the grader fired (live) or would have (shadow).
+    autonomy: Counter[str] = field(default_factory=Counter)
 
     def _bump(self, action_class: str, kind: str) -> None:
         self.per_class.setdefault(action_class, Counter())[kind] += 1
@@ -99,14 +114,80 @@ class GradeReport:
             f"void={self.void} unresolvable={self.unresolvable} "
             f"fuzzy_pending={self.fuzzy_pending} left_open={self.left_open} "
             f"mechanical_share={share_s}"
+            + (f" autonomy={dict(self.autonomy)}" if self.autonomy else "")
         )
 
 
-async def _apply(db: Any, row: dict, res, report: GradeReport, *, now: datetime | None) -> None:
+async def _feed_autonomy(
+    row: dict,
+    res,
+    report: GradeReport,
+    *,
+    autonomy_manager: Any,
+    autonomy_feed: str,
+    now: datetime,
+) -> None:
+    """FAILURE-ONLY autonomy earn-back evidence from a graded task row (P2b).
+
+    Replaces the removed pipeline self-grade feed. Fires ONLY on genuine
+    completion (lane ``completed`` → success) or genuine execution failure
+    (lane ``phase:failed`` → correction). A task that merely missed its
+    deadline while still running (``mechanical_absence``) or was cancelled
+    (``phase:cancelled``) is NOT a competence signal — a correction there would
+    spuriously demote direct_session. SHADOW-FIRST: shadow logs the intent and
+    writes nothing; live fires the manager seam fire-and-forget (a raise never
+    touches the grade, which already landed).
+    """
+    if res.lane == "completed":
+        kind = "success"
+    elif res.lane == "phase:failed":
+        kind = "correction"
+    else:
+        return  # slowness / cancellation / anything else — no autonomy signal
+    if autonomy_feed == "off":
+        return
+    report.autonomy[f"{autonomy_feed}:{kind}"] += 1
+    if autonomy_feed == "shadow":
+        logger.info(
+            "[ledger-autonomy shadow] WOULD record_%s(direct_session) for task %s (lane=%s)",
+            kind,
+            row["subject_ref_id"],
+            res.lane,
+        )
+        return
+    if autonomy_manager is None:  # live but no manager wired — nothing to fire
+        return
+    try:
+        if kind == "success":
+            await autonomy_manager.record_success("direct_session")
+        else:
+            await autonomy_manager.record_correction("direct_session", corrected_at=now.isoformat())
+    except Exception:
+        _autonomy_feed_failures[kind] += 1
+        logger.error(
+            "ledger autonomy feed (%s) failed for task %s — grade unaffected",
+            kind,
+            row["subject_ref_id"],
+            exc_info=True,
+        )
+
+
+async def _apply(
+    db: Any,
+    row: dict,
+    res,
+    report: GradeReport,
+    *,
+    now: datetime,
+    autonomy_manager: Any = None,
+    autonomy_feed: str = "off",
+) -> None:
     """Translate one :class:`Resolution` into a ``resolve()`` call.
 
     Keyed on ``outcome_value`` first (the resolved-iff-non-None invariant),
-    then the lane for the None-outcome dispositions.
+    then the lane for the None-outcome dispositions. A resolved
+    task_execution/completed row additionally feeds autonomy earn-back evidence
+    (failure-only, shadow-first — P2b).
     """
     action_class = row["action_class"]
     if res.outcome_value is not None:
@@ -127,6 +208,18 @@ async def _apply(db: Any, row: dict, res, report: GradeReport, *, now: datetime 
             else:
                 report.mechanical += 1
             report._bump(action_class, f"resolved:{res.lane}")
+            # Exactly-once: only a genuine open→resolved transition (changed)
+            # feeds autonomy — the idempotent resolve() guard makes re-grades
+            # no-ops, so no double-fire across the twice-daily passes.
+            if action_class == "task_execution" and row["metric"] == "completed":
+                await _feed_autonomy(
+                    row,
+                    res,
+                    report,
+                    autonomy_manager=autonomy_manager,
+                    autonomy_feed=autonomy_feed,
+                    now=now,
+                )
         return
 
     lane = res.lane
@@ -152,7 +245,7 @@ async def _apply(db: Any, row: dict, res, report: GradeReport, *, now: datetime 
 
 
 async def grade_due_predictions(
-    db: Any, *, now: datetime | None = None, limit: int = 500
+    db: Any, *, now: datetime | None = None, limit: int = 500, autonomy_manager: Any = None
 ) -> GradeReport:
     """Grade every open prediction whose deadline has passed. Idempotent.
 
@@ -162,8 +255,14 @@ async def grade_due_predictions(
     ``_past_deadline`` check does ``now >= deadline`` with no fallback, so a
     ``None`` would TypeError every absence-path row into ``grade_failed``
     instead of resolving it.
+
+    ``autonomy_manager`` (the runtime ``AutonomyManager``) enables the P2b
+    earn-back feed; the mode (off/shadow/live) is read LIVE once per pass from
+    the ws2_ledger settings domain. Omitting it (tests, or a caller with no
+    runtime) simply skips the feed.
     """
     now = now or datetime.now(UTC)
+    autonomy_feed = autonomy_feed_mode()
     report = GradeReport()
     rows = await lp_crud.list_due_open(db, now=now, limit=limit)
     report.scanned = len(rows)
@@ -197,5 +296,13 @@ async def grade_due_predictions(
             report.left_open += 1
             report._bump(action_class, "grade_failed")
             continue
-        await _apply(db, row, res, report, now=now)
+        await _apply(
+            db,
+            row,
+            res,
+            report,
+            now=now,
+            autonomy_manager=autonomy_manager,
+            autonomy_feed=autonomy_feed,
+        )
     return report

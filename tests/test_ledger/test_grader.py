@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -351,3 +352,131 @@ def test_no_llm_import_path():
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+
+# ── P2b autonomy feed: failure-only + shadow-first (into the autonomy Trap) ───
+
+
+async def _task_pred(db, tid, metric="completed"):
+    await lp.create(
+        db,
+        action_class="task_execution",
+        subject_ref_type="task",
+        subject_ref_id=tid,
+        domain="task.x",
+        metric=metric,
+        confidence=0.5,
+        deadline_at=(BASE + timedelta(hours=1)).isoformat(),
+        provenance="policy_prior",
+        predictor="test",
+        now=BASE,
+    )
+
+
+def _mgr():
+    m = AsyncMock()
+    m.record_success = AsyncMock()
+    m.record_correction = AsyncMock()
+    return m
+
+
+async def test_autonomy_shadow_logs_but_fires_nothing(db, monkeypatch):
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "shadow")
+    await _seed_task(db, "t-shadow", "completed")
+    await _task_pred(db, "t-shadow")
+    mgr = _mgr()
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    assert report.autonomy["shadow:success"] == 1
+    mgr.record_success.assert_not_awaited()  # shadow writes nothing to the Trap
+    mgr.record_correction.assert_not_awaited()
+
+
+async def test_autonomy_live_success_on_completion(db, monkeypatch):
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
+    await _seed_task(db, "t-live", "completed")
+    await _task_pred(db, "t-live")
+    mgr = _mgr()
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    assert report.autonomy["live:success"] == 1
+    mgr.record_success.assert_awaited_once_with("direct_session")
+    mgr.record_correction.assert_not_awaited()
+
+
+async def test_autonomy_live_correction_on_genuine_failure(db, monkeypatch):
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
+    await _seed_task(db, "t-fail", "failed")
+    await _task_pred(db, "t-fail")
+    mgr = _mgr()
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    assert report.autonomy["live:correction"] == 1
+    mgr.record_correction.assert_awaited_once()
+    assert mgr.record_correction.call_args[0][0] == "direct_session"
+    mgr.record_success.assert_not_awaited()
+
+
+async def test_autonomy_no_fire_on_cancelled(db, monkeypatch):
+    # A cancelled task grades 0 (phase:cancelled) but is NOT a competence signal.
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
+    await _seed_task(db, "t-cancel", "cancelled")
+    await _task_pred(db, "t-cancel")
+    mgr = _mgr()
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    assert not report.autonomy
+    mgr.record_success.assert_not_awaited()
+    mgr.record_correction.assert_not_awaited()
+
+
+async def test_autonomy_no_fire_on_deadline_miss(db, monkeypatch):
+    # Still running at deadline → mechanical_absence: slowness, not failure.
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
+    await _seed_task(db, "t-slow", "dispatching")
+    await _task_pred(db, "t-slow")
+    mgr = _mgr()
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    assert report.absence == 1 and not report.autonomy
+    mgr.record_success.assert_not_awaited()
+    mgr.record_correction.assert_not_awaited()
+
+
+async def test_autonomy_off_fires_nothing(db, monkeypatch):
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "off")
+    await _seed_task(db, "t-off", "completed")
+    await _task_pred(db, "t-off")
+    mgr = _mgr()
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    assert not report.autonomy
+    mgr.record_success.assert_not_awaited()
+
+
+async def test_autonomy_only_completed_metric_not_first_attempt(db, monkeypatch):
+    # completed_first_attempt must NOT feed autonomy (one event per task).
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
+    await _seed_task(db, "t-cfa", "completed")
+    await _task_pred(db, "t-cfa", metric="completed_first_attempt")
+    mgr = _mgr()
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    assert report.resolved == 1 and not report.autonomy  # graded, no autonomy
+    mgr.record_success.assert_not_awaited()
+
+
+async def test_autonomy_exactly_once_across_regrade(db, monkeypatch):
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
+    await _seed_task(db, "t-once", "completed")
+    await _task_pred(db, "t-once")
+    mgr = _mgr()
+    await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)  # resolved row not re-listed
+    mgr.record_success.assert_awaited_once()  # fired once, not per pass
+
+
+async def test_autonomy_manager_failure_never_touches_grade(db, monkeypatch):
+    monkeypatch.setattr(grader, "autonomy_feed_mode", lambda: "live")
+    await _seed_task(db, "t-boom", "completed")
+    await _task_pred(db, "t-boom")
+    mgr = _mgr()
+    mgr.record_success = AsyncMock(side_effect=RuntimeError("autonomy store down"))
+    report = await grade_due_predictions(db, now=AFTER, autonomy_manager=mgr)
+    row = (await lp.list_by_subject(db, action_class="task_execution", subject_ref_id="t-boom"))[0]
+    assert row["status"] == "resolved" and row["outcome_value"] == 1  # grade still landed
+    assert report.mechanical == 1
+    assert grader.autonomy_feed_failure_counts() == {"success": 1}
