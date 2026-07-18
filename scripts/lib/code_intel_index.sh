@@ -123,11 +123,12 @@ LOCK_FILE="$LOCK_DIR/code-intel-$(printf '%s' "$REPO_PATH" | sha1sum | cut -c1-1
 # `flock -n 9` failure is indistinguishable from "lock held" otherwise).
 if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
     if ! flock -n 9; then
-        # Lock held: either a concurrent index, or the host's genesis-code-intel-freeze
-        # unit holding THIS flock as a kill-switch. Default rc 0 (back-compat); the
-        # runner sets CODE_INTEL_INDEX_LOCK_SKIP_RC=75 so it can tell "frozen — keep
-        # the marker" apart from a real success. The lock ACQUISITION above is
-        # byte-unchanged, so the freeze keeps neutralizing every trigger regardless.
+        # Lock held: either a concurrent index, or the managed genesis-code-intel-freeze
+        # user unit (scripts/code_intel_freeze.sh) holding THIS flock as a kill-switch.
+        # Default rc 0 (back-compat); the runner sets CODE_INTEL_INDEX_LOCK_SKIP_RC=75
+        # so it can tell "frozen — keep the marker" apart from a real success. The lock
+        # ACQUISITION above is byte-unchanged, so the freeze keeps neutralizing every
+        # trigger regardless.
         _log "skip: an index for $REPO_PATH is already running (lock held)"
         exit "${CODE_INTEL_INDEX_LOCK_SKIP_RC:-0}"
     fi

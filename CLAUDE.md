@@ -62,7 +62,12 @@ pollers split updates and break approval buttons),
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
 `genesis-cc-align.timer` (nightly host CC/Node pin alignment via the guardian
 gateway, so the host recovery brain never lags a pin bump between updates; see
-`scripts/cc_align_host.sh`). MCP servers are CC child processes
+`scripts/cc_align_host.sh`), `genesis-code-intel.timer` (idle-gated code-intel
+index-request consumer; see `scripts/code_intel_runner.sh`) with
+`genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
+NOT auto-enabled — `systemctl --user start/stop genesis-code-intel-freeze` to
+arm/disarm; holds both index locks so nothing indexes while armed; see
+`scripts/code_intel_freeze.sh`). MCP servers are CC child processes
 (not systemd) — code changes take effect on next CC session start.
 
 ## Common Commands
