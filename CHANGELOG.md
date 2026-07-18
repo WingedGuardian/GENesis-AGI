@@ -9,7 +9,26 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Genesis now tidies near-duplicate entities in its knowledge graph.** When
+  it learns about a "thing" (a project, tool, concept, person) whose name is
+  very close to one it already knows, it now decides whether they are the same
+  thing or genuinely different, and can merge the duplicates so its memory of
+  you stays coherent instead of fragmenting across "neural monitor" /
+  "neural-monitor" / "neural_monitor". Two independent models must agree before
+  anything merges, and pairs that only differ by a number (`PR #989` vs
+  `PR #990`) are never merged. It ships in **shadow mode by default** — it
+  records what it *would* merge without touching anything, so you can review the
+  proposals first; flip it to live with
+  `settings_update("entity_adjudication", {"mode": "live"})` (or turn it off
+  entirely). A background sweep also reconciles the entities it already had.
+
 ### Changed
+
+- **Finished background-queue rows are now pruned after 45 days.** The internal
+  deferred-work queue kept every completed item forever; it now retains 45 days
+  of history and drops the rest, so the queue can't slowly grow without bound.
 
 - **Every terminal door now leads to the same persistent session.** Running
   `claude` by hand over SSH or in the dashboard web terminal now lands in a

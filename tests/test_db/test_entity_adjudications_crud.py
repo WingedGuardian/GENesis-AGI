@@ -57,6 +57,17 @@ async def test_all_pair_keys(db):
 
 
 @pytest.mark.asyncio
+async def test_settled_pair_keys_excludes_stale(db):
+    await adj.record_verdict(db, entity_a="a", entity_b="b", verdict="distinct")
+    await adj.record_verdict(db, entity_a="c", entity_b="d", verdict="merge")
+    await adj.record_verdict(db, entity_a="e", entity_b="f", verdict="proposed_merge")
+    await adj.record_verdict(db, entity_a="g", entity_b="h", verdict="stale")
+    # stale is excluded so the sweep can rediscover it; the rest are settled.
+    assert await adj.settled_pair_keys(db) == {"a|b", "c|d", "e|f"}
+    assert await adj.all_pair_keys(db) == {"a|b", "c|d", "e|f", "g|h"}
+
+
+@pytest.mark.asyncio
 async def test_list_proposed_merges_only_proposed(db):
     await adj.record_verdict(
         db, entity_a="a", entity_b="b", verdict="proposed_merge", loser_id="b", survivor_id="a"

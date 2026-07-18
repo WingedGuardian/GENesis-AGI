@@ -135,9 +135,19 @@ async def get_by_pair(db: aiosqlite.Connection, entity_a: str, entity_b: str) ->
 
 
 async def all_pair_keys(db: aiosqlite.Connection) -> set[str]:
-    """Every recorded pair_key — the sweep's dedup set (cheap: bounded by
-    total fuzzy pairs, low thousands)."""
+    """Every recorded pair_key (any verdict). Bounded by total fuzzy pairs
+    (low thousands)."""
     cursor = await db.execute("SELECT pair_key FROM entity_adjudications")
+    return {r[0] for r in await cursor.fetchall()}
+
+
+async def settled_pair_keys(db: aiosqlite.Connection) -> set[str]:
+    """pair_keys with a SETTLED verdict (merge/distinct/proposed_merge) — the
+    sweep's dedup set. Deliberately EXCLUDES ``stale``: a stale verdict means the
+    prior judgment no longer holds (identity drifted), so the sweep SHOULD
+    rediscover the pair and the drainer re-adjudicate it — otherwise a stale pair
+    would be a permanent dead end."""
+    cursor = await db.execute("SELECT pair_key FROM entity_adjudications WHERE verdict != 'stale'")
     return {r[0] for r in await cursor.fetchall()}
 
 

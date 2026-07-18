@@ -21,8 +21,7 @@ from genesis.memory.entity_seed import SEED_MENTIONS, apply_seed
 async def db():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
-    for table in ("entities", "entity_mentions", "entity_links",
-                  "deferred_work_queue"):
+    for table in ("entities", "entity_mentions", "entity_links", "deferred_work_queue"):
         await conn.execute(TABLES[table])
     await conn.commit()
     yield conn
@@ -50,11 +49,17 @@ class TestCrud:
     async def test_mention_upsert_keeps_stronger(self, db):
         eid = await _mk(db, "Qdrant", "product")
         await entities_crud.upsert_mention(
-            db, memory_id="m1", entity_id=eid, provenance="EXTRACTED",
+            db,
+            memory_id="m1",
+            entity_id=eid,
+            provenance="EXTRACTED",
             confidence=0.9,
         )
         await entities_crud.upsert_mention(
-            db, memory_id="m1", entity_id=eid, provenance="INFERRED",
+            db,
+            memory_id="m1",
+            entity_id=eid,
+            provenance="INFERRED",
             confidence=0.4,
         )
         rows = await entities_crud.memories_mentioning(db, [eid])
@@ -66,12 +71,13 @@ class TestCrud:
         a = await _mk(db, "a")
         b = await _mk(db, "b")
         await entities_crud.upsert_link(
-            db, source_id=a, target_id=b, link_type="Is A!",
+            db,
+            source_id=a,
+            target_id=b,
+            link_type="Is A!",
             provenance="EXTRACTED",
         )
-        rows = await db.execute_fetchall(
-            "SELECT link_type FROM entity_links"
-        )
+        rows = await db.execute_fetchall("SELECT link_type FROM entity_links")
         assert rows[0][0] == "is_a"
 
     @pytest.mark.asyncio
@@ -80,12 +86,20 @@ class TestCrud:
         cat = await _mk(db, "voice-edge-device")
         rule = await _mk(db, "repo-split")
         await entities_crud.upsert_link(
-            db, source_id=omi, target_id=cat, link_type="is_a",
-            provenance="EXTRACTED", confidence=0.95,
+            db,
+            source_id=omi,
+            target_id=cat,
+            link_type="is_a",
+            provenance="EXTRACTED",
+            confidence=0.95,
         )
         await entities_crud.upsert_link(
-            db, source_id=cat, target_id=rule, link_type="constrained_by",
-            provenance="EXTRACTED", confidence=0.95,
+            db,
+            source_id=cat,
+            target_id=rule,
+            link_type="constrained_by",
+            provenance="EXTRACTED",
+            confidence=0.95,
         )
         reached = await entities_crud.connected_entities(db, [omi])
         assert reached[cat]["depth"] == 1
@@ -94,7 +108,10 @@ class TestCrud:
         # sibling via undirected hop through the category
         pe = await _mk(db, "haos voice pe", "device")
         await entities_crud.upsert_link(
-            db, source_id=pe, target_id=cat, link_type="is_a",
+            db,
+            source_id=pe,
+            target_id=cat,
+            link_type="is_a",
             provenance="EXTRACTED",
         )
         reached = await entities_crud.connected_entities(db, [omi])
@@ -105,11 +122,16 @@ class TestCrud:
         a = await _mk(db, "a")
         b = await _mk(db, "b")
         await entities_crud.upsert_link(
-            db, source_id=a, target_id=b, link_type="related_to",
+            db,
+            source_id=a,
+            target_id=b,
+            link_type="related_to",
             provenance="EXTRACTED",
         )
         n = await entities_crud.invalidate_links_for_entity(
-            db, entity_id=b, invalid_at="2026-01-01T00:00:00+00:00",
+            db,
+            entity_id=b,
+            invalid_at="2026-01-01T00:00:00+00:00",
             invalidated_by="test",
         )
         assert n == 1
@@ -117,7 +139,9 @@ class TestCrud:
         assert reached == {}
         # as_of BEFORE the invalidation still sees the edge
         reached = await entities_crud.connected_entities(
-            db, [a], as_of="2025-12-01T00:00:00+00:00",
+            db,
+            [a],
+            as_of="2025-12-01T00:00:00+00:00",
         )
         assert b in reached
 
@@ -126,8 +150,12 @@ class TestCrud:
         a = await _mk(db, "a")
         b = await _mk(db, "b")
         await entities_crud.upsert_link(
-            db, source_id=a, target_id=b, link_type="related_to",
-            provenance="AMBIGUOUS", confidence=1.0,
+            db,
+            source_id=a,
+            target_id=b,
+            link_type="related_to",
+            provenance="AMBIGUOUS",
+            confidence=1.0,
         )
         reached = await entities_crud.connected_entities(db, [a])
         assert reached[b]["path_confidence"] == pytest.approx(0.5)
@@ -138,10 +166,16 @@ class TestCrud:
         survivor = await _mk(db, "qdrant", "product")
         other = await _mk(db, "genesis", "product")
         await entities_crud.upsert_mention(
-            db, memory_id="m1", entity_id=loser, provenance="EXTRACTED",
+            db,
+            memory_id="m1",
+            entity_id=loser,
+            provenance="EXTRACTED",
         )
         await entities_crud.upsert_link(
-            db, source_id=loser, target_id=other, link_type="part_of",
+            db,
+            source_id=loser,
+            target_id=other,
+            link_type="part_of",
             provenance="EXTRACTED",
         )
         await entities_crud.merge_entity(db, loser_id=loser, survivor_id=survivor)
@@ -151,7 +185,9 @@ class TestCrud:
         assert other in reached
         # norm lookup on the loser follows the merge to the survivor
         resolved = await entities_crud.get_by_norm_name(
-            db, norm_name="qdrantdb", entity_type="product",
+            db,
+            norm_name="qdrantdb",
+            entity_type="product",
         )
         assert resolved["entity_id"] == survivor
 
@@ -160,11 +196,15 @@ class TestRegistry:
     @pytest.mark.asyncio
     async def test_mechanical_exact_identity(self, db):
         eid1, prov = await entity_registry.resolve_entity(
-            db, name="src/genesis/memory/store.py", entity_type="code_file",
+            db,
+            name="src/genesis/memory/store.py",
+            entity_type="code_file",
             aliases=_NO_ALIASES,
         )
         eid2, _ = await entity_registry.resolve_entity(
-            db, name="src/genesis/memory/store.py", entity_type="code_file",
+            db,
+            name="src/genesis/memory/store.py",
+            entity_type="code_file",
             aliases=_NO_ALIASES,
         )
         assert eid1 == eid2
@@ -173,58 +213,103 @@ class TestRegistry:
     @pytest.mark.asyncio
     async def test_named_cross_cluster_reuse(self, db):
         eid1, _ = await entity_registry.resolve_entity(
-            db, name="OMI", entity_type="product", aliases=_NO_ALIASES,
+            db,
+            name="OMI",
+            entity_type="product",
+            aliases=_NO_ALIASES,
         )
         eid2, prov = await entity_registry.resolve_entity(
-            db, name="omi", entity_type="device", aliases=_NO_ALIASES,
+            db,
+            name="omi",
+            entity_type="device",
+            aliases=_NO_ALIASES,
         )
         assert eid1 == eid2
         assert prov == "EXTRACTED"
 
     @pytest.mark.asyncio
-    async def test_fuzzy_ambiguous_but_no_enqueue_while_gated(self, db):
-        """Gate OFF (default): a fuzzy match still creates the entity and
-        returns AMBIGUOUS, but writes NO adjudication row — the enqueue is a
-        no-op until a drainer exists (stop-the-bleed, follow-up 9127e8ed)."""
+    async def test_fuzzy_ambiguous_but_no_enqueue_while_gated(self, db, monkeypatch):
+        """Gate OFF (producer kill switch): a fuzzy match still creates the
+        entity and returns AMBIGUOUS, but writes NO adjudication row. The gate
+        now defaults ON (the drainer exists), so this explicitly forces it off."""
+        monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", False)
         await entity_registry.resolve_entity(
-            db, name="GENesis-Voice", entity_type="repo", aliases=_NO_ALIASES,
+            db,
+            name="GENesis-Voice",
+            entity_type="repo",
+            aliases=_NO_ALIASES,
         )
         eid, prov = await entity_registry.resolve_entity(
-            db, name="GENesis-Voices", entity_type="repo", aliases=_NO_ALIASES,
+            db,
+            name="GENesis-Voices",
+            entity_type="repo",
+            aliases=_NO_ALIASES,
         )
         assert prov == "AMBIGUOUS"
         # Entity was still created (the fuzzy pair exists, just un-adjudicated).
         assert await entities_crud.get_entity(db, eid) is not None
         rows = await db.execute_fetchall(
-            "SELECT work_type FROM deferred_work_queue "
-            "WHERE work_type = 'entity_adjudication'"
+            "SELECT work_type FROM deferred_work_queue WHERE work_type = 'entity_adjudication'"
         )
         assert rows == []  # no orphan row
 
     @pytest.mark.asyncio
     async def test_fuzzy_enqueues_when_gate_enabled(self, db, monkeypatch):
-        """The enqueue machinery is intact GROUNDWORK — flipping the gate on
-        (what the drainer/A will do) restores the adjudication row."""
-        monkeypatch.setattr(
-            entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", True,
-        )
+        """Gate ON (default now the drainer exists): a fuzzy match enqueues an
+        adjudication row tagged call_site_id='entity_adjudication' (dashboard
+        shows the site, not 'unknown')."""
+        monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", True)
         await entity_registry.resolve_entity(
-            db, name="GENesis-Voice", entity_type="repo", aliases=_NO_ALIASES,
+            db,
+            name="GENesis-Voice",
+            entity_type="repo",
+            aliases=_NO_ALIASES,
         )
         eid, prov = await entity_registry.resolve_entity(
-            db, name="GENesis-Voices", entity_type="repo", aliases=_NO_ALIASES,
+            db,
+            name="GENesis-Voices",
+            entity_type="repo",
+            aliases=_NO_ALIASES,
         )
         assert prov == "AMBIGUOUS"
         rows = await db.execute_fetchall(
-            "SELECT work_type, payload_json FROM deferred_work_queue"
+            "SELECT work_type, payload_json, call_site_id FROM deferred_work_queue"
         )
         assert rows and rows[0][0] == "entity_adjudication"
         assert eid in rows[0][1]
+        assert rows[0][2] == "entity_adjudication"
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_enqueue_deduped_both_orientations(self, db, monkeypatch):
+        """A repeated fuzzy collision for the same pair must NOT pile up rows —
+        the both-orientation NOT-EXISTS guard collapses it to one pending row."""
+        monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", True)
+        e1 = await entities_crud.create_entity(
+            db,
+            name="alpha",
+            norm_name="alpha",
+            entity_type="concept",
+        )
+        e2 = await entities_crud.create_entity(
+            db,
+            name="alphaa",
+            norm_name="alphaa",
+            entity_type="concept",
+        )
+        await entities_crud.enqueue_adjudication(db, entity_id=e1, similar_entity_id=e2)
+        await entities_crud.enqueue_adjudication(db, entity_id=e2, similar_entity_id=e1)
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM deferred_work_queue WHERE work_type='entity_adjudication'"
+        )
+        assert rows[0][0] == 1
 
     @pytest.mark.asyncio
     async def test_distinct_name_is_extracted(self, db):
         _, prov = await entity_registry.resolve_entity(
-            db, name="Tailscale", entity_type="product", aliases=_NO_ALIASES,
+            db,
+            name="Tailscale",
+            entity_type="product",
+            aliases=_NO_ALIASES,
         )
         assert prov == "EXTRACTED"
 
@@ -262,12 +347,21 @@ class TestCodexRemediationCrud:
         b = await _mk(db, "B")
         # Undated weak claim, then a stronger dated one: date must land.
         await entities_crud.upsert_link(
-            db, source_id=a, target_id=b, link_type="is_a",
-            provenance="INFERRED", confidence=0.5,
+            db,
+            source_id=a,
+            target_id=b,
+            link_type="is_a",
+            provenance="INFERRED",
+            confidence=0.5,
         )
         await entities_crud.upsert_link(
-            db, source_id=a, target_id=b, link_type="is_a",
-            provenance="EXTRACTED", confidence=0.9, valid_at="2026-06-14",
+            db,
+            source_id=a,
+            target_id=b,
+            link_type="is_a",
+            provenance="EXTRACTED",
+            confidence=0.9,
+            valid_at="2026-06-14",
         )
         rows = await db.execute_fetchall(
             "SELECT valid_at, confidence FROM entity_links",
@@ -275,8 +369,12 @@ class TestCodexRemediationCrud:
         assert rows[0][0] == "2026-06-14" and rows[0][1] == 0.9
         # An even stronger UNdated claim must not erase the known date.
         await entities_crud.upsert_link(
-            db, source_id=a, target_id=b, link_type="is_a",
-            provenance="EXTRACTED", confidence=0.95,
+            db,
+            source_id=a,
+            target_id=b,
+            link_type="is_a",
+            provenance="EXTRACTED",
+            confidence=0.95,
         )
         rows = await db.execute_fetchall(
             "SELECT valid_at, confidence FROM entity_links",
@@ -290,23 +388,40 @@ class TestCodexRemediationCrud:
         other = await _mk(db, "voice-edge-device")
         # Survivor holds the WEAKER mention and link; loser the stronger.
         await entities_crud.upsert_mention(
-            db, memory_id="m1", entity_id=survivor, provenance="INFERRED",
+            db,
+            memory_id="m1",
+            entity_id=survivor,
+            provenance="INFERRED",
             confidence=0.4,
         )
         await entities_crud.upsert_mention(
-            db, memory_id="m1", entity_id=loser, provenance="EXTRACTED",
+            db,
+            memory_id="m1",
+            entity_id=loser,
+            provenance="EXTRACTED",
             confidence=0.9,
         )
         await entities_crud.upsert_link(
-            db, source_id=survivor, target_id=other, link_type="is_a",
-            provenance="INFERRED", confidence=0.3,
+            db,
+            source_id=survivor,
+            target_id=other,
+            link_type="is_a",
+            provenance="INFERRED",
+            confidence=0.3,
         )
         await entities_crud.upsert_link(
-            db, source_id=loser, target_id=other, link_type="is_a",
-            provenance="EXTRACTED", confidence=0.9, valid_at="2026-06-14",
+            db,
+            source_id=loser,
+            target_id=other,
+            link_type="is_a",
+            provenance="EXTRACTED",
+            confidence=0.9,
+            valid_at="2026-06-14",
         )
         await entities_crud.merge_entity(
-            db, loser_id=loser, survivor_id=survivor,
+            db,
+            loser_id=loser,
+            survivor_id=survivor,
         )
         mention = await db.execute_fetchall(
             "SELECT provenance, confidence FROM entity_mentions "
@@ -329,19 +444,31 @@ class TestCodexRemediationCrud:
         # Survivor: weaker ACTIVE link. Loser: stronger link already
         # CLOSED — the merge must not resurrect it as active.
         await entities_crud.upsert_link(
-            db, source_id=survivor, target_id=other, link_type="is_a",
-            provenance="INFERRED", confidence=0.3,
+            db,
+            source_id=survivor,
+            target_id=other,
+            link_type="is_a",
+            provenance="INFERRED",
+            confidence=0.3,
         )
         await entities_crud.upsert_link(
-            db, source_id=loser, target_id=other, link_type="is_a",
-            provenance="EXTRACTED", confidence=0.9,
+            db,
+            source_id=loser,
+            target_id=other,
+            link_type="is_a",
+            provenance="EXTRACTED",
+            confidence=0.9,
         )
         await entities_crud.invalidate_links_for_entity(
-            db, entity_id=loser, invalid_at="2026-07-01",
+            db,
+            entity_id=loser,
+            invalid_at="2026-07-01",
             invalidated_by="superseding-memory",
         )
         await entities_crud.merge_entity(
-            db, loser_id=loser, survivor_id=survivor,
+            db,
+            loser_id=loser,
+            survivor_id=survivor,
         )
         link = await db.execute_fetchall(
             "SELECT confidence, invalid_at, invalidated_by "
@@ -357,16 +484,26 @@ class TestCodexRemediationCrud:
         doomed = await _mk(db, "000000001", "commit")
         kept = await _mk(db, "OMI", "device")
         await entities_crud.upsert_mention(
-            db, memory_id="m1", entity_id=doomed, provenance="EXTRACTED",
+            db,
+            memory_id="m1",
+            entity_id=doomed,
+            provenance="EXTRACTED",
             confidence=0.9,
         )
         await entities_crud.upsert_mention(
-            db, memory_id="m1", entity_id=kept, provenance="EXTRACTED",
+            db,
+            memory_id="m1",
+            entity_id=kept,
+            provenance="EXTRACTED",
             confidence=0.9,
         )
         await entities_crud.upsert_link(
-            db, source_id=doomed, target_id=kept, link_type="mentions",
-            provenance="EXTRACTED", confidence=0.8,
+            db,
+            source_id=doomed,
+            target_id=kept,
+            link_type="mentions",
+            provenance="EXTRACTED",
+            confidence=0.8,
         )
         counts = await entities_crud.delete_entities_cascade(db, [doomed])
         assert counts == {"entities": 1, "mentions": 1, "links": 1}
@@ -376,5 +513,7 @@ class TestCodexRemediationCrud:
         counts = await entities_crud.delete_entities_cascade(db, [doomed])
         assert counts == {"entities": 0, "mentions": 0, "links": 0}
         assert await entities_crud.delete_entities_cascade(db, []) == {
-            "entities": 0, "mentions": 0, "links": 0,
+            "entities": 0,
+            "mentions": 0,
+            "links": 0,
         }

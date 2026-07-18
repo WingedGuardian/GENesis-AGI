@@ -43,7 +43,12 @@ TTL = "ttl"
 # Kept here (low-level) rather than in ``memory/dream_cycle`` so the observability
 # snapshot can import it without a memory→observability dependency inversion.
 # A drift-guard test pins this against ``dream_cycle.WORKLIST_WORK_TYPE``.
-BATCH_WORK_TYPES: frozenset[str] = frozenset({"dream_synthesis_slice"})
+#
+# ``entity_adjudication``: the reconcile sweep enqueues bursts of near-duplicate
+# pairs (hundreds on first pass) that the hourly drainer works through at
+# ~20/run by design — a deep-but-healthy backlog, not stuck recovery work.
+# Excluded so those bursts don't page the deferred_recovery depth alarm.
+BATCH_WORK_TYPES: frozenset[str] = frozenset({"dream_synthesis_slice", "entity_adjudication"})
 
 # A batch worklist item pending longer than this is treated as genuinely stalled
 # (the daily drain has broken) and folded BACK into the recovery-backlog count so
@@ -95,12 +100,18 @@ class DeferredWorkQueue:
         except Exception:
             logger.error(
                 "Deferred work enqueue FAILED — work lost: type=%s priority=%d reason=%s",
-                work_type, priority, reason, exc_info=True,
+                work_type,
+                priority,
+                reason,
+                exc_info=True,
             )
             return None
         logger.info(
             "Deferred work enqueued: type=%s priority=%d reason=%s id=%s",
-            work_type, priority, reason, item_id,
+            work_type,
+            priority,
+            reason,
+            item_id,
         )
         return item_id
 
@@ -114,7 +125,10 @@ class DeferredWorkQueue:
         item at priority 20 was blocking reflection retries at priority 30).
         """
         items = await crud.query_pending(
-            self._db, work_type=work_type, max_priority=max_priority, limit=1,
+            self._db,
+            work_type=work_type,
+            max_priority=max_priority,
+            limit=1,
         )
         return items[0] if items else None
 
@@ -122,21 +136,31 @@ class DeferredWorkQueue:
         """Mark an item as being processed."""
         now = self._clock().isoformat()
         return await crud.update_status(
-            self._db, id, status="processing", last_attempt_at=now,
+            self._db,
+            id,
+            status="processing",
+            last_attempt_at=now,
         )
 
     async def mark_completed(self, id: str) -> bool:
         """Mark an item as completed."""
         now = self._clock().isoformat()
         return await crud.update_status(
-            self._db, id, status="completed", completed_at=now,
+            self._db,
+            id,
+            status="completed",
+            completed_at=now,
         )
 
     async def mark_discarded(self, id: str, reason: str) -> bool:
         """Mark an item as discarded."""
         now = self._clock().isoformat()
         return await crud.update_status(
-            self._db, id, status="discarded", error_message=reason, completed_at=now,
+            self._db,
+            id,
+            status="discarded",
+            error_message=reason,
+            completed_at=now,
         )
 
     async def expire_stuck_processing(self, max_age_hours: int = 2) -> int:
@@ -146,12 +170,14 @@ class DeferredWorkQueue:
         (e.g., bridge restart). Returns count reset.
         """
         count = await crud.expire_stuck_processing(
-            self._db, max_age_hours=max_age_hours,
+            self._db,
+            max_age_hours=max_age_hours,
         )
         if count > 0:
             logger.info(
                 "Reset %d stuck processing items to pending (age > %dh)",
-                count, max_age_hours,
+                count,
+                max_age_hours,
             )
         return count
 
@@ -179,9 +205,7 @@ class DeferredWorkQueue:
         """
         return await crud.count_pending_in(self._db, work_types=BATCH_WORK_TYPES)
 
-    async def count_recovery_pending(
-        self, stale_worklist_days: int = STALE_WORKLIST_DAYS
-    ) -> int:
+    async def count_recovery_pending(self, stale_worklist_days: int = STALE_WORKLIST_DAYS) -> int:
         """Count pending items that should trip the recovery-backlog depth alarm.
 
         Genuine resilience-recovery work always counts; batch worklist items are
@@ -206,7 +230,9 @@ class DeferredWorkQueue:
         worklist). Returns the count removed.
         """
         return await crud.delete_by_work_type(
-            self._db, work_type=work_type, exclude_status="processing",
+            self._db,
+            work_type=work_type,
+            exclude_status="processing",
         )
 
     async def drain_by_priority(self, limit: int = 10) -> list[dict]:
