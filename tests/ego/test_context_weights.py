@@ -370,9 +370,9 @@ class TestFocusWeightTable:
         assert FOCUS_CONTEXT_WEIGHTS["dispatch_outcome"]["proposal_history"] == "light"
 
     def test_section_count(self):
-        """_ALL_SECTIONS should have exactly 19 entries."""
+        """_ALL_SECTIONS should have exactly 20 entries."""
         from genesis.ego.focus import _ALL_SECTIONS
-        assert len(_ALL_SECTIONS) == 19
+        assert len(_ALL_SECTIONS) == 20
 
     def test_goal_deep_dive_deep_for_goal_review(self):
         """goal_deep_dive is 'deep' only during goal_review cycles."""

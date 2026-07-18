@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
 from genesis.db.crud import j9_eval
+from genesis.db.crud import memory as memory_crud
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -237,16 +238,30 @@ async def _recall_entrenchment(
     }
 
 
+async def _pool_counts_safe(db: aiosqlite.Connection) -> dict:
+    """Point-in-time pool-size counts, isolated in its own try/except so a
+    count failure degrades to None-valued ``pool_*`` keys (series shape kept)
+    rather than sinking the whole memory-quality snapshot — the pool read is
+    strictly additive to the quality metrics."""
+    try:
+        return await memory_crud.pool_size_counts(db)
+    except Exception:
+        logger.warning("J9 pool-size counts failed", exc_info=True)
+        return dict.fromkeys(memory_crud.POOL_COUNT_KEYS, None)
+
+
 async def _compute_memory_quality(
     db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Precision@5, hit rate, MRR from recall_relevance events.
 
     Also folds in the MEM-005 entrenchment aggregation (separate read path over
-    recall_fired) as distinct ``entrenchment_*`` keys — monitor-only, not part
-    of the quality grade.
+    recall_fired) as distinct ``entrenchment_*`` keys — monitor-only — and the
+    point-in-time ``pool_*`` counts (WS2-0), so retrieval quality is always
+    readable against the pool size it was measured over.
     """
     entrenchment = await _recall_entrenchment(db, since, until)
+    pool = await _pool_counts_safe(db)
     relevance_events = await j9_eval.get_events(
         db, dimension="memory", event_type="recall_relevance",
         since=since, until=until, limit=5000,
@@ -259,7 +274,7 @@ async def _compute_memory_quality(
         return {"precision_at_5": None, "precision_at_3": None,
                 "precision_at_3_recalls": 0, "judge_prompt_versions": [],
                 "hit_rate": None, "mrr": None,
-                "usage_rate": None, "total_recalls": 0, **entrenchment}, 0
+                "usage_rate": None, "total_recalls": 0, **entrenchment, **pool}, 0
 
     # Group by recall_event_id
     by_recall: dict[str, list[dict]] = defaultdict(list)
@@ -345,6 +360,8 @@ async def _compute_memory_quality(
         "total_memories_judged": sum(len(v) for v in by_recall.values()),
         # MEM-005 entrenchment signal (monitor-only, distinct from the grade).
         **entrenchment,
+        # Point-in-time pool sizes (WS2-0) — quality readable against pool size.
+        **pool,
     }
     return metrics, total_recalls
 

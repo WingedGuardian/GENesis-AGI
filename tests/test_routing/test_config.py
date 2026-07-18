@@ -158,7 +158,9 @@ def test_load_full_yaml(monkeypatch):
     # 2026-07-15: 55 → 56 after wing_backfill added (one-shot legacy wing backfill).
     # 2026-07-16: 56 → 57 after repo_pulse added (session-manager PR-4a fuzzy
     # matcher neural-monitor registration).
-    assert len(cfg.call_sites) == 57
+    # 2026-07-17: 57 → 59 after entity_adjudication + entity_adjudication_challenge
+    # added (entity-node merge-vs-distinct drainer).
+    assert len(cfg.call_sites) == 59
     assert cfg.call_sites["repo_pulse"].dispatch == "cli"
     assert cfg.call_sites["repo_pulse"].chain == []
     assert cfg.call_sites["repo_pulse"].never_pays is True

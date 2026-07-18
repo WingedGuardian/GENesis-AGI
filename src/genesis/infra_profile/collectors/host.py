@@ -21,7 +21,7 @@ from genesis.infra_profile.types import PLANE_HOST, SectionResult
 
 logger = logging.getLogger(__name__)
 
-HOST_SECTIONS = ("host_system", "host_storage_pool", "host_virt")
+HOST_SECTIONS = ("host_system", "host_storage_pool", "host_virt", "host_time")
 
 
 def _unavailable(reason: str) -> tuple[bool, str, list[SectionResult]]:
@@ -88,10 +88,26 @@ _VIRT_FACTS = frozenset(
     }
 )
 
+# Host clock sync health. The bucketed `ntp_sync_state` (synced/degraded/
+# unsynced — composited host-side from daemon liveness + the kernel flag) is
+# the drift signal: a flip means the host stopped disciplining the clock the
+# container shares. The raw `ntp_synchronized_flag` stays a metric — it
+# mirrors the kernel STA_UNSYNC bit, which flaps independently of daemon
+# health and can lie for hours after a daemon dies.
+_TIME_FACTS = frozenset(
+    {
+        "timezone",
+        "ntp_service",
+        "ntp_enabled",
+        "ntp_sync_state",
+    }
+)
+
 _FACT_KEYS = {
     "host_system": _SYSTEM_FACTS,
     "host_storage_pool": _STORAGE_FACTS,
     "host_virt": _VIRT_FACTS,
+    "host_time": _TIME_FACTS,
 }
 
 
@@ -122,5 +138,23 @@ async def collect_host(guardian_remote=None) -> tuple[bool, str | None, list[Sec
             error = "host-profile gateway verb not deployed on host yet"
         return _unavailable(error[:200])
 
-    sections = [_split(name, blob.get(name, {}), _FACT_KEYS[name]) for name in HOST_SECTIONS]
+    sections = []
+    for name in HOST_SECTIONS:
+        raw = blob.get(name)
+        if raw is None:
+            # Key absent from an ok blob ⇔ the deployed guardian predates this
+            # section (every gathered section is emitted, even on failure).
+            # Unavailable — NOT empty-ok — so the persisted hash stays None and
+            # the facts arriving after the guardian redeploy read as a new
+            # section, not drift (Codex P2 #1087: hashing {} here turned the
+            # rollout itself into a phantom infrastructure_drift observation).
+            sections.append(
+                SectionResult.unavailable(
+                    name,
+                    "missing from host profile — guardian predates this section",
+                    plane=PLANE_HOST,
+                )
+            )
+            continue
+        sections.append(_split(name, raw, _FACT_KEYS[name]))
     return (True, None, sections)

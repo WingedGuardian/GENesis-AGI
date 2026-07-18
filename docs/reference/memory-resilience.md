@@ -121,6 +121,9 @@ restored. Only *explicit* defect values alert — absent/`None` facts stay
 silent (no guardian host plane, cgroup v1, fresh install), so partial installs
 never false-alarm. A profile older than 3 days raises a distinct
 "posture UNKNOWN — refresh broken" alert instead of asserting from dead facts.
+The same check also covers the **network plane** (KeepConfiguration + the
+networkd watchdog), gated so it only fires on networkd-managed boxes — see
+`docs/reference/network-resilience.md` → "The posture alert (active signal)".
 
 ## Notes
 

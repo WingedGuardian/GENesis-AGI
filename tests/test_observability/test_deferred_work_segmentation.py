@@ -75,7 +75,7 @@ class TestQueueCounts:
         await _seed_worklist(db, 5, age_days=0.0)
 
         q = _queue(db)
-        assert await q.count_pending() == 8          # raw total, honest
+        assert await q.count_pending() == 8  # raw total, honest
         assert await q.count_worklist_pending() == 5  # batch subset
         assert await q.count_recovery_pending() == 3  # alarm-eligible subset
 
@@ -93,12 +93,12 @@ class TestQueueCounts:
 
     @pytest.mark.asyncio
     async def test_fresh_and_stale_worklist_mix(self, db):
-        await _seed_worklist(db, 3, age_days=1.0)                    # fresh, excluded
+        await _seed_worklist(db, 3, age_days=1.0)  # fresh, excluded
         await _seed_worklist(db, 2, age_days=STALE_WORKLIST_DAYS + 2)  # stale, folded
 
         q = _queue(db)
-        assert await q.count_worklist_pending() == 5   # all batch, display
-        assert await q.count_recovery_pending() == 2   # only the stale ones
+        assert await q.count_worklist_pending() == 5  # all batch, display
+        assert await q.count_recovery_pending() == 2  # only the stale ones
 
 
 class TestSnapshotSplit:
@@ -117,9 +117,9 @@ class TestSnapshotSplit:
         # (fresh age-0 worklist is excluded from recovery regardless of wall clock).
         result = await qmod.queues(db, _queue(db), None)
 
-        assert result["deferred_work"] == 8       # raw total
-        assert result["deferred_worklist"] == 6   # batch, display-only
-        assert result["deferred_recovery"] == 2   # alarm-eligible
+        assert result["deferred_work"] == 8  # raw total
+        assert result["deferred_worklist"] == 6  # batch, display-only
+        assert result["deferred_recovery"] == 2  # alarm-eligible
 
     @pytest.mark.asyncio
     async def test_queues_snapshot_no_queue_is_zero(self, db):
@@ -142,6 +142,13 @@ class TestDriftGuard:
         from genesis.memory.dream_cycle import WORKLIST_WORK_TYPE
 
         assert WORKLIST_WORK_TYPE in BATCH_WORK_TYPES
+
+    def test_batch_work_types_includes_entity_adjudication(self):
+        # The reconcile sweep parks deep-but-healthy backlogs; they must stay
+        # excluded from the deferred_recovery depth alarm.
+        from genesis.memory.entity_adjudication import WORK_TYPE
+
+        assert WORK_TYPE in BATCH_WORK_TYPES
 
 
 class TestAlarmSwap:

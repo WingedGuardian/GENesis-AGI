@@ -109,56 +109,6 @@ def _sync_genesis_hooks() -> None:
         )
 
 
-def _duplicate_executor_warning(transcript_path: str) -> str | None:
-    """Loud context block when ANOTHER live claude owns this transcript.
-
-    Uses the session-owner registry maintained by
-    scripts/hooks/duplicate_session_guard.py --register. Best-effort and
-    fail-quiet: any error returns None (the PreToolUse guard is the
-    enforcement layer; this is advance visibility for the resuming session).
-    """
-    try:
-        if not transcript_path:
-            return None
-        import json
-
-        sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
-        import proc_ident
-
-        owner_path = (
-            Path.home()
-            / ".genesis"
-            / "session-owners"
-            / f"{proc_ident.transcript_key(transcript_path)}.json"
-        )
-        owner = json.loads(owner_path.read_text(encoding="utf-8"))
-        owner_pid = owner.get("pid")
-        owner_starttime = owner.get("starttime")
-        if not isinstance(owner_pid, int) or not isinstance(owner_starttime, int):
-            return None
-        my_pid = proc_ident.find_claude_ancestor(os.getppid())
-        if my_pid == owner_pid:
-            return None
-        if not proc_ident.is_alive(owner_pid, owner_starttime):
-            return None
-        return (
-            "## ⚠ DUPLICATE SESSION EXECUTOR DETECTED\n\n"
-            f"Another live `claude` process (pid {owner_pid}) is ALREADY "
-            "executing this conversation — this usually means a dropped SSH "
-            "left it running headless and this session is a resume over the "
-            "same transcript.\n\n"
-            "What happens now: the duplicate-session guard applies NEWEST-WINS "
-            "— this (newer) session keeps write access; the older process's "
-            "repo-mutating tools (Bash/Write/Edit) are denied on its next "
-            "call. Tell the user immediately, and offer to stop the orphan: "
-            f"`kill {owner_pid}` (verify with `ps -o pid,etime,cmd -p "
-            f"{owner_pid}` first). Do not race it in the meantime — check "
-            "`git status` for its uncommitted work before making changes."
-        )
-    except Exception:
-        return None
-
-
 def main() -> None:
     # Eject lever: flag file absent → no Genesis context
     if not _FLAG.exists():
@@ -176,15 +126,6 @@ def main() -> None:
         _hook_input = {}
     _hook_session_id = str(_hook_input.get("session_id", "") or "")
     _hook_source = str(_hook_input.get("source", "") or "")
-
-    # Duplicate-executor warning (advisory layer of the duplicate-session
-    # guard; the PreToolUse deny in scripts/hooks/duplicate_session_guard.py
-    # stands regardless, and this whole hook is gated by the cc_context_enabled
-    # eject lever above). If ANOTHER live claude process already owns this
-    # conversation's transcript, say so loudly before any work starts.
-    _dup_warning = _duplicate_executor_warning(str(_hook_input.get("transcript_path", "") or ""))
-    if _dup_warning:
-        _emit(_dup_warning)
 
     # Phase 6: self-heal Genesis git hooks before doing anything else.
     # Runs on every session start so community installs auto-pick up hook

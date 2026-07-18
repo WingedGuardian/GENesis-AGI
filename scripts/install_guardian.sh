@@ -309,8 +309,12 @@ echo "  OK    Container '$CONTAINER_NAME': $CONTAINER_IP"
 # Sets the global TS_IP (host address the container reaches + approval URLs).
 derive_ts_ip
 
-# Claude CLI (optional)
-CLAUDE_PATH=$(command -v claude 2>/dev/null)
+# Claude CLI (optional). `|| true` is load-bearing: under `set -euo pipefail`
+# an unguarded `$(command -v claude)` exits non-zero when claude is absent and
+# aborts the whole installer — and host-setup.sh runs the Guardian install
+# BEFORE Node/CC exist, so every fresh host would fail here. Mirror the guarded
+# python3 probe at the top of this step.
+CLAUDE_PATH=$(command -v claude 2>/dev/null || true)
 CC_AUTHENTICATED=false
 if [ -n "$CLAUDE_PATH" ] && [ -f "$CLAUDE_PATH" ]; then
     echo "  OK    Claude CLI: $CLAUDE_PATH"

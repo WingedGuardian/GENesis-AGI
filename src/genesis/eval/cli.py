@@ -24,19 +24,25 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     # -- eval run --
     run_cmd = eval_sub.add_parser("run", help="Run eval against a provider")
     run_cmd.add_argument(
-        "--model", "-m", required=True,
+        "--model",
+        "-m",
+        required=True,
         help="Provider name from model_routing.yaml (e.g. cerebras-qwen)",
     )
     run_cmd.add_argument(
-        "--dataset", "-d", required=True,
+        "--dataset",
+        "-d",
+        required=True,
         help="Dataset name (without .yaml), or 'all' for all datasets",
     )
     run_cmd.add_argument(
-        "--system-prompt", "-s",
+        "--system-prompt",
+        "-s",
         help="Optional system prompt override",
     )
     run_cmd.add_argument(
-        "--no-db", action="store_true",
+        "--no-db",
+        action="store_true",
         help="Skip storing results in the database",
     )
 
@@ -44,33 +50,41 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     bench_cmd = eval_sub.add_parser(
         "benchmark",
         help="Run all enabled providers across all datasets (comparison table; "
-             "for the Genesis-vs-bare A/B see `bench`)",
+        "for the Genesis-vs-bare A/B see `bench`)",
     )
     bench_cmd.add_argument(
-        "--include-paid", action="store_true",
+        "--include-paid",
+        action="store_true",
         help="Include paid (non-free) providers",
     )
     bench_cmd.add_argument(
-        "--model", "-m",
+        "--model",
+        "-m",
         help="Run only this provider (single-provider mode)",
     )
     bench_cmd.add_argument(
-        "--no-db", action="store_true",
+        "--no-db",
+        action="store_true",
         help="Skip storing results in the database",
     )
 
     # -- eval results --
     results_cmd = eval_sub.add_parser("results", help="Show recent eval results")
     results_cmd.add_argument(
-        "--model", "-m",
+        "--model",
+        "-m",
         help="Filter by provider name",
     )
     results_cmd.add_argument(
-        "--dataset", "-d",
+        "--dataset",
+        "-d",
         help="Filter by dataset name",
     )
     results_cmd.add_argument(
-        "--last", "-n", type=int, default=5,
+        "--last",
+        "-n",
+        type=int,
+        default=5,
         help="Number of recent runs to show (default: 5)",
     )
 
@@ -80,7 +94,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Show comparison table from stored results (no re-running)",
     )
     compare_cmd.add_argument(
-        "--last", "-n", type=int, default=1,
+        "--last",
+        "-n",
+        type=int,
+        default=1,
         help="Most recent N runs per provider/dataset (default: 1)",
     )
 
@@ -90,7 +107,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Export benchmark results as markdown",
     )
     export_cmd.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         help="Write to file instead of stdout",
     )
 
@@ -107,15 +125,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     gauntlet_cmd.add_argument(
-        "--model", "-m", required=True,
+        "--model",
+        "-m",
+        required=True,
         help="Roster model name (e.g. claude, glm-5.2)",
     )
     gauntlet_cmd.add_argument(
-        "--no-db", action="store_true",
+        "--no-db",
+        action="store_true",
         help="Skip storing results in the database",
     )
     gauntlet_cmd.add_argument(
-        "--check-regression", action="store_true",
+        "--check-regression",
+        action="store_true",
         help="Also run the advisory PASS->FAIL regression check (files a proposal)",
     )
 
@@ -132,44 +154,59 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     ab_cmd.add_argument(
-        "--tasks", default=None,
+        "--tasks",
+        default=None,
         help="Task JSONL path (default: ~/.genesis/eval/bench_tasks_v1.jsonl; "
-             "must live OUTSIDE the repo)",
+        "must live OUTSIDE the repo)",
     )
     ab_cmd.add_argument(
-        "--model", "-m", default="sonnet",
+        "--model",
+        "-m",
+        default="sonnet",
         help="CC model for BOTH arms (default: sonnet)",
     )
     ab_cmd.add_argument(
-        "--effort", default="medium",
+        "--effort",
+        default="medium",
         help="CC effort for BOTH arms (default: medium)",
     )
     ab_cmd.add_argument(
-        "--limit", type=int, default=None, help="Run only the first N tasks",
+        "--limit",
+        type=int,
+        default=None,
+        help="Run only the first N tasks",
     )
     ab_cmd.add_argument(
-        "--task-id", default=None, help="Run a single task by id (shakedowns)",
+        "--task-id",
+        default=None,
+        help="Run a single task by id (shakedowns)",
     )
     ab_cmd.add_argument(
-        "--epsilon", type=float, default=0.05,
+        "--epsilon",
+        type=float,
+        default=0.05,
         help="Score-difference tie band for the win-rate (default: 0.05)",
     )
     ab_cmd.add_argument(
-        "--no-db", action="store_true",
+        "--no-db",
+        action="store_true",
         help="Skip persisting paired eval_runs rows",
     )
     ab_cmd.add_argument(
-        "--keep-workdir", action="store_true",
+        "--keep-workdir",
+        action="store_true",
         help="Keep ~/tmp/bench/<run_id> (snapshot, arm workdirs, transcripts)",
     )
     ab_cmd.add_argument(
-        "--no-verify-prod", action="store_true",
+        "--no-verify-prod",
+        action="store_true",
         help="Skip the prod-delta isolation probe (NOT recommended)",
     )
     ab_cmd.add_argument(
-        "--judge-provider", default=None,
+        "--judge-provider",
+        default=None,
         help="Start the judge chain at this routing provider (e.g. "
-             "openrouter-deepseek-v4 when the free NIM tier is down)",
+        "openrouter-deepseek-v4 when the free NIM tier is down)",
     )
 
     # -- eval longmemeval (external memory benchmark, WS-1 A4) --
@@ -184,43 +221,62 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     lme_cmd.add_argument(
-        "--dataset-path", default=None,
+        "--dataset-path",
+        default=None,
         help="oracle JSON (default: ~/tmp/longmemeval/longmemeval_oracle.json)",
     )
     lme_cmd.add_argument("--limit", type=int, default=None, help="first N questions")
     lme_cmd.add_argument("--k", type=int, default=10, help="recall top-K")
     lme_cmd.add_argument("--concurrency", type=int, default=4)
     lme_cmd.add_argument(
-        "--no-rerank", action="store_true", help="skip the Voyage rerank arms",
+        "--no-rerank",
+        action="store_true",
+        help="skip the Voyage rerank arms",
     )
     lme_cmd.add_argument(
-        "--no-persist", action="store_true", help="do not write eval_runs",
+        "--no-persist",
+        action="store_true",
+        help="do not write eval_runs",
     )
     lme_cmd.add_argument(
-        "--db-path", default=None,
+        "--db-path",
+        default=None,
         help="results DB (default: production genesis.db; a fresh path is migrated)",
     )
     lme_cmd.add_argument(
-        "--types", default=None,
+        "--types",
+        default=None,
         help="comma-separated question types to run (filtered before --limit)",
     )
     lme_cmd.add_argument(
-        "--dump-dir", default=None,
+        "--dump-dir",
+        default=None,
         help="write per-question diagnostics (one <arm>.jsonl per arm) here",
     )
     lme_cmd.add_argument(
-        "--graph", action="store_true",
+        "--graph",
+        action="store_true",
         help="ADD a +graph variant of every selected arm (linked store + expansion)",
     )
     lme_cmd.add_argument(
-        "--graph-link-threshold", type=float, default=None,
+        "--graph-link-threshold",
+        type=float,
+        default=None,
         help="cosine threshold for auto-linking on the graph arm's store "
         "(default: the prod linker default, 0.75)",
     )
     lme_cmd.add_argument(
-        "--arms", default=None,
+        "--arms",
+        default=None,
         help="comma-separated arm labels to run (filters the selected "
         "universe, e.g. --graph --arms raw,raw+graph); unknown labels error",
+    )
+    lme_cmd.add_argument(
+        "--variants",
+        default="",
+        help="comma-separated retrieval-config variants to pair against baseline "
+        "(each doubles every base arm with a +<variant> twin; a WS2 lever PR "
+        "registers each variant). Unknown variants error before any spend.",
     )
 
     eval_cmd.set_defaults(func=_run_eval_cli)
@@ -232,6 +288,7 @@ def _load_secrets() -> None:
         from dotenv import load_dotenv
 
         from genesis.env import secrets_path
+
         path = secrets_path()
         if path.is_file():
             load_dotenv(str(path), override=True)
@@ -291,6 +348,7 @@ async def _cmd_longmemeval(args: argparse.Namespace) -> int:
         graph=args.graph,
         graph_link_threshold=args.graph_link_threshold,
         arms_only=args.arms,
+        variants=tuple(v.strip() for v in args.variants.split(",") if v.strip()),
     )
     print_report(summaries)
     return 0
@@ -305,21 +363,19 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             import aiosqlite  # noqa: I001
 
             from genesis.env import genesis_db_path
+
             db = await aiosqlite.connect(str(genesis_db_path()))
             await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         except Exception as e:
             print(f"warning: could not open DB ({e}), results won't be stored")
 
     try:
-        datasets = (
-            list_datasets() if args.dataset == "all"
-            else [args.dataset]
-        )
+        datasets = list_datasets() if args.dataset == "all" else [args.dataset]
 
         for ds_name in datasets:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"  Eval: {args.model} on {ds_name}")
-            print(f"{'='*60}\n")
+            print(f"{'=' * 60}\n")
 
             summary = await run_eval(
                 provider_name=args.model,
@@ -347,6 +403,7 @@ async def _cmd_gauntlet(args: argparse.Namespace) -> int:
             import aiosqlite  # noqa: I001
 
             from genesis.env import genesis_db_path
+
             db = await aiosqlite.connect(str(genesis_db_path()))
             await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         except Exception as e:
@@ -354,9 +411,9 @@ async def _cmd_gauntlet(args: argparse.Namespace) -> int:
 
     summary = None
     try:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Gauntlet: {args.model}")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
         summary = await run_gauntlet(args.model, db=db, trigger=EvalTrigger.MANUAL)
         _print_summary(summary)
         for r in summary.results:
@@ -399,6 +456,7 @@ async def _cmd_bench(args: argparse.Namespace) -> int:
             import aiosqlite  # noqa: I001
 
             from genesis.env import genesis_db_path
+
             db = await aiosqlite.connect(str(genesis_db_path()))
             await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         except Exception as e:
@@ -453,7 +511,8 @@ async def _cmd_benchmark(args: argparse.Namespace) -> int:
         providers = [args.model]
     else:
         providers = [
-            name for name, cfg in sorted(config.providers.items())
+            name
+            for name, cfg in sorted(config.providers.items())
             if getattr(cfg, "enabled", True)  # skip explicitly disabled
             and getattr(cfg, "has_api_key", True)  # skip keyless — eval would 401
             and (args.include_paid or cfg.is_free)
@@ -468,6 +527,7 @@ async def _cmd_benchmark(args: argparse.Namespace) -> int:
         try:
             import aiosqlite  # noqa: I001
             from genesis.env import genesis_db_path
+
             db = await aiosqlite.connect(str(genesis_db_path()))
             await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         except Exception as e:
@@ -500,11 +560,15 @@ async def _cmd_benchmark(args: argparse.Namespace) -> int:
                     )
                     attempted = summary.passed_cases + summary.failed_cases
                     results[provider_name][ds_name] = (
-                        summary.passed_cases, attempted, summary.skipped_cases,
+                        summary.passed_cases,
+                        attempted,
+                        summary.skipped_cases,
                     )
                     pct = (summary.passed_cases / attempted * 100) if attempted > 0 else 0
-                    print(f" {summary.passed_cases}/{attempted} ({pct:.0f}%) "
-                          f"[{summary.skipped_cases} skipped]  {summary.duration_s:.0f}s")
+                    print(
+                        f" {summary.passed_cases}/{attempted} ({pct:.0f}%) "
+                        f"[{summary.skipped_cases} skipped]  {summary.duration_s:.0f}s"
+                    )
                 except Exception as exc:
                     print(f" ERROR: {exc}")
                     results[provider_name][ds_name] = (0, 0, 0)
@@ -529,7 +593,10 @@ async def _cmd_results(args: argparse.Namespace) -> int:
         async with aiosqlite.connect(str(genesis_db_path())) as db:
             await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             runs = await get_runs(
-                db, model_id=args.model, dataset=args.dataset, limit=args.last,
+                db,
+                model_id=args.model,
+                dataset=args.dataset,
+                limit=args.last,
             )
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
@@ -613,7 +680,11 @@ async def _cmd_export(args: argparse.Namespace) -> int:
         from genesis.eval.db import get_runs
         from genesis.routing.config import load_config
 
-        config_path = __import__("pathlib").Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
+        config_path = (
+            __import__("pathlib").Path(__file__).resolve().parents[3]
+            / "config"
+            / "model_routing.yaml"
+        )
         config = load_config(config_path)
 
         datasets = list_datasets()
@@ -677,12 +748,8 @@ def _generate_export_markdown(
     lines.append(
         "Benchmark methodology: 3 datasets (classification, extraction, structured_output)"
     )
-    lines.append(
-        "with 37 total cases. Scores are `passed/attempted` — skipped cases (rate limits,"
-    )
-    lines.append(
-        "API errors) excluded from the denominator. All runs use the eval harness in"
-    )
+    lines.append("with 37 total cases. Scores are `passed/attempted` — skipped cases (rate limits,")
+    lines.append("API errors) excluded from the denominator. All runs use the eval harness in")
     lines.append("`src/genesis/eval/` with binary pass/fail scorers (no LLM-as-judge).\n")
     lines.append("## Current Results\n")
     lines.append("Best run per provider. Providers marked (free) cost $0; others are paid.\n")

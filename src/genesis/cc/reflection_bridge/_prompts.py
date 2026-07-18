@@ -13,6 +13,7 @@ import uuid as _uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from genesis.awareness.signal_format import format_signal_line, format_signals
 from genesis.awareness.types import Depth, SignalReading, TickResult
 from genesis.cc.types import CCModel
 
@@ -30,38 +31,23 @@ _TICK_INTERVAL_MINUTES = 5  # awareness loop tick interval
 
 
 def _format_signal(s: SignalReading, *, unchanged_ticks: int = 0) -> str:
-    """Format a signal with threshold and staleness annotations."""
-    base = f"{s.name}={s.value}"
-    if s.normal_max is not None:
-        status = (
-            "CRITICAL" if s.critical_threshold is not None and s.value >= s.critical_threshold
-            else "WARNING" if s.warning_threshold is not None and s.value >= s.warning_threshold
-            else "normal"
-        )
-        base += f" [{status}]"
-    if s.baseline_note:
-        base += f" -- baseline: {s.baseline_note}"
-    if unchanged_ticks >= 2:
-        hours = unchanged_ticks * _TICK_INTERVAL_MINUTES / 60
-        base += f" (persistent ~{hours:.1f}h)"
-    return base
+    """Thin delegate onto the canonical formatter (awareness.signal_format)."""
+    return format_signal_line(s, unchanged_ticks=unchanged_ticks)
 
 
-def _format_signals_from_tick(
-    tick: TickResult, *, limit: int = 10, min_value: float = 0.0,
-) -> str:
-    """Format signals with staleness annotations from a TickResult.
+def _format_signals_from_tick(tick: TickResult, *, min_value: float = 0.0) -> str:
+    """Canonical signal block for a TickResult (thin delegate).
 
-    When min_value > 0, signals at or below that value are excluded.
-    This filters out bootstrap placeholder signals that always return 0.0.
+    When min_value > 0, signals at or below that value are excluded
+    (bootstrap placeholder filtering). No silent truncation — every
+    passing signal renders, one canonical line each.
     """
-    staleness = tick.signal_staleness or {}
-    parts = [
-        _format_signal(s, unchanged_ticks=staleness.get(s.name, 0))
-        for s in tick.signals[:limit]
-        if s.value > min_value or min_value == 0.0
-    ]
-    return ", ".join(parts) if parts else "none"
+    return format_signals(
+        tick.signals,
+        staleness=tick.signal_staleness or {},
+        min_value=min_value,
+        empty="none",
+    )
 
 
 # ── Light reflection focus rotation ──────────────────────────────────
@@ -296,8 +282,10 @@ async def build_reflection_prompt(
             f"Perform a Light reflection.\n\n"
             f"Tick ID: {tick.tick_id}\n"
             f"Timestamp: {tick.timestamp}\n"
-            f"Trigger: {tick.trigger_reason or 'scheduled'}\n"
-            f"Signals: {signals_summary}\n"
+            f"Trigger: {tick.trigger_reason or 'scheduled'}\n\n"
+            f"## Live Tick Signals (canonical)\n"
+            f"These are the ONLY signals you may cite by name/value. Anything else in this prompt is stored context, not a live signal.\n"
+            f"{signals_summary}\n\n"
             f"Depth scores: {scores_summary}\n\n"
             f"## Current Cognitive State\n\n{cog_state}\n\n"
             f"{focus_instruction}\n\n"
@@ -308,8 +296,10 @@ async def build_reflection_prompt(
         f"Perform a {depth.value} reflection.\n\n"
         f"Tick ID: {tick.tick_id}\n"
         f"Timestamp: {tick.timestamp}\n"
-        f"Trigger: {tick.trigger_reason or 'scheduled'}\n"
-        f"Signals: {signals_summary}\n"
+        f"Trigger: {tick.trigger_reason or 'scheduled'}\n\n"
+        f"## Live Tick Signals (canonical)\n"
+        f"These are the ONLY signals you may cite by name/value. Anything else in this prompt is stored context, not a live signal.\n"
+        f"{signals_summary}\n\n"
         f"Depth scores: {scores_summary}\n\n"
         f"## Current Cognitive State\n\n{cog_state}\n\n"
         f"Analyze the current state, identify patterns and observations, "
@@ -340,7 +330,7 @@ async def build_strategic_prompt_enriched(
         f"Timestamp: {tick.timestamp}",
         f"User timezone: {tz_name}",
         f"Trigger: {tick.trigger_reason or 'scheduled'}",
-        f"Signals: {signals_summary}\n",
+        f"\n## Live Tick Signals (canonical)\nThese are the ONLY signals you may cite by name/value. Anything else in this prompt is stored context, not a live signal.\n{signals_summary}\n",
         f"## Current Cognitive State\n\n{cog_state}\n",
     ]
 
@@ -387,7 +377,7 @@ async def build_enriched_prompt(
 
     if tick.signals:
         signals = _format_signals_from_tick(tick)
-        parts.append(f"\n## Signals\n{signals}")
+        parts.append(f"\n## Live Tick Signals (canonical)\nThese are the ONLY signals you may cite by name/value. Anything else in this prompt is stored context, not a live signal.\n{signals}")
 
     parts.append(f"\n## Current Cognitive State\n{bundle.cognitive_state}")
 
@@ -439,7 +429,14 @@ async def build_enriched_prompt(
         counts = eval_ctx.get("signal_counts", {})
         has_signals = any(counts.get(k, 0) > 0 for k in counts)
         if has_signals:
-            ctx_parts = ["\n## Cross-Interaction Signals (for pattern synthesis)"]
+            ctx_parts = [
+                "\n## Cross-Interaction Context "
+                "(from stored observations — NOT live signals)"
+            ]
+            ctx_parts.append(
+                "These are stored-observation summaries for pattern "
+                "synthesis. Do not cite them as signal names/values."
+            )
             ctx_parts.append(
                 f"Signal counts: {json.dumps(counts)}"
             )
@@ -513,7 +510,7 @@ async def build_light_prompt_enriched(
         f"Tick ID: {tick.tick_id}",
         f"Timestamp: {tick.timestamp}",
         f"Trigger: {tick.trigger_reason or 'scheduled'}\n",
-        f"## Signals\n{ctx.signals_text}",
+        f"## Live Tick Signals (canonical)\nThese are the ONLY signals you may cite by name/value. Anything else in this prompt is stored context, not a live signal.\n{ctx.signals_text}",
         f"\n## Current Cognitive State\n{ctx.cognitive_state or '(none)'}",
     ]
 

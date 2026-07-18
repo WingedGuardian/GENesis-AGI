@@ -36,7 +36,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 36563f95 2026-07-10
+verified: 57fa1f18 2026-07-17
 ```
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
@@ -73,12 +73,21 @@ Easy-to-forget mechanisms:
 - **Entity layer (WS-H Pillar 2)** — typed entity nodes with identity:
   `entities`/`entity_mentions`/`entity_links` tables (migration 0051),
   `db/crud/entities.py` (recursive-CTE traversal, bi-temporal edge validity,
-  EXTRACTED/INFERRED/AMBIGUOUS provenance), `memory/entity_registry.py`
-  (string→ID resolution tiering; fuzzy matches queue `entity_adjudication`),
-  `memory/entity_seed.py` (curated spine incl. the repo-split rule).
-  Distinct from `memory/entity_resolution.py`, which is near-duplicate
-  memory-PAIR dedup. Bitemporal timestamps are canonicalized at the write
-  gate (`db/timeutil.canonical_iso`, migration 0050).
+  EXTRACTED/INFERRED/AMBIGUOUS provenance, `merge_entity` tombstone-with-
+  redirect), `memory/entity_registry.py` (string→ID resolution tiering; fuzzy
+  matches queue `entity_adjudication`), `memory/entity_seed.py` (curated spine
+  incl. the repo-split rule). **Adjudication drainer**
+  (`memory/entity_adjudication.py`, migration 0065 `entity_adjudications`
+  ledger): the hourly consumer of the `entity_adjudication` queue — a mechanical
+  digit-guard rules out numeric-suffix pairs, then a two-model LLM judgment
+  (`entity_adjudication` + flipped-provider `entity_adjudication_challenge`, both
+  must agree) decides merge-vs-distinct. `propose_only` by default (records, does
+  not apply); `live` applies via `merge_entity`. A cursor-managed reconcile sweep
+  rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
+  (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
+  `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
+  Bitemporal timestamps are canonicalized at the write gate
+  (`db/timeutil.canonical_iso`, migration 0050).
 
 **Consolidation (dream cycle)** — `memory/dream_cycle.py` (~1480 LOC):
 weekly clustering (Sun 4am) persists a value-ranked worklist to
@@ -448,15 +457,22 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 159698d4 2026-07-16
+verified: b662f3e3 2026-07-17
 ```
 
-- **Infra protection posture (2026-07-16)**: hourly
+- **Infra protection posture (2026-07-16; network plane 2026-07-17)**: hourly
   `_check_infra_protection_posture` reads the infra profile's effective facts
   and raises one `high` `infrastructure_alert` when a memory-plane protection
   is missing (container `memory.swap.max=0`, oomd pressure-kill off, host swap
   absent, incus swap knob explicitly `"false"`) or the profile is stale (>3d =
-  refresh broken → distinct "posture UNKNOWN" alert). Only EXPLICIT defect
+  refresh broken → distinct "posture UNKNOWN" alert). Also covers the
+  **network plane** — reads the *effective* facts `networkd_default_route_keepconfig`
+  (KeepConfiguration on the default-route link's OWN drop-in, not any-link) and
+  `network_watchdog_enabled` (`systemctl is-enabled`, not mere file presence),
+  gated strictly on `networkd_manages_default_route is True` — a networkctl-derived
+  fact (the running daemon reports the default-route link
+  `AdministrativeState=configured`) that suppresses the rules on NetworkManager
+  installs, so no false-positive on the public repo. Only EXPLICIT defect
   values alert — absent/`None` facts stay silent (no guardian plane, cgroup
   v1, fresh install). One open row per source via `supersede_except_hash`;
   auto-resolves on recovery. Completes the silent-skip closure: provision
@@ -478,11 +494,7 @@ verified: 159698d4 2026-07-16
   collectors). Tick → depth classification (MICRO/LIGHT/DEEP/STRATEGIC) →
   reflection dispatch. Also per-tick `_check_*` housekeeping: CC-slot RSS leak
   watch, subscription-cap detection, SQLite WAL hygiene, resilience-axis folds,
-  liveness heartbeat, duplicate-CC-executor paging (two live `claude` processes
-  on ONE transcript — hook layer `scripts/hooks/duplicate_session_guard.py`
-  writes `~/.genesis/session-owners/*.conflict`, this check pages `critical`
-  and GCs stale registry files; newest executor wins, older one's repo-mutating
-  tools are denied), and (hourly) embedding-backlog degradation — counts
+  liveness heartbeat, and (hourly) embedding-backlog degradation — counts
   `memory_metadata.embedding_status='failed'` (permanently keyword-only rows the
   rate alert misses), hybrid `high` (dashboard) / `critical` (Telegram) by band —
   plus (hourly) deploy staleness: merged-vs-deployed drift (update.sh age,
@@ -753,7 +765,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, env.py, _config_overlay.py]
-verified: 95dee055 2026-07-15
+verified: b662f3e3 2026-07-17
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -918,9 +930,13 @@ verified: 95dee055 2026-07-15
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
   installs (see docs/reference/memory-resilience.md). Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
-  `network_watchdog_installed` (config-plane facts from
-  `scripts/lib/network_resilience.sh`) plus a volatile `watchdog` heal-telemetry
-  metric from `/run/genesis-network-watchdog.json` (see
+  `network_watchdog_installed` (any-link/file-present facts for the annotation
+  layer) alongside the posture check's *effective* variants
+  `networkd_default_route_keepconfig` + `network_watchdog_enabled`, all gated by
+  `networkd_manages_default_route` (the applicability gate — networkctl reports
+  the default-route link `AdministrativeState=configured`, so the posture check
+  stays silent on NetworkManager installs), plus a volatile `watchdog`
+  heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
   docs/reference/network-resilience.md).
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).

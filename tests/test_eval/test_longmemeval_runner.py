@@ -37,6 +37,21 @@ def test_default_arms_are_the_four_combinations():
     assert labels == {"raw", "raw+rerank", "keyword", "keyword+rerank"}
 
 
+def test_arm_label_variant_suffix_is_last_and_baseline_is_byte_identical():
+    """WS2-0: the +variant suffix appends LAST (after rerank, after graph) and
+    only appears when a variant is set — so every pre-WS2-0 label is unchanged."""
+    # baseline labels byte-identical (variant defaults to "")
+    assert Arm(QueryArm.RAW, rerank=False).label == "raw"
+    assert Arm(QueryArm.RAW, rerank=True, graph=True).label == "raw+rerank+graph"
+    # variant appends last, in the documented order
+    assert Arm(QueryArm.RAW, rerank=False, variant="scope").label == "raw+scope"
+    assert (
+        Arm(QueryArm.RAW, rerank=True, graph=True, variant="scope").label
+        == "raw+rerank+graph+scope"
+    )
+    assert Arm(QueryArm.KEYWORD, rerank=True, variant="budget").label == "keyword+rerank+budget"
+
+
 def _r(qid, qtype, correct, evidence=True, coverage=None):  # noqa: FBT002
     return QuestionArmResult(
         question_id=qid,

@@ -73,6 +73,8 @@ EXPECTED_TABLES = [
     "repo_pulse_runs",  # session-manager PR-4a: pulse worker run telemetry
     "repo_pulse_annotations",  # session-manager PR-4a: PR ↔ ledger-item matches
     "ledger_predictions",  # WS-2 P1a: cognitive-ledger falsifiable prediction rows
+    "entity_adjudications",  # entity-node merge-vs-distinct decision ledger (drainer)
+    "autonomy_events",  # append-only success/correction ledger for windowed earn-back
 ]
 
 

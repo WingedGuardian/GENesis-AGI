@@ -41,6 +41,24 @@ _CHANNEL_FORMAT = {
 }
 
 
+def _awaited_dup_key(request: OutreachRequest) -> str:
+    """Identity of an awaited approval for the in-flight duplicate guard —
+    the same (signal_type, topic) a duplicate prompt would collide on."""
+    return f"{request.signal_type}\x00{request.topic}"
+
+
+def _suppressed_awaited_result() -> OutreachResult:
+    """Terminal result for a concurrent duplicate awaited approval that was
+    suppressed (never sent) because an identical prompt is still pending."""
+    return OutreachResult(
+        outreach_id=str(uuid.uuid4()),
+        status=OutreachStatus.REJECTED,
+        channel="",
+        message_content="",
+        governance_result=None,
+    )
+
+
 class OutreachPipeline:
     """Main outreach orchestrator."""
 
@@ -83,6 +101,15 @@ class OutreachPipeline:
         # email sends.  MUTED by default; the dashboard "Activity" ledger is the
         # primary visibility path.  Toggled via set_autonomous_send_notify().
         self._autonomous_send_notify: bool = False
+        # In-flight awaited approvals, keyed by (signal_type, topic). While
+        # one is pending, a concurrent duplicate awaited-approval is
+        # SUPPRESSED rather than delivered as a second prompt: two identical
+        # pending prompts in one chat make resolve_scoped_pending ambiguous
+        # (len(eligible) != 1), so a plain APPROVE would resolve NEITHER. The
+        # key is released when the wait ends (answer OR timeout), so a retry
+        # after a timed-out approval is never blocked — the distinction the
+        # stateless governance dedup window cannot make.
+        self._inflight_awaited: set[str] = set()
 
     def set_reply_waiter(self, waiter: ReplyWaiter) -> None:
         """Attach a ReplyWaiter for bidirectional outreach."""
@@ -299,22 +326,35 @@ class OutreachPipeline:
             result = await self.submit(request)
             return result, None
 
-        result = await self.submit(request)
-        if result.status != OutreachStatus.DELIVERED or not result.delivery_id:
-            return result, None
+        key = _awaited_dup_key(request)
+        if key in self._inflight_awaited:
+            logger.warning(
+                "submit_and_wait: concurrent duplicate awaited approval suppressed "
+                "(signal=%s topic=%r already awaiting a reply)",
+                request.signal_type,
+                request.topic,
+            )
+            return _suppressed_awaited_result(), None
+        self._inflight_awaited.add(key)
+        try:
+            result = await self.submit(request)
+            if result.status != OutreachStatus.DELIVERED or not result.delivery_id:
+                return result, None
 
-        # Register BEFORE attaching context: set_context drops keys with no
-        # registered waiter, so the old order (context first, registration
-        # deferred to wait_for_reply) left every waiter on this path
-        # contextless — standalone replies were structurally unresolvable
-        # (observed live 2026-07-16; every reply degraded to
-        # implicit_activity).
-        self._reply_waiter.register(result.delivery_id)
-        self._attach_waiter_context(result, result.delivery_id)
-        reply = await self._reply_waiter.wait_for_reply(
-            result.delivery_id, timeout_s=timeout_s,
-        )
-        return result, reply
+            # Register BEFORE attaching context: set_context drops keys with no
+            # registered waiter, so the old order (context first, registration
+            # deferred to wait_for_reply) left every waiter on this path
+            # contextless — standalone replies were structurally unresolvable
+            # (observed live 2026-07-16; every reply degraded to
+            # implicit_activity).
+            self._reply_waiter.register(result.delivery_id)
+            self._attach_waiter_context(result, result.delivery_id)
+            reply = await self._reply_waiter.wait_for_reply(
+                result.delivery_id, timeout_s=timeout_s,
+            )
+            return result, reply
+        finally:
+            self._inflight_awaited.discard(key)
 
     def _attach_waiter_context(self, result: OutreachResult, *keys: str) -> None:
         """Record the delivered chat+topic on waiter *keys* so standalone
@@ -356,39 +396,52 @@ class OutreachPipeline:
             result = await self.submit_raw(text, request, reply_markup=reply_markup)
             return result, None
 
-        # Pre-register waiter if button key provided
-        if waiter_key:
-            self._reply_waiter.register(waiter_key)
-
-        result = await self.submit_raw(text, request, reply_markup=reply_markup)
-        if result.status != OutreachStatus.DELIVERED or not result.delivery_id:
-            if waiter_key:
-                self._reply_waiter.cancel(waiter_key)
-            return result, None
-
-        # Alias so quote-reply (by Telegram message_id) also resolves the waiter
-        actual_key = waiter_key or result.delivery_id
-        if waiter_key and result.delivery_id != waiter_key:
-            self._reply_waiter.add_alias(result.delivery_id, waiter_key)
-        elif not waiter_key:
-            # No pre-registered button key: register the delivery_id NOW,
-            # before attaching context — same ordering trap as
-            # submit_and_wait (set_context silently drops unregistered
-            # keys, leaving the waiter ineligible for standalone replies).
-            self._reply_waiter.register(result.delivery_id)
-        self._attach_waiter_context(result, actual_key, result.delivery_id)
-
-        try:
-            reply = await self._reply_waiter.wait_for_reply(
-                actual_key, timeout_s=timeout_s,
+        key = _awaited_dup_key(request)
+        if key in self._inflight_awaited:
+            logger.warning(
+                "submit_raw_and_wait: concurrent duplicate awaited approval suppressed "
+                "(signal=%s topic=%r already awaiting a reply)",
+                request.signal_type,
+                request.topic,
             )
-        finally:
-            # Clean up both keys to prevent stale entries (resolve only
-            # pops one key; the counterpart would leak)
-            if waiter_key and result.delivery_id != waiter_key:
-                self._reply_waiter.remove(result.delivery_id, waiter_key)
+            return _suppressed_awaited_result(), None
+        self._inflight_awaited.add(key)
+        try:
+            # Pre-register waiter if button key provided
+            if waiter_key:
+                self._reply_waiter.register(waiter_key)
 
-        return result, reply
+            result = await self.submit_raw(text, request, reply_markup=reply_markup)
+            if result.status != OutreachStatus.DELIVERED or not result.delivery_id:
+                if waiter_key:
+                    self._reply_waiter.cancel(waiter_key)
+                return result, None
+
+            # Alias so quote-reply (by Telegram message_id) also resolves the waiter
+            actual_key = waiter_key or result.delivery_id
+            if waiter_key and result.delivery_id != waiter_key:
+                self._reply_waiter.add_alias(result.delivery_id, waiter_key)
+            elif not waiter_key:
+                # No pre-registered button key: register the delivery_id NOW,
+                # before attaching context — same ordering trap as
+                # submit_and_wait (set_context silently drops unregistered
+                # keys, leaving the waiter ineligible for standalone replies).
+                self._reply_waiter.register(result.delivery_id)
+            self._attach_waiter_context(result, actual_key, result.delivery_id)
+
+            try:
+                reply = await self._reply_waiter.wait_for_reply(
+                    actual_key, timeout_s=timeout_s,
+                )
+            finally:
+                # Clean up both keys to prevent stale entries (resolve only
+                # pops one key; the counterpart would leak)
+                if waiter_key and result.delivery_id != waiter_key:
+                    self._reply_waiter.remove(result.delivery_id, waiter_key)
+
+            return result, reply
+        finally:
+            self._inflight_awaited.discard(key)
 
     @staticmethod
     def _load_alert_prompt() -> str | None:

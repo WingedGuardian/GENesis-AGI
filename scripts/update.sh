@@ -389,7 +389,7 @@ _sync_deploy_targets() {
 # EXCEPTION — known-ephemeral tracked files (EPHEMERAL_DIRTY_RE): tracked files
 # that are routinely rewritten in place and are safe to ignore. They regenerate
 # themselves, and local edits to them are discarded right before the merge
-# (see "--- Fetching latest ---" below) so an incoming change to one of them
+# (cleared just before the merge below) so an incoming change to one of them
 # never aborts the merge with "local changes would be overwritten". Today:
 #   - top-level `AGENTS.md` (GitNexus rewrites its auto-stat block)
 #   - `config/procedure_triggers.yaml` (the L1 trigger cache rewrites it in
@@ -463,6 +463,26 @@ else
     echo "  Rollback tag: $ROLLBACK_TAG"
 fi
 echo ""
+
+# ── Fetch latest BEFORE stopping services (and before the deploy marker) ──
+# Hoisted above the stop so a slow/hung fetch does NOT extend the downtime
+# window, AND above `_write_state "fetching"` so env.update_in_progress() is not
+# yet true while the (network, potentially-hanging) fetch runs — the watchdog's
+# crash-restart guard stays fully active for the server during the fetch.
+# Guarded EXPLICITLY (not via the ERR trap, which arms only after the stop): the
+# trap's _do_rollback force-stops the server and restarts only WERE_RUNNING
+# (empty here) — a fetch failure routed through it would leave the server DOWN.
+# On failure, delete this run's freshly-created rollback tag and exit clean with
+# the server untouched. POST_MERGE re-entry skips it (code already merged).
+if [[ "$POST_MERGE" == "false" ]]; then
+    echo "--- Fetching latest ---"
+    if ! git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
+        echo "  Fetch failed (network?) — server NOT stopped, nothing changed."
+        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+        rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+        exit 1
+    fi
+fi
 
 _write_state "fetching"
 
@@ -792,9 +812,9 @@ trap _on_err ERR
 if [[ "$POST_MERGE" == "false" ]]; then
 _write_state "merging"
 
-# ── Fetch + Merge ────────────────────────────────────────
-echo "--- Fetching latest ---"
-git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main
+# ── Merge ────────────────────────────────────────────────
+# (git fetch was hoisted ABOVE the stop — see "Fetch latest BEFORE stopping
+# services" — so the network round-trip is no longer inside the downtime window.)
 
 # Clear local edits to known-ephemeral tracked files (EPHEMERAL_DIRTY_RE) before
 # merging. They are rewritten in place at runtime and regenerate themselves
@@ -1096,37 +1116,6 @@ section is safe to hand-edit; install scripts preserve it.
 reminders here.)
 UCLSEED
 fi
-echo "--- Refreshing Network Identity in ~/.claude/CLAUDE.md ---"
-# Block format + detection helpers are shared with host-setup.sh via the
-# lib — the two writers previously drifted (Tailscale line lost, container
-# IP mis-detected as the tailscale0 address).
-# shellcheck source=lib/claude_md_blocks.sh
-. "$SCRIPT_DIR/lib/claude_md_blocks.sh"
-_c_ip=$(detect_container_lan_ip)
-_c_ipv6=$(detect_container_lan_ipv6)
-_ts_ip=$(detect_tailscale_ip)
-_host_ip=$("$VENV_DIR/bin/python" -c "
-import yaml, pathlib
-p = pathlib.Path.home() / '.genesis' / 'guardian_remote.yaml'
-if p.exists():
-    cfg = yaml.safe_load(p.read_text())
-    print(cfg.get('host_ip', ''))
-" 2>/dev/null || true)
-[ -z "$_host_ip" ] && _host_ip=$(ip route | grep default | awk '{print $3}' || true)
-
-build_network_identity_block "$_c_ip" "$_c_ipv6" "$_host_ip" "" "$_ts_ip" \
-    | write_sentinel_block "$_user_claude" "network-identity"
-echo "  Network identity updated in ~/.claude/CLAUDE.md"
-echo ""
-
-# Refresh the container-specs block from the LAST collected infrastructure
-# profile (content owner: genesis.infra_profile.claude_md — no collection, no
-# runtime import; safe while the server is down). Skips gracefully pre-first-
-# collection or on older checkouts without the module.
-"$VENV_DIR/bin/python" -m genesis.infra_profile --claude-md-block 2>/dev/null \
-    && echo "  Container specs refreshed in ~/.claude/CLAUDE.md" \
-    || echo "  Container specs refresh skipped (no profile yet)"
-echo ""
 
 _write_state "health_check"
 
@@ -1210,6 +1199,55 @@ fi
 trap - ERR
 
 _sync_deploy_targets
+
+# ── Refresh CLAUDE.md blocks (hoisted OUT of the downtime window) ──────────
+# Pure-local regeneration (local ifaces / a local yaml / the last-collected
+# profile; no network, no server import). Relocated to AFTER the restart so it
+# no longer runs in the stop→restart window, but BEFORE _write_state "done"
+# (below) so the restarted server's infra_profile collector is still
+# update_in_progress-gated (infra_profile/claude_md.py) and cannot race this
+# write. COSMETIC + post-success + past `trap - ERR`: a hiccup here must NEVER
+# abort an already-healthy, already-restarted deploy — that would strand
+# update_state.json at "health_check" (deferring the watchdog restart guard for
+# hours) and skip the success record. errexit is live here and the multi-step
+# network-identity refresh (lib source + sed-based write) is not otherwise
+# guarded, so bracket the whole section with `set +e`.
+set +e
+echo "--- Refreshing Network Identity in ~/.claude/CLAUDE.md ---"
+# Block format + detection helpers are shared with host-setup.sh via the
+# lib — the two writers previously drifted (Tailscale line lost, container
+# IP mis-detected as the tailscale0 address).
+# shellcheck source=lib/claude_md_blocks.sh
+. "$SCRIPT_DIR/lib/claude_md_blocks.sh"
+_c_ip=$(detect_container_lan_ip)
+_c_ipv6=$(detect_container_lan_ipv6)
+_ts_ip=$(detect_tailscale_ip)
+_host_ip=$("$VENV_DIR/bin/python" -c "
+import yaml, pathlib
+p = pathlib.Path.home() / '.genesis' / 'guardian_remote.yaml'
+if p.exists():
+    cfg = yaml.safe_load(p.read_text())
+    print(cfg.get('host_ip', ''))
+" 2>/dev/null || true)
+[ -z "$_host_ip" ] && _host_ip=$(ip route | grep default | awk '{print $3}' || true)
+
+if build_network_identity_block "$_c_ip" "$_c_ipv6" "$_host_ip" "" "$_ts_ip" \
+    | write_sentinel_block "$_user_claude" "network-identity"; then
+    echo "  Network identity updated in ~/.claude/CLAUDE.md"
+else
+    echo "  WARNING: network-identity refresh failed (non-fatal)"
+fi
+echo ""
+
+# Refresh the container-specs block from the LAST collected infrastructure
+# profile (content owner: genesis.infra_profile.claude_md — no collection, no
+# runtime import; safe while the server is down). Skips gracefully pre-first-
+# collection or on older checkouts without the module.
+"$VENV_DIR/bin/python" -m genesis.infra_profile --claude-md-block 2>/dev/null \
+    && echo "  Container specs refreshed in ~/.claude/CLAUDE.md" \
+    || echo "  Container specs refresh skipped (no profile yet)"
+echo ""
+set -e
 
 # ── Clear update failure file on success ──────────────────
 if [ -f "$HOME/.genesis/last_update_failure.json" ]; then

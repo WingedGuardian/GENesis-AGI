@@ -82,7 +82,8 @@ async def get_by_norm_name(
         )
     else:
         rows = await db.execute_fetchall(
-            "SELECT * FROM entities WHERE norm_name = ?", (norm_name,),
+            "SELECT * FROM entities WHERE norm_name = ?",
+            (norm_name,),
         )
     if not rows:
         return None
@@ -95,9 +96,19 @@ async def get_by_norm_name(
 
 async def get_entity(db: aiosqlite.Connection, entity_id: str) -> dict | None:
     rows = await db.execute_fetchall(
-        "SELECT * FROM entities WHERE entity_id = ?", (entity_id,),
+        "SELECT * FROM entities WHERE entity_id = ?",
+        (entity_id,),
     )
     return _row_to_dict(db, rows[0]) if rows else None
+
+
+async def count_entity_mentions(db: aiosqlite.Connection, entity_id: str) -> int:
+    """Number of memory↔entity mentions for one entity (attestation strength)."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM entity_mentions WHERE entity_id = ?", (entity_id,)
+    )
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def list_norm_names(
@@ -119,8 +130,7 @@ async def list_norm_names(
         )
     else:
         rows = await db.execute_fetchall(
-            "SELECT norm_name, entity_id, entity_type FROM entities "
-            "WHERE status = 'active'",
+            "SELECT norm_name, entity_id, entity_type FROM entities WHERE status = 'active'",
         )
     return [(r[0], r[1], r[2]) for r in rows]
 
@@ -145,7 +155,11 @@ async def upsert_mention(
         "source = excluded.source "
         "WHERE excluded.confidence > entity_mentions.confidence",
         (
-            memory_id, entity_id, provenance, confidence, source,
+            memory_id,
+            entity_id,
+            provenance,
+            confidence,
+            source,
             datetime.now(UTC).isoformat(),
         ),
     )
@@ -202,8 +216,13 @@ async def upsert_link(
         "valid_at = COALESCE(excluded.valid_at, entity_links.valid_at) "
         "WHERE excluded.confidence > entity_links.confidence",
         (
-            source_id, target_id, slugify_link_type(link_type), provenance,
-            confidence, evidence_memory_id, canonical_iso(valid_at),
+            source_id,
+            target_id,
+            slugify_link_type(link_type),
+            provenance,
+            confidence,
+            evidence_memory_id,
+            canonical_iso(valid_at),
             datetime.now(UTC).isoformat(),
         ),
     )
@@ -272,11 +291,7 @@ async def connected_entities(
             for here, there in ((source_id, target_id), (target_id, source_id)):
                 if here not in frontier or there in seeds:
                     continue
-                path_conf = (
-                    frontier[here]
-                    * confidence
-                    * PROVENANCE_WEIGHTS.get(provenance, 0.5)
-                )
+                path_conf = frontier[here] * confidence * PROVENANCE_WEIGHTS.get(provenance, 0.5)
                 prior = reached.get(there)
                 if prior is None or path_conf > prior["path_confidence"]:
                     reached[there] = {
@@ -284,9 +299,7 @@ async def connected_entities(
                         "path_confidence": path_conf,
                         "via_link_type": link_type,
                     }
-                    next_frontier[there] = max(
-                        next_frontier.get(there, 0.0), path_conf
-                    )
+                    next_frontier[there] = max(next_frontier.get(there, 0.0), path_conf)
         frontier = next_frontier
     return reached
 
@@ -350,7 +363,8 @@ async def merge_entity(
         (survivor_id, loser_id),
     )
     await db.execute(
-        "DELETE FROM entity_mentions WHERE entity_id = ?", (loser_id,),
+        "DELETE FROM entity_mentions WHERE entity_id = ?",
+        (loser_id,),
     )
     for src_col, dst_col in (("source_id", "target_id"), ("target_id", "source_id")):
         # dst != survivor guard: a pre-existing loser↔survivor link
@@ -425,13 +439,15 @@ async def delete_entities_cascade(
     return {"entities": deleted, "mentions": mentions, "links": links}
 
 
-# Dormant until a consumer exists. `enqueue_adjudication` writes
-# `entity_adjudication` rows to `deferred_work_queue` for an "entity_maintenance
-# job" that was never built — so the rows were a pure producer-with-no-consumer
-# leak (263 orphans in ~6 days, 0 ever drained). Gated OFF to stop the bleed
-# (follow-up 9127e8ed); the enqueue machinery is preserved GROUNDWORK for the
-# adjudication drainer, which flips this True when it lands. Do NOT delete.
-_ADJUDICATION_ENQUEUE_ENABLED = False
+# Enabled: the entity_adjudication drainer (genesis.memory.entity_adjudication)
+# is the consumer. `enqueue_adjudication` writes `entity_adjudication` rows to
+# `deferred_work_queue`; the hourly drainer LLM-judges each fuzzy pair merge-vs-
+# distinct (propose_only by default). The whole feature is gated at runtime by
+# the entity_adjudication settings lever (mode=off no-ops the drainer); this
+# module-level flag stays as the producer kill switch of last resort. When the
+# drainer's mode is off, rows still enqueue but simply never drain — set this
+# False (or the lever off) if you want to stop enqueuing entirely.
+_ADJUDICATION_ENQUEUE_ENABLED = True
 
 
 async def enqueue_adjudication(
@@ -441,32 +457,41 @@ async def enqueue_adjudication(
     similar_entity_id: str,
     _commit: bool = True,
 ) -> None:
-    """Queue a fuzzy-match pair for LLM adjudication (entity_maintenance job).
+    """Queue a fuzzy-match pair for the entity_adjudication drainer.
 
     Inline INSERT rather than ``deferred_work.create`` — that helper
     commits unconditionally, which would break callers batching under
     ``_commit=False`` (extraction transaction discipline).
 
-    No-op while ``_ADJUDICATION_ENQUEUE_ENABLED`` is False (no drainer exists —
-    see the module-level note). The caller's entity create + AMBIGUOUS status
-    are unaffected; only the orphan queue row is skipped.
+    No-op while ``_ADJUDICATION_ENQUEUE_ENABLED`` is False. Deduped: if a pending
+    row already exists for this pair in EITHER orientation, no new row is written
+    (the producer has no natural dedup key, so a repeated fuzzy collision would
+    otherwise pile up duplicate rows — the exact leak that motivated the gate).
+    The caller's entity create + AMBIGUOUS status are unaffected.
     """
     if not _ADJUDICATION_ENQUEUE_ENABLED:
         return
     now = datetime.now(UTC).isoformat()
+    payload_fwd = json.dumps({"entity_id": entity_id, "similar_entity_id": similar_entity_id})
+    payload_rev = json.dumps({"entity_id": similar_entity_id, "similar_entity_id": entity_id})
     await db.execute(
         """INSERT INTO deferred_work_queue
-           (id, work_type, priority, payload_json, deferred_at,
+           (id, work_type, call_site_id, priority, payload_json, deferred_at,
             deferred_reason, created_at)
-           VALUES (?, 'entity_adjudication', 60, ?, ?, ?, ?)""",
+           SELECT ?, 'entity_adjudication', 'entity_adjudication', 60, ?, ?, ?, ?
+           WHERE NOT EXISTS (
+               SELECT 1 FROM deferred_work_queue
+               WHERE work_type = 'entity_adjudication' AND status = 'pending'
+                 AND payload_json IN (?, ?)
+           )""",
         (
             str(uuid.uuid4()),
-            json.dumps(
-                {"entity_id": entity_id, "similar_entity_id": similar_entity_id}
-            ),
+            payload_fwd,
             now,
             "fuzzy norm_name match at entity creation",
             now,
+            payload_fwd,
+            payload_rev,
         ),
     )
     if _commit:

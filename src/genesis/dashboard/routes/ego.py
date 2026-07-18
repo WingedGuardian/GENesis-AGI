@@ -317,21 +317,9 @@ async def ego_proposal_resolve(proposal_id: str):
     if not updated:
         return jsonify({"ok": False, "error": "proposal not found or not pending"}), 404
 
-    try:
-        from genesis.db.crud import intervention_journal as journal_crud
-        await journal_crud.resolve(
-            rt._db, proposal_id,
-            outcome_status=status,
-            actual_outcome=f"Dashboard: user {status}",
-            user_response=user_response or None,
-        )
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning("Journal resolve failed for %s", proposal_id)
-
-    # Resolution side-effects (earn-back + goal status change). Fetch the
-    # resolved proposal once and run both hooks against it; each is wrapped so
-    # one failing never aborts the other.
+    # Shared post-resolution hook: journal + J-9 + decision capture +
+    # correction memory + all action hooks — full parity with the Telegram
+    # path. The dashboard deny reason is a first-class signal now.
     import logging as _logging
 
     prop = None
@@ -343,60 +331,18 @@ async def ego_proposal_resolve(proposal_id: str):
         )
     if prop:
         try:
-            from genesis.ego.earnback import handle_earnback_resolution
+            from genesis.ego.resolution import handle_proposal_resolution
 
-            await handle_earnback_resolution(
-                rt._db, prop, status, getattr(rt, "_autonomy_manager", None),
+            await handle_proposal_resolution(
+                rt._db, prop, status,
+                reason=user_response or None,
+                source="dashboard",
+                memory_store=getattr(rt, "_memory_store", None),
+                autonomy_manager=getattr(rt, "_autonomy_manager", None),
             )
         except Exception:
             _logging.getLogger(__name__).warning(
-                "earnback resolution hook failed for %s", proposal_id,
-            )
-        try:
-            from genesis.ego.goal_actions import handle_goal_status_change_resolution
-
-            await handle_goal_status_change_resolution(rt._db, prop, status)
-        except Exception:
-            _logging.getLogger(__name__).warning(
-                "goal status-change hook failed for %s", proposal_id,
-            )
-        try:
-            from genesis.ego.cell_promotion import handle_cell_promotion_resolution
-
-            await handle_cell_promotion_resolution(rt._db, prop, status)
-        except Exception:
-            _logging.getLogger(__name__).warning(
-                "cell promotion hook failed for %s", proposal_id,
-            )
-        try:
-            from genesis.ego.cognitive_variant import (
-                handle_cognitive_variant_resolution,
-            )
-
-            await handle_cognitive_variant_resolution(rt._db, prop, status)
-        except Exception:
-            _logging.getLogger(__name__).warning(
-                "cognitive-variant hook failed for %s", proposal_id,
-            )
-        try:
-            from genesis.ego.j9_regression_actions import (
-                handle_j9_regression_resolution,
-            )
-
-            await handle_j9_regression_resolution(rt._db, prop, status)
-        except Exception:
-            _logging.getLogger(__name__).warning(
-                "j9 regression hook failed for %s", proposal_id,
-            )
-        try:
-            from genesis.ego.gauntlet_regression_actions import (
-                handle_gauntlet_regression_resolution,
-            )
-
-            await handle_gauntlet_regression_resolution(rt._db, prop, status)
-        except Exception:
-            _logging.getLogger(__name__).warning(
-                "gauntlet regression hook failed for %s", proposal_id,
+                "resolution hook failed for %s", proposal_id, exc_info=True,
             )
 
     return jsonify({"ok": True, "id": proposal_id, "status": status})

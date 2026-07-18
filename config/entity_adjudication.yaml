@@ -1,0 +1,44 @@
+# Entity adjudication drainer — writable, SHADOW by default.
+#
+# The hourly learning-scheduler job (`entity_adjudication_drain`) re-reads the
+# merged config (this file + ~/.genesis/config/entity_adjudication.local.yaml)
+# on every run, so a settings_update("entity_adjudication", {...}) or a hand
+# edit takes effect on the next run — no restart.
+#
+# Master switch: false stops the job before any queue/LLM/merge work.
+enabled: true
+
+# Mode: off | propose_only | live
+#   off          — the job exits immediately (no drain, no sweep)
+#   propose_only — (default) LLM judges each fuzzy entity pair and RECORDS the
+#                  verdict; a "merge" is stored as `proposed_merge` and NOT
+#                  applied. Review the proposals, then flip to live.
+#   live         — a double-agreed "merge" is APPLIED (loser entity tombstoned
+#                  into the survivor via merge_entity). Stored proposed_merge
+#                  verdicts from the shadow period apply on the flip, guarded
+#                  against staleness (re-adjudicate if identity drifted).
+#
+# Merges are effectively irreversible (the loser's mentions/links are rewritten
+# onto the survivor), so the default is propose_only — the conservative posture
+# (a wrong merge is worse than a wrong split).
+#
+# Hook/env kill switch (separate lever): GENESIS_ENTITY_ADJUDICATION_DISABLED=1
+# forces the job to no-op regardless of this file.
+mode: propose_only
+
+# Max pending queue rows drained (LLM-judged) per hourly run. ~240 fuzzy pairs
+# exist here after the digit-guard; at 20/run the backlog clears in ~12 runs.
+drain_budget: 20
+
+# Reconcile sweep: rediscover fuzzy pairs among EXISTING entities (the producer
+# only catches newly-created ones). Sliced over the entity set, cursor in
+# ego_state; a full pass ≈ 15 hourly slices, then re-runs weekly (near-free —
+# already-judged pairs are skipped via the verdict table).
+sweep_enabled: true
+
+# Entities scanned per sweep slice (difflib runs off-thread). Bounds per-run CPU.
+sweep_slice_size: 200
+
+# Max NEW queue rows the sweep enqueues per run — a safety valve so a slice that
+# finds many candidates cannot flood the queue in one go.
+sweep_enqueue_cap: 50

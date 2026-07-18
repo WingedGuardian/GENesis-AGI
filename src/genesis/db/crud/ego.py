@@ -1047,13 +1047,19 @@ async def list_active_directives(
     db: aiosqlite.Connection,
     ego_target: str = "user_ego",
     limit: int = 5,
+    *,
+    kind: str = "directive",
 ) -> list[dict]:
-    """Active directives for a given ego target, newest first."""
+    """Active directives for a given ego target, newest first.
+
+    ``kind`` defaults to plain directives so pre-decision callers are
+    unchanged; decision rows have their own accessors below.
+    """
     cursor = await db.execute(
         "SELECT * FROM ego_directives "
-        "WHERE status = 'active' AND ego_target = ? "
+        "WHERE status = 'active' AND ego_target = ? AND kind = ? "
         "ORDER BY created_at DESC LIMIT ?",
-        (ego_target, limit),
+        (ego_target, kind, limit),
     )
     return [dict(r) for r in await cursor.fetchall()]
 
@@ -1065,12 +1071,120 @@ async def resolve_directive(
     status: str = "completed",
     resolution: str = "",
 ) -> bool:
-    """Mark a directive as completed/cancelled. Returns True if updated."""
+    """Mark a directive as completed/cancelled. Returns True if updated.
+
+    Decision rows are structurally excluded: the ego cannot complete or
+    cancel a user ruling — only ``supersede_decision`` (a user action)
+    retires one.
+    """
     resolved_at = datetime.now(UTC).isoformat()
     cursor = await db.execute(
         "UPDATE ego_directives SET status = ?, resolved_at = ?, resolution = ? "
-        "WHERE id = ? AND status = 'active'",
+        "WHERE id = ? AND status = 'active' AND kind != 'decision'",
         (status, resolved_at, resolution, directive_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+# ── Decision rows (kind='decision') — durable user rulings ──────────────
+
+
+async def create_decision(
+    db: aiosqlite.Connection,
+    *,
+    content: str,
+    ego_target: str = "user_ego",
+    source_proposal_id: str | None = None,
+    source: str = "user",
+) -> str:
+    """Insert a decision row. Returns the id."""
+    import uuid
+
+    decision_id = uuid.uuid4().hex[:16]
+    created_at = datetime.now(UTC).isoformat()
+    await db.execute(
+        """INSERT INTO ego_directives
+           (id, content, priority, source, ego_target, status, created_at,
+            kind, source_proposal_id)
+           VALUES (?, ?, 'high', ?, ?, 'active', ?, 'decision', ?)""",
+        (decision_id, content, source, ego_target, created_at, source_proposal_id),
+    )
+    await db.commit()
+    return decision_id
+
+
+async def list_active_decisions(
+    db: aiosqlite.Connection,
+    ego_target: str = "user_ego",
+    limit: int = 7,
+) -> tuple[list[dict], int]:
+    """(rows, total_active) — most recently affirmed first, capped."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM ego_directives "
+        "WHERE status = 'active' AND kind = 'decision' AND ego_target = ?",
+        (ego_target,),
+    )
+    row = await cursor.fetchone()
+    total = int(row[0]) if row else 0
+    cursor = await db.execute(
+        "SELECT * FROM ego_directives "
+        "WHERE status = 'active' AND kind = 'decision' AND ego_target = ? "
+        "ORDER BY COALESCE(last_reaffirmed_at, created_at) DESC LIMIT ?",
+        (ego_target, limit),
+    )
+    return [dict(r) for r in await cursor.fetchall()], total
+
+
+async def find_active_decision(
+    db: aiosqlite.Connection,
+    *,
+    prefix: str,
+    ego_target: str = "user_ego",
+) -> dict | None:
+    """Active decision whose content starts with the ``[type/category]``
+    dedup prefix, or None."""
+    cursor = await db.execute(
+        "SELECT * FROM ego_directives "
+        "WHERE status = 'active' AND kind = 'decision' AND ego_target = ? "
+        "AND content LIKE ? ORDER BY created_at DESC LIMIT 1",
+        (ego_target, prefix + "%"),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def reaffirm_decision(db: aiosqlite.Connection, decision_id: str) -> bool:
+    """Record a repeat ruling on an existing decision."""
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        "UPDATE ego_directives SET reaffirm_count = reaffirm_count + 1, "
+        "last_reaffirmed_at = ? WHERE id = ? AND status = 'active' "
+        "AND kind = 'decision'",
+        (now, decision_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def supersede_decision(
+    db: aiosqlite.Connection,
+    decision_id: str,
+    *,
+    resolution: str = "",
+) -> bool:
+    """Retire a decision — the ONLY path that does, and it is user-driven.
+
+    Uses status 'cancelled' with a 'superseded: …' resolution (the status
+    CHECK predates decisions; a rebuild for a fourth enum value isn't
+    worth it — kind + resolution disambiguate).
+    """
+    resolved_at = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        "UPDATE ego_directives SET status = 'cancelled', resolved_at = ?, "
+        "resolution = ? WHERE id = ? AND status = 'active' AND kind = 'decision'",
+        (resolved_at, f"superseded: {resolution}" if resolution else "superseded",
+         decision_id),
     )
     await db.commit()
     return cursor.rowcount > 0

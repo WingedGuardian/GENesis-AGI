@@ -15,7 +15,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
-from genesis.ego.types import ProposalStatus
 from genesis.util.approval_words import (
     APPROVE_PHRASES as _SHARED_BARE_APPROVE,
 )
@@ -525,111 +524,18 @@ class ProposalWorkflow:
                     status,
                     f" ({reason})" if reason else "",
                 )
-                # J-9 eval: log proposal resolution for ego quality tracking
-                from genesis.eval.j9_hooks import emit_proposal_resolved
+                # Shared post-resolution hook: J-9, journal, decision
+                # capture, correction memory, and all action hooks — the
+                # SAME artifact set as the dashboard and MCP paths.
+                from genesis.ego.resolution import handle_proposal_resolution
 
-                await emit_proposal_resolved(
-                    self._db,
-                    proposal_id=prop["id"],
-                    status=status,
-                    confidence=prop.get("confidence"),
-                    action_type=prop.get("action_type"),
+                await handle_proposal_resolution(
+                    self._db, prop, status,
+                    reason=reason,
+                    source="telegram",
+                    memory_store=self._memory_store,
+                    autonomy_manager=self._autonomy_manager,
                 )
-                # Intervention journal: record resolution
-                try:
-                    from genesis.db.crud import intervention_journal as journal_crud
-
-                    await journal_crud.resolve(
-                        self._db,
-                        prop["id"],
-                        outcome_status=status,
-                        actual_outcome=f"User {status}" + (f": {reason}" if reason else ""),
-                        user_response=reason,
-                    )
-                except Exception:
-                    logger.warning("Failed to update intervention journal for %s", prop["id"])
-                # Auto-store correction memory on rejection with reason
-                if status == ProposalStatus.REJECTED and reason and self._memory_store:
-                    await self._store_correction(prop, reason)
-                # Autonomy earn-back: promote on approval / cooldown on reject.
-                # No-op unless this is an autonomy_earnback proposal. Wrapped so a
-                # failure here never aborts resolution of sibling proposals.
-                try:
-                    from genesis.ego.earnback import handle_earnback_resolution
-
-                    await handle_earnback_resolution(
-                        self._db, prop, status, self._autonomy_manager,
-                    )
-                except Exception:
-                    logger.warning(
-                        "earnback resolution hook failed for %s",
-                        prop.get("id"), exc_info=True,
-                    )
-                # Goal status change: apply pause/deprioritize on approval.
-                try:
-                    from genesis.ego.goal_actions import (
-                        handle_goal_status_change_resolution,
-                    )
-
-                    await handle_goal_status_change_resolution(
-                        self._db, prop, status,
-                    )
-                except Exception:
-                    logger.warning(
-                        "goal status-change hook failed for %s",
-                        prop.get("id"), exc_info=True,
-                    )
-                # Cell promotion (WS-8 PR-D): promote on approval / cooldown on reject.
-                try:
-                    from genesis.ego.cell_promotion import (
-                        handle_cell_promotion_resolution,
-                    )
-
-                    await handle_cell_promotion_resolution(self._db, prop, status)
-                except Exception:
-                    logger.warning(
-                        "cell promotion hook failed for %s",
-                        prop.get("id"), exc_info=True,
-                    )
-                # Cognitive variant promotion (Evo PR-B): apply the reflection
-                # prompt winner to the overlay on approval.
-                try:
-                    from genesis.ego.cognitive_variant import (
-                        handle_cognitive_variant_resolution,
-                    )
-
-                    await handle_cognitive_variant_resolution(self._db, prop, status)
-                except Exception:
-                    logger.warning(
-                        "cognitive-variant hook failed for %s",
-                        prop.get("id"), exc_info=True,
-                    )
-                # J-9 regression (informational): mark executed on approval, no
-                # side-effect. Never dispatched (blocklist + NOTIFY_USER gate).
-                try:
-                    from genesis.ego.j9_regression_actions import (
-                        handle_j9_regression_resolution,
-                    )
-
-                    await handle_j9_regression_resolution(self._db, prop, status)
-                except Exception:
-                    logger.warning(
-                        "j9 regression hook failed for %s",
-                        prop.get("id"), exc_info=True,
-                    )
-                # Gauntlet regression (informational): mark executed on approval,
-                # no side-effect. Never dispatched (blocklist + NOTIFY_USER gate).
-                try:
-                    from genesis.ego.gauntlet_regression_actions import (
-                        handle_gauntlet_regression_resolution,
-                    )
-
-                    await handle_gauntlet_regression_resolution(self._db, prop, status)
-                except Exception:
-                    logger.warning(
-                        "gauntlet regression hook failed for %s",
-                        prop.get("id"), exc_info=True,
-                    )
             else:
                 logger.warning(
                     "Proposal %s not updated (already resolved?)",
@@ -637,40 +543,6 @@ class ProposalWorkflow:
                 )
 
         return results
-
-    async def _store_correction(
-        self,
-        proposal: dict,
-        reason: str,
-    ) -> None:
-        """Store a correction memory when a proposal is rejected with a reason."""
-        action_type = proposal.get("action_type", "unknown")
-        action_category = proposal.get("action_category", "")
-        content_snippet = proposal.get("content", "")[:200]
-        correction_text = (
-            f"User rejected [{action_type}]: {content_snippet}. Reason: {reason}. Do not repeat."
-        )
-        tags = ["ego_correction"]
-        if action_category:
-            tags.append(action_category)
-        try:
-            await self._memory_store.store(
-                content=correction_text,
-                source="ego_correction",
-                tags=tags,
-                wing="autonomy",
-                room="ego_corrections",
-                source_subsystem="ego",
-            )
-            logger.info(
-                "Stored ego correction for rejected proposal %s",
-                proposal.get("id", "?"),
-            )
-        except Exception:
-            logger.warning(
-                "Failed to store ego correction — continuing",
-                exc_info=True,
-            )
 
     # -- Cross-batch approval ------------------------------------------------
 

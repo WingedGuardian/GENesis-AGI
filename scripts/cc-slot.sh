@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # cc-slot.sh — Persistent tmux slot for Claude Code sessions.
 #
-# Invoked by SSH RemoteCommand. Parses a hostname like "genesis-3-4"
-# to extract the slot number, then attaches to (or creates) tmux
-# session "cc-4" running claude in ~/genesis.
+# THE one interactive launcher: every door (SSH slot hostnames, manual SSH,
+# the dashboard web terminal via the bashrc claude() wrapper) converges here,
+# on the same attach-or-create tmux sessions. Idempotent by construction — a
+# door walked twice attaches the SAME claude instead of spawning a second one.
 #
-# Usage: cc-slot.sh <hostname>   (e.g., cc-slot.sh genesis-3-4)
+# Usage: cc-slot.sh <hostname>               SSH RemoteCommand; parses a
+#                                            hostname like "genesis-3-4" to
+#                                            slot 4 -> session "cc-4"
+#        cc-slot.sh manual [claude-args...]  manual/dashboard door: prints the
+#                                            slot map, takes the LOWEST free
+#                                            slot, forwards extra args to
+#                                            claude inside the session
 
 set -euo pipefail
 
@@ -19,19 +26,48 @@ export LANG="${LANG:-C.UTF-8}"
 GENESIS_ROOT="${HOME}/genesis"
 SESSION_PREFIX="cc"
 
-# --- Parse slot number from hostname ---
+# --- Parse slot number from hostname (or allocate one in manual mode) ---
 if [[ $# -lt 1 ]]; then
-    echo "Usage: cc-slot.sh <hostname>  (e.g., genesis-3-4)" >&2
+    echo "Usage: cc-slot.sh <hostname>            (e.g., genesis-3-4)" >&2
+    echo "       cc-slot.sh manual [claude-args]  (lowest free slot)" >&2
     exit 1
 fi
 
-HOSTNAME_ARG="$1"
-SLOT="${HOSTNAME_ARG##*-}"
+MODE_ARG="$1"
+shift
+# Extra claude args exist only in manual mode (SSH RemoteCommand passes %n only).
+CLAUDE_EXTRA_ARGS=("$@")
 
-if ! [[ "$SLOT" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Error: Invalid slot '$SLOT' (parsed from '$HOSTNAME_ARG')." >&2
-    echo "Slot must be a positive integer (1, 2, 3, ...)." >&2
-    exit 1
+if [[ "$MODE_ARG" == "manual" ]]; then
+    # Manual/dashboard door. Show what already exists so reattach is the
+    # visible easy path, then take the lowest slot with no live session.
+    # New-by-default is deliberate: auto-reattach would trap "I want a fresh
+    # session" in a loop; reattach stays one printed command away.
+    slot_map=$(tmux list-sessions \
+        -F '#{session_name}|#{session_attached}|#{t:session_activity}' \
+        2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+    if [[ -n "$slot_map" ]]; then
+        echo "Existing slots (reattach: tmux attach -t <name>):" >&2
+        while IFS='|' read -r name attached activity; do
+            state="detached"
+            [[ "$attached" -ge 1 ]] && state="attached"
+            echo "  ${name}  ${state}  (last activity: ${activity})" >&2
+        done <<<"$slot_map"
+    fi
+    SLOT=1
+    # '=' forces exact-name match: a bare -t is prefix-matched by tmux, so
+    # cc-1 would falsely read as existing whenever only cc-10 does.
+    while tmux has-session -t "=${SESSION_PREFIX}-${SLOT}" 2>/dev/null; do
+        SLOT=$((SLOT + 1))
+    done
+else
+    SLOT="${MODE_ARG##*-}"
+
+    if ! [[ "$SLOT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: Invalid slot '$SLOT' (parsed from '$MODE_ARG')." >&2
+        echo "Slot must be a positive integer (1, 2, 3, ...)." >&2
+        exit 1
+    fi
 fi
 
 SESSION_NAME="${SESSION_PREFIX}-${SLOT}"
@@ -53,11 +89,14 @@ max_sessions=$ram_cap
 [[ $max_sessions -lt 1 ]] && max_sessions=1
 [[ $max_sessions -gt $CPU_CAP ]] && max_sessions=$CPU_CAP
 
+# Numeric slots only: retired cc-manual-<ts>-<pid> sessions from the old
+# wrapper (and any other cc-* stray) must not consume cap headroom — manual
+# allocation can only ever probe/create cc-<N>.
 existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-           | grep -c "^${SESSION_PREFIX}-" || true)
+           | grep -cE "^${SESSION_PREFIX}-[0-9]+$" || true)
 
-# Reattaching to existing session — always allow
-if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+# Reattaching to existing session — always allow ('=' = exact-name match)
+if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
     :  # bypass cap check
 elif [[ $existing -ge $max_sessions ]]; then
     echo "ERROR: Session cap reached (${existing}/${max_sessions} active)." >&2
@@ -103,10 +142,25 @@ case "${GENESIS_CC_PERMISSION_MODE:-auto}" in
     *)                     CC_PERM_FLAG="--permission-mode auto" ;;
 esac
 
+# Forwarded manual-mode args: shell-quote each one (%q) — the command below is
+# a single string tmux hands to the default shell (bash on Genesis installs).
+# A caller-supplied permission flag suppresses CC_PERM_FLAG so claude never
+# receives two conflicting permission arguments.
+CLAUDE_ARGS_Q=""
+if [[ ${#CLAUDE_EXTRA_ARGS[@]} -gt 0 ]]; then
+    for arg in "${CLAUDE_EXTRA_ARGS[@]}"; do
+        case "$arg" in
+            --dangerously-skip-permissions|--permission-mode|--permission-mode=*)
+                CC_PERM_FLAG="" ;;
+        esac
+    done
+    CLAUDE_ARGS_Q=$(printf ' %q' "${CLAUDE_EXTRA_ARGS[@]}")
+fi
+
 # -u: force UTF-8 output even if a future client's locale detection fails
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
     -e "LANG=$LANG" \
-    "cd ${GENESIS_ROOT} && exec claude ${CC_PERM_FLAG}"
+    "cd ${GENESIS_ROOT} && exec claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}"

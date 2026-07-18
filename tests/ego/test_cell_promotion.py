@@ -131,17 +131,23 @@ def test_handler_wired_into_all_resolution_paths():
     """Every proposal-resolution entry point MUST call the cell-promotion hook,
     or an approval there silently no-ops."""
     root = Path(genesis.__file__).parent
-    for path in [
+    entry_points = [
         root / "ego" / "proposals.py",
         root / "mcp" / "health" / "ego_tools.py",
         root / "dashboard" / "routes" / "ego.py",
         root / "dashboard" / "routes" / "comms.py",
-    ]:
+    ]
+    for path in entry_points:
         src = path.read_text()
-        assert "handle_cell_promotion_resolution" in src, (
-            f"{path} is missing the cell-promotion apply hook — "
-            "an approval there would silently no-op"
+        assert "handle_proposal_resolution" in src, (
+            f"{path} is missing the shared resolution hook — "
+            "a resolution there would silently skip side effects"
         )
+    shared = (root / "ego" / "resolution.py").read_text()
+    assert "handle_cell_promotion_resolution" in shared, (
+        "ego/resolution.py no longer runs handle_cell_promotion_resolution — "
+        "that action would silently no-op on every entry point"
+    )
 
 
 def test_excluded_from_approved_proposal_sweep():

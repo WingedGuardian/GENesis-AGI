@@ -23,7 +23,8 @@ async def db():
             status TEXT NOT NULL DEFAULT 'active',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             resolved_at TEXT,
-            resolution TEXT
+            resolution TEXT,
+            kind TEXT NOT NULL DEFAULT 'directive'
         )
     """)
     await conn.execute("""

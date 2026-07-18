@@ -9,6 +9,50 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **The morning report's numbers are real now.** Report generation previously
+  counted truncated display lists (reporting "5 follow-ups" when 268 existed),
+  sometimes inverted protective facts into alarms (an active OOM-protection
+  service reported as an OOM risk), and — worst — the carefully grounded
+  draft was silently re-drafted by a generic model with no grounding rules
+  before delivery. The report context now opens with an authoritative
+  Ground Truth section of exact totals, truncated lists are labeled
+  "showing N of M", protective mechanisms are tagged so they can't be read
+  as risks, and the grounded draft is delivered as-is (single draft pass).
+- **Reflections stop arguing with themselves about signals that never
+  fired.** All reflection depths now see live awareness signals in one
+  canonical format (previously light and deep cycles each got a different
+  shape, so one cycle couldn't recognize what the other had cited), the
+  prompt now clearly separates live tick signals from stored-observation
+  history, and a guard strips any signal-by-name-and-value claim from a
+  reflection's persisted narrative when that signal wasn't actually in the
+  live tick. This ends the loop where a phantom claim ("signal X=0.9") got
+  written into cognitive state, re-read by the next reflection, debunked,
+  and then re-asserted for days. The guard only annotates — it never blocks
+  or rejects a reflection's update.
+
+- **Reflection updates in Telegram are now real summaries.** The reflection
+  topic previously relayed the model's raw output, so a malformed reflection
+  could leak internal tool-call chatter to your Telegram verbatim. Messages
+  are now built only from the parsed reflection fields (assessment, key
+  observations, next focus); when a reflection's output can't be parsed you
+  get a short "completed — stored for review" notice instead of noise, and
+  unparseable output is no longer stored as a reflection summary that later
+  reflections would re-read and argue with.
+
+- **Demoted autonomy can actually earn its way back now.** Earn-back
+  eligibility used to be computed over a category's entire lifetime record,
+  so after a rough patch the math could require months of flawless behavior
+  before Genesis would even *propose* restoring a level — in practice the
+  demotion was permanent and the system nagged about it forever. Eligibility
+  now looks at a recent evidence window (45 days by default,
+  `earnback.window_days` in `config/autonomy.yaml`): old mistakes age out,
+  recent clean behavior counts, and promotion still always requires your
+  explicit approval. While an earn-back proposal is sitting in your queue,
+  the internal "autonomy regressed" alarm also calms down instead of firing
+  on every awareness tick.
+
 ### Added
 
 - **Every significant action now commits with a falsifiable prediction.**
@@ -22,6 +66,94 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Task completions and failures also now land on the outcome bus in real
   time (the first live emits), instead of waiting for the twice-daily
   harvester.
+- **Your decisions now stick.** When you reject a proposal with a reason —
+  from Telegram, the dashboard, the chat tab, or in conversation — the ruling
+  is captured as a durable **Settled Decision** that the ego sees in every
+  future cycle and may not re-propose, re-litigate, or work around. Repeat
+  rulings on the same theme reaffirm the existing decision instead of piling
+  up duplicates; only you can supersede one. Previously each entry point
+  recorded a different subset of side effects (the dashboard recorded almost
+  nothing), so the ego could agree with you in chat and then re-propose the
+  same thing days later. A new `ego_decision` tool also captures rulings you
+  state directly in conversation.
+- **Your deny reasons finally count as engagement.** The engagement signal
+  now covers all Genesis outbound — outreach messages *and* ego proposals —
+  and a typed reason on a proposal counts as engagement. The system will no
+  longer claim "the user doesn't engage" while you're actively ruling on its
+  proposals. The dashboard reject flow nudges for a reason ("Why? This
+  teaches the ego — a reason becomes a standing rule"), which stays optional.
+- **Groundwork: Genesis can now measure whether its entity graph would improve
+  recall, without changing any results yet.** A new shadow-only lane resolves a
+  recall query to entities in its knowledge graph, walks their relationships,
+  and records how many new, still-valid memories it would have surfaced that
+  ordinary search missed. This is measurement only (one internal metric per
+  recall); it ships off by default and never alters what recall returns, so the
+  data can decide whether building the live version is worth it.
+- **Genesis now tidies near-duplicate entities in its knowledge graph.** When
+  it learns about a "thing" (a project, tool, concept, person) whose name is
+  very close to one it already knows, it now decides whether they are the same
+  thing or genuinely different, and can merge the duplicates so its memory of
+  you stays coherent instead of fragmenting across "neural monitor" /
+  "neural-monitor" / "neural_monitor". Two independent models must agree before
+  anything merges, and pairs that only differ by a number (`PR #989` vs
+  `PR #990`) are never merged. It ships in **shadow mode by default** — it
+  records what it *would* merge without touching anything, so you can review the
+  proposals first; flip it to live with
+  `settings_update("entity_adjudication", {"mode": "live"})` (or turn it off
+  entirely). A background sweep also reconciles the entities it already had.
+
+### Changed
+
+- **Updates are more resilient and briefly less disruptive.** `scripts/update.sh`
+  now downloads new code *before* stopping Genesis, so a slow or stalled network
+  fetch no longer prolongs the restart — and a failed fetch leaves the server
+  running, untouched. The machine-info blocks in `~/.claude/CLAUDE.md` are also
+  regenerated *after* services come back up instead of during the offline
+  window, trimming the downtime slightly.
+
+- **Finished background-queue rows are now pruned after 45 days.** The internal
+  deferred-work queue kept every completed item forever; it now retains 45 days
+  of history and drops the rest, so the queue can't slowly grow without bound.
+
+- **Every terminal door now leads to the same persistent session.** Running
+  `claude` by hand over SSH or in the dashboard web terminal now lands in a
+  persistent numbered tmux slot (`cc-N`, lowest free — the same pool the SSH
+  slot hostnames use), with a printed map of your existing slots and how to
+  reattach. A dropped connection or closed browser tab just detaches the
+  session; walking back in can never spawn a second copy. Previously, manual
+  launches got a uniquely-named throwaway tmux session that nothing ever
+  reattached to — abandoned launches quietly accumulated as orphaned
+  processes. Extra arguments (e.g. `--resume <id>`) are forwarded into the
+  slot; opt out per-shell with `GENESIS_NO_TMUX_WRAP=1`. The wrapper updates
+  itself on your next `update.sh` run.
+
+### Removed
+
+- **The duplicate-session guard is gone — it fought the wrong enemy.** The
+  guard (July 14) keyed "who owns this conversation" on process liveness, but
+  a slot session lives for days and serves many conversations, so reopening
+  any conversation in a different slot manufactured a phantom "duplicate
+  executor" — denying legitimate work and paging critical alerts for
+  incidents that weren't happening. With every door now attach-or-create
+  (above), the accidental-twin scenario the guard existed for can no longer
+  occur; deliberately resuming one conversation in two terminals at once is
+  allowed and left to your judgment. Removed: the PreToolUse deny hook, the
+  session-owner registry (leftover `~/.genesis/session-owners` data is
+  cleaned up on next bootstrap), the session-start warning, and the paging
+  check. The fast dead-SSH-client detection (sshd ClientAlive) stays — it
+  makes dropped connections detach cleanly.
+
+### Added
+
+- **Genesis now watches whether the host machine's clock is actually being
+  kept in sync.** The container shares its host's clock, so if the host's
+  time-sync daemon dies or stops syncing, TLS handshakes, log timestamps, and
+  scheduled jobs all quietly skew — and nothing noticed. The infrastructure
+  profile's host plane now reports which NTP daemon runs the clock and a
+  composite health state (synced / degraded / unsynced) that catches a dead
+  daemon even while the kernel's own sync flag still claims all is well; a
+  state flip surfaces as an infrastructure-drift observation like any other
+  change to the machine's vitals.
 
 - **Genesis now writes down its predictions before acting — the substrate.**
   A new cognitive ledger stores falsifiable predictions ("this outreach will
@@ -33,15 +165,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   This is the foundation; the hooks that write predictions on every action
   and the grader that scores them land next.
 
-- **An unprotected box now tells you.** If a memory-crash protection is
+- **An unprotected box now tells you.** If a crash-resilience protection is
   missing on your install — container swap disabled, systemd-oomd
-  pressure-kill not configured, no host swap, or the container's swap
-  allowance switched off — Genesis now raises a standing alert (dashboard +
-  morning report) naming what's missing and how to fix it, and clears it
-  automatically once the protection is restored. Previously a box that was
-  *always* unprotected produced no signal at all; only a *change* was
-  detected. If the infrastructure self-profile stops refreshing (>3 days
-  old), you get a distinct "posture unknown" alert instead of stale claims.
+  pressure-kill not configured, no host swap, the container's swap allowance
+  switched off, or (on a systemd-networkd–managed box) the network
+  address-retention or the self-healing networkd watchdog missing — Genesis
+  now raises a standing alert (dashboard + morning report) naming what's
+  missing and how to fix it, and clears it automatically once the protection
+  is restored. The network checks stay silent on NetworkManager installs,
+  where they don't apply. Previously a box that was *always* unprotected
+  produced no signal at all; only a *change* was detected. If the
+  infrastructure self-profile stops refreshing (>3 days old), you get a
+  distinct "posture unknown" alert instead of stale claims.
 
 ### Fixed
 
@@ -53,6 +188,51 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   doors that passed raw client strings straight through (an MCP tool and a
   dashboard endpoint) validate first — a bogus value gets a polite rejection
   instead of a crash.
+- **The host recovery brain no longer goes blind on a misconfigured work
+  directory.** If the guardian's configured Claude Code work directory already
+  exists but isn't writable by the guardian (for example a root-owned
+  `/var/lib` path left over from an older install), it now detects that with a
+  real write probe and falls back to a user-writable directory instead of
+  handing the recovery session an unusable working directory. Previously only a
+  *non-creatable* directory triggered the fallback; an existing-but-unwritable
+  one slipped through and could blind the recovery brain exactly when it was
+  needed most.
+
+- **Disaster recovery no longer risks corrupting the thing it's recovering.** A
+  script audit found three ways deploy/restore could bite at the worst moment,
+  now fixed: (1) during a database restore, the health watchdog could restart
+  the server mid-rebuild — into a half-populated database that the next backup
+  would then capture as the newest "complete" snapshot; restore now holds the
+  same deploy-in-progress marker the watchdog already honors, so it stands down
+  until the restore finishes. (2) The pre-restore "undo" copy was taken from the
+  live database without its write-ahead log and then the original was deleted —
+  leaving a torn, stale rollback copy exactly when an operator needs to undo a
+  bad restore; the copy is now taken after the writer is stopped, via a
+  WAL-aware snapshot. (3) The Guardian installer aborted on any host without
+  Claude Code already installed — which is every fresh host, since the installer
+  runs before Node/CC are set up — because an "optional" CLI probe wasn't guarded
+  under strict mode; it now degrades gracefully as intended.
+  sending on external channels (email, chat), Genesis scans messages and
+  quarantines anything that looks like a leaked credential. Its API-key
+  patterns predated today's key formats, so newer shapes slipped through
+  unflagged — OpenAI project and service-account keys (`sk-proj-…`,
+  `sk-svcacct-…`, `sk-admin-…`), OpenRouter keys (`sk-or-…`), and underscored
+  key bodies. The patterns now cover the full modern `sk-*` family, GitHub
+  tokens (`ghp_…`/`gho_…`/`github_pat_…`) are recognized for the first time,
+  and benign look-alikes (hyphenated slugs such as "sk-learn-pipeline") stay
+  unflagged.
+
+- **Idle abandoned sessions can now actually be cleaned up.** The process
+  reaper's "is anyone looking at this terminal?" check counted every tmux
+  pane as live — including sessions nothing is attached to. Under
+  persistent slot sessions that meant an abandoned session could never be
+  reclaimed, no matter how long it sat idle. A tmux pane now counts as live
+  only while its session has a client attached; a detached session is still
+  spared as long as it shows recent activity (so a dropped connection
+  mid-work is never at risk), and only one that is BOTH detached and idle
+  past the 7-day window becomes a cleanup candidate. The reaper remains in
+  observe-only mode — it reports what it would clean up and touches nothing
+  until explicitly armed.
 
 - **Answering Genesis's questions with a plain message now actually works.**
   When Genesis asked something and waited for your answer (approvals,

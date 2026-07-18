@@ -143,6 +143,36 @@ context, professional role changes, decision principles.
 well-represented in USER.md. Don't store transient conversational context
 ("user seems tired today"). Focus on durable knowledge about who the user is.
 
+## Decision & Agreement Capture
+
+When the user makes a RULING in conversation, capture it with the
+`ego_decision` MCP tool at the moment it happens — decisions that live only
+in the chat transcript are invisible to the ego and WILL be re-litigated.
+
+**What is a decision (capture these):**
+- A settled ruling ("Yes, my contract allows outside activity — publish
+  under my own name")
+- A standing rule ("Never propose de-identification as a compliance need")
+- An overrule of something Genesis proposed or assumed
+- A factual ruling that closes a question the ego keeps reopening
+
+**What is NOT a decision (do not capture):**
+- Preferences and soft guidance → User Knowledge Signals (`memory_store`)
+- One-off choices scoped to the current task ("skip it this time")
+- Explorations, brainstorming, thinking out loud
+
+**How:**
+- `ego_decision(action="record", content="[topic/category] the ruling",
+  ego_target="user_ego")` — distill the ruling into one sentence with a
+  `[type/category]` prefix; keep the user's meaning, not their phrasing.
+- `ego_decision(action="supersede", decision_id="<id>", reason="...")` —
+  ONLY when the user explicitly revokes or replaces an earlier ruling.
+- `ego_decision(action="list")` — check existing rulings before recording
+  a duplicate; if one already covers it, record nothing.
+
+When unsure whether something is a ruling or a preference, ask the user —
+one short question beats a wrong artifact.
+
 ## Session Start
 
 On your FIRST reply after a session starts (a fresh start, a resume, or after a

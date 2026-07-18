@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from genesis.awareness.signal_format import format_signals
 from genesis.awareness.types import Depth, TickResult
 from genesis.db.crud import cognitive_state, observations, predictions, signal_weights
 from genesis.identity.loader import IdentityLoader
@@ -451,33 +452,13 @@ class ContextAssembler:
         excluded_signals: set[str] | None = None,
         min_value: float = 0.0,
     ) -> str:
-        staleness = tick.signal_staleness or {}
-        tick_interval_min = 5  # awareness loop tick interval
-        lines = []
-        for s in tick.signals:
-            if excluded_signals is not None and s.name in excluded_signals:
-                continue
-            if min_value > 0 and s.value <= min_value:
-                continue
-            line = f"{s.name}: {s.value} (source={s.source})"
-            if s.normal_max is not None:
-                status = (
-                    "CRITICAL" if s.critical_threshold is not None and s.value >= s.critical_threshold
-                    else "WARNING" if s.warning_threshold is not None and s.value >= s.warning_threshold
-                    else "normal"
-                )
-                line += (
-                    f" [{status}; normal<={s.normal_max},"
-                    f" warn>={s.warning_threshold}, crit>={s.critical_threshold}]"
-                )
-            if s.baseline_note:
-                line += f" -- baseline: {s.baseline_note}"
-            unchanged = staleness.get(s.name, 0)
-            if unchanged >= 2:
-                hours = unchanged * tick_interval_min / 60
-                line += f" (persistent ~{hours:.1f}h)"
-            lines.append(line)
-        return "\n".join(lines)
+        """Thin delegate onto the canonical formatter (awareness.signal_format)."""
+        return format_signals(
+            tick.signals,
+            staleness=tick.signal_staleness or {},
+            excluded_signals=excluded_signals,
+            min_value=min_value,
+        )
 
     def _extract_tick_number(self, tick: TickResult) -> int:
         """Derive a deterministic tick number from tick_id for template rotation.

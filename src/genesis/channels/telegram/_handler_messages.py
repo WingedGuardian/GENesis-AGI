@@ -1194,7 +1194,7 @@ async def _try_ego_correction_store(ctx: HandlerContext, msg) -> bool:
             await store.store(
                 content=f"User correction (ego): {msg.text}",
                 source="telegram_ego_correction",
-                tags=["user_correction", "ego"],
+                tags=["user_correction", "ego_correction", "ego"],
                 memory_type="episodic",
                 wing="autonomy",
                 room="ego",
