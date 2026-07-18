@@ -124,8 +124,12 @@ async def init(rt: GenesisRuntime) -> None:
             storage_embedding_provider=storage_embedder,
             recall_embedding_provider=recall_embedder,
             activity_tracker=rt._activity_tracker,
+            # Share the SAME reranker the runtime stack uses so the MCP recall
+            # tools (memory_recall / knowledge_recall) actually rerank instead
+            # of silently building a reranker-less retriever.
+            reranker=reranker,
         )
-        logger.info("Memory MCP initialized (dual embedders)")
+        logger.info("Memory MCP initialized (dual embedders, shared reranker)")
 
         if rt._result_writer is not None:
             rt._result_writer._memory_store = rt._memory_store

@@ -229,6 +229,7 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
         from genesis.db.connection import get_db
         from genesis.mcp.memory_mcp import init
         from genesis.memory.embeddings import EmbeddingProvider
+        from genesis.memory.reranker import VoyageReranker
         from genesis.observability.provider_activity import ProviderActivityTracker
 
         # Long-lived shared connection via SerializedConnection (see _bootstrap_health).
@@ -252,8 +253,12 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             # thus the boundary — never attaches.
             tracker = ProviderActivityTracker()
             tracker.set_db(db)
+            # Wire the Voyage reranker into the standalone MCP retriever too, so
+            # memory_recall / knowledge_recall rerank here exactly as in the
+            # full runtime. Degrades to a no-op without API_KEY_VOYAGE.
+            reranker = VoyageReranker()
             init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
-                 activity_tracker=tracker)
+                 activity_tracker=tracker, reranker=reranker)
             clear_mcp_crash("memory")
             yield
         finally:

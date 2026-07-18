@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import UTC, datetime
 
+from genesis.memory import graph_expansion
 from genesis.memory.provenance import label_result_dicts, wrap_external_recall
 from genesis.memory.reference_ops import (
     REFERENCE_KINDS as _REFERENCE_KINDS,
@@ -97,6 +98,9 @@ async def knowledge_recall(
         source="knowledge",
         limit=limit,
         project_type=project,
+        # recall() defaults rerank=True; gate it at this tool boundary so the
+        # config mode + GENESIS_MEMORY_RERANK_OFF kill apply (no-op without key).
+        rerank=graph_expansion.reranker_enabled(),
         event_id_sink=recall_event_sink,
     )
 
@@ -636,6 +640,8 @@ async def reference_lookup(
             query,
             source="episodic",
             limit=vector_limit,
+            # Gate rerank at the tool boundary (see knowledge_recall above).
+            rerank=graph_expansion.reranker_enabled(),
         )
         for r in vector_results:
             vector_hits.append(

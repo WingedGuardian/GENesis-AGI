@@ -489,3 +489,70 @@ async def test_expand_skips_deprecated_neighbor(db):
     out = await graph_expansion.expand_neighbors(db, ["seed-1"], cap=10)
 
     assert out == []
+
+
+# --- reranker mode + kill switch (MCP recall tool gate) --------------------
+# reranker_enabled() gates Voyage reranking on the MCP recall tools ONLY.
+# off | live (no shadow), DEFAULT live. Kill = config mode off OR the
+# GENESIS_MEMORY_RERANK_OFF env. Master ``enabled: false`` also forces off.
+
+
+def test_reranker_defaults_to_live_with_no_files(config_dirs, monkeypatch):
+    monkeypatch.delenv("GENESIS_MEMORY_RERANK_OFF", raising=False)
+    cfg = graph_expansion.load_recall_config()
+    assert cfg["reranker"]["mode"] == "live"
+    assert graph_expansion.reranker_enabled() is True
+
+
+def test_reranker_mode_off_via_base(config_dirs, monkeypatch):
+    monkeypatch.delenv("GENESIS_MEMORY_RERANK_OFF", raising=False)
+    base, _ = config_dirs
+    _write(base, {"reranker": {"mode": "off"}})
+    assert graph_expansion.reranker_enabled() is False
+
+
+def test_reranker_overlay_wins_over_base(config_dirs, monkeypatch):
+    monkeypatch.delenv("GENESIS_MEMORY_RERANK_OFF", raising=False)
+    base, overlay = config_dirs
+    _write(base, {"reranker": {"mode": "live"}})
+    _write(overlay, {"reranker": {"mode": "off"}})
+    assert graph_expansion.reranker_enabled() is False
+
+
+def test_reranker_master_enabled_false_forces_off(config_dirs, monkeypatch):
+    monkeypatch.delenv("GENESIS_MEMORY_RERANK_OFF", raising=False)
+    base, _ = config_dirs
+    _write(base, {"enabled": False, "reranker": {"mode": "live"}})
+    assert graph_expansion.reranker_enabled() is False
+
+
+def test_reranker_invalid_mode_degrades_to_live(config_dirs, monkeypatch):
+    # Unlike graph_expansion (degrades to shadow), the reranker has no shadow —
+    # an invalid value keeps reranking ON (the tools promise it).
+    monkeypatch.delenv("GENESIS_MEMORY_RERANK_OFF", raising=False)
+    base, _ = config_dirs
+    _write(base, {"reranker": {"mode": "banana"}})
+    assert graph_expansion.reranker_enabled() is True
+
+
+def test_reranker_unquoted_off_boolean_is_off(config_dirs, monkeypatch):
+    # A hand-edited unquoted ``mode: off`` parses as YAML-1.1 boolean False.
+    monkeypatch.delenv("GENESIS_MEMORY_RERANK_OFF", raising=False)
+    base, _ = config_dirs
+    base.write_text("reranker:\n  mode: off\n")
+    assert graph_expansion.reranker_enabled() is False
+
+
+def test_reranker_env_kill_forces_off_even_when_config_live(config_dirs, monkeypatch):
+    base, _ = config_dirs
+    _write(base, {"reranker": {"mode": "live"}})
+    monkeypatch.setenv("GENESIS_MEMORY_RERANK_OFF", "1")
+    assert graph_expansion.reranker_enabled() is False
+
+
+def test_reranker_env_kill_various_truthy(config_dirs, monkeypatch):
+    for val in ("1", "true", "yes"):
+        monkeypatch.setenv("GENESIS_MEMORY_RERANK_OFF", val)
+        assert graph_expansion.reranker_enabled() is False
+    monkeypatch.setenv("GENESIS_MEMORY_RERANK_OFF", "0")
+    assert graph_expansion.reranker_enabled() is True

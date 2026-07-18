@@ -28,3 +28,14 @@ graph_expansion:
 # ("off" quoted: unquoted it parses as YAML-1.1 boolean False.)
 entity_lane:
   mode: "off"
+
+# Voyage cross-encoder reranking on the MCP recall tools (memory_recall,
+# knowledge_recall, reference_lookup). off | live — DEFAULT live: these tools
+# default rerank=True and their retriever now carries the Voyage reranker.
+# Kill switch for a Voyage cost / latency / outage concern: set mode "off"
+# (read live, no restart) or export GENESIS_MEMORY_RERANK_OFF=1. Reranking
+# still no-ops automatically when API_KEY_VOYAGE is unset. This gates ONLY the
+# MCP tool path — not the internal runtime context stack (long-standing) nor
+# the LongMemEval harness (hermetic). ("off" quoted per the YAML-1.1 note.)
+reranker:
+  mode: live

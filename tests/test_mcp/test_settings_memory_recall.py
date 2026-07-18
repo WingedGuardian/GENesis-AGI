@@ -73,6 +73,22 @@ def test_exclude_link_types_must_be_str_list():
     assert _validate_memory_recall({"graph_expansion": {"exclude_link_types": []}}) == []
 
 
+def test_reranker_mode_accepts_off_and_live():
+    assert _validate_memory_recall({"reranker": {"mode": "off"}}) == []
+    assert _validate_memory_recall({"reranker": {"mode": "live"}}) == []
+
+
+def test_reranker_mode_rejects_shadow_and_garbage():
+    # Reranker is binary (no shadow) — shadow/other values must be rejected so a
+    # settings_update can't land a config that only degrades-with-warning.
+    assert _validate_memory_recall({"reranker": {"mode": "shadow"}})
+    assert _validate_memory_recall({"reranker": {"mode": "banana"}})
+
+
+def test_reranker_rejects_unknown_subkey():
+    assert _validate_memory_recall({"reranker": {"max_neighbors": 5}})
+
+
 def test_section_must_be_mapping():
     assert _validate_memory_recall({"graph_expansion": "live"})
     assert _validate_memory_recall({"entity_lane": []})
