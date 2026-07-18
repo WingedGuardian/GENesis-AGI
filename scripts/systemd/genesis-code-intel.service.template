@@ -11,12 +11,15 @@ ExecStart=/bin/bash __REPO_DIR__/scripts/code_intel_runner.sh
 # throttled (duty-cycled) full rebuild is never SIGTERMed mid-flight. A wedged
 # runner is still bounded by its own self-flock (one tick at a time).
 TimeoutStartSec=16200
-# PATH MUST include ~/.npm-global/bin — that's where codebase-memory-mcp and
-# gitnexus live. If they are absent from the unit PATH the entrypoint exits 3
-# ("requested tool missing") and the runner keeps the marker instead of silently
-# stamping a fake success. Also needs systemctl/systemd-run (the watchdog's
+# PATH MUST include BOTH tool dirs: gitnexus lives in ~/.npm-global/bin, and
+# codebase-memory-mcp installs to ~/.local/bin (the vendor install.sh default,
+# cf. .claude/mcp/run-codebase-memory). If either is absent from the unit PATH
+# the entrypoint exits 3 ("requested tool missing") and the runner keeps the
+# marker instead of silently stamping a fake success — which is exactly what
+# happened when ~/.local/bin was omitted: cbm indexing was dead for days while
+# gitnexus kept working. Also needs systemctl/systemd-run (the watchdog's
 # cgroup freeze), flock, ps, awk, git (/usr/bin) and the venv python.
-Environment=PATH=__VENV__/bin:__HOME__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=__VENV__/bin:__HOME__/.npm-global/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
 StandardOutput=journal
 StandardError=journal
 # Writes only under $HOME (index-request markers + locks under ~/.genesis, the
