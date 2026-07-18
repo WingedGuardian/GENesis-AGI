@@ -446,7 +446,6 @@ call_sites:
   27_pre_execution_assessment:
     chain:
     - glm51
-    - minimax-m25
     - openrouter-deepseek-v4-flash
     default_paid: true
     retry_profile: user_facing
@@ -455,7 +454,6 @@ call_sites:
   # (awareness/loop.py:perform_tick). Kept as historical; no live consumers.
   28_observation_sweep:
     chain:
-    - minimax-m25
     - openrouter-deepseek-v4-flash
     - glm51
     - groq-free
