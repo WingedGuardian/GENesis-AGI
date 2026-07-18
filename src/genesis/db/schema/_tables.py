@@ -1650,6 +1650,38 @@ TABLES = {
             PRIMARY KEY (source_id, target_id, link_type)
         )
     """,
+    # Entity-node merge-vs-distinct adjudication ledger (migration 0065). NOT
+    # the memory-pair dedup trail — that is entity_resolution_audit. One row per
+    # fuzzy entity PAIR (order-independent pair_key = sorted ids joined), written
+    # by the entity_adjudication drainer. `verdict`: 'distinct' (keep both),
+    # 'merge' (applied — loser tombstoned into survivor), 'proposed_merge'
+    # (propose_only shadow: recorded, NOT applied), 'stale' (a proposal that no
+    # longer holds — one side merged/renamed/gone since). norm_/updated_ snapshots
+    # power the propose_only→live staleness guard. `provider` is the deciding LLM
+    # provider or 'mechanical' (digit-guard). pair_key UNIQUE = the dedup key the
+    # producer never had.
+    "entity_adjudications": """
+        CREATE TABLE IF NOT EXISTS entity_adjudications (
+            id           TEXT PRIMARY KEY,
+            pair_key     TEXT NOT NULL UNIQUE,
+            entity_a     TEXT NOT NULL,
+            entity_b     TEXT NOT NULL,
+            loser_id     TEXT,
+            survivor_id  TEXT,
+            verdict      TEXT NOT NULL CHECK (verdict IN (
+                'merge','distinct','proposed_merge','stale'
+            )),
+            reasoning    TEXT,
+            provider     TEXT,
+            mode         TEXT,
+            norm_a       TEXT,
+            norm_b       TEXT,
+            updated_a    TEXT,
+            updated_b    TEXT,
+            created_at   TEXT NOT NULL,
+            applied_at   TEXT
+        )
+    """,
     # Session-manager durable spine (PR-2a, migration 0058). session_id is the
     # CC transcript session id (= cc_sessions.cc_session_id, NOT cc_sessions.id).
     # origin_prompt/origin_ts are write-once: nullable so MCP stubs can exist
@@ -1991,6 +2023,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)",
     "CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id)",
     "CREATE INDEX IF NOT EXISTS idx_entity_links_target ON entity_links(target_id)",
+    # entity adjudication ledger — hot query is the propose_only→live backlog scan
+    "CREATE INDEX IF NOT EXISTS idx_entity_adjud_verdict ON entity_adjudications(verdict)",
     # pending embeddings
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_status ON pending_embeddings(status)",
     "CREATE INDEX IF NOT EXISTS idx_pending_embeddings_memory ON pending_embeddings(memory_id)",
