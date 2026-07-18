@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -318,6 +319,40 @@ def test_ensure_work_dir_propagates_when_fallback_also_uncreatable(tmp_path):
     blocker.write_text("file")
     with pytest.raises(OSError):
         _ensure_work_dir(blocker / "wd", fallback=blocker / "fb")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory write permissions")
+def test_ensure_work_dir_falls_back_when_configured_exists_but_unwritable(tmp_path):
+    # idx-0 gap: the dir EXISTS (mkdir(exist_ok=True) is a silent no-op) but is
+    # not writable by the guardian user (root-owned / mode 0555 on a vintage
+    # /var/lib install). The CC subprocess would run with an unwritable cwd and
+    # the recovery brain would be blinded — so we must write-probe and fall back.
+    configured = tmp_path / "cc-sessions"
+    configured.mkdir()
+    configured.chmod(0o555)
+    fallback = tmp_path / "state" / "cc-sessions"
+    try:
+        got = _ensure_work_dir(configured, fallback=fallback)
+        assert got == fallback and fallback.is_dir()
+    finally:
+        configured.chmod(0o755)  # let tmp_path cleanup remove it
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory write permissions")
+def test_ensure_work_dir_raises_when_fallback_exists_but_unwritable(tmp_path):
+    # configured uncreatable AND fallback exists-but-unwritable → no usable work
+    # dir anywhere → OSError propagates so diagnose() escalates alert-only,
+    # rather than silently handing back an unwritable fallback.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("file")
+    fallback = tmp_path / "fb"
+    fallback.mkdir()
+    fallback.chmod(0o555)
+    try:
+        with pytest.raises(OSError):
+            _ensure_work_dir(blocker / "wd", fallback=fallback)
+    finally:
+        fallback.chmod(0o755)
 
 
 def _stub_claude(tmp_path, body: str):
