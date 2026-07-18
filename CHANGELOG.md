@@ -23,6 +23,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   normal in-flight worklist the background drainer churns through.
   The API Keys "N ok / M" tally is also correct now (it previously double-
   counted local providers, so the numbers didn't add up).
+- **The Ego card says "needs action" instead of "degraded" when approvals are
+  waiting.** Pending ego proposals are a review queue awaiting you, not a system
+  fault — so the card no longer paints itself amber-degraded when more than a
+  handful pile up. It shows a distinct "needs action" state (its own accent
+  colour and ◆ glyph), and pending approvals no longer drag the overall
+  dashboard health to "degraded" — they ride along as a note on an otherwise
+  healthy system.
 - **Provisioning approvals can be retried, and never race each other.** A
   grow/limits approval prompt that timed out unanswered used to silently block
   every retry for 24 hours (the generic outreach dedup window treated the
