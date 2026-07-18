@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Reflection updates in Telegram are now real summaries.** The reflection
+  topic previously relayed the model's raw output, so a malformed reflection
+  could leak internal tool-call chatter to your Telegram verbatim. Messages
+  are now built only from the parsed reflection fields (assessment, key
+  observations, next focus); when a reflection's output can't be parsed you
+  get a short "completed — stored for review" notice instead of noise, and
+  unparseable output is no longer stored as a reflection summary that later
+  reflections would re-read and argue with.
+
 - **Demoted autonomy can actually earn its way back now.** Earn-back
   eligibility used to be computed over a category's entire lifetime record,
   so after a rough patch the math could require months of flawless behavior
