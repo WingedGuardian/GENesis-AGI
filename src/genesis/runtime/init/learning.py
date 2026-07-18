@@ -1089,7 +1089,7 @@ async def init(rt: GenesisRuntime) -> None:
                 return
             import os
 
-            if os.environ.get("GENESIS_LEDGER_GRADER_DISABLED"):
+            if os.environ.get("GENESIS_LEDGER_GRADER_DISABLED") == "1":
                 return
             try:
                 from genesis.ledger.grader import grade_due_predictions

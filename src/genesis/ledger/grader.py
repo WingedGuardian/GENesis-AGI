@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from genesis.db.crud import ledger_predictions as lp_crud
@@ -157,8 +157,13 @@ async def grade_due_predictions(
     """Grade every open prediction whose deadline has passed. Idempotent.
 
     ``now`` is injectable for tests (also threaded into ``list_due_open`` and
-    each resolver so a single frozen clock drives the whole pass).
+    each resolver so a single frozen clock drives the whole pass). Default it
+    HERE — the production call site passes none, and the resolvers'
+    ``_past_deadline`` check does ``now >= deadline`` with no fallback, so a
+    ``None`` would TypeError every absence-path row into ``grade_failed``
+    instead of resolving it.
     """
+    now = now or datetime.now(UTC)
     report = GradeReport()
     rows = await lp_crud.list_due_open(db, now=now, limit=limit)
     report.scanned = len(rows)

@@ -280,6 +280,36 @@ async def test_double_grade_is_noop(db):
     assert row["status"] == "resolved" and row["outcome_value"] == 1
 
 
+async def test_default_now_grades_absence_rows(db):
+    """The production call site passes no ``now`` — the grader must default it,
+    or every absence-path row TypeErrors into grade_failed (regression: the
+    resolvers' _past_deadline does ``now >= deadline`` with no fallback).
+
+    Deterministic without wall-clock coupling: the row is born with a fixed
+    deadline (2026-07-16T13:00) that is monotonically in the past for any real
+    run, so the defaulted real ``now`` always sees it as due + past-deadline.
+    """
+    await _seed_outreach(db, "o-def")  # exists, silent → absence path
+    await lp.create(
+        db,
+        action_class="outreach_send",
+        subject_ref_type="outreach",
+        subject_ref_id="o-def",
+        domain="outreach.insight",
+        metric="reply_received",
+        confidence=0.5,
+        deadline_at=(BASE + timedelta(hours=1)).isoformat(),
+        provenance="policy_prior",
+        predictor="test",
+        now=BASE,
+    )
+    report = await grade_due_predictions(db)  # NO now= — the production path
+    row = (await lp.list_by_subject(db, action_class="outreach_send", subject_ref_id="o-def"))[0]
+    assert row["status"] == "resolved" and row["resolver"] == "mechanical_absence"
+    assert report.absence == 1
+    assert grader.grade_failure_counts()["grade_failed"] == {}  # no TypeError swallowed
+
+
 async def test_empty_state_clean_noop(db):
     report = await grade_due_predictions(db, now=AFTER)
     assert report.scanned == 0 and report.resolved == 0
