@@ -188,6 +188,10 @@ class EgoCadenceManager:
         # backed-off cadence instead of resetting to base (the in-memory-only
         # reset that pinned the ego at base cadence under restart churn).
         await self._restore_interval()
+        # Restore the last proactive fire time so the quiet-hours floor is not
+        # reset to "allow" by every restart (restart churn would otherwise let
+        # a proactive tick through inside the overnight floor).
+        await self._restore_last_proactive_fire()
         boot_first_fire = await self._compute_boot_first_fire()
         ego_cycle_kwargs: dict[str, object] = {
             "id": "ego_cycle",
@@ -842,7 +846,9 @@ class EgoCadenceManager:
             expires_at=_expires_in(self._current_interval),
         )
         if self._signal_queue.push(signal):
-            self._last_proactive_fire_at = _now_utc()
+            fired_at = _now_utc()
+            self._last_proactive_fire_at = fired_at
+            await self._persist_last_proactive_fire(fired_at)
             logger.debug("Proactive signal pushed: %s", signal.summary)
         else:
             # Roll back count so deep-think alignment is preserved
@@ -1255,7 +1261,11 @@ class EgoCadenceManager:
         except (ValueError, TypeError):
             return
         lo = self._config.cadence_minutes
-        hi = self._config.max_interval_minutes
+        # Ceiling is the recency-aware max, NOT the static config cap: when the
+        # user has been away long enough, _update_interval persists intervals
+        # above max_interval_minutes (480/1440/...). Clamping to the static cap
+        # here would collapse long-idle backoff to 4h on every restart.
+        hi = max(lo, await self._recency_max_interval())
         clamped = max(lo, min(value, hi))
         if clamped != self._current_interval:
             logger.info(
@@ -1282,6 +1292,44 @@ class EgoCadenceManager:
             )
         except Exception:
             logger.debug("Failed to persist cadence interval", exc_info=True)
+
+    async def _persist_last_proactive_fire(self, when: datetime) -> None:
+        """Persist the last proactive fire time so the quiet-hours floor
+        survives restarts. Best-effort.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            await ego_crud.set_state(
+                self._db,
+                key=f"last_proactive_fire:{self._session._source_tag}",
+                value=when.isoformat(),
+            )
+        except Exception:
+            logger.debug("Failed to persist last proactive fire", exc_info=True)
+
+    async def _restore_last_proactive_fire(self) -> None:
+        """Load the persisted last proactive fire time (if any) so the
+        quiet-hours floor is honoured across restarts.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            raw = await ego_crud.get_state(
+                self._db, f"last_proactive_fire:{self._session._source_tag}",
+            )
+        except Exception:
+            logger.debug("Last-fire restore read failed", exc_info=True)
+            return
+        if not raw:
+            return
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            return
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        self._last_proactive_fire_at = parsed
 
     async def _update_interval(self, *, had_proposals: bool) -> None:
         """Adjust cycle interval based on productivity and user recency.

@@ -1458,6 +1458,44 @@ class TestIntervalPersistence:
         await cadence._restore_interval()
         assert cadence.current_interval_minutes == cadence._config.cadence_minutes
 
+    async def test_restore_keeps_recency_expanded_backoff(
+        self, cadence, mock_session, db,
+    ):
+        """A persisted interval above the static cap survives restart when the
+        user has been away long enough for the recency ceiling to expand."""
+        mock_session._source_tag = "user_ego_cycle"
+        # User last active 5 days ago → recency tier raises the ceiling to 1440.
+        await _insert_foreground_session(
+            db, last_activity_at=(datetime.now(UTC) - timedelta(days=5)).isoformat(),
+        )
+        from genesis.db.crud import ego as ego_crud
+        await ego_crud.set_state(
+            db, key="cadence_interval:user_ego_cycle", value="1440",
+        )
+        await cadence._restore_interval()
+        # NOT clamped down to the static config cap (240).
+        assert cadence.current_interval_minutes == 1440
+
+    async def test_last_proactive_fire_persisted_and_restored(
+        self, cadence, mock_session, db, mock_idle_detector, config,
+    ):
+        """The quiet-hours floor survives a restart: last proactive fire time is
+        persisted on tick and restored by a fresh manager."""
+        mock_session._source_tag = "user_ego_cycle"
+        from genesis.db.crud import ego as ego_crud
+        stamp = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        await ego_crud.set_state(
+            db, key="last_proactive_fire:user_ego_cycle", value=stamp,
+        )
+        fresh = EgoCadenceManager(
+            session=mock_session, config=config,
+            idle_detector=mock_idle_detector, db=db,
+        )
+        assert fresh._last_proactive_fire_at is None
+        await fresh._restore_last_proactive_fire()
+        assert fresh._last_proactive_fire_at is not None
+        assert fresh._last_proactive_fire_at.isoformat() == stamp
+
     async def test_boot_first_fire_uses_restored_interval(
         self, cadence, mock_session, db,
     ):
