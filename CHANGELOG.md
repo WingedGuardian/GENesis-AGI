@@ -9,6 +9,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reflections stop arguing with themselves about signals that never
+  fired.** All reflection depths now see live awareness signals in one
+  canonical format (previously light and deep cycles each got a different
+  shape, so one cycle couldn't recognize what the other had cited), the
+  prompt now clearly separates live tick signals from stored-observation
+  history, and a guard strips any signal-by-name-and-value claim from a
+  reflection's persisted narrative when that signal wasn't actually in the
+  live tick. This ends the loop where a phantom claim ("signal X=0.9") got
+  written into cognitive state, re-read by the next reflection, debunked,
+  and then re-asserted for days. The guard only annotates — it never blocks
+  or rejects a reflection's update.
+
 ### Added
 
 - **Genesis now tidies near-duplicate entities in its knowledge graph.** When

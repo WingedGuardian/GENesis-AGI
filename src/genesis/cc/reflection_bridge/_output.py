@@ -40,6 +40,7 @@ async def route_deep_output(
     output_router,
     gathered_obs_ids: tuple[str, ...] = (),
     gathered_surplus_ids: tuple[str, ...] = (),
+    tick_signal_names: set[str] | None = None,
 ) -> dict:
     """Parse and route deep reflection output via OutputRouter.
 
@@ -60,6 +61,7 @@ async def route_deep_output(
         parsed, db,
         gathered_obs_ids=gathered_obs_ids,
         gathered_surplus_ids=gathered_surplus_ids,
+        tick_signal_names=tick_signal_names,
     )
 
 
@@ -124,7 +126,10 @@ async def store_reflection_output(depth, tick, output, *, db) -> None:
 
     # Light: parse JSON for escalation, user_model_deltas, surplus_candidates
     if depth == Depth.LIGHT:
-        await _process_light_output(output, source=source, now=now, db=db)
+        await _process_light_output(
+            output, source=source, now=now, db=db,
+            tick_signal_names={s.name for s in tick.signals} if tick and tick.signals else None,
+        )
 
     # Extract and store focus_next_week from strategic output
     if depth == Depth.STRATEGIC:
@@ -138,8 +143,15 @@ async def store_reflection_output(depth, tick, output, *, db) -> None:
         )
 
 
-async def _process_light_output(output, *, source: str, now: str, db) -> None:
-    """Parse light reflection JSON and extract escalations, deltas, surplus."""
+async def _process_light_output(
+    output, *, source: str, now: str, db,
+    tick_signal_names: set[str] | None = None,
+) -> None:
+    """Parse light reflection JSON and extract escalations, deltas, surplus.
+
+    ``tick_signal_names``: live tick signal names for the phantom-signal
+    claim guard on the ``context_update`` narrative (None = skip).
+    """
     from genesis.db.crud import observations
 
     try:
@@ -292,11 +304,18 @@ async def _process_light_output(output, *, source: str, now: str, db) -> None:
                         pass  # unparseable — don't suppress (fail-open)
 
                 if hours_since_deep >= _DEEP_PRESERVE_HOURS:
+                    from genesis.reflection.signal_claims import guard_narrative
+
+                    guarded_update = await guard_narrative(
+                        db, context_update.strip(),
+                        tick_signal_names=tick_signal_names,
+                        source="light_reflection",
+                    )
                     await cognitive_state.replace_section(
                         db,
                         section="active_context",
                         id=str(uuid.uuid4()),
-                        content=context_update.strip(),
+                        content=guarded_update,
                         generated_by="light_reflection",
                         created_at=now,
                     )
