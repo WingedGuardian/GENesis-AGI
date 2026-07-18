@@ -36,9 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 async def _compute_cognitive_drift(
-    db: aiosqlite.Connection,
-    period_start: str,
-    period_end: str,
+    db: aiosqlite.Connection, period_start: str, period_end: str,
 ) -> tuple[dict, int]:
     """Dark drift metrics over ego_proposals (Phase 7 anti-overfitting baseline).
 
@@ -57,17 +55,13 @@ async def _compute_cognitive_drift(
     from collections import Counter
 
     rows = await ego_crud.get_proposals_for_drift(
-        db,
-        start=period_start,
-        end=period_end,
+        db, start=period_start, end=period_end,
     )
     total = len(rows)
     if total == 0:
         return {
-            "dissent_rate": None,
-            "alternative_rate": None,
-            "diversity_entropy": None,
-            "n_proposals": 0,
+            "dissent_rate": None, "alternative_rate": None,
+            "diversity_entropy": None, "n_proposals": 0,
         }, 0
 
     verdicts = [r["realist_verdict"] for r in rows if r["realist_verdict"]]
@@ -175,9 +169,7 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
             subsystem_results[sub_name] = grade_info
             logger.info(
                 "J9 subsystem %s: grade=%s score=%s (%d samples)",
-                sub_name,
-                grade_info["grade"],
-                grade_info["score"],
+                sub_name, grade_info["grade"], grade_info["score"],
                 grade_info["sample_count"],
             )
         except Exception:
@@ -215,9 +207,7 @@ def _dedupe_by_pair(events: list[dict]) -> list[dict]:
 
 
 async def _recall_entrenchment(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> dict:
     """MEM-005: weekly aggregation of the activation-entrenchment signal.
 
@@ -229,46 +219,30 @@ async def _recall_entrenchment(
     feeds the quality grade.
     """
     fired = await j9_eval.get_events(
-        db,
-        dimension="memory",
-        event_type="recall_fired",
-        since=since,
-        until=until,
-        limit=5000,
+        db, dimension="memory", event_type="recall_fired",
+        since=since, until=until, limit=5000,
     )
-    corrs = [
-        m["entrenchment_corr"]
-        for ev in fired
-        if (m := ev.get("metrics", {})).get("entrenchment_corr") is not None
-    ]
-    ret_counts = [
-        ev.get("metrics", {})["mean_retrieved_count"]
-        for ev in fired
-        if ev.get("metrics", {}).get("mean_retrieved_count") is not None
-    ]
-    ages = [
-        ev.get("metrics", {})["mean_age_days"]
-        for ev in fired
-        if ev.get("metrics", {}).get("mean_age_days") is not None
-    ]
+    corrs = [m["entrenchment_corr"] for ev in fired
+             if (m := ev.get("metrics", {})).get("entrenchment_corr") is not None]
+    ret_counts = [ev.get("metrics", {})["mean_retrieved_count"] for ev in fired
+                  if ev.get("metrics", {}).get("mean_retrieved_count") is not None]
+    ages = [ev.get("metrics", {})["mean_age_days"] for ev in fired
+            if ev.get("metrics", {}).get("mean_age_days") is not None]
     return {
         "entrenchment_corr_mean": round(sum(corrs) / len(corrs), 4) if corrs else None,
         "entrenchment_mean_retrieved_count": (
-            round(sum(ret_counts) / len(ret_counts), 2) if ret_counts else None
-        ),
-        "entrenchment_mean_age_days": (round(sum(ages) / len(ages), 1) if ages else None),
+            round(sum(ret_counts) / len(ret_counts), 2) if ret_counts else None),
+        "entrenchment_mean_age_days": (
+            round(sum(ages) / len(ages), 1) if ages else None),
         "entrenchment_sample": len(corrs),
     }
 
 
 async def _pool_counts_safe(db: aiosqlite.Connection) -> dict:
-    """Point-in-time pool-size counts, isolated in its own try/except.
-
-    A count failure must degrade to None-valued ``pool_*`` keys (series shape
-    preserved) rather than sink the whole memory-quality snapshot — quality
-    metrics and pool size share the row, but the pool read is strictly additive
-    to the quality metrics.
-    """
+    """Point-in-time pool-size counts, isolated in its own try/except so a
+    count failure degrades to None-valued ``pool_*`` keys (series shape kept)
+    rather than sinking the whole memory-quality snapshot — the pool read is
+    strictly additive to the quality metrics."""
     try:
         return await memory_crud.pool_size_counts(db)
     except Exception:
@@ -277,45 +251,30 @@ async def _pool_counts_safe(db: aiosqlite.Connection) -> dict:
 
 
 async def _compute_memory_quality(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Precision@5, hit rate, MRR from recall_relevance events.
 
     Also folds in the MEM-005 entrenchment aggregation (separate read path over
-    recall_fired) as distinct ``entrenchment_*`` keys — monitor-only, not part
-    of the quality grade — and the point-in-time ``pool_*`` counts (WS2-0), so
-    retrieval quality is always readable against the pool size it was measured
-    over.
+    recall_fired) as distinct ``entrenchment_*`` keys — monitor-only — and the
+    point-in-time ``pool_*`` counts (WS2-0), so retrieval quality is always
+    readable against the pool size it was measured over.
     """
     entrenchment = await _recall_entrenchment(db, since, until)
     pool = await _pool_counts_safe(db)
     relevance_events = await j9_eval.get_events(
-        db,
-        dimension="memory",
-        event_type="recall_relevance",
-        since=since,
-        until=until,
-        limit=5000,
+        db, dimension="memory", event_type="recall_relevance",
+        since=since, until=until, limit=5000,
     )
     # Defensive dedup: duplicate (recall, memory) judgments must not skew the
     # average (pre-checkpoint batches could emit the same pair multiple times).
     relevance_events = _dedupe_by_pair(relevance_events)
 
     if not relevance_events:
-        return {
-            "precision_at_5": None,
-            "precision_at_3": None,
-            "precision_at_3_recalls": 0,
-            "judge_prompt_versions": [],
-            "hit_rate": None,
-            "mrr": None,
-            "usage_rate": None,
-            "total_recalls": 0,
-            **entrenchment,
-            **pool,
-        }, 0
+        return {"precision_at_5": None, "precision_at_3": None,
+                "precision_at_3_recalls": 0, "judge_prompt_versions": [],
+                "hit_rate": None, "mrr": None,
+                "usage_rate": None, "total_recalls": 0, **entrenchment, **pool}, 0
 
     # Group by recall_event_id
     by_recall: dict[str, list[dict]] = defaultdict(list)
@@ -369,12 +328,8 @@ async def _compute_memory_quality(
 
     # Also check recall_used events for usage rate
     used_events = await j9_eval.get_events(
-        db,
-        dimension="memory",
-        event_type="recall_used",
-        since=since,
-        until=until,
-        limit=5000,
+        db, dimension="memory", event_type="recall_used",
+        since=since, until=until, limit=5000,
     )
     used_events = _dedupe_by_pair(used_events)
     total_used = sum(1 for ev in used_events if ev.get("metrics", {}).get("used"))
@@ -383,18 +338,15 @@ async def _compute_memory_quality(
     # Judge-prompt versions seen in-window: a change here is a series break
     # (precision@k is judge-rated; a reworded judge prompt shifts the series
     # without any retrieval change). Pre-versioning events → "unversioned".
-    judge_prompt_versions = sorted(
-        {
-            (ev.get("metrics", {}) or {}).get("judge_prompt_version") or "unversioned"
-            for ev in relevance_events
-        }
-    )
+    judge_prompt_versions = sorted({
+        (ev.get("metrics", {}) or {}).get("judge_prompt_version") or "unversioned"
+        for ev in relevance_events
+    })
 
     metrics = {
         "precision_at_5": round(sum(precisions) / len(precisions), 4) if precisions else None,
         "precision_at_3": round(sum(precisions_at_3) / len(precisions_at_3), 4)
-        if precisions_at_3
-        else None,
+        if precisions_at_3 else None,
         # Coverage: recalls that qualified for the @3 metric (fully ranked)
         # vs total_recalls — thin coverage must be visible, not hidden.
         "precision_at_3_recalls": len(precisions_at_3),
@@ -418,9 +370,7 @@ async def _compute_memory_quality(
 
 
 async def _compute_system_composite(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Aggregate signals from cc_sessions, ego_proposals, observations, procedures."""
     # Session success rate
@@ -473,17 +423,9 @@ async def _compute_system_composite(
     mem_precision = mem_snapshot["metrics"].get("precision_at_5") if mem_snapshot else None
 
     # Composite: simple average of available signals (weighted equally)
-    signals = [
-        v
-        for v in [
-            session_success_pct,
-            ego_acceptance_pct,
-            obs_influence_pct,
-            proc_mean_conf,
-            mem_precision,
-        ]
-        if v is not None
-    ]
+    signals = [v for v in [session_success_pct, ego_acceptance_pct,
+                            obs_influence_pct, proc_mean_conf, mem_precision]
+               if v is not None]
     composite = round(sum(signals) / len(signals), 4) if signals else None
 
     sample_count = session_total + ego_total + obs_total
@@ -506,25 +448,17 @@ async def _compute_system_composite(
 
 
 async def _compute_ego_quality(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Approval rate, execution success, confidence calibration."""
     proposals = await ego_crud.get_proposals_for_quality(
-        db,
-        start=since,
-        end=until,
+        db, start=since, end=until,
     )
     total = len(proposals)
 
     if not total:
-        return {
-            "approval_rate": None,
-            "execution_success_rate": None,
-            "confidence_calibration": {},
-            "total_proposals": 0,
-        }, 0
+        return {"approval_rate": None, "execution_success_rate": None,
+                "confidence_calibration": {}, "total_proposals": 0}, 0
 
     # Approval rate (resolved proposals only)
     resolved = [p for p in proposals if p["status"] not in ("pending", "expired")]
@@ -542,13 +476,12 @@ async def _compute_ego_quality(
     for bucket_low in [0.0, 0.2, 0.4, 0.6, 0.8]:
         bucket_high = bucket_low + 0.2
         label = f"{bucket_low:.1f}-{bucket_high:.1f}"
-        in_bucket = [
-            p
-            for p in resolved
-            if p.get("confidence") is not None and bucket_low <= p["confidence"] < bucket_high
-        ]
+        in_bucket = [p for p in resolved
+                     if p.get("confidence") is not None
+                     and bucket_low <= p["confidence"] < bucket_high]
         if in_bucket:
-            bucket_approved = [p for p in in_bucket if p["status"] in ("approved", "executed")]
+            bucket_approved = [p for p in in_bucket
+                               if p["status"] in ("approved", "executed")]
             calibration[label] = {
                 "count": len(in_bucket),
                 "success_rate": round(len(bucket_approved) / len(in_bucket), 4),
@@ -568,9 +501,7 @@ async def _compute_ego_quality(
 
 
 async def _compute_cognitive_loop(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Compare sessions with proactive recall vs without."""
     # Get all sessions in the window
@@ -583,24 +514,17 @@ async def _compute_cognitive_loop(
     sessions = [dict(r) for r in await cursor.fetchall()]
 
     if not sessions:
-        return {
-            "sessions_with_recall": 0,
-            "sessions_without_recall": 0,
-            "success_rate_with": None,
-            "success_rate_without": None,
-            "delta": None,
-        }, 0
+        return {"sessions_with_recall": 0, "sessions_without_recall": 0,
+                "success_rate_with": None, "success_rate_without": None,
+                "delta": None}, 0
 
     # Find which sessions had recall_fired events
     recall_events = await j9_eval.get_events(
-        db,
-        dimension="memory",
-        event_type="recall_fired",
-        since=since,
-        until=until,
-        limit=5000,
+        db, dimension="memory", event_type="recall_fired",
+        since=since, until=until, limit=5000,
     )
-    sessions_with_recall = {ev.get("session_id") for ev in recall_events if ev.get("session_id")}
+    sessions_with_recall = {ev.get("session_id") for ev in recall_events
+                            if ev.get("session_id")}
 
     with_recall = [s for s in sessions if s["id"] in sessions_with_recall]
     without_recall = [s for s in sessions if s["id"] not in sessions_with_recall]
@@ -632,30 +556,20 @@ async def _compute_cognitive_loop(
 
 
 async def _compute_procedural_effectiveness(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Invocation frequency, success rate, confidence calibration."""
     # Invocation events
     invocations = await j9_eval.get_events(
-        db,
-        dimension="procedure",
-        event_type="procedure_invoked",
-        since=since,
-        until=until,
-        limit=1000,
+        db, dimension="procedure", event_type="procedure_invoked",
+        since=since, until=until, limit=1000,
     )
     invocation_count = len(invocations)
 
     # Outcome events
     outcomes = await j9_eval.get_events(
-        db,
-        dimension="procedure",
-        event_type="procedure_outcome",
-        since=since,
-        until=until,
-        limit=1000,
+        db, dimension="procedure", event_type="procedure_outcome",
+        since=since, until=until, limit=1000,
     )
     successes = sum(1 for o in outcomes if o.get("metrics", {}).get("success"))
     outcome_total = len(outcomes)
@@ -696,8 +610,7 @@ async def _compute_procedural_effectiveness(
                 calibration[bucket]["success"] += 1
     for bucket in calibration:
         calibration[bucket]["rate"] = round(
-            calibration[bucket]["success"] / calibration[bucket]["total"],
-            4,
+            calibration[bucket]["success"] / calibration[bucket]["total"], 4,
         )
 
     metrics = {
@@ -721,9 +634,7 @@ _CHURN_ACTION_TYPE = "autonomous_cli_fallback"
 
 
 async def _compute_approvals(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Approval-request resolution metrics over ``approval_requests``.
 
@@ -769,7 +680,9 @@ async def _compute_approvals(
     total_created = (await cursor.fetchone())[0]
 
     # Point-in-time gauge, not windowed: what is open right now.
-    cursor = await db.execute("SELECT COUNT(*) FROM approval_requests WHERE status = 'pending'")
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE status = 'pending'"
+    )
     pending_open = (await cursor.fetchone())[0]
 
     total_resolved = len(resolved)
@@ -778,10 +691,13 @@ async def _compute_approvals(
     auto_resolved = sum(1 for _r, c in classified if c == "system")
     unknown_rows = [r for r, c in classified if c == "unknown"]
 
-    churn_total = sum(1 for r in resolved if r["action_type"] == _CHURN_ACTION_TYPE)
+    churn_total = sum(
+        1 for r in resolved if r["action_type"] == _CHURN_ACTION_TYPE
+    )
     non_churn_total = total_resolved - churn_total
     user_non_churn = sum(
-        1 for r, c in classified if c == "human" and r["action_type"] != _CHURN_ACTION_TYPE
+        1 for r, c in classified
+        if c == "human" and r["action_type"] != _CHURN_ACTION_TYPE
     )
 
     metrics = {
@@ -790,21 +706,23 @@ async def _compute_approvals(
         "churn_total": churn_total,
         "churn_excluded_total": non_churn_total,
         "user_resolved": user_resolved,
-        "user_resolved_rate": round(user_resolved / total_resolved, 4) if total_resolved else None,
+        "user_resolved_rate": round(user_resolved / total_resolved, 4)
+        if total_resolved else None,
         "user_resolved_rate_excl_churn": round(user_non_churn / non_churn_total, 4)
-        if non_churn_total
-        else None,
+        if non_churn_total else None,
         "auto_resolved": auto_resolved,
         "auto_expired": sum(1 for r in resolved if r["status"] == "expired"),
         "system_cancelled": sum(
-            1 for r, c in classified if r["status"] == "cancelled" and c == "system"
+            1 for r, c in classified
+            if r["status"] == "cancelled" and c == "system"
         ),
         "rejection_count": sum(1 for r in resolved if r["status"] == "rejected"),
         # M12 scaffold: a human-resolved rejection = an explicit user denial.
         # Zero observed instances to date — derivation is unvalidated against
         # real deny data until a first real rejection occurs.
         "user_denied_count": sum(
-            1 for r, c in classified if r["status"] == "rejected" and c == "human"
+            1 for r, c in classified
+            if r["status"] == "rejected" and c == "human"
         ),
         "unknown_resolver_count": len(unknown_rows),
         "unknown_resolver_values": sorted(
@@ -819,9 +737,7 @@ async def _compute_approvals(
 
 
 async def _compute_goal_completion(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """``user_goals`` status ratios + completion rate.
 
@@ -838,7 +754,8 @@ async def _compute_goal_completion(
     Snapshot-only dimension (writes no eval_events).
     """
     cursor = await db.execute(
-        "SELECT status, COUNT(*) FROM user_goals WHERE origin = 'user' GROUP BY status"
+        "SELECT status, COUNT(*) FROM user_goals "
+        "WHERE origin = 'user' GROUP BY status"
     )
     by_status = {r[0]: r[1] for r in await cursor.fetchall()}
     total_goals = sum(by_status.values())
@@ -861,7 +778,8 @@ async def _compute_goal_completion(
     metrics = {
         "total_goals": total_goals,
         "by_status": {
-            s: by_status.get(s, 0) for s in ("active", "paused", "achieved", "abandoned")
+            s: by_status.get(s, 0)
+            for s in ("active", "paused", "achieved", "abandoned")
         },
         "terminal_count": terminal,
         "achieved_count": achieved,
@@ -878,9 +796,7 @@ async def _compute_goal_completion(
 
 
 async def _compute_noise_passivity(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Noise/passivity v1: loop-closure leaks + windowed ego-cycle activity.
 
@@ -917,7 +833,8 @@ async def _compute_noise_passivity(
     ego_cycles, empty_ego_cycles = row[0], row[1]
 
     cursor = await db.execute(
-        "SELECT COUNT(*) FROM ego_proposals WHERE created_at >= ? AND created_at < ?",
+        "SELECT COUNT(*) FROM ego_proposals "
+        "WHERE created_at >= ? AND created_at < ?",
         (since, until),
     )
     proposals_in_period = (await cursor.fetchone())[0]
@@ -962,7 +879,8 @@ async def _compute_noise_passivity(
         # Windowed flows
         "ego_cycles": ego_cycles,
         "empty_ego_cycles": empty_ego_cycles,
-        "empty_ego_cycle_pct": round(empty_ego_cycles / ego_cycles, 4) if ego_cycles else None,
+        "empty_ego_cycle_pct": round(empty_ego_cycles / ego_cycles, 4)
+        if ego_cycles else None,
         "proposals_in_period": proposals_in_period,
         # Decisions RESOLVED in window (not created-in-window cohort)
         "rejected_count": decision_counts.get("rejected", 0),
@@ -998,9 +916,7 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
 
 
 async def _compute_dev_quality(
-    db: aiosqlite.Connection,
-    since: str,
-    until: str,
+    db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
     """Dev-quality metrics: PR-review findings + code-audit backlog + edit failures.
 
@@ -1049,8 +965,7 @@ async def _compute_dev_quality(
     prs_merged = 0
     review_findings_total = 0
     by_severity = dict.fromkeys(
-        ("blocker", "should_fix", "note", "unlabeled"),
-        0,
+        ("blocker", "should_fix", "note", "unlabeled"), 0,
     )
     review_count_total = 0
     for r in rows:
@@ -1107,24 +1022,25 @@ async def _compute_dev_quality(
         "prs_merged": prs_merged,
         "review_findings_total": review_findings_total,
         "review_findings_by_severity": by_severity,
-        "findings_per_pr": round(review_findings_total / prs_merged, 2) if prs_merged else None,
+        "findings_per_pr": round(review_findings_total / prs_merged, 2)
+        if prs_merged else None,
         "review_count_total": review_count_total,
-        "mean_reviews_per_pr": round(review_count_total / prs_merged, 2) if prs_merged else None,
+        "mean_reviews_per_pr": round(review_count_total / prs_merged, 2)
+        if prs_merged else None,
         "code_audit_open_findings": len(audit_rows),
         "code_audit_by_severity": audit_by_severity,
         "code_audit_by_category": audit_by_category,
         "edit_calls_total": edit_calls_total,
         "edit_failures": edit_failures,
         "edit_failure_rate": round(edit_failures / edit_calls_total, 4)
-        if edit_calls_total
-        else None,
+        if edit_calls_total else None,
         # Coverage honesty: all harvested PR rows, windowed or not.
         "harvest_prs_seen": harvest_prs_seen,
         "note": "scaffold: code_audit_* reflects only the observations-"
-        "published subset (bridge routes findings to intake/"
-        "surplus_insights, not observations — reconciliation "
-        "tracked); code_audit_by_category sparse until the audit "
-        "taxonomy prompt ships",
+                "published subset (bridge routes findings to intake/"
+                "surplus_insights, not observations — reconciliation "
+                "tracked); code_audit_by_category sparse until the audit "
+                "taxonomy prompt ships",
     }
     return metrics, prs_merged + edit_calls_total
 
@@ -1140,10 +1056,7 @@ async def _compute_composite_trends(db: aiosqlite.Connection) -> dict:
 
     for dim in dimensions:
         snapshots = await j9_eval.get_snapshots(
-            db,
-            dimension=dim,
-            period_type="weekly",
-            limit=12,
+            db, dimension=dim, period_type="weekly", limit=12,
         )
         snapshots.reverse()  # oldest first
         trends[dim] = _extract_trend_values(dim, snapshots)
@@ -1206,7 +1119,8 @@ def _simple_slope(values: list[float]) -> float | None:
 # ── Per-Subsystem Grading ───────────────────────────────────────────────────
 
 # Minimum samples required per subsystem before issuing a letter grade.
-_MIN_SAMPLES = {"memory": 10, "ego": 5, "procedural": 5, "awareness": 20, "reflection": 10}
+_MIN_SAMPLES = {"memory": 10, "ego": 5, "procedural": 5,
+                "awareness": 20, "reflection": 10}
 
 
 def _score_with_zero_fill(
@@ -1257,35 +1171,24 @@ async def _grade_memory(
     usage = metrics.get("usage_rate")
     total = metrics.get("total_recalls", 0)
 
-    factors = {"precision_at_5": p5, "mrr": mrr, "usage_rate": usage, "total_recalls": total}
+    factors = {"precision_at_5": p5, "mrr": mrr, "usage_rate": usage,
+               "total_recalls": total}
 
     available = [(p5, 0.4), (mrr, 0.3), (usage, 0.3)]
 
     if all(v is None for v, _ in available) or total < _MIN_SAMPLES["memory"]:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": total,
-            "reason": f"insufficient data ({total} recalls, need {_MIN_SAMPLES['memory']})",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total,
+                "reason": f"insufficient data ({total} recalls, need {_MIN_SAMPLES['memory']})"}
 
     score = _score_with_zero_fill(available, max_nulls=1)
     if score is None:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": total,
-            "reason": "too many factors unavailable",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total,
+                "reason": "too many factors unavailable"}
 
-    return {
-        "grade": _score_to_grade(score),
-        "score": round(score, 1),
-        "factors": factors,
-        "sample_count": total,
-    }
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": total}
 
 
 async def _grade_ego(
@@ -1322,40 +1225,25 @@ async def _grade_ego(
             cal_errors.append(abs(expected - actual))
     cal_accuracy = 1.0 - (sum(cal_errors) / len(cal_errors)) if cal_errors else None
 
-    factors = {
-        "approval_rate": approval,
-        "execution_success_rate": exec_success,
-        "calibration_accuracy": cal_accuracy,
-        "total_proposals": total,
-    }
+    factors = {"approval_rate": approval, "execution_success_rate": exec_success,
+               "calibration_accuracy": cal_accuracy,
+               "total_proposals": total}
 
     available = [(cal_accuracy, 0.4), (exec_success, 0.4), (approval, 0.2)]
 
     if all(v is None for v, _ in available) or total < _MIN_SAMPLES["ego"]:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": total,
-            "reason": f"insufficient data ({total} proposals, need {_MIN_SAMPLES['ego']})",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total,
+                "reason": f"insufficient data ({total} proposals, need {_MIN_SAMPLES['ego']})"}
 
     score = _score_with_zero_fill(available, max_nulls=1)
     if score is None:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": total,
-            "reason": "too many factors unavailable",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total,
+                "reason": "too many factors unavailable"}
 
-    return {
-        "grade": _score_to_grade(score),
-        "score": round(score, 1),
-        "factors": factors,
-        "sample_count": total,
-    }
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": total}
 
 
 async def _grade_procedural(
@@ -1379,52 +1267,32 @@ async def _grade_procedural(
     # >1.0 per procedure per week = healthy, cap at 1.0 for scoring.
     activity = min(invocations / max(total_procs, 1), 1.0) if invocations else 0.0
 
-    factors = {
-        "success_rate": success,
-        "mean_confidence": confidence,
-        "invocation_count": invocations,
-        "activity_ratio": round(activity, 4),
-        "total_procedures": total_procs,
-    }
+    factors = {"success_rate": success, "mean_confidence": confidence,
+               "invocation_count": invocations, "activity_ratio": round(activity, 4),
+               "total_procedures": total_procs}
 
     available = [(success, 0.5), (confidence, 0.25), (activity, 0.25)]
 
     if invocations < _MIN_SAMPLES["procedural"]:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": invocations,
-            "reason": f"insufficient data ({invocations} invocations, need {_MIN_SAMPLES['procedural']})",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": invocations,
+                "reason": f"insufficient data ({invocations} invocations, need {_MIN_SAMPLES['procedural']})"}
 
     # Primary factor gate: success_rate is the most important signal.
     # Without it, grading on confidence + activity alone is misleading.
     if success is None:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": invocations,
-            "reason": "primary metric (success_rate) not yet measurable",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": invocations,
+                "reason": "primary metric (success_rate) not yet measurable"}
 
     score = _score_with_zero_fill(available, max_nulls=1)
     if score is None:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": invocations,
-            "reason": "too many factors unavailable",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": invocations,
+                "reason": "too many factors unavailable"}
 
-    return {
-        "grade": _score_to_grade(score),
-        "score": round(score, 1),
-        "factors": factors,
-        "sample_count": invocations,
-    }
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": invocations}
 
 
 async def _grade_awareness(
@@ -1447,7 +1315,8 @@ async def _grade_awareness(
     """
     # Total ticks in period
     cursor = await db.execute(
-        "SELECT COUNT(*) as cnt FROM awareness_ticks WHERE created_at >= ? AND created_at < ?",
+        "SELECT COUNT(*) as cnt FROM awareness_ticks "
+        "WHERE created_at >= ? AND created_at < ?",
         (since, until),
     )
     row = await cursor.fetchone()
@@ -1478,9 +1347,7 @@ async def _grade_awareness(
             pass
     # 18 expected signals (21 total minus 3 conditional: genesis/cc version, stale items)
     expected_signals = 18
-    signal_completeness = (
-        min(len(signal_names) / expected_signals, 1.0) if expected_signals else 0.0
-    )
+    signal_completeness = min(len(signal_names) / expected_signals, 1.0) if expected_signals else 0.0
 
     # Informational: classification stats (not scored)
     cursor = await db.execute(
@@ -1494,41 +1361,27 @@ async def _grade_awareness(
     depth_dist = {r["classified_depth"]: r["cnt"] for r in depth_rows}
     classified_count = sum(depth_dist.values())
 
-    factors = {
-        "tick_regularity": round(tick_regularity, 4),
-        "signal_completeness": round(signal_completeness, 4),
-        "unique_signals": len(signal_names),
-        "total_ticks": total_ticks,
-        "classified_count": classified_count,
-        "depth_distribution": depth_dist,
-    }
+    factors = {"tick_regularity": round(tick_regularity, 4),
+               "signal_completeness": round(signal_completeness, 4),
+               "unique_signals": len(signal_names),
+               "total_ticks": total_ticks,
+               "classified_count": classified_count,
+               "depth_distribution": depth_dist}
 
     if total_ticks < _MIN_SAMPLES["awareness"]:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": total_ticks,
-            "reason": f"insufficient data ({total_ticks} ticks, need {_MIN_SAMPLES['awareness']})",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total_ticks,
+                "reason": f"insufficient data ({total_ticks} ticks, need {_MIN_SAMPLES['awareness']})"}
 
     available = [(tick_regularity, 0.6), (signal_completeness, 0.4)]
     score = _score_with_zero_fill(available, max_nulls=0)
     if score is None:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": total_ticks,
-            "reason": "factors unavailable",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total_ticks,
+                "reason": "factors unavailable"}
 
-    return {
-        "grade": _score_to_grade(score),
-        "score": round(score, 1),
-        "factors": factors,
-        "sample_count": total_ticks,
-    }
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": total_ticks}
 
 
 async def _grade_reflection(
@@ -1572,38 +1425,22 @@ async def _grade_reflection(
     # Expect 3+ types for healthy diversity, cap at 1.0
     type_diversity = min(type_count / 3, 1.0) if type_count else 0.0
 
-    factors = {
-        "observation_volume": total_obs,
-        "volume_score": round(volume_score, 4),
-        "influence_rate": round(influence_rate, 4),
-        "type_diversity": round(type_diversity, 4),
-        "type_count": type_count,
-        "influenced_count": influenced,
-    }
+    factors = {"observation_volume": total_obs, "volume_score": round(volume_score, 4),
+               "influence_rate": round(influence_rate, 4),
+               "type_diversity": round(type_diversity, 4),
+               "type_count": type_count, "influenced_count": influenced}
 
     if total_obs < _MIN_SAMPLES["reflection"]:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": total_obs,
-            "reason": f"insufficient data ({total_obs} observations, need {_MIN_SAMPLES['reflection']})",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total_obs,
+                "reason": f"insufficient data ({total_obs} observations, need {_MIN_SAMPLES['reflection']})"}
 
     available = [(volume_score, 0.25), (influence_rate, 0.5), (type_diversity, 0.25)]
     score = _score_with_zero_fill(available, max_nulls=1)
     if score is None:
-        return {
-            "grade": None,
-            "score": None,
-            "factors": factors,
-            "sample_count": total_obs,
-            "reason": "too many factors unavailable",
-        }
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total_obs,
+                "reason": "too many factors unavailable"}
 
-    return {
-        "grade": _score_to_grade(score),
-        "score": round(score, 1),
-        "factors": factors,
-        "sample_count": total_obs,
-    }
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": total_obs}

@@ -46,26 +46,20 @@ async def test_update_event_metrics_merges_in_place(db):
     """update_event_metrics enriches an existing event's metrics without
     creating a second row (audit MEM-003: one recall_fired per logical recall)."""
     eid = await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_fired",
+        db, dimension="memory", event_type="recall_fired",
         metrics={"query": "q", "result_count": 1},
     )
     updated = await j9_eval.update_event_metrics(
-        db,
-        eid,
-        result_count=5,
-        mode="auto",
-        pipeline_used="standard",
+        db, eid, result_count=5, mode="auto", pipeline_used="standard",
     )
     assert updated is True
 
     events = await j9_eval.get_events(db, event_type="recall_fired")
     assert len(events) == 1  # merged in place, NOT a second event
     m = events[0]["metrics"]
-    assert m["query"] == "q"  # pre-existing field preserved
-    assert m["result_count"] == 5  # overwritten
-    assert m["mode"] == "auto"  # new field added
+    assert m["query"] == "q"          # pre-existing field preserved
+    assert m["result_count"] == 5      # overwritten
+    assert m["mode"] == "auto"         # new field added
     assert m["pipeline_used"] == "standard"
 
 
@@ -84,17 +78,13 @@ async def test_recall_entrenchment_aggregates(db):
 
     for corr, rc, age in [(0.8, 5.0, 10.0), (0.6, 3.0, 20.0)]:
         await j9_eval.insert_event(
-            db,
-            dimension="memory",
-            event_type="recall_fired",
-            metrics={"entrenchment_corr": corr, "mean_retrieved_count": rc, "mean_age_days": age},
+            db, dimension="memory", event_type="recall_fired",
+            metrics={"entrenchment_corr": corr,
+                     "mean_retrieved_count": rc, "mean_age_days": age},
         )
     # An older-style event without entrenchment fields must not skew the means.
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_fired",
-        metrics={"query": "q"},
+        db, dimension="memory", event_type="recall_fired", metrics={"query": "q"},
     )
 
     result = await _recall_entrenchment(db, since="2000-01-01", until="2099-01-01")
@@ -110,17 +100,13 @@ async def test_memory_quality_includes_entrenchment_when_no_relevance(db):
     from genesis.eval.j9_aggregator import _compute_memory_quality
 
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_fired",
+        db, dimension="memory", event_type="recall_fired",
         metrics={"entrenchment_corr": 0.5, "mean_retrieved_count": 2.0},
     )
     metrics, sample = await _compute_memory_quality(
-        db,
-        since="2000-01-01",
-        until="2099-01-01",
+        db, since="2000-01-01", until="2099-01-01",
     )
-    assert metrics["precision_at_5"] is None  # no relevance events
+    assert metrics["precision_at_5"] is None      # no relevance events
     assert metrics["entrenchment_corr_mean"] == pytest.approx(0.5)
     assert metrics["entrenchment_sample"] == 1
 
@@ -340,18 +326,12 @@ async def test_count_events(db):
 
 async def test_get_events_with_session_filter(db):
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_fired",
-        metrics={},
-        session_id="sess-A",
+        db, dimension="memory", event_type="recall_fired",
+        metrics={}, session_id="sess-A",
     )
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_fired",
-        metrics={},
-        session_id="sess-B",
+        db, dimension="memory", event_type="recall_fired",
+        metrics={}, session_id="sess-B",
     )
     results = await j9_eval.get_events(db, session_id="sess-A")
     assert len(results) == 1
@@ -483,9 +463,7 @@ async def test_emit_proposal_resolved_survives_db_error():
     bad_db = AsyncMock(spec=["execute", "commit"])
     bad_db.execute.side_effect = Exception("kaboom")
     await emit_proposal_resolved(
-        bad_db,
-        proposal_id="x",
-        status="approved",
+        bad_db, proposal_id="x", status="approved",
     )
 
 
@@ -721,12 +699,8 @@ async def test_grade_reflection_from_observations(db):
             "INSERT INTO observations (id, type, source, content, priority, "
             "created_at, influenced_action) VALUES (?, ?, 'ego_cycle', 'test', "
             "'medium', ?, ?)",
-            (
-                f"obs-{i}",
-                ["task_detected", "pattern", "insight"][i % 3],
-                "2026-05-05T12:00:00Z",
-                1 if i < 10 else 0,
-            ),
+            (f"obs-{i}", ["task_detected", "pattern", "insight"][i % 3],
+             "2026-05-05T12:00:00Z", 1 if i < 10 else 0),
         )
     await db.commit()
 
@@ -807,22 +781,16 @@ async def test_memory_quality_ignores_duplicate_relevance(db):
     # (without dedup it would be 2/3 = 0.667).
     for rel in (1.0, 1.0):
         await j9_eval.insert_event(
-            db,
-            dimension="memory",
-            event_type="recall_relevance",
+            db, dimension="memory", event_type="recall_relevance",
             metrics={"recall_event_id": "r1", "memory_id": "m1", "relevance": rel},
         )
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_relevance",
+        db, dimension="memory", event_type="recall_relevance",
         metrics={"recall_event_id": "r1", "memory_id": "m2", "relevance": 0.0},
     )
 
     metrics, total_recalls = await _compute_memory_quality(
-        db,
-        since="2000-01-01",
-        until="2100-01-01",
+        db, since="2000-01-01", until="2100-01-01",
     )
     assert total_recalls == 1
     assert metrics["precision_at_5"] == 0.5
@@ -841,21 +809,15 @@ async def test_memory_quality_mrr_uses_stored_rank_not_insert_order(db):
 
     # Out of rank order: rank-1 (irrelevant) first … rank-3 (relevant) last.
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_relevance",
+        db, dimension="memory", event_type="recall_relevance",
         metrics={"recall_event_id": "r1", "memory_id": "m1", "relevance": 0.0, "rank": 1},
     )
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_relevance",
+        db, dimension="memory", event_type="recall_relevance",
         metrics={"recall_event_id": "r1", "memory_id": "m2", "relevance": 0.0, "rank": 2},
     )
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_relevance",
+        db, dimension="memory", event_type="recall_relevance",
         metrics={"recall_event_id": "r1", "memory_id": "m3", "relevance": 1.0, "rank": 3},
     )
 
@@ -895,44 +857,28 @@ async def test_insert_run_persists_metadata_json_per_result(db):
 
     detail = _json.dumps({"judge_model": "x", "judge_score": 0.7, "rationale": "ok"})
     summary = EvalRunSummary(
-        run_id="run_meta_1",
-        model_id="m",
-        model_profile="p",
-        dataset="d",
-        trigger=EvalTrigger.MANUAL,
-        task_category=TaskCategory.CLASSIFICATION,
-        total_cases=2,
-        passed_cases=2,
-        failed_cases=0,
+        run_id="run_meta_1", model_id="m", model_profile="p", dataset="d",
+        trigger=EvalTrigger.MANUAL, task_category=TaskCategory.CLASSIFICATION,
+        total_cases=2, passed_cases=2, failed_cases=0,
         results=[
             ScoredOutput(
-                case_id="c1",
-                passed=True,
-                score=0.7,
-                actual_output="out",
-                scorer_type=ScorerType.LLM_JUDGE,
-                scorer_detail=detail,
+                case_id="c1", passed=True, score=0.7, actual_output="out",
+                scorer_type=ScorerType.LLM_JUDGE, scorer_detail=detail,
             ),
             # Non-judge scorer: scorer_detail is a plain (non-JSON) string, so
             # metadata_json (the queryable JSON view) must be NULL, not that string.
             ScoredOutput(
-                case_id="c2",
-                passed=True,
-                score=1.0,
-                actual_output="3",
-                scorer_type=ScorerType.EXACT_MATCH,
-                scorer_detail="expected=3, got=3",
+                case_id="c2", passed=True, score=1.0, actual_output="3",
+                scorer_type=ScorerType.EXACT_MATCH, scorer_detail="expected=3, got=3",
             ),
         ],
     )
     await eval_db.insert_run(db, summary)
     rows = {
         r[0]: r[1]
-        for r in await (
-            await db.execute(
-                "SELECT case_id, metadata_json FROM eval_results WHERE run_id = 'run_meta_1'"
-            )
-        ).fetchall()
+        for r in await (await db.execute(
+            "SELECT case_id, metadata_json FROM eval_results WHERE run_id = 'run_meta_1'"
+        )).fetchall()
     }
     assert rows["c1"] == detail  # judge result → JSON dual-write
     assert rows["c2"] is None  # non-judge result → NULL (not the plain string)
@@ -948,15 +894,9 @@ async def test_memory_quality_precision_at_3(db):
 
     for rank, rel in enumerate((1.0, 0.0, 1.0, 0.0, 1.0), 1):
         await j9_eval.insert_event(
-            db,
-            dimension="memory",
-            event_type="recall_relevance",
-            metrics={
-                "recall_event_id": "r1",
-                "memory_id": f"m{rank}",
-                "relevance": rel,
-                "rank": rank,
-            },
+            db, dimension="memory", event_type="recall_relevance",
+            metrics={"recall_event_id": "r1", "memory_id": f"m{rank}",
+                     "relevance": rel, "rank": rank},
         )
 
     metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
@@ -972,15 +912,9 @@ async def test_memory_quality_precision_at_3_fewer_than_three(db):
 
     for rank, rel in ((1, 1.0), (2, 0.0)):
         await j9_eval.insert_event(
-            db,
-            dimension="memory",
-            event_type="recall_relevance",
-            metrics={
-                "recall_event_id": "r1",
-                "memory_id": f"m{rank}",
-                "relevance": rel,
-                "rank": rank,
-            },
+            db, dimension="memory", event_type="recall_relevance",
+            metrics={"recall_event_id": "r1", "memory_id": f"m{rank}",
+                     "relevance": rel, "rank": rank},
         )
 
     metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
@@ -994,21 +928,14 @@ async def test_memory_quality_truncates_to_top5(db):
 
     for rank in range(1, 6):
         await j9_eval.insert_event(
-            db,
-            dimension="memory",
-            event_type="recall_relevance",
-            metrics={
-                "recall_event_id": "r1",
-                "memory_id": f"m{rank}",
-                "relevance": 0.0,
-                "rank": rank,
-            },
+            db, dimension="memory", event_type="recall_relevance",
+            metrics={"recall_event_id": "r1", "memory_id": f"m{rank}",
+                     "relevance": 0.0, "rank": rank},
         )
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_relevance",
-        metrics={"recall_event_id": "r1", "memory_id": "m6", "relevance": 1.0, "rank": 6},
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m6",
+                 "relevance": 1.0, "rank": 6},
     )
 
     metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
@@ -1023,9 +950,7 @@ async def test_precision_at_3_skips_unranked_recalls(db):
 
     for i, rel in enumerate((1.0, 0.0, 1.0, 0.0), 1):
         await j9_eval.insert_event(
-            db,
-            dimension="memory",
-            event_type="recall_relevance",
+            db, dimension="memory", event_type="recall_relevance",
             metrics={"recall_event_id": "r1", "memory_id": f"m{i}", "relevance": rel},
         )
 
@@ -1041,22 +966,14 @@ async def test_memory_quality_reports_judge_prompt_versions(db):
     from genesis.eval.j9_aggregator import _compute_memory_quality
 
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_relevance",
-        metrics={
-            "recall_event_id": "r1",
-            "memory_id": "m1",
-            "relevance": 1.0,
-            "rank": 1,
-            "judge_prompt_version": "1",
-        },
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r1", "memory_id": "m1", "relevance": 1.0,
+                 "rank": 1, "judge_prompt_version": "1"},
     )
     await j9_eval.insert_event(
-        db,
-        dimension="memory",
-        event_type="recall_relevance",
-        metrics={"recall_event_id": "r2", "memory_id": "m2", "relevance": 0.0, "rank": 1},
+        db, dimension="memory", event_type="recall_relevance",
+        metrics={"recall_event_id": "r2", "memory_id": "m2", "relevance": 0.0,
+                 "rank": 1},
     )
 
     metrics, _ = await _compute_memory_quality(db, since="2000-01-01", until="2100-01-01")
@@ -1066,24 +983,17 @@ async def test_memory_quality_reports_judge_prompt_versions(db):
 # ── WS-1 A2: approvals dimension ─────────────────────────────────────────────
 
 
-async def _approval(
-    db, aid, *, action_type="other", status=None, resolved_at=None, resolved_by=None
-):
+async def _approval(db, aid, *, action_type="other", status=None,
+                    resolved_at=None, resolved_by=None):
     from genesis.db.crud import approval_requests as ar
 
     await ar.create(
-        db,
-        id=aid,
-        action_type=action_type,
-        action_class="reversible",
+        db, id=aid, action_type=action_type, action_class="reversible",
         description="d",
     )
     if status is not None:
         assert await ar.resolve(
-            db,
-            aid,
-            status=status,
-            resolved_at=resolved_at,
+            db, aid, status=status, resolved_at=resolved_at,
             resolved_by=resolved_by,
         )
 
@@ -1095,47 +1005,37 @@ async def test_compute_approvals_buckets(db):
 
     ts = "2026-06-05T12:00:00+00:00"
     # churn class: one human approve, one fail-closed system cancel
-    await _approval(
-        db,
-        "a1",
-        action_type="autonomous_cli_fallback",
-        status="approved",
-        resolved_at=ts,
-        resolved_by="telegram:button:1",
-    )
-    await _approval(
-        db,
-        "a2",
-        action_type="autonomous_cli_fallback",
-        status="cancelled",
-        resolved_at=ts,
-        resolved_by="system",
-    )
+    await _approval(db, "a1", action_type="autonomous_cli_fallback",
+                    status="approved", resolved_at=ts,
+                    resolved_by="telegram:button:1")
+    await _approval(db, "a2", action_type="autonomous_cli_fallback",
+                    status="cancelled", resolved_at=ts, resolved_by="system")
     # non-churn: explicit human denial (M12), timeout expiry, unknown resolver
-    await _approval(db, "a3", status="rejected", resolved_at=ts, resolved_by="telegram:bare_text:1")
-    await _approval(db, "a4", status="expired", resolved_at=ts, resolved_by="timeout_auto_expire")
-    await _approval(db, "a5", status="approved", resolved_at=ts, resolved_by="manual_stale_cleanup")
+    await _approval(db, "a3", status="rejected", resolved_at=ts,
+                    resolved_by="telegram:bare_text:1")
+    await _approval(db, "a4", status="expired", resolved_at=ts,
+                    resolved_by="timeout_auto_expire")
+    await _approval(db, "a5", status="approved", resolved_at=ts,
+                    resolved_by="manual_stale_cleanup")
     # still pending — resolved-population excludes it; pending_open gauge sees it
     await _approval(db, "a6")
 
     metrics, sample = await _compute_approvals(
-        db,
-        since="2000-01-01",
-        until="2100-01-01",
+        db, since="2000-01-01", until="2100-01-01",
     )
     assert sample == 5
     assert metrics["total_created"] == 6
     assert metrics["total_resolved"] == 5
     assert metrics["churn_total"] == 2
     assert metrics["churn_excluded_total"] == 3
-    assert metrics["user_resolved"] == 2  # a1 + a3
+    assert metrics["user_resolved"] == 2          # a1 + a3
     assert metrics["user_resolved_rate"] == 0.4
     assert metrics["user_resolved_rate_excl_churn"] == pytest.approx(1 / 3, abs=1e-3)
-    assert metrics["auto_resolved"] == 2  # a2 + a4
+    assert metrics["auto_resolved"] == 2          # a2 + a4
     assert metrics["auto_expired"] == 1
     assert metrics["system_cancelled"] == 1
     assert metrics["rejection_count"] == 1
-    assert metrics["user_denied_count"] == 1  # M12: human reject
+    assert metrics["user_denied_count"] == 1      # M12: human reject
     assert metrics["unknown_resolver_count"] == 1
     assert metrics["unknown_resolver_values"] == ["manual_stale_cleanup"]
     assert metrics["pending_open"] == 1
@@ -1146,9 +1046,7 @@ async def test_compute_approvals_empty_window_is_null(db):
     from genesis.eval.j9_aggregator import _compute_approvals
 
     metrics, sample = await _compute_approvals(
-        db,
-        since="2000-01-01",
-        until="2100-01-01",
+        db, since="2000-01-01", until="2100-01-01",
     )
     assert sample == 0
     assert metrics["user_resolved_rate"] is None
@@ -1163,30 +1061,20 @@ async def test_compute_approvals_mixed_resolved_at_formats(db):
     from genesis.eval.j9_aggregator import _compute_approvals
 
     # in-window, one of each format
-    await _approval(
-        db,
-        "b1",
-        status="approved",
-        resolved_at="2026-06-05 12:00:00",
-        resolved_by="telegram:button:1",
-    )
-    await _approval(
-        db,
-        "b2",
-        status="approved",
-        resolved_at="2026-06-06T12:00:00+00:00",
-        resolved_by="dashboard",
-    )
+    await _approval(db, "b1", status="approved",
+                    resolved_at="2026-06-05 12:00:00",
+                    resolved_by="telegram:button:1")
+    await _approval(db, "b2", status="approved",
+                    resolved_at="2026-06-06T12:00:00+00:00",
+                    resolved_by="dashboard")
     # space-format AFTER the until bound — lexicographic compare against
     # '2026-06-30T00:00:00+00:00' would wrongly include it (' ' < 'T')
-    await _approval(
-        db, "b3", status="approved", resolved_at="2026-06-30 12:00:00", resolved_by="dashboard"
-    )
+    await _approval(db, "b3", status="approved",
+                    resolved_at="2026-06-30 12:00:00",
+                    resolved_by="dashboard")
 
     metrics, _ = await _compute_approvals(
-        db,
-        since="2026-06-01T00:00:00+00:00",
-        until="2026-06-30T00:00:00+00:00",
+        db, since="2026-06-01T00:00:00+00:00", until="2026-06-30T00:00:00+00:00",
     )
     assert metrics["total_resolved"] == 2  # b3 excluded
     assert metrics["user_resolved"] == 2
@@ -1205,9 +1093,7 @@ async def test_compute_goal_completion_zero_terminal_is_null(db):
     await user_goals.create(db, title="g2", category="learning")
 
     metrics, sample = await _compute_goal_completion(
-        db,
-        since="2000-01-01",
-        until="2100-01-01",
+        db, since="2000-01-01", until="2100-01-01",
     )
     assert sample == 2
     assert metrics["total_goals"] == 2
@@ -1228,15 +1114,10 @@ async def test_compute_goal_completion_rate(db):
     await user_goals.mark_abandoned(db, g2)
 
     metrics, _ = await _compute_goal_completion(
-        db,
-        since="2000-01-01",
-        until="2100-01-01",
+        db, since="2000-01-01", until="2100-01-01",
     )
     assert metrics["by_status"] == {
-        "active": 1,
-        "paused": 0,
-        "achieved": 1,
-        "abandoned": 1,
+        "active": 1, "paused": 0, "achieved": 1, "abandoned": 1,
     }
     assert metrics["terminal_count"] == 2
     assert metrics["achieved_count"] == 1
@@ -1260,20 +1141,17 @@ async def test_compute_noise_passivity(db):
     # follow-ups: one stale-pending (leak), one completed
     await db.execute(
         "INSERT INTO follow_ups (id, source, content, strategy, status, created_at) "
-        "VALUES ('f1','session_retro','x','ego_judgment','pending',?)",
-        (old,),
+        "VALUES ('f1','session_retro','x','ego_judgment','pending',?)", (old,),
     )
     await db.execute(
         "INSERT INTO follow_ups (id, source, content, strategy, status, created_at) "
-        "VALUES ('f2','session_retro','y','ego_judgment','completed',?)",
-        (old,),
+        "VALUES ('f2','session_retro','y','ego_judgment','completed',?)", (old,),
     )
     # observation: unresolved, un-actuated, old → stale leak
     await db.execute(
         "INSERT INTO observations "
         "(id, source, type, content, priority, created_at, influenced_action, resolved, surfaced_count) "
-        "VALUES ('o1','s','generic','c','medium',?,0,0,0)",
-        (old,),
+        "VALUES ('o1','s','generic','c','medium',?,0,0,0)", (old,),
     )
     # ego proposals: rejected + withdrawn (decision buckets window on
     # resolved_at, which the reject/table/withdraw transitions set) +
@@ -1281,32 +1159,26 @@ async def test_compute_noise_passivity(db):
     await db.execute(
         "INSERT INTO ego_proposals "
         "(id, action_type, content, status, created_at, resolved_at, realist_verdict) "
-        "VALUES ('p1','investigate','c','rejected',?,?,'amend')",
-        (old, old),
+        "VALUES ('p1','investigate','c','rejected',?,?,'amend')", (old, old),
     )
     await db.execute(
         "INSERT INTO ego_proposals (id, action_type, content, status, created_at, resolved_at) "
-        "VALUES ('p2','outreach','c','withdrawn',?,?)",
-        (old, old),
+        "VALUES ('p2','outreach','c','withdrawn',?,?)", (old, old),
     )
     await db.execute(
         "INSERT INTO ego_proposals (id, action_type, content, status, created_at) "
-        "VALUES ('p3','maintenance','c','pending',?)",
-        (old,),
+        "VALUES ('p3','maintenance','c','pending',?)", (old,),
     )
     # ego cycles: 2 empty, 1 productive
     for cid, n in (("c1", 0), ("c2", 0), ("c3", 2)):
         await db.execute(
             "INSERT INTO ego_cycle_outcomes (cycle_id, focus_type, num_proposals, created_at) "
-            "VALUES (?, 'signal', ?, ?)",
-            (cid, n, old),
+            "VALUES (?, 'signal', ?, ?)", (cid, n, old),
         )
     await db.commit()
 
     metrics, sample = await _compute_noise_passivity(
-        db,
-        since="2000-01-01T00:00:00+00:00",
-        until="2100-01-01T00:00:00+00:00",
+        db, since="2000-01-01T00:00:00+00:00", until="2100-01-01T00:00:00+00:00",
     )
     assert metrics["stale_followups"] == 1
     assert metrics["followups_pending"] == 1
@@ -1329,9 +1201,7 @@ async def test_compute_noise_passivity_zero_cycles_is_null(db):
     from genesis.eval.j9_aggregator import _compute_noise_passivity
 
     metrics, _ = await _compute_noise_passivity(
-        db,
-        since="2000-01-01T00:00:00+00:00",
-        until="2100-01-01T00:00:00+00:00",
+        db, since="2000-01-01T00:00:00+00:00", until="2100-01-01T00:00:00+00:00",
     )
     assert metrics["empty_ego_cycle_pct"] is None
 
@@ -1348,18 +1218,9 @@ async def test_run_weekly_aggregation_writes_new_dimensions(db):
 
     results = await run_weekly_aggregation(db)
 
-    expected = {
-        "memory",
-        "system",
-        "ego",
-        "cognitive",
-        "procedure",
-        "cognitive_drift",
-        "approvals",
-        "goals",
-        "noise",
-        "dev_quality",
-    }
+    expected = {"memory", "system", "ego", "cognitive", "procedure",
+                "cognitive_drift", "approvals", "goals", "noise",
+                "dev_quality"}
     missing = expected - results.keys()
     assert not missing, f"dimensions failed silently: {missing}"
 
@@ -1393,12 +1254,10 @@ async def test_noise_decision_buckets_window_on_resolved_at(db):
     await db.commit()
 
     metrics, _ = await _compute_noise_passivity(
-        db,
-        since="2000-01-01T00:00:00+00:00",
-        until="2100-01-01T00:00:00+00:00",
+        db, since="2000-01-01T00:00:00+00:00", until="2100-01-01T00:00:00+00:00",
     )
-    assert metrics["rejected_count"] == 1  # pb1: decided in window
-    assert metrics["withdrawn_count"] == 0  # pb2: decided before window
+    assert metrics["rejected_count"] == 1       # pb1: decided in window
+    assert metrics["withdrawn_count"] == 0      # pb2: decided before window
     assert metrics["proposals_in_period"] == 0  # neither was CREATED in window
     assert metrics["rejected_by_action_type"] == {"investigate": 1}
 
@@ -1429,31 +1288,20 @@ async def test_compute_goal_completion_excludes_ego_goals(db):
 
     u1 = await user_goals.create(db, title="user g", category="project")
     e1 = await user_goals.create(
-        db,
-        title="ego g",
-        category="project",
-        origin="genesis_ego",
+        db, title="ego g", category="project", origin="genesis_ego",
     )
     await user_goals.create(
-        db,
-        title="ego g2",
-        category="project",
-        origin="genesis_ego",
+        db, title="ego g2", category="project", origin="genesis_ego",
     )
     await user_goals.mark_achieved(db, u1)
     await user_goals.mark_achieved(db, e1)
 
     metrics, sample = await _compute_goal_completion(
-        db,
-        since="2000-01-01",
-        until="2100-01-01",
+        db, since="2000-01-01", until="2100-01-01",
     )
     assert sample == 1  # the user goal only
     assert metrics["total_goals"] == 1
     assert metrics["by_status"] == {
-        "active": 0,
-        "paused": 0,
-        "achieved": 1,
-        "abandoned": 0,
+        "active": 0, "paused": 0, "achieved": 1, "abandoned": 0,
     }
     assert metrics["achieved_count"] == 1
