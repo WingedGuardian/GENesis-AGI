@@ -320,9 +320,15 @@ manager: **nvm** installs global binaries under `~/.nvm/versions/node/<version>/
 `cc_shadow_scan` prunes the old nvm copy after CC reinstalls under a new version), the baked
 path goes stale and the services can't find `claude` (symptom: `claude: not found` in the
 service journal; note `claude` is a self-contained binary and does **not** need `node` on
-PATH to launch, so only CC spawning breaks, not the Python runtime). **Fix:** re-run
-`scripts/update.sh` (or `bootstrap.sh` + `systemctl --user restart genesis-server`), which
-re-renders the units against the current `claude` location.
+PATH to launch, so only CC spawning breaks, not the Python runtime). **Fix:** the next
+routine `scripts/update.sh` that carries a repo delta re-renders the units automatically
+(self-heal). To repair immediately with no pending update, run `./scripts/bootstrap.sh
+--force` (the `--force` is required — bootstrap refuses on a live server) then `systemctl
+--user restart genesis-server` (and `genesis-bridge` if used) to apply the new PATH — a
+`daemon-reload` alone does not re-read `Environment=` for a running unit. Note that a
+**no-delta** `update.sh` run (`Already up to date`) early-exits after the CC-pin sync
+**without** re-rendering the units (`scripts/update.sh` lines 959-996), so it does not fix a
+standalone stale path on its own — use bootstrap directly for that.
 
 **Host VM (verified 2026-06-15):** The host installs Claude Code the **same way as
 the container — npm-global**, not the native installer. On this host the npm prefix

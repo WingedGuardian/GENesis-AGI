@@ -169,7 +169,7 @@ pytest -v             # tests
 - **Hooks not firing**: Run `python scripts/setup_claude_config.py` and restart CC
 - **MCP servers not connecting**: Check `.mcp.json` has correct paths. Regenerate with the setup script.
 - **Missing venv**: `python3 -m venv .venv && source .venv/bin/activate && pip install -e .`
-- **Services can't find `claude` (nvm users)**: after changing your active Node version under nvm, re-run `scripts/update.sh` to re-render the systemd units' baked Claude Code path (`claude: not found` in the service journal is the tell). See `docs/reference/cc-compatibility.md`.
+- **Services can't find `claude` (nvm users)**: if you change your active Node version under nvm, the systemd units' baked Claude Code path can go stale (`claude: not found` in the service journal is the tell). Repair with `./scripts/bootstrap.sh --force` then `systemctl --user restart genesis-server` (a routine `scripts/update.sh` that pulls new commits also re-renders them). See `docs/reference/cc-compatibility.md`.
 
 ## Architecture
 
