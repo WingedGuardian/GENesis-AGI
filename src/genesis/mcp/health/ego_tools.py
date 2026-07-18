@@ -463,6 +463,9 @@ async def _resolve_one_proposal(
     prop: dict,
     status: str,
     reason: str,
+    *,
+    standing_rule: str = "",
+    one_off: bool = False,
 ) -> str:
     """Resolve a single proposal (given its row dict) and run every
     post-resolution hook.
@@ -502,64 +505,26 @@ async def _resolve_one_proposal(
     if not updated:
         return "not updated"
 
-    # Post-resolution hooks — best-effort, each isolated so one failure never
-    # blocks the others or the resolution itself.
-    # Autonomy earn-back: promote on approval / cooldown on reject.
+    # Shared post-resolution hook: J-9, journal, decision capture,
+    # correction memory (no-op here — the MCP health server has no runtime
+    # embeddings; the decision row is the canonical artifact), and all
+    # action hooks. Full parity with the Telegram and dashboard paths.
     try:
-        from genesis.ego.earnback import handle_earnback_resolution
+        from genesis.ego.resolution import handle_proposal_resolution
         from genesis.runtime import GenesisRuntime
 
         _rt = GenesisRuntime.instance()
-        await handle_earnback_resolution(
-            db, prop, status, getattr(_rt, "_autonomy_manager", None),
+        await handle_proposal_resolution(
+            db, prop, status,
+            reason=reason or None,
+            source="mcp",
+            memory_store=getattr(_rt, "_memory_store", None),
+            autonomy_manager=getattr(_rt, "_autonomy_manager", None),
+            standing_rule=standing_rule.strip() or None,
+            one_off=one_off,
         )
     except Exception:
-        logger.debug("earnback resolution hook failed", exc_info=True)
-    # Goal status change: apply pause/deprioritize on approval.
-    try:
-        from genesis.ego.goal_actions import (
-            handle_goal_status_change_resolution,
-        )
-
-        await handle_goal_status_change_resolution(db, prop, status)
-    except Exception:
-        logger.debug("goal status-change hook failed", exc_info=True)
-    # Cell promotion (WS-8 PR-D).
-    try:
-        from genesis.ego.cell_promotion import (
-            handle_cell_promotion_resolution,
-        )
-
-        await handle_cell_promotion_resolution(db, prop, status)
-    except Exception:
-        logger.debug("cell promotion hook failed", exc_info=True)
-    # Cognitive variant promotion (Evo PR-B).
-    try:
-        from genesis.ego.cognitive_variant import (
-            handle_cognitive_variant_resolution,
-        )
-
-        await handle_cognitive_variant_resolution(db, prop, status)
-    except Exception:
-        logger.debug("cognitive-variant hook failed", exc_info=True)
-    # J-9 regression (informational): mark executed on approval.
-    try:
-        from genesis.ego.j9_regression_actions import (
-            handle_j9_regression_resolution,
-        )
-
-        await handle_j9_regression_resolution(db, prop, status)
-    except Exception:
-        logger.debug("j9 regression hook failed", exc_info=True)
-    # Gauntlet regression (informational): mark executed on approval.
-    try:
-        from genesis.ego.gauntlet_regression_actions import (
-            handle_gauntlet_regression_resolution,
-        )
-
-        await handle_gauntlet_regression_resolution(db, prop, status)
-    except Exception:
-        logger.debug("gauntlet regression hook failed", exc_info=True)
+        logger.warning("resolution hook failed for %s", prop.get("id"), exc_info=True)
 
     return status
 
@@ -570,6 +535,8 @@ async def ego_proposal_resolve(
     proposal_numbers: str = "all",
     reason: str = "",
     proposal_ids: str = "",
+    standing_rule: str = "",
+    one_off: bool = False,
 ) -> dict:
     """Resolve pending ego proposals from a conversation.
 
@@ -597,6 +564,14 @@ async def ego_proposal_resolve(
         reason: Optional reason (recorded as user_response; used for rejections).
         proposal_ids: Comma-separated proposal IDs for precise,
             batch-independent targeting.
+        standing_rule: For rejections — a distilled one-sentence RULING the
+            user's reason implies (e.g. "[content/publishing] De-identification
+            may be proposed on strategic merits only, never as a compliance
+            need"). Stored as the durable decision text; when omitted, the
+            verbatim reason is stored. The resolving session should distill
+            this whenever the reason states a standing position.
+        one_off: True if the user marked the rejection as situational
+            ("just not right now") — skips decision capture.
     """
     if action not in ("approve", "reject"):
         return {
@@ -625,6 +600,7 @@ async def ego_proposal_resolve(
                 previews[pid] = (prop.get("content") or "")[:100]
                 results[pid] = await _resolve_one_proposal(
                     db, prop, status, reason,
+                    standing_rule=standing_rule, one_off=one_off,
                 )
             resolved = sum(
                 1 for v in results.values() if v in ("approved", "rejected")
@@ -706,6 +682,7 @@ async def ego_proposal_resolve(
             previews[prop["id"]] = f"#{idx}: " + (prop.get("content") or "")[:90]
             results[prop["id"]] = await _resolve_one_proposal(
                 db, prop, status, reason,
+                standing_rule=standing_rule, one_off=one_off,
             )
 
         resolved = sum(
@@ -721,3 +698,103 @@ async def ego_proposal_resolve(
             "board_size": len(board),
             "timestamp": datetime.now(UTC).isoformat(),
         }
+
+
+@mcp.tool()
+async def ego_decision(
+    action: str,
+    content: str = "",
+    decision_id: str = "",
+    reason: str = "",
+    ego_target: str = "user_ego",
+) -> dict:
+    """Record, supersede, or list settled user decisions (durable rulings).
+
+    A decision is a user RULING — a settled question, a standing rule, an
+    overrule — captured so the ego context always renders it and never
+    re-litigates it. Preferences and soft guidance belong in memory_store,
+    not here.
+
+    Args:
+        action: "record" | "supersede" | "list".
+        content: For record — the distilled ruling, one sentence, prefixed
+            "[type/category]" (e.g. "[content/publishing] Publish under the
+            user's own name; OBA compliance is settled").
+        decision_id: For supersede — the id of the ruling being replaced.
+        reason: For supersede — why the user revoked/replaced it.
+        ego_target: "user_ego" (default) or "genesis_ego".
+    """
+    from genesis.db.connection import get_raw_db
+    from genesis.db.crud import ego as ego_crud
+
+    if action not in ("record", "supersede", "list"):
+        return {
+            "status": "error",
+            "reason": f"action must be record/supersede/list, got {action!r}",
+        }
+    if ego_target not in ("user_ego", "genesis_ego"):
+        return {"status": "error", "reason": f"bad ego_target {ego_target!r}"}
+
+    db_path = _get_db_path()
+    async with get_raw_db(db_path) as db:
+        if action == "list":
+            decisions, total = await ego_crud.list_active_decisions(
+                db, ego_target=ego_target, limit=20,
+            )
+            return {
+                "status": "ok",
+                "total_active": total,
+                "decisions": [
+                    {
+                        "id": d["id"],
+                        "content": d["content"],
+                        "created_at": d["created_at"],
+                        "reaffirm_count": d.get("reaffirm_count", 0),
+                        "last_reaffirmed_at": d.get("last_reaffirmed_at"),
+                    }
+                    for d in decisions
+                ],
+            }
+
+        if action == "record":
+            text = content.strip()
+            if len(text) < 10:
+                return {
+                    "status": "error",
+                    "reason": "content must be a distilled ruling (>=10 chars)",
+                }
+            # Dedup on the [type/category] prefix when present.
+            if text.startswith("["):
+                prefix = text.split("]", 1)[0] + "]"
+                existing = await ego_crud.find_active_decision(
+                    db, prefix=prefix, ego_target=ego_target,
+                )
+                if existing:
+                    await ego_crud.reaffirm_decision(db, existing["id"])
+                    return {
+                        "status": "ok",
+                        "action": "reaffirmed",
+                        "decision_id": existing["id"],
+                        "existing_content": existing["content"][:200],
+                    }
+            decision_id_new = await ego_crud.create_decision(
+                db, content=text[:500], ego_target=ego_target,
+            )
+            return {
+                "status": "ok",
+                "action": "recorded",
+                "decision_id": decision_id_new,
+            }
+
+        # supersede
+        if not decision_id.strip():
+            return {"status": "error", "reason": "supersede requires decision_id"}
+        ok = await ego_crud.supersede_decision(
+            db, decision_id.strip(), resolution=reason.strip(),
+        )
+        if not ok:
+            return {
+                "status": "error",
+                "reason": f"decision {decision_id!r} not found or not active",
+            }
+        return {"status": "ok", "action": "superseded", "decision_id": decision_id}

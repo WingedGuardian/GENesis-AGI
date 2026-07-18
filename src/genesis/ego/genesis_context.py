@@ -81,6 +81,7 @@ class GenesisEgoContextBuilder:
         section_map: list[tuple[str, Any]] = [
             ("system_health", self._system_health_section),
             ("intentions", self._intentions_section),
+            ("settled_decisions", self._settled_decisions_section),
             ("signals", self._signals_section),
             ("observations", self._observations_section),
             ("follow_ups", self._follow_ups_section),
@@ -183,6 +184,41 @@ class GenesisEgoContextBuilder:
             if last_dispatch:
                 lines.append(f"- Last dispatch: {last_dispatch}")
 
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _settled_decisions_section(self, *, depth: str = "deep") -> str:
+        """Settled user decisions for the Genesis ego — same contract as the
+        user-ego section: rulings, not signals."""
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            decisions, total = await ego_crud.list_active_decisions(
+                self._db, ego_target="genesis_ego", limit=7,
+            )
+        except Exception:
+            logger.debug("Failed to query settled decisions", exc_info=True)
+            return ""
+
+        if not decisions:
+            return ""
+
+        lines = ["## Settled Decisions\n"]
+        lines.append(
+            "*User rulings — constraints, not signals. Do not re-propose, "
+            "re-litigate, or engineer workarounds for anything below. Only "
+            "the user can supersede a ruling; if you believe circumstances "
+            "have changed, ASK — never act on the assumption.*\n"
+        )
+        for d in decisions:
+            when = (d.get("last_reaffirmed_at") or d.get("created_at") or "?")[:10]
+            reaff = d.get("reaffirm_count") or 0
+            marker = f" (reaffirmed ×{reaff})" if reaff else ""
+            lines.append(f"- [{when}]{marker} {d.get('content', '?')[:400]}")
+        if total > len(decisions):
+            lines.append(
+                f"\n*(+{total - len(decisions)} older active rulings not shown)*"
+            )
         lines.append("")
         return "\n".join(lines)
 

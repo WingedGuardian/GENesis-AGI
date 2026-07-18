@@ -1036,7 +1036,14 @@ TABLES = {
                 CHECK (status IN ('active', 'completed', 'cancelled')),
             created_at  TEXT NOT NULL,
             resolved_at TEXT,
-            resolution  TEXT
+            resolution  TEXT,
+            -- decision rows (migration 0066): user rulings captured at
+            -- proposal rejection; superseded only by the user
+            kind        TEXT NOT NULL DEFAULT 'directive'
+                CHECK (kind IN ('directive', 'decision')),
+            source_proposal_id TEXT,
+            reaffirm_count     INTEGER NOT NULL DEFAULT 0,
+            last_reaffirmed_at TEXT
         )
     """,
     # ── Ego Intentions Queue ──────────────────────────────────────────────
@@ -2100,6 +2107,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_goal ON ego_proposals(goal_id)",
     # ego directives
     "CREATE INDEX IF NOT EXISTS idx_ego_directives_status ON ego_directives(status)",
+    "CREATE INDEX IF NOT EXISTS idx_ego_directives_kind_status ON ego_directives(kind, status)",
     "CREATE INDEX IF NOT EXISTS idx_ego_directives_created ON ego_directives(created_at)",
     # ego intentions
     "CREATE INDEX IF NOT EXISTS idx_ego_intentions_source_status ON ego_intentions(ego_source, status)",

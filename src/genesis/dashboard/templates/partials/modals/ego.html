@@ -308,7 +308,8 @@
                         </template>
                         <template x-if="$store.genesisDashboard.egoModal.rejectingId === p.id">
                           <div style="display: flex; gap: 0.3rem; align-items: center; flex: 1;">
-                            <input type="text" placeholder="Reason (optional)"
+                            <input type="text" x-init="$el.focus()"
+                                   placeholder="Why? This teaches the ego — a reason becomes a standing rule"
                                    style="font-size: 0.72rem; padding: 0.2rem 0.5rem; border: 1px solid var(--color-border); border-radius: 4px; background: var(--color-bg); color: var(--color-text); flex: 1;"
                                    x-model="$store.genesisDashboard.egoModal.rejectReason"
                                    @keyup.enter="$store.genesisDashboard.resolveEgoProposal(p.id, 'rejected', $store.genesisDashboard.egoModal.rejectReason)">
