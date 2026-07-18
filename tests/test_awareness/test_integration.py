@@ -106,3 +106,39 @@ async def test_sequential_ticks_track_history(db):
     ticks = await awareness_ticks.query(db)
     assert len(ticks) == 2
     assert ticks[0]["id"] != ticks[1]["id"]
+
+
+async def test_baseline_note_persisted_additively(db):
+    """perform_tick persists baseline_note when a collector provides one,
+    and omits the key entirely when it does not (old-format compat)."""
+
+    class Noted:
+        signal_name = "user_session_pattern"
+
+        async def collect(self):
+            return SignalReading(
+                name="user_session_pattern", value=0.8, source="cc_sessions",
+                collected_at=datetime.now(UTC).isoformat(),
+                baseline_note=(
+                    "Baseline: 4.0 sessions/day (last 21d). "
+                    "Recent: 27.0/day (last 3d)."
+                ),
+            )
+
+    class Bare:
+        signal_name = "conversations_since_reflection"
+
+        async def collect(self):
+            return SignalReading(
+                name="conversations_since_reflection", value=0.2,
+                source="cc_sessions",
+                collected_at=datetime.now(UTC).isoformat(),
+            )
+
+    await perform_tick(db, [Noted(), Bare()], source="scheduled")
+
+    ticks = await awareness_ticks.query(db)
+    assert len(ticks) == 1
+    by_name = {s["name"]: s for s in json.loads(ticks[0]["signals_json"])}
+    assert "Baseline: 4.0 sessions/day" in by_name["user_session_pattern"]["baseline_note"]
+    assert "baseline_note" not in by_name["conversations_since_reflection"]
