@@ -52,6 +52,18 @@ _RECENCY_TIERS: list[tuple[timedelta | None, int]] = [
 ]
 
 
+def _expires_in(minutes: float) -> str:
+    """ISO timestamp *minutes* from now — signal TTL helper.
+
+    TTLs keep requeued/parked signals from going stale in the queue:
+    each producer sets a lifetime matching how long its signal stays
+    actionable (a proactive tick is superseded by the next one; a
+    morning briefing is stale by afternoon). Escalations get NO TTL —
+    critical facts don't expire on their own.
+    """
+    return (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat()
+
+
 def _map_priority(severity_or_priority: str) -> str:
     """Map event severity/priority strings to signal priority levels."""
     s = severity_or_priority.lower()
@@ -286,7 +298,7 @@ class EgoCadenceManager:
         """Push an event that may trigger a reactive ego cycle.
 
         Creates an EgoSignal and pushes to the unified signal queue.
-        Content dedup is handled by SignalQueue (6h window on
+        Content dedup is handled by SignalQueue (per-category window on
         ``reactive:{summary}``). Rate limiting happens at the consumer
         (``_process_signals``) to preserve batch semantics.
 
@@ -306,6 +318,9 @@ class EgoCadenceManager:
                 "event_type": event.get("type"),
                 "source": event.get("source"),
             },
+            # 12h: the deadline scanner re-fires and events re-emit; a
+            # half-day-old reactive signal is stale context, not news.
+            expires_at=_expires_in(12 * 60),
         )
         if self._signal_queue.push(signal):
             logger.debug("Reactive signal pushed: %s", event.get("type", "?"))
@@ -335,6 +350,7 @@ class EgoCadenceManager:
                 "event_type": event.get("type"),
                 "source": event.get("source"),
             },
+            # No expires_at: critical facts don't expire on their own.
         )
         if self._signal_queue.push(signal):
             logger.info("Escalation signal pushed: %s", event.get("type", "?"))
@@ -487,6 +503,9 @@ class EgoCadenceManager:
                         "mode": "stuck" if is_stuck else "stale",
                         "executed_proposals": executed,
                     },
+                    # 24h: the next staleness scan re-detects anything
+                    # still stale.
+                    expires_at=_expires_in(24 * 60),
                 )
                 if self._signal_queue.push(signal):
                     pushed += 1
@@ -748,6 +767,9 @@ class EgoCadenceManager:
             summary=f"Idle tick #{self._proactive_cycle_count}",
             priority="medium",
             metadata={"model_override": model_override} if model_override else {},
+            # Self-superseding: the next tick pushes a fresh one, so a
+            # tick parked longer than the current interval is stale.
+            expires_at=_expires_in(self._current_interval),
         )
         if self._signal_queue.push(signal):
             logger.debug("Proactive signal pushed: %s", signal.summary)
@@ -913,6 +935,10 @@ class EgoCadenceManager:
                 # Effort override comes from the dedicated config field.
                 "effort_override": self._config.morning_report_effort,
             },
+            # 6h: a briefing delivered same-morning (e.g. once a pending
+            # approval resolves) is useful; by afternoon it is stale and
+            # tomorrow's cron covers it.
+            expires_at=_expires_in(6 * 60),
         )
         if self._signal_queue.push(signal):
             logger.info("Morning report signal pushed")
