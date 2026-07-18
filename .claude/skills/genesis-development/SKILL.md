@@ -85,6 +85,27 @@ changes: verify the notification actually arrives. Ask: "If the system
 restarts right now, will this actually work?" If you can't answer yes
 with evidence, you're not done.
 
+### Instance-Fix vs Class-Fix Gate
+
+When a mechanism failed to write or propagate something (a memory, a
+directive, a config row, a status flag), hand-writing the missing
+artifact is a **data repair** — it mitigates ONE instance on ONE
+install. It is never the fix. Before reporting anything as "fixed",
+classify it:
+
+- **Data repair** — you wrote the artifact the mechanism should have
+  written. Label it "data repair" explicitly, and in the same session
+  either fix the mechanism or get the user's explicit deferral
+  (recorded as a follow-up). Never report a data repair as "fixed".
+- **Class fix** — you changed the mechanism so the artifact is written
+  correctly on every install, going forward, with a test proving it.
+
+The test: "If a fresh install hits the same situation tomorrow, does my
+change help them?" If the answer is no, you have repaired data, not
+fixed anything. (Origin: 2026-07-17 — a stale-decision recurrence was
+"fixed" with a hand-written memory + directive; the propagation
+mechanism that failed to write them stayed broken.)
+
 ### Code Intelligence — pick the right lane
 
 **Serena (Python LSP) is always live** — it parses current files per query, so
@@ -212,6 +233,7 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "I'll add the follow-up later" | Follow-ups not created in-session are lost. Create it now while context is fresh. |
 | "I don't need a skill for this" | If a skill exists, use it. The using-superpowers Red Flags table exists for this exact rationalization. |
 | "I can read the summary instead of the source" | Summaries lose context. If you're about to change code, read the code, not the description of it. |
+| "The missing data was the problem — I wrote it, so it's fixed" | The mechanism that failed to write it is the problem. Hand-written artifacts are data repair, not a fix (see Instance-Fix vs Class-Fix Gate). |
 
 ### Code Discovery
 
