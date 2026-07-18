@@ -111,14 +111,18 @@ def entity_lane_mode() -> str:
     """Effective entity-lane mode: ``off | shadow`` — read live from config.
 
     Reads the shared ``memory_recall`` config
-    (``graph_expansion.load_recall_config``, mtime-cached). Recognizes
-    ``off``/``shadow`` only; anything else — including ``live`` (reserved for
-    PR-2) and typos — degrades to ``off``. This is deliberately MORE
-    conservative than ``graph_expansion`` (which degrades unknown→shadow): an
-    unshipped lane must never start running the resolver's active-norm_name
-    scan on a hot recall path because of a hand-edit.
+    (``graph_expansion.load_recall_config``, mtime-cached). The module-wide
+    ``enabled: false`` master kill switch forces ``off`` (parity with
+    ``graph_expansion._mode_from``). Otherwise recognizes ``off``/``shadow``
+    only; anything else — including ``live`` (reserved for PR-2) and typos —
+    degrades to ``off``. This is deliberately MORE conservative than
+    ``graph_expansion`` (which degrades unknown→shadow): an unshipped lane must
+    never start running the resolver's active-norm_name scan on a hot recall
+    path because of a hand-edit.
     """
     cfg = graph_expansion.load_recall_config()
+    if not cfg.get("enabled", True):
+        return "off"
     section = cfg.get("entity_lane")
     mode = section.get("mode") if isinstance(section, dict) else None
     if mode == "shadow":

@@ -1114,3 +1114,29 @@ async def test_recall_survives_entity_lane_shadow_failure(mock_qdrant, mock_crud
     with patch("genesis.memory.entity_query.maybe_entity_lane_shadow", boom):
         results = await retriever.recall("test query", limit=10)
     assert [r.memory_id for r in results] == [r.memory_id for r in baseline]
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_fires_entity_lane_shadow_on_zero_hits(mock_qdrant, mock_crud, mock_links, _e):
+    """Even when vector/FTS/event find nothing (recall returns []), the entity
+    lane shadow probe still fires with empty sets — its highest-value case
+    (organic recall found nothing, the lane might still surface something)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = []  # no vector hits
+    mock_crud.search_ranked = AsyncMock(return_value=[])  # no FTS hits
+    mock_crud.batch_created_at = AsyncMock(return_value={})
+    _setup_link_mocks(mock_links)
+
+    spy = AsyncMock(return_value=None)
+    with patch("genesis.memory.entity_query.maybe_entity_lane_shadow", spy):
+        results = await retriever.recall("test query", limit=10)
+
+    assert results == []  # zero organic candidates
+    spy.assert_awaited_once()  # but the probe still ran
+    kw = spy.await_args.kwargs
+    assert kw["ranked_lists"] == []
+    assert kw["all_ids"] == set()

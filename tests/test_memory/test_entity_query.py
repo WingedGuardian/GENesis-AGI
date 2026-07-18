@@ -138,6 +138,16 @@ def test_entity_lane_mode(monkeypatch, section, expected):
     assert entity_query.entity_lane_mode() == expected
 
 
+def test_entity_lane_mode_honors_master_kill_switch(monkeypatch):
+    # enabled: false silences BOTH lanes even if entity_lane.mode is shadow.
+    monkeypatch.setattr(
+        graph_expansion,
+        "load_recall_config",
+        lambda: {"enabled": False, "entity_lane": {"mode": "shadow"}},
+    )
+    assert entity_query.entity_lane_mode() == "off"
+
+
 # ── resolve_query_entities ───────────────────────────────────────────────
 
 

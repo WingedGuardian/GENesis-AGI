@@ -567,6 +567,37 @@ class HybridRetriever:
         self._db = db
         self._reranker = reranker
 
+    async def _maybe_entity_lane_shadow(
+        self,
+        *,
+        query: str,
+        ranked_lists: list[list[str]],
+        all_ids: set[str],
+        limit: int,
+        embedding_available: bool,
+        recall_event_id: str | None,
+    ) -> None:
+        """Fire the entity-lane SHADOW probe (off by default). Fully contained
+        (its own guard belts the helper's internal try/except) — appends one
+        eval_event, never touches recall output. Called on BOTH the
+        empty-candidate early return (the lane's highest-value case: organic
+        recall found nothing) and the normal tail.
+        """
+        try:
+            from genesis.memory import entity_query
+
+            await entity_query.maybe_entity_lane_shadow(
+                self._db,
+                query=query,
+                ranked_lists=ranked_lists,
+                all_ids=all_ids,
+                limit=limit,
+                embedding_available=embedding_available,
+                recall_event_id=recall_event_id,
+            )
+        except Exception:
+            logger.debug("entity_lane_shadow call failed — recall unaffected", exc_info=True)
+
     async def recall(
         self,
         query: str,
@@ -686,17 +717,30 @@ class HybridRetriever:
 
         # 4. Union of all candidate memory_ids
         all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
-        if not all_ids:
-            return []
 
         # 4b. Phase 1.5e: drop candidates past their bitemporal invalid_at.
-        all_ids, event_memory_ids = await self._filter_expired_candidates(
-            all_ids,
-            qdrant_by_id,
-            fts_by_id,
-            event_memory_ids,
-        )
+        # (No-op on an empty set — guard the call so both empty exits share one
+        # path below.)
+        if all_ids:
+            all_ids, event_memory_ids = await self._filter_expired_candidates(
+                all_ids,
+                qdrant_by_id,
+                fts_by_id,
+                event_memory_ids,
+            )
         if not all_ids:
+            # No organic candidates from vector/FTS/event lanes. Still measure
+            # whether the entity lane would surface something — its highest-value
+            # case (Codex #1121 P2: don't skip the zero-hit path). No ranked
+            # lists exist here, so lane novelty = its valid candidates.
+            await self._maybe_entity_lane_shadow(
+                query=query,
+                ranked_lists=[],
+                all_ids=set(),
+                limit=limit,
+                embedding_available=embedding_available,
+                recall_event_id=None,
+            )
             return []
 
         now_str = datetime.now(UTC).isoformat()
@@ -916,22 +960,15 @@ class HybridRetriever:
         # entity graph would surface novel valid candidates the vector/FTS lanes
         # miss — pure observation that appends one eval_event and NEVER touches
         # ``results``. Placed after the write-backs so its insert_event commit
-        # can't flush partial recall state; own guard belts the helper's own
-        # try/except (belt-and-suspenders — recall must never break here).
-        try:
-            from genesis.memory import entity_query
-
-            await entity_query.maybe_entity_lane_shadow(
-                self._db,
-                query=query,
-                ranked_lists=ranked_lists,
-                all_ids=all_ids,
-                limit=limit,
-                embedding_available=embedding_available,
-                recall_event_id=recall_event_id,
-            )
-        except Exception:
-            logger.debug("entity_lane_shadow call failed — recall unaffected", exc_info=True)
+        # can't flush partial recall state. See also the zero-hit call above.
+        await self._maybe_entity_lane_shadow(
+            query=query,
+            ranked_lists=ranked_lists,
+            all_ids=all_ids,
+            limit=limit,
+            embedding_available=embedding_available,
+            recall_event_id=recall_event_id,
+        )
 
         return results
 
