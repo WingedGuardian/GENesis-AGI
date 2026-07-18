@@ -2,7 +2,10 @@
 # Genesis full machine bootstrap.
 # Run once after cloning on a new machine.
 #
-# Usage: ./scripts/bootstrap.sh
+# Usage: ./scripts/bootstrap.sh [--force]
+#
+# Refuses to run while genesis-server is live (--force overrides): bootstrap
+# is a setup/repair tool, not a deploy path — see lib/live_system_guard.sh.
 
 set -euo pipefail
 
@@ -18,6 +21,13 @@ fi
 echo "=== Genesis Bootstrap ==="
 echo "Genesis root: $GENESIS_ROOT"
 echo
+
+# ── Live-system guard — BEFORE anything mutating (incl. the crash-recovery
+# block below, whose git reset --hard is also unsafe on a live system).
+# update.sh opts out via GENESIS_BOOTSTRAP_ALLOW_LIVE=1; humans use --force.
+# shellcheck source=lib/live_system_guard.sh
+. "$SCRIPT_DIR/lib/live_system_guard.sh"
+bootstrap_refuse_if_server_live "$@" || exit 3
 
 # ── Crash recovery: check for interrupted update ─────────
 UPDATE_STATE="$HOME/.genesis/update_state.json"

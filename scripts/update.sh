@@ -1029,8 +1029,12 @@ echo ""
 _write_state "bootstrap"
 
 # ── Run bootstrap (idempotent — handles deps, configs, hooks, systemd) ─
+# GENESIS_BOOTSTRAP_ALLOW_LIVE: opt out of bootstrap's live-system guard
+# (lib/live_system_guard.sh). This is the sanctioned deploy path — the server
+# was stopped above, and the ERR trap is armed here, so a guard refusal would
+# escalate into a full update rollback. The guard must never gate this call.
 echo "--- Running bootstrap ---"
-"$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
+GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
 echo "  Bootstrap complete"
 echo ""
 
