@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Provisioning approvals can be retried, and never race each other.** A
+  grow/limits approval prompt that timed out unanswered used to silently block
+  every retry for 24 hours (the generic outreach dedup window treated the
+  retry as a duplicate of the expired prompt). Provisioning approvals and
+  outcome notices are now never deduplicated — every request reaches you —
+  and a new in-flight guard suppresses a genuinely concurrent duplicate
+  prompt (e.g. a double-click) so a plain APPROVE reply always resolves
+  unambiguously.
 - **The morning report's numbers are real now.** Report generation previously
   counted truncated display lists (reporting "5 follow-ups" when 268 existed),
   sometimes inverted protective facts into alarms (an active OOM-protection
