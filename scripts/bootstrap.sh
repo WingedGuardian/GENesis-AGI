@@ -822,7 +822,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         # -g` it: its target is `$(npm config get prefix)/bin` (nvm bin,
         # ~/.npm-global, or a system prefix) with the same empty/`/usr` guards.
         # Hardcoding ~/.npm-global would miss an nvm-based Node install.
-        _cc_prefix="$(npm config get prefix 2>/dev/null)"
+        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
         [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
         [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
         CC_BIN_DIR="$_cc_prefix/bin"
