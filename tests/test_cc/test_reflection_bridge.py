@@ -864,3 +864,102 @@ async def test_light_prompt_no_prior_context(db):
 
     assert "Previous Light Cycle Finding" not in prompt
     assert "Perform a Light reflection" in prompt
+
+
+# ── Topic delivery gating (PR-5a): parsed fields only, never raw text ──────
+
+
+def _cc_output(text: str) -> CCOutput:
+    return CCOutput(
+        session_id="refl-topic-1",
+        text=text,
+        model_used="haiku",
+        cost_usd=0.001,
+        input_tokens=100,
+        output_tokens=50,
+        duration_ms=1000,
+        exit_code=0,
+    )
+
+
+def test_topic_summary_parse_failure_one_liner():
+    """Unparseable output → liveness one-liner; raw text NEVER leaks."""
+    from genesis.cc.reflection_bridge._output import format_topic_summary
+
+    raw = "That last tool call was a mistake INTERNAL-CHATTER-MARKER {broken"
+    msg = format_topic_summary(Depth.DEEP, _cc_output(raw))
+    assert "Deep Reflection" in msg
+    assert "not parseable" in msg
+    assert "INTERNAL-CHATTER-MARKER" not in msg
+
+
+def test_topic_summary_structured_fields():
+    from genesis.cc.reflection_bridge._output import format_topic_summary
+
+    payload = json.dumps({
+        "assessment": "Steady state; memory pipeline healthy.",
+        "observations": ["obs one", "obs two", "obs three", "obs four"],
+        "focus_next": "Watch the embedding backlog.",
+        "confidence": 0.8,
+    })
+    msg = format_topic_summary(Depth.LIGHT, _cc_output(f"```json\n{payload}\n```"))
+    assert "Light Reflection" in msg
+    assert "Steady state; memory pipeline healthy." in msg
+    assert "obs one" in msg and "obs three" in msg
+    assert "obs four" not in msg  # capped at 3
+    assert "Watch the embedding backlog." in msg
+
+
+def test_topic_summary_no_fields_one_liner():
+    from genesis.cc.reflection_bridge._output import format_topic_summary
+
+    msg = format_topic_summary(
+        Depth.DEEP, _cc_output(json.dumps({"confidence": 0.9})),
+    )
+    assert "no summary fields" in msg
+
+
+def test_topic_summary_escapes_html():
+    from genesis.cc.reflection_bridge._output import format_topic_summary
+
+    payload = json.dumps({"assessment": "a <b>bold</b> & risky claim"})
+    msg = format_topic_summary(Depth.LIGHT, _cc_output(payload))
+    assert "&lt;b&gt;" in msg
+    assert "&amp;" in msg
+
+
+@pytest.mark.asyncio
+async def test_send_to_topic_sends_prebuilt_text():
+    from unittest.mock import AsyncMock
+
+    from genesis.cc.reflection_bridge._output import send_to_topic
+
+    tm = AsyncMock()
+    await send_to_topic("sid", Depth.DEEP, "<b>Deep Reflection</b>\n\nready", topic_manager=tm)
+    tm.send_to_category.assert_awaited_once_with(
+        "reflection_deep", "<b>Deep Reflection</b>\n\nready",
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_reflection_summary_skips_unparseable(db):
+    """Parse failure no longer stores raw text as a reflection_summary
+    observation (the phantom-claim feedback loop source)."""
+    from genesis.cc.reflection_bridge._output import store_reflection_output
+
+    tick = TickResult(
+        tick_id="tick-garbage-1",
+        timestamp="2026-05-30T14:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.LIGHT,
+        trigger_reason="test",
+    )
+    output = _cc_output("tool-call chatter, definitely { not json")
+    await store_reflection_output(Depth.LIGHT, tick, output, db=db)
+
+    rows = await db.execute_fetchall(
+        "SELECT content FROM observations WHERE type = 'reflection_summary'"
+    )
+    assert rows == []
