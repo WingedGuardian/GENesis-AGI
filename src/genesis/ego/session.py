@@ -96,6 +96,11 @@ _EGO_CYCLE_DISALLOWED_TOOLS = (
     "mcp__genesis-health__ego_goal_create",
     "mcp__genesis-health__ego_goal_update",
     "mcp__genesis-health__ego_goal_progress",
+    # Settled decisions are USER rulings. The ego cycle must not record,
+    # reaffirm, or — above all — supersede one (same no-approval-gate risk
+    # class as the goal tools above). Capture happens in user-facing
+    # sessions (conversation, resolution paths), never inside a cycle.
+    "mcp__genesis-health__ego_decision",
 )
 
 # Per-cycle cap on autonomous own-goal creations (genesis ego). One per cycle

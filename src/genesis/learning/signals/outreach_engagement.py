@@ -50,14 +50,19 @@ class OutreachEngagementCollector:
         # positive set (see genesis.outreach.types).
         engaged = sum(r[1] for r in rows if r[0] in POSITIVE_ENGAGEMENT_OUTCOMES)
 
-        # Ego proposals: ego_proposals columns only (proposal digests write
-        # NO outreach_history rows — verified 2026-07-18).
+        # Ego proposals (digests write NO outreach_history rows — verified
+        # 2026-07-18). The typed-reason check reads intervention_journal:
+        # that row is written ONCE at resolution by the shared hook and
+        # never touched again, whereas ego_proposals.user_response is later
+        # overwritten by dispatch bookkeeping ('dispatching', session ids,
+        # '|completed:' suffixes) which would inflate the count.
         cursor = await self._db.execute(
             "SELECT COUNT(*), "
-            "SUM(CASE WHEN user_response IS NOT NULL "
-            "AND TRIM(user_response) != '' THEN 1 ELSE 0 END) "
-            "FROM ego_proposals "
-            "WHERE created_at >= datetime('now', '-7 days')"
+            "SUM(CASE WHEN ij.user_response IS NOT NULL "
+            "AND TRIM(ij.user_response) != '' THEN 1 ELSE 0 END) "
+            "FROM ego_proposals p "
+            "LEFT JOIN intervention_journal ij ON ij.proposal_id = p.id "
+            "WHERE p.created_at >= datetime('now', '-7 days')"
         )
         prow = await cursor.fetchone()
         total += int(prow[0] or 0)

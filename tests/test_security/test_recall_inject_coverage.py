@@ -84,10 +84,6 @@ KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
         "first-party",
         "source=episodic (past task executions)",
     ),
-    "ego/context.py::_user_corrections_section": (
-        "first-party",
-        "source=episodic, D12-pinned to first-party user corrections",
-    ),
     "mcp/memory/knowledge.py::reference_lookup": (
         "first-party",
         "source=episodic; takes unit_id/score only, not content",
