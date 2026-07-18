@@ -30,6 +30,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   colour and ◆ glyph), and pending approvals no longer drag the overall
   dashboard health to "degraded" — they ride along as a note on an otherwise
   healthy system.
+- **A long-retired background job no longer haunts the job-health view.** The
+  infra-monitor job was replaced months ago, but its stale record lingered and
+  showed as a perpetually-"healthy" job (the staleness check only catches jobs
+  that run-but-fail, not ones that stopped running entirely). Its fossil record
+  is now purged on upgrade.
 - **Provisioning approvals can be retried, and never race each other.** A
   grow/limits approval prompt that timed out unanswered used to silently block
   every retry for 24 hours (the generic outreach dedup window treated the
