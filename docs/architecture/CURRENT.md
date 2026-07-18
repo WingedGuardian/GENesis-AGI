@@ -448,15 +448,20 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 71703f2d 2026-07-16
+verified: b662f3e3 2026-07-17
 ```
 
-- **Infra protection posture (2026-07-16)**: hourly
+- **Infra protection posture (2026-07-16; network plane 2026-07-17)**: hourly
   `_check_infra_protection_posture` reads the infra profile's effective facts
   and raises one `high` `infrastructure_alert` when a memory-plane protection
   is missing (container `memory.swap.max=0`, oomd pressure-kill off, host swap
   absent, incus swap knob explicitly `"false"`) or the profile is stale (>3d =
-  refresh broken → distinct "posture UNKNOWN" alert). Only EXPLICIT defect
+  refresh broken → distinct "posture UNKNOWN" alert). Also covers the
+  **network plane** (`networkd_keep_configuration` / `network_watchdog_installed`
+  off), gated strictly on `networkd_manages_default_route is True` — a
+  networkctl-derived fact (the running daemon reports the default-route link
+  `AdministrativeState=configured`) that suppresses the rules on NetworkManager
+  installs, so no false-positive on the public repo. Only EXPLICIT defect
   values alert — absent/`None` facts stay silent (no guardian plane, cgroup
   v1, fresh install). One open row per source via `supersede_except_hash`;
   auto-resolves on recovery. Completes the silent-skip closure: provision
@@ -739,7 +744,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, env.py, _config_overlay.py]
-verified: 95dee055 2026-07-15
+verified: b662f3e3 2026-07-17
 ```
 
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
@@ -905,8 +910,11 @@ verified: 95dee055 2026-07-15
   installs (see docs/reference/memory-resilience.md). Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
   `network_watchdog_installed` (config-plane facts from
-  `scripts/lib/network_resilience.sh`) plus a volatile `watchdog` heal-telemetry
-  metric from `/run/genesis-network-watchdog.json` (see
+  `scripts/lib/network_resilience.sh`), plus `networkd_manages_default_route`
+  (the applicability gate — networkctl reports the default-route link
+  `AdministrativeState=configured`, so the posture check stays silent on
+  NetworkManager installs), plus a volatile `watchdog` heal-telemetry metric
+  from `/run/genesis-network-watchdog.json` (see
   docs/reference/network-resilience.md).
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
