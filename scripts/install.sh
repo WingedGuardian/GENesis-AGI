@@ -821,6 +821,21 @@ fi
 # ══════════════════════════════════════════════════════════════
 #  Step 7 — Generate systemd service files from templates
 # ══════════════════════════════════════════════════════════════
+# Install Claude Code BEFORE generating the systemd units (next step) so the
+# unit PATH can be resolved from claude's real install location via `command
+# -v` instead of guessing where npm will place it. cc_ensure_local is
+# idempotent; Step 12 re-runs it (a no-op here) and finalizes wrapper/settings.
+_cc_env="$SCRIPT_DIR/lib/cc_version.sh"
+if [ -f "$_cc_env" ]; then
+    # shellcheck source=/dev/null
+    source "$_cc_env"
+    echo "  Installing Claude Code (v${CC_VERSION}) before service generation..."
+    if ! cc_ensure_local; then
+        echo "    (will finalize at step 12; manual: npm install -g @anthropic-ai/claude-code@${CC_VERSION})"
+        SETUP_WARNINGS=1
+    fi
+fi
+
 echo "  [7/$TOTAL_STEPS] Generating systemd service files from templates..."
 
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
@@ -829,23 +844,17 @@ SYSTEMD_TEMPLATE_DIR="$REPO_DIR/scripts/systemd"
 SERVICES_GENERATED=0
 
 if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
-    # Detect Claude Code binary directory for systemd PATH injection
-    # Resolve the Claude Code binary dir. `dirname ""` collapses to "." and
-    # exits 0 when claude isn't on PATH yet (units render before CC installs),
-    # so split the pipeline and resolve the real npm prefix explicitly.
+    # Detect the Claude Code binary directory for systemd PATH injection.
+    # CC is installed above (before this step), so `command -v` resolves its
+    # real location (nvm bin, ~/.npm-global, or a system prefix) — no guessing.
+    # The fallback applies only if that install failed, in which case services
+    # can't spawn CC regardless; a later bootstrap.sh re-renders the units with
+    # the correct path once CC is present.
     _cc_path="$(command -v claude 2>/dev/null || true)"
     if [ -n "$_cc_path" ]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        # claude not yet on PATH (units render before CC installs). Point at
-        # wherever cc_ensure_local (scripts/lib/cc_version.sh) will `npm install
-        # -g` it: its target is `$(npm config get prefix)/bin` (nvm bin,
-        # ~/.npm-global, or a system prefix) with the same empty/`/usr` guards.
-        # Hardcoding ~/.npm-global would miss an nvm-based Node install.
-        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
-        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
-        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
-        CC_BIN_DIR="$_cc_prefix/bin"
+        CC_BIN_DIR="$HOME/.npm-global/bin"
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
