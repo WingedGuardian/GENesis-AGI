@@ -223,6 +223,13 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "action). GROUNDWORK(sentinel-auto-topup): a future user-gated "
         "auto-credit-top-up keyed off CRITICAL_CALL_SITES would plug in here."
     ),
+    "ledger:write_failed:": (
+        "A cognitive-ledger writer hook (WS-2 P1b) failed to persist a "
+        "prediction — a code/coverage bug (bad metric wiring, schema drift), "
+        "not an infra fault the firefighter can auto-heal. It is a WARNING-"
+        "level observability signal for the developer/ego to fix at the "
+        "source; waking the Sentinel would achieve nothing."
+    ),
 }
 
 
