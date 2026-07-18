@@ -69,7 +69,13 @@ class TriageClassifier:
     def _load_calibration(self) -> str:
         path = self._calibration_path
         if not path.exists():
-            return ""
+            # install.sh-only setups may have the seed template but not the
+            # runtime copy; fall back to the .example so triage runs with real
+            # calibration instead of an empty prompt (bootstrap seeds the copy).
+            example = path.parent / (path.name + ".example")
+            if not example.exists():
+                return ""
+            path = example
         mtime = os.path.getmtime(path)
         if self._calibration_text is None or mtime != self._calibration_mtime:
             self._calibration_text = path.read_text()

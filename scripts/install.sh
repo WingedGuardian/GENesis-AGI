@@ -676,6 +676,15 @@ if [ ! -f "$SECRETS_FILE" ]; then
     fi
 fi
 
+# Identity seed files (runtime-generated, gitignored) — mirror bootstrap.sh so
+# install.sh-only setups don't triage/act with empty calibration until first regen.
+for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md; do
+    if [ ! -f "$REPO_DIR/src/genesis/identity/$f" ] && [ -f "$REPO_DIR/src/genesis/identity/$f.example" ]; then
+        cp "$REPO_DIR/src/genesis/identity/$f.example" "$REPO_DIR/src/genesis/identity/$f"
+        echo "    + Seeded $f from template"
+    fi
+done
+
 echo ""
 
 
@@ -821,7 +830,15 @@ SERVICES_GENERATED=0
 
 if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     # Detect Claude Code binary directory for systemd PATH injection
-    CC_BIN_DIR="$(dirname "$(command -v claude 2>/dev/null)" 2>/dev/null || echo "$HOME/.npm-global/bin")"
+    # Resolve the Claude Code binary dir. `dirname ""` collapses to "." and
+    # exits 0 when claude isn't on PATH yet (units render before CC installs),
+    # so split the pipeline and default the npm-global dir explicitly.
+    _cc_path="$(command -v claude 2>/dev/null || true)"
+    if [ -n "$_cc_path" ]; then
+        CC_BIN_DIR="$(dirname "$_cc_path")"
+    else
+        CC_BIN_DIR="$HOME/.npm-global/bin"
+    fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [ -f "$template" ] || continue

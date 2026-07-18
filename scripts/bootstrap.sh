@@ -810,7 +810,15 @@ SERVICES_UPDATED=0
 if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     mkdir -p "$SYSTEMD_USER_DIR"
     # Detect Claude Code binary directory for systemd PATH injection
-    CC_BIN_DIR="$(dirname "$(command -v claude 2>/dev/null)" 2>/dev/null || echo "$HOME/.npm-global/bin")"
+    # Resolve the Claude Code binary dir. `dirname ""` collapses to "." and
+    # exits 0 when claude isn't on PATH yet, so split the pipeline and default
+    # the npm-global dir explicitly.
+    _cc_path="$(command -v claude 2>/dev/null || true)"
+    if [[ -n "$_cc_path" ]]; then
+        CC_BIN_DIR="$(dirname "$_cc_path")"
+    else
+        CC_BIN_DIR="$HOME/.npm-global/bin"
+    fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [[ -f "$template" ]] || continue
