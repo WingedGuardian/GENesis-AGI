@@ -132,3 +132,23 @@ async def test_guard_narrative_none_tick_passthrough(db):
     assert await guard_narrative(
         db, text, tick_signal_names=None, source="x",
     ) == text
+
+
+@pytest.mark.asyncio
+async def test_registry_includes_recent_tick_signals(db):
+    """Signals absent from signal_weights but present in recent ticks are
+    still guardable (the registry is a union, not the weights table alone)."""
+    import json as _json
+
+    from genesis.reflection.signal_claims import registry_signal_names
+
+    await db.execute(
+        "INSERT INTO awareness_ticks (id, source, signals_json, created_at) "
+        "VALUES ('t1', 'scheduled', ?, '2026-07-18T00:00:00+00:00')",
+        (_json.dumps([
+            {"name": "container_memory_pct", "value": 0.4, "source": "host"},
+        ]),),
+    )
+    await db.commit()
+    names = await registry_signal_names(db)
+    assert "container_memory_pct" in names

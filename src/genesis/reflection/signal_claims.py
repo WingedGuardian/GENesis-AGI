@@ -37,14 +37,39 @@ _CLAIM_RE = re.compile(
 
 
 async def registry_signal_names(db) -> set[str]:
-    """Names of all registered signals (``signal_weights``). Empty set on
-    any failure — which makes the guard a no-op, never a blocker."""
+    """Names of all known signals: ``signal_weights`` UNION names observed
+    in recent ``awareness_ticks``.
+
+    The union matters: several live collectors are not seeded into
+    signal_weights (they vary by install), so the weights table alone
+    leaves their claims unguardable. Recent ticks are ground truth for
+    what this install actually collects — install-agnostic, no seed-list
+    maintenance. Empty set on total failure — which makes the guard a
+    no-op, never a blocker."""
+    names: set[str] = set()
     try:
         cursor = await db.execute("SELECT signal_name FROM signal_weights")
-        return {row[0] for row in await cursor.fetchall()}
+        names.update(row[0] for row in await cursor.fetchall())
     except Exception:
-        logger.debug("signal registry query failed — guard disabled", exc_info=True)
-        return set()
+        logger.debug("signal_weights registry query failed", exc_info=True)
+    try:
+        cursor = await db.execute(
+            "SELECT signals_json FROM awareness_ticks "
+            "ORDER BY created_at DESC LIMIT 12"
+        )
+        for (signals_json,) in await cursor.fetchall():
+            try:
+                entries = json.loads(signals_json) if signals_json else []
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(entries, dict):
+                entries = list(entries.values())
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("name"):
+                    names.add(str(entry["name"]))
+    except Exception:
+        logger.debug("awareness_ticks registry query failed", exc_info=True)
+    return names
 
 
 def validate_signal_claims(
