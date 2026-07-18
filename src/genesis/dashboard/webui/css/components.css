@@ -40,6 +40,9 @@
  * informational/neutral chips applied via static class, e.g. count badges. */
 .chip--info  { color: var(--info);  background: color-mix(in srgb, var(--info-dim) 45%, transparent);  border-color: var(--info-dim); }
 .chip--stale { color: var(--stale); background: color-mix(in srgb, var(--stale) 12%, transparent);     border-color: color-mix(in srgb, var(--stale) 35%, transparent); }
+/* chip--action = "needs your action" (e.g. pending approvals). Reuses the
+ * ego/cognitive accent so it reads as attention, not fault (warn) or fine (ok). */
+.chip--action { color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, transparent); border-color: color-mix(in srgb, var(--accent) 42%, transparent); }
 .chip--off   { color: var(--t3);    background: transparent;                                           border-color: var(--border); }
 
 /* ── Skeleton shimmer (loading placeholder) ──────────────────────────────

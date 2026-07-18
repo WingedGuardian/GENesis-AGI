@@ -3185,7 +3185,7 @@
           // chipState() the chips use, so the two surfaces can never disagree
           // about what a state means. Values match the token palette
           // (--ok/--warn/--err); off/idle/unknown keep the historical dot gray.
-          const colors = { ok: "#4caf50", warn: "#f0ad4e", err: "#d9534f", stale: "#9e9e9e", off: "#888" };
+          const colors = { ok: "#4caf50", warn: "#f0ad4e", err: "#d9534f", stale: "#9e9e9e", action: "#7c4dff", off: "#888" };
           return colors[chipState(state)] || "#888";
         },
 
@@ -3368,9 +3368,11 @@
             const which = ueCad?.is_paused ? "CEO" : "COO";
             return { state: "degraded", reason: `${which} paused` };
           }
-          // Proposals piling up
+          // Proposals piling up: this is a review queue awaiting the user, not
+          // a fault. Surface it as "needs action" (distinct from degraded) so it
+          // reads as a to-do, not a system problem.
           if (ego.pending_proposals > 5) {
-            return { state: "degraded", reason: `${ego.pending_proposals} proposals awaiting review` };
+            return { state: "needs action", reason: `${ego.pending_proposals} pending approvals — needs action` };
           }
           return { state: "healthy", reason: ego.focus_summary || "ego active" };
         },
@@ -3572,18 +3574,23 @@
           const hasError = checks.some(c => c.state === "error");
           const hasDegraded = checks.some(c => c.state === "degraded" || c.state === "fallback");
           const hasUnknown = checks.some(c => c.state === "unknown");
+          // "needs action" is not a fault — it means Genesis is waiting on the
+          // user (e.g. pending approvals). It NEVER degrades overall health; it
+          // rides along as an appended note on whatever the real status is.
+          const actionReasons = checks.filter(c => c.state === "needs action").map(c => c.reason);
+          const actionNote = actionReasons.length ? ` · ${actionReasons.join("; ")}` : "";
           if (hasError) {
             const reasons = checks.filter(c => c.state === "error").map(c => c.reason);
-            return { state: "error", reason: reasons.join("; ") };
+            return { state: "error", reason: reasons.join("; ") + actionNote };
           }
           if (hasDegraded) {
             const reasons = checks.filter(c => c.state === "degraded" || c.state === "fallback").map(c => c.reason);
-            return { state: "degraded", reason: reasons.join("; ") };
+            return { state: "degraded", reason: reasons.join("; ") + actionNote };
           }
           if (hasUnknown) {
-            return { state: "unknown", reason: "some subsystems have unknown status" };
+            return { state: "unknown", reason: "some subsystems have unknown status" + actionNote };
           }
-          return { state: "healthy", reason: "all core subsystems operational" };
+          return { state: "healthy", reason: "all core subsystems operational" + actionNote };
         },
 
         routingSemantic() {
