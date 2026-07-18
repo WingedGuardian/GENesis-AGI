@@ -3293,20 +3293,37 @@
               || (queues.deferred_stuck || 0) > 0 || (queues.failed_embeddings || 0) > 0) {
             return { state: "error", reason: "stuck/failed items or dead letters require attention" };
           }
-          if ((queues.deferred_work || 0) > 0 || (queues.deferred_processing || 0) > 0) {
-            return { state: "degraded", reason: "work is backing up in deferred queues" };
+          // Alarm on the recovery-only subset (deferred_recovery, per #909):
+          // raw deferred_work counts normal in-flight worklist depth that the
+          // backend deliberately excludes from alerting ("cries wolf on every
+          // tick"). Batch worklists only count here once stalled past a full
+          // drain cycle (STALE_WORKLIST_DAYS), so a genuinely broken drain
+          // still surfaces.
+          if ((queues.deferred_recovery || 0) > 0) {
+            return { state: "degraded", reason: `${queues.deferred_recovery} recovery item(s) backing up` };
+          }
+          // Honor the backend queue-depth alarm (mcp/health/errors.py
+          // _QUEUE_DEPTH_FIELDS emits a WARNING when a depth field exceeds 100):
+          // a processing backlog that hasn't yet aged into deferred_stuck still
+          // warrants a warning, so the card never reads green while
+          // health_alerts warns. Keep the raw deferred_work total suppressed.
+          if ((queues.deferred_processing || 0) > 100) {
+            return { state: "degraded", reason: `${queues.deferred_processing} items processing (backlog)` };
           }
           const pe = queues.pending_embeddings || 0;
           if (pe > 2000) {
             return { state: "error", reason: `embedding queue critically backed up (${pe} pending)` };
           }
-          if (pe > 500) {
+          // >100 matches the backend depth threshold (was >500 — a 101–500 gap
+          // where the backend warned but the card read green).
+          if (pe > 100) {
             return { state: "degraded", reason: `embedding queue backed up (${pe} pending)` };
           }
           if (Array.isArray(queues.errors) && queues.errors.length > 0) {
             return { state: "unknown", reason: "some queue counters could not be collected" };
           }
-          return { state: "healthy", reason: "queues are clear" };
+          const worklist = queues.deferred_worklist || 0;
+          return { state: "healthy", reason: worklist > 0 ? `queues clear — ${worklist} worklist item(s) in flight` : "queues are clear" };
         },
 
         surplusSemantic() {
@@ -3512,17 +3529,31 @@
           if (!apiKeys) return { state: "unknown", reason: "API key data unavailable" };
           const keys = apiKeys.providers || apiKeys;
           const vals = Object.values(keys);
-          // Convention: red = a provider's API is not working (breaker open /
-          // out of credits) → error chip; yellow = a key is missing/unconfigured
-          // → degraded chip; otherwise healthy. (System-wide alarm is governed
-          // separately by essential coverage, not by this card.)
+          // Convention: red = a provider's API is present but NOT working
+          // (breaker open / out of credits) → error, regardless of criticality.
           const red = vals.filter(info => info.key_health === "red").length;
-          const yellow = vals.filter(info => info.key_health === "yellow").length;
           if (red > 0) {
             return { state: "error", reason: `${red} provider API(s) not working (e.g. out of credits)` };
           }
+          // A MISSING key is graded by the backend criticality layer: it only
+          // becomes a warning/critical alert when the provider is load-bearing
+          // (sole/systemic + non-free). A missing key for a dormant or
+          // fallback-only provider is benign. Trust that verdict — the same
+          // alerts array providerHealthSemantic() reads — instead of degrading
+          // on raw yellow dots (which flagged benign unconfigured providers).
+          const alerts = apiKeys.alerts || [];
+          const critical = alerts.filter(a => a.severity === "critical");
+          if (critical.length > 0) {
+            return { state: "error", reason: critical.map(a => a.message).join("; ") };
+          }
+          const warnings = alerts.filter(a => a.severity === "warning");
+          if (warnings.length > 0) {
+            return { state: "degraded", reason: warnings.map(a => a.message).join("; ") };
+          }
+          // Benign: keys may be unconfigured but none are load-bearing.
+          const yellow = vals.filter(info => info.key_health === "yellow").length;
           if (yellow > 0) {
-            return { state: "degraded", reason: `${yellow} provider key(s) missing or unconfigured` };
+            return { state: "healthy", reason: `provider keys healthy — ${yellow} unconfigured (none load-bearing)` };
           }
           return { state: "healthy", reason: "provider keys are configured and working" };
         },

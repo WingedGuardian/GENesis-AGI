@@ -776,10 +776,14 @@
                         x-text="(() => {
                           const keys = ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {});
                           const vals = Object.values(keys);
-                          const local = vals.filter(k => ['local','cc_managed','disabled'].includes(k.status)).length;
+                          const isLocal = k => ['local','cc_managed','disabled'].includes(k.status);
+                          const local = vals.filter(isLocal).length;
                           const red = vals.filter(k => k.key_health === 'red').length;
                           const yellow = vals.filter(k => k.key_health === 'yellow').length;
-                          const green = vals.filter(k => k.key_health === 'green').length;
+                          // Count green among TRACKED (non-local) providers only —
+                          // local/cc_managed providers are green too but excluded from
+                          // `tracked`, so counting them made 'ok + issues' overshoot the total.
+                          const green = vals.filter(k => k.key_health === 'green' && !isLocal(k)).length;
                           const tracked = vals.length - local;
                           if (red > 0 || yellow > 0) return green + ' ok, ' + (red + yellow) + ' issue(s) / ' + tracked;
                           return green + '/' + tracked + ' working';
