@@ -866,6 +866,63 @@ async def test_light_prompt_no_prior_context(db):
     assert "Perform a Light reflection" in prompt
 
 
+# ── Signal integrity (PR-5b): canonical block + headings ───────────────────
+
+
+def _signal_tick():
+    from genesis.awareness.types import SignalReading
+
+    return TickResult(
+        tick_id="tick-sig-1",
+        timestamp="2026-03-07T12:00:00",
+        source="scheduled",
+        signals=[
+            SignalReading(
+                name="autonomy_activity", value=0.7, source="autonomy_state",
+                collected_at="2026-03-07T12:00:00+00:00",
+                baseline_note="0.0=stable",
+            ),
+            SignalReading(
+                name="memory_backlog", value=0.2, source="observations",
+                collected_at="2026-03-07T12:00:00+00:00",
+            ),
+        ],
+        scores=[],
+        classified_depth=Depth.DEEP,
+        trigger_reason="test",
+    )
+
+
+async def test_prompt_uses_canonical_signal_heading(db):
+    """Every depth's prompt labels the live tick block canonically."""
+    from genesis.cc.reflection_bridge._prompts import build_reflection_prompt
+
+    tick = _signal_tick()
+    for depth in (Depth.LIGHT, Depth.DEEP):
+        prompt, _o, _s = await build_reflection_prompt(
+            depth=depth, tick=tick, db=db,
+            context_gatherer=None, context_assembler=None,
+            prompt_dir=Path("/nonexistent"),
+        )
+        assert "## Live Tick Signals (canonical)" in prompt
+        assert "ONLY signals you may cite" in prompt
+        assert "Signals: " not in prompt  # old inline label gone
+
+
+async def test_prompt_signal_lines_are_canonical_format(db):
+    """The tick block uses the rich canonical line format (parity with the
+    ContextAssembler path) — name: value (source=...), newline-joined."""
+    from genesis.awareness.signal_format import format_signals
+    from genesis.cc.reflection_bridge._prompts import _format_signals_from_tick
+
+    tick = _signal_tick()
+    expected = format_signals(
+        tick.signals, staleness=tick.signal_staleness or {}, empty="none",
+    )
+    assert _format_signals_from_tick(tick) == expected
+    for s in tick.signals:
+        assert f"{s.name}: {s.value} (source={s.source})" in expected
+
 # ── Topic delivery gating (PR-5a): parsed fields only, never raw text ──────
 
 

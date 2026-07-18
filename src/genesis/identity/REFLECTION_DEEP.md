@@ -93,8 +93,11 @@ evolution system can propose improvements.
 
 ### Cross-Interaction Patterns (if evaluation context is provided)
 
-Look across recent signals from all channels — inbox evaluations, conversations,
-recon findings — for patterns the user or Genesis should know about:
+The prompt may include a "Cross-Interaction Context" section built from stored
+observations (inbox evaluations, conversations, recon findings). These are
+NOT live signals — never cite them as signal names/values; only the "Live
+Tick Signals (canonical)" block may be cited that way. Look across them for
+patterns the user or Genesis should know about:
 
 - **Recurring topics**: Is the user repeatedly exploring the same domain across
   different interactions? (3+ signals on the same topic = emerging interest)

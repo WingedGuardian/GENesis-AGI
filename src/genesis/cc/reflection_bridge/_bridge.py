@@ -458,6 +458,9 @@ class CCReflectionBridge:
                     output.text, db=db, output_router=self._output_router,
                     gathered_obs_ids=gathered_obs_ids,
                     gathered_surplus_ids=gathered_surplus_ids,
+                    tick_signal_names=(
+                        {s.name for s in tick.signals} if tick.signals else None
+                    ),
                 )
                 if routing_summary.get("parse_failed") or routing_summary.get("empty_output"):
                     routing_failed = True
