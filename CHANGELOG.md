@@ -93,6 +93,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Updates are more resilient and briefly less disruptive.** `scripts/update.sh`
+  now downloads new code *before* stopping Genesis, so a slow or stalled network
+  fetch no longer prolongs the restart — and a failed fetch leaves the server
+  running, untouched. The machine-info blocks in `~/.claude/CLAUDE.md` are also
+  regenerated *after* services come back up instead of during the offline
+  window, trimming the downtime slightly.
+
 - **Finished background-queue rows are now pruned after 45 days.** The internal
   deferred-work queue kept every completed item forever; it now retains 45 days
   of history and drops the rest, so the queue can't slowly grow without bound.
