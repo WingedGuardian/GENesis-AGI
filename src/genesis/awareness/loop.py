@@ -633,11 +633,10 @@ async def _check_infra_protection_posture(db) -> None:
             key = ",".join(missing)
             details = "; ".join(f"[{slug}] {_INFRA_POSTURE_DETAIL[slug]}" for slug in missing)
             content = (
-                f"Memory-protection posture: {len(missing)} protection(s) "
+                f"Infra protection posture: {len(missing)} protection(s) "
                 f"missing on this install (profile collected {collected_at}): "
-                f"{details}. A missing protection means a memory spike can "
-                f"wedge the container instead of being absorbed (2026-07 "
-                f"incident class)."
+                f"{details}. Each missing protection removes a crash-resilience "
+                f"guarantee this box relies on (2026-07 incident class)."
             )
             if unverifiable:
                 content += (
