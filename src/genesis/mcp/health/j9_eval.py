@@ -8,6 +8,38 @@ from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
 
+# Metric keys pulled from each weekly memory snapshot into the retrieval trend.
+# pool_* land only from WS2-0 onward, so every key is read with .get → None on
+# older snapshots (the series shape stays stable, gaps are honest nulls).
+_TREND_METRIC_KEYS: tuple[str, ...] = (
+    "precision_at_5",
+    "precision_at_3",
+    "hit_rate",
+    "mrr",
+    "usage_rate",
+    "total_recalls",
+    "pool_episodic_total",
+    "pool_episodic_embedded",
+    "pool_knowledge_units_total",
+    "pool_memory_links_total",
+)
+
+
+def _retrieval_trend(mem_snapshots: list[dict]) -> list[dict]:
+    """Map weekly memory snapshots (newest-first) → a chronological trend series.
+
+    Reads every metric with ``.get`` so pre-WS2-0 snapshots (no ``pool_*``)
+    surface as explicit ``None`` rather than a fabricated value or a KeyError.
+    """
+    trend: list[dict] = []
+    for snap in reversed(mem_snapshots):  # DESC → chronological
+        metrics = snap.get("metrics", {}) or {}
+        row = {"period_end": snap.get("period_end")}
+        for key in _TREND_METRIC_KEYS:
+            row[key] = metrics.get(key)
+        trend.append(row)
+    return trend
+
 
 async def _impl_j9_eval_status() -> dict:
     """Get J-9 eval collection status across all 5 dimensions."""
@@ -52,11 +84,22 @@ async def _impl_j9_eval_status() -> dict:
             "weeks_of_data": composite["metrics"].get("weeks_of_data", 0),
         }
 
+    # Retrieval-efficacy trend: last 12 weekly memory snapshots, chronological,
+    # so quality (precision@k/hit_rate/MRR) is readable against pool size.
+    mem_snaps = await j9_eval.get_snapshots(
+        db,
+        dimension="memory",
+        period_type="weekly",
+        limit=12,
+    )
+    retrieval_trend = _retrieval_trend(mem_snaps)
+
     return {
         "event_counts": event_counts,
         "total_events": sum(event_counts.values()),
         "latest_snapshots": latest_snapshots,
         "go_status": go_status,
+        "retrieval_trend": retrieval_trend,
     }
 
 

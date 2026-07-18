@@ -1125,6 +1125,41 @@ async def memory_core_facts(
     return [item for item, _ in top]
 
 
+async def _memory_quality_block(db) -> dict | None:
+    """Latest J-9 memory-quality headline + subsystem grade, or None.
+
+    Joins the capacity surface (memory_stats) to the quality surface (weekly J-9
+    snapshots) so "recall efficacy at the current pool size" is one read.
+    Fully guarded — a missing table or an un-aggregated install returns None,
+    never breaking the capacity stats.
+    """
+    try:
+        from genesis.db.crud import j9_eval
+
+        snap = await j9_eval.get_latest_snapshot(db, dimension="memory")
+        if not snap:
+            return None
+        metrics = snap.get("metrics", {}) or {}
+        grades = await j9_eval.get_latest_subsystem_grades(db)
+        mem_grade = next((g for g in grades if g.get("subsystem") == "memory"), None)
+        return {
+            "period_end": snap.get("period_end"),
+            "precision_at_5": metrics.get("precision_at_5"),
+            "precision_at_3": metrics.get("precision_at_3"),
+            "hit_rate": metrics.get("hit_rate"),
+            "mrr": metrics.get("mrr"),
+            "usage_rate": metrics.get("usage_rate"),
+            "total_recalls": metrics.get("total_recalls"),
+            "pool_episodic_total": metrics.get("pool_episodic_total"),
+            "pool_knowledge_units_total": metrics.get("pool_knowledge_units_total"),
+            "grade": mem_grade.get("grade") if mem_grade else None,
+            "grade_score": mem_grade.get("score") if mem_grade else None,
+        }
+    except Exception:
+        logger.debug("Memory quality block unavailable", exc_info=True)
+        return None
+
+
 @mcp.tool()
 async def memory_stats() -> dict:
     """Health, capacity, and structural metrics for the memory system."""
@@ -1185,6 +1220,7 @@ async def memory_stats() -> dict:
         "extraction": extraction,
         "code_index": code_index,
         "essential_knowledge": ek_info,
+        "quality": await _memory_quality_block(memory_mod._db),
     }
 
 

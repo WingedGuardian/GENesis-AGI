@@ -222,6 +222,97 @@ async def test_memory_quality_pool_failure_degrades_to_none(db, monkeypatch):
     assert "precision_at_5" in metrics  # quality series intact
 
 
+# ── WS2-0: retrieval-efficacy readers (j9_eval_status trend + memory_stats) ───
+
+
+def test_retrieval_trend_chronological_and_none_tolerant():
+    """Newest-first snapshots become an oldest-first trend; a pre-WS2-0 snapshot
+    (no pool_* keys) yields explicit None, never a KeyError or fabricated value."""
+    from genesis.mcp.health.j9_eval import _retrieval_trend
+
+    snaps = [  # DESC (newest-first), as get_snapshots returns
+        {
+            "period_end": "2026-07-17",
+            "metrics": {"precision_at_5": 0.8, "hit_rate": 0.7, "pool_episodic_total": 55000},
+        },
+        {"period_end": "2026-07-10", "metrics": {"precision_at_5": 0.6}},  # pre-WS2-0
+    ]
+    trend = _retrieval_trend(snaps)
+    assert [r["period_end"] for r in trend] == ["2026-07-10", "2026-07-17"]
+    assert trend[0]["pool_episodic_total"] is None  # older snapshot → honest gap
+    assert trend[1]["pool_episodic_total"] == 55000
+    assert trend[1]["hit_rate"] == 0.7
+
+
+def test_retrieval_trend_empty():
+    from genesis.mcp.health.j9_eval import _retrieval_trend
+
+    assert _retrieval_trend([]) == []
+
+
+async def test_memory_quality_block_joins_snapshot_and_grade(db):
+    """_memory_quality_block returns the latest memory snapshot headline joined
+    to the memory subsystem grade — capacity and quality on one surface."""
+    from genesis.mcp.memory.core import _memory_quality_block
+
+    await j9_eval.insert_snapshot(
+        db,
+        period_start="2026-07-10",
+        period_end="2026-07-17",
+        period_type="weekly",
+        dimension="memory",
+        metrics={
+            "precision_at_5": 0.82,
+            "hit_rate": 0.75,
+            "mrr": 0.6,
+            "total_recalls": 40,
+            "pool_episodic_total": 55000,
+            "pool_knowledge_units_total": 3900,
+        },
+        sample_count=40,
+    )
+    await j9_eval.insert_subsystem_grade(
+        db,
+        period_start="2026-07-10",
+        period_end="2026-07-17",
+        period_type="weekly",
+        subsystem="memory",
+        grade="B",
+        score=0.82,
+        factors={},
+        sample_count=40,
+    )
+    block = await _memory_quality_block(db)
+    assert block["precision_at_5"] == 0.82
+    assert block["pool_episodic_total"] == 55000
+    assert block["grade"] == "B"
+    assert block["grade_score"] == 0.82
+
+
+async def test_memory_quality_block_grade_missing_is_none(db):
+    """A snapshot with no grade row still returns the headline; grade is None."""
+    from genesis.mcp.memory.core import _memory_quality_block
+
+    await j9_eval.insert_snapshot(
+        db,
+        period_start="2026-07-10",
+        period_end="2026-07-17",
+        period_type="weekly",
+        dimension="memory",
+        metrics={"precision_at_5": 0.5},
+        sample_count=1,
+    )
+    block = await _memory_quality_block(db)
+    assert block["precision_at_5"] == 0.5
+    assert block["grade"] is None
+
+
+async def test_memory_quality_block_none_when_no_snapshot(db):
+    from genesis.mcp.memory.core import _memory_quality_block
+
+    assert await _memory_quality_block(db) is None
+
+
 async def test_get_events_filter_by_type(db):
     await j9_eval.insert_event(db, dimension="memory", event_type="recall_fired", metrics={})
     await j9_eval.insert_event(db, dimension="memory", event_type="recall_relevance", metrics={})
