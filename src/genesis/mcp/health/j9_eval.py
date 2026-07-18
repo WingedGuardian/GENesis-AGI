@@ -19,6 +19,7 @@ _TREND_METRIC_KEYS: tuple[str, ...] = (
     "usage_rate",
     "total_recalls",
     "pool_episodic_total",
+    "pool_episodic_retrievable",
     "pool_episodic_embedded",
     "pool_knowledge_units_total",
     "pool_memory_links_total",

@@ -139,3 +139,14 @@ def test_render_md_smoke_empty_and_populated():
     assert "Drift check" in md
     assert "drift" in md.lower()
     assert "flip-gate checklist" in md
+
+
+def test_build_report_carries_retrievable_pool_when_present():
+    snapshots = [
+        _snap("2026-07-17", hit_rate=0.7, pool_episodic_total=55000,
+              pool_episodic_retrievable=52000),
+    ]
+    report = _rep.build_report(snapshots=snapshots, reconstructed_pool={}, lme_runs=[])
+    assert report["trend"][0]["pool_episodic_retrievable"] == 52000
+    md = _rep.render_md(report, generated_at="2026-07-17T00:00:00Z")
+    assert "retrievable" in md

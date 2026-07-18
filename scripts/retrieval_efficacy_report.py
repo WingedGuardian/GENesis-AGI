@@ -83,6 +83,11 @@ def build_report(
                 "mrr": metrics.get("mrr"),
                 "total_recalls": metrics.get("total_recalls"),
                 "pool_episodic_total": pool,
+                # Retrievable pool (deprecated/expired excluded) — the denominator
+                # the drift hypothesis cares about. Only present from WS2-0 on;
+                # reconstructed weeks have no retrievable count (current-state
+                # flags can't be reconstructed historically) -> None.
+                "pool_episodic_retrievable": metrics.get("pool_episodic_retrievable"),
                 "pool_source": pool_source,
             }
         )
@@ -142,18 +147,19 @@ def render_md(report: dict, *, generated_at: str) -> str:
         "",
         "## Pool-growth vs quality trend",
         "",
-        "| Week ending | precision@5 | hit_rate | MRR | recalls | episodic pool | pool source |",
-        "|---|---|---|---|---|---|---|",
+        "| Week ending | precision@5 | hit_rate | MRR | recalls | "
+        "episodic pool | retrievable | pool source |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for row in report["trend"]:
         lines.append(
             f"| {_fmt(row['period_end'])} | {_fmt(row['precision_at_5'])} | "
             f"{_fmt(row['hit_rate'])} | {_fmt(row['mrr'])} | "
             f"{_fmt(row['total_recalls'])} | {_fmt(row['pool_episodic_total'])} | "
-            f"{row['pool_source']} |"
+            f"{_fmt(row.get('pool_episodic_retrievable'))} | {row['pool_source']} |"
         )
     if not report["trend"]:
-        lines.append("| _(no weekly memory snapshots yet)_ | | | | | | |")
+        lines.append("| _(no weekly memory snapshots yet)_ | | | | | | | |")
 
     lines += ["", "## Drift check", ""]
     drift = report["drift"]
@@ -206,19 +212,17 @@ async def _reconstruct_pool(db, period_ends: list[str]) -> dict[str, int]:
     """Episodic pool size as of each ``period_end`` from ``created_at``.
 
     APPROXIMATE — cannot see dedup/forgetting deletions, so biased high on older
-    weeks. Never written back; only used to fill pre-WS2-0 snapshots.
+    weeks. Never written back; only used to fill pre-WS2-0 snapshots. Delegates
+    the count to the CRUD layer (``episodic_count_created_before``).
     """
+    from genesis.db.crud import memory as memory_crud
+
     out: dict[str, int] = {}
     for pe in period_ends:
         if not pe:
             continue
         try:
-            rows = await db.execute_fetchall(
-                "SELECT COUNT(*) FROM memory_metadata "
-                "WHERE collection = 'episodic_memory' AND created_at <= ?",
-                (pe,),
-            )
-            out[pe] = int(rows[0][0]) if rows else 0
+            out[pe] = await memory_crud.episodic_count_created_before(db, pe)
         except Exception as exc:  # noqa: BLE001 - LOUD, never silently empty
             print(
                 f"retrieval_efficacy_report: pool reconstruct failed at {pe}: {exc}",

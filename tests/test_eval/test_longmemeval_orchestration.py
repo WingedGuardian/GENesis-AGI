@@ -537,3 +537,17 @@ async def test_run_arm_applies_variant_recall_kwargs_and_post_recall(_variants_c
     assert "alpha_memory" in joined
     assert "beta_memory" not in joined
     assert result.arm_label == "raw+probe"
+
+
+def test_eval_cli_longmemeval_accepts_variants():
+    """The primary `genesis eval longmemeval` path exposes --variants (not just
+    the module __main__), so a lever's variant is reachable from both CLIs."""
+    import argparse
+
+    from genesis.eval.cli import add_parser
+
+    top = argparse.ArgumentParser()
+    sub = top.add_subparsers(dest="command")
+    add_parser(sub)
+    args = top.parse_args(["eval", "longmemeval", "--variants", "scope,budget"])
+    assert args.variants == "scope,budget"

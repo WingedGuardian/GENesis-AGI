@@ -1151,6 +1151,7 @@ async def _memory_quality_block(db) -> dict | None:
             "usage_rate": metrics.get("usage_rate"),
             "total_recalls": metrics.get("total_recalls"),
             "pool_episodic_total": metrics.get("pool_episodic_total"),
+            "pool_episodic_retrievable": metrics.get("pool_episodic_retrievable"),
             "pool_knowledge_units_total": metrics.get("pool_knowledge_units_total"),
             "grade": mem_grade.get("grade") if mem_grade else None,
             "grade_score": mem_grade.get("score") if mem_grade else None,

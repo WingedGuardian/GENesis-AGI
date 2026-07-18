@@ -684,6 +684,7 @@ async def count(
 # key set without drifting from this function's output.
 POOL_COUNT_KEYS: tuple[str, ...] = (
     "pool_episodic_total",
+    "pool_episodic_retrievable",
     "pool_episodic_embedded",
     "pool_knowledge_units_total",
     "pool_memory_links_total",
@@ -698,14 +699,31 @@ async def pool_size_counts(db: aiosqlite.Connection) -> dict[str, int]:
     pool it was measured over — the pool-growth-vs-quality trend the WS2
     retrieval-drift work needs and that nothing measured before.
 
+    ``pool_episodic_retrievable`` applies the SAME two filters the recall path
+    applies (``recall`` :195-203): NOT deprecated by the dream cycle AND still
+    bitemporally valid (``invalid_at`` NULL or in the future). That is the
+    denominator the drift hypothesis actually cares about — a deprecated/expired
+    row is not a candidate any recall dilutes. ``pool_episodic_total`` keeps the
+    raw count for reference (total minus retrievable = accumulated dead weight).
+
     SQLite-side counts only (the weekly aggregator holds no Qdrant client), so
-    these may differ slightly from Qdrant ``points_count`` on rows still
-    pending embed. ``memory_metadata`` mixes the ``episodic_memory`` and
-    ``knowledge_base`` collections, so episodic is counted by collection, not
-    as the whole table. Keys match ``POOL_COUNT_KEYS``.
+    these may differ slightly from Qdrant ``points_count`` on rows still pending
+    embed. ``memory_metadata`` mixes the ``episodic_memory`` and
+    ``knowledge_base`` collections, so episodic is counted by collection, not as
+    the whole table. Keys match ``POOL_COUNT_KEYS``.
     """
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
     ep_total = await db.execute_fetchall(
         "SELECT COUNT(*) FROM memory_metadata WHERE collection = 'episodic_memory'"
+    )
+    ep_retrievable = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM memory_metadata "
+        "WHERE collection = 'episodic_memory' "
+        "AND (deprecated IS NULL OR deprecated = 0) "
+        "AND (invalid_at IS NULL OR invalid_at > ?)",
+        (now,),
     )
     ep_embedded = await db.execute_fetchall(
         "SELECT COUNT(*) FROM memory_metadata "
@@ -715,7 +733,26 @@ async def pool_size_counts(db: aiosqlite.Connection) -> dict[str, int]:
     links = await db.execute_fetchall("SELECT COUNT(*) FROM memory_links")
     return {
         "pool_episodic_total": int(ep_total[0][0]) if ep_total else 0,
+        "pool_episodic_retrievable": int(ep_retrievable[0][0]) if ep_retrievable else 0,
         "pool_episodic_embedded": int(ep_embedded[0][0]) if ep_embedded else 0,
         "pool_knowledge_units_total": int(ku[0][0]) if ku else 0,
         "pool_memory_links_total": int(links[0][0]) if links else 0,
     }
+
+
+async def episodic_count_created_before(db: aiosqlite.Connection, ts: str) -> int:
+    """Count episodic rows created on or before ``ts`` (ISO-8601).
+
+    Used ONLY by the retrieval-efficacy report to reconstruct a pool size for
+    pre-WS2-0 weeks that carry no ``pool_*`` snapshot. Deliberately a total-
+    created count, not retrievable-as-of: ``deprecated``/``invalid_at`` are
+    current-state flags, so "retrievable in the past" cannot be reconstructed —
+    a row deprecated today was retrievable then. The report labels this an
+    approximation (biased high on older weeks) and never writes it back.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM memory_metadata "
+        "WHERE collection = 'episodic_memory' AND created_at <= ?",
+        (ts,),
+    )
+    return int(rows[0][0]) if rows else 0
