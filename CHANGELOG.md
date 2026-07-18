@@ -61,10 +61,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   this), so triage runs with real calibration instead of an empty prompt on a
   fresh install; and the content-pipeline module now honors its declared
   enabled state instead of always seeding disabled.
-- **Observations expire on schedule.** A time-to-live check compared expiry
-  timestamps stored in two different formats, which could resolve some
-  observations as expired up to a day early. TTL comparisons are now
-  format-normalized so observations live exactly as long as intended.
+- **Time-limited internal state expires on schedule.** Two time-to-live checks
+  compared expiry timestamps stored in different formats: observations could be
+  resolved as expired up to a day early, while same-day cognitive-state entries
+  lingered in the morning report as "active" long after they had actually
+  expired. Both comparisons are now format-normalized, so internal state lives
+  exactly as long as intended.
 - **The morning report's numbers are real now.** Report generation previously
   counted truncated display lists (reporting "5 follow-ups" when 268 existed),
   sometimes inverted protective facts into alarms (an active OOM-protection
