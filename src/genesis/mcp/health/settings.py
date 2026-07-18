@@ -79,7 +79,9 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         description=(
             "Memory recall wiring — 1-hop graph expansion over memory_links "
             "(`graph_expansion.mode` off/shadow/live + neighbor caps) and the "
-            "entity lane (PR-2, off/shadow for now). Read live per recall by "
+            "entity lane (PR-2, off/shadow for now), and the Voyage reranker on "
+            "the recall tools (`reranker.mode` off/live, default live; kill via "
+            "GENESIS_MEMORY_RERANK_OFF). Read live per recall by "
             "genesis.memory.graph_expansion (no restart); shadow only emits "
             "eval_events metrics, live appends linked neighbors after the "
             "organic results."
@@ -855,6 +857,8 @@ def _validate_memory_recall(changes: dict) -> list[str]:
     section_modes = {
         "graph_expansion": MODES,
         "entity_lane": ("off", "shadow"),
+        # Reranker on the MCP recall tools — off | live (no shadow).
+        "reranker": ("off", "live"),
     }
     for key, value in changes.items():
         if key == "enabled":
@@ -886,7 +890,9 @@ def _validate_memory_recall(changes: dict) -> list[str]:
                 else:
                     errors.append(f"Unknown key '{key}.{sub_key}'")
         else:
-            errors.append(f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane")
+            errors.append(
+                f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane, reranker"
+            )
     return errors
 
 

@@ -122,6 +122,25 @@ def memory_writebacks_off() -> bool:
     )
 
 
+def memory_rerank_off() -> bool:
+    """True when Voyage cross-encoder reranking on the MCP recall tools must be
+    suppressed (kill switch).
+
+    memory_recall / knowledge_recall / reference_lookup rerank by default once
+    the retriever has a reranker. This env kill (plus the ``reranker`` mode in
+    ``config/memory_recall.yaml``) lets an operator turn that tool-path rerank
+    off — for a Voyage cost/latency/outage concern — without a restart or code
+    change. Default off: reranking stays on. Does NOT gate the internal runtime
+    context stack (its reranking predates this switch); unset ``API_KEY_VOYAGE``
+    for a full stop.
+    """
+    return os.environ.get("GENESIS_MEMORY_RERANK_OFF", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 # A real deploy completes in minutes (update.sh's health-check phase caps at
 # ~3 min). A state file whose start is older than this cutoff is a crashed or
 # abandoned deploy, not a live one — treating it as stale bounds the (rare)

@@ -77,7 +77,18 @@ DEFAULTS: dict[str, Any] = {
     "entity_lane": {
         "mode": "off",
     },
+    # Voyage cross-encoder reranking on the MCP recall tools (memory_recall /
+    # knowledge_recall / reference_lookup). off | live — DEFAULT live (the tools
+    # promise reranking). Gates ONLY the MCP tool path, not the internal runtime
+    # context stack or the LongMemEval harness (both pass explicit rerank kwargs
+    # and must stay hermetic). Kill: mode off OR GENESIS_MEMORY_RERANK_OFF.
+    "reranker": {
+        "mode": "live",
+    },
 }
+
+# Reranker is a binary on/off (no shadow) — unlike graph_expansion's tri-state.
+_RERANKER_MODES = ("off", "live")
 
 # Neighbor ordering score: organic RRF-fused scores are O(0.01)+ and rerank
 # scores larger still, so 0.01 * strength (strength ∈ (0, 1]) sorts every
@@ -177,6 +188,43 @@ def _mode_from(cfg: dict[str, Any]) -> str:
 def expansion_mode() -> str:
     """Effective graph-expansion mode: ``off | shadow | live`` — read live."""
     return _mode_from(load_recall_config())
+
+
+def _reranker_mode_from(cfg: dict[str, Any]) -> str:
+    """Effective reranker mode from a loaded config — ``off | live``.
+
+    Master ``enabled: false`` forces off. An unquoted ``mode: off`` parses as
+    YAML-1.1 boolean ``False``; any other invalid value degrades to ``live``
+    (the tools promise reranking, so the safe default keeps it on).
+    """
+    if not cfg.get("enabled", True):
+        return "off"
+    section = cfg.get("reranker")
+    mode = section.get("mode") if isinstance(section, dict) else None
+    if mode is False:
+        mode = "off"
+    if mode not in _RERANKER_MODES:
+        logger.warning(
+            "memory_recall reranker has invalid mode %r — defaulting to live",
+            mode,
+        )
+        return "live"
+    return mode
+
+
+def reranker_enabled() -> bool:
+    """Whether the MCP recall tools should rerank — read live per call.
+
+    True unless the ``reranker`` config mode is ``off`` OR the
+    ``GENESIS_MEMORY_RERANK_OFF`` env kill is set. Gates ONLY the MCP tool
+    path; the internal runtime context stack and the LongMemEval harness pass
+    explicit ``rerank`` kwargs and never consult this.
+    """
+    from genesis.env import memory_rerank_off
+
+    if memory_rerank_off():
+        return False
+    return _reranker_mode_from(load_recall_config()) == "live"
 
 
 async def expand_neighbors(

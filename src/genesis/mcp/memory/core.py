@@ -205,7 +205,10 @@ async def memory_recall(
             expand_query_terms=expand_query_terms,
             include_subsystem=include_subsystem,
             only_subsystem=only_subsystem,
-            rerank=rerank,
+            # Reranking is gated at this MCP tool boundary (config mode +
+            # GENESIS_MEMORY_RERANK_OFF kill) so the switch never reaches the
+            # hermetic LongMemEval harness or the internal runtime stack.
+            rerank=rerank and graph_expansion.reranker_enabled(),
             include_deprecated=include_deprecated,
             event_id_sink=recall_event_sink,
         )
