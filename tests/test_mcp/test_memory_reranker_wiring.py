@@ -12,7 +12,28 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 import genesis.mcp.memory as mem
+
+# init() rebinds these module globals; restore them so a populated state can't
+# leak into the *_requires_init tests (which assert an uninitialized module).
+_INIT_GLOBALS = (
+    "_store",
+    "_db",
+    "_qdrant",
+    "_retriever",
+    "_user_model_evolver",
+    "_bookmark_mgr",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_memory_globals():
+    saved = {name: getattr(mem, name) for name in _INIT_GLOBALS}
+    yield
+    for name, value in saved.items():
+        setattr(mem, name, value)
 
 
 def _stub_init_deps(monkeypatch) -> dict:
