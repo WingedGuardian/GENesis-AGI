@@ -911,6 +911,28 @@ class HybridRetriever:
             query_expanded=fts_query != query,
         )
 
+        # Entity-lane SHADOW probe (off by default; entity_lane.mode: shadow).
+        # Measures whether resolving the query to entity nodes + walking the
+        # entity graph would surface novel valid candidates the vector/FTS lanes
+        # miss — pure observation that appends one eval_event and NEVER touches
+        # ``results``. Placed after the write-backs so its insert_event commit
+        # can't flush partial recall state; own guard belts the helper's own
+        # try/except (belt-and-suspenders — recall must never break here).
+        try:
+            from genesis.memory import entity_query
+
+            await entity_query.maybe_entity_lane_shadow(
+                self._db,
+                query=query,
+                ranked_lists=ranked_lists,
+                all_ids=all_ids,
+                limit=limit,
+                embedding_available=embedding_available,
+                recall_event_id=recall_event_id,
+            )
+        except Exception:
+            logger.debug("entity_lane_shadow call failed — recall unaffected", exc_info=True)
+
         return results
 
     # --- recall() stage helpers (read-only gathers/computes) ---

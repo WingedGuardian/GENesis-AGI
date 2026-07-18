@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Groundwork: Genesis can now measure whether its entity graph would improve
+  recall, without changing any results yet.** A new shadow-only lane resolves a
+  recall query to entities in its knowledge graph, walks their relationships,
+  and records how many new, still-valid memories it would have surfaced that
+  ordinary search missed. This is measurement only (one internal metric per
+  recall); it ships off by default and never alters what recall returns, so the
+  data can decide whether building the live version is worth it.
 - **Genesis now tidies near-duplicate entities in its knowledge graph.** When
   it learns about a "thing" (a project, tool, concept, person) whose name is
   very close to one it already knows, it now decides whether they are the same

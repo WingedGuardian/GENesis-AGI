@@ -1063,3 +1063,54 @@ async def test_compute_activations_fts_ghost_falls_back_to_now(
         {"ghost"}, {}, now_str,
     )
     assert created_at_by_id["ghost"] == now_str
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_invokes_entity_lane_shadow(mock_qdrant, mock_crud, mock_links, _mock_expand):
+    """The entity-lane shadow probe is wired into recall() with the sets it
+    needs (ranked_lists/all_ids/limit/embedding_available/recall_event_id)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.95)]
+    mock_crud.search_ranked = AsyncMock(return_value=[_make_fts_row("mem-1", -5.0)])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
+    _setup_link_mocks(mock_links, link_count=1)
+
+    spy = AsyncMock(return_value=None)
+    with patch("genesis.memory.entity_query.maybe_entity_lane_shadow", spy):
+        results = await retriever.recall("test query", limit=10)
+
+    assert len(results) > 0
+    spy.assert_awaited_once()
+    kw = spy.await_args.kwargs
+    assert kw["query"] == "test query"
+    assert isinstance(kw["ranked_lists"], list)
+    assert isinstance(kw["all_ids"], set)
+    assert kw["limit"] == 10
+    assert isinstance(kw["embedding_available"], bool)
+    assert "recall_event_id" in kw  # correlation id passed for joinable events
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_survives_entity_lane_shadow_failure(mock_qdrant, mock_crud, mock_links, _e):
+    """A raising shadow helper must not change recall's output (the call site's
+    own guard belts the helper's internal try/except)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.95), _make_qdrant_hit("mem-2", 0.8)]
+    mock_crud.search_ranked = AsyncMock(return_value=[_make_fts_row("mem-1", -5.0)])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
+    _setup_link_mocks(mock_links, link_count=1)
+
+    # Baseline: real helper is a no-op (config ships mode: off).
+    baseline = await retriever.recall("test query", limit=10)
+    boom = AsyncMock(side_effect=RuntimeError("boom"))
+    with patch("genesis.memory.entity_query.maybe_entity_lane_shadow", boom):
+        results = await retriever.recall("test query", limit=10)
+    assert [r.memory_id for r in results] == [r.memory_id for r in baseline]
