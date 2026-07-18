@@ -95,7 +95,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
-- **The outbound secret scanner now catches modern API-key formats.** Before
+- **Disaster recovery no longer risks corrupting the thing it's recovering.** A
+  script audit found three ways deploy/restore could bite at the worst moment,
+  now fixed: (1) during a database restore, the health watchdog could restart
+  the server mid-rebuild — into a half-populated database that the next backup
+  would then capture as the newest "complete" snapshot; restore now holds the
+  same deploy-in-progress marker the watchdog already honors, so it stands down
+  until the restore finishes. (2) The pre-restore "undo" copy was taken from the
+  live database without its write-ahead log and then the original was deleted —
+  leaving a torn, stale rollback copy exactly when an operator needs to undo a
+  bad restore; the copy is now taken after the writer is stopped, via a
+  WAL-aware snapshot. (3) The Guardian installer aborted on any host without
+  Claude Code already installed — which is every fresh host, since the installer
+  runs before Node/CC are set up — because an "optional" CLI probe wasn't guarded
+  under strict mode; it now degrades gracefully as intended.
   sending on external channels (email, chat), Genesis scans messages and
   quarantines anything that looks like a leaked credential. Its API-key
   patterns predated today's key formats, so newer shapes slipped through

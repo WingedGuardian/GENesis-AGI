@@ -45,7 +45,17 @@
 # host-facing source IP — install_guardian.sh derives and installs this):
 #   from="CONTAINER_IP",command="~/.local/bin/guardian-gateway.sh",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 ...
 #
-# This gives Genesis a fixed allowlist of operations on the host. Nothing else.
+# This restricts Genesis to a fixed set of verbs on the host. Treat that as a
+# ROBUSTNESS boundary (a buggy or rogue command can't run arbitrary host ops),
+# NOT a security boundary against a *compromised* container. The `redeploy` verb
+# by design installs guardian code the container supplies, which the host then
+# runs as a passwordless-sudo user — so a compromised container can reach host
+# root through it. The sha256 on redeploy verifies TRANSFER INTEGRITY (the
+# container supplies that hash too), not PROVENANCE. Container compromise should
+# be treated as host compromise; the per-verb validation bounds blast radius from
+# bugs and mistakes, not from a hostile container. (Closing that gap would take a
+# host-side signature against a key the container does not hold — a deliberate
+# posture upgrade, not claimed here.)
 
 set -euo pipefail
 
@@ -429,6 +439,10 @@ PYEOF
         #   2. A membership gate checks the tar CONTAINS the required files
         #      (tar -tf, also pre-extraction) on BOTH forms — catching a
         #      wrong-pathspec / partial archive.
+        # These are ROBUSTNESS guards (they catch corruption/truncation/mistakes),
+        # NOT provenance: the sha256 is container-supplied, so a compromised
+        # container can ship attacker code with a matching hash. See the header
+        # note — redeploy is container-ships-code-the-host-runs by design.
         # Older update.sh clients that send only <hash> still work (sha skipped).
         REDEPLOY_ARGS="${SSH_ORIGINAL_COMMAND#redeploy }"
         COMMIT_HASH="${REDEPLOY_ARGS%% *}"
