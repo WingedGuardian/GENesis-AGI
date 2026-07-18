@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     import aiosqlite
     from qdrant_client import QdrantClient
 
+    from genesis.memory.reranker import VoyageReranker
+
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("genesis-memory")
@@ -67,6 +69,7 @@ def init(
     storage_embedding_provider: EmbeddingProvider | None = None,
     recall_embedding_provider: EmbeddingProvider | None = None,
     activity_tracker: object | None = None,
+    reranker: VoyageReranker | None = None,
     # Backward compat — old callers pass ``embedding_provider``
     embedding_provider: EmbeddingProvider | None = None,
 ) -> None:
@@ -76,6 +79,14 @@ def init(
     writes (MemoryStore) and ``recall_embedding_provider`` for reads
     (HybridRetriever).  If only ``embedding_provider`` is given (old
     callers), it is used for both paths.
+
+    ``reranker`` wires the Voyage cross-encoder into the MCP-path retriever so
+    ``memory_recall`` / ``knowledge_recall`` actually rerank (they default
+    ``rerank=True`` but were previously built with no reranker, so the
+    ``_maybe_rerank`` gate never fired). ``None`` preserves the legacy
+    no-rerank behavior; a reranker with no ``API_KEY_VOYAGE`` degrades to a
+    no-op exactly as the runtime stack does. The MCP recall tools additionally
+    honor the ``reranker`` config mode + ``GENESIS_MEMORY_RERANK_OFF`` kill.
     """
     from genesis.bookmark.manager import BookmarkManager
     from genesis.memory.linker import MemoryLinker
@@ -104,6 +115,7 @@ def init(
         embedding_provider=recall_emb,
         qdrant_client=qdrant_client,
         db=db,
+        reranker=reranker,
     )
     _user_model_evolver = UserModelEvolver(db=db)
     _bookmark_mgr = BookmarkManager(
@@ -144,7 +156,9 @@ def _resolve_session_id(session_id: str) -> str:
     if not sessions_dir.exists():
         return session_id
 
-    matches = [d.name for d in sessions_dir.iterdir() if d.is_dir() and d.name.startswith(session_id)]
+    matches = [
+        d.name for d in sessions_dir.iterdir() if d.is_dir() and d.name.startswith(session_id)
+    ]
     if len(matches) == 1:
         return matches[0]
 

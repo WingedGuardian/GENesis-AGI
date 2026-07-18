@@ -20,7 +20,8 @@ logger = logging.getLogger("genesis.runtime")
 
 
 async def run_status_writer_loop(
-    runtime: GenesisRuntime, interval_s: float = _STATUS_WRITE_INTERVAL_S,
+    runtime: GenesisRuntime,
+    interval_s: float = _STATUS_WRITE_INTERVAL_S,
 ) -> None:
     """Background loop that refreshes status.json on a fixed cadence.
 
@@ -42,7 +43,8 @@ async def run_status_writer_loop(
         except Exception as exc:
             runtime.record_job_failure("status_writer_loop", str(exc))
             logger.error(
-                "Status writer loop iteration failed", exc_info=True,
+                "Status writer loop iteration failed",
+                exc_info=True,
             )
 
 
@@ -58,6 +60,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         qdrant = QdrantClient(url=qdrant_url(), timeout=5)
         from genesis.qdrant.collections import ensure_collections
+
         ensure_collections(qdrant)
         logger.info("Qdrant collections ensured")
 
@@ -124,8 +127,12 @@ async def init(rt: GenesisRuntime) -> None:
             storage_embedding_provider=storage_embedder,
             recall_embedding_provider=recall_embedder,
             activity_tracker=rt._activity_tracker,
+            # Share the SAME reranker the runtime stack uses so the MCP recall
+            # tools (memory_recall / knowledge_recall) actually rerank instead
+            # of silently building a reranker-less retriever.
+            reranker=reranker,
         )
-        logger.info("Memory MCP initialized (dual embedders)")
+        logger.info("Memory MCP initialized (dual embedders, shared reranker)")
 
         if rt._result_writer is not None:
             rt._result_writer._memory_store = rt._memory_store
@@ -150,11 +157,13 @@ async def init(rt: GenesisRuntime) -> None:
                 await rt._status_writer.write()
             except Exception:
                 logger.warning(
-                    "Initial status writer write failed", exc_info=True,
+                    "Initial status writer write failed",
+                    exc_info=True,
                 )
 
             rt._status_writer_task = tracked_task(
-                run_status_writer_loop(rt), name="status-writer-loop",
+                run_status_writer_loop(rt),
+                name="status-writer-loop",
             )
             logger.info(
                 "Status writer loop started (interval=%ds)",
@@ -203,23 +212,29 @@ async def init(rt: GenesisRuntime) -> None:
 
     except (ConnectionError, TimeoutError) as exc:
         logger.error(
-            "MemoryStore creation failed (Qdrant down?) — "
-            "continuing without vector memory",
+            "MemoryStore creation failed (Qdrant down?) — continuing without vector memory",
             exc_info=True,
         )
         from genesis.runtime._degradation import record_init_degradation
-        await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")
+
+        await record_init_degradation(
+            rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error"
+        )
     except Exception as exc:
         logger.error(
             "MemoryStore creation failed — continuing without vector memory",
             exc_info=True,
         )
         from genesis.runtime._degradation import record_init_degradation
-        await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")
+
+        await record_init_degradation(
+            rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error"
+        )
 
 
 async def _migrate_reference_vectors(
-    qdrant: QdrantClient, db: aiosqlite.Connection,
+    qdrant: QdrantClient,
+    db: aiosqlite.Connection,
 ) -> None:
     """One-time migration: move reference vectors from knowledge_base → episodic_memory.
 
@@ -272,9 +287,7 @@ async def _migrate_reference_vectors(
         for p in to_migrate:
             payload = dict(p.payload) if p.payload else {}
             payload["memory_type"] = "episodic"
-            points_to_upsert.append(
-                PointStruct(id=str(p.id), vector=p.vector, payload=payload)
-            )
+            points_to_upsert.append(PointStruct(id=str(p.id), vector=p.vector, payload=payload))
 
         qdrant.upsert(
             collection_name="episodic_memory",
@@ -290,8 +303,7 @@ async def _migrate_reference_vectors(
         )
 
         logger.info(
-            "Reference vector migration: moved %d points from "
-            "knowledge_base → episodic_memory",
+            "Reference vector migration: moved %d points from knowledge_base → episodic_memory",
             len(to_migrate),
         )
     except Exception:
