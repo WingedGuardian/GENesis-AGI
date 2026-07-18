@@ -35,6 +35,13 @@ approval_timeouts:
   task_proposal: null
   irreversible: null     # Wait forever
 
+# Earn-back evidence window (days). Eligibility to propose restoring a
+# demoted autonomy level is computed from the Bayesian posterior over
+# autonomy_events within this window — recent behavior, not lifetime
+# history. Promotion always requires explicit user approval.
+earnback:
+  window_days: 45
+
 # Regression policy
 regression:
   consecutive_corrections_threshold: 2  # Drop one level after this many

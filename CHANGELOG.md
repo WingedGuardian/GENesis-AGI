@@ -23,6 +23,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and then re-asserted for days. The guard only annotates — it never blocks
   or rejects a reflection's update.
 
+- **Reflection updates in Telegram are now real summaries.** The reflection
+  topic previously relayed the model's raw output, so a malformed reflection
+  could leak internal tool-call chatter to your Telegram verbatim. Messages
+  are now built only from the parsed reflection fields (assessment, key
+  observations, next focus); when a reflection's output can't be parsed you
+  get a short "completed — stored for review" notice instead of noise, and
+  unparseable output is no longer stored as a reflection summary that later
+  reflections would re-read and argue with.
+
+- **Demoted autonomy can actually earn its way back now.** Earn-back
+  eligibility used to be computed over a category's entire lifetime record,
+  so after a rough patch the math could require months of flawless behavior
+  before Genesis would even *propose* restoring a level — in practice the
+  demotion was permanent and the system nagged about it forever. Eligibility
+  now looks at a recent evidence window (45 days by default,
+  `earnback.window_days` in `config/autonomy.yaml`): old mistakes age out,
+  recent clean behavior counts, and promotion still always requires your
+  explicit approval. While an earn-back proposal is sitting in your queue,
+  the internal "autonomy regressed" alarm also calms down instead of firing
+  on every awareness tick.
+
 ### Added
 
 - **Genesis now tidies near-duplicate entities in its knowledge graph.** When
@@ -108,6 +129,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   distinct "posture unknown" alert instead of stale claims.
 
 ### Fixed
+
+- **The host recovery brain no longer goes blind on a misconfigured work
+  directory.** If the guardian's configured Claude Code work directory already
+  exists but isn't writable by the guardian (for example a root-owned
+  `/var/lib` path left over from an older install), it now detects that with a
+  real write probe and falls back to a user-writable directory instead of
+  handing the recovery session an unusable working directory. Previously only a
+  *non-creatable* directory triggered the fallback; an existing-but-unwritable
+  one slipped through and could blind the recovery brain exactly when it was
+  needed most.
 
 - **Disaster recovery no longer risks corrupting the thing it's recovering.** A
   script audit found three ways deploy/restore could bite at the worst moment,

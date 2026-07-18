@@ -229,6 +229,14 @@ TABLES = {
             updated_at             TEXT NOT NULL
         )
     """,
+    "autonomy_events": """
+        CREATE TABLE IF NOT EXISTS autonomy_events (
+            id          TEXT PRIMARY KEY,
+            category    TEXT NOT NULL,
+            kind        TEXT NOT NULL CHECK (kind IN ('success', 'correction')),
+            occurred_at TEXT NOT NULL
+        )
+    """,
     "outreach_history": """
         CREATE TABLE IF NOT EXISTS outreach_history (
             id                  TEXT PRIMARY KEY,
@@ -1928,6 +1936,7 @@ KNOWLEDGE_FTS5_DDL = """
 # ─── Indexes ──────────────────────────────────────────────────────────────────
 
 INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_autonomy_events_cat_time ON autonomy_events(category, occurred_at)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_session ON attention_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_ts ON attention_events(ts)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_unlabeled ON attention_events(acceptance_signal) WHERE acceptance_signal IS NULL",

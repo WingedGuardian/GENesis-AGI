@@ -359,6 +359,49 @@ class TestAutonomyActivityCollector:
         r = await AutonomyActivityCollector(db).collect()
         assert r.value == 1.0
 
+    async def test_regression_with_pending_earnback_dampens(self, db):
+        """A regression whose earn-back proposal is already awaiting the user
+        reads 0.7, not a pinned 1.0 — the recovery path is out of the
+        system's hands."""
+        from genesis.learning.signals.autonomy_activity import AutonomyActivityCollector
+
+        await self._insert_autonomy_state(
+            db, "background_cognitive",
+            current_level=2, earned_level=4,
+        )
+        await db.execute(
+            "INSERT INTO ego_proposals (id, action_type, action_category, "
+            "content, rationale, confidence, urgency, status, created_at) "
+            "VALUES ('eb1', 'autonomy_earnback', 'background_cognitive', "
+            "'Restore background_cognitive to L4', 'evidence recovered', "
+            "0.9, 'low', 'pending', ?)",
+            (_now_iso(),),
+        )
+        await db.commit()
+        r = await AutonomyActivityCollector(db).collect()
+        assert r.value == 0.7
+        assert r.source == "regression_pending_earnback_background_cognitive"
+
+    async def test_regression_with_resolved_earnback_stays_hot(self, db):
+        """A rejected/expired earn-back proposal does NOT dampen the signal."""
+        from genesis.learning.signals.autonomy_activity import AutonomyActivityCollector
+
+        await self._insert_autonomy_state(
+            db, "background_cognitive",
+            current_level=2, earned_level=4,
+        )
+        await db.execute(
+            "INSERT INTO ego_proposals (id, action_type, action_category, "
+            "content, rationale, confidence, urgency, status, created_at) "
+            "VALUES ('eb2', 'autonomy_earnback', 'background_cognitive', "
+            "'Restore background_cognitive to L4', 'evidence recovered', "
+            "0.9, 'low', 'rejected', ?)",
+            (_now_iso(),),
+        )
+        await db.commit()
+        r = await AutonomyActivityCollector(db).collect()
+        assert r.value == 1.0
+
     async def test_isinstance_protocol(self, db):
         from genesis.learning.signals.autonomy_activity import AutonomyActivityCollector
 

@@ -21,9 +21,13 @@ class AutonomyActivityCollector:
     | Stable (no corrections, no level gaps)        | 0.0         |
     | Corrections accumulating (consecutive > 0)    | 0.3         |
     | Near regression (consecutive >= threshold-1)  | 0.7         |
-    | Regression active (current < earned level)    | 1.0         |
+    | Regression, earn-back proposal pending        | 0.7         |
+    | Regression active, no earn-back path pending  | 1.0         |
 
     Checks ALL autonomy categories — the worst state drives the signal.
+    A regression with a pending ``autonomy_earnback`` proposal is dampened
+    to 0.7: the system has already surfaced the recovery path and is
+    waiting on the user, so a pinned 1.0 would be pure reflection noise.
     """
 
     signal_name = "autonomy_activity"
@@ -52,8 +56,14 @@ class AutonomyActivityCollector:
             category_name = cat.get("category", "unknown")
 
             if current_level < earned_level:
-                # Active regression — strongest signal
-                if worst_value < 1.0:
+                # Active regression — strongest signal, unless the recovery
+                # path is already sitting with the user as a pending
+                # earn-back proposal.
+                if await self._earnback_pending(category_name):
+                    if worst_value < 0.7:
+                        worst_value = 0.7
+                        worst_source = f"regression_pending_earnback_{category_name}"
+                elif worst_value < 1.0:
                     worst_value = 1.0
                     worst_source = f"regression_{category_name}"
             elif consecutive >= self._REGRESSION_THRESHOLD - 1:
@@ -68,11 +78,30 @@ class AutonomyActivityCollector:
 
         return self._reading(worst_value, worst_source)
 
+    async def _earnback_pending(self, category: str) -> bool:
+        """True if a pending earn-back proposal exists for *category*."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT 1 FROM ego_proposals WHERE status = 'pending' "
+                "AND action_type = 'autonomy_earnback' "
+                "AND action_category = ? LIMIT 1",
+                (category,),
+            )
+            return await cursor.fetchone() is not None
+        except Exception:
+            logger.debug("earnback-pending check failed", exc_info=True)
+            return False
+
     def _reading(self, value: float, source: str) -> SignalReading:
         return SignalReading(
             name=self.signal_name,
             value=value,
             source=source,
             collected_at=datetime.now(UTC).isoformat(),
-            baseline_note="0.0=stable autonomy (normal). 0.3=corrections accumulating, 0.7=near regression, 1.0=active regression",
+            baseline_note=(
+                "0.0=stable autonomy (normal). 0.3=corrections accumulating, "
+                "0.7=near regression OR regression with an earn-back proposal "
+                "awaiting the user, 1.0=active regression with no pending "
+                "earn-back path"
+            ),
         )

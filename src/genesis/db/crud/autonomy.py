@@ -1,6 +1,9 @@
-"""CRUD operations for autonomy_state table."""
+"""CRUD operations for autonomy_state + the autonomy_events evidence ledger."""
 
 from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -147,6 +150,9 @@ async def record_correction(
         posterior = bayesian_posterior(row["total_successes"], new_corrections)
         regression_reason = f"Bayesian regression (posterior={posterior:.3f}) at {corrected_at}"
         last_regression = corrected_at
+    await _insert_event(
+        db, category=row["category"], kind="correction", occurred_at=corrected_at,
+    )
     cursor = await db.execute(
         """UPDATE autonomy_state SET
            consecutive_corrections = ?, total_corrections = ?,
@@ -169,6 +175,9 @@ async def record_success(
         return False
     new_successes = row["total_successes"] + 1
 
+    await _insert_event(
+        db, category=row["category"], kind="success", occurred_at=updated_at,
+    )
     cursor = await db.execute(
         """UPDATE autonomy_state SET
            total_successes = ?, consecutive_corrections = 0,
@@ -178,6 +187,43 @@ async def record_success(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def _insert_event(
+    db: aiosqlite.Connection, *, category: str, kind: str, occurred_at: str
+) -> None:
+    """Append to the autonomy_events evidence ledger (same transaction as the
+    counter update — the caller owns the commit)."""
+    await db.execute(
+        "INSERT INTO autonomy_events (id, category, kind, occurred_at) "
+        "VALUES (?, ?, ?, ?)",
+        (str(uuid.uuid4()), category, kind, occurred_at),
+    )
+
+
+async def windowed_counts(
+    db: aiosqlite.Connection,
+    category: str,
+    *,
+    window_days: int,
+    now: datetime | None = None,
+) -> tuple[int, int]:
+    """(successes, corrections) for *category* within the last *window_days*.
+
+    Reads the append-only ``autonomy_events`` ledger. Events predate nothing:
+    the ledger starts empty on migration (no backfill), so windowed evidence
+    accumulates only from genuine post-migration activity. *now* is
+    injectable for tests.
+    """
+    ref = now or datetime.now(UTC)
+    cutoff = (ref - timedelta(days=window_days)).isoformat()
+    cursor = await db.execute(
+        "SELECT kind, COUNT(*) FROM autonomy_events "
+        "WHERE category = ? AND occurred_at >= ? GROUP BY kind",
+        (category, cutoff),
+    )
+    counts = {row[0]: row[1] for row in await cursor.fetchall()}
+    return counts.get("success", 0), counts.get("correction", 0)
 
 
 async def promote(

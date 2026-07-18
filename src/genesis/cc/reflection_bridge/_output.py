@@ -8,6 +8,7 @@ storage, light-output parsing, and topic forwarding.
 from __future__ import annotations
 
 import hashlib
+import html as _html
 import json
 import logging
 import re
@@ -377,8 +378,15 @@ async def _store_reflection_summary(
                 if obs:
                     summary_parts.append(str(obs))
     except (json.JSONDecodeError, TypeError):
-        if output.text.strip():
-            summary_parts.append(output.text[:2000])
+        # Unparseable output is NOT a reflection summary — storing the raw
+        # text creates a reflection_summary observation full of tool-call
+        # chatter that later re-surfaces in reflection context (the
+        # phantom-claim feedback loop). Log and skip.
+        logger.warning(
+            "Reflection summary skipped: %s output was not parseable JSON",
+            source,
+        )
+        return
     if summary_parts:
         # Cooldown: skip if a reflection_summary from this source exists
         # within the last 30 minutes.
@@ -406,8 +414,60 @@ async def _store_reflection_summary(
             )
 
 
-async def send_to_topic(session_id: str, depth, output, *, topic_manager) -> None:
-    """Send a reflection summary to the depth-specific topic."""
+def format_topic_summary(depth, output) -> str:
+    """Build the Telegram topic message from PARSED reflection fields only.
+
+    Raw ``output.text`` must never reach the topic: when the model output is
+    unparseable (tool-call chatter, truncation, partial JSON) the raw text is
+    internal noise, not a summary — it has leaked mid-session artifacts to
+    the user verbatim. The topic stays a liveness surface: parse failure
+    still produces a one-liner, never silence and never raw text.
+    """
+    header = f"<b>{depth.value} Reflection</b>"
+    fallback = (
+        f"{header}\n\nReflection completed — output was not parseable; "
+        "stored for review."
+    )
+    try:
+        data = json.loads(_extract_fenced_json(output.text))
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+    if not isinstance(data, dict):
+        return fallback
+
+    parts = [header]
+    try:
+        assessment = data.get("assessment") or data.get("cognitive_state_update")
+        if isinstance(assessment, str) and assessment.strip():
+            parts.append(_html.escape(assessment[:1500]))
+        obs = data.get("observations") or []
+        obs_lines = []
+        for entry in (obs if isinstance(obs, list) else [])[:3]:
+            text = entry if isinstance(entry, str) else ""
+            if text.strip():
+                obs_lines.append(f"• {_html.escape(text[:300])}")
+        if obs_lines:
+            parts.append("\n".join(obs_lines))
+        focus = data.get("focus_next_week") or data.get("focus_next")
+        if isinstance(focus, str) and focus.strip():
+            parts.append(f"<b>Focus:</b> {_html.escape(focus[:500])}")
+    except Exception:
+        # A schema-violating field shape must degrade to the liveness
+        # one-liner, never crash the reflection at the delivery step.
+        logger.warning("format_topic_summary field extraction failed", exc_info=True)
+        return fallback
+
+    if len(parts) == 1:
+        return (
+            f"{header}\n\nReflection completed — no summary fields in "
+            "output; stored for review."
+        )
+    return "\n\n".join(parts)
+
+
+async def send_to_topic(session_id: str, depth, text: str, *, topic_manager) -> None:
+    """Send pre-built topic text (see ``format_topic_summary``) to the
+    depth-specific topic. Never receives raw model output."""
     if not topic_manager:
         logger.warning(
             "send_to_topic: topic_manager not set — skipping %s topic send",
@@ -415,11 +475,7 @@ async def send_to_topic(session_id: str, depth, output, *, topic_manager) -> Non
         )
         return
     category = f"reflection_{depth.value.lower()}"
-    summary = (
-        f"<b>{depth.value} Reflection</b>\n\n"
-        f"{output.text[:3000]}"
-    )
     try:
-        await topic_manager.send_to_category(category, summary)
+        await topic_manager.send_to_category(category, text)
     except Exception:
         logger.warning("Failed to send reflection to topic %s", category, exc_info=True)

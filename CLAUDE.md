@@ -376,6 +376,11 @@ When a user shares a file path or URL in conversation:
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
   bug you consciously defer becomes a `tabled` record (bug-tracker lane above),
   never a silent drop.
+- **Data repair is not a fix.** If a mechanism failed to write or propagate
+  something, hand-writing the missing artifact (memory, directive, row, flag)
+  repairs ONE instance on ONE install. Label it "data repair", and fix the
+  mechanism in the same session — or get the user's explicit deferral. Never
+  report a data repair as "fixed".
 - **Telegram reminders**: use `outreach_send` with `preferred_timing`,
   NOT the `/schedule` skill (that's Claude Code's remote scheduler).
 - **Cognitive co-pilot, not order taker.** On every task, ask: "what else

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
@@ -437,44 +437,194 @@ async def _seed_autonomy_state(
     await db.commit()
 
 
+async def _seed_autonomy_events(
+    db, category, *, successes=0, corrections=0, age_days=1,
+):
+    """Insert autonomy_events rows *age_days* old for windowed-gate tests."""
+    occurred = (datetime.now(UTC) - timedelta(days=age_days)).isoformat()
+    rows = [("success",)] * successes + [("correction",)] * corrections
+    for i, (kind,) in enumerate(rows):
+        await db.execute(
+            "INSERT INTO autonomy_events (id, category, kind, occurred_at) "
+            "VALUES (?, ?, ?, ?)",
+            (f"{category}-{kind}-{age_days}-{i}", category, kind, occurred),
+        )
+    await db.commit()
+
+
 class TestDetectEarnbackCandidates:
     @pytest.mark.asyncio
     async def test_candidate_when_demoted_and_evidence_recovered(self, manager, db):
-        # 50 successes / 2 corrections → posterior 0.94 → L4 supports earned L4.
+        # 50 in-window successes / 2 corrections → posterior 0.94 → L4.
         await _seed_autonomy_state(
             db, "direct_session", current=2, earned=4, successes=50, corrections=2,
+        )
+        await _seed_autonomy_events(
+            db, "direct_session", successes=50, corrections=2, age_days=1,
         )
         cands = await manager.detect_earnback_candidates()
         assert len(cands) == 1
         assert cands[0]["category"] == "direct_session"
         assert cands[0]["current_level"] == 2
         assert cands[0]["target_level"] == 4
+        assert cands[0]["window_successes"] == 50
+        assert cands[0]["window_corrections"] == 2
 
     @pytest.mark.asyncio
     async def test_no_candidate_when_not_demoted(self, manager, db):
         await _seed_autonomy_state(
             db, "direct_session", current=4, earned=4, successes=50, corrections=2,
         )
+        await _seed_autonomy_events(
+            db, "direct_session", successes=50, corrections=2, age_days=1,
+        )
         assert await manager.detect_earnback_candidates() == []
 
     @pytest.mark.asyncio
-    async def test_no_candidate_when_evidence_insufficient(self, manager, db):
-        # Live direct_session shape: 33S / 14C → posterior 0.694 → L3 < earned L4.
+    async def test_no_candidate_when_window_evidence_insufficient(self, manager, db):
+        # In-window 33S / 14C → posterior 0.694 → L3 < earned L4.
         await _seed_autonomy_state(
             db, "direct_session", current=3, earned=4, successes=33, corrections=14,
         )
+        await _seed_autonomy_events(
+            db, "direct_session", successes=33, corrections=14, age_days=1,
+        )
         assert await manager.detect_earnback_candidates() == []
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_on_empty_window(self, manager, db):
+        # Lifetime counters look great, but NO events in the window (ledger
+        # empty — e.g. right after migration). No evidence ≠ eligibility.
+        await _seed_autonomy_state(
+            db, "direct_session", current=2, earned=4, successes=50, corrections=2,
+        )
+        assert await manager.detect_earnback_candidates() == []
+
+    @pytest.mark.asyncio
+    async def test_candidate_when_old_corrections_aged_out(self, manager, db):
+        # THE unreachable-gate fix: lifetime history is poisoned (38S/21C →
+        # lifetime L3 < earned L4), but the corrections are months old and
+        # recent behavior is clean → windowed posterior supports L4.
+        await _seed_autonomy_state(
+            db, "direct_session", current=3, earned=4, successes=38, corrections=21,
+        )
+        await _seed_autonomy_events(
+            db, "direct_session", corrections=21, age_days=100,  # outside 45d
+        )
+        await _seed_autonomy_events(
+            db, "direct_session", successes=12, age_days=5,  # inside window
+        )
+        cands = await manager.detect_earnback_candidates()
+        assert len(cands) == 1
+        assert cands[0]["category"] == "direct_session"
+        assert cands[0]["window_corrections"] == 0
+        assert cands[0]["posterior"] > 0.9
+
+    @pytest.mark.asyncio
+    async def test_recent_corrections_block_candidacy(self, manager, db):
+        # Same lifetime shape, but the corrections are RECENT → still blocked.
+        await _seed_autonomy_state(
+            db, "direct_session", current=3, earned=4, successes=38, corrections=21,
+        )
+        await _seed_autonomy_events(
+            db, "direct_session", successes=12, corrections=21, age_days=5,
+        )
+        assert await manager.detect_earnback_candidates() == []
+
+    @pytest.mark.asyncio
+    async def test_window_days_config_lever(self, db, tmp_path):
+        # window_days=200 pulls the "old" corrections back into scope.
+        cfg = tmp_path / "autonomy_window.yaml"
+        cfg.write_text(yaml.dump({"earnback": {"window_days": 200}}))
+        mgr = AutonomyManager(db=db, config_path=cfg)
+        await _seed_autonomy_state(
+            db, "direct_session", current=3, earned=4, successes=38, corrections=21,
+        )
+        await _seed_autonomy_events(db, "direct_session", corrections=21, age_days=100)
+        await _seed_autonomy_events(db, "direct_session", successes=12, age_days=5)
+        assert await mgr.detect_earnback_candidates() == []
 
     @pytest.mark.asyncio
     async def test_returns_only_eligible_categories(self, manager, db):
         await _seed_autonomy_state(
             db, "direct_session", current=2, earned=4, successes=50, corrections=2,
+        )
+        await _seed_autonomy_events(
+            db, "direct_session", successes=50, corrections=2, age_days=1,
         )  # eligible
         await _seed_autonomy_state(
             db, "outreach", current=1, earned=1, successes=0, corrections=0,
         )  # not demoted
         await _seed_autonomy_state(
             db, "sub_agent", current=2, earned=3, successes=3, corrections=14,
+        )
+        await _seed_autonomy_events(
+            db, "sub_agent", successes=3, corrections=14, age_days=1,
         )  # evidence too low (L1 < earned L3)
         cands = await manager.detect_earnback_candidates()
         assert [c["category"] for c in cands] == ["direct_session"]
+
+
+# ---------------------------------------------------------------------------
+# autonomy_events evidence ledger (windowed earn-back, migration 0067)
+# ---------------------------------------------------------------------------
+
+
+class TestAutonomyEventsLedger:
+    @pytest.mark.asyncio
+    async def test_record_success_writes_event(self, manager, db):
+        await manager.load_or_create_defaults()
+        await manager.record_success("direct_session")
+        cursor = await db.execute(
+            "SELECT category, kind FROM autonomy_events",
+        )
+        rows = [tuple(r) for r in await cursor.fetchall()]
+        assert rows == [("direct_session", "success")]
+
+    @pytest.mark.asyncio
+    async def test_record_correction_writes_event(self, manager, db):
+        await manager.load_or_create_defaults()
+        ts = datetime.now(UTC).isoformat()
+        await manager.record_correction("outreach", corrected_at=ts)
+        cursor = await db.execute(
+            "SELECT category, kind, occurred_at FROM autonomy_events",
+        )
+        rows = [tuple(r) for r in await cursor.fetchall()]
+        assert rows == [("outreach", "correction", ts)]
+
+    @pytest.mark.asyncio
+    async def test_windowed_counts_boundary(self, db):
+        from genesis.db.crud.autonomy import windowed_counts
+
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        inside = (now - timedelta(days=44)).isoformat()
+        outside = (now - timedelta(days=46)).isoformat()
+        for i, (kind, ts) in enumerate([
+            ("success", inside), ("success", outside),
+            ("correction", inside), ("correction", outside),
+        ]):
+            await db.execute(
+                "INSERT INTO autonomy_events (id, category, kind, occurred_at) "
+                "VALUES (?, 'direct_session', ?, ?)",
+                (f"ev-{i}", kind, ts),
+            )
+        await db.commit()
+        s, c = await windowed_counts(
+            db, "direct_session", window_days=45, now=now,
+        )
+        assert (s, c) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_windowed_counts_scoped_to_category(self, db):
+        from genesis.db.crud.autonomy import windowed_counts
+
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+        await db.execute(
+            "INSERT INTO autonomy_events (id, category, kind, occurred_at) "
+            "VALUES ('ev-x', 'outreach', 'success', ?)",
+            ((now - timedelta(days=1)).isoformat(),),
+        )
+        await db.commit()
+        assert await windowed_counts(
+            db, "direct_session", window_days=45, now=now,
+        ) == (0, 0)

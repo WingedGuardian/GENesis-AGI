@@ -4,7 +4,7 @@ cadence detection/anti-spam path."""
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
@@ -246,6 +246,15 @@ async def test_e2e_earnback_promotes_through_resolution(db):
     await db.execute(
         "UPDATE autonomy_state SET total_successes=50, total_corrections=2 WHERE id='ds'",
     )
+    # Windowed gate (migration 0067): eligibility reads recent autonomy_events,
+    # not lifetime counters — seed matching in-window evidence.
+    occurred = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    for i, kind in enumerate(["success"] * 50 + ["correction"] * 2):
+        await db.execute(
+            "INSERT INTO autonomy_events (id, category, kind, occurred_at) "
+            "VALUES (?, 'direct_session', ?, ?)",
+            (f"ev-{i}", kind, occurred),
+        )
     await db.commit()
 
     mgr = AutonomyManager(db=db)

@@ -21,6 +21,7 @@ from genesis.autonomy.types import ActionClass, ApprovalDecision, AutonomyCatego
 from genesis.awareness.types import Depth
 from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.cc.reflection_bridge._output import (
+    format_topic_summary,
     route_deep_output,
     send_to_topic,
     store_reflection_output,
@@ -480,8 +481,11 @@ class CCReflectionBridge:
                 except Exception:
                     logger.warning("Failed to mark influenced observations", exc_info=True)
 
-        # 6. Send to topic
-        await send_to_topic(session_id, depth, output, topic_manager=self._topic_manager)
+        # 6. Send to topic — parsed-fields summary only, never raw output.text
+        await send_to_topic(
+            session_id, depth, format_topic_summary(depth, output),
+            topic_manager=self._topic_manager,
+        )
 
         logger.info(
             "%s %s reflection completed (cost=$%.4f, tokens=%d+%d)",

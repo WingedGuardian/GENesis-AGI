@@ -61,6 +61,24 @@ def _host_mem_available_gib() -> float | None:
 _WORK_DIR_FALLBACK = "~/.local/state/genesis-guardian/cc-sessions"
 
 
+def _dir_is_writable(path: Path) -> bool:
+    """Probe real write access with a create-and-delete file.
+
+    ``mkdir(exist_ok=True)`` and ``os.access`` both report success on a
+    pre-existing directory this process cannot actually write to (root-owned,
+    mode 0555), so only an actual write proves the CC subprocess can use it as
+    its cwd. Best-effort cleanup; a crash between touch and unlink leaves only a
+    hidden probe file the next probe overwrites.
+    """
+    probe = path / f".guardian-writeprobe-{os.getpid()}"
+    try:
+        probe.touch()
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def _ensure_work_dir(configured: Path, fallback: Path | None = None) -> Path:
     """Create the CC diagnosis work dir, returning the dir actually usable.
 
@@ -71,20 +89,34 @@ def _ensure_work_dir(configured: Path, fallback: Path | None = None) -> Path:
     alert-only — exactly the failure seen live during a freeze. Fall back to a
     user-writable state dir so the diagnosis brain still runs.
 
-    If the fallback itself can't be created, the OSError propagates — with no
-    writable work dir anywhere, alert-only is the honest degradation.
+    A directory that already *exists* but is not writable by the guardian user
+    (the same root-owned ``/var/lib`` path, where ``mkdir(exist_ok=True)`` is a
+    silent no-op) is just as blinding, so we write-probe before trusting either
+    the configured dir or the fallback. If neither is writable the OSError
+    propagates — with no writable work dir anywhere, alert-only is the honest
+    degradation.
     """
     fallback = fallback or Path(_WORK_DIR_FALLBACK).expanduser()
     try:
         configured.mkdir(parents=True, exist_ok=True)
-        return configured
+        if _dir_is_writable(configured):
+            return configured
+        logger.warning(
+            "guardian cc.work_dir %s exists but is not writable — falling back to %s",
+            configured, fallback,
+        )
     except OSError as exc:
         logger.warning(
             "guardian cc.work_dir %s not creatable (%s) — falling back to %s",
             configured, exc, fallback,
         )
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
+    fallback.mkdir(parents=True, exist_ok=True)
+    if not _dir_is_writable(fallback):
+        raise OSError(
+            f"guardian fallback work_dir {fallback} exists but is not writable — "
+            "no usable CC work dir (alert-only degradation)"
+        )
+    return fallback
 
 
 class CCDiagnosisError(Exception):
