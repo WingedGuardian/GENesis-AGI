@@ -81,7 +81,40 @@ _write_status() {
 {"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
 STATUSEOF
 }
-trap '_write_status; backend_cleanup' EXIT
+# ── Deploy-in-progress marker ────────────────────────────────────────
+# While restore.sh holds the server stopped to rebuild the DB (a multi-minute
+# `.read` of a ~269MB dump), the autonomy watchdog (genesis-watchdog.timer,
+# ~every 300s) would otherwise see the inactive unit and restart genesis-server
+# into a HALF-BUILT database — which the 6h backup timer can then snapshot as the
+# newest COMPLETE backup. We hold the same marker `env.update_in_progress()`
+# already honors (~/.genesis/update_in_progress.pid, a bare live PID) so the
+# watchdog DEFERS its restart until the restore's EXIT trap clears it. We refuse
+# to clobber a marker a real update.sh/dashboard deploy already owns, and remove
+# it only if it is still OUR pid — never another deploy's.
+_UPDATE_PID_FILE="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid"
+_WROTE_UPDATE_MARKER=false
+_acquire_deploy_marker() {
+    mkdir -p "$(dirname "$_UPDATE_PID_FILE")"
+    if [ -f "$_UPDATE_PID_FILE" ]; then
+        local _other
+        _other="$(cat "$_UPDATE_PID_FILE" 2>/dev/null || true)"
+        if [[ "$_other" =~ ^[0-9]+$ ]] && [ "$_other" -gt 1 ] && kill -0 "$_other" 2>/dev/null; then
+            warn "a deploy already holds $_UPDATE_PID_FILE (pid $_other) — not overwriting; a concurrent update+restore is unsafe, verify the result"
+            return 0
+        fi
+    fi
+    echo "$$" > "$_UPDATE_PID_FILE"
+    _WROTE_UPDATE_MARKER=true
+    log "Holding deploy-in-progress marker (pid $$) so the watchdog won't revive genesis-server mid-restore"
+}
+_release_deploy_marker() {
+    $_WROTE_UPDATE_MARKER || return 0
+    # Remove only if it is still OUR pid (a later deploy may have taken over).
+    if [ -f "$_UPDATE_PID_FILE" ] && [ "$(cat "$_UPDATE_PID_FILE" 2>/dev/null || true)" = "$$" ]; then
+        rm -f "$_UPDATE_PID_FILE"
+    fi
+}
+trap '_write_status; _release_deploy_marker; backend_cleanup' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
@@ -113,6 +146,9 @@ _SERVER_WAS_STOPPED=false
 _quiesce_genesis_server() {
     command -v systemctl >/dev/null 2>&1 || return 0
     if systemctl --user is-active --quiet genesis-server 2>/dev/null; then
+        # Hold the deploy marker BEFORE the stop so there is no window in which
+        # the watchdog sees an inactive unit without the defer signal in place.
+        _acquire_deploy_marker
         log "Stopping genesis-server before SQLite restore (will NOT auto-restart)..."
         # Only record "stopped" if the stop actually succeeded — otherwise the
         # end-of-run note would tell the operator to restart a server that never
@@ -390,14 +426,30 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
                 cp "$src" "$_SQL_TMP"
             fi
             if [ -s "$_SQL_TMP" ]; then
-                # Back up the existing DB before we overwrite it.
-                if [ -f "$DB_FILE" ]; then
-                    cp "$DB_FILE" "${DB_FILE}.pre-restore.$(date +%s)"
-                fi
-                # Fresh DB from the SQL dump. Stop the live writer first, and
-                # clear stale WAL/SHM sidecars — a leftover -wal would replay
-                # onto the new DB and corrupt it.
+                # Fresh DB from the SQL dump. Stop the live writer FIRST — both
+                # the pre-restore safety copy AND the new DB must be taken with
+                # no open WAL connection, or they are torn/stale.
                 _quiesce_genesis_server
+                # Back up the existing DB before we overwrite it. Taken AFTER
+                # quiescing and via `sqlite3 .backup` (WAL-aware) so the undo
+                # artifact is a consistent snapshot — the old behavior did a
+                # plain `cp` of only the main db file BEFORE quiescing, missing
+                # the -wal, so the sole rollback copy was torn exactly when an
+                # operator needs it to undo a bad restore. Fall back to copying
+                # the db + its sidecars together if sqlite3 is unavailable.
+                if [ -f "$DB_FILE" ]; then
+                    _PRE_RESTORE="${DB_FILE}.pre-restore.$(date +%s)"
+                    if command -v sqlite3 >/dev/null && sqlite3 "$DB_FILE" ".backup '$_PRE_RESTORE'" 2>/dev/null; then
+                        log "SQLite: pre-restore safety copy → $_PRE_RESTORE (sqlite3 .backup, WAL-correct)"
+                    else
+                        cp "$DB_FILE" "$_PRE_RESTORE"
+                        [ -f "$DB_FILE-wal" ] && cp "$DB_FILE-wal" "${_PRE_RESTORE}-wal"
+                        [ -f "$DB_FILE-shm" ] && cp "$DB_FILE-shm" "${_PRE_RESTORE}-shm"
+                        log "SQLite: pre-restore safety copy → $_PRE_RESTORE (cp + sidecars; sqlite3 unavailable)"
+                    fi
+                fi
+                # Clear stale WAL/SHM sidecars — a leftover -wal would replay
+                # onto the new DB and corrupt it.
                 rm -f "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm"
                 if command -v sqlite3 >/dev/null; then
                     if sqlite3 "$DB_FILE" ".read $_SQL_TMP"; then
