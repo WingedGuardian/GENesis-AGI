@@ -1,0 +1,32 @@
+[Unit]
+Description=Genesis Code-Intelligence Freeze — managed indexing kill-switch
+# Repo-shipped replacement for the hand-armed systemd-run freeze the 2026-07-13
+# load-spike postmortem flagged (an unmanaged transient nobody re-armed is how
+# that incident got its false premise). NOT auto-enabled by bootstrap — it is an
+# on-demand emergency lever. Arm/disarm:
+#   systemctl --user start   genesis-code-intel-freeze    # arm now
+#   systemctl --user enable  genesis-code-intel-freeze    # arm on boot too
+#   systemctl --user stop/disable genesis-code-intel-freeze   # disarm
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_DIR__
+# Kill-then-seal: stop any in-flight transient index scope FIRST so ExecStart's
+# blocking flock seals in ~a second instead of waiting out a 17-min full index.
+# The '-' prefix ignores a non-zero exit (nothing running / no match); systemctl
+# itself expands the glob against currently-loaded units. Killing the scope makes
+# the entrypoint release its per-repo lock, which ExecStart then seizes.
+ExecStartPre=-/usr/bin/systemctl --user stop code-intel-*.scope
+ExecStart=/bin/bash __REPO_DIR__/scripts/code_intel_freeze.sh __REPO_DIR__
+# Needs systemctl (ExecStartPre glob-stop), flock, sha1sum, date. No venv/tool
+# PATH required — this holds locks, it never indexes.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Restart=no
+StandardOutput=journal
+StandardError=journal
+# Writes only the lock files under ~/.genesis/locks.
+ProtectSystem=strict
+ReadWritePaths=%h
+
+[Install]
+WantedBy=default.target

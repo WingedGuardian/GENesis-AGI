@@ -113,10 +113,27 @@ working I/O throttle here) under load and kills a run that can't make headway. A
 guardrail test (`tests/test_scripts/test_code_intel_index.py`) fails the build on
 any new raw spawn site. `CODE_INTEL_INDEX_DISABLE=1` skips indexing entirely.
 
+**Emergency kill-switch — `genesis-code-intel-freeze`.** A managed systemd USER
+unit (`scripts/code_intel_freeze.sh`) that holds BOTH single-flight locks (the
+main-repo lock and the runner self-lock), so while armed nothing indexes at all:
+the idle runner exits each tick untouched and a manual/hook entrypoint run exits
+75 ("host-frozen — keep the marker"). Rendered by bootstrap but **not** enabled —
+it is an on-demand lever. Arming stops any in-flight index scope first
+(kill-then-seal), so it engages in ~a second even mid-storm:
+
+```
+systemctl --user start   genesis-code-intel-freeze    # arm now
+systemctl --user enable  genesis-code-intel-freeze    # arm across reboots too
+systemctl --user stop    genesis-code-intel-freeze    # disarm
+```
+
+For a single index run, `CODE_INTEL_INDEX_DISABLE=1` or stopping
+`genesis-code-intel.timer` are lighter alternatives.
+
 **Do NOT call CBM's `index_repository` MCP tool for a fresh full index of
-`~/genesis`.** It runs in-process and bypasses the lock, the caps, AND the host
-kill-switch — a from-scratch full index that way is exactly what read-saturated
-the container. Queue a marker instead and let the idle runner do it:
+`~/genesis`.** It runs in-process and bypasses the lock, the caps, AND the
+freeze kill-switch — a from-scratch full index that way is exactly what
+read-saturated the container. Queue a marker instead and let the idle runner do it:
 `python3 scripts/lib/index_marker.py write --repo ~/genesis --tools both --mode fast`.
 
 ---
