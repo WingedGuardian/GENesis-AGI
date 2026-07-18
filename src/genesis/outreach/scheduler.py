@@ -732,6 +732,10 @@ class OutreachScheduler:
                         channel=channel,
                         thread_id=row.get("thread_id"),
                         validated_recipient=row.get("validated_recipient"),
+                        # The queue stores already-final agent messages
+                        # (outreach_send bridge path). Deliver them EXACTLY —
+                        # the LLM drafter must never re-word a stored message.
+                        verbatim=True,
                     )
                     if row.get("urgency") == "high":
                         result = await self._pipeline.submit_urgent(req)

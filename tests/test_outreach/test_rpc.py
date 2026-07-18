@@ -31,6 +31,31 @@ async def test_send_and_wait_via_pipeline_delivers():
                    "reply": "approved", "timed_out": False}
     # timeout threaded through as a float
     assert pipe.submit_and_wait.call_args.kwargs["timeout_s"] == 30.0
+    # The caller's message is delivered VERBATIM — never LLM-rewritten. A
+    # send_and_wait message is a literal prompt (often an exact instruction to
+    # reply to); the drafter once inverted one ("please reply..." -> "...failed").
+    assert pipe.submit_and_wait.call_args.args[0].verbatim is True
+    assert pipe.submit_and_wait.call_args.args[0].context == "approve?"
+
+
+@pytest.mark.asyncio
+async def test_send_and_wait_via_pipeline_full_message_survives_topic_truncation():
+    """The 100-char topic cap must not truncate the delivered message: verbatim
+    delivers `context` (full message), while topic stays the short label."""
+    res = MagicMock()
+    res.outreach_id = "o-2"
+    res.status.value = "delivered"
+    pipe = AsyncMock()
+    pipe.submit_and_wait = AsyncMock(return_value=(res, None))
+    long_msg = "A" * 250
+
+    await send_and_wait_via_pipeline(
+        pipe, message=long_msg, category="blocker", channel="telegram", timeout_s=5,
+    )
+    req = pipe.submit_and_wait.call_args.args[0]
+    assert req.verbatim is True
+    assert req.context == long_msg  # full message preserved for verbatim delivery
+    assert len(req.topic) <= 100  # label only
 
 
 @pytest.mark.asyncio

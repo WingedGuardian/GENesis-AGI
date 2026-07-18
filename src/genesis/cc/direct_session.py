@@ -1341,6 +1341,7 @@ class DirectSessionRunner:
                     topic="direct_session_fail",
                     context=body,
                     salience_score=0.9,
+                    verbatim=True,  # composed failure detail — never reword
                 )
             )
         except Exception:

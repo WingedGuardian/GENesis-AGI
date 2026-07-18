@@ -118,6 +118,36 @@ class TestRouteUserQuestion:
         assert "Options:" in request.context
 
     @pytest.mark.asyncio
+    async def test_route_question_verbatim_preserves_question_text(self):
+        """BLOCKER-1: the question is surfaced verbatim (no LLM rewrite of a
+        literal question + numbered options). Because verbatim delivers
+        `context`, the question TEXT (previously only in `topic`) must be folded
+        into context — else the user sees background + options with no question.
+        """
+        mock_gate = AsyncMock()
+        mock_gate.can_ask.return_value = True
+        mock_gate.record_question.return_value = "obs-9"
+        mock_pipeline = AsyncMock()
+        router = OutputRouter(question_gate=mock_gate, outreach_pipeline=mock_pipeline)
+        output = DeepReflectionOutput(
+            observations=["obs1"],
+            confidence=0.8,
+            user_question=UserQuestion(
+                text="Should we refactor the router?",
+                context="Complexity is growing",
+                options=["Yes, full refactor", "No, defer"],
+            ),
+        )
+        await router.route(output, AsyncMock())
+
+        request = mock_pipeline.submit.call_args[0][0]
+        assert request.verbatim is True
+        # The exact question, its background, and every option must be present.
+        assert "Should we refactor the router?" in request.context
+        assert "Complexity is growing" in request.context
+        assert "Yes, full refactor" in request.context
+
+    @pytest.mark.asyncio
     async def test_route_skips_when_pending(self):
         """Pending question → submit not called."""
         mock_gate = AsyncMock()

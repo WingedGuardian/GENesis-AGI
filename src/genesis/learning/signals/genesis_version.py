@@ -524,6 +524,7 @@ class GenesisVersionCollector:
                 context=message,
                 salience_score=0.4,
                 signal_type="genesis_update",
+                verbatim=True,  # pre-composed factual notice — no LLM rewrite
             ))
         except Exception:
             logger.error("Failed to send update notification", exc_info=True)
@@ -612,6 +613,7 @@ class GenesisVersionCollector:
                     ),
                     salience_score=0.9,
                     signal_type="genesis_update_failed",
+                    verbatim=True,  # machine fact (rollback tags) — never reword
                 ))
             except Exception:
                 logger.error("Failed to send update failure alert", exc_info=True)

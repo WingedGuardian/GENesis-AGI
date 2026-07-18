@@ -19,6 +19,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and a new in-flight guard suppresses a genuinely concurrent duplicate
   prompt (e.g. a double-click) so a plain APPROVE reply always resolves
   unambiguously.
+- **Messages Genesis sends you now arrive exactly as written — no silent
+  rewriting.** Notifications, reminders, and reply-and-wait prompts were
+  quietly run through an LLM "drafter" before delivery, which could reword or
+  even invert their meaning: a test message asking "please reply with a plain
+  message" went out as "…failed, reply to verify," inventing an alarming
+  status that was never there. Delivery paths (`outreach_send`, the
+  reply-and-wait tool, the queued-message drain) now deliver the composed text
+  verbatim, and the internal notification paths that relay a machine fact
+  (health-remediation alerts, "update available/failed," session-failure
+  alerts, ego notifications, surfaced reflection questions) do the same — so a
+  factual alert can never be creatively rewritten into a false claim. Reflection
+  questions also keep their full text and every option intact. Generative
+  content (marketing drafts) still uses the drafter, as intended.
 - **The morning report's numbers are real now.** Report generation previously
   counted truncated display lists (reporting "5 follow-ups" when 268 existed),
   sometimes inverted protective facts into alarms (an active OOM-protection

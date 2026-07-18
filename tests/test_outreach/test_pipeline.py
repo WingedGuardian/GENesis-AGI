@@ -153,6 +153,66 @@ async def test_submit_urgent_bypasses_governance(config, db, mock_drafter, mock_
 
 
 @pytest.mark.asyncio
+async def test_submit_urgent_verbatim_skips_drafter(config, db, mock_drafter, mock_formatter, mock_channel):
+    """A verbatim urgent request delivers `context` exactly — no drafter.
+
+    submit_urgent previously ALWAYS drafted, silently ignoring request.verbatim
+    (making e.g. process_reaper's verbatim=True a no-op and letting the LLM
+    rewrite machine-factual kill alerts). It must honor the flag like submit().
+    """
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": mock_channel},
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.BLOCKER,
+        topic="reaper killed pid 4242",
+        context="Reaped idle session cc-3 (pid 4242) after 300s idle.",
+        salience_score=1.0,
+        signal_type="process_reaper",
+        verbatim=True,
+    )
+    result = await pipeline.submit_urgent(req)
+    assert result.status == OutreachStatus.DELIVERED
+    # The drafter must NOT run — the exact context is delivered.
+    mock_drafter.draft.assert_not_called()
+    # The formatter receives the verbatim context, not a drafted string.
+    mock_formatter.format.assert_called_once()
+    assert mock_formatter.format.call_args[0][0] == req.context
+
+
+@pytest.mark.asyncio
+async def test_submit_urgent_non_verbatim_still_drafts(config, db, mock_drafter, mock_formatter, mock_channel):
+    """Regression: without verbatim, submit_urgent still routes through the drafter."""
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": mock_channel},
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.BLOCKER,
+        topic="All APIs down",
+        context="Critical failure",
+        salience_score=1.0,
+        signal_type="critical_failure",
+    )
+    result = await pipeline.submit_urgent(req)
+    assert result.status == OutreachStatus.DELIVERED
+    mock_drafter.draft.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_submit_records_in_db(config, db, mock_drafter, mock_formatter, mock_channel):
     from genesis.db.crud import outreach as outreach_crud
 
