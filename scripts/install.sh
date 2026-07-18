@@ -854,7 +854,14 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     if [ -n "$_cc_path" ]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        CC_BIN_DIR="$HOME/.npm-global/bin"
+        # Installed above but not on this (non-interactive) shell's PATH — a user
+        # npm prefix whose PATH export only fires in interactive shells. Resolve
+        # where npm placed it, matching cc_ensure_local's own target (guarded so
+        # a missing npm can't abort under set -e).
+        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
+        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
+        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
+        CC_BIN_DIR="$_cc_prefix/bin"
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
