@@ -503,9 +503,12 @@ class UserEgoContextBuilder:
             (0.3, "oldest pending goal is moderately stale (7-14 days)"),
             (0.0, "pending goals are relatively fresh"),
         ],
+        # NOTE: user_session_pattern is a SYMMETRIC deviation score — both
+        # drops and surges raise it. Interpretation text must stay
+        # direction-neutral; the persisted baseline_note carries direction.
         "user_session_pattern": [
-            (0.7, "user activity is significantly below their baseline"),
-            (0.3, "user activity is somewhat below their baseline"),
+            (0.7, "user activity deviates significantly from their baseline"),
+            (0.3, "user activity deviates somewhat from their baseline"),
             (0.0, "user activity is near their normal pattern"),
         ],
         "stale_pending_items": [
@@ -583,9 +586,14 @@ class UserEgoContextBuilder:
             interpretation = self._interpret_signal(sig_name, float(value))
             if interpretation:
                 label = sig_name.replace("_", " ").title()
-                pulse_items.append(
-                    f"- **{label}**: {interpretation} (signal: {value:.2f})"
+                item = f"- **{label}**: {interpretation} (signal: {value:.2f})"
+                note = (
+                    sig_info.get("baseline_note")
+                    if isinstance(sig_info, dict) else None
                 )
+                if note:
+                    item += f" — {note}"
+                pulse_items.append(item)
 
         if not pulse_items:
             lines.append("*All user activity signals nominal.*\n")

@@ -654,11 +654,66 @@ class TestUserEgoContextBuilder:
         assert "User Goal Staleness" in result
         assert "moderately stale" in result
         assert "User Session Pattern" in result
-        assert "significantly below" in result
+        assert "deviates significantly" in result
         assert "Conversations Since Reflection" in result
         # Genesis-internal signal excluded
         assert "Software Error Spike" not in result
         assert "circuit_breakers" not in result
+
+    @pytest.mark.asyncio
+    async def test_activity_pulse_baseline_note_rendered(
+        self, db, mock_health_data, capabilities,
+    ):
+        """A persisted baseline_note is appended as ground truth, and the
+        interpretation text stays direction-neutral on a surge."""
+        signals = json.dumps([
+            {
+                "name": "user_session_pattern", "value": 0.8,
+                "source": "cc_sessions",
+                # A SURGE: recent far above baseline
+                "baseline_note": (
+                    "Baseline: 4.0 sessions/day (last 21d). "
+                    "Recent: 27.0/day (last 3d). 0.0=typical, 1.0=very unusual."
+                ),
+            },
+        ])
+        await db.execute(
+            "INSERT INTO awareness_ticks "
+            "(id, signals_json, classified_depth, created_at) "
+            "VALUES (?, ?, ?, datetime('now'))",
+            ("tick_note", signals, "Micro", ),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "deviates significantly" in result
+        assert "Baseline: 4.0 sessions/day" in result
+        assert "Recent: 27.0/day" in result
+        # The old inverted reading must be gone
+        assert "below their baseline" not in result
+
+    @pytest.mark.asyncio
+    async def test_activity_pulse_old_tick_without_note(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Ticks persisted before baseline_note existed degrade gracefully
+        to the neutral interpretation with no note appended."""
+        signals = json.dumps([
+            {"name": "user_session_pattern", "value": 0.8, "source": "cc_sessions"},
+        ])
+        await db.execute(
+            "INSERT INTO awareness_ticks "
+            "(id, signals_json, classified_depth, created_at) "
+            "VALUES (?, ?, ?, datetime('now'))",
+            ("tick_old", signals, "Micro", ),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "deviates significantly" in result
+        assert "Baseline:" not in result
 
     @pytest.mark.asyncio
     async def test_activity_pulse_all_zero(self, db, mock_health_data, capabilities):
