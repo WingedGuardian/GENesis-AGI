@@ -811,13 +811,21 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     mkdir -p "$SYSTEMD_USER_DIR"
     # Detect Claude Code binary directory for systemd PATH injection
     # Resolve the Claude Code binary dir. `dirname ""` collapses to "." and
-    # exits 0 when claude isn't on PATH yet, so split the pipeline and default
-    # the npm-global dir explicitly.
+    # exits 0 when claude isn't on PATH yet, so split the pipeline and resolve
+    # the real npm prefix explicitly.
     _cc_path="$(command -v claude 2>/dev/null || true)"
     if [[ -n "$_cc_path" ]]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        CC_BIN_DIR="$HOME/.npm-global/bin"
+        # claude not yet on PATH (units render before CC installs). Point at
+        # wherever cc_ensure_local (scripts/lib/cc_version.sh) will `npm install
+        # -g` it: its target is `$(npm config get prefix)/bin` (nvm bin,
+        # ~/.npm-global, or a system prefix) with the same empty/`/usr` guards.
+        # Hardcoding ~/.npm-global would miss an nvm-based Node install.
+        _cc_prefix="$(npm config get prefix 2>/dev/null)"
+        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
+        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
+        CC_BIN_DIR="$_cc_prefix/bin"
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
