@@ -330,6 +330,44 @@ async def test_incorrect_memory_path_no_web(retriever):
     assert any(r.get("memory_id") == "m99" for r in out)
 
 
+async def test_kill_switch_suppresses_crag_rerank(retriever, monkeypatch):
+    # GENESIS_MEMORY_RERANK_OFF must reach the corrective path: the relaxed
+    # re-retrieve goes out with rerank=False and no Voyage call is made.
+    monkeypatch.setenv("GENESIS_MEMORY_RERANK_OFF", "1")
+    results = [_mem_result("m1", "off-topic", 0.2)]
+    router = MagicMock()
+    router.route_call = AsyncMock(
+        return_value=_routing_result(success=True, content=_grade_content(0.05)),
+    )
+    aug = MagicMock()
+    aug.memory_id = "m99"
+    aug.content = "augmented"
+    aug.score = 0.8
+    aug.payload = {}
+    retriever.recall = AsyncMock(return_value=[aug])
+
+    mock_reranker = MagicMock()
+    mock_reranker.rerank = AsyncMock(return_value=[])
+    mock_reranker.close = AsyncMock()
+
+    with patch("genesis.memory.reranker.VoyageReranker", return_value=mock_reranker):
+        out = await maybe_correct_recall(
+            query="q",
+            results=results,
+            retriever=retriever,
+            db=MagicMock(),
+            path="memory",
+            router=router,
+        )
+
+    # The relaxed re-retrieve (first recall call) carried rerank=False.
+    assert retriever.recall.await_args_list[0].kwargs.get("rerank") is False
+    # Voyage was never called through the corrective merge-rerank.
+    mock_reranker.rerank.assert_not_called()
+    # Augmentation still works (dedup/trim), just without reranking.
+    assert any(r.get("memory_id") == "m99" for r in out)
+
+
 # ---------------------------------------------------------------------------
 # Behavior: Incorrect on knowledge path → MAY call web
 # ---------------------------------------------------------------------------

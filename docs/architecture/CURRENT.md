@@ -64,8 +64,10 @@ Easy-to-forget mechanisms:
   `reranker.mode` in `config/memory_recall.yaml` (off|live, live default) plus the
   `GENESIS_MEMORY_RERANK_OFF` kill, read live via
   `graph_expansion.reranker_enabled()`. The gate is applied at the MCP tool
-  boundary only, so the internal runtime stack and the hermetic LongMemEval
-  harness (both pass explicit `rerank` kwargs) are unaffected.
+  boundary — the three recall tools plus the CRAG corrective-augmentation path
+  (`memory/corrective.py`), which runs inside those tools — so the internal
+  runtime stack and the hermetic LongMemEval harness (both pass explicit
+  `rerank` kwargs) are unaffected.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
   FTS drilldown searches every collection in `source_collections`,
   rank-merged across collections.

@@ -284,13 +284,16 @@ def _bucket(grades: list[float | None]) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _web_augment(query: str) -> list[dict]:
+async def _web_augment(query: str, *, rerank_enabled: bool = True) -> list[dict]:
     """Search + fetch + web-strip refine into result-shaped dicts.
 
     ONLY called for ``path == "knowledge"``. Search the web, fetch the top 1-2
     URLs, chunk each fetch into paragraphs, rerank the chunks against the query,
     and recompose the top chunks into a bounded snippet. Every web call is
     wrapped — any failure yields an empty list (skip web silently).
+
+    ``rerank_enabled=False`` (the reranker kill switch) skips the Voyage chunk
+    rerank entirely and falls back to leading chunks — no Voyage call is made.
     """
     from genesis.mcp.health.web_tools import _impl_web_fetch, _impl_web_search
     from genesis.memory.reranker import VoyageReranker
@@ -312,7 +315,9 @@ async def _web_augment(query: str) -> list[dict]:
     if not urls:
         return out
 
-    reranker = VoyageReranker()
+    # Kill switch off (rerank_enabled=False) → never instantiate/call Voyage;
+    # the leading-chunks fallback below covers it.
+    reranker = VoyageReranker() if rerank_enabled else None
     for url in urls:
         try:
             fetched = await _impl_web_fetch(url)
@@ -331,7 +336,7 @@ async def _web_augment(query: str) -> list[dict]:
         snippet = ""
         score = 0.0
         try:
-            reranked = await reranker.rerank(query, docs, top_k=_WEB_TOP_CHUNKS)
+            reranked = await reranker.rerank(query, docs, top_k=_WEB_TOP_CHUNKS) if reranker else []
         except Exception:
             reranked = []
         if reranked:
@@ -356,8 +361,9 @@ async def _web_augment(query: str) -> list[dict]:
                 }
             )
 
-    with contextlib.suppress(Exception):
-        await reranker.close()
+    if reranker is not None:
+        with contextlib.suppress(Exception):
+            await reranker.close()
     return out
 
 
@@ -400,7 +406,14 @@ async def _augment(
     path only), then merge with ``kept``, dedup, rerank, and trim to the
     original limit. Returns result-shaped dicts.
     """
+    from genesis.memory.graph_expansion import reranker_enabled
     from genesis.memory.reranker import VoyageReranker
+
+    # CRAG runs inside the memory_recall / knowledge_recall tool path, so it
+    # honors the same reranker kill switch (config mode + GENESIS_MEMORY_RERANK_OFF)
+    # as the primary recall — otherwise the switch would still leak Voyage calls
+    # through corrective augmentation.
+    rerank_on = reranker_enabled()
 
     candidates: list[dict] = list(kept)
 
@@ -415,7 +428,7 @@ async def _augment(
             life_domain=None,
             expand_query_terms=True,
             include_subsystem=True,
-            rerank=True,
+            rerank=rerank_on,
         )
         candidates.extend(_retrieval_to_dict(rr) for rr in relaxed)
     except Exception:
@@ -431,7 +444,9 @@ async def _augment(
     # 3. Web fallback — knowledge path ONLY, never for memory.
     if path == "knowledge":
         try:
-            web = await asyncio.wait_for(_web_augment(query), timeout=_WEB_TIMEOUT_S)
+            web = await asyncio.wait_for(
+                _web_augment(query, rerank_enabled=rerank_on), timeout=_WEB_TIMEOUT_S
+            )
             candidates.extend(web)
         except TimeoutError:
             logger.debug("CRAG: web augment timed out")
@@ -455,7 +470,7 @@ async def _augment(
         content = _norm(c)["content"]
         if content:
             docs.append({"id": str(i), "text": content})
-    if docs:
+    if docs and rerank_on:
         reranker = VoyageReranker()
         try:
             reranked = await reranker.rerank(query, docs, top_k=_ORIG_LIMIT)
