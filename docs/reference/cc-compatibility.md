@@ -9,7 +9,7 @@
 > through 8 evaluation lenses (see analyzer prompt for details). This document
 > is updated manually after each evaluation.
 >
-> Created: 2026-03-09 | Last updated: 2026-07-05
+> Created: 2026-03-09 | Last updated: 2026-07-18
 
 ---
 
@@ -307,6 +307,22 @@ your configured prefix, which is what PATH finds:
 npm install -g @anthropic-ai/claude-code@<version>
 ```
 If your prefix requires root (`/usr/local`), add `sudo --prefix /usr/local`.
+
+**nvm-managed Node (systemd PATH caveat, 2026-07-18):** `install.sh`/`bootstrap.sh`
+resolve `CC_BIN_DIR` = `dirname $(command -v claude)` at **unit-render time** and bake it
+into each service's `Environment=PATH`. The templates also carry `~/.npm-global/bin` + the
+system dirs as PATH fallbacks, so a wrong `CC_BIN_DIR` is self-covering for every **stable**
+prefix (system, `~/.npm-global`, and the `n` version manager — which swaps versions in a
+single stable bin dir). The one prefix a fallback cannot cover is a **per-version-directory**
+manager: **nvm** installs global binaries under `~/.nvm/versions/node/<version>/bin`, so
+`CC_BIN_DIR` bakes a version-scoped path. nvm keeps old version dirs on upgrade, so a plain
+`nvm install` is harmless — but if you later remove that Node version (or Genesis's
+`cc_shadow_scan` prunes the old nvm copy after CC reinstalls under a new version), the baked
+path goes stale and the services can't find `claude` (symptom: `claude: not found` in the
+service journal; note `claude` is a self-contained binary and does **not** need `node` on
+PATH to launch, so only CC spawning breaks, not the Python runtime). **Fix:** re-run
+`scripts/update.sh` (or `bootstrap.sh` + `systemctl --user restart genesis-server`), which
+re-renders the units against the current `claude` location.
 
 **Host VM (verified 2026-06-15):** The host installs Claude Code the **same way as
 the container — npm-global**, not the native installer. On this host the npm prefix
