@@ -1510,7 +1510,11 @@ async def perform_tick(
             source=source,
             signals_json=json.dumps([
                 {"name": s.name, "value": s.value, "source": s.source,
-                 "collected_at": s.collected_at}
+                 "collected_at": s.collected_at,
+                 # Additive: ground-truth context (e.g. "Baseline: 4.0/day,
+                 # Recent: 27.0/day") so downstream consumers can't misread
+                 # a symmetric deviation score's direction.
+                 **({"baseline_note": s.baseline_note} if s.baseline_note else {})}
                 for s in signals
             ]),
             scores_json=json.dumps([

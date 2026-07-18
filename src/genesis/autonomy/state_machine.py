@@ -99,6 +99,14 @@ class AutonomyManager:
         defaults = self._config.get("defaults", {})
         return int(defaults.get(category, 1))
 
+    def _earnback_window_days(self) -> int:
+        """Evidence window for earn-back eligibility (config lever)."""
+        earnback = self._config.get("earnback") or {}
+        try:
+            return int(earnback.get("window_days", 45))
+        except (TypeError, ValueError):
+            return 45
+
     # ------------------------------------------------------------------
     # State loading
     # ------------------------------------------------------------------
@@ -148,12 +156,22 @@ class AutonomyManager:
         """Categories whose autonomy can be earned back, gated on EVIDENCE.
 
         A category is a candidate iff it is demoted (``current_level <
-        earned_level``) AND the system's own Bayesian evidence now supports the
-        earned level again (``bayesian_level(successes, corrections) >=
-        earned_level``). This keeps proposals silent while the lower level is
-        genuinely correct and fires only once the category re-earns the level.
-        Promotion itself still requires explicit user approval — this only
-        identifies who is eligible.
+        earned_level``) AND recent evidence supports the earned level again:
+        ``bayesian_level(*windowed_counts(category))`` over the last
+        ``earnback.window_days`` (config, default 45) must reach the earned
+        level. This keeps proposals silent while the lower level is genuinely
+        correct and fires once the category re-earns the level with RECENT
+        behavior. Promotion itself still requires explicit user approval —
+        this only identifies who is eligible.
+
+        Why windowed, not lifetime: the lifetime posterior over
+        ``total_successes``/``total_corrections`` is dominated by history — a
+        category with a long mixed record needs dozens of consecutive
+        successes before the lifetime posterior recovers, making earn-back
+        mathematically unreachable after a deep regression. The
+        ``autonomy_events`` ledger (append-only, no backfill) scopes the
+        posterior to what the category has actually done lately. An empty
+        window means no evidence, not eligibility.
 
         Note: ``consecutive_corrections`` is deliberately NOT part of the gate.
         ``record_correction`` resets it to 0 on a regression, so it would be 0
@@ -161,25 +179,33 @@ class AutonomyManager:
         sufficient signal.
 
         Returns dicts: ``{category, current_level, target_level,
-        total_successes, total_corrections, posterior, last_regression_at}``.
+        total_successes, total_corrections, window_successes,
+        window_corrections, window_days, posterior, last_regression_at}``
+        where ``posterior`` is the WINDOWED posterior driving eligibility
+        (lifetime totals are included for context only).
         """
+        window_days = self._earnback_window_days()
         candidates: list[dict] = []
         for row in await crud.list_all(self._db):
             current = row["current_level"]
             earned = row["earned_level"]
             if current >= earned:
                 continue  # not demoted — nothing to earn back
-            successes = row.get("total_successes", 0)
-            corrections = row.get("total_corrections", 0)
-            if crud.bayesian_level(successes, corrections) < earned:
-                continue  # evidence does not yet support the earned level
+            w_successes, w_corrections = await crud.windowed_counts(
+                self._db, row["category"], window_days=window_days,
+            )
+            if crud.bayesian_level(w_successes, w_corrections) < earned:
+                continue  # recent evidence does not yet support the earned level
             candidates.append({
                 "category": row["category"],
                 "current_level": current,
                 "target_level": earned,
-                "total_successes": successes,
-                "total_corrections": corrections,
-                "posterior": crud.bayesian_posterior(successes, corrections),
+                "total_successes": row.get("total_successes", 0),
+                "total_corrections": row.get("total_corrections", 0),
+                "window_successes": w_successes,
+                "window_corrections": w_corrections,
+                "window_days": window_days,
+                "posterior": crud.bayesian_posterior(w_successes, w_corrections),
                 "last_regression_at": row.get("last_regression_at"),
             })
         return candidates
