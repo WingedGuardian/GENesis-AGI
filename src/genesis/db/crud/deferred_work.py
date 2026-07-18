@@ -25,8 +25,19 @@ async def create(
            (id, work_type, call_site_id, priority, payload_json, deferred_at,
             deferred_reason, staleness_policy, staleness_ttl_s, status, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, work_type, call_site_id, priority, payload_json, deferred_at,
-         deferred_reason, staleness_policy, staleness_ttl_s, status, created_at),
+        (
+            id,
+            work_type,
+            call_site_id,
+            priority,
+            payload_json,
+            deferred_at,
+            deferred_reason,
+            staleness_policy,
+            staleness_ttl_s,
+            status,
+            created_at,
+        ),
     )
     await db.commit()
     return id
@@ -272,3 +283,25 @@ async def query_failed(
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(sql, params)
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def prune_terminal(db: aiosqlite.Connection, *, cutoff_iso: str) -> int:
+    """Delete terminal rows (completed/discarded/expired) finished before *cutoff_iso*.
+
+    Terminal-row retention across ALL work types — the queue had no prune, so
+    finished rows accumulated forever (the leak class the entity_adjudication
+    orphans were a symptom of). Prunes on ``completed_at`` (when the row actually
+    finished), NOT ``created_at`` — a long-pending row that just completed must
+    not be swept by an age test against its birth. Rows with a NULL completed_at
+    are never pruned here (they are not truly terminal from a timing standpoint).
+    Returns the number of rows deleted.
+    """
+    cursor = await db.execute(
+        """DELETE FROM deferred_work_queue
+           WHERE status IN ('completed', 'discarded', 'expired')
+             AND completed_at IS NOT NULL
+             AND completed_at < ?""",
+        (cutoff_iso,),
+    )
+    await db.commit()
+    return cursor.rowcount
