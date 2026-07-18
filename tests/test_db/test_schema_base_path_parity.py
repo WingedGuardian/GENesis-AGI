@@ -34,8 +34,10 @@ Pure static analysis — no DB, no services, no network. Install-agnostic.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
+import textwrap
 from pathlib import Path
 
 from genesis.db import migrations as _migrations_pkg
@@ -44,6 +46,27 @@ from genesis.db.schema import _migrations as _schema_migrations
 
 _ALTER_RE = re.compile(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", re.IGNORECASE)
 _INDEX_ON_RE = re.compile(r"\bON\s+(\w+)\s*\(([^)]+)\)(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _alter_pairs_in_source(source: str) -> set[tuple[str, str]]:
+    """(table, column) ALTER…ADD COLUMN pairs in Python *source*, parsed via AST.
+
+    Scans string-literal constants, not raw text — so a statement split across
+    adjacent string literals (``"ALTER TABLE t " "ADD COLUMN c ..."``, which
+    Python concatenates into one constant at parse time, e.g. migration 0066's
+    ``ego_directives.kind``) is matched. A raw-text regex misses that split and
+    would leave the exact #1123 case invisible to this guard."""
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        # Fall back to raw-text scan if the snippet isn't parseable on its own.
+        return {(t.lower(), c.lower()) for t, c in _ALTER_RE.findall(source)}
+    pairs: set[tuple[str, str]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for t, c in _ALTER_RE.findall(node.value):
+                pairs.add((t.lower(), c.lower()))
+    return pairs
 
 
 def _index_column_pairs() -> set[tuple[str, str]]:
@@ -61,31 +84,68 @@ def _index_column_pairs() -> set[tuple[str, str]]:
     return pairs
 
 
+# SQL tokens that appear in a partial-index WHERE clause but are not columns.
+_SQL_PREDICATE_KEYWORDS = frozenset(
+    {
+        "and",
+        "or",
+        "not",
+        "is",
+        "null",
+        "in",
+        "like",
+        "glob",
+        "between",
+        "exists",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
+        "cast",
+        "as",
+        "collate",
+        "escape",
+        "true",
+        "false",
+        "current_timestamp",
+        "current_date",
+        "current_time",
+    }
+)
+
+
 def _index_predicate_pairs() -> set[tuple[str, str]]:
-    """(table, identifier) tokens in the WHERE clause of a partial index. A
-    partial index's predicate columns must ALSO exist at index-build time, so a
-    migration-only WHERE column is the same #1123 crash. Loose — includes SQL
-    keywords/values, which is safe for the crash-class check only (a keyword is
-    never a migration-added column). NOT used by the fresh-DB check, where a
-    keyword token would false-positive."""
+    """(table, column) identifiers in a partial index's WHERE clause, filtered to
+    plausible column names: string/numeric literals removed, SQL keywords
+    dropped, and function names (an identifier immediately followed by ``(``)
+    skipped. A partial index's predicate columns must exist at index-build time
+    exactly like its key columns, so both the crash-class and fresh-DB checks
+    consume this. Filtering keeps the fresh-DB check from flagging a keyword or
+    literal as a missing column."""
     pairs: set[tuple[str, str]] = set()
     for stmt in INDEXES:
         m = _INDEX_ON_RE.search(stmt)
         if not m:
             continue
         table = m.group(1).lower()
-        where = re.search(r"\bWHERE\b(.*)$", m.group(3), re.IGNORECASE | re.DOTALL)
-        if not where:
+        wm = re.search(r"\bWHERE\b(.*)$", m.group(3), re.IGNORECASE | re.DOTALL)
+        if not wm:
             continue
-        for tok in re.findall(r"[a-z_]\w*", where.group(1), re.IGNORECASE):
+        clause = re.sub(r"'[^']*'", " ", wm.group(1))  # strip string literals
+        for tok_m in re.finditer(r"[A-Za-z_]\w*", clause):
+            tok = tok_m.group(0)
+            if tok.lower() in _SQL_PREDICATE_KEYWORDS:
+                continue
+            if clause[tok_m.end() :].lstrip().startswith("("):  # function call, not a column
+                continue
             pairs.add((table, tok.lower()))
     return pairs
 
 
 def _base_path_addable() -> set[tuple[str, str]]:
     """(table, column) pairs that _migrate_add_columns adds on the base path."""
-    src = inspect.getsource(_schema_migrations._migrate_add_columns)
-    return {(t.lower(), c.lower()) for t, c in _ALTER_RE.findall(src)}
+    return _alter_pairs_in_source(inspect.getsource(_schema_migrations._migrate_add_columns))
 
 
 def _migration_added() -> set[tuple[str, str]]:
@@ -93,8 +153,7 @@ def _migration_added() -> set[tuple[str, str]]:
     mig_dir = Path(_migrations_pkg.__file__).parent
     pairs: set[tuple[str, str]] = set()
     for path in sorted(mig_dir.glob("[0-9][0-9][0-9][0-9]_*.py")):
-        for t, c in _ALTER_RE.findall(path.read_text()):
-            pairs.add((t.lower(), c.lower()))
+        pairs |= _alter_pairs_in_source(path.read_text())
     return pairs
 
 
@@ -150,11 +209,12 @@ def test_every_indexed_column_is_creatable_before_index_build():
     _migrate_add_columns (e.g. memory_metadata.superseded_by is add-column-only
     and never in the canonical DDL — that is legitimate and safe). A column in
     neither means the index references something that exists nowhere — a fresh
-    DB crashes on the index build."""
+    DB crashes on the index build. Covers ON(...) key columns and partial-index
+    WHERE-predicate columns (a predicate column must exist at build time too)."""
     canon = _canonical_columns()
     addable = _base_path_addable()
     missing = []
-    for table, col in sorted(_index_column_pairs()):
+    for table, col in sorted(_index_column_pairs() | _index_predicate_pairs()):
         # unknown table (view/fts/dynamically-created) — out of scope for this guard
         if table not in canon:
             continue
@@ -178,3 +238,21 @@ def test_checker_detects_synthetic_gap():
     assert crash_class_columns(indexed, migration_added, addable={("widgets", "color")}) == set()
     # an original (non-migration) indexed column is never flagged
     assert crash_class_columns({("widgets", "id")}, migration_added, addable=set()) == set()
+
+
+def test_alter_parser_handles_split_string_literals():
+    """The AST parser must catch an ALTER split across adjacent string literals
+    (migration 0066's style) — a raw-text regex misses it, leaving the exact
+    #1123 case invisible. Guards against silent regression of the parser."""
+    contiguous = '"ALTER TABLE t ADD COLUMN c1 TEXT"'
+    split = 'db.execute(\n    "ALTER TABLE t "\n    "ADD COLUMN c2 TEXT NOT NULL"\n)'
+    assert ("t", "c1") in _alter_pairs_in_source(contiguous)
+    assert ("t", "c2") in _alter_pairs_in_source(split)
+
+
+def test_ego_directives_kind_seen_as_migration_added():
+    """Concrete regression for the Codex-flagged blind spot: ego_directives.kind
+    (added by migration 0066 via split literals, indexed by
+    idx_ego_directives_kind_status) must register as migration-added so the
+    crash-class guard actually protects it."""
+    assert ("ego_directives", "kind") in _migration_added()
