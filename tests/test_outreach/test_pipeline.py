@@ -798,6 +798,7 @@ async def test_submit_and_wait_standalone_reply_resolves(config):
 
     pipeline = OutreachPipeline.__new__(OutreachPipeline)
     pipeline._reply_waiter = ReplyWaiter()
+    pipeline._inflight_awaited = set()
     pipeline.submit = AsyncMock(return_value=_delivered_result())
 
     task = asyncio.ensure_future(
@@ -818,6 +819,7 @@ async def test_submit_raw_and_wait_no_key_standalone_reply_resolves(config):
 
     pipeline = OutreachPipeline.__new__(OutreachPipeline)
     pipeline._reply_waiter = ReplyWaiter()
+    pipeline._inflight_awaited = set()
     pipeline.submit_raw = AsyncMock(return_value=_delivered_result())
 
     task = asyncio.ensure_future(
@@ -839,6 +841,7 @@ async def test_submit_raw_and_wait_with_key_still_resolves(config):
 
     pipeline = OutreachPipeline.__new__(OutreachPipeline)
     pipeline._reply_waiter = ReplyWaiter()
+    pipeline._inflight_awaited = set()
     pipeline.submit_raw = AsyncMock(return_value=_delivered_result())
 
     task = asyncio.ensure_future(
@@ -852,3 +855,78 @@ async def test_submit_raw_and_wait_with_key_still_resolves(config):
     assert set(keys) == {"uuid-1", "555"}
     result, reply = await task
     assert reply == "go"
+
+
+@pytest.mark.asyncio
+async def test_inflight_awaited_concurrent_duplicate_suppressed(config):
+    """While an awaited approval is pending, a second identical one is
+    SUPPRESSED (never sent) — two identical pending prompts would make a plain
+    APPROVE ambiguous (resolve_scoped_pending len(eligible) != 1)."""
+    from genesis.outreach.reply_waiter import ReplyWaiter
+
+    pipeline = OutreachPipeline.__new__(OutreachPipeline)
+    pipeline._reply_waiter = ReplyWaiter()
+    pipeline._inflight_awaited = set()
+    pipeline.submit_raw = AsyncMock(return_value=_delivered_result())
+
+    req = OutreachRequest(
+        category=OutreachCategory.BLOCKER,
+        topic="Grow container root to 40 GiB?",
+        context="reply APPROVE / DENY",
+        salience_score=1.0,
+        signal_type="provision_approval",
+    )
+
+    # First call starts waiting (registers a waiter, blocks on the reply).
+    task = asyncio.ensure_future(pipeline.submit_raw_and_wait("txt", req, timeout_s=5.0))
+    for _ in range(200):
+        if pipeline._reply_waiter.pending_count:
+            break
+        await asyncio.sleep(0.005)
+    assert pipeline._reply_waiter.pending_count == 1
+
+    # Second IDENTICAL call while the first is pending -> suppressed, no send.
+    pipeline.submit_raw.reset_mock()
+    result2, reply2 = await pipeline.submit_raw_and_wait("txt", req, timeout_s=5.0)
+    assert result2.status == OutreachStatus.REJECTED
+    assert reply2 is None
+    pipeline.submit_raw.assert_not_called()
+    assert pipeline._reply_waiter.pending_count == 1  # still exactly one prompt
+
+    # Resolve the first; its key releases on completion.
+    pipeline._reply_waiter.resolve_scoped_pending("APPROVE", thread_key="-100123:42")
+    _r1, reply1 = await task
+    assert reply1 == "APPROVE"
+    assert pipeline._inflight_awaited == set()
+
+
+@pytest.mark.asyncio
+async def test_inflight_awaited_released_after_timeout_allows_retry(config):
+    """A retry after the previous approval TIMED OUT is NOT suppressed — the
+    in-flight key releases when the wait ends, the distinction that keeps the
+    retry-after-timeout bug fixed (Phase-C 2026-07-18)."""
+    from genesis.outreach.reply_waiter import ReplyWaiter
+
+    pipeline = OutreachPipeline.__new__(OutreachPipeline)
+    pipeline._reply_waiter = ReplyWaiter()
+    pipeline._inflight_awaited = set()
+    pipeline.submit_raw = AsyncMock(return_value=_delivered_result())
+
+    req = OutreachRequest(
+        category=OutreachCategory.BLOCKER,
+        topic="Grow container root to 40 GiB?",
+        context="reply APPROVE / DENY",
+        salience_score=1.0,
+        signal_type="provision_approval",
+    )
+
+    # First call times out (no resolver) -> key released.
+    _r1, reply1 = await pipeline.submit_raw_and_wait("txt", req, timeout_s=0.05)
+    assert reply1 is None
+    assert pipeline._inflight_awaited == set()
+
+    # Retry the SAME request -> NOT suppressed, delivered again.
+    pipeline.submit_raw.reset_mock()
+    _r2, reply2 = await pipeline.submit_raw_and_wait("txt", req, timeout_s=0.05)
+    assert reply2 is None
+    pipeline.submit_raw.assert_called_once()

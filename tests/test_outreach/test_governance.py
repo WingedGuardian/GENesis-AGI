@@ -668,3 +668,47 @@ async def test_dedup_window_zero_skips_check(db):
     )
     is_dup = await gate.is_duplicate(req)
     assert is_dup is False
+
+
+@pytest.mark.asyncio
+async def test_provision_approval_never_deduped(db):
+    """provision_approval / provision_outcome must never be deduped (window=0).
+
+    A grow approval that timed out UNANSWERED leaves a delivered_at row; at the
+    old 24h default that row REJECTed the retry for 24h (Phase-C, 2026-07-18).
+    Like cli_approval (#143), every provision approval/outcome must be delivered.
+    """
+    cfg = _cfg_no_quiet()
+    gate = GovernanceGate(cfg, db)
+    now = datetime.now(UTC).isoformat()
+
+    for i, signal in enumerate(("provision_approval", "provision_outcome")):
+        oid = f"prov-{i}"
+        await outreach_crud.create(
+            db,
+            id=oid,
+            signal_type=signal,
+            topic="Grow container root to 40 GiB?",
+            category="blocker",
+            salience_score=1.0,
+            channel="telegram",
+            message_content="reply APPROVE / DENY",
+            created_at=now,
+        )
+        await outreach_crud.record_delivery(db, oid, delivered_at=now)
+
+        # Identical signal_type + topic + category, delivered just now. window=0
+        # means never dedup, so a legitimate retry is not suppressed.
+        req = OutreachRequest(
+            category=OutreachCategory.BLOCKER,
+            topic="Grow container root to 40 GiB?",
+            context="reply APPROVE / DENY",
+            salience_score=1.0,
+            signal_type=signal,
+        )
+        assert await gate.is_duplicate(req) is False
+
+        # And the full blocker gate BYPASSes (delivers), never DENY-suppressed.
+        result = await gate.check(req)
+        assert result.verdict == GovernanceVerdict.BYPASS
+        assert "dedup" not in result.checks_failed
