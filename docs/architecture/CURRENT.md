@@ -652,7 +652,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: fe5d0945 2026-07-10
+verified: 1828ee2f 2026-07-18
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -732,8 +732,18 @@ verified: fe5d0945 2026-07-10
   0.5) and stated-confidence seams (`OutreachRequest.stated_confidence`;
   `task_submit` optional field → outputs JSON envelope). Hook failures
   increment a counter surfaced as `ledger:write_failed:<class>` via
-  `_compute_alerts` (never block the action). Grader = P2 (read side still
-  dark). Outreach metrics resolve off `outreach_history.engagement_signal`
+  `_compute_alerts` (never block the action). **Grader LIVE (P2a)**:
+  `ledger/grader.py` runs twice daily (`ledger_grader` 6:15/18:15, env
+  kill-switch `GENESIS_LEDGER_GRADER_DISABLED`) — mechanically resolves due
+  predictions (`list_due_open`) by running each metric's resolver, mapping
+  keyed on `outcome_value` (non-None ⟺ `resolved`), and writing outcome+Brier
+  through the CRUD's idempotent `resolve()`; ZERO LLM calls (own no-`routing`
+  import lock). Registry drift / resolver faults alarm
+  `ledger:metric_vanished:<class>` / `ledger:grade_failed:<class>` via the same
+  counter→`_compute_alerts` path. The autonomy-evidence rewire (demote the LLM
+  self-grade feed) and calibration-cell aggregation are later PRs; the fuzzy
+  LLM-fallback lane is deferred (no `acceptance_pass` writer yet). Outreach
+  metrics resolve off `outreach_history.engagement_signal`
   (spike-measured 99.5% mechanical); the engagement_outcome CHECK now
   ENFORCES the canonical vocabulary (rebuild #4 in the
   `_migrate_add_columns` chain — its DDL must preserve the three older

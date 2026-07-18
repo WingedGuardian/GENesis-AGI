@@ -96,6 +96,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Those predictions now get graded.** A mechanical grader runs twice daily
+  and settles every prediction whose deadline has passed — reading the actual
+  outcome straight from the system's own records (did the reply arrive, did the
+  task complete, did the job run clean), with zero LLM calls on that path. Each
+  prediction gets a real accuracy score, so the system's confidence starts
+  being measured against what actually happened instead of never being checked.
+  A prediction that references a metric no longer in the code, or whose grader
+  hits an error, surfaces as a health alert rather than silently rotting.
+
 - **Every significant action now commits with a falsifiable prediction.**
   Outreach sends, autonomous task claims, build-lane verdicts, and ego
   proposals each write their prediction rows the moment they commit — code

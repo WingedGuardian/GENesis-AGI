@@ -71,19 +71,24 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_ledger_write_failures():
-    """Reset the ledger writer-failure counter around every test (WS-2 P1b).
+    """Reset the ledger writer + grader failure counters around every test.
 
-    ``genesis.ledger.writers._write_failures`` is a process-global Counter —
-    correct for production (it accumulates failures since process start, read
-    by ``_compute_alerts``), but it leaks across tests: a hook-failure test
-    would otherwise make an unrelated health-alert test see a stray
-    ``ledger:write_failed`` alert. Clear it before and after each test.
+    ``genesis.ledger.writers._write_failures`` (P1b) and the P2 grader's
+    ``_metric_vanished`` / ``_grade_failed`` are process-global Counters —
+    correct for production (they accumulate since process start, read by
+    ``_compute_alerts``), but they leak across tests: a hook/grader-failure
+    test would otherwise make an unrelated health-alert test see a stray
+    ``ledger:write_failed`` / ``ledger:grade_failed`` alert. Clear before and
+    after each test.
     """
+    from genesis.ledger import grader as _ledger_grader
     from genesis.ledger import writers as _ledger_writers
 
     _ledger_writers._write_failures.clear()
+    _ledger_grader._reset_grade_failure_counts_for_tests()
     yield
     _ledger_writers._write_failures.clear()
+    _ledger_grader._reset_grade_failure_counts_for_tests()
 
 
 @pytest.fixture
