@@ -148,6 +148,7 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
         # foreign_keys=False preserves the prior raw-connection behavior.
         db = await get_db(_DEFAULT_DB, foreign_keys=False)
         try:
+
             # Bootstrap standalone router for LLM-dependent tools
             try:
                 from genesis.routing.standalone import create_standalone_router
@@ -205,7 +206,6 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
             yield
         finally:
             from genesis.mcp.health.browser import async_cleanup as _browser_cleanup
-
             await _browser_cleanup()
             await db.close()
 
@@ -236,6 +236,7 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
         db = await get_db(_DEFAULT_DB, foreign_keys=False)
 
         try:
+
             # Bootstrap standalone router for LLM-dependent tools
             try:
                 from genesis.routing.standalone import create_standalone_router
@@ -256,13 +257,8 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             # memory_recall / knowledge_recall rerank here exactly as in the
             # full runtime. Degrades to a no-op without API_KEY_VOYAGE.
             reranker = VoyageReranker()
-            init(
-                db=db,
-                qdrant_client=qdrant,
-                embedding_provider=embedding,
-                activity_tracker=tracker,
-                reranker=reranker,
-            )
+            init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
+                 activity_tracker=tracker, reranker=reranker)
             clear_mcp_crash("memory")
             yield
         finally:
@@ -290,6 +286,7 @@ def _bootstrap_recon(transport_kwargs: dict) -> None:
         db = await get_db(_DEFAULT_DB, foreign_keys=False)
 
         try:
+
             # Bootstrap standalone router for LLM-dependent tools
             try:
                 from genesis.routing.standalone import create_standalone_router
@@ -350,10 +347,7 @@ def _bootstrap_outreach(transport_kwargs: dict) -> None:
             tracker = ProviderActivityTracker()
             tracker.set_db(db)
             init_outreach_mcp(
-                pipeline=None,
-                engagement=None,
-                config=None,
-                db=db,
+                pipeline=None, engagement=None, config=None, db=db,
                 activity_tracker=tracker,
             )
             clear_mcp_crash("outreach")
@@ -468,16 +462,14 @@ def _bearer_auth_middleware(expected_token: str):
 
             if scope["type"] == "http":
                 body = _json.dumps({"error": "Unauthorized"}).encode()
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 401,
-                        "headers": [
-                            [b"content-type", b"application/json"],
-                            [b"content-length", str(len(body)).encode()],
-                        ],
-                    }
-                )
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        [b"content-type", b"application/json"],
+                        [b"content-length", str(len(body)).encode()],
+                    ],
+                })
                 await send({"type": "http.response.body", "body": body})
                 return
 
@@ -503,24 +495,16 @@ def main(argv: list[str] | None = None) -> None:
     # Without the API keys, EmbeddingProvider gets zero backends and silently degrades.
     _MCP_VARS = {
         # Infrastructure
-        "OLLAMA_URL",
-        "QDRANT_URL",
-        "GENESIS_DB_PATH",
-        "GENESIS_CC_PROJECT_ID",
+        "OLLAMA_URL", "QDRANT_URL", "GENESIS_DB_PATH", "GENESIS_CC_PROJECT_ID",
         # Browser (CDP remote backend)
         "GENESIS_CDP_URL",
         # Embedding providers (required for memory MCP)
-        "API_KEY_DEEPINFRA",
-        "API_KEY_QWEN",
+        "API_KEY_DEEPINFRA", "API_KEY_QWEN",
         # LLM providers (used by recon/outreach MCP tools)
-        "GOOGLE_API_KEY",
-        "API_KEY_GROQ",
-        "API_KEY_MISTRAL",
-        "API_KEY_OPENROUTER",
+        "GOOGLE_API_KEY", "API_KEY_GROQ", "API_KEY_MISTRAL", "API_KEY_OPENROUTER",
         "API_KEY_DEEPSEEK",
         # Ollama config
-        "GENESIS_ENABLE_OLLAMA",
-        "OLLAMA_EMBEDDING_MODEL",
+        "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
         # HTTP transport auth
         "GENESIS_MCP_HTTP_TOKEN",
         # Discord bot (used by discord-bot MCP server)
@@ -587,17 +571,12 @@ def _record_mcp_crash(server_name: str) -> None:
         _MCP_CRASH_DIR.mkdir(parents=True, exist_ok=True)
         crash_file = _MCP_CRASH_DIR / f"{server_name}.json"
         tb = traceback.format_exc()
-        crash_file.write_text(
-            json.dumps(
-                {
-                    "server": server_name,
-                    "error": tb.splitlines()[-1] if tb.strip() else "unknown",
-                    "traceback": "\n".join(tb.splitlines()[-15:]),
-                    "timestamp": datetime.now(UTC).isoformat(),
-                },
-                indent=2,
-            )
-        )
+        crash_file.write_text(json.dumps({
+            "server": server_name,
+            "error": tb.splitlines()[-1] if tb.strip() else "unknown",
+            "traceback": "\n".join(tb.splitlines()[-15:]),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }, indent=2))
     except Exception:
         pass  # Best-effort — don't mask the original crash
 
