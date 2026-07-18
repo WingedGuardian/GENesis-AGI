@@ -138,6 +138,30 @@ class TestValidateEgoConfig:
     def test_empty_changes_valid(self):
         assert validate_ego_config({}) == []
 
+    def test_quiet_hours_enabled_rejects_non_bool(self):
+        errors = validate_ego_config({"quiet_hours_enabled": "yes"})
+        assert len(errors) == 1
+        assert "quiet_hours_enabled must be a boolean" in errors[0]
+
+    def test_quiet_hours_bounds(self):
+        assert validate_ego_config({"quiet_hours_start": 23}) == []
+        assert validate_ego_config({"quiet_hours_end": 0}) == []
+        assert len(validate_ego_config({"quiet_hours_start": 24})) == 1
+        assert len(validate_ego_config({"quiet_hours_end": -1})) == 1
+
+    def test_quiet_hours_min_interval(self):
+        assert validate_ego_config({"quiet_hours_min_interval_minutes": 240}) == []
+        errors = validate_ego_config({"quiet_hours_min_interval_minutes": 0})
+        assert len(errors) == 1
+        assert "quiet_hours_min_interval_minutes must be >= 1" in errors[0]
+
+    def test_quiet_hours_defaults(self):
+        cfg = EgoConfig()
+        assert cfg.quiet_hours_enabled is True
+        assert cfg.quiet_hours_start == 23
+        assert cfg.quiet_hours_end == 7
+        assert cfg.quiet_hours_min_interval_minutes == 240
+
 
 class TestMaxActiveEgoGoalsValidation:
     def test_valid(self):

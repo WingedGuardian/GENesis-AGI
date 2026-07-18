@@ -158,4 +158,17 @@ def validate_ego_config(changes: dict) -> list[str]:
         changes["outcome_bus_capability_feed"], bool
     ):
         errors.append("outcome_bus_capability_feed must be a boolean")
+    if "quiet_hours_enabled" in changes and not isinstance(
+        changes["quiet_hours_enabled"], bool
+    ):
+        errors.append("quiet_hours_enabled must be a boolean")
+    for _qh_hour in ("quiet_hours_start", "quiet_hours_end"):
+        if _qh_hour in changes:
+            v = changes[_qh_hour]
+            if not isinstance(v, int) or not (0 <= v <= 23):
+                errors.append(f"{_qh_hour} must be an integer 0-23")
+    if "quiet_hours_min_interval_minutes" in changes:
+        v = changes["quiet_hours_min_interval_minutes"]
+        if not isinstance(v, (int, float)) or v < 1:
+            errors.append("quiet_hours_min_interval_minutes must be >= 1")
     return errors

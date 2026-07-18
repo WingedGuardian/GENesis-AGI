@@ -62,19 +62,31 @@ async def ego_status():
     genesis_focus = await ego_crud.get_state(rt._db, "genesis_ego_focus_summary")
 
     # Cadence state from runtime managers
-    def _cadence_snapshot(mgr) -> dict:
+    async def _cadence_snapshot(mgr) -> dict:
         if mgr is None:
             return {"available": False}
-        return {
+        snap = {
             "available": True,
             "is_running": mgr.is_running,
             "is_paused": mgr.is_paused,
             "current_interval_minutes": mgr.current_interval_minutes,
             "consecutive_failures": mgr.consecutive_failures,
+            "next_fire_at": mgr.next_fire_at,
+            "gated": False,
         }
+        # Display hint: is this ego currently blocked on a pending CLI approval?
+        # Best-effort — a query failure must not 500 the dashboard.
+        try:
+            snap["gated"] = await ego_crud.has_pending_cli_approval(
+                rt._db,
+                mgr.source_tag,
+            )
+        except Exception:
+            snap["gated_error"] = True
+        return snap
 
-    user_cadence = _cadence_snapshot(rt._ego_cadence_manager)
-    genesis_cadence = _cadence_snapshot(rt._genesis_ego_cadence_manager)
+    user_cadence = await _cadence_snapshot(rt._ego_cadence_manager)
+    genesis_cadence = await _cadence_snapshot(rt._genesis_ego_cadence_manager)
 
     # Genesis ego config — uses dedicated config fields
     genesis_ego_config = {
@@ -112,23 +124,25 @@ async def ego_status():
         },
     }
 
-    return jsonify({
-        "enabled": config.enabled,
-        "model": config.model,
-        "default_effort": config.default_effort,
-        "morning_report_effort": config.morning_report_effort,
-        "cadence_minutes": config.cadence_minutes,
-        "daily_cost_usd": round(daily_cost, 4),
-        "daily_dispatch_cost_usd": round(dispatch_cost, 4),
-        "rolling_daily_avg_usd": round(rolling_avg, 4),
-        "focus_summary": focus,
-        "last_cycle": last_cycle,
-        "pending_proposals": len(pending),
-        "uncompacted_cycles": uncompacted,
-        "shadow_morning_report": config.shadow_morning_report,
-        "board_size": config.board_size,
-        "egos": egos,
-    })
+    return jsonify(
+        {
+            "enabled": config.enabled,
+            "model": config.model,
+            "default_effort": config.default_effort,
+            "morning_report_effort": config.morning_report_effort,
+            "cadence_minutes": config.cadence_minutes,
+            "daily_cost_usd": round(daily_cost, 4),
+            "daily_dispatch_cost_usd": round(dispatch_cost, 4),
+            "rolling_daily_avg_usd": round(rolling_avg, 4),
+            "focus_summary": focus,
+            "last_cycle": last_cycle,
+            "pending_proposals": len(pending),
+            "uncompacted_cycles": uncompacted,
+            "shadow_morning_report": config.shadow_morning_report,
+            "board_size": config.board_size,
+            "egos": egos,
+        }
+    )
 
 
 @blueprint.route("/api/genesis/ego/trigger", methods=["POST"])
@@ -180,21 +194,23 @@ async def ego_cycles():
         return jsonify([])
 
     cycles = await ego_crud.list_recent_cycles(rt._db, limit=20)
-    return jsonify([
-        {
-            "id": c["id"],
-            "created_at": c["created_at"],
-            "focus_summary": c["focus_summary"],
-            "cost_usd": c["cost_usd"],
-            "model_used": c["model_used"],
-            "input_tokens": c["input_tokens"],
-            "output_tokens": c["output_tokens"],
-            "duration_ms": c["duration_ms"],
-            "compacted_into": c["compacted_into"],
-            "ego_source": c.get("ego_source", ""),
-        }
-        for c in cycles
-    ])
+    return jsonify(
+        [
+            {
+                "id": c["id"],
+                "created_at": c["created_at"],
+                "focus_summary": c["focus_summary"],
+                "cost_usd": c["cost_usd"],
+                "model_used": c["model_used"],
+                "input_tokens": c["input_tokens"],
+                "output_tokens": c["output_tokens"],
+                "duration_ms": c["duration_ms"],
+                "compacted_into": c["compacted_into"],
+                "ego_source": c.get("ego_source", ""),
+            }
+            for c in cycles
+        ]
+    )
 
 
 @blueprint.route("/api/genesis/ego/proposals")
@@ -209,31 +225,34 @@ async def ego_proposals():
         return jsonify([])
 
     pending = await ego_crud.list_pending_proposals(rt._db)
-    return jsonify([
-        {
-            "id": p["id"],
-            "action_type": p["action_type"],
-            "action_category": p["action_category"],
-            "content": p["content"],
-            "confidence": p["confidence"],
-            "urgency": p["urgency"],
-            "status": p["status"],
-            "created_at": p["created_at"],
-            "expires_at": p["expires_at"],
-            "rank": p.get("rank"),
-            "execution_plan": p.get("execution_plan"),
-            "recurring": bool(p.get("recurring", 0)),
-            "ego_source": p.get("ego_source"),
-            "realist_verdict": p.get("realist_verdict"),
-        }
-        for p in pending
-    ])
+    return jsonify(
+        [
+            {
+                "id": p["id"],
+                "action_type": p["action_type"],
+                "action_category": p["action_category"],
+                "content": p["content"],
+                "confidence": p["confidence"],
+                "urgency": p["urgency"],
+                "status": p["status"],
+                "created_at": p["created_at"],
+                "expires_at": p["expires_at"],
+                "rank": p.get("rank"),
+                "execution_plan": p.get("execution_plan"),
+                "recurring": bool(p.get("recurring", 0)),
+                "ego_source": p.get("ego_source"),
+                "realist_verdict": p.get("realist_verdict"),
+            }
+            for p in pending
+        ]
+    )
 
 
 @blueprint.route("/api/genesis/ego/cadence")
 @_async_route
 async def ego_cadence():
     """Return runtime cadence state from the EgoCadenceManager."""
+    from genesis.db.crud import ego as ego_crud
     from genesis.runtime import GenesisRuntime
 
     rt = GenesisRuntime.instance()
@@ -244,13 +263,25 @@ async def ego_cadence():
     if mgr is None:
         return jsonify({"available": False})
 
-    return jsonify({
-        "available": True,
-        "is_running": mgr.is_running,
-        "is_paused": mgr.is_paused,
-        "current_interval_minutes": mgr.current_interval_minutes,
-        "consecutive_failures": mgr.consecutive_failures,
-    })
+    gated = False
+    gated_error = False
+    try:
+        gated = await ego_crud.has_pending_cli_approval(rt._db, mgr.source_tag)
+    except Exception:
+        gated_error = True
+
+    return jsonify(
+        {
+            "available": True,
+            "is_running": mgr.is_running,
+            "is_paused": mgr.is_paused,
+            "current_interval_minutes": mgr.current_interval_minutes,
+            "consecutive_failures": mgr.consecutive_failures,
+            "next_fire_at": mgr.next_fire_at,
+            "gated": gated,
+            "gated_error": gated_error,
+        }
+    )
 
 
 @blueprint.route("/api/genesis/ego/proposals/all")
@@ -268,30 +299,32 @@ async def ego_proposals_all():
     limit = min(request.args.get("limit", 50, type=int), 200)
 
     proposals = await ego_crud.list_proposals(rt._db, status=status, limit=limit)
-    return jsonify([
-        {
-            "id": p["id"],
-            "action_type": p["action_type"],
-            "action_category": p["action_category"],
-            "content": p["content"],
-            "rationale": p["rationale"],
-            "confidence": p["confidence"],
-            "urgency": p["urgency"],
-            "alternatives": p["alternatives"],
-            "status": p["status"],
-            "user_response": p["user_response"],
-            "cycle_id": p["cycle_id"],
-            "batch_id": p["batch_id"],
-            "created_at": p["created_at"],
-            "resolved_at": p["resolved_at"],
-            "expires_at": p["expires_at"],
-            "rank": p.get("rank"),
-            "execution_plan": p.get("execution_plan"),
-            "recurring": bool(p.get("recurring", 0)),
-            "ego_source": p.get("ego_source"),
-        }
-        for p in proposals
-    ])
+    return jsonify(
+        [
+            {
+                "id": p["id"],
+                "action_type": p["action_type"],
+                "action_category": p["action_category"],
+                "content": p["content"],
+                "rationale": p["rationale"],
+                "confidence": p["confidence"],
+                "urgency": p["urgency"],
+                "alternatives": p["alternatives"],
+                "status": p["status"],
+                "user_response": p["user_response"],
+                "cycle_id": p["cycle_id"],
+                "batch_id": p["batch_id"],
+                "created_at": p["created_at"],
+                "resolved_at": p["resolved_at"],
+                "expires_at": p["expires_at"],
+                "rank": p.get("rank"),
+                "execution_plan": p.get("execution_plan"),
+                "recurring": bool(p.get("recurring", 0)),
+                "ego_source": p.get("ego_source"),
+            }
+            for p in proposals
+        ]
+    )
 
 
 @blueprint.route("/api/genesis/ego/proposals/<proposal_id>/resolve", methods=["POST"])
@@ -312,7 +345,10 @@ async def ego_proposal_resolve(proposal_id: str):
 
     user_response = body.get("response", "")
     updated = await ego_crud.resolve_proposal(
-        rt._db, proposal_id, status=status, user_response=user_response,
+        rt._db,
+        proposal_id,
+        status=status,
+        user_response=user_response,
     )
     if not updated:
         return jsonify({"ok": False, "error": "proposal not found or not pending"}), 404
@@ -327,14 +363,17 @@ async def ego_proposal_resolve(proposal_id: str):
         prop = await ego_crud.get_proposal(rt._db, proposal_id)
     except Exception:
         _logging.getLogger(__name__).warning(
-            "could not load proposal %s for resolution hooks", proposal_id,
+            "could not load proposal %s for resolution hooks",
+            proposal_id,
         )
     if prop:
         try:
             from genesis.ego.resolution import handle_proposal_resolution
 
             await handle_proposal_resolution(
-                rt._db, prop, status,
+                rt._db,
+                prop,
+                status,
                 reason=user_response or None,
                 source="dashboard",
                 memory_store=getattr(rt, "_memory_store", None),
@@ -342,7 +381,9 @@ async def ego_proposal_resolve(proposal_id: str):
             )
         except Exception:
             _logging.getLogger(__name__).warning(
-                "resolution hook failed for %s", proposal_id, exc_info=True,
+                "resolution hook failed for %s",
+                proposal_id,
+                exc_info=True,
             )
 
     return jsonify({"ok": True, "id": proposal_id, "status": status})
@@ -360,19 +401,21 @@ async def ego_follow_ups():
         return jsonify([])
 
     items = await fu_crud.get_pending(rt._db, source="ego_cycle")
-    return jsonify([
-        {
-            "id": f["id"],
-            "content": f["content"],
-            "reason": f["reason"],
-            "strategy": f["strategy"],
-            "status": f["status"],
-            "priority": f["priority"],
-            "created_at": f["created_at"],
-            "scheduled_at": f["scheduled_at"],
-        }
-        for f in items
-    ])
+    return jsonify(
+        [
+            {
+                "id": f["id"],
+                "content": f["content"],
+                "reason": f["reason"],
+                "strategy": f["strategy"],
+                "status": f["status"],
+                "priority": f["priority"],
+                "created_at": f["created_at"],
+                "scheduled_at": f["scheduled_at"],
+            }
+            for f in items
+        ]
+    )
 
 
 @blueprint.route("/api/genesis/ego/vcr")
@@ -384,12 +427,17 @@ async def ego_vcr():
 
     rt = GenesisRuntime.instance()
     if not rt.is_bootstrapped or rt._db is None:
-        return jsonify({
-            "vcr": 0.0, "dispatch_rate": 0.0,
-            "total_resolved": 0, "total_executed": 0,
-            "outcomes_completed": 0, "outcomes_failed": 0,
-            "outcomes_unknown": 0,
-        })
+        return jsonify(
+            {
+                "vcr": 0.0,
+                "dispatch_rate": 0.0,
+                "total_resolved": 0,
+                "total_executed": 0,
+                "outcomes_completed": 0,
+                "outcomes_failed": 0,
+                "outcomes_unknown": 0,
+            }
+        )
 
     data = await compute_vcr(rt._db, days=30)
     return jsonify(data)

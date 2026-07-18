@@ -38,6 +38,15 @@ shadow_morning_report: true  # shadow mode: separate topic for 2 weeks
 dispatch_model_overrides:
   investigate: opus
 
+# Quiet hours (circadian floor) — throttle PROACTIVE ego ticks overnight to at
+# most one per quiet_hours_min_interval_minutes. Morning report, reactive events,
+# and CRITICAL escalations are NEVER gated by this — a 3am incident still wakes
+# the ego. Local time uses the system timezone. Live — takes effect next tick.
+quiet_hours_enabled: true
+quiet_hours_start: 23          # local hour [0-23], inclusive
+quiet_hours_end: 7             # local hour [0-23], exclusive
+quiet_hours_min_interval_minutes: 240   # min gap between overnight proactive ticks
+
 # Circuit breaker
 consecutive_failure_limit: 3
 failure_backoff_minutes: 60  # pause after N consecutive failures

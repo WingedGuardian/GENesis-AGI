@@ -400,19 +400,19 @@
                   <!-- Cadence progress bar -->
                   <div style="display: flex; align-items: center; gap: 0.3rem;">
                     <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
-                         :title="'Interval: ' + (ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'min / ' + (ue?.max_interval_minutes || 240) + 'min max'">
+                         :title="ue?.cadence?.gated ? 'Gated — awaiting approval' : ('Interval: ' + (ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'min / ' + (ue?.max_interval_minutes || 240) + 'min max')">
                       <div :style="(() => {
                         const cur = ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || 90;
                         const base = ue?.cadence_minutes || 90;
                         const max = ue?.max_interval_minutes || 240;
-                        const pct = Math.min(100, (cur / max) * 100);
+                        const pct = ue?.cadence?.gated ? 100 : Math.min(100, (cur / max) * 100);
                         const cFail = ue?.cadence?.consecutive_failures || 0;
-                        const color = cFail >= 3 ? '#d9534f' : cur <= base ? '#4caf50' : '#f0ad4e';
+                        const color = ue?.cadence?.gated ? '#6c757d' : cFail >= 3 ? '#d9534f' : cur <= base ? '#4caf50' : '#f0ad4e';
                         return `width: ${pct}%; height: 100%; background: ${color}; border-radius: 2px; transition: width 0.5s;`;
                       })()"></div>
                     </div>
                     <span style="font-size: 0.6rem; color: var(--color-text-secondary); min-width: 2.2rem; text-align: right;"
-                          x-text="(ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'm'"></span>
+                          x-text="ue?.cadence?.gated ? 'gated — awaiting approval' : ((ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'm')"></span>
                   </div>
                 </div>
                 <!-- Genesis Ego (COO) row -->
@@ -427,19 +427,19 @@
                   <!-- Cadence progress bar -->
                   <div style="display: flex; align-items: center; gap: 0.3rem;">
                     <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
-                         :title="'Interval: ' + (ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'min / ' + (ge?.max_interval_minutes || 240) + 'min max'">
+                         :title="ge?.cadence?.gated ? 'Gated — awaiting approval' : ('Interval: ' + (ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'min / ' + (ge?.max_interval_minutes || 240) + 'min max')">
                       <div :style="(() => {
                         const cur = ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || 90;
                         const base = ge?.cadence_minutes || 90;
                         const max = ge?.max_interval_minutes || 240;
-                        const pct = Math.min(100, (cur / max) * 100);
+                        const pct = ge?.cadence?.gated ? 100 : Math.min(100, (cur / max) * 100);
                         const cFail = ge?.cadence?.consecutive_failures || 0;
-                        const color = cFail >= 3 ? '#d9534f' : cur <= base ? '#4caf50' : '#f0ad4e';
+                        const color = ge?.cadence?.gated ? '#6c757d' : cFail >= 3 ? '#d9534f' : cur <= base ? '#4caf50' : '#f0ad4e';
                         return `width: ${pct}%; height: 100%; background: ${color}; border-radius: 2px; transition: width 0.5s;`;
                       })()"></div>
                     </div>
                     <span style="font-size: 0.6rem; color: var(--color-text-secondary); min-width: 2.2rem; text-align: right;"
-                          x-text="(ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'm'"></span>
+                          x-text="ge?.cadence?.gated ? 'gated — awaiting approval' : ((ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'm')"></span>
                   </div>
                 </div>
                 <!-- Cost footer -->
