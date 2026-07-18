@@ -920,12 +920,37 @@ class MorningReportGenerator:
         "swap enabled": "swap protection — its presence is protective",
     }
 
-    def _protective_tag(self, content: str) -> str:
+    # A protection named alongside any of these cues is being reported as
+    # ABSENT/broken — that IS a risk and must never be tagged protective
+    # (the tag would instruct the drafter to soften or omit it).
+    _NEGATION_CUES: tuple[str, ...] = (
+        "not ", "n't", "no ", "never", "disabled", "absent", "missing",
+        "unprotected", "inactive", "stopped", "failed", "broken", "off ",
+        "lost", "without",
+    )
+
+    # Sources that ONLY ever report missing/broken protections — never tag.
+    _NEVER_PROTECTIVE_SOURCES: frozenset[str] = frozenset({
+        "infra_protection_posture_monitor",
+    })
+
+    def _protective_tag(self, content: str, *, source: str = "") -> str:
         """Return ' [protective: …]' when the observation cites a known
-        protective mechanism, else ''."""
+        protective mechanism AS PRESENT, else ''.
+
+        Never tags posture-monitor alerts (that source exists to report
+        protections that are MISSING) and never tags content carrying a
+        negation cue — "systemd-oomd is not enforced" is a live risk, and
+        tagging it protective would invert (and, per the prompt rule,
+        suppress) exactly the alert class this map exists to protect.
+        """
+        if source in self._NEVER_PROTECTIVE_SOURCES:
+            return ""
         lowered = content.lower()
         for fact, note in self._PROTECTIVE_FACTS.items():
             if fact in lowered:
+                if any(cue in lowered for cue in self._NEGATION_CUES):
+                    return ""
                 return f" [protective: {note}]"
         return ""
 
@@ -962,7 +987,9 @@ class MorningReportGenerator:
             badge = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(prio, "")
             content = obs["content"][:200].replace("\n", " ")
             age = _relative_age(obs.get("created_at", ""))
-            protective = self._protective_tag(content)
+            protective = self._protective_tag(
+                content, source=obs.get("source") or "",
+            )
             lines.append(
                 f"- {badge} **{prio}**{aged} ({age}): {content}{protective}"
             )

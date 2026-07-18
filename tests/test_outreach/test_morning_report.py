@@ -662,3 +662,44 @@ async def test_prompt_contract_grounding_rules():
     assert "Ground Truth" in prompt
     assert "Never derive a total from a list section" in prompt
     assert "Protective facts are never risks" in prompt
+
+
+async def test_negated_protection_never_tagged_protective(db, mock_health, mock_drafter):
+    """The REAL shipping alert class: 'systemd-oomd … is not enforced' is a
+    live risk. Tagging it protective would invert it and — via the prompt
+    rule — suppress it. Neither negated content nor posture-monitor alerts
+    may ever be tagged."""
+    import uuid as _uuid
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id=str(_uuid.uuid4()),
+        source="infra_protection_posture_monitor",
+        type="infrastructure_alert",
+        content=(
+            "systemd-oomd pressure-kill is not enforced for user.slice — "
+            "nothing gracefully kills the memory hog before a hard OOM wedge"
+        ),
+        priority="high",
+        created_at=now,
+    )
+    # Negated phrasing from any other source must also stay untagged.
+    await observations.create(
+        db,
+        id=str(_uuid.uuid4()),
+        source="awareness",
+        type="infra_posture",
+        content="zram is disabled after the unmask sweep",
+        priority="high",
+        created_at=now,
+    )
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    context = await gen._assemble_context()
+    assert "[protective:" not in context
+    # ...and the alerts themselves still surface
+    assert "not enforced" in context
+    assert "zram is disabled" in context
