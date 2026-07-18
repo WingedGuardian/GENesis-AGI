@@ -198,6 +198,15 @@ def _load_native_module(data: dict, filename: str):
         if data.get(attr) and hasattr(module, f"_{attr}"):
             setattr(module, f"_{attr}", data[attr])
 
+    # Native modules carry no ProgramConfig, so the seed path
+    # (_restore_module_states) can't read a `_config.enabled`. Apply the YAML
+    # `enabled` flag directly to the instance here so a fresh install seeds the
+    # module in its declared state (external modules get this from
+    # ProgramConfig.enabled).
+    enabled = data.get("enabled")
+    if isinstance(enabled, bool):
+        module.enabled = enabled
+
     logger.info("Native module '%s' loaded from %s", data["name"], filename)
     return module
 
@@ -241,11 +250,12 @@ async def _restore_module_states(rt: GenesisRuntime) -> None:
                     )
             logger.info("Restored module '%s' state: enabled=%s", mod_name, mod.enabled)
         else:
-            # New module — seed with YAML default or disabled
+            # New module — seed with its resolved default: ProgramConfig.enabled
+            # for external modules, or the YAML `enabled` already applied to the
+            # instance at load time for native modules (else its __init__ default).
             default_enabled = getattr(mod, "_config", None)
             if default_enabled and hasattr(default_enabled, "enabled"):
                 mod.enabled = default_enabled.enabled
-            else:
-                mod.enabled = False
+            # else: keep the loader-resolved mod.enabled (native YAML `enabled`)
             await save_module_state(rt._db, mod_name, enabled=mod.enabled)
             logger.info("Module '%s' seeded (enabled=%s)", mod_name, mod.enabled)
