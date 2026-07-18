@@ -9,6 +9,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reflection updates in Telegram are now real summaries.** The reflection
+  topic previously relayed the model's raw output, so a malformed reflection
+  could leak internal tool-call chatter to your Telegram verbatim. Messages
+  are now built only from the parsed reflection fields (assessment, key
+  observations, next focus); when a reflection's output can't be parsed you
+  get a short "completed — stored for review" notice instead of noise, and
+  unparseable output is no longer stored as a reflection summary that later
+  reflections would re-read and argue with.
+
 ### Added
 
 - **Genesis now tidies near-duplicate entities in its knowledge graph.** When

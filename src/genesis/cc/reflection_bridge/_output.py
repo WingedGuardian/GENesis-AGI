@@ -417,19 +417,26 @@ def format_topic_summary(depth, output) -> str:
         return fallback
 
     parts = [header]
-    assessment = data.get("assessment") or data.get("cognitive_state_update")
-    if isinstance(assessment, str) and assessment.strip():
-        parts.append(_html.escape(assessment[:1500]))
-    obs_lines = []
-    for obs in (data.get("observations") or [])[:3]:
-        text = obs if isinstance(obs, str) else ""
-        if text.strip():
-            obs_lines.append(f"• {_html.escape(text[:300])}")
-    if obs_lines:
-        parts.append("\n".join(obs_lines))
-    focus = data.get("focus_next_week") or data.get("focus_next")
-    if isinstance(focus, str) and focus.strip():
-        parts.append(f"<b>Focus:</b> {_html.escape(focus[:500])}")
+    try:
+        assessment = data.get("assessment") or data.get("cognitive_state_update")
+        if isinstance(assessment, str) and assessment.strip():
+            parts.append(_html.escape(assessment[:1500]))
+        obs = data.get("observations") or []
+        obs_lines = []
+        for entry in (obs if isinstance(obs, list) else [])[:3]:
+            text = entry if isinstance(entry, str) else ""
+            if text.strip():
+                obs_lines.append(f"• {_html.escape(text[:300])}")
+        if obs_lines:
+            parts.append("\n".join(obs_lines))
+        focus = data.get("focus_next_week") or data.get("focus_next")
+        if isinstance(focus, str) and focus.strip():
+            parts.append(f"<b>Focus:</b> {_html.escape(focus[:500])}")
+    except Exception:
+        # A schema-violating field shape must degrade to the liveness
+        # one-liner, never crash the reflection at the delivery step.
+        logger.warning("format_topic_summary field extraction failed", exc_info=True)
+        return fallback
 
     if len(parts) == 1:
         return (
