@@ -56,6 +56,7 @@ def _local_config() -> dict:
         return {}
     try:
         import yaml  # noqa: PLC0415 — lazy import, yaml is always available
+
         with cfg_path.open() as fh:
             _LOCAL_CONFIG = yaml.safe_load(fh) or {}
     except Exception:
@@ -115,7 +116,9 @@ def memory_writebacks_off() -> bool:
     re-rank memories for later ones. Default off: production unaffected.
     """
     return os.environ.get("GENESIS_MEMORY_WRITEBACKS_OFF", "").strip() in (
-        "1", "true", "yes",
+        "1",
+        "true",
+        "yes",
     )
 
 
@@ -154,10 +157,12 @@ def update_in_progress() -> bool:
     and deadlocks bootstrap's procedure seed (incident IR-2). Two independent
     deploy signals are honored — either one alive → in progress:
 
-    * ``~/.genesis/update_in_progress.pid`` — a bare-integer PID written by the
-      dashboard-orchestrated update path (``dashboard/routes/updates.py``).
-      Present ONLY for dashboard-triggered updates; a CLI ``./scripts/update.sh``
-      run never writes it.
+    * ``~/.genesis/update_in_progress.pid`` — a bare-integer PID. Written by the
+      dashboard-orchestrated update path (``dashboard/routes/updates.py``) and by
+      ``scripts/restore.sh`` while it holds the server stopped to rebuild the DB
+      (so the watchdog does not revive it into a half-built database). A CLI
+      ``./scripts/update.sh`` run does not write it — it uses the state file
+      below. Any writer is honored: only liveness is checked, never identity.
     * ``~/.genesis/update_state.json`` — ``{phase, pid, started_at, ...}`` written
       per-phase by ``update.sh::_write_state`` (the CLI path; the incident path).
       Counts only while ``phase != "done"`` (``done`` is written immediately

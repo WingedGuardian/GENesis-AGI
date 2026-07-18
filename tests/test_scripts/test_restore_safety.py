@@ -236,6 +236,46 @@ def test_restore_holds_deploy_marker_across_stop(sandbox):
     )
 
 
+def _write_sqlite3_marker_probe(bind: Path, calls: Path) -> None:
+    """sqlite3 wrapper that, on the dump `.read`, records whether the deploy
+    marker exists AT THAT MOMENT — proving the marker is held during the
+    multi-minute DB rebuild — then execs the real sqlite3."""
+    real = shutil.which("sqlite3")
+    _make_stub(
+        bind / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do case "$a" in\n'
+        '  .read*) if [ -f "$HOME/.genesis/update_in_progress.pid" ]; then\n'
+        f'            echo MARKER_PRESENT_DURING_READ >> "{calls}"\n'
+        "          else\n"
+        f'            echo MARKER_ABSENT_DURING_READ >> "{calls}"\n'
+        "          fi ;;\n"
+        "esac; done\n"
+        f'exec {real} "$@"\n',
+    )
+
+
+def test_restore_holds_marker_when_server_already_inactive(sandbox):
+    """The watchdog revives an INACTIVE unit — so the marker must be held during
+    the DB rebuild even when genesis-server is already stopped at restore start
+    (operator pre-stop, or a crash): the highest-risk, longest window."""
+    _write_systemctl(sandbox["bind"], sandbox["calls"], active=False)
+    _write_sqlite3_marker_probe(sandbox["bind"], sandbox["calls"])
+    _seed_live_db(sandbox["gd"])
+    proc = _run_restore(sandbox)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    calls = _calls(sandbox)
+    assert "stop genesis-server" not in calls, "stopped a server that wasn't active"
+    assert "MARKER_PRESENT_DURING_READ" in calls, (
+        "deploy marker NOT held during the DB rebuild when the server was already "
+        f"inactive — watchdog could revive mid-restore:\n{calls}\n{proc.stdout}"
+    )
+    assert "MARKER_ABSENT_DURING_READ" not in calls, calls
+    assert not (sandbox["home"] / ".genesis" / "update_in_progress.pid").exists(), (
+        "deploy marker not released by the EXIT trap"
+    )
+
+
 def test_restore_does_not_clobber_a_live_foreign_deploy_marker(sandbox):
     """If a real update.sh/dashboard deploy already owns the marker, restore must
     NOT overwrite it (and must not remove another deploy's marker in its trap);

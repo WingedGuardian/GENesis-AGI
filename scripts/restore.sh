@@ -145,10 +145,15 @@ log "big-temp dir: $GENESIS_BIG_TMP"
 _SERVER_WAS_STOPPED=false
 _quiesce_genesis_server() {
     command -v systemctl >/dev/null 2>&1 || return 0
+    # Acquire the deploy marker UNCONDITIONALLY (systemctl exists → a watchdog
+    # could run). The watchdog revives an INACTIVE unit, so the marker matters
+    # MOST when the server is already stopped at restore start — a cautious
+    # operator may `systemctl --user stop genesis-server` before restoring, or it
+    # may have crashed. Gating the marker on is-active (as an earlier draft did)
+    # would leave that highest-risk case — the multi-minute .read — unprotected.
+    # Only the stop ACTION below is gated on liveness.
+    _acquire_deploy_marker
     if systemctl --user is-active --quiet genesis-server 2>/dev/null; then
-        # Hold the deploy marker BEFORE the stop so there is no window in which
-        # the watchdog sees an inactive unit without the defer signal in place.
-        _acquire_deploy_marker
         log "Stopping genesis-server before SQLite restore (will NOT auto-restart)..."
         # Only record "stopped" if the stop actually succeeded — otherwise the
         # end-of-run note would tell the operator to restart a server that never
