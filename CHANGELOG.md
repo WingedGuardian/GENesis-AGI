@@ -64,6 +64,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   (no change without an `API_KEY_VOYAGE`). It can be turned off live via the
   `memory_recall` setting `reranker.mode: off` or `GENESIS_MEMORY_RERANK_OFF=1`
   if you want to trade a little recall quality for lower latency/cost.
+- **Fresh installs come up correctly the first time.** Several install-only
+  defects are fixed: generated systemd units no longer get a broken service
+  PATH (missing the npm-global bin dir) when Claude Code isn't on PATH yet at
+  unit-generation time, so background services can reliably find the `claude`
+  CLI; the triage-calibration and user-knowledge seed files are now populated
+  from their templates during `install.sh` (previously only `bootstrap.sh` did
+  this), so triage runs with real calibration instead of an empty prompt on a
+  fresh install; and the content-pipeline module now honors its declared
+  enabled state instead of always seeding disabled.
+- **Time-limited internal state expires on schedule.** Two time-to-live checks
+  compared expiry timestamps stored in different formats: observations could be
+  resolved as expired up to a day early, while same-day cognitive-state entries
+  lingered in the morning report as "active" long after they had actually
+  expired. Both comparisons are now format-normalized, so internal state lives
+  exactly as long as intended.
 - **The morning report's numbers are real now.** Report generation previously
   counted truncated display lists (reporting "5 follow-ups" when 268 existed),
   sometimes inverted protective facts into alarms (an active OOM-protection

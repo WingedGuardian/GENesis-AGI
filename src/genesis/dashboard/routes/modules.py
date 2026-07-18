@@ -326,6 +326,21 @@ async def module_toggle(name: str):
     })
 
 
+def _mask_config_response(config: dict, fields: list[dict]) -> dict:
+    """Null out secret/sensitive values in a flat {name: value} config dict.
+
+    Used for PATCH responses: update_config returns the full live config, and a
+    save that skips a masked sensitive field (preserving its stored value) must
+    not echo that value back to the client. Mirrors the read-path masking.
+    """
+    sensitive = {
+        f.get("name")
+        for f in fields
+        if f.get("type") == "secret" or f.get("sensitive")
+    }
+    return {k: (None if k in sensitive else v) for k, v in config.items()}
+
+
 @blueprint.route("/api/genesis/modules/<name>/config", methods=["PATCH"])
 @_async_route
 async def module_config(name: str):
@@ -363,6 +378,20 @@ async def module_config(name: str):
         if rt.db is not None:
             await save_module_state(rt.db, name, config_json=json.dumps(new_config))
 
-        return jsonify({"status": "ok", "name": name, "config": new_config})
+        # Mask secret/sensitive values in the RESPONSE only (the persisted config
+        # above keeps real values). Skipping a masked sensitive field on save
+        # preserves its stored value, which must not echo back to the client.
+        response_config = new_config
+        if callable(getattr(mod, "configurable_fields", None)):
+            try:
+                response_config = _mask_config_response(
+                    new_config, mod.configurable_fields()
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to mask PATCH response config for %s", name, exc_info=True
+                )
+
+        return jsonify({"status": "ok", "name": name, "config": response_config})
     except (ValueError, TypeError) as e:
         return jsonify({"status": "error", "message": str(e)}), 400
