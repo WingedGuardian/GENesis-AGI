@@ -46,6 +46,11 @@ async def send_and_wait_via_pipeline(
         salience_score=1.0,
         signal_type=category,
         channel=channel,
+        # Deliver the caller's message EXACTLY — never run it through the LLM
+        # drafter. A send_and_wait message is a literal prompt (frequently an
+        # exact instruction the reply is matched against); drafting once
+        # inverted one ("please reply with a plain message" -> "...failed").
+        verbatim=True,
     )
     result, reply = await pipeline.submit_and_wait(req, timeout_s=float(timeout_s))
     return {

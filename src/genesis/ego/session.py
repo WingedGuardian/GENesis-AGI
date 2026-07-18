@@ -2017,6 +2017,9 @@ class EgoSession:
                     salience_score=salience,
                     signal_type="ego_notification",
                     channel="telegram",
+                    # The ego already composed `content` — deliver it exactly,
+                    # never re-word an ego notification through the drafter.
+                    verbatim=True,
                 )
                 await self._outreach_pipeline.submit(request)
                 submitted += 1

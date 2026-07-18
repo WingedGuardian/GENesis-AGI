@@ -258,6 +258,31 @@ async def test_drain_reconstructs_request_with_thread_and_recipient(config, db):
     req = pipeline.submit.call_args[0][0]
     assert req.thread_id == "t1"
     assert req.validated_recipient == "real@prospect.com"
+    # The queue holds already-final agent messages (outreach_send bridge path);
+    # they must be delivered VERBATIM, never run back through the LLM drafter.
+    assert req.verbatim is True
+
+
+@pytest.mark.asyncio
+async def test_drain_delivers_verbatim_on_urgent_path(config, db):
+    """High-urgency queued rows go through submit_urgent — which must ALSO
+    receive verbatim=True so the drafter never rewrites the stored message."""
+    from genesis.db.crud import pending_outreach
+
+    await pending_outreach.enqueue(
+        db,
+        message="Deploy #1234 rolled back to 5ad2bff6.",
+        category="notification",
+        channel="telegram",
+        urgency="high",
+    )
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit_urgent.assert_called_once()
+    assert pipeline.submit_urgent.call_args[0][0].verbatim is True
 
 
 @pytest.mark.asyncio

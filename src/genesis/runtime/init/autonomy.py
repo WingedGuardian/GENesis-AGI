@@ -271,6 +271,8 @@ async def init(rt: GenesisRuntime) -> None:
                         salience_score=0.9,
                         signal_type="health_alert",
                         source_id=f"remediation:{title}",
+                        # Remediation body is a machine fact — deliver exactly.
+                        verbatim=True,
                     ))
                 outreach_fn = _outreach_submit
             rt._remediation_registry = RemediationRegistry(outreach_fn=outreach_fn)

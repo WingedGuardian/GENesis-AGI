@@ -463,6 +463,7 @@ class CCUpdateAnalyzer:
             context=text,
             salience_score=0.9,
             signal_type="cc_version_update",
+            verbatim=True,  # composed changelog summary — never reword
         )
 
         try:

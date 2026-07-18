@@ -449,13 +449,23 @@ class OutputRouter:
                         )
                     from genesis.outreach.types import OutreachCategory, OutreachRequest
 
+                    # Deliver the question verbatim — a literal question with
+                    # numbered options must never be LLM-rewritten. Verbatim
+                    # delivers `context`, so the question TEXT (kept in `topic`
+                    # as the short label) is folded into context here or it
+                    # would be dropped from what the user sees.
+                    question_body = (
+                        f"{output.user_question.text}\n\n"
+                        f"{output.user_question.context}{options_text}"
+                    )
                     await self._outreach_pipeline.submit(OutreachRequest(
                         category=OutreachCategory.SURPLUS,
                         topic=output.user_question.text[:100],
-                        context=output.user_question.context + options_text,
+                        context=question_body,
                         salience_score=0.8,
                         signal_type="reflection_question",
                         source_id=obs_id,
+                        verbatim=True,
                     ))
                     summary["question_surfaced"] = True
                     logger.info(

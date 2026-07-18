@@ -43,6 +43,7 @@ async def fire_fallback_alert(*, topic: str, context: str) -> None:
             topic=topic,
             context=context,
             salience_score=0.9,
+            verbatim=True,  # pre-composed recovery alert — never reword
         ))
     except Exception:
         logger.debug("fallback ALERT dispatch failed", exc_info=True)

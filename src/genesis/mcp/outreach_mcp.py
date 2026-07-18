@@ -62,6 +62,10 @@ async def outreach_send(
 ) -> str:
     """Queue a message for delivery. Returns outreach_id.
 
+    The message is delivered AS-IS — Genesis does not rewrite or rephrase it.
+    Compose the exact text you want the recipient to see (this is the tool for
+    reminders and literal notifications).
+
     For email replies, pass thread_id to route to the correct recipient.
     The thread_id maps to a registered email thread whose recipient is
     used for delivery.
@@ -143,6 +147,11 @@ async def outreach_send(
         labeled_surplus=labeled_surplus,
         validated_recipient=validated_recipient,
         thread_id=thread_id,
+        # The caller composed this message; deliver it exactly — never route an
+        # agent-authored message back through the LLM drafter (it once inverted
+        # a send_and_wait test message's meaning). The bridge/queue path mirrors
+        # this via the pending_outreach drain.
+        verbatim=True,
     )
     if urgency == "critical":
         result = await _pipeline.submit_urgent(req)

@@ -140,6 +140,7 @@ class SkillEvolutionPipeline:
                 ),
                 salience_score=0.6,
                 signal_type="skill_proposal",
+                verbatim=True,  # composed proposal summary — never reword
             )
             await self._outreach_fn(request)
         except Exception:

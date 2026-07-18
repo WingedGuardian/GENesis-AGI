@@ -303,15 +303,25 @@ class OutreachPipeline:
         channel = request.channel or self._select_channel(request.category)
         format_target = _CHANNEL_FORMAT.get(channel, FormatTarget.GENERIC)
 
-        draft = await self._drafter.draft(DraftRequest(
-            topic=request.topic,
-            context=request.context,
-            target=format_target,
-            tone="urgent",
-            max_length=None,
-            system_prompt=self._load_alert_prompt(),
-        ))
-        formatted = self._formatter.format(draft.content.text, format_target)
+        if request.verbatim:
+            # Deliver `context` EXACTLY — no LLM in the path — same contract as
+            # submit(). An urgent caller that opts into verbatim is relaying a
+            # machine fact (e.g. process_reaper kill alerts) that must never be
+            # creatively rewritten. Fall back to `topic` so an empty context
+            # never delivers an empty string.
+            formatted = self._formatter.format(
+                request.context or request.topic, format_target,
+            )
+        else:
+            draft = await self._drafter.draft(DraftRequest(
+                topic=request.topic,
+                context=request.context,
+                target=format_target,
+                tone="urgent",
+                max_length=None,
+                system_prompt=self._load_alert_prompt(),
+            ))
+            formatted = self._formatter.format(draft.content.text, format_target)
         return await self._deliver(outreach_id, channel, formatted, request, None)
 
     async def submit_and_wait(

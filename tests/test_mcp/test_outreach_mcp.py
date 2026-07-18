@@ -136,6 +136,40 @@ async def test_send_and_wait_success():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("urgency,method", [("low", "submit"), ("critical", "submit_urgent")])
+async def test_outreach_send_delivers_verbatim(urgency, method):
+    """outreach_send delivers the caller's message as-is on BOTH the normal and
+    critical routes — the LLM drafter never re-words an agent-composed message.
+    """
+    mock_result = MagicMock()
+    mock_result.outreach_id = "out-9"
+    mock_result.status.value = "delivered"
+    mock_result.channel = "telegram"
+    mock_result.error = None
+
+    mock_pipeline = AsyncMock()
+    getattr(mock_pipeline, method).return_value = mock_result
+
+    old_pipeline = mcp_mod._pipeline
+    try:
+        mcp_mod._pipeline = mock_pipeline
+        tools = await mcp.get_tools()
+        await tools["outreach_send"].fn(
+            message="Remind me to call the bank at 3pm — do NOT paraphrase this.",
+            category="notification",
+            channel="telegram",
+            urgency=urgency,
+        )
+        submit_mock = getattr(mock_pipeline, method)
+        submit_mock.assert_called_once()
+        req = submit_mock.call_args[0][0]
+        assert req.verbatim is True
+        assert req.context == "Remind me to call the bank at 3pm — do NOT paraphrase this."
+    finally:
+        mcp_mod._pipeline = old_pipeline
+
+
+@pytest.mark.asyncio
 async def test_send_and_wait_timeout():
     """Should indicate timeout when reply is None."""
     mock_result = MagicMock()
