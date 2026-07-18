@@ -55,6 +55,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Your decisions now stick.** When you reject a proposal with a reason —
+  from Telegram, the dashboard, the chat tab, or in conversation — the ruling
+  is captured as a durable **Settled Decision** that the ego sees in every
+  future cycle and may not re-propose, re-litigate, or work around. Repeat
+  rulings on the same theme reaffirm the existing decision instead of piling
+  up duplicates; only you can supersede one. Previously each entry point
+  recorded a different subset of side effects (the dashboard recorded almost
+  nothing), so the ego could agree with you in chat and then re-propose the
+  same thing days later. A new `ego_decision` tool also captures rulings you
+  state directly in conversation.
+- **Your deny reasons finally count as engagement.** The engagement signal
+  now covers all Genesis outbound — outreach messages *and* ego proposals —
+  and a typed reason on a proposal counts as engagement. The system will no
+  longer claim "the user doesn't engage" while you're actively ruling on its
+  proposals. The dashboard reject flow nudges for a reason ("Why? This
+  teaches the ego — a reason becomes a standing rule"), which stays optional.
 - **Groundwork: Genesis can now measure whether its entity graph would improve
   recall, without changing any results yet.** A new shadow-only lane resolves a
   recall query to entities in its knowledge graph, walks their relationships,

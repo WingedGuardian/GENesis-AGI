@@ -275,7 +275,8 @@
                   </template>
                   <template x-if="$store.genesisDashboard.commsRejectingId === p.id">
                     <div style="display:flex; gap:0.25rem; flex:1;">
-                      <input type="text" x-model="$store.genesisDashboard.commsRejectReason" placeholder="Reason (optional)"
+                      <input type="text" x-model="$store.genesisDashboard.commsRejectReason" x-init="$el.focus()"
+                             placeholder="Why? This teaches the ego — a reason becomes a standing rule"
                              style="flex:1; font-size:0.68rem; padding:0.2rem 0.4rem; background:var(--color-background); border:1px solid var(--color-border); color:var(--color-text); border-radius:3px;">
                       <button style="font-size:0.68rem; padding:0.2rem 0.5rem; border-radius:3px; cursor:pointer; border:1px solid #d9534f; color:#d9534f; background:#d9534f22;"
                               @click="$store.genesisDashboard.resolveCommsProposal(p.id, 'rejected', $store.genesisDashboard.commsRejectReason)">Confirm</button>

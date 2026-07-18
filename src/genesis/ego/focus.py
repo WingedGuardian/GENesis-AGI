@@ -73,6 +73,7 @@ _ALL_SECTIONS = (
     "intentions",
     "goals",
     "directives",
+    "settled_decisions",
     "world_snapshot",
     "activity_pulse",
     "recent_conversations",
@@ -92,7 +93,8 @@ _ALL_SECTIONS = (
 
 # Sections that are always included at full depth regardless of weights.
 _ALWAYS_SECTIONS = frozenset({
-    "user_model", "intentions", "directives", "output_contract",
+    "user_model", "intentions", "directives", "settled_decisions",
+    "output_contract",
 })
 
 

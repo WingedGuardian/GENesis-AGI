@@ -186,7 +186,12 @@ def test_handler_wired_into_all_resolution_paths():
     ]
     for path in entry_points:
         src = path.read_text()
-        assert "handle_goal_status_change_resolution" in src, (
-            f"{path} is missing the goal-status apply hook — "
-            "an approval there would silently no-op"
+        assert "handle_proposal_resolution" in src, (
+            f"{path} is missing the shared resolution hook — "
+            "a resolution there would silently skip side effects"
         )
+    shared = (root / "ego" / "resolution.py").read_text()
+    assert "handle_goal_status_change_resolution" in shared, (
+        "ego/resolution.py no longer runs handle_goal_status_change_resolution — "
+        "that action would silently no-op on every entry point"
+    )

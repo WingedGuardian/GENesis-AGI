@@ -186,20 +186,9 @@ async def comms_resolve_proposal(proposal_id: str):
     if not ok:
         return jsonify({"error": "Proposal not found or already resolved"}), 404
 
-    try:
-        from genesis.db.crud import intervention_journal as journal_crud
-        await journal_crud.resolve(
-            rt.db, proposal_id,
-            outcome_status=status,
-            actual_outcome=f"Dashboard: user {status}",
-            user_response=user_response or None,
-        )
-    except Exception:
-        logger.warning("Journal resolve failed for proposal %s", proposal_id)
-
-    # Resolution side-effects (earn-back + goal status change). Fetch the
-    # resolved proposal once and run both hooks against it; each is wrapped so
-    # one failing never aborts the other.
+    # Shared post-resolution hook: journal + J-9 + decision capture +
+    # correction memory + ALL action hooks (this route previously ran only
+    # 4 of the 6 and no J-9/journal parity — the fifth resolution path).
     prop = None
     try:
         prop = await ego.get_proposal(rt.db, proposal_id)
@@ -207,33 +196,19 @@ async def comms_resolve_proposal(proposal_id: str):
         logger.warning("could not load proposal %s for resolution hooks", proposal_id)
     if prop:
         try:
-            from genesis.ego.earnback import handle_earnback_resolution
+            from genesis.ego.resolution import handle_proposal_resolution
 
-            await handle_earnback_resolution(
-                rt.db, prop, status, getattr(rt, "_autonomy_manager", None),
+            await handle_proposal_resolution(
+                rt.db, prop, status,
+                reason=user_response or None,
+                source="dashboard",
+                memory_store=getattr(rt, "_memory_store", None),
+                autonomy_manager=getattr(rt, "_autonomy_manager", None),
             )
         except Exception:
-            logger.warning("earnback resolution hook failed for %s", proposal_id)
-        try:
-            from genesis.ego.goal_actions import handle_goal_status_change_resolution
-
-            await handle_goal_status_change_resolution(rt.db, prop, status)
-        except Exception:
-            logger.warning("goal status-change hook failed for %s", proposal_id)
-        try:
-            from genesis.ego.cell_promotion import handle_cell_promotion_resolution
-
-            await handle_cell_promotion_resolution(rt.db, prop, status)
-        except Exception:
-            logger.warning("cell promotion hook failed for %s", proposal_id)
-        try:
-            from genesis.ego.cognitive_variant import (
-                handle_cognitive_variant_resolution,
+            logger.warning(
+                "resolution hook failed for %s", proposal_id, exc_info=True,
             )
-
-            await handle_cognitive_variant_resolution(rt.db, prop, status)
-        except Exception:
-            logger.warning("cognitive-variant hook failed for %s", proposal_id)
 
     # Trigger delayed sweep on approval — same 5-min grace as Telegram,
     # so the user can revoke before dispatch fires.
