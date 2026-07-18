@@ -17,6 +17,8 @@
 #      (WS-5 Discord observe-only gate log; bounds the shadow store)
 #   8. Retention prune of session_ledger_shadow_* (>45d) → scripts/prune_ledger_shadow.py
 #      (session-manager PR-3 ambient extractor shadow store; runs + events)
+#   9. Retention prune of ~/.genesis/output/retrieval_efficacy/*.md (>45d)
+#      (WS2-0 retrieval-efficacy report; dated md per run — file-age prune)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -96,6 +98,15 @@ main() {
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
         || echo "prune_repo_pulse exited $?"
+
+    echo "--- retrieval-efficacy report retention prune (>45d) ---"
+    # WS2-0: retrieval_efficacy_report.py writes a dated md per run; bound the
+    # dir so a periodic report never slow-leaks disk on a smaller install.
+    if [ -d "$HOME/.genesis/output/retrieval_efficacy" ]; then
+        find "$HOME/.genesis/output/retrieval_efficacy" -maxdepth 1 -type f \
+            -name '*.md' -mtime +45 -delete 2>/dev/null \
+            || echo "retrieval_efficacy prune exited $?"
+    fi
 
     echo "=== genesis-disk-hygiene done ==="
 }

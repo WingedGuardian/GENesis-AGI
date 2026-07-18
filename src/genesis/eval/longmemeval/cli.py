@@ -13,9 +13,16 @@ from typing import TYPE_CHECKING
 
 from genesis.eval.longmemeval.client import load_secrets
 from genesis.eval.longmemeval.dataset import filter_by_types, load_oracle
-from genesis.eval.longmemeval.runner import filter_arms, run_longmemeval, select_arms
+from genesis.eval.longmemeval.runner import (
+    filter_arms,
+    run_longmemeval,
+    select_arms,
+    validate_variants,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from genesis.eval.types import EvalRunSummary
 
 logger = logging.getLogger("genesis.eval.longmemeval")
@@ -99,6 +106,7 @@ async def execute(
     graph: bool = False,
     graph_link_threshold: float | None = None,
     arms_only: str | None = None,
+    variants: Sequence[str] = (),
 ) -> dict[str, EvalRunSummary]:
     """Load the dataset, run the harness, persist (optionally), return summaries.
 
@@ -119,11 +127,14 @@ async def execute(
         instances = instances[:limit]
     logger.info("loaded %d questions from %s", len(instances), dataset_path)
 
-    arms = select_arms(no_rerank=no_rerank, graph=graph)
+    arms = select_arms(no_rerank=no_rerank, graph=graph, variants=variants)
     if arms_only is not None:
         # An empty string still reaches filter_arms and raises there — a paid
         # run must never silently widen back to the full arm universe.
         arms = filter_arms(arms, arms_only)
+    # Fail-fast BEFORE any spend: unknown variant or a variant declaring a
+    # recall kwarg that recall() doesn't accept raises here, not mid-run.
+    validate_variants(arms)
     reranker = None if no_rerank else build_reranker()
 
     db = None

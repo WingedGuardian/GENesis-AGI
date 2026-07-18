@@ -62,6 +62,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated arm labels to run (filters the selected "
         "universe, e.g. --graph --arms raw,raw+graph); unknown labels error",
     )
+    p.add_argument(
+        "--variants",
+        default="",
+        help="comma-separated retrieval-config variants to pair against baseline "
+        "(each doubles every base arm with a +<variant> twin; a WS2 lever PR "
+        "registers each variant). Unknown variants error before any spend.",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -86,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
             graph=args.graph,
             graph_link_threshold=args.graph_link_threshold,
             arms_only=args.arms,
+            variants=tuple(v.strip() for v in args.variants.split(",") if v.strip()),
         ),
     )
     print_report(summaries)

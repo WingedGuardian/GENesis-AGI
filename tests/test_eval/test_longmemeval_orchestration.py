@@ -384,3 +384,170 @@ async def test_run_longmemeval_runs_questions_concurrently():
     # the offload lets multiple blocking LLM calls overlap; a blocking-on-loop
     # implementation would serialize to max_active == 1
     assert client.max_active >= 2
+
+
+# ── WS2-0: retrieval-config variant seam ─────────────────────────────────────
+
+
+@pytest.fixture
+def _variants_clean():
+    """Snapshot/restore the module-global VARIANTS registry so a test that
+    registers a variant never leaks into another test."""
+    from genesis.eval.longmemeval import runner
+
+    saved = dict(runner.VARIANTS)
+    try:
+        yield
+    finally:
+        runner.VARIANTS.clear()
+        runner.VARIANTS.update(saved)
+
+
+def test_select_arms_variants_double_without_variant_of_variant(_variants_clean):
+    from genesis.eval.longmemeval.runner import select_arms
+
+    arms = select_arms(no_rerank=True, variants=["scope"])
+    assert {a.label for a in arms} == {"raw", "keyword", "raw+scope", "keyword+scope"}
+    # two variants each double the BASE arms only — never variant-of-variant
+    labels = {a.label for a in select_arms(no_rerank=True, variants=["scope", "budget"])}
+    assert labels == {
+        "raw", "keyword",
+        "raw+scope", "keyword+scope",
+        "raw+budget", "keyword+budget",
+    }
+    assert not any("scope" in x and "budget" in x for x in labels)
+
+
+def test_validate_variants_rejects_unknown_variant():
+    from genesis.eval.longmemeval.query import QueryArm
+    from genesis.eval.longmemeval.runner import Arm, validate_variants
+
+    with pytest.raises(ValueError, match="unknown arm variant"):
+        validate_variants([Arm(QueryArm.RAW, rerank=False, variant="nope")])
+
+
+def test_validate_variants_rejects_unknown_recall_kwarg(_variants_clean):
+    from genesis.eval.longmemeval.query import QueryArm
+    from genesis.eval.longmemeval.runner import (
+        Arm,
+        ArmVariant,
+        register_variant,
+        validate_variants,
+    )
+
+    register_variant(ArmVariant(name="bad", recall_kwarg_names=("not_a_real_kwarg",)))
+    with pytest.raises(ValueError, match="unknown recall kwargs"):
+        validate_variants([Arm(QueryArm.RAW, rerank=False, variant="bad")])
+
+
+def test_validate_variants_passes_registered_valid_kwargs(_variants_clean):
+    from genesis.eval.longmemeval.query import QueryArm
+    from genesis.eval.longmemeval.runner import (
+        Arm,
+        ArmVariant,
+        register_variant,
+        validate_variants,
+    )
+
+    register_variant(ArmVariant(name="ok", recall_kwarg_names=("wing",)))
+    # 'wing' is a real recall() kwarg; baseline (no-variant) arms always pass
+    validate_variants([
+        Arm(QueryArm.RAW, rerank=False),
+        Arm(QueryArm.RAW, rerank=False, variant="ok"),
+    ])
+
+
+class _RecordAllClient:
+    """Sync client recording the full concatenated prompt of every call."""
+
+    def __init__(self):
+        self.prompts: list[str] = []
+        self._lock = threading.Lock()
+        chat = type("Chat", (), {})()
+        completions = type("Completions", (), {})()
+
+        def create(**kwargs):
+            with self._lock:
+                self.prompts.append(
+                    " ".join(m.get("content", "") for m in kwargs["messages"]),
+                )
+            return _FakeCompletion("yes Business Administration")
+
+        completions.create = create
+        chat.completions = completions
+        self.chat = chat
+
+
+@pytest.mark.asyncio
+async def test_run_arm_applies_variant_recall_kwargs_and_post_recall(_variants_clean):
+    """A variant's recall_kwargs reach recall(), and its post_recall transforms
+    the content list actually fed to the reader — proven directly via spies."""
+    from genesis.eval.longmemeval.query import QueryArm
+    from genesis.eval.longmemeval.runner import (
+        Arm,
+        ArmVariant,
+        _run_arm,
+        register_variant,
+    )
+
+    seen_recall_kwargs: dict = {}
+    seen_post_recall: list = []
+
+    class _Hit:
+        def __init__(self, mid, content):
+            self.memory_id = mid
+            self.content = content
+
+    class _Retriever:
+        async def recall(self, query, *, source, limit, rerank, **extra):
+            seen_recall_kwargs.update(extra)
+            return [_Hit("m1", "alpha_memory"), _Hit("m2", "beta_memory")]
+
+    class _ES:
+        retriever = _Retriever()
+        db = None
+
+    class _Ingest:
+        evidence_memory_ids = {"m1"}
+
+    def _derive(instance, arm):
+        return {"wing": "infrastructure"}
+
+    def _trim(memories):
+        seen_post_recall.append(list(memories))
+        return memories[:1]  # keep only the top memory
+
+    register_variant(
+        ArmVariant(
+            name="probe",
+            recall_kwarg_names=("wing",),
+            recall_kwargs=_derive,
+            post_recall=_trim,
+        ),
+    )
+
+    client = _RecordAllClient()
+    arm = Arm(QueryArm.RAW, rerank=False, variant="probe")
+    result = await _run_arm(_ES(), _Ingest(), _instance("q1"), arm, k=10, client=client)
+
+    assert seen_recall_kwargs == {"wing": "infrastructure"}     # kwargs reached recall()
+    assert seen_post_recall == [["alpha_memory", "beta_memory"]]  # got the recalled set
+    # the trimmed list (only alpha) reached the reader; beta was dropped
+    joined = " ".join(client.prompts)
+    assert "alpha_memory" in joined
+    assert "beta_memory" not in joined
+    assert result.arm_label == "raw+probe"
+
+
+def test_eval_cli_longmemeval_accepts_variants():
+    """The primary `genesis eval longmemeval` path exposes --variants (not just
+    the module __main__), so a lever's variant is reachable from both CLIs."""
+    import argparse
+
+    from genesis.eval.cli import add_parser
+
+    top = argparse.ArgumentParser()
+    sub = top.add_subparsers(dest="command")
+    add_parser(sub)
+    args = top.parse_args(["eval", "longmemeval", "--variants", "scope,budget"])
+    assert args.variants == "scope,budget"
