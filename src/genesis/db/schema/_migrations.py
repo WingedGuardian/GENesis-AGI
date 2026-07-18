@@ -1518,6 +1518,35 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "approval_requests.chain_hash",
     )
 
+    # ego_directives: kind='decision' rows (durable user rulings) — see
+    # 0066_ego_directive_decisions.py. These MUST be added here (the base
+    # create_all_tables path) and not only in the numbered migration, because
+    # create_all_tables builds INDEXES (incl. idx_ego_directives_kind_status,
+    # which references `kind`) immediately after this function — on an existing
+    # DB the CREATE TABLE is a no-op, so without this the index build hits
+    # 'no such column: kind'. schema_both_build_paths.
+    await _try_alter(
+        db,
+        "ALTER TABLE ego_directives ADD COLUMN kind TEXT NOT NULL DEFAULT 'directive' "
+        "CHECK (kind IN ('directive', 'decision'))",
+        "ego_directives.kind",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE ego_directives ADD COLUMN source_proposal_id TEXT",
+        "ego_directives.source_proposal_id",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE ego_directives ADD COLUMN reaffirm_count INTEGER NOT NULL DEFAULT 0",
+        "ego_directives.reaffirm_count",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE ego_directives ADD COLUMN last_reaffirmed_at TEXT",
+        "ego_directives.last_reaffirmed_at",
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.
