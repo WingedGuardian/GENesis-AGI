@@ -35,6 +35,13 @@ async def create_all_tables(db: aiosqlite.Connection) -> None:
     # Schema migrations BEFORE indexes — migrations add columns that indexes may reference
     await _migrate_add_columns(db)
 
+    # INVARIANT: every column an entry below references must already exist here —
+    # i.e. it is in a canonical CREATE TABLE above OR added by
+    # _migrate_add_columns. A legacy DB only has the numbered-migration runner
+    # AFTER this point (runtime/init/db.py), so indexing a column that only a
+    # numbered migration adds crashes bootstrap before that migration runs (the
+    # #1123/#1127 class). tests/test_db/test_schema_base_path_parity.py guards it.
+
     for idx in INDEXES:
         await db.execute(idx)
 
