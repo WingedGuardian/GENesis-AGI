@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The morning report's numbers are real now.** Report generation previously
+  counted truncated display lists (reporting "5 follow-ups" when 268 existed),
+  sometimes inverted protective facts into alarms (an active OOM-protection
+  service reported as an OOM risk), and — worst — the carefully grounded
+  draft was silently re-drafted by a generic model with no grounding rules
+  before delivery. The report context now opens with an authoritative
+  Ground Truth section of exact totals, truncated lists are labeled
+  "showing N of M", protective mechanisms are tagged so they can't be read
+  as risks, and the grounded draft is delivered as-is (single draft pass).
+
 - **Demoted autonomy can actually earn its way back now.** Earn-back
   eligibility used to be computed over a category's entire lifetime record,
   so after a rough patch the math could require months of flawless behavior

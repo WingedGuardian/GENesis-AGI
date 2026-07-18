@@ -191,6 +191,11 @@ class MorningReportGenerator:
             context=draft.content.text,
             salience_score=0.0,
             signal_type="morning_report",
+            # The draft above ran with the MORNING_REPORT.md system prompt
+            # against grounded context. Without verbatim, the pipeline
+            # re-drafts it through the generic drafter (system_prompt=None),
+            # un-grounding every number. Formatter still applies.
+            verbatim=True,
         )
 
     async def confirm_delivery(self) -> None:
@@ -241,6 +246,16 @@ class MorningReportGenerator:
 
     async def _assemble_context(self) -> str:
         sections: list[str] = []
+
+        # 0. Ground truth — deterministic totals, assembled before any list
+        # section. List sections below are TRUNCATED SAMPLES; these numbers
+        # are the authoritative counts the report must restate exactly.
+        try:
+            ground = await self._ground_truth_section()
+            sections.append(ground)
+        except Exception:
+            logger.warning("Morning report: ground truth unavailable", exc_info=True)
+            await self._emit_warning("ground_truth", "Ground-truth totals unavailable")
 
         # 1. System Health
         try:
@@ -343,6 +358,71 @@ class MorningReportGenerator:
             logger.warning("Morning report: standing items unavailable", exc_info=True)
 
         return "\n\n".join(sections)
+
+    async def _ground_truth_section(self) -> str:
+        """Deterministic SQL totals — the report's authoritative numbers.
+
+        Every count here is a full COUNT/len over the un-truncated query,
+        never the length of a display slice. The system prompt instructs
+        the drafter to restate these exactly and never derive totals from
+        the (truncated) list sections.
+        """
+        from genesis.db.crud import approval_requests as approval_crud
+        from genesis.db.crud import ego as ego_crud
+        from genesis.db.crud import follow_ups
+        from genesis.db.crud.observations import count_unsurfaced
+
+        lines = [
+            "## Ground Truth (authoritative totals — restate these EXACTLY; "
+            "the list sections below are truncated samples)",
+        ]
+
+        # Same queries the list sections run (un-truncated lens), so these
+        # totals can never disagree with the samples below.
+        try:
+            needs_input = len(await follow_ups.get_pending(
+                self._db, strategy="user_input_needed", domain="user_world",
+            ))
+            pending_all = len(await follow_ups.get_pending(
+                self._db, domain="user_world",
+            ))
+            blocked = len(await follow_ups.get_by_status(
+                self._db, "blocked", domain="user_world",
+            ))
+            failed = len(await follow_ups.get_by_status(
+                self._db, "failed", domain="user_world",
+            ))
+            lines.append(
+                f"- Follow-ups (user-world): {needs_input} awaiting your "
+                f"input, {pending_all} pending total, {blocked} blocked, "
+                f"{failed} failed"
+            )
+        except Exception:
+            logger.warning("Ground truth: follow-up counts failed", exc_info=True)
+
+        try:
+            proposals = await ego_crud.list_pending_proposals(self._db)
+            lines.append(f"- Pending ego proposals: {len(proposals)}")
+        except Exception:
+            logger.warning("Ground truth: proposal count failed", exc_info=True)
+
+        try:
+            approvals = await approval_crud.list_pending(self._db)
+            lines.append(f"- Pending approval requests: {len(approvals)}")
+        except Exception:
+            logger.warning("Ground truth: approval count failed", exc_info=True)
+
+        try:
+            unsurfaced = await count_unsurfaced(
+                self._db,
+                priority_filter=("critical", "high", "medium"),
+                exclude_types=_INTERNAL_OBS_TYPES,
+            )
+            lines.append(f"- Unsurfaced observations (worth attention): {unsurfaced}")
+        except Exception:
+            logger.warning("Ground truth: observation count failed", exc_info=True)
+
+        return "\n".join(lines)
 
     async def _emit_warning(self, section: str, message: str) -> None:
         if not self._event_bus:
@@ -637,11 +717,16 @@ class MorningReportGenerator:
         # Pending ego proposals (user needs to approve/reject on dashboard)
         try:
             proposals = await ego_crud.list_pending_proposals(self._db)
+            total_proposals = len(proposals)
             proposals = proposals[:5]
             if proposals:
+                shown = (
+                    f" (showing {len(proposals)} of {total_proposals})"
+                    if total_proposals > len(proposals) else ""
+                )
                 lines.append(
-                    f"- {len(proposals)} pending ego proposal(s) "
-                    "(approve/reject on dashboard):"
+                    f"- {total_proposals} pending ego proposal(s) "
+                    f"(approve/reject on dashboard){shown}:"
                 )
                 for p in proposals:
                     lines.append(
@@ -656,10 +741,15 @@ class MorningReportGenerator:
         # Pending approval requests
         try:
             approvals = await approval_crud.list_pending(self._db)
+            total_approvals = len(approvals)
             approvals = approvals[:5]
             if approvals:
+                shown = (
+                    f" (showing {len(approvals)} of {total_approvals})"
+                    if total_approvals > len(approvals) else ""
+                )
                 lines.append(
-                    f"- {len(approvals)} pending approval request(s):"
+                    f"- {total_approvals} pending approval request(s){shown}:"
                 )
                 for a in approvals:
                     lines.append(f"  - {(a.get('description') or '?')[:150]}")
@@ -684,7 +774,10 @@ class MorningReportGenerator:
             self._db, strategy="user_input_needed", domain="user_world",
         )
         if user_items:
-            lines.append("**Needs your input:**")
+            shown = (
+                f" (showing 5 of {len(user_items)})" if len(user_items) > 5 else ""
+            )
+            lines.append(f"**Needs your input ({len(user_items)} total){shown}:**")
             for fu in user_items[:5]:
                 lines.append(
                     f"- {fu['content'][:200]} ({_relative_age(fu.get('created_at', ''))})"
@@ -694,7 +787,10 @@ class MorningReportGenerator:
         blocked = await follow_ups.get_by_status(self._db, "failed", domain="user_world")
         blocked += await follow_ups.get_by_status(self._db, "blocked", domain="user_world")
         if blocked:
-            lines.append("**Blocked/failed:**")
+            shown = (
+                f" (showing 5 of {len(blocked)})" if len(blocked) > 5 else ""
+            )
+            lines.append(f"**Blocked/failed ({len(blocked)} total){shown}:**")
             for fu in blocked[:5]:
                 reason = fu.get("blocked_reason", "") or "no reason recorded"
                 lines.append(
@@ -728,7 +824,13 @@ class MorningReportGenerator:
         if not resolved:
             return None
 
-        lines = [f"Ego resolved {len(resolved)} inbox follow-up(s) this week:"]
+        header_shown = (
+            f" (showing 10 of {len(resolved)})" if len(resolved) > 10 else ""
+        )
+        lines = [
+            f"Ego resolved {len(resolved)} inbox follow-up(s) this week"
+            f"{header_shown}:"
+        ]
         for fu in resolved[:10]:
             content = (fu.get("content") or "?")[:150]
             notes = (fu.get("resolution_notes") or "no notes")[:100]
@@ -807,6 +909,26 @@ class MorningReportGenerator:
 
         return "\n".join(lines)
 
+    # Fact-name → note map for conditions that are PROTECTIVE, not risks.
+    # Install-agnostic (matched against observation content, lowercase):
+    # the drafter has repeatedly inverted these into alarms ("systemd-oomd
+    # active" reported as an OOM risk).
+    _PROTECTIVE_FACTS: dict[str, str] = {
+        "systemd-oomd": "OOM-protection service — its presence is protective",
+        "earlyoom": "OOM-protection service — its presence is protective",
+        "zram": "compressed-swap protection — its presence is protective",
+        "swap enabled": "swap protection — its presence is protective",
+    }
+
+    def _protective_tag(self, content: str) -> str:
+        """Return ' [protective: …]' when the observation cites a known
+        protective mechanism, else ''."""
+        lowered = content.lower()
+        for fact, note in self._PROTECTIVE_FACTS.items():
+            if fact in lowered:
+                return f" [protective: {note}]"
+        return ""
+
     async def _get_observation_insights(self) -> str | None:
         """Surface unsurfaced observations that deserve user attention.
 
@@ -840,7 +962,10 @@ class MorningReportGenerator:
             badge = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(prio, "")
             content = obs["content"][:200].replace("\n", " ")
             age = _relative_age(obs.get("created_at", ""))
-            lines.append(f"- {badge} **{prio}**{aged} ({age}): {content}")
+            protective = self._protective_tag(content)
+            lines.append(
+                f"- {badge} **{prio}**{aged} ({age}): {content}{protective}"
+            )
 
         # Defer surfacing until delivery is confirmed via confirm_delivery().
         # If delivery fails, these observations re-appear in the next report.

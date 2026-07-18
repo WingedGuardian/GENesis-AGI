@@ -580,3 +580,85 @@ def test_goal_autonomous_action_is_user_visible():
 
     assert "goal_autonomous_action" not in INTERNAL_OBS_TYPES
     assert "goal_recommendation" not in INTERNAL_OBS_TYPES
+
+
+# ── Grounding (PR morning-report-grounding) ────────────────────────────────
+
+
+async def test_report_request_is_verbatim(db, mock_health, mock_drafter):
+    """The grounded draft IS the report — the pipeline must not re-draft it
+    through the generic drafter (which runs with system_prompt=None)."""
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    request = await gen.generate()
+    assert request.verbatim is True
+
+
+async def test_ground_truth_totals_precede_truncated_lists(db, mock_health, mock_drafter):
+    """Authoritative totals render from un-truncated queries; the pending
+    list shows 'showing 5 of N' rather than presenting the slice as the
+    count."""
+    from genesis.db.crud import ego as ego_crud
+
+    for i in range(7):
+        await ego_crud.create_proposal(
+            db, id=f"gt-{i}", action_type="t", content=f"proposal {i}",
+        )
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    context = await gen._assemble_context()
+
+    assert "## Ground Truth" in context
+    assert "- Pending ego proposals: 7" in context
+    assert "7 pending ego proposal(s)" in context
+    assert "(showing 5 of 7)" in context
+    # Ground truth section renders before any list section
+    assert context.index("## Ground Truth") < context.index("## Pending Items")
+
+
+async def test_ground_truth_follow_up_counts(db, mock_health, mock_drafter):
+    from genesis.db.crud import follow_ups
+
+    for i in range(8):
+        await follow_ups.create(
+            db,
+            id=f"fu-{i}",
+            content=f"item {i}",
+            source="test",
+            strategy="user_input_needed" if i < 3 else "ego_judgment",
+            domain="user_world",
+        )
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    context = await gen._assemble_context()
+    assert "3 awaiting your input, 8 pending total" in context
+
+
+async def test_protective_fact_tagged(db, mock_health, mock_drafter):
+    """A protective mechanism observation carries the [protective: …] tag so
+    the drafter cannot invert it into an active risk."""
+    import uuid as _uuid
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+
+    await observations.create(
+        db,
+        id=str(_uuid.uuid4()),
+        source="awareness",
+        type="infra_posture",
+        content="systemd-oomd is active and monitoring memory pressure",
+        priority="high",
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    context = await gen._assemble_context()
+    assert "[protective:" in context
+
+
+async def test_prompt_contract_grounding_rules():
+    """MORNING_REPORT.md carries the counts-are-totals + polarity rules."""
+    from genesis.outreach.morning_report import MorningReportGenerator as G
+
+    prompt = G._load_system_prompt()
+    assert prompt is not None
+    assert "Ground Truth" in prompt
+    assert "Never derive a total from a list section" in prompt
+    assert "Protective facts are never risks" in prompt
