@@ -475,11 +475,32 @@ async def outreach_engagement(
     signal: str,
     channel: str | None = None,
 ) -> bool:
-    """Record engagement event (delivered, opened, replied, acted_on, ignored)."""
+    """Record an engagement OUTCOME (useful, engaged, acted_on, acknowledged,
+    not_useful, ambivalent, ignored; 'replied' maps to 'useful').
+
+    Lifecycle events like 'delivered'/'opened' are not outcomes and are
+    rejected — the outreach_history CHECK now enforces the vocabulary
+    (WS-2 P1b), so an unvalidated write would crash instead of recording.
+    """
     if not _db:
         return False
     from genesis.db.crud import outreach as crud
-    await crud.record_engagement(_db, outreach_id, engagement_outcome=signal, engagement_signal=signal)
+    from genesis.outreach.types import ENGAGEMENT_OUTCOME_ALIASES, ENGAGEMENT_OUTCOMES
+
+    outcome = ENGAGEMENT_OUTCOME_ALIASES.get(signal, signal)
+    if outcome not in ENGAGEMENT_OUTCOMES:
+        logger.warning(
+            "outreach_engagement: rejected non-outcome signal %r for %s",
+            signal, outreach_id,
+        )
+        return False
+    # Normalize the signal too: the ledger's reply_received resolver treats
+    # only engagement_signal='user_reply' as an actual reply — a stored
+    # 'replied' would grade as no-reply at deadline (Codex P2, #1109).
+    normalized_signal = "user_reply" if signal == "replied" else signal
+    await crud.record_engagement(
+        _db, outreach_id, engagement_outcome=outcome, engagement_signal=normalized_signal
+    )
     return True
 
 

@@ -636,6 +636,124 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             exc_info=True,
         )
 
+    # WS-2 P1b (f/u 54e0fa72): make the engagement_outcome CHECK actually
+    # enforce.  The original constraint `IN (..., NULL)` is a no-op — SQL
+    # three-valued logic makes every non-matching value compare NULL, which
+    # PASSES a CHECK — so writers drifted the vocabulary for months (live
+    # census: acknowledged/acted_on/'' rows on an "enforced" column).  Same
+    # rebuild pattern as above.  The category CHECK text is copied VERBATIM
+    # from the 'notification' rebuild — the three probes above match on
+    # exact DDL fragments, and changing that text would re-trigger an older
+    # rebuild on next boot and undo this one.  The copy normalizes drift:
+    # legacy 'replied' (MCP passthrough) maps to 'useful'; '' and unknown
+    # junk (writable only because the CHECK never enforced) become NULL.
+    _ENGAGED_FRAGMENT = "'engaged'"
+    _CANONICAL_OUTCOMES_SQL = (
+        "'useful', 'engaged', 'acted_on', 'acknowledged', "
+        "'not_useful', 'ambivalent', 'ignored'"
+    )
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='outreach_history'"
+        )
+        row = await cursor.fetchone()
+        if row and _ENGAGED_FRAGMENT not in (row[0] or ""):
+            # Clean up an orphaned temp table from any prior failed rebuild
+            await db.execute("DROP TABLE IF EXISTS outreach_history_new")
+            await db.execute("""
+                CREATE TABLE outreach_history_new (
+                    id                  TEXT PRIMARY KEY,
+                    person_id           TEXT,
+                    signal_type         TEXT NOT NULL,
+                    topic               TEXT NOT NULL,
+                    category            TEXT NOT NULL CHECK (category IN (
+                        'blocker', 'alert', 'finding', 'insight', 'opportunity',
+                        'digest', 'surplus', 'approval', 'content', 'notification'
+                    )),
+                    salience_score      REAL NOT NULL,
+                    channel             TEXT NOT NULL,
+                    message_content     TEXT NOT NULL,
+                    drive_alignment     TEXT,
+                    labeled_surplus     INTEGER DEFAULT 0,
+                    content_hash        TEXT,
+                    delivery_id         TEXT,
+                    delivered_at        TEXT,
+                    opened_at           TEXT,
+                    user_response       TEXT,
+                    action_taken        TEXT,
+                    engagement_outcome  TEXT CHECK (
+                        engagement_outcome IS NULL OR engagement_outcome IN (
+                        'useful', 'engaged', 'acted_on', 'acknowledged',
+                        'not_useful', 'ambivalent', 'ignored'
+                    )),
+                    engagement_signal   TEXT,
+                    prediction_error    REAL,
+                    created_at          TEXT NOT NULL
+                )
+            """)
+            await db.execute(f"""
+                INSERT INTO outreach_history_new
+                    (id, person_id, signal_type, topic, category, salience_score,
+                     channel, message_content, drive_alignment, labeled_surplus,
+                     content_hash, delivery_id, delivered_at, opened_at,
+                     user_response, action_taken, engagement_outcome,
+                     engagement_signal, prediction_error, created_at)
+                SELECT
+                     id, person_id, signal_type, topic, category, salience_score,
+                     channel, message_content, drive_alignment, labeled_surplus,
+                     content_hash, delivery_id, delivered_at, opened_at,
+                     user_response, action_taken,
+                     CASE
+                         WHEN engagement_outcome IN ({_CANONICAL_OUTCOMES_SQL})
+                             THEN engagement_outcome
+                         WHEN engagement_outcome = 'replied' THEN 'useful'
+                         ELSE NULL
+                     END,
+                     engagement_signal, prediction_error, created_at
+                FROM outreach_history
+            """)  # noqa: S608 — interpolant is a module-local literal constant
+            await db.execute("DROP TABLE outreach_history")
+            await db.execute(
+                "ALTER TABLE outreach_history_new RENAME TO outreach_history"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_channel "
+                "ON outreach_history(channel)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_category "
+                "ON outreach_history(category)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_delivered "
+                "ON outreach_history(delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_outcome "
+                "ON outreach_history(engagement_outcome)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_dedup "
+                "ON outreach_history(signal_type, topic, category, delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_content_hash "
+                "ON outreach_history(signal_type, category, content_hash, delivered_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outreach_person "
+                "ON outreach_history(person_id)"
+            )
+            await db.commit()
+            logger.info(
+                "outreach_history table rebuilt with enforcing engagement_outcome CHECK"
+            )
+    except Exception:
+        logger.error(
+            "outreach_history CHECK constraint migration (engagement_outcome) failed",
+            exc_info=True,
+        )
+
     # Memory photographic: extraction watermark tracking on cc_sessions
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_at TEXT",

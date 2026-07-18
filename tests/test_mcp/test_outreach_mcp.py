@@ -458,3 +458,45 @@ async def test_init_schedules_ensure_table_via_tracked_task():
     finally:
         mcp_mod._pipeline = old_pipeline
         mcp_mod._db = old_db
+
+
+# ── WS-2 P1b: outreach_engagement vocabulary guard ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_engagement_rejects_lifecycle_and_normalizes_replied(monkeypatch):
+    """The enforcing engagement_outcome CHECK means raw passthrough would
+    crash — lifecycle values are rejected; legacy 'replied' normalizes BOTH
+    fields ('useful' outcome + 'user_reply' signal, or the ledger's
+    reply_received resolver would grade a real reply as no-reply)."""
+    import genesis.mcp.outreach_mcp as mcp_mod
+
+    calls = []
+
+    async def _fake_record(db, outreach_id, **kwargs):
+        calls.append((outreach_id, kwargs))
+
+    monkeypatch.setattr(
+        "genesis.db.crud.outreach.record_engagement", _fake_record
+    )
+    old_db = mcp_mod._db
+    try:
+        mcp_mod._db = object()  # truthy stand-in; crud is patched
+
+        assert await mcp_mod.outreach_engagement.fn("o-1", "delivered") is False
+        assert await mcp_mod.outreach_engagement.fn("o-1", "opened") is False
+        assert calls == []
+
+        assert await mcp_mod.outreach_engagement.fn("o-1", "replied") is True
+        assert calls[-1] == (
+            "o-1",
+            {"engagement_outcome": "useful", "engagement_signal": "user_reply"},
+        )
+
+        assert await mcp_mod.outreach_engagement.fn("o-2", "acted_on") is True
+        assert calls[-1] == (
+            "o-2",
+            {"engagement_outcome": "acted_on", "engagement_signal": "acted_on"},
+        )
+    finally:
+        mcp_mod._db = old_db

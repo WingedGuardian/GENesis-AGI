@@ -69,6 +69,23 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     monkeypatch.setattr(cb_mod, "_STATE_FILE", tmp_path / "cb_state.json")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ledger_write_failures():
+    """Reset the ledger writer-failure counter around every test (WS-2 P1b).
+
+    ``genesis.ledger.writers._write_failures`` is a process-global Counter —
+    correct for production (it accumulates failures since process start, read
+    by ``_compute_alerts``), but it leaks across tests: a hook-failure test
+    would otherwise make an unrelated health-alert test see a stray
+    ``ledger:write_failed`` alert. Clear it before and after each test.
+    """
+    from genesis.ledger import writers as _ledger_writers
+
+    _ledger_writers._write_failures.clear()
+    yield
+    _ledger_writers._write_failures.clear()
+
+
 @pytest.fixture
 async def db():
     """In-memory SQLite database with all tables created and seeded."""

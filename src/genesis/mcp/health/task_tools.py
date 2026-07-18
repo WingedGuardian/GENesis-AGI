@@ -121,7 +121,12 @@ async def _impl_intake_complete() -> dict:
             await db.close()
 
 
-async def _impl_task_submit(plan_path: str, description: str, intake_token: str | None = None) -> dict:
+async def _impl_task_submit(
+    plan_path: str,
+    description: str,
+    intake_token: str | None = None,
+    stated_confidence: float | None = None,
+) -> dict:
     """Submit a task for autonomous execution.
 
     When the dispatcher is wired (in-server), uses it directly.
@@ -139,7 +144,12 @@ async def _impl_task_submit(plan_path: str, description: str, intake_token: str 
     # In-server path: use dispatcher directly
     if _dispatcher is not None:
         try:
-            task_id = await _dispatcher.submit(plan_path, description, intake_token=intake_token)
+            task_id = await _dispatcher.submit(
+                plan_path,
+                description,
+                intake_token=intake_token,
+                stated_confidence=stated_confidence,
+            )
             return {"task_id": task_id, "status": "dispatched"}
         except ValueError as exc:
             return {"error": str(exc)}
@@ -176,6 +186,14 @@ async def _impl_task_submit(plan_path: str, description: str, intake_token: str 
     try:
         from genesis.db.crud import task_states
 
+        # WS-2 P1b: optional stated-confidence seam — JSON envelope only when
+        # provided (the executor parses both forms).
+        outputs = str(resolved)
+        if stated_confidence is not None:
+            outputs = json.dumps(
+                {"plan_path": outputs, "stated_confidence": float(stated_confidence)}
+            )
+
         db = await _get_db()
         try:
             # task_states.create() auto-commits
@@ -186,7 +204,7 @@ async def _impl_task_submit(plan_path: str, description: str, intake_token: str 
                 current_phase="pending",
                 decisions=None,
                 blockers=None,
-                outputs=str(resolved),
+                outputs=outputs,
                 session_id=None,
                 intake_token=intake_token,
                 created_at=now,
@@ -364,7 +382,12 @@ async def intake_complete() -> dict:
 
 
 @mcp.tool()
-async def task_submit(plan_path: str, description: str, intake_token: str = "") -> dict:
+async def task_submit(
+    plan_path: str,
+    description: str,
+    intake_token: str = "",
+    stated_confidence: float = 0.0,
+) -> dict:
     """Submit a task for autonomous background execution.
 
     Provide the path to an approved plan file, a brief description, and
@@ -375,8 +398,17 @@ async def task_submit(plan_path: str, description: str, intake_token: str = "") 
     Plan files must be in ~/.genesis/plans/ or ~/.claude/plans/.
     The intake_token is required — generate it via intake_complete after
     completing the /task guided intake process.
+
+    stated_confidence (optional, 0.01-0.99): your probability that this task
+    completes successfully — recorded as a falsifiable ledger prediction and
+    graded mechanically at deadline. Omit (0.0) to ride the policy-prior lane.
     """
-    return await _impl_task_submit(plan_path, description, intake_token=intake_token or None)
+    return await _impl_task_submit(
+        plan_path,
+        description,
+        intake_token=intake_token or None,
+        stated_confidence=stated_confidence or None,
+    )
 
 
 @mcp.tool()

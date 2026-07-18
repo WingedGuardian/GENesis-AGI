@@ -28,10 +28,11 @@ async def db(tmp_path):
     path = str(tmp_path / "harvest.db")
     async with aiosqlite.connect(path) as conn:
         await create_all_tables(conn)
-        # Live prod carries engagement_outcome values ('acted_on', 'acknowledged',
-        # '') that violate the current CHECK — the harvester must handle data that
-        # already exists. Disable CHECK enforcement so the fixture can reproduce
-        # that real-world condition.
+        # WS-2 P1b made the engagement_outcome CHECK enforce, and the rebuild
+        # normalizes legacy '' rows to NULL — but this suite deliberately
+        # keeps enforcement OFF because it pins the harvester's tolerance of
+        # PRE-rebuild data (the '' row below): a restored old backup or an
+        # install crashing mid-upgrade must still harvest cleanly.
         await conn.execute("PRAGMA ignore_check_constraints = ON")
         await conn.commit()
         yield conn

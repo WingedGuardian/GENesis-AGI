@@ -458,3 +458,28 @@ class TestValidateBatch:
         proposals = [{"action_type": "investigate", "confidence": 0.85, "content": "review API latency trends", "rationale": "Latency p99 has been climbing for 3 days"}]
         issues = await workflow_with_db.validate_batch(proposals)
         assert issues == []
+
+
+# ---------------------------------------------------------------------------
+# WS-2 P1b: ledger prediction hook fires from the create_batch call site
+# ---------------------------------------------------------------------------
+
+
+class TestLedgerHookWiring:
+    async def test_create_batch_writes_prediction_per_proposal(self, workflow, db):
+        from genesis.db.crud import ledger_predictions
+        from genesis.db.schema import TABLES as _ALL_TABLES
+
+        # the suite's shared fixture builds only the ego tables
+        await db.execute(_ALL_TABLES["ledger_predictions"])
+
+        _batch_id, ids, _ = await workflow.create_batch(
+            _sample_proposals(2), cycle_id="cycle-ledger",
+        )
+        assert len(ids) == 2
+        for pid in ids:
+            (row,) = await ledger_predictions.list_by_subject(
+                db, action_class="ego_proposal", subject_ref_id=pid,
+            )
+            assert row["metric"] == "approved_and_executes"
+            assert row["domain"].startswith("ego.")

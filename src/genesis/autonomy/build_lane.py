@@ -180,9 +180,10 @@ class BuildLane:
             extra_context=extra,
         )
 
+        candidate_id = _new_id()
         await build_candidates.create(
             self._db,
-            id=_new_id(),
+            id=candidate_id,
             item_key=key,
             item_title=title,
             source_file=source_file,
@@ -195,6 +196,7 @@ class BuildLane:
             plan_path=plan_path,
             approval_request_id=request_id,
         )
+        await self._ledger_hook(candidate_id, "build", rec.confidence)
         logger.info(
             "build_lane: greenlight card sent for %s (candidate carded, req=%s)",
             title, request_id,
@@ -206,9 +208,10 @@ class BuildLane:
         source_file: str, batch_id: str, eval_path: str | None,
     ) -> int:
         """Record a report-only calibration row (no card, no plan)."""
+        candidate_id = _new_id()
         await build_candidates.create(
             self._db,
-            id=_new_id(),
+            id=candidate_id,
             item_key=key,
             item_title=title,
             source_file=source_file,
@@ -219,8 +222,28 @@ class BuildLane:
             confidence=rec.confidence,
             build_spec=json.dumps(rec.build_spec) if rec.build_spec else None,
         )
+        await self._ledger_hook(candidate_id, verdict, rec.confidence)
         logger.info("build_lane: recorded %s calibration row for %s", verdict, title)
         return 1
+
+    async def _ledger_hook(
+        self, candidate_id: str, verdict: str, confidence_label: str | None,
+    ) -> None:
+        """WS-2 P1b: user_greenlights prediction for BOTH create sites — the
+        carded 'build' path AND the report-only calibration path (a
+        dont_build/needs_discussion verdict predicts the complement). Wrapped
+        so even an import failure can never break the lane."""
+        try:
+            from genesis.ledger.writers import on_build_verdict
+
+            await on_build_verdict(
+                self._db,
+                candidate_id=candidate_id,
+                verdict=verdict,
+                confidence_label=confidence_label,
+            )
+        except Exception:  # noqa: BLE001 — ledger is best-effort
+            logger.debug("ledger prediction hook failed", exc_info=True)
 
     # -- plan materialization --------------------------------------------
 

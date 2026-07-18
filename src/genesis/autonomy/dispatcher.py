@@ -13,6 +13,7 @@ Implements:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -139,6 +140,7 @@ class TaskDispatcher:
         *,
         source: str = "user",
         intake_token: str | None = None,
+        stated_confidence: float | None = None,
     ) -> str:
         """Submit a task for immediate execution.
 
@@ -174,6 +176,15 @@ class TaskDispatcher:
         if intake_token is None and source != "user":
             intake_token = await self._generate_intake_token()
 
+        # WS-2 P1b: optional stated-confidence seam. Only when provided does
+        # outputs become a JSON envelope (the executor parses both forms);
+        # omitted → plain string, zero behavior change for existing callers.
+        outputs = str(resolved_path)
+        if stated_confidence is not None:
+            outputs = json.dumps(
+                {"plan_path": outputs, "stated_confidence": float(stated_confidence)}
+            )
+
         await task_states.create(
             self._db,
             task_id=task_id,
@@ -181,7 +192,7 @@ class TaskDispatcher:
             current_phase=TaskPhase.PENDING.value,
             decisions=None,
             blockers=None,
-            outputs=str(resolved_path),
+            outputs=outputs,
             session_id=None,
             intake_token=intake_token,
             source=source,

@@ -1493,3 +1493,90 @@ class TestDispatchClaim:
         engine._pause_events["t-001"].set()
         assert await asyncio.wait_for(task, timeout=5.0) is True
         mock_reviewer.verify_deliverable.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# WS-2 P1b: ledger prediction hook + T1 outcome-bus emits
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLedgerAndBusEmits:
+    async def _outcome_events(self, db, task_id):
+        cur = await db.execute(
+            "SELECT polarity, value FROM outcome_events WHERE source='autonomy'"
+            " AND ref_type='task' AND ref_id=? AND signal_type='execution_outcome'",
+            (task_id,),
+        )
+        return [tuple(r) for r in await cur.fetchall()]
+
+    async def _predictions(self, db, task_id):
+        from genesis.db.crud import ledger_predictions
+
+        return await ledger_predictions.list_by_subject(
+            db, action_class="task_execution", subject_ref_id=task_id,
+        )
+
+    async def test_claim_writes_predictions_and_completion_emits_positive(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        assert await engine.execute("t-001") is True
+
+        rows = await self._predictions(db, "t-001")
+        assert {r["metric"] for r in rows} == {"completed", "completed_first_attempt"}
+        assert all(r["provenance"] == "policy_prior" for r in rows)
+        assert all(r["domain"] == "task.user" for r in rows)
+
+        # positive T1 emit landed exactly once
+        assert await self._outcome_events(db, "t-001") == [("positive", 1.0)]
+
+    async def test_stated_confidence_envelope_threads_to_predictions(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        envelope = json.dumps({"plan_path": plan_file, "stated_confidence": 0.8})
+        await _seed_task(db, plan_path=envelope)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        assert await engine.execute("t-001") is True
+        rows = await self._predictions(db, "t-001")
+        assert rows and all(
+            r["provenance"] == "stated" and r["confidence"] == 0.8 for r in rows
+        )
+
+    async def test_fail_task_emits_negative_once_even_when_double_invoked(
+        self, db, mock_invoker, mock_decomposer, mock_reviewer,
+    ):
+        await _seed_task(db, plan_path="/nonexistent/plan.md")
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        assert await engine.execute("t-001") is False
+        # pre-claim failure: no predictions were written (nothing was claimed)
+        assert await self._predictions(db, "t-001") == []
+        # the negative emit landed
+        assert await self._outcome_events(db, "t-001") == [("negative", 0.0)]
+
+        # double invoke (the known direct-call + exception-handler path):
+        # terminal-state guard + idempotent bus key -> still exactly one row
+        await engine._fail_task("t-001", "again")
+        assert await self._outcome_events(db, "t-001") == [("negative", 0.0)]
+
+    async def test_ledger_hook_failure_never_blocks_execution(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess, monkeypatch,
+    ):
+        from genesis.ledger import writers as ledger_writers
+
+        async def _boom(*a, **k):
+            raise RuntimeError("ledger down")
+
+        monkeypatch.setattr(ledger_writers, "on_task_claimed", _boom)
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        assert await engine.execute("t-001") is True
+        assert await self._predictions(db, "t-001") == []

@@ -296,6 +296,21 @@ class ProposalWorkflow:
             ids.append(pid)
             created_proposals.append(p)
 
+            # WS-2 P1b: approved_and_executes prediction per created proposal
+            # (dedup-skipped proposals above never reach here). Wrapped so
+            # even an import failure can never break the batch.
+            try:
+                from genesis.ledger.writers import on_ego_proposal
+
+                await on_ego_proposal(
+                    self._db,
+                    proposal_id=pid,
+                    action_type=p.get("action_type", "unknown"),
+                    confidence=float(p.get("confidence", 0.0)),
+                )
+            except Exception:  # noqa: BLE001 — ledger is best-effort
+                logger.debug("ledger prediction hook failed", exc_info=True)
+
         logger.info(
             "Created ego proposal batch %s with %d proposals",
             batch_id,

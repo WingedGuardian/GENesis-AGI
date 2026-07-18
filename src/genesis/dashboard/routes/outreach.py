@@ -47,6 +47,17 @@ async def outreach_engage(msg_id: str):
     outcome = data.get("outcome", "engaged")
     response = data.get("response", "")
 
+    # WS-2 P1b: the outreach_history CHECK now enforces the vocabulary —
+    # validate client input here so a bogus value 400s instead of 500ing
+    # on IntegrityError.
+    from genesis.outreach.types import ENGAGEMENT_OUTCOME_ALIASES, ENGAGEMENT_OUTCOMES
+
+    outcome = ENGAGEMENT_OUTCOME_ALIASES.get(outcome, outcome)
+    if outcome not in ENGAGEMENT_OUTCOMES:
+        return jsonify(
+            {"error": f"invalid outcome {outcome!r}", "allowed": sorted(ENGAGEMENT_OUTCOMES)}
+        ), 400
+
     now = datetime.now(UTC).isoformat()
     await rt.db.execute(
         """UPDATE outreach_history

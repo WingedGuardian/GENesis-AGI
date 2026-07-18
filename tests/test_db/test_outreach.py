@@ -43,12 +43,18 @@ async def test_list_by_channel_empty(db):
 
 async def test_record_engagement(db):
     await outreach.create(db, id="oh4", **_COMMON)
-    assert await outreach.record_engagement(
-        db, "oh4", engagement_outcome="positive",
-        engagement_signal="liked", prediction_error=0.1,
-    ) is True
+    assert (
+        await outreach.record_engagement(
+            db,
+            "oh4",
+            engagement_outcome="useful",
+            engagement_signal="user_reply",
+            prediction_error=0.1,
+        )
+        is True
+    )
     row = await outreach.get_by_id(db, "oh4")
-    assert row["engagement_outcome"] == "positive"
+    assert row["engagement_outcome"] == "useful"
 
 
 async def test_record_engagement_nonexistent(db):

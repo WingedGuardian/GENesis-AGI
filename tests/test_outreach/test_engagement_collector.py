@@ -15,10 +15,10 @@ async def db():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await create_all_tables(conn)
-    # engagement_outcome CHECK is a no-op and prod carries drifted values
-    # ('acted_on', 'acknowledged'); disable check enforcement for parity with
-    # real data (see tests/feedback/test_harvest.py).
-    await conn.execute("PRAGMA ignore_check_constraints = ON")
+    # WS-2 P1b: the engagement_outcome CHECK now ENFORCES the canonical
+    # vocabulary (acted_on/acknowledged/engaged are legal members) — this
+    # fixture runs with enforcement ON so a test writing outside the
+    # vocabulary fails here, exactly like prod would.
     yield conn
     await conn.close()
 

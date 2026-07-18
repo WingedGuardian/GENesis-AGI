@@ -917,6 +917,115 @@ async def test_submit_raw_and_wait_with_key_still_resolves(config):
     assert reply == "go"
 
 
+# ── WS-2 P1b: ledger prediction hook at the _deliver chokepoint ──────────────
+
+
+@pytest.mark.asyncio
+async def test_deliver_writes_ledger_predictions(
+    config, db, mock_drafter, mock_formatter, mock_channel,
+):
+    from genesis.db.crud import ledger_predictions
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate, drafter=mock_drafter, formatter=mock_formatter,
+        channels={"telegram": mock_channel}, db=db, config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS, topic="Ledger test",
+        context="Predict me", salience_score=0.9, signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+
+    rows = await ledger_predictions.list_by_subject(
+        db, action_class="outreach_send", subject_ref_id=result.outreach_id,
+    )
+    assert {r["metric"] for r in rows} == {"reply_received", "positive_engagement"}
+    assert all(
+        r["provenance"] == "policy_prior" and r["domain"] == "outreach.surplus"
+        for r in rows
+    )
+
+
+@pytest.mark.asyncio
+async def test_deliver_threads_stated_confidence(
+    config, db, mock_drafter, mock_formatter, mock_channel,
+):
+    from genesis.db.crud import ledger_predictions
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate, drafter=mock_drafter, formatter=mock_formatter,
+        channels={"telegram": mock_channel}, db=db, config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS, topic="Stated",
+        context="c", salience_score=0.9, signal_type="surplus_insight",
+        stated_confidence=0.3,
+    )
+    result = await pipeline.submit(req)
+    rows = await ledger_predictions.list_by_subject(
+        db, action_class="outreach_send", subject_ref_id=result.outreach_id,
+    )
+    assert rows and all(
+        r["provenance"] == "stated" and r["confidence"] == 0.3 for r in rows
+    )
+
+
+@pytest.mark.asyncio
+async def test_deliver_survives_ledger_hook_failure(
+    config, db, mock_drafter, mock_formatter, mock_channel, monkeypatch,
+):
+    from genesis.ledger import writers as ledger_writers
+
+    async def _boom(*a, **k):
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(ledger_writers, "on_outreach_delivered", _boom)
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate, drafter=mock_drafter, formatter=mock_formatter,
+        channels={"telegram": mock_channel}, db=db, config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS, topic="Survive",
+        context="c", salience_score=0.9, signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+    assert result.status == OutreachStatus.DELIVERED
+
+
+@pytest.mark.asyncio
+async def test_held_and_failed_sends_write_no_predictions(
+    config, db, mock_drafter, mock_formatter,
+):
+    """A send that never delivers must never carry a prediction (void-lane
+    hygiene: the premise didn't happen)."""
+    from genesis.db.crud import ledger_predictions
+
+    failing_channel = AsyncMock()
+    failing_channel.send_message.side_effect = RuntimeError("telegram down")
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate, drafter=mock_drafter, formatter=mock_formatter,
+        channels={"telegram": failing_channel}, db=db, config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS, topic="Fail",
+        context="c", salience_score=0.9, signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+    assert result.status != OutreachStatus.DELIVERED
+    rows = await ledger_predictions.list_by_subject(
+        db, action_class="outreach_send", subject_ref_id=result.outreach_id,
+    )
+    assert rows == []
+
+
 @pytest.mark.asyncio
 async def test_inflight_awaited_concurrent_duplicate_suppressed(config):
     """While an awaited approval is pending, a second identical one is
