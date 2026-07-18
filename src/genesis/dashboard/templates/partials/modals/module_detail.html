@@ -251,6 +251,9 @@
                     fields.forEach(f => {
                       // Secret fields: only include if user typed a value
                       if (f.type === 'secret') { if (f.value) updates[f.name] = f.value; }
+                      // Masked sensitive field left untouched (value===null): skip so
+                      // we don't overwrite the stored value with null.
+                      else if (f.sensitive && f.value === null) { /* skip */ }
                       else updates[f.name] = f.value;
                     });
                     fetch('/api/genesis/modules/' + $store.genesisDashboard.selectedModule.name + '/config', {
