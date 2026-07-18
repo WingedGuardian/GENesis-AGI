@@ -9,6 +9,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Demoted autonomy can actually earn its way back now.** Earn-back
+  eligibility used to be computed over a category's entire lifetime record,
+  so after a rough patch the math could require months of flawless behavior
+  before Genesis would even *propose* restoring a level — in practice the
+  demotion was permanent and the system nagged about it forever. Eligibility
+  now looks at a recent evidence window (45 days by default,
+  `earnback.window_days` in `config/autonomy.yaml`): old mistakes age out,
+  recent clean behavior counts, and promotion still always requires your
+  explicit approval. While an earn-back proposal is sitting in your queue,
+  the internal "autonomy regressed" alarm also calms down instead of firing
+  on every awareness tick.
+
 ### Added
 
 - **Genesis now tidies near-duplicate entities in its knowledge graph.** When
