@@ -42,6 +42,17 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "surplus_opportunity": 24,
     "content_review": 1,  # Short window — distinct content pieces may share topics
     "cli_approval": 0,  # Never dedup — every approval request must be delivered
+    # Provisioning approvals + outcomes — same "must always deliver" class as
+    # cli_approval (#143). A synchronous, user-initiated grow approval that
+    # times out UNANSWERED still leaves a delivered_at row; at the 24h default
+    # that row then REJECTs the retry for 24h (observed 2026-07-18, Phase-C:
+    # a second provision_grow returned instantly denied). No autonomous
+    # re-asker exists on this path — the only callers of grow_via_pipeline are
+    # the synchronous MCP tool + dashboard route; the guardian pool-crit
+    # propose path is host-side and independently ledger-damped — so 0 is safe.
+    # Outcomes are distinct operational status events, like task_* below.
+    "provision_approval": 0,
+    "provision_outcome": 0,
     "ambient_health": 0,  # Never dedup — the monitor's state machine gates re-alerts/recovery
     # Task lifecycle notifications — never dedup. Each is a distinct status
     # event for one task (topic = "Task <id>"), and every _notify call site
