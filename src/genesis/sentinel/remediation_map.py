@@ -230,6 +230,16 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "level observability signal for the developer/ego to fix at the "
         "source; waking the Sentinel would achieve nothing."
     ),
+    "ledger:metric_vanished:": (
+        "A cognitive-ledger prediction references a metric no longer in the "
+        "code registry (WS-2 P2 grader) — schema-vs-code drift for a developer "
+        "to fix at the source, not an infra fault. WARNING-level observability."
+    ),
+    "ledger:grade_failed:": (
+        "A cognitive-ledger resolver raised during grading (WS-2 P2) — a code "
+        "bug or malformed evidence for the developer/ego to fix, not something "
+        "the firefighter can auto-heal. WARNING-level observability."
+    ),
 }
 
 

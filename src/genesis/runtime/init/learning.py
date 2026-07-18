@@ -1079,6 +1079,37 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _run_ledger_grader() -> None:
+            # WS-2 P2: mechanically grade open predictions past their deadline.
+            # Reads evidence straight off state tables (outreach_history,
+            # task_states, job_run_events, build_candidates, ego_proposals) —
+            # ZERO LLM calls. A second daily pass keeps same-day (24h) task
+            # deadlines from waiting overnight; cheap when nothing is due.
+            if rt._db is None:
+                return
+            import os
+
+            if os.environ.get("GENESIS_LEDGER_GRADER_DISABLED") == "1":
+                return
+            try:
+                from genesis.ledger.grader import grade_due_predictions
+
+                report = await grade_due_predictions(rt._db)
+                rt.record_job_success("ledger_grader")
+                if report.scanned:
+                    logger.info("Ledger grader: %s", report.summary())
+            except Exception as exc:
+                rt.record_job_failure("ledger_grader", str(exc))
+                logger.exception("Ledger grader failed")
+
+        rt._learning_scheduler.add_job(
+            _run_ledger_grader,
+            CronTrigger(hour="6,18", minute=15, timezone=user_timezone()),
+            id="ledger_grader",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _reap_activity_log() -> None:
             if rt._activity_tracker is None:
                 return
