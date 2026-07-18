@@ -103,6 +103,19 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "ws2_ledger": SettingsDomain(
+        name="ws2_ledger",
+        description=(
+            "WS-2 cognitive-ledger consumer levers — master `enabled` + "
+            "`autonomy_feed` off/shadow/live (P2b grader→autonomy earn-back "
+            "feed). Shadow (default) logs what it WOULD fire without writing "
+            "the autonomy Trap; an invalid value degrades to shadow. Read live "
+            "per grading pass by genesis.ledger.ws2_ledger_config (no restart)."
+        ),
+        config_filename="ws2_ledger.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per grading pass by ws2_ledger_config
+    ),
     "repo_pulse": SettingsDomain(
         name="repo_pulse",
         description=(
@@ -812,6 +825,23 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_ws2_ledger(changes: dict) -> list[str]:
+    """Validate ws2_ledger consumer-lever changes (see
+    genesis.ledger.ws2_ledger_config)."""
+    from genesis.ledger.ws2_ledger_config import MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key not in ("enabled", "autonomy_feed"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, autonomy_feed")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'autonomy_feed' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_repo_pulse(changes: dict) -> list[str]:
     """Validate repo-pulse lever changes (see
     genesis.session_awareness.repo_pulse_config)."""
@@ -923,6 +953,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,
     "session_ledger_shadow": _validate_session_ledger_shadow,
+    "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
     "cc_roster": _validate_cc_roster,
     "resilience": _validate_resilience,

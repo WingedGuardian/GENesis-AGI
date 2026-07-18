@@ -1,0 +1,17 @@
+# WS-2 cognitive-ledger consumer levers (read live by genesis.ledger.ws2_ledger_config).
+#
+# Overlay per install at ~/.genesis/config/ws2_ledger.local.yaml (deep-merged
+# over this base). Shipped defaults must be safe on a fresh clone with no overlay.
+
+# Master switch for all ledger consumers. false → every lever below reads "off".
+enabled: true
+
+# grader → autonomy earn-back feed (WS-2 P2b). off | shadow | live.
+#   shadow (default): the grader LOGS the record_success/correction it would
+#     fire for direct_session from mechanically-graded task rows, writes nothing
+#     to the autonomy store. Watch the real firing pattern here first.
+#   live: the grader actually feeds direct_session evidence (failure-only:
+#     completed→success, genuine failure→correction; never on slowness/cancel).
+#   off: no autonomy side-effect (the grader still grades predictions).
+# Autonomy is a Trap subsystem — this stays shadow until the operator flips it.
+autonomy_feed: shadow

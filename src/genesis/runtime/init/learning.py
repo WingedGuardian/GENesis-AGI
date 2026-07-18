@@ -1094,7 +1094,12 @@ async def init(rt: GenesisRuntime) -> None:
             try:
                 from genesis.ledger.grader import grade_due_predictions
 
-                report = await grade_due_predictions(rt._db)
+                # Pass the autonomy manager for the P2b earn-back feed; its mode
+                # (off/shadow/live, default shadow) is read live per pass from
+                # the ws2_ledger settings domain inside the grader.
+                report = await grade_due_predictions(
+                    rt._db, autonomy_manager=getattr(rt, "_autonomy_manager", None)
+                )
                 rt.record_job_success("ledger_grader")
                 if report.scanned:
                     logger.info("Ledger grader: %s", report.summary())

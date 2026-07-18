@@ -153,9 +153,7 @@ class TestTriagePipeline:
             observation_writer=ow,
             router=router,
         )
-        text_with_learnings = (
-            "response\n## Learnings\n- something\n- else"
-        )
+        text_with_learnings = "response\n## Learnings\n- something\n- else"
         await pipeline(FakeCCOutput(text=text_with_learnings), "q", "terminal")
 
         oc.classify.assert_awaited_once()
@@ -164,9 +162,7 @@ class TestTriagePipeline:
         # Procedure extraction routes through router — must NOT fire
         router.route_call.assert_not_awaited()
         # Debrief parsing is independent — should still write learnings
-        learning_calls = [
-            c for c in ow.write.call_args_list if c[1].get("source") == "cc_debrief"
-        ]
+        learning_calls = [c for c in ow.write.call_args_list if c[1].get("source") == "cc_debrief"]
         assert len(learning_calls) == 2
 
     @pytest.mark.asyncio
@@ -203,9 +199,7 @@ class TestTriagePipeline:
         output = FakeCCOutput(text=text_with_learnings)
         await pipeline(output, "test", "terminal")
         # Should write 2 learnings
-        learning_calls = [
-            c for c in ow.write.call_args_list if c[1].get("source") == "cc_debrief"
-        ]
+        learning_calls = [c for c in ow.write.call_args_list if c[1].get("source") == "cc_debrief"]
         assert len(learning_calls) == 2
 
     @pytest.mark.asyncio
@@ -226,78 +220,12 @@ class TestTriagePipeline:
         assert call_kwargs["event_type"] == "triage.classified"
 
 
-class TestAutonomyCalibration:
-    """Pipeline wires outcome classification to autonomy manager."""
-
-    @pytest.mark.asyncio
-    async def test_success_outcome_records_autonomy_success(self, db):
-        """SUCCESS outcome triggers autonomy_manager.record_success."""
-        mgr = AsyncMock()
-        mgr.record_success = AsyncMock(return_value=(True, False))
-        runtime = MagicMock()
-        runtime._autonomy_manager = mgr
-        runtime.record_job_success = MagicMock()
-        runtime.record_job_failure = MagicMock()
-
-        ow = MagicMock()
-        ow.write = AsyncMock(return_value="obs-1")
-        pipeline = build_triage_pipeline(
-            db=db,
-            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
-            outcome_classifier=_make_outcome_classifier(OutcomeClass.SUCCESS),
-            delta_assessor=_make_delta_assessor(),
-            observation_writer=ow,
-            runtime=runtime,
-        )
-        await pipeline(FakeCCOutput(), "test", "terminal")
-        mgr.record_success.assert_awaited_once_with("direct_session")
-
-    @pytest.mark.asyncio
-    async def test_failure_outcome_records_autonomy_correction(self, db):
-        """APPROACH_FAILURE outcome triggers autonomy_manager.record_correction."""
-        mgr = AsyncMock()
-        mgr.record_correction = AsyncMock(return_value=(True, True))
-        runtime = MagicMock()
-        runtime._autonomy_manager = mgr
-        runtime.record_job_success = MagicMock()
-        runtime.record_job_failure = MagicMock()
-
-        ow = MagicMock()
-        ow.write = AsyncMock(return_value="obs-1")
-        pipeline = build_triage_pipeline(
-            db=db,
-            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
-            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
-            delta_assessor=_make_delta_assessor(),
-            observation_writer=ow,
-            runtime=runtime,
-        )
-        await pipeline(FakeCCOutput(), "test", "terminal")
-        mgr.record_correction.assert_awaited_once()
-        # Verify category is direct_session
-        call_args = mgr.record_correction.call_args
-        assert call_args[0][0] == "direct_session"
-
-    @pytest.mark.asyncio
-    async def test_no_autonomy_manager_does_not_crash(self, db):
-        """Pipeline doesn't crash when runtime has no autonomy manager."""
-        runtime = MagicMock()
-        runtime._autonomy_manager = None
-        runtime.record_job_success = MagicMock()
-        runtime.record_job_failure = MagicMock()
-
-        ow = MagicMock()
-        ow.write = AsyncMock(return_value="obs-1")
-        pipeline = build_triage_pipeline(
-            db=db,
-            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
-            outcome_classifier=_make_outcome_classifier(OutcomeClass.SUCCESS),
-            delta_assessor=_make_delta_assessor(),
-            observation_writer=ow,
-            runtime=runtime,
-        )
-        # Should not raise
-        await pipeline(FakeCCOutput(), "test", "terminal")
+# TestAutonomyCalibration REMOVED (WS-2 P2b): the pipeline no longer feeds
+# autonomy record_success/record_correction from the LLM classifier's
+# SUCCESS/APPROACH_FAILURE verdict (the A1 harm-removal — Genesis grading its
+# own state). Autonomy earn-back evidence now flows from the ledger grader over
+# mechanically-graded task rows (failure-only, shadow-first) — covered by
+# tests/test_ledger/test_grader.py::TestAutonomyFeed.
 
 
 class TestSteeringRuleExtraction:
@@ -417,7 +345,8 @@ class TestSuccessExtractionChannelGate:
             return None
 
         monkeypatch.setattr(
-            "genesis.learning.pipeline.extract_procedure", fake_extract,
+            "genesis.learning.pipeline.extract_procedure",
+            fake_extract,
         )
         router = MagicMock()
         router.route_call = AsyncMock()
@@ -442,7 +371,8 @@ class TestSuccessExtractionChannelGate:
             return None
 
         monkeypatch.setattr(
-            "genesis.learning.pipeline.extract_procedure", fake_extract,
+            "genesis.learning.pipeline.extract_procedure",
+            fake_extract,
         )
         router = MagicMock()
         router.route_call = AsyncMock()
@@ -468,7 +398,8 @@ class TestSuccessExtractionChannelGate:
             return None
 
         monkeypatch.setattr(
-            "genesis.learning.pipeline.extract_procedure", fake_extract,
+            "genesis.learning.pipeline.extract_procedure",
+            fake_extract,
         )
         router = MagicMock()
         router.route_call = AsyncMock()
