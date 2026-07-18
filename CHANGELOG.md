@@ -18,8 +18,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   card stays healthy when the only missing keys belong to dormant or
   fallback-only providers (and still degrades when a genuinely load-bearing
   key is missing or a provider is out of credits), and the Queues card
-  degrades only on the recovery-work subset that actually indicates a stall
-  (not the normal in-flight worklist the background drainer churns through).
+  degrades on genuine backlog signals — recovery work, or a processing /
+  embedding queue past the backend's own depth threshold — rather than the
+  normal in-flight worklist the background drainer churns through.
   The API Keys "N ok / M" tally is also correct now (it previously double-
   counted local providers, so the numbers didn't add up).
 - **Provisioning approvals can be retried, and never race each other.** A

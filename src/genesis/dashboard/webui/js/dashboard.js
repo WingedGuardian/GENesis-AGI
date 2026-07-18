@@ -3302,11 +3302,21 @@
           if ((queues.deferred_recovery || 0) > 0) {
             return { state: "degraded", reason: `${queues.deferred_recovery} recovery item(s) backing up` };
           }
+          // Honor the backend queue-depth alarm (mcp/health/errors.py
+          // _QUEUE_DEPTH_FIELDS emits a WARNING when a depth field exceeds 100):
+          // a processing backlog that hasn't yet aged into deferred_stuck still
+          // warrants a warning, so the card never reads green while
+          // health_alerts warns. Keep the raw deferred_work total suppressed.
+          if ((queues.deferred_processing || 0) > 100) {
+            return { state: "degraded", reason: `${queues.deferred_processing} items processing (backlog)` };
+          }
           const pe = queues.pending_embeddings || 0;
           if (pe > 2000) {
             return { state: "error", reason: `embedding queue critically backed up (${pe} pending)` };
           }
-          if (pe > 500) {
+          // >100 matches the backend depth threshold (was >500 — a 101–500 gap
+          // where the backend warned but the card read green).
+          if (pe > 100) {
             return { state: "degraded", reason: `embedding queue backed up (${pe} pending)` };
           }
           if (Array.isArray(queues.errors) && queues.errors.length > 0) {
