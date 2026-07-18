@@ -540,7 +540,7 @@ async def resolve_expired(db: aiosqlite.Connection) -> int:
     cursor = await db.execute(
         "UPDATE observations SET resolved = 1, resolved_at = ?, "
         "resolution_notes = 'auto-expired (TTL)' "
-        "WHERE resolved = 0 AND expires_at IS NOT NULL AND expires_at < ?",
+        "WHERE resolved = 0 AND expires_at IS NOT NULL AND datetime(expires_at) < datetime(?)",
         (now, now),
     )
     await db.commit()

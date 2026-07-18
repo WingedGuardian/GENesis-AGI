@@ -969,7 +969,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         cursor = await db.execute(
             "UPDATE observations SET resolved = 1, resolved_at = ?, "
             "resolution_notes = 'auto-expired (TTL, migration sweep)' "
-            "WHERE resolved = 0 AND expires_at IS NOT NULL AND expires_at < ?",
+            "WHERE resolved = 0 AND expires_at IS NOT NULL AND datetime(expires_at) < datetime(?)",
             (now, now),
         )
         expired_count = cursor.rowcount
@@ -996,7 +996,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         for obs_type, ttl in _TTL_BY_TYPE.items():
             secs = int(ttl.total_seconds())
             cursor = await db.execute(
-                "UPDATE observations SET expires_at = datetime(created_at, ? || ' seconds') "
+                "UPDATE observations SET expires_at = strftime('%Y-%m-%dT%H:%M:%S', created_at, ? || ' seconds') "
                 "WHERE resolved = 0 AND expires_at IS NULL AND type = ?",
                 (str(secs), obs_type),
             )
@@ -1004,7 +1004,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         for prefix, ttl in _TTL_PREFIX:
             secs = int(ttl.total_seconds())
             cursor = await db.execute(
-                "UPDATE observations SET expires_at = datetime(created_at, ? || ' seconds') "
+                "UPDATE observations SET expires_at = strftime('%Y-%m-%dT%H:%M:%S', created_at, ? || ' seconds') "
                 "WHERE resolved = 0 AND expires_at IS NULL AND type LIKE ?",
                 (str(secs), f"{prefix}%"),
             )
@@ -1017,7 +1017,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         cursor = await db.execute(
             "UPDATE observations SET resolved = 1, resolved_at = ?, "
             "resolution_notes = 'auto-expired (TTL backfill)' "
-            "WHERE resolved = 0 AND expires_at IS NOT NULL AND expires_at < ?",
+            "WHERE resolved = 0 AND expires_at IS NOT NULL AND datetime(expires_at) < datetime(?)",
             (now_iso, now_iso),
         )
         newly_expired = cursor.rowcount
