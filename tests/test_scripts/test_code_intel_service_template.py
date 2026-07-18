@@ -40,7 +40,7 @@ def test_runner_path_includes_cbm_and_gitnexus_dirs() -> None:
         "that killed cbm indexing for days."
     )
     assert "__HOME__/.npm-global/bin" in path_line, (
-        "code-intel runner PATH omits ~/.npm-global/bin — gitnexus analyze will fail."
+        "code-intel runner PATH omits ~/.npm-global/bin — gitnexus indexing will fail."
     )
 
 
