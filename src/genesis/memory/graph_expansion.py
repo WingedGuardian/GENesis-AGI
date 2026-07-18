@@ -90,12 +90,49 @@ def _base_path():
     return repo_root() / "config" / _CONFIG_NAME
 
 
-def load_recall_config() -> dict[str, Any]:
-    """Read the merged memory_recall config fresh — per call, NO cache.
+# (stat-key, parsed-config) memo — see load_recall_config. Reset in tests via
+# the config_dirs fixture so a tmp-keyed entry can't leak across tests.
+_config_cache: tuple[tuple, dict[str, Any]] | None = None
 
-    Deep-merges (defaults ← base yaml ← .local.yaml overlay). Missing or
-    corrupt files degrade layer-by-layer toward DEFAULTS.
+
+def _config_stat_key() -> tuple:
+    """``(base, overlay)`` ``(st_mtime_ns, st_size)`` pairs — the cache key.
+
+    A missing file contributes ``None``, so creating/removing/editing either
+    file (base yaml or ``.local.yaml`` overlay) changes the key and forces a
+    re-read on the next call.
     """
+    from genesis._config_overlay import _resolve_overlay_path
+
+    base_path = _base_path()
+
+    def _key(p) -> tuple[int, int] | None:
+        try:
+            st = p.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    return (_key(base_path), _key(_resolve_overlay_path(base_path)))
+
+
+def load_recall_config() -> dict[str, Any]:
+    """Read the merged memory_recall config — mtime-cached, effectively live.
+
+    Deep-merges (defaults ← base yaml ← .local.yaml overlay). The parse result
+    is memoized and reused until either file's ``(mtime, size)`` changes, so a
+    ``settings_update`` / hand-edit still takes effect on the next recall while
+    the steady-state hot path — ``recall()`` calls this per-recall for BOTH the
+    graph-expansion and entity-lane gates — pays a ``stat`` + dict lookup, not
+    two YAML reads and a parse. Missing or corrupt files degrade layer-by-layer
+    toward DEFAULTS. Callers always receive a fresh deep copy (the memo is never
+    handed out, so a caller mutation can't poison it).
+    """
+    global _config_cache
+    stat_key = _config_stat_key()
+    if _config_cache is not None and _config_cache[0] == stat_key:
+        return copy.deepcopy(_config_cache[1])
+
     merged = copy.deepcopy(DEFAULTS)
     base_path = _base_path()
     base: dict[str, Any] = {}
@@ -116,7 +153,8 @@ def load_recall_config() -> dict[str, Any]:
             merged[key] = {**merged[key], **value}
         else:
             merged[key] = value
-    return merged
+    _config_cache = (stat_key, merged)
+    return copy.deepcopy(merged)
 
 
 def _mode_from(cfg: dict[str, Any]) -> str:

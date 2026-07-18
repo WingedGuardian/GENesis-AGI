@@ -49,6 +49,8 @@ def config_dirs(tmp_path, monkeypatch) -> tuple[Path, Path]:
         "genesis._config_overlay._user_config_dir",
         lambda: user_dir,
     )
+    # Reset the module-level mtime cache so it can't leak across tests.
+    monkeypatch.setattr(graph_expansion, "_config_cache", None, raising=False)
 
     return (
         repo_dir / "config" / "memory_recall.yaml",
@@ -161,12 +163,36 @@ def test_corrupt_base_degrades_to_defaults(config_dirs):
     assert graph_expansion.expansion_mode() == "shadow"
 
 
-def test_live_reread_no_cache(config_dirs):
+def test_live_reread_on_file_change(config_dirs):
+    # A settings_update / hand-edit changes the file's mtime+size, so the
+    # mtime-keyed cache re-reads it on the next recall (the "takes effect on
+    # next recall" contract is preserved).
     base, _ = config_dirs
     _write(base, {"graph_expansion": {"mode": "off"}})
     assert graph_expansion.expansion_mode() == "off"
     _write(base, {"graph_expansion": {"mode": "live"}})
     assert graph_expansion.expansion_mode() == "live"
+
+
+def test_config_cached_until_file_changes(config_dirs, monkeypatch):
+    # Unchanged files must not be re-parsed on every recall (hot path). Count
+    # base-yaml parses: a second load with no file change is served from cache.
+    base, _ = config_dirs
+    _write(base, {"graph_expansion": {"mode": "shadow"}})
+    calls = {"n": 0}
+    real = graph_expansion.yaml.safe_load
+
+    def _counting(text):
+        calls["n"] += 1
+        return real(text)
+
+    monkeypatch.setattr(graph_expansion.yaml, "safe_load", _counting)
+    graph_expansion.load_recall_config()
+    graph_expansion.load_recall_config()
+    assert calls["n"] == 1  # second load served from cache
+    _write(base, {"graph_expansion": {"mode": "live"}})
+    graph_expansion.load_recall_config()
+    assert calls["n"] == 2  # file changed → cache invalidated, re-parsed
 
 
 # ─── expand_neighbors: the mode-independent primitive ────────────────────────

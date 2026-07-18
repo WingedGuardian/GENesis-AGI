@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from genesis.db.crud import cognitive_state, observations, procedural
 from genesis.perception.confidence import load_config as load_confidence_config
 from genesis.perception.confidence import should_gate
+from genesis.reflection.signal_claims import guard_narrative
 from genesis.reflection.types import (
     DeepReflectionOutput,
     DimensionScore,
@@ -239,6 +240,7 @@ class OutputRouter:
         self, output: DeepReflectionOutput, db: aiosqlite.Connection,
         *, gathered_obs_ids: tuple[str, ...] = (),
         gathered_surplus_ids: tuple[str, ...] = (),
+        tick_signal_names: set[str] | None = None,
     ) -> dict:
         """Route all components of a deep reflection output to their stores.
 
@@ -247,6 +249,10 @@ class OutputRouter:
         ``gathered_obs_ids``: observation IDs fed into the reflection context.
         Marked as "influenced" only when output is substantive.
         ``gathered_surplus_ids``: promoted surplus insight IDs fed into context.
+        ``tick_signal_names``: names of the live tick's signals. When provided,
+        narrative writes (cognitive_state_update, focus_next) pass through the
+        phantom-signal claim guard (annotate-and-strip, never blocking);
+        ``None`` skips validation (back-compat).
         Marked as consumed after successful routing.
         """
         summary: dict = {
@@ -361,11 +367,15 @@ class OutputRouter:
         # 3. Cognitive state update
         now = datetime.now(UTC).isoformat()
         if output.cognitive_state_update:
+            state_content = await guard_narrative(
+                db, output.cognitive_state_update,
+                tick_signal_names=tick_signal_names, source="deep_reflection",
+            )
             await cognitive_state.replace_section(
                 db,
                 section="active_context",
                 id=str(uuid.uuid4()),
-                content=output.cognitive_state_update,
+                content=state_content,
                 generated_by="deep_reflection",
                 created_at=now,
             )
@@ -377,7 +387,11 @@ class OutputRouter:
         # NOTE: replace_section is destructive — overwrites all state_flags content.
         # This is a known limitation of the cognitive_state schema (post-phase-9 fix).
         if output.focus_next:
-            focus_content = f"## Deep Reflection Focus Directive\n{output.focus_next}"
+            focus_text = await guard_narrative(
+                db, output.focus_next,
+                tick_signal_names=tick_signal_names, source="deep_reflection",
+            )
+            focus_content = f"## Deep Reflection Focus Directive\n{focus_text}"
             await cognitive_state.replace_section(
                 db,
                 section="state_flags",

@@ -892,3 +892,77 @@ class TestWriteObservationDedup:
         row = await cursor.fetchone()
         assert row[0] is not None
         assert len(row[0]) == 64  # SHA-256 hex
+
+
+# ── Phantom-signal claim guard wiring (PR-5b) ──────────────────────────────
+
+
+class TestSignalClaimGuardWiring:
+    async def _register_signal(self, db, name):
+        await db.execute(
+            "INSERT OR IGNORE INTO signal_weights (signal_name, source_mcp, "
+            "current_weight, initial_weight, feeds_depths) "
+            "VALUES (?, 'test', 0.5, 0.5, ?)",
+            (name, '["Deep"]'),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_route_strips_phantom_claim_from_cognitive_state(self, db, router):
+        await self._register_signal(db, "memory_backlog")
+        output = DeepReflectionOutput(
+            cognitive_state_update="Concern: memory_backlog=0.9 is rising.",
+        )
+        summary = await router.route(
+            output, db, tick_signal_names={"autonomy_activity"},
+        )
+        assert summary["cognitive_state_updated"]
+        rows = await db.execute_fetchall(
+            "SELECT content FROM cognitive_state WHERE section='active_context'"
+        )
+        stored = rows[-1]["content"]
+        assert "[unverified signal claim removed: memory_backlog]" in stored
+        assert "memory_backlog=0.9" not in stored
+        # ...and the violation is recorded for observability
+        obs = await db.execute_fetchall(
+            "SELECT content FROM observations WHERE type='phantom_signal_claim'"
+        )
+        assert len(obs) == 1
+
+    @pytest.mark.asyncio
+    async def test_route_keeps_claim_present_in_tick(self, db, router):
+        await self._register_signal(db, "memory_backlog")
+        output = DeepReflectionOutput(
+            cognitive_state_update="memory_backlog=0.9 confirmed by tick.",
+        )
+        await router.route(output, db, tick_signal_names={"memory_backlog"})
+        rows = await db.execute_fetchall(
+            "SELECT content FROM cognitive_state WHERE section='active_context'"
+        )
+        assert "memory_backlog=0.9 confirmed by tick." in rows[-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_route_without_tick_names_skips_guard(self, db, router):
+        """Back-compat: callers that can't provide the tick are untouched."""
+        await self._register_signal(db, "memory_backlog")
+        output = DeepReflectionOutput(
+            cognitive_state_update="memory_backlog=0.9 asserted blind.",
+        )
+        await router.route(output, db)
+        rows = await db.execute_fetchall(
+            "SELECT content FROM cognitive_state WHERE section='active_context'"
+        )
+        assert "memory_backlog=0.9 asserted blind." in rows[-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_route_guards_focus_next(self, db, router):
+        await self._register_signal(db, "memory_backlog")
+        output = DeepReflectionOutput(
+            focus_next="Chase memory_backlog=0.9 next cycle.",
+        )
+        await router.route(output, db, tick_signal_names=set())
+        rows = await db.execute_fetchall(
+            "SELECT content FROM cognitive_state WHERE section='state_flags'"
+        )
+        joined = " ".join(r["content"] for r in rows)
+        assert "[unverified signal claim removed: memory_backlog]" in joined
