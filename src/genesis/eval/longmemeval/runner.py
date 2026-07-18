@@ -45,7 +45,7 @@ from genesis.eval.types import (
 from genesis.memory.linker import DEFAULT_SIMILARITY_THRESHOLD
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     import aiosqlite
 
@@ -75,12 +75,21 @@ class Arm:
     query_arm: QueryArm
     rerank: bool
     graph: bool = False
+    #: A registered retrieval-config variant (WS2-0); "" = baseline. Each WS2
+    #: lever PR registers one in VARIANTS and adds its paired arm here.
+    variant: str = ""
 
     @property
     def label(self) -> str:
-        # Deterministic suffix order (rerank before graph): model_profile
-        # "longmemeval:<label>" and dump filenames must be stable across runs.
-        suffix = ("+rerank" if self.rerank else "") + ("+graph" if self.graph else "")
+        # Deterministic suffix order (rerank, then graph, then variant):
+        # model_profile "longmemeval:<label>" and dump filenames must be stable
+        # across runs, and every pre-WS2-0 label stays byte-identical because
+        # the +variant suffix only appears when a variant is set.
+        suffix = (
+            ("+rerank" if self.rerank else "")
+            + ("+graph" if self.graph else "")
+            + (f"+{self.variant}" if self.variant else "")
+        )
         return f"{self.query_arm.value}{suffix}"
 
 
@@ -94,10 +103,80 @@ def default_arms() -> list[Arm]:
     ]
 
 
-def select_arms(*, no_rerank: bool = False, graph: bool = False) -> list[Arm]:
+@dataclass(frozen=True)
+class ArmVariant:
+    """A registered retrieval-config variant an eval arm can carry (WS2-0).
+
+    The instrumentation PR ships the machinery with an EMPTY registry; each WS2
+    lever PR registers exactly one variant here and adds its paired arm, so the
+    levers stay additive instead of re-opening this file's core arm logic. Two
+    application seams cover the recall-side levers:
+
+    * ``recall_kwargs(instance, arm) -> dict`` — extra kwargs merged into the
+      per-question ``recall()`` call (e.g. scope routing derives ``wing`` from
+      the question text).
+    * ``post_recall(memories) -> memories`` — transforms the final content list
+      fed to the reader (e.g. an output token budget trims the relevance-sorted
+      tail). Evidence metrics are computed from the untrimmed recall, so a
+      budget arm stays coverage-comparable while its effect shows in the answer.
+
+    ``recall_kwarg_names`` declares the ``recall()`` kwargs the variant injects;
+    it is validated against the live ``recall()`` signature BEFORE any paid run
+    (fail-fast, mirroring ``filter_arms``' label check).
+    """
+
+    name: str
+    recall_kwarg_names: tuple[str, ...] = ()
+    recall_kwargs: Callable[[LongMemEvalInstance, Arm], dict] | None = None
+    post_recall: Callable[[list[str]], list[str]] | None = None
+
+
+#: Registered variants, keyed by name. Empty until a lever PR registers one.
+VARIANTS: dict[str, ArmVariant] = {}
+
+
+def register_variant(variant: ArmVariant) -> None:
+    """Register a retrieval-config variant (idempotent by name; last wins)."""
+    VARIANTS[variant.name] = variant
+
+
+def _recall_param_names() -> set[str]:
+    """The keyword parameters ``HybridRetriever.recall`` accepts."""
+    import inspect
+
+    from genesis.memory.retrieval import HybridRetriever
+
+    return set(inspect.signature(HybridRetriever.recall).parameters)
+
+
+def validate_variants(arms: list[Arm]) -> None:
+    """Fail-fast before any spend: every arm's variant must be registered and
+    its declared recall kwargs must exist on ``recall()``. Raises ValueError."""
+    recall_params = _recall_param_names()
+    for arm in arms:
+        if not arm.variant:
+            continue
+        variant = VARIANTS.get(arm.variant)
+        if variant is None:
+            msg = f"unknown arm variant {arm.variant!r}; registered: {sorted(VARIANTS)}"
+            raise ValueError(msg)
+        unknown = sorted(set(variant.recall_kwarg_names) - recall_params)
+        if unknown:
+            msg = f"variant {arm.variant!r} injects unknown recall kwargs {unknown}"
+            raise ValueError(msg)
+
+
+def select_arms(
+    *,
+    no_rerank: bool = False,
+    graph: bool = False,
+    variants: Sequence[str] = (),
+) -> list[Arm]:
     """Build the CLI's arm list: default arms, optionally rerank-filtered,
-    optionally doubled with a ``+graph`` variant of every selected arm
-    (paired baseline-vs-graph comparison in one run)."""
+    optionally doubled with a ``+graph`` variant of every selected arm, then
+    doubled again with each named ``+variant`` twin (paired baseline-vs-lever
+    comparison in one run). Variant twins are only made from non-variant arms,
+    so ``--variants`` never produces variant-of-variant labels."""
     from dataclasses import replace
 
     arms = default_arms()
@@ -105,6 +184,8 @@ def select_arms(*, no_rerank: bool = False, graph: bool = False) -> list[Arm]:
         arms = [a for a in arms if not a.rerank]
     if graph:
         arms = [*arms, *(replace(a, graph=True) for a in arms)]
+    for name in variants:
+        arms = [*arms, *(replace(a, variant=name) for a in arms if not a.variant)]
     return arms
 
 
@@ -414,11 +495,14 @@ async def _run_arm(
     """
     t0 = time.monotonic()
     query = build_query(instance.question, arm.query_arm)
+    variant = VARIANTS.get(arm.variant) if arm.variant else None
+    recall_extra = variant.recall_kwargs(instance, arm) if variant and variant.recall_kwargs else {}
     hits = await es.retriever.recall(
         query,
         source="episodic",
         limit=k,
         rerank=arm.rerank,
+        **recall_extra,
     )
     recalled_ids = {h.memory_id for h in hits}
     evidence_ids = ingest.evidence_memory_ids
@@ -437,6 +521,12 @@ async def _run_arm(
         )
 
     evidence_recalled, evidence_coverage = _coverage(evidence_ids, recalled_ids)
+    # Variant post-recall transform (e.g. output token budget) acts on the
+    # final content list fed to the reader — AFTER graph expansion and AFTER the
+    # evidence metrics above, so coverage stays comparable to baseline while the
+    # transform's effect surfaces only in the answer.
+    if variant and variant.post_recall:
+        memories = variant.post_recall(memories)
     # answer_question / judge_answer use the SYNC OpenAI client, so run
     # them in a worker thread — a blocking create() on the event loop
     # would stall ALL concurrent questions and defeat `concurrency`.
