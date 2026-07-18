@@ -411,8 +411,8 @@ async def get_recent_active(
     """Get unexpired cognitive state entries created within the time window."""
     cursor = await db.execute(
         "SELECT section, content, created_at FROM cognitive_state "
-        "WHERE (expires_at IS NULL OR expires_at > datetime('now')) "
-        "AND created_at > datetime('now', ? || ' hours') "
+        "WHERE (expires_at IS NULL OR datetime(expires_at) > datetime('now')) "
+        "AND datetime(created_at) > datetime('now', ? || ' hours') "
         "ORDER BY section, created_at DESC LIMIT ?",
         (f"-{hours}", limit),
     )
