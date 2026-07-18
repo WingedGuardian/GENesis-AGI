@@ -216,7 +216,15 @@ class SignalQueue:
                     (s for s in self._items if s._priority_order == lowest),
                     key=lambda s: s.created_at,
                 )
-                self._items.remove(victim)
+                # Remove by identity — EgoSignal.__eq__ compares only
+                # _priority_order (every other field is compare=False), so
+                # list.remove() would delete the FIRST same-priority signal
+                # rather than this specific oldest victim.
+                self._items = [s for s in self._items if s is not victim]
+                # Drop the victim's dedup stamp: it never reached a cycle, so
+                # its content must be free to re-enter within the window —
+                # otherwise eviction reintroduces the silent-loss case.
+                self._seen.pop(self._dedup_key(victim), None)
                 logger.warning(
                     "Signal queue full — evicted [%s] %r to admit [%s] %r",
                     victim.priority,

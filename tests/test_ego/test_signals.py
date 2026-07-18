@@ -270,6 +270,38 @@ def test_eviction_victim_is_oldest_of_lowest_class():
     assert "new low" in summaries
 
 
+def test_eviction_removes_selected_victim_by_identity():
+    """The oldest victim is removed even when it is NOT the first same-priority
+    signal in the list. EgoSignal.__eq__ compares only _priority_order, so a
+    list.remove(victim) would wrongly delete the first low-priority signal.
+    """
+    q = SignalQueue(maxsize=2)
+    recent = (datetime.now(UTC)).isoformat()
+    stale = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    # Append RECENT first, STALE second — the oldest victim is appended last.
+    q.push(EgoSignal(priority="low", summary="recent low", created_at=recent))
+    q.push(EgoSignal(priority="low", summary="stale low", created_at=stale))
+    assert q.push(EgoSignal(priority="critical", summary="crit")) is True
+
+    summaries = {s.summary for s in q.drain()}
+    assert "crit" in summaries
+    assert "recent low" in summaries  # first-appended survivor kept
+    assert "stale low" not in summaries  # actual oldest victim removed
+
+
+def test_evicted_signal_can_repush_within_window():
+    """An evicted signal's dedup stamp is cleared so its content can re-enter —
+    otherwise eviction reintroduces silent signal-loss under queue pressure.
+    """
+    q = SignalQueue(maxsize=1)
+    q.push(EgoSignal(priority="low", summary="evict me"))
+    # Critical evicts the low signal.
+    q.push(EgoSignal(priority="critical", summary="urgent"))
+    # The evicted summary must be immediately re-pushable (dedup stamp cleared).
+    q.drain()
+    assert q.push(EgoSignal(priority="low", summary="evict me")) is True
+
+
 def test_expired_pruned_before_eviction():
     """A full queue frees space by pruning expired signals first."""
     import time
