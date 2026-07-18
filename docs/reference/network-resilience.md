@@ -77,11 +77,50 @@ The infrastructure profile (`INFRASTRUCTURE.md`, `infra_profile` package)
 records the posture as facts, so the annotation layer flags an unprotected
 install on its own:
 
-| Key | Kind | Healthy | Defect |
-|---|---|---|---|
-| `networkd_keep_configuration` | fact | `true` | `false` |
-| `network_watchdog_installed` | fact | `true` | `false` |
-| `watchdog` (heal telemetry) | metric | rare/zero heals | frequent heals |
+| Key | Kind | Role | Healthy | Defect |
+|---|---|---|---|---|
+| `networkd_manages_default_route` | fact | posture gate | `true` (networkd owns the route) | — (gate) |
+| `networkd_default_route_keepconfig` | fact | posture | `true` | `false` |
+| `network_watchdog_enabled` | fact | posture | `true` | `false` |
+| `networkd_keep_configuration` | fact | annotation (any link) | `true` | `false` |
+| `network_watchdog_installed` | fact | annotation (file present) | `true` | `false` |
+| `watchdog` (heal telemetry) | metric | — | rare/zero heals | frequent heals |
+
+### The posture alert (active signal)
+
+The annotation layer is passive prose no one reads. The awareness posture check
+(`awareness/loop.py::_check_infra_protection_posture`, the silent-skip closure)
+turns the posture facts into an *active* one-shot `high` `infrastructure_alert`
+(dashboard + morning report) when a protection is missing, and auto-resolves it
+when restored — the same signal the memory plane raises for swap/oomd.
+
+**Two fact granularities, on purpose.** The annotation layer reads the broad
+`networkd_keep_configuration` (any link protected) and `network_watchdog_installed`
+(timer file present). The posture check instead reads *effective* variants that
+measure what actually protects THIS box:
+
+- `networkd_default_route_keepconfig` — KeepConfiguration on the **default-route
+  link specifically** (its own `.network.d` drop-in, located via networkctl's
+  `NetworkFile`). A protected but unrelated link on a multi-interface box can no
+  longer mask a bare default route.
+- `network_watchdog_enabled` — the timer is `systemctl is-enabled`, not merely
+  installed. The installer deliberately ignores `enable`/`start` failures, so a
+  file-present-but-disabled timer would otherwise read healthy while nothing heals.
+
+**The applicability gate.** Both rules are gated on
+`networkd_manages_default_route`, the fact that makes this safe on a public repo:
+the running systemd-networkd daemon (queried live via `networkctl --json`) must
+report the **default-route** interface as `AdministrativeState == "configured"`.
+On a NetworkManager box the daemon is not running or reports the link
+`unmanaged` — the rules stay silent. A false alert would require networkd to
+claim it configures a link it doesn't manage, a contradiction; every doubt path
+suppresses (a false-negative is re-checked next collection, never a false alarm
+on someone else's install).
+
+> It is queried live rather than by reading `/run/systemd/netif/state`, which
+> would be wrong: the unit ships `RuntimeDirectoryPreserve=yes`, so that runtime
+> state **survives a networkd stop** and its presence would not prove networkd is
+> the active manager.
 
 `watchdog` is a **metric** (never hashed): the watchdog rewrites
 `/run/genesis-network-watchdog.json` every run
