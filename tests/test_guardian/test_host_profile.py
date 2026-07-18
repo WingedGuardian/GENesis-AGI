@@ -61,6 +61,87 @@ class TestHostSystem:
         assert isinstance(section["swap_free_kb"], int)
 
 
+# Real `timedatectl show` / `show-timesync` shapes from the live host
+# (2026-07-16): systemd-timesyncd active, synced against ntp.ubuntu.com.
+_TIMEDATECTL_SHOW = """\
+Timezone=Etc/UTC
+LocalRTC=no
+CanNTP=yes
+NTP=yes
+NTPSynchronized=yes
+TimeUSec=Thu 2026-07-16 04:03:28 UTC
+RTCTimeUSec=Thu 2026-07-16 04:03:28 UTC
+"""
+_TIMEDATECTL_TIMESYNC = """\
+FallbackNTPServers=ntp.ubuntu.com
+ServerName=ntp.ubuntu.com
+ServerAddress=185.125.190.56
+RootDistanceMaxUSec=5s
+PollIntervalMinUSec=32s
+PollIntervalMaxUSec=34min 8s
+PollIntervalUSec=34min 8s
+"""
+
+
+def _time_run(active_units: set[str], show: str | None = _TIMEDATECTL_SHOW):
+    """A fake ``_run`` serving only the time-probe argvs (None otherwise)."""
+
+    async def fake_run(*argv):
+        if argv == ("timedatectl", "show"):
+            return show
+        if argv == ("timedatectl", "show-timesync"):
+            return _TIMEDATECTL_TIMESYNC if "systemd-timesyncd" in active_units else None
+        if argv[:2] == ("systemctl", "is-active"):
+            return "active\n" if argv[2] in active_units else None
+        return None
+
+    return fake_run
+
+
+class TestHostTime:
+    async def test_timesyncd_synced(self, monkeypatch) -> None:
+        monkeypatch.setattr(hp, "_run", _time_run({"systemd-timesyncd"}))
+        section = await hp._host_time()
+        assert section["ntp_service"] == "systemd-timesyncd"
+        assert section["ntp_enabled"] == "yes"
+        assert section["ntp_sync_state"] == "synced"
+        assert section["ntp_synchronized_flag"] == "yes"
+        assert section["timezone"] == "Etc/UTC"
+        assert section["ntp_server_name"] == "ntp.ubuntu.com"
+        assert section["ntp_poll_interval"] == "34min 8s"
+
+    async def test_chrony_synced_without_timesync_detail(self, monkeypatch) -> None:
+        monkeypatch.setattr(hp, "_run", _time_run({"chrony"}))
+        section = await hp._host_time()
+        assert section["ntp_service"] == "chrony"
+        assert section["ntp_sync_state"] == "synced"
+        assert "ntp_server_name" not in section  # timesyncd-only detail
+
+    async def test_daemon_dead_is_unsynced_even_with_stale_kernel_flag(self, monkeypatch) -> None:
+        """NTPSynchronized mirrors the kernel flag, which can stay 'yes' long
+        after the daemon dies — daemon liveness must win the composite."""
+        monkeypatch.setattr(hp, "_run", _time_run(set()))
+        section = await hp._host_time()
+        assert section["ntp_synchronized_flag"] == "yes"  # the lying flag
+        assert section["ntp_service"] == "none"
+        assert section["ntp_sync_state"] == "unsynced"
+
+    async def test_daemon_up_but_not_synced_is_degraded(self, monkeypatch) -> None:
+        show = _TIMEDATECTL_SHOW.replace("NTPSynchronized=yes", "NTPSynchronized=no")
+        monkeypatch.setattr(hp, "_run", _time_run({"systemd-timesyncd"}, show=show))
+        section = await hp._host_time()
+        assert section["ntp_service"] == "systemd-timesyncd"
+        assert section["ntp_sync_state"] == "degraded"
+
+    async def test_no_tools_at_all_degrades_not_raises(self, monkeypatch) -> None:
+        async def fake_run(*argv):
+            return None
+
+        monkeypatch.setattr(hp, "_run", fake_run)
+        section = await hp._host_time()
+        assert section == {"ntp_service": "none", "ntp_sync_state": "unsynced"}
+
+
 class TestGatherHostProfile:
     @pytest.fixture
     def config(self) -> GuardianConfig:
@@ -68,8 +149,11 @@ class TestGatherHostProfile:
 
     async def test_three_sections_present_and_ok(self, config, monkeypatch) -> None:
         pool_status = StoragePoolStatus(
-            detected=True, data_pct=61.19, metadata_pct=42.6,
-            vg_free_bytes=34359738368, detail="lvm vg0 data=61.19 meta=42.6",
+            detected=True,
+            data_pct=61.19,
+            metadata_pct=42.6,
+            vg_free_bytes=34359738368,
+            detail="lvm vg0 data=61.19 meta=42.6",
         )
 
         async def fake_measure(cfg):
@@ -82,6 +166,8 @@ class TestGatherHostProfile:
 
         monkeypatch.setattr("genesis.guardian.pool._detect_pool_name", fake_pool_name)
 
+        time_run = _time_run({"systemd-timesyncd"})
+
         async def fake_run(*argv):
             if argv == ("incus", "version"):
                 return "Client version: 6.0.0\nServer version: 6.0.0\n"
@@ -89,13 +175,13 @@ class TestGatherHostProfile:
                 return _INCUS_CONFIG_YAML
             if argv == ("systemd-detect-virt",):
                 return "kvm\n"
-            return None
+            return await time_run(*argv)
 
         monkeypatch.setattr(hp, "_run", fake_run)
 
         result = await hp.gather_host_profile(config)
         assert result["ok"] is True
-        assert set(result) >= {"host_system", "host_storage_pool", "host_virt"}
+        assert set(result) >= {"host_system", "host_storage_pool", "host_virt", "host_time"}
         pool = result["host_storage_pool"]
         assert pool["detected"] is True
         assert pool["data_pct"] == 61.19
@@ -106,6 +192,9 @@ class TestGatherHostProfile:
         assert virt["container_limits"] == {"limits.cpu": "8", "limits.memory": "16GiB"}
         assert virt["detect_virt"] == "kvm"
         assert virt["pve_version"] is None  # absent on the guardian VM
+        time_section = result["host_time"]
+        assert time_section["ntp_service"] == "systemd-timesyncd"
+        assert time_section["ntp_sync_state"] == "synced"
 
     async def test_section_failure_degrades_not_raises(self, config, monkeypatch) -> None:
         async def boom(cfg):
@@ -155,12 +244,17 @@ class TestGatherHostProfile:
 
         monkeypatch.setattr(hp, "_host_virt", virt_boom)
 
+        async def time_boom():
+            raise RuntimeError("time boom")
+
+        monkeypatch.setattr(hp, "_host_time", time_boom)
+
         result = await hp.gather_host_profile(config)
         assert result["ok"] is False
         assert result["error"] == "all host sections failed"
         assert all(
             "error" in result[name]
-            for name in ("host_system", "host_storage_pool", "host_virt")
+            for name in ("host_system", "host_storage_pool", "host_virt", "host_time")
         )
 
     def test_pool_status_fields_match_dataclass(self) -> None:
@@ -169,6 +263,10 @@ class TestGatherHostProfile:
         revisited (collectors/host.py allowlists)."""
         fields = {f.name for f in dataclasses.fields(StoragePoolStatus)}
         assert fields == {
-            "detected", "data_pct", "metadata_pct",
-            "vg_free_bytes", "pool_used_pct", "detail",
+            "detected",
+            "data_pct",
+            "metadata_pct",
+            "vg_free_bytes",
+            "pool_used_pct",
+            "detail",
         }

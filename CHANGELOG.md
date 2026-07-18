@@ -41,6 +41,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now watches whether the host machine's clock is actually being
+  kept in sync.** The container shares its host's clock, so if the host's
+  time-sync daemon dies or stops syncing, TLS handshakes, log timestamps, and
+  scheduled jobs all quietly skew — and nothing noticed. The infrastructure
+  profile's host plane now reports which NTP daemon runs the clock and a
+  composite health state (synced / degraded / unsynced) that catches a dead
+  daemon even while the kernel's own sync flag still claims all is well; a
+  state flip surfaces as an infrastructure-drift observation like any other
+  change to the machine's vitals.
+
 - **Genesis now writes down its predictions before acting — the substrate.**
   A new cognitive ledger stores falsifiable predictions ("this outreach will
   get a reply within 72 hours, confidence 0.02") behind a hard validation
