@@ -32,6 +32,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   factual alert can never be creatively rewritten into a false claim. Reflection
   questions also keep their full text and every option intact. Generative
   content (marketing drafts) still uses the drafter, as intended.
+- **Memory search actually reranks now.** `memory_recall` and
+  `knowledge_recall` advertised Voyage cross-encoder reranking and defaulted it
+  on, but the recall tools were built without a reranker, so it silently never
+  ran — searches returned raw fusion order instead of the promised
+  relevance-reranked results. The reranker is now wired into the recall tools
+  (no change without an `API_KEY_VOYAGE`). It can be turned off live via the
+  `memory_recall` setting `reranker.mode: off` or `GENESIS_MEMORY_RERANK_OFF=1`
+  if you want to trade a little recall quality for lower latency/cost.
 - **The morning report's numbers are real now.** Report generation previously
   counted truncated display lists (reporting "5 follow-ups" when 268 existed),
   sometimes inverted protective facts into alarms (an active OOM-protection

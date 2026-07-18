@@ -36,7 +36,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 57fa1f18 2026-07-17
+verified: 9decfd6f 2026-07-18
 ```
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
@@ -56,9 +56,16 @@ Easy-to-forget mechanisms:
   frozen snapshot suppress this via `GENESIS_MEMORY_WRITEBACKS_OFF`
   (`env.memory_writebacks_off()`); any NEW write inside a read path must
   honor the same seam.
-- **VoyageReranker** (`memory/reranker.py`, rerank-2.5) exists and is
-  API_KEY_VOYAGE-gated; the `rerank=` param is off by default at the retriever
-  and applied by callers.
+- **VoyageReranker** (`memory/reranker.py`, rerank-2.5) is API_KEY_VOYAGE-gated
+  and wired into BOTH retriever stacks: the runtime context stack (long-standing)
+  and — since the MCP `init()` had passed no reranker, so it silently never ran —
+  the MCP recall tools. `recall()` defaults `rerank=True`; the recall tools
+  (`memory_recall` / `knowledge_recall` / `reference_lookup`) rerank subject to
+  `reranker.mode` in `config/memory_recall.yaml` (off|live, live default) plus the
+  `GENESIS_MEMORY_RERANK_OFF` kill, read live via
+  `graph_expansion.reranker_enabled()`. The gate is applied at the MCP tool
+  boundary only, so the internal runtime stack and the hermetic LongMemEval
+  harness (both pass explicit `rerank` kwargs) are unaffected.
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
   FTS drilldown searches every collection in `source_collections`,
   rank-merged across collections.
