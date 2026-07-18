@@ -677,3 +677,45 @@ async def count(
         rows = await db.execute_fetchall("SELECT COUNT(*) FROM memory_metadata")
     row = rows[0] if rows else None
     return row[0] if row else 0
+
+
+# Pool-size keys stamped onto the weekly J-9 memory snapshot. Exported so the
+# aggregator's failure-fallback and the efficacy report can reference the exact
+# key set without drifting from this function's output.
+POOL_COUNT_KEYS: tuple[str, ...] = (
+    "pool_episodic_total",
+    "pool_episodic_embedded",
+    "pool_knowledge_units_total",
+    "pool_memory_links_total",
+)
+
+
+async def pool_size_counts(db: aiosqlite.Connection) -> dict[str, int]:
+    """Return point-in-time pool-size counts for retrieval-efficacy trending.
+
+    Snapshotted alongside the J-9 weekly memory-quality metrics so retrieval
+    quality (precision@k, hit_rate, MRR) can be read against the size of the
+    pool it was measured over — the pool-growth-vs-quality trend the WS2
+    retrieval-drift work needs and that nothing measured before.
+
+    SQLite-side counts only (the weekly aggregator holds no Qdrant client), so
+    these may differ slightly from Qdrant ``points_count`` on rows still
+    pending embed. ``memory_metadata`` mixes the ``episodic_memory`` and
+    ``knowledge_base`` collections, so episodic is counted by collection, not
+    as the whole table. Keys match ``POOL_COUNT_KEYS``.
+    """
+    ep_total = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM memory_metadata WHERE collection = 'episodic_memory'"
+    )
+    ep_embedded = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM memory_metadata "
+        "WHERE collection = 'episodic_memory' AND embedding_status = 'embedded'"
+    )
+    ku = await db.execute_fetchall("SELECT COUNT(*) FROM knowledge_units")
+    links = await db.execute_fetchall("SELECT COUNT(*) FROM memory_links")
+    return {
+        "pool_episodic_total": int(ep_total[0][0]) if ep_total else 0,
+        "pool_episodic_embedded": int(ep_embedded[0][0]) if ep_embedded else 0,
+        "pool_knowledge_units_total": int(ku[0][0]) if ku else 0,
+        "pool_memory_links_total": int(links[0][0]) if links else 0,
+    }
