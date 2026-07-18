@@ -143,8 +143,9 @@ async def test_registry_includes_recent_tick_signals(db):
     from genesis.reflection.signal_claims import registry_signal_names
 
     await db.execute(
-        "INSERT INTO awareness_ticks (id, source, signals_json, created_at) "
-        "VALUES ('t1', 'scheduled', ?, '2026-07-18T00:00:00+00:00')",
+        "INSERT INTO awareness_ticks (id, source, signals_json, scores_json, "
+        "created_at) "
+        "VALUES ('t1', 'scheduled', ?, '[]', '2026-07-18T00:00:00+00:00')",
         (_json.dumps([
             {"name": "container_memory_pct", "value": 0.4, "source": "host"},
         ]),),
