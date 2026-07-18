@@ -539,6 +539,22 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": True,
         "see_also": ["dream_cycle_entity_check"],
     },
+    "entity_adjudication": {
+        "description": "Entity-NODE merge-vs-distinct adjudication — decides whether two fuzzily-similar entities are the same real-world thing. Hourly drainer over the entity_adjudication queue; digit-differing pairs skip the LLM (mechanical distinct).",
+        "category": "consolidation",
+        "frequency": "Hourly drain (:25), budget ~20 pairs/run; propose_only by default",
+        "model_tier": "slm",
+        "wired": True,
+        "see_also": ["entity_adjudication_challenge"],
+    },
+    "entity_adjudication_challenge": {
+        "description": "Adversarial second opinion on an entity-node 'merge' verdict. Flipped provider pairing (DeepSeek challenges Kimi). Both must agree before two entities are merged.",
+        "category": "consolidation",
+        "frequency": "Hourly drain (:25), fired on merge verdicts only",
+        "model_tier": "slm",
+        "wired": True,
+        "see_also": ["entity_adjudication"],
+    },
     "28_observation_sweep": {
         "description": "Functionally replaced by awareness loop's signal collection (awareness/loop.py:perform_tick). Kept as historical reference; no live consumers route through this call site.",
         "category": "processing",

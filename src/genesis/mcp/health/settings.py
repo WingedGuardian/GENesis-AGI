@@ -115,6 +115,20 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "entity_adjudication": SettingsDomain(
+        name="entity_adjudication",
+        description=(
+            "Entity adjudication drainer — master `enabled` + `mode` "
+            "off/propose_only/live, plus drain/sweep knobs. propose_only "
+            "(default) records merge verdicts without applying them; live "
+            "applies double-agreed merges (loser entity tombstoned into "
+            "survivor) and applies the shadow-period backlog on the flip. "
+            "Read live each hourly run — takes effect next run, no restart."
+        ),
+        config_filename="entity_adjudication.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every drain run
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -876,7 +890,29 @@ def _validate_memory_recall(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_entity_adjudication(changes: dict) -> list[str]:
+    """Validate entity-adjudication lever changes (see
+    genesis.memory.entity_adjudication_config)."""
+    from genesis.memory.entity_adjudication_config import INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "sweep_enabled", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key in ("enabled", "sweep_enabled"):
+            if not isinstance(value, bool):
+                errors.append(f"'{key}' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
+    "entity_adjudication": _validate_entity_adjudication,
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,

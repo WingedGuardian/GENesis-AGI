@@ -413,6 +413,26 @@ call_sites:
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     retry_profile: background
+  # Entity-NODE merge-vs-distinct adjudication (entity_adjudication drainer).
+  # Same free-SLM shape as dream_cycle_entity_check; hourly, small backlog.
+  entity_adjudication:
+    chain:
+    - nvidia-nim-kimi
+    - groq-free
+    - mistral-small-free
+    - openrouter-free
+    - gemini-free
+    - mistral-large-free
+    - openrouter-gemma4
+    retry_profile: background
+  # Adversarial challenge of an entity-node "merge" verdict. Flipped pairing
+  # (DeepSeek challenges Kimi) so a single model's mistake cannot merge two
+  # distinct entities — both must agree before a merge.
+  entity_adjudication_challenge:
+    chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
+    retry_profile: background
   # One-shot supervised wing backfill (scripts/wing_backfill.py) — batch
   # classification of legacy general/uncategorized memories into wings.
   # Same free background family as the dream-cycle classification sites.

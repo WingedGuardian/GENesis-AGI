@@ -36,7 +36,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 36563f95 2026-07-10
+verified: 57fa1f18 2026-07-17
 ```
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
@@ -73,12 +73,21 @@ Easy-to-forget mechanisms:
 - **Entity layer (WS-H Pillar 2)** — typed entity nodes with identity:
   `entities`/`entity_mentions`/`entity_links` tables (migration 0051),
   `db/crud/entities.py` (recursive-CTE traversal, bi-temporal edge validity,
-  EXTRACTED/INFERRED/AMBIGUOUS provenance), `memory/entity_registry.py`
-  (string→ID resolution tiering; fuzzy matches queue `entity_adjudication`),
-  `memory/entity_seed.py` (curated spine incl. the repo-split rule).
-  Distinct from `memory/entity_resolution.py`, which is near-duplicate
-  memory-PAIR dedup. Bitemporal timestamps are canonicalized at the write
-  gate (`db/timeutil.canonical_iso`, migration 0050).
+  EXTRACTED/INFERRED/AMBIGUOUS provenance, `merge_entity` tombstone-with-
+  redirect), `memory/entity_registry.py` (string→ID resolution tiering; fuzzy
+  matches queue `entity_adjudication`), `memory/entity_seed.py` (curated spine
+  incl. the repo-split rule). **Adjudication drainer**
+  (`memory/entity_adjudication.py`, migration 0065 `entity_adjudications`
+  ledger): the hourly consumer of the `entity_adjudication` queue — a mechanical
+  digit-guard rules out numeric-suffix pairs, then a two-model LLM judgment
+  (`entity_adjudication` + flipped-provider `entity_adjudication_challenge`, both
+  must agree) decides merge-vs-distinct. `propose_only` by default (records, does
+  not apply); `live` applies via `merge_entity`. A cursor-managed reconcile sweep
+  rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
+  (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
+  `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
+  Bitemporal timestamps are canonicalized at the write gate
+  (`db/timeutil.canonical_iso`, migration 0050).
 
 **Consolidation (dream cycle)** — `memory/dream_cycle.py` (~1480 LOC):
 weekly clustering (Sun 4am) persists a value-ranked worklist to

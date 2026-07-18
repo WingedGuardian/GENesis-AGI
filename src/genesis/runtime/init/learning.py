@@ -140,6 +140,31 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         misfire_grace_time=3600,
     )
 
+    async def _prune_deferred_work() -> None:
+        if rt._db is None:
+            return
+        try:
+            from datetime import timedelta
+
+            from genesis.db.crud import deferred_work as _dw
+
+            cutoff = (datetime.now(UTC) - timedelta(days=45)).isoformat()
+            removed = await _dw.prune_terminal(rt._db, cutoff_iso=cutoff)
+            rt.record_job_success("deferred_work_prune")
+            if removed:
+                logger.info("deferred_work prune: removed %d terminal rows (>45d)", removed)
+        except Exception as exc:
+            rt.record_job_failure("deferred_work_prune", str(exc))
+            logger.exception("deferred_work prune failed")
+
+    scheduler.add_job(
+        _prune_deferred_work,
+        CronTrigger(hour=5, minute=30, timezone=user_timezone()),
+        id="deferred_work_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
 
 async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""
@@ -672,6 +697,60 @@ async def init(rt: GenesisRuntime) -> None:
             id="dead_letter_redispatch",
             max_instances=1,
             misfire_grace_time=3600,
+        )
+
+        async def _run_entity_adjudication() -> None:
+            try:
+                if rt.paused:
+                    logger.debug("Entity adjudication skipped (Genesis paused)")
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping adjudication as precaution",
+                    exc_info=True,
+                )
+                return
+            if rt._db is None or rt._router is None:
+                return
+            try:
+                from genesis.memory import entity_adjudication as _adj
+                from genesis.memory.entity_adjudication_config import (
+                    effective_mode,
+                    knob_int,
+                    load_config,
+                )
+
+                mode = effective_mode()
+                if mode == "off":
+                    rt.record_job_success("entity_adjudication_drain")
+                    return
+                cfg = load_config()
+                budget = knob_int(cfg, "drain_budget")
+                counts = await _adj.run_adjudication_drain(
+                    rt._db, rt._router, mode=mode, budget=budget
+                )
+                if cfg.get("sweep_enabled", True):
+                    await _adj.maybe_run_sweep(
+                        rt._db,
+                        drain_budget=budget,
+                        slice_size=knob_int(cfg, "sweep_slice_size"),
+                        enqueue_cap=knob_int(cfg, "sweep_enqueue_cap"),
+                    )
+                rt.record_job_success("entity_adjudication_drain")
+                if counts.get("judged") or counts.get("merged") or counts.get("proposed"):
+                    logger.info("entity_adjudication drain (mode=%s): %s", mode, counts)
+            except Exception as exc:
+                rt.record_job_failure("entity_adjudication_drain", str(exc))
+                logger.exception("entity_adjudication drain failed")
+
+        # CronTrigger (not IntervalTrigger — resets on restart). :25 is a clean
+        # minute (:15 process_reaper, :30 procedure_promotion, :45 dead-letter).
+        rt._learning_scheduler.add_job(
+            _run_entity_adjudication,
+            CronTrigger(minute=25),
+            id="entity_adjudication_drain",
+            max_instances=1,
+            misfire_grace_time=600,
         )
 
         async def _run_procedure_promotion() -> None:
