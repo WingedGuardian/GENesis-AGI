@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from genesis.infra_profile.collectors import container as _container
 from genesis.infra_profile.collectors.container import (
+    _networkd_manages_link,
     collect_cpu,
     collect_kernel,
     collect_memory,
@@ -285,3 +289,58 @@ async def test_network_resilience_facts_are_deterministic(tmp_path):
     second = await collect_network(etc_root=tmp_path)
     assert first.facts["networkd_keep_configuration"] is True
     assert section_hash(first.facts) == section_hash(second.facts)
+
+
+# ── networkd default-route management gate (network-posture applicability) ───
+
+
+@pytest.mark.parametrize(
+    "networkctl_json, dev, expected",
+    [
+        # networkd owns the default-route link → the two protections apply
+        ('{"Interfaces": [{"Name": "eth0", "AdministrativeState": "configured"}]}', "eth0", True),
+        # NetworkManager / foreign owns it → not applicable, stay silent
+        ('{"Interfaces": [{"Name": "eth0", "AdministrativeState": "unmanaged"}]}', "eth0", False),
+        # default-route dev is not one of networkd's links → not applicable
+        ('{"Interfaces": [{"Name": "eth1", "AdministrativeState": "configured"}]}', "eth0", False),
+        # networkctl absent / networkd not running (_run_cmd → None) → suppress
+        (None, "eth0", False),
+        # no default route resolved → nothing to correlate on
+        ('{"Interfaces": [{"Name": "eth0", "AdministrativeState": "configured"}]}', None, False),
+        # malformed / wrong-shape JSON must fail safe, never raise
+        ("not json", "eth0", False),
+        ("[]", "eth0", False),
+        ('{"Interfaces": null}', "eth0", False),
+        ("", "eth0", False),
+    ],
+)
+def test_networkd_manages_link(networkctl_json, dev, expected):
+    assert _networkd_manages_link(networkctl_json, dev) is expected
+
+
+def _route_and_networkctl(admin_state: str):
+    """A fake _run_cmd: default route on eth0 + a networkctl verdict for it."""
+
+    async def _fake(*argv, **_kw):
+        if argv and argv[0] == "ip" and "route" in argv:
+            return '[{"dev": "eth0", "gateway": "10.0.0.1"}]'
+        if argv and argv[0] == "networkctl":
+            return json.dumps(
+                {"Interfaces": [{"Name": "eth0", "AdministrativeState": admin_state}]}
+            )
+        return None  # ip -j addr etc. → harmless None
+
+    return _fake
+
+
+async def test_collect_network_populates_manages_default_route(tmp_path, monkeypatch):
+    monkeypatch.setattr(_container, "_run_cmd", _route_and_networkctl("configured"))
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["default_route_dev"] == "eth0"
+    assert result.facts["networkd_manages_default_route"] is True
+
+
+async def test_collect_network_suppresses_when_networkmanager(tmp_path, monkeypatch):
+    monkeypatch.setattr(_container, "_run_cmd", _route_and_networkctl("unmanaged"))
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["networkd_manages_default_route"] is False

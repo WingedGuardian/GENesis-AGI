@@ -56,6 +56,9 @@ def _profile(
     oomd: object = True,
     host_swap_kb: object = 8_000_000,
     knob: object = "true",
+    networkd_route: object = True,
+    keepconfig: object = True,
+    watchdog: object = True,
     age_days: float = 0.0,
     collected_at: object = "auto",
 ) -> dict:
@@ -80,6 +83,14 @@ def _profile(
                 "status": "ok",
                 "facts": {"container_limits": {"limits.memory.swap": knob}},
             },
+            "network": {
+                "status": "ok",
+                "facts": {
+                    "networkd_manages_default_route": networkd_route,
+                    "networkd_keep_configuration": keepconfig,
+                    "network_watchdog_installed": watchdog,
+                },
+            },
         }
     }
     if collected_at is not None:
@@ -103,14 +114,24 @@ def _reset_cooldown():
 # ── rule semantics ──────────────────────────────────────────────────────────
 
 
+_ALL_DEFECTS = dict(
+    swap_max=0,
+    oomd=False,
+    host_swap_kb=0,
+    knob="false",
+    networkd_route=True,  # networkd owns the route, so the network rules apply
+    keepconfig=False,
+    watchdog=False,
+)
+
+
 def test_all_defects_detected():
-    missing = _infra_missing_protections(
-        _profile(swap_max=0, oomd=False, host_swap_kb=0, knob="false")
-    )
-    assert missing == [
+    assert _infra_missing_protections(_profile(**_ALL_DEFECTS)) == [
         "container_swap_disabled",
         "container_swap_knob_off",
         "host_swap_absent",
+        "network_watchdog_absent",
+        "networkd_keepconfig_missing",
         "oomd_pressure_kill_off",
     ]
 
@@ -122,12 +143,7 @@ def test_healthy_profile_no_defects():
 def test_absent_facts_are_silent():
     # No guardian host plane, no host_virt, empty memory facts — a public
     # install missing optional planes must never false-alarm.
-    assert (
-        _infra_missing_protections(
-            {"sections": {"memory": {"status": "ok", "facts": {}}}}
-        )
-        == []
-    )
+    assert _infra_missing_protections({"sections": {"memory": {"status": "ok", "facts": {}}}}) == []
     assert _infra_missing_protections({}) == []
 
 
@@ -163,6 +179,61 @@ def test_absent_knob_is_healthy():
     # incus default is true — only an explicit "false" alerts.
     profile = _profile()
     del profile["sections"]["host_virt"]["facts"]["container_limits"]
+    assert _infra_missing_protections(profile) == []
+
+
+# ── network-plane rules (gated on networkd managing the default route) ───────
+
+
+def test_network_defects_when_networkd_manages():
+    # networkd owns the default route but neither protection is installed.
+    missing = _infra_missing_protections(
+        _profile(networkd_route=True, keepconfig=False, watchdog=False)
+    )
+    assert missing == ["network_watchdog_absent", "networkd_keepconfig_missing"]
+
+
+def test_networkmanager_box_suppressed():
+    # networkd does NOT manage the route (NetworkManager / foreign) — the
+    # protections are not applicable, so False facts must stay silent. This is
+    # the whole point of the disambiguation gate (no false-positive on a public
+    # NetworkManager install).
+    assert (
+        _infra_missing_protections(_profile(networkd_route=False, keepconfig=False, watchdog=False))
+        == []
+    )
+
+
+def test_networkd_gate_absent_suppressed():
+    # An OLD profile collected before this fact existed: the network section is
+    # ok but has no networkd_manages_default_route key → suppressed until the
+    # next collection re-populates it (never assert from a missing gate).
+    profile = _profile(keepconfig=False, watchdog=False)
+    del profile["sections"]["network"]["facts"]["networkd_manages_default_route"]
+    assert _infra_missing_protections(profile) == []
+
+
+def test_network_gate_requires_bool_true():
+    # Strict `is True` (mirrors the explicit-value discipline): a stringy
+    # "true" is not the bool the collector emits, so it must not enable the
+    # rules — a malformed fact fails safe (suppress), never false-alarms.
+    assert (
+        _infra_missing_protections(
+            _profile(networkd_route="true", keepconfig=False, watchdog=False)
+        )
+        == []
+    )
+
+
+def test_network_protections_present_are_silent():
+    assert _infra_missing_protections(_profile(networkd_route=True)) == []
+
+
+def test_network_not_ok_section_is_ignored():
+    # Codex P2 parity: a failing network collector RETAINS facts with
+    # status=error — the rules must not assert from them.
+    profile = _profile(networkd_route=True, keepconfig=False, watchdog=False)
+    profile["sections"]["network"]["status"] = "error"
     assert _infra_missing_protections(profile) == []
 
 
@@ -398,15 +469,13 @@ def test_every_rule_slug_has_detail_text():
     # The alert content is built via _INFRA_POSTURE_DETAIL[slug] — a rule slug
     # without detail text would KeyError inside the (swallowed) check. Derive
     # the producible set from the rules themselves.
-    producible = set(
-        _infra_missing_protections(_profile(swap_max=0, oomd=False, host_swap_kb=0, knob="false"))
-    )
+    producible = set(_infra_missing_protections(_profile(**_ALL_DEFECTS)))
     assert producible == set(_loop._INFRA_POSTURE_DETAIL)
 
 
-def test_memory_resilience_facts_are_covered():
-    # Provision-or-surface: every memory-resilience effective-fact must be
-    # read by the posture rules, so a protection can't silently lose its
+def test_resilience_facts_are_covered():
+    # Provision-or-surface: every memory- AND network-resilience effective-fact
+    # must be read by the posture rules, so a protection can't silently lose its
     # surfacing signal in a refactor. (Adding a NEW protection fact requires
     # extending both the rules and this list — that is the point.)
     src = inspect.getsource(_infra_missing_protections)
@@ -415,6 +484,9 @@ def test_memory_resilience_facts_are_covered():
         "oomd_user_slice_kill",
         "swap_total_kb",
         "limits.memory.swap",
+        "networkd_manages_default_route",
+        "networkd_keep_configuration",
+        "network_watchdog_installed",
     ):
         assert fact in src, f"posture rules no longer read {fact!r}"
 
@@ -424,4 +496,3 @@ def test_check_is_wired_into_the_tick():
     # pipeline, not just exist as a function.
     src = inspect.getsource(_loop)
     assert "await _check_infra_protection_posture(self._db)" in src
-

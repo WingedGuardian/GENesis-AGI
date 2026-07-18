@@ -192,6 +192,34 @@ def _networkd_keep_configuration(etc_root: Path) -> bool:
     return False
 
 
+def _networkd_manages_link(networkctl_json: str | None, dev: str | None) -> bool:
+    """True when the RUNNING systemd-networkd daemon reports interface ``dev`` as
+    ``AdministrativeState == "configured"`` — i.e. networkd owns that link via a
+    .network file. This is the applicability gate for the network-resilience
+    posture: the KeepConfiguration + watchdog protections only matter when
+    networkd manages the box's primary connectivity. On a NetworkManager install
+    the daemon either is not running (``networkctl`` fails → None reaches here)
+    or reports the link ``unmanaged`` (foreign/NM-managed) — either way False, so
+    the posture check stays silent instead of false-alarming.
+
+    Any doubt returns False (no output, unparseable JSON, dev absent/None, link
+    not "configured"): a false-negative is re-checked next collection; a
+    false-positive would nag a NetworkManager box that can't act on it. Queried
+    live rather than reading /run/systemd/netif/links/<idx>, which is marked "do
+    not parse" and — under the unit's RuntimeDirectoryPreserve=yes — survives a
+    networkd stop, so its presence would NOT prove networkd is the manager."""
+    if not networkctl_json or not dev:
+        return False
+    try:
+        interfaces = json.loads(networkctl_json).get("Interfaces") or []
+    except (ValueError, TypeError, AttributeError):
+        return False
+    for iface in interfaces:
+        if isinstance(iface, dict) and iface.get("Name") == dev:
+            return iface.get("AdministrativeState") == "configured"
+    return False
+
+
 def _read_watchdog_state(run_root: Path) -> dict | None:
     """Parse the network watchdog's /run telemetry (last_check / last_heal /
     last_trigger / heal_count / last_action). Returns None when absent or
@@ -504,6 +532,15 @@ async def collect_network(
     facts["network_watchdog_installed"] = (
         etc_root / "systemd/system/genesis-network-watchdog.timer"
     ).exists()
+    # Applicability gate for the two facts above: are they even relevant here?
+    # The posture check only asserts a network protection is MISSING when
+    # networkd manages the default-route link — otherwise (NetworkManager /
+    # foreign-managed) the protections don't apply and staying silent is
+    # correct. Live daemon query; any doubt → False → silent (see the helper).
+    facts["networkd_manages_default_route"] = _networkd_manages_link(
+        await _run_cmd("networkctl", "--json=short", "list"),
+        facts.get("default_route_dev"),
+    )
 
     # Watchdog heal telemetry is volatile (heal_count/timestamps move), so it is
     # a METRIC — never hashed. Absent file → key omitted (no drift churn).

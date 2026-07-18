@@ -474,6 +474,19 @@ _INFRA_POSTURE_DETAIL = {
         "limits.memory.swap true (scripts/host-setup.sh sets this; the host "
         "guardian also reconciles it when healthy)"
     ),
+    "networkd_keepconfig_missing": (
+        "systemd-networkd manages the default route but no link carries "
+        "KeepConfiguration — a networkd failure under memory pressure DROPS the "
+        "address (the 2026-07 eth0 wedge) instead of retaining it. Re-run "
+        "scripts/bootstrap.sh (lib/network_resilience.sh sets "
+        "KeepConfiguration=true on the default-route link)"
+    ),
+    "network_watchdog_absent": (
+        "no genesis-network-watchdog.timer — a wedged or route-less "
+        "systemd-networkd is never auto-healed and stays down until a manual "
+        "restart. Re-run scripts/bootstrap.sh (installs the watchdog timer + "
+        "oneshot service via lib/network_resilience.sh)"
+    ),
 }
 
 
@@ -492,7 +505,7 @@ def _infra_profile_age_days(profile: dict) -> float | None:
 
 
 def _infra_missing_protections(profile: dict) -> list[str]:
-    """Evaluate the memory-plane protection rules against profile facts.
+    """Evaluate the memory- and network-plane protection rules against profile facts.
 
     Only an EXPLICIT defect value counts — absent/None facts stay silent.
     Tri-state contract for cgroup_memory_swap_max (collectors/container.py):
@@ -537,10 +550,20 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     limits = _facts("host_virt").get("container_limits")
     if isinstance(limits, dict) and limits.get("limits.memory.swap") == "false":
         missing.append("container_swap_knob_off")
+    # Network plane, gated on networkd actually managing the default route
+    # (collectors/container.py::_networkd_manages_link). On a NetworkManager
+    # box the fact is False/absent, so these rules stay silent — the
+    # KeepConfiguration + watchdog protections only apply under networkd.
+    network = _facts("network")
+    if network.get("networkd_manages_default_route") is True:
+        if network.get("networkd_keep_configuration") is False:
+            missing.append("networkd_keepconfig_missing")
+        if network.get("network_watchdog_installed") is False:
+            missing.append("network_watchdog_absent")
     return sorted(missing)
 
 
-_POSTURE_PLANES = ("memory", "host_system", "host_virt")
+_POSTURE_PLANES = ("memory", "host_system", "host_virt", "network")
 
 
 def _infra_unverifiable_planes(profile: dict) -> list[str]:
@@ -564,7 +587,7 @@ def _infra_unverifiable_planes(profile: dict) -> list[str]:
 
 
 async def _check_infra_protection_posture(db) -> None:
-    """Alert when a memory-plane protection is missing or the profile is stale.
+    """Alert when a memory- or network-plane protection is missing or the profile is stale.
 
     One 'high' infrastructure_alert (dashboard + morning report; the WS-2 M10
     reconciler absorbs it into the durable open-set) describing the CURRENT
@@ -676,7 +699,7 @@ async def _resolve_infra_protection_posture(db) -> None:
             type="infrastructure_alert",
             resolved_at=datetime.now(UTC).isoformat(),
             resolution_notes=(
-                "auto-resolved: all memory-plane protections present and the profile is fresh"
+                "auto-resolved: all memory/network protections present and the profile is fresh"
             ),
         )
         if resolved:
@@ -2022,7 +2045,7 @@ class AwarenessLoop:
                     await _check_user_model_staleness(self._db)
                     # Infra protection posture (silent-skip closure, Phase 3) —
                     # a stable-unprotected box must never be silent: a missing
-                    # memory-plane protection (or a stale profile) raises one
+                    # memory/network protection (or a stale profile) raises one
                     # 'high' infrastructure_alert; self-resolves on recovery.
                     # Facts change at most ~daily (profile refresh) → hourly.
                     await _check_infra_protection_posture(self._db)
