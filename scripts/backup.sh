@@ -526,6 +526,26 @@ else
         fi
     done < <(find memory -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
 
+    # Upload eval golden sets (§6c) into the COMPLETE off-site snapshot so a
+    # no-git fresh-box DR rehydrates them (restore §4b) — without this they were
+    # Tier-1-git-only. Encrypted; nests under eval/golden/, so mirror the
+    # relative path (backend_mkdir is idempotent). A failed upload of a present
+    # file flips _T2_OK, same contract as the payloads above.
+    if [ -d eval ]; then
+        backend_mkdir "${_T2_DIR}/eval"
+        while IFS= read -r -d '' f; do
+            rel="${f#eval/}"
+            _sub="$(dirname "$rel")"
+            [ "$_sub" != "." ] && backend_mkdir "${_T2_DIR}/eval/${_sub}"
+            if backend_put "$f" "${_T2_DIR}/eval/${rel}"; then
+                log "  off-site: uploaded eval/${rel}"
+            else
+                log "WARNING: off-site upload failed for eval/${rel}"
+                _T2_OK=false
+            fi
+        done < <(find eval -type f -name '*.gpg' -print0 2>/dev/null)
+    fi
+
     backend_mkdir "${_T2_DIR}/config_overrides"
     while IFS= read -r -d '' f; do
         fname=$(basename "$f")

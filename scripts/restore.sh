@@ -382,6 +382,20 @@ _pull_from_offsite() {
             warn "off-site: failed to pull secrets.env.gpg from snapshot $latest — secrets will not be restored"
         fi
     fi
+    # eval golden sets — a no-git fresh box needs them from the snapshot too
+    # (restore §4b reads $BACKUP_DIR/eval). backend_list is single-level, so
+    # iterate eval/ and eval/golden/ separately; the .gpg filter drops the
+    # `golden` subdir entry so it is not mis-fetched as a flat file.
+    for _sub in eval eval/golden; do
+        while read -r fname; do
+            mkdir -p "$BACKUP_DIR/$_sub"
+            if backend_get "$snap/$_sub/$fname" "$BACKUP_DIR/$_sub/$fname"; then
+                log "  off-site: pulled $_sub/$fname"
+            else
+                warn "off-site: failed to pull $_sub/$fname from snapshot $latest"
+            fi
+        done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
+    done
     # creds — Tier-1 git normally carries these; a no-git box needs them from the
     # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
     # single-level, so iterate creds/ and creds/ssh/ separately; the .gpg filter
