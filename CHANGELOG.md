@@ -20,6 +20,26 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Ground Truth section of exact totals, truncated lists are labeled
   "showing N of M", protective mechanisms are tagged so they can't be read
   as risks, and the grounded draft is delivered as-is (single draft pass).
+- **Reflections stop arguing with themselves about signals that never
+  fired.** All reflection depths now see live awareness signals in one
+  canonical format (previously light and deep cycles each got a different
+  shape, so one cycle couldn't recognize what the other had cited), the
+  prompt now clearly separates live tick signals from stored-observation
+  history, and a guard strips any signal-by-name-and-value claim from a
+  reflection's persisted narrative when that signal wasn't actually in the
+  live tick. This ends the loop where a phantom claim ("signal X=0.9") got
+  written into cognitive state, re-read by the next reflection, debunked,
+  and then re-asserted for days. The guard only annotates — it never blocks
+  or rejects a reflection's update.
+
+- **Reflection updates in Telegram are now real summaries.** The reflection
+  topic previously relayed the model's raw output, so a malformed reflection
+  could leak internal tool-call chatter to your Telegram verbatim. Messages
+  are now built only from the parsed reflection fields (assessment, key
+  observations, next focus); when a reflection's output can't be parsed you
+  get a short "completed — stored for review" notice instead of noise, and
+  unparseable output is no longer stored as a reflection summary that later
+  reflections would re-read and argue with.
 
 - **Demoted autonomy can actually earn its way back now.** Earn-back
   eligibility used to be computed over a category's entire lifetime record,
@@ -35,6 +55,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Groundwork: Genesis can now measure whether its entity graph would improve
+  recall, without changing any results yet.** A new shadow-only lane resolves a
+  recall query to entities in its knowledge graph, walks their relationships,
+  and records how many new, still-valid memories it would have surfaced that
+  ordinary search missed. This is measurement only (one internal metric per
+  recall); it ships off by default and never alters what recall returns, so the
+  data can decide whether building the live version is worth it.
 - **Genesis now tidies near-duplicate entities in its knowledge graph.** When
   it learns about a "thing" (a project, tool, concept, person) whose name is
   very close to one it already knows, it now decides whether they are the same
