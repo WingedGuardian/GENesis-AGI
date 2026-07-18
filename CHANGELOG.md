@@ -95,6 +95,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The host recovery brain no longer goes blind on a misconfigured work
+  directory.** If the guardian's configured Claude Code work directory already
+  exists but isn't writable by the guardian (for example a root-owned
+  `/var/lib` path left over from an older install), it now detects that with a
+  real write probe and falls back to a user-writable directory instead of
+  handing the recovery session an unusable working directory. Previously only a
+  *non-creatable* directory triggered the fallback; an existing-but-unwritable
+  one slipped through and could blind the recovery brain exactly when it was
+  needed most.
+
 - **Disaster recovery no longer risks corrupting the thing it's recovering.** A
   script audit found three ways deploy/restore could bite at the worst moment,
   now fixed: (1) during a database restore, the health watchdog could restart
