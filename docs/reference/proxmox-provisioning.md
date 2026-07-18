@@ -213,7 +213,9 @@ curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d
 - **Grow memory:** `provision_grow` (`kind="memory"`) grows *configured* RAM;
   it **takes effect only after a VM reboot** (hotplug is off on this install).
   The provision token deliberately lacks `VM.PowerMgmt` — power stays
-  human/approved. Schedule the stop/start as a downtime window.
+  human/approved. Schedule the stop/start as a downtime window. **The reboot
+  has a sharp edge — see "Applying a memory grow: the reboot" below** (a reboot
+  from *inside* the guest silently does nothing).
 - **Grow the CONTAINER (local, no Proxmox token):** `provision_grow`
   (`kind="root"`) grows the container root volume to `<gib>` GB total — incus
   resizes the thin LV + filesystem ONLINE, no restart (`guardian/grow_capacity.py`,
@@ -233,6 +235,62 @@ curl -sk -X PUT -H "Authorization: $AUD" "$H/nodes/<NODE>/qemu/<VMID>/config" -d
   vzdump exists (see "Backups (vzdump)" below); with the JIT chain in place a
   stale backup then turns a grow proposal into a backup→verify→grow chain
   instead of a dead end.
+
+## Applying a memory grow: the reboot (the pending-config gotcha)
+
+A `kind="memory"` grow only writes the VM's *configured* memory. Because
+memory hotplug is off, the new value is **pending** until the QEMU process is
+respawned — and that is the trap:
+
+- **A reboot from INSIDE the guest does NOT apply it.** `sudo reboot` (or any
+  guest-initiated restart) reboots the OS but leaves the *same* QEMU process
+  running, so Proxmox never picks up the pending config. The change silently
+  does nothing and you are left debugging "I grew the RAM but `free` still shows
+  the old size." The QEMU process must actually stop and start.
+- **Reboot from the Proxmox side instead:** `qm reboot <vmid>` (CLI) or the GUI
+  **Reboot** button. `qm reboot` shuts the VM down gracefully and starts it
+  again, applying pending changes on the way up. Confirm what is staged first
+  with `qm pending <vmid>`, which lists each key's live `value` vs its `pending`
+  target. (The guardian's `provision-status` verb reports the *configured*
+  memory, which already reflects a staged grow, but does not itself show the
+  live-vs-pending split — use `qm pending` for that.)
+- **If you drive the reboot from a session that lives INSIDE the VM** (e.g. the
+  Genesis container itself), that session dies the moment the VM goes down —
+  mid-command. Issue the reboot *detached on the Proxmox host* so the SSH
+  client's death cannot abort it, then reconnect after boot:
+  `ssh root@<pve-host> "nohup qm reboot <vmid> --timeout 120 >/dev/null 2>&1 & disown"`.
+- **Graceful-reboot hang fallback.** `qm reboot` uses ACPI. Without the QEMU
+  guest agent it depends on the guest honoring ACPI; if it times out, the VM
+  keeps running **unchanged** (nothing applied, no harm). To force it, do a full
+  power cycle — `qm stop <vmid> && qm start <vmid>` — which is a hard power-off,
+  so take a fresh backup/snapshot first and treat forcing as a deliberate step.
+
+### Post-reboot checklist
+
+1. **The grow actually applied:** inside the guest, `MemTotal` (`/proc/meminfo`)
+   reflects the new size. If it still shows the old value, the pending config
+   did NOT apply — power-cycle with `qm stop`/`qm start`.
+2. **The container came back:** `boot.autostart` brings it up; the guardian's
+   `incus start` fallback covers a missed autostart. Verify the container is
+   RUNNING and `genesis-server` + the guardian tick are healthy.
+3. **Host swap tier is present:** `swapon --show` lists the host zram device (if
+   configured). Note that `host_swap_apply` runs at install and on guardian
+   *redeploy*, **not** every guardian tick — so if a fresh boot did not bring the
+   zram device up, re-run the installer swap step (or an `update.sh` redeploy)
+   rather than waiting for self-heal. The container's own swap knob
+   (`limits.memory.swap`) *is* reconciled per-tick by the guardian; the host zram
+   device is a separate layer that is not.
+4. **Complete the coupling (Phase-C):** run `provision_grow(kind="limits")` so
+   the grown RAM actually reaches the container's cgroup cap (grow-only, capped
+   below host `MemTotal−reserve`, applied live). A grown VM whose container cap
+   is untouched wastes the new RAM entirely.
+5. **Per-service caps lag one restart.** systemd units that cap memory as a
+   *percentage* (e.g. `MemoryMax=80%`) resolve that percentage to absolute bytes
+   at unit start, against whatever the container cap was *then*. After raising
+   the cap they keep their old absolute limit until each unit next restarts —
+   the container-level cap applies immediately, the per-service caps catch up on
+   their next natural restart (a deploy, a manual restart, or a reboot that
+   happens *after* the cap raise).
 
 ## Backups (vzdump) — two-phase, JIT + rotation
 
