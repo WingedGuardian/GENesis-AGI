@@ -160,64 +160,85 @@ def _oomd_user_slice_kill(etc_root: Path) -> bool:
     return effective == "kill"
 
 
-def _networkd_keep_configuration(etc_root: Path) -> bool:
-    """True when at least one systemd-networkd link has an effective
-    KeepConfiguration policy (any value other than "no") — the
+def _keepconf_effective_in_dir(dropin_dir: Path) -> bool:
+    """KeepConfiguration verdict for ONE `.network.d` drop-in dir: last-
+    assignment-wins across its sorted `*.conf` (a later zz-*.conf reverting to
+    `no` disables the link), effective iff the final value is non-"no". The
     genesis-keep-config.conf that scripts/lib/network_resilience.sh lays down so
     a networkd failure RETAINS the address instead of dropping it (the 2026-07
-    eth0 wedge). Scoped the way systemd scopes drop-ins: last-assignment-wins
-    WITHIN each `.network.d` directory (a later zz-*.conf reverting to `auto`/
-    `no` disables that link), then OR'd across links — an unrelated drop-in on
-    a *different* interface can neither fake protection nor mask it. Config-
-    plane: scans our world-readable /etc drop-ins (the /run render is root-only).
-    Comments are full-line only (unit files have no inline comments)."""
+    eth0 wedge). Config-plane: reads our world-readable /etc drop-ins (the /run
+    render is root-only). Comments are full-line only (units have no inline)."""
+    if not dropin_dir.is_dir():
+        return False
+    effective: str | None = None
+    for conf in sorted(dropin_dir.glob("*.conf")):
+        raw = _read(conf) or ""
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("#", ";")):
+                continue
+            key, sep, value = stripped.partition("=")
+            if sep and key.strip() == "KeepConfiguration":
+                effective = value.strip()
+    return effective is not None and effective.lower() != "no"
+
+
+def _networkd_keep_configuration(etc_root: Path) -> bool:
+    """True when AT LEAST ONE systemd-networkd link has effective
+    KeepConfiguration — an install-wide OR (an unrelated drop-in on a different
+    interface can neither fake nor mask another link). This feeds the annotation
+    layer; the posture check uses the default-route-SCOPED `_keepconf_on_route_link`
+    instead, so a protected non-default link can't hide an unprotected route."""
     net_dir = etc_root / "systemd/network"
     if not net_dir.is_dir():
         return False
-    for dropin_dir in sorted(net_dir.glob("*.network.d")):
-        if not dropin_dir.is_dir():
-            continue
-        effective: str | None = None
-        for conf in sorted(dropin_dir.glob("*.conf")):
-            raw = _read(conf) or ""
-            for line in raw.splitlines():
-                stripped = line.strip()
-                if stripped.startswith(("#", ";")):
-                    continue
-                key, sep, value = stripped.partition("=")
-                if sep and key.strip() == "KeepConfiguration":
-                    effective = value.strip()
-        if effective is not None and effective.lower() != "no":
-            return True
-    return False
+    return any(_keepconf_effective_in_dir(d) for d in sorted(net_dir.glob("*.network.d")))
 
 
-def _networkd_manages_link(networkctl_json: str | None, dev: str | None) -> bool:
-    """True when the RUNNING systemd-networkd daemon reports interface ``dev`` as
-    ``AdministrativeState == "configured"`` — i.e. networkd owns that link via a
-    .network file. This is the applicability gate for the network-resilience
-    posture: the KeepConfiguration + watchdog protections only matter when
-    networkd manages the box's primary connectivity. On a NetworkManager install
-    the daemon either is not running (``networkctl`` fails → None reaches here)
-    or reports the link ``unmanaged`` (foreign/NM-managed) — either way False, so
-    the posture check stays silent instead of false-alarming.
-
-    Any doubt returns False (no output, unparseable JSON, dev absent/None, link
-    not "configured"): a false-negative is re-checked next collection; a
-    false-positive would nag a NetworkManager box that can't act on it. Queried
-    live rather than reading /run/systemd/netif/links/<idx>, which is marked "do
-    not parse" and — under the unit's RuntimeDirectoryPreserve=yes — survives a
-    networkd stop, so its presence would NOT prove networkd is the manager."""
+def _networkd_route_iface(networkctl_json: str | None, dev: str | None) -> dict | None:
+    """The `networkctl --json` interface record for ``dev`` (or None on any
+    doubt: no output, unparseable, wrong shape, dev absent/None). The single
+    parse behind both the management gate and the route link's `.network` unit
+    identity. Queried live rather than reading /run/systemd/netif/links/<idx>,
+    which is marked "do not parse" and — under the unit's
+    RuntimeDirectoryPreserve=yes — survives a networkd stop, so its presence
+    would NOT prove networkd is the manager."""
     if not networkctl_json or not dev:
-        return False
+        return None
     try:
         interfaces = json.loads(networkctl_json).get("Interfaces") or []
     except (ValueError, TypeError, AttributeError):
-        return False
+        return None
     for iface in interfaces:
         if isinstance(iface, dict) and iface.get("Name") == dev:
-            return iface.get("AdministrativeState") == "configured"
-    return False
+            return iface
+    return None
+
+
+def _networkd_manages_link(networkctl_json: str | None, dev: str | None) -> bool:
+    """True when the RUNNING systemd-networkd daemon reports ``dev`` as
+    ``AdministrativeState == "configured"`` — networkd owns that link via a
+    .network file. The applicability gate for the network-resilience posture:
+    the KeepConfiguration + watchdog protections only matter when networkd
+    manages the box's primary connectivity. On a NetworkManager install the
+    daemon is not running (``networkctl`` fails) or reports the link
+    ``unmanaged`` — either way False, so the posture check stays silent instead
+    of false-alarming. Any doubt → False (safe: a false-negative is re-checked
+    next collection; a false-positive would nag an NM box that can't act)."""
+    iface = _networkd_route_iface(networkctl_json, dev)
+    return iface is not None and iface.get("AdministrativeState") == "configured"
+
+
+def _keepconf_on_route_link(etc_root: Path, network_file: str | None) -> bool:
+    """KeepConfiguration effective specifically on the DEFAULT-ROUTE link,
+    identified by its main `.network` unit (``network_file`` from networkctl's
+    NetworkFile). Its /etc override dir is ``<unit-basename>.d``. Route-scoped so
+    a protected but unrelated link cannot hide an unprotected default route (the
+    multi-interface false-negative). None/absent unit → False (nothing to
+    credit — networkd isn't managing the route, or the daemon didn't report)."""
+    if not network_file:
+        return False
+    return _keepconf_effective_in_dir(etc_root / "systemd/network" / f"{Path(network_file).name}.d")
 
 
 def _read_watchdog_state(run_root: Path) -> dict | None:
@@ -525,22 +546,32 @@ async def collect_network(
         except (ValueError, IndexError, TypeError):
             pass
 
-    # Resilience posture (config-plane facts — see docs/reference/network-
-    # resilience.md). Deterministic file reads, so they belong in facts: the
-    # annotation layer flags an install that lacks either protection.
+    # Resilience posture — see the annotation-vs-posture split in
+    # docs/reference/network-resilience.md. The first two are install-wide/
+    # on-disk facts for the ANNOTATION layer; the posture check reads the
+    # effective, default-route-scoped variants below instead.
     facts["networkd_keep_configuration"] = _networkd_keep_configuration(etc_root)
     facts["network_watchdog_installed"] = (
         etc_root / "systemd/system/genesis-network-watchdog.timer"
     ).exists()
-    # Applicability gate for the two facts above: are they even relevant here?
-    # The posture check only asserts a network protection is MISSING when
-    # networkd manages the default-route link — otherwise (NetworkManager /
-    # foreign-managed) the protections don't apply and staying silent is
-    # correct. Live daemon query; any doubt → False → silent (see the helper).
-    facts["networkd_manages_default_route"] = _networkd_manages_link(
-        await _run_cmd("networkctl", "--json=short", "list"),
-        facts.get("default_route_dev"),
+    # POSTURE inputs. One networkctl query drives both the applicability gate
+    # (networkd manages the default route — otherwise NetworkManager/foreign, so
+    # stay silent) AND the route link's `.network` unit, which scopes the
+    # KeepConfiguration verdict to THAT link (a protected non-default link must
+    # not mask an unprotected route). The watchdog fact is is-enabled, not mere
+    # file presence, since the installer ignores enable failures. Any doubt path
+    # → False → posture silent.
+    networkctl_json = await _run_cmd("networkctl", "--json=short", "list")
+    dev = facts.get("default_route_dev")
+    manages = _networkd_manages_link(networkctl_json, dev)
+    facts["networkd_manages_default_route"] = manages
+    route_iface = _networkd_route_iface(networkctl_json, dev) if manages else None
+    facts["networkd_default_route_keepconfig"] = _keepconf_on_route_link(
+        etc_root, route_iface.get("NetworkFile") if route_iface else None
     )
+    facts["network_watchdog_enabled"] = (
+        await _run_cmd("systemctl", "is-enabled", "genesis-network-watchdog.timer")
+    ) == "enabled"
 
     # Watchdog heal telemetry is volatile (heal_count/timestamps move), so it is
     # a METRIC — never hashed. Absent file → key omitted (no drift churn).

@@ -457,9 +457,11 @@ verified: b662f3e3 2026-07-17
   is missing (container `memory.swap.max=0`, oomd pressure-kill off, host swap
   absent, incus swap knob explicitly `"false"`) or the profile is stale (>3d =
   refresh broken → distinct "posture UNKNOWN" alert). Also covers the
-  **network plane** (`networkd_keep_configuration` / `network_watchdog_installed`
-  off), gated strictly on `networkd_manages_default_route is True` — a
-  networkctl-derived fact (the running daemon reports the default-route link
+  **network plane** — reads the *effective* facts `networkd_default_route_keepconfig`
+  (KeepConfiguration on the default-route link's OWN drop-in, not any-link) and
+  `network_watchdog_enabled` (`systemctl is-enabled`, not mere file presence),
+  gated strictly on `networkd_manages_default_route is True` — a networkctl-derived
+  fact (the running daemon reports the default-route link
   `AdministrativeState=configured`) that suppresses the rules on NetworkManager
   installs, so no false-positive on the public repo. Only EXPLICIT defect
   values alert — absent/`None` facts stay silent (no guardian plane, cgroup
@@ -909,12 +911,13 @@ verified: b662f3e3 2026-07-17
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
   installs (see docs/reference/memory-resilience.md). Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
-  `network_watchdog_installed` (config-plane facts from
-  `scripts/lib/network_resilience.sh`), plus `networkd_manages_default_route`
-  (the applicability gate — networkctl reports the default-route link
-  `AdministrativeState=configured`, so the posture check stays silent on
-  NetworkManager installs), plus a volatile `watchdog` heal-telemetry metric
-  from `/run/genesis-network-watchdog.json` (see
+  `network_watchdog_installed` (any-link/file-present facts for the annotation
+  layer) alongside the posture check's *effective* variants
+  `networkd_default_route_keepconfig` + `network_watchdog_enabled`, all gated by
+  `networkd_manages_default_route` (the applicability gate — networkctl reports
+  the default-route link `AdministrativeState=configured`, so the posture check
+  stays silent on NetworkManager installs), plus a volatile `watchdog`
+  heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
   docs/reference/network-resilience.md).
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).

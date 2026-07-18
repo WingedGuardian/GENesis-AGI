@@ -475,17 +475,18 @@ _INFRA_POSTURE_DETAIL = {
         "guardian also reconciles it when healthy)"
     ),
     "networkd_keepconfig_missing": (
-        "systemd-networkd manages the default route but no link carries "
+        "systemd-networkd manages the default route but its link carries no "
         "KeepConfiguration — a networkd failure under memory pressure DROPS the "
         "address (the 2026-07 eth0 wedge) instead of retaining it. Re-run "
         "scripts/bootstrap.sh (lib/network_resilience.sh sets "
         "KeepConfiguration=true on the default-route link)"
     ),
     "network_watchdog_absent": (
-        "no genesis-network-watchdog.timer — a wedged or route-less "
-        "systemd-networkd is never auto-healed and stays down until a manual "
-        "restart. Re-run scripts/bootstrap.sh (installs the watchdog timer + "
-        "oneshot service via lib/network_resilience.sh)"
+        "the genesis-network-watchdog.timer is not enabled (missing, or its "
+        "enable was skipped/failed) — a wedged or route-less systemd-networkd is "
+        "never auto-healed and stays down until a manual restart. Re-run "
+        "scripts/bootstrap.sh (installs + enables the watchdog timer via "
+        "lib/network_resilience.sh)"
     ),
 }
 
@@ -556,9 +557,9 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # KeepConfiguration + watchdog protections only apply under networkd.
     network = _facts("network")
     if network.get("networkd_manages_default_route") is True:
-        if network.get("networkd_keep_configuration") is False:
+        if network.get("networkd_default_route_keepconfig") is False:
             missing.append("networkd_keepconfig_missing")
-        if network.get("network_watchdog_installed") is False:
+        if network.get("network_watchdog_enabled") is False:
             missing.append("network_watchdog_absent")
     return sorted(missing)
 

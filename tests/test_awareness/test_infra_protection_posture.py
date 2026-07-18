@@ -87,8 +87,8 @@ def _profile(
                 "status": "ok",
                 "facts": {
                     "networkd_manages_default_route": networkd_route,
-                    "networkd_keep_configuration": keepconfig,
-                    "network_watchdog_installed": watchdog,
+                    "networkd_default_route_keepconfig": keepconfig,
+                    "network_watchdog_enabled": watchdog,
                 },
             },
         }
@@ -485,8 +485,8 @@ def test_resilience_facts_are_covered():
         "swap_total_kb",
         "limits.memory.swap",
         "networkd_manages_default_route",
-        "networkd_keep_configuration",
-        "network_watchdog_installed",
+        "networkd_default_route_keepconfig",
+        "network_watchdog_enabled",
     ):
         assert fact in src, f"posture rules no longer read {fact!r}"
 

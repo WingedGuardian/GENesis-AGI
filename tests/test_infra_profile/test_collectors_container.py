@@ -8,7 +8,9 @@ import pytest
 
 from genesis.infra_profile.collectors import container as _container
 from genesis.infra_profile.collectors.container import (
+    _keepconf_on_route_link,
     _networkd_manages_link,
+    _networkd_route_iface,
     collect_cpu,
     collect_kernel,
     collect_memory,
@@ -318,29 +320,90 @@ def test_networkd_manages_link(networkctl_json, dev, expected):
     assert _networkd_manages_link(networkctl_json, dev) is expected
 
 
-def _route_and_networkctl(admin_state: str):
-    """A fake _run_cmd: default route on eth0 + a networkctl verdict for it."""
+def test_networkd_route_iface_selects_by_name():
+    payload = json.dumps(
+        {
+            "Interfaces": [
+                {"Name": "lo", "AdministrativeState": "unmanaged"},
+                {"Name": "eth0", "AdministrativeState": "configured", "NetworkFile": "/x.network"},
+            ]
+        }
+    )
+    assert _networkd_route_iface(payload, "eth0")["NetworkFile"] == "/x.network"
+    assert _networkd_route_iface(payload, "eth9") is None
+    assert _networkd_route_iface(None, "eth0") is None
+    assert _networkd_route_iface("not json", "eth0") is None
+    assert _networkd_route_iface("[]", "eth0") is None  # wrong shape → None, no raise
+
+
+def test_keepconf_on_route_link_is_scoped_to_that_unit(tmp_path):
+    # P2 #1: KeepConfiguration must be verified on the DEFAULT-ROUTE link's own
+    # drop-in dir — a protected *other* link must not count.
+    net = tmp_path / "systemd/network"
+    (net / "10-eth0.network.d").mkdir(parents=True)
+    (net / "20-eth1.network.d").mkdir(parents=True)
+    (net / "20-eth1.network.d/keep.conf").write_text("[Network]\nKeepConfiguration=true\n")
+    nf = "/run/systemd/network/10-eth0.network"  # the default-route link
+    # eth1 is protected, eth0 is not → route-scoped verdict is False.
+    assert _keepconf_on_route_link(tmp_path, nf) is False
+    # protect eth0 itself → True.
+    (net / "10-eth0.network.d/keep.conf").write_text("[Network]\nKeepConfiguration=true\n")
+    assert _keepconf_on_route_link(tmp_path, nf) is True
+    # no unit (networkd not managing / not reported) → False.
+    assert _keepconf_on_route_link(tmp_path, None) is False
+
+
+def _fake_run_cmd(
+    *,
+    admin_state="configured",
+    network_file="/run/systemd/network/10-netplan-eth0.network",
+    watchdog_enabled=True,
+):
+    """Fake _run_cmd covering the three commands collect_network shells out to."""
 
     async def _fake(*argv, **_kw):
         if argv and argv[0] == "ip" and "route" in argv:
-            return '[{"dev": "eth0", "gateway": "10.0.0.1"}]'
+            return json.dumps([{"dev": "eth0", "gateway": "10.0.0.1"}])
         if argv and argv[0] == "networkctl":
-            return json.dumps(
-                {"Interfaces": [{"Name": "eth0", "AdministrativeState": admin_state}]}
-            )
+            iface = {"Name": "eth0", "AdministrativeState": admin_state}
+            if network_file is not None:
+                iface["NetworkFile"] = network_file
+            return json.dumps({"Interfaces": [iface]})
+        if argv and argv[0] == "systemctl" and "is-enabled" in argv:
+            # real _run_cmd returns None on non-zero rc (disabled/masked/absent)
+            return "enabled" if watchdog_enabled else None
         return None  # ip -j addr etc. → harmless None
 
     return _fake
 
 
-async def test_collect_network_populates_manages_default_route(tmp_path, monkeypatch):
-    monkeypatch.setattr(_container, "_run_cmd", _route_and_networkctl("configured"))
+async def test_collect_network_effective_facts_all_present(tmp_path, monkeypatch):
+    # networkd owns eth0; its drop-in has KeepConfiguration; watchdog enabled.
+    (tmp_path / "systemd/network/10-netplan-eth0.network.d").mkdir(parents=True)
+    (tmp_path / "systemd/network/10-netplan-eth0.network.d/keep.conf").write_text(
+        "[Network]\nKeepConfiguration=true\n"
+    )
+    monkeypatch.setattr(_container, "_run_cmd", _fake_run_cmd())
     result = await collect_network(etc_root=tmp_path)
     assert result.facts["default_route_dev"] == "eth0"
     assert result.facts["networkd_manages_default_route"] is True
+    assert result.facts["networkd_default_route_keepconfig"] is True
+    assert result.facts["network_watchdog_enabled"] is True
+
+
+async def test_collect_network_effective_facts_all_missing(tmp_path, monkeypatch):
+    # networkd owns eth0 but NO KeepConfiguration drop-in and watchdog disabled.
+    monkeypatch.setattr(_container, "_run_cmd", _fake_run_cmd(watchdog_enabled=False))
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["networkd_manages_default_route"] is True
+    assert result.facts["networkd_default_route_keepconfig"] is False
+    assert result.facts["network_watchdog_enabled"] is False
 
 
 async def test_collect_network_suppresses_when_networkmanager(tmp_path, monkeypatch):
-    monkeypatch.setattr(_container, "_run_cmd", _route_and_networkctl("unmanaged"))
+    # Unmanaged default route → gate False, and the scoped keepconfig fact is
+    # False (no NetworkFile credited) regardless of any drop-ins present.
+    monkeypatch.setattr(_container, "_run_cmd", _fake_run_cmd(admin_state="unmanaged"))
     result = await collect_network(etc_root=tmp_path)
     assert result.facts["networkd_manages_default_route"] is False
+    assert result.facts["networkd_default_route_keepconfig"] is False
