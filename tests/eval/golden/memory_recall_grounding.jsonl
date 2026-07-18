@@ -8,8 +8,23 @@
 #    "expected": "<reference label, e.g. 'relevant' or 'not_relevant'>",
 #    "user_passed": <true if you'd judge this memory as relevant for
 #                    the query, false otherwise>,
+#    "fail_reason": "<OPTIONAL, only on user_passed=false — one of
+#                     answer-doesnt-exist | partial-topic-mismatch |
+#                     truly-off-topic>",
 #    "scorer_config": {"rubric_name": "memory_recall_grounding",
 #                      "query": "<the original query the user asked>"}}
+#
+# fail_reason separates a COVERAGE miss (answer-doesnt-exist: the store
+# held no answer, so recall returned a topical best-effort — not a recall
+# bug) from a RECALL-QUALITY miss (partial-topic-mismatch / truly-off-topic).
+# Compute the coverage-controlled effective rate by dropping
+# answer-doesnt-exist rows before comparing against the ship gate — a raw
+# rate can look sub-gate purely because the tested queries have no answers
+# in the store yet.
+#
+# This committed file is a TEMPLATE (no cases). An install's real golden
+# set contains recalled memory content and lives OUTSIDE the repo at
+# ~/.genesis/eval/golden/<rubric>.jsonl; pass it to run_calibration.
 #
 # Aim for 30-50 hand-graded cases before running calibration. Mix:
 #   - clear-positives: query and memory line up tightly

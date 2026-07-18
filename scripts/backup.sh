@@ -72,7 +72,7 @@ _write_status() {
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 trap '_write_status; backend_cleanup' EXIT
@@ -341,6 +341,32 @@ if [ -d "$HOME/.genesis/infrastructure" ]; then
     for _f in profile.json annotations.json INFRASTRUCTURE.md; do
         [ -f "$HOME/.genesis/infrastructure/$_f" ] && cp "$HOME/.genesis/infrastructure/$_f" infrastructure/
     done
+fi
+
+# --- 6c. Eval golden sets (encrypted — hand-graded rubric calibration data
+# holding recalled memory content: PII-bearing like section 4, and expensive
+# to recreate. Install-local (~/.genesis/eval), absent on a fresh install. ---
+_EVAL_DIR="$HOME/.genesis/eval"
+if [ -d "$_EVAL_DIR" ]; then
+    log "Backing up eval golden sets..."
+    mkdir -p eval
+    # Purge any pre-encryption plaintext.
+    find eval -type f ! -name '*.gpg' -delete 2>/dev/null || true
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping eval (refusing plaintext)"
+    else
+        while IFS= read -r -d '' src; do
+            rel="${src#"$_EVAL_DIR"/}"
+            dst="eval/${rel}.gpg"
+            mkdir -p "$(dirname "$dst")"
+            if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
+                continue
+            fi
+            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt eval/$rel"
+        done < <(find "$_EVAL_DIR" -type f -print0)
+        _EVAL_COUNT=$(find eval -type f -name '*.gpg' 2>/dev/null | wc -l)
+        log "Eval golden sets: $_EVAL_COUNT files (encrypted)"
+    fi
 fi
 
 # --- 7. Secrets (encrypted with GPG symmetric) ---
