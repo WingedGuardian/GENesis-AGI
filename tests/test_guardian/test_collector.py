@@ -143,3 +143,35 @@ class TestCollectDiagnostics:
         # Container info should be default since it raised
         assert snap.container_status == ""
         assert snap.collected_at != ""
+
+
+async def test_collect_disk_probes_and_dedupes_cc_tmp(config, monkeypatch):
+    import genesis.guardian.collector as gc
+
+    cc_tmp = f"/home/{config.container_user}/.genesis/cc-tmp"
+    calls = []
+
+    async def fake_exec(container, *args):
+        mount = args[-1]
+        calls.append(mount)
+        target = "/" if mount in ("/", cc_tmp) else mount  # cc-tmp shares rootfs pre-split
+        return (0, "Mounted 1M Used Avail Use%\n" + f"{target} 1000 500 500 50%\n")
+
+    monkeypatch.setattr(gc, "_incus_exec", fake_exec)
+    disks = await gc._collect_disk(config)
+    assert cc_tmp in calls  # cc-tmp is probed
+    assert [d.mount for d in disks].count("/") == 1  # root+cc-tmp deduped to one row
+
+
+async def test_collect_disk_isolated_cc_tmp_is_own_row(config, monkeypatch):
+    import genesis.guardian.collector as gc
+
+    cc_tmp = f"/home/{config.container_user}/.genesis/cc-tmp"
+
+    async def fake_exec(container, *args):
+        mount = args[-1]  # each path is its own mount (cc-tmp isolated)
+        return (0, "Mounted 1M Used Avail Use%\n" + f"{mount} 2048 100 1948 5%\n")
+
+    monkeypatch.setattr(gc, "_incus_exec", fake_exec)
+    disks = await gc._collect_disk(config)
+    assert cc_tmp in [d.mount for d in disks]  # isolated cc-tmp surfaces as its own row

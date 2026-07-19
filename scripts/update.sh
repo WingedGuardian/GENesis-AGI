@@ -195,7 +195,7 @@ _sync_deploy_targets() {
             # TimeoutStartSec) registers as drift and triggers a redeploy — the
             # archive below ships those units and the gateway's redeploy verb
             # copies them, but none of that fires unless the drift gate sees them.
-            GUARDIAN_PATHS="src/genesis/guardian src/genesis/util src/genesis/env.py src/genesis/observability src/genesis/db config/guardian-claude.md config/genesis-guardian.service config/genesis-guardian.timer config/genesis-guardian-watchman.service config/genesis-guardian-watchman.timer pyproject.toml scripts/install_guardian.sh scripts/guardian-gateway.sh scripts/lib/host_swap.sh"
+            GUARDIAN_PATHS="src/genesis/guardian src/genesis/util src/genesis/env.py src/genesis/observability src/genesis/db config/guardian-claude.md config/genesis-guardian.service config/genesis-guardian.timer config/genesis-guardian-watchman.service config/genesis-guardian-watchman.timer pyproject.toml scripts/install_guardian.sh scripts/guardian-gateway.sh scripts/lib/host_swap.sh scripts/lib/cc_tmp_volume.sh"
             DEPLOY_HASH=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
             # ── Read host state ONCE: deployed_commit + node/cc versions ──

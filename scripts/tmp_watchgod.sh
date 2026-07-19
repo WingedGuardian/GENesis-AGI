@@ -87,16 +87,32 @@ fs_free_mb() {
     echo "${result:-999999}"
 }
 
+fs_total_mb() {
+    # Total size of the filesystem containing the given path, in MB. After the
+    # cc-tmp blast-radius split this reports the dedicated volume's size, so the
+    # state file (and dashboard) can show the volume's capacity/headroom, not
+    # the rootfs's.
+    local result
+    result=$(df -BM --output=size "$1" 2>/dev/null | tail -1 | tr -d ' M') || true
+    echo "${result:-0}"
+}
+
 write_state() {
     local cc_tier="$1" cc_used="$2" sys_tier="$3" sys_pct="$4"
     local is_tmpfs="false"
     if df -T /tmp 2>/dev/null | grep -q tmpfs; then
         is_tmpfs="true"
     fi
+    # Filesystem headroom for cc-tmp's mount. Post-split these describe the
+    # dedicated volume; pre-split they describe the rootfs. Consumers read them
+    # via .get(..) so an older state file (without these keys) stays valid.
+    local cc_fs_free cc_fs_total
+    cc_fs_free=$(fs_free_mb "$CC_TMP_DIR")
+    cc_fs_total=$(fs_total_mb "$CC_TMP_DIR")
     local tmp="${STATE_FILE}.tmp"
     cat > "$tmp" <<EOF
 {
-  "cc_tmp": {"tier": "$cc_tier", "used_mb": $cc_used, "budget_mb": $CC_TMP_BUDGET_MB, "sacred_mb": $SACRED_GROUND_MB},
+  "cc_tmp": {"tier": "$cc_tier", "used_mb": $cc_used, "budget_mb": $CC_TMP_BUDGET_MB, "sacred_mb": $SACRED_GROUND_MB, "fs_free_mb": $cc_fs_free, "fs_total_mb": $cc_fs_total},
   "system_tmp": {"tier": "$sys_tier", "used_pct": $sys_pct, "is_tmpfs": $is_tmpfs},
   "poll_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -239,6 +255,10 @@ check_cc_tmp() {
 
     local tier="green"
 
+    # After the cc-tmp blast-radius split, free_mb measures the DEDICATED
+    # volume, so this sacred-ground trigger guards that volume (not the rootfs).
+    # On a 2 GiB volume it is a pure backstop behind the 450 MiB budget-red
+    # above; rootfs free-space monitoring lives in Zone B (/tmp) below.
     if (( used_mb > threshold_red )) || (( free_mb < SACRED_GROUND_MB )); then
         tier="red"
         _log_cc_pressure red "$used_mb" "$free_mb"   # capture BEFORE the nuclear cleanup erases it

@@ -443,7 +443,8 @@ async def collect_storage(
 
     # /tmp is a MEASUREMENT TARGET here (small tmpfs = known incident class),
     # not a temp-file location.
-    for label, path in (("root", "/"), ("home", str(Path.home())), ("tmp", "/tmp")):  # noqa: S108
+    cc_tmp_path = Path.home() / ".genesis" / "cc-tmp"
+    for label, path in (("root", "/"), ("home", str(Path.home())), ("tmp", "/tmp"), ("cc_tmp", str(cc_tmp_path))):  # noqa: S108
         try:
             st = os.statvfs(path)
             total = st.f_blocks * st.f_frsize
@@ -456,6 +457,21 @@ async def collect_storage(
             }
         except OSError:
             continue
+
+    # cc-tmp isolation — EFFECTIVE-state fact (measures the live filesystem,
+    # not on-disk config). True when ~/.genesis/cc-tmp sits on its own device
+    # (the dedicated blast-radius volume); False when it shares a device with
+    # its parent ~/.genesis (the rootfs — a runaway temp fill can fill root and
+    # kill every CC session). Absent when cc-tmp does not exist yet (pre-
+    # bootstrap). The posture rule that nags on False is gated on
+    # virt.container == "lxc", since the remedy (a dedicated incus volume) only
+    # applies on a container install.
+    try:
+        _cc_dev = os.stat(cc_tmp_path).st_dev
+        _parent_dev = os.stat(cc_tmp_path.parent).st_dev
+        facts["cc_tmp_isolated"] = _cc_dev != _parent_dev
+    except OSError:
+        pass
 
     return SectionResult(name="storage", facts=facts, metrics=metrics)
 

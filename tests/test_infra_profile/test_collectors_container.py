@@ -407,3 +407,40 @@ async def test_collect_network_suppresses_when_networkmanager(tmp_path, monkeypa
     result = await collect_network(etc_root=tmp_path)
     assert result.facts["networkd_manages_default_route"] is False
     assert result.facts["networkd_default_route_keepconfig"] is False
+
+
+# ── cc-tmp isolation (blast-radius split) ──────────────────────────────────
+
+
+async def test_storage_cc_tmp_not_isolated_same_fs(proc_root, sys_root, tmp_path, monkeypatch):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert result.facts["cc_tmp_isolated"] is False  # shares a device with its parent
+    assert "cc_tmp" in result.metrics  # df headroom label present
+
+
+async def test_storage_cc_tmp_isolated_own_device(proc_root, sys_root, tmp_path, monkeypatch):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+
+    class _S:
+        def __init__(self, dev):
+            self.st_dev = dev
+
+    def fake_stat(path, *a, **k):
+        return _S(1 if str(path).endswith("cc-tmp") else 2)
+
+    monkeypatch.setattr(_container.os, "stat", fake_stat)
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert result.facts["cc_tmp_isolated"] is True
+
+
+async def test_storage_cc_tmp_fact_absent_when_missing(proc_root, sys_root, tmp_path, monkeypatch):
+    home = tmp_path / "h"
+    (home / ".genesis").mkdir(parents=True)  # cc-tmp does not exist
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert "cc_tmp_isolated" not in result.facts
