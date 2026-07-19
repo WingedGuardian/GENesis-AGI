@@ -475,6 +475,9 @@ class EgoSession:
                     "focus_id": r.get("focus_id", ""),
                     "rationale": r.get("perception_rationale", ""),
                     "created_at": r.get("created_at", ""),
+                    # Carried through (was dropped): the ego's prior self-review
+                    # of the focused goal, read back in the goal deep-dive.
+                    "assessment": r.get("assessment", "") or "",
                 }
                 for r in rows
             ]

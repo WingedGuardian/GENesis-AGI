@@ -503,7 +503,8 @@ class GenesisEgoContextBuilder:
                 lines.append("")
 
         except Exception:
-            lines.append("*No proposal history available.*\n")
+            logger.warning("Failed to build proposal history section", exc_info=True)
+            lines.append("*Proposal history unavailable (query error — see logs).*\n")
 
         lines.append("")
         return "\n".join(lines)
@@ -664,7 +665,7 @@ class GenesisEgoContextBuilder:
             return ""
         except Exception:
             logger.warning("Failed to build confidence calibration section", exc_info=True)
-            return ""
+            return "## Confidence Calibration\n\n*Calibration unavailable (query error — see logs).*\n"
 
     async def _capability_performance_section(self, *, depth: str = "deep") -> str:
         """System capability performance — domain confidence from multiple sources."""

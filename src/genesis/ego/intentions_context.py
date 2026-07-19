@@ -28,7 +28,10 @@ async def build_intentions_section(
         active = await ego_intentions.list_active(db, ego_source)
     except Exception:
         logger.error("Failed to query ego_intentions", exc_info=True)
-        return ""
+        return (
+            "## Deferred Intentions\n\n"
+            "*Intentions unavailable (query error — see logs).*\n"
+        )
 
     if not active:
         return (

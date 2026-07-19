@@ -1048,9 +1048,11 @@ async def init(rt: GenesisRuntime) -> None:
 
         async def _run_ego_calibration() -> None:
             # Compute the ego's confidence calibration from the Outcome Bus T1
-            # rows and snapshot it (ECE-over-time trend). MEASURE-ONLY / DARK:
-            # writes only ego_calibration_snapshots (no cognitive-path reader),
-            # never injects back into the ego. Runs 15 min after outcome_harvest
+            # rows and snapshot it (ECE-over-time trend). Writes
+            # ego_calibration_snapshots, which the genesis ego's context builder
+            # (_confidence_calibration_section) reads back and injects each cycle
+            # (gated on calibration_injection_enabled). Runs 15 min after
+            # outcome_harvest
             # (8:45/20:45) so it reads a fresh harvest, 15 min before
             # capability_map_refresh (9:15/21:15) — a clean WAL gap.
             if rt._db is None:

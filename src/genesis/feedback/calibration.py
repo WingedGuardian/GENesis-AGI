@@ -5,11 +5,15 @@ Outcome Bus T1 (ground-truth) rows: "the ego said 90%, it was right 82%". Writes
 one snapshot per run to ``ego_calibration_snapshots`` so the ECE trend over time
 accrues — the self-improvement signal.
 
-DARK by construction:
-- Writes only to ``ego_calibration_snapshots`` (no cognitive-path reader).
-- Never writes ``calibration_curves`` (auto-read by ``perception/context.py``).
-- Never injects calibration back into the ego — self-correction is a deliberate,
-  separately-flagged future PR.
+Wiring (updated 2026-07):
+- Writes one snapshot per run to ``ego_calibration_snapshots``.
+- Does NOT write ``calibration_curves`` (the table auto-read by
+  ``perception/context.py``) — that path stays separate.
+- The snapshot IS read back into the genesis ego's context by
+  ``ego/genesis_context.py::_confidence_calibration_section`` and injected each
+  cycle, gated on ``EgoConfig.calibration_injection_enabled`` (default on).
+  Injection is informational (the ego sees its own ECE) — never a mechanical
+  rescale of stated confidence.
 """
 
 from __future__ import annotations

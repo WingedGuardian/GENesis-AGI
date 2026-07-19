@@ -76,6 +76,43 @@ async def test_create_cycle_outcome_with_focus_id(db):
     assert rows[0]["perception_rationale"] == "Goal stale for 14 days"
 
 
+@pytest.mark.asyncio
+async def test_get_latest_goal_assessment_returns_newest(db):
+    """get_latest_goal_assessment returns the most recent non-empty verdict
+    for a goal, ignoring NULL/empty rows and other goals."""
+    # Older assessment for the goal.
+    await ego_crud.create_cycle_outcome(
+        db, cycle_id="c-old", focus_type="goal_review",
+        focus_id="goal_x", assessment="early: keep going",
+    )
+    # A NULL-assessment cycle for the same goal (non-goal_review) — ignored.
+    await ego_crud.create_cycle_outcome(
+        db, cycle_id="c-null", focus_type="proactive", focus_id="goal_x",
+    )
+    # Newer assessment for the goal — this one wins.
+    await ego_crud.create_cycle_outcome(
+        db, cycle_id="c-new", focus_type="goal_review",
+        focus_id="goal_x", assessment="later: stalled, replan",
+    )
+    # A different goal — must not leak.
+    await ego_crud.create_cycle_outcome(
+        db, cycle_id="c-other", focus_type="goal_review",
+        focus_id="goal_y", assessment="unrelated",
+    )
+    got = await ego_crud.get_latest_goal_assessment(db, "goal_x")
+    assert got == "later: stalled, replan"
+
+
+@pytest.mark.asyncio
+async def test_get_latest_goal_assessment_none_when_absent(db):
+    """No assessment rows for the goal → None (empty-state safe)."""
+    await ego_crud.create_cycle_outcome(
+        db, cycle_id="c1", focus_type="proactive", focus_id="goal_z",
+    )
+    assert await ego_crud.get_latest_goal_assessment(db, "goal_z") is None
+    assert await ego_crud.get_latest_goal_assessment(db, "missing") is None
+
+
 # ── EgoSignal integration ─────────────────────────────────────────────────
 
 
