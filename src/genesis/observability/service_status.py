@@ -298,6 +298,8 @@ def collect_cc_tmp_usage() -> dict:
             "cc_used_mb": cc.get("used_mb", 0),
             "cc_budget_mb": cc.get("budget_mb", 500),
             "cc_sacred_mb": cc.get("sacred_mb", 150),
+            "cc_fs_free_mb": cc.get("fs_free_mb", None),
+            "cc_fs_total_mb": cc.get("fs_total_mb", None),
             "sys_tier": sys_tmp.get("tier", "unknown"),
             "sys_used_pct": sys_tmp.get("used_pct", 0),
             "poll_at": data.get("poll_at", ""),

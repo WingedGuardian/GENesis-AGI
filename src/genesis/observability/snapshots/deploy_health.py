@@ -71,6 +71,7 @@ GUARDIAN_HOST_PATHS = (
     "scripts/install_guardian.sh",
     "scripts/guardian-gateway.sh",
     "scripts/lib/host_swap.sh",
+    "scripts/lib/cc_tmp_volume.sh",
 )
 
 _HOST_STATE_FILE = "host_gateway_state.json"

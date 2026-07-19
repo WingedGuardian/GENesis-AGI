@@ -59,6 +59,8 @@ def _profile(
     networkd_route: object = True,
     keepconfig: object = True,
     watchdog: object = True,
+    cc_tmp_isolated: object = True,
+    container: object = "lxc",
     age_days: float = 0.0,
     collected_at: object = "auto",
 ) -> dict:
@@ -91,6 +93,8 @@ def _profile(
                     "network_watchdog_enabled": watchdog,
                 },
             },
+            "virt": {"status": "ok", "facts": {"container": container}},
+            "storage": {"status": "ok", "facts": {"cc_tmp_isolated": cc_tmp_isolated}},
         }
     }
     if collected_at is not None:
@@ -122,11 +126,13 @@ _ALL_DEFECTS = dict(
     networkd_route=True,  # networkd owns the route, so the network rules apply
     keepconfig=False,
     watchdog=False,
+    cc_tmp_isolated=False,
 )
 
 
 def test_all_defects_detected():
     assert _infra_missing_protections(_profile(**_ALL_DEFECTS)) == [
+        "cc_tmp_shared_fs",
         "container_swap_disabled",
         "container_swap_knob_off",
         "host_swap_absent",
@@ -138,6 +144,33 @@ def test_all_defects_detected():
 
 def test_healthy_profile_no_defects():
     assert _infra_missing_protections(_profile()) == []
+
+
+def test_cc_tmp_shared_fs_detected_in_lxc():
+    # cc-tmp NOT isolated on an lxc container → the nag fires.
+    assert "cc_tmp_shared_fs" in _infra_missing_protections(
+        _profile(cc_tmp_isolated=False, container="lxc")
+    )
+
+
+def test_cc_tmp_isolated_is_silent():
+    # cc-tmp on its own volume → no nag.
+    assert "cc_tmp_shared_fs" not in _infra_missing_protections(_profile(cc_tmp_isolated=True))
+
+
+def test_cc_tmp_not_nagged_off_lxc():
+    # Non-container topology: the remedy (a dedicated incus volume) is not
+    # actionable, so a False fact must stay silent.
+    assert "cc_tmp_shared_fs" not in _infra_missing_protections(
+        _profile(cc_tmp_isolated=False, container="none")
+    )
+
+
+def test_cc_tmp_fact_absent_is_silent():
+    # Fact not yet collected (pre-bootstrap) → silent.
+    prof = _profile(container="lxc")
+    del prof["sections"]["storage"]["facts"]["cc_tmp_isolated"]
+    assert "cc_tmp_shared_fs" not in _infra_missing_protections(prof)
 
 
 def test_absent_facts_are_silent():
@@ -487,6 +520,7 @@ def test_resilience_facts_are_covered():
         "networkd_manages_default_route",
         "networkd_default_route_keepconfig",
         "network_watchdog_enabled",
+        "cc_tmp_isolated",
     ):
         assert fact in src, f"posture rules no longer read {fact!r}"
 
