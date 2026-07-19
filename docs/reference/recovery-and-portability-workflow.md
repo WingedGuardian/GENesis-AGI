@@ -266,6 +266,13 @@ growth can starve cc-tmp below the watchdog's ~150 MiB sacred-ground floor. The
 split moves cc-tmp onto a dedicated, size-capped incus custom storage volume so
 neither can happen.
 
+**Pool requirement.** The isolation and the size cap only hold on a
+block/CoW-backed pool (lvm/zfs/btrfs/ceph) — the default install uses LVM-thin.
+On a `dir`-backed pool the custom volume shares the container root's filesystem
+and `size=` is not enforced without fs-level project quotas, so the guarantee
+would be cosmetic; `cc_tmp_volume_apply` detects this and skips with a note
+rather than reporting a false isolation.
+
 **Topology.** A thin custom volume in the container's own pool
 (`<container>-cc-tmp`), attached as a disk device named `cc-tmp` mounted at
 `~/.genesis/cc-tmp`, made writable by the container user via a `chown` from

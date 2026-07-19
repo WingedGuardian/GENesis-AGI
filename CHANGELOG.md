@@ -20,10 +20,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   longer starve cc-tmp below the watchdog's floor. Applied automatically on
   fresh installs (host-setup) and on existing installs (guardian redeploy, when
   no CC session is live so a running session is never disturbed); size defaults
-  to 2 GiB, override with `CCTMPVOL_SIZE_GIB`. A new infrastructure-posture
-  check raises a standing alert on any container install where cc-tmp is not yet
-  isolated, and `scripts/lib/cc_tmp_volume.sh`'s `cc_tmp_volume_remove` reverts
-  it.
+  to 2 GiB, override with `CCTMPVOL_SIZE_GIB`. Requires a block/CoW-backed
+  storage pool (lvm/zfs/btrfs/ceph — what the default install uses); a dir-backed
+  pool can't enforce the cap on its own device, so it's skipped rather than
+  giving a cosmetic guarantee. A new infrastructure-posture check raises a
+  standing alert on any container install where cc-tmp is not yet isolated, and
+  `scripts/lib/cc_tmp_volume.sh`'s `cc_tmp_volume_remove` reverts it.
 
 ### Fixed
 

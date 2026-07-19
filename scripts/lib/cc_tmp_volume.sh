@@ -160,6 +160,24 @@ cc_tmp_volume_apply() {
         echo "  Skipped: could not resolve a storage pool for '$c'."
         return 0
     fi
+
+    # The isolation AND the size cap only hold on a backend that both puts the
+    # volume on its own device/dataset and enforces a per-volume quota. A `dir`
+    # pool places the custom volume on the SAME host filesystem as the container
+    # root and only quotas with fs-level project quotas — so a runaway fill
+    # could still reach the rootfs and the cap would be cosmetic. Only apply on
+    # block/CoW backends where the guarantee is real; skip (honestly) otherwise.
+    local driver
+    driver="$(incus storage show "$pool" 2>/dev/null | awk -F': *' '/^driver:/ {print $2; exit}')"
+    case "$driver" in
+        lvm | zfs | btrfs | ceph) : ;;
+        *)
+            echo "  Skipped: pool '$pool' (driver='${driver:-unknown}') does not enforce a"
+            echo "           per-volume size cap on its own device — cc-tmp isolation would be"
+            echo "           cosmetic. A block/CoW-backed pool (lvm/zfs/btrfs/ceph) is required."
+            return 0 ;;
+    esac
+
     vol="$(_cctmpvol_volume_name "$c")"
     size="$(_cctmpvol_size_gib)"
     path="$(_cctmpvol_mount_path "$c")"

@@ -495,7 +495,8 @@ _INFRA_POSTURE_DETAIL = {
         "prevent). On the host: re-run scripts/host-setup.sh, or the guardian "
         "gateway redeploy applies scripts/lib/cc_tmp_volume.sh automatically "
         "when no CC session is live (moves cc-tmp onto a dedicated storage "
-        "volume, size-capped so a runaway can never reach the rootfs)"
+        "volume, size-capped so a runaway can never reach the rootfs; requires "
+        "a block/CoW-backed storage pool — lvm/zfs/btrfs/ceph)"
     ),
 }
 

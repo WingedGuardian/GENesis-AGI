@@ -60,6 +60,7 @@ case "$1" in
     exit 0 ;;
   storage)
     if [ "$2" = "list" ]; then echo "default,lvm,vg0,,1,CREATED"; exit 0; fi
+    if [ "$2" = "show" ]; then echo "driver: ${INCUS_DRIVER:-lvm}"; exit 0; fi
     if [ "$2 $3" = "volume show" ]; then exit "${INCUS_VOLUME_EXISTS:-1}"; fi
     if [ "$2 $3" = "volume create" ]; then exit "${INCUS_CREATE_RC:-0}"; fi
     exit 0 ;;
@@ -169,6 +170,19 @@ def test_live_claude_session_skips_without_mutating(tmp_path):
     # The whole point: a live session must NOT be disturbed.
     assert "storage volume create" not in log
     assert "config device add" not in log
+
+
+def test_dir_pool_skips_cosmetic_isolation(tmp_path):
+    # A dir-backed pool can't enforce the size cap on its own device — applying
+    # would be cosmetic (a runaway could still reach the rootfs), so the lib
+    # must skip honestly rather than report a false isolation.
+    env = _sandbox(tmp_path, INCUS_DRIVER="dir")
+    res = _run(env)
+    assert res.returncode == 0 and "__DONE__" in res.stdout
+    log = _log(tmp_path)
+    assert "storage volume create" not in log
+    assert "config device add" not in log
+    assert "cosmetic" in res.stdout
 
 
 # ── happy path: correct ordering + writability ──────────────────────────────
