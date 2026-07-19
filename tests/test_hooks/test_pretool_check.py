@@ -116,6 +116,8 @@ class TestSubprocessCriticalBlocked:
         assert result.returncode == 2
 
     def test_bridge_systemd_unit(self):
+        # The stale config/genesis-bridge.service duplicate was removed; a path
+        # with that name is still blocked via the generic "*.service" pattern.
         result = _run_subprocess_json("config/genesis-bridge.service")
         assert result.returncode == 2
 
@@ -596,7 +598,6 @@ class TestConfigCompleteness:
         patterns = _load_critical_patterns()
         expected = [
             "src/genesis/channels/**",
-            "config/genesis-bridge.service",
             "scripts/systemd/*.template",
             "src/genesis/autonomy/protection.py",
             "config/protected_paths.yaml",
