@@ -240,6 +240,13 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "bug or malformed evidence for the developer/ego to fix, not something "
         "the firefighter can auto-heal. WARNING-level observability."
     ),
+    "ledger:cell_recompute_failed:": (
+        "The calibration-cell recompute at the grader tail raised (WS-2 P3) — "
+        "grades still landed; only the derived calibration_cells table is "
+        "stale for its consumers. A code bug for the developer/ego to fix at "
+        "the source (same posture as the other ledger alarms); the next "
+        "successful pass self-heals the staleness. WARNING-level observability."
+    ),
 }
 
 
