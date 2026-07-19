@@ -34,6 +34,8 @@ def _mock_runtime(*, bootstrapped=True, db=True, cadence=True):
         mgr.is_paused = False
         mgr.current_interval_minutes = 120
         mgr.consecutive_failures = 0
+        mgr.next_fire_at = "2026-01-01T00:00:00+00:00"
+        mgr.source_tag = "user_ego_cycle"
         rt._ego_cadence_manager = mgr
     else:
         rt._ego_cadence_manager = None
@@ -63,7 +65,10 @@ class TestEgoCadence:
 
     def test_returns_cadence_state(self, client):
         rt = _mock_runtime()
-        with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        with patch("genesis.runtime.GenesisRuntime") as MockRT, patch(
+            "genesis.db.crud.ego.has_pending_cli_approval",
+            new=AsyncMock(return_value=False),
+        ):
             MockRT.instance.return_value = rt
             resp = client.get("/api/genesis/ego/cadence")
             data = resp.get_json()
@@ -72,6 +77,20 @@ class TestEgoCadence:
             assert data["is_paused"] is False
             assert data["current_interval_minutes"] == 120
             assert data["consecutive_failures"] == 0
+            # WS-3 additions: honest cadence surface.
+            assert data["next_fire_at"] == "2026-01-01T00:00:00+00:00"
+            assert data["gated"] is False
+
+    def test_gated_when_approval_pending(self, client):
+        rt = _mock_runtime()
+        with patch("genesis.runtime.GenesisRuntime") as MockRT, patch(
+            "genesis.db.crud.ego.has_pending_cli_approval",
+            new=AsyncMock(return_value=True),
+        ):
+            MockRT.instance.return_value = rt
+            resp = client.get("/api/genesis/ego/cadence")
+            data = resp.get_json()
+            assert data["gated"] is True
 
 
 # ── /api/genesis/ego/proposals/all ──────────────────────────────────

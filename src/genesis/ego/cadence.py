@@ -64,6 +64,28 @@ def _expires_in(minutes: float) -> str:
     return (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat()
 
 
+def _now_utc() -> datetime:
+    """UTC now — indirection so tests can control time deterministically."""
+    return datetime.now(UTC)
+
+
+def _local_now(tz: object) -> datetime:
+    """Now in *tz* — indirection so quiet-hours tests can pin the clock.
+
+    ``tz`` is typically the IANA string from :func:`user_timezone`; convert to
+    a tzinfo (falling back to UTC on an unknown name) since ``datetime.now``
+    rejects a bare string.
+    """
+    if isinstance(tz, str):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            tz = ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            tz = UTC
+    return datetime.now(tz)  # type: ignore[arg-type]
+
+
 def _map_priority(severity_or_priority: str) -> str:
     """Map event severity/priority strings to signal priority levels."""
     s = severity_or_priority.lower()
@@ -120,6 +142,10 @@ class EgoCadenceManager:
         # Adaptive interval
         self._current_interval = config.cadence_minutes
 
+        # Last time a proactive tick actually pushed a signal — the quiet-hours
+        # floor throttles overnight ticks relative to this.
+        self._last_proactive_fire_at: datetime | None = None
+
         # Prevent concurrent cycles (interval + morning could overlap)
         self._lock = asyncio.Lock()
 
@@ -158,6 +184,14 @@ class EgoCadenceManager:
         # IntervalTrigger-resets-on-restart trap. None => fresh install =>
         # OMIT next_run_time (never pass None — APScheduler treats an explicit
         # next_run_time=None as a PAUSED job).
+        # Restore the persisted adaptive interval so a restart resumes the
+        # backed-off cadence instead of resetting to base (the in-memory-only
+        # reset that pinned the ego at base cadence under restart churn).
+        await self._restore_interval()
+        # Restore the last proactive fire time so the quiet-hours floor is not
+        # reset to "allow" by every restart (restart churn would otherwise let
+        # a proactive tick through inside the overnight floor).
+        await self._restore_last_proactive_fire()
         boot_first_fire = await self._compute_boot_first_fire()
         ego_cycle_kwargs: dict[str, object] = {
             "id": "ego_cycle",
@@ -289,6 +323,27 @@ class EgoCadenceManager:
         return self._current_interval
 
     @property
+    def source_tag(self) -> str:
+        """This ego's source tag ('user_ego_cycle' / 'genesis_ego_cycle')."""
+        return self._session._source_tag
+
+    @property
+    def next_fire_at(self) -> str | None:
+        """ISO timestamp of the next scheduled proactive cycle, or None.
+
+        Reflects APScheduler's live next_run_time for the ``ego_cycle`` job,
+        so the dashboard shows the real next fire (which adaptive backoff and
+        per-cycle reschedules move), not a computed guess.
+        """
+        try:
+            job = self._scheduler.get_job("ego_cycle")
+            if job is not None and job.next_run_time is not None:
+                return job.next_run_time.isoformat()
+        except Exception:
+            logger.debug("next_fire_at lookup failed", exc_info=True)
+        return None
+
+    @property
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
 
@@ -397,7 +452,9 @@ class EgoCadenceManager:
             from genesis.db.crud import memory_events
 
             events = await memory_events.approaching_deadlines(
-                self._session._db, days=2, limit=5,
+                self._session._db,
+                days=2,
+                limit=5,
             )
             if not events:
                 return
@@ -407,12 +464,14 @@ class EgoCadenceManager:
                 verb = evt.get("verb", "?")
                 obj = evt.get("object", "")
                 date = evt.get("event_date", "")[:10]
-                self.push_reactive_event({
-                    "type": "deadline_approaching",
-                    "summary": f"{subj} {verb} {obj} on {date}",
-                    "priority": "high",
-                    "source": "deadline_scanner",
-                })
+                self.push_reactive_event(
+                    {
+                        "type": "deadline_approaching",
+                        "summary": f"{subj} {verb} {obj} on {date}",
+                        "priority": "high",
+                        "source": "deadline_scanner",
+                    }
+                )
             logger.debug("Deadline scanner found %d approaching event(s)", len(events))
         except Exception:
             logger.debug("Deadline scanner failed", exc_info=True)
@@ -440,7 +499,8 @@ class EgoCadenceManager:
             from genesis.ego.types import GOAL_STUCK_EXECUTED_THRESHOLD
 
             goals = await user_goals.list_active(
-                self._session._db, origin="user",
+                self._session._db,
+                origin="user",
             )
             if not goals:
                 return
@@ -464,9 +524,7 @@ class EgoCadenceManager:
                 # Per-goal cadence override (cadence_days > 0), else global
                 per_goal = g.get("cadence_days")
                 threshold_days = (
-                    per_goal
-                    if isinstance(per_goal, int) and per_goal > 0
-                    else global_threshold
+                    per_goal if isinstance(per_goal, int) and per_goal > 0 else global_threshold
                 )
                 if days_stale < threshold_days:
                     continue
@@ -477,7 +535,8 @@ class EgoCadenceManager:
                 # higher-priority signal so the ego replans rather than nudges.
                 # Best-effort — a query failure yields {} → treated as stale.
                 summary_counts = await ego_crud.get_goal_proposal_summary(
-                    self._session._db, g["id"],
+                    self._session._db,
+                    g["id"],
                 )
                 executed = summary_counts.get("executed", 0)
                 is_stuck = executed >= GOAL_STUCK_EXECUTED_THRESHOLD
@@ -485,8 +544,7 @@ class EgoCadenceManager:
                 title = (g.get("title") or "?")[:80]
                 if is_stuck:
                     sig_summary = (
-                        f"Goal stuck ({days_stale}d, {executed} executed, "
-                        f"not advancing): {title}"
+                        f"Goal stuck ({days_stale}d, {executed} executed, not advancing): {title}"
                     )
                     sig_priority = "high"
                 else:
@@ -512,7 +570,8 @@ class EgoCadenceManager:
 
             if pushed:
                 logger.info(
-                    "Goal staleness scanner: %d signal(s) pushed", pushed,
+                    "Goal staleness scanner: %d signal(s) pushed",
+                    pushed,
                 )
         except Exception:
             logger.debug("Goal staleness scanner failed", exc_info=True)
@@ -560,14 +619,17 @@ class EgoCadenceManager:
                 return
 
             batch_id, ids, _ = await self._session._proposals.create_batch(
-                to_make, ego_source="user_ego_cycle",
+                to_make,
+                ego_source="user_ego_cycle",
             )
             if ids:
                 await self._session._proposals.send_digest(
-                    batch_id, ego_source="user_ego_cycle",
+                    batch_id,
+                    ego_source="user_ego_cycle",
                 )
                 logger.info(
-                    "Earn-back: proposed promotion for %d categor(ies)", len(ids),
+                    "Earn-back: proposed promotion for %d categor(ies)",
+                    len(ids),
                 )
         except Exception:
             logger.warning("Earn-back opportunity check failed", exc_info=True)
@@ -577,7 +639,8 @@ class EgoCadenceManager:
         from genesis.db.crud import ego as ego_crud
 
         ts = await ego_crud.get_state(
-            self._session._db, f"earnback_reject:{category}",
+            self._session._db,
+            f"earnback_reject:{category}",
         )
         if not ts:
             return False
@@ -666,11 +729,13 @@ class EgoCadenceManager:
                 return
 
             batch_id, ids, _ = await self._session._proposals.create_batch(
-                to_make, ego_source="user_ego_cycle",
+                to_make,
+                ego_source="user_ego_cycle",
             )
             if ids:
                 await self._session._proposals.send_digest(
-                    batch_id, ego_source="user_ego_cycle",
+                    batch_id,
+                    ego_source="user_ego_cycle",
                 )
                 logger.info(
                     "Cell promotion: proposed standing autonomy for %d cell(s)",
@@ -684,7 +749,8 @@ class EgoCadenceManager:
         from genesis.db.crud import ego as ego_crud
 
         ts = await ego_crud.get_state(
-            self._session._db, f"cell_promotion_reject:{cell_id}",
+            self._session._db,
+            f"cell_promotion_reject:{cell_id}",
         )
         if not ts:
             return False
@@ -746,6 +812,14 @@ class EgoCadenceManager:
         if not self._should_run(skip_idle_check=False):
             return
 
+        # Quiet-hours floor (PROACTIVE only): overnight, throttle proactive
+        # ticks to at most one per quiet_hours_min_interval_minutes. Checked
+        # before the deep-think increment so a suppressed tick consumes no
+        # counter slot. Morning report / reactive / escalation are unaffected.
+        if self._quiet_hours_suppresses_tick():
+            logger.debug("Ego proactive tick suppressed — quiet hours")
+            return
+
         # Deep-think: every Nth proactive cycle upgrades to Opus.
         # Only effective for egos that normally run Sonnet (Genesis ego).
         self._proactive_cycle_count += 1
@@ -772,6 +846,9 @@ class EgoCadenceManager:
             expires_at=_expires_in(self._current_interval),
         )
         if self._signal_queue.push(signal):
+            fired_at = _now_utc()
+            self._last_proactive_fire_at = fired_at
+            await self._persist_last_proactive_fire(fired_at)
             logger.debug("Proactive signal pushed: %s", signal.summary)
         else:
             # Roll back count so deep-think alignment is preserved
@@ -799,17 +876,12 @@ class EgoCadenceManager:
         if has_reactive:
             now = datetime.now(UTC)
             cutoff = now - timedelta(hours=1)
-            self._reactive_timestamps = [
-                ts for ts in self._reactive_timestamps if ts > cutoff
-            ]
+            self._reactive_timestamps = [ts for ts in self._reactive_timestamps if ts > cutoff]
             if len(self._reactive_timestamps) >= self._reactive_max_per_hour:
-                non_reactive = [
-                    s for s in signals if s.focus_category != "reactive"
-                ]
+                non_reactive = [s for s in signals if s.focus_category != "reactive"]
                 if not non_reactive:
                     logger.info(
-                        "Reactive rate limit: %d/%d in last hour, "
-                        "dropping %d signal(s)",
+                        "Reactive rate limit: %d/%d in last hour, dropping %d signal(s)",
                         len(self._reactive_timestamps),
                         self._reactive_max_per_hour,
                         len(signals),
@@ -868,12 +940,14 @@ class EgoCadenceManager:
                 proposals = json.loads(cycle.proposals_json)
             except (json.JSONDecodeError, TypeError):
                 logger.debug(
-                    "Could not parse proposals_json for cycle %s", cycle.id,
+                    "Could not parse proposals_json for cycle %s",
+                    cycle.id,
                 )
 
             if not cycle.focus_summary and not proposals:
                 logger.warning(
-                    "Unified cycle %s produced no usable output", cycle.id,
+                    "Unified cycle %s produced no usable output",
+                    cycle.id,
                 )
                 self._record_failure("cycle produced no usable output")
                 return
@@ -886,9 +960,7 @@ class EgoCadenceManager:
 
             # Morning report always resets interval to base (it's a
             # reporting event, not a proposal-productivity measurement).
-            is_morning_report = any(
-                s.focus_category == "daily_briefing" for s in signals
-            )
+            is_morning_report = any(s.focus_category == "daily_briefing" for s in signals)
             await self._update_interval(
                 had_proposals=bool(proposals) or is_morning_report,
             )
@@ -910,7 +982,8 @@ class EgoCadenceManager:
                 break
             except Exception:
                 logger.warning(
-                    "Signal consumer error — backing off 60s", exc_info=True,
+                    "Signal consumer error — backing off 60s",
+                    exc_info=True,
                 )
                 await asyncio.sleep(60)
 
@@ -1035,7 +1108,8 @@ class EgoCadenceManager:
 
             # Per-ego job_health key — see _record_success.
             GenesisRuntime.instance().record_job_failure(
-                self._session._source_tag, error,
+                self._session._source_tag,
+                error,
             )
         except ImportError:
             pass
@@ -1106,7 +1180,8 @@ class EgoCadenceManager:
             from genesis.db.crud import job_health as job_health_crud
 
             last_success_iso = await job_health_crud.get_job_last_success(
-                self._db, self._session._source_tag,
+                self._db,
+                self._session._source_tag,
             )
         except Exception:
             logger.debug(
@@ -1125,10 +1200,136 @@ class EgoCadenceManager:
             last_success = last_success.replace(tzinfo=UTC)
 
         now = datetime.now(UTC)
-        base = timedelta(minutes=self._config.cadence_minutes)
+        # Anchor to the CURRENT (restored) interval, not base — a backed-off
+        # ego resuming after a restart must not re-accelerate to base cadence.
+        interval = timedelta(minutes=self._current_interval)
         # ~60s boot-pin mirrors #863's memory_extraction restart-safe schedule.
         boot_pin = now + timedelta(seconds=60)
-        return max(boot_pin, last_success + base)
+        return max(boot_pin, last_success + interval)
+
+    def _in_quiet_hours(self, now_local: datetime) -> bool:
+        """True if *now_local* falls inside the configured quiet-hours window.
+
+        Handles windows that cross midnight (e.g. 23 → 7). A window with
+        start == end is treated as disabled (zero-width).
+        """
+        start = self._config.quiet_hours_start
+        end = self._config.quiet_hours_end
+        if start == end:
+            return False
+        hour = now_local.hour
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end  # crosses midnight
+
+    def _quiet_hours_suppresses_tick(self) -> bool:
+        """Whether the current proactive tick should be skipped for quiet hours.
+
+        Suppresses only when quiet hours are enabled, the local clock is inside
+        the window, AND the last proactive fire was less than
+        quiet_hours_min_interval_minutes ago. A first tick with no recorded
+        prior fire is allowed (never block on unknown boot state).
+        """
+        if not getattr(self._config, "quiet_hours_enabled", False):
+            return False
+        if not self._in_quiet_hours(_local_now(user_timezone())):
+            return False
+        last = self._last_proactive_fire_at
+        if last is None:
+            return False
+        floor = timedelta(minutes=self._config.quiet_hours_min_interval_minutes)
+        return (_now_utc() - last) < floor
+
+    async def _restore_interval(self) -> None:
+        """Load the persisted adaptive interval, clamped to current config
+        bounds. Fresh install / missing / unparseable → keep the base default.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            raw = await ego_crud.get_state(
+                self._db,
+                f"cadence_interval:{self._session._source_tag}",
+            )
+        except Exception:
+            logger.debug("Cadence interval restore read failed", exc_info=True)
+            return
+        if not raw:
+            return
+        try:
+            value = int(raw)
+        except (ValueError, TypeError):
+            return
+        lo = self._config.cadence_minutes
+        # Ceiling is the recency-aware max, NOT the static config cap: when the
+        # user has been away long enough, _update_interval persists intervals
+        # above max_interval_minutes (480/1440/...). Clamping to the static cap
+        # here would collapse long-idle backoff to 4h on every restart.
+        hi = max(lo, await self._recency_max_interval())
+        clamped = max(lo, min(value, hi))
+        if clamped != self._current_interval:
+            logger.info(
+                "Ego interval restored: %dm (persisted=%s, clamped to [%d,%d])",
+                clamped,
+                raw,
+                lo,
+                hi,
+            )
+        self._current_interval = clamped
+
+    async def _persist_interval(self, interval: int) -> None:
+        """Persist the adaptive interval so a restart resumes the backed-off
+        cadence instead of resetting to base. Best-effort — never break the
+        cycle path on a write failure.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            await ego_crud.set_state(
+                self._db,
+                key=f"cadence_interval:{self._session._source_tag}",
+                value=str(interval),
+            )
+        except Exception:
+            logger.debug("Failed to persist cadence interval", exc_info=True)
+
+    async def _persist_last_proactive_fire(self, when: datetime) -> None:
+        """Persist the last proactive fire time so the quiet-hours floor
+        survives restarts. Best-effort.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            await ego_crud.set_state(
+                self._db,
+                key=f"last_proactive_fire:{self._session._source_tag}",
+                value=when.isoformat(),
+            )
+        except Exception:
+            logger.debug("Failed to persist last proactive fire", exc_info=True)
+
+    async def _restore_last_proactive_fire(self) -> None:
+        """Load the persisted last proactive fire time (if any) so the
+        quiet-hours floor is honoured across restarts.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            raw = await ego_crud.get_state(
+                self._db, f"last_proactive_fire:{self._session._source_tag}",
+            )
+        except Exception:
+            logger.debug("Last-fire restore read failed", exc_info=True)
+            return
+        if not raw:
+            return
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            return
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        self._last_proactive_fire_at = parsed
 
     async def _update_interval(self, *, had_proposals: bool) -> None:
         """Adjust cycle interval based on productivity and user recency.
@@ -1173,6 +1374,7 @@ class EgoCadenceManager:
         if new_interval != self._current_interval:
             old_interval = self._current_interval
             self._current_interval = new_interval
+            await self._persist_interval(new_interval)
             try:
                 self._scheduler.reschedule_job(
                     "ego_cycle",

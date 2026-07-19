@@ -44,6 +44,9 @@ def config():
         backoff_multiplier=2.0,
         consecutive_failure_limit=3,
         failure_backoff_minutes=60,
+        # Neutral by default — quiet-hours behavior is exercised explicitly in
+        # TestQuietHours, so shared tests stay deterministic overnight.
+        quiet_hours_enabled=False,
     )
 
 
@@ -430,6 +433,7 @@ class TestProcessSignals:
         mock_idle_detector.is_idle.return_value = True
         sonnet_config = EgoConfig(
             cadence_minutes=60, model="sonnet",  # Non-opus so deep-think triggers
+            quiet_hours_enabled=False,  # keep this test independent of wall clock
         )
         cadence._config = sonnet_config
         # Prevent hot-reload from overwriting test config back to disk values
@@ -1388,3 +1392,286 @@ class TestSignalTTLs:
         [sig] = cadence._signal_queue.drain()
         assert sig.focus_category == "escalation"
         assert sig.expires_at is None
+
+
+# ---------------------------------------------------------------------------
+# Interval persistence across restarts (WS-3)
+# ---------------------------------------------------------------------------
+
+
+class TestIntervalPersistence:
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self, monkeypatch, config):
+        """Prevent hot-reload from overriding the test config with disk values."""
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda: config,
+        )
+
+    async def test_backoff_persisted_then_restored(
+        self, cadence, mock_session, config, db, mock_idle_detector,
+    ):
+        mock_session._source_tag = "user_ego_cycle"
+        mock_session.run_unified_cycle.return_value = EgoCycle(
+            output_text="quiet", proposals_json="[]", focus_summary="idle",
+            ego_source="user_ego_cycle",
+        )
+        await cadence._on_tick()
+        await cadence._process_signals()
+        backed_off = cadence.current_interval_minutes
+        assert backed_off > config.cadence_minutes
+
+        from genesis.db.crud import ego as ego_crud
+        stored = await ego_crud.get_state(db, "cadence_interval:user_ego_cycle")
+        assert stored == str(backed_off)
+
+        # A fresh manager on the same db restores the backed-off interval,
+        # instead of resetting to base as it did before this change.
+        fresh = EgoCadenceManager(
+            session=mock_session, config=config,
+            idle_detector=mock_idle_detector, db=db,
+        )
+        assert fresh.current_interval_minutes == config.cadence_minutes
+        await fresh._restore_interval()
+        assert fresh.current_interval_minutes == backed_off
+
+    async def test_restore_clamps_to_max(self, cadence, mock_session, db):
+        mock_session._source_tag = "user_ego_cycle"
+        from genesis.db.crud import ego as ego_crud
+        await ego_crud.set_state(
+            db, key="cadence_interval:user_ego_cycle", value="99999",
+        )
+        await cadence._restore_interval()
+        assert cadence.current_interval_minutes == cadence._config.max_interval_minutes
+
+    async def test_restore_no_row_keeps_base(self, cadence, mock_session, db):
+        mock_session._source_tag = "genesis_ego_cycle"
+        await cadence._restore_interval()
+        assert cadence.current_interval_minutes == cadence._config.cadence_minutes
+
+    async def test_restore_invalid_value_keeps_base(self, cadence, mock_session, db):
+        mock_session._source_tag = "user_ego_cycle"
+        from genesis.db.crud import ego as ego_crud
+        await ego_crud.set_state(
+            db, key="cadence_interval:user_ego_cycle", value="not-an-int",
+        )
+        await cadence._restore_interval()
+        assert cadence.current_interval_minutes == cadence._config.cadence_minutes
+
+    async def test_restore_keeps_recency_expanded_backoff(
+        self, cadence, mock_session, db,
+    ):
+        """A persisted interval above the static cap survives restart when the
+        user has been away long enough for the recency ceiling to expand."""
+        mock_session._source_tag = "user_ego_cycle"
+        # User last active 5 days ago → recency tier raises the ceiling to 1440.
+        await _insert_foreground_session(
+            db, last_activity_at=(datetime.now(UTC) - timedelta(days=5)).isoformat(),
+        )
+        from genesis.db.crud import ego as ego_crud
+        await ego_crud.set_state(
+            db, key="cadence_interval:user_ego_cycle", value="1440",
+        )
+        await cadence._restore_interval()
+        # NOT clamped down to the static config cap (240).
+        assert cadence.current_interval_minutes == 1440
+
+    async def test_last_proactive_fire_persisted_and_restored(
+        self, cadence, mock_session, db, mock_idle_detector, config,
+    ):
+        """The quiet-hours floor survives a restart: last proactive fire time is
+        persisted on tick and restored by a fresh manager."""
+        mock_session._source_tag = "user_ego_cycle"
+        from genesis.db.crud import ego as ego_crud
+        stamp = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        await ego_crud.set_state(
+            db, key="last_proactive_fire:user_ego_cycle", value=stamp,
+        )
+        fresh = EgoCadenceManager(
+            session=mock_session, config=config,
+            idle_detector=mock_idle_detector, db=db,
+        )
+        assert fresh._last_proactive_fire_at is None
+        await fresh._restore_last_proactive_fire()
+        assert fresh._last_proactive_fire_at is not None
+        assert fresh._last_proactive_fire_at.isoformat() == stamp
+
+    async def test_boot_first_fire_uses_restored_interval(
+        self, cadence, mock_session, db,
+    ):
+        mock_session._source_tag = "user_ego_cycle"
+        from genesis.db.crud import ego as ego_crud
+        await ego_crud.set_state(
+            db, key="cadence_interval:user_ego_cycle", value="180",
+        )
+        await cadence._restore_interval()
+        assert cadence.current_interval_minutes == 180
+        last = datetime.now(UTC) - timedelta(minutes=10)
+        await _seed_last_success(db, "user_ego_cycle", last)
+        first_fire = await cadence._compute_boot_first_fire()
+        expected = last + timedelta(minutes=180)  # restored interval, not base
+        assert abs((first_fire - expected).total_seconds()) < 2
+
+
+# ---------------------------------------------------------------------------
+# Quiet-hours floor (circadian model) — proactive ticks only
+# ---------------------------------------------------------------------------
+
+
+class TestQuietHours:
+    def _mgr(self, db, mock_session, mock_idle_detector, **overrides):
+        cfg_kwargs = {
+            "cadence_minutes": 60,
+            "max_interval_minutes": 240,
+            "quiet_hours_enabled": True,
+            "quiet_hours_start": 23,
+            "quiet_hours_end": 7,
+            "quiet_hours_min_interval_minutes": 240,
+        }
+        cfg_kwargs.update(overrides)
+        cfg = EgoConfig(**cfg_kwargs)
+        mock_session._source_tag = "user_ego_cycle"
+        return EgoCadenceManager(
+            session=mock_session, config=cfg,
+            idle_detector=mock_idle_detector, db=db,
+        )
+
+    @staticmethod
+    def _at(hour: int):
+        import datetime as _dt
+        return _dt.datetime(2026, 1, 1, hour, 0, tzinfo=_dt.UTC)
+
+    def test_in_quiet_hours_crosses_midnight(self, db, mock_session, mock_idle_detector):
+        mgr = self._mgr(db, mock_session, mock_idle_detector)  # 23 → 7
+        assert mgr._in_quiet_hours(self._at(23)) is True
+        assert mgr._in_quiet_hours(self._at(2)) is True
+        assert mgr._in_quiet_hours(self._at(6)) is True
+        assert mgr._in_quiet_hours(self._at(7)) is False  # end is exclusive
+        assert mgr._in_quiet_hours(self._at(12)) is False
+        assert mgr._in_quiet_hours(self._at(22)) is False
+
+    def test_in_quiet_hours_same_day_window(self, db, mock_session, mock_idle_detector):
+        mgr = self._mgr(
+            db, mock_session, mock_idle_detector,
+            quiet_hours_start=1, quiet_hours_end=5,
+        )
+        assert mgr._in_quiet_hours(self._at(0)) is False
+        assert mgr._in_quiet_hours(self._at(1)) is True
+        assert mgr._in_quiet_hours(self._at(4)) is True
+        assert mgr._in_quiet_hours(self._at(5)) is False
+
+    def test_zero_width_window_never_in(self, db, mock_session, mock_idle_detector):
+        mgr = self._mgr(
+            db, mock_session, mock_idle_detector,
+            quiet_hours_start=3, quiet_hours_end=3,
+        )
+        assert mgr._in_quiet_hours(self._at(3)) is False
+
+    def test_suppresses_inside_window_when_recent(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(db, mock_session, mock_idle_detector)
+        now = self._at(2)  # 02:00 local, inside window
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        mgr._last_proactive_fire_at = now - timedelta(minutes=30)  # < 240 floor
+        assert mgr._quiet_hours_suppresses_tick() is True
+
+    def test_allows_inside_window_without_prior_fire(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(db, mock_session, mock_idle_detector)
+        now = self._at(2)
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        mgr._last_proactive_fire_at = None
+        assert mgr._quiet_hours_suppresses_tick() is False
+
+    def test_allows_inside_window_when_floor_elapsed(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(db, mock_session, mock_idle_detector)
+        now = self._at(6)
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        mgr._last_proactive_fire_at = now - timedelta(minutes=300)  # > 240 floor
+        assert mgr._quiet_hours_suppresses_tick() is False
+
+    def test_allows_outside_window(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(db, mock_session, mock_idle_detector)
+        now = self._at(14)  # daytime
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        mgr._last_proactive_fire_at = now - timedelta(minutes=1)  # very recent
+        assert mgr._quiet_hours_suppresses_tick() is False
+
+    def test_disabled_never_suppresses(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(db, mock_session, mock_idle_detector, quiet_hours_enabled=False)
+        now = self._at(2)
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        mgr._last_proactive_fire_at = now - timedelta(minutes=1)
+        assert mgr._quiet_hours_suppresses_tick() is False
+
+    async def test_on_tick_suppressed_pushes_nothing(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(db, mock_session, mock_idle_detector)
+        now = self._at(2)
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        mgr._last_proactive_fire_at = now - timedelta(minutes=30)
+        before = mgr._proactive_cycle_count
+        await mgr._on_tick()
+        assert mgr._signal_queue.empty()
+        assert mgr._proactive_cycle_count == before  # no counter slot consumed
+
+    async def test_morning_report_not_gated_by_quiet_hours(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(db, mock_session, mock_idle_detector)
+        now = self._at(2)
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        mgr._last_proactive_fire_at = now - timedelta(minutes=5)  # would gate a tick
+        await mgr._on_morning_report()
+        assert not mgr._signal_queue.empty()
+        [sig] = mgr._signal_queue.drain()
+        assert sig.focus_category == "daily_briefing"
+
+
+# ---------------------------------------------------------------------------
+# Dashboard gated-approval helper (WS-3)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingCliApproval:
+    async def test_detects_pending_ego_approval(self, db):
+        from genesis.db.crud import ego as ego_crud
+        await db.execute(TABLES["approval_requests"])
+        await db.execute(
+            "INSERT INTO approval_requests "
+            "(id, action_type, action_class, description, status) "
+            "VALUES ('a1', 'autonomous_cli_fallback', 'costly_reversible', "
+            "'Approve Claude Code session for user ego cycle?', 'pending')",
+        )
+        await db.commit()
+        assert await ego_crud.has_pending_cli_approval(db, "user_ego_cycle") is True
+        # The genesis ego is NOT matched by the user-ego label.
+        assert await ego_crud.has_pending_cli_approval(db, "genesis_ego_cycle") is False
+
+    async def test_ignores_resolved_and_other_types(self, db):
+        from genesis.db.crud import ego as ego_crud
+        await db.execute(TABLES["approval_requests"])
+        await db.execute(
+            "INSERT INTO approval_requests "
+            "(id, action_type, action_class, description, status) "
+            "VALUES ('a2', 'autonomous_cli_fallback', 'costly_reversible', "
+            "'Approve Claude Code session for user ego cycle?', 'approved')",
+        )
+        await db.commit()
+        assert await ego_crud.has_pending_cli_approval(db, "user_ego_cycle") is False

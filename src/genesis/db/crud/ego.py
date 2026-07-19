@@ -293,6 +293,28 @@ async def get_state(db: aiosqlite.Connection, key: str) -> str | None:
     return row[0] if row else None
 
 
+async def has_pending_cli_approval(
+    db: aiosqlite.Connection, source_tag: str,
+) -> bool:
+    """True if an ego cycle for *source_tag* is currently blocked on a pending
+    autonomous-CLI approval.
+
+    Display-only signal for the dashboard cadence card. Matches on the approval
+    request description ("Approve Claude Code session for <label>?") where
+    <label> is the dispatcher's ``source_tag.replace("_", " ")`` — the same
+    label the ego passes as ``action_label``.
+    """
+    label = source_tag.replace("_", " ")
+    cursor = await db.execute(
+        "SELECT 1 FROM approval_requests "
+        "WHERE status = 'pending' "
+        "AND action_type = 'autonomous_cli_fallback' "
+        "AND description LIKE ? LIMIT 1",
+        (f"%for {label}?%",),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def set_state(
     db: aiosqlite.Connection,
     *,

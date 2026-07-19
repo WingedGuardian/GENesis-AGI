@@ -161,5 +161,13 @@ class EgoConfig:
     # display-only (rendered into ego-context sections, no code gate), so even ON
     # only nudges the numbers the ego sees about itself. Live-read each refresh.
     outcome_bus_capability_feed: bool = False
+    # Quiet-hours floor (circadian model): during the overnight window, throttle
+    # PROACTIVE ticks to at most one per quiet_hours_min_interval_minutes. Morning
+    # report, reactive, and escalation paths are never gated by this. Local time
+    # via genesis.env.user_timezone(). A window with start==end is treated as off.
+    quiet_hours_enabled: bool = True
+    quiet_hours_start: int = 23  # local hour [0-23], inclusive
+    quiet_hours_end: int = 7  # local hour [0-23], exclusive
+    quiet_hours_min_interval_minutes: int = 240  # min gap between overnight ticks
 
 
