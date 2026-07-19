@@ -14,8 +14,10 @@ critical:
   # Channel/relay infrastructure — modifying via relay could lock user out
   - pattern: "src/genesis/channels/**"
     reason: "Relay infrastructure — modifying via Telegram could break Telegram"
-  - pattern: "config/genesis-bridge.service"
-    reason: "Bridge systemd unit — misconfiguration kills remote access"
+  # NOTE: the live bridge unit renders from scripts/systemd/*.template (covered
+  # below); the deployed unit is covered by the generic "*.service" pattern. The
+  # old dedicated "config/genesis-bridge.service" rule pointed at a stale
+  # duplicate file that has been removed (mirrors PR #969's watchdog cleanup).
   - pattern: "scripts/systemd/*.template"
     reason: "Systemd unit templates — install/update render live units from these; a corrupted template becomes a corrupted service"
 

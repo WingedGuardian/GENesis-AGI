@@ -19,8 +19,6 @@ def rules() -> list[ProtectedPathRule]:
     return [
         ProtectedPathRule("src/genesis/channels/**", ProtectionLevel.CRITICAL,
                           "Relay infrastructure"),
-        ProtectedPathRule("config/genesis-bridge.service", ProtectionLevel.CRITICAL,
-                          "Bridge systemd unit"),
         ProtectedPathRule("*/secrets.env", ProtectionLevel.CRITICAL, "Secrets"),
         ProtectedPathRule(".claude/settings.json", ProtectionLevel.CRITICAL, "CC hooks"),
         ProtectedPathRule("src/genesis/autonomy/protection.py", ProtectionLevel.CRITICAL,
@@ -59,6 +57,8 @@ class TestClassify:
         assert registry.classify("src/genesis/channels/telegram/adapter.py") is ProtectionLevel.CRITICAL
 
     def test_critical_systemd_unit(self, registry: ProtectedPathRegistry):
+        # No dedicated rule for this path — the generic "*.service" pattern
+        # covers it (the old config/genesis-bridge.service duplicate was removed).
         assert registry.classify("config/genesis-bridge.service") is ProtectionLevel.CRITICAL
 
     def test_critical_wildcard_service(self, registry: ProtectedPathRegistry):
@@ -197,15 +197,15 @@ class TestEdgeCases:
         assert reg.classify("src/genesis/awareness/loop.py") is ProtectionLevel.SENSITIVE
 
     def test_rule_count(self, registry: ProtectedPathRegistry):
-        assert registry.rule_count == 13
+        assert registry.rule_count == 12
 
     def test_get_rules_all(self, registry: ProtectedPathRegistry):
-        assert len(registry.get_rules()) == 13
+        assert len(registry.get_rules()) == 12
 
     def test_get_rules_filtered(self, registry: ProtectedPathRegistry):
         critical = registry.get_rules(ProtectionLevel.CRITICAL)
         sensitive = registry.get_rules(ProtectionLevel.SENSITIVE)
-        assert len(critical) == 9
+        assert len(critical) == 8
         assert len(sensitive) == 4
 
 
