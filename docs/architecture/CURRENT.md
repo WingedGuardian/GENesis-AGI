@@ -749,7 +749,7 @@ verified: c6ef28e7 2026-07-19
   (off/shadow/live, default shadow, read live via `ledger/ws2_ledger_config.py`;
   live feeds the same seam #1119's `autonomy_events` windowed ledger consumes).
   **Calibration table LIVE (P3)**: `ledger/cells.py` recomputes
-  `calibration_cells` + `calibration_cell_history` (migration 0068) at the end
+  `calibration_cells` + `calibration_cell_history` (migration 0069) at the end
   of every grading pass — Murphy decomposition + ECE per (domain, class,
   metric, lane, 30/90/all-time window) over resolved rows keyed on
   `resolved_at`, stated/policy_prior lanes partitioned at grouping time,

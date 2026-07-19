@@ -11,9 +11,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+<<<<<<< HEAD
 - **Genesis now keeps an honest, mechanical scorecard of its own confidence.**
   The cognitive ledger's graded predictions roll up into a unified calibration
-  table (`calibration_cells`, migration 0068), recomputed after every grading
+  table (`calibration_cells`, migration 0069), recomputed after every grading
   pass: per domain/metric/window, how often Genesis said X% and how often it
   was actually right — Brier score, Murphy decomposition (is the miss
   overconfidence or uninformativeness?), and a shrinkage-stabilized track
@@ -24,6 +25,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   mechanical-vs-LLM grading shares), and Deep/Strategic reflections now read
   their "when you report ~80% you're right ~60%" advisory from this real
   graded record instead of the legacy proto-calibration table.
+=======
+- **Voice graduation door (W0).** The core now exposes an authenticated
+  `POST /v1/voice/graduate` endpoint where a voice edge machine can land
+  typed "graduation" events (synthesized claims from ambient/meeting
+  capture — never raw transcripts). Events are quarantined verbatim in a
+  new `graduation_events` table with idempotent delivery (safe edge
+  retries), and nothing consumes them yet — the policy drainer that routes
+  them into memory arrives in a later phase. Dispositioned events are
+  pruned after 90 days; pending events are never pruned. The memory
+  metadata schema also gains dormant provenance/trust columns
+  (`provenance_class`, `trust_level`, `attribution`, `origin_ref`,
+  `capture_clarity`) for that later phase.
+>>>>>>> origin/main
 - **A runaway Claude Code temp write can no longer fill the container's root
   disk.** `~/.genesis/cc-tmp` — the scratch space every CC session (and
   genesis-server) writes to — now lives on its own size-capped incus storage
@@ -40,8 +54,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   standing alert on any container install where cc-tmp is not yet isolated, and
   `scripts/lib/cc_tmp_volume.sh`'s `cc_tmp_volume_remove` reverts it.
 
+### Changed
+
+- **The voice API is now fail-closed.** Previously, leaving
+  `GENESIS_MCP_HTTP_TOKEN` unset left every `/v1/voice/*` route open to the
+  network. Now an unset token disables the voice API (503 + a boot-time
+  warning in the server log). **Upgrade note:** if you use the voice API,
+  set `GENESIS_MCP_HTTP_TOKEN` in `secrets.env` and make sure your Home
+  Assistant / voice-addon configs send it as a Bearer token — token-less
+  setups stop working on this upgrade.
+
 ### Fixed
 
+- **`update.sh` no longer aborts on Serena's config churn.** `.serena/project.yml`
+  is now install-local (untracked): Serena rewrites the file's comment block on
+  its own version bumps, so any install running the Serena MCP went permanently
+  "dirty" and every update required a manual stash dance. The updater carries
+  your live copy through the transition automatically, and fresh clones need
+  nothing — Serena regenerates the file on first run.
 - **Dashboard health cards stop crying wolf.** The API Keys and Queues cards
   read "degraded" whenever *any* provider key was unconfigured or *any*
   deferred-work item was queued — even when nothing was actually wrong. Both

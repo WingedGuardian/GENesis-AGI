@@ -1,4 +1,4 @@
-"""Migration 0068 — create ``calibration_cells`` + ``calibration_cell_history``.
+"""Migration 0069 — create ``calibration_cells`` + ``calibration_cell_history``.
 
 Verifies the full column set of both tables, the history trend index,
 idempotency, the CHECK matrix on ``calibration_cells`` (the history table
@@ -15,7 +15,7 @@ import sqlite3
 import aiosqlite
 import pytest
 
-M68 = importlib.import_module("genesis.db.migrations.0068_calibration_cells")
+M69 = importlib.import_module("genesis.db.migrations.0069_calibration_cells")
 
 _EXPECTED_CELL_COLUMNS = {
     "domain",
@@ -87,7 +87,7 @@ async def _insert_cell(db: aiosqlite.Connection, **overrides) -> None:
 @pytest.mark.asyncio
 async def test_up_creates_both_tables_with_full_column_sets(tmp_path):
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
-        await M68.up(db)
+        await M69.up(db)
         assert await _columns(db, "calibration_cells") == _EXPECTED_CELL_COLUMNS
         assert await _columns(db, "calibration_cell_history") == _EXPECTED_HISTORY_COLUMNS
 
@@ -95,7 +95,7 @@ async def test_up_creates_both_tables_with_full_column_sets(tmp_path):
 @pytest.mark.asyncio
 async def test_up_creates_history_trend_index(tmp_path):
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
-        await M68.up(db)
+        await M69.up(db)
         cur = await db.execute(
             "SELECT name, sql FROM sqlite_master WHERE type='index' "
             "AND tbl_name='calibration_cell_history' AND name='idx_cch_cell_time'"
@@ -109,8 +109,8 @@ async def test_up_creates_history_trend_index(tmp_path):
 @pytest.mark.asyncio
 async def test_up_is_idempotent(tmp_path):
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
-        await M68.up(db)
-        await M68.up(db)  # second run must not raise
+        await M69.up(db)
+        await M69.up(db)  # second run must not raise
         assert await _columns(db, "calibration_cells") == _EXPECTED_CELL_COLUMNS
 
 
@@ -127,7 +127,7 @@ async def test_up_is_idempotent(tmp_path):
 async def test_check_matrix_rejects(tmp_path, overrides):
     """Defense-in-depth CHECKs hold even for raw-SQL writers."""
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
-        await M68.up(db)
+        await M69.up(db)
         with pytest.raises(sqlite3.IntegrityError):
             await _insert_cell(db, **overrides)
 
@@ -136,7 +136,7 @@ async def test_check_matrix_rejects(tmp_path, overrides):
 async def test_composite_pk_dedupes(tmp_path):
     """(domain, action_class, metric, provenance, window_days) is the cell key."""
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
-        await M68.up(db)
+        await M69.up(db)
         await _insert_cell(db)
         with pytest.raises(sqlite3.IntegrityError):
             await _insert_cell(db, n=99)  # same key, different payload
@@ -155,7 +155,7 @@ async def test_fresh_canonical_parity(tmp_path):
         fresh_cells = await _columns(db, "calibration_cells")
         fresh_history = await _columns(db, "calibration_cell_history")
     async with aiosqlite.connect(str(tmp_path / "m.db")) as db:
-        await M68.up(db)
+        await M69.up(db)
         migrated_cells = await _columns(db, "calibration_cells")
         migrated_history = await _columns(db, "calibration_cell_history")
     assert fresh_cells == migrated_cells == _EXPECTED_CELL_COLUMNS
@@ -165,8 +165,8 @@ async def test_fresh_canonical_parity(tmp_path):
 @pytest.mark.asyncio
 async def test_down_drops_both_tables(tmp_path):
     async with aiosqlite.connect(str(tmp_path / "t.db")) as db:
-        await M68.up(db)
-        await M68.down(db)
+        await M69.up(db)
+        await M69.down(db)
         cur = await db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name IN ('calibration_cells','calibration_cell_history')"

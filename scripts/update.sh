@@ -405,7 +405,13 @@ _sync_deploy_targets() {
 # blocked update.sh. This release de-tracks it again — the entry below excuses it
 # transitionally, and the backup/restore pair around the merge preserves the live
 # copy through the upstream deletion. Steady state: untracked + .gitignored.)
-EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$| \.claude/settings\.local\.json$'
+# (`.serena/project.yml` is the same failure mode: committed-but-machine-owned.
+# Serena rewrites its comment block on version bumps, so every install where
+# Serena runs went permanently dirty and update.sh required a stash dance. This
+# release de-tracks it (`.serena/` is already .gitignored); the entry below plus
+# its backup/restore pair carry the live copy through the upstream deletion.
+# Serena autogenerates the file when missing, so fresh clones need nothing.)
+EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$| \.claude/settings\.local\.json$| \.serena/project\.yml$'
 if [[ "$POST_MERGE" == "false" ]]; then
     DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null \
         | grep -v "^??" \
@@ -839,6 +845,24 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SETTINGS_LOCAL" &>/dev/null
 fi
 # END settings-local-premerge
 
+# Transitional (.serena/project.yml de-track): same pattern as settings.local.json
+# above — Serena rewrites this machine-owned file in place, so while it is still
+# TRACKED (pre-de-track install), back up the live copy outside the repo and
+# clear local edits so the upstream deletion merges clean. Restored (untracked;
+# `.serena/` is .gitignored) after the merge join point below. Steady state
+# (already untracked): ls-files fails -> no-op.
+# BEGIN serena-yml-premerge (extracted by tests/test_scripts/test_update_serena_transition.py)
+SERENA_YML=".serena/project.yml"
+SERENA_YML_BAK="$HOME/.genesis/serena.project.yml.premerge"
+if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SERENA_YML" &>/dev/null \
+   && [ -f "$GENESIS_ROOT/$SERENA_YML" ]; then
+    mkdir -p "$HOME/.genesis"
+    cp "$GENESIS_ROOT/$SERENA_YML" "$SERENA_YML_BAK"
+    git -C "$GENESIS_ROOT" checkout HEAD -- "$SERENA_YML" 2>/dev/null \
+        && echo "  (backed up live $SERENA_YML; cleared local edits pre-merge)"
+fi
+# END serena-yml-premerge
+
 for _eph in AGENTS.md config/procedure_triggers.yaml; do
     if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_eph" &>/dev/null \
        && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$_eph" 2>/dev/null; then
@@ -973,12 +997,18 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # in-progress signals (like the success path) — a leftover must never linger.
     rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
     # Transitional: the pre-merge step may have cleared live settings.local.json
-    # edits — put them back even though no merge landed.
+    # or .serena/project.yml edits — put them back even though no merge landed.
     if [ -f "$SETTINGS_LOCAL_BAK" ]; then
         mkdir -p "$(dirname "$GENESIS_ROOT/$SETTINGS_LOCAL")"
         cp "$SETTINGS_LOCAL_BAK" "$GENESIS_ROOT/$SETTINGS_LOCAL"
         rm -f "$SETTINGS_LOCAL_BAK"
         echo "  (restored live $SETTINGS_LOCAL from pre-merge backup)"
+    fi
+    if [ -f "$SERENA_YML_BAK" ]; then
+        mkdir -p "$(dirname "$GENESIS_ROOT/$SERENA_YML")"
+        cp "$SERENA_YML_BAK" "$GENESIS_ROOT/$SERENA_YML"
+        rm -f "$SERENA_YML_BAK"
+        echo "  (restored live $SERENA_YML from pre-merge backup)"
     fi
     # Even with no repo delta, heal deploy-target drift (host/container CC + Node
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
@@ -1011,6 +1041,20 @@ if [ -f "$SETTINGS_LOCAL_BAK" ]; then
     echo "  (restored live $SETTINGS_LOCAL from pre-merge backup)"
 fi
 # END settings-local-restore
+
+# Transitional (.serena/project.yml de-track): restore the pre-merge live copy
+# as an UNTRACKED file after the upstream deletion applied. See the premerge
+# block for the full story. No-op once installs are past the transition.
+# BEGIN serena-yml-restore (extracted by tests/test_scripts/test_update_serena_transition.py)
+SERENA_YML="${SERENA_YML:-.serena/project.yml}"
+SERENA_YML_BAK="${SERENA_YML_BAK:-$HOME/.genesis/serena.project.yml.premerge}"
+if [ -f "$SERENA_YML_BAK" ]; then
+    mkdir -p "$(dirname "$GENESIS_ROOT/$SERENA_YML")"
+    cp "$SERENA_YML_BAK" "$GENESIS_ROOT/$SERENA_YML"
+    rm -f "$SERENA_YML_BAK"
+    echo "  (restored live $SERENA_YML from pre-merge backup)"
+fi
+# END serena-yml-restore
 
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)

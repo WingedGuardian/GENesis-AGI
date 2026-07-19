@@ -233,7 +233,14 @@ async def create_cycle_outcome(
     perception_rationale: str | None = None,
     perceive_cost_usd: float = 0.0,
 ) -> str:
-    """Record a cycle outcome for the Learn phase."""
+    """Record a cycle outcome for the Learn phase.
+
+    ``assessment`` is the ego's free-text self-review of the focused goal and
+    is populated ONLY on goal_review cycles (the LLM emits ``goal_assessment``
+    only then). Non-goal_review cycles write NULL by design — a low populated
+    fraction across all rows is expected, not a bug. Read back per-goal via
+    :func:`get_latest_goal_assessment`.
+    """
     from datetime import UTC, datetime
 
     await db.execute(
@@ -257,6 +264,25 @@ async def create_cycle_outcome(
     )
     await db.commit()
     return cycle_id
+
+
+async def get_latest_goal_assessment(
+    db: aiosqlite.Connection, focus_id: str,
+) -> str | None:
+    """Most recent non-empty goal_assessment for *focus_id*, or None.
+
+    Surfaces the ego's own last verdict on a specific goal so a later
+    goal_review cycle sees it (closes the write-only gap on
+    ``ego_cycle_outcomes.assessment``).
+    """
+    cursor = await db.execute(
+        """SELECT assessment FROM ego_cycle_outcomes
+           WHERE focus_id = ? AND assessment IS NOT NULL AND assessment != ''
+           ORDER BY created_at DESC LIMIT 1""",
+        (focus_id,),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else None
 
 
 async def list_cycle_outcomes(
@@ -294,23 +320,25 @@ async def get_state(db: aiosqlite.Connection, key: str) -> str | None:
 
 
 async def has_pending_cli_approval(
-    db: aiosqlite.Connection, source_tag: str,
+    db: aiosqlite.Connection,
+    source_tag: str,
 ) -> bool:
     """True if an ego cycle for *source_tag* is currently blocked on a pending
     autonomous-CLI approval.
 
-    Display-only signal for the dashboard cadence card. Matches on the approval
-    request description ("Approve Claude Code session for <label>?") where
-    <label> is the dispatcher's ``source_tag.replace("_", " ")`` — the same
-    label the ego passes as ``action_label``.
+    Load-bearing: read both by the dashboard cadence card AND by the consumer's
+    pre-drain gate (``EgoCadenceManager._approval_pending``). Matches on the
+    approval request's ``context.policy_id`` — which the dispatcher sets to the
+    ego's ``source_tag`` (``user_ego_cycle`` / ``genesis_ego_cycle``) — rather
+    than the human-readable description, so the two egos never cross-match and a
+    wording change to the approval message can never silently break the gate.
     """
-    label = source_tag.replace("_", " ")
     cursor = await db.execute(
         "SELECT 1 FROM approval_requests "
         "WHERE status = 'pending' "
         "AND action_type = 'autonomous_cli_fallback' "
-        "AND description LIKE ? LIMIT 1",
-        (f"%for {label}?%",),
+        "AND json_extract(context, '$.policy_id') = ? LIMIT 1",
+        (source_tag,),
     )
     return await cursor.fetchone() is not None
 
@@ -371,7 +399,8 @@ async def set_mode(db: aiosqlite.Connection, mode: str, ego_key: str = "ego_mode
 
 
 async def has_pending_proposal_with_hash(
-    db: aiosqlite.Connection, content_hash: str,
+    db: aiosqlite.Connection,
+    content_hash: str,
 ) -> bool:
     """Check if a pending or approved proposal with this content hash exists."""
     cursor = await db.execute(
@@ -721,8 +750,7 @@ async def unboard_proposal(
     Returns True if a row was updated.
     """
     cursor = await db.execute(
-        "UPDATE ego_proposals SET rank = NULL "
-        "WHERE id = ? AND status = 'pending'",
+        "UPDATE ego_proposals SET rank = NULL WHERE id = ? AND status = 'pending'",
         (id,),
     )
     await db.commit()
@@ -773,8 +801,7 @@ async def auto_table_stale_proposals(
 
     # Get IDs first so we can update journal too
     cursor = await db.execute(
-        "SELECT id FROM ego_proposals "
-        "WHERE status = 'pending' AND created_at < datetime('now', ?)",
+        "SELECT id FROM ego_proposals WHERE status = 'pending' AND created_at < datetime('now', ?)",
         (threshold,),
     )
     rows = await cursor.fetchall()
@@ -832,7 +859,8 @@ async def auto_table_stale_proposals(
         unranked_count = len(unranked_ids)
         logger.info(
             "Auto-tabled %d unranked proposal(s) (>%dd)",
-            unranked_count, unranked_days,
+            unranked_count,
+            unranked_days,
         )
 
     return len(ids) + unranked_count
@@ -1205,8 +1233,7 @@ async def supersede_decision(
     cursor = await db.execute(
         "UPDATE ego_directives SET status = 'cancelled', resolved_at = ?, "
         "resolution = ? WHERE id = ? AND status = 'active' AND kind = 'decision'",
-        (resolved_at, f"superseded: {resolution}" if resolution else "superseded",
-         decision_id),
+        (resolved_at, f"superseded: {resolution}" if resolution else "superseded", decision_id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -1219,8 +1246,7 @@ async def get_goal_proposal_summary(
     """Count proposals by status for a given goal_id."""
     try:
         cursor = await db.execute(
-            "SELECT status, count(*) FROM ego_proposals "
-            "WHERE goal_id = ? GROUP BY status",
+            "SELECT status, count(*) FROM ego_proposals WHERE goal_id = ? GROUP BY status",
             (goal_id,),
         )
         return dict(await cursor.fetchall())
@@ -1275,9 +1301,13 @@ async def compute_vcr(
         rows = await cursor.fetchall()
     except Exception:
         return {
-            "total_resolved": 0, "total_executed": 0,
-            "outcomes_completed": 0, "outcomes_failed": 0,
-            "outcomes_unknown": 0, "vcr": 0.0, "dispatch_rate": 0.0,
+            "total_resolved": 0,
+            "total_executed": 0,
+            "outcomes_completed": 0,
+            "outcomes_failed": 0,
+            "outcomes_unknown": 0,
+            "vcr": 0.0,
+            "dispatch_rate": 0.0,
         }
 
     total_resolved = 0

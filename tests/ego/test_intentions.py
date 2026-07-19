@@ -435,3 +435,24 @@ class TestValidateOutput:
         }
         result = _validate_output(data)
         assert len(result["intentions"]["review"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Error-state visibility (WS-5): a query failure is a distinguishable marker,
+# never silently rendered as the empty state.
+# ---------------------------------------------------------------------------
+
+
+class TestIntentionsSectionErrorMarker:
+    @pytest.mark.asyncio
+    async def test_query_error_renders_visible_marker(self, db, monkeypatch):
+        from genesis.db.crud import ego_intentions
+        from genesis.ego import intentions_context
+
+        async def _boom(*a, **k):
+            raise RuntimeError("db exploded")
+
+        monkeypatch.setattr(ego_intentions, "list_active", _boom)
+        out = await intentions_context.build_intentions_section(db, "user_ego_cycle")
+        assert "query error" in out.lower()
+        assert out != ""  # not masked as the empty state

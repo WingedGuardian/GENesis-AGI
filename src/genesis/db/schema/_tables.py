@@ -1169,7 +1169,35 @@ TABLES = {
             source_subsystem TEXT,
             deprecated       INTEGER NOT NULL DEFAULT 0,
             dream_cycle_run_id TEXT,
-            origin_class     TEXT
+            origin_class     TEXT,
+            -- GROUNDWORK(voice-graduation-w2): provenance/trust columns for
+            -- graduated overheard content — written by the W2 policy drainer,
+            -- dark until then. trust_level ladder is overheard-only (NULL
+            -- for non-overheard rows).
+            provenance_class TEXT,
+            trust_level      TEXT,
+            attribution      TEXT,
+            origin_ref       TEXT,
+            capture_clarity  REAL
+        )
+    """,
+    "graduation_events": """
+        CREATE TABLE IF NOT EXISTS graduation_events (
+            id                 TEXT PRIMARY KEY,
+            event_id           TEXT NOT NULL UNIQUE,
+            schema_version     INTEGER NOT NULL,
+            type               TEXT NOT NULL
+                               CHECK (type IN ('perk_up','memory_candidate','meeting_summary')),
+            source             TEXT NOT NULL,
+            occurred_at        TEXT NOT NULL,
+            received_at        TEXT NOT NULL,
+            payload            TEXT NOT NULL,
+            provenance         TEXT NOT NULL,
+            disposition        TEXT NOT NULL DEFAULT 'pending'
+                               CHECK (disposition IN ('pending','landed','rejected','merged')),
+            memory_id          TEXT,
+            disposition_reason TEXT,
+            disposed_at        TEXT
         )
     """,
     "code_modules": """
@@ -2297,6 +2325,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_lp_domain ON ledger_predictions(domain, action_class, metric)",
     "CREATE INDEX IF NOT EXISTS idx_lp_status ON ledger_predictions(status)",
     "CREATE INDEX IF NOT EXISTS idx_lp_subject ON ledger_predictions(subject_ref_type, subject_ref_id)",
+    # Voice graduation quarantine (W0) — serves the W2 drainer's pending scan
+    # and the dispositioned-only prune
+    "CREATE INDEX IF NOT EXISTS idx_graduation_events_disposition ON graduation_events(disposition, received_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

@@ -165,6 +165,31 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         misfire_grace_time=3600,
     )
 
+    async def _prune_graduation_events() -> None:
+        if rt._db is None:
+            return
+        try:
+            from genesis.db.crud import graduation_events as _ge
+
+            removed = await _ge.prune_older_than(rt._db, days=90)
+            rt.record_job_success("graduation_events_prune")
+            if removed:
+                logger.info(
+                    "graduation_events prune: removed %d dispositioned rows (>90d)",
+                    removed,
+                )
+        except Exception as exc:
+            rt.record_job_failure("graduation_events_prune", str(exc))
+            logger.exception("graduation_events prune failed")
+
+    scheduler.add_job(
+        _prune_graduation_events,
+        CronTrigger(hour=5, minute=40, timezone=user_timezone()),
+        id="graduation_events_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
 
 async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""
@@ -1048,9 +1073,11 @@ async def init(rt: GenesisRuntime) -> None:
 
         async def _run_ego_calibration() -> None:
             # Compute the ego's confidence calibration from the Outcome Bus T1
-            # rows and snapshot it (ECE-over-time trend). MEASURE-ONLY / DARK:
-            # writes only ego_calibration_snapshots (no cognitive-path reader),
-            # never injects back into the ego. Runs 15 min after outcome_harvest
+            # rows and snapshot it (ECE-over-time trend). Writes
+            # ego_calibration_snapshots, which the genesis ego's context builder
+            # (_confidence_calibration_section) reads back and injects each cycle
+            # (gated on calibration_injection_enabled). Runs 15 min after
+            # outcome_harvest
             # (8:45/20:45) so it reads a fresh harvest, 15 min before
             # capability_map_refresh (9:15/21:15) — a clean WAL gap.
             if rt._db is None:

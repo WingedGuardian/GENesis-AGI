@@ -412,7 +412,7 @@
                       })()"></div>
                     </div>
                     <span style="font-size: 0.6rem; color: var(--color-text-secondary); min-width: 2.2rem; text-align: right;"
-                          x-text="ue?.cadence?.gated ? 'gated — awaiting approval' : ((ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'm')"></span>
+                          x-text="ue?.cadence?.gated ? 'gated — awaiting approval' : (ue?.cadence?.next_fire_at ? ('next ' + new Date(ue.cadence.next_fire_at).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})) : ((ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'm'))"></span>
                   </div>
                 </div>
                 <!-- Genesis Ego (COO) row -->
@@ -439,7 +439,7 @@
                       })()"></div>
                     </div>
                     <span style="font-size: 0.6rem; color: var(--color-text-secondary); min-width: 2.2rem; text-align: right;"
-                          x-text="ge?.cadence?.gated ? 'gated — awaiting approval' : ((ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'm')"></span>
+                          x-text="ge?.cadence?.gated ? 'gated — awaiting approval' : (ge?.cadence?.next_fire_at ? ('next ' + new Date(ge.cadence.next_fire_at).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})) : ((ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'm'))"></span>
                   </div>
                 </div>
                 <!-- Cost footer -->
