@@ -667,6 +667,45 @@ class TestGenesisEgoContextBuilder:
         assert "repo/branch/status" in result
 
 
+class TestErrorVisibilityMarkers:
+    """P-9: a query FAILURE must render a distinguishable marker, never the same
+    output as the genuine-empty state (a dead instrument must read as dead)."""
+
+    @pytest.mark.asyncio
+    async def test_settled_decisions_query_error_renders_marker(
+        self, db, mock_health_data, capabilities, monkeypatch,
+    ):
+        from genesis.db.crud import ego as ego_crud
+
+        async def _boom(*a, **k):
+            raise RuntimeError("db exploded")
+
+        monkeypatch.setattr(ego_crud, "list_active_decisions", _boom)
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        out = await builder._settled_decisions_section()
+        assert "query error" in out.lower()
+        assert out != ""  # not masked as the empty state
+
+    @pytest.mark.asyncio
+    async def test_capability_performance_query_error_renders_marker(
+        self, db, mock_health_data, capabilities, monkeypatch,
+    ):
+        from genesis.db.crud import capability_map as cap_crud
+
+        async def _boom(*a, **k):
+            raise RuntimeError("db exploded")
+
+        monkeypatch.setattr(cap_crud, "get_all", _boom)
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        out = await builder._capability_performance_section()
+        assert "query error" in out.lower()
+        assert out != ""
+
+
 class TestOwnGoalsSection:
     """PR-3b: the genesis ego's own-goal lane rendering — what makes
     own-goal review non-blind."""

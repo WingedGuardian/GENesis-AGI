@@ -437,8 +437,11 @@ class UserEgoContextBuilder:
                 limit=5,
             )
         except Exception:
-            logger.debug("Failed to query ego directives", exc_info=True)
-            return ""
+            logger.warning("Failed to query ego directives", exc_info=True)
+            return (
+                "## User Directives\n\n"
+                "*User directives unavailable (query error — see logs).*\n"
+            )
 
         if not directives:
             return ""
@@ -489,8 +492,11 @@ class UserEgoContextBuilder:
                 limit=7,
             )
         except Exception:
-            logger.debug("Failed to query settled decisions", exc_info=True)
-            return ""
+            logger.warning("Failed to query settled decisions", exc_info=True)
+            return (
+                "## Settled Decisions\n\n"
+                "*Settled decisions unavailable (query error — see logs).*\n"
+            )
 
         if not decisions:
             return ""
@@ -1061,7 +1067,8 @@ class UserEgoContextBuilder:
                 lines.append("")
 
         except Exception:
-            lines.append("*No proposal history available.*\n")
+            logger.warning("Failed to build proposal history section", exc_info=True)
+            lines.append("*Proposal history unavailable (query error — see logs).*\n")
 
         return "\n".join(lines)
 
@@ -1296,8 +1303,13 @@ class UserEgoContextBuilder:
         try:
             goal = await user_goals.get_by_id(self._db, focus_id)
         except Exception:
-            logger.debug("Failed to fetch goal %s for deep dive", focus_id)
-            return ""
+            logger.warning(
+                "Failed to fetch goal %s for deep dive", focus_id, exc_info=True
+            )
+            return (
+                "## Goal Deep Dive\n\n"
+                "*Goal deep dive unavailable (query error — see logs).*\n"
+            )
 
         if not goal:
             return f"## Goal Deep Dive\n*Goal {focus_id} not found.*\n"
@@ -1467,7 +1479,11 @@ class UserEgoContextBuilder:
 
             entries = await cap_crud.get_all(self._db)
         except Exception:
-            return ""
+            logger.warning("Failed to query capability performance", exc_info=True)
+            lines.append(
+                "*Capability performance unavailable (query error — see logs).*\n"
+            )
+            return "\n".join(lines)
 
         if not entries:
             lines.append("*No performance data yet.*\n")

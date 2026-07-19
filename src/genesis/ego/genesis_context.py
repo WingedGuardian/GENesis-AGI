@@ -197,8 +197,11 @@ class GenesisEgoContextBuilder:
                 self._db, ego_target="genesis_ego", limit=7,
             )
         except Exception:
-            logger.debug("Failed to query settled decisions", exc_info=True)
-            return ""
+            logger.warning("Failed to query settled decisions", exc_info=True)
+            return (
+                "## Settled Decisions\n\n"
+                "*Settled decisions unavailable (query error — see logs).*\n"
+            )
 
         if not decisions:
             return ""
@@ -676,7 +679,11 @@ class GenesisEgoContextBuilder:
 
             entries = await cap_crud.get_all(self._db)
         except Exception:
-            return ""
+            logger.warning("Failed to query capability performance", exc_info=True)
+            lines.append(
+                "*Capability performance unavailable (query error — see logs).*\n"
+            )
+            return "\n".join(lines)
 
         if not entries:
             lines.append("*No performance data yet.*\n")
