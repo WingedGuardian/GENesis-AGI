@@ -64,6 +64,25 @@ class TestUsageAndStatus:
         assert await tracker.get_usage_pct() == pytest.approx(0.0)
         assert await tracker.get_status() == CCStatus.NORMAL
 
+    async def test_ignores_voice_conversation_rows(self, tracker, db):
+        # Voice conversation rows (source_tag='voice') are transcript-index
+        # entries, not CC invocations — a chatty voice day must not throttle
+        # background CC sessions.
+        recent = (datetime(2026, 3, 11, 11, 30, 0, tzinfo=UTC)).isoformat()
+        for _ in range(25):
+            sid = str(uuid.uuid4())
+            await db.execute(
+                """INSERT INTO cc_sessions
+                   (id, session_type, channel, model, started_at,
+                    last_activity_at, status, source_tag)
+                   VALUES (?, 'foreground', 'voice_s2s', 'voice', ?, ?,
+                           'completed', 'voice')""",
+                (sid, recent, recent),
+            )
+        await db.commit()
+        assert await tracker.get_usage_pct() == pytest.approx(0.0)
+        assert await tracker.get_status() == CCStatus.NORMAL
+
 
 class TestThrottling:
     async def test_normal_nothing_throttled(self, tracker, db):

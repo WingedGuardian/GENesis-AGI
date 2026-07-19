@@ -304,3 +304,33 @@ class TestOutcomeBusSource:
         assert inv is not None
         assert "proposals:" in inv["evidence"]
         assert "outcomes:" in inv["evidence"]
+
+
+class TestVoiceRowExclusion:
+    @pytest.mark.asyncio
+    async def test_voice_rows_never_form_a_domain(self, db):
+        """Voice conversation rows (source_tag='voice') are transcript-index
+        entries, always 'completed' — including them would fabricate a
+        100%-complete phantom capability domain."""
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        for i in range(5):
+            await db.execute(
+                "INSERT INTO cc_sessions (id, session_type, model, status, "
+                "source_tag, started_at) "
+                "VALUES (?, 'foreground', 'voice', 'completed', 'voice', ?)",
+                (f"v{i}", now),
+            )
+        for i in range(4):
+            await db.execute(
+                "INSERT INTO cc_sessions (id, session_type, model, status, "
+                "source_tag, started_at) "
+                "VALUES (?, 'background_task', 'sonnet', 'completed', 'sentinel', ?)",
+                (f"s{i}", now),
+            )
+        await db.commit()
+
+        results = await compute_capability_map(db)
+        assert not any(r["domain"] == "voice" for r in results)
+        assert any(r["domain"] == "sentinel" for r in results)
