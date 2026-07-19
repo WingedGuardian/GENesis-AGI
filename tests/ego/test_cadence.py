@@ -174,7 +174,9 @@ class TestBootFirstFire:
     async def test_overdue_fires_soon(self, cadence, mock_session, db):
         mock_session._source_tag = "user_ego_cycle"
         await _seed_last_success(
-            db, "user_ego_cycle", datetime.now(UTC) - timedelta(days=5),
+            db,
+            "user_ego_cycle",
+            datetime.now(UTC) - timedelta(days=5),
         )
         first_fire = await cadence._compute_boot_first_fire()
         assert first_fire is not None
@@ -204,17 +206,24 @@ class TestBootFirstFire:
     async def test_per_ego_isolation(self, cadence, mock_session, db):
         # only the genesis row exists; the user ego must NOT read it
         await _seed_last_success(
-            db, "genesis_ego_cycle", datetime.now(UTC) - timedelta(days=5),
+            db,
+            "genesis_ego_cycle",
+            datetime.now(UTC) - timedelta(days=5),
         )
         mock_session._source_tag = "user_ego_cycle"
         assert await cadence._compute_boot_first_fire() is None
 
     async def test_start_pins_next_run_time_when_overdue(
-        self, cadence, mock_session, db,
+        self,
+        cadence,
+        mock_session,
+        db,
     ):
         mock_session._source_tag = "user_ego_cycle"
         await _seed_last_success(
-            db, "user_ego_cycle", datetime.now(UTC) - timedelta(days=5),
+            db,
+            "user_ego_cycle",
+            datetime.now(UTC) - timedelta(days=5),
         )
         await cadence.start()
         try:
@@ -315,7 +324,9 @@ class TestCadenceHeartbeat:
 
 class TestCadenceTick:
     async def test_tick_pushes_signal_to_queue(
-        self, cadence, mock_idle_detector,
+        self,
+        cadence,
+        mock_idle_detector,
     ):
         """_on_tick() pushes a signal to the queue (doesn't call run_cycle)."""
         mock_idle_detector.is_idle.return_value = True
@@ -323,7 +334,10 @@ class TestCadenceTick:
         assert not cadence._signal_queue.empty()
 
     async def test_tick_runs_unified_cycle_when_idle(
-        self, cadence, mock_session, mock_idle_detector,
+        self,
+        cadence,
+        mock_session,
+        mock_idle_detector,
     ):
         """_on_tick() + _process_signals() calls run_unified_cycle."""
         mock_idle_detector.is_idle.return_value = True
@@ -334,7 +348,10 @@ class TestCadenceTick:
         assert mock_session.run_unified_cycle.call_args.kwargs.get("model_override") is None
 
     async def test_tick_skips_when_active(
-        self, cadence, mock_session, mock_idle_detector,
+        self,
+        cadence,
+        mock_session,
+        mock_idle_detector,
     ):
         mock_idle_detector.is_idle.return_value = False
         await cadence._on_tick()
@@ -342,7 +359,10 @@ class TestCadenceTick:
         assert cadence._signal_queue.empty()
 
     async def test_tick_skips_when_onboarding_incomplete(
-        self, cadence, mock_session, tmp_path,
+        self,
+        cadence,
+        mock_session,
+        tmp_path,
     ):
         # Remove the marker created by autouse fixture
         (tmp_path / ".genesis" / "setup-complete").unlink()
@@ -351,7 +371,9 @@ class TestCadenceTick:
         assert cadence._signal_queue.empty()
 
     async def test_tick_skips_when_paused(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         cadence.pause()
         await cadence._on_tick()
@@ -359,7 +381,9 @@ class TestCadenceTick:
         assert cadence._signal_queue.empty()
 
     async def test_tick_skips_when_circuit_open(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         cadence._circuit_open_until = datetime.now(UTC) + timedelta(hours=1)
         await cadence._on_tick()
@@ -367,7 +391,9 @@ class TestCadenceTick:
         assert cadence._signal_queue.empty()
 
     async def test_tick_handles_exception(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Exception in run_unified_cycle records a failure."""
         mock_session.run_unified_cycle.side_effect = RuntimeError("boom")
@@ -376,7 +402,9 @@ class TestCadenceTick:
         assert cadence.consecutive_failures == 1
 
     async def test_tick_cycle_blocked_does_not_trip_breaker(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """CycleBlockedError is a gate, not a failure — no circuit breaker impact."""
         mock_session.run_unified_cycle.side_effect = CycleBlockedError("approval pending")
@@ -385,7 +413,9 @@ class TestCadenceTick:
         assert cadence.consecutive_failures == 0
 
     async def test_morning_report_cycle_blocked_does_not_trip_breaker(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """CycleBlockedError in morning report also doesn't trip breaker."""
         mock_session.run_unified_cycle.side_effect = CycleBlockedError("approval pending")
@@ -401,16 +431,20 @@ class TestCadenceTick:
 
 class TestProcessSignals:
     async def test_process_signals_calls_unified_cycle(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """_process_signals() drains queue and calls run_unified_cycle."""
         from genesis.ego.signals import EgoSignal
 
-        cadence._signal_queue.push(EgoSignal(
-            signal_type="timer",
-            focus_category="proactive",
-            summary="Idle tick #1",
-        ))
+        cadence._signal_queue.push(
+            EgoSignal(
+                signal_type="timer",
+                focus_category="proactive",
+                summary="Idle tick #1",
+            )
+        )
         await cadence._process_signals()
         mock_session.run_unified_cycle.assert_called_once()
         # Signals are passed as first positional arg
@@ -420,19 +454,27 @@ class TestProcessSignals:
         assert signals[0].summary == "Idle tick #1"
 
     async def test_process_signals_empty_queue_noop(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Empty queue → no cycle call."""
         await cadence._process_signals()
         mock_session.run_unified_cycle.assert_not_called()
 
     async def test_deep_think_passes_model_override_via_metadata(
-        self, cadence, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        cadence,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
-        """Every Nth proactive cycle passes model_override='opus' via signal metadata."""
+        """Every Nth COMPLETED proactive cycle runs on Opus (decided at consume
+        time in _process_signals, not at tick time)."""
         mock_idle_detector.is_idle.return_value = True
         sonnet_config = EgoConfig(
-            cadence_minutes=60, model="sonnet",  # Non-opus so deep-think triggers
+            cadence_minutes=60,
+            model="sonnet",  # Non-opus so deep-think triggers
             quiet_hours_enabled=False,  # keep this test independent of wall clock
         )
         cadence._config = sonnet_config
@@ -477,7 +519,10 @@ class TestProcessSignals:
 
 class TestMorningReport:
     async def test_morning_report_ignores_idle(
-        self, cadence, mock_session, mock_idle_detector,
+        self,
+        cadence,
+        mock_session,
+        mock_idle_detector,
     ):
         """Morning report runs even when user is active."""
         mock_idle_detector.is_idle.return_value = False
@@ -489,14 +534,17 @@ class TestMorningReport:
         assert signals[0].focus_category == "daily_briefing"
 
     async def test_morning_report_still_checks_pause(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         cadence.pause()
         await cadence._on_morning_report()
         assert cadence._signal_queue.empty()
 
     async def test_morning_report_pushes_daily_briefing_signal(
-        self, cadence,
+        self,
+        cadence,
     ):
         """Morning report signal has correct metadata."""
         await cadence._on_morning_report()
@@ -512,7 +560,9 @@ class TestMorningReport:
         assert sig.metadata.get("effort_override") == "low"
 
     async def test_morning_report_effort_via_metadata(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Morning report effort override flows through to unified cycle."""
         await cadence._on_morning_report()
@@ -524,7 +574,9 @@ class TestMorningReport:
         assert call_kwargs["effort_override"] == "low"
 
     async def test_morning_report_resets_interval(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Morning report always resets interval to base (reporting event)."""
         # Back off the interval first
@@ -567,7 +619,9 @@ class TestCircuitBreaker:
 
         # Success resets
         mock_session.run_unified_cycle.return_value = EgoCycle(
-            output_text="ok", proposals_json="[]", focus_summary="ok",
+            output_text="ok",
+            proposals_json="[]",
+            focus_summary="ok",
             ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
@@ -600,17 +654,23 @@ class TestAdaptiveInterval:
     async def test_backoff_increases_interval(self, cadence, mock_session, config):
         # Cycle with no proposals → backoff
         mock_session.run_unified_cycle.return_value = EgoCycle(
-            output_text="quiet", proposals_json="[]", focus_summary="idle",
+            output_text="quiet",
+            proposals_json="[]",
+            focus_summary="idle",
             ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
         await cadence._process_signals()
-        assert cadence.current_interval_minutes == int(config.cadence_minutes * config.backoff_multiplier)
+        assert cadence.current_interval_minutes == int(
+            config.cadence_minutes * config.backoff_multiplier
+        )
 
     async def test_proposals_reset_interval(self, cadence, mock_session, config):
         # First: backoff
         mock_session.run_unified_cycle.return_value = EgoCycle(
-            output_text="quiet", proposals_json="[]", focus_summary="idle",
+            output_text="quiet",
+            proposals_json="[]",
+            focus_summary="idle",
             ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
@@ -631,7 +691,9 @@ class TestAdaptiveInterval:
     async def test_backoff_capped_at_max(self, cadence, mock_session, config):
         """Multiple idle cycles don't exceed max_interval_minutes."""
         mock_session.run_unified_cycle.return_value = EgoCycle(
-            output_text="quiet", proposals_json="[]", focus_summary="idle",
+            output_text="quiet",
+            proposals_json="[]",
+            focus_summary="idle",
             ego_source="user_ego_cycle",
         )
         # Run enough times to exceed max
@@ -647,7 +709,9 @@ class TestAdaptiveInterval:
 
 
 async def _insert_foreground_session(
-    db: aiosqlite.Connection, *, last_activity_at: str,
+    db: aiosqlite.Connection,
+    *,
+    last_activity_at: str,
 ) -> None:
     """Insert a foreground session with the given last_activity_at."""
     await db.execute(
@@ -741,7 +805,9 @@ class TestRecencyAwareBackoff:
         await _insert_foreground_session(db, last_activity_at=ts)
 
         mock_session.run_unified_cycle.return_value = EgoCycle(
-            output_text="quiet", proposals_json="[]", focus_summary="idle",
+            output_text="quiet",
+            proposals_json="[]",
+            focus_summary="idle",
             ego_source="user_ego_cycle",
         )
         # Run enough idle cycles to hit the cap
@@ -760,7 +826,9 @@ class TestRecencyAwareBackoff:
         await _insert_foreground_session(db, last_activity_at=old_ts)
 
         mock_session.run_unified_cycle.return_value = EgoCycle(
-            output_text="quiet", proposals_json="[]", focus_summary="idle",
+            output_text="quiet",
+            proposals_json="[]",
+            focus_summary="idle",
             ego_source="user_ego_cycle",
         )
         for _ in range(5):
@@ -814,12 +882,14 @@ class TestReactiveSignals:
     def test_push_reactive_creates_signal(self, cadence):
         """push_reactive_event creates an EgoSignal in the signal queue."""
         cadence._running = True
-        cadence.push_reactive_event({
-            "type": "breaker.tripped",
-            "summary": "Provider X circuit breaker tripped",
-            "priority": "high",
-            "source": "routing",
-        })
+        cadence.push_reactive_event(
+            {
+                "type": "breaker.tripped",
+                "summary": "Provider X circuit breaker tripped",
+                "priority": "high",
+                "source": "routing",
+            }
+        )
         assert not cadence._signal_queue.empty()
         signals = cadence._signal_queue.drain()
         assert len(signals) == 1
@@ -868,15 +938,19 @@ class TestReactiveSignals:
         assert "effort_override" not in signals[0].metadata
 
     async def test_reactive_flows_through_unified_cycle(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """push_reactive_event + _process_signals → run_unified_cycle."""
         cadence._running = True
-        cadence.push_reactive_event({
-            "type": "health.degraded",
-            "summary": "System health degraded",
-            "priority": "high",
-        })
+        cadence.push_reactive_event(
+            {
+                "type": "health.degraded",
+                "summary": "System health degraded",
+                "priority": "high",
+            }
+        )
         await cadence._process_signals()
         mock_session.run_unified_cycle.assert_called_once()
         call_args = mock_session.run_unified_cycle.call_args
@@ -888,7 +962,9 @@ class TestReactiveSignals:
         assert call_args[1]["effort_override"] is None
 
     async def test_reactive_rate_limit_at_consumer(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Consumer drops reactive signals when rate limit (3/hour) is hit."""
         cadence._running = True
@@ -899,16 +975,20 @@ class TestReactiveSignals:
             now - timedelta(minutes=20),
             now - timedelta(minutes=30),
         ]
-        cadence.push_reactive_event({
-            "type": "test",
-            "summary": "4th event this hour",
-            "priority": "high",
-        })
+        cadence.push_reactive_event(
+            {
+                "type": "test",
+                "summary": "4th event this hour",
+                "priority": "high",
+            }
+        )
         await cadence._process_signals()
         mock_session.run_unified_cycle.assert_not_called()
 
     async def test_reactive_rate_limit_preserves_non_reactive(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Non-reactive signals survive when reactive rate limit is hit."""
         cadence._running = True
@@ -922,18 +1002,22 @@ class TestReactiveSignals:
         # Push a reactive signal AND a proactive signal
         from genesis.ego.signals import EgoSignal
 
-        cadence._signal_queue.push(EgoSignal(
-            signal_type="event",
-            focus_category="reactive",
-            summary="reactive event",
-            priority="high",
-        ))
-        cadence._signal_queue.push(EgoSignal(
-            signal_type="timer",
-            focus_category="proactive",
-            summary="proactive tick",
-            priority="medium",
-        ))
+        cadence._signal_queue.push(
+            EgoSignal(
+                signal_type="event",
+                focus_category="reactive",
+                summary="reactive event",
+                priority="high",
+            )
+        )
+        cadence._signal_queue.push(
+            EgoSignal(
+                signal_type="timer",
+                focus_category="proactive",
+                summary="proactive tick",
+                priority="medium",
+            )
+        )
         await cadence._process_signals()
         # Should still run with the proactive signal
         mock_session.run_unified_cycle.assert_called_once()
@@ -943,16 +1027,20 @@ class TestReactiveSignals:
         assert signals[0].focus_category == "proactive"
 
     async def test_reactive_records_timestamp_on_success(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Successful reactive cycle records a timestamp for rate limiting."""
         cadence._running = True
         assert len(cadence._reactive_timestamps) == 0
-        cadence.push_reactive_event({
-            "type": "test",
-            "summary": "alert event",
-            "priority": "high",
-        })
+        cadence.push_reactive_event(
+            {
+                "type": "test",
+                "summary": "alert event",
+                "priority": "high",
+            }
+        )
         await cadence._process_signals()
         assert len(cadence._reactive_timestamps) == 1
 
@@ -978,12 +1066,14 @@ class TestEscalationSignals:
     def test_push_escalation_creates_signal(self, cadence):
         """push_escalation_event creates a critical escalation signal."""
         cadence._running = True
-        cadence.push_escalation_event({
-            "type": "health.critical",
-            "summary": "Database unreachable",
-            "priority": "CRITICAL",
-            "source": "health",
-        })
+        cadence.push_escalation_event(
+            {
+                "type": "health.critical",
+                "summary": "Database unreachable",
+                "priority": "CRITICAL",
+                "source": "health",
+            }
+        )
         assert not cadence._signal_queue.empty()
         signals = cadence._signal_queue.drain()
         assert len(signals) == 1
@@ -997,7 +1087,9 @@ class TestEscalationSignals:
         assert sig.metadata["effort_override"] == "high"
 
     async def test_escalation_not_rate_limited(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Escalation signals are NOT subject to reactive rate limiting."""
         cadence._running = True
@@ -1008,10 +1100,12 @@ class TestEscalationSignals:
             now - timedelta(minutes=20),
             now - timedelta(minutes=30),
         ]
-        cadence.push_escalation_event({
-            "type": "health.critical",
-            "summary": "Critical system failure",
-        })
+        cadence.push_escalation_event(
+            {
+                "type": "health.critical",
+                "summary": "Critical system failure",
+            }
+        )
         await cadence._process_signals()
         # Should still run — escalation is not reactive
         mock_session.run_unified_cycle.assert_called_once()
@@ -1027,7 +1121,9 @@ class TestEscalationSignals:
         assert cadence._signal_queue.empty()
 
     async def test_escalation_survives_reactive_rate_limit_in_mixed_batch(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """Escalation survives reactive rate limit when batched with reactive signal."""
         cadence._running = True
@@ -1049,14 +1145,18 @@ class TestEscalationSignals:
         assert signals[0].focus_category == "escalation"
 
     async def test_escalation_flows_through_unified_cycle(
-        self, cadence, mock_session,
+        self,
+        cadence,
+        mock_session,
     ):
         """push_escalation_event + _process_signals → run_unified_cycle."""
         cadence._running = True
-        cadence.push_escalation_event({
-            "type": "guardian.alert",
-            "summary": "Container OOM detected",
-        })
+        cadence.push_escalation_event(
+            {
+                "type": "guardian.alert",
+                "summary": "Container OOM detected",
+            }
+        )
         await cadence._process_signals()
         mock_session.run_unified_cycle.assert_called_once()
         call_args = mock_session.run_unified_cycle.call_args
@@ -1078,8 +1178,11 @@ class TestGoalStaleness:
         async with aiosqlite.connect(":memory:") as conn:
             conn.row_factory = aiosqlite.Row
             for table in (
-                "ego_cycles", "ego_state", "cc_sessions",
-                "user_goals", "ego_proposals",
+                "ego_cycles",
+                "ego_state",
+                "cc_sessions",
+                "user_goals",
+                "ego_proposals",
             ):
                 await conn.execute(TABLES[table])
             await conn.commit()
@@ -1103,8 +1206,7 @@ class TestGoalStaleness:
             "INSERT INTO user_goals "
             "(id, title, category, priority, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("goal-1", "Test Goal", "project", "high", "active",
-             twenty_days_ago, twenty_days_ago),
+            ("goal-1", "Test Goal", "project", "high", "active", twenty_days_ago, twenty_days_ago),
         )
         await goal_db.commit()
 
@@ -1140,8 +1242,7 @@ class TestGoalStaleness:
             "INSERT INTO user_goals "
             "(id, title, category, priority, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("goal-3", "Stale Goal", "career", "high", "active",
-             twenty_days_ago, twenty_days_ago),
+            ("goal-3", "Stale Goal", "career", "high", "active", twenty_days_ago, twenty_days_ago),
         )
         await goal_db.commit()
 
@@ -1157,8 +1258,15 @@ class TestGoalStaleness:
             "INSERT INTO user_goals "
             "(id, title, category, priority, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("goal-4", "Not Stale Yet", "learning", "medium", "active",
-             fifteen_days_ago, fifteen_days_ago),
+            (
+                "goal-4",
+                "Not Stale Yet",
+                "learning",
+                "medium",
+                "active",
+                fifteen_days_ago,
+                fifteen_days_ago,
+            ),
         )
         await goal_db.commit()
 
@@ -1179,8 +1287,17 @@ class TestGoalStaleness:
             "(id, title, category, priority, status, created_at, updated_at, "
             " goal_type, cadence_days) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("goal-cad1", "Weekly Review Goal", "project", "high", "active",
-             eight_days_ago, eight_days_ago, "milestone", 7),
+            (
+                "goal-cad1",
+                "Weekly Review Goal",
+                "project",
+                "high",
+                "active",
+                eight_days_ago,
+                eight_days_ago,
+                "milestone",
+                7,
+            ),
         )
         await goal_db.commit()
 
@@ -1196,8 +1313,15 @@ class TestGoalStaleness:
             "INSERT INTO user_goals "
             "(id, title, category, priority, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("goal-cad2", "No Cadence Goal", "project", "medium", "active",
-             eight_days_ago, eight_days_ago),
+            (
+                "goal-cad2",
+                "No Cadence Goal",
+                "project",
+                "medium",
+                "active",
+                eight_days_ago,
+                eight_days_ago,
+            ),
         )
         await goal_db.commit()
 
@@ -1269,7 +1393,6 @@ class TestGoalStaleness:
         assert sig.metadata["mode"] == "stale"
         assert sig.metadata["executed_proposals"] == 1
 
-
     async def test_genesis_origin_goal_not_scanned(self, goal_cadence, goal_db):
         """PR-3a: the user-ego scanner reviews USER goals only — a stale
         origin='genesis_ego' goal must not generate a user-facing goal_review
@@ -1279,8 +1402,16 @@ class TestGoalStaleness:
             "INSERT INTO user_goals "
             "(id, title, category, priority, status, origin, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ("goal-ego", "Ego Ops Goal", "project", "high", "active",
-             "genesis_ego", twenty_days_ago, twenty_days_ago),
+            (
+                "goal-ego",
+                "Ego Ops Goal",
+                "project",
+                "high",
+                "active",
+                "genesis_ego",
+                twenty_days_ago,
+                twenty_days_ago,
+            ),
         )
         await goal_db.commit()
 
@@ -1301,7 +1432,10 @@ class TestJobHealthKeyPerEgo:
 
     @pytest.mark.parametrize("source_tag", ["user_ego_cycle", "genesis_ego_cycle"])
     async def test_record_success_uses_per_ego_key(
-        self, cadence, source_tag, monkeypatch,
+        self,
+        cadence,
+        source_tag,
+        monkeypatch,
     ):
         cadence._session._source_tag = source_tag
         mock_rt = MagicMock()
@@ -1314,7 +1448,10 @@ class TestJobHealthKeyPerEgo:
 
     @pytest.mark.parametrize("source_tag", ["user_ego_cycle", "genesis_ego_cycle"])
     async def test_record_failure_uses_per_ego_key(
-        self, cadence, source_tag, monkeypatch,
+        self,
+        cadence,
+        source_tag,
+        monkeypatch,
     ):
         cadence._session._source_tag = source_tag
         mock_rt = MagicMock()
@@ -1326,7 +1463,11 @@ class TestJobHealthKeyPerEgo:
         mock_rt.record_job_failure.assert_called_once_with(source_tag, "boom")
 
     async def test_two_egos_write_distinct_keys(
-        self, config, mock_idle_detector, db, monkeypatch,
+        self,
+        config,
+        mock_idle_detector,
+        db,
+        monkeypatch,
     ):
         """The core guarantee: user and genesis egos never collide on one key."""
         recorded: list[str] = []
@@ -1340,8 +1481,10 @@ class TestJobHealthKeyPerEgo:
             session = AsyncMock()
             session._source_tag = tag
             mgr = EgoCadenceManager(
-                session=session, config=config,
-                idle_detector=mock_idle_detector, db=db,
+                session=session,
+                config=config,
+                idle_detector=mock_idle_detector,
+                db=db,
             )
             mgr._record_success()
         assert recorded == ["user_ego_cycle", "genesis_ego_cycle"]
@@ -1409,11 +1552,18 @@ class TestIntervalPersistence:
         )
 
     async def test_backoff_persisted_then_restored(
-        self, cadence, mock_session, config, db, mock_idle_detector,
+        self,
+        cadence,
+        mock_session,
+        config,
+        db,
+        mock_idle_detector,
     ):
         mock_session._source_tag = "user_ego_cycle"
         mock_session.run_unified_cycle.return_value = EgoCycle(
-            output_text="quiet", proposals_json="[]", focus_summary="idle",
+            output_text="quiet",
+            proposals_json="[]",
+            focus_summary="idle",
             ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
@@ -1422,14 +1572,17 @@ class TestIntervalPersistence:
         assert backed_off > config.cadence_minutes
 
         from genesis.db.crud import ego as ego_crud
+
         stored = await ego_crud.get_state(db, "cadence_interval:user_ego_cycle")
         assert stored == str(backed_off)
 
         # A fresh manager on the same db restores the backed-off interval,
         # instead of resetting to base as it did before this change.
         fresh = EgoCadenceManager(
-            session=mock_session, config=config,
-            idle_detector=mock_idle_detector, db=db,
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=db,
         )
         assert fresh.current_interval_minutes == config.cadence_minutes
         await fresh._restore_interval()
@@ -1438,8 +1591,11 @@ class TestIntervalPersistence:
     async def test_restore_clamps_to_max(self, cadence, mock_session, db):
         mock_session._source_tag = "user_ego_cycle"
         from genesis.db.crud import ego as ego_crud
+
         await ego_crud.set_state(
-            db, key="cadence_interval:user_ego_cycle", value="99999",
+            db,
+            key="cadence_interval:user_ego_cycle",
+            value="99999",
         )
         await cadence._restore_interval()
         assert cadence.current_interval_minutes == cadence._config.max_interval_minutes
@@ -1452,44 +1608,64 @@ class TestIntervalPersistence:
     async def test_restore_invalid_value_keeps_base(self, cadence, mock_session, db):
         mock_session._source_tag = "user_ego_cycle"
         from genesis.db.crud import ego as ego_crud
+
         await ego_crud.set_state(
-            db, key="cadence_interval:user_ego_cycle", value="not-an-int",
+            db,
+            key="cadence_interval:user_ego_cycle",
+            value="not-an-int",
         )
         await cadence._restore_interval()
         assert cadence.current_interval_minutes == cadence._config.cadence_minutes
 
     async def test_restore_keeps_recency_expanded_backoff(
-        self, cadence, mock_session, db,
+        self,
+        cadence,
+        mock_session,
+        db,
     ):
         """A persisted interval above the static cap survives restart when the
         user has been away long enough for the recency ceiling to expand."""
         mock_session._source_tag = "user_ego_cycle"
         # User last active 5 days ago → recency tier raises the ceiling to 1440.
         await _insert_foreground_session(
-            db, last_activity_at=(datetime.now(UTC) - timedelta(days=5)).isoformat(),
+            db,
+            last_activity_at=(datetime.now(UTC) - timedelta(days=5)).isoformat(),
         )
         from genesis.db.crud import ego as ego_crud
+
         await ego_crud.set_state(
-            db, key="cadence_interval:user_ego_cycle", value="1440",
+            db,
+            key="cadence_interval:user_ego_cycle",
+            value="1440",
         )
         await cadence._restore_interval()
         # NOT clamped down to the static config cap (240).
         assert cadence.current_interval_minutes == 1440
 
     async def test_last_proactive_fire_persisted_and_restored(
-        self, cadence, mock_session, db, mock_idle_detector, config,
+        self,
+        cadence,
+        mock_session,
+        db,
+        mock_idle_detector,
+        config,
     ):
         """The quiet-hours floor survives a restart: last proactive fire time is
         persisted on tick and restored by a fresh manager."""
         mock_session._source_tag = "user_ego_cycle"
         from genesis.db.crud import ego as ego_crud
+
         stamp = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
         await ego_crud.set_state(
-            db, key="last_proactive_fire:user_ego_cycle", value=stamp,
+            db,
+            key="last_proactive_fire:user_ego_cycle",
+            value=stamp,
         )
         fresh = EgoCadenceManager(
-            session=mock_session, config=config,
-            idle_detector=mock_idle_detector, db=db,
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=db,
         )
         assert fresh._last_proactive_fire_at is None
         await fresh._restore_last_proactive_fire()
@@ -1497,12 +1673,18 @@ class TestIntervalPersistence:
         assert fresh._last_proactive_fire_at.isoformat() == stamp
 
     async def test_boot_first_fire_uses_restored_interval(
-        self, cadence, mock_session, db,
+        self,
+        cadence,
+        mock_session,
+        db,
     ):
         mock_session._source_tag = "user_ego_cycle"
         from genesis.db.crud import ego as ego_crud
+
         await ego_crud.set_state(
-            db, key="cadence_interval:user_ego_cycle", value="180",
+            db,
+            key="cadence_interval:user_ego_cycle",
+            value="180",
         )
         await cadence._restore_interval()
         assert cadence.current_interval_minutes == 180
@@ -1532,13 +1714,16 @@ class TestQuietHours:
         cfg = EgoConfig(**cfg_kwargs)
         mock_session._source_tag = "user_ego_cycle"
         return EgoCadenceManager(
-            session=mock_session, config=cfg,
-            idle_detector=mock_idle_detector, db=db,
+            session=mock_session,
+            config=cfg,
+            idle_detector=mock_idle_detector,
+            db=db,
         )
 
     @staticmethod
     def _at(hour: int):
         import datetime as _dt
+
         return _dt.datetime(2026, 1, 1, hour, 0, tzinfo=_dt.UTC)
 
     def test_in_quiet_hours_crosses_midnight(self, db, mock_session, mock_idle_detector):
@@ -1552,8 +1737,11 @@ class TestQuietHours:
 
     def test_in_quiet_hours_same_day_window(self, db, mock_session, mock_idle_detector):
         mgr = self._mgr(
-            db, mock_session, mock_idle_detector,
-            quiet_hours_start=1, quiet_hours_end=5,
+            db,
+            mock_session,
+            mock_idle_detector,
+            quiet_hours_start=1,
+            quiet_hours_end=5,
         )
         assert mgr._in_quiet_hours(self._at(0)) is False
         assert mgr._in_quiet_hours(self._at(1)) is True
@@ -1562,13 +1750,20 @@ class TestQuietHours:
 
     def test_zero_width_window_never_in(self, db, mock_session, mock_idle_detector):
         mgr = self._mgr(
-            db, mock_session, mock_idle_detector,
-            quiet_hours_start=3, quiet_hours_end=3,
+            db,
+            mock_session,
+            mock_idle_detector,
+            quiet_hours_start=3,
+            quiet_hours_end=3,
         )
         assert mgr._in_quiet_hours(self._at(3)) is False
 
     def test_suppresses_inside_window_when_recent(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector)
         now = self._at(2)  # 02:00 local, inside window
@@ -1578,7 +1773,11 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is True
 
     def test_allows_inside_window_without_prior_fire(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector)
         now = self._at(2)
@@ -1588,7 +1787,11 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is False
 
     def test_allows_inside_window_when_floor_elapsed(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector)
         now = self._at(6)
@@ -1598,7 +1801,11 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is False
 
     def test_allows_outside_window(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector)
         now = self._at(14)  # daytime
@@ -1608,7 +1815,11 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is False
 
     def test_disabled_never_suppresses(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector, quiet_hours_enabled=False)
         now = self._at(2)
@@ -1618,7 +1829,11 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is False
 
     async def test_on_tick_suppressed_pushes_nothing(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector)
         now = self._at(2)
@@ -1631,7 +1846,11 @@ class TestQuietHours:
         assert mgr._proactive_cycle_count == before  # no counter slot consumed
 
     async def test_morning_report_not_gated_by_quiet_hours(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector)
         now = self._at(2)
@@ -1652,26 +1871,188 @@ class TestQuietHours:
 class TestPendingCliApproval:
     async def test_detects_pending_ego_approval(self, db):
         from genesis.db.crud import ego as ego_crud
+
         await db.execute(TABLES["approval_requests"])
         await db.execute(
             "INSERT INTO approval_requests "
-            "(id, action_type, action_class, description, status) "
+            "(id, action_type, action_class, description, context, status) "
             "VALUES ('a1', 'autonomous_cli_fallback', 'costly_reversible', "
-            "'Approve Claude Code session for user ego cycle?', 'pending')",
+            "'Approve Claude Code session for user ego cycle?', "
+            '\'{"policy_id": "user_ego_cycle", "subsystem": "ego"}\', \'pending\')',
         )
         await db.commit()
         assert await ego_crud.has_pending_cli_approval(db, "user_ego_cycle") is True
-        # The genesis ego is NOT matched by the user-ego label.
+        # Both egos share subsystem="ego"; the distinct policy_id is what keeps
+        # the user ego's pending approval from cross-stalling the genesis ego.
         assert await ego_crud.has_pending_cli_approval(db, "genesis_ego_cycle") is False
 
     async def test_ignores_resolved_and_other_types(self, db):
         from genesis.db.crud import ego as ego_crud
+
         await db.execute(TABLES["approval_requests"])
         await db.execute(
             "INSERT INTO approval_requests "
-            "(id, action_type, action_class, description, status) "
+            "(id, action_type, action_class, description, context, status) "
             "VALUES ('a2', 'autonomous_cli_fallback', 'costly_reversible', "
-            "'Approve Claude Code session for user ego cycle?', 'approved')",
+            "'Approve Claude Code session for user ego cycle?', "
+            "'{\"policy_id\": \"user_ego_cycle\"}', 'approved')",
         )
         await db.commit()
         assert await ego_crud.has_pending_cli_approval(db, "user_ego_cycle") is False
+
+    async def test_matches_on_policy_id_not_description(self, db):
+        """A reworded approval message must not break the gate: matching keys on
+        context.policy_id, never the human-readable description text."""
+        from genesis.db.crud import ego as ego_crud
+
+        await db.execute(TABLES["approval_requests"])
+        await db.execute(
+            "INSERT INTO approval_requests "
+            "(id, action_type, action_class, description, context, status) "
+            "VALUES ('a3', 'autonomous_cli_fallback', 'costly_reversible', "
+            "'Totally reworded approval prompt with no matchable label', "
+            "'{\"policy_id\": \"user_ego_cycle\"}', 'pending')",
+        )
+        await db.commit()
+        assert await ego_crud.has_pending_cli_approval(db, "user_ego_cycle") is True
+
+
+# ---------------------------------------------------------------------------
+# Gate-aware consumer — signals survive a gated window (WS-2)
+# ---------------------------------------------------------------------------
+
+
+class TestGateAwareConsumer:
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self, monkeypatch, config):
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda: config,
+        )
+
+    async def test_paused_preserves_signals_without_draining(
+        self,
+        cadence,
+        mock_session,
+    ):
+        """Pre-drain gate: a paused ego leaves queued signals intact."""
+        cadence._running = True
+        cadence.push_reactive_event({"type": "t", "summary": "keep me"})
+        assert len(cadence._signal_queue) == 1
+        cadence.pause()
+        status = await cadence._process_signals()
+        assert status == "gated"
+        assert len(cadence._signal_queue) == 1  # NOT drained/lost
+        mock_session.run_unified_cycle.assert_not_called()
+
+    async def test_approval_pending_preserves_signals(
+        self,
+        cadence,
+        mock_session,
+        monkeypatch,
+    ):
+        """Pre-flight: a pending CLI approval skips drain + context assembly."""
+        cadence._running = True
+        cadence.push_reactive_event({"type": "t", "summary": "briefing"})
+        monkeypatch.setattr(cadence, "_approval_pending", AsyncMock(return_value=True))
+        status = await cadence._process_signals()
+        assert status == "gated"
+        assert len(cadence._signal_queue) == 1
+        mock_session.run_unified_cycle.assert_not_called()
+
+    async def test_cycle_blocked_requeues_when_approval_pending(
+        self,
+        cadence,
+        mock_session,
+        monkeypatch,
+    ):
+        """Safety net: a pending-approval block at dispatch time requeues."""
+        cadence._running = True
+        cadence.push_reactive_event({"type": "t", "summary": "survive the block"})
+        mock_session.run_unified_cycle.side_effect = CycleBlockedError("approval pending")
+        # Pre-flight false (no row yet), but the dispatch created a pending row —
+        # so the post-block re-check sees it. Model that ordering:
+        pending = iter([False, True])
+        monkeypatch.setattr(
+            cadence,
+            "_approval_pending",
+            AsyncMock(side_effect=lambda: next(pending)),
+        )
+        status = await cadence._process_signals()
+        assert status == "gated"
+        assert len(cadence._signal_queue) == 1  # requeued
+        [sig] = cadence._signal_queue.drain()
+        assert sig.summary == "survive the block"
+
+    async def test_terminal_block_does_not_requeue(
+        self,
+        cadence,
+        mock_session,
+        monkeypatch,
+    ):
+        """A terminal block (no pending approval row ever) drops signals rather
+        than looping the consumer forever on a no-TTL escalation."""
+        cadence._running = True
+        cadence.push_escalation_event({"type": "t", "summary": "cli disabled"})
+        mock_session.run_unified_cycle.side_effect = CycleBlockedError("cli fallback disabled")
+        # _approval_pending stays False throughout: no resolvable row exists.
+        monkeypatch.setattr(cadence, "_approval_pending", AsyncMock(return_value=False))
+        status = await cadence._process_signals()
+        assert status == "ran"  # attempted + dropped, NOT gated
+        assert len(cadence._signal_queue) == 0  # not requeued → no loop
+
+    async def test_empty_and_ran_statuses(self, cadence, mock_session):
+        cadence._running = True
+        assert await cadence._process_signals() == "empty"
+        cadence.push_reactive_event({"type": "t", "summary": "go"})
+        assert await cadence._process_signals() == "ran"
+
+    async def test_deep_think_not_burned_by_gated_attempt(
+        self,
+        cadence,
+        mock_session,
+        monkeypatch,
+    ):
+        """A gated attempt consumes no deep-think slot — the Opus upgrade still
+        lands on the Nth COMPLETED proactive cycle (WS-2d)."""
+        sonnet = EgoConfig(
+            cadence_minutes=60,
+            model="sonnet",
+            quiet_hours_enabled=False,
+        )
+        cadence._config = sonnet
+        monkeypatch.setattr("genesis.ego.config.load_ego_config", lambda: sonnet)
+        cadence._deep_think_interval = 2
+        mock_session.run_unified_cycle.return_value = EgoCycle(
+            output_text="x",
+            proposals_json="[]",
+            focus_summary="f",
+            ego_source="user_ego_cycle",
+        )
+
+        # Attempt 1: gated by a pending approval → no completion, no slot spent.
+        monkeypatch.setattr(cadence, "_approval_pending", AsyncMock(return_value=True))
+        await cadence._on_tick()
+        assert await cadence._process_signals() == "gated"
+        assert cadence._completed_proactive_count == 0
+
+        # Ungate → completed proactive cycle 1: sonnet (1 % 2 != 0).
+        monkeypatch.setattr(cadence, "_approval_pending", AsyncMock(return_value=False))
+        assert await cadence._process_signals() == "ran"  # drains the queued tick
+        assert cadence._completed_proactive_count == 1
+        assert mock_session.run_unified_cycle.call_args.kwargs.get("model_override") is None
+
+        # Completed proactive cycle 2: deep-think → opus (2 % 2 == 0).
+        mock_session.run_unified_cycle.reset_mock()
+        await cadence._on_tick()
+        assert await cadence._process_signals() == "ran"
+        assert cadence._completed_proactive_count == 2
+        assert mock_session.run_unified_cycle.call_args.kwargs.get("model_override") == "opus"
+
+    async def test_on_tick_no_longer_sets_model_override(self, cadence):
+        """Deep-think moved to consume time — _on_tick pushes a plain signal."""
+        cadence._deep_think_interval = 1  # would have fired every tick under old logic
+        cadence._config = EgoConfig(model="sonnet", quiet_hours_enabled=False)
+        await cadence._on_tick()
+        [sig] = cadence._signal_queue.drain()
+        assert sig.metadata.get("model_override") is None

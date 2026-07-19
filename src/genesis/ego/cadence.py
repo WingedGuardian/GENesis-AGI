@@ -40,6 +40,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# When a cycle can't run because it's blocked on a gate (pending CLI approval,
+# runtime pause, circuit open), the consumer waits this long before re-checking
+# rather than spinning on the still-signaled queue. 5 min keeps tap-to-cycle
+# latency low once an approval resolves, at one cheap pre-flight query per wait.
+_GATED_RETRY_SECONDS = 300
+
 # User-recency tiers: (elapsed_threshold, max_interval_minutes).
 # When the user hasn't had a foreground session in a while, the ego
 # naturally winds down — through the cadence system, not self-suppression.
@@ -153,7 +159,12 @@ class EgoCadenceManager:
         # of the ego's base model. Only meaningful for egos that run Sonnet
         # by default (Genesis ego). User ego already runs Opus proactive.
         self._deep_think_interval = 5
+        # _proactive_cycle_count bumps per pushed tick (keeps the signal summary
+        # unique for dedup). _completed_proactive_count bumps only when a
+        # proactive cycle actually COMPLETES — deep-think keys off the latter so
+        # a gated/failed attempt never burns an Opus slot (WS-2d).
         self._proactive_cycle_count = 0
+        self._completed_proactive_count = 0
 
         # Unified signal queue: all signal sources push here, consumer loop drains.
         # Proactive (_on_tick), morning report (_on_morning_report), reactive
@@ -820,27 +831,15 @@ class EgoCadenceManager:
             logger.debug("Ego proactive tick suppressed — quiet hours")
             return
 
-        # Deep-think: every Nth proactive cycle upgrades to Opus.
-        # Only effective for egos that normally run Sonnet (Genesis ego).
+        # Bump the tick counter only to keep each idle-tick summary unique for
+        # the signal-queue dedup window. Deep-think is decided at CONSUME time
+        # (_process_signals) so a gated/failed attempt never burns an Opus slot.
         self._proactive_cycle_count += 1
-        model_override = None
-        if (
-            self._deep_think_interval > 0
-            and self._proactive_cycle_count % self._deep_think_interval == 0
-            and self._config.model != "opus"
-        ):
-            model_override = "opus"
-            logger.info(
-                "Deep-think cycle %d — upgrading to Opus",
-                self._proactive_cycle_count,
-            )
-
         signal = EgoSignal(
             signal_type="timer",
             focus_category="proactive",
             summary=f"Idle tick #{self._proactive_cycle_count}",
             priority="medium",
-            metadata={"model_override": model_override} if model_override else {},
             # Self-superseding: the next tick pushes a fresh one, so a
             # tick parked longer than the current interval is stale.
             expires_at=_expires_in(self._current_interval),
@@ -854,19 +853,50 @@ class EgoCadenceManager:
             # Roll back count so deep-think alignment is preserved
             self._proactive_cycle_count -= 1
 
-    async def _process_signals(self) -> None:
-        """Drain signal queue and run unified cycle.
+    async def _approval_pending(self) -> bool:
+        """Cheap pre-flight: does this ego have a pending CLI approval right now?
 
-        Separated from the consumer loop for testability — tests call
-        this directly after pushing signals.
-
-        Reactive rate limiting happens here (not at push time) to preserve
-        batch semantics: a burst of events batches into one cycle consuming
-        one rate-limit slot.
+        When true, ``run_unified_cycle`` would just block, so the consumer
+        skips the drain AND the expensive context assembly until the approval
+        resolves. Fail-open — a query error falls through to the authoritative
+        dispatch gate (backed by the requeue safety net below), never silently
+        suppresses a cycle.
         """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            return await ego_crud.has_pending_cli_approval(
+                self._db, self._session._source_tag,
+            )
+        except Exception:
+            logger.debug("Approval pre-flight check failed", exc_info=True)
+            return False
+
+    async def _process_signals(self) -> str:
+        """Drain the signal queue and run a unified cycle.
+
+        Returns a status: ``"empty"`` (nothing queued), ``"gated"`` (blocked on
+        a gate/approval — signals PRESERVED for a later cycle), or ``"ran"`` (a
+        cycle was attempted). The consumer loop backs off on ``"gated"`` instead
+        of spinning on the still-signaled queue.
+
+        Separated from the consumer loop for testability — tests call this
+        directly after pushing signals. Reactive rate limiting happens here (not
+        at push time) to preserve batch semantics: a burst of events batches
+        into one cycle consuming one rate-limit slot.
+        """
+        # Pre-drain gate (WS-2a): if we can't run right now, DON'T drain — leave
+        # the signals in the queue so an eventually-approved cycle still sees
+        # them. Replaces the old drain-then-drop that silently lost the morning
+        # report, goal reviews, and escalations during a gated window.
+        if not self._should_run(skip_idle_check=True):
+            return "gated"
+        if await self._approval_pending():
+            return "gated"
+
         signals = self._signal_queue.drain()
         if not signals:
-            return
+            return "empty"
 
         # Reactive rate limit: max N reactive-focused cycles per hour.
         # If the batch contains reactive signals and the limit is hit,
@@ -880,37 +910,52 @@ class EgoCadenceManager:
             if len(self._reactive_timestamps) >= self._reactive_max_per_hour:
                 non_reactive = [s for s in signals if s.focus_category != "reactive"]
                 if not non_reactive:
+                    # Intentional shedding, not a gate — these re-fire on their
+                    # own (deadline scanner) or are one-shot; requeuing would
+                    # just re-hit the limit. Not preserved.
                     logger.info(
                         "Reactive rate limit: %d/%d in last hour, dropping %d signal(s)",
                         len(self._reactive_timestamps),
                         self._reactive_max_per_hour,
                         len(signals),
                     )
-                    return
+                    return "ran"
                 signals = non_reactive
                 has_reactive = False
 
-        # Extract overrides from signal metadata (deep-think model, morning
-        # effort, escalation effort). Use `is None` checks (not falsy) so
-        # empty strings don't slip through.
-        model_override = None
+        # Effort override from signal metadata (morning report / escalation).
         effort_override = None
         for sig in signals:
-            if model_override is None:
-                mo = sig.metadata.get("model_override")
-                if mo is not None:
-                    model_override = mo
             if effort_override is None:
                 eo = sig.metadata.get("effort_override")
                 if eo is not None:
                     effort_override = eo
 
+        # Model override: honor an explicit signal-metadata value if present,
+        # otherwise decide deep-think HERE (WS-2d) so it's only spent on a cycle
+        # that actually runs. Proactive-only; keyed on completed proactive cycles.
+        model_override = None
+        for sig in signals:
+            mo = sig.metadata.get("model_override")
+            if mo is not None:
+                model_override = mo
+                break
+        is_proactive = any(s.focus_category == "proactive" for s in signals)
+        if (
+            model_override is None
+            and is_proactive
+            and self._deep_think_interval > 0
+            and (self._completed_proactive_count + 1) % self._deep_think_interval == 0
+            and self._config.model != "opus"
+        ):
+            model_override = "opus"
+
         async with self._lock:
-            # Re-check gates under lock (state may have changed since emission).
-            # If rejected, drained signals are lost — acceptable for timer ticks
-            # since the next scheduled tick will push a new signal.
+            # Re-check gates under lock (state may have changed since the
+            # pre-drain check). On rejection, PRESERVE the drained signals.
             if not self._should_run(skip_idle_check=True):
-                return
+                self._signal_queue.requeue(signals)
+                return "gated"
 
             try:
                 cycle = await self._session.run_unified_cycle(
@@ -919,12 +964,31 @@ class EgoCadenceManager:
                     effort_override=effort_override,
                 )
             except CycleBlockedError as exc:
-                logger.info("Unified cycle gated: %s", exc)
-                return
+                # Preserve signals ONLY for a resolvable pending-approval block:
+                # the dispatch just created (or matched) a pending approval row,
+                # so requeuing lets the approved cycle pick them up. A TERMINAL
+                # block (e.g. autonomous CLI fallback disabled) creates no
+                # pending row and will never resolve — requeuing there would
+                # loop the consumer every _GATED_RETRY_SECONDS forever on a
+                # no-TTL escalation. `_approval_pending()` is the discriminator.
+                if await self._approval_pending():
+                    logger.info(
+                        "Unified cycle gated (approval pending): %s — "
+                        "requeuing %d signal(s)",
+                        exc, len(signals),
+                    )
+                    self._signal_queue.requeue(signals)
+                    return "gated"
+                logger.warning(
+                    "Unified cycle blocked with no pending approval "
+                    "(non-resolvable): %s — dropping %d signal(s)",
+                    exc, len(signals),
+                )
+                return "ran"
             except Exception as exc:
                 logger.error("Unified cycle failed", exc_info=True)
                 self._record_failure(str(exc))
-                return
+                return "ran"
 
             if cycle is None:
                 # None here means CC-level failure (session creation,
@@ -932,7 +996,7 @@ class EgoCadenceManager:
                 # from _perceive cannot reach here because we guard
                 # `if not signals: return` above.
                 self._record_failure("unified cycle returned None")
-                return
+                return "ran"
 
             # Validate output (same logic as the old _on_tick)
             proposals = []
@@ -950,9 +1014,19 @@ class EgoCadenceManager:
                     cycle.id,
                 )
                 self._record_failure("cycle produced no usable output")
-                return
+                return "ran"
 
             self._record_success()
+
+            # Deep-think accounting: only a COMPLETED proactive cycle advances
+            # the counter, so gated/failed attempts never shift the cadence.
+            if is_proactive:
+                self._completed_proactive_count += 1
+                if model_override == "opus":
+                    logger.info(
+                        "Deep-think proactive cycle %d ran on Opus",
+                        self._completed_proactive_count,
+                    )
 
             # Record reactive timestamp for rate limiting
             if has_reactive:
@@ -964,6 +1038,7 @@ class EgoCadenceManager:
             await self._update_interval(
                 had_proposals=bool(proposals) or is_morning_report,
             )
+            return "ran"
 
     async def _signal_consumer_loop(self) -> None:
         """Background consumer for the unified signal queue.
@@ -976,7 +1051,13 @@ class EgoCadenceManager:
             try:
                 await self._signal_queue.wait()
                 await asyncio.sleep(2)  # Brief batch window
-                await self._process_signals()
+                status = await self._process_signals()
+                if status == "gated":
+                    # Signals remain queued (pre-drain gate) or were requeued
+                    # (dispatch block). The notify event is still set, so wait
+                    # out a retry window instead of spinning — a resolved
+                    # approval is picked up within ~_GATED_RETRY_SECONDS.
+                    await asyncio.sleep(_GATED_RETRY_SECONDS)
             except asyncio.CancelledError:
                 logger.debug("Signal consumer loop cancelled")
                 break
