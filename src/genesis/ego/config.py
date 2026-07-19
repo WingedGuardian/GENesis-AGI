@@ -171,4 +171,9 @@ def validate_ego_config(changes: dict) -> list[str]:
         v = changes["quiet_hours_min_interval_minutes"]
         if not isinstance(v, (int, float)) or v < 1:
             errors.append("quiet_hours_min_interval_minutes must be >= 1")
+    if "quiet_hours_mode" in changes and changes["quiet_hours_mode"] not in (
+        "floor",
+        "suppress",
+    ):
+        errors.append("quiet_hours_mode must be 'floor' or 'suppress'")
     return errors

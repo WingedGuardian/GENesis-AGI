@@ -46,6 +46,7 @@ quiet_hours_enabled: true
 quiet_hours_start: 23          # local hour [0-23], inclusive
 quiet_hours_end: 7             # local hour [0-23], exclusive
 quiet_hours_min_interval_minutes: 240   # min gap between overnight proactive ticks
+quiet_hours_mode: floor        # "floor" = throttle to 1/interval | "suppress" = full silence
 
 # Circuit breaker
 consecutive_failure_limit: 3

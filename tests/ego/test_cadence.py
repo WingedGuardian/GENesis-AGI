@@ -1726,6 +1726,51 @@ class TestQuietHours:
 
         return _dt.datetime(2026, 1, 1, hour, 0, tzinfo=_dt.UTC)
 
+    def test_suppress_mode_skips_entire_window(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(
+            db, mock_session, mock_idle_detector, quiet_hours_mode="suppress",
+        )
+        now = self._at(2)
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        # No prior fire AND a very recent fire both suppress in suppress mode.
+        mgr._last_proactive_fire_at = None
+        assert mgr._quiet_hours_suppresses_tick() is True
+        mgr._last_proactive_fire_at = now - timedelta(minutes=1)
+        assert mgr._quiet_hours_suppresses_tick() is True
+
+    def test_floor_mode_is_default_and_throttles(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        mgr = self._mgr(db, mock_session, mock_idle_detector)  # default mode
+        assert mgr._config.quiet_hours_mode == "floor"
+        now = self._at(2)
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        monkeypatch.setattr("genesis.ego.cadence._now_utc", lambda: now)
+        mgr._last_proactive_fire_at = now - timedelta(minutes=1)  # recent → throttled
+        assert mgr._quiet_hours_suppresses_tick() is True
+        mgr._last_proactive_fire_at = None  # no prior fire → allowed
+        assert mgr._quiet_hours_suppresses_tick() is False
+
+    def test_suppress_mode_reschedules_past_window(
+        self, db, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        from unittest.mock import MagicMock
+
+        mgr = self._mgr(
+            db, mock_session, mock_idle_detector, quiet_hours_mode="suppress",
+        )
+        now = self._at(2)  # inside the 23→7 window
+        monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
+        mgr._scheduler = MagicMock()
+        mgr._reschedule_past_quiet_hours()
+        assert mgr._scheduler.modify_job.called
+        _, kwargs = mgr._scheduler.modify_job.call_args
+        # Next fire advanced to the window end (07:00), not left in-window.
+        assert kwargs["next_run_time"].hour == 7
+
     def test_in_quiet_hours_crosses_midnight(self, db, mock_session, mock_idle_detector):
         mgr = self._mgr(db, mock_session, mock_idle_detector)  # 23 → 7
         assert mgr._in_quiet_hours(self._at(23)) is True
