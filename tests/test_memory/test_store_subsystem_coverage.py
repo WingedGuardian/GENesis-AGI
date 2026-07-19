@@ -37,10 +37,19 @@ _SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "genesis"
 # Distinctive MemoryStore.store(...) keyword parameters. A ``.store(...)`` call
 # passing any of these is treated as a memory write (filters out unrelated
 # ``.store()`` APIs like ``conn.store``).
-_MEMORY_KWARGS = frozenset({
-    "memory_type", "source_pipeline", "source_subsystem", "wing", "room",
-    "auto_link", "source_session_id", "invalid_at", "memory_class",
-})
+_MEMORY_KWARGS = frozenset(
+    {
+        "memory_type",
+        "source_pipeline",
+        "source_subsystem",
+        "wing",
+        "room",
+        "auto_link",
+        "source_session_id",
+        "invalid_at",
+        "memory_class",
+    }
+)
 
 # file (relative to src/genesis) :: enclosing function  ->  why it is NULL.
 # These writers deliberately leave source_subsystem NULL: the content is
@@ -51,28 +60,21 @@ USER_CONTEXT_ALLOWLIST: dict[str, str] = {
     "bookmark/manager.py::create_micro": "user-saved bookmark (user content)",
     "bookmark/manager.py::create_topic": "user-saved bookmark (user content)",
     "bookmark/manager.py::enrich": "user-saved bookmark enrichment (user content)",
-    "channels/telegram/_handler_messages.py::_try_ego_correction_store":
-        "user-authored ego correction (user content; ego must recall it)",
-    "channels/voice/s2s_session.py::close":
-        "voice conversation memory (user content)",
-    "eval/longmemeval/ingest.py::ingest_haystack":
-        "LongMemEval benchmark haystack ingest into an EPHEMERAL throwaway store "
-        "(first_party user-history content; never touches prod; not a subsystem)",
-    "knowledge/ingest_upload.py::_store_as_is":
-        "user-uploaded knowledge_base content (external-world, recallable)",
-    "knowledge/orchestrator.py::_store_units":
-        "ingested knowledge units (external-world, recallable)",
+    "channels/telegram/_handler_messages.py::_try_ego_correction_store": "user-authored ego correction (user content; ego must recall it)",
+    # NOTE: s2s_session.py::close no longer writes memory — voice conversations
+    # now land as extractable transcripts (W0.5), so there is no .store() call
+    # here to classify.
+    "eval/longmemeval/ingest.py::ingest_haystack": "LongMemEval benchmark haystack ingest into an EPHEMERAL throwaway store "
+    "(first_party user-history content; never touches prod; not a subsystem)",
+    "knowledge/ingest_upload.py::_store_as_is": "user-uploaded knowledge_base content (external-world, recallable)",
+    "knowledge/orchestrator.py::_store_units": "ingested knowledge units (external-world, recallable)",
     "mcp/memory/core.py::memory_store": "user-invoked MCP store",
     "mcp/memory/core.py::memory_extract": "user-invoked MCP extraction",
     "mcp/memory/core.py::memory_synthesize": "user-invoked MCP synthesis",
-    "memory/dream_cycle.py::_synthesize_and_deprecate":
-        "consolidated memory meant FOR recall (tagging would break update_payload)",
-    "memory/knowledge_ingest.py::ingest_knowledge_unit":
-        "knowledge_base ingest (external-world, recallable)",
-    "memory/session_observer.py::process_pending_observations":
-        "conversation-derived observations (~48% of recall pool; must stay)",
-    "recon/cc_update_analyzer.py::_ingest_to_knowledge":
-        "external-world CC-update knowledge (recallable)",
+    "memory/dream_cycle.py::_synthesize_and_deprecate": "consolidated memory meant FOR recall (tagging would break update_payload)",
+    "memory/knowledge_ingest.py::ingest_knowledge_unit": "knowledge_base ingest (external-world, recallable)",
+    "memory/session_observer.py::process_pending_observations": "conversation-derived observations (~48% of recall pool; must stay)",
+    "recon/cc_update_analyzer.py::_ingest_to_knowledge": "external-world CC-update knowledge (recallable)",
 }
 
 
@@ -139,7 +141,8 @@ def test_every_untagged_writer_is_classified():
     unclassified = untagged - allow
     assert not unclassified, (
         "New memory writer(s) that do NOT pass source_subsystem= and are not "
-        "classified:\n  " + "\n  ".join(sorted(unclassified))
+        "classified:\n  "
+        + "\n  ".join(sorted(unclassified))
         + "\n\nIf this is an internal-subsystem writer (ego/triage/reflection/"
         "autonomy), add source_subsystem=. If it is user-sourced / knowledge / "
         "consolidated content that must stay recallable, register it in "
@@ -149,8 +152,7 @@ def test_every_untagged_writer_is_classified():
     stale = allow - untagged
     assert not stale, (
         "Allowlisted writer(s) no longer found untagged (now tagged, renamed, "
-        "or removed) — update USER_CONTEXT_ALLOWLIST:\n  "
-        + "\n  ".join(sorted(stale))
+        "or removed) — update USER_CONTEXT_ALLOWLIST:\n  " + "\n  ".join(sorted(stale))
     )
 
 
@@ -160,6 +162,5 @@ def test_no_module_sets_source_subsystem():
     assert not tagged_module, (
         "module .store() call(s) set source_subsystem — modules are external "
         "capabilities ('hands, not brain', see modules/base.py), NEVER Genesis "
-        "subsystems, and must never tag a memory write:\n  "
-        + "\n  ".join(sorted(tagged_module))
+        "subsystems, and must never tag a memory write:\n  " + "\n  ".join(sorted(tagged_module))
     )
