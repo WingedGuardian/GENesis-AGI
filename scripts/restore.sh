@@ -64,6 +64,7 @@ _SQLITE_RESTORED=false
 _QDRANT_RESTORED=0
 _TRANSCRIPT_RESTORED=0
 _MEMORY_RESTORED=0
+_EVAL_RESTORED=0
 _CCMEM_RESTORED=false
 _OVERLAYS_RESTORED=0
 _SECRETS_RESTORED=false
@@ -78,7 +79,7 @@ _write_status() {
     _failures_json=$(printf '%s\n' "${_FAILURES[@]:-}" | python3 -c "import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))")
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
 STATUSEOF
 }
 # ── Deploy-in-progress marker ────────────────────────────────────────
@@ -381,6 +382,20 @@ _pull_from_offsite() {
             warn "off-site: failed to pull secrets.env.gpg from snapshot $latest — secrets will not be restored"
         fi
     fi
+    # eval golden sets — a no-git fresh box needs them from the snapshot too
+    # (restore §4b reads $BACKUP_DIR/eval). backend_list is single-level, so
+    # iterate eval/ and eval/golden/ separately; the .gpg filter drops the
+    # `golden` subdir entry so it is not mis-fetched as a flat file.
+    for _sub in eval eval/golden; do
+        while read -r fname; do
+            mkdir -p "$BACKUP_DIR/$_sub"
+            if backend_get "$snap/$_sub/$fname" "$BACKUP_DIR/$_sub/$fname"; then
+                log "  off-site: pulled $_sub/$fname"
+            else
+                warn "off-site: failed to pull $_sub/$fname from snapshot $latest"
+            fi
+        done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
+    done
     # creds — Tier-1 git normally carries these; a no-git box needs them from the
     # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
     # single-level, so iterate creds/ and creds/ssh/ separately; the .gpg filter
@@ -628,6 +643,36 @@ if [ -d "$BACKUP_DIR/memory" ]; then
     log "Memory: $_MEMORY_RESTORED restored"
 else
     log "Memory: no backup directory"
+fi
+
+# ── 4b. Eval golden sets ─────────────────────────────────────────────
+log "--- Eval golden sets ---"
+if [ -d "$BACKUP_DIR/eval" ]; then
+    _EVAL_TARGET="$HOME/.genesis/eval"
+    mkdir -p "$_EVAL_TARGET"
+    while IFS= read -r -d '' src; do
+        rel="${src#"$BACKUP_DIR"/eval/}"
+        dst_rel="${rel%.gpg}"
+        dst="$_EVAL_TARGET/$dst_rel"
+        if [ -f "$dst" ] && [ "$dst" -nt "$src" ] && ! $FORCE; then
+            continue
+        fi
+        if $DRY_RUN; then
+            log "Eval: would restore $rel → $dst"
+            _EVAL_RESTORED=$(( _EVAL_RESTORED + 1 ))
+            continue
+        fi
+        mkdir -p "$(dirname "$dst")"
+        if [[ "$src" == *.gpg ]]; then
+            decrypt_file "$src" "$dst" || { warn "eval decrypt failed: $rel"; continue; }
+        else
+            cp "$src" "$dst"
+        fi
+        _EVAL_RESTORED=$(( _EVAL_RESTORED + 1 ))
+    done < <(find "$BACKUP_DIR/eval" -type f -print0 2>/dev/null)
+    log "Eval golden sets: $_EVAL_RESTORED restored"
+else
+    log "Eval golden sets: no backup directory"
 fi
 
 # ── 5. In-repo CC memory backup ──────────────────────────────────────
