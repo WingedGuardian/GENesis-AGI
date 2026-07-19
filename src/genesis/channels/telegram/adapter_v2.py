@@ -38,6 +38,7 @@ from genesis.channels.telegram.transport.send import (
     safe_send_document,
     safe_send_message,
     safe_send_voice,
+    send_with_client_heal,
 )
 from genesis.channels.telegram.transport.typing_breaker import TypingCircuitBreaker
 from genesis.channels.telegram.transport.update_dedupe import TelegramUpdateDedupe
@@ -76,6 +77,10 @@ class TelegramAdapterV2(ChannelAdapter):
         self._autonomous_cli_gate = autonomous_cli_gate
         self._proposal_workflow = proposal_workflow
         self._app = None
+        # Set True at the top of stop() so background senders healing a
+        # shutdown-closed httpx client don't resurrect a client the process
+        # is deliberately tearing down (send_with_client_heal reads this).
+        self._stopping = False
 
         # Transport layer components
         self._dedupe = TelegramUpdateDedupe()
@@ -234,6 +239,10 @@ class TelegramAdapterV2(ChannelAdapter):
         self._watchdog.start()
 
     async def stop(self) -> None:
+        # Signal in-flight/background senders to stop healing the client we are
+        # about to close — a heal during shutdown would just leak a client the
+        # process is discarding.
+        self._stopping = True
         if self._watchdog:
             await self._watchdog.stop()
         if self._app:
@@ -259,13 +268,17 @@ class TelegramAdapterV2(ChannelAdapter):
         if not self._app:
             raise RuntimeError("Adapter not started")
 
-        msg = await safe_send_message(
+        msg = await send_with_client_heal(
             self._app.bot,
-            int(channel_id),
-            text,
-            parse_mode=parse_mode or "HTML",
-            message_thread_id=message_thread_id,
-            reply_markup=reply_markup,
+            lambda: safe_send_message(
+                self._app.bot,
+                int(channel_id),
+                text,
+                parse_mode=parse_mode or "HTML",
+                message_thread_id=message_thread_id,
+                reply_markup=reply_markup,
+            ),
+            stopping=lambda: self._stopping,
         )
         if msg is None:
             raise RuntimeError("Failed to send message after retries")
@@ -319,11 +332,15 @@ class TelegramAdapterV2(ChannelAdapter):
     ) -> str:
         if not self._app:
             raise RuntimeError("Adapter not started")
-        msg = await safe_send_voice(
+        msg = await send_with_client_heal(
             self._app.bot,
-            int(channel_id),
-            io.BytesIO(audio_bytes),
-            reply_to_message_id=int(reply_to_message_id) if reply_to_message_id else None,
+            lambda: safe_send_voice(
+                self._app.bot,
+                int(channel_id),
+                io.BytesIO(audio_bytes),
+                reply_to_message_id=int(reply_to_message_id) if reply_to_message_id else None,
+            ),
+            stopping=lambda: self._stopping,
         )
         if msg is None:
             raise RuntimeError("Failed to send voice after retries")
@@ -342,19 +359,29 @@ class TelegramAdapterV2(ChannelAdapter):
         if not self._app:
             raise RuntimeError("Adapter not started")
 
-        if isinstance(document, bytes):
-            doc_input = io.BytesIO(document)
-            if filename:
-                doc_input.name = filename
-        else:
-            doc_input = document  # file_id or URL
+        # Build a FRESH stream per send attempt. PTB's InputFile reads a
+        # file-like document to EOF at construction — which happens before the
+        # closed-client error is raised — so reusing one BytesIO across a
+        # heal-retry would silently upload zero bytes. String file_id/URL docs
+        # are stateless, so the factory just returns them.
+        def _doc_input() -> io.BytesIO | str:
+            if isinstance(document, bytes):
+                stream = io.BytesIO(document)
+                if filename:
+                    stream.name = filename
+                return stream
+            return document  # file_id or URL
 
-        msg = await safe_send_document(
+        msg = await send_with_client_heal(
             self._app.bot,
-            int(channel_id),
-            doc_input,
-            caption=caption,
-            message_thread_id=message_thread_id,
+            lambda: safe_send_document(
+                self._app.bot,
+                int(channel_id),
+                _doc_input(),
+                caption=caption,
+                message_thread_id=message_thread_id,
+            ),
+            stopping=lambda: self._stopping,
         )
         if msg is None:
             raise RuntimeError("Failed to send document after retries")

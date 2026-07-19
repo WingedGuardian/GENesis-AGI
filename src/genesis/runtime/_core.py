@@ -562,6 +562,28 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         write_capabilities_file(self)
 
+    async def stop_outbound_senders(self) -> None:
+        """Stop the outreach recovery worker before the Telegram client closes.
+
+        The recovery worker is the one background sender with the
+        retry-exhaust-then-permanent-discard pathology: it polls every 60s and
+        burns its 5-retry budget against whatever client it's given. The host
+        calls this BEFORE ``adapter.stop()`` closes the httpx client, so a late
+        retry can't fire through a torn-down client and discard the payload —
+        the failure that silently dropped two Sentinel approval requests on
+        2026-07-15. Other outbound senders (schedulers, awareness) are stopped
+        later in ``shutdown()``; a send from one in the small post-close window
+        just re-raises (heal is disabled during shutdown) rather than
+        exhaust-discarding. Idempotent and exception-guarded so it never blocks
+        shutdown; ``shutdown()`` also stops the worker as a belt.
+        """
+        worker = getattr(self, "_outreach_recovery_worker", None)
+        if worker is not None:
+            try:
+                await worker.stop()
+            except Exception:
+                logger.exception("Failed to stop outreach recovery worker")
+
     async def shutdown(self) -> None:
         if not self._bootstrapped:
             return
@@ -599,6 +621,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             ("user_ego_cadence", self._ego_cadence_manager),
             ("genesis_ego_cadence", self._genesis_ego_cadence_manager),
             ("outreach_scheduler", self._outreach_scheduler),
+            # getattr: only set when outreach init succeeded (init/outreach.py).
+            ("outreach_recovery", getattr(self, "_outreach_recovery_worker", None)),
             ("user_job_scheduler", self._user_job_scheduler),
             ("reflection_scheduler", self._reflection_scheduler),
             ("inbox_monitor", self._inbox_monitor),

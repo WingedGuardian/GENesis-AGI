@@ -182,6 +182,13 @@ class StandaloneAdapter:
         # Stop Wyoming servers
         await self._shutdown_wyoming_servers()
 
+        # Stop background senders (outreach recovery worker) BEFORE closing the
+        # Telegram client below, so no late retry fires through a torn-down
+        # client and exhausts into a permanent discard — the failure that
+        # silently dropped two Sentinel approval requests on 2026-07-15.
+        if self._runtime is not None:
+            await self._runtime.stop_outbound_senders()
+
         if self._telegram_adapter is not None:
             try:
                 await self._telegram_adapter.stop()
@@ -637,6 +644,7 @@ class StandaloneAdapter:
                     adapter._app.bot,
                     config["forum_chat_id"],
                     db=rt.db,
+                    stopping=lambda: adapter._stopping,
                 )
                 await topic_manager.load_persisted()
 

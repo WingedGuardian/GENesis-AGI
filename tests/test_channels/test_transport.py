@@ -1,13 +1,14 @@
 """Tests for Telegram V2 transport layer."""
+
 from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from telegram.error import NetworkError
+from telegram.error import NetworkError, TimedOut
 
 from genesis.channels.telegram.transport.offset_store import (
     delete_offset,
@@ -29,6 +30,7 @@ from genesis.channels.telegram.transport.update_dedupe import (
 )
 
 # ---- UpdateDedupe ----
+
 
 class TestUpdateDedupe:
     def test_first_seen_not_duplicate(self):
@@ -68,6 +70,7 @@ class TestUpdateDedupe:
 
 # ---- OffsetStore ----
 
+
 class TestOffsetStore:
     def test_read_nonexistent(self, tmp_path):
         with patch(
@@ -95,6 +98,7 @@ class TestOffsetStore:
 
 
 # ---- SendSafety ----
+
 
 class TestSendSafety:
     def test_connect_error_is_safe(self):
@@ -141,6 +145,7 @@ class TestSendSafety:
 
 # ---- TypingCircuitBreaker ----
 
+
 class TestTypingBreaker:
     def test_initially_should_send(self):
         cb = TypingCircuitBreaker()
@@ -174,6 +179,7 @@ class TestTypingBreaker:
 
 # ---- PollingWatchdog ----
 
+
 class TestPollingWatchdog:
     @pytest.mark.asyncio
     async def test_stall_triggers_callback(self):
@@ -205,6 +211,7 @@ class TestPollingWatchdog:
 
 
 # ---- DraftStreamer ----
+
 
 class TestDraftStreamer:
     @pytest.mark.asyncio
@@ -264,17 +271,20 @@ class TestDraftStreamer:
 
 # ---- FTS5 Escape Fix ----
 
+
 class TestFTS5Prepare:
     """Tests for _prepare_fts5 — the FTS5 query sanitizer."""
 
     def test_commas_escaped(self):
         from genesis.db.crud.memory import _prepare_fts5
+
         result = _prepare_fts5("hello, world, test")
         assert "," not in result
         assert result is not None
 
     def test_natural_language(self):
         from genesis.db.crud.memory import _prepare_fts5
+
         result = _prepare_fts5("What's the weather like today?")
         assert result is not None
         assert "?" not in result
@@ -282,6 +292,7 @@ class TestFTS5Prepare:
 
     def test_parentheses_escaped(self):
         from genesis.db.crud.knowledge import _prepare_fts5
+
         result = _prepare_fts5("function(arg1, arg2)")
         assert "(" not in result
         assert ")" not in result
@@ -289,11 +300,13 @@ class TestFTS5Prepare:
 
     def test_empty_after_escape_returns_none(self):
         from genesis.db.crud.memory import _prepare_fts5
+
         result = _prepare_fts5("!!!")
         assert result is None
 
     def test_unicode_preserved(self):
         from genesis.db.crud.memory import _prepare_fts5
+
         result = _prepare_fts5("café résumé naïve")
         assert result is not None
         assert "café" in result
@@ -301,6 +314,7 @@ class TestFTS5Prepare:
     def test_uppercase_or_and_neutralized(self):
         """Uppercase OR/AND in user queries must not become FTS5 operators."""
         from genesis.db.crud.memory import _prepare_fts5
+
         result = _prepare_fts5("FTS5 boolean OR AND query")
         assert result is not None
         # Lowercased — or/and are plain search terms, not FTS5 operators
@@ -312,8 +326,10 @@ class TestFTS5Prepare:
     def test_boolean_mode_preserves_operators(self):
         """Boolean mode preserves OR/AND/parens for expand_query output."""
         from genesis.db.crud.memory import _prepare_fts5
+
         result = _prepare_fts5(
-            "(configure AND routing) OR setup OR deploy", boolean=True,
+            "(configure AND routing) OR setup OR deploy",
+            boolean=True,
         )
         assert result is not None
         assert "OR" in result
@@ -324,6 +340,7 @@ class TestFTS5Prepare:
     def test_boolean_mode_unbalanced_parens_stripped(self):
         """Unbalanced parentheses in boolean mode are safely stripped."""
         from genesis.db.crud.memory import _prepare_fts5
+
         result = _prepare_fts5("(test AND query", boolean=True)
         assert result is not None
         assert "(" not in result  # parens stripped due to imbalance
@@ -332,8 +349,10 @@ class TestFTS5Prepare:
     def test_boolean_mode_strips_special_chars(self):
         """Boolean mode still strips non-operator special chars."""
         from genesis.db.crud.memory import _prepare_fts5
+
         result = _prepare_fts5(
-            '(test AND "query") OR setup*', boolean=True,
+            '(test AND "query") OR setup*',
+            boolean=True,
         )
         assert '"' not in result
         assert "*" not in result
@@ -354,6 +373,7 @@ class TestAdapterOffsetDebounce:
 
     def _make_adapter(self):
         from genesis.channels.telegram.adapter_v2 import TelegramAdapterV2
+
         return TelegramAdapterV2(token="t", conversation_loop=AsyncMock())
 
     def test_sentinel_initialized_to_none(self):
@@ -450,7 +470,8 @@ class TestLivenessHTTPXRequest:
 
         calls = []
         req = LivenessHTTPXRequest(
-            connection_pool_size=1, on_success=lambda: calls.append(1),
+            connection_pool_size=1,
+            on_success=lambda: calls.append(1),
         )
         parent = AsyncMock()
         if do_request_exc is not None:
@@ -458,7 +479,8 @@ class TestLivenessHTTPXRequest:
         else:
             parent.return_value = do_request_result
         patcher = patch(
-            "telegram.request.HTTPXRequest.do_request", parent,
+            "telegram.request.HTTPXRequest.do_request",
+            parent,
         )
         return req, calls, patcher
 
@@ -494,3 +516,207 @@ class TestLivenessHTTPXRequest:
         req = LivenessHTTPXRequest(connection_pool_size=1)
         with patch("telegram.request.HTTPXRequest.do_request", AsyncMock(return_value=(200, b""))):
             await req.do_request(url="u", method="post")  # must not raise
+
+
+# ---- send_with_client_heal / _is_closed_client_error ----
+
+
+def _closed_client_error() -> NetworkError:
+    """Build the exact exception PTB raises when the send client is closed.
+
+    ``HTTPXRequest.do_request`` raises RuntimeError("This HTTPXRequest is not
+    initialized!"); ``_request_wrapper`` rewraps it as NetworkError(...) from exc.
+    """
+    inner = RuntimeError("This HTTPXRequest is not initialized!")
+    wrapped = NetworkError(f"Unknown error in HTTP implementation: {inner!r}")
+    wrapped.__cause__ = inner
+    return wrapped
+
+
+class TestClosedClientMatcher:
+    def test_matches_wrapped_error_on_message(self):
+        from genesis.channels.telegram.transport.send import _is_closed_client_error
+
+        assert _is_closed_client_error(_closed_client_error())
+
+    def test_matches_cause_chain_only(self):
+        # Outer message clean, signature only on the __cause__.
+        from genesis.channels.telegram.transport.send import _is_closed_client_error
+
+        e = NetworkError("Unknown error in HTTP implementation")
+        e.__cause__ = RuntimeError("This HTTPXRequest is not initialized!")
+        assert _is_closed_client_error(e)
+
+    def test_rejects_ordinary_network_errors(self):
+        from genesis.channels.telegram.transport.send import _is_closed_client_error
+
+        assert not _is_closed_client_error(TimedOut("Timed out"))
+        assert not _is_closed_client_error(NetworkError("Connection reset by peer"))
+
+    def test_no_infinite_loop_on_cyclic_cause(self):
+        from genesis.channels.telegram.transport.send import _is_closed_client_error
+
+        a = NetworkError("a")
+        b = NetworkError("b")
+        a.__cause__ = b
+        b.__cause__ = a  # cycle
+        assert _is_closed_client_error(a) is False  # terminates, no hang
+
+
+class TestSendWithClientHeal:
+    @pytest.mark.asyncio
+    async def test_heals_and_retries_once_then_succeeds(self):
+        from genesis.channels.telegram.transport.send import send_with_client_heal
+
+        bot = MagicMock()
+        bot.request.initialize = AsyncMock()
+        calls = {"n": 0}
+
+        async def send():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _closed_client_error()
+            return "delivered"
+
+        result = await send_with_client_heal(bot, send, stopping=lambda: False)
+        assert result == "delivered"
+        assert calls["n"] == 2  # first fails, heal, second succeeds
+        bot.request.initialize.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stopping_reraises_without_heal(self):
+        from genesis.channels.telegram.transport.send import send_with_client_heal
+
+        bot = MagicMock()
+        bot.request.initialize = AsyncMock()
+
+        async def send():
+            raise _closed_client_error()
+
+        with pytest.raises(NetworkError):
+            await send_with_client_heal(bot, send, stopping=lambda: True)
+        bot.request.initialize.assert_not_awaited()  # never resurrect on shutdown
+
+    @pytest.mark.asyncio
+    async def test_non_closed_error_reraises_without_heal(self):
+        from genesis.channels.telegram.transport.send import send_with_client_heal
+
+        bot = MagicMock()
+        bot.request.initialize = AsyncMock()
+
+        async def send():
+            raise TimedOut("Timed out")
+
+        with pytest.raises(TimedOut):
+            await send_with_client_heal(bot, send, stopping=lambda: False)
+        bot.request.initialize.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_heal_retry_still_failing_reraises_bounded(self):
+        # Client stays dead: heal once, retry, still fails -> raise (no loop).
+        from genesis.channels.telegram.transport.send import send_with_client_heal
+
+        bot = MagicMock()
+        bot.request.initialize = AsyncMock()
+
+        async def send():
+            raise _closed_client_error()
+
+        with pytest.raises(NetworkError):
+            await send_with_client_heal(bot, send, stopping=lambda: False)
+        bot.request.initialize.assert_awaited_once()  # exactly one heal attempt
+
+
+class TestAdapterDocumentHeal:
+    @pytest.mark.asyncio
+    async def test_document_heal_retry_uses_fresh_stream(self):
+        """Regression: on a heal-retry the document must re-stream from the
+        start. PTB's InputFile consumes the BytesIO to EOF on the first
+        (failing) attempt; a reused stream would upload zero bytes silently."""
+        from genesis.channels.telegram.adapter_v2 import TelegramAdapterV2
+
+        adapter = TelegramAdapterV2(token="123:ABC", conversation_loop=MagicMock())
+        adapter._app = MagicMock()
+        adapter._app.bot.request.initialize = AsyncMock()
+
+        seen: list[bytes] = []
+        calls = {"n": 0}
+
+        async def fake_send_document(bot, chat_id, document, **kwargs):
+            calls["n"] += 1
+            data = document.read()  # PTB consumes the stream at InputFile build
+            if calls["n"] == 1:
+                raise _closed_client_error()
+            seen.append(data)
+            return MagicMock(message_id=99)
+
+        with patch(
+            "genesis.channels.telegram.adapter_v2.safe_send_document",
+            side_effect=fake_send_document,
+        ):
+            msg_id = await adapter.send_document("123", b"PAYLOAD-BYTES", filename="f.txt")
+
+        assert msg_id == "99"
+        assert seen == [b"PAYLOAD-BYTES"]  # retry got the FULL payload, not b""
+        adapter._app.bot.request.initialize.assert_awaited_once()
+
+
+class TestClientHealE2E:
+    @pytest.mark.asyncio
+    async def test_real_ptb_closed_client_heals_and_delivers(self, caplog):
+        """End-to-end through REAL PTB: a shutdown-closed httpx send-client is
+        rebuilt by the heal and the message is delivered. Network is mocked via
+        httpx.MockTransport, but do_request, initialize(), and the NetworkError
+        wrap are all real PTB — this guards against a PTB upgrade changing
+        HTTPXRequest.initialize() rebuild semantics (the load-bearing mechanism).
+        """
+        import logging
+
+        from telegram import Bot
+        from telegram.request import HTTPXRequest
+
+        from genesis.channels.telegram.adapter_v2 import TelegramAdapterV2
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": {
+                        "message_id": 555,
+                        "date": 0,
+                        "chat": {"id": 123, "type": "private"},
+                        "text": "x",
+                    },
+                },
+            )
+
+        req = HTTPXRequest(httpx_kwargs={"transport": httpx.MockTransport(handler)})
+        bot = Bot(token="123:ABC", request=req)
+        conv = MagicMock()
+        conv._db = None  # skip DB persistence path
+        adapter = TelegramAdapterV2(token="123:ABC", conversation_loop=conv)
+        app = MagicMock()
+        app.bot = bot
+        adapter._app = app
+
+        try:
+            # Reproduce the 2026-07-15 state: the real send client is closed.
+            await bot.request.shutdown()
+            assert bot.request._client.is_closed
+
+            # Real adapter path: raises the real closed-client error, heals via
+            # real bot.request.initialize(), retries, delivers.
+            with caplog.at_level(logging.ERROR):
+                mid = await adapter.send_message("123", "after client closed")
+            assert mid == "555"
+            assert not bot.request._client.is_closed  # rebuilt
+
+            # During shutdown, the heal must NOT resurrect the client.
+            adapter._stopping = True
+            await bot.request.shutdown()
+            with pytest.raises(NetworkError):
+                await adapter.send_message("123", "during shutdown")
+            assert bot.request._client.is_closed
+        finally:
+            await req.shutdown()

@@ -176,6 +176,7 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer |
         draft_id=generate_draft_id(),
         message_thread_id=msg.message_thread_id,
         prefix=prefix,
+        stopping=lambda: getattr(ctx.adapter, "_stopping", False),
     )
 
     # Flush immediately — user sees prefix before inference starts

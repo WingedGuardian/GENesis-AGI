@@ -214,3 +214,52 @@ async def test_shutdown_stops_direct_session_runner_before_db_close() -> None:
     assert db_was_usable == [True], (
         "runner.shutdown() must run BEFORE the DB closes"
     )
+
+
+@pytest.mark.asyncio
+async def test_stop_outbound_senders_stops_worker() -> None:
+    """stop_outbound_senders() must stop the outreach recovery worker so a late
+    retry can't fire through a Telegram send client the host is about to close
+    (the 2026-07-15 Sentinel-approval discard)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    GenesisRuntime.reset()
+    rt = GenesisRuntime.instance()
+    worker = MagicMock()
+    worker.stop = AsyncMock()
+    rt._outreach_recovery_worker = worker
+
+    await rt.stop_outbound_senders()
+
+    worker.stop.assert_awaited_once()
+    GenesisRuntime.reset()
+
+
+@pytest.mark.asyncio
+async def test_stop_outbound_senders_noop_when_worker_absent() -> None:
+    """When outreach init never ran, the attribute is unset — getattr(None)
+    must make this a safe no-op, never an AttributeError."""
+    GenesisRuntime.reset()
+    rt = GenesisRuntime.instance()
+    # Ensure the attribute is genuinely absent.
+    if hasattr(rt, "_outreach_recovery_worker"):
+        delattr(rt, "_outreach_recovery_worker")
+
+    await rt.stop_outbound_senders()  # must not raise
+    GenesisRuntime.reset()
+
+
+@pytest.mark.asyncio
+async def test_stop_outbound_senders_swallows_worker_error() -> None:
+    """A failing worker.stop() must never block or crash shutdown."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    GenesisRuntime.reset()
+    rt = GenesisRuntime.instance()
+    worker = MagicMock()
+    worker.stop = AsyncMock(side_effect=RuntimeError("boom"))
+    rt._outreach_recovery_worker = worker
+
+    await rt.stop_outbound_senders()  # must not raise
+    worker.stop.assert_awaited_once()
+    GenesisRuntime.reset()
