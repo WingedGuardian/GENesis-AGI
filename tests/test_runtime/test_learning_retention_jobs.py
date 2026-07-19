@@ -19,6 +19,7 @@ _EXPECTED = (
     "file_modifications_prune",
     "job_run_events_prune",
     "alert_events_prune",
+    "graduation_events_prune",
 )
 
 
