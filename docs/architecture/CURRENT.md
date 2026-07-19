@@ -652,7 +652,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 732c4f3d 2026-07-19
+verified: c6ef28e7 2026-07-19
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -757,7 +757,10 @@ verified: 732c4f3d 2026-07-19
   rates from `tool_call_outcomes` as the strict policy_prior lane, and
   ok/thin/unknown cold-start labels (thin/unknown NEVER render as a bare
   percentage on any surface). Writes are upsert-then-prune (never an
-  observably-empty table mid-rebuild); history prunes at 180d in-pass.
+  observably-empty table mid-rebuild); history prunes at 180d in-pass; a
+  recompute failure never blocks grading — it raises the standing
+  `ledger:cell_recompute_failed` WARNING (stale-cells signal) on the same
+  counter→`_compute_alerts` contract as the writer/grader alarms.
   Surfaces: `calibration_status` MCP (escalation phrasing on thin/unknown,
   top over/under-confident domains), dashboard Calibration tab
   (`/api/genesis/calibration` — cells + mechanical/fallback shares), and
