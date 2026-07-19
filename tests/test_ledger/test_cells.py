@@ -397,3 +397,24 @@ async def test_crud_rejects_invalid_enums(db):
             ],
             now=NOW,
         )
+
+
+# ── health surfacing ─────────────────────────────────────────────────────────
+
+
+async def test_compute_alerts_surfaces_recompute_failure_counter():
+    """_compute_alerts emits ledger:cell_recompute_failed while the counter is
+    nonzero — stale derived data must not be silent (provision-or-surface)."""
+    from genesis.ledger import cells as cells_mod
+    from genesis.mcp.health import errors as health_errors
+
+    cells_mod._recompute_failed["recompute"] = 2
+    alerts, current_ids = await health_errors._compute_alerts()
+    assert "ledger:cell_recompute_failed:recompute" in current_ids
+    (alert,) = [a for a in alerts if a["id"] == "ledger:cell_recompute_failed:recompute"]
+    assert alert["severity"] == "WARNING"
+    assert "calibration_cells is stale" in alert["message"]
+
+    cells_mod._reset_cell_counters_for_tests()
+    alerts, current_ids = await health_errors._compute_alerts()
+    assert not any(i.startswith("ledger:cell_recompute_failed") for i in current_ids)

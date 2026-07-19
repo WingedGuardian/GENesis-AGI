@@ -268,6 +268,30 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     except Exception:
         logger.debug("ledger grade-failure alert check failed", exc_info=True)
 
+    # WS-2 P3: calibration-cell recompute failures — grading still lands, but
+    # every calibration consumer (MCP, dashboard, perception advisory) reads
+    # stale cells until a pass succeeds. Same per-process counter contract.
+    try:
+        from genesis.ledger.cells import cell_recompute_failure_counts
+
+        for kind, count in sorted(cell_recompute_failure_counts().items()):
+            if count > 0:
+                alert_id = f"ledger:cell_recompute_failed:{kind}"
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": (
+                            f"{count} calibration-cell recompute(s) failed since "
+                            "process start — grades landed but calibration_cells "
+                            "is stale for all consumers"
+                        ),
+                    }
+                )
+                current_ids.add(alert_id)
+    except Exception:
+        logger.debug("cell recompute alert check failed", exc_info=True)
+
     if _service is None:
         alerts.append(
             {
