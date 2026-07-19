@@ -145,3 +145,11 @@ async def test_empty_state_summary(db):
     assert data["summary"]["graded_total"] == 0
     assert data["summary"]["mechanical_share"] is None
     assert data["summary"]["last_computed_at"] is None
+
+
+def test_400_on_invalid_window(client):
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = _rt(db=MagicMock())
+        assert client.get("/api/genesis/calibration?window=45").status_code == 400
+        # Flask type=int would silently default non-numeric input — raw parse must 400
+        assert client.get("/api/genesis/calibration?window=abc").status_code == 400

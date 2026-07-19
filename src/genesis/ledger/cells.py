@@ -74,6 +74,11 @@ def cell_recompute_failure_counts() -> dict[str, int]:
     return dict(_recompute_failed)
 
 
+def record_recompute_failure() -> None:
+    """Bump the failure counter — the ONE write path (the grader's except arm)."""
+    _recompute_failed["recompute"] += 1
+
+
 def _reset_cell_counters_for_tests() -> None:
     _recompute_failed.clear()
 
@@ -248,10 +253,13 @@ async def _build_tool_cells(db: Any, *, now: datetime) -> list[dict]:
             )
         else:
             cutoff = canonical_iso((now - timedelta(days=window)).isoformat())
+            # Plain (sargable) comparison rides idx_tco_tool_ts: both sides are
+            # canonical ISO from datetime.isoformat() — a microsecond-less row
+            # sorts sub-second early at the boundary, negligible on day windows.
             cursor = await db.execute(
                 "SELECT tool_name, COUNT(*) AS n, AVG(success) AS base_rate "
                 "FROM tool_call_outcomes "
-                "WHERE datetime(timestamp) >= datetime(?) GROUP BY tool_name",
+                "WHERE timestamp >= ? GROUP BY tool_name",
                 (cutoff,),
             )
         for row in await cursor.fetchall():

@@ -76,7 +76,15 @@ async def calibration_cells():
     lane = request.args.get("lane", "stated")
     if lane not in _LANES:
         return jsonify({"error": f"lane must be one of {sorted(_LANES)}"}), 400
-    window = request.args.get("window", 90, type=int)
+    # Parse the raw arg — Flask's type=int silently falls back to the default
+    # on coercion failure, which would turn ?window=abc into a 200 for 90d.
+    raw_window = request.args.get("window", "90")
+    try:
+        window = int(raw_window)
+    except ValueError:
+        window = -1
+    if window not in (0, 30, 90):
+        return jsonify({"error": "window must be one of [0, 30, 90]"}), 400
     domain = request.args.get("domain") or None
 
     try:

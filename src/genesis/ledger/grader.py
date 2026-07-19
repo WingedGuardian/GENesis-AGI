@@ -323,7 +323,7 @@ async def grade_due_predictions(
         cell_report = await _cells.recompute_calibration_cells(db, now=now)
         report.cells_written = cell_report.cells_written
     except Exception:
-        _cells._recompute_failed["recompute"] += 1
+        _cells.record_recompute_failure()
         logger.error(
             "calibration-cell recompute failed — grades landed, cells stale",
             exc_info=True,

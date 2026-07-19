@@ -64,8 +64,8 @@ async def _impl_calibration_status(domain: str = "", include_history: bool = Fal
             "message": (
                 "No calibration cells yet"
                 + (f" for domain={domain!r}" if domain else "")
-                + ". Cells are recomputed at the end of each grading pass "
-                "(06:15/18:15) from resolved ledger_predictions rows and "
+                + ". Cells are recomputed at the end of each scheduled grading "
+                "pass (twice daily) from resolved ledger_predictions rows and "
                 "tool_call_outcomes — expected until predictions cross their "
                 "deadlines and get graded."
             ),

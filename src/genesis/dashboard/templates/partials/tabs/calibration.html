@@ -68,7 +68,7 @@
       <div x-show="!$store.genesisDashboard.calibrationCells.length"
            style="color: var(--color-text-secondary); font-size: .85em; padding: 1rem 0;">
         No calibration cells for this lane/window yet. Cells appear once graded
-        predictions accumulate (the grader runs at 06:15 / 18:15).
+        predictions accumulate (recomputed at each scheduled grading pass, twice daily).
       </div>
       <table x-show="$store.genesisDashboard.calibrationCells.length" style="width: 100%; border-collapse: collapse; font-size: .85rem;">
         <thead>

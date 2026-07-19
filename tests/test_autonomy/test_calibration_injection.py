@@ -97,7 +97,7 @@ async def _seed_cell(
             window_days,
             n,
             n,
-            shrunk_estimate,
+            shrunk_estimate,  # base_rate: raw ≈ shrunk at fixture n; unread by perception
             mean_confidence,
             shrunk_estimate,
             status,
