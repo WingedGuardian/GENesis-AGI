@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from telegram import Bot
@@ -28,6 +29,65 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _TG_MAX_LEN = 4096
+
+
+def _is_closed_client_error(exc: BaseException) -> bool:
+    """True if ``exc`` signals PTB's httpx send-client was closed (shut down).
+
+    PTB's ``HTTPXRequest.do_request`` raises
+    ``RuntimeError("This HTTPXRequest is not initialized!")`` when the client
+    is closed, which ``_request_wrapper`` rewraps as
+    ``NetworkError("Unknown error in HTTP implementation: RuntimeError('This
+    HTTPXRequest is not initialized!')") from exc``. The ``not initialized``
+    signature therefore appears both on the outer ``NetworkError`` message and
+    on its ``__cause__``/``__context__`` chain, so we walk the chain and match
+    either — precise enough that ordinary network blips never trigger a rebuild,
+    and resilient if a future PTB tweaks the wrapper text.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    depth = 0
+    while cur is not None and depth < 10 and id(cur) not in seen:
+        seen.add(id(cur))
+        if "not initialized" in str(cur).lower():
+            return True
+        cur = cur.__cause__ or cur.__context__
+        depth += 1
+    return False
+
+
+async def send_with_client_heal(
+    bot: Bot,
+    send: Callable[[], Awaitable[Any]],
+    *,
+    stopping: Callable[[], bool],
+) -> Any:
+    """Run a Telegram send, self-healing a shutdown-closed httpx client once.
+
+    ``send`` is a zero-arg coroutine factory that performs the actual bot call
+    (so it can be re-run cleanly on retry). On a closed-client error, if we are
+    NOT shutting down (``stopping()`` is ``False``), rebuild the send client via
+    ``bot.request.initialize()`` — idempotent, since ``HTTPXRequest.initialize``
+    only rebuilds when the client ``is_closed`` — and retry the send exactly
+    once. During shutdown we re-raise instead of resurrecting a client the
+    process is deliberately tearing down.
+
+    Background: on 2026-07-15 the send client was closed while background senders
+    kept firing; every send raised the closed-client error, the outreach recovery
+    worker exhausted its 5 retries against the dead client, and two Sentinel
+    approval requests were permanently discarded (the owner never saw them). This
+    recovers the client instead of failing permanently — whatever closed it.
+    """
+    try:
+        return await send()
+    except Exception as exc:
+        if not _is_closed_client_error(exc) or stopping():
+            raise
+        logger.warning(
+            "Telegram send client was closed; reinitializing and retrying once",
+        )
+        await bot.request.initialize()
+        return await send()
 
 
 async def safe_send_message(

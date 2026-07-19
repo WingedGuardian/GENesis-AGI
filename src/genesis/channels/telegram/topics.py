@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING
 
 from telegram.error import BadRequest
 
+from genesis.channels.telegram.transport.send import send_with_client_heal
+
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import aiosqlite
     from telegram import Bot
 
@@ -57,6 +61,7 @@ class TopicManager:
         *,
         db: aiosqlite.Connection | None = None,
         categories: dict[str, str] | None = None,
+        stopping: Callable[[], bool] | None = None,
     ) -> None:
         self._bot = bot
         self._chat_id = forum_chat_id
@@ -64,6 +69,10 @@ class TopicManager:
         self._categories = categories or DEFAULT_CATEGORIES
         self._persistent_topics: dict[str, int] = {}  # category → thread_id
         self._create_lock = asyncio.Lock()
+        # Heal a shutdown-closed send client on outbound topic messages. The
+        # host wires this to the Telegram adapter's stopping flag so we never
+        # resurrect a client mid-shutdown; default = never stopping.
+        self._stopping = stopping or (lambda: False)
 
     async def load_persisted(self) -> None:
         """Load persisted topic mappings from DB. Call once after construction."""
@@ -185,6 +194,19 @@ class TopicManager:
 
         return first_msg_id
 
+    async def _send_message_healed(self, **kwargs):
+        """Send via the bot, self-healing a shutdown-closed httpx client once.
+
+        Wraps the raw ``bot.send_message`` (TopicManager holds the bot directly,
+        bypassing the adapter's send methods) so a closed send client is rebuilt
+        and retried instead of failing permanently.
+        """
+        return await send_with_client_heal(
+            self._bot,
+            lambda: self._bot.send_message(**kwargs),
+            stopping=self._stopping,
+        )
+
     async def _send_single(
         self,
         text: str,
@@ -204,7 +226,7 @@ class TopicManager:
             if parse_mode:
                 kwargs["parse_mode"] = parse_mode
             try:
-                msg = await self._bot.send_message(**kwargs)
+                msg = await self._send_message_healed(**kwargs)
             except BadRequest as exc:
                 err_msg = str(exc).lower()
                 if "thread not found" in err_msg:
@@ -215,14 +237,14 @@ class TopicManager:
                     if thread_id is None:
                         return None
                     kwargs["message_thread_id"] = thread_id
-                    msg = await self._bot.send_message(**kwargs)
+                    msg = await self._send_message_healed(**kwargs)
                 elif parse_mode and ("can't parse" in err_msg or "parse entities" in err_msg):
                     logger.warning(
                         "Topic send with %s failed, retrying plain",
                         parse_mode, exc_info=True,
                     )
                     kwargs.pop("parse_mode", None)
-                    msg = await self._bot.send_message(**kwargs)
+                    msg = await self._send_message_healed(**kwargs)
                 else:
                     raise
             # Persist outbound message for audit trail + reply resolution

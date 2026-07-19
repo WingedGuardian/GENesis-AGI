@@ -18,8 +18,14 @@ from __future__ import annotations
 import logging
 import secrets
 import time
+from typing import TYPE_CHECKING
 
 import telegram
+
+from genesis.channels.telegram.transport.send import send_with_client_heal
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +75,7 @@ class DraftStreamer:
         message_thread_id: int | None = None,
         throttle_s: float = _DEFAULT_THROTTLE_S,
         prefix: str = "",
+        stopping: Callable[[], bool] | None = None,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
@@ -76,6 +83,9 @@ class DraftStreamer:
         self.message_thread_id = message_thread_id
         self.throttle_s = throttle_s
         self._prefix = prefix
+        # Heal a shutdown-closed send client on draft sends; wired to the
+        # adapter's stopping flag by the caller (default: never stopping).
+        self._stopping = stopping or (lambda: False)
 
         self._tool_lines: list[str] = []
         self._text = ""
@@ -193,7 +203,11 @@ class DraftStreamer:
             }
             if self.message_thread_id is not None:
                 kwargs["message_thread_id"] = self.message_thread_id
-            await self.bot.send_message_draft(**kwargs)
+            await send_with_client_heal(
+                self.bot,
+                lambda: self.bot.send_message_draft(**kwargs),
+                stopping=self._stopping,
+            )
             self._last_send_time = time.monotonic()
             self._last_draft_text = draft_text
             self._any_draft_sent = True

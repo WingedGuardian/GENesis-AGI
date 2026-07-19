@@ -280,6 +280,7 @@ async def main():
             adapter._app.bot,
             config["forum_chat_id"],
             db=runtime.db,
+            stopping=lambda: getattr(adapter, "_stopping", False),
         )
         await topic_manager.load_persisted()
 
