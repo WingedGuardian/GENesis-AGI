@@ -26,7 +26,6 @@ from datetime import UTC, datetime
 from flask import Blueprint, current_app, jsonify, request
 
 from genesis.channels.voice.graduation import validate_envelope
-from genesis.dashboard._blueprint import _async_route
 
 logger = logging.getLogger("genesis.dashboard.voice_api")
 
@@ -317,9 +316,35 @@ _GRADUATE_TIMEOUT_SECONDS = 10.0
 _MAX_GRADUATE_BYTES = 64 * 1024
 
 
+async def _land_graduation_event(data: dict) -> bool:
+    """Insert the validated envelope into quarantine (runs on the runtime loop).
+
+    Returns True if inserted, False on an event_id replay. Raises
+    LookupError when the runtime/DB isn't ready — the route maps it to 503
+    so the edge outbox retries.
+    """
+    from genesis.db.crud import graduation_events
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        raise LookupError("Genesis runtime not ready")
+
+    return await graduation_events.insert_event(
+        rt.db,
+        event_id=data["event_id"],
+        schema_version=data["schema_version"],
+        type=data["type"],
+        source=data["source"],
+        occurred_at=data["occurred_at"],
+        received_at=datetime.now(UTC).isoformat(),
+        payload=data["payload"],
+        provenance=data["provenance"],
+    )
+
+
 @voice_api_bp.route("/v1/voice/graduate", methods=["POST"])
-@_async_route(timeout=_GRADUATE_TIMEOUT_SECONDS)
-async def voice_graduate():
+def voice_graduate():
     """Land a graduation event from the voice edge (W0 quarantine landing).
 
     Responses (spec §4.9): 200 ``{"status": "accepted"}`` only after the
@@ -327,6 +352,10 @@ async def voice_graduate():
     (edge treats both as delivered); 400 ``{"status": "rejected", "errors":
     [...]}`` on envelope validation failure. One-way boundary — no core data
     ever returns.
+
+    Auth + validation run synchronously (same pattern as the sibling voice
+    routes) so fail-closed answers correctly even while the runtime loop is
+    still starting; only the DB insert dispatches to the runtime loop.
     """
     auth = _check_voice_token()
     if auth is not None:
@@ -343,25 +372,31 @@ async def voice_graduate():
     if errors:
         return jsonify({"status": "rejected", "errors": errors}), 400
 
-    from genesis.runtime import GenesisRuntime
+    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
+    if event_loop is None or not event_loop.is_running():
+        return jsonify({"error": "Event loop not available"}), 503
 
-    rt = GenesisRuntime.instance()
-    if not rt.is_bootstrapped or rt.db is None:
-        return jsonify({"error": "Genesis runtime not ready"}), 503
-
-    from genesis.db.crud import graduation_events
-
-    inserted = await graduation_events.insert_event(
-        rt.db,
-        event_id=data["event_id"],
-        schema_version=data["schema_version"],
-        type=data["type"],
-        source=data["source"],
-        occurred_at=data["occurred_at"],
-        received_at=datetime.now(UTC).isoformat(),
-        payload=data["payload"],
-        provenance=data["provenance"],
+    future = asyncio.run_coroutine_threadsafe(
+        _land_graduation_event(data), event_loop
     )
+    try:
+        inserted = future.result(timeout=_GRADUATE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        future.cancel()
+        logger.error(
+            "Voice graduate timed out after %.0fs for event %s",
+            _GRADUATE_TIMEOUT_SECONDS, data["event_id"][:16],
+        )
+        return jsonify({"error": "graduate landing timed out"}), 503
+    except LookupError:
+        return jsonify({"error": "Genesis runtime not ready"}), 503
+    except Exception:
+        logger.error(
+            "Voice graduate failed for event %s", data["event_id"][:16],
+            exc_info=True,
+        )
+        return jsonify({"error": "graduate landing failed"}), 500
+
     status = "accepted" if inserted else "duplicate"
     logger.info(
         "Voice graduate: %s event %s from %s",
