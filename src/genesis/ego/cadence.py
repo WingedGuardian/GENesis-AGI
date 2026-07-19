@@ -964,14 +964,27 @@ class EgoCadenceManager:
                     effort_override=effort_override,
                 )
             except CycleBlockedError as exc:
-                # An approval appeared between the pre-flight and dispatch —
-                # preserve the drained signals so the approved cycle sees them.
-                logger.info(
-                    "Unified cycle gated: %s — requeuing %d signal(s)",
+                # Preserve signals ONLY for a resolvable pending-approval block:
+                # the dispatch just created (or matched) a pending approval row,
+                # so requeuing lets the approved cycle pick them up. A TERMINAL
+                # block (e.g. autonomous CLI fallback disabled) creates no
+                # pending row and will never resolve — requeuing there would
+                # loop the consumer every _GATED_RETRY_SECONDS forever on a
+                # no-TTL escalation. `_approval_pending()` is the discriminator.
+                if await self._approval_pending():
+                    logger.info(
+                        "Unified cycle gated (approval pending): %s — "
+                        "requeuing %d signal(s)",
+                        exc, len(signals),
+                    )
+                    self._signal_queue.requeue(signals)
+                    return "gated"
+                logger.warning(
+                    "Unified cycle blocked with no pending approval "
+                    "(non-resolvable): %s — dropping %d signal(s)",
                     exc, len(signals),
                 )
-                self._signal_queue.requeue(signals)
-                return "gated"
+                return "ran"
             except Exception as exc:
                 logger.error("Unified cycle failed", exc_info=True)
                 self._record_failure(str(exc))

@@ -1715,19 +1715,39 @@ class TestGateAwareConsumer:
         assert len(cadence._signal_queue) == 1
         mock_session.run_unified_cycle.assert_not_called()
 
-    async def test_cycle_blocked_requeues_drained_signals(
-        self, cadence, mock_session,
+    async def test_cycle_blocked_requeues_when_approval_pending(
+        self, cadence, mock_session, monkeypatch,
     ):
-        """Safety net: an approval appearing at dispatch time requeues signals."""
+        """Safety net: a pending-approval block at dispatch time requeues."""
         cadence._running = True
         cadence.push_reactive_event({"type": "t", "summary": "survive the block"})
         mock_session.run_unified_cycle.side_effect = CycleBlockedError("approval pending")
+        # Pre-flight false (no row yet), but the dispatch created a pending row —
+        # so the post-block re-check sees it. Model that ordering:
+        pending = iter([False, True])
+        monkeypatch.setattr(
+            cadence, "_approval_pending",
+            AsyncMock(side_effect=lambda: next(pending)),
+        )
         status = await cadence._process_signals()
         assert status == "gated"
-        # Drained then requeued — still present for the eventually-approved cycle.
-        assert len(cadence._signal_queue) == 1
+        assert len(cadence._signal_queue) == 1  # requeued
         [sig] = cadence._signal_queue.drain()
         assert sig.summary == "survive the block"
+
+    async def test_terminal_block_does_not_requeue(
+        self, cadence, mock_session, monkeypatch,
+    ):
+        """A terminal block (no pending approval row ever) drops signals rather
+        than looping the consumer forever on a no-TTL escalation."""
+        cadence._running = True
+        cadence.push_escalation_event({"type": "t", "summary": "cli disabled"})
+        mock_session.run_unified_cycle.side_effect = CycleBlockedError("cli fallback disabled")
+        # _approval_pending stays False throughout: no resolvable row exists.
+        monkeypatch.setattr(cadence, "_approval_pending", AsyncMock(return_value=False))
+        status = await cadence._process_signals()
+        assert status == "ran"  # attempted + dropped, NOT gated
+        assert len(cadence._signal_queue) == 0  # not requeued → no loop
 
     async def test_empty_and_ran_statuses(self, cadence, mock_session):
         cadence._running = True
