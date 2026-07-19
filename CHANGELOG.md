@@ -50,6 +50,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **`update.sh` no longer aborts on Serena's config churn.** `.serena/project.yml`
+  is now install-local (untracked): Serena rewrites the file's comment block on
+  its own version bumps, so any install running the Serena MCP went permanently
+  "dirty" and every update required a manual stash dance. The updater carries
+  your live copy through the transition automatically, and fresh clones need
+  nothing — Serena regenerates the file on first run.
 - **Dashboard health cards stop crying wolf.** The API Keys and Queues cards
   read "degraded" whenever *any* provider key was unconfigured or *any*
   deferred-work item was queued — even when nothing was actually wrong. Both
