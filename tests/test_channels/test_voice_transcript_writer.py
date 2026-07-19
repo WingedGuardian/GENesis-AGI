@@ -7,6 +7,8 @@ transcripts the extraction job can mine, so the real parser is the oracle.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from genesis.channels.voice.transcript_writer import (
@@ -197,3 +199,33 @@ class TestVoiceTranscriptWriter:
         await writer.append_message("edge-1", "user", "   ")
         sid = transcript_session_id("edge-1")
         assert not (tmp_path / "voice" / f"{sid}.jsonl").exists()
+
+    async def test_concurrent_same_session_syncs_append_delta_once(self, writer, tmp_path):
+        """The route dispatches each POST on its own WSGI thread onto the shared
+        loop, so a double-fire (same cumulative list, near-simultaneous) runs
+        two sync_cumulative coroutines concurrently. Without the lock, both read
+        line-count N across the await in the critical section and both append
+        turns[N:] — duplicating the whole conversation. The lock serializes the
+        read-modify-write so the delta lands exactly once.
+
+        A yield is injected into _ensure_registered to force the interleave that
+        the lock must defeat; without the lock this test appends 2N lines.
+        """
+        orig_register = writer._ensure_registered
+
+        async def _slow_register(sid: str) -> None:
+            await asyncio.sleep(0)  # force a yield at the critical point
+            await orig_register(sid)
+
+        writer._ensure_registered = _slow_register
+
+        results = await asyncio.gather(
+            writer.sync_cumulative("edge-race", _turns(4)),
+            writer.sync_cumulative("edge-race", _turns(4)),
+        )
+
+        # One coroutine appends all 4, the other sees them already there.
+        assert sorted(results) == [0, 4]
+        sid = transcript_session_id("edge-race")
+        messages = read_transcript_messages(tmp_path / "voice" / f"{sid}.jsonl")
+        assert len(messages) == 4

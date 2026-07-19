@@ -78,6 +78,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Voice conversation delivery no longer double-writes turns under a burst.**
+  The `POST /v1/voice/conversation` landing did a read-then-append (count the
+  transcript's lines, then write the new turns) with an `await` in the middle.
+  Because the dashboard serves requests on threads that all feed one event
+  loop, two near-simultaneous deliveries of the same conversation (a voice
+  edge can fire the same disconnect twice within a second) could both read the
+  same line count and both append the same turns, duplicating them in the
+  transcript. Deliveries now hold a lock across the read-and-append so the
+  turns land exactly once.
 - **Legacy voice conversation blobs are swept from episodic memory.** The old
   one-blob landing left duplicated, ever-growing "Voice conversation [...]"
   memories polluting recall (and their vector embeddings polluting semantic

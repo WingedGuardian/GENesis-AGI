@@ -17,12 +17,16 @@ Two producers share this component:
 Idempotency: session ids are deterministic (uuid5 of the external session
 id) and ``sync_cumulative`` appends only turns beyond the file's current
 line count — replays, double-fires and cumulative re-sends land exactly
-once. All methods MUST be called on the runtime event loop (single-writer;
-no file locking needed).
+once. Appends run under an ``asyncio.Lock``: the ``/v1/voice/conversation``
+route dispatches each request on its own WSGI thread onto the shared runtime
+loop, so without the lock two same-session cumulative syncs could both read
+line count N (across the ``await`` in the critical section) and both append
+the same delta — duplicating turns. All methods MUST be called on that loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -115,6 +119,10 @@ class VoiceTranscriptWriter:
         self._db = db
         self._dir = transcript_dir or voice_transcript_dir()
         self._registered: set[str] = set()
+        # Serializes the read-modify-write in append_message / sync_cumulative
+        # so concurrent same-session requests on the shared loop cannot
+        # interleave a line-count read with another append (double-write).
+        self._lock = asyncio.Lock()
 
     async def heal_orphans(self) -> int:
         """Complete 'active' voice rows idle >1h (boot + daily self-heal).
@@ -127,7 +135,8 @@ class VoiceTranscriptWriter:
 
         cutoff = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
         healed = await sessions_crud.complete_orphaned_voice_sessions(
-            self._db, idle_before=cutoff,
+            self._db,
+            idle_before=cutoff,
         )
         if healed:
             logger.info("Completed %d orphaned voice session row(s)", healed)
@@ -143,9 +152,10 @@ class VoiceTranscriptWriter:
         if role not in _ROLES or not text.strip():
             return
         sid = transcript_session_id(external_session_id)
-        await self._ensure_registered(sid)
-        self._append_lines(sid, [(role, text)])
-        await self._touch_activity(sid)
+        async with self._lock:
+            await self._ensure_registered(sid)
+            self._append_lines(sid, [(role, text)])
+            await self._touch_activity(sid)
 
     async def sync_cumulative(
         self,
@@ -162,24 +172,28 @@ class VoiceTranscriptWriter:
         """
         sid = transcript_session_id(external_session_id)
 
-        existing = self._line_count(sid)
-        if len(turns) < existing:
-            logger.warning(
-                "Voice cumulative sync for %s sent %d turns but transcript "
-                "already has %d — producer turn cache reset without a new "
-                "session id; appending nothing",
-                external_session_id[:32],
-                len(turns),
-                existing,
-            )
-            return 0
+        # The read (line count) and the append MUST be atomic w.r.t. other
+        # coroutines: concurrent same-session syncs on the shared loop would
+        # otherwise both read N and both append turns[N:] (double-write).
+        async with self._lock:
+            existing = self._line_count(sid)
+            if len(turns) < existing:
+                logger.warning(
+                    "Voice cumulative sync for %s sent %d turns but transcript "
+                    "already has %d — producer turn cache reset without a new "
+                    "session id; appending nothing",
+                    external_session_id[:32],
+                    len(turns),
+                    existing,
+                )
+                return 0
 
-        new_turns = [(t["role"], t["text"]) for t in turns[existing:]]
-        if new_turns:
-            await self._ensure_registered(sid)
-            self._append_lines(sid, new_turns)
-            await self._touch_activity(sid)
-        return len(new_turns)
+            new_turns = [(t["role"], t["text"]) for t in turns[existing:]]
+            if new_turns:
+                await self._ensure_registered(sid)
+                self._append_lines(sid, new_turns)
+                await self._touch_activity(sid)
+            return len(new_turns)
 
     async def close_session(self, external_session_id: str) -> None:
         """Mark a session's row completed (transcript stays for extraction)."""
@@ -201,7 +215,9 @@ class VoiceTranscriptWriter:
 
     async def _touch_activity(self, sid: str) -> None:
         await sessions_crud.update_activity(
-            self._db, sid, last_activity_at=datetime.now(UTC).isoformat(),
+            self._db,
+            sid,
+            last_activity_at=datetime.now(UTC).isoformat(),
         )
 
     def _path(self, sid: str) -> Path:
