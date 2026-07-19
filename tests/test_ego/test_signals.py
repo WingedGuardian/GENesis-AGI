@@ -230,3 +230,168 @@ async def test_push_during_drain_resets_notify():
     q.push(EgoSignal(summary="new signal"))
     await asyncio.wait_for(q.wait(), timeout=1.0)
     assert not q.empty()
+
+
+# ── Priority eviction on overflow ────────────────────────────────────────
+
+
+def test_full_queue_evicts_lower_priority_for_higher():
+    """A CRITICAL newcomer evicts a low-priority signal from a full queue."""
+    q = SignalQueue(maxsize=2)
+    assert q.push(EgoSignal(priority="low", summary="low a")) is True
+    assert q.push(EgoSignal(priority="low", summary="low b")) is True
+    assert q.push(EgoSignal(priority="critical", summary="urgent")) is True
+    assert len(q) == 2
+    summaries = [s.summary for s in q.drain()]
+    assert "urgent" in summaries
+
+
+def test_full_queue_rejects_equal_priority():
+    """No eviction among equals — a full queue still rejects same-priority."""
+    q = SignalQueue(maxsize=1)
+    assert q.push(EgoSignal(priority="high", summary="first")) is True
+    assert q.push(EgoSignal(priority="high", summary="second")) is False
+    assert len(q) == 1
+
+
+def test_eviction_victim_is_oldest_of_lowest_class():
+    """Eviction picks the oldest signal in the lowest priority class."""
+    q = SignalQueue(maxsize=3)
+    old = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    new = datetime.now(UTC).isoformat()
+    q.push(EgoSignal(priority="low", summary="old low", created_at=old))
+    q.push(EgoSignal(priority="low", summary="new low", created_at=new))
+    q.push(EgoSignal(priority="medium", summary="med"))
+
+    assert q.push(EgoSignal(priority="critical", summary="crit")) is True
+    summaries = [s.summary for s in q.drain()]
+    assert summaries[0] == "crit"
+    assert "old low" not in summaries
+    assert "new low" in summaries
+
+
+def test_eviction_removes_selected_victim_by_identity():
+    """The oldest victim is removed even when it is NOT the first same-priority
+    signal in the list. EgoSignal.__eq__ compares only _priority_order, so a
+    list.remove(victim) would wrongly delete the first low-priority signal.
+    """
+    q = SignalQueue(maxsize=2)
+    recent = (datetime.now(UTC)).isoformat()
+    stale = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    # Append RECENT first, STALE second — the oldest victim is appended last.
+    q.push(EgoSignal(priority="low", summary="recent low", created_at=recent))
+    q.push(EgoSignal(priority="low", summary="stale low", created_at=stale))
+    assert q.push(EgoSignal(priority="critical", summary="crit")) is True
+
+    summaries = {s.summary for s in q.drain()}
+    assert "crit" in summaries
+    assert "recent low" in summaries  # first-appended survivor kept
+    assert "stale low" not in summaries  # actual oldest victim removed
+
+
+def test_evicted_signal_can_repush_within_window():
+    """An evicted signal's dedup stamp is cleared so its content can re-enter —
+    otherwise eviction reintroduces silent signal-loss under queue pressure.
+    """
+    q = SignalQueue(maxsize=1)
+    q.push(EgoSignal(priority="low", summary="evict me"))
+    # Critical evicts the low signal.
+    q.push(EgoSignal(priority="critical", summary="urgent"))
+    # The evicted summary must be immediately re-pushable (dedup stamp cleared).
+    q.drain()
+    assert q.push(EgoSignal(priority="low", summary="evict me")) is True
+
+
+def test_expired_pruned_before_eviction():
+    """A full queue frees space by pruning expired signals first."""
+    import time
+
+    q = SignalQueue(maxsize=1)
+    soon = (datetime.now(UTC) + timedelta(milliseconds=10)).isoformat()
+    q.push(EgoSignal(priority="medium", summary="short lived", expires_at=soon))
+    time.sleep(0.05)
+    # Same priority — only admitted because the occupant expired.
+    assert q.push(EgoSignal(priority="medium", summary="newcomer")) is True
+    assert [s.summary for s in q.drain()] == ["newcomer"]
+
+
+# ── Dedup semantics ──────────────────────────────────────────────────────
+
+
+def test_rejected_push_does_not_poison_dedup():
+    """A push rejected for overflow must not stamp the dedup window."""
+    q = SignalQueue(maxsize=1)
+    q.push(EgoSignal(priority="high", summary="occupied"))
+    assert q.push(EgoSignal(priority="high", summary="try again")) is False
+    q.drain()
+    # Retry after the queue empties: must be admitted, not dedup-blocked.
+    assert q.push(EgoSignal(priority="high", summary="try again")) is True
+
+
+def test_escalation_dedup_window_is_shorter():
+    """Escalations re-admit after 1h — a re-firing CRITICAL is news."""
+    q = SignalQueue(maxsize=10, dedup_hours=6)
+    make = lambda: EgoSignal(  # noqa: E731
+        focus_category="escalation",
+        priority="critical",
+        summary="db down",
+    )
+    assert q.push(make()) is True
+    assert q.push(make()) is False  # inside the 1h escalation window
+
+    # Backdate the stamp past 1h but inside the 6h default window.
+    q._seen["escalation:db down"] = datetime.now(UTC) - timedelta(hours=2)
+    assert q.push(make()) is True
+
+
+def test_default_category_keeps_long_window():
+    """Non-escalation categories keep the constructor's dedup window."""
+    q = SignalQueue(maxsize=10, dedup_hours=6)
+    assert q.push(EgoSignal(summary="routine")) is True
+    q._seen["proactive:routine"] = datetime.now(UTC) - timedelta(hours=2)
+    assert q.push(EgoSignal(summary="routine")) is False  # 2h < 6h
+
+
+# ── requeue() — gated-cycle survival ─────────────────────────────────────
+
+
+def test_requeue_bypasses_dedup():
+    """Drained signals re-enter despite their still-standing dedup stamps."""
+    q = SignalQueue(maxsize=10)
+    q.push(EgoSignal(summary="gated work"))
+    drained = q.drain()
+    assert q.push(EgoSignal(summary="gated work")) is False  # dedup holds
+    assert q.requeue(drained) == 1
+    assert len(q) == 1
+
+
+def test_requeue_drops_expired():
+    q = SignalQueue(maxsize=10)
+    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    stale = EgoSignal(summary="stale", expires_at=past)
+    fresh = EgoSignal(summary="fresh")
+    assert q.requeue([stale, fresh]) == 1
+    assert [s.summary for s in q.drain()] == ["fresh"]
+
+
+def test_requeue_applies_priority_eviction():
+    q = SignalQueue(maxsize=1)
+    q.push(EgoSignal(priority="low", summary="filler"))
+    crit = EgoSignal(
+        focus_category="escalation",
+        priority="critical",
+        summary="requeued crit",
+    )
+    assert q.requeue([crit]) == 1
+    assert [s.summary for s in q.drain()] == ["requeued crit"]
+
+
+@pytest.mark.asyncio
+async def test_requeue_sets_notify():
+    """Requeued signals must wake the consumer like a fresh push."""
+    q = SignalQueue(maxsize=10)
+    q.push(EgoSignal(summary="x"))
+    drained = q.drain()  # clears notify
+    q.requeue(drained)
+    await asyncio.wait_for(q.wait(), timeout=1.0)
+    assert not q.empty()

@@ -1342,3 +1342,49 @@ class TestJobHealthKeyPerEgo:
             mgr._record_success()
         assert recorded == ["user_ego_cycle", "genesis_ego_cycle"]
         assert len(set(recorded)) == 2  # no collision
+
+
+# ---------------------------------------------------------------------------
+# Signal TTLs — every producer stamps a lifetime (signal-resilience PR-1)
+# ---------------------------------------------------------------------------
+
+
+class TestSignalTTLs:
+    """Producers stamp expires_at so parked/requeued signals age out
+    instead of going stale in the queue. Escalations carry NO TTL —
+    critical facts don't expire on their own.
+    """
+
+    @staticmethod
+    def _ttl_minutes(sig) -> float:
+        assert sig.expires_at is not None, "producer must stamp expires_at"
+        expires = datetime.fromisoformat(sig.expires_at)
+        return (expires - datetime.now(UTC)).total_seconds() / 60
+
+    async def test_proactive_tick_ttl_matches_current_interval(self, cadence):
+        await cadence._on_tick()
+        [sig] = cadence._signal_queue.drain()
+        ttl = self._ttl_minutes(sig)
+        assert cadence._current_interval - 1 < ttl <= cadence._current_interval
+
+    async def test_morning_report_ttl_six_hours(self, cadence):
+        await cadence._on_morning_report()
+        [sig] = cadence._signal_queue.drain()
+        assert sig.focus_category == "daily_briefing"
+        ttl = self._ttl_minutes(sig)
+        assert 6 * 60 - 1 < ttl <= 6 * 60
+
+    async def test_reactive_ttl_twelve_hours(self, cadence):
+        cadence._running = True
+        cadence.push_reactive_event({"type": "test", "summary": "an error"})
+        [sig] = cadence._signal_queue.drain()
+        assert sig.focus_category == "reactive"
+        ttl = self._ttl_minutes(sig)
+        assert 12 * 60 - 1 < ttl <= 12 * 60
+
+    async def test_escalation_has_no_ttl(self, cadence):
+        cadence._running = True
+        cadence.push_escalation_event({"type": "test", "summary": "critical"})
+        [sig] = cadence._signal_queue.drain()
+        assert sig.focus_category == "escalation"
+        assert sig.expires_at is None
