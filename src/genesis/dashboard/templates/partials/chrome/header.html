@@ -91,6 +91,8 @@
               @click="location.hash = 'campaigns'">Campaigns</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'references' }"
               @click="location.hash = 'references'">References</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'calibration' }"
+              @click="location.hash = 'calibration'">Calibration</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'files' }"
               @click="location.hash = 'files'">Files</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'config' }"

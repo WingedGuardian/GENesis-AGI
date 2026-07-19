@@ -1,0 +1,114 @@
+
+
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'calibration'" style="overflow-y: auto; max-height: calc(100vh - 180px);">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">balance</span>
+        Calibration
+      </div>
+      <div style="padding: 1rem;">
+
+      <div style="margin-bottom: 1rem; color: var(--color-text-secondary); font-size: .85em;">
+        The mechanically-graded record: does Genesis's stated confidence track reality?
+        One cell per domain / metric / lane / window, recomputed after each grading pass.
+        Thin and unknown cells are unverified by design &mdash; escalate, don't trust a number.
+      </div>
+
+      <!-- Summary chips -->
+      <div style="display: flex; gap: 1rem; margin-bottom: 1.25rem; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 90px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700; color: #4caf50;" x-text="$store.genesisDashboard.calibrationSummary?.ok ?? '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">OK cells</div>
+        </div>
+        <div style="flex: 1; min-width: 90px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700; color: #fbbf24;" x-text="$store.genesisDashboard.calibrationSummary?.thin ?? '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Thin</div>
+        </div>
+        <div style="flex: 1; min-width: 90px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700; color: #6b7280;" x-text="$store.genesisDashboard.calibrationSummary?.unknown ?? '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Unknown</div>
+        </div>
+        <div style="flex: 1; min-width: 110px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;"
+               x-text="$store.genesisDashboard.calibrationSummary?.mechanical_share != null ? Math.round($store.genesisDashboard.calibrationSummary.mechanical_share * 100) + '%' : '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Mechanical share</div>
+        </div>
+        <div style="flex: 1; min-width: 110px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;"
+               x-text="$store.genesisDashboard.calibrationSummary?.fallback_share != null ? Math.round($store.genesisDashboard.calibrationSummary.fallback_share * 100) + '%' : '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">LLM-fallback share</div>
+        </div>
+      </div>
+
+      <!-- Filters -->
+      <div style="display: flex; gap: .75rem; margin-bottom: 1rem; align-items: center; flex-wrap: wrap;">
+        <label style="font-size: .8rem; color: var(--color-text-secondary);">Lane
+          <select x-model="$store.genesisDashboard.calibrationLane"
+                  @change="$store.genesisDashboard.fetchCalibration()"
+                  style="margin-left: .4rem;">
+            <option value="stated">stated</option>
+            <option value="policy_prior">policy_prior</option>
+            <option value="all">all</option>
+          </select>
+        </label>
+        <label style="font-size: .8rem; color: var(--color-text-secondary);">Window
+          <select x-model="$store.genesisDashboard.calibrationWindow"
+                  @change="$store.genesisDashboard.fetchCalibration()"
+                  style="margin-left: .4rem;">
+            <option value="90">90 days</option>
+            <option value="30">30 days</option>
+            <option value="0">all-time</option>
+          </select>
+        </label>
+        <span style="font-size: .75rem; color: var(--color-text-secondary);"
+              x-show="$store.genesisDashboard.calibrationSummary?.last_computed_at"
+              x-text="'computed ' + $store.genesisDashboard.calibrationSummary?.last_computed_at"></span>
+      </div>
+
+      <!-- Cell table -->
+      <div x-show="!$store.genesisDashboard.calibrationCells.length"
+           style="color: var(--color-text-secondary); font-size: .85em; padding: 1rem 0;">
+        No calibration cells for this lane/window yet. Cells appear once graded
+        predictions accumulate (the grader runs at 06:15 / 18:15).
+      </div>
+      <table x-show="$store.genesisDashboard.calibrationCells.length" style="width: 100%; border-collapse: collapse; font-size: .85rem;">
+        <thead>
+          <tr style="text-align: left; color: var(--color-text-secondary); border-bottom: 1px solid var(--color-border);">
+            <th style="padding: .4rem;">Domain</th>
+            <th style="padding: .4rem;">Class</th>
+            <th style="padding: .4rem;">Metric</th>
+            <th style="padding: .4rem; text-align: right;">n</th>
+            <th style="padding: .4rem; text-align: right;">Says</th>
+            <th style="padding: .4rem; text-align: right;">Track record</th>
+            <th style="padding: .4rem; text-align: right;">Brier</th>
+            <th style="padding: .4rem; text-align: right;">ECE</th>
+            <th style="padding: .4rem;">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="cell in $store.genesisDashboard.calibrationCells" :key="cell.domain + cell.action_class + cell.metric">
+            <tr style="border-bottom: 1px solid var(--color-border);">
+              <td style="padding: .4rem;" x-text="cell.domain"></td>
+              <td style="padding: .4rem; color: var(--color-text-secondary);" x-text="cell.action_class"></td>
+              <td style="padding: .4rem; color: var(--color-text-secondary);" x-text="cell.metric"></td>
+              <td style="padding: .4rem; text-align: right;" x-text="cell.n"></td>
+              <!-- thin/unknown NEVER show a percentage — the cold-start honesty contract -->
+              <td style="padding: .4rem; text-align: right;"
+                  x-text="cell.status === 'ok' && cell.mean_confidence != null ? Math.round(cell.mean_confidence * 100) + '%' : '—'"></td>
+              <td style="padding: .4rem; text-align: right;"
+                  x-text="cell.status === 'ok' ? (cell.mean_confidence != null && cell.shrunk_estimate != null ? Math.round(cell.shrunk_estimate * 100) + '%' : (cell.base_rate != null ? Math.round(cell.base_rate * 100) + '% (observed)' : '—')) : '—'"></td>
+              <td style="padding: .4rem; text-align: right;"
+                  x-text="cell.status === 'ok' && cell.brier != null ? cell.brier.toFixed(3) : '—'"></td>
+              <td style="padding: .4rem; text-align: right;"
+                  x-text="cell.status === 'ok' && cell.ece != null ? cell.ece.toFixed(3) : '—'"></td>
+              <td style="padding: .4rem;">
+                <span x-show="cell.status === 'ok'" style="color: #4caf50;">ok</span>
+                <span x-show="cell.status === 'thin'" style="color: #fbbf24;" :title="'thin sample (n=' + cell.n + ') — unverified'">thin — unverified</span>
+                <span x-show="cell.status === 'unknown'" style="color: #6b7280;" :title="'n=' + cell.n + ' — escalate to user'">unknown — escalate</span>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+
+      </div>
+    </div>
