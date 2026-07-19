@@ -10,7 +10,7 @@ import aiosqlite
 
 from genesis.awareness.signal_format import format_signals
 from genesis.awareness.types import Depth, TickResult
-from genesis.db.crud import cognitive_state, observations, predictions, signal_weights
+from genesis.db.crud import cognitive_state, observations, signal_weights
 from genesis.identity.loader import IdentityLoader
 from genesis.memory.user_model import UserModelEvolver
 from genesis.perception.types import LIGHT_FOCUS_ROTATION, PromptContext
@@ -38,6 +38,7 @@ async def micro_excluded_signals(db: aiosqlite.Connection) -> set[str]:
     except Exception:
         logger.debug("Could not load signal_weights for Micro filtering")
         return set()
+
 
 # Minimum sample count per domain before injecting calibration feedback
 _DEFAULT_MIN_SAMPLES = 10
@@ -76,8 +77,14 @@ _SOURCE_CATEGORIES: dict[str, str] = {
 }
 
 _CATEGORY_ORDER = [
-    "Sentinel", "Guardian", "Recon", "Reflections",
-    "Surplus", "Conversation", "Inbox", "Other",
+    "Sentinel",
+    "Guardian",
+    "Recon",
+    "Reflections",
+    "Surplus",
+    "Conversation",
+    "Inbox",
+    "Other",
 ]
 
 
@@ -178,7 +185,9 @@ class ContextAssembler:
         # For Light reflections, filter out zero-value bootstrap placeholder signals
         _min_val = 0.001 if depth == Depth.LIGHT else 0.0
         signals_text = self._format_signals(
-            tick, excluded_signals=excluded_signals, min_value=_min_val,
+            tick,
+            excluded_signals=excluded_signals,
+            min_value=_min_val,
         )
         tick_number = self._extract_tick_number(tick)
 
@@ -238,7 +247,9 @@ class ContextAssembler:
             calibration_text=calibration_text,
         )
 
-    async def _build_memory_hits(self, db: aiosqlite.Connection, depth_value: str = "deep") -> str | None:
+    async def _build_memory_hits(
+        self, db: aiosqlite.Connection, depth_value: str = "deep"
+    ) -> str | None:
         """Build recent observation context for reflection prompts.
 
         Two-pass diversity query ensures reflection-source observations always
@@ -248,14 +259,17 @@ class ContextAssembler:
         Tracks retrieval via increment_retrieved_batch.
         """
         _REFLECTION_SOURCES = [
-            "reflection", "light_reflection", "deep_reflection",
-            "cc_reflection_deep", "cc_reflection_light",
+            "reflection",
+            "light_reflection",
+            "deep_reflection",
+            "cc_reflection_deep",
+            "cc_reflection_light",
         ]
         # Depth-aware caps: light gets focused context (7 obs),
         # deep/strategic get full context (up to 20 obs).
         _MEMORY_CAPS: dict[str, tuple[int, int]] = {
-            "light": (3, 4),       # 3 reflection-source + 4 other = 7 total
-            "deep": (10, 20),      # existing behavior
+            "light": (3, 4),  # 3 reflection-source + 4 other = 7 total
+            "deep": (10, 20),  # existing behavior
             "strategic": (10, 20),
         }
         refl_cap, other_cap = _MEMORY_CAPS.get(depth_value, (10, 20))
@@ -272,12 +286,17 @@ class ContextAssembler:
             # Pass 1: reflection-origin observations (exclude micro — low-value
             # free-model output that adds noise to higher-depth context).
             reflection_obs = await observations.query(
-                db, resolved=False, source_in=_REFLECTION_SOURCES, limit=refl_cap,
+                db,
+                resolved=False,
+                source_in=_REFLECTION_SOURCES,
+                limit=refl_cap,
                 exclude_types=("micro_reflection",),
             )
             # Pass 2: everything else
             other_obs = await observations.query(
-                db, resolved=False, limit=other_cap,
+                db,
+                resolved=False,
+                limit=other_cap,
                 exclude_types=("micro_reflection",),
             )
 
@@ -286,7 +305,12 @@ class ContextAssembler:
             cutoff = (datetime.now(UTC) - timedelta(hours=cutoff_hours)).isoformat()
             reflection_obs = [o for o in reflection_obs if o.get("created_at", "") >= cutoff]
             other_obs = [o for o in other_obs if o.get("created_at", "") >= cutoff]
-            logger.debug("Age guard (%s, %dh): %d obs after filtering", depth_value, cutoff_hours, len(reflection_obs) + len(other_obs))
+            logger.debug(
+                "Age guard (%s, %dh): %d obs after filtering",
+                depth_value,
+                cutoff_hours,
+                len(reflection_obs) + len(other_obs),
+            )
         except Exception:
             logger.warning("Failed to query observations for memory_hits", exc_info=True)
             return None
@@ -306,7 +330,7 @@ class ContextAssembler:
                 merged.append(obs)
 
         # Depth-aware total cap
-        merged = merged[:refl_cap + other_cap]
+        merged = merged[: refl_cap + other_cap]
 
         if not merged:
             return None
@@ -326,7 +350,9 @@ class ContextAssembler:
                 await observations.increment_retrieved_batch(db, obs_ids)
                 await observations.mark_influenced_batch(db, obs_ids)
             except Exception:
-                logger.warning("Failed to track observation retrieval in memory_hits", exc_info=True)
+                logger.warning(
+                    "Failed to track observation retrieval in memory_hits", exc_info=True
+                )
 
         result = "\n".join(lines)
         if chain_section:
@@ -334,7 +360,9 @@ class ContextAssembler:
         return result
 
     async def _build_light_chain_context(
-        self, db: aiosqlite.Connection, depth_value: str,
+        self,
+        db: aiosqlite.Connection,
+        depth_value: str,
     ) -> str:
         """Build Light assessment chain context for Deep/Strategic.
 
@@ -354,7 +382,10 @@ class ContextAssembler:
 
         try:
             light_obs = await observations.query(
-                db, resolved=False, type="light_reflection", limit=15,
+                db,
+                resolved=False,
+                type="light_reflection",
+                limit=15,
             )
             # Filter to observations since last run at this depth
             light_obs = [o for o in light_obs if o.get("created_at", "") >= since]
@@ -389,61 +420,66 @@ class ContextAssembler:
         return "\n".join(lines)
 
     async def _build_calibration_text(self, db: aiosqlite.Connection) -> str | None:
-        """Build calibration feedback text from calibration_curves table.
+        """Build calibration feedback text from the WS-2 ``calibration_cells``.
 
-        Only includes domains with enough samples. Returns None if no data.
+        Reads the mechanically-graded record (stated lane only — a policy
+        prior is not "you reported"), preferring each (domain, class, metric)'s
+        90-day cell and falling back to all-time when the recent window is too
+        thin. Only ``status='ok'`` cells render: thin/unknown cells never
+        appear here, because on this advisory surface an unlabelled percentage
+        would be exactly the bare-percentage trust the design bans (§3.4) —
+        their escalation phrasing lives on the calibration_status MCP and the
+        dashboard tab, which show them explicitly. ``ego``/``ego.*`` domains
+        are excluded (design §4.2 — ego calibration stays scoped to the
+        flag-guarded ego-context section). Returns None if nothing qualifies
+        (including on a pre-migration DB where the table doesn't exist yet).
         """
         try:
-            # Get all domains that have calibration data
             cursor = await db.execute(
-                "SELECT DISTINCT domain FROM calibration_curves"
+                "SELECT domain, action_class, metric, n, mean_confidence, "
+                "shrunk_estimate, window_days FROM calibration_cells "
+                "WHERE provenance = 'stated' AND status = 'ok' "
+                "AND window_days IN (90, 0) "
+                "AND NOT (domain = 'ego' OR domain LIKE 'ego.%') "
+                "AND mean_confidence IS NOT NULL "
+                "AND shrunk_estimate IS NOT NULL "
+                "AND n >= ? "
+                "ORDER BY domain, action_class, metric",
+                (self._calibration_min_samples,),
             )
-            domains = [row[0] for row in await cursor.fetchall()]
+            rows = [dict(r) for r in await cursor.fetchall()]
         except Exception:
-            logger.debug("Could not query calibration domains", exc_info=True)
+            logger.debug("Could not query calibration cells", exc_info=True)
             return None
 
-        if not domains:
+        if not rows:
             return None
+
+        # Prefer the 90d cell per (domain, class, metric); all-time fills in
+        # only where no recent cell qualified.
+        chosen: dict[tuple[str, str, str], dict] = {}
+        for row in rows:
+            key = (row["domain"], row["action_class"], row["metric"])
+            if key not in chosen or (chosen[key]["window_days"] == 0 and row["window_days"] == 90):
+                chosen[key] = row
+
+        by_domain: dict[str, list[dict]] = {}
+        for (domain, _, _), row in sorted(chosen.items()):
+            by_domain.setdefault(domain, []).append(row)
 
         lines: list[str] = []
-        for domain in domains:
-            try:
-                curves = await predictions.get_calibration_curves(db, domain)
-            except Exception:
-                logger.debug("Could not load calibration for domain=%s", domain, exc_info=True)
-                continue
-
-            # Filter to buckets with enough samples
-            relevant = [
-                c for c in curves
-                if c.get("sample_count", 0) >= self._calibration_min_samples
-            ]
-            if not relevant:
-                continue
-
-            domain_lines: list[str] = []
-            for curve in relevant:
-                predicted = curve.get("predicted_confidence", 0)
-                actual = curve.get("actual_success_rate", 0)
-                samples = curve.get("sample_count", 0)
-                predicted_pct = int(predicted * 100)
-                actual_pct = int(actual * 100)
-                domain_lines.append(
+        for domain, cells in by_domain.items():
+            lines.append(f"Domain: {domain}")
+            for cell in cells:
+                predicted_pct = int(cell["mean_confidence"] * 100)
+                actual_pct = int(cell["shrunk_estimate"] * 100)
+                lines.append(
                     f"  - When you report ~{predicted_pct}% confidence, "
                     f"you're historically right ~{actual_pct}% of the time "
-                    f"(n={samples})"
+                    f"(n={cell['n']})"
                 )
-            if domain_lines:
-                lines.append(f"Domain: {domain}")
-                lines.extend(domain_lines)
 
-        if not lines:
-            return None
-
-        header = (
-            "Historical calibration (adjust your confidence accordingly):"
-        )
+        header = "Historical calibration (adjust your confidence accordingly):"
         return header + "\n" + "\n".join(lines)
 
     def _format_signals(
