@@ -1949,6 +1949,57 @@ TABLES = {
             UNIQUE (action_class, subject_ref_id, metric)
         )
     """,
+    # ── WS-2 P3: unified calibration table (design §4) ────────────────────
+    # One row per (domain, action_class, metric, provenance, window_days)
+    # cell, recomputed by the grader at the end of each grading pass from
+    # resolved ledger_predictions rows + tool_call_outcomes base rates.
+    # Murphy decomposition per cell (brier = reliability − resolution +
+    # uncertainty); Beta-binomial shrunk estimate toward parent domain
+    # toward global (m=10). status = cold-start honesty: thin/unknown cells
+    # must NEVER be rendered as a bare percentage by any consumer.
+    "calibration_cells": """
+        CREATE TABLE IF NOT EXISTS calibration_cells (
+            domain          TEXT NOT NULL,
+            action_class    TEXT NOT NULL,
+            metric          TEXT NOT NULL,
+            provenance      TEXT NOT NULL
+                              CHECK (provenance IN ('stated','policy_prior','all')),
+            window_days     INTEGER NOT NULL,   -- 30, 90, 0 = all-time
+            n               INTEGER NOT NULL,
+            n_mechanical    INTEGER NOT NULL,
+            base_rate       REAL,
+            mean_confidence REAL,
+            brier           REAL,
+            reliability     REAL,               -- Murphy decomposition
+            resolution      REAL,               -- the informativeness term
+            uncertainty     REAL,
+            ece             REAL,
+            shrunk_estimate REAL,
+            status          TEXT NOT NULL CHECK (status IN ('ok','thin','unknown')),
+            computed_at     TEXT NOT NULL,
+            PRIMARY KEY (domain, action_class, metric, provenance, window_days)
+        )
+    """,
+    # Per-recompute snapshots for trend surfaces (replaces the role of
+    # ego_calibration_snapshots in later sunset phases). Bounded: the grader
+    # prunes rows older than 180 days in the same pass that appends.
+    "calibration_cell_history": """
+        CREATE TABLE IF NOT EXISTS calibration_cell_history (
+            id           TEXT PRIMARY KEY,
+            domain       TEXT NOT NULL,
+            action_class TEXT NOT NULL,
+            metric       TEXT NOT NULL,
+            provenance   TEXT NOT NULL,
+            window_days  INTEGER NOT NULL,
+            n            INTEGER NOT NULL,
+            brier        REAL,
+            reliability  REAL,
+            resolution   REAL,
+            ece          REAL,
+            status       TEXT NOT NULL,
+            snapshot_at  TEXT NOT NULL
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1979,6 +2030,7 @@ KNOWLEDGE_FTS5_DDL = """
 
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_autonomy_events_cat_time ON autonomy_events(category, occurred_at)",
+    "CREATE INDEX IF NOT EXISTS idx_cch_cell_time ON calibration_cell_history(domain, metric, snapshot_at)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_session ON attention_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_ts ON attention_events(ts)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_unlabeled ON attention_events(acceptance_signal) WHERE acceptance_signal IS NULL",

@@ -5,7 +5,12 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, campaigns: false, references: false, backup: false },
+        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, "follow-ups": false, observations: false, traces: false, autonomy: false, memory: false, knowledge: false, campaigns: false, references: false, calibration: false, backup: false },
+        // ── Calibration tab state ──
+        calibrationCells: [],
+        calibrationSummary: null,
+        calibrationLane: "stated",
+        calibrationWindow: "90",
         // ── Campaigns tab state ──
         campaignsList: [],
         campaignsMutating: {},
@@ -458,7 +463,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "backup", "sessions"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "follow-ups", "observations", "traces", "autonomy", "memory", "knowledge", "campaigns", "references", "calibration", "backup", "sessions"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -547,6 +552,9 @@
               break;
             case "references":
               if (first) { this.fetchReferenceList(); this.fetchReferenceStats(); }
+              break;
+            case "calibration":
+              if (first) { this.fetchCalibration(); }
               break;
             case "backup":
               if (first) { this.fetchBackupStatus(); this.fetchBackupConfig(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
@@ -1584,6 +1592,22 @@
             await this.fetchKnowledgeRecent();
             await this.fetchKnowledgeStats();
           } catch (e) { console.warn("Knowledge delete failed:", e); }
+        },
+
+        // ── Calibration tab ────────────────────────────────────────
+        async fetchCalibration() {
+          try {
+            const params = new URLSearchParams({
+              lane: this.calibrationLane,
+              window: this.calibrationWindow,
+            });
+            const resp = await fetchApi(`/api/genesis/calibration?${params}`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.calibrationCells = data.cells || [];
+              this.calibrationSummary = data.summary || null;
+            }
+          } catch (e) { console.warn("Calibration fetch failed:", e); }
         },
 
         // ── References tab ─────────────────────────────────────────

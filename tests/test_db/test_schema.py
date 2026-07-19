@@ -76,6 +76,8 @@ EXPECTED_TABLES = [
     "entity_adjudications",  # entity-node merge-vs-distinct decision ledger (drainer)
     "autonomy_events",  # append-only success/correction ledger for windowed earn-back
     "graduation_events",  # voice graduation quarantine (W0; drained in W2)
+    "calibration_cells",  # WS-2 P3: per-(domain,class,metric,lane,window) calibration aggregates
+    "calibration_cell_history",  # WS-2 P3: per-recompute snapshots (180d retention)
 ]
 
 

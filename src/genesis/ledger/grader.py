@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from genesis.db.crud import ledger_predictions as lp_crud
+from genesis.ledger import cells as _cells
 from genesis.ledger.metrics import REGISTRY
 from genesis.ledger.ws2_ledger_config import autonomy_feed_mode
 
@@ -94,6 +95,9 @@ class GradeReport:
     # WS-2 P2b autonomy feed, keyed "<mode>:<kind>" (e.g. "shadow:success",
     # "live:correction") — what the grader fired (live) or would have (shadow).
     autonomy: Counter[str] = field(default_factory=Counter)
+    # WS-2 P3: calibration cells recomputed at the end of this pass (0 when
+    # the recompute failed — see cells.cell_recompute_failure_counts).
+    cells_written: int = 0
 
     def _bump(self, action_class: str, kind: str) -> None:
         self.per_class.setdefault(action_class, Counter())[kind] += 1
@@ -115,6 +119,7 @@ class GradeReport:
             f"fuzzy_pending={self.fuzzy_pending} left_open={self.left_open} "
             f"mechanical_share={share_s}"
             + (f" autonomy={dict(self.autonomy)}" if self.autonomy else "")
+            + (f" cells={self.cells_written}" if self.cells_written else "")
         )
 
 
@@ -309,5 +314,18 @@ async def grade_due_predictions(
             now=now,
             autonomy_manager=autonomy_manager,
             autonomy_feed=autonomy_feed,
+        )
+
+    # WS-2 P3: refresh the calibration cells from the graded record. Never
+    # allowed to break grading — the grades above are committed row-by-row;
+    # a recompute failure only leaves derived data stale (counted + logged).
+    try:
+        cell_report = await _cells.recompute_calibration_cells(db, now=now)
+        report.cells_written = cell_report.cells_written
+    except Exception:
+        _cells.record_recompute_failure()
+        logger.error(
+            "calibration-cell recompute failed — grades landed, cells stale",
+            exc_info=True,
         )
     return report

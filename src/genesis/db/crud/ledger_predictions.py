@@ -172,6 +172,40 @@ async def list_by_subject(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def list_resolved(db: aiosqlite.Connection) -> list[dict]:
+    """All graded rows (terminal with an outcome) — the cell aggregator's feed.
+
+    Bounded by construction: the grader only ever grades rows the writers
+    created, and the aggregator scans once per grading pass.
+    """
+    cursor = await db.execute(
+        "SELECT domain, action_class, metric, provenance, confidence, "
+        "outcome_value, resolver, resolved_at FROM ledger_predictions "
+        "WHERE status IN ('resolved', 'fuzzy_resolved') "
+        "AND outcome_value IS NOT NULL"
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def resolver_share_counts(db: aiosqlite.Connection) -> dict[str, int]:
+    """Graded-row totals by resolver family (the §7 falsifier's numbers).
+
+    ``{'mechanical': n, 'llm_fallback': n, 'graded': n}`` over resolved +
+    fuzzy_resolved rows with an outcome.
+    """
+    cursor = await db.execute(
+        "SELECT "
+        "  COALESCE(SUM(resolver IN ('mechanical', 'mechanical_absence')), 0), "
+        "  COALESCE(SUM(resolver = 'llm_fallback'), 0), "
+        "  COUNT(*) "
+        "FROM ledger_predictions "
+        "WHERE status IN ('resolved', 'fuzzy_resolved') "
+        "AND outcome_value IS NOT NULL"
+    )
+    mechanical, llm_fallback, graded = await cursor.fetchone()
+    return {"mechanical": mechanical, "llm_fallback": llm_fallback, "graded": graded}
+
+
 async def resolve(
     db: aiosqlite.Connection,
     prediction_id: str,

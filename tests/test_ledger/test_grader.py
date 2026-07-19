@@ -491,3 +491,50 @@ async def test_autonomy_manager_failure_never_touches_grade(db, monkeypatch):
     assert row["status"] == "resolved" and row["outcome_value"] == 1  # grade still landed
     assert report.mechanical == 1
     assert grader.autonomy_feed_failure_counts() == {"success": 1}
+
+
+# ── WS-2 P3: cell recompute rides the grading pass ───────────────────────────
+
+
+async def test_grading_pass_recomputes_cells(db):
+    from genesis.db.crud import calibration_cells as cc_crud
+
+    await _seed_outreach(db, "o-cells", signal="user_reply")
+    await _predict(
+        db,
+        action_class="outreach_send",
+        subject_type="outreach",
+        subject="o-cells",
+        metric="reply_received",
+        domain="outreach.general",
+    )
+    report = await grade_due_predictions(db, now=AFTER)
+    assert report.mechanical == 1
+    assert report.cells_written > 0
+    cells = await cc_crud.list_cells(db, domain="outreach.general", provenance="policy_prior")
+    assert any(c["n"] == 1 for c in cells)  # the graded row landed in a cell
+    assert f"cells={report.cells_written}" in report.summary()
+
+
+async def test_cell_recompute_failure_never_touches_grades(db, monkeypatch):
+    from genesis.ledger import cells as cells_mod
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("cell table on fire")
+
+    monkeypatch.setattr(cells_mod, "recompute_calibration_cells", _boom)
+    await _seed_outreach(db, "o-boom", signal="user_reply")
+    await _predict(
+        db,
+        action_class="outreach_send",
+        subject_type="outreach",
+        subject="o-boom",
+        metric="reply_received",
+        domain="outreach.general",
+    )
+    report = await grade_due_predictions(db, now=AFTER)
+    row = (await lp.list_by_subject(db, action_class="outreach_send", subject_ref_id="o-boom"))[0]
+    assert row["status"] == "resolved" and row["outcome_value"] == 1  # grade landed
+    assert report.mechanical == 1
+    assert report.cells_written == 0
+    assert cells_mod.cell_recompute_failure_counts() == {"recompute": 1}

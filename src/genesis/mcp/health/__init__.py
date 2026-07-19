@@ -64,6 +64,7 @@ from genesis.mcp.health import (  # noqa: E402
 )
 from genesis.mcp.health import browser as _browser  # noqa: E402
 from genesis.mcp.health import build_lane_status as _build_lane_status  # noqa: E402, F401
+from genesis.mcp.health import calibration_status as _calibration_status  # noqa: E402, F401
 from genesis.mcp.health import campaign_tools as _campaign_tools  # noqa: E402, F401
 from genesis.mcp.health import codebase as _codebase  # noqa: E402
 from genesis.mcp.health import cognitive_ledger_tools as _cognitive_ledger_tools  # noqa: E402, F401
