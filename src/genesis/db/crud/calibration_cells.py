@@ -184,9 +184,14 @@ async def list_history(
     metric: str | None = None,
     limit: int = 90,
 ) -> list[dict]:
-    """Trend snapshots for a domain, newest first. Rides ``idx_cch_cell_time``."""
-    clauses = ["domain = ?"]
-    params: list[object] = [domain]
+    """Trend snapshots for a domain, newest first. Rides ``idx_cch_cell_time``.
+
+    ``domain`` matches exactly or as a dotted prefix — the same semantics as
+    ``list_cells`` (a caller filtering cells and history with one value must
+    see the same slice of the world from both).
+    """
+    clauses = ["(domain = ? OR domain LIKE ?)"]
+    params: list[object] = [domain, f"{domain}.%"]
     if metric:
         clauses.append("metric = ?")
         params.append(metric)
