@@ -818,6 +818,12 @@ class EgoCadenceManager:
         # counter slot. Morning report / reactive / escalation are unaffected.
         if self._quiet_hours_suppresses_tick():
             logger.debug("Ego proactive tick suppressed — quiet hours")
+            # In suppress mode, advance the next fire to the window end so a
+            # large (24h-multiple) interval phased inside the window cannot
+            # starve the ego indefinitely. Floor mode self-corrects — it lets
+            # one tick through once quiet_hours_min_interval_minutes elapses.
+            if getattr(self._config, "quiet_hours_mode", "floor") == "suppress":
+                self._reschedule_past_quiet_hours()
             return
 
         # Deep-think: every Nth proactive cycle upgrades to Opus.
@@ -1245,6 +1251,34 @@ class EgoCadenceManager:
             return False
         floor = timedelta(minutes=self._config.quiet_hours_min_interval_minutes)
         return (_now_utc() - last) < floor
+
+    def _reschedule_past_quiet_hours(self) -> None:
+        """Move the next ego_cycle fire to the next quiet-hours-end boundary.
+
+        Guards suppress mode against starvation: if the adaptive interval has
+        backed off to a 24h multiple whose phase lands inside the quiet
+        window, every fire would be suppressed and proactive cycles would
+        never resume. Best-effort — a failure leaves the schedule untouched.
+        """
+        try:
+            now_local = _local_now(user_timezone())
+            end_local = now_local.replace(
+                hour=self._config.quiet_hours_end,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if end_local <= now_local:
+                end_local = end_local + timedelta(days=1)
+            self._scheduler.modify_job(
+                "ego_cycle", next_run_time=end_local.astimezone(UTC),
+            )
+            logger.info(
+                "Quiet-hours suppress: next ego tick moved to %s (window end)",
+                end_local.isoformat(),
+            )
+        except Exception:
+            logger.debug("Quiet-hours reschedule failed", exc_info=True)
 
     async def _restore_interval(self) -> None:
         """Load the persisted adaptive interval, clamped to current config
