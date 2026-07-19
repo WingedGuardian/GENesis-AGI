@@ -494,6 +494,12 @@ class StandaloneAdapter:
             if "voice_api" not in app.blueprints:
                 app.register_blueprint(voice_api_bp)
                 logger.info("Voice API blueprint registered")
+            if not os.environ.get("GENESIS_MCP_HTTP_TOKEN"):
+                logger.warning(
+                    "voice API disabled: GENESIS_MCP_HTTP_TOKEN not configured "
+                    "— all /v1/voice/* routes answer 503 (fail-closed; set the "
+                    "token in secrets.env to enable the voice API)"
+                )
         except Exception:
             logger.exception("Failed to register voice API blueprint")
 
