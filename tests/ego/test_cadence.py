@@ -429,7 +429,8 @@ class TestProcessSignals:
     async def test_deep_think_passes_model_override_via_metadata(
         self, cadence, mock_session, mock_idle_detector, monkeypatch,
     ):
-        """Every Nth proactive cycle passes model_override='opus' via signal metadata."""
+        """Every Nth COMPLETED proactive cycle runs on Opus (decided at consume
+        time in _process_signals, not at tick time)."""
         mock_idle_detector.is_idle.return_value = True
         sonnet_config = EgoConfig(
             cadence_minutes=60, model="sonnet",  # Non-opus so deep-think triggers
@@ -1675,3 +1676,104 @@ class TestPendingCliApproval:
         )
         await db.commit()
         assert await ego_crud.has_pending_cli_approval(db, "user_ego_cycle") is False
+
+
+# ---------------------------------------------------------------------------
+# Gate-aware consumer — signals survive a gated window (WS-2)
+# ---------------------------------------------------------------------------
+
+
+class TestGateAwareConsumer:
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self, monkeypatch, config):
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config", lambda: config,
+        )
+
+    async def test_paused_preserves_signals_without_draining(
+        self, cadence, mock_session,
+    ):
+        """Pre-drain gate: a paused ego leaves queued signals intact."""
+        cadence._running = True
+        cadence.push_reactive_event({"type": "t", "summary": "keep me"})
+        assert len(cadence._signal_queue) == 1
+        cadence.pause()
+        status = await cadence._process_signals()
+        assert status == "gated"
+        assert len(cadence._signal_queue) == 1  # NOT drained/lost
+        mock_session.run_unified_cycle.assert_not_called()
+
+    async def test_approval_pending_preserves_signals(
+        self, cadence, mock_session, monkeypatch,
+    ):
+        """Pre-flight: a pending CLI approval skips drain + context assembly."""
+        cadence._running = True
+        cadence.push_reactive_event({"type": "t", "summary": "briefing"})
+        monkeypatch.setattr(cadence, "_approval_pending", AsyncMock(return_value=True))
+        status = await cadence._process_signals()
+        assert status == "gated"
+        assert len(cadence._signal_queue) == 1
+        mock_session.run_unified_cycle.assert_not_called()
+
+    async def test_cycle_blocked_requeues_drained_signals(
+        self, cadence, mock_session,
+    ):
+        """Safety net: an approval appearing at dispatch time requeues signals."""
+        cadence._running = True
+        cadence.push_reactive_event({"type": "t", "summary": "survive the block"})
+        mock_session.run_unified_cycle.side_effect = CycleBlockedError("approval pending")
+        status = await cadence._process_signals()
+        assert status == "gated"
+        # Drained then requeued — still present for the eventually-approved cycle.
+        assert len(cadence._signal_queue) == 1
+        [sig] = cadence._signal_queue.drain()
+        assert sig.summary == "survive the block"
+
+    async def test_empty_and_ran_statuses(self, cadence, mock_session):
+        cadence._running = True
+        assert await cadence._process_signals() == "empty"
+        cadence.push_reactive_event({"type": "t", "summary": "go"})
+        assert await cadence._process_signals() == "ran"
+
+    async def test_deep_think_not_burned_by_gated_attempt(
+        self, cadence, mock_session, monkeypatch,
+    ):
+        """A gated attempt consumes no deep-think slot — the Opus upgrade still
+        lands on the Nth COMPLETED proactive cycle (WS-2d)."""
+        sonnet = EgoConfig(
+            cadence_minutes=60, model="sonnet", quiet_hours_enabled=False,
+        )
+        cadence._config = sonnet
+        monkeypatch.setattr("genesis.ego.config.load_ego_config", lambda: sonnet)
+        cadence._deep_think_interval = 2
+        mock_session.run_unified_cycle.return_value = EgoCycle(
+            output_text="x", proposals_json="[]", focus_summary="f",
+            ego_source="user_ego_cycle",
+        )
+
+        # Attempt 1: gated by a pending approval → no completion, no slot spent.
+        monkeypatch.setattr(cadence, "_approval_pending", AsyncMock(return_value=True))
+        await cadence._on_tick()
+        assert await cadence._process_signals() == "gated"
+        assert cadence._completed_proactive_count == 0
+
+        # Ungate → completed proactive cycle 1: sonnet (1 % 2 != 0).
+        monkeypatch.setattr(cadence, "_approval_pending", AsyncMock(return_value=False))
+        assert await cadence._process_signals() == "ran"  # drains the queued tick
+        assert cadence._completed_proactive_count == 1
+        assert mock_session.run_unified_cycle.call_args.kwargs.get("model_override") is None
+
+        # Completed proactive cycle 2: deep-think → opus (2 % 2 == 0).
+        mock_session.run_unified_cycle.reset_mock()
+        await cadence._on_tick()
+        assert await cadence._process_signals() == "ran"
+        assert cadence._completed_proactive_count == 2
+        assert mock_session.run_unified_cycle.call_args.kwargs.get("model_override") == "opus"
+
+    async def test_on_tick_no_longer_sets_model_override(self, cadence):
+        """Deep-think moved to consume time — _on_tick pushes a plain signal."""
+        cadence._deep_think_interval = 1  # would have fired every tick under old logic
+        cadence._config = EgoConfig(model="sonnet", quiet_hours_enabled=False)
+        await cadence._on_tick()
+        [sig] = cadence._signal_queue.drain()
+        assert sig.metadata.get("model_override") is None
