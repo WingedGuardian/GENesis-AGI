@@ -652,7 +652,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: b1163dd5 2026-07-18
+verified: 732c4f3d 2026-07-19
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -721,7 +721,7 @@ verified: b1163dd5 2026-07-18
   `feedback/calibration` ego-ECE, `eval/calibration` golden-set loader) —
   don't conflate. Slated for WS-2 sunset (P5) once the ledger's unified
   calibration table bakes.
-- **ledger/** (WS-2 P1a+P1b): the cognitive ledger — falsifiable predictions
+- **ledger/** (WS-2 P1a+P1b+P2+P3): the cognitive ledger — falsifiable predictions
   in `ledger_predictions` (migration 0064), written only through the
   validating CRUD (`db/crud/ledger_predictions.py`) against the code registry
   (`ledger/metrics.py`: 9 v1 metrics, each with a pure-SQL resolver; NO
@@ -748,7 +748,22 @@ verified: b1163dd5 2026-07-18
   nothing on slowness/cancel) and SHADOW-FIRST behind `ws2_ledger.autonomy_feed`
   (off/shadow/live, default shadow, read live via `ledger/ws2_ledger_config.py`;
   live feeds the same seam #1119's `autonomy_events` windowed ledger consumes).
-  Calibration-cell aggregation is a later PR; the fuzzy LLM-fallback lane is
+  **Calibration table LIVE (P3)**: `ledger/cells.py` recomputes
+  `calibration_cells` + `calibration_cell_history` (migration 0068) at the end
+  of every grading pass — Murphy decomposition + ECE per (domain, class,
+  metric, lane, 30/90/all-time window) over resolved rows keyed on
+  `resolved_at`, stated/policy_prior lanes partitioned at grouping time,
+  Beta-binomial shrinkage (m=10) cell→parent-domain→global, per-tool base
+  rates from `tool_call_outcomes` as the strict policy_prior lane, and
+  ok/thin/unknown cold-start labels (thin/unknown NEVER render as a bare
+  percentage on any surface). Writes are upsert-then-prune (never an
+  observably-empty table mid-rebuild); history prunes at 180d in-pass.
+  Surfaces: `calibration_status` MCP (escalation phrasing on thin/unknown,
+  top over/under-confident domains), dashboard Calibration tab
+  (`/api/genesis/calibration` — cells + mechanical/fallback shares), and
+  perception's advisory text repointed from legacy `calibration_curves` to
+  ok stated cells (90d-preferred, ego.* excluded, byte-stable sentence
+  contract). The fuzzy LLM-fallback lane is
   deferred (no `acceptance_pass` writer yet). Outreach
   metrics resolve off `outreach_history.engagement_signal`
   (spike-measured 99.5% mechanical); the engagement_outcome CHECK now

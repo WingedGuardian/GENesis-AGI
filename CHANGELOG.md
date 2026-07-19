@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now keeps an honest, mechanical scorecard of its own confidence.**
+  The cognitive ledger's graded predictions roll up into a unified calibration
+  table (`calibration_cells`, migration 0068), recomputed after every grading
+  pass: per domain/metric/window, how often Genesis said X% and how often it
+  was actually right — Brier score, Murphy decomposition (is the miss
+  overconfidence or uninformativeness?), and a shrinkage-stabilized track
+  record, plus per-tool success base rates. Cold-start honesty is built in:
+  cells with thin or no data say "unverified — escalate to the user" and
+  never render as a bare percentage, on any surface. Explore it via the new
+  `calibration_status` MCP tool, a dashboard **Calibration** tab (with the
+  mechanical-vs-LLM grading shares), and Deep/Strategic reflections now read
+  their "when you report ~80% you're right ~60%" advisory from this real
+  graded record instead of the legacy proto-calibration table.
 - **A runaway Claude Code temp write can no longer fill the container's root
   disk.** `~/.genesis/cc-tmp` — the scratch space every CC session (and
   genesis-server) writes to — now lives on its own size-capped incus storage
