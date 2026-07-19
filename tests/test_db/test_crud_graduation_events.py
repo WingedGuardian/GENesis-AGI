@@ -90,3 +90,17 @@ async def test_prune_removes_old_dispositioned_keeps_recent(db):
     assert removed == 1
     assert await graduation_events.get_by_event_id(db, event_id="evt-landed-old") is None
     assert await graduation_events.get_by_event_id(db, event_id="evt-landed-recent") is not None
+
+
+async def test_constraint_violation_raises_not_duplicate(db):
+    """OR IGNORE swallows CHECK violations too — insert_event must surface a
+    non-duplicate ignore as an error, never a silent 'duplicate' (silent data
+    loss if a future event type is missing from an old DB's frozen CHECK)."""
+    import aiosqlite
+
+    with pytest.raises(aiosqlite.IntegrityError, match="non-duplicate"):
+        await _insert(db, event_id="evt-bogus-type", type="not_a_real_type")
+
+    assert (
+        await graduation_events.get_by_event_id(db, event_id="evt-bogus-type") is None
+    )

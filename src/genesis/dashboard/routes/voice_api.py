@@ -362,12 +362,19 @@ def voice_graduate():
         msg, status = auth
         return jsonify({"error": msg}), status
 
-    if (request.content_length or 0) > _MAX_GRADUATE_BYTES:
+    # Measure the actual body, not the Content-Length header — a chunked
+    # request has no header and would bypass a content_length check; get_json
+    # below reuses this cached read.
+    if len(request.get_data(cache=True)) > _MAX_GRADUATE_BYTES:
         return jsonify(
             {"status": "rejected", "errors": ["envelope exceeds 64KB"]}
         ), 400
 
-    data = request.get_json(force=True, silent=True) or {}
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify(
+            {"status": "rejected", "errors": ["body must be a JSON object"]}
+        ), 400
     errors = validate_envelope(data)
     if errors:
         return jsonify({"status": "rejected", "errors": errors}), 400

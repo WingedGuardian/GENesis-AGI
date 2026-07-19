@@ -18,6 +18,7 @@ read back on the same aiosqlite connection.
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -151,3 +152,30 @@ async def test_base_path_parity_on_legacy_db():
         assert row[0] == "2026-01-01"
     finally:
         await db.close()
+
+
+def test_event_types_match_ddl_check_lists():
+    """EVENT_TYPES (validator) must equal the CHECK list in BOTH DDL copies.
+
+    SQLite cannot ALTER a CHECK constraint — existing installs keep the W0
+    list forever. If a future PR extends EVENT_TYPES without a migration
+    strategy for the frozen CHECK, validated events of the new type would be
+    OR-IGNOREd on old DBs. insert_event now raises on that case; this test
+    catches the drift at CI time instead.
+    """
+    import re
+
+    from genesis.channels.voice.graduation import EVENT_TYPES
+    from genesis.db.schema._tables import TABLES
+
+    def check_list(ddl: str) -> tuple[str, ...]:
+        m = re.search(r"type\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(type IN \(([^)]+)\)", ddl)
+        assert m, "type CHECK not found in DDL"
+        return tuple(v.strip().strip("'") for v in m.group(1).split(","))
+
+    canonical = check_list(TABLES["graduation_events"])
+    migration_src = Path(M68.__file__).read_text()
+    migration = check_list(migration_src)
+
+    assert canonical == EVENT_TYPES
+    assert migration == EVENT_TYPES

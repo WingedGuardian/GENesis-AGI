@@ -56,6 +56,21 @@ async def insert_event(
         ),
     )
     inserted = (cursor.rowcount or 0) == 1
+    if not inserted:
+        # OR IGNORE swallows ANY conflict (CHECK/NOT NULL too, not just the
+        # event_id UNIQUE). Only a genuine replay may answer "duplicate" —
+        # anything else ignored here is silent data loss (e.g. a future
+        # EVENT_TYPES addition missing from an old DB's frozen CHECK list)
+        # and must surface as an error so the edge retries and logs show it.
+        check = await db.execute(
+            "SELECT 1 FROM graduation_events WHERE event_id = ?", (event_id,)
+        )
+        if await check.fetchone() is None:
+            await db.rollback()
+            raise aiosqlite.IntegrityError(
+                f"graduation_events insert ignored for non-duplicate {event_id!r} "
+                "(constraint violation — schema/validator drift?)"
+            )
     await db.commit()
     return inserted
 
@@ -78,6 +93,10 @@ async def prune_older_than(db: aiosqlite.Connection, *, days: int = 90) -> int:
 
     NEVER deletes a pending row — pending is the drainer's inbox and the
     audit obligation. Signature matches the drip-retention prune contract.
+
+    Contract for the W2 drainer: ``disposed_at`` MUST be written as UTC
+    ISO8601 — the cutoff compares lexically against SQLite's UTC
+    ``datetime('now')`` (house pattern, cf. ``alert_events``).
     """
     cursor = await db.execute(
         "DELETE FROM graduation_events "

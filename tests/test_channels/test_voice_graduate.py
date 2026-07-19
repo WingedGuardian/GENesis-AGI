@@ -183,6 +183,23 @@ class TestVoiceGraduate:
             assert len(body["errors"]) == 2
             insert.assert_not_awaited()
 
+    @pytest.mark.parametrize("body", ['[1, 2, 3]', '"hello"', "42"])
+    def test_non_object_json_body_rejected(self, app, body):
+        """A top-level JSON array/string/number is a 400 rejection, never a 500
+        (the edge outbox would retry a 500 forever on a permanently-bad body)."""
+        with (
+            patch.dict("os.environ", self._ENV, clear=False),
+            app.test_client() as client,
+        ):
+            resp = client.post(
+                "/v1/voice/graduate",
+                data=body,
+                content_type="application/json",
+                headers=self._AUTH,
+            )
+            assert resp.status_code == 400
+            assert resp.get_json()["status"] == "rejected"
+
     def test_oversized_envelope_rejected(self, app):
         with (
             patch.dict("os.environ", self._ENV, clear=False),
