@@ -155,6 +155,13 @@ class TestValidateEgoConfig:
         assert len(errors) == 1
         assert "quiet_hours_min_interval_minutes must be >= 1" in errors[0]
 
+    def test_quiet_hours_mode(self):
+        assert validate_ego_config({"quiet_hours_mode": "floor"}) == []
+        assert validate_ego_config({"quiet_hours_mode": "suppress"}) == []
+        errors = validate_ego_config({"quiet_hours_mode": "loud"})
+        assert len(errors) == 1
+        assert "quiet_hours_mode must be" in errors[0]
+
     def test_quiet_hours_defaults(self):
         cfg = EgoConfig()
         assert cfg.quiet_hours_enabled is True

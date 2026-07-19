@@ -1225,15 +1225,21 @@ class EgoCadenceManager:
     def _quiet_hours_suppresses_tick(self) -> bool:
         """Whether the current proactive tick should be skipped for quiet hours.
 
-        Suppresses only when quiet hours are enabled, the local clock is inside
-        the window, AND the last proactive fire was less than
-        quiet_hours_min_interval_minutes ago. A first tick with no recorded
-        prior fire is allowed (never block on unknown boot state).
+        Only ever suppresses when quiet hours are enabled and the local clock is
+        inside the window. Within the window, behaviour depends on
+        quiet_hours_mode:
+        - "suppress": skip every proactive tick until the window ends.
+        - "floor" (default): allow at most one proactive tick per
+          quiet_hours_min_interval_minutes; a first tick with no recorded prior
+          fire is allowed (never block on unknown boot state).
+        Morning report / reactive / escalation paths are never gated here.
         """
         if not getattr(self._config, "quiet_hours_enabled", False):
             return False
         if not self._in_quiet_hours(_local_now(user_timezone())):
             return False
+        if getattr(self._config, "quiet_hours_mode", "floor") == "suppress":
+            return True
         last = self._last_proactive_fire_at
         if last is None:
             return False

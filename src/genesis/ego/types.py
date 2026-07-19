@@ -169,5 +169,6 @@ class EgoConfig:
     quiet_hours_start: int = 23  # local hour [0-23], inclusive
     quiet_hours_end: int = 7  # local hour [0-23], exclusive
     quiet_hours_min_interval_minutes: int = 240  # min gap between overnight ticks
+    quiet_hours_mode: str = "floor"  # "floor" (throttle) | "suppress" (silence window)
 
 
