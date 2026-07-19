@@ -9,6 +9,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **A runaway Claude Code temp write can no longer fill the container's root
+  disk.** `~/.genesis/cc-tmp` — the scratch space every CC session (and
+  genesis-server) writes to — now lives on its own size-capped incus storage
+  volume. A runaway temp write fills only that volume; the container root
+  filesystem is never touched (a full rootfs would otherwise kill every CC
+  session). It also guards the reverse case: unrelated rootfs growth can no
+  longer starve cc-tmp below the watchdog's floor. Applied automatically on
+  fresh installs (host-setup) and on existing installs (guardian redeploy, when
+  no CC session is live so a running session is never disturbed); size defaults
+  to 2 GiB, override with `CCTMPVOL_SIZE_GIB`. A new infrastructure-posture
+  check raises a standing alert on any container install where cc-tmp is not yet
+  isolated, and `scripts/lib/cc_tmp_volume.sh`'s `cc_tmp_volume_remove` reverts
+  it.
+
 ### Fixed
 
 - **Dashboard health cards stop crying wolf.** The API Keys and Queues cards

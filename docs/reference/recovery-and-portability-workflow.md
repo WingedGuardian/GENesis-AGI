@@ -256,3 +256,51 @@ git remote set-url origin <your public GENesis-AGI URL>
 
 The clone checks out the exact `HEAD` the bundle captured (`--all` records HEAD +
 every branch/tag), so the working tree matches the container at publish time.
+
+## cc-tmp Blast-Radius Volume (`scripts/lib/cc_tmp_volume.sh`)
+
+`~/.genesis/cc-tmp` is the TMPDIR for every Claude Code session and for
+genesis-server. On a shared rootfs it is a two-way hazard: a runaway temp write
+can fill the container root (killing every CC session), and unrelated rootfs
+growth can starve cc-tmp below the watchdog's ~150 MiB sacred-ground floor. The
+split moves cc-tmp onto a dedicated, size-capped incus custom storage volume so
+neither can happen.
+
+**Topology.** A thin custom volume in the container's own pool
+(`<container>-cc-tmp`), attached as a disk device named `cc-tmp` mounted at
+`~/.genesis/cc-tmp`, made writable by the container user via a `chown` from
+container-root (no `security.shifted` — a fresh volume mounts owned by
+container-root, and chown maps to the correct unprivileged host uid). Root's
+`limits.read`/`limits.write` IO caps are mirrored onto the device. Size defaults
+to 2 GiB (`CCTMPVOL_SIZE_GIB`).
+
+**How installs get it.** Fresh installs: `scripts/host-setup.sh` applies it at
+container creation. Existing installs: the guardian gateway `redeploy` verb runs
+`cc_tmp_volume_apply` on every update — but it **skips while a CC session is
+live** (attaching over cc-tmp would shadow that session's open temp files), so
+an always-busy install converges on a later quiet window. To apply immediately,
+during a quiet moment (no `claude` processes) run on the host:
+`bash -c '. <install-dir>/scripts/lib/cc_tmp_volume.sh && cc_tmp_volume_apply'`,
+then inside the container `systemctl --user restart genesis-server` to drop any
+shadowed temp fds.
+
+**Monitoring.** The infra-profile `storage` section carries an effective-state
+`cc_tmp_isolated` fact; the awareness posture check raises a standing
+`cc_tmp_shared_fs` alert on any lxc install where it is still `false` (gated on
+`virt.container == "lxc"` — never nags a non-container topology). The watchgod
+state file gains `fs_free_mb`/`fs_total_mb` describing the volume's headroom.
+Pool-level exhaustion is already covered by the guardian's `measure_storage_pool`
+tiers (a thin volume counts toward the pool's `data%`).
+
+**Snapshots.** incus container snapshots do NOT include custom volumes — so the
+guardian healthy-snapshot rollback lifeline never churns scratch data (desirable
+for temp). The volume is disposable: `cc_tmp_volume_remove` (host-side, during a
+quiet window) detaches and deletes it, reverting cc-tmp to the rootfs.
+
+**Rollback.** `bash -c '. <install-dir>/scripts/lib/cc_tmp_volume.sh && cc_tmp_volume_remove'`.
+
+**Seams** (defaults work on any single-container install; override only for
+non-standard topologies): `CCTMPVOL_SIZE_GIB` (2), `CCTMPVOL_CONTAINER` (resolved
+from guardian.yaml, else `genesis`), `CCTMPVOL_POOL` (root device's pool),
+`CCTMPVOL_VOLUME_NAME` (`<container>-cc-tmp`), `CCTMPVOL_USER` (`ubuntu`),
+`CCTMPVOL_DISABLE` (opt out).

@@ -601,6 +601,20 @@ if [ "$root_dev" != "$home_dev" ] && [ "${home_avail_kb:-0}" -gt "${root_avail_k
     fi
 fi
 
+# ── cc-tmp blast-radius isolation ────────────────────────────────────────────
+# Put the Claude Code scratch dir (~/.genesis/cc-tmp) on its own size-capped
+# incus storage volume so a runaway temp write can never fill the container root
+# filesystem (which would kill every CC session), and nothing else on the rootfs
+# can starve it. Applied outside the creation block AND after any homedisk
+# attach/restart above, so re-running host-setup retrofits existing containers
+# and the mount is never shadowed by a later bind. A fresh container has no CC
+# session, so it applies immediately; on a busy retrofit the lib skips (it won't
+# attach over a live session) and a later apply converges.
+# shellcheck source=lib/cc_tmp_volume.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/cc_tmp_volume.sh"
+CCTMPVOL_CONTAINER="$CONTAINER_NAME"
+cc_tmp_volume_apply
+
 # ── Verify container networking ──────────────────────────────
 # DHCP can be slow, especially on first boot or after UFW rules are freshly added.
 # Actively kick the DHCP client if needed rather than just waiting and hoping.

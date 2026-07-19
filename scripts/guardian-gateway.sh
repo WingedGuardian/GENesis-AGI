@@ -634,6 +634,20 @@ PYEOF
                 1>&2 || true
         fi
 
+        # cc-tmp blast-radius isolation: put the container's CC scratch dir on
+        # its own size-capped storage volume. Same retrofit rationale as the
+        # zram block above (installer steps never re-run — existing installs get
+        # it here). Same best-effort/stderr-only/[ -f ]-guarded contract; 120s
+        # because a volume create + several incus execs run. The lib resolves
+        # the container from guardian.yaml and SKIPS when a CC session is live
+        # (it will not attach over a running session, so this never disrupts an
+        # in-flight session), converging on a later quiet apply.
+        if [ -f "$INSTALL_DIR/scripts/lib/cc_tmp_volume.sh" ]; then
+            timeout 120 bash -c \
+                ". '$INSTALL_DIR/scripts/lib/cc_tmp_volume.sh' && cc_tmp_volume_apply" \
+                1>&2 || true
+        fi
+
         # Clean up backup on success
         rm -rf "$BACKUP_DIR"
         ;;

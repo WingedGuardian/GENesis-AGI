@@ -488,6 +488,15 @@ _INFRA_POSTURE_DETAIL = {
         "scripts/bootstrap.sh (installs + enables the watchdog timer via "
         "lib/network_resilience.sh)"
     ),
+    "cc_tmp_shared_fs": (
+        "the Claude Code scratch dir (~/.genesis/cc-tmp) shares a filesystem "
+        "with the container root — a runaway temp write can fill the root disk "
+        "and take every CC session down (the watchgod can only mitigate, not "
+        "prevent). On the host: re-run scripts/host-setup.sh, or the guardian "
+        "gateway redeploy applies scripts/lib/cc_tmp_volume.sh automatically "
+        "when no CC session is live (moves cc-tmp onto a dedicated storage "
+        "volume, size-capped so a runaway can never reach the rootfs)"
+    ),
 }
 
 
@@ -506,7 +515,7 @@ def _infra_profile_age_days(profile: dict) -> float | None:
 
 
 def _infra_missing_protections(profile: dict) -> list[str]:
-    """Evaluate the memory- and network-plane protection rules against profile facts.
+    """Evaluate the memory-, network-, and storage-plane protection rules against profile facts.
 
     Only an EXPLICIT defect value counts — absent/None facts stay silent.
     Tri-state contract for cgroup_memory_swap_max (collectors/container.py):
@@ -561,10 +570,20 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("networkd_keepconfig_missing")
         if network.get("network_watchdog_enabled") is False:
             missing.append("network_watchdog_absent")
+    # Storage plane: cc-tmp blast-radius isolation (EFFECTIVE-state fact from
+    # collectors/container.py::collect_storage). Gated on an lxc container —
+    # the remedy is a dedicated incus volume, which only exists on a container
+    # install; a bare-metal/other topology where the fact reads False is not
+    # actionable, so stay silent there.
+    if (
+        _facts("virt").get("container") == "lxc"
+        and _facts("storage").get("cc_tmp_isolated") is False
+    ):
+        missing.append("cc_tmp_shared_fs")
     return sorted(missing)
 
 
-_POSTURE_PLANES = ("memory", "host_system", "host_virt", "network")
+_POSTURE_PLANES = ("memory", "host_system", "host_virt", "network", "storage")
 
 
 def _infra_unverifiable_planes(profile: dict) -> list[str]:
@@ -588,7 +607,7 @@ def _infra_unverifiable_planes(profile: dict) -> list[str]:
 
 
 async def _check_infra_protection_posture(db) -> None:
-    """Alert when a memory- or network-plane protection is missing or the profile is stale.
+    """Alert when a memory-, network-, or storage-plane protection is missing or the profile is stale.
 
     One 'high' infrastructure_alert (dashboard + morning report; the WS-2 M10
     reconciler absorbs it into the durable open-set) describing the CURRENT

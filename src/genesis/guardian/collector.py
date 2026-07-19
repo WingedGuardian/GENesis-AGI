@@ -313,7 +313,11 @@ async def _collect_cpu(config: GuardianConfig) -> CPUInfo:
 async def _collect_disk(config: GuardianConfig) -> list[DiskInfo]:
     """Collect disk usage for key mount points."""
     disks = []
-    for mount in ["/", "/tmp", "/home"]:  # noqa: S108 - monitoring host mounts, not creating temp files
+    seen: set[str] = set()
+    # cc-tmp: after the blast-radius split it is its own mount; pre-split df
+    # resolves it to "/" (deduped below so it does not double-count).
+    cc_tmp = f"/home/{config.container_user}/.genesis/cc-tmp"
+    for mount in ["/", "/tmp", "/home", cc_tmp]:  # noqa: S108 - monitoring host mounts, not creating temp files
         try:
             rc, out = await _incus_exec(
                 config.container_name,
@@ -326,6 +330,9 @@ async def _collect_disk(config: GuardianConfig) -> list[DiskInfo]:
                 continue
             parts = lines[-1].split()
             if len(parts) >= 5:
+                if parts[0] in seen:
+                    continue  # cc-tmp resolved to an already-probed mount
+                seen.add(parts[0])
                 disks.append(DiskInfo(
                     mount=parts[0],
                     total_mb=int(parts[1]),

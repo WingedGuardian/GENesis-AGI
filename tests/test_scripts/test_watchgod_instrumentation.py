@@ -84,3 +84,22 @@ def test_pressure_snapshots_are_bounded(tmp_path):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     remaining = list(logs.glob("cc_tmp_top_*.txt"))
     assert len(remaining) <= 20, f"snapshots not bounded: {len(remaining)} remain"
+
+
+def test_write_state_includes_fs_headroom(tmp_path):
+    import json
+
+    home, cctmp, bind = _sandbox(tmp_path)
+    out = _run(home, bind, "write_state green 100 green 5")
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    state = json.loads((home / ".genesis" / "watchgod_state.json").read_text())
+    cc = state["cc_tmp"]
+    assert "fs_free_mb" in cc and "fs_total_mb" in cc  # post-split volume headroom
+    assert cc["fs_total_mb"] > 0  # the cc-tmp dir exists in the sandbox
+
+
+def test_fs_total_mb_reports_positive(tmp_path):
+    home, cctmp, bind = _sandbox(tmp_path)
+    out = _run(home, bind, f"fs_total_mb '{cctmp}'")
+    assert out.returncode == 0, out.stderr
+    assert int(out.stdout.strip()) > 0

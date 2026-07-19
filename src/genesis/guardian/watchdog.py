@@ -45,7 +45,7 @@ class GuardianWatchdog:
         "src/genesis/observability", "src/genesis/db",
         "config/guardian-claude.md", "pyproject.toml",
         "scripts/install_guardian.sh", "scripts/guardian-gateway.sh",
-        "scripts/lib/host_swap.sh",
+        "scripts/lib/host_swap.sh", "scripts/lib/cc_tmp_volume.sh",
     ]
     DRIFT_ALERT_THRESHOLD = 3   # Consecutive drifted ticks before alerting
     CC_TOKEN_WARN_AGE_DAYS = 335  # warn ~30d before a 1-year setup-token expires
