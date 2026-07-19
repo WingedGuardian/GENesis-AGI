@@ -197,8 +197,11 @@ class GenesisEgoContextBuilder:
                 self._db, ego_target="genesis_ego", limit=7,
             )
         except Exception:
-            logger.debug("Failed to query settled decisions", exc_info=True)
-            return ""
+            logger.warning("Failed to query settled decisions", exc_info=True)
+            return (
+                "## Settled Decisions\n\n"
+                "*Settled decisions unavailable (query error — see logs).*\n"
+            )
 
         if not decisions:
             return ""
@@ -503,7 +506,8 @@ class GenesisEgoContextBuilder:
                 lines.append("")
 
         except Exception:
-            lines.append("*No proposal history available.*\n")
+            logger.warning("Failed to build proposal history section", exc_info=True)
+            lines.append("*Proposal history unavailable (query error — see logs).*\n")
 
         lines.append("")
         return "\n".join(lines)
@@ -664,7 +668,7 @@ class GenesisEgoContextBuilder:
             return ""
         except Exception:
             logger.warning("Failed to build confidence calibration section", exc_info=True)
-            return ""
+            return "## Confidence Calibration\n\n*Calibration unavailable (query error — see logs).*\n"
 
     async def _capability_performance_section(self, *, depth: str = "deep") -> str:
         """System capability performance — domain confidence from multiple sources."""
@@ -675,7 +679,11 @@ class GenesisEgoContextBuilder:
 
             entries = await cap_crud.get_all(self._db)
         except Exception:
-            return ""
+            logger.warning("Failed to query capability performance", exc_info=True)
+            lines.append(
+                "*Capability performance unavailable (query error — see logs).*\n"
+            )
+            return "\n".join(lines)
 
         if not entries:
             lines.append("*No performance data yet.*\n")

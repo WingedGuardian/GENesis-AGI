@@ -27,15 +27,30 @@ logger = logging.getLogger(__name__)
 
 # Observation categories that represent user-world signals.
 # Used by GenesisEgoContextBuilder to EXCLUDE these from its system-focused view.
-_USER_WORLD_CATEGORIES = frozenset({
-    "email_recon", "inbox", "finding", "interest", "interests",
-    "contribution", "user_model_delta",
-    # User-domain categories — genesis ego should not see these
-    "career", "career_advancement", "career_application",
-    "content", "content_publishing", "content_distribution",
-    "goal_management", "goal_review", "portfolio",
-    "marketing", "outreach", "networking",
-})
+_USER_WORLD_CATEGORIES = frozenset(
+    {
+        "email_recon",
+        "inbox",
+        "finding",
+        "interest",
+        "interests",
+        "contribution",
+        "user_model_delta",
+        # User-domain categories — genesis ego should not see these
+        "career",
+        "career_advancement",
+        "career_application",
+        "content",
+        "content_publishing",
+        "content_distribution",
+        "goal_management",
+        "goal_review",
+        "portfolio",
+        "marketing",
+        "outreach",
+        "networking",
+    }
+)
 
 # Genesis-internal keyword detection now lives in genesis.ego.domain_classifier
 # (shared with follow-up domain classification); imported above as
@@ -144,10 +159,7 @@ class UserEgoContextBuilder:
                 continue
             is_async = asyncio.iscoroutinefunction(method)
             if depth == "light":
-                result = (
-                    await method(depth="light") if is_async
-                    else method(depth="light")
-                )
+                result = await method(depth="light") if is_async else method(depth="light")
             else:
                 # "deep" or "always" — full depth (default behavior)
                 result = await method() if is_async else method()
@@ -224,11 +236,19 @@ class UserEgoContextBuilder:
 
         # Extract the most actionable fields for ego decision-making
         priority_keys = [
-            "active_projects", "current_focus", "priorities",
-            "goals", "professional_role", "expertise_areas",
-            "communication_preferences", "autonomy_preferences",
-            "decision_making_style", "interests", "active_investigations",
-            "binding_constraints", "bottleneck_awareness",
+            "active_projects",
+            "current_focus",
+            "priorities",
+            "goals",
+            "professional_role",
+            "expertise_areas",
+            "communication_preferences",
+            "autonomy_preferences",
+            "decision_making_style",
+            "interests",
+            "active_investigations",
+            "binding_constraints",
+            "bottleneck_awareness",
         ]
 
         for key in priority_keys:
@@ -246,9 +266,7 @@ class UserEgoContextBuilder:
         shown = len([k for k in priority_keys if k in model])
         remaining = len(model) - shown
         if remaining > 0:
-            lines.append(
-                f"\n*{remaining} more fields available via memory_recall.*"
-            )
+            lines.append(f"\n*{remaining} more fields available via memory_recall.*")
 
         lines.append("")
         return "\n".join(lines)
@@ -260,6 +278,7 @@ class UserEgoContextBuilder:
         are in _ALWAYS_SECTIONS and always render at full depth.
         """
         from genesis.ego.intentions_context import build_intentions_section
+
         return await build_intentions_section(self._db, "user_ego_cycle")
 
     async def _user_goals_section(self, *, depth: str = "deep") -> str:
@@ -268,10 +287,13 @@ class UserEgoContextBuilder:
 
         try:
             from genesis.db.crud import user_goals
+
             # origin="user": ego-owned goals must never render as user
             # directives in the user ego's world model.
             goals = await user_goals.list_active(
-                self._db, limit=20, origin="user",
+                self._db,
+                limit=20,
+                origin="user",
             )
         except Exception:
             logger.debug("Failed to query user goals", exc_info=True)
@@ -287,6 +309,7 @@ class UserEgoContextBuilder:
 
         if depth == "light":
             from datetime import UTC, datetime
+
             now = datetime.now(UTC)
             stale = 0
             for g in goals:
@@ -301,9 +324,7 @@ class UserEgoContextBuilder:
             summary = f"{len(goals)} active goals"
             if stale:
                 summary += f" ({stale} stale)"
-            titles = ", ".join(
-                g.get("title", "?")[:40] for g in goals[:3]
-            )
+            titles = ", ".join(g.get("title", "?")[:40] for g in goals[:3])
             if len(goals) > 3:
                 titles += f", +{len(goals) - 3} more"
             return f"## User Goals\n{summary}: {titles}\n"
@@ -353,6 +374,7 @@ class UserEgoContextBuilder:
             progress_notes_raw = g.get("progress_notes", "[]")
             try:
                 import json
+
                 notes = (
                     json.loads(progress_notes_raw)
                     if isinstance(progress_notes_raw, str)
@@ -361,9 +383,7 @@ class UserEgoContextBuilder:
                 if notes and isinstance(notes, list):
                     latest = notes[-1]
                     note_text = (
-                        latest.get("note", str(latest))
-                        if isinstance(latest, dict)
-                        else str(latest)
+                        latest.get("note", str(latest)) if isinstance(latest, dict) else str(latest)
                     )
                     progress_str = f' | Last: "{note_text[:60]}"'
             except (json.JSONDecodeError, TypeError):
@@ -373,24 +393,19 @@ class UserEgoContextBuilder:
             proposal_str = ""
             try:
                 summary = await ego_crud.get_goal_proposal_summary(
-                    self._db, goal_id,
+                    self._db,
+                    goal_id,
                 )
                 if summary:
-                    parts = [
-                        f"{count} {status}"
-                        for status, count in summary.items()
-                    ]
+                    parts = [f"{count} {status}" for status, count in summary.items()]
                     proposal_str = f" | Proposals: {', '.join(parts)}"
             except Exception:
                 pass
 
             header = (
-                f"{prefix}[{priority.upper()}] **{title}** "
-                f"(id={goal_id}, {category}){type_tag}"
+                f"{prefix}[{priority.upper()}] **{title}** (id={goal_id}, {category}){type_tag}"
             )
-            detail_parts = [
-                p for p in [stale_str, progress_str, proposal_str] if p
-            ]
+            detail_parts = [p for p in [stale_str, progress_str, proposal_str] if p]
             if detail_parts:
                 detail = "".join(detail_parts).lstrip(" |")
                 indent = "  " if prefix == "- " else "    "
@@ -417,11 +432,16 @@ class UserEgoContextBuilder:
             from genesis.db.crud import ego as ego_crud
 
             directives = await ego_crud.list_active_directives(
-                self._db, ego_target="user_ego", limit=5,
+                self._db,
+                ego_target="user_ego",
+                limit=5,
             )
         except Exception:
-            logger.debug("Failed to query ego directives", exc_info=True)
-            return ""
+            logger.warning("Failed to query ego directives", exc_info=True)
+            return (
+                "## User Directives\n\n"
+                "*User directives unavailable (query error — see logs).*\n"
+            )
 
         if not directives:
             return ""
@@ -454,10 +474,7 @@ class UserEgoContextBuilder:
                 except (ValueError, TypeError):
                     pass
             age_part = f", {age_str}" if age_str else ""
-            lines.append(
-                f"- [{priority}] {content}\n"
-                f"  (id={directive_id}{age_part})"
-            )
+            lines.append(f"- [{priority}] {content}\n  (id={directive_id}{age_part})")
 
         lines.append("")
         return "\n".join(lines)
@@ -470,11 +487,16 @@ class UserEgoContextBuilder:
             from genesis.db.crud import ego as ego_crud
 
             decisions, total = await ego_crud.list_active_decisions(
-                self._db, ego_target="user_ego", limit=7,
+                self._db,
+                ego_target="user_ego",
+                limit=7,
             )
         except Exception:
-            logger.debug("Failed to query settled decisions", exc_info=True)
-            return ""
+            logger.warning("Failed to query settled decisions", exc_info=True)
+            return (
+                "## Settled Decisions\n\n"
+                "*Settled decisions unavailable (query error — see logs).*\n"
+            )
 
         if not decisions:
             return ""
@@ -492,9 +514,7 @@ class UserEgoContextBuilder:
             marker = f" (reaffirmed ×{reaff})" if reaff else ""
             lines.append(f"- [{when}]{marker} {d.get('content', '?')[:400]}")
         if total > len(decisions):
-            lines.append(
-                f"\n*(+{total - len(decisions)} older active rulings not shown)*"
-            )
+            lines.append(f"\n*(+{total - len(decisions)} older active rulings not shown)*")
         lines.append("")
         return "\n".join(lines)
 
@@ -507,6 +527,7 @@ class UserEgoContextBuilder:
         if depth == "light":
             try:
                 from genesis.ego.world_snapshot import build as build_snapshot
+
                 snapshot = await build_snapshot(self._db)
                 rendered = snapshot.render()
                 # Count non-empty lines as content proxy
@@ -519,6 +540,7 @@ class UserEgoContextBuilder:
 
         try:
             from genesis.ego.world_snapshot import build as build_snapshot
+
             snapshot = await build_snapshot(self._db)
             rendered = snapshot.render()
             lines.append(rendered)
@@ -605,11 +627,7 @@ class UserEgoContextBuilder:
 
         # Normalize list format to dict (same as genesis_context.py)
         if isinstance(signals, list):
-            signals = {
-                s["name"]: s
-                for s in signals
-                if isinstance(s, dict) and "name" in s
-            }
+            signals = {s["name"]: s for s in signals if isinstance(s, dict) and "name" in s}
 
         # Filter to user-facing signals with non-zero values
         pulse_items: list[str] = []
@@ -624,10 +642,7 @@ class UserEgoContextBuilder:
             if interpretation:
                 label = sig_name.replace("_", " ").title()
                 item = f"- **{label}**: {interpretation} (signal: {value:.2f})"
-                note = (
-                    sig_info.get("baseline_note")
-                    if isinstance(sig_info, dict) else None
-                )
+                note = sig_info.get("baseline_note") if isinstance(sig_info, dict) else None
                 if note:
                     item += f" — {note}"
                 pulse_items.append(item)
@@ -780,11 +795,21 @@ class UserEgoContextBuilder:
     # Pure-infrastructure keywords — escalations containing these are
     # filtered from the user ego's view.  The genesis ego handles infra;
     # the user ego only sees user-impacting escalations.
-    _INFRA_ESCALATION_KEYWORDS = frozenset({
-        "cost_unknown", "dream cycle", "deepseek",
-        "provider fail", "circuit breaker", "qdrant", "heartbeat",
-        "dead letter", "watchdog", "systemd", "memory growth",
-    })
+    _INFRA_ESCALATION_KEYWORDS = frozenset(
+        {
+            "cost_unknown",
+            "dream cycle",
+            "deepseek",
+            "provider fail",
+            "circuit breaker",
+            "qdrant",
+            "heartbeat",
+            "dead letter",
+            "watchdog",
+            "systemd",
+            "memory growth",
+        }
+    )
 
     async def _genesis_escalations_section(self, *, depth: str = "deep") -> str:
         """Escalations from the Genesis ego that need user ego attention.
@@ -824,10 +849,7 @@ class UserEgoContextBuilder:
         # handles those.  Keep escalations with user-facing impact.
         # (id is r[0] now, so content is r[2].)
         rows = [
-            r for r in rows
-            if not any(
-                kw in r[2].lower() for kw in self._INFRA_ESCALATION_KEYWORDS
-            )
+            r for r in rows if not any(kw in r[2].lower() for kw in self._INFRA_ESCALATION_KEYWORDS)
         ]
 
         # Read-receipt (non-fatal): these escalations were pulled into the user
@@ -873,10 +895,7 @@ class UserEgoContextBuilder:
             return "## Genesis Capabilities\n*No capabilities registered.*\n"
 
         if depth == "light":
-            return (
-                f"## Genesis Capabilities\n"
-                f"{len(self._capabilities)} capabilities available.\n"
-            )
+            return f"## Genesis Capabilities\n{len(self._capabilities)} capabilities available.\n"
 
         lines = ["## Genesis Capabilities\n"]
 
@@ -885,8 +904,7 @@ class UserEgoContextBuilder:
             lines.append(f"- **{name}**: {description}")
 
         lines.append(
-            "\nThink about which capabilities could serve the user "
-            "that aren't being used enough.\n"
+            "\nThink about which capabilities could serve the user that aren't being used enough.\n"
         )
         return "\n".join(lines)
 
@@ -903,7 +921,8 @@ class UserEgoContextBuilder:
             # rank past the cap and never appear. Pinned/high-priority internal
             # items intentionally re-home to the cockpit, not the user ego.
             actionable = await follow_up_crud.get_actionable(
-                self._db, domain="user_world",
+                self._db,
+                domain="user_world",
             )
         except Exception:
             logger.error("Failed to query follow-ups", exc_info=True)
@@ -919,7 +938,8 @@ class UserEgoContextBuilder:
 
         # Filter to user-relevant follow-ups (pinned items always shown)
         user_relevant = [
-            fu for fu in actionable
+            fu
+            for fu in actionable
             if fu.get("strategy") in ("ego_judgment", "user_input_needed")
             or fu.get("priority") in ("high", "critical")
             or fu.get("pinned")
@@ -927,8 +947,7 @@ class UserEgoContextBuilder:
 
         if not user_relevant:
             lines.append(
-                f"*{len(actionable)} follow-ups exist but none require "
-                f"user ego attention.*\n"
+                f"*{len(actionable)} follow-ups exist but none require user ego attention.*\n"
             )
             return "\n".join(lines)
 
@@ -979,17 +998,13 @@ class UserEgoContextBuilder:
                     "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
                 )
                 tried = (await cursor2.fetchone())[0]
-                return (
-                    f"## Proposals\n"
-                    f"Active: {active} | Recently tried: {tried}\n"
-                )
+                return f"## Proposals\nActive: {active} | Recently tried: {tried}\n"
             except Exception:
                 return "## Proposals\n*Not available.*\n"
 
         lines = ["## Active Proposals\n"]
         table_header = (
-            "| Action | Topic | Outcome | Realist |\n"
-            "|--------|-------|---------|---------|"
+            "| Action | Topic | Outcome | Realist |\n|--------|-------|---------|---------|"
         )
 
         def _format_row(row) -> str:
@@ -1052,7 +1067,8 @@ class UserEgoContextBuilder:
                 lines.append("")
 
         except Exception:
-            lines.append("*No proposal history available.*\n")
+            logger.warning("Failed to build proposal history section", exc_info=True)
+            lines.append("*Proposal history unavailable (query error — see logs).*\n")
 
         return "\n".join(lines)
 
@@ -1083,7 +1099,7 @@ class UserEgoContextBuilder:
 
         # ---- Fetch all pending proposals ----
         try:
-            all_pending = await ego_crud.get_pending_queue(self._db, ego_source='user_ego_cycle')
+            all_pending = await ego_crud.get_pending_queue(self._db, ego_source="user_ego_cycle")
         except Exception:
             logger.error("Failed to query pending proposals", exc_info=True)
             lines.append("## Proposal Board\n")
@@ -1129,23 +1145,20 @@ class UserEgoContextBuilder:
             for p in queue:
                 age = self._proposal_age(p.get("created_at"))
                 content = (p.get("content") or "")[:150].replace("\n", " ")
-                lines.append(
-                    f"- (id:{p['id']}) [{age}] "
-                    f"**{p.get('action_type', '?')}**: {content}"
-                )
+                lines.append(f"- (id:{p['id']}) [{age}] **{p.get('action_type', '?')}**: {content}")
 
         # Queue health
         total = len(all_pending)
         if total > 0:
             lines.append(f"\nQueue: {total} total pending.")
         if total > 10:
-            lines.append(
-                "Queue growing — consider tabling items you no longer recommend."
-            )
+            lines.append("Queue growing — consider tabling items you no longer recommend.")
 
         # ---- Approved proposals ready for execution ----
         try:
-            approved = await ego_crud.list_proposals(self._db, status="approved", limit=5, ego_source='user_ego_cycle')
+            approved = await ego_crud.list_proposals(
+                self._db, status="approved", limit=5, ego_source="user_ego_cycle"
+            )
         except Exception:
             approved = []
 
@@ -1153,9 +1166,7 @@ class UserEgoContextBuilder:
             lines.append(f"\n**{len(approved)} approved proposals** (ready for execution):\n")
             for p in approved:
                 content = (p.get("content") or "")[:150].replace("\n", " ")
-                lines.append(
-                    f"- **{p.get('action_type', '?')}** (id:{p['id']}): {content}"
-                )
+                lines.append(f"- **{p.get('action_type', '?')}** (id:{p['id']}): {content}")
             lines.append(
                 "\nYou can execute these by outputting execution_briefs "
                 "with the proposal_id and dispatch instructions.\n"
@@ -1165,7 +1176,7 @@ class UserEgoContextBuilder:
 
         # ---- Deferred (tabled) proposals ----
         try:
-            tabled = await ego_crud.get_tabled(self._db, ego_source='user_ego_cycle')
+            tabled = await ego_crud.get_tabled(self._db, ego_source="user_ego_cycle")
         except Exception:
             tabled = []
 
@@ -1174,9 +1185,7 @@ class UserEgoContextBuilder:
             lines.append(f"\n**Deferred ({len(tabled)} tabled)**:\n")
             for p in shown:
                 content = (p.get("content") or "")[:120].replace("\n", " ")
-                lines.append(
-                    f"- (id:{p['id']}) **{p.get('action_type', '?')}**: {content}"
-                )
+                lines.append(f"- (id:{p['id']}) **{p.get('action_type', '?')}**: {content}")
             if len(tabled) > 8:
                 lines.append(f"- ... and {len(tabled) - 8} more")
             lines.append(
@@ -1259,7 +1268,9 @@ class UserEgoContextBuilder:
             by_goal.setdefault(goal_id, {"title": title, "items": []})
             # user_response format: "session:{id}|completed:{summary}" or "|failed:{summary}"
             resp = response or ""
-            outcome = "done" if "|completed:" in resp else "failed" if "|failed:" in resp else status
+            outcome = (
+                "done" if "|completed:" in resp else "failed" if "|failed:" in resp else status
+            )
             by_goal[goal_id]["items"].append(
                 f"  - [{outcome}] {(content or '')[:100]} ({(created or '')[:10]})"
             )
@@ -1292,8 +1303,13 @@ class UserEgoContextBuilder:
         try:
             goal = await user_goals.get_by_id(self._db, focus_id)
         except Exception:
-            logger.debug("Failed to fetch goal %s for deep dive", focus_id)
-            return ""
+            logger.warning(
+                "Failed to fetch goal %s for deep dive", focus_id, exc_info=True
+            )
+            return (
+                "## Goal Deep Dive\n\n"
+                "*Goal deep dive unavailable (query error — see logs).*\n"
+            )
 
         if not goal:
             return f"## Goal Deep Dive\n*Goal {focus_id} not found.*\n"
@@ -1313,16 +1329,30 @@ class UserEgoContextBuilder:
             lines.append(f"- **Description**: {goal['description'][:300]}")
         lines.append("")
 
+        # The ego's own last verdict on THIS goal — a write-back of the
+        # previously write-only ego_cycle_outcomes.assessment, giving goal
+        # reviews cross-cycle continuity ("what did I conclude last time?").
+        try:
+            from genesis.db.crud import ego as _ego_crud
+
+            prior_assessment = await _ego_crud.get_latest_goal_assessment(
+                self._db,
+                focus_id,
+            )
+        except Exception:
+            logger.debug("Failed to fetch prior goal assessment", exc_info=True)
+            prior_assessment = None
+        if prior_assessment:
+            lines.append("### Your Last Assessment of This Goal\n")
+            lines.append(prior_assessment.strip()[:800])
+            lines.append("")
+
         # Full progress note history (last 15)
         import json as _json
 
         progress_raw = goal.get("progress_notes", "[]")
         try:
-            notes = (
-                _json.loads(progress_raw)
-                if isinstance(progress_raw, str)
-                else progress_raw
-            )
+            notes = _json.loads(progress_raw) if isinstance(progress_raw, str) else progress_raw
         except (_json.JSONDecodeError, TypeError):
             notes = []
 
@@ -1370,9 +1400,7 @@ class UserEgoContextBuilder:
                 lines.append(f"- [{created}] [{status}] **{action}**: {content}")
             lines.append("")
         else:
-            lines.append(
-                "### Goal-Linked Proposals\n*No proposals for this goal.*\n"
-            )
+            lines.append("### Goal-Linked Proposals\n*No proposals for this goal.*\n")
 
         # Stuck diagnosis: effort spent (>= N executed proposals) but the goal
         # is still active and hasn't advanced. Prompt the ego to diagnose WHY
@@ -1385,10 +1413,7 @@ class UserEgoContextBuilder:
 
         _summary = await _ego_crud.get_goal_proposal_summary(self._db, focus_id)
         executed_count = _summary.get("executed", 0)
-        if (
-            executed_count >= GOAL_STUCK_EXECUTED_THRESHOLD
-            and goal.get("status") == "active"
-        ):
+        if executed_count >= GOAL_STUCK_EXECUTED_THRESHOLD and goal.get("status") == "active":
             lines.append(
                 "### ⚠ Stuck Signal\n"
                 f"This goal has **{executed_count} executed proposals** but is "
@@ -1406,7 +1431,9 @@ class UserEgoContextBuilder:
             from genesis.db.crud import user_goals as ug_crud
 
             children = await ug_crud.list_children(
-                self._db, focus_id, include_achieved=True,
+                self._db,
+                focus_id,
+                include_achieved=True,
             )
             if children:
                 lines.append("### Subgoals\n")
@@ -1414,9 +1441,7 @@ class UserEgoContextBuilder:
                     ch_status = ch.get("status", "?")
                     ch_title = (ch.get("title") or "?")[:100]
                     ch_id = ch.get("id", "?")
-                    lines.append(
-                        f"- [{ch_status}] **{ch_title}** (id={ch_id})"
-                    )
+                    lines.append(f"- [{ch_status}] **{ch_title}** (id={ch_id})")
                 lines.append("")
         except Exception:
             logger.debug("Failed to query subgoals for %s", focus_id)
@@ -1425,7 +1450,8 @@ class UserEgoContextBuilder:
         if goal.get("parent_goal_id"):
             try:
                 parent = await user_goals.get_by_id(
-                    self._db, goal["parent_goal_id"],
+                    self._db,
+                    goal["parent_goal_id"],
                 )
                 if parent:
                     lines.append(
@@ -1453,7 +1479,11 @@ class UserEgoContextBuilder:
 
             entries = await cap_crud.get_all(self._db)
         except Exception:
-            return ""
+            logger.warning("Failed to query capability performance", exc_info=True)
+            lines.append(
+                "*Capability performance unavailable (query error — see logs).*\n"
+            )
+            return "\n".join(lines)
 
         if not entries:
             lines.append("*No performance data yet.*\n")
@@ -1485,7 +1515,6 @@ class UserEgoContextBuilder:
         )
         return "\n".join(lines)
 
-
     async def _recurring_patterns_section(self, *, depth: str = "deep") -> str:
         """Detect recurring observation patterns (3+ occurrences in 72h).
 
@@ -1502,8 +1531,11 @@ class UserEgoContextBuilder:
             from genesis.db.crud.observations import INTERNAL_OBS_TYPES
 
             _GENESIS_CATEGORIES = (
-                "system_health", "infrastructure", "performance",
-                "maintenance", "security",
+                "system_health",
+                "infrastructure",
+                "performance",
+                "maintenance",
+                "security",
             )
             cat_placeholders = ",".join("?" for _ in _GENESIS_CATEGORIES)
             type_placeholders = ",".join("?" for _ in INTERNAL_OBS_TYPES)
@@ -1535,10 +1567,7 @@ class UserEgoContextBuilder:
         if depth == "light":
             return f"## Recurring Patterns (72h)\n{len(rows)} patterns detected.\n"
 
-        lines.append(
-            f"**{len(rows)} pattern(s)** appearing 3+ times "
-            f"(may warrant automation):\n"
-        )
+        lines.append(f"**{len(rows)} pattern(s)** appearing 3+ times (may warrant automation):\n")
         for obs_type, category, cnt, sample, _latest in rows:
             cat_str = f"/{category}" if category else ""
             short = (sample or "")[:100].replace("\n", " ")
