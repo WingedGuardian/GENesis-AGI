@@ -51,6 +51,8 @@ from typing import Any
 
 from genesis.calibration.metrics import compute_ece
 from genesis.db.crud import calibration_cells as cells_crud
+from genesis.db.crud import ledger_predictions as lp_crud
+from genesis.db.crud import tool_call_outcomes as tco_crud
 from genesis.db.timeutil import canonical_iso
 
 logger = logging.getLogger(__name__)
@@ -246,23 +248,9 @@ async def _build_tool_cells(db: Any, *, now: datetime) -> list[dict]:
     """Per-tool success base rates (design §4.4, strict: n + base_rate only)."""
     cells: list[dict] = []
     for window in WINDOWS:
-        if window == 0:
-            cursor = await db.execute(
-                "SELECT tool_name, COUNT(*) AS n, AVG(success) AS base_rate "
-                "FROM tool_call_outcomes GROUP BY tool_name"
-            )
-        else:
-            cutoff = canonical_iso((now - timedelta(days=window)).isoformat())
-            # Plain (sargable) comparison rides idx_tco_tool_ts: both sides are
-            # canonical ISO from datetime.isoformat() — a microsecond-less row
-            # sorts sub-second early at the boundary, negligible on day windows.
-            cursor = await db.execute(
-                "SELECT tool_name, COUNT(*) AS n, AVG(success) AS base_rate "
-                "FROM tool_call_outcomes "
-                "WHERE timestamp >= ? GROUP BY tool_name",
-                (cutoff,),
-            )
-        for row in await cursor.fetchall():
+        since = None if window == 0 else canonical_iso((now - timedelta(days=window)).isoformat())
+        rows = await tco_crud.aggregate_success_rates(db, since=since)
+        for row in rows:
             n = int(row["n"])
             cells.append(
                 {
@@ -297,13 +285,7 @@ async def recompute_calibration_cells(db: Any, *, now: datetime | None = None) -
     counter and the error log say so).
     """
     now = now or datetime.now(UTC)
-    cursor = await db.execute(
-        "SELECT domain, action_class, metric, provenance, confidence, "
-        "outcome_value, resolver, resolved_at FROM ledger_predictions "
-        "WHERE status IN ('resolved', 'fuzzy_resolved') "
-        "AND outcome_value IS NOT NULL"
-    )
-    rows = [dict(r) for r in await cursor.fetchall()]
+    rows = await lp_crud.list_resolved(db)
 
     cells = _build_prediction_cells(rows, now=now)
     cells.extend(await _build_tool_cells(db, now=now))

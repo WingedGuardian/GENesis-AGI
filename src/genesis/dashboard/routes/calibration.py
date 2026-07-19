@@ -25,6 +25,7 @@ _LANES = {"stated", "policy_prior", "all"}
 async def _collect_calibration(db, *, lane: str, window: int, domain: str | None = None) -> dict:
     """Cells + summary scalars for one lane/window slice."""
     from genesis.db.crud import calibration_cells as cc_crud
+    from genesis.db.crud import ledger_predictions as lp_crud
 
     cells = await cc_crud.list_cells(db, domain=domain, provenance=lane, window_days=window)
     status_counts = {"ok": 0, "thin": 0, "unknown": 0}
@@ -34,24 +35,16 @@ async def _collect_calibration(db, *, lane: str, window: int, domain: str | None
     # Pass-level shares from the graded record (same definitions as the
     # grader report / design §7 falsifier): mechanical share over graded
     # non-void rows; fallback share = LLM-graded fraction of resolutions.
-    cursor = await db.execute(
-        "SELECT "
-        "  COALESCE(SUM(resolver IN ('mechanical', 'mechanical_absence')), 0), "
-        "  COALESCE(SUM(resolver = 'llm_fallback'), 0), "
-        "  COUNT(*) "
-        "FROM ledger_predictions "
-        "WHERE status IN ('resolved', 'fuzzy_resolved') "
-        "AND outcome_value IS NOT NULL"
-    )
-    mech, fallback, graded = await cursor.fetchone()
+    shares = await lp_crud.resolver_share_counts(db)
+    graded = shares["graded"]
     return {
         "cells": cells,
         "summary": {
             **status_counts,
             "cell_count": len(cells),
             "graded_total": graded,
-            "mechanical_share": (mech / graded) if graded else None,
-            "fallback_share": (fallback / graded) if graded else None,
+            "mechanical_share": (shares["mechanical"] / graded) if graded else None,
+            "fallback_share": (shares["llm_fallback"] / graded) if graded else None,
             "last_computed_at": cells[0]["computed_at"] if cells else None,
         },
     }
