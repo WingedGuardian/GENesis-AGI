@@ -384,11 +384,24 @@ async def queues(
     deferred_items: list[dict] = []
     if db:
         try:
+            # Exclude scheduled batch worklists (dream-synthesis, entity
+            # adjudication) from the review sample — they are drained on a daily
+            # budget by design and sit pending for days, so surfacing them as
+            # "Deferred review" items is a false alarm. They stay counted in the
+            # separate `deferred_worklist` gauge. Same segmentation the
+            # recovery-depth alarm applies (see BATCH_WORK_TYPES).
+            from genesis.resilience.deferred_work import BATCH_WORK_TYPES
+
             now_dt = datetime.now(UTC)
+            placeholders = ",".join("?" * len(BATCH_WORK_TYPES))
+            # NOT-IN values are bound parameters; only the placeholder count is
+            # interpolated (from an internal constant), so no injection surface.
             cur = await db.execute(
-                """SELECT work_type, call_site_id, deferred_reason, attempts, created_at
-                   FROM deferred_work_queue WHERE status='pending'
-                   ORDER BY priority, created_at LIMIT 5"""
+                f"""SELECT work_type, call_site_id, deferred_reason, attempts, created_at
+                   FROM deferred_work_queue
+                   WHERE status='pending' AND work_type NOT IN ({placeholders})
+                   ORDER BY priority, created_at LIMIT 5""",  # noqa: S608
+                tuple(BATCH_WORK_TYPES),
             )
             for row in await cur.fetchall():
                 age = (now_dt - datetime.fromisoformat(row["created_at"])).total_seconds()
