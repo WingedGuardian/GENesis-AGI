@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from flask import Blueprint, current_app, jsonify, request
 
 from genesis.channels.voice.graduation import validate_envelope
+from genesis.channels.voice.transcript_writer import validate_conversation
 
 logger = logging.getLogger("genesis.dashboard.voice_api")
 
@@ -410,3 +411,103 @@ def voice_graduate():
         status, data["event_id"][:16], data["source"][:32],
     )
     return jsonify({"status": status})
+
+
+# ── Conversation transcript landing (W0.5 — s2s extraction parity) ──
+# The edge s2s bridge posts its FULL cumulative turn list here on client
+# disconnect (and may re-post on replays/double-fires). The transcript writer
+# appends only new turns to a per-session CC-format JSONL that the memory
+# extraction job mines like any other channel — replacing the legacy
+# "one-blob memory_store" landing entirely.
+
+# 10s: a bounded file append + at most two SQLite writes — the same bound
+# class as /v1/voice/graduate (busy_timeout=5000 + loop scheduling headroom).
+# Fast-fail is safe: the edge re-posts its cumulative list, and the
+# line-count reconciliation makes any replay idempotent.
+_CONVERSATION_TIMEOUT_SECONDS = 10.0
+
+# Cumulative turn lists are bigger than graduation envelopes (largest blob
+# observed in the wild: ~25KB after weeks of accumulation) — 256KB is ~10x
+# headroom while still refusing pathological bodies.
+_MAX_CONVERSATION_BYTES = 256 * 1024
+
+
+async def _land_conversation(data: dict) -> int:
+    """Reconcile the cumulative turn list (runs on the runtime loop).
+
+    Returns the number of newly appended messages. Raises LookupError when
+    the runtime/DB isn't ready — mapped to 503 so the edge retries.
+    """
+    from genesis.channels.voice.transcript_writer import get_shared_writer
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        raise LookupError("Genesis runtime not ready")
+
+    writer = await get_shared_writer(rt.db)
+    return await writer.sync_cumulative(data["session_id"], data["turns"])
+
+
+@voice_api_bp.route("/v1/voice/conversation", methods=["POST"])
+def voice_conversation():
+    """Land a voice conversation's cumulative turn list from the edge bridge.
+
+    Body: ``{"session_id": str, "satellite_id": str?, "turns": [{"role":
+    "user"|"assistant", "text": str}, ...]}`` where ``turns`` is the full
+    cumulative list for the session. Contract: the producer must regenerate
+    ``session_id`` whenever its turn cache resets (a shorter-than-known list
+    appends nothing and logs a warning server-side).
+
+    Responses: 200 ``{"status": "ok", "appended": N}`` after the transcript
+    append is durable; 400 ``{"status": "rejected", "errors": [...]}`` on
+    validation failure; 503 while the runtime is not ready (edge retries).
+    """
+    auth = _check_voice_token()
+    if auth is not None:
+        msg, status = auth
+        return jsonify({"error": msg}), status
+
+    # Measure the actual body, not the Content-Length header (chunked-safe);
+    # get_json below reuses this cached read.
+    if len(request.get_data(cache=True)) > _MAX_CONVERSATION_BYTES:
+        return jsonify({"status": "rejected", "errors": ["body exceeds 256KB"]}), 400
+
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "rejected", "errors": ["body must be a JSON object"]}), 400
+    errors = validate_conversation(data)
+    if errors:
+        return jsonify({"status": "rejected", "errors": errors}), 400
+
+    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
+    if event_loop is None or not event_loop.is_running():
+        return jsonify({"error": "Event loop not available"}), 503
+
+    future = asyncio.run_coroutine_threadsafe(_land_conversation(data), event_loop)
+    try:
+        appended = future.result(timeout=_CONVERSATION_TIMEOUT_SECONDS)
+    except TimeoutError:
+        future.cancel()
+        logger.error(
+            "Voice conversation landing timed out after %.0fs for session %s",
+            _CONVERSATION_TIMEOUT_SECONDS,
+            data["session_id"][:32],
+        )
+        return jsonify({"error": "conversation landing timed out"}), 503
+    except LookupError:
+        return jsonify({"error": "Genesis runtime not ready"}), 503
+    except Exception:
+        logger.error(
+            "Voice conversation landing failed for session %s",
+            data["session_id"][:32],
+            exc_info=True,
+        )
+        return jsonify({"error": "conversation landing failed"}), 500
+
+    logger.info(
+        "Voice conversation: %d message(s) appended for session %s",
+        appended,
+        data["session_id"][:32],
+    )
+    return jsonify({"status": "ok", "appended": appended})

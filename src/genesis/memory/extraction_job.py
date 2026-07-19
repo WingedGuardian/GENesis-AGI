@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
-from genesis.env import cc_project_dir
+from genesis.env import cc_project_dir, voice_transcript_dir
 from genesis.learning.procedural.judge import ProcedureBuilderUnavailable
 from genesis.memory.extraction import (
     RETRY_PROMPT,
@@ -45,8 +45,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Session types eligible for extraction
-_EXTRACTABLE_SOURCE_TAGS = {"foreground", "inbox"}
+# Session types eligible for extraction. 'voice' rows are written by the
+# voice transcript writer (channels/voice/transcript_writer.py) — their
+# transcripts live in voice_transcript_dir(), not the CC projects dir.
+_EXTRACTABLE_SOURCE_TAGS = {"foreground", "inbox", "voice"}
 
 # Transcript directory
 _TRANSCRIPT_DIR = Path.home() / ".claude" / "projects" / cc_project_dir()
@@ -189,6 +191,11 @@ async def run_extraction_cycle(
         else:
             last_line = session.get("last_extracted_line") or 0
         transcript_path = _find_transcript(transcript_dir, cc_session_id)
+        if not transcript_path and session.get("source_tag") == "voice":
+            # Voice sessions keep their transcripts outside the CC projects
+            # dir (same CC-JSONL format, written by the voice transcript
+            # writer) so the CC resume picker never lists them.
+            transcript_path = _find_transcript(voice_transcript_dir(), cc_session_id)
 
         if not transcript_path:
             continue

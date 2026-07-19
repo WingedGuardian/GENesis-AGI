@@ -39,7 +39,7 @@ from genesis.channels.voice.genesis_bridge import (
 )
 
 if TYPE_CHECKING:
-    from genesis.memory.store import MemoryStore
+    from genesis.channels.voice.transcript_writer import VoiceTranscriptWriter
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ class S2SSession:
     _conn_mgr: object | None = field(default=None, repr=False)
     input_transcript: str = ""
     output_transcript: str = ""
+    _turn_output: str = ""  # current turn's assistant text (reset per turn)
     turn_count: int = 0
     _closed: bool = False
 
@@ -84,11 +85,11 @@ class S2SSessionManager:
         self,
         *,
         bridge: GenesisBridge,
-        memory_store: MemoryStore | None = None,
+        transcript_writer: VoiceTranscriptWriter | None = None,
         max_idle_seconds: int = 300,
     ) -> None:
         self._bridge = bridge
-        self._memory_store = memory_store
+        self._transcript_writer = transcript_writer
         self._max_idle_seconds = max_idle_seconds
         self._sessions: dict[str, S2SSession] = {}
         self._client: openai.AsyncOpenAI | None = None
@@ -126,7 +127,10 @@ class S2SSessionManager:
         if self._client is None:
             self._client = openai.AsyncOpenAI()
 
-        session_id = f"s2s-{satellite_id}-{datetime.now(UTC).strftime('%H%M%S')}"
+        # Date included: this id is now a durable identity key (uuid5 →
+        # transcript file + cc_sessions row) — HHMMSS alone collides across
+        # days and would merge two conversations into one transcript.
+        session_id = f"s2s-{satellite_id}-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
         session = S2SSession(session_id=session_id, satellite_id=satellite_id)
         self._sessions[satellite_id] = session
         logger.info("S2S session created: %s for satellite %s", session_id, satellite_id)
@@ -241,12 +245,14 @@ class S2SSessionManager:
             # Audio transcript (text of what the model is saying)
             elif etype == "response.output_audio_transcript.delta":
                 session.output_transcript += event.delta
+                session._turn_output += event.delta
                 yield S2SResponseEvent(type="transcript", text=event.delta)
 
             # Input transcript (what the user said — async via Whisper)
             elif etype == "conversation.item.input_audio_transcription.completed":
                 if hasattr(event, "transcript") and event.transcript:
                     session.input_transcript += event.transcript
+                    await self._record_turn(session, "user", event.transcript)
 
             # Response complete — check if it's a function call or final audio
             elif etype == "response.done":
@@ -293,6 +299,8 @@ class S2SSessionManager:
                     session.turn_count += 1
                     session.last_activity = datetime.now(UTC)
                     session.output_transcript += "\n"
+                    await self._record_turn(session, "assistant", session._turn_output)
+                    session._turn_output = ""
                     yield S2SResponseEvent(type="done")
                     break
 
@@ -308,16 +316,42 @@ class S2SSessionManager:
                     continue
 
                 logger.error("S2S error: %s", msg)
+                # Flush the partial turn (its audio was already streaming to
+                # the user) so it can't leak into the NEXT turn's record.
+                await self._record_turn(session, "assistant", session._turn_output)
+                session._turn_output = ""
                 yield S2SResponseEvent(type="error", text=msg)
                 break
 
+    async def _record_turn(self, session: S2SSession, role: str, text: str) -> None:
+        """Append one turn to the session's transcript (best-effort, durable).
+
+        Per-turn writes replace the legacy store-one-blob-at-close landing:
+        a crash loses nothing already spoken, and the extraction job mines
+        the transcript like any other channel's conversation.
+        """
+        if self._transcript_writer is None or not text.strip():
+            return
+        try:
+            await self._transcript_writer.append_message(
+                session.session_id, role, text,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to record voice turn for %s",
+                session.session_id, exc_info=True,
+            )
+
     async def close(self, satellite_id: str) -> tuple[str, str]:
-        """Close a session, store transcripts, return (input, output)."""
+        """Close a session, finalize its transcript, return (input, output)."""
         session = self._sessions.pop(satellite_id, None)
         if not session:
             return "", ""
 
         session._closed = True
+        # Flush any partial turn abandoned mid-stream (client disconnect).
+        await self._record_turn(session, "assistant", session._turn_output)
+        session._turn_output = ""
         transcripts = (session.input_transcript, session.output_transcript)
 
         if session.connection:
@@ -328,29 +362,14 @@ class S2SSessionManager:
             except Exception:
                 logger.exception("Error closing S2S session %s", session.session_id)
 
-        # Store conversation transcripts to episodic memory (best-effort)
-        if self._memory_store and (transcripts[0] or transcripts[1]):
+        # Mark the transcript session completed (turns were written as they
+        # happened via _record_turn — nothing is stored at close anymore).
+        if self._transcript_writer and (transcripts[0] or transcripts[1]):
             try:
-                content = (
-                    f"Voice conversation [{satellite_id}]:\n"
-                    f"User: {transcripts[0]}\n"
-                    f"Genesis: {transcripts[1]}"
-                )
-                await self._memory_store.store(
-                    content,
-                    source="voice_s2s",
-                    memory_type="episodic",
-                    tags=["voice", "s2s", "conversation"],
-                    wing="channels",
-                    room="voice",
-                )
-                logger.info(
-                    "Voice transcript stored for session %s (%d turns)",
-                    session.session_id, session.turn_count,
-                )
+                await self._transcript_writer.close_session(session.session_id)
             except Exception:
                 logger.warning(
-                    "Failed to store voice transcript for %s",
+                    "Failed to finalize voice transcript for %s",
                     session.session_id, exc_info=True,
                 )
 

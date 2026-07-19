@@ -313,6 +313,7 @@ class StandaloneAdapter:
         try:
             from genesis.channels.voice.genesis_bridge import GenesisBridge
             from genesis.channels.voice.s2s_session import S2SSessionManager
+            from genesis.channels.voice.transcript_writer import get_shared_writer
             from genesis.channels.voice.wyoming_stt import WyomingSTTServer
             from genesis.channels.voice.wyoming_tts import WyomingTTSServer
 
@@ -328,10 +329,17 @@ class StandaloneAdapter:
                 approval_gate=approval_gate,
             )
 
-            # S2S session manager (memory_store for transcript persistence)
+            # S2S session manager — conversations land as per-turn transcript
+            # files that the extraction job mines (W0.5 parity), not as
+            # one-blob memories at close.
+            transcript_writer = (
+                await get_shared_writer(self._runtime.db)
+                if self._runtime and self._runtime.db is not None
+                else None
+            )
             s2s_manager = S2SSessionManager(
                 bridge=bridge,
-                memory_store=self._runtime.memory_store if self._runtime else None,
+                transcript_writer=transcript_writer,
             )
             await s2s_manager.start_reaper()
             logger.info(

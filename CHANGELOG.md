@@ -11,7 +11,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
-<<<<<<< HEAD
+- **Voice conversations now feed real memory extraction (W0.5).** S2S voice
+  conversations used to land in episodic memory as one growing raw blob per
+  session close — duplicated on replays, never mined for facts. They now
+  land as per-conversation transcripts (CC-transcript format, under
+  `~/.genesis/voice-transcripts/`, outside the Claude Code resume picker)
+  that the existing memory extraction job mines incrementally like every
+  other channel: facts, references, and a topic index instead of raw dumps.
+  A new authenticated `POST /v1/voice/conversation` endpoint lets a voice
+  edge machine deliver its conversation turns with replay-safe, idempotent
+  append semantics (double-fires and cumulative re-sends land exactly once,
+  and turns are durable before the endpoint acknowledges). Voice transcripts
+  are kept for 1 year (daily prune; an in-progress conversation is never
+  touched), and voice conversation rows are excluded from the Claude Code
+  session budget and the ego's capability self-model — they are
+  conversations, not work sessions.
 - **Genesis now keeps an honest, mechanical scorecard of its own confidence.**
   The cognitive ledger's graded predictions roll up into a unified calibration
   table (`calibration_cells`, migration 0069), recomputed after every grading
@@ -25,7 +39,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   mechanical-vs-LLM grading shares), and Deep/Strategic reflections now read
   their "when you report ~80% you're right ~60%" advisory from this real
   graded record instead of the legacy proto-calibration table.
-=======
 - **Voice graduation door (W0).** The core now exposes an authenticated
   `POST /v1/voice/graduate` endpoint where a voice edge machine can land
   typed "graduation" events (synthesized claims from ambient/meeting
@@ -37,7 +50,6 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   metadata schema also gains dormant provenance/trust columns
   (`provenance_class`, `trust_level`, `attribution`, `origin_ref`,
   `capture_clarity`) for that later phase.
->>>>>>> origin/main
 - **A runaway Claude Code temp write can no longer fill the container's root
   disk.** `~/.genesis/cc-tmp` — the scratch space every CC session (and
   genesis-server) writes to — now lives on its own size-capped incus storage
@@ -66,6 +78,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Legacy voice conversation blobs are swept from episodic memory.** The old
+  one-blob landing left duplicated, ever-growing "Voice conversation [...]"
+  memories polluting recall (and their vector embeddings polluting semantic
+  search). A daily voice-hygiene job now removes them across all storage
+  layers; it runs as a standing sweep (not a one-shot migration) so blobs
+  written by a voice edge that hasn't been updated yet are cleaned up too,
+  and it logs loudly when it finds any — a nonzero sweep after your edge is
+  current means a stale producer is back.
 - **`update.sh` no longer aborts on Serena's config churn.** `.serena/project.yml`
   is now install-local (untracked): Serena rewrites the file's comment block on
   its own version bumps, so any install running the Serena MCP went permanently

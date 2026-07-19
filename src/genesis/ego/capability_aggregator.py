@@ -101,7 +101,9 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     except Exception:
         logger.debug("Capability aggregation: procedural_memory unavailable")
 
-    # 5. CC sessions — completion rate by source_tag (30d)
+    # 5. CC sessions — completion rate by source_tag (30d). 'voice' rows are
+    # conversation transcript indexes, not CC work sessions — including them
+    # would fabricate an always-100%-complete "voice" capability domain.
     try:
         cur = await db.execute(
             """SELECT source_tag,
@@ -109,7 +111,7 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
                       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed
                FROM cc_sessions
                WHERE started_at >= datetime('now', '-30 days')
-                 AND source_tag != 'foreground'
+                 AND source_tag NOT IN ('foreground', 'voice')
                GROUP BY source_tag
                HAVING total >= 3"""
         )

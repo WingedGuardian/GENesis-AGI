@@ -51,10 +51,13 @@ class TestVoiceConfig:
             assert not s2s_enabled()
 
     def test_s2s_enabled_gemini(self):
-        with patch.dict("os.environ", {
-            "VOICE_S2S_PROVIDER": "gemini",
-            "GOOGLE_API_KEY": "test",
-        }):
+        with patch.dict(
+            "os.environ",
+            {
+                "VOICE_S2S_PROVIDER": "gemini",
+                "GOOGLE_API_KEY": "test",
+            },
+        ):
             assert s2s_enabled()
 
 
@@ -90,7 +93,8 @@ class TestGenesisBridge:
     async def test_ask_genesis_no_handler(self):
         bridge = GenesisBridge()
         result = await bridge.handle_tool_call(
-            "ask_genesis", json.dumps({"query": "test"}),
+            "ask_genesis",
+            json.dumps({"query": "test"}),
         )
         data = json.loads(result)
         assert "answer" in data  # Returns "handler not available"
@@ -101,7 +105,8 @@ class TestGenesisBridge:
 
         bridge = GenesisBridge(voice_handler=handler)
         result = await bridge.handle_tool_call(
-            "ask_genesis", json.dumps({"query": "what did we do yesterday?"}),
+            "ask_genesis",
+            json.dumps({"query": "what did we do yesterday?"}),
         )
         data = json.loads(result)
         assert "answer" in data
@@ -140,7 +145,8 @@ class TestGenesisBridge:
 
         bridge = GenesisBridge(voice_handler=handler)
         result = await bridge.handle_tool_call(
-            "ask_genesis", json.dumps({"query": "test"}),
+            "ask_genesis",
+            json.dumps({"query": "test"}),
         )
         data = json.loads(result)
         assert "answer" in data
@@ -150,7 +156,8 @@ class TestGenesisBridge:
     async def test_web_search_import_failure(self):
         bridge = GenesisBridge()
         result = await bridge.handle_tool_call(
-            "web_search", json.dumps({"query": "weather"}),
+            "web_search",
+            json.dumps({"query": "weather"}),
         )
         data = json.loads(result)
         assert isinstance(data, dict)
@@ -165,7 +172,8 @@ class TestGenesisBridge:
     async def test_approve_pending_no_gate(self):
         bridge = GenesisBridge()
         result = await bridge.handle_tool_call(
-            "approve_pending", json.dumps({"decision": "approved"}),
+            "approve_pending",
+            json.dumps({"decision": "approved"}),
         )
         data = json.loads(result)
         assert "error" in data
@@ -173,27 +181,38 @@ class TestGenesisBridge:
 
     async def test_approve_pending_success(self):
         gate = AsyncMock()
-        gate.resolve_pending_voice = AsyncMock(return_value={
-            "status": "resolved", "request_id": "abc12345", "label": "run tests",
-        })
+        gate.resolve_pending_voice = AsyncMock(
+            return_value={
+                "status": "resolved",
+                "request_id": "abc12345",
+                "label": "run tests",
+            }
+        )
 
         bridge = GenesisBridge(approval_gate=gate)
         result = await bridge.handle_tool_call(
-            "approve_pending", json.dumps({"decision": "approved"}),
+            "approve_pending",
+            json.dumps({"decision": "approved"}),
         )
         data = json.loads(result)
         assert "result" in data
         assert "approved" in data["result"]
         assert data["action"] == "run tests"
         gate.resolve_pending_voice.assert_awaited_once_with(
-            decision="approved", resolved_by="voice:s2s", request_id=None,
+            decision="approved",
+            resolved_by="voice:s2s",
+            request_id=None,
         )
 
     async def test_approve_pending_by_id(self):
         gate = AsyncMock()
-        gate.resolve_pending_voice = AsyncMock(return_value={
-            "status": "resolved", "request_id": "id-2", "label": "send email",
-        })
+        gate.resolve_pending_voice = AsyncMock(
+            return_value={
+                "status": "resolved",
+                "request_id": "id-2",
+                "label": "send email",
+            }
+        )
 
         bridge = GenesisBridge(approval_gate=gate)
         result = await bridge.handle_tool_call(
@@ -203,22 +222,27 @@ class TestGenesisBridge:
         data = json.loads(result)
         assert "result" in data
         gate.resolve_pending_voice.assert_awaited_once_with(
-            decision="approved", resolved_by="voice:s2s", request_id="id-2",
+            decision="approved",
+            resolved_by="voice:s2s",
+            request_id="id-2",
         )
 
     async def test_approve_pending_ambiguous_asks_which(self):
         gate = AsyncMock()
-        gate.resolve_pending_voice = AsyncMock(return_value={
-            "status": "ambiguous",
-            "candidates": [
-                {"id": "id-1", "label": "run tests"},
-                {"id": "id-2", "label": "send email"},
-            ],
-        })
+        gate.resolve_pending_voice = AsyncMock(
+            return_value={
+                "status": "ambiguous",
+                "candidates": [
+                    {"id": "id-1", "label": "run tests"},
+                    {"id": "id-2", "label": "send email"},
+                ],
+            }
+        )
 
         bridge = GenesisBridge(approval_gate=gate)
         result = await bridge.handle_tool_call(
-            "approve_pending", json.dumps({"decision": "approved"}),
+            "approve_pending",
+            json.dumps({"decision": "approved"}),
         )
         data = json.loads(result)
         assert "needs_clarification" in data
@@ -243,7 +267,8 @@ class TestGenesisBridge:
 
         bridge = GenesisBridge(approval_gate=gate)
         result = await bridge.handle_tool_call(
-            "approve_pending", json.dumps({"decision": "rejected"}),
+            "approve_pending",
+            json.dumps({"decision": "rejected"}),
         )
         data = json.loads(result)
         assert "error" in data
@@ -253,7 +278,8 @@ class TestGenesisBridge:
         gate = AsyncMock()
         bridge = GenesisBridge(approval_gate=gate)
         result = await bridge.handle_tool_call(
-            "approve_pending", json.dumps({"decision": "maybe"}),
+            "approve_pending",
+            json.dumps({"decision": "maybe"}),
         )
         data = json.loads(result)
         assert "error" in data
@@ -292,41 +318,52 @@ class TestGenesisBridge:
         try:
             mgr = ApprovalManager(db=conn)
             rid1 = await mgr.request_approval(
-                action_type="sentinel_dispatch", action_class="reversible",
+                action_type="sentinel_dispatch",
+                action_class="reversible",
                 description="investigate the disk alert",
             )
             rid2 = await mgr.request_approval(
-                action_type="autonomous_cli_fallback", action_class="reversible",
+                action_type="autonomous_cli_fallback",
+                action_class="reversible",
                 description="run the deploy script",
             )
             gate = AutonomousCliApprovalGate(
-                runtime=MagicMock(), approval_manager=mgr,
+                runtime=MagicMock(),
+                approval_manager=mgr,
             )
             bridge = GenesisBridge(approval_gate=gate)
 
             # Two pending -> bare "approve" refuses to guess.
-            amb = json.loads(await bridge.handle_tool_call(
-                "approve_pending", json.dumps({"decision": "approved"}),
-            ))
+            amb = json.loads(
+                await bridge.handle_tool_call(
+                    "approve_pending",
+                    json.dumps({"decision": "approved"}),
+                )
+            )
             assert "needs_clarification" in amb
             assert {p["request_id"] for p in amb["pending"]} == {rid1, rid2}
             assert (await mgr.get_by_id(rid1))["status"] == "pending"
             assert (await mgr.get_by_id(rid2))["status"] == "pending"
 
             # Resolve the specific one by id.
-            ok = json.loads(await bridge.handle_tool_call(
-                "approve_pending",
-                json.dumps({"decision": "approved", "request_id": rid2}),
-            ))
+            ok = json.loads(
+                await bridge.handle_tool_call(
+                    "approve_pending",
+                    json.dumps({"decision": "approved", "request_id": rid2}),
+                )
+            )
             assert ok["result"] == "Request approved"
             assert ok["action"] == "run the deploy script"
             assert (await mgr.get_by_id(rid2))["status"] == "approved"
             assert (await mgr.get_by_id(rid1))["status"] == "pending"
 
             # Now only one pending -> unambiguous resolution.
-            ok2 = json.loads(await bridge.handle_tool_call(
-                "approve_pending", json.dumps({"decision": "rejected"}),
-            ))
+            ok2 = json.loads(
+                await bridge.handle_tool_call(
+                    "approve_pending",
+                    json.dumps({"decision": "rejected"}),
+                )
+            )
             assert ok2["result"] == "Request rejected"
             assert (await mgr.get_by_id(rid1))["status"] == "rejected"
         finally:
@@ -601,59 +638,103 @@ class TestS2SSessionManager:
         assert out == "hi there"
         assert "sat-1" not in mgr._sessions
 
-    async def test_close_stores_transcript(self):
+    async def test_close_finalizes_transcript_session_not_a_blob_store(self):
+        """W0.5: close() marks the transcript session completed — the legacy
+        one-blob memory_store landing is gone (turns are written per-turn
+        via _record_turn as the conversation happens)."""
         from genesis.channels.voice.s2s_session import S2SSessionManager
 
-        store = AsyncMock()
-        store.store = AsyncMock(return_value="mem-123")
+        writer = MagicMock()
+        writer.close_session = AsyncMock()
+        writer.append_message = AsyncMock()
 
         bridge = GenesisBridge()
-        mgr = S2SSessionManager(bridge=bridge, memory_store=store)
+        mgr = S2SSessionManager(bridge=bridge, transcript_writer=writer)
         session = await mgr.get_or_create("sat-1")
         session.input_transcript = "What did we work on?"
         session.output_transcript = "We worked on voice pipeline."
 
         await mgr.close("sat-1")
 
-        store.store.assert_awaited_once()
-        call_kwargs = store.store.call_args
-        content = call_kwargs[0][0]  # first positional arg
-        assert "What did we work on?" in content
-        assert "We worked on voice pipeline." in content
-        assert call_kwargs[1]["source"] == "voice_s2s"
-        assert call_kwargs[1]["wing"] == "channels"
-        assert call_kwargs[1]["room"] == "voice"
+        writer.close_session.assert_awaited_once_with(session.session_id)
+        assert not hasattr(mgr, "_memory_store")
 
-    async def test_close_skips_store_when_empty(self):
+    async def test_close_skips_finalize_when_empty(self):
         from genesis.channels.voice.s2s_session import S2SSessionManager
 
-        store = AsyncMock()
-        store.store = AsyncMock()
+        writer = MagicMock()
+        writer.close_session = AsyncMock()
 
         bridge = GenesisBridge()
-        mgr = S2SSessionManager(bridge=bridge, memory_store=store)
+        mgr = S2SSessionManager(bridge=bridge, transcript_writer=writer)
         await mgr.get_or_create("sat-1")
         # No transcripts set
 
         await mgr.close("sat-1")
-        store.store.assert_not_awaited()
+        writer.close_session.assert_not_awaited()
 
-    async def test_close_handles_store_failure(self):
+    async def test_close_handles_writer_failure(self):
         from genesis.channels.voice.s2s_session import S2SSessionManager
 
-        store = AsyncMock()
-        store.store = AsyncMock(side_effect=Exception("DB error"))
+        writer = MagicMock()
+        writer.close_session = AsyncMock(side_effect=Exception("DB error"))
 
         bridge = GenesisBridge()
-        mgr = S2SSessionManager(bridge=bridge, memory_store=store)
+        mgr = S2SSessionManager(bridge=bridge, transcript_writer=writer)
         session = await mgr.get_or_create("sat-1")
         session.input_transcript = "hello"
         session.output_transcript = "hi"
 
-        # Should not raise — store failure is best-effort
+        # Should not raise — transcript finalize is best-effort
         inp, out = await mgr.close("sat-1")
         assert inp == "hello"
         assert out == "hi"
+
+    async def test_record_turn_writes_through_writer(self):
+        from genesis.channels.voice.s2s_session import S2SSessionManager
+
+        writer = MagicMock()
+        writer.append_message = AsyncMock()
+
+        bridge = GenesisBridge()
+        mgr = S2SSessionManager(bridge=bridge, transcript_writer=writer)
+        session = await mgr.get_or_create("sat-1")
+
+        await mgr._record_turn(session, "user", "what time is it")
+        await mgr._record_turn(session, "assistant", "half past three")
+        assert writer.append_message.await_args_list[0].args == (
+            session.session_id,
+            "user",
+            "what time is it",
+        )
+        assert writer.append_message.await_args_list[1].args == (
+            session.session_id,
+            "assistant",
+            "half past three",
+        )
+
+    async def test_record_turn_skips_blank_and_survives_writer_error(self):
+        from genesis.channels.voice.s2s_session import S2SSessionManager
+
+        writer = MagicMock()
+        writer.append_message = AsyncMock(side_effect=Exception("disk full"))
+
+        bridge = GenesisBridge()
+        mgr = S2SSessionManager(bridge=bridge, transcript_writer=writer)
+        session = await mgr.get_or_create("sat-1")
+
+        await mgr._record_turn(session, "user", "   ")
+        writer.append_message.assert_not_awaited()
+        # Error path must not raise (best-effort recording)
+        await mgr._record_turn(session, "user", "hello")
+
+    async def test_record_turn_noop_without_writer(self):
+        from genesis.channels.voice.s2s_session import S2SSessionManager
+
+        bridge = GenesisBridge()
+        mgr = S2SSessionManager(bridge=bridge)
+        session = await mgr.get_or_create("sat-1")
+        await mgr._record_turn(session, "user", "hello")  # must not raise
 
 
 # ─── Voice hours + _should_voice tests ─────────────────────────────────
@@ -736,7 +817,9 @@ class TestVoiceHours:
         pipe = self._make_pipeline(has_voice=False)
         req = OutreachRequest(
             category=OutreachCategory.ALERT,
-            topic="test", context="test", salience_score=1.0,
+            topic="test",
+            context="test",
+            salience_score=1.0,
             source_id="infra:disk_low",
         )
         with patch.object(pipe, "_in_voice_hours", return_value=True):
@@ -756,7 +839,10 @@ class TestVoiceHours:
             OutreachCategory.APPROVAL,
         ):
             req = OutreachRequest(
-                category=cat, topic="t", context="t", salience_score=1.0,
+                category=cat,
+                topic="t",
+                context="t",
+                salience_score=1.0,
             )
             with patch.object(pipe, "_in_voice_hours", return_value=True):
                 assert not pipe._should_voice(req), f"category={cat}"
@@ -768,8 +854,11 @@ class TestVoiceHours:
         pipe = self._make_pipeline()
         req = OutreachRequest(
             category=OutreachCategory.BLOCKER,
-            topic="t", context="t", salience_score=1.0,
-            signal_type="health_alert", source_id="infra:disk_low",
+            topic="t",
+            context="t",
+            salience_score=1.0,
+            signal_type="health_alert",
+            source_id="infra:disk_low",
         )
         with patch.object(pipe, "_in_voice_hours", return_value=True):
             assert pipe._should_voice(req)
@@ -781,7 +870,9 @@ class TestVoiceHours:
         pipe = self._make_pipeline()
         req = OutreachRequest(
             category=OutreachCategory.BLOCKER,
-            topic="t", context="t", salience_score=1.0,
+            topic="t",
+            context="t",
+            salience_score=1.0,
             signal_type="health_alert",
             source_id="queue:stale_dead_letters,infra:disk_low",
         )
@@ -795,7 +886,9 @@ class TestVoiceHours:
         pipe = self._make_pipeline()
         req = OutreachRequest(
             category=OutreachCategory.BLOCKER,
-            topic="t", context="t", salience_score=1.0,
+            topic="t",
+            context="t",
+            salience_score=1.0,
             signal_type="sentinel_escalation",
             source_id="sentinel-escalation:mem:123",
         )
@@ -816,8 +909,11 @@ class TestVoiceHours:
         ):
             req = OutreachRequest(
                 category=OutreachCategory.ALERT,
-                topic="t", context="t", salience_score=1.0,
-                signal_type=signal, source_id="task:abc123",
+                topic="t",
+                context="t",
+                salience_score=1.0,
+                signal_type=signal,
+                source_id="task:abc123",
             )
             with patch.object(pipe, "_in_voice_hours", return_value=True):
                 assert pipe._should_voice(req) is expected, f"signal={signal}"
@@ -829,7 +925,9 @@ class TestVoiceHours:
         pipe = self._make_pipeline()
         req = OutreachRequest(
             category=OutreachCategory.BLOCKER,
-            topic="t", context="t", salience_score=1.0,
+            topic="t",
+            context="t",
+            salience_score=1.0,
             signal_type="critical_observation",
             source_id="obs-uuid-1,obs-uuid-2",
         )
@@ -843,8 +941,11 @@ class TestVoiceHours:
         pipe = self._make_pipeline()
         req = OutreachRequest(
             category=OutreachCategory.APPROVAL,
-            topic="t", context="t", salience_score=1.0,
-            signal_type="cli_approval", source_id="cli-approval:42",
+            topic="t",
+            context="t",
+            salience_score=1.0,
+            signal_type="cli_approval",
+            source_id="cli-approval:42",
         )
         with patch.object(pipe, "_in_voice_hours", return_value=True):
             assert not pipe._should_voice(req)
@@ -856,7 +957,9 @@ class TestVoiceHours:
         pipe = self._make_pipeline(voice_alert_ids=("provider:credit_exhaustion",))
         req = OutreachRequest(
             category=OutreachCategory.BLOCKER,
-            topic="t", context="t", salience_score=1.0,
+            topic="t",
+            context="t",
+            salience_score=1.0,
             source_id="provider:credit_exhaustion:deepinfra",
         )
         with patch.object(pipe, "_in_voice_hours", return_value=True):
@@ -869,7 +972,9 @@ class TestVoiceHours:
         pipe = self._make_pipeline()
         req = OutreachRequest(
             category=OutreachCategory.BLOCKER,
-            topic="t", context="t", salience_score=1.0,
+            topic="t",
+            context="t",
+            salience_score=1.0,
             source_id="infra:disk_low",
         )
         with patch.object(pipe, "_in_voice_hours", return_value=False):

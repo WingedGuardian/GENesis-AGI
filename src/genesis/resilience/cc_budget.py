@@ -57,11 +57,17 @@ class CCBudgetTracker:
             )
 
     async def _count_recent_sessions(self) -> int:
-        """Count sessions started in the last hour (active or completed)."""
+        """Count sessions started in the last hour (active or completed).
+
+        Voice conversation rows (source_tag='voice') are transcript-index
+        entries, not CC invocations — they must not consume the budget or
+        trigger throttling.
+        """
         cutoff = (self._clock() - timedelta(hours=1)).isoformat()
         cursor = await self._db.execute(
             """SELECT COUNT(*) FROM cc_sessions
-               WHERE started_at > ? AND status IN ('active', 'completed', 'expired')""",
+               WHERE started_at > ? AND status IN ('active', 'completed', 'expired')
+                 AND source_tag != 'voice'""",
             (cutoff,),
         )
         row = await cursor.fetchone()
