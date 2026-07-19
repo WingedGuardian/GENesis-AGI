@@ -122,6 +122,27 @@ class TestSnapshotSplit:
         assert result["deferred_recovery"] == 2  # alarm-eligible
 
     @pytest.mark.asyncio
+    async def test_deferred_items_sample_excludes_batch_worklists(self, db):
+        # The "Deferred review" card renders `deferred_items`. Batch worklists
+        # drain on a daily budget and sit pending for days by design, so they
+        # must not crowd the sample or surface as items "needing review" — even
+        # when they dominate the pending set (400 dream slices was the live
+        # trigger). Only genuine recovery items belong here.
+        import importlib
+
+        qmod = importlib.import_module("genesis.observability.snapshots.queues")
+
+        await _seed_recovery(db, 2)
+        await _seed_worklist(db, 50, age_days=0.0)  # batch flood
+
+        result = await qmod.queues(db, _queue(db), None)
+
+        sampled_types = {item["type"] for item in result["deferred_items"]}
+        assert WORKLIST_TYPE not in sampled_types
+        assert sampled_types == {"reflection"}
+        assert len(result["deferred_items"]) == 2
+
+    @pytest.mark.asyncio
     async def test_queues_snapshot_no_queue_is_zero(self, db):
         import importlib
 
