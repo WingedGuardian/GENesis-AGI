@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
-from genesis.env import cc_project_dir
+from genesis.env import cc_project_dir, voice_transcript_dir
 from genesis.learning.procedural.judge import ProcedureBuilderUnavailable
 from genesis.memory.extraction import (
     RETRY_PROMPT,
@@ -45,8 +45,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Session types eligible for extraction
-_EXTRACTABLE_SOURCE_TAGS = {"foreground", "inbox"}
+# Session types eligible for extraction. 'voice' rows are written by the
+# voice transcript writer (channels/voice/transcript_writer.py) — their
+# transcripts live in voice_transcript_dir(), not the CC projects dir.
+_EXTRACTABLE_SOURCE_TAGS = {"foreground", "inbox", "voice"}
 
 # Transcript directory
 _TRANSCRIPT_DIR = Path.home() / ".claude" / "projects" / cc_project_dir()
@@ -76,6 +78,7 @@ async def _check_claim_duplicate(
     to confirm. Deduplicates across all sessions.
     """
     import re
+
     # Use a simple alphanumeric tokenizer inline rather than importing
     # the private _extract_terms. Avoids cross-module private API coupling.
     words = re.findall(r"[a-z0-9]+", content.lower())
@@ -90,8 +93,7 @@ async def _check_claim_duplicate(
 
     try:
         cursor = await db.execute(
-            "SELECT memory_id, content FROM memory_fts "
-            "WHERE memory_fts MATCH ? LIMIT ?",
+            "SELECT memory_id, content FROM memory_fts WHERE memory_fts MATCH ? LIMIT ?",
             (fts_query, fts5_limit),
         )
         rows = await cursor.fetchall()
@@ -160,11 +162,7 @@ async def run_extraction_cycle(
     # (``if not messages: continue``) — this drain is the only path that recovers
     # them. Skipped for the history-mining / filtered invocations, which don't
     # own production extraction state.
-    if (
-        not reference_only_mode
-        and start_line_override is None
-        and session_filter is None
-    ):
+    if not reference_only_mode and start_line_override is None and session_filter is None:
         try:
             await _drain_procedure_rebuilds(
                 db=db,
@@ -189,6 +187,11 @@ async def run_extraction_cycle(
         else:
             last_line = session.get("last_extracted_line") or 0
         transcript_path = _find_transcript(transcript_dir, cc_session_id)
+        if not transcript_path and session.get("source_tag") == "voice":
+            # Voice sessions keep their transcripts outside the CC projects
+            # dir (same CC-JSONL format, written by the voice transcript
+            # writer) so the CC resume picker never lists them.
+            transcript_path = _find_transcript(voice_transcript_dir(), cc_session_id)
 
         if not transcript_path:
             continue
@@ -228,7 +231,10 @@ async def run_extraction_cycle(
                 summary["errors"] += 1
                 logger.error(
                     "Extraction parse error for session %s chunk %d-%d: %s",
-                    session_id, chunk_start, chunk_end, result.parse_error,
+                    session_id,
+                    chunk_start,
+                    chunk_end,
+                    result.parse_error,
                 )
                 continue
 
@@ -243,7 +249,9 @@ async def run_extraction_cycle(
                 logger.warning(
                     "Zero entities extracted from session %s chunk %d-%d "
                     "(possible extraction quality issue)",
-                    session_id, chunk_start, chunk_end,
+                    session_id,
+                    chunk_start,
+                    chunk_end,
                 )
                 continue
 
@@ -256,9 +264,7 @@ async def run_extraction_cycle(
                 # Gate reference auto-capture to the USER's own words — the
                 # classifier must not mine Genesis's analysis prose (the
                 # dominant source of junk refs) for credentials/IPs/URLs.
-                chunk_user_text = "\n".join(
-                    m.text for m in chunk if m.role == "user"
-                )
+                chunk_user_text = "\n".join(m.text for m in chunk if m.role == "user")
                 ref_count = await extract_references_from_chunk(
                     result.extractions,
                     store=store,
@@ -275,7 +281,10 @@ async def run_extraction_cycle(
                 # pipeline — log and continue.
                 logger.warning(
                     "Reference extractor failed on session %s chunk %d-%d",
-                    session_id, chunk_start, chunk_end, exc_info=True,
+                    session_id,
+                    chunk_start,
+                    chunk_end,
+                    exc_info=True,
                 )
 
             # Stream 2: procedure candidate flagging (C2b — flag-only). The SLM
@@ -291,13 +300,14 @@ async def run_extraction_cycle(
                         extract_procedures_from_chunk,
                     )
 
-                    session_candidates.extend(
-                        extract_procedures_from_chunk(result.extractions)
-                    )
+                    session_candidates.extend(extract_procedures_from_chunk(result.extractions))
                 except Exception:
                     logger.warning(
                         "Procedure candidate flagging failed on session %s chunk %d-%d",
-                        session_id, chunk_start, chunk_end, exc_info=True,
+                        session_id,
+                        chunk_start,
+                        chunk_end,
+                        exc_info=True,
                     )
 
             if reference_only_mode:
@@ -321,17 +331,21 @@ async def run_extraction_cycle(
                 # source transcript chunk. Demote confidence for ungrounded
                 # extractions. See memory-immune-system-design.md §1.1.
                 overlap_result = verify_source_overlap(
-                    extraction.content, source_text,
+                    extraction.content,
+                    source_text,
                 )
                 if not overlap_result.verified:
                     extraction.confidence = max(
-                        extraction.confidence - 0.3, 0.1,
+                        extraction.confidence - 0.3,
+                        0.1,
                     )
                     logger.info(
                         "Source-overlap FAIL for extraction in session %s "
                         "(overlap=%.2f, confidence demoted to %.2f): %.80s",
-                        session_id, overlap_result.overlap,
-                        extraction.confidence, extraction.content,
+                        session_id,
+                        overlap_result.overlap,
+                        extraction.confidence,
+                        extraction.content,
                     )
 
                 # ── Cross-session claim dedup ──
@@ -340,7 +354,8 @@ async def run_extraction_cycle(
                 # See memory-immune-system-design.md §1.2.
                 try:
                     is_dup = await _check_claim_duplicate(
-                        db, extraction.content,
+                        db,
+                        extraction.content,
                     )
                     if is_dup:
                         summary.setdefault("claims_deduped", 0)
@@ -348,7 +363,8 @@ async def run_extraction_cycle(
                         logger.info(
                             "Cross-session dedup: skipping extraction in "
                             "session %s (duplicate of existing memory): %.80s",
-                            session_id, extraction.content,
+                            session_id,
+                            extraction.content,
                         )
                         continue  # Skip this extraction entirely
                 except Exception:
@@ -370,7 +386,8 @@ async def run_extraction_cycle(
                     # extraction cycle from hammering the embedding backend
                     # with hundreds of sequential calls.
                     memory_id = await store.store(
-                        **kwargs, force_fts5_only=True,
+                        **kwargs,
+                        force_fts5_only=True,
                     )
                     summary["entities_extracted"] += 1
                     # Count source-unverified only for stored extractions
@@ -378,14 +395,13 @@ async def run_extraction_cycle(
                         summary.setdefault("source_unverified", 0)
                         summary["source_unverified"] += 1
                     session_extraction_count += 1
-                    _newly_stored.append(
-                        (memory_id, extraction.content, cc_session_id)
-                    )
+                    _newly_stored.append((memory_id, extraction.content, cc_session_id))
 
                     # Store SVO event if temporal + verb present
                     if extraction.event_verb and extraction.temporal:
                         try:
                             from genesis.db.crud import memory_events
+
                             await memory_events.insert(
                                 db,
                                 memory_id=memory_id,
@@ -402,19 +418,22 @@ async def run_extraction_cycle(
                             summary["events_failed"] += 1
                             logger.warning(
                                 "Failed to store SVO event for %s",
-                                memory_id, exc_info=True,
+                                memory_id,
+                                exc_info=True,
                             )
 
                     # Create typed links from extraction relationships
                     if linker and extraction.relationships:
                         try:
                             await linker.create_typed_links(
-                                memory_id, extraction.relationships,
+                                memory_id,
+                                extraction.relationships,
                             )
                         except Exception:
                             logger.error(
                                 "Failed to create typed links for %s",
-                                memory_id, exc_info=True,
+                                memory_id,
+                                exc_info=True,
                             )
 
                     # Entity layer (E3): give extracted entities and
@@ -428,7 +447,9 @@ async def run_extraction_cycle(
                             )
 
                             entity_counts = await record_extraction(
-                                db, memory_id, extraction,
+                                db,
+                                memory_id,
+                                extraction,
                             )
                             summary.setdefault("entity_mentions", 0)
                             summary.setdefault("entity_links", 0)
@@ -437,7 +458,8 @@ async def run_extraction_cycle(
                         except Exception:
                             logger.warning(
                                 "Entity-layer recording failed for %s",
-                                memory_id, exc_info=True,
+                                memory_id,
+                                exc_info=True,
                             )
 
                     # Goal signal detection — DISABLED: keyword matcher
@@ -452,29 +474,33 @@ async def run_extraction_cycle(
                         from genesis.memory.contact_tracker import (
                             process_extraction as _track_contact,
                         )
+
                         n = await _track_contact(
-                            db, extraction,
+                            db,
+                            extraction,
                             source_session_id=cc_session_id,
                         )
                         summary["contacts_detected"] += n
                     except Exception:
                         logger.debug(
                             "Contact tracker failed for %s",
-                            memory_id, exc_info=True,
+                            memory_id,
+                            exc_info=True,
                         )
                 except Exception:
                     summary["errors"] += 1
                     logger.error(
                         "Failed to store extraction from session %s",
-                        session_id, exc_info=True,
+                        session_id,
+                        exc_info=True,
                     )
 
             # Check per-session cap after storing this chunk's extractions
             if session_extraction_count >= max_extractions_per_session:
                 logger.info(
-                    "Hit per-session extraction cap (%d) for session %s, "
-                    "skipping remaining chunks",
-                    max_extractions_per_session, session_id,
+                    "Hit per-session extraction cap (%d) for session %s, skipping remaining chunks",
+                    max_extractions_per_session,
+                    session_id,
                 )
                 break
 
@@ -486,8 +512,10 @@ async def run_extraction_cycle(
             await _update_watermark(db, session_id, max_line)
             if all_keywords or latest_topic:
                 await _update_session_index(
-                    db, session_id,
-                    keywords=all_keywords, topic=latest_topic,
+                    db,
+                    session_id,
+                    keywords=all_keywords,
+                    topic=latest_topic,
                 )
 
             # Stream 1: the whole-session procedure BUILDER (runs once per
@@ -509,9 +537,8 @@ async def run_extraction_cycle(
                 struggle_score = score_struggle(spine)
                 struggle_triggered = struggle_score >= STRUGGLE_THRESHOLD
                 if (
-                    (struggle_triggered or session_candidates)
-                    and session_procs < max_procedures_per_session
-                ):
+                    struggle_triggered or session_candidates
+                ) and session_procs < max_procedures_per_session:
                     from genesis.learning.procedural.judge import (
                         JUDGE_TIMEOUT_SECS,
                         judge_multi_procedure,
@@ -519,7 +546,11 @@ async def run_extraction_cycle(
 
                     stored_ids = await asyncio.wait_for(
                         judge_multi_procedure(
-                            db, spine, haystack, struggle_score, router,
+                            db,
+                            spine,
+                            haystack,
+                            struggle_score,
+                            router,
                             source_session_id=cc_session_id,
                             max_new=max_procedures_per_session - session_procs,
                         ),
@@ -527,21 +558,25 @@ async def run_extraction_cycle(
                     )
                     session_procs += len(stored_ids)
                     if stored_ids:
-                        summary["struggle_procedures"] = (
-                            summary.get("struggle_procedures", 0) + len(stored_ids)
-                        )
+                        summary["struggle_procedures"] = summary.get(
+                            "struggle_procedures", 0
+                        ) + len(stored_ids)
                     # Measure SLM over-flagging: the builder fired on chunk
                     # candidates alone, with no struggle signal.
                     if session_candidates and not struggle_triggered:
                         logger.info(
                             "Procedure builder fired on candidates-only for %s "
                             "(%d candidates, score=%.2f): stored=%d",
-                            session_id, len(session_candidates), struggle_score,
+                            session_id,
+                            len(session_candidates),
+                            struggle_score,
                             len(stored_ids),
                         )
                     logger.info(
                         "Procedure builder for %s: score=%.2f, candidates=%d, stored=%d",
-                        session_id, struggle_score, len(session_candidates),
+                        session_id,
+                        struggle_score,
+                        len(session_candidates),
                         len(stored_ids),
                     )
             except (ProcedureBuilderUnavailable, TimeoutError) as exc:
@@ -556,8 +591,9 @@ async def run_extraction_cycle(
                 # self-commit and the deferred memory_events was committed by the
                 # watermark update above.
                 logger.warning(
-                    "Procedure builder unavailable for session %s (%s) — "
-                    "re-queuing for rebuild", session_id, type(exc).__name__,
+                    "Procedure builder unavailable for session %s (%s) — re-queuing for rebuild",
+                    session_id,
+                    type(exc).__name__,
                 )
                 await _enqueue_procedure_rebuild(db, session_id, cc_session_id)
             except Exception:
@@ -566,7 +602,8 @@ async def run_extraction_cycle(
                 # connection — see above).
                 logger.warning(
                     "Procedure builder failed for session %s",
-                    session_id, exc_info=True,
+                    session_id,
+                    exc_info=True,
                 )
 
         summary["sessions_processed"] += 1
@@ -590,7 +627,9 @@ async def run_extraction_cycle(
 
 
 async def _enqueue_procedure_rebuild(
-    db: aiosqlite.Connection, session_id: str, cc_session_id: str,
+    db: aiosqlite.Connection,
+    session_id: str,
+    cc_session_id: str,
 ) -> None:
     """Re-queue a session whose procedure build died on provider exhaustion.
 
@@ -611,16 +650,15 @@ async def _enqueue_procedure_rebuild(
             work_type=_PROCEDURE_REBUILD_WORK,
             call_site_id="38_procedure_extraction",
             priority=MEMORY_OPS,
-            payload=json.dumps(
-                {"session_id": session_id, "cc_session_id": cc_session_id}
-            ),
+            payload=json.dumps({"session_id": session_id, "cc_session_id": cc_session_id}),
             reason="procedure builder provider-exhausted; watermark already advanced",
             staleness_policy=DRAIN,
         )
     except Exception:
         logger.error(
             "Failed to enqueue procedure rebuild for session %s",
-            session_id, exc_info=True,
+            session_id,
+            exc_info=True,
         )
 
 
@@ -656,7 +694,9 @@ async def _drain_procedure_rebuilds(
 
     queue = DeferredWorkQueue(db)
     items = await dw_crud.query_pending(
-        db, work_type=_PROCEDURE_REBUILD_WORK, limit=20,
+        db,
+        work_type=_PROCEDURE_REBUILD_WORK,
+        limit=20,
     )
     for item in items:
         item_id = item["id"]
@@ -673,9 +713,7 @@ async def _drain_procedure_rebuilds(
             continue
 
         cc_session_id = payload.get("cc_session_id") or payload.get("session_id")
-        transcript_path = (
-            _find_transcript(transcript_dir, cc_session_id) if cc_session_id else None
-        )
+        transcript_path = _find_transcript(transcript_dir, cc_session_id) if cc_session_id else None
         if not transcript_path:
             # Transcript rotated/gone — nothing to rebuild from.
             await queue.mark_discarded(item_id, "transcript not found")
@@ -687,20 +725,24 @@ async def _drain_procedure_rebuilds(
             score = score_struggle(spine)
             stored_ids = await asyncio.wait_for(
                 judge_multi_procedure(
-                    db, spine, haystack, score, router,
+                    db,
+                    spine,
+                    haystack,
+                    score,
+                    router,
                     source_session_id=cc_session_id,
                     max_new=max_procedures_per_session,
                 ),
                 timeout=JUDGE_TIMEOUT_SECS,
             )
             await queue.mark_completed(item_id)
-            summary["procedures_rebuilt"] = (
-                summary.get("procedures_rebuilt", 0) + len(stored_ids)
-            )
+            summary["procedures_rebuilt"] = summary.get("procedures_rebuilt", 0) + len(stored_ids)
             if stored_ids:
                 logger.info(
                     "Rebuilt %d procedure(s) for session %s (attempt %d)",
-                    len(stored_ids), cc_session_id, attempts + 1,
+                    len(stored_ids),
+                    cc_session_id,
+                    attempts + 1,
                 )
         except (ProcedureBuilderUnavailable, TimeoutError):
             # Providers still down — keep it pending for a later cycle. No
@@ -712,7 +754,8 @@ async def _drain_procedure_rebuilds(
             # Deterministic failure (bad transcript / parse) — don't loop forever.
             logger.warning(
                 "Procedure rebuild failed permanently for session %s",
-                cc_session_id, exc_info=True,
+                cc_session_id,
+                exc_info=True,
             )
             await queue.mark_discarded(item_id, "rebuild raised non-retryable error")
 
@@ -752,7 +795,8 @@ async def _exhaust_procedure_rebuild(db: aiosqlite.Connection, queue, item: dict
         )
     logger.warning(
         "Procedure rebuild EXHAUSTED for session %s after %d attempts",
-        cc_session_id, _MAX_PROCEDURE_REBUILD_ATTEMPTS,
+        cc_session_id,
+        _MAX_PROCEDURE_REBUILD_ATTEMPTS,
     )
 
 
@@ -784,6 +828,7 @@ async def _find_extractable_sessions(
                     continue
                 # Auto-register as foreground session
                 import uuid as _uuid
+
                 try:
                     _uuid.UUID(session_id)  # validate UUID format
                 except ValueError:
@@ -791,7 +836,8 @@ async def _find_extractable_sessions(
 
                 # Get file mtime as approximate start time
                 mtime = datetime.fromtimestamp(
-                    jsonl_file.stat().st_mtime, tz=UTC,
+                    jsonl_file.stat().st_mtime,
+                    tz=UTC,
                 )
                 mtime_iso = mtime.isoformat()
                 await sessions_crud.register_from_filesystem(
@@ -808,7 +854,8 @@ async def _find_extractable_sessions(
 
     # Phase 2: Query all extractable sessions (including newly registered ones)
     return await sessions_crud.get_extractable(
-        db, source_tags=_EXTRACTABLE_SOURCE_TAGS,
+        db,
+        source_tags=_EXTRACTABLE_SOURCE_TAGS,
     )
 
 
@@ -822,7 +869,8 @@ async def _update_watermark(
 
     now_iso = datetime.now(UTC).isoformat()
     await sessions_crud.update_extraction_watermark(
-        db, session_id,
+        db,
+        session_id,
         last_extracted_line=line_number,
         last_extracted_at=now_iso,
     )
@@ -853,11 +901,16 @@ async def _update_session_index(
     keywords_str = ", ".join(merged)
 
     await sessions_crud.update_topic_and_keywords(
-        db, session_id, topic=topic, keywords=keywords_str,
+        db,
+        session_id,
+        topic=topic,
+        keywords=keywords_str,
     )
     logger.info(
         "Session %s indexed: topic=%r, keywords=%d",
-        session_id[:8], topic[:60], len(merged),
+        session_id[:8],
+        topic[:60],
+        len(merged),
     )
 
 
@@ -913,7 +966,10 @@ async def _extract_chunk(
             else:
                 messages = [
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "(previous attempt failed to produce valid JSON)"},
+                    {
+                        "role": "assistant",
+                        "content": "(previous attempt failed to produce valid JSON)",
+                    },
                     {"role": "user", "content": RETRY_PROMPT},
                 ]
 
@@ -950,7 +1006,9 @@ async def _extract_chunk(
             if attempt < max_retries - 1:
                 logger.warning(
                     "Extraction parse failed (attempt %d/%d): %s",
-                    attempt + 1, max_retries, exc,
+                    attempt + 1,
+                    max_retries,
+                    exc,
                 )
                 continue
             return ExtractionResult(
@@ -962,7 +1020,9 @@ async def _extract_chunk(
             )
         except Exception as exc:
             logger.error(
-                "Extraction LLM call failed: %s", exc, exc_info=True,
+                "Extraction LLM call failed: %s",
+                exc,
+                exc_info=True,
             )
             return ExtractionResult(
                 extractions=[],

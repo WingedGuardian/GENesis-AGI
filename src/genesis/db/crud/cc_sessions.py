@@ -389,6 +389,53 @@ async def register_from_filesystem(
     return cursor.rowcount > 0
 
 
+async def register_voice_session(
+    db: aiosqlite.Connection,
+    *,
+    id: str,
+    started_at: str,
+    channel: str = "voice_s2s",
+) -> bool:
+    """Register a voice conversation session for memory extraction.
+
+    Voice sessions are not CC invocations: they carry ``source_tag='voice'``
+    so extraction picks them up while the CC-budget counter and ego
+    capability aggregator exclude them. ``session_type='foreground'`` is the
+    closest CHECK-constraint member (user-facing conversation).
+
+    INSERT OR IGNORE + deterministic ids (uuid5 of the external session id)
+    make re-registration idempotent across restarts and replays.
+    Returns True if a new row was inserted.
+    """
+    cursor = await db.execute(
+        "INSERT OR IGNORE INTO cc_sessions "
+        "(id, cc_session_id, session_type, channel, model, source_tag, "
+        " status, started_at, last_activity_at) "
+        "VALUES (?, ?, 'foreground', ?, 'voice', 'voice', "
+        " 'active', ?, ?)",
+        (id, id, channel, started_at, started_at),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def complete_orphaned_voice_sessions(db: aiosqlite.Connection) -> int:
+    """Mark stale ``active`` voice sessions as completed.
+
+    Voice sessions never survive a server restart, but the foreground
+    session_type exempts them from ``cleanup_stale`` — without this, a crash
+    between conversation start and close leaves an ``active`` row forever.
+    Called on transcript-writer construction (boot); keyed on observable
+    state, so it is safe to run any time.
+    """
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET status = 'completed' "
+        "WHERE source_tag = 'voice' AND status = 'active'",
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def get_extractable(
     db: aiosqlite.Connection,
     *,

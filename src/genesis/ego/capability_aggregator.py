@@ -32,6 +32,7 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     # events, not user decisions on proposal quality.
     try:
         from genesis.db.crud import intervention_journal as journal_crud
+
         aggs = await journal_crud.aggregate_by_type(db)
         for row in aggs:
             domain = row["action_type"]
@@ -101,7 +102,9 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     except Exception:
         logger.debug("Capability aggregation: procedural_memory unavailable")
 
-    # 5. CC sessions — completion rate by source_tag (30d)
+    # 5. CC sessions — completion rate by source_tag (30d). 'voice' rows are
+    # conversation transcript indexes, not CC work sessions — including them
+    # would fabricate an always-100%-complete "voice" capability domain.
     try:
         cur = await db.execute(
             """SELECT source_tag,
@@ -109,7 +112,7 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
                       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed
                FROM cc_sessions
                WHERE started_at >= datetime('now', '-30 days')
-                 AND source_tag != 'foreground'
+                 AND source_tag NOT IN ('foreground', 'voice')
                GROUP BY source_tag
                HAVING total >= 3"""
         )
@@ -135,9 +138,7 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
         cfg = load_ego_config()
         # Default OFF: enable ONLY on an explicit True (a YAML null / missing key
         # / falsey value all keep it off, so it can't be silently enabled).
-        outcome_bus_enabled = (
-            getattr(cfg, "outcome_bus_capability_feed", False) is True
-        )
+        outcome_bus_enabled = getattr(cfg, "outcome_bus_capability_feed", False) is True
     except Exception:
         logger.debug("Capability aggregation: ego config unreadable; outcome bus OFF")
 
@@ -145,9 +146,7 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
         try:
             from genesis.db.crud import outcome_events as oe_crud
 
-            rows = await oe_crud.aggregate_by_domain(
-                db, tier=1, source="surplus", days=30
-            )
+            rows = await oe_crud.aggregate_by_domain(db, tier=1, source="surplus", days=30)
             for row in rows:
                 n = row.get("n") or 0
                 # Noise gate — mirrors cc_sessions' HAVING total >= 3.
@@ -229,9 +228,7 @@ class _DomainAccumulator:
         field_scores = {source: rate for source, rate, _ in self.signals}
         # Arithmetic mean as fallback if rates are out-of-range (shouldn't
         # happen, but DB values could be corrupted)
-        arithmetic_mean = round(
-            sum(rate * n for _, rate, n in self.signals) / total_weight, 3
-        )
+        arithmetic_mean = round(sum(rate * n for _, rate, n in self.signals) / total_weight, 3)
         try:
             confidence = round(inverse_confidence_weight(field_scores), 3)
         except ValueError:

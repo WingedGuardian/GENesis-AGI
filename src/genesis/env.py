@@ -254,6 +254,18 @@ def output_dir() -> Path:
     return Path(value).expanduser() if value else genesis_home() / "output"
 
 
+def voice_transcript_dir() -> Path:
+    """Voice conversation transcripts (~/.genesis/voice-transcripts).
+
+    Per-session CC-format JSONL written by the voice transcript writer and
+    read incrementally by the memory extraction job. Deliberately outside
+    both the repo tree and Claude Code's projects directory (so the CC
+    resume picker never lists voice sessions).
+    """
+    value = os.environ.get("GENESIS_VOICE_TRANSCRIPT_DIR")
+    return Path(value).expanduser() if value else genesis_home() / "voice-transcripts"
+
+
 def cc_project_dir() -> str:
     """Claude Code project directory name, derived from repo root path.
 

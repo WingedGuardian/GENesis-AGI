@@ -39,7 +39,7 @@ from genesis.channels.voice.genesis_bridge import (
 )
 
 if TYPE_CHECKING:
-    from genesis.memory.store import MemoryStore
+    from genesis.channels.voice.transcript_writer import VoiceTranscriptWriter
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ class S2SSession:
     _conn_mgr: object | None = field(default=None, repr=False)
     input_transcript: str = ""
     output_transcript: str = ""
+    _turn_output: str = ""  # current turn's assistant text (reset per turn)
     turn_count: int = 0
     _closed: bool = False
 
@@ -84,11 +85,11 @@ class S2SSessionManager:
         self,
         *,
         bridge: GenesisBridge,
-        memory_store: MemoryStore | None = None,
+        transcript_writer: VoiceTranscriptWriter | None = None,
         max_idle_seconds: int = 300,
     ) -> None:
         self._bridge = bridge
-        self._memory_store = memory_store
+        self._transcript_writer = transcript_writer
         self._max_idle_seconds = max_idle_seconds
         self._sessions: dict[str, S2SSession] = {}
         self._client: openai.AsyncOpenAI | None = None
@@ -97,8 +98,10 @@ class S2SSessionManager:
     async def start_reaper(self) -> None:
         """Start the idle session reaper (runs every 15s)."""
         from genesis.util.tasks import tracked_task
+
         self._reaper_task = tracked_task(
-            self._reap_loop(), name="s2s-session-reaper",
+            self._reap_loop(),
+            name="s2s-session-reaper",
         )
 
     async def _reap_loop(self) -> None:
@@ -107,7 +110,8 @@ class S2SSessionManager:
             await asyncio.sleep(15)
             now = datetime.now(UTC)
             stale = [
-                sat_id for sat_id, s in self._sessions.items()
+                sat_id
+                for sat_id, s in self._sessions.items()
                 if (now - s.last_activity).total_seconds() > self._max_idle_seconds
                 and not s._closed
             ]
@@ -149,11 +153,13 @@ class S2SSessionManager:
         # server VAD, 24kHz PCM. We use conversation.item.create for audio
         # input so VAD doesn't interfere with bulk utterances from Wyoming.
         system_prompt = self._bridge.get_system_prompt()
-        await conn.session.update(session={
-            "type": "realtime",
-            "instructions": system_prompt,
-            "tools": TOOL_DECLARATIONS,
-        })
+        await conn.session.update(
+            session={
+                "type": "realtime",
+                "instructions": system_prompt,
+                "tools": TOOL_DECLARATIONS,
+            }
+        )
 
         # Wait for session.updated confirmation (timeout: 10s)
         try:
@@ -173,7 +179,11 @@ class S2SSessionManager:
             raise RuntimeError("S2S session config timed out") from None
 
     async def send_turn(
-        self, session: S2SSession, audio: bytes, *, input_rate: int = 16000,
+        self,
+        session: S2SSession,
+        audio: bytes,
+        *,
+        input_rate: int = 16000,
     ) -> None:
         """Send a complete utterance as a conversation item and trigger a response.
 
@@ -187,16 +197,19 @@ class S2SSessionManager:
         # Resample 16kHz → 24kHz (Realtime API requires 24kHz PCM)
         if input_rate != 24000:
             from genesis.channels.voice.wyoming_tts import _resample_pcm
+
             audio = _resample_pcm(audio, input_rate, 24000)
 
         encoded = base64.b64encode(audio).decode()
 
         # Send as a conversation item (bypasses input_audio_buffer entirely)
-        await session.connection.conversation.item.create(item={
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_audio", "audio": encoded}],
-        })
+        await session.connection.conversation.item.create(
+            item={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_audio", "audio": encoded}],
+            }
+        )
 
         # Brief pause to let the model ingest the audio before we request
         # a response.  Without this, response.create() can fire before
@@ -211,7 +224,8 @@ class S2SSessionManager:
         await session.connection.response.create()
 
     async def receive_response(
-        self, session: S2SSession,
+        self,
+        session: S2SSession,
     ) -> AsyncIterator[S2SResponseEvent]:
         """Yield response events from the S2S model.
 
@@ -241,12 +255,14 @@ class S2SSessionManager:
             # Audio transcript (text of what the model is saying)
             elif etype == "response.output_audio_transcript.delta":
                 session.output_transcript += event.delta
+                session._turn_output += event.delta
                 yield S2SResponseEvent(type="transcript", text=event.delta)
 
             # Input transcript (what the user said — async via Whisper)
             elif etype == "conversation.item.input_audio_transcription.completed":
                 if hasattr(event, "transcript") and event.transcript:
                     session.input_transcript += event.transcript
+                    await self._record_turn(session, "user", event.transcript)
 
             # Response complete — check if it's a function call or final audio
             elif etype == "response.done":
@@ -255,8 +271,7 @@ class S2SSessionManager:
 
                 # Check for function calls in this response
                 func_calls = [
-                    item for item in output_items
-                    if getattr(item, "type", None) == "function_call"
+                    item for item in output_items if getattr(item, "type", None) == "function_call"
                 ]
 
                 if func_calls:
@@ -275,15 +290,19 @@ class S2SSessionManager:
 
                         # Dispatch the tool call (pass satellite for session scoping)
                         result = await self._bridge.handle_tool_call(
-                            name, args, satellite_id=session.satellite_id,
+                            name,
+                            args,
+                            satellite_id=session.satellite_id,
                         )
 
                         # Send result back to model
-                        await conn.conversation.item.create(item={
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": result,
-                        })
+                        await conn.conversation.item.create(
+                            item={
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": result,
+                            }
+                        )
 
                     # Trigger the follow-up audio response
                     await conn.response.create()
@@ -293,6 +312,8 @@ class S2SSessionManager:
                     session.turn_count += 1
                     session.last_activity = datetime.now(UTC)
                     session.output_transcript += "\n"
+                    await self._record_turn(session, "assistant", session._turn_output)
+                    session._turn_output = ""
                     yield S2SResponseEvent(type="done")
                     break
 
@@ -311,8 +332,30 @@ class S2SSessionManager:
                 yield S2SResponseEvent(type="error", text=msg)
                 break
 
+    async def _record_turn(self, session: S2SSession, role: str, text: str) -> None:
+        """Append one turn to the session's transcript (best-effort, durable).
+
+        Per-turn writes replace the legacy store-one-blob-at-close landing:
+        a crash loses nothing already spoken, and the extraction job mines
+        the transcript like any other channel's conversation.
+        """
+        if self._transcript_writer is None or not text.strip():
+            return
+        try:
+            await self._transcript_writer.append_message(
+                session.session_id,
+                role,
+                text,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to record voice turn for %s",
+                session.session_id,
+                exc_info=True,
+            )
+
     async def close(self, satellite_id: str) -> tuple[str, str]:
-        """Close a session, store transcripts, return (input, output)."""
+        """Close a session, finalize its transcript, return (input, output)."""
         session = self._sessions.pop(satellite_id, None)
         if not session:
             return "", ""
@@ -328,35 +371,22 @@ class S2SSessionManager:
             except Exception:
                 logger.exception("Error closing S2S session %s", session.session_id)
 
-        # Store conversation transcripts to episodic memory (best-effort)
-        if self._memory_store and (transcripts[0] or transcripts[1]):
+        # Mark the transcript session completed (turns were written as they
+        # happened via _record_turn — nothing is stored at close anymore).
+        if self._transcript_writer and (transcripts[0] or transcripts[1]):
             try:
-                content = (
-                    f"Voice conversation [{satellite_id}]:\n"
-                    f"User: {transcripts[0]}\n"
-                    f"Genesis: {transcripts[1]}"
-                )
-                await self._memory_store.store(
-                    content,
-                    source="voice_s2s",
-                    memory_type="episodic",
-                    tags=["voice", "s2s", "conversation"],
-                    wing="channels",
-                    room="voice",
-                )
-                logger.info(
-                    "Voice transcript stored for session %s (%d turns)",
-                    session.session_id, session.turn_count,
-                )
+                await self._transcript_writer.close_session(session.session_id)
             except Exception:
                 logger.warning(
-                    "Failed to store voice transcript for %s",
-                    session.session_id, exc_info=True,
+                    "Failed to finalize voice transcript for %s",
+                    session.session_id,
+                    exc_info=True,
                 )
 
         logger.info(
             "S2S session closed: %s (turns=%d)",
-            session.session_id, session.turn_count,
+            session.session_id,
+            session.turn_count,
         )
         return transcripts
 

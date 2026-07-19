@@ -47,21 +47,37 @@ class CCBudgetTracker:
                 """INSERT INTO cc_sessions
                    (id, session_type, model, started_at, last_activity_at, status, source_tag)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), session_type, "sonnet", now, now, "active", f"priority_{priority}"),
+                (
+                    str(uuid.uuid4()),
+                    session_type,
+                    "sonnet",
+                    now,
+                    now,
+                    "active",
+                    f"priority_{priority}",
+                ),
             )
             await self._db.commit()
         except Exception:
             logger.error(
                 "CC budget record FAILED: session_type=%s priority=%d",
-                session_type, priority, exc_info=True,
+                session_type,
+                priority,
+                exc_info=True,
             )
 
     async def _count_recent_sessions(self) -> int:
-        """Count sessions started in the last hour (active or completed)."""
+        """Count sessions started in the last hour (active or completed).
+
+        Voice conversation rows (source_tag='voice') are transcript-index
+        entries, not CC invocations — they must not consume the budget or
+        trigger throttling.
+        """
         cutoff = (self._clock() - timedelta(hours=1)).isoformat()
         cursor = await self._db.execute(
             """SELECT COUNT(*) FROM cc_sessions
-               WHERE started_at > ? AND status IN ('active', 'completed', 'expired')""",
+               WHERE started_at > ? AND status IN ('active', 'completed', 'expired')
+                 AND source_tag != 'voice'""",
             (cutoff,),
         )
         row = await cursor.fetchone()

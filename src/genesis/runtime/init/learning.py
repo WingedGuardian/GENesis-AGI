@@ -190,6 +190,45 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         misfire_grace_time=3600,
     )
 
+    async def _voice_hygiene() -> None:
+        # Three observable-state duties (channels/voice/hygiene.py):
+        # transcript files past the 1-year retention, legacy one-blob voice
+        # memories from stale producers (a job, not a data migration — the
+        # migration runner never re-runs, so it couldn't sweep blobs written
+        # by a not-yet-updated edge bridge), and orphaned 'active' voice
+        # session rows (crash between conversation start and close).
+        if rt._db is None:
+            return
+        try:
+            from genesis.channels.voice import hygiene as _vh
+            from genesis.db.crud import cc_sessions as _sessions
+
+            pruned = await _vh.prune_old_transcripts(rt._db)
+            healed = await _sessions.complete_orphaned_voice_sessions(rt._db)
+            swept = 0
+            if rt._memory_store is not None:
+                swept = await _vh.sweep_blob_memories(rt._db, rt._memory_store)
+            rt.record_job_success("voice_hygiene")
+            if pruned or swept or healed:
+                logger.info(
+                    "voice hygiene: pruned %d transcript(s), swept %d blob "
+                    "memor(ies), healed %d orphan row(s)",
+                    pruned,
+                    swept,
+                    healed,
+                )
+        except Exception as exc:
+            rt.record_job_failure("voice_hygiene", str(exc))
+            logger.exception("voice hygiene failed")
+
+    scheduler.add_job(
+        _voice_hygiene,
+        CronTrigger(hour=5, minute=50, timezone=user_timezone()),
+        id="voice_hygiene",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
 
 async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""
