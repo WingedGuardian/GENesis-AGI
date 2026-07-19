@@ -32,7 +32,6 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     # events, not user decisions on proposal quality.
     try:
         from genesis.db.crud import intervention_journal as journal_crud
-
         aggs = await journal_crud.aggregate_by_type(db)
         for row in aggs:
             domain = row["action_type"]
@@ -138,7 +137,9 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
         cfg = load_ego_config()
         # Default OFF: enable ONLY on an explicit True (a YAML null / missing key
         # / falsey value all keep it off, so it can't be silently enabled).
-        outcome_bus_enabled = getattr(cfg, "outcome_bus_capability_feed", False) is True
+        outcome_bus_enabled = (
+            getattr(cfg, "outcome_bus_capability_feed", False) is True
+        )
     except Exception:
         logger.debug("Capability aggregation: ego config unreadable; outcome bus OFF")
 
@@ -146,7 +147,9 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
         try:
             from genesis.db.crud import outcome_events as oe_crud
 
-            rows = await oe_crud.aggregate_by_domain(db, tier=1, source="surplus", days=30)
+            rows = await oe_crud.aggregate_by_domain(
+                db, tier=1, source="surplus", days=30
+            )
             for row in rows:
                 n = row.get("n") or 0
                 # Noise gate — mirrors cc_sessions' HAVING total >= 3.
@@ -228,7 +231,9 @@ class _DomainAccumulator:
         field_scores = {source: rate for source, rate, _ in self.signals}
         # Arithmetic mean as fallback if rates are out-of-range (shouldn't
         # happen, but DB values could be corrupted)
-        arithmetic_mean = round(sum(rate * n for _, rate, n in self.signals) / total_weight, 3)
+        arithmetic_mean = round(
+            sum(rate * n for _, rate, n in self.signals) / total_weight, 3
+        )
         try:
             confidence = round(inverse_confidence_weight(field_scores), 3)
         except ValueError:

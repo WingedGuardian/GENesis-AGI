@@ -419,18 +419,23 @@ async def register_voice_session(
     return cursor.rowcount > 0
 
 
-async def complete_orphaned_voice_sessions(db: aiosqlite.Connection) -> int:
-    """Mark stale ``active`` voice sessions as completed.
+async def complete_orphaned_voice_sessions(
+    db: aiosqlite.Connection, *, idle_before: str,
+) -> int:
+    """Mark ``active`` voice sessions idle since before ``idle_before`` completed.
 
     Voice sessions never survive a server restart, but the foreground
     session_type exempts them from ``cleanup_stale`` — without this, a crash
     between conversation start and close leaves an ``active`` row forever.
-    Called on transcript-writer construction (boot); keyed on observable
-    state, so it is safe to run any time.
+    The idle gate (appends refresh last_activity_at) protects a conversation
+    that is live at heal time, so this is safe at boot AND from the daily
+    hygiene job.
     """
     cursor = await db.execute(
         "UPDATE cc_sessions SET status = 'completed' "
-        "WHERE source_tag = 'voice' AND status = 'active'",
+        "WHERE source_tag = 'voice' AND status = 'active' "
+        "  AND last_activity_at < ?",
+        (idle_before,),
     )
     await db.commit()
     return cursor.rowcount

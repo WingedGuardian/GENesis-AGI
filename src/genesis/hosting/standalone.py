@@ -108,9 +108,7 @@ class StandaloneAdapter:
         )
         flask_thread.start()
         logger.info(
-            "Dashboard at http://%s:%d/genesis",
-            self._host,
-            self._port,
+            "Dashboard at http://%s:%d/genesis", self._host, self._port,
         )
 
         # Telegram if configured
@@ -124,21 +122,16 @@ class StandaloneAdapter:
             while not self._shutdown_event.is_set():
                 # Update status_writer so dashboard health panel has fresh data
                 if self._runtime and self._runtime.status_writer:
-                    self._runtime.status_writer.set_extra_data(
-                        "standalone",
-                        {
-                            "flask_running": self._app is not None,
-                            "telegram_active": self._telegram_adapter is not None,
-                            "uptime_h": round(
-                                (time.monotonic() - start_time) / 3600,
-                                2,
-                            ),
-                        },
-                    )
+                    self._runtime.status_writer.set_extra_data("standalone", {
+                        "flask_running": self._app is not None,
+                        "telegram_active": self._telegram_adapter is not None,
+                        "uptime_h": round(
+                            (time.monotonic() - start_time) / 3600, 2,
+                        ),
+                    })
                 try:
                     await asyncio.wait_for(
-                        self._shutdown_event.wait(),
-                        timeout=1800,
+                        self._shutdown_event.wait(), timeout=1800,
                     )
                     break
                 except TimeoutError:
@@ -289,8 +282,7 @@ class StandaloneAdapter:
             ha_token = os.environ.get("HA_LONG_LIVED_TOKEN", "")
             if ha_url and ha_token:
                 voice_adapter = VoiceChannelAdapter(
-                    ha_url=ha_url,
-                    ha_token=ha_token,
+                    ha_url=ha_url, ha_token=ha_token,
                 )
                 self._app.config["VOICE_ADAPTER"] = voice_adapter
                 logger.info("Voice adapter initialized (outbound TTS via HA)")
@@ -312,7 +304,8 @@ class StandaloneAdapter:
 
         if not voice_config.s2s_enabled():
             logger.info(
-                "S2S voice disabled — no API key for provider '%s'. Wyoming servers not started.",
+                "S2S voice disabled — no API key for provider '%s'. "
+                "Wyoming servers not started.",
                 voice_config.s2s_provider(),
             )
             return
@@ -327,7 +320,10 @@ class StandaloneAdapter:
             # Genesis bridge for tool calls — delegates ask_genesis to
             # the existing VoiceConversationHandler (no DRY violation)
             voice_handler = self._app.config.get("VOICE_HANDLER") if self._app else None
-            approval_gate = self._runtime.autonomous_cli_approval_gate if self._runtime else None
+            approval_gate = (
+                self._runtime.autonomous_cli_approval_gate
+                if self._runtime else None
+            )
             bridge = GenesisBridge(
                 voice_handler=voice_handler,
                 approval_gate=approval_gate,
@@ -591,8 +587,7 @@ class StandaloneAdapter:
 
             tts_provider = None
             tts_enabled = os.environ.get(
-                "TTS_ENABLED",
-                "true",
+                "TTS_ENABLED", "true",
             ).lower() not in ("false", "0", "no")
             if tts_enabled and rt.provider_registry:
                 from genesis.providers.types import ProviderCategory
@@ -632,7 +627,9 @@ class StandaloneAdapter:
 
             # Register channel
             recipient = (
-                str(next(iter(config["allowed_users"]), "")) if config["allowed_users"] else ""
+                str(next(iter(config["allowed_users"]), ""))
+                if config["allowed_users"]
+                else ""
             )
             rt.register_channel("telegram", adapter, recipient=recipient)
 
@@ -656,16 +653,10 @@ class StandaloneAdapter:
                 # startup, not just after the first approval is delivered).
                 # Mirrors channels/bridge.py:236-241.
                 for cat in (
-                    "conversation",
-                    "morning_report",
-                    "alert",
-                    "reflection_micro",
-                    "reflection_light",
-                    "reflection_deep",
-                    "reflection_strategic",
-                    "surplus",
-                    "recon",
-                    "approvals",
+                    "conversation", "morning_report", "alert",
+                    "reflection_micro", "reflection_light",
+                    "reflection_deep", "reflection_strategic",
+                    "surplus", "recon", "approvals",
                     "ego_proposals",
                 ):
                     await topic_manager.get_or_create_persistent(cat)

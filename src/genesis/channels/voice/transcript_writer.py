@@ -117,8 +117,18 @@ class VoiceTranscriptWriter:
         self._registered: set[str] = set()
 
     async def heal_orphans(self) -> int:
-        """Complete stale 'active' voice rows (boot-time self-heal)."""
-        healed = await sessions_crud.complete_orphaned_voice_sessions(self._db)
+        """Complete 'active' voice rows idle >1h (boot + daily self-heal).
+
+        The idle gate keeps a conversation that is live RIGHT NOW (writer
+        constructed lazily mid-uptime, or the daily hygiene tick) from having
+        its row flipped mid-call; appends refresh last_activity_at.
+        """
+        from datetime import timedelta
+
+        cutoff = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        healed = await sessions_crud.complete_orphaned_voice_sessions(
+            self._db, idle_before=cutoff,
+        )
         if healed:
             logger.info("Completed %d orphaned voice session row(s)", healed)
         return healed
@@ -135,6 +145,7 @@ class VoiceTranscriptWriter:
         sid = transcript_session_id(external_session_id)
         await self._ensure_registered(sid)
         self._append_lines(sid, [(role, text)])
+        await self._touch_activity(sid)
 
     async def sync_cumulative(
         self,
@@ -150,7 +161,6 @@ class VoiceTranscriptWriter:
         appended. Returns the number of messages appended.
         """
         sid = transcript_session_id(external_session_id)
-        await self._ensure_registered(sid)
 
         existing = self._line_count(sid)
         if len(turns) < existing:
@@ -166,7 +176,9 @@ class VoiceTranscriptWriter:
 
         new_turns = [(t["role"], t["text"]) for t in turns[existing:]]
         if new_turns:
+            await self._ensure_registered(sid)
             self._append_lines(sid, new_turns)
+            await self._touch_activity(sid)
         return len(new_turns)
 
     async def close_session(self, external_session_id: str) -> None:
@@ -187,6 +199,11 @@ class VoiceTranscriptWriter:
         )
         self._registered.add(sid)
 
+    async def _touch_activity(self, sid: str) -> None:
+        await sessions_crud.update_activity(
+            self._db, sid, last_activity_at=datetime.now(UTC).isoformat(),
+        )
+
     def _path(self, sid: str) -> Path:
         return self._dir / f"{sid}.jsonl"
 
@@ -194,12 +211,11 @@ class VoiceTranscriptWriter:
         path = self._path(sid)
         if not path.exists():
             return 0
-        try:
-            with open(path, encoding="utf-8") as f:
-                return sum(1 for _ in f)
-        except OSError:
-            logger.warning("Could not count transcript lines: %s", path, exc_info=True)
-            return 0
+        # An unreadable file must NOT read as "0 lines" — that would make
+        # the next cumulative sync re-append the whole conversation. Let the
+        # OSError propagate (route answers 500; the producer retries).
+        with open(path, encoding="utf-8") as f:
+            return sum(1 for _ in f)
 
     def _append_lines(self, sid: str, turns: list[tuple[str, str]]) -> None:
         """Append CC-transcript-format JSONL lines (the shape
@@ -218,8 +234,17 @@ class VoiceTranscriptWriter:
                     {"type": role, "message": message, "timestamp": now},
                 )
             )
-        try:
-            with open(self._path(sid), "a", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
-        except OSError:
-            logger.error("Voice transcript append failed: %s", sid, exc_info=True)
+        # Durable-before-ack: an append failure must RAISE so the route
+        # answers 5xx and the producer retries — a swallowed OSError here
+        # would return 200 to a caller that then discards its turn cache.
+        path = self._path(sid)
+        prefix = ""
+        if path.exists() and path.stat().st_size > 0:
+            # Crash-guard: a torn final line without a trailing newline must
+            # not have the next message concatenated onto it.
+            with open(path, "rb") as f:
+                f.seek(-1, 2)
+                if f.read(1) != b"\n":
+                    prefix = "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(prefix + "\n".join(lines) + "\n")

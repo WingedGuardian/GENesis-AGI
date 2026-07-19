@@ -146,11 +146,20 @@ class TestVoiceTranscriptWriter:
         assert await w2.sync_cumulative("edge-1", _turns(3)) == 0
         assert await w2.sync_cumulative("edge-1", _turns(4)) == 1
 
-    async def test_heal_orphans_completes_only_voice_actives(self, db, tmp_path):
+    async def test_heal_orphans_completes_only_idle_voice_actives(self, db, tmp_path):
+        from datetime import UTC, datetime
+
         await sessions_crud.register_voice_session(
             db,
             id="voice-orphan",
             started_at="2026-07-01T00:00:00+00:00",
+        )
+        # A voice session active RIGHT NOW (fresh last_activity_at) must
+        # never be healed mid-call — the idle gate protects it.
+        await sessions_crud.register_voice_session(
+            db,
+            id="voice-live",
+            started_at=datetime.now(UTC).isoformat(),
         )
         await sessions_crud.create(
             db,
@@ -164,7 +173,24 @@ class TestVoiceTranscriptWriter:
         writer = VoiceTranscriptWriter(db, transcript_dir=tmp_path / "voice")
         assert await writer.heal_orphans() == 1
         assert (await sessions_crud.get_by_id(db, "voice-orphan"))["status"] == "completed"
+        assert (await sessions_crud.get_by_id(db, "voice-live"))["status"] == "active"
         assert (await sessions_crud.get_by_id(db, "cc-foreground"))["status"] == "active"
+
+    async def test_empty_cumulative_sync_registers_nothing(self, writer, db, tmp_path):
+        assert await writer.sync_cumulative("edge-empty", []) == 0
+        sid = transcript_session_id("edge-empty")
+        assert await sessions_crud.get_by_id(db, sid) is None
+        assert not (tmp_path / "voice" / f"{sid}.jsonl").exists()
+
+    async def test_append_failure_raises_not_swallows(self, db, tmp_path):
+        """Durable-before-ack: an unwritable transcript dir must RAISE (the
+        route answers 5xx and the producer retries) — a swallowed error
+        would ack turns that were never written."""
+        blocked = tmp_path / "blocked"
+        blocked.write_text("a file, not a dir")
+        writer = VoiceTranscriptWriter(db, transcript_dir=blocked)
+        with pytest.raises(OSError):
+            await writer.sync_cumulative("edge-1", _turns(2))
 
     async def test_append_ignores_invalid_role_and_blank_text(self, writer, tmp_path):
         await writer.append_message("edge-1", "system", "nope")

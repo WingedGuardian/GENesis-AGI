@@ -47,23 +47,13 @@ class CCBudgetTracker:
                 """INSERT INTO cc_sessions
                    (id, session_type, model, started_at, last_activity_at, status, source_tag)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    str(uuid.uuid4()),
-                    session_type,
-                    "sonnet",
-                    now,
-                    now,
-                    "active",
-                    f"priority_{priority}",
-                ),
+                (str(uuid.uuid4()), session_type, "sonnet", now, now, "active", f"priority_{priority}"),
             )
             await self._db.commit()
         except Exception:
             logger.error(
                 "CC budget record FAILED: session_type=%s priority=%d",
-                session_type,
-                priority,
-                exc_info=True,
+                session_type, priority, exc_info=True,
             )
 
     async def _count_recent_sessions(self) -> int:

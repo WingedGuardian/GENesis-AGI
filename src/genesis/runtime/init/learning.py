@@ -200,11 +200,16 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         if rt._db is None:
             return
         try:
+            from datetime import timedelta
+
             from genesis.channels.voice import hygiene as _vh
             from genesis.db.crud import cc_sessions as _sessions
 
             pruned = await _vh.prune_old_transcripts(rt._db)
-            healed = await _sessions.complete_orphaned_voice_sessions(rt._db)
+            idle_cutoff = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+            healed = await _sessions.complete_orphaned_voice_sessions(
+                rt._db, idle_before=idle_cutoff,
+            )
             swept = 0
             if rt._memory_store is not None:
                 swept = await _vh.sweep_blob_memories(rt._db, rt._memory_store)

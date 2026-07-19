@@ -79,25 +79,20 @@ def voice_chat_completions():
     event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
 
     if voice_handler is None:
-        return jsonify(
-            {
-                "error": {"message": "Voice handler not initialized", "type": "server_error"},
-            }
-        ), 503
+        return jsonify({
+            "error": {"message": "Voice handler not initialized", "type": "server_error"},
+        }), 503
 
     if event_loop is None or not event_loop.is_running():
-        return jsonify(
-            {
-                "error": {"message": "Event loop not available", "type": "server_error"},
-            }
-        ), 503
+        return jsonify({
+            "error": {"message": "Event loop not available", "type": "server_error"},
+        }), 503
 
     # S2S short-circuit: if the S2S model already handled this request
     # (audio response queued on Wyoming TTS server), return the transcript
     # as-is without making another LLM call.  HA's pipeline still requires
     # a conversation agent response — we give it one, but cheaply.
     from genesis.channels.voice import config as voice_config
-
     if voice_config.s2s_enabled():
         data = request.get_json(force=True, silent=True) or {}
         messages = data.get("messages", [])
@@ -111,20 +106,16 @@ def voice_chat_completions():
         # text — HA will send it to Wyoming TTS, which will serve the S2S
         # audio instead of synthesizing from this text.
         logger.info("S2S mode: passing through transcript (%d chars)", len(transcript))
-        return jsonify(
-            {
-                "id": "chatcmpl-s2s-passthrough",
-                "object": "chat.completion",
-                "model": "genesis-voice-s2s",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": transcript or "..."},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-        )
+        return jsonify({
+            "id": "chatcmpl-s2s-passthrough",
+            "object": "chat.completion",
+            "model": "genesis-voice-s2s",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": transcript or "..."},
+                "finish_reason": "stop",
+            }],
+        })
 
     # Parse request
     data = request.get_json(force=True, silent=True) or {}
@@ -138,11 +129,9 @@ def voice_chat_completions():
             break
 
     if not transcript:
-        return jsonify(
-            {
-                "error": {"message": "No user message in request", "type": "invalid_request_error"},
-            }
-        ), 400
+        return jsonify({
+            "error": {"message": "No user message in request", "type": "invalid_request_error"},
+        }), 400
 
     # Cap transcript length — voice transcripts are typically 1-100 words
     _MAX_TRANSCRIPT_CHARS = 2000
@@ -167,50 +156,42 @@ def voice_chat_completions():
         elapsed = time.monotonic() - start
         logger.error(
             "Voice handler timed out after %.1fs for session %s",
-            elapsed,
-            session_id[:12],
+            elapsed, session_id[:12],
         )
         response_text = "I'm taking too long to respond. Try a simpler question."
     except Exception:
         logger.error(
             "Voice handler failed for session %s",
-            session_id[:12],
-            exc_info=True,
+            session_id[:12], exc_info=True,
         )
         response_text = "Something went wrong. Try again."
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
     logger.info(
         "Voice response: %dms, %d chars, session=%s",
-        elapsed_ms,
-        len(response_text),
-        session_id[:12],
+        elapsed_ms, len(response_text), session_id[:12],
     )
 
     # Return OpenAI-compatible response
-    return jsonify(
-        {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": "genesis-voice",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response_text,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
+    return jsonify({
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "genesis-voice",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": response_text,
             },
-        }
-    )
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    })
 
 
 # ── S2S Bridge Tool Dispatch ────────────────────────────────────────
@@ -314,7 +295,6 @@ def voice_tool_declarations():
         return jsonify({"error": msg}), status
 
     from genesis.channels.voice.genesis_bridge import TOOL_DECLARATIONS
-
     return jsonify({"tools": TOOL_DECLARATIONS})
 
 
@@ -387,11 +367,15 @@ def voice_graduate():
     # request has no header and would bypass a content_length check; get_json
     # below reuses this cached read.
     if len(request.get_data(cache=True)) > _MAX_GRADUATE_BYTES:
-        return jsonify({"status": "rejected", "errors": ["envelope exceeds 64KB"]}), 400
+        return jsonify(
+            {"status": "rejected", "errors": ["envelope exceeds 64KB"]}
+        ), 400
 
     data = request.get_json(force=True, silent=True)
     if not isinstance(data, dict):
-        return jsonify({"status": "rejected", "errors": ["body must be a JSON object"]}), 400
+        return jsonify(
+            {"status": "rejected", "errors": ["body must be a JSON object"]}
+        ), 400
     errors = validate_envelope(data)
     if errors:
         return jsonify({"status": "rejected", "errors": errors}), 400
@@ -400,23 +384,23 @@ def voice_graduate():
     if event_loop is None or not event_loop.is_running():
         return jsonify({"error": "Event loop not available"}), 503
 
-    future = asyncio.run_coroutine_threadsafe(_land_graduation_event(data), event_loop)
+    future = asyncio.run_coroutine_threadsafe(
+        _land_graduation_event(data), event_loop
+    )
     try:
         inserted = future.result(timeout=_GRADUATE_TIMEOUT_SECONDS)
     except TimeoutError:
         future.cancel()
         logger.error(
             "Voice graduate timed out after %.0fs for event %s",
-            _GRADUATE_TIMEOUT_SECONDS,
-            data["event_id"][:16],
+            _GRADUATE_TIMEOUT_SECONDS, data["event_id"][:16],
         )
         return jsonify({"error": "graduate landing timed out"}), 503
     except LookupError:
         return jsonify({"error": "Genesis runtime not ready"}), 503
     except Exception:
         logger.error(
-            "Voice graduate failed for event %s",
-            data["event_id"][:16],
+            "Voice graduate failed for event %s", data["event_id"][:16],
             exc_info=True,
         )
         return jsonify({"error": "graduate landing failed"}), 500
@@ -424,9 +408,7 @@ def voice_graduate():
     status = "accepted" if inserted else "duplicate"
     logger.info(
         "Voice graduate: %s event %s from %s",
-        status,
-        data["event_id"][:16],
-        data["source"][:32],
+        status, data["event_id"][:16], data["source"][:32],
     )
     return jsonify({"status": status})
 
