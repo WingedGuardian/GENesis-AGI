@@ -1672,6 +1672,37 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ego_directives.last_reaffirmed_at",
     )
 
+    # Voice graduation W0 (2026-07-18): provenance/trust columns for graduated
+    # overheard content. GROUNDWORK(voice-graduation-w2) — written by the W2
+    # policy drainer, dark until then. Mirrored in migration 0068 for the
+    # standalone runner; added here too so an existing DB gets them on the
+    # base create_all_tables path (schema_both_build_paths).
+    await _try_alter(
+        db,
+        "ALTER TABLE memory_metadata ADD COLUMN provenance_class TEXT",
+        "memory_metadata.provenance_class",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE memory_metadata ADD COLUMN trust_level TEXT",
+        "memory_metadata.trust_level",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE memory_metadata ADD COLUMN attribution TEXT",
+        "memory_metadata.attribution",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE memory_metadata ADD COLUMN origin_ref TEXT",
+        "memory_metadata.origin_ref",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE memory_metadata ADD COLUMN capture_clarity REAL",
+        "memory_metadata.capture_clarity",
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

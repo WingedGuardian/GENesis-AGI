@@ -21,8 +21,11 @@ import logging
 import os
 import time
 import uuid
+from datetime import UTC, datetime
 
 from flask import Blueprint, current_app, jsonify, request
+
+from genesis.channels.voice.graduation import validate_envelope
 
 logger = logging.getLogger("genesis.dashboard.voice_api")
 
@@ -32,25 +35,26 @@ voice_api_bp = Blueprint("voice_api", __name__)
 _FUTURE_TIMEOUT_SECONDS = 8.0
 
 
-def _check_voice_token() -> str | None:
-    """Validate Bearer token. Returns error message or None if OK.
+def _check_voice_token() -> tuple[str, int] | None:
+    """Validate Bearer token. Returns (error message, http status) or None if OK.
 
-    When ``GENESIS_MCP_HTTP_TOKEN`` is not set, requests are allowed
-    through without auth (Tailscale-only network, local dev).  Set
-    the token in ``secrets.env`` to enforce auth in production.
+    Fail-closed: when ``GENESIS_MCP_HTTP_TOKEN`` is not set, every
+    ``/v1/voice/*`` route answers 503 — a write surface (``/v1/voice/graduate``)
+    shares this token model, so open-by-default is not acceptable even on a
+    trusted network. Set the token in ``secrets.env`` to enable the voice API
+    (the standalone host logs a boot-time warning when it is missing).
     """
     token = os.environ.get("GENESIS_MCP_HTTP_TOKEN", "")
     if not token:
-        # No token configured — allow through (Tailscale-only network)
-        return None
+        return ("voice API disabled: GENESIS_MCP_HTTP_TOKEN not configured", 503)
 
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        return "Missing or invalid Authorization header"
+        return ("Missing or invalid Authorization header", 401)
 
     request_token = auth_header[7:]
     if not hmac.compare_digest(request_token, token):
-        return "Invalid bearer token"
+        return ("Invalid bearer token", 401)
 
     return None
 
@@ -64,9 +68,10 @@ def voice_chat_completions():
     the response in OpenAI format.
     """
     # Auth check
-    auth_error = _check_voice_token()
-    if auth_error:
-        return jsonify({"error": auth_error}), 401
+    auth = _check_voice_token()
+    if auth is not None:
+        msg, status = auth
+        return jsonify({"error": msg}), status
 
     # Get handler and event loop from app config
     voice_handler = current_app.config.get("VOICE_HANDLER")
@@ -205,9 +210,10 @@ def voice_tool_call():
     Expects JSON: ``{"tool_name": "ask_genesis", "arguments": {"query": "..."}}``.
     Returns the tool result as JSON.
     """
-    auth_error = _check_voice_token()
-    if auth_error:
-        return jsonify({"error": auth_error}), 401
+    auth = _check_voice_token()
+    if auth is not None:
+        msg, status = auth
+        return jsonify({"error": msg}), status
 
     bridge = current_app.config.get("GENESIS_BRIDGE")
     event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
@@ -259,9 +265,10 @@ def voice_system_prompt():
     Called by the voice addon at session start to configure the
     OpenAI Realtime model with Genesis persona + context.
     """
-    auth_error = _check_voice_token()
-    if auth_error:
-        return jsonify({"error": auth_error}), 401
+    auth = _check_voice_token()
+    if auth is not None:
+        msg, status = auth
+        return jsonify({"error": msg}), status
 
     bridge = current_app.config.get("GENESIS_BRIDGE")
     if bridge is None:
@@ -281,9 +288,125 @@ def voice_tool_declarations():
     Called by the voice addon at session start to register Genesis
     tools with the OpenAI Realtime API.
     """
-    auth_error = _check_voice_token()
-    if auth_error:
-        return jsonify({"error": auth_error}), 401
+    auth = _check_voice_token()
+    if auth is not None:
+        msg, status = auth
+        return jsonify({"error": msg}), status
 
     from genesis.channels.voice.genesis_bridge import TOOL_DECLARATIONS
     return jsonify({"tools": TOOL_DECLARATIONS})
+
+
+# ── Graduation landing (W0 — DARK: quarantine insert only, no consumer) ──
+# The voice edge pushes typed graduation events (synthesized claims, never raw
+# transcripts) here; they land verbatim in the graduation_events quarantine
+# table with disposition='pending'. The W2 policy drainer (separate PR) is the
+# only consumer. Bearer auth is REQUIRED — _check_voice_token is fail-closed,
+# so an unset token disables this write surface entirely.
+
+# 10s: a single INSERT. The realistic hang is SQLite write-lock contention,
+# bounded by busy_timeout=5000 (db/connection.py); 10s = that + runtime-loop
+# scheduling headroom. Fast-fail is safe: the edge outbox retries on 503, and
+# a timed-out-but-committed insert resolves as 'duplicate' on retry (event_id
+# dedup) — effectively-once either way.
+_GRADUATE_TIMEOUT_SECONDS = 10.0
+
+# Envelope sanity cap — graduation events are small JSON (claims + metadata);
+# app-level MAX_CONTENT_LENGTH is sized for uploads, not this route.
+_MAX_GRADUATE_BYTES = 64 * 1024
+
+
+async def _land_graduation_event(data: dict) -> bool:
+    """Insert the validated envelope into quarantine (runs on the runtime loop).
+
+    Returns True if inserted, False on an event_id replay. Raises
+    LookupError when the runtime/DB isn't ready — the route maps it to 503
+    so the edge outbox retries.
+    """
+    from genesis.db.crud import graduation_events
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        raise LookupError("Genesis runtime not ready")
+
+    return await graduation_events.insert_event(
+        rt.db,
+        event_id=data["event_id"],
+        schema_version=data["schema_version"],
+        type=data["type"],
+        source=data["source"],
+        occurred_at=data["occurred_at"],
+        received_at=datetime.now(UTC).isoformat(),
+        payload=data["payload"],
+        provenance=data["provenance"],
+    )
+
+
+@voice_api_bp.route("/v1/voice/graduate", methods=["POST"])
+def voice_graduate():
+    """Land a graduation event from the voice edge (W0 quarantine landing).
+
+    Responses (spec §4.9): 200 ``{"status": "accepted"}`` only after the
+    INSERT commits; 200 ``{"status": "duplicate"}`` on an event_id replay
+    (edge treats both as delivered); 400 ``{"status": "rejected", "errors":
+    [...]}`` on envelope validation failure. One-way boundary — no core data
+    ever returns.
+
+    Auth + validation run synchronously (same pattern as the sibling voice
+    routes) so fail-closed answers correctly even while the runtime loop is
+    still starting; only the DB insert dispatches to the runtime loop.
+    """
+    auth = _check_voice_token()
+    if auth is not None:
+        msg, status = auth
+        return jsonify({"error": msg}), status
+
+    # Measure the actual body, not the Content-Length header — a chunked
+    # request has no header and would bypass a content_length check; get_json
+    # below reuses this cached read.
+    if len(request.get_data(cache=True)) > _MAX_GRADUATE_BYTES:
+        return jsonify(
+            {"status": "rejected", "errors": ["envelope exceeds 64KB"]}
+        ), 400
+
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify(
+            {"status": "rejected", "errors": ["body must be a JSON object"]}
+        ), 400
+    errors = validate_envelope(data)
+    if errors:
+        return jsonify({"status": "rejected", "errors": errors}), 400
+
+    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
+    if event_loop is None or not event_loop.is_running():
+        return jsonify({"error": "Event loop not available"}), 503
+
+    future = asyncio.run_coroutine_threadsafe(
+        _land_graduation_event(data), event_loop
+    )
+    try:
+        inserted = future.result(timeout=_GRADUATE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        future.cancel()
+        logger.error(
+            "Voice graduate timed out after %.0fs for event %s",
+            _GRADUATE_TIMEOUT_SECONDS, data["event_id"][:16],
+        )
+        return jsonify({"error": "graduate landing timed out"}), 503
+    except LookupError:
+        return jsonify({"error": "Genesis runtime not ready"}), 503
+    except Exception:
+        logger.error(
+            "Voice graduate failed for event %s", data["event_id"][:16],
+            exc_info=True,
+        )
+        return jsonify({"error": "graduate landing failed"}), 500
+
+    status = "accepted" if inserted else "duplicate"
+    logger.info(
+        "Voice graduate: %s event %s from %s",
+        status, data["event_id"][:16], data["source"][:32],
+    )
+    return jsonify({"status": status})

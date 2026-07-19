@@ -467,12 +467,13 @@ class TestVoiceAPI:
         t.start()
         try:
             with (
-                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False),
                 app.test_client() as client,
             ):
                 resp = client.post(
                     "/v1/voice/chat/completions",
                     json={"messages": [{"role": "system", "content": "you are helpful"}]},
+                    headers={"Authorization": "Bearer secret"},
                 )
                 assert resp.status_code == 400
         finally:
@@ -482,18 +483,19 @@ class TestVoiceAPI:
     def test_handler_not_initialized(self, app):
         app.config["VOICE_HANDLER"] = None
         with (
-            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False),
             app.test_client() as client,
         ):
             resp = client.post(
                 "/v1/voice/chat/completions",
                 json={"messages": [{"role": "user", "content": "hello"}]},
+                headers={"Authorization": "Bearer secret"},
             )
             assert resp.status_code == 503
 
     def test_successful_response_format(self, app):
         """Verify OpenAI-compatible response structure."""
-        with patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False):
+        with patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False):
             loop = app.config["GENESIS_EVENT_LOOP"]
 
             # Override to use synchronous mock
@@ -514,6 +516,7 @@ class TestVoiceAPI:
                             "messages": [{"role": "user", "content": "what happened yesterday"}],
                             "user": "ha-voice-test",
                         },
+                        headers={"Authorization": "Bearer secret"},
                     )
                     assert resp.status_code == 200
                     data = resp.get_json()
@@ -531,12 +534,13 @@ class TestVoiceAPI:
     def test_tool_call_no_bridge(self, app):
         """Returns 503 when bridge is not initialized."""
         with (
-            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False),
             app.test_client() as client,
         ):
             resp = client.post(
                 "/v1/voice/tool_call",
                 json={"tool_name": "ask_genesis", "arguments": {"query": "test"}},
+                headers={"Authorization": "Bearer secret"},
             )
             assert resp.status_code == 503
 
@@ -559,12 +563,13 @@ class TestVoiceAPI:
         t.start()
         try:
             with (
-                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False),
                 app.test_client() as client,
             ):
                 resp = client.post(
                     "/v1/voice/tool_call",
                     json={"arguments": {"query": "test"}},
+                    headers={"Authorization": "Bearer secret"},
                 )
                 assert resp.status_code == 400
         finally:
@@ -592,12 +597,13 @@ class TestVoiceAPI:
         t.start()
         try:
             with (
-                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False),
                 app.test_client() as client,
             ):
                 resp = client.post(
                     "/v1/voice/tool_call",
                     json={"tool_name": "ask_genesis", "arguments": {"query": "what did we work on"}},
+                    headers={"Authorization": "Bearer secret"},
                 )
                 assert resp.status_code == 200
                 data = resp.get_json()
@@ -627,10 +633,13 @@ class TestVoiceAPI:
         app.config["GENESIS_BRIDGE"] = bridge
 
         with (
-            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False),
             app.test_client() as client,
         ):
-            resp = client.get("/v1/voice/system_prompt")
+            resp = client.get(
+                "/v1/voice/system_prompt",
+                headers={"Authorization": "Bearer secret"},
+            )
             assert resp.status_code == 200
             data = resp.get_json()
             assert "prompt" in data
@@ -640,10 +649,13 @@ class TestVoiceAPI:
         """Tool declarations endpoint returns the advertised voice tools
         (ask_genesis disabled until the memory refactor)."""
         with (
-            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}, clear=False),
             app.test_client() as client,
         ):
-            resp = client.get("/v1/voice/tool_declarations")
+            resp = client.get(
+                "/v1/voice/tool_declarations",
+                headers={"Authorization": "Bearer secret"},
+            )
             assert resp.status_code == 200
             data = resp.get_json()
             assert "tools" in data
@@ -651,6 +663,31 @@ class TestVoiceAPI:
             assert "ask_genesis" not in tool_names  # disabled until the memory refactor
             assert "web_search" in tool_names
             assert "approve_pending" in tool_names
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("post", "/v1/voice/chat/completions"),
+            ("post", "/v1/voice/tool_call"),
+            ("get", "/v1/voice/system_prompt"),
+            ("get", "/v1/voice/tool_declarations"),
+            ("post", "/v1/voice/graduate"),
+        ],
+    )
+    def test_fail_closed_when_token_unset(self, app, method, path):
+        """Unset GENESIS_MCP_HTTP_TOKEN disables the whole voice API (503).
+
+        This is the fail-closed flip (spec §3.4-1): no token ⇒ no open door,
+        even on a trusted network — /v1/voice/graduate is a write surface on
+        the same token model.
+        """
+        with (
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            app.test_client() as client,
+        ):
+            resp = getattr(client, method)(path, json={})
+            assert resp.status_code == 503
+            assert "GENESIS_MCP_HTTP_TOKEN" in resp.get_json()["error"]
 
 
 # ── Standalone shutdown chime ────────────────────────────────────────

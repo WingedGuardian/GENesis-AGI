@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Voice graduation door (W0).** The core now exposes an authenticated
+  `POST /v1/voice/graduate` endpoint where a voice edge machine can land
+  typed "graduation" events (synthesized claims from ambient/meeting
+  capture — never raw transcripts). Events are quarantined verbatim in a
+  new `graduation_events` table with idempotent delivery (safe edge
+  retries), and nothing consumes them yet — the policy drainer that routes
+  them into memory arrives in a later phase. Dispositioned events are
+  pruned after 90 days; pending events are never pruned. The memory
+  metadata schema also gains dormant provenance/trust columns
+  (`provenance_class`, `trust_level`, `attribution`, `origin_ref`,
+  `capture_clarity`) for that later phase.
 - **A runaway Claude Code temp write can no longer fill the container's root
   disk.** `~/.genesis/cc-tmp` — the scratch space every CC session (and
   genesis-server) writes to — now lives on its own size-capped incus storage
@@ -26,6 +37,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   giving a cosmetic guarantee. A new infrastructure-posture check raises a
   standing alert on any container install where cc-tmp is not yet isolated, and
   `scripts/lib/cc_tmp_volume.sh`'s `cc_tmp_volume_remove` reverts it.
+
+### Changed
+
+- **The voice API is now fail-closed.** Previously, leaving
+  `GENESIS_MCP_HTTP_TOKEN` unset left every `/v1/voice/*` route open to the
+  network. Now an unset token disables the voice API (503 + a boot-time
+  warning in the server log). **Upgrade note:** if you use the voice API,
+  set `GENESIS_MCP_HTTP_TOKEN` in `secrets.env` and make sure your Home
+  Assistant / voice-addon configs send it as a Bearer token — token-less
+  setups stop working on this upgrade.
 
 ### Fixed
 

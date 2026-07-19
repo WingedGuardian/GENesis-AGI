@@ -75,6 +75,7 @@ EXPECTED_TABLES = [
     "ledger_predictions",  # WS-2 P1a: cognitive-ledger falsifiable prediction rows
     "entity_adjudications",  # entity-node merge-vs-distinct decision ledger (drainer)
     "autonomy_events",  # append-only success/correction ledger for windowed earn-back
+    "graduation_events",  # voice graduation quarantine (W0; drained in W2)
 ]
 
 
@@ -448,6 +449,8 @@ async def test_key_indexes_exist(db):
         # dead letter
         "idx_dead_letter_status",
         "idx_dead_letter_provider",
+        # voice graduation quarantine
+        "idx_graduation_events_disposition",
     }
     for idx in expected:
         assert idx in indexes, f"Missing index: {idx}"
