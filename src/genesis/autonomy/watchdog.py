@@ -90,18 +90,18 @@ class WatchdogChecker:
     def _detect_target_service(self) -> str:
         """Auto-detect which Genesis service to monitor.
 
-        Prefers genesis-server.service, falls back to genesis-bridge.service.
+        Reuses the canonical detector (``observability.service_status``): it
+        probes ``is-enabled`` then ``is-active`` for genesis-server, then the
+        legacy relay, and defaults to genesis-server. It never targets the
+        deprecated relay when genesis-server is present (the 2026-07-02 §7
+        recovery bug: restarting an inactive unit "succeeds" but hides
+        genesis-server crash loops) while still recovering a relay-only legacy
+        install. Single call at construction — imported lazily to keep the
+        module import graph acyclic.
         """
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-enabled", "genesis-server.service"],
-                capture_output=True, text=True, timeout=5, env=systemctl_env(),
-            )
-            if result.returncode == 0:
-                return "genesis-server.service"
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            pass
-        return "genesis-bridge.service"
+        from genesis.observability.service_status import _detect_genesis_service
+
+        return _detect_genesis_service()[0]
 
     @classmethod
     def from_yaml(cls, path: str | Path | None = None) -> WatchdogChecker:
@@ -654,7 +654,7 @@ def _wait_until_active(
     return False
 
 
-def restart_bridge(service: str = "genesis-bridge.service", *, timeout_s: int = 120) -> int:
+def restart_bridge(service: str = "genesis-server.service", *, timeout_s: int = 120) -> int:
     """Restart the specified Genesis service via systemctl. Returns exit code.
 
     Returns 0 if the service is confirmed active after the restart, 1 if not,
@@ -671,8 +671,10 @@ def restart_bridge(service: str = "genesis-bridge.service", *, timeout_s: int = 
     margin while still bounding a genuinely hung systemctl — important because
     the watchdog timer cannot overlap oneshot runs.
 
-    Defaults to genesis-bridge.service for backward compatibility.
-    Pass checker.target_service to restart the auto-detected service.
+    Defaults to genesis-server.service (the main service). The sole runtime
+    caller passes checker.target_service explicitly, so the default is only a
+    safety net — never the deprecated relay unit. (Name kept for call-site
+    stability; it acts on ``service``, the auto-detected target.)
     """
     logger.info("Restarting %s via systemctl...", service)
     try:
