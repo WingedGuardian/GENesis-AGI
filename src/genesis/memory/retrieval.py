@@ -616,6 +616,7 @@ class HybridRetriever:
         include_deprecated: bool = False,
         event_id_sink: list[str] | None = None,
         skip_writeback: Callable[[RetrievalResult], bool] | None = None,
+        extra_fts_terms: list[str] | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 
@@ -702,6 +703,7 @@ class HybridRetriever:
             query,
             collections,
             expand_query_terms=expand_query_terms,
+            extra_fts_terms=extra_fts_terms,
         )
 
         # 3. FTS5 text search (using expanded query)
@@ -1084,9 +1086,20 @@ class HybridRetriever:
         collections: list[str],
         *,
         expand_query_terms: bool,
+        extra_fts_terms: list[str] | None = None,
     ) -> str:
         """Stage 2c: expand the FTS query via tag co-occurrence (degrades to
-        the original query on failure)."""
+        the original query on failure).
+
+        ``extra_fts_terms`` (proactive hook's file-context keywords) are
+        OR-appended so a memory can surface on a recent-file term alone —
+        preserving the old subprocess hook's file-keyword lane. FTS-only:
+        they never touch the embedding or intent. Appended in boolean form;
+        ``search_ranked``'s ``_prepare_fts5(boolean=True)`` re-sanitizes, so
+        raw terms can't cause an FTS5 syntax error. When they're present the
+        result differs from ``query`` and the caller's ``fts_is_boolean`` flag
+        flips on automatically.
+        """
         fts_query = query
         if expand_query_terms:
             try:
@@ -1098,6 +1111,10 @@ class HybridRetriever:
                 )
             except Exception:
                 logger.warning("Query expansion failed, using original", exc_info=True)
+        if extra_fts_terms:
+            extra = " OR ".join(str(t) for t in extra_fts_terms if t)
+            if extra:
+                fts_query = f"({fts_query}) OR ({extra})"
         return fts_query
 
     async def _gather_fts_candidates(

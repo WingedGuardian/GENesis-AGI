@@ -809,12 +809,14 @@ async def memory_extract(
     return ids
 
 
-@mcp.tool()
-async def memory_proactive(
+async def _proactive_impl(
     current_message: str,
     limit: int = 5,
+    *,
+    rerank: bool = False,
+    extra_fts_terms: list[str] | None = None,
 ) -> list[dict]:
-    """Cross-session context injection for prompts.
+    """Cross-session context injection for prompts — shared engine.
 
     ``limit`` bounds the ORGANIC (query-ranked) results. When graph expansion
     is live, up to ``proactive_max_neighbors`` (default 2, settings-capped)
@@ -822,6 +824,13 @@ async def memory_proactive(
     deliberate contract: the benchmark-proven lift comes from adding linked
     context the ranked top-K missed, so trimming the total to ``limit`` would
     displace the organic results expansion is meant to supplement.
+
+    Backs both the ``memory_proactive`` MCP tool (rerank off, no extra terms)
+    and the genesis-server proactive recall endpoint (rerank + file-context
+    terms per config). ``rerank``/``extra_fts_terms`` are the ONLY behavioral
+    knobs; every security stage (memory_operation filter, injection-defense
+    wrap, gate-4 enforce-drop, graph expansion, immunity emit) is shared, so
+    both callers get identical protection with no duplicated orchestration.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -839,7 +848,8 @@ async def memory_proactive(
         current_message,
         limit=limit * 2,
         min_activation=0.0,
-        rerank=False,
+        rerank=rerank,
+        extra_fts_terms=extra_fts_terms,
         skip_writeback=lambda r: immunity_shadow.should_enforce_drop(
             gate="injection",
             collection=r.collection,
@@ -946,13 +956,27 @@ async def memory_proactive(
     await immunity_shadow.record_would_block(
         gate="injection",
         source_kind="recall_inject",
-        source_ref="mcp/memory/core.py::memory_proactive",
+        source_ref="mcp/memory/core.py::_proactive_impl",
         process="server",
         blockable_count=blockable + dropped,
         db=memory_mod._db,
         detail={"enforced_drops": dropped} if dropped else None,
     )
     return out
+
+
+@mcp.tool()
+async def memory_proactive(
+    current_message: str,
+    limit: int = 5,
+) -> list[dict]:
+    """Cross-session context injection for prompts.
+
+    Thin MCP-tool wrapper over :func:`_proactive_impl` (the shared engine that
+    also backs the genesis-server proactive recall endpoint). Behavior-
+    preserving: the MCP path keeps rerank off and passes no file-context terms.
+    """
+    return await _proactive_impl(current_message, limit)
 
 
 @mcp.tool()

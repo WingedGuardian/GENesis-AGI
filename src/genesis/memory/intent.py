@@ -160,6 +160,81 @@ def classify_intent(query: str) -> QueryIntent:
     )
 
 
+# ---------------------------------------------------------------------------
+# Stance classification — drives the intent-aware proactive result budget
+# ---------------------------------------------------------------------------
+#
+# Distinct from ``classify_intent`` (which routes source + biases ranking):
+# stance answers "how many memories does this prompt deserve?" for the
+# proactive recall endpoint. A bare command ("restart the server") wants
+# ~0-1; a decision question ("what did we decide about X") wants 5-8. The
+# fixed top-3 was never the problem — a count that ignores intent was.
+# The stance→count map is config-driven (config/memory_recall.yaml
+# ``proactive.profiles.<name>.budgets``); this function only names the stance.
+
+STANCES: tuple[str, ...] = ("command", "chatter", "general", "question_decision")
+
+# Imperative verbs that, when they lead a non-interrogative prompt, mark it a
+# command (act-on-the-system, minimal recall). Kept broad but action-oriented.
+_COMMAND_VERBS = frozenset({
+    "restart", "run", "rerun", "deploy", "redeploy", "stop", "start", "commit",
+    "push", "pull", "fix", "install", "uninstall", "delete", "remove", "drop",
+    "add", "create", "update", "upgrade", "rebuild", "build", "revert", "merge",
+    "rebase", "kill", "enable", "disable", "set", "unset", "clear", "checkout",
+    "retry", "execute", "launch", "apply", "reset", "rollback", "bump",
+    "regenerate", "reload", "restore", "sync", "cancel", "abort", "purge",
+})
+
+# "what did we decide/agree/choose …" and kin — history-recall questions that
+# deserve a wider budget even when ``classify_intent`` returns GENERAL.
+_DECISION_QUESTION = re.compile(
+    r"\b(decide|decided|decision|agree|agreed|chose|choose|chosen|settle|"
+    r"settled|conclude|concluded|pick|picked|plan(?:ned)?\s+to|"
+    r"what\s+did\s+we|why\s+did\s+we|last\s+time)\b",
+    re.IGNORECASE,
+)
+
+# Intent categories that inherently want more grounding context.
+_DECISION_INTENTS = frozenset({"WHY", "WHEN", "STATUS"})
+
+_INTERROGATIVE_LEAD = re.compile(
+    r"^\s*(what|why|how|when|where|which|who|is|are|do|does|did|can|could|"
+    r"should|would|will|shall|may|might|has|have|had)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_stance(prompt: str) -> str:
+    """Name the prompt's stance for the proactive result budget.
+
+    One of ``STANCES``. LLM-free (this is latency-critical — runs on the
+    prompt-hook path). Precedence: chatter (too little signal) → command
+    (imperative-led, non-interrogative) → question_decision (decision phrasing
+    or a WHY/WHEN/STATUS intent) → general (default).
+    """
+    cleaned = (prompt or "").strip()
+    tokens = _tokenize_query(cleaned)
+    # Chatter: greetings / acks / fragments — nothing worth grounding.
+    if len(tokens) < 2:
+        return "chatter"
+
+    lead_is_question = bool(_INTERROGATIVE_LEAD.match(cleaned))
+
+    # Command: leads with an imperative verb and is not phrased as a question.
+    first = tokens[0].lower()
+    if not lead_is_question and first in _COMMAND_VERBS:
+        return "command"
+
+    # Decision/history question: explicit decision phrasing, or an intent that
+    # inherently references shared history/state.
+    if _DECISION_QUESTION.search(cleaned):
+        return "question_decision"
+    if classify_intent(cleaned).category in _DECISION_INTENTS:
+        return "question_decision"
+
+    return "general"
+
+
 def compute_intent_affinity(
     intent: QueryIntent,
     source: str,

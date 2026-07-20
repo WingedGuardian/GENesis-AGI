@@ -131,6 +131,25 @@ async def init(rt: GenesisRuntime) -> None:
         )
         logger.info("Memory MCP initialized (dual embedders, shared reranker)")
 
+        # Boot warmup: one throwaway recall to prime the recall embedder's HTTP
+        # connection, the Qdrant client, and the shared embedding diskcache, so
+        # the FIRST proactive-hook prompt after boot/idle doesn't pay the cold-
+        # connection cost (~4.6s measured on this box) and degrade to the hook's
+        # FTS5 fallback. Fire-and-forget so it never delays bootstrap; write-
+        # backs skipped so the warmup can't perturb retrieved_count/activation.
+        async def _warm_recall() -> None:
+            try:
+                await rt._hybrid_retriever.recall(
+                    "genesis proactive recall warmup",
+                    limit=1,
+                    skip_writeback=lambda _r: True,
+                )
+                logger.debug("proactive recall warmup complete")
+            except Exception:
+                logger.debug("proactive recall warmup failed (non-fatal)", exc_info=True)
+
+        tracked_task(_warm_recall(), name="proactive-recall-warmup")
+
         if rt._result_writer is not None:
             rt._result_writer._memory_store = rt._memory_store
             logger.info("MemoryStore injected into ResultWriter")
