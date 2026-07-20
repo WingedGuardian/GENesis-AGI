@@ -67,12 +67,17 @@ _Row = tuple[str, str, str, bytes, str | None]
 
 
 class _FakeDB:
-    """Minimal stand-in exposing the one method _load_procedure_cache uses."""
+    """Stand-in for the runtime db. The bulk query (no params) returns the cached
+    rows; the winner recheck (``WHERE id = ?``, one param) returns a truthy row
+    iff that id is still "live" (default: every row is live)."""
 
-    def __init__(self, rows: list[_Row]) -> None:
+    def __init__(self, rows: list[_Row], live_ids: set[str] | None = None) -> None:
         self._rows = rows
+        self._live_ids = {r[0] for r in rows} if live_ids is None else set(live_ids)
 
-    async def execute_fetchall(self, _sql: str, _params: object = None) -> list[_Row]:
+    async def execute_fetchall(self, _sql: str, params: object = None) -> list:
+        if params is not None:  # winner recheck
+            return [(1,)] if params[0] in self._live_ids else []
         return self._rows
 
 
@@ -156,3 +161,19 @@ async def test_surface_procedure_empty_and_bad_rows() -> None:
     proactive._procedure_cache = None
     got = await proactive._surface_procedure(_FakeDB([bad, good]), q)
     assert got is not None and got["id"] == "good"
+
+
+async def test_surface_procedure_rechecks_live_winner() -> None:
+    """A procedure still in the (≤TTL stale) cache but quarantined/deprecated
+    since the build must NOT surface — the winner is re-verified live first."""
+    rng = np.random.default_rng(11)
+    q = _rand_vec(rng)
+    row = ("q1", "task", "p", pack_embedding(q), "CORE")  # self-match clears the bar
+
+    proactive._procedure_cache = None
+    got = await proactive._surface_procedure(_FakeDB([row]), q)
+    assert got is not None and got["id"] == "q1"  # live → surfaces
+
+    proactive._procedure_cache = None
+    got = await proactive._surface_procedure(_FakeDB([row], live_ids=set()), q)
+    assert got is None  # excluded since build → suppressed

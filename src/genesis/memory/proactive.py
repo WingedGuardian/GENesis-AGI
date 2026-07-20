@@ -349,6 +349,25 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
     if best_idx < 0:
         return None
     proc_id, task_type, principle, tier = cache.meta[best_idx]
+
+    # The cache is up to TTL stale, so it can still hold a procedure that was
+    # quarantined/deprecated since the build — the exclusion the bulk SQL filter
+    # (deprecated=0 AND quarantined=0) would otherwise re-apply every call. Verify
+    # the single winner live before surfacing: one PK lookup, only on the surface
+    # path (a minority of prompts). Fail-closed — if it is gone, excluded, or the
+    # check errors, surface nothing this turn (self-heals at the next rebuild)
+    # rather than advise a procedure the rest of the system now excludes.
+    try:
+        live = await db.execute_fetchall(
+            "SELECT 1 FROM procedural_memory "
+            "WHERE id = ? AND deprecated = 0 AND quarantined = 0 LIMIT 1",
+            (proc_id,),
+        )
+    except Exception:
+        return None
+    if not live:
+        return None
+
     return {"id": proc_id, "task_type": task_type, "principle": principle[:200], "tier": tier}
 
 
