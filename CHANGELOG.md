@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now screens its own skill self-edits for degradation.** When the
+  skill-evolution loop rewrites one of Genesis's own skill files, a new Critic
+  reads the change and flags the classic self-modification failure modes —
+  quietly dropping a safety guard or scope limit, forgetting existing
+  capability, over-narrowing the skill to a single case, or gaming its own
+  success metric. It runs in shadow first: it records a verdict (surfaced when
+  it flags something) without blocking the edit, so the pattern can be watched
+  before the screen is ever given veto power. Tunable via the new
+  `skill_evolution_gate` setting (`off` | `shadow`) with a
+  `GENESIS_SKILL_EVOLUTION_GATE_OFF` kill switch.
 - **Voice conversations now feed real memory extraction (W0.5).** S2S voice
   conversations used to land in episodic memory as one growing raw blob per
   session close — duplicated on replays, never mined for facts. They now
