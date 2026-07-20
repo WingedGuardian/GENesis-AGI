@@ -206,8 +206,12 @@ that answers your question before escalating.
 index. If this answers "what are we working on," don't burn a recall.
 
 **L2 — Proactive Recall (automatic per prompt):**
-The UserPromptSubmit hook searches FTS5 + Qdrant based on your prompt keywords
-and injects `[Memory | age | wing | id:xxx]` tags (300/200 chars, rank 1/2-3).
+The UserPromptSubmit hook delegates recall to the genesis-server engine
+(`POST /api/genesis/hook/recall` — FTS5 + vector + reranker + graph expansion +
+injection defense) and injects `[Memory | age | wing | id:xxx]` tags. If the
+server is unreachable it degrades to a clearly-labelled keyword-only FTS5 search
+(`[Memory·degraded …]`) and self-heals next prompt; `GENESIS_PROACTIVE_HOOK_MODE`
+(`server`/`local`/`off`) gates it. See `.claude/docs/proactive-memory-hook.md`.
 Check these first before doing explicit recall. Results are biased toward the
 active wing (domain) when detectable. Use the `id:` handle with `memory_expand`
 for full context without re-searching. Proactive hook results are keyword-matched
