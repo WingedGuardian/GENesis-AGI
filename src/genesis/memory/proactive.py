@@ -610,6 +610,20 @@ async def proactive_context(
         procedure = await _surface_procedure(db, vector)
         if procedure:
             lines.append(_render_procedure_line(procedure))
+            # HONEST funnel signal: bump surfaced_count (NOT invocation_count —
+            # passive surfacing must never feed the promoter, which reads
+            # invocation_count). This lives server-side so EVERY profile records
+            # it in one place; the pre-flip fork bumped it in the hook
+            # (_record_procedure_surfaced), which the thin-client flip removes.
+            # Best-effort: a bump failure must never fail recall.
+            try:
+                await db.execute(
+                    "UPDATE procedural_memory SET surfaced_count = surfaced_count + 1 WHERE id = ?",
+                    (procedure["id"],),
+                )
+                await db.commit()
+            except Exception:
+                logger.debug("surfaced_count bump failed", exc_info=True)
 
     shadow = _shadow_projection(dicts, suppress)
     results = [_result_row(d) for d in dicts]

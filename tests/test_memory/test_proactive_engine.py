@@ -298,3 +298,85 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
     assert captured["extra"] == ["memory", "retrieval"]  # falsy dropped
     assert captured["rerank"] is True  # cc_hook default
     assert captured["limit"] == 1  # command budget
+
+
+async def test_proactive_context_bumps_surfaced_count_not_invocation():
+    """When the engine surfaces a procedure it bumps ``surfaced_count`` (the
+    honest funnel signal), NOT ``invocation_count`` — parity with the pre-flip
+    fork's ``_record_procedure_surfaced``, now single-sited server-side so every
+    profile records it. Regression guard for the thin-client flip: the hook
+    stops writing this, so the engine MUST.
+    """
+
+    class _BumpDB:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, tuple]] = []
+
+        async def execute_fetchall(self, sql, params=()):
+            return []  # no enrich/breadcrumb rows needed
+
+        async def execute(self, sql, params=()):
+            self.executed.append((sql, tuple(params) if params else ()))
+
+        async def commit(self):
+            return None
+
+    class _BumpMod:
+        _retriever = _FakeRetriever()
+        _db = _BumpDB()
+
+        @staticmethod
+        def _require_init():
+            return None
+
+    mod = _BumpMod()
+    proc = {"id": "proc-abc", "task_type": "deploy", "principle": "do the thing", "tier": "CORE"}
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=mod),
+        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=[])),
+        patch("genesis.memory.proactive._surface_procedure", new=AsyncMock(return_value=proc)),
+    ):
+        resp = await P.proactive_context(prompt="deploy the latest build", session_id="s")
+
+    assert resp["procedure"] == {"id": "proc-abc", "tier": "CORE"}
+    bumps = [(sql, params) for sql, params in mod._db.executed if "surfaced_count" in sql.lower()]
+    assert len(bumps) == 1, f"expected exactly one surfaced_count bump, got {mod._db.executed}"
+    sql, params = bumps[0]
+    assert "invocation_count" not in sql.lower()  # must NEVER feed the promoter
+    assert params == ("proc-abc",)
+
+
+async def test_proactive_context_no_procedure_no_bump():
+    """No procedure surfaced → no surfaced_count write at all."""
+
+    class _BumpDB:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, tuple]] = []
+
+        async def execute_fetchall(self, sql, params=()):
+            return []
+
+        async def execute(self, sql, params=()):
+            self.executed.append((sql, tuple(params) if params else ()))
+
+        async def commit(self):
+            return None
+
+    class _BumpMod:
+        _retriever = _FakeRetriever()
+        _db = _BumpDB()
+
+        @staticmethod
+        def _require_init():
+            return None
+
+    mod = _BumpMod()
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=mod),
+        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=[])),
+        patch("genesis.memory.proactive._surface_procedure", new=AsyncMock(return_value=None)),
+    ):
+        resp = await P.proactive_context(prompt="deploy the latest build", session_id="s")
+
+    assert resp["procedure"] is None
+    assert not [s for s, _ in mod._db.executed if "surfaced_count" in s.lower()]
