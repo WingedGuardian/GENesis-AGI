@@ -237,16 +237,50 @@ DEFAULT_PROFILE = "cc_hook"
 _PROCEDURE_SURFACE_THRESHOLD = 0.7
 _DORMANT_SURFACE_THRESHOLD = 0.78
 
+# TTL for the surfaceable-procedure cache. Procedure principle embeddings change
+# rarely (novelty-gated writes), so a stale-by-≤300s cache on a soft top-1
+# advisory is fine — and it keeps the ~300-row read + BLOB unpack + row
+# normalization off the per-prompt hot path (they run once per TTL, not every
+# call). The pure-Python O(n·d) cosine loop that dominated the old path
+# (~98ms/call — DB read + unpack + scalar cosine over ~300×1024) becomes one
+# cached matmul (~0.25ms). Single event loop → no lock needed (a concurrent
+# rebuild just recomputes identical data, last writer wins).
+_PROCEDURE_CACHE_TTL_S = 300.0
 
-async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
-    """Return ``{"id", "task_type", "principle", "tier"}`` for the best
-    procedure clearing its tier-dependent cosine bar, else None."""
+
+@dataclass(frozen=True)
+class _ProcedureCache:
+    """Pre-normalized principle-embedding matrix + row-aligned metadata."""
+
+    matrix: Any  # (N, D) L2-normalized float64 ndarray (np.empty((0, 0)) when N=0)
+    meta: list[tuple[str, str, str, str]]  # (id, task_type, principle, tier), row-aligned
+    built_at: float  # time.monotonic() at build
+
+
+_procedure_cache: _ProcedureCache | None = None
+
+
+async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
+    """Return the cached surfaceable-procedure matrix, rebuilding past the TTL.
+
+    On a DB/read error the last good cache is served (returns None only when one
+    was never built) — more resilient than the old per-call path, which surfaced
+    nothing on a transient error. Staleness is normally ≤ TTL, but during a
+    *sustained* read outage the last snapshot is served until the DB recovers
+    (acceptable for a soft top-1 advisory; a down DB fails ``recall()`` upstream
+    long before this matters). The cache is process-global and NOT keyed on
+    ``db`` — correct because the runtime passes exactly one process-global
+    connection (``memory_mod._db``) for its whole lifetime.
+    """
+    global _procedure_cache
+    now = time.monotonic()
+    cache = _procedure_cache
+    if cache is not None and (now - cache.built_at) < _PROCEDURE_CACHE_TTL_S:
+        return cache
+
+    from genesis.learning.procedural.embedding import normalize_rows, unpack_embedding
+
     try:
-        from genesis.learning.procedural.embedding import (
-            cosine_similarity,
-            unpack_embedding,
-        )
-
         rows = await db.execute_fetchall(
             "SELECT id, task_type, principle, principle_embedding, activation_tier "
             "FROM procedural_memory "
@@ -255,26 +289,85 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
             "ORDER BY confidence DESC LIMIT 1000"
         )
     except Exception:
-        return None  # table absent / DB error — never block the endpoint
+        logger.debug("procedure cache reload failed — keeping prior cache", exc_info=True)
+        return cache  # table absent / DB error — never block the endpoint
 
-    best: tuple[float, str, str, str, str] | None = None
+    import numpy as np
+
+    vectors: list[list[float]] = []
+    meta: list[tuple[str, str, str, str]] = []
     for row in rows:
-        existing = unpack_embedding(row[3])
-        if existing is None:
+        vec = unpack_embedding(row[3])
+        if vec is None:
             continue
-        sim = cosine_similarity(vector, existing)
-        tier = row[4] or "DORMANT"
+        vectors.append(vec)
+        # Principle is truncated to the returned width here so the cache doesn't
+        # pin full principle text for every row over the TTL (only [:200] is ever
+        # surfaced). float64 matrix is deliberate — the scalar cosine_similarity
+        # computes in Python float; a float32 matmul would diverge ~1e-6 and can
+        # flip a near-threshold surface, so keep float64 for parity.
+        meta.append((row[0], row[1] or "", (row[2] or "")[:200], row[4] or "DORMANT"))
+
+    matrix = normalize_rows(np.asarray(vectors, dtype=np.float64)) if vectors else np.empty((0, 0))
+    _procedure_cache = _ProcedureCache(matrix=matrix, meta=meta, built_at=now)
+    return _procedure_cache
+
+
+async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
+    """Return ``{"id", "task_type", "principle", "tier"}`` for the best
+    procedure clearing its tier-dependent cosine bar, else None.
+
+    Vectorized against the TTL-cached, pre-normalized matrix (see
+    :func:`_load_procedure_cache`) — parity with the old per-row scalar loop
+    within floating-point tolerance (measured Δ ~1e-16 vs the scalar cosine):
+    same confidence-DESC row order, same strict ``>`` tie-break (first/highest-
+    confidence wins), same per-tier thresholds. The only conceivable divergence
+    is a cosine sitting within ~machine-ε of a tier bar flipping surface/skip —
+    measure-zero on continuous embeddings and immaterial for a soft advisory.
+    """
+    from genesis.learning.procedural.embedding import cosine_similarity_batch
+
+    cache = await _load_procedure_cache(db)
+    if cache is None or not cache.meta:
+        return None
+
+    sims = cosine_similarity_batch(cache.matrix, vector)
+
+    best_idx = -1
+    best_sim = -1.0
+    for idx, (_pid, _task, _principle, tier) in enumerate(cache.meta):
         threshold = (
             _DORMANT_SURFACE_THRESHOLD if tier == "DORMANT" else _PROCEDURE_SURFACE_THRESHOLD
         )
+        sim = float(sims[idx])
         if sim < threshold:
             continue
-        if best is None or sim > best[0]:
-            best = (sim, row[0], row[1] or "", row[2] or "", tier)
+        if sim > best_sim:
+            best_sim = sim
+            best_idx = idx
 
-    if best is None:
+    if best_idx < 0:
         return None
-    _sim, proc_id, task_type, principle, tier = best
+    proc_id, task_type, principle, tier = cache.meta[best_idx]
+
+    # The cache is up to TTL stale, so it can still hold a procedure that was
+    # quarantined/deprecated since the build — the exclusion the bulk SQL filter
+    # (deprecated=0 AND quarantined=0) would otherwise re-apply every call. Verify
+    # the single winner live before surfacing: one PK lookup, only on the surface
+    # path (a minority of prompts). Fail-closed — if it is gone, excluded, or the
+    # check errors, surface nothing this turn (self-heals at the next rebuild)
+    # rather than advise a procedure the rest of the system now excludes.
+    try:
+        live = await db.execute_fetchall(
+            "SELECT 1 FROM procedural_memory "
+            "WHERE id = ? AND deprecated = 0 AND quarantined = 0 LIMIT 1",
+            (proc_id,),
+        )
+    except Exception:
+        return None
+    if not live:
+        return None
+
     return {"id": proc_id, "task_type": task_type, "principle": principle[:200], "tier": tier}
 
 
