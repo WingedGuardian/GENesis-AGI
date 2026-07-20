@@ -51,6 +51,9 @@ export function chipState(health, lastRun = null, nowMs = Date.now()) {
   // approvals). Not a fault and not neutral-quiet: its own visible state so it
   // never masquerades as degraded (a fault) or healthy (nothing to do).
   if (["needs action", "action", "attention"].includes(h)) return "action";
+  // "deploying" — an update is in progress (server intentionally down/restarting).
+  // Informational, not a fault: render neutral-blue (chip--info), never amber/red.
+  if (h === "deploying") return "info";
   return "warn"; // genuinely novel health value: surface it, don't hide it
 }
 
@@ -60,8 +63,8 @@ export function chipClass(state) {
 }
 
 /** Shape glyph per state — color-blind support without icon fonts.
- * ("info" is not a health state — chipState never returns it — but chips
- * using .chip--info via static class can still ask for its glyph.) */
+ * ("info" is the transient "deploying" state (chipState) plus chips using
+ * .chip--info via a static class.) */
 export function chipGlyph(state) {
   return { ok: "●", warn: "▲", err: "✕", stale: "◔", info: "ℹ", action: "◆", off: "○" }[state] ?? "●";
 }

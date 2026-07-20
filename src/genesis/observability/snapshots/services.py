@@ -41,6 +41,21 @@ def _finish_services(result: dict) -> dict:
     Host-framework ``detect()`` is near-free (empty detector registry, 30s cache),
     so it stays here too rather than warranting its own offload.
     """
+    # Deploy-aware: update.sh/restore intentionally stop genesis-server during a
+    # deploy. Reuse the SAME signal the watchdog honors (env.update_in_progress —
+    # PID-liveness + phase-gated + 4h-bounded, fail-open to False) so the dashboard
+    # shows "deploying" instead of a false "degraded/stale". The visible window is
+    # the post-restart health_check phase (fresh server, empty sentinel heartbeat →
+    # would read stale); the full server-down window is correctly invisible (no
+    # server to serve /health).
+    try:
+        from genesis.env import update_in_progress
+
+        deploying = bool(update_in_progress())
+    except Exception:
+        deploying = False
+    result["deploying"] = deploying
+
     # Host framework detection (USB mode)
     try:
         status = _get_registry().detect()
@@ -84,10 +99,17 @@ def _finish_services(result: dict) -> dict:
                 age_s = 9999  # No heartbeat recorded yet — treat as stale
             is_stale = age_s > 600  # 10 min = 2x awareness loop interval
 
-            # Only override to "stale" when sentinel reports healthy — active
-            # states (investigating, escalated) are more informative than stale.
+            # Only coerce a HEALTHY sentinel — active states (investigating,
+            # escalated, remediating, awaiting_*) are more informative and must
+            # not be masked by "stale" or "deploying". During a deploy the fresh
+            # server's heartbeat is legitimately empty (not stale): suppress stale
+            # and surface "deploying" so the dashboard reads informational, not red.
             reported_state = state.current_state
-            if is_stale and reported_state == "healthy":
+            if deploying:
+                is_stale = False
+                if reported_state == "healthy":
+                    reported_state = "deploying"
+            elif is_stale and reported_state == "healthy":
                 reported_state = "stale"
 
             result["sentinel"] = {

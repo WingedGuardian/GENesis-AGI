@@ -23,6 +23,7 @@ from genesis.runtime._core import GenesisRuntime
 
 def _fake_sentinel(current_state="healthy", is_active=False, **kw):
     from datetime import UTC, datetime
+
     state = SimpleNamespace(
         current_state=current_state,
         last_trigger_source=kw.get("last_trigger_source", ""),
@@ -57,12 +58,14 @@ def test_services_includes_sentinel_key_when_healthy(runtime_singleton):
 
 
 def test_services_sentinel_investigating_active(runtime_singleton):
-    _install_runtime(_fake_sentinel(
-        current_state="investigating",
-        is_active=True,
-        last_trigger_source="fire_alarm",
-        last_trigger_reason="router.all_exhausted",
-    ))
+    _install_runtime(
+        _fake_sentinel(
+            current_state="investigating",
+            is_active=True,
+            last_trigger_source="fire_alarm",
+            last_trigger_reason="router.all_exhausted",
+        )
+    )
     result = services()
     assert result["sentinel"]["current_state"] == "investigating"
     assert result["sentinel"]["is_active"] is True
@@ -87,7 +90,8 @@ def test_services_sentinel_unavailable_when_sentinel_is_none(runtime_singleton):
 
 
 def test_services_sentinel_unavailable_when_runtime_not_bootstrapped(
-    runtime_singleton, monkeypatch,
+    runtime_singleton,
+    monkeypatch,
 ):
     """The real bootstrap-never-ran path: the snapshot reads the runtime via
     ``peek()`` and reports 'unavailable' without ever constructing one.
@@ -114,3 +118,45 @@ def test_services_sentinel_unavailable_when_runtime_not_bootstrapped(
     # The snapshot must read the runtime via peek() (never instance(), which would
     # construct). If a future change swaps peek() for instance(), this fails.
     peek_spy.assert_called()
+
+
+# ── Deploy-aware display (services.deploying reuses env.update_in_progress) ──
+
+
+def _stale_heartbeat() -> str:
+    """An ISO timestamp old enough to trip the 600s staleness threshold."""
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+
+
+def test_services_deploying_suppresses_stale(runtime_singleton, monkeypatch):
+    """During a deploy, a fresh/stale HEALTHY sentinel reads 'deploying', not
+    'stale' — the post-restart health_check window this fix exists for."""
+    _install_runtime(_fake_sentinel(current_state="healthy", last_heartbeat_at=_stale_heartbeat()))
+    monkeypatch.setattr("genesis.env.update_in_progress", lambda: True)
+    result = services()
+    assert result["deploying"] is True
+    assert result["sentinel"]["is_stale"] is False
+    assert result["sentinel"]["current_state"] == "deploying"
+
+
+def test_services_deploying_preserves_active_sentinel(runtime_singleton, monkeypatch):
+    """A deploy must NOT mask an active/escalated sentinel — a real fault mid-deploy
+    stays visible; only stale is suppressed."""
+    _install_runtime(_fake_sentinel(current_state="escalated", escalated_count=1))
+    monkeypatch.setattr("genesis.env.update_in_progress", lambda: True)
+    result = services()
+    assert result["deploying"] is True
+    assert result["sentinel"]["current_state"] == "escalated"  # preserved, not coerced
+    assert result["sentinel"]["is_stale"] is False
+
+
+def test_services_not_deploying_by_default(runtime_singleton, monkeypatch):
+    """No deploy in progress → deploying False and the stale path is unchanged."""
+    _install_runtime(_fake_sentinel(current_state="healthy", last_heartbeat_at=_stale_heartbeat()))
+    monkeypatch.setattr("genesis.env.update_in_progress", lambda: False)
+    result = services()
+    assert result["deploying"] is False
+    assert result["sentinel"]["is_stale"] is True
+    assert result["sentinel"]["current_state"] == "stale"
