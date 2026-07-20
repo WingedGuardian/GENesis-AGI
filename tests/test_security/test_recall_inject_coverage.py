@@ -56,9 +56,11 @@ KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
         "wrapped",
         "external items wrapped after label_result_dicts (full path)",
     ),
-    "mcp/memory/core.py::memory_proactive": (
+    "mcp/memory/core.py::_proactive_impl": (
         "wrapped",
-        "source=both default; external items wrapped in the return",
+        "source=both default; external items wrapped in the return "
+        "(shared engine behind the memory_proactive tool + the server "
+        "proactive recall endpoint)",
     ),
     "mcp/memory/knowledge.py::knowledge_recall": (
         "wrapped",
@@ -100,6 +102,12 @@ KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
     "memory/corrective.py::_augment": (
         "pipeline-internal",
         "CRAG re-retrieve; results flow back through wrapped recall",
+    ),
+    "runtime/init/memory.py::_warm_recall": (
+        "pipeline-internal",
+        "boot warmup: throwaway recall to prime the embedder/Qdrant/diskcache; "
+        "the result is discarded (never rendered, reaches no prompt) and "
+        "skip_writeback drops all write-backs — no injection sink",
     ),
 }
 
@@ -182,9 +190,11 @@ INJECTION_GATE_SITES: dict[str, tuple[str, str]] = {
         "gated",
         "emits on BOTH the full (enriched) and compact-preview branches",
     ),
-    "mcp/memory/core.py::memory_proactive": (
+    "mcp/memory/core.py::_proactive_impl": (
         "gated",
-        "source=both default; emits per-call blockable count",
+        "source=both default; emits per-call blockable count "
+        "(shared engine behind the memory_proactive tool + the server "
+        "proactive recall endpoint)",
     ),
     "mcp/memory/knowledge.py::knowledge_recall": (
         "gated",

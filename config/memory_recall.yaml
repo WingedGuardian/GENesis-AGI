@@ -39,3 +39,29 @@ entity_lane:
 # the LongMemEval harness (hermetic). ("off" quoted per the YAML-1.1 note.)
 reranker:
   mode: live
+
+# Proactive recall endpoint (/api/genesis/hook/recall) — the UserPromptSubmit
+# hook is a thin client over this. Read live by genesis.memory.proactive.
+#
+# Intent-aware result budget: the fixed top-3 is replaced by a stance→count
+# curve, so a bare command deserves ~1 memory and a decision question deserves
+# 5-8. Per-profile so a future voice/s2s channel can share the engine with a
+# lower curve + a plain-English renderer. Code defaults (genesis.memory.
+# proactive._DEFAULT_BUDGETS) match these, so a trimmed install with no yaml
+# still works.
+proactive:
+  # Master on/off for the endpoint's engine (the hook falls back to FTS5-only
+  # when off or unreachable). enabled: false = kill switch.
+  enabled: true
+  profiles:
+    cc_hook:
+      # on | off — Voyage rerank on the per-prompt hook path (user decision
+      # 2026-07-19). Flip to off (read live, no restart) for a latency/cost
+      # concern; also no-ops automatically without API_KEY_VOYAGE.
+      rerank: on
+      budgets:
+        command: 1
+        chatter: 1
+        general: 3
+        question_decision: 6
+        max: 8
