@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook: proactive memory surfacing.
+"""UserPromptSubmit hook: proactive memory surfacing (thin client).
 
-Searches the memory system for memories relevant to the user's current
-message and injects them as context. Uses tiered retrieval:
-1. FTS5 keyword search (always, ~5ms) — covers both episodic and knowledge
-2. Qdrant vector search on episodic_memory (~400-500ms, falls back gracefully)
-3. Qdrant vector search on knowledge_base (filtered to intentional ingestions, parallel)
-4. RRF fusion across all sources
+Session-local awareness (heartbeat, intent trail, working set, ambient fold)
+runs in-process; MEMORY RECALL is delegated to the genesis-server engine via
+``POST /api/genesis/hook/recall`` so recall logic (reranker, fusion, entity
+lane, graph expansion, injection defense, procedure surfacing) lives in exactly
+one place. On any server failure the hook falls back to a degraded FTS5-only
+keyword search (no write-backs) so a prompt is never blocked.
 
-After the routing fix, ALL internal memory lives in episodic_memory.
-knowledge_base holds external domain data + intentionally ingested content.
+Modes (``GENESIS_PROACTIVE_HOOK_MODE``, default ``server``):
+  server — call the endpoint; degrade to FTS5 on failure
+  local  — skip the endpoint, always use the FTS5 degraded path
+  off    — session-local awareness only, no memory recall
+Endpoint base URL: ``GENESIS_PROACTIVE_HOOK_URL`` (default http://127.0.0.1:5000).
 
-Budget: <2.0s total. FTS5-only if embedding unavailable or slow.
+Budget: <2.2s client (server times out first at 2.0s → clean fallback).
 
 Reads hook input from stdin as JSON:
   {"session_id": "...", "prompt": "...", ...}
@@ -53,63 +56,210 @@ def _genesis_db_path() -> Path:
     return importlib.import_module("genesis.env").genesis_db_path()
 
 
-def _qdrant_url() -> str:
-    return importlib.import_module("genesis.env").qdrant_url()
-
-
 _DB_PATH = _genesis_db_path()
-_QDRANT_URL = _qdrant_url()
-_QDRANT_COLLECTION = "episodic_memory"
-# Total budget for embedding in a UserPromptSubmit hook. Cloud-first chain
-# means typical latency is ~500ms (DeepInfra GPU). Budget of 3s is generous
-# enough for one cloud round-trip plus retries, but bounded to prevent hangs
-# when all backends are down.
-_EMBED_TIMEOUT_S = 3.0
-_MAX_RESULTS = 3
+_MAX_RESULTS = 3  # Degraded-fallback result cap (the server owns the live budget).
 _MIN_PROMPT_WORDS = 1  # Stop words already filter greetings to 0 keywords
 _METRICS_PATH = Path.home() / ".genesis" / "proactive_metrics.json"
 
-# Rank-2+ RRF floor and single-KB-slot cap for result selection. Module-level
-# so the H-1 PR2a shadow projection (_shadow_gate) shares the exact same values
-# as the real selection loop in _rrf_fusion.
-_MIN_RRF_SCORE_RANK2 = 0.015
-_MAX_KB_SLOTS = 1  # Prevent KB from flooding out episodic context
+# Recall delegation to the genesis-server engine (thin-client flip). The hook
+# posts each prompt here; recall logic lives server-side in exactly one place.
+_HOOK_MODE = os.environ.get("GENESIS_PROACTIVE_HOOK_MODE", "server").strip().lower()
+_SERVER_BASE = os.environ.get(
+    "GENESIS_PROACTIVE_HOOK_URL",
+    "http://127.0.0.1:5000",
+).rstrip("/")
+_RECALL_ENDPOINT = f"{_SERVER_BASE}/api/genesis/hook/recall"
+# Client budget slightly ABOVE the server's 2.0s _async_route timeout so the
+# server times out first and returns a clean 503 (→ fallback), rather than the
+# client aborting mid-flight; the short connect timeout catches a down server fast.
+_SERVER_TIMEOUT_S = 2.2
+_SERVER_CONNECT_TIMEOUT_S = 0.25
 
-# H-1 PR2a novelty-gate shadow: serendipity boost applied (in projection only)
-# to never-surfaced episodic memories, and the kill-switch flag that neutralizes
-# the suppression set without a deploy. PR2a is measurement-only — these affect
-# the shadow projection, never the injected output.
-_SERENDIPITY_BOOST = 1.3
+# Kill-switch flag consumed by _compute_suppress_ids (H-1 shadow suppression set).
 _WS_GATE_DISABLED_FLAG = Path.home() / ".genesis" / "ws_gate_disabled"
 
+# Automated-subsystem writes excluded from the degraded-fallback FTS5 lane
+# (parity with the server engine's recall filter). NULL source_subsystem
+# (user-sourced + legacy rows) is always preserved.
+_PROACTIVE_EXCLUDED_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection", "autonomy")
+
 # Common English stop words to filter from search queries
-_STOP_WORDS = frozenset({
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "can", "shall", "must", "need",
-    "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
-    "they", "them", "their", "this", "that", "these", "those",
-    "what", "which", "who", "whom", "where", "when", "why", "how",
-    "not", "no", "nor", "but", "or", "and", "so", "if", "then",
-    "than", "too", "very", "just", "about", "also", "of", "in",
-    "on", "at", "to", "for", "with", "from", "by", "as", "into",
-    "through", "during", "before", "after", "above", "below",
-    "up", "down", "out", "off", "over", "under", "again",
-    "let", "lets", "let's", "please", "ok", "okay", "yeah", "yes",
-    "hey", "hi", "hello", "thanks", "thank",
-    # Conversational filler that dilutes FTS5 queries
-    "now", "deal", "set", "get", "got", "put", "make", "made",
-    "thing", "things", "stuff", "like", "want", "know", "think",
-    "look", "right", "well", "going", "really", "actually",
-    "already", "still", "here", "there", "start", "something",
-    "kind", "sort", "sure", "guess", "maybe", "basically",
-    "pretty", "anyway", "gonna", "wanna", "gotta",
-    "more", "both", "generally", "specifically", "topics", "topic",
-    "way", "take", "give", "come", "talk", "tell", "said",
-    "use", "using", "used", "try", "first", "last",
-    "new", "old", "big", "little", "much", "many", "few",
-    "whole", "part", "point", "matter",
-})
+_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "can",
+        "shall",
+        "must",
+        "need",
+        "i",
+        "me",
+        "my",
+        "we",
+        "our",
+        "you",
+        "your",
+        "he",
+        "she",
+        "it",
+        "they",
+        "them",
+        "their",
+        "this",
+        "that",
+        "these",
+        "those",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "where",
+        "when",
+        "why",
+        "how",
+        "not",
+        "no",
+        "nor",
+        "but",
+        "or",
+        "and",
+        "so",
+        "if",
+        "then",
+        "than",
+        "too",
+        "very",
+        "just",
+        "about",
+        "also",
+        "of",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "with",
+        "from",
+        "by",
+        "as",
+        "into",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "up",
+        "down",
+        "out",
+        "off",
+        "over",
+        "under",
+        "again",
+        "let",
+        "lets",
+        "let's",
+        "please",
+        "ok",
+        "okay",
+        "yeah",
+        "yes",
+        "hey",
+        "hi",
+        "hello",
+        "thanks",
+        "thank",
+        # Conversational filler that dilutes FTS5 queries
+        "now",
+        "deal",
+        "set",
+        "get",
+        "got",
+        "put",
+        "make",
+        "made",
+        "thing",
+        "things",
+        "stuff",
+        "like",
+        "want",
+        "know",
+        "think",
+        "look",
+        "right",
+        "well",
+        "going",
+        "really",
+        "actually",
+        "already",
+        "still",
+        "here",
+        "there",
+        "start",
+        "something",
+        "kind",
+        "sort",
+        "sure",
+        "guess",
+        "maybe",
+        "basically",
+        "pretty",
+        "anyway",
+        "gonna",
+        "wanna",
+        "gotta",
+        "more",
+        "both",
+        "generally",
+        "specifically",
+        "topics",
+        "topic",
+        "way",
+        "take",
+        "give",
+        "come",
+        "talk",
+        "tell",
+        "said",
+        "use",
+        "using",
+        "used",
+        "try",
+        "first",
+        "last",
+        "new",
+        "old",
+        "big",
+        "little",
+        "much",
+        "many",
+        "few",
+        "whole",
+        "part",
+        "point",
+        "matter",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +354,15 @@ def _is_harness_envelope(prompt: str) -> bool:
 
 
 def _record_pivot_observation(
-    db_path: Path, session_id: str, label: str, trigger: str,
+    db_path: Path,
+    session_id: str,
+    label: str,
+    trigger: str,
 ) -> None:
     """Write a conversation_pivot observation to the DB."""
     try:
         import uuid as _uuid
+
         now = datetime.now(UTC)
         expires_at = (now + timedelta(days=7)).isoformat()
         conn = sqlite3.connect(str(db_path), timeout=2)
@@ -235,7 +389,9 @@ def _record_pivot_observation(
 
 
 def _update_and_format_trail(
-    session_id: str, keywords: list[str], prompt: str,
+    session_id: str,
+    keywords: list[str],
+    prompt: str,
 ) -> str | None:
     """Update intent trail and return formatted line for injection.
 
@@ -474,10 +630,12 @@ def _ws_measure(
     raises — any internal failure returns the stats gathered so far with
     safe defaults for the rest.
 
-    ``shadow`` (H-1 PR2a) is the ``_shadow_gate`` projection for this prompt;
-    when non-empty its ``projected_injected``/``suppressed``/``serendipity_boosted``
-    fields are merged into the injection-log record and returned stats. It never
-    changes the injected output — this step already runs after stdout is flushed.
+    ``shadow`` (H-1 PR2a) is the novelty-gate projection for this prompt —
+    supplied by the server engine's ``_shadow_projection`` on the server path,
+    and ``None`` on the degraded fallback. When non-empty its
+    ``projected_injected``/``suppressed``/``serendipity_boosted`` fields are
+    merged into the injection-log record and returned stats. It never changes the
+    injected output — this step already runs after stdout is flushed.
     """
     stats: dict = {
         "injected_ids": [],
@@ -495,8 +653,7 @@ def _ws_measure(
         stats["zero_retrieved_injected"] = sum(
             1
             for r in fused
-            if r.get("collection") != "knowledge_base"
-            and r.get("_retrieved_count", -1) == 0
+            if r.get("collection") != "knowledge_base" and r.get("_retrieved_count", -1) == 0
         )
         if session_id and (stats["injected_ids"] or surfaced_proc_id):
             ws = _load_working_set(session_id)
@@ -538,9 +695,10 @@ def _is_garbage(content: str) -> bool:
     """Filter out content that should never surface as proactive memory."""
     # NOTE (PR2): we deliberately no longer drop content merely for containing
     # `<external-content>` markers. That was a blunt defense against leaked
-    # boundary markers, but it also silently lost legitimate hits. `_format_results`
-    # now strips any leaked markers and re-labels external-world hits (`KB·…`),
-    # so surfacing-clean is safe. Do not re-add this drop as "protective".
+    # boundary markers, but it also silently lost legitimate hits. The degraded
+    # fallback formatter (`_format_degraded`) strips any leaked markers, so
+    # surfacing-clean is safe. Do not re-add this drop as "protective". (Used
+    # only on the degraded path now; the server engine owns the primary filter.)
     if content is None:
         return True  # NULL-content row (FTS content is nullable): filter, never crash
     stripped = content.lstrip()
@@ -571,7 +729,11 @@ def _keywords_from_files(file_paths: list[str]) -> list[str]:
         parts = path.replace("/", " ").replace("_", " ").replace(".", " ").split()
         for part in parts:
             part = part.lower()
-            if part not in _STOP_WORDS and len(part) >= 3 and part not in ("src", "py", "md", "txt", "json", "yaml", "tests", "test"):
+            if (
+                part not in _STOP_WORDS
+                and len(part) >= 3
+                and part not in ("src", "py", "md", "txt", "json", "yaml", "tests", "test")
+            ):
                 keywords.append(part)
     # Deduplicate preserving order
     seen: set[str] = set()
@@ -643,12 +805,14 @@ def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
                 if row["parent_class"]:
                     loc = f"{row['module_path']}:{row['parent_class']}"
                 content = f"[Code] {sig} — {loc}"
-                results.append({
-                    "memory_id": f"code:{row['module_path']}:{row['name']}",
-                    "content": content,
-                    "source_type": "code_index",
-                    "memory_class": "fact",
-                })
+                results.append(
+                    {
+                        "memory_id": f"code:{row['module_path']}:{row['name']}",
+                        "content": content,
+                        "source_type": "code_index",
+                        "memory_class": "fact",
+                    }
+                )
             return results
         finally:
             conn.close()
@@ -722,17 +886,22 @@ def _search_fts5(
                 ORDER BY rank
                 LIMIT ?
                 """,  # noqa: S608 -- placeholders bound separately
-                (fts_query, *collection_params,
-                 *_PROACTIVE_EXCLUDED_SUBSYSTEMS,
-                 now_iso,
-                 _MAX_RESULTS * 2),
+                (
+                    fts_query,
+                    *collection_params,
+                    *_PROACTIVE_EXCLUDED_SUBSYSTEMS,
+                    now_iso,
+                    _MAX_RESULTS * 2,
+                ),
             )
             rows = [dict(row) for row in cursor.fetchall()]
             # Require minimum keyword overlap for multi-keyword queries
             if len(keywords) >= 3:
+
                 def _keyword_overlap(content: str, kws: list[str]) -> int:
                     content_lower = content.lower()
                     return sum(1 for k in kws if k in content_lower)
+
                 rows = [r for r in rows if _keyword_overlap(r.get("content", ""), keywords) >= 2]
             return rows
         finally:
@@ -740,458 +909,6 @@ def _search_fts5(
     except Exception as exc:
         print(f"FTS5 search error: {exc}", file=sys.stderr)
         return []
-
-
-def _expired_memory_ids(
-    db_path: Path,
-    ids: set[str],
-    now_iso: str | None = None,
-) -> set[str]:
-    """Return the subset of ``ids`` whose ``invalid_at`` is in the past.
-
-    Post-query bitemporal filter for the Qdrant union: vector + wing hits
-    enter the fused set without seeing ``memory_metadata.invalid_at`` (the
-    Qdrant payload doesn't carry it). Mirrors
-    ``memory.retrieval._expired_candidate_ids``.
-
-    NULL ``invalid_at`` = "valid forever" and is never returned. Ids with no
-    ``memory_metadata`` row (e.g. knowledge_base points) simply don't match,
-    so they're safely ignored. On any DB error this returns an empty set —
-    the safe direction: never drop context we can't positively prove expired.
-    """
-    if not ids:
-        return set()
-    if now_iso is None:
-        now_iso = datetime.now(UTC).isoformat()
-    placeholders = ",".join("?" * len(ids))
-    try:
-        conn = sqlite3.connect(str(db_path), timeout=2)
-        try:
-            cursor = conn.execute(
-                f"SELECT memory_id FROM memory_metadata "  # noqa: S608 -- bound below
-                f"WHERE memory_id IN ({placeholders}) "
-                f"AND invalid_at IS NOT NULL AND invalid_at <= ?",
-                (*ids, now_iso),
-            )
-            return {row[0] for row in cursor.fetchall()}
-        finally:
-            conn.close()
-    except Exception as exc:
-        print(f"invalid_at filter error: {exc}", file=sys.stderr)
-        return set()
-
-
-_PROCEDURE_SURFACE_THRESHOLD = 0.7  # Cosine cutoff for PROVEN tiers (CORE/ADVISORY/LIBRARY).
-# "Recommend a procedure" carries higher risk of being a false positive than
-# "recommend a memory" (procedures are workflow assertions), so use a stricter
-# cosine cutoff. Top-1 only: most prompts have no relevant procedure.
-_DORMANT_SURFACE_THRESHOLD = 0.78  # Stricter bar for UNPROVEN drafts (DORMANT).
-# DORMANT procedures (0 invocations, confidence 0.0) are eligible for surfacing —
-# that's how golden-dormant drafts escape the never-seen → never-used → never-
-# promoted lockout — but they must clear a HIGHER relevance bar than proven tiers
-# before being auto-injected, and the caller frames them as unproven suggestions.
-
-
-def _search_procedures(
-    db_path: Path, prompt_vector: list[float],
-) -> tuple[str, str, str, str] | None:
-    """Return (procedure_id, task_type, principle_snippet, activation_tier) if a
-    procedure's principle embedding clears its tier-dependent cosine threshold,
-    else None.
-
-    ALL non-deprecated, non-quarantined, embedded procedures are eligible —
-    including DORMANT drafts. Each row is gated against its OWN tier threshold
-    (DORMANT must clear the stricter ``_DORMANT_SURFACE_THRESHOLD``), then the
-    highest-similarity row that cleared its bar wins — so a high-similarity-but-
-    rejected DORMANT never shadows a proven LIBRARY match just below it.
-
-    Best-effort: catches every failure mode and returns None so the parent
-    hook (memory recall) is never blocked by this addition.
-    """
-    try:
-        from genesis.learning.procedural.embedding import (
-            cosine_similarity,
-            unpack_embedding,
-        )
-
-        conn = sqlite3.connect(str(db_path), timeout=2)
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT id, task_type, principle, principle_embedding, activation_tier "
-                "FROM procedural_memory "
-                "WHERE deprecated = 0 AND quarantined = 0 "
-                "AND principle_embedding IS NOT NULL "
-                # All tiers eligible — including DORMANT drafts. The per-row tier
-                # threshold below (not the SQL) is what gates unproven drafts;
-                # surfacing them is how they escape the golden-dormant lockout.
-                # NB: DORMANT drafts have confidence 0.0, so they sort LAST under
-                # "confidence DESC" — a tight LIMIT would starve the exact rows
-                # we want to unlock. The bound is generous (procedures are sparse
-                # by design); the real selector is cosine, computed below over the
-                # whole fetched set. Revisit with a vector index if the pool nears
-                # this bound.
-                "ORDER BY confidence DESC LIMIT 1000"
-            ).fetchall()
-        finally:
-            conn.close()
-
-        best: tuple[float, str, str, str, str] | None = None
-        for row in rows:
-            existing_vec = unpack_embedding(row["principle_embedding"])
-            if existing_vec is None:
-                continue
-            sim = cosine_similarity(prompt_vector, existing_vec)
-            tier = row["activation_tier"] or "DORMANT"
-            threshold = (
-                _DORMANT_SURFACE_THRESHOLD
-                if tier == "DORMANT"
-                else _PROCEDURE_SURFACE_THRESHOLD
-            )
-            if sim < threshold:
-                continue  # row failed its OWN tier's bar — never let it win
-            if best is None or sim > best[0]:
-                best = (sim, row["id"], row["task_type"] or "", row["principle"] or "", tier)
-
-        if best is None:
-            return None
-        _sim, proc_id, task_type, principle, tier = best
-        return proc_id, task_type, principle[:200], tier
-    except Exception:
-        return None  # Never block the memory hook
-
-
-async def _embed_text(text: str) -> list[float] | None:
-    """Get embedding from the configured backend chain (cloud-first).
-
-    Returns None if all backends fail or the total budget is exceeded.
-    Budget exists because this runs in a UserPromptSubmit hook that blocks
-    the conversation — can't let 3 × 30s backend timeouts stack up.
-
-    Backend order is cloud-first (DeepInfra → DashScope → Ollama) for
-    latency: cloud GPU ~500ms vs Ollama CPU ~1500ms. This differs from the
-    storage path (Ollama → cloud) which optimizes for cost.
-    """
-    try:
-        mod = importlib.import_module("genesis.memory.embeddings")
-        EmbeddingProvider = mod.EmbeddingProvider  # noqa: N806
-        DeepInfraBackend = mod.DeepInfraBackend  # noqa: N806
-        DashScopeBackend = mod.DashScopeBackend  # noqa: N806
-        OllamaBackend = mod.OllamaBackend  # noqa: N806
-
-        # Build cloud-first chain for recall (latency-optimized)
-        backends: list = []
-        di_key = os.environ.get("API_KEY_DEEPINFRA", "").strip()
-        if di_key:
-            backends.append(DeepInfraBackend(api_key=di_key))
-        ds_key = os.environ.get("API_KEY_QWEN", "").strip()
-        if ds_key:
-            backends.append(DashScopeBackend(api_key=ds_key))
-        # Ollama last — slow CPU inference, but free
-        env_mod = importlib.import_module("genesis.env")
-        if env_mod.ollama_enabled():
-            model = os.environ.get(
-                "OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b-fp16",
-            )
-            backends.append(OllamaBackend(url=env_mod.ollama_url(), model=model))
-
-        if not backends:
-            # No backends configured — fall back to default chain
-            provider = EmbeddingProvider(cache_dir=None)
-        else:
-            provider = EmbeddingProvider(backends=backends, cache_dir=None)
-
-        return await asyncio.wait_for(provider.embed(text), timeout=_EMBED_TIMEOUT_S)
-    except TimeoutError:
-        print(
-            f"Embedding exceeded {_EMBED_TIMEOUT_S}s budget (all backends slow/down)",
-            file=sys.stderr,
-        )
-    except Exception as exc:
-        print(f"Embedding error: {exc}", file=sys.stderr)
-    return None
-
-
-# Subsystems whose memory writes are excluded from the UserPromptSubmit
-# proactive injection by default. Mirror genesis.memory.retrieval._KNOWN_SUBSYSTEMS
-# — this hook runs in a separate subprocess and can't import the package
-# without slowing the prompt path. Update both lists together if either
-# changes.
-_PROACTIVE_EXCLUDED_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection", "autonomy")
-
-
-async def _search_qdrant(
-    vector: list[float],
-    wing_filter: str | None = None,
-    collection: str = _QDRANT_COLLECTION,
-    extra_filter: dict | None = None,
-) -> list[dict]:
-    """Search a Qdrant collection for similar memories.
-
-    Args:
-        vector: Embedding vector to search with.
-        wing_filter: Optional wing to filter results (e.g., "memory", "routing").
-        collection: Qdrant collection to search (default: episodic_memory).
-        extra_filter: Optional additional Qdrant filter conditions (merged with wing_filter).
-
-    Automatically excludes automated-subsystem writes (ego, triage,
-    reflection) via a ``must_not`` payload filter so subsystem
-    decisional content doesn't leak into the CC prompt context.
-    """
-    try:
-        import httpx
-        body: dict = {
-            "vector": vector,
-            "limit": _MAX_RESULTS * 2,
-            "with_payload": True,
-        }
-        must_conditions: list[dict] = []
-        if wing_filter:
-            must_conditions.append({"key": "wing", "match": {"value": wing_filter}})
-        if extra_filter:
-            must_conditions.extend(extra_filter.get("must", []))
-        filter_block: dict = {}
-        if must_conditions:
-            filter_block["must"] = must_conditions
-        # Default exclusion of subsystem writes. ``must_not`` against a
-        # missing payload key preserves the point — legacy rows without
-        # ``source_subsystem`` continue to surface.
-        filter_block["must_not"] = [
-            {
-                "key": "source_subsystem",
-                "match": {"any": list(_PROACTIVE_EXCLUDED_SUBSYSTEMS)},
-            },
-            {
-                "key": "deprecated",
-                "match": {"value": True},
-            },
-        ]
-        body["filter"] = filter_block
-
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.post(
-                f"{_QDRANT_URL}/collections/{collection}/points/search",
-                json=body,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                results = []
-                for hit in data.get("result", []):
-                    payload = hit.get("payload", {})
-                    results.append({
-                        "memory_id": str(hit.get("id", "")),
-                        "content": payload.get("content", ""),
-                        "score": hit.get("score", 0.0),
-                        "confidence": payload.get("confidence", 0.5),
-                        "source_session_id": payload.get("source_session_id"),
-                        "memory_class": payload.get("memory_class", "fact"),
-                        "_retrieved_count": payload.get("retrieved_count", 0),
-                        "_wing": payload.get("wing"),
-                        "collection": collection,
-                        # Provenance source tier for KB results (audit D12) — the
-                        # label needs it; memory_metadata doesn't carry it.
-                        "source_pipeline": payload.get("source_pipeline"),
-                        # WS-3 stored provenance (0054-stamped at store).
-                        "origin_class": payload.get("origin_class"),
-                    })
-                return results
-    except Exception as exc:
-        print(f"Qdrant search error ({collection}): {exc}", file=sys.stderr)
-    return []
-
-
-def _rrf_fusion(
-    fts_results: list[dict],
-    vector_results: list[dict],
-    wing_results: list[dict] | None = None,
-    code_results: list[dict] | None = None,
-    knowledge_results: list[dict] | None = None,
-    k: int = 60,
-    suppress_ids: frozenset[str] = frozenset(),
-    shadow: dict | None = None,
-) -> list[dict]:
-    """Reciprocal Rank Fusion of FTS5, vector, wing-filtered, knowledge, and code results.
-
-    Wing-filtered results get a 1.5x bonus to prioritize domain-relevant
-    content without exclusively filtering (cross-domain results still surface).
-    Knowledge base results get 0.6x base weight scaled by ingestion confidence
-    (curated ~0.95 competes at rank 2+; recon ~0.65 rarely surfaces). Max 1 KB
-    slot prevents KB from flooding out episodic context.
-    Code index results get a 0.5x weight (supplementary, not primary).
-
-    ``suppress_ids`` and ``shadow`` drive the H-1 PR2a novelty-gate MEASUREMENT
-    only — they never affect the returned results. When ``shadow`` is a dict, the
-    projected gate (suppress ``suppress_ids`` + serendipity boost) is computed on
-    copies and written into it fail-open; when ``shadow`` is None (all existing
-    callers) nothing extra runs.
-    """
-    scores: dict[str, float] = {}
-    content_map: dict[str, dict] = {}
-
-    for rank, r in enumerate(fts_results):
-        mid = r.get("memory_id", "")
-        if not mid:
-            continue
-        scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
-        content_map[mid] = r
-
-    for rank, r in enumerate(vector_results):
-        mid = r.get("memory_id", "")
-        if not mid:
-            continue
-        scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
-        if mid not in content_map:
-            content_map[mid] = r
-
-    # Wing-filtered results get 1.5x RRF bonus (domain-relevant boost)
-    if wing_results:
-        _WING_BOOST = 1.5
-        for rank, r in enumerate(wing_results):
-            mid = r.get("memory_id", "")
-            if not mid:
-                continue
-            scores[mid] = scores.get(mid, 0.0) + _WING_BOOST / (k + rank + 1)
-            if mid not in content_map:
-                content_map[mid] = r
-
-    # Code index results — supplementary signal (0.5x weight)
-    if code_results:
-        _CODE_WEIGHT = 0.5
-        for rank, r in enumerate(code_results):
-            mid = r.get("memory_id", "")
-            if not mid:
-                continue
-            scores[mid] = scores.get(mid, 0.0) + _CODE_WEIGHT / (k + rank + 1)
-            if mid not in content_map:
-                content_map[mid] = r
-
-    # Knowledge base results — confidence-weighted (0.6x base, scaled by
-    # ingestion confidence). Curated content (~0.95 conf) competes at rank 2+;
-    # recon/bulk intelligence (~0.65 conf) rarely surfaces over episodic.
-    if knowledge_results:
-        _KB_BASE_WEIGHT = 0.6
-        for rank, r in enumerate(knowledge_results):
-            mid = r.get("memory_id", "")
-            if not mid:
-                continue
-            confidence = r.get("confidence", 0.5)
-            scores[mid] = scores.get(mid, 0.0) + (_KB_BASE_WEIGHT * confidence) / (k + rank + 1)
-            if mid not in content_map:
-                content_map[mid] = r
-
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    # Dynamic count: rank 0 always surfaces; rank 1-2 only if they meet
-    # a minimum RRF score threshold (_MIN_RRF_SCORE_RANK2, module-level).  At
-    # k=60, single-source rank 0 scores ~0.016 so 0.015 filters code-index-only
-    # results (0.5x weight = 0.008) and very weak multi-source hits.  Tune
-    # upward to ~0.025 if rank 2-3 results are still noisy in practice.
-    kb_count = 0
-    results = []
-    for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS * 2]):  # scan extra to handle KB slot skips
-        if mid not in content_map:
-            continue
-        if i > 0 and score < _MIN_RRF_SCORE_RANK2:
-            break
-        entry = content_map[mid]
-        if entry.get("collection") == "knowledge_base":
-            kb_count += 1
-            if kb_count > _MAX_KB_SLOTS:
-                continue  # Skip this KB result, keep scanning
-        results.append(entry)
-        if len(results) >= _MAX_RESULTS:
-            break
-
-    # H-1 PR2a (measurement-only): project what the novelty gate WOULD inject,
-    # without touching `results`. Skipped entirely when shadow is None (every
-    # existing caller). Wrapped fail-open: this runs inline BEFORE the caller
-    # prints `results`, so a shadow-projection failure must never suppress the
-    # real injection — the measurement is strictly subordinate to the output.
-    if shadow is not None:
-        # Shadow projection must never affect the real injection path.
-        with contextlib.suppress(Exception):
-            # content_map may hold a duplicate's FTS row (no _retrieved_count).
-            # Build an authoritative count map from EVERY Qdrant-backed source
-            # that carries the payload (vector + wing-filtered + KB + code), so a
-            # never-surfaced hit is recognized regardless of which search found it.
-            rc_map: dict[str, int] = {}
-            for _src in (vector_results, wing_results, knowledge_results, code_results):
-                for r in _src or []:
-                    mid = r.get("memory_id")
-                    if mid and "_retrieved_count" in r:
-                        rc_map[mid] = r["_retrieved_count"]
-            shadow.update(_shadow_gate(scores, content_map, suppress_ids, rc_map))
-
-    return results
-
-
-def _shadow_gate(
-    scores: dict[str, float],
-    content_map: dict[str, dict],
-    suppress_ids: frozenset[str],
-    retrieved_counts: dict[str, int] | None = None,
-) -> dict:
-    """Project the PR2b novelty gate's injection set (H-1 PR2a, measurement-only).
-
-    Mirrors the real selection loop in ``_rrf_fusion`` but on COPIES: applies the
-    serendipity boost to never-surfaced episodic memories (``_retrieved_count==0``,
-    non-KB), then skips already-surfaced ``suppress_ids`` over a widened scan.
-    Never mutates its inputs — the real injection path above is untouched. PR2b
-    folds this logic into the real loop; here it only feeds measurement.
-
-    (Intentional near-duplicate of the loop above: keeping it separate is what
-    guarantees the measured path stays byte-identical during the shadow window.)
-    """
-    # A memory hit by both FTS and vector keeps its FTS row in content_map (no
-    # _retrieved_count); retrieved_counts carries the vector payload's value so a
-    # never-surfaced duplicate hit is still recognized as serendipity-eligible.
-    retrieved_counts = retrieved_counts or {}
-    boosted = dict(scores)
-    serendipity_boosted = 0
-    for mid, entry in content_map.items():
-        if mid not in boosted:
-            continue
-        rc = retrieved_counts.get(mid, entry.get("_retrieved_count", -1))
-        if rc == 0 and entry.get("collection") != "knowledge_base":
-            boosted[mid] *= _SERENDIPITY_BOOST
-            serendipity_boosted += 1
-    ranked = sorted(boosted.items(), key=lambda x: x[1], reverse=True)
-
-    suppressed = 0
-    kb_count = 0
-    selected: list[dict] = []
-    for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS * 4]):
-        if mid not in content_map:
-            continue
-        if i > 0 and score < _MIN_RRF_SCORE_RANK2:
-            break
-        if mid in suppress_ids:
-            suppressed += 1
-            continue
-        entry = content_map[mid]
-        if entry.get("collection") == "knowledge_base":
-            kb_count += 1
-            if kb_count > _MAX_KB_SLOTS:
-                continue
-        selected.append(entry)
-        if len(selected) >= _MAX_RESULTS:
-            break
-    # Mirror the real path exactly (see _run: `fused = [r for r in fused if not
-    # _is_garbage(...)]`): drop garbage from the SELECTED set with NO backfill,
-    # so projected vs actual differs ONLY by suppression + serendipity boost —
-    # the two mechanisms PR2a exists to measure. (The widened *4 scan above is
-    # for skipping suppressed IDs, not for backfilling garbage.)
-    projected = [
-        e.get("memory_id", "")
-        for e in selected
-        if not _is_garbage(e.get("content", ""))
-    ]
-    return {
-        "projected_ids": projected,
-        "projected_injected": len(projected),
-        "suppressed": suppressed,
-        "serendipity_boosted": serendipity_boosted,
-    }
 
 
 def _format_age(iso_str: str) -> str:
@@ -1253,123 +970,14 @@ def _enrich_with_metadata(results: list[dict]) -> None:
                     # refuse the fill). A real search-path value always wins.
                     if r.get("origin_class") is None:
                         r["origin_class"] = meta[mid].get("origin_class")
-                    # Called both before the enforce filter and inside
-                    # _format_results — the marker keeps the second pass from
-                    # re-querying rows this pass already resolved.
+                    # The ``_enriched`` marker keeps a second enrichment pass
+                    # (e.g. from _format_degraded) from re-querying rows this
+                    # pass already resolved.
                     r["_enriched"] = True
         finally:
             conn.close()
     except Exception:
         pass  # Best-effort enrichment — never block the hook
-
-
-def _format_results(results: list[dict]) -> str:
-    """Format surfaced memories for injection with age, wing, and ID.
-
-    Enriched format gives the model staleness awareness (age), domain
-    context (wing), and a handle for targeted recall (memory ID).
-    Rank 1 and rules get 200 chars; rank 2+ non-rules get 120 chars.
-    """
-    if not results:
-        return ""
-
-    _enrich_with_metadata(results)
-
-    lines = []
-    for rank, r in enumerate(results):
-        is_rule = r.get("memory_class") == "rule"
-        max_len = 300 if (rank == 0 or is_rule) else 200
-        content = r.get("content", "")
-        # Injection defense (PR2): strip any leaked <external-content> boundary
-        # markers from BOTH first-party and KB hits, so raw markers never reach
-        # the model. External-world hits keep their soft `KB·source` label below
-        # (this line-oriented one-per-hint format can't carry a multi-line
-        # structural wrapper — the full-content MCP/expand paths do that).
-        from genesis.security.sanitizer import strip_boundary_markers
-        content = strip_boundary_markers(content)
-        # Strip extraction-pipeline prefixes like [discovery], [feature], etc.
-        # These are baked into stored content but waste display chars.
-        if content.startswith("[") and "] " in content[:30]:
-            content = content[content.index("] ") + 2:]
-        # Smart truncation: cut at last sentence boundary before limit
-        if len(content) > max_len:
-            for i in range(max_len - 1, max(max_len - 60, 0), -1):
-                if content[i] in ".!?":
-                    content = content[: i + 1]
-                    break
-            else:
-                content = content[:max_len]
-
-
-        mid = r.get("memory_id", "")
-        age = _format_age(r.get("_created_at", ""))
-        wing = r.get("_wing") or ""
-
-        is_kb = r.get("collection") == "knowledge_base"
-        if is_kb:
-            # Name the external source tier so the model treats KB content as
-            # external-world info, not its own first-party memory (audit D12).
-            from genesis.memory.provenance import short_source
-            parts = [f"KB·{short_source(r.get('source_pipeline'))}"]
-        elif r.get("origin_class") == "external_untrusted":
-            # Stored-external EPISODIC row (written by a dispatched session
-            # ingesting external content, #1021): kept under shadow/foreground,
-            # but it must not render as first-party `[Memory]` — same
-            # external-world tier as KB hits, episodic collection.
-            parts = ["Memory·external"]
-        else:
-            parts = ["Memory"]
-        if age != "?" and not is_kb:
-            parts.append(age)
-        if wing and wing != "memory":
-            parts.append(wing)
-        if mid and not mid.startswith("code:"):
-            parts.append(f"id:{mid[:8]}")
-
-        tag = " | ".join(parts)
-        # Graph breadcrumbs: append related memory hints if available
-        related = r.get("related_ids")
-        if related:
-            tag += " | → " + ", ".join(f"id:{rid}" for rid in related)
-        lines.append(f"[{tag}] {content}")
-
-    # Remind the session about deeper search options beyond this hook
-    lines.append(
-        "Need more? Use `memory_recall` MCP (semantic search) "
-        "or query `cc_sessions` in SQLite. Grep transcripts is last resort."
-    )
-
-    return "\n".join(lines)
-
-
-async def _increment_retrieved(results: list[dict]) -> None:
-    """Increment retrieved_count in Qdrant for surfaced memories.
-
-    Fire-and-forget after output. Mirrors retrieval.py:178-189.
-    """
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=1.0) as client:
-            for r in results:
-                mid = r.get("memory_id", "")
-                old_count = r.get("_retrieved_count", 0)
-                if not mid:
-                    continue
-                try:
-                    await client.post(
-                        f"{_QDRANT_URL}/collections/{_QDRANT_COLLECTION}/points/payload",
-                        json={
-                            "payload": {"retrieved_count": old_count + 1},
-                            "points": [mid],
-                        },
-                    )
-                except Exception as inner_exc:
-                    print(
-                        f"retrieved_count update failed for {mid}: {inner_exc}",
-                        file=sys.stderr,
-                    )
-    except Exception as exc:
-        print(f"Increment retrieved_count error: {exc}", file=sys.stderr)
 
 
 def _ensure_knowledge_retrieved_count(db_path: Path) -> None:
@@ -1378,8 +986,7 @@ def _ensure_knowledge_retrieved_count(db_path: Path) -> None:
         conn = sqlite3.connect(str(db_path), timeout=2)
         try:
             conn.execute(
-                "ALTER TABLE knowledge_units "
-                "ADD COLUMN retrieved_count INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE knowledge_units ADD COLUMN retrieved_count INTEGER NOT NULL DEFAULT 0"
             )
             conn.commit()
         except sqlite3.OperationalError:
@@ -1388,6 +995,87 @@ def _ensure_knowledge_retrieved_count(db_path: Path) -> None:
             conn.close()
     except Exception:
         pass  # Never block
+
+
+async def _call_server(
+    prompt: str,
+    session_id: str,
+    file_keywords: list[str],
+    suppress_ids: frozenset[str],
+) -> dict | None:
+    """POST the prompt to the genesis-server proactive recall endpoint.
+
+    Returns the parsed JSON dict on a 200 (status ``ok`` or ``disabled``), or
+    None on ANY failure (connection refused, timeout, non-200, bad JSON) so the
+    caller falls back to the degraded FTS5 path. Never raises — a down or slow
+    server must never block the user's prompt.
+    """
+    import httpx
+
+    payload = {
+        "prompt": prompt,
+        "session_id": session_id,
+        "profile": "cc_hook",
+        "file_keywords": file_keywords,
+        "suppress_ids": list(suppress_ids)[:300],
+        "hook_version": 2,
+    }
+    try:
+        timeout = httpx.Timeout(_SERVER_TIMEOUT_S, connect=_SERVER_CONNECT_TIMEOUT_S)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(_RECALL_ENDPOINT, json=payload)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _format_degraded(results: list[dict], *, forced_local: bool = False) -> str:
+    """Render FTS5/code fallback hits with a visible degraded marker.
+
+    Used ONLY when the server recall path is unavailable (server down/slow) or
+    deliberately bypassed (``GENESIS_PROACTIVE_HOOK_MODE=local``). Reuses the
+    offline SQLite enrichment (_enrich_with_metadata) + age formatting, but tags
+    every line ``[Memory·degraded | …]`` so the model knows this is keyword-only
+    recall, not the full engine. No write-backs happen on this path.
+    """
+    if not results:
+        return ""
+    _enrich_with_metadata(results)
+    from genesis.security.sanitizer import strip_boundary_markers
+
+    banner = (
+        "[Memory recall in local keyword-only mode (GENESIS_PROACTIVE_HOOK_MODE=local)]"
+        if forced_local
+        else "[Memory recall degraded — genesis-server unreachable; keyword-only results]"
+    )
+    lines = [banner]
+    for rank, r in enumerate(results):
+        max_len = 300 if rank == 0 else 200
+        content = strip_boundary_markers(r.get("content", "") or "")
+        # Strip extraction-pipeline prefixes ([discovery], [feature], …).
+        if content.startswith("[") and "] " in content[:30]:
+            content = content[content.index("] ") + 2 :]
+        if len(content) > max_len:
+            content = content[:max_len]
+        mid = r.get("memory_id", "")
+        age = _format_age(r.get("_created_at", ""))
+        wing = r.get("_wing") or ""
+        parts = ["Memory·degraded"]
+        if age != "?":
+            parts.append(age)
+        if wing and wing != "memory":
+            parts.append(wing)
+        if mid and not mid.startswith("code:"):
+            parts.append(f"id:{mid[:8]}")
+        lines.append(f"[{' | '.join(parts)}] {content}")
+    lines.append(
+        "Need more? Use `memory_recall` MCP (semantic search) "
+        "or query `cc_sessions` in SQLite. Grep transcripts is last resort."
+    )
+    return "\n".join(lines)
 
 
 def _record_activity(db_path: Path, latency_ms: float, success: bool) -> None:
@@ -1399,29 +1087,6 @@ def _record_activity(db_path: Path, latency_ms: float, success: bool) -> None:
                 "INSERT INTO activity_log (provider, latency_ms, success, cache_hit)"
                 " VALUES (?, ?, ?, 0)",
                 ("proactive_memory", latency_ms, int(success)),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception:
-        pass  # Never block user prompt
-
-
-def _record_procedure_surfaced(db_path: Path, proc_id: str) -> None:
-    """Bump a procedure's ``surfaced_count`` after surfacing it into context.
-
-    HONEST funnel observability ONLY — deliberately bumps ``surfaced_count`` and
-    NOT ``invocation_count``, so passive surfacing never feeds the promoter
-    (which reads ``invocation_count``) and cannot promote an unproven draft.
-    Fire-and-forget: best-effort, never blocks the user prompt.
-    """
-    try:
-        conn = sqlite3.connect(str(db_path), timeout=1)
-        try:
-            conn.execute(
-                "UPDATE procedural_memory "
-                "SET surfaced_count = surfaced_count + 1 WHERE id = ?",
-                (proc_id,),
             )
             conn.commit()
         finally:
@@ -1447,6 +1112,8 @@ def _record_detail(
     projected_injected: int | None = None,
     suppressed: int = 0,
     serendipity_boosted: int = 0,
+    mode: str = "server",
+    server_ms: float | None = None,
 ) -> None:
     """Atomic JSON write — latest invocation detail for health dashboard.
 
@@ -1455,9 +1122,15 @@ def _record_detail(
     are None when no injection happened or no session ID was available. The
     shadow fields (H-1 PR2a) are the novelty-gate projection for this prompt —
     ``projected_injected`` is None when no shadow ran.
+
+    ``mode`` (server | degraded | local | off) + ``server_ms`` expose the
+    thin-client recall path, so the fallback rate is directly observable in
+    ``proactive_metrics.json`` (the 1-week latency/fallback review reads this).
     """
     data = {
         "timestamp": datetime.now(UTC).isoformat(),
+        "mode": mode,
+        "server_ms": round(server_ms, 1) if server_ms is not None else None,
         "fts_results": fts_count,
         "vector_results": vector_count,
         "fused_results": fused_count,
@@ -1568,6 +1241,7 @@ def _heartbeat_write(
         genesis_summary = _extract_genesis_summary(session_id)
 
         from genesis.db.crud.session_heartbeats import upsert_sync
+
         upsert_sync(
             str(db_path),
             cc_session_id=session_id,
@@ -1591,6 +1265,7 @@ def _heartbeat_read_and_inject(
 
     try:
         from genesis.db.crud.session_heartbeats import get_active_sync
+
         active = get_active_sync(str(db_path), exclude_session=session_id)
 
         for s in active:
@@ -1660,17 +1335,30 @@ async def _run(prompt: str, session_id: str = "") -> None:
     except Exception:
         pass  # Never block
 
-    # Augment keywords with file-context from PostToolUse tracking
+    # File-context keywords (PostToolUse tracking): sent to the server as extra
+    # FTS terms; merged into the local keyword set for the degraded fallback.
     recent_files = _load_recent_files(session_id)
-    if recent_files:
-        file_keywords = _keywords_from_files(recent_files)
-        # Append file keywords after prompt keywords (lower priority in FTS5)
-        keywords = keywords + [k for k in file_keywords if k not in keywords]
+    file_keywords = _keywords_from_files(recent_files) if recent_files else []
 
-    if len(keywords) < _MIN_PROMPT_WORDS:
+    def _flush_deferred() -> None:
+        for line in _deferred_lines:
+            print(line)
+        if _deferred_lines:
+            sys.stdout.flush()
+
+    # off mode: session-local awareness only (heartbeat/trail already ran).
+    if _HOOK_MODE == "off":
+        _flush_deferred()
+        return
+
+    # Skip recall only when there's nothing to search on (prompt has no
+    # keywords AND no file context) — parity with the old merged-keyword gate.
+    if len(keywords) < _MIN_PROMPT_WORDS and not file_keywords:
+        _flush_deferred()
         return
 
     if not _DB_PATH.exists():
+        _flush_deferred()
         return
 
     # Self-heal: ensure knowledge_units has retrieved_count column (once)
@@ -1680,220 +1368,105 @@ async def _run(prompt: str, session_id: str = "") -> None:
         _SENTINEL.parent.mkdir(parents=True, exist_ok=True)
         _SENTINEL.touch(exist_ok=True)
 
-    # Detect active wing from prompt and recent files
-    active_wing: str | None = None
-    try:
-        from genesis.memory.taxonomy import detect_wing_from_prompt
-        active_wing = detect_wing_from_prompt(prompt, file_paths=recent_files)
-    except Exception:
-        pass  # Taxonomy module failure must not block hook
-
-    # As-of instant for bitemporal invalid_at filtering across FTS + Qdrant
-    # (parity with retrieval.py). Computed once so every path agrees.
+    suppress_ids = _compute_suppress_ids(session_id)
     now_iso = datetime.now(UTC).isoformat()
 
-    # FTS5 search (synchronous, fast) — episodic only; KB comes via Qdrant
-    fts_results = _search_fts5(
-        _DB_PATH, keywords, collection="episodic_memory", now_iso=now_iso,
-    )
+    # ── Delegated recall: server engine (default) with FTS5 fallback ─
+    server_data: dict | None = None
+    server_ms: float | None = None
+    if _HOOK_MODE != "local":
+        _t_srv = time.monotonic()
+        server_data = await _call_server(prompt, session_id, file_keywords, suppress_ids)
+        server_ms = (time.monotonic() - _t_srv) * 1000
 
-    # Code index search (synchronous, fast) — structural code matches
-    code_results = _search_code_index(_DB_PATH, keywords)
+    if server_data is not None:
+        # ── SERVER PATH: the engine owns recall, formatting, procedure
+        # surfacing, and the retrieved_count / surfaced_count / immunity
+        # write-backs. The hook only prints and measures. ─
+        lines = server_data.get("lines") or []
+        for line in lines:
+            print(line)
+        if lines:
+            sys.stdout.flush()
 
-    # Vector search (async, may timeout)
-    vector_results: list[dict] = []
-    wing_results: list[dict] = []
-    knowledge_results: list[dict] = []
-    embed_latency_ms: float | None = None
-    embed_start = time.monotonic()
-    vector = await _embed_text(prompt)
-    embed_latency_ms = (time.monotonic() - embed_start) * 1000
-    if vector:
-        # Knowledge base: only surface intentionally ingested content
-        # (user-requested ingestions, not noisy pipeline output)
-        _knowledge_filter = {
-            "must": [
-                {"key": "source_pipeline", "match": {"any": [
-                    "extraction_job", "knowledge_ingest", "knowledge_ingest_source",
-                    "reference_store",
-                ]}},
-            ],
-        }
-        if active_wing:
-            # Run all searches in parallel to stay within budget
-            vector_results, wing_results, knowledge_results = await asyncio.gather(
-                _search_qdrant(vector),
-                _search_qdrant(vector, wing_filter=active_wing),
-                _search_qdrant(vector, collection="knowledge_base",
-                               extra_filter=_knowledge_filter),
-            )
-        else:
-            vector_results, knowledge_results = await asyncio.gather(
-                _search_qdrant(vector),
-                _search_qdrant(vector, collection="knowledge_base",
-                               extra_filter=_knowledge_filter),
-            )
+        # Adapt structured rows for H-1 measurement: the engine emits pre-bump
+        # ``retrieved_count``; _ws_measure reads ``_retrieved_count`` (default -1
+        # → FTS-only hits stay excluded from the never-surfaced stat, exactly as
+        # the old fork behaved).
+        fused: list[dict] = []
+        for r in server_data.get("results") or []:
+            row = dict(r)
+            if "retrieved_count" in r:
+                row["_retrieved_count"] = r["retrieved_count"]
+            fused.append(row)
+        proc = server_data.get("procedure")
+        surfaced_proc_id = proc.get("id") if isinstance(proc, dict) else None
+        shadow = server_data.get("shadow") or {}
+        embedding = server_data.get("embedding")
 
-    # Bitemporal parity: drop memories past their invalid_at from the Qdrant
-    # union (episodic vector + wing). knowledge_base ids aren't episodic
-    # memory_metadata rows, so knowledge_results is intentionally not filtered.
-    _episodic_ids = {r["memory_id"] for r in vector_results}
-    _episodic_ids |= {r["memory_id"] for r in wing_results}
-    _expired = _expired_memory_ids(_DB_PATH, _episodic_ids, now_iso)
-    if _expired:
-        vector_results = [r for r in vector_results if r["memory_id"] not in _expired]
-        wing_results = [r for r in wing_results if r["memory_id"] not in _expired]
+        _flush_deferred()
 
-    fts_only_fallback = len(vector_results) == 0 and len(fts_results) > 0
-
-    # Fuse results (with wing boost, code index, and knowledge base)
-    # WS-3 B4 gate-4 (pushed-surfaces cut) — DISPOSITION, not a filter:
-    # dispatched sessions NEVER execute this hook (module-level
-    # GENESIS_CC_SESSION exit at the top of this file), so the pushed-feed
-    # protection here is total absence — stronger than any per-item drop.
-    # Every process that reaches this point is a user-launched foreground
-    # terminal session (supervised by definition), which keeps wrapped/labeled
-    # external content in every mode per the cut. If that early exit is ever
-    # narrowed, this surface re-enters the enforce-drop set — see the registry
-    # disposition in tests/test_security/test_recall_inject_coverage.py.
-    fused: list[dict] = []
-    fused_count = 0
-    # H-1 PR2a: shadow-project the novelty gate. suppress_ids feeds the shadow
-    # projection ONLY — the real selection loop ignores it, so injected output
-    # is unchanged. _shadow accumulates the projection for the injection log.
-    _suppress_ids = _compute_suppress_ids(session_id)
-    _shadow: dict = {}
-    if fts_results or vector_results or wing_results or code_results or knowledge_results:
-        fused = _rrf_fusion(
-            fts_results, vector_results,
-            wing_results=wing_results,
-            code_results=code_results or None,
-            knowledge_results=knowledge_results or None,
-            suppress_ids=_suppress_ids,
-            shadow=_shadow,
+        ws_stats = _ws_measure(fused, session_id, surfaced_proc_id, now_iso, shadow=shadow)
+        total_ms = (time.monotonic() - start) * 1000
+        _record_activity(_DB_PATH, total_ms, success=bool(fused))
+        _record_detail(
+            fts_count=0,
+            vector_count=len(fused),
+            fused_count=len(fused),
+            embed_latency_ms=None,
+            total_latency_ms=total_ms,
+            fts_only_fallback=False,
+            heartbeat_ms=heartbeat_ms,
+            injected_ids=ws_stats["injected_ids"],
+            repeat_count=ws_stats["repeat_count"],
+            overlap_pct=ws_stats["overlap_pct"],
+            working_set_size=ws_stats["working_set_size"],
+            zero_retrieved_injected=ws_stats["zero_retrieved_injected"],
+            procedure_repeat=ws_stats["procedure_repeat"],
+            projected_injected=ws_stats.get("projected_injected"),
+            suppressed=ws_stats.get("suppressed", 0),
+            serendipity_boosted=ws_stats.get("serendipity_boosted", 0),
+            mode="server",
+            server_ms=server_ms,
         )
-        fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
-        fused_count = len(fused)
+        # Ambient fold on the server-returned prompt embedding (None-safe).
+        _ambient_fold(embedding, session_id, prompt, recent_files)
+        return
 
-        # Graph breadcrumbs: 1-hop sync SQL for top results (~5ms total).
-        # Appends related memory IDs so CC can expand via memory_expand.
-        if fused and _DB_PATH.exists():
-            try:
-                _gc = sqlite3.connect(str(_DB_PATH), timeout=2)
-                try:
-                    seen = {r.get("memory_id") for r in fused}
-                    for r in fused[:3]:
-                        mid = r.get("memory_id")
-                        if not mid:
-                            continue
-                        rows = _gc.execute(
-                            "SELECT target_id FROM memory_links"
-                            " WHERE source_id = ? AND strength >= 0.5"
-                            " ORDER BY strength DESC LIMIT 2",
-                            (mid,),
-                        ).fetchall()
-                        related = [row[0][:8] for row in rows if row[0] not in seen]
-                        if related:
-                            r["related_ids"] = related
-                finally:
-                    _gc.close()
-            except Exception:
-                pass  # Graph breadcrumbs are best-effort
+    # ── DEGRADED FALLBACK: FTS5 + code index only, NO write-backs ────
+    # Reached when the server is unreachable/slow (mode "server") or when the
+    # operator forced local recall (GENESIS_PROACTIVE_HOOK_MODE=local).
+    fallback_mode = "local" if _HOOK_MODE == "local" else "degraded"
+    fallback_keywords = keywords + [k for k in file_keywords if k not in keywords]
+    fts_results = _search_fts5(
+        _DB_PATH,
+        fallback_keywords,
+        collection="episodic_memory",
+        now_iso=now_iso,
+    )
+    code_results = _search_code_index(_DB_PATH, fallback_keywords)
+    fused = [r for r in fts_results if not _is_garbage(r.get("content", ""))][:_MAX_RESULTS]
+    if len(fused) < _MAX_RESULTS and code_results:
+        fused += code_results[: _MAX_RESULTS - len(fused)]
 
-        output = _format_results(fused)
+    if fused:
+        output = _format_degraded(fused, forced_local=(fallback_mode == "local"))
         if output:
             print(output)
             sys.stdout.flush()
 
-    # Procedure surfacing — reuses the already-computed prompt embedding
-    # so there's no extra cloud call. Top-1 only, per-tier cosine bar. Wrapped
-    # in a broad try/except so a bad procedure read can't crash the memory hook.
-    _surfaced_proc_id: str | None = None
-    if vector:
-        try:
-            proc = _search_procedures(_DB_PATH, vector)
-            if proc is not None:
-                proc_id, task_type, principle, tier = proc
-                _surfaced_proc_id = proc_id
-                # DORMANT drafts are unproven (0 invocations, conf 0.0): label
-                # them so the model treats them as a hint, not authoritative.
-                label = (
-                    "Procedure (unproven draft — suggestion, not authoritative)"
-                    if tier == "DORMANT"
-                    else "Procedure"
-                )
-                tag = f"{label} | {task_type} | id:{proc_id[:8]}" if task_type else f"{label} | id:{proc_id[:8]}"
-                print(f"[{tag}] {principle}")
-                sys.stdout.flush()
-        except Exception as proc_exc:
-            print(f"Procedure surfacing skipped: {proc_exc}", file=sys.stderr)
+    _flush_deferred()
 
-    # Print deferred metadata AFTER memory results (memories are more
-    # actionable and should appear first in the injection block).
-    for line in _deferred_lines:
-        print(line)
-    if _deferred_lines:
-        sys.stdout.flush()
-
-    # Post-output: increment retrieved_count (fire-and-forget, after flush)
-    if fused:
-        await _increment_retrieved(fused)
-
-    # Post-output: WS-3 gate 4 (injection) record. External-world hits in this
-    # proactive injection reach the CC-session prompt (action-capable).
-    # Fire-and-forget AFTER flush — never delays the injection, never crashes the
-    # hook; skipped live if the gate is off (master kill switch / per-gate off).
-    if fused:
-        try:
-            from genesis.security.immunity_shadow import (
-                item_is_blockable,
-                record_would_block_sync,
-            )
-
-            blockable = sum(
-                1
-                for r in fused
-                if item_is_blockable(
-                    collection=r.get("collection"),
-                    source_pipeline=r.get("source_pipeline"),
-                    origin_class=r.get("origin_class"),
-                )
-            )
-            if blockable:
-                conn = sqlite3.connect(str(_DB_PATH), timeout=2)
-                try:
-                    record_would_block_sync(
-                        conn, gate="injection", source_kind="proactive_hook",
-                        source_ref="scripts/proactive_memory_hook.py::_run",
-                        blockable_count=blockable,
-                    )
-                finally:
-                    conn.close()
-        except Exception as exc:
-            print(f"Immunity shadow emit skipped: {exc}", file=sys.stderr)
-
-    # ── Working-set measurement (H-1 PR1 record-only + PR2a shadow) ─
-    # Overlap stats + the shadow novelty-gate projection feed the PR2b
-    # enforcement decision. Runs after all stdout is flushed — never touches
-    # injection output. Inside the total_ms window so budget_exceeded watches
-    # its file I/O too.
-    ws_stats = _ws_measure(fused, session_id, _surfaced_proc_id, now_iso, shadow=_shadow)
-
+    ws_stats = _ws_measure(fused, session_id, None, now_iso, shadow=None)
     total_ms = (time.monotonic() - start) * 1000
-
-    had_results = fused_count > 0
-    _record_activity(_DB_PATH, total_ms, success=had_results)
-    # Honest funnel signal: count that we surfaced this procedure into context
-    # (NOT an invocation — does not feed promotion). Fire-and-forget after flush.
-    if _surfaced_proc_id is not None:
-        _record_procedure_surfaced(_DB_PATH, _surfaced_proc_id)
+    _record_activity(_DB_PATH, total_ms, success=bool(fused))
     _record_detail(
         fts_count=len(fts_results),
-        vector_count=len(vector_results),
-        fused_count=fused_count,
-        embed_latency_ms=embed_latency_ms,
+        vector_count=0,
+        fused_count=len(fused),
+        embed_latency_ms=None,
         total_latency_ms=total_ms,
-        fts_only_fallback=fts_only_fallback,
+        fts_only_fallback=True,
         heartbeat_ms=heartbeat_ms,
         injected_ids=ws_stats["injected_ids"],
         repeat_count=ws_stats["repeat_count"],
@@ -1901,19 +1474,11 @@ async def _run(prompt: str, session_id: str = "") -> None:
         working_set_size=ws_stats["working_set_size"],
         zero_retrieved_injected=ws_stats["zero_retrieved_injected"],
         procedure_repeat=ws_stats["procedure_repeat"],
-        projected_injected=ws_stats.get("projected_injected"),
-        suppressed=ws_stats.get("suppressed", 0),
-        serendipity_boosted=ws_stats.get("serendipity_boosted", 0),
+        mode=fallback_mode,
+        server_ms=server_ms,
     )
-
-    # ── Ambient session-awareness fold (WS-C) ──────────────────────
-    # Folds the prompt embedding (already computed above) into a
-    # session-theme EMA; on a drift-trigger fire, spawns the detached
-    # ambient worker (shadow mode: retrieve+rank only, no injection).
-    # No output. Runs after all stdout AND all existing metrics so it
-    # can never affect either; placed outside the total_ms window on
-    # purpose — new work must not skew the H-1 latency baselines.
-    _ambient_fold(vector, session_id, prompt, recent_files)
+    # No embedding on the fallback path — the ambient fold degrades silently.
+    _ambient_fold(None, session_id, prompt, recent_files)
 
 
 def _turn_pivoted(session_id: str) -> bool:
@@ -1982,16 +1547,16 @@ def _spawn_ambient_worker(session_id: str) -> None:
             contextlib.suppress(OSError),
         ):
             subprocess.Popen(
-                    [
-                        sys.executable,
-                        str(script),
-                        "--session-id",
-                        session_id,
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=log_fh,
-                    start_new_session=True,
-                )
+                [
+                    sys.executable,
+                    str(script),
+                    "--session-id",
+                    session_id,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=log_fh,
+                start_new_session=True,
+            )
     except Exception:
         pass  # Spawn failure must never affect the hook
 
@@ -2012,6 +1577,7 @@ def main() -> None:
     except Exception:
         # Hooks must never crash — log to stderr for debugging
         import traceback
+
         print(traceback.format_exc(), file=sys.stderr)
 
 
