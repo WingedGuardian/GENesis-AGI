@@ -20,6 +20,8 @@ import logging
 import math
 import os
 import random
+import re
+import signal
 import time
 from pathlib import Path
 
@@ -611,6 +613,133 @@ def _start_idle_watcher():
         )
 
 
+def _parse_ss_listeners(ss_output):
+    """Parse `ss -ltnpH` output into a deduped list of (pid, process_name).
+
+    Each listener row ends with e.g. ``users:(("x11vnc",pid=509730,fd=8))``.
+    A process listening on both IPv4 and IPv6 appears on two rows with the
+    same pid, so dedup by pid (the names are identical).
+    """
+    holders = {}
+    for name, pid_str in re.findall(r'\(\("([^"]+)",pid=(\d+),', ss_output):
+        try:
+            holders[int(pid_str)] = name
+        except ValueError:
+            continue
+    return list(holders.items())
+
+
+def _parse_fuser_pids(fuser_output):
+    """Parse `fuser <port>/tcp` stdout (space-separated PIDs) into deduped ints."""
+    pids = []
+    seen = set()
+    for tok in fuser_output.split():
+        try:
+            pid = int(tok)
+        except ValueError:
+            continue
+        if pid not in seen:
+            seen.add(pid)
+            pids.append(pid)
+    return pids
+
+
+def _proc_comm(pid):
+    """Return /proc/<pid>/comm (process name) or None if unreadable/gone."""
+    try:
+        with open(f"/proc/{pid}/comm") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def _reclaim_vnc_port(port=5999, unit="genesis-vnc"):
+    """Safely reclaim a VNC port held by a stale x11vnc process.
+
+    Only SIGKILLs a *foreign* x11vnc process (pid != the unit's MainPID) that
+    holds the port while the systemd unit is genuinely down.  Never acts when
+    the unit is active/activating (legitimate owner or mid-startup), never
+    touches a non-x11vnc process, never blanket-kills the port, and never
+    kills pid <= 1.  Prefers `ss` (atomic name+pid, no TOCTOU); falls back to
+    `fuser` + /proc/<pid>/comm.  Best-effort: any failure leaves the port as-is.
+    Sync (runs in an executor).
+    """
+    import subprocess as _sp
+
+    # 1. Identify holders (pid + process name when ss is available).
+    holders = None
+    try:
+        r = _sp.run(
+            ["ss", "-ltnpH", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        holders = _parse_ss_listeners(r.stdout)
+    except FileNotFoundError:
+        pass  # ss absent — fall back to fuser
+    except Exception:
+        logger.debug("ss VNC-port probe failed", exc_info=True)
+        return
+    if holders is None:
+        try:
+            r = _sp.run(
+                ["fuser", f"{port}/tcp"],
+                capture_output=True, text=True, timeout=3,
+            )
+            holders = [(pid, None) for pid in _parse_fuser_pids(r.stdout)]
+        except FileNotFoundError:
+            logger.warning(
+                "Neither ss nor fuser available — cannot reclaim VNC port %d", port,
+            )
+            return
+        except Exception:
+            logger.debug("fuser VNC-port probe failed", exc_info=True)
+            return
+    if not holders:
+        return  # nothing holds the port
+
+    # 2. Never disturb a live or starting unit.
+    try:
+        state = _sp.run(
+            ["systemctl", "--user", "show", "-p", "ActiveState", "--value", unit],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+    except Exception:
+        state = ""
+    if state in ("active", "activating"):
+        return
+
+    # 3. Never kill the unit's own MainPID.
+    try:
+        main_pid = int(
+            _sp.run(
+                ["systemctl", "--user", "show", "-p", "MainPID", "--value", unit],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.strip()
+            or "0"
+        )
+    except Exception:
+        main_pid = 0
+
+    killed = False
+    for pid, name in holders:
+        # pid > 1 guard: os.kill(1, ...)/(0, ...) would signal init / the whole
+        # process group — catastrophic in a container.
+        if pid <= 1 or pid == main_pid:
+            continue
+        proc_name = name if name is not None else _proc_comm(pid)
+        if proc_name != "x11vnc":
+            continue  # only reclaim from a stale x11vnc — never a bystander
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed = True
+            logger.info("Killed stale x11vnc pid %d holding VNC port %d", pid, port)
+        except (ProcessLookupError, PermissionError):
+            continue  # already gone or not ours to signal
+
+    if killed:
+        time.sleep(1)  # brief grace so systemd can rebind the freed port
+
+
 async def _ensure_vnc():
     """Verify x11vnc + websockify are running for local browser VNC access.
 
@@ -628,30 +757,10 @@ async def _ensure_vnc():
         nonlocal started
         import subprocess as _sp
 
-        # Kill stale x11vnc processes that hold port 5900 and prevent
-        # the systemd service from starting (common after session restart).
-        try:
-            r = _sp.run(
-                ["fuser", "5999/tcp"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if r.stdout.strip():
-                # Port is held — check if it's the systemd-managed process
-                svc = _sp.run(
-                    ["systemctl", "--user", "is-active", "genesis-vnc"],
-                    capture_output=True, text=True, timeout=3,
-                )
-                if svc.stdout.strip() != "active":
-                    # Stale process — kill it so systemd can bind
-                    _sp.run(
-                        ["fuser", "-k", "5999/tcp"],
-                        capture_output=True, timeout=3,
-                    )
-                    logger.info("Killed stale process holding VNC port 5999")
-                    import time
-                    time.sleep(1)
-        except FileNotFoundError:
-            pass  # fuser not available, proceed anyway
+        # Reclaim a stale VNC port safely: only a foreign x11vnc holder when
+        # the genesis-vnc unit is genuinely down — never the live unit, an
+        # 'activating' (mid-startup) unit, or an unrelated process.
+        _reclaim_vnc_port(5999, "genesis-vnc")
 
         try:
             r = _sp.run(
@@ -1829,6 +1938,13 @@ async def _impl_browser_click(selector: str) -> dict:
     try:
         await _human_delay()
         await _stealth_click(page, selector)
+        # A click may trigger navigation (form submit, link). The stealth mouse
+        # path — unlike page.click() — has no navigation auto-wait, so settle
+        # briefly to let a nav commit, then best-effort wait for the new
+        # document. Fully swallowed: never break a click that already worked.
+        await asyncio.sleep(0.3)
+        with contextlib.suppress(Exception):
+            await page.wait_for_load_state("domcontentloaded", timeout=3000)
         _update_remote_url()  # Click may cause navigation (form submit, link)
         snapshot = await _snapshot_page(page)
         return {"clicked": selector, "url": page.url, "snapshot": snapshot}
