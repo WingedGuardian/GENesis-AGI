@@ -16,6 +16,8 @@ import math
 import struct
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 if TYPE_CHECKING:
     from genesis.memory.embeddings import EmbeddingProvider
 
@@ -97,3 +99,39 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     if na == 0.0 or nb == 0.0:
         return 0.0
     return dot / (na * nb)
+
+
+def normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    """L2-normalize each row of an ``(N, D)`` matrix.
+
+    Zero-norm rows are left as zero rows, so their dot with any query is 0.0 —
+    matching :func:`cosine_similarity`'s zero-norm contract. Intended to run
+    ONCE at cache-build time (see ``memory.proactive._load_procedure_cache``),
+    hoisting normalization out of the per-query hot path.
+    """
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    return matrix / norms
+
+
+def cosine_similarity_batch(normalized_matrix: np.ndarray, query: list[float]) -> np.ndarray:
+    """Cosine of ``query`` against every row of a PRE-normalized ``(N, D)`` matrix.
+
+    Returns an ``(N,)`` float64 array — the vectorized (single matmul, GIL-
+    releasing) equivalent of calling :func:`cosine_similarity` once per row,
+    without the per-row Python overhead. Rows MUST already be L2-normalized via
+    :func:`normalize_rows`. Edge cases return an all-zeros result to match the
+    scalar contract: empty matrix, zero-norm query, or a query whose length
+    differs from the matrix width (the scalar helper returns 0.0 on length
+    mismatch, never raising).
+    """
+    n = normalized_matrix.shape[0]
+    if normalized_matrix.size == 0:
+        return np.zeros(n, dtype=np.float64)
+    q = np.asarray(query, dtype=np.float64)
+    if q.ndim != 1 or q.shape[0] != normalized_matrix.shape[1]:
+        return np.zeros(n, dtype=np.float64)
+    qn = np.linalg.norm(q)
+    if qn == 0.0:
+        return np.zeros(n, dtype=np.float64)
+    return normalized_matrix @ (q / qn)

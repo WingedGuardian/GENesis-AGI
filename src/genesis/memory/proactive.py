@@ -237,16 +237,45 @@ DEFAULT_PROFILE = "cc_hook"
 _PROCEDURE_SURFACE_THRESHOLD = 0.7
 _DORMANT_SURFACE_THRESHOLD = 0.78
 
+# TTL for the surfaceable-procedure cache. Procedure principle embeddings change
+# rarely (novelty-gated writes), so a stale-by-≤300s cache on a soft top-1
+# advisory is fine — and it keeps the ~300-row read + BLOB unpack + row
+# normalization off the per-prompt hot path (they run once per TTL, not every
+# call). The pure-Python O(n·d) cosine loop that dominated the old path
+# (~98ms/call — DB read + unpack + scalar cosine over ~300×1024) becomes one
+# cached matmul (~0.25ms). Single event loop → no lock needed (a concurrent
+# rebuild just recomputes identical data, last writer wins).
+_PROCEDURE_CACHE_TTL_S = 300.0
 
-async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
-    """Return ``{"id", "task_type", "principle", "tier"}`` for the best
-    procedure clearing its tier-dependent cosine bar, else None."""
+
+@dataclass(frozen=True)
+class _ProcedureCache:
+    """Pre-normalized principle-embedding matrix + row-aligned metadata."""
+
+    matrix: Any  # (N, D) L2-normalized float64 ndarray (np.empty((0, 0)) when N=0)
+    meta: list[tuple[str, str, str, str]]  # (id, task_type, principle, tier), row-aligned
+    built_at: float  # time.monotonic() at build
+
+
+_procedure_cache: _ProcedureCache | None = None
+
+
+async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
+    """Return the cached surfaceable-procedure matrix, rebuilding past the TTL.
+
+    On a DB/read error the prior cache is kept (returns None only when one was
+    never built) — strictly more resilient than the old per-call path, which
+    surfaced nothing on a transient error, and still bounded by the TTL.
+    """
+    global _procedure_cache
+    now = time.monotonic()
+    cache = _procedure_cache
+    if cache is not None and (now - cache.built_at) < _PROCEDURE_CACHE_TTL_S:
+        return cache
+
+    from genesis.learning.procedural.embedding import normalize_rows, unpack_embedding
+
     try:
-        from genesis.learning.procedural.embedding import (
-            cosine_similarity,
-            unpack_embedding,
-        )
-
         rows = await db.execute_fetchall(
             "SELECT id, task_type, principle, principle_embedding, activation_tier "
             "FROM procedural_memory "
@@ -255,26 +284,58 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
             "ORDER BY confidence DESC LIMIT 1000"
         )
     except Exception:
-        return None  # table absent / DB error — never block the endpoint
+        logger.debug("procedure cache reload failed — keeping prior cache", exc_info=True)
+        return cache  # table absent / DB error — never block the endpoint
 
-    best: tuple[float, str, str, str, str] | None = None
+    import numpy as np
+
+    vectors: list[list[float]] = []
+    meta: list[tuple[str, str, str, str]] = []
     for row in rows:
-        existing = unpack_embedding(row[3])
-        if existing is None:
+        vec = unpack_embedding(row[3])
+        if vec is None:
             continue
-        sim = cosine_similarity(vector, existing)
-        tier = row[4] or "DORMANT"
+        vectors.append(vec)
+        meta.append((row[0], row[1] or "", row[2] or "", row[4] or "DORMANT"))
+
+    matrix = normalize_rows(np.asarray(vectors, dtype=np.float64)) if vectors else np.empty((0, 0))
+    _procedure_cache = _ProcedureCache(matrix=matrix, meta=meta, built_at=now)
+    return _procedure_cache
+
+
+async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
+    """Return ``{"id", "task_type", "principle", "tier"}`` for the best
+    procedure clearing its tier-dependent cosine bar, else None.
+
+    Vectorized against the TTL-cached, pre-normalized matrix (see
+    :func:`_load_procedure_cache`) — exact-parity with the old per-row scalar
+    loop: same confidence-DESC row order, same strict ``>`` tie-break (first/
+    highest-confidence wins), same per-tier thresholds.
+    """
+    from genesis.learning.procedural.embedding import cosine_similarity_batch
+
+    cache = await _load_procedure_cache(db)
+    if cache is None or not cache.meta:
+        return None
+
+    sims = cosine_similarity_batch(cache.matrix, vector)
+
+    best_idx = -1
+    best_sim = -1.0
+    for idx, (_pid, _task, _principle, tier) in enumerate(cache.meta):
         threshold = (
             _DORMANT_SURFACE_THRESHOLD if tier == "DORMANT" else _PROCEDURE_SURFACE_THRESHOLD
         )
+        sim = float(sims[idx])
         if sim < threshold:
             continue
-        if best is None or sim > best[0]:
-            best = (sim, row[0], row[1] or "", row[2] or "", tier)
+        if sim > best_sim:
+            best_sim = sim
+            best_idx = idx
 
-    if best is None:
+    if best_idx < 0:
         return None
-    _sim, proc_id, task_type, principle, tier = best
+    proc_id, task_type, principle, tier = cache.meta[best_idx]
     return {"id": proc_id, "task_type": task_type, "principle": principle[:200], "tier": tier}
 
 
