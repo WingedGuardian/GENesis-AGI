@@ -1063,7 +1063,15 @@ def _format_degraded(results: list[dict], *, forced_local: bool = False) -> str:
         mid = r.get("memory_id", "")
         age = _format_age(r.get("_created_at", ""))
         wing = r.get("_wing") or ""
-        parts = ["Memory·degraded"]
+        # Preserve external-world provenance even on the degraded path: a stored
+        # ``external_untrusted`` episodic hit must NOT read as first-party memory
+        # (the degraded banner already signals keyword-only mode globally). Matches
+        # the server renderer's Memory·external tier + the injection-defense cut.
+        parts = (
+            ["Memory·external"]
+            if r.get("origin_class") == "external_untrusted"
+            else ["Memory·degraded"]
+        )
         if age != "?":
             parts.append(age)
         if wing and wing != "memory":
@@ -1456,6 +1464,42 @@ async def _run(prompt: str, session_id: str = "") -> None:
             sys.stdout.flush()
 
     _flush_deferred()
+
+    # WS-3 gate 4 (injection) shadow record — DEGRADED PATH ONLY. The server
+    # path emits server-side (mcp/memory/core.py::_proactive_impl); here the hook
+    # injects FTS5 content locally, so it must record blockable external-world
+    # hits that reach the prompt itself. Fire-and-forget after flush; the items
+    # were enriched with origin_class by _format_degraded above.
+    if fused:
+        try:
+            from genesis.security.immunity_shadow import (
+                item_is_blockable,
+                record_would_block_sync,
+            )
+
+            blockable = sum(
+                1
+                for r in fused
+                if item_is_blockable(
+                    collection=r.get("collection"),
+                    source_pipeline=r.get("source_pipeline"),
+                    origin_class=r.get("origin_class"),
+                )
+            )
+            if blockable:
+                conn = sqlite3.connect(str(_DB_PATH), timeout=2)
+                try:
+                    record_would_block_sync(
+                        conn,
+                        gate="injection",
+                        source_kind="proactive_hook",
+                        source_ref="scripts/proactive_memory_hook.py::_run",
+                        blockable_count=blockable,
+                    )
+                finally:
+                    conn.close()
+        except Exception as exc:
+            print(f"Immunity shadow emit skipped: {exc}", file=sys.stderr)
 
     ws_stats = _ws_measure(fused, session_id, None, now_iso, shadow=None)
     total_ms = (time.monotonic() - start) * 1000
