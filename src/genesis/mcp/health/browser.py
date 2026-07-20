@@ -697,18 +697,23 @@ def _reclaim_vnc_port(port=5999, unit="genesis-vnc"):
     if not holders:
         return  # nothing holds the port
 
-    # 2. Never disturb a live or starting unit.
+    # 2. Never disturb a live or starting unit. If we cannot determine the
+    #    unit state (systemctl/dbus hiccup), fail SAFE: leave the port as-is
+    #    rather than defaulting to a value that would bypass this guard.
     try:
         state = _sp.run(
             ["systemctl", "--user", "show", "-p", "ActiveState", "--value", unit],
             capture_output=True, text=True, timeout=3,
         ).stdout.strip()
     except Exception:
-        state = ""
+        logger.debug("VNC unit ActiveState probe failed — leaving port as-is", exc_info=True)
+        return
     if state in ("active", "activating"):
         return
 
-    # 3. Never kill the unit's own MainPID.
+    # 3. Never kill the unit's own MainPID. Same fail-safe: an unverifiable
+    #    MainPID must NOT default to 0 (which matches no real pid and would
+    #    let the kill loop reach a legitimate holder).
     try:
         main_pid = int(
             _sp.run(
@@ -718,7 +723,8 @@ def _reclaim_vnc_port(port=5999, unit="genesis-vnc"):
             or "0"
         )
     except Exception:
-        main_pid = 0
+        logger.debug("VNC unit MainPID probe failed — leaving port as-is", exc_info=True)
+        return
 
     killed = False
     for pid, name in holders:

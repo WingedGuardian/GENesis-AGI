@@ -1040,9 +1040,9 @@ class TestReclaimVncPort:
     """FIX 3 (idx 9): safe VNC stale-port reclaim (ss-primary, MainPID-guarded)."""
 
     @staticmethod
-    def _fake_run(*, ss_out=None, ss_missing=False, fuser_out=None,
-                  fuser_missing=False, active_state="inactive", main_pid="0",
-                  calls=None):
+    def _fake_run(*, ss_out=None, ss_missing=False, ss_exc=None, fuser_out=None,
+                  fuser_missing=False, fuser_exc=None, active_state="inactive",
+                  active_exc=None, main_pid="0", mainpid_exc=None, calls=None):
         def _run(argv, **kwargs):
             if calls is not None:
                 calls.append(list(argv))
@@ -1050,16 +1050,24 @@ class TestReclaimVncPort:
             if cmd == "ss":
                 if ss_missing:
                     raise FileNotFoundError("ss")
+                if ss_exc is not None:
+                    raise ss_exc
                 return MagicMock(stdout=ss_out or "", stderr="", returncode=0)
             if cmd == "fuser":
                 if fuser_missing:
                     raise FileNotFoundError("fuser")
+                if fuser_exc is not None:
+                    raise fuser_exc
                 return MagicMock(stdout=fuser_out or "", stderr="", returncode=0)
             if cmd == "systemctl":
                 prop = argv[4] if len(argv) > 4 else ""
                 if prop == "ActiveState":
+                    if active_exc is not None:
+                        raise active_exc
                     return MagicMock(stdout=active_state + "\n", returncode=0)
                 if prop == "MainPID":
+                    if mainpid_exc is not None:
+                        raise mainpid_exc
                     return MagicMock(stdout=main_pid + "\n", returncode=0)
                 return MagicMock(stdout="", returncode=0)
             return MagicMock(stdout="", returncode=0)
@@ -1128,6 +1136,33 @@ class TestReclaimVncPort:
 
     def test_neither_ss_nor_fuser(self):
         run = self._fake_run(ss_missing=True, fuser_missing=True)
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_activestate_probe_raises_no_kill(self):
+        # systemctl ActiveState lookup fails -> can't verify unit is down -> fail-safe.
+        run = self._fake_run(ss_out=_ss_line(4242), active_exc=TimeoutError("dbus"))
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_mainpid_probe_raises_no_kill(self):
+        # systemctl MainPID lookup fails -> can't verify holder != MainPID -> fail-safe.
+        run = self._fake_run(ss_out=_ss_line(4242), active_state="inactive",
+                             mainpid_exc=TimeoutError("dbus"))
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_ss_generic_exception_no_kill(self):
+        run = self._fake_run(ss_exc=OSError("netlink"))
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_fuser_generic_exception_no_kill(self):
+        run = self._fake_run(ss_missing=True, fuser_exc=OSError("boom"))
         with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
             browser._reclaim_vnc_port()
         kill.assert_not_called()
