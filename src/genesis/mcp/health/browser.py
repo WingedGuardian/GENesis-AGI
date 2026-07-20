@@ -697,33 +697,51 @@ def _reclaim_vnc_port(port=5999, unit="genesis-vnc"):
     if not holders:
         return  # nothing holds the port
 
-    # 2. Never disturb a live or starting unit. If we cannot determine the
-    #    unit state (systemctl/dbus hiccup), fail SAFE: leave the port as-is
-    #    rather than defaulting to a value that would bypass this guard.
+    # 2. Never disturb a live or starting unit. Treat the state as UNVERIFIABLE
+    #    — and fail SAFE (leave the port as-is) — if the probe raises OR returns
+    #    nonzero/empty. The systemd bus being down is the key case: `systemctl`
+    #    exits 1 with EMPTY stdout and does NOT raise, so an exception-only guard
+    #    would sail past it. A genuinely-down unit returns rc=0 with a real state
+    #    ("inactive"), so this never blocks a legitimate reclaim.
     try:
-        state = _sp.run(
+        probe = _sp.run(
             ["systemctl", "--user", "show", "-p", "ActiveState", "--value", unit],
             capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
+        )
     except Exception:
-        logger.debug("VNC unit ActiveState probe failed — leaving port as-is", exc_info=True)
+        logger.debug("VNC unit ActiveState probe raised — leaving port as-is", exc_info=True)
+        return
+    state = probe.stdout.strip()
+    if probe.returncode != 0 or not state:
+        logger.debug(
+            "VNC unit ActiveState unverifiable (rc=%s) — leaving port as-is",
+            probe.returncode,
+        )
         return
     if state in ("active", "activating"):
         return
 
-    # 3. Never kill the unit's own MainPID. Same fail-safe: an unverifiable
-    #    MainPID must NOT default to 0 (which matches no real pid and would
-    #    let the kill loop reach a legitimate holder).
+    # 3. Never kill the unit's own MainPID. Same fail-safe on raise/nonzero/empty.
+    #    A down unit returns rc=0 stdout="0" (MainPID 0) — valid, so proceed.
     try:
-        main_pid = int(
-            _sp.run(
-                ["systemctl", "--user", "show", "-p", "MainPID", "--value", unit],
-                capture_output=True, text=True, timeout=3,
-            ).stdout.strip()
-            or "0"
+        probe = _sp.run(
+            ["systemctl", "--user", "show", "-p", "MainPID", "--value", unit],
+            capture_output=True, text=True, timeout=3,
         )
     except Exception:
-        logger.debug("VNC unit MainPID probe failed — leaving port as-is", exc_info=True)
+        logger.debug("VNC unit MainPID probe raised — leaving port as-is", exc_info=True)
+        return
+    mp_raw = probe.stdout.strip()
+    if probe.returncode != 0 or not mp_raw:
+        logger.debug(
+            "VNC unit MainPID unverifiable (rc=%s) — leaving port as-is",
+            probe.returncode,
+        )
+        return
+    try:
+        main_pid = int(mp_raw)
+    except ValueError:
+        logger.debug("VNC unit MainPID not an int (%r) — leaving port as-is", mp_raw)
         return
 
     killed = False

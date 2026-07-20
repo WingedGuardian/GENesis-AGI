@@ -1042,7 +1042,8 @@ class TestReclaimVncPort:
     @staticmethod
     def _fake_run(*, ss_out=None, ss_missing=False, ss_exc=None, fuser_out=None,
                   fuser_missing=False, fuser_exc=None, active_state="inactive",
-                  active_exc=None, main_pid="0", mainpid_exc=None, calls=None):
+                  active_exc=None, active_rc=0, main_pid="0", mainpid_exc=None,
+                  mainpid_rc=0, calls=None):
         def _run(argv, **kwargs):
             if calls is not None:
                 calls.append(list(argv))
@@ -1064,11 +1065,13 @@ class TestReclaimVncPort:
                 if prop == "ActiveState":
                     if active_exc is not None:
                         raise active_exc
-                    return MagicMock(stdout=active_state + "\n", returncode=0)
+                    out = "" if active_rc != 0 else active_state + "\n"
+                    return MagicMock(stdout=out, returncode=active_rc)
                 if prop == "MainPID":
                     if mainpid_exc is not None:
                         raise mainpid_exc
-                    return MagicMock(stdout=main_pid + "\n", returncode=0)
+                    out = "" if mainpid_rc != 0 else main_pid + "\n"
+                    return MagicMock(stdout=out, returncode=mainpid_rc)
                 return MagicMock(stdout="", returncode=0)
             return MagicMock(stdout="", returncode=0)
         return _run
@@ -1163,6 +1166,19 @@ class TestReclaimVncPort:
 
     def test_fuser_generic_exception_no_kill(self):
         run = self._fake_run(ss_missing=True, fuser_exc=OSError("boom"))
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_activestate_nonzero_rc_no_kill(self):
+        # bus down -> systemctl exits 1 with empty stdout and does NOT raise.
+        run = self._fake_run(ss_out=_ss_line(4242), active_rc=1)
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_mainpid_nonzero_rc_no_kill(self):
+        run = self._fake_run(ss_out=_ss_line(4242), active_state="inactive", mainpid_rc=1)
         with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
             browser._reclaim_vnc_port()
         kill.assert_not_called()
