@@ -45,6 +45,25 @@ def test_budget_curve_and_cap():
 # --- KB slot cap ------------------------------------------------------------
 
 
+def test_rerank_for_honors_live_config_kill_switch():
+    # Documented latency/cost kill switch: proactive.profiles.cc_hook.rerank: off
+    with patch.object(
+        P, "_proactive_config", return_value={"profiles": {"cc_hook": {"rerank": "off"}}}
+    ):
+        assert P._rerank_for("cc_hook") is False
+    with patch.object(
+        P, "_proactive_config", return_value={"profiles": {"cc_hook": {"rerank": False}}}
+    ):
+        assert P._rerank_for("cc_hook") is False
+    with patch.object(
+        P, "_proactive_config", return_value={"profiles": {"cc_hook": {"rerank": "on"}}}
+    ):
+        assert P._rerank_for("cc_hook") is True
+    # Silent config → profile default (cc_hook ships rerank on).
+    with patch.object(P, "_proactive_config", return_value={}):
+        assert P._rerank_for("cc_hook") is True
+
+
 def test_kb_cap_keeps_all_episodic_caps_kb():
     dicts = [
         {"memory_id": "e1", "collection": "episodic_memory"},

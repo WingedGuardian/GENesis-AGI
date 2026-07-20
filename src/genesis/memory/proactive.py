@@ -489,12 +489,18 @@ async def proactive_context(
         logger.debug("proactive embed failed — degrading", exc_info=True)
     embed_ms = (time.monotonic() - t_embed) * 1000
 
+    # Rerank posture is read LIVE from config (proactive.profiles.<p>.rerank) so
+    # the documented ``rerank: off`` latency/cost kill switch takes effect
+    # without a restart — _PROFILES only supplies the default when config is
+    # silent, and reranking still no-ops downstream without API_KEY_VOYAGE.
+    rerank_live = _rerank_for(profile)
+
     # The shared security pipeline (recall + filters + wrap + enforce + graph
     # expansion + immunity emit + retrieved_count write-back).
     dicts = await _core._proactive_impl(
         prompt,
         limit=budget,
-        rerank=prof.rerank,
+        rerank=rerank_live,
         extra_fts_terms=[k for k in (file_keywords or []) if k] or None,
     )
 
@@ -526,7 +532,7 @@ async def proactive_context(
         "embedding": vector,
         "timings_ms": {"embed": round(embed_ms, 1), "total": round(total_ms, 1)},
         "engine": {
-            "reranked": prof.rerank,
+            "reranked": rerank_live,
             "graph_expansion": graph_expansion.expansion_mode(),
             "intent": classify_intent(prompt).category,
             "profile": profile,
