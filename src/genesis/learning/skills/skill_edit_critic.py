@@ -22,6 +22,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from genesis.env import skill_gate_off
@@ -88,11 +89,17 @@ def _parse_pathologies(raw_response: str) -> list[str]:
     ``raw_response`` is the judge's raw output (fences possible, truncated to
     1000 chars by the scorer). Any parse failure yields an empty list — the
     pathology labels are enrichment, not the authoritative pass/fail signal.
-    """
-    try:
-        from genesis.eval.scorers import _extract_json
 
-        data = json.loads(_extract_json(raw_response))
+    Parsing is inlined (a markdown-fence strip + ``json.loads``) rather than
+    reusing the scorer's private ``_extract_json`` — the enrichment isn't worth
+    a cross-subsystem coupling to an underscore-prefixed helper.
+    """
+    text = raw_response.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        data = json.loads(text)
     except Exception:
         return []
     if not isinstance(data, dict):

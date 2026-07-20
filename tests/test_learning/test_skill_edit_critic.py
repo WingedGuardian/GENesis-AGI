@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import aiosqlite
 import pytest
 
+from genesis.eval.scorers import _JUDGE_CALL_FAIL, _JUDGE_PARSE_FAIL
 from genesis.learning.skills import skill_edit_critic as sec
 from genesis.learning.skills.applicator import SkillApplicator
 from genesis.learning.skills.types import ChangeSize, SkillProposal, ValidationResult
@@ -98,7 +99,7 @@ async def test_unavailable_on_call_failure():
         router=StubRouter(success=False, error="all providers exhausted"),
     )
     assert critic["verdict"] == "unavailable"
-    assert critic["error"] == "judge_call_fail"
+    assert critic["error"] == _JUDGE_CALL_FAIL
     # No confident score/pathologies on an outage.
     assert "score" not in critic
 
@@ -110,7 +111,7 @@ async def test_unavailable_on_parse_failure():
         router=StubRouter(response_content="not json at all"),
     )
     assert critic["verdict"] == "unavailable"
-    assert critic["error"] == "judge_parse_fail"
+    assert critic["error"] == _JUDGE_PARSE_FAIL
 
 
 async def test_unavailable_on_scorer_exception():

@@ -139,7 +139,7 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "without blocking the auto-apply; off skips the Critic entirely. "
             "No `enforce` mode yet. Read live per skill-evolution pass by "
             "genesis.learning.skills.skill_gate_config (no restart); kill via "
-            "GENESIS_SKILL_GATE_OFF."
+            "GENESIS_SKILL_EVOLUTION_GATE_OFF."
         ),
         config_filename="skill_evolution_gate.yaml",
         readonly=False,
