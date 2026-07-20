@@ -263,9 +263,14 @@ _procedure_cache: _ProcedureCache | None = None
 async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
     """Return the cached surfaceable-procedure matrix, rebuilding past the TTL.
 
-    On a DB/read error the prior cache is kept (returns None only when one was
-    never built) — strictly more resilient than the old per-call path, which
-    surfaced nothing on a transient error, and still bounded by the TTL.
+    On a DB/read error the last good cache is served (returns None only when one
+    was never built) — more resilient than the old per-call path, which surfaced
+    nothing on a transient error. Staleness is normally ≤ TTL, but during a
+    *sustained* read outage the last snapshot is served until the DB recovers
+    (acceptable for a soft top-1 advisory; a down DB fails ``recall()`` upstream
+    long before this matters). The cache is process-global and NOT keyed on
+    ``db`` — correct because the runtime passes exactly one process-global
+    connection (``memory_mod._db``) for its whole lifetime.
     """
     global _procedure_cache
     now = time.monotonic()
@@ -296,7 +301,12 @@ async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
         if vec is None:
             continue
         vectors.append(vec)
-        meta.append((row[0], row[1] or "", row[2] or "", row[4] or "DORMANT"))
+        # Principle is truncated to the returned width here so the cache doesn't
+        # pin full principle text for every row over the TTL (only [:200] is ever
+        # surfaced). float64 matrix is deliberate — the scalar cosine_similarity
+        # computes in Python float; a float32 matmul would diverge ~1e-6 and can
+        # flip a near-threshold surface, so keep float64 for parity.
+        meta.append((row[0], row[1] or "", (row[2] or "")[:200], row[4] or "DORMANT"))
 
     matrix = normalize_rows(np.asarray(vectors, dtype=np.float64)) if vectors else np.empty((0, 0))
     _procedure_cache = _ProcedureCache(matrix=matrix, meta=meta, built_at=now)
@@ -308,9 +318,12 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
     procedure clearing its tier-dependent cosine bar, else None.
 
     Vectorized against the TTL-cached, pre-normalized matrix (see
-    :func:`_load_procedure_cache`) — exact-parity with the old per-row scalar
-    loop: same confidence-DESC row order, same strict ``>`` tie-break (first/
-    highest-confidence wins), same per-tier thresholds.
+    :func:`_load_procedure_cache`) — parity with the old per-row scalar loop
+    within floating-point tolerance (measured Δ ~1e-16 vs the scalar cosine):
+    same confidence-DESC row order, same strict ``>`` tie-break (first/highest-
+    confidence wins), same per-tier thresholds. The only conceivable divergence
+    is a cosine sitting within ~machine-ε of a tier bar flipping surface/skip —
+    measure-zero on continuous embeddings and immaterial for a soft advisory.
     """
     from genesis.learning.procedural.embedding import cosine_similarity_batch
 
