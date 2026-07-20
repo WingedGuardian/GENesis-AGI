@@ -1,0 +1,23 @@
+# Skill-edit Critic gate (read live by genesis.learning.skills.skill_gate_config).
+#
+# Overlay per install at ~/.genesis/config/skill_evolution_gate.local.yaml
+# (deep-merged over this base). Shipped defaults must be safe on a fresh clone
+# with no overlay.
+#
+# The Critic screens self-proposed SKILL.md edits for self-modification
+# pathologies (reward-hacking / catastrophic-forgetting / under-exploration /
+# constraint-stripping) at the skill-evolution auto-apply seam. It is a SHADOW
+# gate: it LOGS a verdict observation and NEVER blocks the edit (WS1). Read live
+# per skill-evolution pass — no restart needed. Hard kill (no restart):
+# GENESIS_SKILL_EVOLUTION_GATE_OFF=1.
+
+# Master switch. false → mode reads "off" (no Critic call, no observation).
+enabled: true
+
+# Critic mode. off | shadow.
+#   shadow (default): run the Critic and log its verdict to observations
+#     (source="skill_evolution_gate"); the edit STILL auto-applies unchanged.
+#   off: skip the Critic entirely (no LLM call, no observation).
+# There is no "enforce" mode yet — the gate never blocks an edit while it bakes.
+# An invalid value degrades to shadow (observe-only, the safe baseline).
+mode: shadow

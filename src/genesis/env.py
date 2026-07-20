@@ -141,6 +141,24 @@ def memory_rerank_off() -> bool:
     )
 
 
+def skill_gate_off() -> bool:
+    """True when the skill-edit Critic must be suppressed entirely (kill switch).
+
+    The skill-evolution pipeline screens self-proposed SKILL.md edits through a
+    shadow Critic (``learning/skills/skill_edit_critic``) that logs a verdict
+    but never blocks the edit. This env kill (plus the ``mode`` in
+    ``config/skill_evolution_gate.yaml``) lets an operator stop the Critic — for
+    a judge cost/latency/outage concern — without a restart or code change.
+    Checked BEFORE the config mode, so it is a hard override. Default off: the
+    Critic runs in shadow.
+    """
+    return os.environ.get("GENESIS_SKILL_EVOLUTION_GATE_OFF", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 # A real deploy completes in minutes (update.sh's health-check phase caps at
 # ~3 min). A state file whose start is older than this cutoff is a crashed or
 # abandoned deploy, not a live one — treating it as stale bounds the (rare)

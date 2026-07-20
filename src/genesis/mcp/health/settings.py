@@ -130,6 +130,21 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "skill_evolution_gate": SettingsDomain(
+        name="skill_evolution_gate",
+        description=(
+            "Skill-edit Critic (WS1) — master `enabled` + `mode` off/shadow. "
+            "Shadow (default) screens self-proposed SKILL.md edits for "
+            "self-modification pathologies and LOGS a verdict observation "
+            "without blocking the auto-apply; off skips the Critic entirely. "
+            "No `enforce` mode yet. Read live per skill-evolution pass by "
+            "genesis.learning.skills.skill_gate_config (no restart); kill via "
+            "GENESIS_SKILL_GATE_OFF."
+        ),
+        config_filename="skill_evolution_gate.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per pass by skill_gate_config
+    ),
     "entity_adjudication": SettingsDomain(
         name="entity_adjudication",
         description=(
@@ -842,6 +857,23 @@ def _validate_ws2_ledger(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_skill_evolution_gate(changes: dict) -> list[str]:
+    """Validate skill-edit Critic lever changes (see
+    genesis.learning.skills.skill_gate_config)."""
+    from genesis.learning.skills.skill_gate_config import MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key not in ("enabled", "mode"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_repo_pulse(changes: dict) -> list[str]:
     """Validate repo-pulse lever changes (see
     genesis.session_awareness.repo_pulse_config)."""
@@ -955,6 +987,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
+    "skill_evolution_gate": _validate_skill_evolution_gate,
     "cc_roster": _validate_cc_roster,
     "resilience": _validate_resilience,
     "inbox_monitor": _validate_inbox_monitor,

@@ -157,6 +157,11 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "interaction_theme": timedelta(days=30),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),
+    # skill-edit Critic shadow verdicts (WS1) — kept 30d (vs 14d for the
+    # skill_evolution/skill_proposal events) so a multi-week shadow-bake
+    # adjudication window survives. NOT in INTERNAL_OBS_TYPES: flagged
+    # (high-priority) verdicts stay visible during the bake.
+    "skill_edit_critic": timedelta(days=30),
     # ── 60-day (action-required, real issues) ──────────────────────────
     "bug_identified": timedelta(days=60),
     "tech_debt": timedelta(days=60),
@@ -277,7 +282,8 @@ async def create(
         if cursor.rowcount == 0:
             logger.debug(
                 "Observation dedup: skipping duplicate (source=%s, hash=%s)",
-                source, content_hash[:12],
+                source,
+                content_hash[:12],
             )
             return None
         return id
