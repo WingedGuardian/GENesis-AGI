@@ -47,7 +47,7 @@ class DedupResult:
     matched_memory_id: str | None = None
 
 
-def _extract_terms(text: str) -> set[str]:
+def extract_terms(text: str) -> set[str]:
     """Extract meaningful terms from text, lowercased, stopwords removed."""
     words = _WORD_RE.findall(text.lower())
     return {w for w in words if w not in _STOPWORDS and len(w) > 1}
@@ -74,8 +74,8 @@ def verify_source_overlap(
         return OverlapResult(verified=False, overlap=0.0,
                              extraction_terms=0, matched_terms=0)
 
-    ext_terms = _extract_terms(extraction_content)
-    src_terms = _extract_terms(source_text)
+    ext_terms = extract_terms(extraction_content)
+    src_terms = extract_terms(source_text)
 
     if not ext_terms:
         return OverlapResult(verified=False, overlap=0.0,
@@ -94,8 +94,8 @@ def verify_source_overlap(
 
 def compute_jaccard(text_a: str, text_b: str) -> float:
     """Compute Jaccard similarity between two texts (stopword-filtered)."""
-    terms_a = _extract_terms(text_a)
-    terms_b = _extract_terms(text_b)
+    terms_a = extract_terms(text_a)
+    terms_b = extract_terms(text_b)
     if not terms_a or not terms_b:
         return 0.0
     intersection = terms_a & terms_b

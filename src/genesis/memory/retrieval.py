@@ -233,7 +233,7 @@ def _apply_diversity_penalty(
     **Mutates ``fused`` in-place** — penalized scores are written directly
     into the dict. Callers that need pre-penalty scores must copy first.
     """
-    from genesis.memory.source_verification import compute_jaccard
+    from genesis.memory.source_verification import extract_terms
 
     if len(candidates) < 2:
         return candidates
@@ -246,24 +246,38 @@ def _apply_diversity_penalty(
     cluster_count: dict[int, int] = {}
     next_cluster = 0
 
-    # Cache content to avoid repeated lookups
+    # Pre-tokenize each candidate's content ONCE. ``compute_jaccard`` extracts a
+    # stopword-filtered term set from BOTH texts on every call, so the O(n²)
+    # comparison loop below otherwise re-tokenizes each candidate's content ~n
+    # times — the dominant cost of recall on large pools (measured 100-550ms on
+    # this call site, blocking the event loop). Hoisting the extraction out is
+    # exact-parity (same terms → same Jaccard, same empty-set → 0.0 rule) and
+    # collapses each comparison to two set operations.
     content_cache: dict[str, str] = {}
+    terms_cache: dict[str, set[str]] = {}
     for mid in sorted_cands:
-        content_cache[mid] = _get_candidate_content(mid, qdrant_by_id, fts_by_id)
+        content = _get_candidate_content(mid, qdrant_by_id, fts_by_id)
+        content_cache[mid] = content
+        terms_cache[mid] = extract_terms(content) if content else set()
 
     # Greedy clustering: compare each candidate against earlier (higher-scored) ones
     for i, mid in enumerate(sorted_cands):
-        content_i = content_cache[mid]
-        if not content_i:
+        if not content_cache[mid]:
             continue
+        terms_i = terms_cache[mid]
 
         matched_cluster = None
         for j in range(i):
             earlier = sorted_cands[j]
-            content_j = content_cache.get(earlier, "")
-            if not content_j:
+            if not content_cache.get(earlier, ""):
                 continue
-            if compute_jaccard(content_i, content_j) >= jaccard_threshold:
+            terms_j = terms_cache[earlier]
+            # Jaccard over the precomputed term sets — identical to
+            # compute_jaccard(content_i, content_j): 0.0 when either set is empty.
+            jaccard = (
+                len(terms_i & terms_j) / len(terms_i | terms_j) if terms_i and terms_j else 0.0
+            )
+            if jaccard >= jaccard_threshold:
                 matched_cluster = cluster_of.get(earlier)
                 break
 
