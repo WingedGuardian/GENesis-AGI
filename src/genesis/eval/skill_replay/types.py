@@ -16,6 +16,12 @@ VERDICT_NET_POSITIVE = "net_positive"  # zero regression AND at least one improv
 VERDICT_REGRESSION = "regression"  # NEW lost on >=1 task, or pass-rate favours OLD
 VERDICT_INCONCLUSIVE = "inconclusive"  # all ties, or too few complete pairs to judge
 
+# Arm identifiers for the paired replay — control = OLD (current) skill content,
+# treatment = NEW (proposed). Plain strings so the dependency-light modules
+# (runner, persist) can label without importing the CC arm builder.
+ARM_OLD = "old"
+ARM_NEW = "new"
+
 
 @dataclass(frozen=True)
 class SkillReplayConfig:
