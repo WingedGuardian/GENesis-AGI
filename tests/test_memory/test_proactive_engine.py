@@ -426,9 +426,11 @@ def test_is_proactive_noise_predicate():
     assert noise("knowledge_base", "surplus", "clean text") is True
     assert noise("knowledge_base", "recon", "clean text") is True
     assert noise("knowledge_base", None, "clean text") is True
-    # intentional knowledge_base survives
+    # intentional knowledge_base survives (incl. dashboard file/URL uploads =
+    # source_pipeline "curated" — genesis.knowledge.ingest_upload)
     assert noise("knowledge_base", "knowledge_ingest", "clean text") is False
     assert noise("knowledge_base", "reference_store", "clean text") is False
+    assert noise("knowledge_base", "curated", "clean text") is False
     # clean episodic survives
     assert noise("episodic_memory", None, "a normal memory") is False
 

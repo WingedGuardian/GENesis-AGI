@@ -103,11 +103,20 @@ def is_garbage(content: str | None) -> bool:
 
 
 # knowledge_base rows representing INTENTIONAL ingestions (user-requested docs,
-# references, structured extractions). Everything else in knowledge_base is noisy
-# pipeline output (surplus insights, recon/web crawl) that must not surface into a
-# proactive prompt. (Live: knowledge_base is ~71% surplus.)
+# references, structured extractions, dashboard file/URL uploads). Everything else
+# in knowledge_base is noisy pipeline output (surplus insights, recon/web crawl)
+# that must not surface into a proactive prompt. (Live: knowledge_base is ~71%
+# surplus.) ``curated`` is the dashboard upload / orchestrator ingestion pipeline
+# (genesis.knowledge.ingest_upload) — intentional user content, so it belongs here
+# even though it is external_untrusted (it still surfaces, labelled external).
 _KB_INTENTIONAL_PIPELINES = frozenset(
-    {"extraction_job", "knowledge_ingest", "knowledge_ingest_source", "reference_store"}
+    {
+        "extraction_job",
+        "knowledge_ingest",
+        "knowledge_ingest_source",
+        "reference_store",
+        "curated",
+    }
 )
 
 

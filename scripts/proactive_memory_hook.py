@@ -1384,11 +1384,14 @@ async def _run(prompt: str, session_id: str = "") -> None:
         # code_symbols matches on code/debug prompts, so keep that lane hook-side —
         # a cheap local SQLite lookup, distinct from (and additive to) memory
         # recall. Best-effort; empty when the code index hasn't been built.
-        code_keywords = keywords + [k for k in file_keywords if k not in keywords]
-        for ch in _search_code_index(_DB_PATH, code_keywords)[:_MAX_RESULTS]:
-            content = ch.get("content")
-            if content:
-                print(content)
+        # Suppressed when the engine is deliberately silenced (status "disabled" =
+        # config kill switch → inject NOTHING), so code hints don't leak past it.
+        if server_data.get("status") != "disabled":
+            code_keywords = keywords + [k for k in file_keywords if k not in keywords]
+            for ch in _search_code_index(_DB_PATH, code_keywords)[:_MAX_RESULTS]:
+                content = ch.get("content")
+                if content:
+                    print(content)
                 sys.stdout.flush()
 
         # Adapt structured rows for H-1 measurement: the engine emits pre-bump
