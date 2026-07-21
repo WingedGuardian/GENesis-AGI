@@ -1,0 +1,418 @@
+"""WS-2 B5 learned-knob substrate — the closed registry + ledgered file writes.
+
+Design §5.3, SUBSTRATE ONLY: the knob file, the bounds validator, the ledgered
+write path (`apply_knob_change`), and the startup applier that syncs DB-backed
+knobs from file. The deterministic calibration TRIGGER (cell ok, n≥50,
+2-window directional miss → ego proposal) is deliberately NOT built — no v1
+calibration lane grades awareness/memory behavior, so it would be structurally
+dormant; it lands with the lane that gives it evidence (tabled record).
+
+The registry is a CLOSED set of three knob groups (§5.3):
+
+1. ``awareness.signal_weights.<signal_name>`` — DB-backed
+   (``signal_weights.current_weight``; baseline = the row's
+   ``initial_weight``; the CRUD clamps to the row's min/max in SQL).
+2. ``awareness.depth_thresholds.<Micro|Light|Deep|Strategic>`` — DB-backed
+   (``depth_thresholds.threshold``; no initial column, so the baseline is
+   captured from the live value at first apply and pinned in the file entry).
+3. ``memory.activation_blend.<base|access|connectivity>`` — code-backed
+   (the activation blend constants; ``memory/activation.py`` reads
+   :func:`activation_blend` through its module-level seam).
+
+File model (the immunity config split): the repo base
+``config/learned_knobs.yaml`` ships as documentation + empty registry and is
+NEVER machine-written (a mutated repo file would dirty the tree and fight
+deploys). Learned entries live in the install-local overlay
+``~/.genesis/config/learned_knobs.local.yaml`` — every write goes through
+``cognitive_ledger.record_file_modification`` (actor ``ws2_effector``), so
+pre-image capture, drift-guarded rollback, and the MCP rollback tool are all
+inherited. Rollback = file rollback + re-sync (:func:`apply_learned_knobs_to_db`).
+
+Bounds are validator-enforced per §5.3: step ≤5% of baseline per change,
+cumulative ≤±20% of baseline. (The 14-day per-knob cooldown is trigger
+policy, deferred with the trigger.)
+
+Dependency rule: module-level imports are stdlib + yaml + genesis.env +
+genesis._config_overlay only (the ws2_ledger_config rule) — DB CRUDs and the
+cognitive ledger import lazily inside functions, so the memory/awareness hot
+paths can import this module without dragging the learning stack.
+
+Cross-process caveat (for the future trigger builder): the activation blend
+is cached per process at import; ``reload_blend()`` only fires in the process
+that ran the change/rollback. Other processes computing activation (e.g. the
+memory MCP server) pick the new blend up at their next restart. Applies to
+concurrency too: ``apply_knob_change`` has no cross-process write lock — the
+trigger must serialize its applies (v1 has no autonomous writer).
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import yaml
+
+from genesis._config_overlay import merge_local_overlay
+from genesis.env import repo_root
+
+if TYPE_CHECKING:
+    import aiosqlite
+
+logger = logging.getLogger(__name__)
+
+_CONFIG_NAME = "learned_knobs.yaml"
+
+# Shipped activation-blend constants (memory/activation.py's coefficients —
+# sum to 1.0 at maximum AS SHIPPED). Components are bounded independently
+# (±20% each), so a fully-retuned file can push the sum to 1.2: relative
+# ranking is unaffected, but ABSOLUTE-score consumers (e.g. the drift
+# archival gate's min_activation) shift with it — a deliberate part of the
+# knob's effect, not an accident.
+BLEND_DEFAULTS = {"base": 0.6, "access": 0.25, "connectivity": 0.15}
+
+# The CLOSED registry — key must match exactly one pattern (§5.3).
+_KNOB_PATTERNS = (
+    re.compile(r"^awareness\.signal_weights\.(?P<name>[a-z0-9_]+)$"),
+    re.compile(r"^awareness\.depth_thresholds\.(?P<name>Micro|Light|Deep|Strategic)$"),
+    re.compile(r"^memory\.activation_blend\.(?P<name>base|access|connectivity)$"),
+)
+
+_STEP_LIMIT = 0.05  # ≤5% of baseline per change
+_CUMULATIVE_LIMIT = 0.20  # ≤±20% of baseline from baseline
+_EPS = 1e-9
+
+_OVERLAY_HEADER = (
+    "# Learned knob overrides — MACHINE-WRITTEN via the cognitive ledger\n"
+    "# (actor ws2_effector). Hand-edits are allowed but the ledger pre-image\n"
+    "# trail only covers writes made through apply_knob_change. Schema per\n"
+    "# knob key: {baseline: <pinned>, current: <value>}. Bounds: each change\n"
+    "# <=5% of baseline, cumulative <=+/-20% of baseline. See\n"
+    "# config/learned_knobs.yaml for the closed key registry.\n"
+)
+
+
+def _base_path() -> Path:
+    return repo_root() / "config" / _CONFIG_NAME
+
+
+def _overlay_path() -> Path:
+    """The overlay path for WRITES — the user config dir, unconditionally.
+
+    Deliberately NOT ``_resolve_overlay_path`` (which falls back to the
+    repo-relative sibling when the user file doesn't exist yet): the first
+    ever knob write must never land inside the repo tree (cfg-001 — the
+    dashboard/MCP settings writers use the same user-dir-always convention).
+    Reads via ``merge_local_overlay`` still resolve user-dir-first, so reader
+    and writer agree from the first write onward.
+    """
+    from genesis._config_overlay import _user_config_dir
+
+    return _user_config_dir() / _base_path().with_suffix(".local.yaml").name
+
+
+def parse_knob_key(key: str) -> tuple[str, str] | None:
+    """Return ``(group, name)`` for a registry key, or None if not in the
+    closed set. group ∈ {signal_weights, depth_thresholds, activation_blend}."""
+    for pat in _KNOB_PATTERNS:
+        m = pat.match(key)
+        if m:
+            group = key.split(".")[1]
+            return group, m.group("name")
+    return None
+
+
+def load_knobs() -> dict[str, dict[str, Any]]:
+    """The merged knob entries — ``{key: {baseline, current}}``.
+
+    Reads base ← overlay fresh per call (no cache — same live-read contract
+    as ws2_ledger_config). Malformed layers degrade to empty.
+    """
+    base: dict[str, Any] = {}
+    base_path = _base_path()
+    try:
+        loaded = yaml.safe_load(base_path.read_text()) or {}
+        if isinstance(loaded, dict):
+            base = loaded
+    except Exception:
+        logger.debug("learned_knobs base config unreadable at %s", base_path)
+    try:
+        base = merge_local_overlay(base, base_path)
+    except Exception:
+        logger.warning("learned_knobs overlay merge failed", exc_info=True)
+    knobs = base.get("knobs")
+    if not isinstance(knobs, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for key, entry in knobs.items():
+        if parse_knob_key(str(key)) is None:
+            logger.warning("learned_knobs: ignoring unregistered key %r", key)
+            continue
+        if not isinstance(entry, dict) or "current" not in entry:
+            logger.warning("learned_knobs: ignoring malformed entry for %r", key)
+            continue
+        out[str(key)] = entry
+    return out
+
+
+def activation_blend() -> dict[str, float]:
+    """The activation-blend coefficients with any learned overrides applied.
+
+    Consumed by ``memory/activation.py``'s module-level seam. Falls back
+    per-component to :data:`BLEND_DEFAULTS`; a value outside the ±20% bound
+    of its shipped default is ignored (defense against hand-edited files —
+    the blend shapes every memory activation score).
+    """
+    blend = dict(BLEND_DEFAULTS)
+    try:
+        for key, entry in load_knobs().items():
+            parsed = parse_knob_key(key)
+            if parsed is None or parsed[0] != "activation_blend":
+                continue
+            name = parsed[1]
+            default = BLEND_DEFAULTS[name]
+            try:
+                value = float(entry["current"])
+            except (TypeError, ValueError):
+                continue
+            if abs(value - default) <= _CUMULATIVE_LIMIT * default + _EPS:
+                blend[name] = value
+            else:
+                logger.warning(
+                    "learned_knobs: activation_blend.%s=%r outside ±20%% of default %.2f — ignored",
+                    name,
+                    value,
+                    default,
+                )
+    except Exception:
+        logger.debug("learned_knobs activation_blend read failed", exc_info=True)
+    return blend
+
+
+def validate_change(*, baseline: float, current: float, new_value: float) -> list[str]:
+    """Bounds check per §5.3 — returns error strings (empty = valid)."""
+    errors: list[str] = []
+    if baseline <= 0:
+        return [f"baseline must be positive, got {baseline!r}"]
+    if abs(new_value - current) > _STEP_LIMIT * baseline + _EPS:
+        errors.append(
+            f"step {abs(new_value - current):.4f} exceeds 5% of baseline "
+            f"({_STEP_LIMIT * baseline:.4f})"
+        )
+    if abs(new_value - baseline) > _CUMULATIVE_LIMIT * baseline + _EPS:
+        errors.append(
+            f"cumulative drift {abs(new_value - baseline):.4f} exceeds ±20% of "
+            f"baseline ({_CUMULATIVE_LIMIT * baseline:.4f})"
+        )
+    return errors
+
+
+async def _resolve_baseline_and_current(
+    db: aiosqlite.Connection, key: str, group: str, name: str
+) -> tuple[float, float]:
+    """(baseline, current) for *key* — file entry first, then the source."""
+    entry = load_knobs().get(key)
+    if entry is not None and "baseline" in entry:
+        return float(entry["baseline"]), float(entry["current"])
+
+    if group == "signal_weights":
+        from genesis.db.crud import signal_weights as sw_crud
+
+        row = await sw_crud.get(db, name)
+        if row is None:
+            raise ValueError(f"unknown signal {name!r}")
+        return float(row["initial_weight"]), float(row["current_weight"])
+    if group == "depth_thresholds":
+        from genesis.db.crud import depth_thresholds as dt_crud
+
+        row = await dt_crud.get(db, name)
+        if row is None:
+            raise ValueError(f"unknown depth {name!r}")
+        # No initial column — the live value at first apply IS the baseline
+        # (pinned into the file entry from then on).
+        return float(row["threshold"]), float(row["threshold"])
+    return float(BLEND_DEFAULTS[name]), float(activation_blend()[name])
+
+
+async def apply_knob_change(
+    db: aiosqlite.Connection, key: str, new_value: float, *, reason: str = ""
+) -> str | None:
+    """Apply one validated knob change — THE write path for learned knobs.
+
+    Validates the key against the closed registry and the §5.3 bounds, writes
+    the overlay file through ``record_file_modification`` (actor
+    ``ws2_effector`` — pre-image + rollback inherited), then syncs the value
+    to its consumer (DB row via the clamped CRUDs, or the activation-blend
+    module seam). Returns the cognitive-ledger mod id (None if only the
+    ledger row failed — the file write itself raising propagates).
+
+    Raises ``ValueError`` on an unregistered key, unknown signal/depth, or a
+    bounds violation. This is called by the future calibration trigger and by
+    deliberate operator action — never fire-and-forget.
+    """
+    parsed = parse_knob_key(key)
+    if parsed is None:
+        raise ValueError(f"knob {key!r} is not in the closed registry")
+    group, name = parsed
+    new_value = float(new_value)
+
+    baseline, current = await _resolve_baseline_and_current(db, key, group, name)
+    errors = validate_change(baseline=baseline, current=current, new_value=new_value)
+    if errors:
+        raise ValueError(f"knob {key!r}: " + "; ".join(errors))
+
+    # Read the RAW overlay (not the merged view) so we only ever rewrite
+    # install-local state, preserving unrelated hand-added entries.
+    overlay_path = _overlay_path()
+    overlay: dict[str, Any] = {}
+    try:
+        loaded = yaml.safe_load(overlay_path.read_text()) or {}
+        if isinstance(loaded, dict):
+            overlay = loaded
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.warning("learned_knobs overlay unreadable — rewriting", exc_info=True)
+    knobs = overlay.setdefault("knobs", {})
+    if not isinstance(knobs, dict):
+        knobs = overlay["knobs"] = {}
+    knobs[key] = {"baseline": baseline, "current": new_value}
+
+    body = _OVERLAY_HEADER + yaml.safe_dump(overlay, sort_keys=True)
+    from genesis.learning.cognitive_ledger import record_file_modification
+
+    mod_id = await record_file_modification(
+        db,
+        actor="ws2_effector",
+        path=overlay_path,
+        new_content=body,
+        summary=(
+            f"knob {key}: {current:.4f} → {new_value:.4f}" + (f" ({reason})" if reason else "")
+        ),
+        metadata={"knob": key, "baseline": baseline, "previous": current},
+    )
+
+    await _sync_knob(db, group, name, new_value)
+    return mod_id
+
+
+async def _sync_knob(db: aiosqlite.Connection, group: str, name: str, value: float) -> None:
+    """Push one knob value to its consumer."""
+    if group == "signal_weights":
+        from genesis.db.crud import signal_weights as sw_crud
+
+        await sw_crud.update_weight(db, name, new_weight=value)
+    elif group == "depth_thresholds":
+        from genesis.db.crud import depth_thresholds as dt_crud
+
+        # Absolute backstop mirroring the signal CRUD's SQL clamp: thresholds
+        # live in (0, 1] and the CRUD itself doesn't clamp — without this, a
+        # hand-edited overlay with a self-attested baseline could land an
+        # arbitrary value and make a depth unreachable in the scorer.
+        await dt_crud.update_threshold(db, name, new_threshold=max(0.01, min(1.0, value)))
+    else:  # activation_blend — poke the module-level seam
+        try:
+            from genesis.memory.activation import reload_blend
+
+            reload_blend()
+        except Exception:
+            logger.debug("activation blend reload failed", exc_info=True)
+
+
+async def apply_learned_knobs_to_db(db: aiosqlite.Connection) -> int:
+    """Startup applier — sync every DB-backed file entry into its row.
+
+    The file is the source of truth for learned values; a fresh DB (or a
+    restore) re-converges here. Activation-blend entries need no DB sync
+    (activation.py reads the file through its seam). Never raises; returns
+    the number of knobs applied.
+    """
+    applied = 0
+    try:
+        for key, entry in load_knobs().items():
+            parsed = parse_knob_key(key)
+            if parsed is None or parsed[0] == "activation_blend":
+                continue
+            group, name = parsed
+            try:
+                baseline = float(entry.get("baseline", 0.0))
+                value = float(entry["current"])
+            except (TypeError, ValueError):
+                logger.warning("learned_knobs: non-numeric entry for %r", key)
+                continue
+            errors = validate_change(baseline=baseline, current=value, new_value=value)
+            # Startup re-sync only checks the CUMULATIVE bound (step vs
+            # itself is 0); a corrupted/out-of-bounds entry is skipped loudly.
+            if any("cumulative" in e or "baseline" in e for e in errors):
+                logger.warning("learned_knobs: %r out of bounds — skipped: %s", key, errors)
+                continue
+            await _sync_knob(db, group, name, value)
+            applied += 1
+        if applied:
+            logger.info("learned_knobs: applied %d knob(s) from file to DB", applied)
+        # Surface the reader/writer overlay asymmetry: a legacy repo-local
+        # overlay is silently shadowed once the user-dir file exists (the
+        # resolver picks one file, it does not merge the two).
+        legacy = _base_path().with_suffix(".local.yaml")
+        if legacy.is_file() and _overlay_path().is_file():
+            logger.warning(
+                "learned_knobs: BOTH %s and %s exist — only the user-dir file "
+                "is read; fold the repo-local entries in and delete it",
+                legacy,
+                _overlay_path(),
+            )
+    except Exception:
+        logger.warning("learned_knobs startup apply failed", exc_info=True)
+    return applied
+
+
+async def resync_after_ledger_rollback(db: aiosqlite.Connection, row: dict) -> str:
+    """Re-converge knob consumers after a cognitive-ledger file rollback.
+
+    Called by ``cognitive_ledger.rollback`` for ``ws2_effector`` rows: the
+    ledger restores the FILE, but the knobs' consumers (DB rows, the cached
+    activation blend) would otherwise keep the un-rolled-back values until
+    the next restart. Two cases:
+
+    - entry survived with an older value (rollback of a later write) → the
+      normal applier re-converges it;
+    - entry VANISHED (rollback of the first-ever write deletes the overlay)
+      → the applier can't see it, so the pre-change value is restored from
+      the ledger row's own recorded ``metadata.previous`` — without this,
+      the DB would keep the learned value forever while the file says "no
+      learned state", and the next apply would re-pin the baseline at the
+      drifted value (compounding the ±20% window).
+    """
+    applied = await apply_learned_knobs_to_db(db)
+    # The file changed under the cached activation blend either way.
+    try:
+        from genesis.memory.activation import reload_blend
+
+        reload_blend()
+    except Exception:
+        logger.debug("activation blend reload failed", exc_info=True)
+
+    meta_raw = row.get("metadata")
+    meta: dict[str, Any] = {}
+    if isinstance(meta_raw, dict):
+        meta = meta_raw
+    elif isinstance(meta_raw, str) and meta_raw:
+        try:
+            import json
+
+            loaded = json.loads(meta_raw)
+            if isinstance(loaded, dict):
+                meta = loaded
+        except ValueError:
+            pass
+    knob = meta.get("knob")
+    parsed = parse_knob_key(str(knob)) if knob else None
+    if parsed and knob not in load_knobs() and "previous" in meta:
+        group, name = parsed
+        try:
+            await _sync_knob(db, group, name, float(meta["previous"]))
+            return f"resynced ({applied} from file; {knob} restored to previous)"
+        except (TypeError, ValueError):
+            logger.warning("learned_knobs: bad metadata.previous for %r", knob)
+    return f"resynced ({applied} from file)"
