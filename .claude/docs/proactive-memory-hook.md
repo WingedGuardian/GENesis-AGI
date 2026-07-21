@@ -10,6 +10,10 @@ reimplementation of it.
 1. **Session-local awareness** (always, in-process): heartbeat + concurrent-
    session tags, intent-trail/pivot detection, recent-activity summary, the H-1
    working-set measurement, and the ambient session-awareness fold.
+   The hook also runs a local `code_symbols` lookup and prints any `[Code]
+   symbol — location` structural hints on the server path — the server engine
+   surfaces semantic memory only, so this cheap local lane (which the pre-flip
+   fork fused) stays hook-side.
 2. **Recall** (delegated): the hook POSTs `{prompt, session_id, profile:"cc_hook",
    file_keywords, suppress_ids}` to `POST /api/genesis/hook/recall`. The server
    engine (`genesis.memory.proactive.proactive_context`) runs the full pipeline —

@@ -65,17 +65,8 @@ def test_rerank_for_honors_live_config_kill_switch():
         assert P._rerank_for("cc_hook") is True
 
 
-def test_kb_cap_keeps_all_episodic_caps_kb():
-    dicts = [
-        {"memory_id": "e1", "collection": "episodic_memory"},
-        {"memory_id": "k1", "collection": "knowledge_base"},
-        {"memory_id": "k2", "collection": "knowledge_base"},
-        {"memory_id": "e2", "collection": "episodic_memory"},
-        {"memory_id": "k3", "collection": "knowledge_base"},
-    ]
-    kept = P._apply_kb_cap(dicts, kb_slots=1)
-    ids = [d["memory_id"] for d in kept]
-    assert ids == ["e1", "k1", "e2"]  # both episodic kept, only first KB
+# (The KB slot cap moved into _proactive_impl's backfill loop — see
+# test_proactive_impl_kb_slot_cap_backfills below.)
 
 
 # --- renderer ---------------------------------------------------------------
@@ -285,7 +276,7 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
     captured = {}
 
     async def _fake_impl(
-        prompt, limit=5, *, rerank=False, extra_fts_terms=None, filter_noise=False
+        prompt, limit=5, *, rerank=False, extra_fts_terms=None, filter_noise=False, kb_slots=None
     ):
         captured["extra"] = extra_fts_terms
         captured["rerank"] = rerank
@@ -408,7 +399,7 @@ async def test_proactive_context_requests_noise_filter():
     captured = {}
 
     async def _fake_impl(
-        prompt, limit=5, *, rerank=False, extra_fts_terms=None, filter_noise=False
+        prompt, limit=5, *, rerank=False, extra_fts_terms=None, filter_noise=False, kb_slots=None
     ):
         captured["filter_noise"] = filter_noise
         return []
@@ -442,39 +433,35 @@ def test_is_proactive_noise_predicate():
     assert noise("episodic_memory", None, "a normal memory") is False
 
 
-async def test_proactive_impl_filter_noise_backfills_and_predates_wrap():
-    """filter_noise drops garbage + non-intentional KB INSIDE the backfill loop
-    (a dropped noisy top-K item is replaced by the next safe candidate — Codex P2
-    #1) and BEFORE wrapping (raw content is checked — Codex P2 #2). filter_noise
-    =False leaves them, proving the flag gates the behavior (MCP tool unchanged)."""
-    from genesis.mcp.memory import core as C
+def _rr(mid, collection, content, source_pipeline=None):
     from genesis.memory.types import RetrievalResult
 
-    def _rr(mid, collection, content, source_pipeline=None):
-        return RetrievalResult(
-            memory_id=mid,
-            content=content,
-            source="",
-            memory_type="fact",
-            score=0.5,
-            vector_rank=1,
-            fts_rank=None,
-            activation_score=0.0,
-            payload={},
-            collection=collection,
-            source_pipeline=source_pipeline,
-        )
+    return RetrievalResult(
+        memory_id=mid,
+        content=content,
+        source="",
+        memory_type="fact",
+        score=0.5,
+        vector_rank=1,
+        fts_rank=None,
+        activation_score=0.0,
+        payload={},
+        collection=collection,
+        source_pipeline=source_pipeline,
+    )
 
-    # Top-2 candidates are noise; the two deeper rows are clean episodic.
-    candidates = [
-        _rr("kbsurplus", "knowledge_base", "surplus insight", "surplus"),
-        _rr("garbageep", "episodic_memory", '{"operation": "store"}'),
-        _rr("cleanep01", "episodic_memory", "clean memory one"),
-        _rr("cleanep02", "episodic_memory", "clean memory two"),
-    ]
+
+async def _run_impl(candidates, *, capture=None, **kwargs):
+    """Run the real _proactive_impl over ``candidates`` with the external
+    collaborators (retriever / graph expansion / immunity) mocked out. If
+    ``capture`` is a dict, the ``skip_writeback`` predicate recall received is
+    stored under ``capture['skip_writeback']``."""
+    from genesis.mcp.memory import core as C
 
     class _Retriever:
-        async def recall(self, *a, **k):
+        async def recall(self, *a, skip_writeback=None, **k):
+            if capture is not None:
+                capture["skip_writeback"] = skip_writeback
             return list(candidates)
 
     fake_mod = SimpleNamespace(
@@ -497,8 +484,22 @@ async def test_proactive_impl_filter_noise_backfills_and_predates_wrap():
         patch.object(C.immunity_shadow, "is_dispatched_session_env", return_value=False),
         patch.object(C.immunity_shadow, "record_would_block", new=_record),
     ):
-        filtered = await C._proactive_impl("q", limit=2, filter_noise=True)
-        unfiltered = await C._proactive_impl("q", limit=2, filter_noise=False)
+        return await C._proactive_impl("q", **kwargs)
+
+
+async def test_proactive_impl_filter_noise_backfills_and_predates_wrap():
+    """filter_noise drops garbage + non-intentional KB INSIDE the backfill loop
+    (a dropped noisy top-K item is replaced by the next safe candidate — Codex P2
+    #1) and BEFORE wrapping (raw content is checked — Codex P2 #2). filter_noise
+    =False leaves them, proving the flag gates the behavior (MCP tool unchanged)."""
+    candidates = [
+        _rr("kbsurplus", "knowledge_base", "surplus insight", "surplus"),
+        _rr("garbageep", "episodic_memory", '{"operation": "store"}'),
+        _rr("cleanep01", "episodic_memory", "clean memory one"),
+        _rr("cleanep02", "episodic_memory", "clean memory two"),
+    ]
+    filtered = await _run_impl(candidates, limit=2, filter_noise=True)
+    unfiltered = await _run_impl(candidates, limit=2, filter_noise=False)
 
     fids = [d["memory_id"] for d in filtered]
     uids = [d["memory_id"] for d in unfiltered]
@@ -506,6 +507,39 @@ async def test_proactive_impl_filter_noise_backfills_and_predates_wrap():
     assert fids == ["cleanep01", "cleanep02"], fids
     # without the flag the top-2 (incl. noise) survive → the flag gates it
     assert "kbsurplus" in uids and "garbageep" in uids
+
+
+async def test_proactive_impl_kb_slot_cap_backfills():
+    """kb_slots caps knowledge_base hits IN the loop, backfilling from deeper safe
+    candidates instead of leaving the prompt under-filled (Codex #1169)."""
+    candidates = [
+        _rr("kb1", "knowledge_base", "kb one", "knowledge_ingest"),
+        _rr("kb2", "knowledge_base", "kb two", "knowledge_ingest"),
+        _rr("ep1", "episodic_memory", "episodic one"),
+        _rr("ep2", "episodic_memory", "episodic two"),
+    ]
+    out = await _run_impl(candidates, limit=3, filter_noise=True, kb_slots=1)
+    ids = [d["memory_id"] for d in out]
+    # kb2 is over the 1-slot cap → dropped + backfilled with ep2, so 3 items land.
+    assert ids == ["kb1", "ep1", "ep2"], ids
+    # kb_slots=None (the MCP-tool default) → no cap.
+    out2 = await _run_impl(candidates, limit=3)
+    assert [d["memory_id"] for d in out2] == ["kb1", "kb2", "ep1"]
+
+
+async def test_proactive_impl_noise_skips_writeback():
+    """A noise-dropped candidate must skip recall's retrieved_count write-back so
+    filtered content can't farm ranking energy from every session (Codex #1169)."""
+    capture: dict = {}
+    await _run_impl([], capture=capture, limit=3, filter_noise=True)
+    skip = capture["skip_writeback"]
+    assert skip(_rr("g", "episodic_memory", '{"operation": "x"}')) is True  # garbage
+    assert skip(_rr("kb", "knowledge_base", "clean", "surplus")) is True  # noisy KB
+    assert skip(_rr("ok", "episodic_memory", "a normal memory")) is False  # kept
+    # With filter_noise off, the noise predicate does not skip write-backs.
+    capture2: dict = {}
+    await _run_impl([], capture=capture2, limit=3)
+    assert capture2["skip_writeback"](_rr("g", "episodic_memory", '{"operation": "x"}')) is False
 
 
 def test_is_garbage_predicate():

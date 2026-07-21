@@ -187,6 +187,61 @@ def test_stub_server_mode_server(fts_db: Path, tmp_path: Path):
     assert _FTS_ID in ws["entries"]
 
 
+def test_server_path_includes_code_index_hints(fts_db: Path, tmp_path: Path):
+    """The server path still surfaces local ``[Code]`` structural hints — the
+    engine does semantic memory only, so the hook keeps the code_symbols lane the
+    fork fused (Codex #1169)."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(fts_db))
+    conn.execute(
+        "INSERT INTO code_modules (path, package, module_name, loc, file_mtime, last_indexed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("src/genesis/memory/retrieval.py", "genesis.memory", "retrieval", 100, 0.0, "2026-07-01"),
+    )
+    conn.execute(
+        "INSERT INTO code_symbols (module_path, name, symbol_type, line_start, signature, is_public) "
+        "VALUES (?, ?, ?, ?, ?, 1)",
+        (
+            "src/genesis/memory/retrieval.py",
+            "recall_reranker",
+            "function",
+            10,
+            "def recall_reranker(q)",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    home = tmp_path / "home"
+    home.mkdir()
+    response = {
+        "status": "ok",
+        "lines": ["[Memory | 1d | id:aaaaaaaa] a semantic memory"],
+        "results": [],
+        "procedure": None,
+        "shadow": {},
+        "budget": {},
+        "embedding": None,
+        "timings_ms": {},
+        "engine": {},
+    }
+    with _stub_server(response) as base_url:
+        result = _run_hook(
+            "what did we decide about the recall reranker",
+            "codesess",
+            {
+                "GENESIS_DB_PATH": str(fts_db),
+                "GENESIS_PROACTIVE_HOOK_URL": base_url,
+                "GENESIS_PROACTIVE_HOOK_MODE": "server",
+            },
+            home,
+        )
+    assert result.returncode == 0, result.stderr[:2000]
+    assert "[Code]" in result.stdout  # structural hint surfaced on the server path
+    assert "recall_reranker" in result.stdout
+
+
 def test_server_down_falls_back_to_fts5(fts_db: Path, tmp_path: Path):
     """No server (dead port) → degraded banner + FTS5 hit + mode=degraded, exit 0."""
     home = tmp_path / "home"

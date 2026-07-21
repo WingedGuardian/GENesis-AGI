@@ -510,20 +510,6 @@ def _result_row(d: dict) -> dict:
     return row
 
 
-def _apply_kb_cap(dicts: list[dict], kb_slots: int) -> list[dict]:
-    """Keep every non-KB hit; cap knowledge_base hits at ``kb_slots`` (order-
-    preserving) so KB can't flood episodic context under a wider budget."""
-    out: list[dict] = []
-    kb = 0
-    for d in dicts:
-        if d.get("collection") == "knowledge_base":
-            kb += 1
-            if kb > kb_slots:
-                continue
-        out.append(d)
-    return out
-
-
 async def proactive_context(
     *,
     prompt: str,
@@ -590,21 +576,22 @@ async def proactive_context(
 
     # The shared security pipeline (recall + filters + wrap + enforce + graph
     # expansion + immunity emit + retrieved_count write-back).
-    # filter_noise=True restores the pre-flip hook's content guards (garbage rows
-    # + non-intentional knowledge_base) INSIDE the engine's backfill loop and
-    # BEFORE external-content wrapping — so a dropped noisy top-K item is
-    # backfilled from the deeper safe pool and the garbage check sees raw content
-    # (Codex P2 on #1169). memory_proactive (the MCP tool) leaves it False.
+    # filter_noise + kb_slots restore the pre-flip hook's content guards (garbage
+    # rows + non-intentional knowledge_base + the KB slot budget) INSIDE the
+    # engine's backfill loop and BEFORE external-content wrapping — so a dropped
+    # noisy/over-cap hit is backfilled from the deeper safe pool (not left as a
+    # hole), the garbage check sees raw content, and dropped items skip
+    # retrieved_count write-backs (Codex on #1169). memory_proactive (the MCP
+    # tool) passes neither, so it is byte-for-byte unchanged.
+    kb_slots = max(1, budget // 3)
     dicts = await _core._proactive_impl(
         prompt,
         limit=budget,
         rerank=rerank_live,
         extra_fts_terms=[k for k in (file_keywords or []) if k] or None,
         filter_noise=True,
+        kb_slots=kb_slots,
     )
-
-    kb_slots = max(1, budget // 3)
-    dicts = _apply_kb_cap(dicts, kb_slots)
 
     await _enrich(db, dicts)
     await _breadcrumbs(db, dicts)
