@@ -247,6 +247,13 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "the source (same posture as the other ledger alarms); the next "
         "successful pass self-heals the staleness. WARNING-level observability."
     ),
+    "ledger:arbitration_failed:": (
+        "An ego-proposal arbitration calibration lookup raised (WS-2 P4) — "
+        "the proposal still shipped, just without its calibration badge/"
+        "escalation note. A code bug for the developer/ego to fix at the "
+        "source (same posture as the other ledger alarms). WARNING-level "
+        "observability."
+    ),
 }
 
 

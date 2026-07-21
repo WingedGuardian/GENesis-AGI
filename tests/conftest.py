@@ -81,6 +81,7 @@ def _isolate_ledger_write_failures():
     ``ledger:write_failed`` / ``ledger:grade_failed`` alert. Clear before and
     after each test.
     """
+    from genesis.ego import proposals as _ego_proposals
     from genesis.ledger import cells as _ledger_cells
     from genesis.ledger import grader as _ledger_grader
     from genesis.ledger import writers as _ledger_writers
@@ -88,10 +89,12 @@ def _isolate_ledger_write_failures():
     _ledger_writers._write_failures.clear()
     _ledger_grader._reset_grade_failure_counts_for_tests()
     _ledger_cells._reset_cell_counters_for_tests()
+    _ego_proposals._reset_arbitration_failures_for_tests()
     yield
     _ledger_writers._write_failures.clear()
     _ledger_grader._reset_grade_failure_counts_for_tests()
     _ledger_cells._reset_cell_counters_for_tests()
+    _ego_proposals._reset_arbitration_failures_for_tests()
 
 
 @pytest.fixture

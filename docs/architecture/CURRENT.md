@@ -779,7 +779,20 @@ verified: fbcf8ee4 2026-07-21
   (`/api/genesis/calibration` — cells + mechanical/fallback shares), and
   perception's advisory text repointed from legacy `calibration_curves` to
   ok stated cells (90d-preferred, ego.* excluded, byte-stable sentence
-  contract). The fuzzy LLM-fallback lane is
+  contract). **Consumers LIVE (P4a)**: the ego-proposal **arbitration
+  discount** (`ego/proposals.py::annotate_calibration`, gated by
+  `ws2_ledger.arbitration` off/shadow/enforce, default shadow) reads each
+  proposal's stated-lane 90d cell (`ego.<action_type>` /
+  `approved_and_executes`) — thin/unknown → escalation note only (never a
+  discount on ignorance), ok with overconfidence gap >0.15 →
+  `_calibrated_confidence` + a digest badge; the calibrated value drives
+  digest sort ONLY in enforce; a proposal is never suppressed (sovereignty
+  invariant). Lookup failures count into the standing
+  `ledger:arbitration_failed` WARNING. `calibration_status` also carries the
+  **E1 earn-back evidence stream** (`earnback` key: windowed
+  `autonomy_events` counts + posterior per demoted category — surfaced
+  MCP-side instead of the design's `v_earnback_evidence` view, declared
+  deviation). The fuzzy LLM-fallback lane is
   deferred (no `acceptance_pass` writer yet). Outreach
   metrics resolve off `outreach_history.engagement_signal`
   (spike-measured 99.5% mechanical); the engagement_outcome CHECK now
