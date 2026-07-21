@@ -691,24 +691,6 @@ def _ws_measure(
     return stats
 
 
-def _is_garbage(content: str) -> bool:
-    """Filter out content that should never surface as proactive memory."""
-    # NOTE (PR2): we deliberately no longer drop content merely for containing
-    # `<external-content>` markers. That was a blunt defense against leaked
-    # boundary markers, but it also silently lost legitimate hits. The degraded
-    # fallback formatter (`_format_degraded`) strips any leaked markers, so
-    # surfacing-clean is safe. Do not re-add this drop as "protective". (Used
-    # only on the degraded path now; the server engine owns the primary filter.)
-    if content is None:
-        return True  # NULL-content row (FTS content is nullable): filter, never crash
-    stripped = content.lstrip()
-    if stripped.startswith("{") and any(
-        k in stripped[:100] for k in ('"drift_detected"', '"tags"', '"type":', '"operation"')
-    ):
-        return True  # Raw JSON observation blob
-    return stripped.startswith("---\n") and "type:" in stripped[:200]
-
-
 def _extract_keywords(prompt: str) -> list[str]:
     """Extract significant keywords from user prompt."""
     cleaned = "".join(c if c.isalnum() or c.isspace() else " " for c in prompt)
@@ -1418,8 +1400,11 @@ async def _run(prompt: str, session_id: str = "") -> None:
         total_ms = (time.monotonic() - start) * 1000
         _record_activity(_DB_PATH, total_ms, success=bool(fused))
         _record_detail(
+            # On the server path the HOOK does zero local fts/vector search — the
+            # server owns retrieval. Report 0/0 (fused_count + mode carry meaning);
+            # labeling server hits as "vector" would lie to the 1-week review.
             fts_count=0,
-            vector_count=len(fused),
+            vector_count=0,
             fused_count=len(fused),
             embed_latency_ms=None,
             total_latency_ms=total_ms,
@@ -1452,8 +1437,10 @@ async def _run(prompt: str, session_id: str = "") -> None:
         collection="episodic_memory",
         now_iso=now_iso,
     )
+    from genesis.memory.provenance import is_garbage
+
     code_results = _search_code_index(_DB_PATH, fallback_keywords)
-    fused = [r for r in fts_results if not _is_garbage(r.get("content", ""))][:_MAX_RESULTS]
+    fused = [r for r in fts_results if not is_garbage(r.get("content", ""))][:_MAX_RESULTS]
     if len(fused) < _MAX_RESULTS and code_results:
         fused += code_results[: _MAX_RESULTS - len(fused)]
 

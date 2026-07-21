@@ -77,7 +77,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   renders the result, so every memory improvement ships once instead of twice.
   If genesis-server is unreachable the hook degrades to a keyword-only FTS5
   search (clearly labelled) so a prompt is never blocked, and self-heals on the
-  next prompt. New knobs: `GENESIS_PROACTIVE_HOOK_MODE` (`server`/`local`/`off`)
+  next prompt. The fork's content-quality guards are preserved server-side on
+  the endpoint path — malformed rows (raw JSON blobs / YAML frontmatter) and
+  non-intentional `knowledge_base` ingestions (surplus/recon crawl) are filtered
+  out of proactive injection, as before. New knobs: `GENESIS_PROACTIVE_HOOK_MODE` (`server`/`local`/`off`)
   and `GENESIS_PROACTIVE_HOOK_URL` (see `env.example`); `proactive_metrics.json`
   gains a `mode` + `server_ms` field so the fallback rate is observable.
   **Upgrade note:** the memories surfaced per prompt will differ (and improve) —

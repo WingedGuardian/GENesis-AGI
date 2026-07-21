@@ -239,7 +239,10 @@ async def test_proactive_context_end_to_end_faked():
             "collection": "knowledge_base",
             "memory_class": "fact",
             "origin_class": None,
-            "source_pipeline": "curated",
+            # intentional-ingestion pipeline → survives the proactive KB filter
+            # (a non-allowlisted pipeline like "curated"/"surplus" is dropped;
+            # see test_proactive_context_filters_noisy_kb).
+            "source_pipeline": "knowledge_ingest",
             "score": 0.01,
             "payload": {"retrieved_count": 5},
             "via_graph": False,
@@ -380,3 +383,76 @@ async def test_proactive_context_no_procedure_no_bump():
 
     assert resp["procedure"] is None
     assert not [s for s, _ in mod._db.executed if "surfaced_count" in s.lower()]
+
+
+def _mem(mid, collection, content="ordinary memory content", source_pipeline=None):
+    return {
+        "memory_id": mid,
+        "content": content,
+        "collection": collection,
+        "memory_class": "fact",
+        "origin_class": None,
+        "source_pipeline": source_pipeline,
+        "score": 0.02,
+        "payload": {"retrieved_count": 1},
+        "via_graph": False,
+    }
+
+
+async def test_proactive_context_filters_noisy_kb():
+    """knowledge_base hits that are NOT intentional ingestions are dropped
+    (restores the pre-flip hook's KB allowlist); episodic + intentional KB kept."""
+    delivered = [
+        _mem("epepepep0001", "episodic_memory"),
+        _mem("kbsurplus001", "knowledge_base", source_pipeline="surplus"),
+        _mem("kbrecon00001", "knowledge_base", source_pipeline="recon"),
+        _mem("kbnopipe0001", "knowledge_base", source_pipeline=None),
+        _mem("kbingest0001", "knowledge_base", source_pipeline="knowledge_ingest"),
+    ]
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=delivered)),
+    ):
+        # decision-question → budget 6, kb_slots 2 (so the 1 kept KB isn't capped out)
+        resp = await P.proactive_context(prompt="what did we decide about the recall reranker")
+
+    ids = {r["memory_id"] for r in resp["results"]}
+    assert "epepepep0001" in ids  # episodic kept
+    assert "kbingest0001" in ids  # intentional KB kept
+    assert "kbsurplus001" not in ids  # surplus dropped
+    assert "kbrecon00001" not in ids  # recon dropped
+    assert "kbnopipe0001" not in ids  # unknown/None pipeline dropped
+
+
+async def test_proactive_context_drops_garbage():
+    """Malformed stored content (JSON observation blob / YAML frontmatter / NULL)
+    never surfaces on the server path."""
+    delivered = [
+        _mem("cleanmem0001", "episodic_memory", content="A normal, clean decision memory."),
+        _mem("jsonblob0001", "episodic_memory", content='{"drift_detected": true, "tags": []}'),
+        _mem("frontmat0001", "episodic_memory", content="---\ntype: observation\nid: x\n"),
+        _mem("nullmem00001", "episodic_memory", content=None),
+    ]
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=delivered)),
+    ):
+        resp = await P.proactive_context(prompt="what did we decide about the recall reranker")
+
+    ids = {r["memory_id"] for r in resp["results"]}
+    assert ids == {"cleanmem0001"}, f"garbage leaked: {ids}"
+
+
+def test_is_garbage_predicate():
+    """provenance.is_garbage — the shared guard used by the engine + degraded hook."""
+    from genesis.memory.provenance import is_garbage
+
+    assert is_garbage(None) is True
+    assert is_garbage("") is False
+    assert is_garbage("a normal memory") is False
+    assert is_garbage('{"drift_detected": 1}') is True
+    assert is_garbage('   {"operation": "store"}') is True  # leading whitespace tolerated
+    assert is_garbage('{"type": "x"}') is True
+    assert is_garbage("---\ntype: observation\n") is True
+    assert is_garbage("{just braces, no json keys}") is False
+    assert is_garbage("--- not frontmatter, just dashes") is False

@@ -82,6 +82,26 @@ _SAFE_ORIGINS = frozenset({ORIGIN_OWNER, ORIGIN_FIRST_PARTY})
 SESSION_ORIGIN_ENV = "GENESIS_SESSION_ORIGIN"
 
 
+def is_garbage(content: str | None) -> bool:
+    """True if *content* should never surface as proactive memory.
+
+    Ported verbatim from the pre-flip proactive hook's local ``_is_garbage`` so
+    the server recall path and the hook's degraded FTS5 fallback share ONE
+    definition. Drops: NULL content (FTS content is nullable — filter, never
+    crash), raw JSON observation blobs (`{"drift_detected"…/"operation"…}`), and
+    YAML-frontmatter rows (`---\ntype:`). These are malformed stored rows that
+    must not reach an LLM prompt.
+    """
+    if content is None:
+        return True
+    stripped = content.lstrip()
+    if stripped.startswith("{") and any(
+        k in stripped[:100] for k in ('"drift_detected"', '"tags"', '"type":', '"operation"')
+    ):
+        return True
+    return stripped.startswith("---\n") and "type:" in stripped[:200]
+
+
 def session_origin_from_env() -> str | None:
     """The dispatching session's origin_class from ``GENESIS_SESSION_ORIGIN``.
 

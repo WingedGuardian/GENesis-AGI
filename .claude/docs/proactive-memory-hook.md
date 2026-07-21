@@ -23,6 +23,14 @@ Because recall lives in exactly one place, every memory improvement (reranker,
 graph expansion, new lanes) reaches the hook automatically — no more shipping
 each change twice.
 
+The endpoint path also re-applies the two content-quality guards the old fork
+had (they were hook-only, never in the shared `memory_proactive` MCP tool):
+malformed rows (`provenance.is_garbage` — raw JSON observation blobs, YAML
+frontmatter, NULL) and non-intentional `knowledge_base` hits (only
+`extraction_job`/`knowledge_ingest`/`knowledge_ingest_source`/`reference_store`
+survive; the collection is otherwise majority surplus/recon crawl). These live
+in `proactive_context._filter_proactive_noise`, scoped to the hook's backend.
+
 ## Modes — `GENESIS_PROACTIVE_HOOK_MODE`
 
 | value | behaviour |
