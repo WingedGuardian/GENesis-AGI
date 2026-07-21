@@ -43,6 +43,33 @@ else
     queue_alert() { :; }
 fi
 
+# ── Mutual exclusion (SF5): backup↔restore share one whole-run lock ──
+# Non-blocking: a 6h timer run SKIPS (exit 0) when a restore — or another
+# backup — holds the lock; it must never queue behind a multi-minute DR
+# restore. The skip deliberately does NOT touch backup_status.json: writing
+# success:false would page a false CRITICAL (health `backup:last_failed`)
+# during a legitimate restore, so the prior run's status stays put and the
+# existing `backup:overdue` staleness alert (>8h) detects a wedged holder
+# honestly. That is why this block sits BEFORE the EXIT trap below — a skip
+# must write nothing (log() isn't defined yet either; the echo is inline).
+# The lock fd is held for the script's lifetime and released at exit; the
+# open is APPEND mode so a losing contender never truncates the holder line
+# (only the winner rewrites it, by path, after acquiring).
+# NOTE deliberately NOT checked here: ~/.genesis/update_in_progress.pid —
+# update.sh invokes this script AS its pre-update backup while the dashboard
+# orchestrator holds that marker; honoring it would silently skip every
+# pre-deploy backup while update.sh prints "Backup complete".
+_LOCK_DIR="$HOME/.genesis/locks"
+_LOCK_FILE="$_LOCK_DIR/backup-restore.lock"
+mkdir -p "$_LOCK_DIR"
+exec 200>>"$_LOCK_FILE"
+if ! flock -n 200; then
+    _holder="$(cat "$_LOCK_FILE" 2>/dev/null || true)"
+    echo "[genesis-backup] $(date -Iseconds) SKIPPED: backup-restore lock held by ${_holder:-unknown} — backup not run"
+    exit 0
+fi
+printf '%s backup %s\n' "$$" "$(date -Iseconds)" > "$_LOCK_FILE"
+
 # ── Status tracking ──────────────────────────────────────────────────
 _STATUS_FILE="$HOME/.genesis/backup_status.json"
 _STARTED_AT=$(date +%s)
@@ -53,6 +80,13 @@ _MEMORY_COUNT=0
 _SECRETS_OK=false
 _SUCCESS=false
 _FAILURE_REASON=""
+# SF3 freshness tracking: only payloads regenerated THIS run may enter the
+# off-site dated snapshot — a leftover .gpg from a prior run must never be
+# re-badged under a fresh COMPLETE stamp (it silently misrepresents recency,
+# and GFS retention then ages out the snapshots holding genuinely-fresh data).
+_SQL_FRESH=false
+_QDRANT_FRESH=""    # space-separated collections snapshotted+encrypted this run
+_QDRANT_FAILED=""   # collections that EXIST but failed to snapshot this run
 # Tier-1 replication: true once the local repo is in sync with the GitHub remote.
 _TIER1_PUSHED=false
 # Off-site snapshot bookkeeping. _T2_SNAPSHOT_COUNT / _T2_PRUNED stay UNSET until
@@ -93,6 +127,10 @@ LOG_PREFIX="[genesis-backup]"
 # shellcheck source=scripts/lib/load_secrets.sh
 source "$_SCRIPT_DIR/lib/load_secrets.sh"
 load_secrets_file "$SECRETS_FILE"
+
+# Escrow lookup for the SF4 round-trip (shared with restore.sh).
+# shellcheck source=scripts/lib/passphrase_escrow.sh
+source "$_SCRIPT_DIR/lib/passphrase_escrow.sh"
 
 log() { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 
@@ -174,6 +212,9 @@ cd "$BACKUP_DIR"
 # Ensure git identity is configured (per-repo, not global)
 git config user.name "Genesis Backup" 2>/dev/null || true
 git config user.email "backup@genesis.local" 2>/dev/null || true
+# Keep gc in-process: a detached auto-gc (gc.autoDetach default) inherits the
+# held backup-restore lock fd and would hold the DR lock past script exit.
+git config gc.autoDetach false 2>/dev/null || true
 
 git pull --rebase --quiet 2>/dev/null || log "WARNING: git pull failed, continuing with local state"
 
@@ -192,7 +233,38 @@ if [ -f "$DB_FILE" ]; then
         if sqlite3 "$DB_FILE" .dump > "$_SQL_TMP" 2>/dev/null; then
             _SQLITE_LINES=$(wc -l < "$_SQL_TMP")
             if encrypt_file "$_SQL_TMP" data/genesis.sql.gpg; then
+                _SQL_FRESH=true
                 log "SQLite: $_SQLITE_LINES lines (encrypted)"
+                # SF4 round-trip: prove the artifact DECRYPTS with the
+                # passphrase a DR box would actually use. Prefer the escrowed
+                # copy — env-encrypt + escrow-decrypt is the drift detector
+                # (passphrase rotated in secrets.env with a stale escrow is
+                # undecryptable exactly when secrets.env is lost). No escrow →
+                # verify with the env passphrase (catches archive corruption).
+                # `tail -5 | grep COMMIT;` also catches a bad dump: sqlite3
+                # .dump ends `COMMIT;` on success, `ROLLBACK; -- due to errors`
+                # on a mid-dump failure. Under pipefail any stage failing
+                # (incl. gpg MDC integrity errors) fails the check. gpg stderr
+                # is kept (not discarded) so the alert names the real error.
+                passphrase_escrow_lookup
+                _rt_pass="$_BACKUP_PASSPHRASE"
+                _rt_src="env"
+                if [ -n "$ESCROW_PASSPHRASE" ]; then
+                    _rt_pass="$ESCROW_PASSPHRASE"
+                    _rt_src="escrow ($ESCROW_SOURCE)"
+                fi
+                _rt_err=$(mktemp)
+                if printf '%s' "$_rt_pass" \
+                    | gpg --batch --passphrase-fd 0 -d data/genesis.sql.gpg 2>"$_rt_err" \
+                    | tail -5 | grep -q '^COMMIT;'; then
+                    log "SQLite: round-trip decrypt verified (passphrase source: $_rt_src)"
+                else
+                    _rt_detail=$(head -c 300 "$_rt_err" | tr '\n' ' ')
+                    _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }SQL round-trip decrypt failed with $_rt_src passphrase (${_rt_detail:-no gpg output}) — backup may be UNRESTORABLE (passphrase drift or corrupt archive)"
+                    log "WARNING: $_FAILURE_REASON"
+                    _SQLITE_LINES=0
+                fi
+                rm -f "$_rt_err"
             else
                 log "WARNING: SQLite encryption failed"
                 _SQLITE_LINES=0
@@ -214,19 +286,42 @@ mkdir -p data/qdrant
 # alongside the new encrypted form.
 find data/qdrant -maxdepth 1 -name '*.snapshot' -type f -delete 2>/dev/null || true
 for collection in episodic_memory knowledge_base; do
-    # Create snapshot via Qdrant API
-    snapshot_resp=$(curl -sf -X POST "$QDRANT_URL/collections/$collection/snapshots" 2>/dev/null) || {
-        log "WARNING: Qdrant snapshot failed for $collection (collection may not exist)"
+    # SF3 existence probe, branched on the HTTP code: only a real 404 is the
+    # benign "collection absent" skip. Connection-refused/timeout/5xx mean the
+    # SERVER is unreachable — with the old `curl -sf || continue` those read
+    # as "may not exist" and every backup reported success with zero fresh
+    # Qdrant payloads, forever (the audit's exact hole). --max-time 10: a
+    # localhost liveness GET, not a transfer.
+    _probe_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        "$QDRANT_URL/collections/$collection" 2>/dev/null || echo 000)
+    if [ "$_probe_code" = "404" ]; then
+        log "Qdrant: collection $collection does not exist — skipping"
+        continue
+    elif [ "$_probe_code" != "200" ]; then
+        log "WARNING: Qdrant unreachable probing $collection (HTTP $_probe_code)"
+        _QDRANT_FAILED="$_QDRANT_FAILED $collection(probe:$_probe_code)"
+        continue
+    fi
+    # Create snapshot via Qdrant API. --max-time 600: snapshot creation is a
+    # server-side write of the full collection (~282MB and growing); bounded
+    # so a wedged Qdrant can't hold the DR lock forever, sized ~10x a healthy
+    # local snapshot write.
+    snapshot_resp=$(curl -sf --max-time 600 -X POST "$QDRANT_URL/collections/$collection/snapshots" 2>/dev/null) || {
+        log "WARNING: Qdrant snapshot creation failed for $collection"
+        _QDRANT_FAILED="$_QDRANT_FAILED $collection(create)"
         continue
     }
     snapshot_name=$(echo "$snapshot_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['name'])" 2>/dev/null) || {
         log "WARNING: Could not parse snapshot response for $collection"
+        _QDRANT_FAILED="$_QDRANT_FAILED $collection(parse)"
         continue
     }
-    # Download snapshot
-    curl -sf "$QDRANT_URL/collections/$collection/snapshots/$snapshot_name" \
+    # Download snapshot. --max-time 900: a localhost transfer of the full
+    # collection; bounded against a hung server, generous for a healthy one.
+    curl -sf --max-time 900 "$QDRANT_URL/collections/$collection/snapshots/$snapshot_name" \
         -o "data/qdrant/${collection}.snapshot" 2>/dev/null || {
         log "WARNING: Could not download snapshot for $collection"
+        _QDRANT_FAILED="$_QDRANT_FAILED $collection(download)"
         continue
     }
 
@@ -238,15 +333,24 @@ for collection in episodic_memory knowledge_base; do
     elif encrypt_file "data/qdrant/${collection}.snapshot" "data/qdrant/${collection}.snapshot.gpg"; then
         rm -f "data/qdrant/${collection}.snapshot"
         _QDRANT_COUNT=$(( _QDRANT_COUNT + 1 ))
+        _QDRANT_FRESH="$_QDRANT_FRESH $collection"
         log "Qdrant: $collection ($(du -sh "data/qdrant/${collection}.snapshot.gpg" | cut -f1), encrypted)"
     else
         log "WARNING: Qdrant encryption failed for $collection"
+        _QDRANT_FAILED="$_QDRANT_FAILED $collection(encrypt)"
         rm -f "data/qdrant/${collection}.snapshot"
     fi
 
     # Clean up snapshot from Qdrant server
-    curl -sf -X DELETE "$QDRANT_URL/collections/$collection/snapshots/$snapshot_name" >/dev/null 2>&1 || true
+    curl -sf --max-time 60 -X DELETE "$QDRANT_URL/collections/$collection/snapshots/$snapshot_name" >/dev/null 2>&1 || true
 done
+# A collection that EXISTS but produced no fresh payload is a backup failure
+# (success:false → CRITICAL + Telegram), not a quiet gap: restore auto-selects
+# the newest COMPLETE snapshot, so silence here would let stale-or-missing
+# vectors masquerade as current until a disaster surfaces it.
+if [ -n "$_QDRANT_FAILED" ]; then
+    _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }Qdrant backup failed for:${_QDRANT_FAILED}"
+fi
 
 # --- 3. CC session transcripts (encrypted — contain conversation PII) ---
 #
@@ -470,10 +574,23 @@ else
 
     _T2_OK=true
 
-    # Upload Qdrant snapshots
+    # Upload Qdrant snapshots — FRESH ones only (SF3). A .gpg left on disk by
+    # a prior run (this run's snapshot failed) must not be stamped into a new
+    # dated snapshot: it would misrepresent recency, and GFS retention would
+    # age out the snapshots holding the genuinely-fresh copy. The stale local
+    # file is kept (last-good copy); the failure already pages via
+    # _QDRANT_FAILED above.
     for f in data/qdrant/*.gpg; do
         [ -f "$f" ] || continue
         fname=$(basename "$f")
+        _coll="${fname%.snapshot.gpg}"
+        case " $_QDRANT_FRESH " in
+            *" $_coll "*) ;;
+            *)
+                log "WARNING: $fname is stale (not regenerated this run) — excluded from off-site snapshot"
+                continue
+                ;;
+        esac
         if backend_put "$f" "${_T2_DIR}/qdrant/$fname"; then
             log "  off-site: uploaded $fname"
         else
@@ -482,14 +599,20 @@ else
         fi
     done
 
-    # Upload SQL dump
-    if [ -f data/genesis.sql.gpg ]; then
+    # Upload SQL dump — same freshness gate (SF3, SQL variant). A regenerated
+    # dump whose round-trip FAILED still uploads (_SQL_FRESH is set at encrypt
+    # time): it is the best artifact available — in the escrow-drift case it
+    # decrypts with the env passphrase — and the backup already fails loudly.
+    # Only a NOT-regenerated leftover is excluded.
+    if [ -f data/genesis.sql.gpg ] && $_SQL_FRESH; then
         if backend_put "data/genesis.sql.gpg" "${_T2_DIR}/data/genesis.sql.gpg"; then
             log "  off-site: uploaded genesis.sql.gpg"
         else
             log "WARNING: off-site upload failed for genesis.sql.gpg"
             _T2_OK=false
         fi
+    elif [ -f data/genesis.sql.gpg ]; then
+        log "WARNING: genesis.sql.gpg is stale (not regenerated this run) — excluded from off-site snapshot"
     fi
 
     # Upload transcripts (part of the off-site snapshot)
@@ -684,14 +807,16 @@ else
     # (as happened 2026-05-08 through 2026-05-25: 17 days unnoticed).
     if git commit -m "backup: $(date -Iseconds)" --quiet 2>&1; then
         if ! git push --quiet 2>&1; then
-            _FAILURE_REASON="git push failed — backup exists locally only (not replicated to remote)"
-            log "ERROR: $_FAILURE_REASON"
+            # Append, never overwrite — an earlier SF3/SF4 failure reason must
+            # survive into the status file alongside the push failure.
+            _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }git push failed — backup exists locally only (not replicated to remote)"
+            log "ERROR: git push failed — backup exists locally only (not replicated to remote)"
         else
             _TIER1_PUSHED=true
             log "Backup committed and pushed"
         fi
     else
-        _FAILURE_REASON="git commit failed (corrupt repo or index error)"
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }git commit failed (corrupt repo or index error)"
         log "ERROR: git commit failed — repository may need re-clone from remote"
     fi
 fi

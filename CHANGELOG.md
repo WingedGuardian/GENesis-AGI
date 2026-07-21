@@ -140,6 +140,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Backups now prove they're restorable, can't collide with a restore, and
+  never re-badge stale data as fresh.** Three disaster-recovery integrity fixes
+  (deploy-script audit SF3/SF4/SF5): the 6-hourly backup now decrypt-verifies
+  the SQL archive with the passphrase a recovery box would actually use (a
+  rotated-but-not-escrowed passphrase pages immediately instead of surfacing at
+  disaster time); backup and restore share a lock so the timer can never
+  snapshot a half-restored database (a backup skips quietly, a restore waits
+  then says who's holding the lock); and the off-site dated snapshot only ever
+  contains payloads regenerated that run — a Qdrant outage now fails the backup
+  loudly (previously it read as "collection may not exist" and reported success
+  forever) instead of silently shipping the previous run's files under a fresh
+  timestamp. All off-site operations are also time-bounded, so a hung NAS mount
+  degrades to a partial-backup alert instead of wedging backups indefinitely.
+
 - **The dashboard no longer shows a false "degraded / sentinel stale" during an
   update.** While `update.sh` restarts the server, the freshly booted server's
   sentinel heartbeat is briefly empty, which used to paint the Services card

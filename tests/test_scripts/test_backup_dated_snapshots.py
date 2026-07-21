@@ -37,9 +37,11 @@ def backup_env(tmp_path):
     (gd / "data").mkdir(parents=True)
     (home / ".genesis").mkdir(parents=True)
     (home / ".gnupg").mkdir(mode=0o700)
-    subprocess.run(["sqlite3", str(gd / "data" / "genesis.db"),
-                    "CREATE TABLE t(x); INSERT INTO t VALUES(1);"],
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["sqlite3", str(gd / "data" / "genesis.db"), "CREATE TABLE t(x); INSERT INTO t VALUES(1);"],
+        check=True,
+        capture_output=True,
+    )
     # A2a inputs: auto-memory (flat), a config overlay, and a secrets file — so the
     # off-site snapshot can include them alongside data/qdrant/transcripts.
     cc_id = str(gd).replace("/", "-")
@@ -73,32 +75,43 @@ def backup_env(tmp_path):
     # smbclient stub: log the -c command (the arg after -c), succeed.
     _make_stub(
         bind / "smbclient",
-        '#!/usr/bin/env bash\n'
+        "#!/usr/bin/env bash\n"
         'prev=""\n'
         'for a in "$@"; do\n'
         f'  [ "$prev" = "-c" ] && printf "%s\\n" "$a" >> "{smb_log}"\n'
         '  prev="$a"\n'
-        'done\n'
-        'exit 0\n',
+        "done\n"
+        "exit 0\n",
     )
-    # curl stub: Telegram captured (unused here), everything else fails (Qdrant skipped).
-    _make_stub(bind / "curl", '#!/usr/bin/env bash\nexit 1\n')
+    # curl stub: SF3 existence probe answers 404 (collections genuinely absent
+    # → benign skip; a bare connection failure now FAILS the backup);
+    # everything else fails (no Telegram asserted here).
+    _make_stub(
+        bind / "curl",
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do [ "$a" = "-w" ] && { printf "404"; exit 0; }; done\n'
+        "exit 1\n",
+    )
     return {"home": home, "gd": gd, "bind": bind, "smb_log": smb_log, "tmp": tmp_path}
 
 
 def _run(backup_env):
     env = dict(os.environ)
     env.update(
-        HOME=str(backup_env["home"]), GENESIS_DIR=str(backup_env["gd"]),
-        GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
-        GENESIS_BACKUP_NAS="//nas/share", GENESIS_BACKUP_NAS_USER="u",
+        HOME=str(backup_env["home"]),
+        GENESIS_DIR=str(backup_env["gd"]),
+        GENESIS_BACKUP_PASSPHRASE="testpass",
+        QDRANT_URL="http://127.0.0.1:1",
+        GENESIS_BACKUP_NAS="//nas/share",
+        GENESIS_BACKUP_NAS_USER="u",
         GENESIS_BACKUP_NAS_PASS="p",
-        PATH=f'{backup_env["bind"]}:{os.environ["PATH"]}',
+        PATH=f"{backup_env['bind']}:{os.environ['PATH']}",
     )
     for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_FORUM_CHAT_ID"):
         env.pop(k, None)
-    proc = subprocess.run(["bash", str(_BACKUP)], env=env,
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    proc = subprocess.run(
+        ["bash", str(_BACKUP)], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
     cmds = backup_env["smb_log"].read_text() if backup_env["smb_log"].exists() else ""
     return proc, cmds
 
@@ -110,8 +123,9 @@ def test_sqlite_uploaded_under_dated_snapshot_dir(backup_env):
     put_sql = [ln for ln in cmds.splitlines() if "put" in ln and "genesis.sql.gpg" in ln]
     assert put_sql, f"no SQL upload command logged:\n{cmds}"
     # The cd target for the SQL put must include a dated snapshot dir + /data.
-    assert any(_STAMP_RE.search(ln) for ln in put_sql), \
+    assert any(_STAMP_RE.search(ln) for ln in put_sql), (
         f"SQL upload not under a dated snapshot dir:\n{put_sql}"
+    )
     assert any("/data" in ln for ln in put_sql), f"SQL upload not under .../data:\n{put_sql}"
 
 
@@ -132,17 +146,25 @@ def _run_local(backup_env, offsite_root: Path):
     """Run backup.sh through the `local` Tier-2 backend (no smbclient stub)."""
     env = dict(os.environ)
     env.update(
-        HOME=str(backup_env["home"]), GENESIS_DIR=str(backup_env["gd"]),
-        GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
+        HOME=str(backup_env["home"]),
+        GENESIS_DIR=str(backup_env["gd"]),
+        GENESIS_BACKUP_PASSPHRASE="testpass",
+        QDRANT_URL="http://127.0.0.1:1",
         GENESIS_BACKUP_TIER2_BACKEND="local",
         GENESIS_BACKUP_LOCAL_PATH=str(offsite_root),
-        PATH=f'{backup_env["bind"]}:{os.environ["PATH"]}',
+        PATH=f"{backup_env['bind']}:{os.environ['PATH']}",
     )
-    for k in ("GENESIS_BACKUP_NAS", "GENESIS_BACKUP_NAS_USER", "GENESIS_BACKUP_NAS_PASS",
-              "TELEGRAM_BOT_TOKEN", "TELEGRAM_FORUM_CHAT_ID"):
+    for k in (
+        "GENESIS_BACKUP_NAS",
+        "GENESIS_BACKUP_NAS_USER",
+        "GENESIS_BACKUP_NAS_PASS",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_FORUM_CHAT_ID",
+    ):
         env.pop(k, None)
-    return subprocess.run(["bash", str(_BACKUP)], env=env,
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    return subprocess.run(
+        ["bash", str(_BACKUP)], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
 
 
 def test_local_backend_writes_dated_snapshot_to_real_fs(backup_env, tmp_path):
@@ -190,11 +212,13 @@ def test_local_backend_snapshot_includes_memory_config_secrets(backup_env, tmp_p
     mem_gpgs = list((snap / "memory").glob("*.gpg")) if (snap / "memory").is_dir() else []
     assert mem_gpgs, f"no memory/*.gpg in the off-site snapshot: {[d.name for d in snap.iterdir()]}"
     # config_overrides: the overlay shipped as-is (plaintext, mirrors Tier-1).
-    assert (snap / "config_overrides" / "sample.local.yaml").is_file(), \
+    assert (snap / "config_overrides" / "sample.local.yaml").is_file(), (
         f"config overlay missing from off-site snapshot: {[d.name for d in snap.iterdir()]}"
+    )
     # secrets: the encrypted secrets payload.
-    assert (snap / "secrets" / "secrets.env.gpg").is_file(), \
+    assert (snap / "secrets" / "secrets.env.gpg").is_file(), (
         f"secrets payload missing from off-site snapshot: {[d.name for d in snap.iterdir()]}"
+    )
     # COMPLETE still written (and only because all three landed too).
     assert (snap / "COMPLETE").is_file(), "COMPLETE marker not written"
 
@@ -211,8 +235,9 @@ def test_offsite_memory_includes_dotfiles(backup_env, tmp_path):
     snaps = [d for d in host.iterdir() if _STAMP_RE.fullmatch(d.name)]
     assert len(snaps) == 1, [d.name for d in snaps]
     mem = snaps[0] / "memory"
-    assert (mem / ".consolidate-lock.gpg").is_file(), \
+    assert (mem / ".consolidate-lock.gpg").is_file(), (
         f"dotfile dropped from off-site memory mirror: {sorted(p.name for p in mem.iterdir())}"
+    )
     assert (mem / "note.md.gpg").is_file()  # regular file still mirrored (no regression)
 
 
@@ -224,33 +249,44 @@ def test_large_temp_goes_to_dedicated_dir_not_inherited_tmpdir(backup_env, tmp_p
     The seeded `tmp_filesystem_limit` procedure already mandates ~/tmp for large temp."""
     offsite = tmp_path / "offsite"
     offsite.mkdir()
-    cctmp = tmp_path / "cc-tmp-sentinel"   # stand-in for the watchgod "oxygen" folder
+    cctmp = tmp_path / "cc-tmp-sentinel"  # stand-in for the watchgod "oxygen" folder
     cctmp.mkdir()
     bigtmp = tmp_path / "dedicated-big-tmp"
     bigtmp.mkdir()
     env = dict(os.environ)
     env.update(
-        HOME=str(backup_env["home"]), GENESIS_DIR=str(backup_env["gd"]),
-        GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
-        GENESIS_BACKUP_TIER2_BACKEND="local", GENESIS_BACKUP_LOCAL_PATH=str(offsite),
-        TMPDIR=str(cctmp),                  # inherited — MUST NOT be used for the big dump
+        HOME=str(backup_env["home"]),
+        GENESIS_DIR=str(backup_env["gd"]),
+        GENESIS_BACKUP_PASSPHRASE="testpass",
+        QDRANT_URL="http://127.0.0.1:1",
+        GENESIS_BACKUP_TIER2_BACKEND="local",
+        GENESIS_BACKUP_LOCAL_PATH=str(offsite),
+        TMPDIR=str(cctmp),  # inherited — MUST NOT be used for the big dump
         GENESIS_BACKUP_TMPDIR=str(bigtmp),  # the dedicated dir the dump MUST use
-        PATH=f'{backup_env["bind"]}:{os.environ["PATH"]}',
+        PATH=f"{backup_env['bind']}:{os.environ['PATH']}",
     )
-    for k in ("GENESIS_BACKUP_NAS", "GENESIS_BACKUP_NAS_USER", "GENESIS_BACKUP_NAS_PASS",
-              "TELEGRAM_BOT_TOKEN", "TELEGRAM_FORUM_CHAT_ID"):
+    for k in (
+        "GENESIS_BACKUP_NAS",
+        "GENESIS_BACKUP_NAS_USER",
+        "GENESIS_BACKUP_NAS_PASS",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_FORUM_CHAT_ID",
+    ):
         env.pop(k, None)
-    proc = subprocess.run(["bash", str(_BACKUP)], env=env, capture_output=True,
-                          text=True, stdin=subprocess.DEVNULL)
+    proc = subprocess.run(
+        ["bash", str(_BACKUP)], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     # The script announces where large temp goes; it must be the dedicated dir, not cc-tmp.
     assert f"big-temp dir: {bigtmp}" in proc.stdout, (
-        f"backup did not route large temp to the dedicated dir (expected {bigtmp}):\n{proc.stdout}")
+        f"backup did not route large temp to the dedicated dir (expected {bigtmp}):\n{proc.stdout}"
+    )
 
 
 # --------------------------------------------------------------------------- #
 # GFS retention prune (D4) — off-site dated snapshots
 # --------------------------------------------------------------------------- #
+
 
 def _seed_offsite_snapshot(host_dir: Path, stamp: str, *, complete: bool) -> None:
     snap = host_dir / stamp
