@@ -334,6 +334,10 @@ def test_mode_off_no_recall(fts_db: Path, tmp_path: Path):
     assert result.returncode == 0, result.stderr[:2000]
     assert "[Memory" not in result.stdout
     assert "degraded" not in result.stdout.lower()
+    # off mode is still recorded (observable), not a metrics blind spot.
+    m = _metrics(home)
+    assert m["mode"] == "off"
+    assert m["fused_results"] == 0
 
 
 def test_local_mode_forces_fts5(fts_db: Path, tmp_path: Path):

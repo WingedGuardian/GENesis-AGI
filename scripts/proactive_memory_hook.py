@@ -1343,6 +1343,18 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # off mode: session-local awareness only (heartbeat/trail already ran).
     if _HOOK_MODE == "off":
         _flush_deferred()
+        # Record the turn so off-mode is observable in proactive_metrics.json
+        # (how often recall is silenced) rather than a blind spot.
+        _record_detail(
+            fts_count=0,
+            vector_count=0,
+            fused_count=0,
+            embed_latency_ms=None,
+            total_latency_ms=(time.monotonic() - start) * 1000,
+            fts_only_fallback=False,
+            heartbeat_ms=heartbeat_ms,
+            mode="off",
+        )
         return
 
     # Skip recall only when there's nothing to search on (prompt has no
