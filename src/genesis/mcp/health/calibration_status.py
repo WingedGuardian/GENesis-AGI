@@ -118,6 +118,7 @@ async def _impl_calibration_status(domain: str = "", include_history: bool = Fal
         "cells_readable": [_readable(c) for c in cells],
         "overconfident_domains": overconfident,
         "underconfident_domains": underconfident,
+        "earnback": await _earnback_evidence(db),
         "note": (
             "Read-only. thin/unknown cells carry escalation phrasing by design "
             "— never treat them as a usable percentage. Rankings use the "
@@ -133,6 +134,55 @@ async def _impl_calibration_status(domain: str = "", include_history: bool = Fal
     return result
 
 
+# Default evidence window — mirrors AutonomyManager._earnback_window_days
+# (autonomy config `earnback.window_days`, default 45). This surface is
+# read-only observability; the AUTHORITATIVE earn-back proposal path is the
+# ego cadence, which reads the live config.
+_EARNBACK_WINDOW_DAYS = 45
+
+
+async def _earnback_evidence(db) -> dict:
+    """E1 earn-back evidence stream (WS-2 P4, design §5.2 — surfaced here
+    instead of a ``v_earnback_evidence`` SQL view; declared deviation).
+
+    For every DEMOTED autonomy category (current_level < earned_level):
+    windowed success/correction counts from the append-only ``autonomy_events``
+    ledger, the windowed Bayesian posterior, and ``evidence_supports_earned``
+    (whether recent evidence alone re-reaches the earned level — the same
+    predicate ``detect_earnback_candidates`` gates on). Empty list = nothing
+    demoted. Never raises — degrades to an ``unavailable`` marker.
+    """
+    try:
+        from genesis.db.crud import autonomy as autonomy_crud
+
+        demoted = []
+        for row in await autonomy_crud.list_all(db):
+            if row["current_level"] >= row["earned_level"]:
+                continue
+            successes, corrections = await autonomy_crud.windowed_counts(
+                db, row["category"], window_days=_EARNBACK_WINDOW_DAYS
+            )
+            demoted.append(
+                {
+                    "category": row["category"],
+                    "current_level": row["current_level"],
+                    "earned_level": row["earned_level"],
+                    "window_days": _EARNBACK_WINDOW_DAYS,
+                    "window_successes": successes,
+                    "window_corrections": corrections,
+                    "posterior": round(autonomy_crud.bayesian_posterior(successes, corrections), 4),
+                    "evidence_supports_earned": (
+                        autonomy_crud.bayesian_level(successes, corrections) >= row["earned_level"]
+                    ),
+                    "last_regression_at": row["last_regression_at"],
+                }
+            )
+        return {"demoted_categories": demoted}
+    except Exception:  # noqa: BLE001 — observability add-on, never breaks the tool
+        logger.debug("earnback evidence read failed", exc_info=True)
+        return {"demoted_categories": [], "unavailable": True}
+
+
 @mcp.tool()
 async def calibration_status(domain: str = "", include_history: bool = False) -> dict:
     """Genesis's mechanically-graded calibration record, per cell.
@@ -143,7 +193,9 @@ async def calibration_status(domain: str = "", include_history: bool = False) ->
     by dotted prefix (e.g. ``outreach``); ``include_history`` adds trend
     snapshots (requires a domain). Cells labelled thin/unknown render
     escalation phrasing instead of percentages — that is the cold-start
-    honesty contract, not missing data. Distinct from ``ego_calibration_status``
+    honesty contract, not missing data. The ``earnback`` key surfaces the
+    E1 evidence stream: windowed graded evidence for every demoted autonomy
+    category. Distinct from ``ego_calibration_status``
     (the ego's snapshot ECE surface).
     """
     return await _impl_calibration_status(domain, include_history)

@@ -292,6 +292,30 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     except Exception:
         logger.debug("cell recompute alert check failed", exc_info=True)
 
+    # WS-2 P4: ego-proposal arbitration lookup failures — proposals still ship
+    # (annotation is best-effort) but calibration badges/escalation notes are
+    # silently absent. Same per-process counter contract.
+    try:
+        from genesis.ego.proposals import arbitration_failure_counts
+
+        for action_type, count in sorted(arbitration_failure_counts().items()):
+            if count > 0:
+                alert_id = f"ledger:arbitration_failed:{action_type}"
+                alerts.append(
+                    {
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": (
+                            f"{count} arbitration calibration lookup(s) failed for "
+                            f"ego action_type {action_type} — proposals shipped "
+                            "without calibration annotations"
+                        ),
+                    }
+                )
+                current_ids.add(alert_id)
+    except Exception:
+        logger.debug("arbitration alert check failed", exc_info=True)
+
     if _service is None:
         alerts.append(
             {
