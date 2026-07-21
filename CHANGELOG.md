@@ -88,6 +88,25 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **The proactive-memory hook is now a thin client of the server engine.**
+  The Claude Code `UserPromptSubmit` hook (`scripts/proactive_memory_hook.py`)
+  was a ~2,000-line hand-maintained fork of the retrieval engine — its own
+  Qdrant search, RRF fusion, and formatting — that drifted from the real
+  engine (no reranker, entity lane, or graph expansion). It now posts each
+  prompt to the server recall endpoint (`POST /api/genesis/hook/recall`) and
+  renders the result, so every memory improvement ships once instead of twice.
+  If genesis-server is unreachable the hook degrades to a keyword-only FTS5
+  search (clearly labelled) so a prompt is never blocked, and self-heals on the
+  next prompt. The fork's content-quality guards are preserved server-side on
+  the endpoint path — malformed rows (raw JSON blobs / YAML frontmatter) and
+  non-intentional `knowledge_base` ingestions (surplus/recon crawl) are filtered
+  out of proactive injection, as before. New knobs: `GENESIS_PROACTIVE_HOOK_MODE` (`server`/`local`/`off`)
+  and `GENESIS_PROACTIVE_HOOK_URL` (see `env.example`); `proactive_metrics.json`
+  gains a `mode` + `server_ms` field so the fallback rate is observable.
+  **Upgrade note:** the memories surfaced per prompt will differ (and improve) —
+  the engine's reranker/fusion/intent-aware budget replaces the fork's simpler
+  ranking; command turns surface fewer, decision questions more.
+
 - **The voice API is now fail-closed.** Previously, leaving
   `GENESIS_MCP_HTTP_TOKEN` unset left every `/v1/voice/*` route open to the
   network. Now an unset token disables the voice API (503 + a boot-time

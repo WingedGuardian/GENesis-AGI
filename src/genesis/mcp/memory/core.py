@@ -12,6 +12,7 @@ from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
 from genesis.memory.provenance import (
     is_external,
+    is_proactive_noise,
     label_result_dicts,
     provenance_descriptor,
     wrap_external_recall,
@@ -815,6 +816,8 @@ async def _proactive_impl(
     *,
     rerank: bool = False,
     extra_fts_terms: list[str] | None = None,
+    filter_noise: bool = False,
+    kb_slots: int | None = None,
 ) -> list[dict]:
     """Cross-session context injection for prompts — shared engine.
 
@@ -839,24 +842,33 @@ async def _proactive_impl(
     # With confidence=0.5 (96% of memories) and retrieved_count=0 (80%),
     # even day-old memories fail a 0.3 threshold. Let RRF fusion rank instead.
     _unsupervised = immunity_shadow.is_dispatched_session_env()
-    # skip_writeback: an item the enforce branch below will DROP must not gain
+
+    def _is_noise(r) -> bool:
+        """Proactive noise (garbage / non-intentional KB), endpoint-gated."""
+        return filter_noise and is_proactive_noise(r.collection, r.source_pipeline, r.content)
+
+    # skip_writeback: an item the loop below will DROP must not gain
     # retrieved_count/activation credit from this recall — otherwise blocked
-    # external content farms ranking energy from every dispatched session that
-    # matches it while never being delivered (Codex #1048 P2). Same predicate
-    # as the drop loop; fail-open (predicate error -> normal write-backs).
+    # external content (enforce-drop) or filtered noise (garbage / non-intentional
+    # KB) farms ranking energy from every session that matches it while never
+    # being delivered (Codex #1048 P2 + Codex #1169). Same predicates as the drop
+    # loop; fail-open (predicate error -> normal write-backs).
     results = await memory_mod._retriever.recall(
         current_message,
         limit=limit * 2,
         min_activation=0.0,
         rerank=rerank,
         extra_fts_terms=extra_fts_terms,
-        skip_writeback=lambda r: immunity_shadow.should_enforce_drop(
-            gate="injection",
-            collection=r.collection,
-            source_pipeline=r.source_pipeline,
-            origin_class=r.origin_class,
-            pushed_surface=True,
-            unsupervised=_unsupervised,
+        skip_writeback=lambda r: (
+            immunity_shadow.should_enforce_drop(
+                gate="injection",
+                collection=r.collection,
+                source_pipeline=r.source_pipeline,
+                origin_class=r.origin_class,
+                pushed_surface=True,
+                unsupervised=_unsupervised,
+            )
+            or _is_noise(r)
         ),
     )
     # Keep the full candidate pool (recall fetched limit*2) UNSLICED — the
@@ -872,10 +884,25 @@ async def _proactive_impl(
     kept: list = []  # RetrievalResults behind `out` — graph-expansion seeds
     blockable = 0
     dropped = 0
+    kb_count = 0  # knowledge_base hits delivered so far (for the in-loop KB cap)
     for r in filtered:
         if len(out) >= limit:
             break
         d = asdict(r)
+        # Proactive-injection noise guard (endpoint only; memory_proactive passes
+        # filter_noise=False → unchanged). Drops garbage-shaped content + non-
+        # intentional knowledge_base hits BEFORE wrapping (so the garbage check
+        # sees RAW content) and inside THIS backfill loop (so a dropped noisy
+        # top-K item is replaced by the next safe candidate, not left as a hole).
+        # Restores the pre-flip hook's guards; fixes Codex P2 on #1169.
+        if _is_noise(r):
+            continue
+        # KB slot cap IN the backfill loop (endpoint sets kb_slots; the MCP tool
+        # leaves it None = uncapped). Capping here, not post-selection, means an
+        # over-cap KB hit is replaced by the next safe candidate instead of
+        # leaving the prompt under-filled below its intent budget (Codex #1169).
+        if kb_slots is not None and r.collection == "knowledge_base" and kb_count >= kb_slots:
+            continue
         # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): memory_proactive is a
         # query-less ambient feed — in a DISPATCHED session under enforce,
         # blockable stored-external items are DROPPED (not returned at all).
@@ -908,6 +935,8 @@ async def _proactive_impl(
             blockable += 1
         out.append(d)
         kept.append(r)
+        if r.collection == "knowledge_base":
+            kb_count += 1
     # Graph expansion (benchmark-proven; tiny proactive cap): 1-hop neighbors
     # of the DELIVERED set, run through the SAME memory_operation filter,
     # enforce-drop, and blockable+wrap pipeline as organic items — expansion
@@ -922,6 +951,13 @@ async def _proactive_impl(
         # Neighbor tags come from the FTS row as a STRING — substring check
         # mirrors the organic list-membership filter above.
         if "memory_operation" in (nr.payload.get("tags") or ""):
+            continue
+        # Same proactive noise + KB-cap guards as the organic loop — a graph
+        # neighbor must not bypass the garbage/non-intentional-KB filter or the
+        # KB slot budget.
+        if _is_noise(nr):
+            continue
+        if kb_slots is not None and nr.collection == "knowledge_base" and kb_count >= kb_slots:
             continue
         if immunity_shadow.should_enforce_drop(
             gate="injection",
@@ -947,6 +983,8 @@ async def _proactive_impl(
         if _nb:
             blockable += 1
         out.append(nd)
+        if nr.collection == "knowledge_base":
+            kb_count += 1
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # proactive-recall prompt (observe-only). db=memory_mod._db when set, else
     # the emit self-resolves a short-lived connection. `enforced_drops` in the
