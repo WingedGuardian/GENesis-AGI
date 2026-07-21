@@ -828,12 +828,15 @@ async def _proactive_impl(
     context the ranked top-K missed, so trimming the total to ``limit`` would
     displace the organic results expansion is meant to supplement.
 
-    Backs both the ``memory_proactive`` MCP tool (rerank off, no extra terms)
-    and the genesis-server proactive recall endpoint (rerank + file-context
-    terms per config). ``rerank``/``extra_fts_terms`` are the ONLY behavioral
-    knobs; every security stage (memory_operation filter, injection-defense
-    wrap, gate-4 enforce-drop, graph expansion, immunity emit) is shared, so
-    both callers get identical protection with no duplicated orchestration.
+    Backs both the ``memory_proactive`` MCP tool (rerank off, no extra terms,
+    no noise filter, no KB cap) and the genesis-server proactive recall endpoint
+    (rerank + file-context terms + ``filter_noise`` + ``kb_slots`` per config).
+    The shared security stages (memory_operation filter, injection-defense wrap,
+    gate-4 enforce-drop, graph expansion, immunity emit) run for both callers.
+    The endpoint is DELIBERATELY stricter on injection QUALITY: ``filter_noise``
+    drops garbage + non-intentional knowledge_base and ``kb_slots`` caps KB — so
+    the two callers do NOT get identical injected results; the MCP tool is
+    intentionally left unfiltered. No duplicated orchestration.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -847,12 +850,15 @@ async def _proactive_impl(
         """Proactive noise (garbage / non-intentional KB), endpoint-gated."""
         return filter_noise and is_proactive_noise(r.collection, r.source_pipeline, r.content)
 
-    # skip_writeback: an item the loop below will DROP must not gain
-    # retrieved_count/activation credit from this recall — otherwise blocked
-    # external content (enforce-drop) or filtered noise (garbage / non-intentional
-    # KB) farms ranking energy from every session that matches it while never
-    # being delivered (Codex #1048 P2 + Codex #1169). Same predicates as the drop
-    # loop; fail-open (predicate error -> normal write-backs).
+    # skip_writeback: an item the loop below DROPS for a content reason must not
+    # gain retrieved_count/activation credit — otherwise blocked external content
+    # (enforce-drop) or filtered noise (garbage / non-intentional KB) farms
+    # ranking energy from every session that matches it while never being
+    # delivered (Codex #1048 P2 + Codex #1169). Mirrors the enforce-drop + noise
+    # predicates ONLY: a KB-slot-CAP drop below deliberately KEEPS its write-back
+    # credit (it was legitimately retrieved, merely over the display budget —
+    # unlike blocked/garbage content). fail-open (predicate error -> normal
+    # write-backs).
     results = await memory_mod._retriever.recall(
         current_message,
         limit=limit * 2,
@@ -895,6 +901,11 @@ async def _proactive_impl(
         # sees RAW content) and inside THIS backfill loop (so a dropped noisy
         # top-K item is replaced by the next safe candidate, not left as a hole).
         # Restores the pre-flip hook's guards; fixes Codex P2 on #1169.
+        # NOTE: this guard + the KB-slot cap below sit UPSTREAM of the gate-4
+        # enforce accounting, so items they drop are intentionally NOT counted in
+        # the immunity block-ledger — a dedicated quality filter already removed
+        # them before they could reach the prompt; the ledger measures enforce-
+        # gate activity (delivered-blockable + enforce-dropped), not quality drops.
         if _is_noise(r):
             continue
         # KB slot cap IN the backfill loop (endpoint sets kb_slots; the MCP tool

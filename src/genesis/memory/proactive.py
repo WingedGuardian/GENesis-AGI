@@ -443,8 +443,6 @@ async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
 # H-1 working-set shadow projection (post-selection, degraded).
 # ---------------------------------------------------------------------------
 
-_SERENDIPITY_BOOST = 1.3  # documented for parity; not applied post-selection
-
 
 def _shadow_projection(dicts: list[dict], suppress_ids: frozenset[str]) -> dict:
     """Project the PR2b novelty gate over the DELIVERED set (H-1 measurement).
