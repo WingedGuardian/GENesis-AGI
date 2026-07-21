@@ -1775,6 +1775,21 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
         _ts_log.info("Page URL: %s", page.url)
         logger.info("Cloudflare challenge detected — waiting for auto-resolve")
 
+        # Track whether we ever actually observed the challenge in the DOM. A
+        # header-only detection (cf-mitigated with no chrome/widget that never
+        # renders) must NOT be treated as "gone" by the DOM-based gates below —
+        # that would falsely report resolved; it runs the ladder to a blocked
+        # result instead. A challenge we DID see and then watched disappear
+        # (e.g. a redirect interstitial) is a genuine resolution.
+        saw_challenge_dom = await _challenge_present(page)
+
+        async def _challenge_gone() -> bool:
+            nonlocal saw_challenge_dom
+            if await _challenge_present(page):
+                saw_challenge_dom = True
+                return False
+            return saw_challenge_dom
+
         # Phase 1: auto-resolve (3-5s for trusted browsers, 15s max)
         _ts_log.info("PHASE 1: auto-resolve (%.0fs)", timeout_ms / 1000)
         if await _poll_turnstile_token(page, timeout_ms / 1000, 1.0):
@@ -1793,7 +1808,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                     _ts_log.info("RESOLVED: widget_click (attempt %d)", click_attempt)
                     logger.info("Challenge resolved via widget click (attempt %d)", click_attempt)
                     return {"status": "resolved", "method": "iframe_click"}
-                if not await _challenge_present(page):
+                if await _challenge_gone():
                     _ts_log.info("RESOLVED: widget_click (challenge gone)")
                     return {"status": "resolved", "method": "iframe_click"}
                 _ts_log.info("Widget click %d: sent but not resolved", click_attempt)
@@ -1811,7 +1826,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                 _ts_log.info("RESOLVED: playwright_captcha")
                 logger.info("Challenge resolved via playwright-captcha")
                 return {"status": "resolved", "method": "playwright_captcha"}
-            if not await _challenge_present(page):
+            if await _challenge_gone():
                 _ts_log.info("RESOLVED: playwright_captcha (challenge gone)")
                 return {"status": "resolved", "method": "playwright_captcha"}
 
@@ -1831,7 +1846,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                     await asyncio.sleep(random.uniform(1.0, 3.0))
                     return {"status": "resolved", "method": "auto_delayed"}
 
-                if not await _challenge_present(page):
+                if await _challenge_gone():
                     logger.info("Challenge page gone — resolved")
                     return {"status": "resolved", "method": "external"}
 

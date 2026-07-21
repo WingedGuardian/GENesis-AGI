@@ -1313,6 +1313,24 @@ class TestTurnstileShortGrace:
         alert.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test_header_only_interstitial_not_falsely_resolved(self):
+        # cf-mitigated header but NO DOM chrome/widget and a non-English title.
+        # The DOM-based "gone?" gates must NOT report resolved (the challenge was
+        # never observed in the DOM) — it must run to a blocked result instead.
+        page = _ts_page(selectors_present=set(), title="verificando")
+        resp = _ts_response({"cf-mitigated": "challenge"})
+        with patch.object(browser, "_poll_turnstile_token", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_click_turnstile_widget", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_solve_with_playwright_captcha", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_vnc_click_turnstile", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_ensure_vnc", new=AsyncMock()), \
+             patch.object(browser, "_send_turnstile_alert", new=AsyncMock()) as alert, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            result = await browser._wait_for_turnstile(page, response=resp)
+        assert result == {"status": "blocked", "method": "timeout"}, result
+        alert.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_interstitial_runs_full_ladder_to_alert(self):
         page = _ts_page(selectors_present={"#cf-challenge-running"}, title="Just a moment...")
         resp = _ts_response({"cf-mitigated": "challenge"})
