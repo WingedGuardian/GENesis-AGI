@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -940,6 +941,110 @@ async def test_recall_reranker_replaces_fused_with_positional_scores(
     assert [r.memory_id for r in results] == ["mem-2", "mem-1"]
     assert results[0].score == pytest.approx(1.0)   # 1/(1+0)
     assert results[1].score == pytest.approx(0.5)   # 1/(1+1)
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_rerank_timebox_expiry_keeps_rrf_order(
+    mock_qdrant,
+    mock_crud,
+    mock_links,
+    _mock_expand,
+):
+    """A rerank call slower than ``rerank_timeout_s`` degrades to RRF order —
+    identical contract to an API failure — and the stats sink records the
+    expiry instead of claiming a rerank executed."""
+    embed_provider = MagicMock()
+    embed_provider.embed = AsyncMock(return_value=[0.1] * 1024)
+    reranker = MagicMock()
+    reranker.enabled = True
+
+    async def _slow_rerank(*args, **kwargs):
+        await asyncio.sleep(5)
+        return [{"id": "mem-2"}]
+
+    reranker.rerank = _slow_rerank
+    retriever = HybridRetriever(
+        embedding_provider=embed_provider,
+        qdrant_client=MagicMock(),
+        db=MagicMock(spec_set=["execute", "commit"]),
+        reranker=reranker,
+    )
+
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit("mem-1", 0.95),
+        _make_qdrant_hit("mem-2", 0.80),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
+    _setup_link_mocks(mock_links)
+
+    stats: dict = {}
+    results = await retriever.recall(
+        "test query",
+        limit=5,
+        rerank=True,
+        rerank_timeout_s=0.05,
+        stats=stats,
+    )
+
+    # RRF order preserved; nothing dropped by the (aborted) reranker.
+    assert [r.memory_id for r in results] == ["mem-1", "mem-2"]
+    assert stats["rerank_executed"] is False
+    assert stats["rerank_timed_out"] is True
+    assert stats["rerank_ms"] >= 50.0
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_stats_report_rerank_executed_vs_api_failure(
+    mock_qdrant,
+    mock_crud,
+    mock_links,
+    _mock_expand,
+):
+    """``stats['rerank_executed']`` is True only when the reranker actually
+    returned an ordering; an API failure (empty return) reports False — the
+    requested-vs-executed distinction the #1169 budget validation missed."""
+    embed_provider = MagicMock()
+    embed_provider.embed = AsyncMock(return_value=[0.1] * 1024)
+    reranker = MagicMock()
+    reranker.enabled = True
+    reranker.rerank = AsyncMock(return_value=[{"id": "mem-2"}, {"id": "mem-1"}])
+    retriever = HybridRetriever(
+        embedding_provider=embed_provider,
+        qdrant_client=MagicMock(),
+        db=MagicMock(spec_set=["execute", "commit"]),
+        reranker=reranker,
+    )
+
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit("mem-1", 0.95),
+        _make_qdrant_hit("mem-2", 0.80),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_crud.batch_created_at = AsyncMock(return_value={})
+    _setup_link_mocks(mock_links)
+
+    stats: dict = {}
+    results = await retriever.recall("test query", limit=5, rerank=True, stats=stats)
+    assert [r.memory_id for r in results] == ["mem-2", "mem-1"]
+    assert stats["rerank_executed"] is True
+    assert stats["rerank_ms"] >= 0.0
+    assert "rerank_timed_out" not in stats
+
+    # API failure path: reranker returns [] (its own degrade contract).
+    reranker.rerank = AsyncMock(return_value=[])
+    stats2: dict = {}
+    results = await retriever.recall("test query", limit=5, rerank=True, stats=stats2)
+    assert [r.memory_id for r in results] == ["mem-1", "mem-2"]
+    assert stats2["rerank_executed"] is False
 
 
 # --- mem-007: diversity penalty must not contaminate J9-logged scores ---

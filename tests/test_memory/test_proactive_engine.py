@@ -269,18 +269,35 @@ async def test_proactive_context_end_to_end_faked():
     # embedding returned for the hook's ambient fold
     assert resp["embedding"] == [0.1] * 8
     assert resp["engine"]["profile"] == "cc_hook"
-    assert resp["engine"]["reranked"] is True
+    # ``reranked`` reports EXECUTED, not requested — the faked impl never
+    # populates the stats sink, so this is honestly False even though the
+    # cc_hook profile requested reranking.
+    assert resp["engine"]["reranked"] is False
+    assert resp["engine"]["rerank_requested"] is True
+    assert resp["engine"]["rerank_timed_out"] is False
+    # Per-stage timings present (values are wall-clock, just assert shape).
+    for key in ("embed", "recall", "enrich", "procedure", "total"):
+        assert key in resp["timings_ms"]
 
 
 async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
     captured = {}
 
     async def _fake_impl(
-        prompt, limit=5, *, rerank=False, extra_fts_terms=None, filter_noise=False, kb_slots=None
+        prompt,
+        limit=5,
+        *,
+        rerank=False,
+        extra_fts_terms=None,
+        filter_noise=False,
+        kb_slots=None,
+        rerank_timeout_s=None,
+        stats=None,
     ):
         captured["extra"] = extra_fts_terms
         captured["rerank"] = rerank
         captured["limit"] = limit
+        captured["rerank_timeout_s"] = rerank_timeout_s
         return []
 
     with (
@@ -295,6 +312,7 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
     assert captured["extra"] == ["memory", "retrieval"]  # falsy dropped
     assert captured["rerank"] is True  # cc_hook default
     assert captured["limit"] == 1  # command budget
+    assert captured["rerank_timeout_s"] == P._RERANK_TIMEOUT_S  # hot-path timebox threaded
 
 
 async def test_proactive_context_bumps_surfaced_count_not_invocation():
@@ -399,7 +417,15 @@ async def test_proactive_context_requests_noise_filter():
     captured = {}
 
     async def _fake_impl(
-        prompt, limit=5, *, rerank=False, extra_fts_terms=None, filter_noise=False, kb_slots=None
+        prompt,
+        limit=5,
+        *,
+        rerank=False,
+        extra_fts_terms=None,
+        filter_noise=False,
+        kb_slots=None,
+        rerank_timeout_s=None,
+        stats=None,
     ):
         captured["filter_noise"] = filter_noise
         return []
@@ -411,6 +437,65 @@ async def test_proactive_context_requests_noise_filter():
         await P.proactive_context(prompt="what did we decide about the recall reranker")
 
     assert captured["filter_noise"] is True
+
+
+async def test_proactive_context_surfaces_engine_stats():
+    """Rerank telemetry flows from the engine's stats sink into the response:
+    ``engine.reranked`` mirrors EXECUTED (not requested), ``timings_ms.rerank``
+    carries the stage latency, and a timebox expiry is flagged."""
+
+    async def _fake_impl(
+        prompt,
+        limit=5,
+        *,
+        rerank=False,
+        extra_fts_terms=None,
+        filter_noise=False,
+        kb_slots=None,
+        rerank_timeout_s=None,
+        stats=None,
+    ):
+        if stats is not None:
+            stats["rerank_executed"] = True
+            stats["rerank_ms"] = 123.4
+        return []
+
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=_fake_impl),
+    ):
+        resp = await P.proactive_context(prompt="what did we decide about voice STT")
+
+    assert resp["engine"]["reranked"] is True
+    assert resp["engine"]["rerank_timed_out"] is False
+    assert resp["timings_ms"]["rerank"] == 123.4
+
+    async def _timed_out_impl(
+        prompt,
+        limit=5,
+        *,
+        rerank=False,
+        extra_fts_terms=None,
+        filter_noise=False,
+        kb_slots=None,
+        rerank_timeout_s=None,
+        stats=None,
+    ):
+        if stats is not None:
+            stats["rerank_executed"] = False
+            stats["rerank_timed_out"] = True
+            stats["rerank_ms"] = 1000.2
+        return []
+
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=_timed_out_impl),
+    ):
+        resp = await P.proactive_context(prompt="what did we decide about voice STT")
+
+    assert resp["engine"]["reranked"] is False
+    assert resp["engine"]["rerank_timed_out"] is True
+    assert resp["timings_ms"]["rerank"] == 1000.2
 
 
 def test_is_proactive_noise_predicate():

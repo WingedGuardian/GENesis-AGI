@@ -55,6 +55,18 @@ _DEFAULT_BUDGETS: dict[str, int] = {
     "max": 8,
 }
 
+# Timebox on the cross-encoder rerank stage for THIS (per-prompt, latency-
+# budgeted) path only — deep-search callers (memory_recall MCP) are unbounded.
+# Measured 2026-07-21 on the production install: Voyage rerank ≈ 400ms typical,
+# but its client allows 10s and a slow call alone can eat the route budget. On
+# expiry the engine keeps RRF order (identical contract to an API failure).
+# User-set value (2026-07-21): 1.0s.
+_RERANK_TIMEOUT_S = 1.0
+
+# Emit one INFO journal line with the stage breakdown when a call exceeds this
+# — slow calls become diagnosable from the journal without live probing.
+_SLOW_RECALL_LOG_MS = 2000.0
+
 
 def _proactive_config() -> dict[str, Any]:
     """The ``proactive`` section of the merged memory_recall config (live)."""
@@ -582,6 +594,8 @@ async def proactive_context(
     # retrieved_count write-backs (Codex on #1169). memory_proactive (the MCP
     # tool) passes neither, so it is byte-for-byte unchanged.
     kb_slots = max(1, budget // 3)
+    engine_stats: dict[str, Any] = {}
+    t_recall = time.monotonic()
     dicts = await _core._proactive_impl(
         prompt,
         limit=budget,
@@ -589,13 +603,19 @@ async def proactive_context(
         extra_fts_terms=[k for k in (file_keywords or []) if k] or None,
         filter_noise=True,
         kb_slots=kb_slots,
+        rerank_timeout_s=_RERANK_TIMEOUT_S,
+        stats=engine_stats,
     )
+    recall_ms = (time.monotonic() - t_recall) * 1000
 
+    t_enrich = time.monotonic()
     await _enrich(db, dicts)
     await _breadcrumbs(db, dicts)
+    enrich_ms = (time.monotonic() - t_enrich) * 1000
 
     lines = prof.renderer(dicts)
 
+    t_proc = time.monotonic()
     procedure = None
     if vector:
         procedure = await _surface_procedure(db, vector)
@@ -609,7 +629,8 @@ async def proactive_context(
             # SEMANTIC: counts "the engine included this procedure in a RETURNED
             # recall response." Under the split client/server model this can
             # marginally over-count vs "the user saw it": if this response is slow
-            # enough that the client times out (>2.2s under heavy concurrency) and
+            # enough that the client times out (past its budget, see the hook's
+            # _SERVER_TIMEOUT_S) and
             # falls back to the degraded path, the bump already committed but the
             # line was never injected. Accepted — surfaced_count is advisory (never
             # feeds promotion) and the window is a narrow race; a perfect fix would
@@ -624,10 +645,26 @@ async def proactive_context(
             except Exception:
                 logger.debug("surfaced_count bump failed", exc_info=True)
 
+    procedure_ms = (time.monotonic() - t_proc) * 1000
+
     shadow = _shadow_projection(dicts, suppress)
     results = [_result_row(d) for d in dicts]
 
     total_ms = (time.monotonic() - t0) * 1000
+    timings = {
+        "embed": round(embed_ms, 1),
+        "recall": round(recall_ms, 1),
+        "enrich": round(enrich_ms, 1),
+        "procedure": round(procedure_ms, 1),
+        "total": round(total_ms, 1),
+    }
+    if "rerank_ms" in engine_stats:
+        timings["rerank"] = engine_stats["rerank_ms"]
+    if total_ms > _SLOW_RECALL_LOG_MS:
+        # One INFO line per slow call so a latency regression is diagnosable
+        # from the journal alone (the 503 path discards timings_ms entirely —
+        # this was the observability gap behind the #1169 timeout hunt).
+        logger.info("proactive recall slow: %s", timings)
     return {
         "status": "ok",
         "lines": lines,
@@ -636,9 +673,15 @@ async def proactive_context(
         "shadow": shadow,
         "budget": {"stance": stance, "limit": budget, "kb_slots": kb_slots, "cap": cap},
         "embedding": vector,
-        "timings_ms": {"embed": round(embed_ms, 1), "total": round(total_ms, 1)},
+        "timings_ms": timings,
         "engine": {
-            "reranked": rerank_live,
+            # EXECUTED, not requested — a missing Voyage key, API failure, or
+            # timebox expiry leaves results in RRF order even when the profile
+            # asked to rerank. (The requested-not-executed reading of this flag
+            # is how the 2.0s budget got validated against a no-rerank install.)
+            "reranked": bool(engine_stats.get("rerank_executed", False)),
+            "rerank_requested": rerank_live,
+            "rerank_timed_out": bool(engine_stats.get("rerank_timed_out", False)),
             "graph_expansion": graph_expansion.expansion_mode(),
             "intent": classify_intent(prompt).category,
             "profile": profile,

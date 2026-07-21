@@ -818,6 +818,8 @@ async def _proactive_impl(
     extra_fts_terms: list[str] | None = None,
     filter_noise: bool = False,
     kb_slots: int | None = None,
+    rerank_timeout_s: float | None = None,
+    stats: dict | None = None,
 ) -> list[dict]:
     """Cross-session context injection for prompts — shared engine.
 
@@ -830,7 +832,9 @@ async def _proactive_impl(
 
     Backs both the ``memory_proactive`` MCP tool (rerank off, no extra terms,
     no noise filter, no KB cap) and the genesis-server proactive recall endpoint
-    (rerank + file-context terms + ``filter_noise`` + ``kb_slots`` per config).
+    (rerank + file-context terms + ``filter_noise`` + ``kb_slots`` per config,
+    plus ``rerank_timeout_s``/``stats`` — the per-prompt latency timebox and
+    stage-telemetry sink; both ``None`` on the MCP path, byte-for-byte no-op).
     The shared security stages (memory_operation filter, injection-defense wrap,
     gate-4 enforce-drop, graph expansion, immunity emit) run for both callers.
     The endpoint is DELIBERATELY stricter on injection QUALITY: ``filter_noise``
@@ -864,6 +868,8 @@ async def _proactive_impl(
         limit=limit * 2,
         min_activation=0.0,
         rerank=rerank,
+        rerank_timeout_s=rerank_timeout_s,
+        stats=stats,
         extra_fts_terms=extra_fts_terms,
         skip_writeback=lambda r: (
             immunity_shadow.should_enforce_drop(

@@ -9,9 +9,15 @@ every prompt and falls back to a degraded FTS5-only local path on any non-200.
 Open (no bearer token) — same posture as ``/api/genesis/memory/search`` and
 the guardian health probe (user decision 2026-07-19); loopback bind + the
 memory system already being reachable via ``/api/genesis/memory/search`` mean
-a token would add friction without closing a new surface. Bounded at 2.0s (the
-per-prompt latency budget) — on expiry the worker returns 503 and the hook
-falls back rather than blocking the prompt.
+a token would add friction without closing a new surface. Bounded at 4.5s —
+on expiry the worker returns 503 and the hook falls back rather than blocking
+the prompt. The bound is sized to the MEASURED cold-path p99 of the production
+engine (2026-07-21: DeepInfra embed ~0.4-1.0s + Voyage rerank ≤1.0s timebox +
+retrieval/enrichment ~0.2-2.0s under load on a 60k-row corpus), with headroom
+left inside the hook wrapper's 10s ceiling for the hook's own session-local
+work. The original 2.0s value was validated on an install that silently ran
+no reranker (missing API key), shadow graph expansion, and half the corpus —
+see the #1169 timeout investigation.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 @blueprint.route("/api/genesis/hook/recall", methods=["POST"])
-@_async_route(timeout=2.0)
+@_async_route(timeout=4.5)
 async def proactive_recall():
     """Build proactive injection context for one prompt (hook backend)."""
     from genesis.runtime import GenesisRuntime
