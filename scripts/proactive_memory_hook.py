@@ -69,10 +69,14 @@ _SERVER_BASE = os.environ.get(
     "http://127.0.0.1:5000",
 ).rstrip("/")
 _RECALL_ENDPOINT = f"{_SERVER_BASE}/api/genesis/hook/recall"
-# Client budget slightly ABOVE the server's 2.0s _async_route timeout so the
+# Client budget slightly ABOVE the server's 4.5s _async_route timeout so the
 # server times out first and returns a clean 503 (→ fallback), rather than the
 # client aborting mid-flight; the short connect timeout catches a down server fast.
-_SERVER_TIMEOUT_S = 2.2
+# 4.5s is sized to the production engine's measured cold path (embed + rerank
+# timebox + retrieval under load) — the original 2.0s degraded ~70% of real
+# prompts to keyword-only recall (#1169 investigation, 2026-07-21). Total stays
+# well inside the hook wrapper's 10s ceiling (.claude/settings.json).
+_SERVER_TIMEOUT_S = 4.75
 _SERVER_CONNECT_TIMEOUT_S = 0.25
 
 # Kill-switch flag consumed by _compute_suppress_ids (H-1 shadow suppression set).

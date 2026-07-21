@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import math
@@ -631,8 +632,22 @@ class HybridRetriever:
         event_id_sink: list[str] | None = None,
         skip_writeback: Callable[[RetrievalResult], bool] | None = None,
         extra_fts_terms: list[str] | None = None,
+        rerank_timeout_s: float | None = None,
+        stats: dict | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
+
+        ``rerank_timeout_s``: optional wall-clock bound on the cross-encoder
+        rerank stage ONLY (latency-budgeted callers, e.g. the per-prompt
+        proactive path). On expiry the stage degrades to RRF order — the
+        same contract as a reranker API failure. ``None`` (default, all
+        deep-search callers) keeps the reranker's own HTTP timeout as the
+        only bound.
+
+        ``stats``: optional caller-owned dict populated with rerank stage
+        telemetry (``rerank_executed``, ``rerank_ms``, ``rerank_timed_out``).
+        Caller-owned so concurrent recalls on the shared retriever can never
+        race each other's numbers.
 
         Source selection:
             - ``source=None`` (default): classify the query's intent and
@@ -812,6 +827,8 @@ class HybridRetriever:
             fts_by_id=fts_by_id,
             limit=limit,
             rerank=rerank,
+            timeout_s=rerank_timeout_s,
+            stats=stats,
         )
 
         # 7b. Graph boost: backlink + adjacency (floor-gated); mutates
@@ -1283,6 +1300,8 @@ class HybridRetriever:
         fts_by_id: dict[str, dict],
         limit: int,
         rerank: bool,
+        timeout_s: float | None = None,
+        stats: dict | None = None,
     ) -> dict[str, float]:
         """Stage 7.5: cross-encoder reranking (optional, off by default).
 
@@ -1293,9 +1312,18 @@ class HybridRetriever:
         didn't score are dropped — if they lacked content or fell below
         top_k, they weren't strong enough to keep.
 
+        ``timeout_s`` bounds the reranker call for latency-budgeted callers;
+        on expiry the stage keeps RRF order (identical to an API failure,
+        which already returns ``[]``). ``stats`` (caller-owned) records
+        whether reranking actually EXECUTED — distinct from "was requested":
+        a missing API key, empty candidate set, API failure, or timebox
+        expiry all leave results in RRF order while ``rerank=True``.
+
         Returns the SAME ``fused`` object when reranking is skipped, or a
         replacement positional-score dict when it ran.
         """
+        if stats is not None:
+            stats.setdefault("rerank_executed", False)
         if rerank and self._reranker and self._reranker.enabled and fused:
             rerank_candidates = sorted(
                 fused,
@@ -1313,12 +1341,31 @@ class HybridRetriever:
                 if content:
                     rerank_docs.append({"id": mid, "text": content})
             if rerank_docs:
-                reranked = await self._reranker.rerank(
+                t0 = time.monotonic()
+                coro = self._reranker.rerank(
                     query,
                     rerank_docs,
                     top_k=limit * 2,
                 )
+                try:
+                    if timeout_s is not None:
+                        reranked = await asyncio.wait_for(coro, timeout=timeout_s)
+                    else:
+                        reranked = await coro
+                except TimeoutError:
+                    logger.warning(
+                        "Rerank exceeded %.1fs timebox — keeping RRF order",
+                        timeout_s,
+                    )
+                    if stats is not None:
+                        stats["rerank_timed_out"] = True
+                        stats["rerank_ms"] = round((time.monotonic() - t0) * 1000, 1)
+                    return fused
+                if stats is not None:
+                    stats["rerank_ms"] = round((time.monotonic() - t0) * 1000, 1)
                 if reranked:
+                    if stats is not None:
+                        stats["rerank_executed"] = True
                     # Rebuild fused with only reranked candidates, using
                     # positional scores so graph boost floor-gating works.
                     fused = {item["id"]: 1.0 / (1 + rank) for rank, item in enumerate(reranked)}

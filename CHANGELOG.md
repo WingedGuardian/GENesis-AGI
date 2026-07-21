@@ -9,6 +9,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Per-prompt memory recall no longer silently degrades on busy installs.**
+  The server-side recall budget behind the proactive memory hook was sized
+  against a dev install that (unnoticed) ran no reranker and a half-size
+  corpus; on a loaded production install the real pipeline routinely exceeded
+  it, so most prompts fell back to keyword-only recall with a
+  `[Memory·degraded]` banner. The budget now matches the measured production
+  cold path (4.5s server / 4.75s client, still inside the hook's 10s ceiling),
+  the cross-encoder rerank stage is timeboxed at 1s (degrading to fusion order
+  rather than eating the whole budget), recall responses report whether
+  reranking actually **executed** (not merely was requested — the
+  requested-vs-executed confusion is how the old budget got validated), and
+  slow recalls log a per-stage timing breakdown to the journal.
+
 ### Added
 
 - **Genesis's tunable cognition knobs now live in one auditable file.** Three

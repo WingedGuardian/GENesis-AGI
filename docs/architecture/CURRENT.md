@@ -71,10 +71,16 @@ Easy-to-forget mechanisms:
 - **`drift_recall`** (`memory/drift.py`) is the degraded-mode fallback; its
   FTS drilldown searches every collection in `source_collections`,
   rank-merged across collections.
-- The proactive per-prompt path is `scripts/proactive_memory_hook.py` — an
-  **independent reimplementation** (own FTS5→Qdrant→RRF pipeline), not a
-  `HybridRetriever` caller. The `memory_proactive` MCP tool is registered but
-  has zero internal callers — the hook is the live path.
+- The proactive per-prompt path is `scripts/proactive_memory_hook.py` — since
+  #1169 a **thin HTTP client** of `POST /api/genesis/hook/recall`
+  (`dashboard/routes/proactive.py` → `memory/proactive.py::proactive_context`
+  → the shared `_proactive_impl` engine), with a keyword-only FTS5 fallback
+  when the server can't answer. Latency budget: 4.5s server / 4.75s client
+  (sized to the production engine's measured cold path — embed + a 1.0s
+  rerank timebox + retrieval under load; see the #1169 timeout
+  investigation), inside the hook wrapper's 10s ceiling. The
+  `memory_proactive` MCP tool shares the engine but stays unfiltered/
+  un-reranked.
 - `procedure_recall` deliberately uses Jaccard tag-overlap
   (`learning/procedural/matcher.py find_relevant`), not hybrid retrieval.
 - External-world recall results are provenance-wrapped (`wrap_external_recall`)
