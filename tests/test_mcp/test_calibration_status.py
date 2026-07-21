@@ -182,3 +182,76 @@ async def test_tool_lane_cells_render_observed_base_rate(db):
     result = await _run(db)
     (line,) = result["cells_readable"]
     assert "base rate 90%" in line and "observed only" in line
+
+
+# ── WS-2 P4: earn-back evidence stream ──────────────────────────────────────
+
+
+async def _seed_autonomy(db, *, category="direct_session", current=2, earned=4):
+    await db.execute(
+        "INSERT INTO autonomy_state (id, category, current_level, earned_level,"
+        " updated_at) VALUES (?, ?, ?, ?, ?)",
+        (f"as-{category}", category, current, earned, NOW.isoformat()),
+    )
+    await db.commit()
+
+
+async def _seed_events(db, category, *, successes=0, corrections=0):
+    for i in range(successes):
+        await db.execute(
+            "INSERT INTO autonomy_events (id, category, kind, occurred_at)"
+            " VALUES (?, ?, 'success', ?)",
+            (f"ev-s-{category}-{i}", category, NOW.isoformat()),
+        )
+    for i in range(corrections):
+        await db.execute(
+            "INSERT INTO autonomy_events (id, category, kind, occurred_at)"
+            " VALUES (?, ?, 'correction', ?)",
+            (f"ev-c-{category}-{i}", category, NOW.isoformat()),
+        )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_earnback_empty_when_nothing_demoted(db):
+    await cc_crud.replace_cells(db, [_cell()], now=NOW)
+    await _seed_autonomy(db, current=4, earned=4)  # not demoted
+    result = await _run(db)
+    assert result["earnback"] == {"demoted_categories": []}
+
+
+@pytest.mark.asyncio
+async def test_earnback_surfaces_demoted_category_with_windowed_evidence(db):
+    await cc_crud.replace_cells(db, [_cell()], now=NOW)
+    await _seed_autonomy(db, current=2, earned=4)
+    await _seed_events(db, "direct_session", successes=30, corrections=1)
+    result = await _run(db)
+    (entry,) = result["earnback"]["demoted_categories"]
+    assert entry["category"] == "direct_session"
+    assert entry["current_level"] == 2
+    assert entry["earned_level"] == 4
+    assert entry["window_successes"] == 30
+    assert entry["window_corrections"] == 1
+    assert 0.0 < entry["posterior"] <= 1.0
+    assert isinstance(entry["evidence_supports_earned"], bool)
+
+
+@pytest.mark.asyncio
+async def test_earnback_no_evidence_reads_zero_counts(db):
+    await cc_crud.replace_cells(db, [_cell()], now=NOW)
+    await _seed_autonomy(db, current=1, earned=3)
+    result = await _run(db)
+    (entry,) = result["earnback"]["demoted_categories"]
+    assert entry["window_successes"] == 0
+    assert entry["window_corrections"] == 0
+    assert entry["evidence_supports_earned"] is False
+
+
+@pytest.mark.asyncio
+async def test_earnback_failure_degrades_to_unavailable(db):
+    await cc_crud.replace_cells(db, [_cell()], now=NOW)
+    await db.execute("DROP TABLE autonomy_state")
+    await db.commit()
+    result = await _run(db)
+    assert result["earnback"]["demoted_categories"] == []
+    assert result["earnback"]["unavailable"] is True
