@@ -11,6 +11,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Ego proposals now carry their track record.** When Genesis's ego proposes
+  an action, the proposal digest can show how proposals of that type have
+  actually fared: a domain with a healthy graded history whose stated
+  confidence runs >15 points hot gets a badge ("⚖ stated 0.90 → track record
+  0.62 (n=41)"), and a domain with too little graded history gets an explicit
+  "escalate — track record not yet trustworthy" note instead of a number.
+  Annotation-only by default (`ws2_ledger.arbitration: shadow`); an optional
+  `enforce` mode lets the track record drive the digest ordering. A proposal
+  is never hidden — annotations inform, the user decides.
+- **The `calibration_status` view now includes earn-back evidence.** For any
+  autonomy category running below its earned level, the tool surfaces the
+  recent graded evidence (windowed successes/corrections + Bayesian posterior)
+  so "has it re-earned that level?" is answerable from mechanically graded
+  data instead of judgment.
 - **Genesis now screens its own skill self-edits for degradation.** When the
   skill-evolution loop rewrites one of Genesis's own skill files, a new Critic
   reads the change and flags the classic self-modification failure modes —
