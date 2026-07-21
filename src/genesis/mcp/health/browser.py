@@ -1726,7 +1726,13 @@ async def _challenge_present(page) -> bool:
 
 
 async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> dict | None:
-    """Detect and handle Cloudflare challenge (Turnstile or managed).
+    """Detect and handle a Cloudflare challenge (Turnstile or managed).
+
+    ``response`` is the ``page.goto`` Response when available; its ``cf-mitigated``
+    header is the strongest (language-independent) interstitial signal. Only a
+    real interstitial runs the full ladder below. A page that merely EMBEDS a
+    Turnstile widget (no interstitial) gets a short auto-resolve grace poll and
+    returns ``{"status": "embedded"}`` with no VNC/Telegram escalation.
 
     Phase 1 (auto-resolve): Polls for ``timeout_ms`` for automatic resolution.
 
@@ -1739,7 +1745,8 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
 
     No human escalation — Genesis handles this itself.
 
-    Returns None if no challenge detected, or a status dict.
+    Returns None if neither an interstitial nor a widget is present, else a
+    status dict (``resolved`` / ``embedded`` / ``blocked``).
     """
     try:
         # Brief delay for SPA-injected widgets to load
