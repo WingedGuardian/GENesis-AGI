@@ -1188,3 +1188,121 @@ class TestReclaimVncPort:
         with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
             browser._reclaim_vnc_port()
         kill.assert_not_called()
+
+
+def _ts_page(*, selectors_present=(), title="Example Domain", url="https://example.com/"):
+    """Fake page for turnstile detection tests."""
+    present = set(selectors_present)
+
+    async def _qs(sel):
+        return MagicMock() if sel in present else None
+
+    page = MagicMock()
+    page.query_selector = AsyncMock(side_effect=_qs)
+    page.title = AsyncMock(return_value=title)
+    page.reload = AsyncMock()
+    page.url = url
+    return page
+
+
+def _ts_response(headers=None):
+    resp = MagicMock()
+    resp.headers = headers if headers is not None else {}
+    return resp
+
+
+_WIDGET_INPUT = 'input[name="cf-turnstile-response"]'
+_WIDGET_IFRAME = 'iframe[src*="challenges.cloudflare.com"]'
+
+
+class TestInterstitialDetection:
+    """FIX 1 (idx 38): _detect_interstitial fires only on interstitial evidence."""
+
+    @pytest.mark.asyncio
+    async def test_cf_mitigated_header_is_interstitial(self):
+        page = _ts_page(title="Example Domain")
+        resp = _ts_response({"cf-mitigated": "challenge"})
+        assert await browser._detect_interstitial(page, resp) is True
+
+    @pytest.mark.asyncio
+    async def test_challenge_title_is_interstitial(self):
+        page = _ts_page(title="Just a moment...")
+        assert await browser._detect_interstitial(page, None) is True
+
+    @pytest.mark.asyncio
+    async def test_challenge_chrome_is_interstitial(self):
+        page = _ts_page(selectors_present={"#cf-challenge-running"}, title="x")
+        assert await browser._detect_interstitial(page, None) is True
+
+    @pytest.mark.asyncio
+    async def test_embedded_widget_only_is_not_interstitial(self):
+        # Widget markers present, but NO interstitial evidence -> NOT blocking.
+        page = _ts_page(selectors_present={_WIDGET_INPUT, _WIDGET_IFRAME}, title="Sign in")
+        assert await browser._detect_interstitial(page, None) is False
+
+    @pytest.mark.asyncio
+    async def test_response_none_is_safe(self):
+        page = _ts_page(title="Home")
+        assert await browser._detect_interstitial(page, None) is False
+
+
+class TestWidgetDetection:
+    @pytest.mark.asyncio
+    async def test_widget_input_present(self):
+        page = _ts_page(selectors_present={_WIDGET_INPUT})
+        assert await browser._detect_widget(page) is True
+
+    @pytest.mark.asyncio
+    async def test_no_widget(self):
+        page = _ts_page()
+        assert await browser._detect_widget(page) is False
+
+
+class TestTurnstileShortGrace:
+    """FIX 1: widget-only -> short grace (no VNC/Telegram); interstitial -> full ladder."""
+
+    @pytest.mark.asyncio
+    async def test_embedded_widget_short_grace_no_escalation(self):
+        page = _ts_page(selectors_present={_WIDGET_INPUT}, title="Sign in")
+        with patch.object(browser, "_poll_turnstile_token", new=AsyncMock(return_value=False)) as poll, \
+             patch.object(browser, "_click_turnstile_widget", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_vnc_click_turnstile", new=AsyncMock(return_value=False)) as vnc, \
+             patch.object(browser, "_send_turnstile_alert", new=AsyncMock()) as alert, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            result = await browser._wait_for_turnstile(page, response=None)
+        assert result == {"status": "embedded", "method": "widget_no_interstitial"}
+        poll.assert_awaited()          # grace poll ran
+        vnc.assert_not_called()        # NO VNC escalation
+        alert.assert_not_called()      # NO Telegram alert
+
+    @pytest.mark.asyncio
+    async def test_embedded_widget_grace_resolves(self):
+        page = _ts_page(selectors_present={_WIDGET_INPUT}, title="Sign in")
+        with patch.object(browser, "_poll_turnstile_token", new=AsyncMock(return_value=True)), \
+             patch.object(browser, "_send_turnstile_alert", new=AsyncMock()) as alert, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            result = await browser._wait_for_turnstile(page, response=None)
+        assert result["status"] == "resolved"
+        alert.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_challenge_returns_none(self):
+        page = _ts_page(title="Home")
+        with patch("asyncio.sleep", new=AsyncMock()):
+            result = await browser._wait_for_turnstile(page, response=None)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_interstitial_runs_full_ladder_to_alert(self):
+        page = _ts_page(selectors_present={"#cf-challenge-running"}, title="Just a moment...")
+        resp = _ts_response({"cf-mitigated": "challenge"})
+        with patch.object(browser, "_poll_turnstile_token", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_click_turnstile_widget", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_solve_with_playwright_captcha", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_vnc_click_turnstile", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_ensure_vnc", new=AsyncMock()), \
+             patch.object(browser, "_send_turnstile_alert", new=AsyncMock()) as alert, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            result = await browser._wait_for_turnstile(page, response=resp)
+        assert result == {"status": "blocked", "method": "timeout"}
+        alert.assert_awaited()         # ladder ran to exhaustion

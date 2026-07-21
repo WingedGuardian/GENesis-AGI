@@ -141,8 +141,10 @@ resolved. The resolution cascade runs without any manual intervention:
 - Escalate to the user
 
 Simply call `browser_navigate(url)` and check the response. If
-`turnstile.status == "resolved"`, the page is ready. If `"blocked"`,
-a Telegram alert was already sent.
+`turnstile.status == "resolved"`, the page is ready. If `"embedded"`,
+the page merely embeds a Turnstile widget (no blocking interstitial —
+the page is already loaded; solve the widget only if a later form submit
+needs it). If `"blocked"`, a Telegram alert was already sent.
 
 ---
 
