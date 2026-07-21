@@ -510,42 +510,6 @@ def _result_row(d: dict) -> dict:
     return row
 
 
-# knowledge_base rows that represent INTENTIONAL ingestions (user-requested docs,
-# references, structured extractions) — everything else in knowledge_base is noisy
-# pipeline output (surplus insights, recon/web crawl) that must not surface into a
-# proactive prompt. Restores the pre-flip hook's KB filter for the endpoint path;
-# the shared MCP memory_proactive tool is deliberately left unchanged.
-_KB_INTENTIONAL_PIPELINES = frozenset(
-    {"extraction_job", "knowledge_ingest", "knowledge_ingest_source", "reference_store"}
-)
-
-
-def _filter_proactive_noise(dicts: list[dict]) -> list[dict]:
-    """Drop rows the pre-flip hook excluded, restoring hook parity for the endpoint.
-
-    Two guards the shared ``_proactive_impl`` never had (they lived in the hook):
-    - **garbage** — malformed stored content (raw JSON observation blobs, YAML
-      frontmatter, NULL) from ANY collection (``provenance.is_garbage``).
-    - **KB noise** — ``knowledge_base`` hits whose ``source_pipeline`` is not an
-      intentional ingestion (the collection is majority surplus/recon output).
-    Runs on the delivered dicts BEFORE the KB slot cap so the cap sees only
-    intentional KB. Endpoint-only (does not touch the MCP ``memory_proactive`` tool).
-    """
-    from genesis.memory.provenance import is_garbage
-
-    out: list[dict] = []
-    for d in dicts:
-        if is_garbage(d.get("content")):
-            continue
-        if (
-            d.get("collection") == "knowledge_base"
-            and d.get("source_pipeline") not in _KB_INTENTIONAL_PIPELINES
-        ):
-            continue
-        out.append(d)
-    return out
-
-
 def _apply_kb_cap(dicts: list[dict], kb_slots: int) -> list[dict]:
     """Keep every non-KB hit; cap knowledge_base hits at ``kb_slots`` (order-
     preserving) so KB can't flood episodic context under a wider budget."""
@@ -626,16 +590,18 @@ async def proactive_context(
 
     # The shared security pipeline (recall + filters + wrap + enforce + graph
     # expansion + immunity emit + retrieved_count write-back).
+    # filter_noise=True restores the pre-flip hook's content guards (garbage rows
+    # + non-intentional knowledge_base) INSIDE the engine's backfill loop and
+    # BEFORE external-content wrapping — so a dropped noisy top-K item is
+    # backfilled from the deeper safe pool and the garbage check sees raw content
+    # (Codex P2 on #1169). memory_proactive (the MCP tool) leaves it False.
     dicts = await _core._proactive_impl(
         prompt,
         limit=budget,
         rerank=rerank_live,
         extra_fts_terms=[k for k in (file_keywords or []) if k] or None,
+        filter_noise=True,
     )
-
-    # Restore the pre-flip hook's content guards (garbage rows + noisy-KB filter)
-    # BEFORE the slot cap, so the cap allocates its slots to intentional KB only.
-    dicts = _filter_proactive_noise(dicts)
 
     kb_slots = max(1, budget // 3)
     dicts = _apply_kb_cap(dicts, kb_slots)

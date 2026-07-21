@@ -9,7 +9,8 @@ Install-agnostic: no live retriever, Qdrant, network, or DB.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from genesis.memory import proactive as P
 from genesis.memory.intent import classify_stance
@@ -283,7 +284,9 @@ async def test_proactive_context_end_to_end_faked():
 async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
     captured = {}
 
-    async def _fake_impl(prompt, limit=5, *, rerank=False, extra_fts_terms=None):
+    async def _fake_impl(
+        prompt, limit=5, *, rerank=False, extra_fts_terms=None, filter_noise=False
+    ):
         captured["extra"] = extra_fts_terms
         captured["rerank"] = rerank
         captured["limit"] = limit
@@ -399,48 +402,110 @@ def _mem(mid, collection, content="ordinary memory content", source_pipeline=Non
     }
 
 
-async def test_proactive_context_filters_noisy_kb():
-    """knowledge_base hits that are NOT intentional ingestions are dropped
-    (restores the pre-flip hook's KB allowlist); episodic + intentional KB kept."""
-    delivered = [
-        _mem("epepepep0001", "episodic_memory"),
-        _mem("kbsurplus001", "knowledge_base", source_pipeline="surplus"),
-        _mem("kbrecon00001", "knowledge_base", source_pipeline="recon"),
-        _mem("kbnopipe0001", "knowledge_base", source_pipeline=None),
-        _mem("kbingest0001", "knowledge_base", source_pipeline="knowledge_ingest"),
-    ]
+async def test_proactive_context_requests_noise_filter():
+    """The endpoint delegates noise filtering to the engine (filter_noise=True) so
+    it happens in the backfill loop + before wrapping — not post-hoc (Codex P2)."""
+    captured = {}
+
+    async def _fake_impl(
+        prompt, limit=5, *, rerank=False, extra_fts_terms=None, filter_noise=False
+    ):
+        captured["filter_noise"] = filter_noise
+        return []
+
     with (
         patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
-        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=delivered)),
+        patch("genesis.mcp.memory.core._proactive_impl", new=_fake_impl),
     ):
-        # decision-question → budget 6, kb_slots 2 (so the 1 kept KB isn't capped out)
-        resp = await P.proactive_context(prompt="what did we decide about the recall reranker")
+        await P.proactive_context(prompt="what did we decide about the recall reranker")
 
-    ids = {r["memory_id"] for r in resp["results"]}
-    assert "epepepep0001" in ids  # episodic kept
-    assert "kbingest0001" in ids  # intentional KB kept
-    assert "kbsurplus001" not in ids  # surplus dropped
-    assert "kbrecon00001" not in ids  # recon dropped
-    assert "kbnopipe0001" not in ids  # unknown/None pipeline dropped
+    assert captured["filter_noise"] is True
 
 
-async def test_proactive_context_drops_garbage():
-    """Malformed stored content (JSON observation blob / YAML frontmatter / NULL)
-    never surfaces on the server path."""
-    delivered = [
-        _mem("cleanmem0001", "episodic_memory", content="A normal, clean decision memory."),
-        _mem("jsonblob0001", "episodic_memory", content='{"drift_detected": true, "tags": []}'),
-        _mem("frontmat0001", "episodic_memory", content="---\ntype: observation\nid: x\n"),
-        _mem("nullmem00001", "episodic_memory", content=None),
+def test_is_proactive_noise_predicate():
+    """provenance.is_proactive_noise — garbage from any collection OR a
+    non-intentional knowledge_base hit; intentional KB + clean episodic kept."""
+    from genesis.memory.provenance import is_proactive_noise as noise
+
+    # garbage content from ANY collection (operates on RAW, unwrapped content)
+    assert noise("episodic_memory", None, '{"drift_detected": 1}') is True
+    assert noise("episodic_memory", None, "---\ntype: obs\n") is True
+    assert noise("episodic_memory", None, None) is True
+    # non-intentional knowledge_base
+    assert noise("knowledge_base", "surplus", "clean text") is True
+    assert noise("knowledge_base", "recon", "clean text") is True
+    assert noise("knowledge_base", None, "clean text") is True
+    # intentional knowledge_base survives
+    assert noise("knowledge_base", "knowledge_ingest", "clean text") is False
+    assert noise("knowledge_base", "reference_store", "clean text") is False
+    # clean episodic survives
+    assert noise("episodic_memory", None, "a normal memory") is False
+
+
+async def test_proactive_impl_filter_noise_backfills_and_predates_wrap():
+    """filter_noise drops garbage + non-intentional KB INSIDE the backfill loop
+    (a dropped noisy top-K item is replaced by the next safe candidate — Codex P2
+    #1) and BEFORE wrapping (raw content is checked — Codex P2 #2). filter_noise
+    =False leaves them, proving the flag gates the behavior (MCP tool unchanged)."""
+    from genesis.mcp.memory import core as C
+    from genesis.memory.types import RetrievalResult
+
+    def _rr(mid, collection, content, source_pipeline=None):
+        return RetrievalResult(
+            memory_id=mid,
+            content=content,
+            source="",
+            memory_type="fact",
+            score=0.5,
+            vector_rank=1,
+            fts_rank=None,
+            activation_score=0.0,
+            payload={},
+            collection=collection,
+            source_pipeline=source_pipeline,
+        )
+
+    # Top-2 candidates are noise; the two deeper rows are clean episodic.
+    candidates = [
+        _rr("kbsurplus", "knowledge_base", "surplus insight", "surplus"),
+        _rr("garbageep", "episodic_memory", '{"operation": "store"}'),
+        _rr("cleanep01", "episodic_memory", "clean memory one"),
+        _rr("cleanep02", "episodic_memory", "clean memory two"),
     ]
-    with (
-        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
-        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=delivered)),
-    ):
-        resp = await P.proactive_context(prompt="what did we decide about the recall reranker")
 
-    ids = {r["memory_id"] for r in resp["results"]}
-    assert ids == {"cleanmem0001"}, f"garbage leaked: {ids}"
+    class _Retriever:
+        async def recall(self, *a, **k):
+            return list(candidates)
+
+    fake_mod = SimpleNamespace(
+        _retriever=_Retriever(),
+        _db=MagicMock(),
+        _require_init=lambda: None,
+    )
+
+    async def _maybe_expand(db, kept, surface):
+        return list(kept)  # no graph neighbors
+
+    async def _record(*a, **k):
+        return None
+
+    with (
+        patch.object(C, "_memory_mod", return_value=fake_mod),
+        patch.object(C.graph_expansion, "maybe_expand", new=_maybe_expand),
+        patch.object(C.immunity_shadow, "should_enforce_drop", return_value=False),
+        patch.object(C.immunity_shadow, "item_is_blockable", return_value=False),
+        patch.object(C.immunity_shadow, "is_dispatched_session_env", return_value=False),
+        patch.object(C.immunity_shadow, "record_would_block", new=_record),
+    ):
+        filtered = await C._proactive_impl("q", limit=2, filter_noise=True)
+        unfiltered = await C._proactive_impl("q", limit=2, filter_noise=False)
+
+    fids = [d["memory_id"] for d in filtered]
+    uids = [d["memory_id"] for d in unfiltered]
+    # backfill: the two noise items are dropped, deeper clean rows fill both slots
+    assert fids == ["cleanep01", "cleanep02"], fids
+    # without the flag the top-2 (incl. noise) survive → the flag gates it
+    assert "kbsurplus" in uids and "garbageep" in uids
 
 
 def test_is_garbage_predicate():

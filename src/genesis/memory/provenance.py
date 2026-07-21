@@ -102,6 +102,33 @@ def is_garbage(content: str | None) -> bool:
     return stripped.startswith("---\n") and "type:" in stripped[:200]
 
 
+# knowledge_base rows representing INTENTIONAL ingestions (user-requested docs,
+# references, structured extractions). Everything else in knowledge_base is noisy
+# pipeline output (surplus insights, recon/web crawl) that must not surface into a
+# proactive prompt. (Live: knowledge_base is ~71% surplus.)
+_KB_INTENTIONAL_PIPELINES = frozenset(
+    {"extraction_job", "knowledge_ingest", "knowledge_ingest_source", "reference_store"}
+)
+
+
+def is_proactive_noise(
+    collection: str | None,
+    source_pipeline: str | None,
+    content: str | None,
+) -> bool:
+    """True if a recall hit must be dropped from PROACTIVE injection.
+
+    Restores the two guards the pre-flip hook had (which the shared
+    ``memory_proactive`` MCP tool never had): malformed content (``is_garbage``)
+    OR a ``knowledge_base`` hit that is not an intentional ingestion. Operates on
+    RAW (unwrapped) content, so it MUST run before ``wrap_external_recall`` — a
+    wrapped garbage row no longer starts with ``{``/``---`` and would slip past.
+    """
+    if is_garbage(content):
+        return True
+    return collection == KNOWLEDGE_COLLECTION and source_pipeline not in _KB_INTENTIONAL_PIPELINES
+
+
 def session_origin_from_env() -> str | None:
     """The dispatching session's origin_class from ``GENESIS_SESSION_ORIGIN``.
 

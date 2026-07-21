@@ -12,6 +12,7 @@ from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
 from genesis.memory.provenance import (
     is_external,
+    is_proactive_noise,
     label_result_dicts,
     provenance_descriptor,
     wrap_external_recall,
@@ -815,6 +816,7 @@ async def _proactive_impl(
     *,
     rerank: bool = False,
     extra_fts_terms: list[str] | None = None,
+    filter_noise: bool = False,
 ) -> list[dict]:
     """Cross-session context injection for prompts — shared engine.
 
@@ -876,6 +878,14 @@ async def _proactive_impl(
         if len(out) >= limit:
             break
         d = asdict(r)
+        # Proactive-injection noise guard (endpoint only; memory_proactive passes
+        # filter_noise=False → unchanged). Drops garbage-shaped content + non-
+        # intentional knowledge_base hits BEFORE wrapping (so the garbage check
+        # sees RAW content) and inside THIS backfill loop (so a dropped noisy
+        # top-K item is replaced by the next safe candidate, not left as a hole).
+        # Restores the pre-flip hook's guards; fixes Codex P2 on #1169.
+        if filter_noise and is_proactive_noise(r.collection, r.source_pipeline, r.content):
+            continue
         # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): memory_proactive is a
         # query-less ambient feed — in a DISPATCHED session under enforce,
         # blockable stored-external items are DROPPED (not returned at all).
@@ -922,6 +932,10 @@ async def _proactive_impl(
         # Neighbor tags come from the FTS row as a STRING — substring check
         # mirrors the organic list-membership filter above.
         if "memory_operation" in (nr.payload.get("tags") or ""):
+            continue
+        # Same proactive noise guard as the organic loop — a graph neighbor must
+        # not be a bypass around the garbage / non-intentional-KB filter.
+        if filter_noise and is_proactive_noise(nr.collection, nr.source_pipeline, nr.content):
             continue
         if immunity_shadow.should_enforce_drop(
             gate="injection",

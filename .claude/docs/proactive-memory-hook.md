@@ -28,8 +28,11 @@ had (they were hook-only, never in the shared `memory_proactive` MCP tool):
 malformed rows (`provenance.is_garbage` — raw JSON observation blobs, YAML
 frontmatter, NULL) and non-intentional `knowledge_base` hits (only
 `extraction_job`/`knowledge_ingest`/`knowledge_ingest_source`/`reference_store`
-survive; the collection is otherwise majority surplus/recon crawl). These live
-in `proactive_context._filter_proactive_noise`, scoped to the hook's backend.
+survive; the collection is otherwise majority surplus/recon crawl). These run
+inside `_proactive_impl` (gated by a `filter_noise` flag the endpoint sets and
+the MCP tool leaves off) — in the backfill loop and before external-content
+wrapping, so a dropped noisy hit is replaced by the next safe candidate and the
+garbage check sees raw content. Predicate: `provenance.is_proactive_noise`.
 
 ## Modes — `GENESIS_PROACTIVE_HOOK_MODE`
 
