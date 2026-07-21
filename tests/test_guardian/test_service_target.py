@@ -35,3 +35,22 @@ def test_recovery_brain_targets_genesis_server_not_bridge(module: str) -> None:
         "bridge is an inactive on-demand relay. Restarting/probing it 'succeeds' "
         "but heals nothing and hides genesis-server crash loops."
     )
+
+
+# The container-side watchdog is a recovery caller too — the same guard, its own
+# path/message (autonomy/watchdog.py is not a guardian module). It reuses the
+# canonical service detector, which recovers a relay-only legacy install without
+# ever picking the relay when genesis-server is present.
+_AUTONOMY_WATCHDOG = (
+    Path(__file__).resolve().parents[2] / "src" / "genesis" / "autonomy" / "watchdog.py"
+)
+
+
+def test_watchdog_targets_genesis_server_not_bridge() -> None:
+    src = _AUTONOMY_WATCHDOG.read_text()
+    assert "genesis-bridge" not in src, (
+        "autonomy/watchdog.py references the deprecated genesis-bridge unit. The "
+        "watchdog must target genesis-server (via _detect_genesis_service); "
+        "restarting/probing the inactive relay 'succeeds' but heals nothing and "
+        "hides genesis-server crash loops (audit 2026-07-02 §7)."
+    )

@@ -35,40 +35,47 @@ _SYSTEMD_UNITS = {
 _TMP_WATCHGOD_STATE = Path.home() / ".genesis" / "watchgod_state.json"
 
 
-def _detect_genesis_service() -> tuple[str, str]:
-    """Detect which Genesis service is active.
+def _unit_installed(unit: str) -> bool:
+    """True if a systemd USER unit FILE exists (installed), regardless of its
+    enabled/active state.
 
-    Returns (unit_name, display_label) — prefers genesis-server,
-    falls back to genesis-bridge for legacy deployments.
+    Uses ``list-unit-files`` (stable across systemd versions) so a
+    present-but-disabled unit still counts as installed.
     """
-    for unit, label in [
-        ("genesis-server.service", "Server"),
-        ("genesis-bridge.service", "Bridge"),
-    ]:
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-enabled", unit],
-                capture_output=True, text=True, timeout=5, env=systemctl_env(),
-            )
-            if result.returncode == 0:
-                return unit, label
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            pass
-    # Nothing enabled — check if either is at least loaded
-    for unit, label in [
-        ("genesis-server.service", "Server"),
-        ("genesis-bridge.service", "Bridge"),
-    ]:
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-active", unit],
-                capture_output=True, text=True, timeout=5, env=systemctl_env(),
-            )
-            if result.stdout.strip() == "active":
-                return unit, label
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            pass
-    return "genesis-server.service", "Server"
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "list-unit-files", unit, "--no-legend"],
+            capture_output=True, text=True, timeout=5, env=systemctl_env(),
+        )
+        return result.returncode == 0 and unit in result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _detect_genesis_service() -> tuple[str, str]:
+    """Detect which Genesis service to report on / recover.
+
+    Returns ``(unit_name, display_label)``. Prefers genesis-server whenever its
+    unit is INSTALLED — even disabled or stopped — so recovery and the dashboard
+    surface a down main service rather than masking it behind the deprecated
+    genesis-bridge relay (2026-07-02 §7: restarting/probing the inactive relay
+    "succeeds" but hides genesis-server crash loops). Only a true server-absent
+    (relay-only legacy) install falls back to the relay.
+    """
+    server = ("genesis-server.service", "Server")
+    if _unit_installed("genesis-server.service"):
+        return server
+    # genesis-server not installed → legacy relay-only deployment.
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "genesis-bridge.service"],
+            capture_output=True, text=True, timeout=5, env=systemctl_env(),
+        )
+        if result.stdout.strip() == "active":
+            return "genesis-bridge.service", "Bridge"
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return server
 
 
 def query_systemd_unit(unit_name: str) -> dict:

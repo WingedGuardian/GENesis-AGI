@@ -35,9 +35,13 @@ to the repository root.
 - Exponential backoff: 10s initial, doubles per failure, capped at 300s
 - Max 5 consecutive restart attempts before `WatchdogAction.NOTIFY`
 - Pre-restart config validation: checks `secrets.env` exists with `TELEGRAM_BOT_TOKEN`, compiles bridge module for syntax errors
-- Restart via `systemctl --user restart genesis-bridge.service` — never `os.kill()`
+- Restarts the **auto-detected** target service — `_detect_target_service()` reuses
+  `observability.service_status._detect_genesis_service()` (is-enabled → is-active →
+  default), which resolves to `genesis-server.service` on a normal install and never
+  targets the deprecated relay when genesis-server is present. Via `systemctl --user
+  restart <target>` — never `os.kill()`
 - State persisted in `~/.genesis/watchdog_state.json` (survives process restarts)
-- Also checks `systemctl --user is-active genesis-bridge.service` as a fast-path before staleness check
+- Also checks `systemctl --user is-active <target>` as a fast-path before staleness check
 
 `src/genesis/autonomy/watchdog_runner.py` — systemd oneshot entry point called by `genesis-watchdog.timer` every 300s (60s after boot).
 
@@ -139,7 +143,7 @@ and the governance controls that gate it.
 
 | Health Signal | Condition | Remediation | Reversibility | Governance | Cooldown | Max Attempts |
 |---|---|---|---|---|---|---|
-| Bridge status stale | `status.json` >300s old | `systemctl --user restart genesis-bridge.service` | REVERSIBLE | L2 (auto) | 10s exponential backoff to 300s | 5 (existing) |
+| Server status stale | `status.json` >300s old | `systemctl --user restart <auto-detected target>` (genesis-server on a normal install; never the deprecated relay) | REVERSIBLE | L2 (auto) | 10s exponential backoff to 300s | 5 (existing) |
 | Bridge process inactive | `systemctl is-active` returns non-active | Same as above | REVERSIBLE | L2 (auto) | Same backoff | 5 (existing) |
 | Qdrant probe DOWN | >2 consecutive `probe_qdrant()` failures | `systemctl restart qdrant` | REVERSIBLE | L2 (auto) | 300s | 3 |
 | `/tmp` usage >80% | `os.statvfs('/tmp')` shows >80% used | Remove stale CC artifacts in `/tmp/claude-*` | REVERSIBLE | L2 (auto) | 600s | 5 |
