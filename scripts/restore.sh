@@ -131,6 +131,27 @@ log()  { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 warn() { log "WARNING: $*"; _FAILURES+=("$*"); }
 die()  { log "FATAL: $*"; _FAILURES+=("$*"); exit 1; }
 
+# ── Mutual exclusion (SF5): backup↔restore share one whole-run lock ──
+# Counterpart of backup.sh's non-blocking skip. A restore is operator-driven,
+# so it WAITS (bounded) rather than skipping — the 6h backup timer firing
+# mid-restore would otherwise snapshot the half-built DB as the newest
+# COMPLETE backup. Acquired AFTER the EXIT trap above so a lock timeout is
+# recorded in restore_status.json as a real failure, and BEFORE the
+# repo-obtain below (backup.sh commits into the same clone this git-pulls).
+# The default 300s wait is deliberately shorter than a full off-site backup
+# run — dying with the holder named is the right behavior for an operator
+# script (wait for the backup, re-run); override for unattended DR flows.
+# Append-mode open: a losing contender must never truncate the holder line.
+# shellcheck source=scripts/lib/dr_lock.sh
+source "$_SCRIPT_DIR/lib/dr_lock.sh"
+_LOCK_WAIT="${GENESIS_RESTORE_LOCK_WAIT:-300}"
+dr_lock_open
+if ! flock -w "$_LOCK_WAIT" "$DR_LOCK_FD"; then
+    _holder="$(cat "$DR_LOCK_FILE" 2>/dev/null || true)"
+    die "backup-restore lock still held by ${_holder:-unknown} after ${_LOCK_WAIT}s — a backup is likely running; wait for it to finish and re-run (or set GENESIS_RESTORE_LOCK_WAIT higher)"
+fi
+dr_lock_stamp restore
+
 # Large intermediate files (the ~269MB decrypted SQLite .dump, decrypted Qdrant snapshots)
 # must NOT land in the inherited TMPDIR (cc-tmp = the watchgod "oxygen" folder for a CC run;
 # /tmp tmpfs/RAM otherwise). Route them to a dedicated on-disk dir per the tmp_filesystem_limit
@@ -172,24 +193,16 @@ _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 # Circular-trap fallback: if the passphrase is not in the environment (e.g.
 # secrets.env was lost — the exact disaster this backup exists for), read it
 # from the host-side escrow the credential bridge writes. Without this, an
-# encrypted backup of a lost secrets.env would be undecryptable.
+# encrypted backup of a lost secrets.env would be undecryptable. Lookup logic
+# lives in lib/passphrase_escrow.sh (shared with backup.sh's SF4 round-trip).
+# shellcheck source=scripts/lib/passphrase_escrow.sh
+source "$_SCRIPT_DIR/lib/passphrase_escrow.sh"
 if [ -z "$_BACKUP_PASSPHRASE" ]; then
-    for _escrow in \
-        "${GENESIS_PASSPHRASE_ESCROW:-}" \
-        "$HOME/.genesis/shared/guardian/backup_passphrase.env" \
-        "$HOME/.local/state/genesis-guardian/shared/guardian/backup_passphrase.env" \
-        "$HOME/.local/state/genesis-guardian/creds-archive/backup_passphrase.env"; do
-        [ -n "$_escrow" ] && [ -f "$_escrow" ] || continue
-        # Bridge writes exactly `GENESIS_BACKUP_PASSPHRASE=<value>` (no quotes);
-        # tolerate an optional `export ` prefix. Do NOT strip quotes — the
-        # passphrase may legitimately contain them.
-        _escrowed="$(sed -n 's/^\(export \)\{0,1\}GENESIS_BACKUP_PASSPHRASE=//p' "$_escrow" | head -n1)"
-        if [ -n "$_escrowed" ]; then
-            _BACKUP_PASSPHRASE="$_escrowed"
-            log "Using escrowed backup passphrase from $_escrow (env passphrase absent)"
-            break
-        fi
-    done
+    passphrase_escrow_lookup
+    if [ -n "$ESCROW_PASSPHRASE" ]; then
+        _BACKUP_PASSPHRASE="$ESCROW_PASSPHRASE"
+        log "Using escrowed backup passphrase from $ESCROW_SOURCE (env passphrase absent)"
+    fi
 fi
 
 # G.4 host-side credential mirror fallback. If the Tier-1 backup clone lacks the
@@ -806,6 +819,15 @@ else
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────
+# A COMPLETE off-site snapshot can legitimately lack a Qdrant collection (the
+# backup gates each collection on its being reachable+fresh that run — Qdrant is
+# rebuildable from SQLite, so fresh-SQL-without-vectors beats no-snapshot). Warn
+# loudly when we restored the DB but no vectors, so the operator rebuilds them
+# instead of running on a silently-empty vector store.
+if ! $DRY_RUN && $_SQLITE_RESTORED && [ "$_QDRANT_RESTORED" -eq 0 ]; then
+    log "NOTE: SQLite restored but 0 Qdrant collections were in this snapshot."
+    log "      Rebuild the vector store from the DB: python -m genesis reindex (or scripts/reindex_fts_to_qdrant.py)."
+fi
 if $_SERVER_WAS_STOPPED; then
     log "NOTE: genesis-server was stopped for the restore and left stopped."
     log "      Verify the restored DB, then: systemctl --user start genesis-server"

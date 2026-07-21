@@ -48,6 +48,34 @@ _BACKEND_CREDS=""       # smb: temp creds file (cleaned by backend_cleanup)
 _BACKEND_NAS=""         # smb: //host/share
 _BACKEND_LOCAL_ROOT=""  # local: root directory
 
+# ── Operation timeouts ───────────────────────────────────────────────
+# Named failure mode: a hung SMB/NFS mount (or dead smbclient TCP session)
+# blocks forever inside a backend op. Since SF5 both scripts hold the shared
+# backup-restore flock for their whole run, an unbounded hang here would hold
+# the DR lock indefinitely — blocking a real disaster-recovery restore. Every
+# backend op is therefore bounded, in three tiers sized to the work:
+#   ctl  (60s):   mkdir/list/exists — session setup + one dir op; seconds on
+#                 any live link, 60s is 10-20x headroom.
+#   xfer (1800s): put/get — the largest real payload is the episodic_memory
+#                 Qdrant snapshot (~282MB and growing); at a worst-case
+#                 0.3MB/s that is ~940s, so 900 would kill a slow-but-alive
+#                 link. 1800 bounds a hung mount at 30min without capping a
+#                 healthy slow transfer.
+#   del  (600s):  recursive delete — O(files) server-side (a dated snapshot
+#                 holds 1000+ transcript files); per-file SMB round trips can
+#                 legitimately exceed the ctl tier.
+# Env-overridable for unusual links (levers, not hardcoded policy).
+_BACKEND_CTL_TIMEOUT="${GENESIS_BACKUP_CTL_TIMEOUT:-60}"
+_BACKEND_XFER_TIMEOUT="${GENESIS_BACKUP_XFER_TIMEOUT:-1800}"
+_BACKEND_DEL_TIMEOUT="${GENESIS_BACKUP_DEL_TIMEOUT:-600}"
+# `-k 10`: if the op ignores/blocks SIGTERM at the deadline, SIGKILL it 10s
+# later. (A truly uninterruptible D-state mount wait survives even SIGKILL
+# until the kernel IO returns — no userland timeout can escape that; the -k
+# just bounds the SIGTERM-ignoring case.)
+_t_ctl()  { timeout -k 10 "$_BACKEND_CTL_TIMEOUT"  "$@"; }
+_t_xfer() { timeout -k 10 "$_BACKEND_XFER_TIMEOUT" "$@"; }
+_t_del()  { timeout -k 10 "$_BACKEND_DEL_TIMEOUT"  "$@"; }
+
 _backend_resolve() {
     local b="${GENESIS_BACKUP_TIER2_BACKEND:-}"
     # Backward-compat: a configured NAS with no explicit selector means smb.
@@ -83,16 +111,21 @@ backend_cleanup() {
 backend_name() { printf '%s' "$_BACKEND"; }
 
 # 0 if the backend's tool + config are usable; non-zero otherwise.
+# The local arm's dir probe is external `test` under timeout, NOT the `[ -d ]`
+# builtin: a hung NFS/CIFS mount hangs the stat() inside the builtin with no
+# way to bound it — and this probe runs FIRST, while the DR lock is held.
 backend_available() {
     case "$_BACKEND" in
         smb)   [ -n "$_BACKEND_NAS" ] && command -v smbclient >/dev/null 2>&1 ;;
-        local) [ -n "$_BACKEND_LOCAL_ROOT" ] && [ -d "$_BACKEND_LOCAL_ROOT" ] ;;
+        local) [ -n "$_BACKEND_LOCAL_ROOT" ] && _t_ctl test -d "$_BACKEND_LOCAL_ROOT" ;;
         *)     return 1 ;;
     esac
 }
 
 # ── smb backend ──────────────────────────────────────────────────────
-_smb_run() { smbclient "$_BACKEND_NAS" -A "$_BACKEND_CREDS" "$@"; }
+# _SMB_OP_TIMEOUT is dynamically scoped: put/get/delete override it per-call
+# (bash `local` in the caller is visible here); everything else gets ctl.
+_smb_run() { timeout "${_SMB_OP_TIMEOUT:-$_BACKEND_CTL_TIMEOUT}" smbclient "$_BACKEND_NAS" -A "$_BACKEND_CREDS" "$@"; }
 
 _smb_mkdir() {
     # smbclient mkdir is non-recursive — create each ancestor in one -c batch.
@@ -109,12 +142,12 @@ _smb_mkdir() {
 }
 
 _smb_put() {
-    local src="$1" dst="$2"
+    local src="$1" dst="$2" _SMB_OP_TIMEOUT="$_BACKEND_XFER_TIMEOUT"
     _smb_run -c "cd \"$(dirname "$dst")\"; put \"$src\" \"$(basename "$dst")\"" >/dev/null 2>&1
 }
 
 _smb_get() {
-    local rem="$1" dst="$2"
+    local rem="$1" dst="$2" _SMB_OP_TIMEOUT="$_BACKEND_XFER_TIMEOUT"
     _smb_run -c "cd \"$(dirname "$rem")\"; get \"$(basename "$rem")\" \"$dst\"" >/dev/null 2>&1
 }
 
@@ -142,17 +175,20 @@ _smb_exists() {
         | awk -v n="$b" '$1==n && $2 ~ /^[DAHSRN]+$/ {f=1} END{exit !f}'
 }
 
-_smb_delete() { _smb_run -c "deltree \"$1\"" >/dev/null 2>&1; }
+_smb_delete() { local _SMB_OP_TIMEOUT="$_BACKEND_DEL_TIMEOUT"; _smb_run -c "deltree \"$1\"" >/dev/null 2>&1; }
 
 # ── local backend (cp/ls/test/rm to a mounted path) ──────────────────
 # Also the real-filesystem regression anchor for tests (no binary stub needed).
-_local_mkdir()  { mkdir -p "$_BACKEND_LOCAL_ROOT/$1" 2>/dev/null; }
-_local_put()    { mkdir -p "$(dirname "$_BACKEND_LOCAL_ROOT/$2")" 2>/dev/null && cp "$1" "$_BACKEND_LOCAL_ROOT/$2"; }
-_local_get()    { cp "$_BACKEND_LOCAL_ROOT/$1" "$2"; }
-_local_list()   { ls -1A "$_BACKEND_LOCAL_ROOT/$1" 2>/dev/null || true; }
-_local_list_dirs() { find "$_BACKEND_LOCAL_ROOT/$1" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null || true; }
-_local_exists() { [ -e "$_BACKEND_LOCAL_ROOT/$1" ]; }
-_local_delete() { rm -rf "${_BACKEND_LOCAL_ROOT:?}/$1"; }
+# Every op runs under a tiered timeout: "local" here usually means a MOUNTED
+# path (NFS/CIFS), where a dead server hangs mkdir/cp/ls/stat forever — and
+# builtins (`[ -e ]`) can't be bounded, hence external `test`.
+_local_mkdir()  { _t_ctl mkdir -p "$_BACKEND_LOCAL_ROOT/$1" 2>/dev/null; }
+_local_put()    { _t_ctl mkdir -p "$(dirname "$_BACKEND_LOCAL_ROOT/$2")" 2>/dev/null && _t_xfer cp "$1" "$_BACKEND_LOCAL_ROOT/$2"; }
+_local_get()    { _t_xfer cp "$_BACKEND_LOCAL_ROOT/$1" "$2"; }
+_local_list()   { _t_ctl ls -1A "$_BACKEND_LOCAL_ROOT/$1" 2>/dev/null || true; }
+_local_list_dirs() { _t_ctl find "$_BACKEND_LOCAL_ROOT/$1" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null || true; }
+_local_exists() { _t_ctl test -e "$_BACKEND_LOCAL_ROOT/$1"; }
+_local_delete() { _t_del rm -rf "${_BACKEND_LOCAL_ROOT:?}/$1"; }
 
 # ── dispatch ─────────────────────────────────────────────────────────
 backend_mkdir() {

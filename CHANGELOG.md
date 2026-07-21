@@ -155,6 +155,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Backups now verify the database archive is restorable, can't collide with a
+  restore, and never re-badge stale data as fresh.** Three disaster-recovery
+  integrity fixes: the 6-hourly backup now decrypt-verifies the SQLite archive
+  with the passphrase a recovery box would actually use, so a
+  rotated-but-not-re-escrowed passphrase is caught immediately (and the fresh
+  copy is held out of the off-site snapshot until re-escrowed) instead of
+  surfacing at disaster time; backup and restore share a lock so the timer can
+  never snapshot a half-restored database (a backup skips quietly, a restore
+  waits then says who's holding the lock); and the off-site snapshot only ever
+  contains payloads regenerated that run — a reachable collection that fails to
+  snapshot now fails the backup loudly instead of silently shipping the previous
+  run's copy under a fresh timestamp (a genuinely absent or unreachable vector
+  store degrades gracefully, since it rebuilds from the database). All off-site
+  operations are time-bounded, so a hung network mount degrades to a
+  partial-backup alert instead of wedging backups indefinitely.
+
 - **The dashboard no longer shows a false "degraded / sentinel stale" during an
   update.** While `update.sh` restarts the server, the freshly booted server's
   sentinel heartbeat is briefly empty, which used to paint the Services card

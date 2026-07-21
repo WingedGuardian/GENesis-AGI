@@ -37,9 +37,11 @@ def backup_env(tmp_path):
     (gd / "data").mkdir(parents=True)
     (home / ".genesis").mkdir(parents=True)
     (home / ".gnupg").mkdir(mode=0o700)
-    subprocess.run(["sqlite3", str(gd / "data" / "genesis.db"),
-                    "CREATE TABLE t(x); INSERT INTO t VALUES(1);"],
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["sqlite3", str(gd / "data" / "genesis.db"), "CREATE TABLE t(x); INSERT INTO t VALUES(1);"],
+        check=True,
+        capture_output=True,
+    )
 
     # Backup repo: bare remote (main) + a clone at $HOME/backups/genesis-backups
     # so backup.sh skips its clone and `git push` lands on the local remote.
@@ -61,42 +63,60 @@ def backup_env(tmp_path):
     bind = tmp_path / "bin"
     bind.mkdir()
     tg = tmp_path / "telegram_calls.log"
-    # curl stub: capture Telegram sends; fail everything else (Qdrant → skipped).
+    # curl stub: capture Telegram sends; answer the SF3 existence probe with
+    # 404 (collections genuinely absent → benign skip — a bare connection
+    # failure now correctly FAILS the backup); fail everything else.
     _make_stub(
         bind / "curl",
-        '#!/usr/bin/env bash\n'
+        "#!/usr/bin/env bash\n"
         'for a in "$@"; do case "$a" in\n'
         f'  *api.telegram.org*) printf "%s\\n" "$*" >> "{tg}"; exit 0 ;;\n'
-        'esac; done\n'
-        'exit 1\n',
+        "esac; done\n"
+        'for a in "$@"; do [ "$a" = "-w" ] && { printf "404"; exit 0; }; done\n'
+        "exit 1\n",
     )
     return {"home": home, "gd": gd, "bind": bind, "tg": tg, "tmp": tmp_path}
 
 
-def _run(backup_env, *, smb_rc: int = 0, nas: bool = True, remove_db: bool = False,
-         fail_complete: bool = False):
+def _run(
+    backup_env,
+    *,
+    smb_rc: int = 0,
+    nas: bool = True,
+    remove_db: bool = False,
+    fail_complete: bool = False,
+):
     if remove_db:  # force _SUCCESS=false (no SQLite data) for the failure-alert path
         (backup_env["gd"] / "data" / "genesis.db").unlink(missing_ok=True)
     if fail_complete:  # payloads upload OK, only the COMPLETE marker fails
-        _make_stub(backup_env["bind"] / "smbclient",
-                   '#!/usr/bin/env bash\ncase "$*" in *COMPLETE*) exit 1 ;; esac\nexit 0\n')
+        _make_stub(
+            backup_env["bind"] / "smbclient",
+            '#!/usr/bin/env bash\ncase "$*" in *COMPLETE*) exit 1 ;; esac\nexit 0\n',
+        )
     else:
-        _make_stub(backup_env["bind"] / "smbclient", f'#!/usr/bin/env bash\nexit {smb_rc}\n')
+        _make_stub(backup_env["bind"] / "smbclient", f"#!/usr/bin/env bash\nexit {smb_rc}\n")
     env = dict(os.environ)
     env.update(
-        HOME=str(backup_env["home"]), GENESIS_DIR=str(backup_env["gd"]),
-        GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
-        TELEGRAM_BOT_TOKEN="bot-x", TELEGRAM_FORUM_CHAT_ID="chat-y",
-        PATH=f'{backup_env["bind"]}:{os.environ["PATH"]}',
+        HOME=str(backup_env["home"]),
+        GENESIS_DIR=str(backup_env["gd"]),
+        GENESIS_BACKUP_PASSPHRASE="testpass",
+        QDRANT_URL="http://127.0.0.1:1",
+        TELEGRAM_BOT_TOKEN="bot-x",
+        TELEGRAM_FORUM_CHAT_ID="chat-y",
+        PATH=f"{backup_env['bind']}:{os.environ['PATH']}",
     )
     if nas:
-        env.update(GENESIS_BACKUP_NAS="//nas/share",
-                   GENESIS_BACKUP_NAS_USER="u", GENESIS_BACKUP_NAS_PASS="p")
+        env.update(
+            GENESIS_BACKUP_NAS="//nas/share",
+            GENESIS_BACKUP_NAS_USER="u",
+            GENESIS_BACKUP_NAS_PASS="p",
+        )
     else:
         for k in ("GENESIS_BACKUP_NAS", "GENESIS_BACKUP_NAS_USER", "GENESIS_BACKUP_NAS_PASS"):
             env.pop(k, None)
-    proc = subprocess.run(["bash", str(_BACKUP)], env=env,
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    proc = subprocess.run(
+        ["bash", str(_BACKUP)], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
     status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
     tg = backup_env["tg"].read_text() if backup_env["tg"].exists() else ""
     return proc, status, tg
@@ -117,7 +137,9 @@ def test_offsite_failure_alerts_but_local_succeeds(backup_env):
     """NAS configured but the upload fails → offsite_confirmed:false, the LOCAL
     backup still succeeds, and a distinct off-site alert fires."""
     proc, status, tg = _run(backup_env, smb_rc=1, nas=True)  # NAS upload fails
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"  # off-site miss is not a hard failure
+    assert proc.returncode == 0, (
+        f"{proc.stdout}\n{proc.stderr}"
+    )  # off-site miss is not a hard failure
     assert status["success"] is True, status
     assert status["offsite_confirmed"] is False, status
     assert status["tier2_status"] != "ok", status
@@ -136,7 +158,7 @@ def test_backup_failure_still_alerts(backup_env):
 def test_offsite_alert_deduplicated(backup_env):
     """A persistent off-site outage alerts ONCE (on the transition), not every
     6h run — the second consecutive failure is deduped via the prior status."""
-    _run(backup_env, smb_rc=1, nas=True)              # 1st failure → alert
+    _run(backup_env, smb_rc=1, nas=True)  # 1st failure → alert
     _, status2, tg = _run(backup_env, smb_rc=1, nas=True)  # 2nd failure → deduped
     assert status2["offsite_confirmed"] is False, status2
     n = tg.lower().count("off-site replication failed")
@@ -184,7 +206,7 @@ def test_complete_marker_failure_is_offsite_failure(backup_env):
     """If payloads upload but the COMPLETE marker fails, restore would skip the
     snapshot — so it must report partial + offsite_confirmed:false + alert, not ok."""
     proc, status, tg = _run(backup_env, fail_complete=True, nas=True)
-    assert status["success"] is True, status          # local backup is still fine
+    assert status["success"] is True, status  # local backup is still fine
     assert status["tier2_status"] == "partial", status
     assert status["offsite_confirmed"] is False, status
     assert "replication" in tg.lower() or "off-site" in tg.lower(), tg
