@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034  # ESCROW_* are caller-visible outputs (backup/restore), not locals
 # (sourced fragment, not an executable script — no shebang)
 #
 # Host-side backup-passphrase escrow lookup — shared by scripts/restore.sh
@@ -20,6 +21,8 @@
 # quote-stripped — the passphrase may legitimately contain quotes.
 
 passphrase_escrow_lookup() {
+    # ESCROW_PASSPHRASE / ESCROW_SOURCE are the caller-visible outputs
+    # (consumed by backup.sh / restore.sh), not locals.
     ESCROW_PASSPHRASE=""
     ESCROW_SOURCE=""
     local _escrow _val

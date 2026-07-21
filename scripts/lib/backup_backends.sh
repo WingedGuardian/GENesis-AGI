@@ -68,9 +68,13 @@ _BACKEND_LOCAL_ROOT=""  # local: root directory
 _BACKEND_CTL_TIMEOUT="${GENESIS_BACKUP_CTL_TIMEOUT:-60}"
 _BACKEND_XFER_TIMEOUT="${GENESIS_BACKUP_XFER_TIMEOUT:-1800}"
 _BACKEND_DEL_TIMEOUT="${GENESIS_BACKUP_DEL_TIMEOUT:-600}"
-_t_ctl()  { timeout "$_BACKEND_CTL_TIMEOUT"  "$@"; }
-_t_xfer() { timeout "$_BACKEND_XFER_TIMEOUT" "$@"; }
-_t_del()  { timeout "$_BACKEND_DEL_TIMEOUT"  "$@"; }
+# `-k 10`: if the op ignores/blocks SIGTERM at the deadline, SIGKILL it 10s
+# later. (A truly uninterruptible D-state mount wait survives even SIGKILL
+# until the kernel IO returns — no userland timeout can escape that; the -k
+# just bounds the SIGTERM-ignoring case.)
+_t_ctl()  { timeout -k 10 "$_BACKEND_CTL_TIMEOUT"  "$@"; }
+_t_xfer() { timeout -k 10 "$_BACKEND_XFER_TIMEOUT" "$@"; }
+_t_del()  { timeout -k 10 "$_BACKEND_DEL_TIMEOUT"  "$@"; }
 
 _backend_resolve() {
     local b="${GENESIS_BACKUP_TIER2_BACKEND:-}"

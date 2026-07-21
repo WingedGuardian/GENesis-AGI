@@ -142,16 +142,15 @@ die()  { log "FATAL: $*"; _FAILURES+=("$*"); exit 1; }
 # run — dying with the holder named is the right behavior for an operator
 # script (wait for the backup, re-run); override for unattended DR flows.
 # Append-mode open: a losing contender must never truncate the holder line.
-_LOCK_DIR="$HOME/.genesis/locks"
-_LOCK_FILE="$_LOCK_DIR/backup-restore.lock"
+# shellcheck source=scripts/lib/dr_lock.sh
+source "$_SCRIPT_DIR/lib/dr_lock.sh"
 _LOCK_WAIT="${GENESIS_RESTORE_LOCK_WAIT:-300}"
-mkdir -p "$_LOCK_DIR"
-exec 200>>"$_LOCK_FILE"
-if ! flock -w "$_LOCK_WAIT" 200; then
-    _holder="$(cat "$_LOCK_FILE" 2>/dev/null || true)"
+dr_lock_open
+if ! flock -w "$_LOCK_WAIT" "$DR_LOCK_FD"; then
+    _holder="$(cat "$DR_LOCK_FILE" 2>/dev/null || true)"
     die "backup-restore lock still held by ${_holder:-unknown} after ${_LOCK_WAIT}s — a backup is likely running; wait for it to finish and re-run (or set GENESIS_RESTORE_LOCK_WAIT higher)"
 fi
-printf '%s restore %s\n' "$$" "$(date -Iseconds)" > "$_LOCK_FILE"
+dr_lock_stamp restore
 
 # Large intermediate files (the ~269MB decrypted SQLite .dump, decrypted Qdrant snapshots)
 # must NOT land in the inherited TMPDIR (cc-tmp = the watchgod "oxygen" folder for a CC run;
@@ -820,6 +819,15 @@ else
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────
+# A COMPLETE off-site snapshot can legitimately lack a Qdrant collection (the
+# backup gates each collection on its being reachable+fresh that run — Qdrant is
+# rebuildable from SQLite, so fresh-SQL-without-vectors beats no-snapshot). Warn
+# loudly when we restored the DB but no vectors, so the operator rebuilds them
+# instead of running on a silently-empty vector store.
+if ! $DRY_RUN && $_SQLITE_RESTORED && [ "$_QDRANT_RESTORED" -eq 0 ]; then
+    log "NOTE: SQLite restored but 0 Qdrant collections were in this snapshot."
+    log "      Rebuild the vector store from the DB: python -m genesis reindex (or scripts/reindex_fts_to_qdrant.py)."
+fi
 if $_SERVER_WAS_STOPPED; then
     log "NOTE: genesis-server was stopped for the restore and left stopped."
     log "      Verify the restored DB, then: systemctl --user start genesis-server"

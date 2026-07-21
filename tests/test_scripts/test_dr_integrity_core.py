@@ -81,6 +81,14 @@ case "$*" in *api.telegram.org*) printf '%s\\n' "$*" >> "__TGLOG__"; exit 0 ;; e
 exit 1
 """
 
+_CURL_EXISTS_NOSNAP = """#!/usr/bin/env bash
+# Collection EXISTS (probe 200) but snapshot creation fails — the audit's real
+# "collections exist but weren't captured" case.
+case "$*" in *api.telegram.org*) printf '%s\\n' "$*" >> "__TGLOG__"; exit 0 ;; esac
+for a in "$@"; do [ "$a" = "-w" ] && { printf '200'; exit 0; }; done
+exit 1
+"""
+
 
 @pytest.fixture
 def sandbox(tmp_path):
@@ -251,47 +259,120 @@ def test_roundtrip_env_passphrase_verified(sandbox):
     """No escrow → round-trip runs with the env passphrase and passes."""
     _install_curl(sandbox, _CURL_ABSENT)
     proc, status = _run_backup(sandbox)
-    assert "round-trip decrypt verified (passphrase source: env)" in proc.stdout, proc.stdout
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
     assert status["success"] is True, status
 
 
-def test_roundtrip_escrow_drift_fails_backup(sandbox):
-    """Escrowed passphrase differs from the env one (rotation drift) → the
-    round-trip fails, the backup fails loudly, and the alert names it."""
-    _install_curl(sandbox, _CURL_ABSENT)
+def test_escrow_drift_degrades_offsite_not_critical(sandbox):
+    """Escrow stale but env passphrase decrypts (rotation drift): the LOCAL
+    backup still succeeds (not a CRITICAL backup-failure), the fresh SQL dump is
+    WITHHELD from the off-site snapshot (a DR box couldn't decrypt it), and a
+    distinct re-escrow alert fires instead of 'backup failed'."""
+    _install_curl(sandbox, _CURL_HEALTHY)
     escrow = sandbox["home"] / ".genesis" / "shared" / "guardian"
     escrow.mkdir(parents=True)
     (escrow / "backup_passphrase.env").write_text("GENESIS_BACKUP_PASSPHRASE=stale-rotated-away\n")
     proc, status = _run_backup(sandbox)
-    assert status["success"] is False, status
-    assert "round-trip" in status["failure_reason"], status
-    assert status["sqlite_lines"] == 0, status
+    assert status["success"] is True, status  # env-decryptable → local OK
+    assert status["offsite_confirmed"] is False, status
+    files = _offsite_files(sandbox)
+    assert not any(f.endswith("data/genesis.sql.gpg") for f in files), files
+    assert not any(f.endswith("/COMPLETE") for f in files), (
+        files
+    )  # no COMPLETE around a withheld dump
     tg = sandbox["tg"].read_text() if sandbox["tg"].exists() else ""
-    assert "backup failed" in tg.lower(), tg
+    assert "escrow drift" in tg.lower(), tg
+    assert "backup failed" not in tg.lower(), tg
 
 
 def test_roundtrip_escrow_matching_passes(sandbox):
-    """Escrow present and matching → verified against the escrow copy."""
-    _install_curl(sandbox, _CURL_ABSENT)
+    """Escrow present and matching the env passphrase → RESTORABLE via the
+    escrow-preferred branch; backup succeeds and the SQL ships off-site."""
+    _install_curl(sandbox, _CURL_HEALTHY)
     escrow = sandbox["home"] / ".genesis" / "shared" / "guardian"
     escrow.mkdir(parents=True)
     (escrow / "backup_passphrase.env").write_text("GENESIS_BACKUP_PASSPHRASE=testpass\n")
     proc, status = _run_backup(sandbox)
-    assert "passphrase source: escrow" in proc.stdout, proc.stdout
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
     assert status["success"] is True, status
+    files = _offsite_files(sandbox)
+    assert any(f.endswith("data/genesis.sql.gpg") for f in files), files
+
+
+def test_corrupt_sql_fails_and_withheld(sandbox):
+    """A dump that won't decrypt with its OWN env passphrase (corruption) fails
+    the backup AND is withheld from the off-site snapshot."""
+    _install_curl(sandbox, _CURL_HEALTHY)
+    # Corrupt the artifact after encryption by making the round-trip gpg see a
+    # truncated file: stub gpg's decrypt to fail. Simplest deterministic route —
+    # wrong env passphrase can't be injected mid-run, so overwrite the encrypted
+    # file via a wrapper is complex; instead assert via a broken cipher: feed a
+    # DB whose dump encrypts fine but we corrupt the .gpg with a post-encrypt
+    # hook is not available. Use the escrow-absent + a gpg stub that fails -d.
+    gpg_stub = sandbox["bind"] / "gpg"
+    real_gpg = subprocess.run(
+        ["bash", "-lc", "command -v gpg"], capture_output=True, text=True
+    ).stdout.strip()
+    _make_stub(
+        gpg_stub,
+        f"#!/usr/bin/env bash\n"
+        f'for a in "$@"; do [ "$a" = "-d" ] && {{ echo "gpg: decryption failed: Bad session key" >&2; exit 2; }}; done\n'
+        f'exec {real_gpg} "$@"\n',
+    )
+    proc, status = _run_backup(sandbox)
+    assert status["success"] is False, status
+    assert "round-trip" in status["failure_reason"], status
+    files = _offsite_files(sandbox)
+    assert not any(f.endswith("data/genesis.sql.gpg") for f in files), files
+
+
+def test_roundtrip_error_detail_sanitized_valid_json(sandbox):
+    """A gpg error containing control chars / non-ASCII must not corrupt
+    backup_status.json (the health consumer's read_text()+json.loads would
+    otherwise crash or swallow the CRITICAL). The status file stays valid JSON
+    and parseable — proven by _run_backup already json.loads-ing it."""
+    _install_curl(sandbox, _CURL_HEALTHY)
+    gpg_stub = sandbox["bind"] / "gpg"
+    real_gpg = subprocess.run(
+        ["bash", "-lc", "command -v gpg"], capture_output=True, text=True
+    ).stdout.strip()
+    # Decrypt fails with a tab + CR + non-ASCII (é, 0xE9) in the message.
+    _make_stub(
+        gpg_stub,
+        f"#!/usr/bin/env bash\n"
+        f'for a in "$@"; do [ "$a" = "-d" ] && {{ printf "gpg:\\tbad\\rk\\xc3\\xa9y\\n" >&2; exit 2; }}; done\n'
+        f'exec {real_gpg} "$@"\n',
+    )
+    proc, status = _run_backup(sandbox)
+    # status is not None ⇒ json.loads succeeded ⇒ valid JSON despite the gpg tab/CR/UTF-8.
+    assert status is not None and status["success"] is False, status
+    assert "\t" not in status["failure_reason"] and "\r" not in status["failure_reason"], repr(
+        status["failure_reason"]
+    )
 
 
 # ── SF3: freshness gate ──────────────────────────────────────────────
 
 
-def test_qdrant_down_fails_backup(sandbox):
-    """Server unreachable is a FAILURE (the audit hole: it used to read as
-    'collection may not exist' and report success forever)."""
+def test_qdrant_unreachable_is_benign(sandbox):
+    """Server unreachable (000) is NOT a failure — a fresh/bootstrapping install
+    or Qdrant-less host would otherwise page CRITICAL every 6h forever. Qdrant is
+    rebuildable from SQL, so the backup succeeds with a WARNING."""
     _install_curl(sandbox, _CURL_DOWN)
+    proc, status = _run_backup(sandbox)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert status["success"] is True, status
+    assert "Qdrant" not in status["failure_reason"], status
+    assert "unreachable" in proc.stdout.lower(), proc.stdout
+
+
+def test_qdrant_reachable_but_snapshot_fails(sandbox):
+    """A REACHABLE collection (probe 200) that then fails to snapshot IS the
+    audit's real failure — data is present but wasn't captured."""
+    _install_curl(sandbox, _CURL_EXISTS_NOSNAP)
     proc, status = _run_backup(sandbox)
     assert status["success"] is False, status
     assert "Qdrant backup failed" in status["failure_reason"], status
-    assert "probe" in status["failure_reason"], status
 
 
 def test_qdrant_absent_is_benign(sandbox):

@@ -156,6 +156,24 @@ use crontab.
 > crontab -l | grep -v 'scripts/backup.sh' | crontab -
 > ```
 
+### Backup ↔ restore mutual exclusion
+
+`backup.sh` and `restore.sh` coordinate through a single lock
+(`~/.genesis/locks/backup-restore.lock`) so the 6-hourly timer can never
+snapshot a database that a restore is mid-way through rebuilding:
+
+- A **backup** that finds the lock held (a restore is running) **skips** that
+  run — it logs `SKIPPED: backup-restore lock held …` to the journal and exits
+  cleanly. The next scheduled run backs up normally. (The dashboard's Backup
+  status keeps showing the prior run until then.)
+- A **restore** that finds the lock held (a backup is running) **waits** up to
+  `GENESIS_RESTORE_LOCK_WAIT` seconds (default **300**), then aborts naming the
+  holder. A first full off-site backup can take longer than 300s, so for an
+  unattended disaster-recovery restore during a backup window, raise it:
+  ```bash
+  GENESIS_RESTORE_LOCK_WAIT=1800 scripts/restore.sh …
+  ```
+
 ## Verify Installation
 
 ```bash

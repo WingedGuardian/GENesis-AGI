@@ -59,16 +59,15 @@ fi
 # update.sh invokes this script AS its pre-update backup while the dashboard
 # orchestrator holds that marker; honoring it would silently skip every
 # pre-deploy backup while update.sh prints "Backup complete".
-_LOCK_DIR="$HOME/.genesis/locks"
-_LOCK_FILE="$_LOCK_DIR/backup-restore.lock"
-mkdir -p "$_LOCK_DIR"
-exec 200>>"$_LOCK_FILE"
-if ! flock -n 200; then
-    _holder="$(cat "$_LOCK_FILE" 2>/dev/null || true)"
+# shellcheck source=scripts/lib/dr_lock.sh
+source "$_SCRIPT_DIR/lib/dr_lock.sh"
+dr_lock_open
+if ! flock -n "$DR_LOCK_FD"; then
+    _holder="$(cat "$DR_LOCK_FILE" 2>/dev/null || true)"
     echo "[genesis-backup] $(date -Iseconds) SKIPPED: backup-restore lock held by ${_holder:-unknown} — backup not run"
     exit 0
 fi
-printf '%s backup %s\n' "$$" "$(date -Iseconds)" > "$_LOCK_FILE"
+dr_lock_stamp backup
 
 # ── Status tracking ──────────────────────────────────────────────────
 _STATUS_FILE="$HOME/.genesis/backup_status.json"
@@ -84,9 +83,11 @@ _FAILURE_REASON=""
 # off-site dated snapshot — a leftover .gpg from a prior run must never be
 # re-badged under a fresh COMPLETE stamp (it silently misrepresents recency,
 # and GFS retention then ages out the snapshots holding genuinely-fresh data).
-_SQL_FRESH=false
+_SQL_FRESH=false        # SQL dump regenerated (encrypted) this run
+_SQL_RESTORABLE=false   # AND round-trip-verified → eligible for off-site COMPLETE
+_SQL_ESCROW_DRIFT=false # env-decryptable but escrow stale → off-site DR degraded
 _QDRANT_FRESH=""    # space-separated collections snapshotted+encrypted this run
-_QDRANT_FAILED=""   # collections that EXIST but failed to snapshot this run
+_QDRANT_FAILED=""   # collections that EXIST (HTTP 200) but failed to snapshot this run
 # Tier-1 replication: true once the local repo is in sync with the GitHub remote.
 _TIER1_PUSHED=false
 # Off-site snapshot bookkeeping. _T2_SNAPSHOT_COUNT / _T2_PRUNED stay UNSET until
@@ -193,6 +194,78 @@ encrypt_file() {
         --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
 }
 
+# Git network ops run while the backup↔restore lock is held for the whole run,
+# so an unbounded stall (half-open TCP to the remote — kernel retransmit can
+# hang 10-15min) would block a concurrent DR restore past its wait. Bound them
+# (named failure: stalled push/pull/clone holding the DR lock). GENESIS-
+# overridable for slow links; -k SIGKILLs a SIGTERM-ignoring git.
+_GIT_NET_TIMEOUT="${GENESIS_BACKUP_GIT_TIMEOUT:-300}"
+_git_net() { timeout -k 10 "$_GIT_NET_TIMEOUT" git "$@"; }
+
+# _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — decrypt-verify that
+# <artifact.gpg> decrypts with <passphrase> AND ends with the sqlite `.dump`
+# success marker `COMMIT;` (a mid-dump failure ends `ROLLBACK; -- due to
+# errors`). Returns 0 on verified, 1 otherwise. Streams (no plaintext temp).
+# Captures the decrypt tail into a var FIRST so `grep -q` matching early can't
+# SIGPIPE `tail` and flip the pipeline non-zero under pipefail on a good dump.
+_roundtrip_ok() {
+    local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _tailf _rc _grc
+    _tailf=$(mktemp -p "$GENESIS_BIG_TMP")
+    # Real pipeline (NOT inside $()) so PIPESTATUS reflects gpg's own exit; tail
+    # buffers to a file (not piped into grep) so nothing can SIGPIPE gpg/tail and
+    # flip the result under pipefail. tail -5 reads to EOF, so gpg always runs
+    # fully and its exit at PIPESTATUS[1] (printf=0, gpg=1, tail=2) is authoritative.
+    printf '%s' "$_pass" | gpg --batch --passphrase-fd 0 -d "$_art" 2>"$_errf" | tail -5 > "$_tailf"
+    _rc=${PIPESTATUS[1]}
+    if [ "$_rc" -ne 0 ]; then rm -f "$_tailf"; return 1; fi
+    grep -q '^COMMIT;' "$_tailf"; _grc=$?
+    rm -f "$_tailf"
+    return "$_grc"
+}
+
+# _verify_sql_roundtrip <artifact.gpg> — classify the freshly-encrypted SQL
+# archive's restorability and echo one verdict word:
+#   RESTORABLE — decrypts with the passphrase a DR box would use (escrow if
+#                present, else env). Ships off-site, normal success.
+#   DRIFT      — decrypts with the ENV passphrase but NOT the escrowed one
+#                (secrets.env rotated, escrow stale). The LOCAL backup is fine
+#                (env-decryptable, and secrets.env is itself backed up), so this
+#                is NOT a backup failure — but a real DR box (env gone) decrypts
+#                with escrow and would fail, so the artifact is withheld from the
+#                off-site COMPLETE snapshot and the caller surfaces "re-escrow".
+#   CORRUPT    — does not decrypt with the ENV passphrase it was encrypted with
+#                → the archive is damaged (bad GPG MDC / truncation). Hard fail.
+# Happy path is ONE decrypt (escrow present & matches, or env-only & good); the
+# second decrypt runs only to classify a first-decrypt failure.
+_verify_sql_roundtrip() {
+    local _art="$1" _errf
+    _errf=$(mktemp -p "$GENESIS_BIG_TMP")
+    passphrase_escrow_lookup
+    local _primary="$_BACKUP_PASSPHRASE" _have_escrow=false
+    if [ -n "$ESCROW_PASSPHRASE" ]; then _primary="$ESCROW_PASSPHRASE"; _have_escrow=true; fi
+    if _roundtrip_ok "$_primary" "$_art" "$_errf"; then
+        rm -f "$_errf"
+        echo RESTORABLE
+        return 0
+    fi
+    # Primary failed. If the primary WAS escrow, an env-passphrase success means
+    # drift (artifact good, escrow stale); env failure means genuine corruption.
+    if $_have_escrow && _roundtrip_ok "$_BACKUP_PASSPHRASE" "$_art" /dev/null; then
+        rm -f "$_errf"
+        echo DRIFT
+        return 0
+    fi
+    # Surface the gpg error, sanitized to printable ASCII: _write_status only
+    # escapes quotes/backslashes, so a raw tab/CR/UTF-8 gpg message would make
+    # backup_status.json invalid — and the health consumer's read_text()+
+    # json.loads would then throw UnicodeDecodeError (uncaught → crashes health)
+    # or JSONDecodeError (swallowed → suppresses the very CRITICAL this raises).
+    ROUNDTRIP_DETAIL=$(LC_ALL=C tr -cd '[:print:]' < "$_errf" | cut -c1-200)
+    rm -f "$_errf"
+    echo CORRUPT
+    return 0
+}
+
 # --- Clone or pull backup repo ---
 if [ ! -d "$BACKUP_DIR/.git" ]; then
     # Determine backup repo URL: env var → auto-detect from existing clone → fail
@@ -204,7 +277,7 @@ if [ ! -d "$BACKUP_DIR/.git" ]; then
     fi
     log "Cloning backup repo..."
     mkdir -p "$(dirname "$BACKUP_DIR")"
-    git clone "$BACKUP_REPO" "$BACKUP_DIR"
+    _git_net clone "$BACKUP_REPO" "$BACKUP_DIR"
 fi
 
 cd "$BACKUP_DIR"
@@ -216,7 +289,7 @@ git config user.email "backup@genesis.local" 2>/dev/null || true
 # held backup-restore lock fd and would hold the DR lock past script exit.
 git config gc.autoDetach false 2>/dev/null || true
 
-git pull --rebase --quiet 2>/dev/null || log "WARNING: git pull failed, continuing with local state"
+_git_net pull --rebase --quiet 2>/dev/null || log "WARNING: git pull failed, continuing with local state"
 
 # --- 1. SQLite dump (encrypted — may hold memory-stored credentials/PII) ---
 log "Backing up SQLite database..."
@@ -235,36 +308,36 @@ if [ -f "$DB_FILE" ]; then
             if encrypt_file "$_SQL_TMP" data/genesis.sql.gpg; then
                 _SQL_FRESH=true
                 log "SQLite: $_SQLITE_LINES lines (encrypted)"
-                # SF4 round-trip: prove the artifact DECRYPTS with the
-                # passphrase a DR box would actually use. Prefer the escrowed
-                # copy — env-encrypt + escrow-decrypt is the drift detector
-                # (passphrase rotated in secrets.env with a stale escrow is
-                # undecryptable exactly when secrets.env is lost). No escrow →
-                # verify with the env passphrase (catches archive corruption).
-                # `tail -5 | grep COMMIT;` also catches a bad dump: sqlite3
-                # .dump ends `COMMIT;` on success, `ROLLBACK; -- due to errors`
-                # on a mid-dump failure. Under pipefail any stage failing
-                # (incl. gpg MDC integrity errors) fails the check. gpg stderr
-                # is kept (not discarded) so the alert names the real error.
-                passphrase_escrow_lookup
-                _rt_pass="$_BACKUP_PASSPHRASE"
-                _rt_src="env"
-                if [ -n "$ESCROW_PASSPHRASE" ]; then
-                    _rt_pass="$ESCROW_PASSPHRASE"
-                    _rt_src="escrow ($ESCROW_SOURCE)"
-                fi
-                _rt_err=$(mktemp)
-                if printf '%s' "$_rt_pass" \
-                    | gpg --batch --passphrase-fd 0 -d data/genesis.sql.gpg 2>"$_rt_err" \
-                    | tail -5 | grep -q '^COMMIT;'; then
-                    log "SQLite: round-trip decrypt verified (passphrase source: $_rt_src)"
-                else
-                    _rt_detail=$(head -c 300 "$_rt_err" | tr '\n' ' ')
-                    _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }SQL round-trip decrypt failed with $_rt_src passphrase (${_rt_detail:-no gpg output}) — backup may be UNRESTORABLE (passphrase drift or corrupt archive)"
-                    log "WARNING: $_FAILURE_REASON"
-                    _SQLITE_LINES=0
-                fi
-                rm -f "$_rt_err"
+                # SF4 round-trip: classify the fresh artifact's restorability
+                # (see _verify_sql_roundtrip). ROUNDTRIP_DETAIL is set (sanitized)
+                # only on CORRUPT. _SQL_RESTORABLE gates the OFF-SITE upload so a
+                # DR box never auto-selects a COMPLETE snapshot it can't decrypt.
+                ROUNDTRIP_DETAIL=""
+                case "$(_verify_sql_roundtrip data/genesis.sql.gpg)" in
+                    RESTORABLE)
+                        _SQL_RESTORABLE=true
+                        log "SQLite: round-trip decrypt verified"
+                        ;;
+                    DRIFT)
+                        # Local backup is fine (env-decryptable + secrets.env is
+                        # itself backed up), so NOT a backup failure — but a real
+                        # DR box decrypts with the stale escrow and would fail, so
+                        # withhold this dump from the off-site COMPLETE snapshot
+                        # (the last-good off-site copy, encrypted under the
+                        # pre-rotation passphrase == the escrow, stays restorable)
+                        # and surface a distinct re-escrow alert via the off-site
+                        # path (never CRITICAL "backup failed").
+                        _SQL_RESTORABLE=false
+                        _SQL_ESCROW_DRIFT=true
+                        log "WARNING: SQL round-trip failed with the ESCROWED passphrase but SUCCEEDED with the env one — escrow is stale (secrets.env rotated?). Local backup OK; off-site DR degraded until re-escrow."
+                        ;;
+                    *)  # CORRUPT
+                        _SQL_RESTORABLE=false
+                        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }SQL archive failed round-trip decrypt with its own env passphrase (${ROUNDTRIP_DETAIL:-no gpg output}) — corrupt/unrestorable, withheld from off-site"
+                        log "WARNING: $_FAILURE_REASON"
+                        _SQLITE_LINES=0
+                        ;;
+                esac
             else
                 log "WARNING: SQLite encryption failed"
                 _SQLITE_LINES=0
@@ -298,8 +371,15 @@ for collection in episodic_memory knowledge_base; do
         log "Qdrant: collection $collection does not exist — skipping"
         continue
     elif [ "$_probe_code" != "200" ]; then
-        log "WARNING: Qdrant unreachable probing $collection (HTTP $_probe_code)"
-        _QDRANT_FAILED="$_QDRANT_FAILED $collection(probe:$_probe_code)"
+        # Server unreachable/erroring (000/timeout/5xx) — we CANNOT confirm the
+        # collection exists, so this is NOT the audit's "collections exist but
+        # weren't captured" failure. Qdrant is rebuildable from the (round-trip-
+        # verified) SQLite dump, and restore.sh likewise treats an unreachable
+        # Qdrant as a skip — so degrade gracefully (WARNING, backup still
+        # succeeds) instead of paging CRITICAL every 6h forever on a host where
+        # Qdrant is optional, still booting, or briefly down. Only a REACHABLE
+        # collection (HTTP 200) that then fails to snapshot is a hard failure.
+        log "WARNING: Qdrant unreachable probing $collection (HTTP $_probe_code) — skipping (rebuildable from SQL)"
         continue
     fi
     # Create snapshot via Qdrant API. --max-time 600: snapshot creation is a
@@ -341,7 +421,10 @@ for collection in episodic_memory knowledge_base; do
         rm -f "data/qdrant/${collection}.snapshot"
     fi
 
-    # Clean up snapshot from Qdrant server
+    # Clean up snapshot from Qdrant server. --max-time 60: a local best-effort
+    # DELETE (failure mode: a wedged Qdrant leaves the server-side snapshot to
+    # its own retention — non-fatal, `|| true`); bounded only so a hung server
+    # can't stall the backup here.
     curl -sf --max-time 60 -X DELETE "$QDRANT_URL/collections/$collection/snapshots/$snapshot_name" >/dev/null 2>&1 || true
 done
 # A collection that EXISTS but produced no fresh payload is a backup failure
@@ -599,20 +682,28 @@ else
         fi
     done
 
-    # Upload SQL dump — same freshness gate (SF3, SQL variant). A regenerated
-    # dump whose round-trip FAILED still uploads (_SQL_FRESH is set at encrypt
-    # time): it is the best artifact available — in the escrow-drift case it
-    # decrypts with the env passphrase — and the backup already fails loudly.
-    # Only a NOT-regenerated leftover is excluded.
-    if [ -f data/genesis.sql.gpg ] && $_SQL_FRESH; then
+    # Upload SQL dump — freshness AND restorability gated (SF3 + SF4). The
+    # off-site snapshot is what a fresh DR box auto-selects, so it must only
+    # ever carry a dump that box can actually decrypt: _SQL_RESTORABLE is true
+    # only when the round-trip verified with the DR passphrase (escrow if
+    # present). A stale (not-regenerated) OR round-trip-failed (corrupt, or
+    # escrow-drift → DR box can't decrypt) dump is withheld, forcing NO COMPLETE
+    # this run so restore keeps falling back to the last verified-good snapshot.
+    if [ -f data/genesis.sql.gpg ] && $_SQL_FRESH && $_SQL_RESTORABLE; then
         if backend_put "data/genesis.sql.gpg" "${_T2_DIR}/data/genesis.sql.gpg"; then
             log "  off-site: uploaded genesis.sql.gpg"
         else
             log "WARNING: off-site upload failed for genesis.sql.gpg"
             _T2_OK=false
         fi
+    elif [ -f data/genesis.sql.gpg ] && $_SQL_FRESH; then
+        # Regenerated but not restorable with the DR passphrase — do NOT stamp a
+        # COMPLETE snapshot around an undecryptable/corrupt dump.
+        log "WARNING: genesis.sql.gpg failed round-trip verify — withheld from off-site (no COMPLETE this run; last-good retained)"
+        _T2_OK=false
     elif [ -f data/genesis.sql.gpg ]; then
         log "WARNING: genesis.sql.gpg is stale (not regenerated this run) — excluded from off-site snapshot"
+        _T2_OK=false
     fi
 
     # Upload transcripts (part of the off-site snapshot)
@@ -851,12 +942,25 @@ if [ "${_T2_BACKEND:-none}" != "none" ] && [ "$_T2_STATUS" != "ok" ]; then
     # once off-site recovers (offsite_confirmed flips true) and then fails again.
     _prev_offsite=$(python3 -c "import json; print(json.load(open('$_STATUS_FILE')).get('offsite_confirmed', True))" 2>/dev/null || echo "True")
     if [ "$_prev_offsite" != "False" ]; then
-        _send_telegram "⚠️ *Off-site replication failed*
+        # Escrow drift withheld the SQL dump from the off-site snapshot (the
+        # target is fine — the escrowed passphrase is stale), so name the real
+        # cause + fix instead of pointing at the off-site target.
+        if [ "$_SQL_ESCROW_DRIFT" = true ]; then
+            _send_telegram "⚠️ *Off-site DR degraded — backup passphrase escrow drift*
+
+The local backup is OK (decrypts with the env passphrase), but the ESCROWED
+passphrase a disaster-recovery box would use no longer matches — so the fresh
+SQL dump was withheld from the off-site snapshot (last-good retained).
+Re-escrow the current GENESIS_BACKUP_PASSPHRASE to restore off-site DR.
+Time: $(date -Is)"
+        else
+            _send_telegram "⚠️ *Off-site replication failed*
 
 The local backup is OK, but it was NOT replicated off-site.
 Tier-2 status: ${_T2_STATUS}
 Time: $(date -Is)
 Off-site copies are missing — check the off-site target."
+        fi
     fi
 fi
 log "Backup complete (success=$_SUCCESS)"
