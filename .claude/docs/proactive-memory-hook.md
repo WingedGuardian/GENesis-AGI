@@ -31,8 +31,9 @@ The endpoint path also re-applies the two content-quality guards the old fork
 had (they were hook-only, never in the shared `memory_proactive` MCP tool):
 malformed rows (`provenance.is_garbage` — raw JSON observation blobs, YAML
 frontmatter, NULL) and non-intentional `knowledge_base` hits (only
-`extraction_job`/`knowledge_ingest`/`knowledge_ingest_source`/`reference_store`
-survive; the collection is otherwise majority surplus/recon crawl). These run
+`extraction_job`/`knowledge_ingest`/`knowledge_ingest_source`/`reference_store`/
+`curated` — the dashboard file/URL upload pipeline — survive; the collection is
+otherwise majority surplus/recon crawl). These run
 inside `_proactive_impl` (gated by a `filter_noise` flag the endpoint sets and
 the MCP tool leaves off) — in the backfill loop and before external-content
 wrapping, so a dropped noisy hit is replaced by the next safe candidate and the
