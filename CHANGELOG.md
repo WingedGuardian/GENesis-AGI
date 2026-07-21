@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis's tunable cognition knobs now live in one auditable file.** Three
+  cognitive parameters — awareness signal weights, depth thresholds, and the
+  memory-activation blend — form a closed "learned knob" registry
+  (`config/learned_knobs.yaml` documents it; learned values live in
+  `~/.genesis/config/learned_knobs.local.yaml`). Every change goes through the
+  cognitive ledger (pre-image capture, drift-guarded rollback, visible in the
+  dashboard) with hard bounds: ≤5% per step, ≤±20% total from baseline.
+  Nothing adjusts autonomously yet — this is the substrate; the evidence-gated
+  proposer arrives once calibration data covers these domains.
 - **Ego proposals now carry their track record.** When Genesis's ego proposes
   an action, the proposal digest can show how proposals of that type have
   actually fared: a domain with a healthy graded history whose stated

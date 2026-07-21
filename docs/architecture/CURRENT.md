@@ -792,7 +792,20 @@ verified: fbcf8ee4 2026-07-21
   **E1 earn-back evidence stream** (`earnback` key: windowed
   `autonomy_events` counts + posterior per demoted category — surfaced
   MCP-side instead of the design's `v_earnback_evidence` view, declared
-  deviation). The fuzzy LLM-fallback lane is
+  deviation). **B5 knob SUBSTRATE (P4b)**: `ledger/learned_knobs.py` — a
+  CLOSED 3-knob registry (`awareness.signal_weights.*`,
+  `awareness.depth_thresholds.*`, `memory.activation_blend.*`) with base file
+  `config/learned_knobs.yaml` (documentation, never machine-written) +
+  install-local overlay `~/.genesis/config/learned_knobs.local.yaml` written
+  ONLY via `apply_knob_change` → `cognitive_ledger.record_file_modification`
+  (actor `ws2_effector`; pre-image/rollback/MCP tool inherited; bounds
+  validator-enforced ≤5%/step, ≤±20% cumulative). Startup applier in learning
+  init re-syncs DB-backed knobs from file (SQL clamps backstop);
+  `memory/activation.py` reads the blend through a module-level seam
+  (import-time load + `reload_blend()`, shipped-constants fallback). The
+  deterministic calibration TRIGGER (cell ok, n≥50, 2-window miss → ego
+  proposal) is DEFERRED — structurally dormant until a lane grades
+  awareness/memory behavior (tabled). The fuzzy LLM-fallback lane is
   deferred (no `acceptance_pass` writer yet). Outreach
   metrics resolve off `outreach_history.engagement_signal`
   (spike-measured 99.5% mechanical); the engagement_outcome CHECK now
