@@ -208,7 +208,8 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             pruned = await _vh.prune_old_transcripts(rt._db)
             idle_cutoff = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
             healed = await _sessions.complete_orphaned_voice_sessions(
-                rt._db, idle_before=idle_cutoff,
+                rt._db,
+                idle_before=idle_cutoff,
             )
             swept = 0
             if rt._memory_store is not None:
@@ -1185,6 +1186,19 @@ async def init(rt: GenesisRuntime) -> None:
             max_instances=1,
             misfire_grace_time=3600,
         )
+
+        # WS-2 B5 substrate: re-sync DB-backed learned knobs from the knob
+        # file at startup (file = source of truth; a fresh/restored DB
+        # re-converges here). Best-effort — never blocks learning init; no-op
+        # while the overlay has no entries (v1 propose-only, nothing writes
+        # autonomously).
+        if rt._db is not None:
+            try:
+                from genesis.ledger.learned_knobs import apply_learned_knobs_to_db
+
+                await apply_learned_knobs_to_db(rt._db)
+            except Exception:
+                logger.warning("learned-knob startup apply failed", exc_info=True)
 
         async def _reap_activity_log() -> None:
             if rt._activity_tracker is None:

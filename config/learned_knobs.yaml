@@ -1,0 +1,33 @@
+# Learned knobs — WS-2 B5 substrate (design §5.3).
+#
+# This BASE file is documentation + the closed registry; it ships empty and is
+# NEVER machine-written (learned state must not dirty the repo tree). Learned
+# entries live in the install-local overlay:
+#     ~/.genesis/config/learned_knobs.local.yaml
+# written EXCLUSIVELY through genesis.ledger.learned_knobs.apply_knob_change
+# (cognitive-ledger actor `ws2_effector` — pre-image capture, drift-guarded
+# rollback, MCP rollback tool all apply). Deep-merged base <- overlay.
+#
+# CLOSED key registry (anything else is ignored, loudly):
+#   awareness.signal_weights.<signal_name>      -> signal_weights.current_weight
+#       (baseline = the row's initial_weight; SQL-clamped to the row's min/max)
+#   awareness.depth_thresholds.<Micro|Light|Deep|Strategic>
+#                                               -> depth_thresholds.threshold
+#       (baseline = live value at first apply, pinned in the entry)
+#   memory.activation_blend.<base|access|connectivity>
+#                                               -> memory/activation.py blend
+#       (baseline = shipped constants 0.6 / 0.25 / 0.15)
+#
+# Entry schema, per knob key:
+#   knobs:
+#     awareness.depth_thresholds.Deep: {baseline: 0.45, current: 0.44}
+#
+# Bounds (validator-enforced): each change <=5% of baseline; cumulative drift
+# <=+/-20% of baseline. Out-of-bounds entries are skipped loudly at startup.
+#
+# v1 is propose-only substrate: nothing writes here autonomously — the
+# deterministic calibration trigger (cell ok, n>=50, 2-window directional
+# miss -> ego proposal) ships later, gated on a calibration lane that
+# actually grades awareness/memory behavior.
+
+knobs: {}
