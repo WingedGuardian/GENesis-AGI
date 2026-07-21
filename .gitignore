@@ -87,6 +87,10 @@ data/genesis.sql
 # repo — the bench test suite loads them. The REAL task set stays private
 # under ~/.genesis/eval/ and is refused by the loader if found in-repo.
 !tests/test_eval/bench_fixtures/*.jsonl
+# Synthetic skill-replay golden fixtures (fake voice tasks) MUST be in the repo —
+# the skill-replay test suite loads them. Real per-skill golden suites stay
+# private under ~/.genesis/eval/skill_golden/ and are refused if found in-repo.
+!tests/test_eval/skill_golden_fixtures/*.jsonl
 .config/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock

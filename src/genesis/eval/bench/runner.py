@@ -87,37 +87,53 @@ def _release_lock(fh) -> None:
         fh.close()
 
 
-async def _run_arm(
+async def run_arm(
     invoker,
     inv,
     task: BenchTask,
     arm: str,
 ) -> BenchArmOutcome:
-    """Execute one arm; infra failures become skipped outcomes."""
+    """Execute one arm; infra failures become skipped outcomes.
+
+    Public + arm-agnostic: reused by the skill-replay gate (WS1) whose arms are
+    OLD/NEW pinned-skill invocations. Takes any CCInvocation-shaped ``inv`` and
+    an arbitrary ``arm`` label; the skip semantics (CC error/timeout, empty
+    output, model downgrade) are harness-independent.
+    """
     try:
         output = await invoker.run(inv)
     except CCError as e:
         return BenchArmOutcome(
-            task_id=task.id, arm=arm, output_text="",
-            skipped=True, skip_reason=f"infra: {type(e).__name__}: {e}",
+            task_id=task.id,
+            arm=arm,
+            output_text="",
+            skipped=True,
+            skip_reason=f"infra: {type(e).__name__}: {e}",
         )
     if output.is_error:
         return BenchArmOutcome(
-            task_id=task.id, arm=arm, output_text="",
+            task_id=task.id,
+            arm=arm,
+            output_text="",
             skipped=True,
             skip_reason=f"infra: cc error: {output.error_message or 'unknown'}",
         )
     if not (output.text or "").strip():
         # Silent-cap signature: successful-looking empty completion.
         return BenchArmOutcome(
-            task_id=task.id, arm=arm, output_text="",
-            skipped=True, skip_reason="infra: empty output",
+            task_id=task.id,
+            arm=arm,
+            output_text="",
+            skipped=True,
+            skip_reason="infra: empty output",
         )
     if getattr(output, "downgraded", False):
         # Fairness violation: this arm ran a lower tier than requested (e.g.
         # a quota downgrade). The pair can't be compared — infra skip.
         return BenchArmOutcome(
-            task_id=task.id, arm=arm, output_text="",
+            task_id=task.id,
+            arm=arm,
+            output_text="",
             model_used=output.model_used,
             skipped=True,
             skip_reason=(
@@ -137,8 +153,13 @@ async def _run_arm(
     )
 
 
-async def _judge_arm(scorer, task: BenchTask, outcome: BenchArmOutcome) -> BenchArmOutcome:
-    """Judge one arm's output. Judge infra failures skip the outcome."""
+async def judge_arm(scorer, task: BenchTask, outcome: BenchArmOutcome) -> BenchArmOutcome:
+    """Judge one arm's output against the task's ex-ante criteria.
+
+    Public + harness-agnostic (reused by the skill-replay gate, WS1): grades the
+    arm's final text via ``scorer.score_async`` against the ``bench_task_success``
+    rubric; a judge call/parse failure skips the outcome (infra ≠ quality).
+    """
     if outcome.skipped:
         return outcome
     passed, score, detail = await scorer.score_async(
@@ -152,18 +173,29 @@ async def _judge_arm(scorer, task: BenchTask, outcome: BenchArmOutcome) -> Bench
         detail_obj = {}
     if detail_obj.get("error"):
         return BenchArmOutcome(
-            task_id=outcome.task_id, arm=outcome.arm,
-            output_text=outcome.output_text, model_used=outcome.model_used,
-            duration_s=outcome.duration_s, cost_usd=outcome.cost_usd,
-            input_tokens=outcome.input_tokens, output_tokens=outcome.output_tokens,
-            skipped=True, skip_reason=f"judge: {detail_obj['error']}",
+            task_id=outcome.task_id,
+            arm=outcome.arm,
+            output_text=outcome.output_text,
+            model_used=outcome.model_used,
+            duration_s=outcome.duration_s,
+            cost_usd=outcome.cost_usd,
+            input_tokens=outcome.input_tokens,
+            output_tokens=outcome.output_tokens,
+            skipped=True,
+            skip_reason=f"judge: {detail_obj['error']}",
         )
     return BenchArmOutcome(
-        task_id=outcome.task_id, arm=outcome.arm,
-        output_text=outcome.output_text, model_used=outcome.model_used,
-        duration_s=outcome.duration_s, cost_usd=outcome.cost_usd,
-        input_tokens=outcome.input_tokens, output_tokens=outcome.output_tokens,
-        judge_passed=passed, judge_score=score, judge_detail=detail,
+        task_id=outcome.task_id,
+        arm=outcome.arm,
+        output_text=outcome.output_text,
+        model_used=outcome.model_used,
+        duration_s=outcome.duration_s,
+        cost_usd=outcome.cost_usd,
+        input_tokens=outcome.input_tokens,
+        output_tokens=outcome.output_tokens,
+        judge_passed=passed,
+        judge_score=score,
+        judge_detail=detail,
     )
 
 
@@ -174,9 +206,7 @@ def _arm_summary(
     duration_s: float,
     extra_metadata: dict,
 ) -> EvalRunSummary:
-    outcomes = [
-        (p.bare if arm == ARM_BARE else p.genesis) for p in report.pairs
-    ]
+    outcomes = [(p.bare if arm == ARM_BARE else p.genesis) for p in report.pairs]
     results = [
         ScoredOutput(
             case_id=o.task_id,
@@ -257,7 +287,8 @@ async def run_bench(
         logger.info("bench: scrubbed nested-CC env vars: %s", ", ".join(sorted(removed)))
 
     tasks, task_set_version, sha256 = load_tasks(
-        tasks_path or DEFAULT_TASKS_PATH, allow_repo_path=allow_repo_tasks,
+        tasks_path or DEFAULT_TASKS_PATH,
+        allow_repo_path=allow_repo_tasks,
     )
     if task_id:
         tasks = [t for t in tasks if t.id == task_id]
@@ -325,7 +356,8 @@ async def run_bench(
             if judge_provider:
                 chain = [judge_provider, *[p for p in chain if p != judge_provider]]
             router = StandaloneLiteLLMRouter(
-                chain[0], fallback_providers=tuple(chain[1:]),
+                chain[0],
+                fallback_providers=tuple(chain[1:]),
             )
         scorer = LLMJudgeScorer(router=router)
 
@@ -333,25 +365,34 @@ async def run_bench(
         for i, task in enumerate(tasks, start=1):
             logger.info("bench: task %d/%d %s (%s)", i, len(tasks), task.id, task.category)
             bare_inv = build_bare_arm_invocation(
-                task, run_dir, model, effort, bare_cfg, run_id,
+                task,
+                run_dir,
+                model,
+                effort,
+                bare_cfg,
+                run_id,
             )
             genesis_inv = build_genesis_arm_invocation(
-                task, run_dir, model, effort, mcp_config_path, run_id,
+                task,
+                run_dir,
+                model,
+                effort,
+                mcp_config_path,
+                run_id,
             )
             bare_out, genesis_out = await asyncio.gather(
-                _run_arm(invoker, bare_inv, task, ARM_BARE),
-                _run_arm(invoker, genesis_inv, task, ARM_GENESIS),
+                run_arm(invoker, bare_inv, task, ARM_BARE),
+                run_arm(invoker, genesis_inv, task, ARM_GENESIS),
             )
             # Captured BEFORE judging — a judge failure must not mask the
             # arm-degradation positive control below.
             genesis_ran = genesis_ran or not genesis_out.skipped
-            bare_out = await _judge_arm(scorer, task, bare_out)
-            genesis_out = await _judge_arm(scorer, task, genesis_out)
+            bare_out = await judge_arm(scorer, task, bare_out)
+            genesis_out = await judge_arm(scorer, task, genesis_out)
             pair = BenchPair(task=task, bare=bare_out, genesis=genesis_out)
             if pair.skipped:
                 reasons = "; ".join(
-                    f"{o.arm}: {o.skip_reason}"
-                    for o in (bare_out, genesis_out) if o.skipped
+                    f"{o.arm}: {o.skip_reason}" for o in (bare_out, genesis_out) if o.skipped
                 )
                 logger.warning("bench: pair %s SKIPPED (%s)", task.id, reasons)
             report.pairs.append(pair)
@@ -392,7 +433,9 @@ async def run_bench(
             bare_scores = [p.bare.judge_score for p in complete]
             genesis_scores = [p.genesis.judge_score for p in complete]
             report.score_winrate = compute_score_winrate(
-                bare_scores, genesis_scores, epsilon=epsilon,
+                bare_scores,
+                genesis_scores,
+                epsilon=epsilon,
             )
             report.pass_winrate = compute_winrate(
                 [p.bare.judge_passed for p in complete],
@@ -430,7 +473,10 @@ async def run_bench(
                 treatment_id = await insert_run(
                     db,
                     _arm_summary(
-                        report, ARM_GENESIS, f"{run_id}-genesis", duration_s,
+                        report,
+                        ARM_GENESIS,
+                        f"{run_id}-genesis",
+                        duration_s,
                         {**extra, "paired_run_id": control_id},
                     ),
                 )
@@ -443,7 +489,8 @@ async def run_bench(
                 # persistence from it rather than wasting the whole run.
                 logger.exception(
                     "bench: persisting to eval_runs failed — report at %s "
-                    "is the source of truth for replay", report_path,
+                    "is the source of truth for replay",
+                    report_path,
                 )
                 report.notes.append("PERSISTENCE FAILED — see log; report on disk")
 

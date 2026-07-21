@@ -5,11 +5,17 @@ against the OLD vs NEW skill content and comparing per-task judge scores —
 control = OLD, treatment = NEW. The verdict is recommend-only (it is logged as
 an observation and NEVER blocks an edit); the promotion posture it encodes is
 the spec's "promote only on zero-regression + net-positive". See ``verdict.py``.
+
+Reuses the bench's pure task/outcome dataclasses (``BenchTask``,
+``BenchArmOutcome`` — no CC, no DB) so the golden-suite format and the arm
+skip-semantics are shared across eval harnesses.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from genesis.eval.bench.types import BenchArmOutcome, BenchTask
 
 # Verdict labels — the three outcomes of a replay comparison.
 VERDICT_NET_POSITIVE = "net_positive"  # zero regression AND at least one improvement
@@ -48,3 +54,36 @@ class SkillReplayVerdict:
     score_winrate: dict = field(default_factory=dict)  # compute_score_winrate output
     pass_winrate: dict = field(default_factory=dict)  # compute_winrate output
     note: str = ""
+
+
+@dataclass(frozen=True)
+class SkillReplayPair:
+    """Both arms' outcomes on one golden task. control = OLD, treatment = NEW."""
+
+    task: BenchTask
+    old: BenchArmOutcome
+    new: BenchArmOutcome
+
+    @property
+    def skipped(self) -> bool:
+        return self.old.skipped or self.new.skipped
+
+
+@dataclass
+class SkillReplayReport:
+    """Aggregate result of one skill-replay run (the runner's return value)."""
+
+    run_id: str
+    skill_name: str
+    model: str
+    effort: str
+    task_set_version: str
+    task_file_sha256: str
+    rubric_name: str
+    rubric_version: str
+    pairs: list[SkillReplayPair] = field(default_factory=list)
+    verdict: SkillReplayVerdict | None = None
+    prod_delta: dict = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    control_run_id: str = ""
+    treatment_run_id: str = ""
