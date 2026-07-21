@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from genesis._config_overlay import _resolve_overlay_path, merge_local_overlay
+from genesis._config_overlay import merge_local_overlay
 from genesis.env import repo_root
 
 if TYPE_CHECKING:
@@ -87,7 +87,18 @@ def _base_path() -> Path:
 
 
 def _overlay_path() -> Path:
-    return _resolve_overlay_path(_base_path())
+    """The overlay path for WRITES — the user config dir, unconditionally.
+
+    Deliberately NOT ``_resolve_overlay_path`` (which falls back to the
+    repo-relative sibling when the user file doesn't exist yet): the first
+    ever knob write must never land inside the repo tree (cfg-001 — the
+    dashboard/MCP settings writers use the same user-dir-always convention).
+    Reads via ``merge_local_overlay`` still resolve user-dir-first, so reader
+    and writer agree from the first write onward.
+    """
+    from genesis._config_overlay import _user_config_dir
+
+    return _user_config_dir() / _base_path().with_suffix(".local.yaml").name
 
 
 def parse_knob_key(key: str) -> tuple[str, str] | None:
