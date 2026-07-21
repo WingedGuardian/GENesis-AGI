@@ -88,6 +88,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The dashboard no longer shows a false "degraded / sentinel stale" during an
+  update.** While `update.sh` restarts the server, the freshly booted server's
+  sentinel heartbeat is briefly empty, which used to paint the Services card
+  amber ("sentinel stale — last heartbeat Nm ago") even though nothing was
+  wrong. The health snapshot now recognizes an in-progress deploy (the same
+  signal the watchdog already uses to defer restarts) and shows a neutral
+  "deploying" state for that window instead — a genuine fault (an escalated
+  sentinel, a down service) still shows through.
 - **Voice conversation delivery no longer double-writes turns under a burst.**
   The `POST /v1/voice/conversation` landing did a read-then-append (count the
   transcript's lines, then write the new turns) with an `await` in the middle.

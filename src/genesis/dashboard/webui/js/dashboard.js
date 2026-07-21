@@ -3209,7 +3209,7 @@
           // chipState() the chips use, so the two surfaces can never disagree
           // about what a state means. Values match the token palette
           // (--ok/--warn/--err); off/idle/unknown keep the historical dot gray.
-          const colors = { ok: "#4caf50", warn: "#f0ad4e", err: "#d9534f", stale: "#9e9e9e", action: "#7c4dff", off: "#888" };
+          const colors = { ok: "#4caf50", warn: "#f0ad4e", err: "#d9534f", stale: "#9e9e9e", action: "#7c4dff", info: "#2196f3", off: "#888" };
           return colors[chipState(state)] || "#888";
         },
 
@@ -3405,13 +3405,27 @@
           const services = this.health.services;
           if (!services || services.status === "unknown") return { state: "unknown", reason: "service status unavailable" };
           const svcLabel = (services?.bridge?.service_label || "Genesis").toLowerCase();
+          // A deploy intentionally stops/restarts the server. Suppress only the
+          // TRANSIENT signals it causes (the server briefly "activating"; the fresh
+          // server's empty sentinel heartbeat reading stale — the latter already
+          // suppressed server-side). GENUINE faults (host-framework down, watchdog
+          // restart-loop, an escalated/investigating sentinel) must still win, so the
+          // neutral "deploying" verdict is returned LAST — only if nothing real is wrong.
+          const deploying = !!services?.deploying;
           // Host framework health
           const hf = services?.host_framework;
           if (hf?.detected && (hf.status === "down" || hf.status === "error")) {
             return { state: "error", reason: `${hf.name} is ${hf.status}` };
           }
-          if (services?.bridge?.active_state && services.bridge.active_state !== "active") {
-            if (services.bridge.active_state === "unknown") {
+          // During a deploy the server is legitimately restarting — suppress ONLY
+          // the transient systemd states (activating/deactivating/reloading). A
+          // genuinely failed/inactive unit still reads red (e.g. update.sh's
+          // direct-serve fallback can leave the systemd unit failed while a bare
+          // process serves the dashboard).
+          const svcState = services?.bridge?.active_state;
+          const svcTransient = deploying && ["activating", "deactivating", "reloading"].includes(svcState);
+          if (svcState && svcState !== "active" && !svcTransient) {
+            if (svcState === "unknown") {
               return { state: "unknown", reason: `${svcLabel} service state is unknown` };
             }
             return { state: "error", reason: `${svcLabel} service is not active` };
@@ -3445,6 +3459,9 @@
               return { state: "degraded", reason: `sentinel ${label}` };
             }
           }
+          // Nothing genuine is wrong — surface the in-progress deploy as neutral
+          // (info) rather than a false "healthy" mid-restart.
+          if (deploying) return { state: "deploying", reason: "deploy in progress" };
           return { state: "healthy", reason: `${svcLabel} and watchdog services are active` };
         },
 
