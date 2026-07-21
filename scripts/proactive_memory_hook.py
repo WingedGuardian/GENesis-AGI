@@ -1004,7 +1004,11 @@ async def _call_server(
     }
     try:
         timeout = httpx.Timeout(_SERVER_TIMEOUT_S, connect=_SERVER_CONNECT_TIMEOUT_S)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # trust_env=False: this is a LOOPBACK POST to genesis-server. Honoring
+        # HTTP_PROXY/ALL_PROXY here would route the payload (the user's prompt)
+        # through an external proxy when NO_PROXY doesn't cover 127.0.0.1 — a
+        # data-leak / failure path. A localhost call must never use a proxy.
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             resp = await client.post(_RECALL_ENDPOINT, json=payload)
         if resp.status_code != 200:
             return None
@@ -1386,13 +1390,15 @@ async def _run(prompt: str, session_id: str = "") -> None:
         # recall. Best-effort; empty when the code index hasn't been built.
         # Suppressed when the engine is deliberately silenced (status "disabled" =
         # config kill switch → inject NOTHING), so code hints don't leak past it.
+        code_hits: list[dict] = []
         if server_data.get("status") != "disabled":
             code_keywords = keywords + [k for k in file_keywords if k not in keywords]
             for ch in _search_code_index(_DB_PATH, code_keywords)[:_MAX_RESULTS]:
                 content = ch.get("content")
                 if content:
                     print(content)
-                sys.stdout.flush()
+                    sys.stdout.flush()
+                    code_hits.append(ch)
 
         # Adapt structured rows for H-1 measurement: the engine emits pre-bump
         # ``retrieved_count``; _ws_measure reads ``_retrieved_count`` (default -1
@@ -1404,6 +1410,10 @@ async def _run(prompt: str, session_id: str = "") -> None:
             if "retrieved_count" in r:
                 row["_retrieved_count"] = r["retrieved_count"]
             fused.append(row)
+        # Count the locally-injected code hints in the H-1 accounting too (their
+        # ``code:`` ids classify as kind "code" in the working set) — the fork
+        # fused them into the same measured set (Codex #1169).
+        fused.extend(code_hits)
         proc = server_data.get("procedure")
         surfaced_proc_id = proc.get("id") if isinstance(proc, dict) else None
         shadow = server_data.get("shadow") or {}
