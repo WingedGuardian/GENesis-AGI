@@ -62,6 +62,18 @@ async def test_missing_old_content_errors(monkeypatch):
     assert "OLD content" in res["message"]
 
 
+async def test_load_skill_raising_returns_error_not_crash(monkeypatch):
+    # SHOULD-FIX 2: an unreadable SKILL.md (bad encoding / TOCTOU) must become a
+    # structured error, not an exception out of the tool.
+    def boom(_name):
+        raise UnicodeDecodeError("utf-8", b"", 0, 1, "bad")
+
+    monkeypatch.setattr("genesis.learning.skills.wiring.load_skill", boom)
+    res = await _impl_skill_replay_run(skill_name="voice-master")
+    assert res["status"] == "error"
+    assert "could not read current SKILL.md" in res["message"]
+
+
 async def test_missing_suite_errors():
     res = await _impl_skill_replay_run(
         skill_name="voice-master",

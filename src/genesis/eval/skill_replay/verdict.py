@@ -5,16 +5,21 @@ Given the COMPLETE (non-skipped) task pairs of an OLD-vs-NEW replay, decide
 NEW. The bar is the spec's "promote only on zero-regression + net-positive":
 
   * REGRESSION  — NEW scored worse than OLD on >=1 task (by more than epsilon),
-    OR the binary pass-rate favours OLD. This is the safety signal.
+    OR the binary pass-rate net-favours OLD (more pass->fail flips than
+    fail->pass). This is the safety signal.
   * NET_POSITIVE — zero regressions AND NEW strictly improved on >=1 task.
   * INCONCLUSIVE — everything else (all ties, or fewer than ``min_pairs``
     complete pairs to judge).
 
 Significance (McNemar exact, carried in the winrate dicts) is ADVISORY at
-shadow scale, NOT a gate: at 8-15 tasks a clean 5-0 improvement only reaches
-p=0.0625, so requiring significance would perversely reject genuine
-improvements. The verdict rests on zero-regression + strict-improvement; a
-future ENFORCE flip may add a significance floor once suites grow past ~30.
+shadow scale, NOT a gate — applied symmetrically to BOTH signals: at 8-15 tasks
+a clean 5-0 improvement only reaches p=0.0625, so requiring significance would
+perversely reject genuine improvements AND (on the pass side) silently mask a
+real pass->fail regression. The verdict rests on zero-regression +
+strict-improvement. CAVEAT: per-task binary pass/fail is noisy at small N (judge
+variance can flip a task on identical content) — a pass-rate-only regression is
+a weak signal to adjudicate, not trust. A future ENFORCE flip needs larger
+suites / repetition before either signal is trusted to gate.
 
 Pure and CC-free — the runner extracts the per-case lists and calls this.
 """
@@ -69,7 +74,18 @@ def compute_verdict(
     pass_wr = compute_winrate(old_pass, new_pass)
     n_reg = score_wr["n_control_wins"]  # OLD scored > NEW by > epsilon
     n_imp = score_wr["n_treatment_wins"]  # NEW scored > OLD by > epsilon
-    pass_favours_old = pass_wr["recommendation"] == "control_wins"
+    # Binary pass-rate backstop for a score change that straddles the pass/fail
+    # line within epsilon (a graded near-tie the score check treats as a tie).
+    # Flag it on NET pass->fail flips favouring OLD, significance-INDEPENDENT
+    # (McNemar's `recommendation` needs ~6 unanimous discordant pairs to reach
+    # p<0.05, so a small suite would silently mask a real pass->fail; and the
+    # module treats significance as advisory, not a gate). Using the NET count
+    # (control_wins > treatment_wins) tolerates one stray pass<->fail flip from
+    # judge noise cancelling against its opposite — but a lone pass->fail on a
+    # small, noisy suite still flags: sensitive-by-design for a shadow bake that
+    # feeds human adjudication (see the small-N caveat in the module docstring).
+    n_pass_reg = pass_wr["n_control_wins"]  # tasks OLD passed but NEW failed
+    pass_favours_old = n_pass_reg > pass_wr["n_treatment_wins"]
 
     if n_reg >= 1 or pass_favours_old:
         verdict = VERDICT_REGRESSION
@@ -77,7 +93,10 @@ def compute_verdict(
         if n_reg >= 1:
             parts.append(f"{n_reg} task(s) regressed (OLD scored >epsilon higher)")
         if pass_favours_old:
-            parts.append("binary pass-rate favours OLD")
+            parts.append(
+                f"net pass->fail flips favour OLD ({n_pass_reg} vs "
+                f"{pass_wr['n_treatment_wins']}) — noisy at small N, adjudicate"
+            )
         note = "; ".join(parts)
     elif n_imp >= 1:
         verdict = VERDICT_NET_POSITIVE

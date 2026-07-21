@@ -88,7 +88,13 @@ async def _impl_skill_replay_run(
         return _err(f"skill not found: {skill_name}")
 
     if new_content is None:
-        new_content = load_skill(skill_name)
+        try:
+            new_content = load_skill(skill_name)
+        except Exception:  # noqa: BLE001 — never crash the tool (bad encoding / TOCTOU)
+            logger.warning(
+                "skill_replay_run: reading SKILL.md for %s failed", skill_name, exc_info=True
+            )
+            return _err(f"could not read current SKILL.md for {skill_name}")
     if not new_content:
         return _err(f"no NEW content resolved for {skill_name}")
 

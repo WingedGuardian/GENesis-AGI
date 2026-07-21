@@ -51,19 +51,35 @@ def test_regression_on_single_task_score_loss():
 def test_regression_when_pass_rate_favours_old_despite_score_ties():
     # Scores all tie (no per-task score win either way), but OLD passes 6 tasks
     # NEW fails → significant McNemar control_wins → regression via pass-rate.
-    old_pass = [True, True, True, True, True, True, False]
-    new_pass = [False, False, False, False, False, False, False]
-    scores = [0.5] * 7
+    # A single pass->fail flip with NO score regression (scores tie) — this is
+    # significance-independent now, so even 1 net flip flags it (previously the
+    # McNemar-gated check masked it into inconclusive).
     v = compute_verdict(
-        old_scores=scores,
-        new_scores=list(scores),
-        old_pass=old_pass,
-        new_pass=new_pass,
+        old_scores=[0.6] * 5,
+        new_scores=[0.6] * 5,
+        old_pass=[True, True, True, True, True],
+        new_pass=[False, True, True, True, True],
         config=_CFG,
     )
     assert v.verdict == VERDICT_REGRESSION
     assert v.n_regressions == 0  # no per-task SCORE regression...
-    assert v.pass_winrate["recommendation"] == "control_wins"  # ...pass-rate is why
+    assert v.pass_winrate["n_control_wins"] > v.pass_winrate["n_treatment_wins"]  # ...pass is why
+
+
+def test_pass_to_fail_not_masked_into_net_positive():
+    # Reviewer scenario: task1 crosses the pass/fail line within epsilon
+    # (0.62->0.58, a score tie) while 4 other tasks improve but STAY passing.
+    # Must be REGRESSION, not net_positive — the pass->fail flip is real.
+    v = compute_verdict(
+        old_scores=[0.62, 0.70, 0.70, 0.70, 0.70],
+        new_scores=[0.58, 0.90, 0.90, 0.90, 0.90],
+        old_pass=[True, True, True, True, True],
+        new_pass=[False, True, True, True, True],
+        config=_CFG,
+    )
+    assert v.verdict == VERDICT_REGRESSION
+    assert v.n_regressions == 0  # score deltas are ties (task1) or improvements
+    assert v.n_improvements == 4
 
 
 def test_inconclusive_all_ties():
