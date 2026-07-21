@@ -168,6 +168,11 @@ async def _earnback_evidence(db) -> dict:
                     "current_level": row["current_level"],
                     "earned_level": row["earned_level"],
                     "window_days": _EARNBACK_WINDOW_DAYS,
+                    # This surface uses the DEFAULT window; the authoritative
+                    # gate (ego cadence → detect_earnback_candidates) reads
+                    # the live autonomy config and may differ if the operator
+                    # changed earnback.window_days.
+                    "window_source": "default",
                     "window_successes": successes,
                     "window_corrections": corrections,
                     "posterior": round(autonomy_crud.bayesian_posterior(successes, corrections), 4),

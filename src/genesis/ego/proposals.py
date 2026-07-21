@@ -240,7 +240,12 @@ async def annotate_calibration(db: aiosqlite.Connection, proposal: dict) -> None
                 f"\u2696 stated {stated:.2f} \u2192 track record {float(shrunk):.2f} (n={cell['n']})"
             )
     except Exception:  # noqa: BLE001 \u2014 annotation is best-effort, never blocking
-        _arbitration_failures[action_type] = _arbitration_failures.get(action_type, 0) + 1
+        # Sanitize before keying: action_type is free-form ego-LLM text and
+        # this key flows into the durable alert-id namespace
+        # (ledger:arbitration_failed:<key>) \u2014 unlike the schema-CHECKed
+        # action_class of the sibling alarms.
+        key = re.sub(r"[^a-z0-9_.-]", "_", str(action_type).lower())[:48] or "unknown"
+        _arbitration_failures[key] = _arbitration_failures.get(key, 0) + 1
         logger.debug("arbitration calibration lookup failed", exc_info=True)
 
 
@@ -302,16 +307,6 @@ class ProposalWorkflow:
         """
         batch_id = uuid.uuid4().hex[:16]
         created_at = datetime.now(UTC).isoformat()
-
-        # WS-2 P4 arbitration mode — read live once per batch. `off` skips the
-        # calibration lookup entirely; shadow/enforce both annotate (the sort
-        # distinction lives in _sort_proposals). Fail-safe toward shadow.
-        try:
-            from genesis.ledger.ws2_ledger_config import arbitration_mode
-
-            annotate = arbitration_mode() != "off"
-        except Exception:  # noqa: BLE001 — config must never break the batch
-            annotate = True
 
         # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
         # hallucinated goal_ids from persisting).
@@ -430,10 +425,6 @@ class ProposalWorkflow:
             except Exception:  # noqa: BLE001 — ledger is best-effort
                 logger.debug("ledger prediction hook failed", exc_info=True)
 
-            # WS-2 P4: calibration annotation (never raises, never blocks).
-            if annotate:
-                await annotate_calibration(self._db, p)
-
         logger.info(
             "Created ego proposal batch %s with %d proposals",
             batch_id,
@@ -534,6 +525,20 @@ class ProposalWorkflow:
         if not proposals:
             logger.warning("No proposals found for batch %s", batch_id)
             return None
+
+        # WS-2 P4: annotate at the RENDER boundary — the reload above returns
+        # bare DB rows (the transient _calibration_* keys are never persisted),
+        # so annotating any earlier could not reach the delivered digest.
+        # Delivery-time annotation also renders the freshest twice-daily cells.
+        try:
+            from genesis.ledger.ws2_ledger_config import arbitration_mode
+
+            annotate = arbitration_mode() != "off"
+        except Exception:  # noqa: BLE001 — config must never block delivery
+            annotate = True
+        if annotate:
+            for p in proposals:
+                await annotate_calibration(self._db, p)
 
         digest_html = self.format_digest(proposals, batch_id, ego_source=ego_source)
 

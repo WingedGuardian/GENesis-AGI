@@ -8,6 +8,7 @@ suppressed (sovereignty invariant, design §5).
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock
 
 import aiosqlite
@@ -41,7 +42,9 @@ async def db():
 
 @pytest.fixture
 def workflow(db):
-    return ProposalWorkflow(db=db, topic_manager=AsyncMock(), memory_store=AsyncMock())
+    tm = AsyncMock()
+    tm.send_to_category.return_value = "msg12345"
+    return ProposalWorkflow(db=db, topic_manager=tm, memory_store=AsyncMock())
 
 
 async def _insert_cell(
@@ -166,17 +169,33 @@ class TestAnnotateCalibration:
 
 
 # ---------------------------------------------------------------------------
-# create_batch wiring
+# Delivery wiring (annotation happens at the RENDER boundary in send_digest —
+# the reload from DB returns bare rows, so any earlier annotation is invisible)
 # ---------------------------------------------------------------------------
 
 
-class TestCreateBatchWiring:
-    async def test_shadow_annotates_created_proposals(self, db, workflow, monkeypatch):
+class TestDeliveryWiring:
+    async def test_send_digest_renders_badge_from_db_state_e2e(self, db, workflow, monkeypatch):
+        """Regression for the built≠wired gap: cell in DB + create_batch +
+        send_digest must produce the badge in the DELIVERED HTML — no
+        in-memory dict handoff anywhere."""
         monkeypatch.setattr("genesis.ledger.ws2_ledger_config.arbitration_mode", lambda: "shadow")
         await _insert_cell(db, domain="ego.dispatch", mean_confidence=0.85, shrunk_estimate=0.62)
-        _, ids, created = await workflow.create_batch([_proposal("dispatch", 0.9)])
+        batch_id, ids, _ = await workflow.create_batch([_proposal("dispatch", 0.9)])
         assert len(ids) == 1
-        assert created[0]["_calibrated_confidence"] == pytest.approx(0.62)
+        delivery_id = await workflow.send_digest(batch_id)
+        assert delivery_id is not None
+        html = workflow._topic_manager.send_to_category.call_args.args[1]
+        assert "⚖ stated 0.90 → track record 0.62 (n=41)" in html
+
+    async def test_send_digest_renders_escalation_note_e2e(self, db, workflow, monkeypatch):
+        monkeypatch.setattr("genesis.ledger.ws2_ledger_config.arbitration_mode", lambda: "shadow")
+        await _insert_cell(db, domain="ego.dispatch", status="thin", n=7)
+        batch_id, _, _ = await workflow.create_batch([_proposal("dispatch")])
+        await workflow.send_digest(batch_id)
+        html = workflow._topic_manager.send_to_category.call_args.args[1]
+        assert "escalate" in html
+        assert "thin" in html
 
     async def test_off_skips_lookup_entirely(self, db, workflow, monkeypatch):
         monkeypatch.setattr("genesis.ledger.ws2_ledger_config.arbitration_mode", lambda: "off")
@@ -188,21 +207,45 @@ class TestCreateBatchWiring:
             return []
 
         monkeypatch.setattr("genesis.db.crud.calibration_cells.list_cells", _spy)
-        _, ids, created = await workflow.create_batch([_proposal("dispatch")])
+        batch_id, ids, _ = await workflow.create_batch([_proposal("dispatch")])
+        delivery_id = await workflow.send_digest(batch_id)
         assert len(ids) == 1
+        assert delivery_id is not None
         assert called is False
-        assert "_calibrated_confidence" not in created[0]
 
-    async def test_annotation_failure_never_blocks_batch(self, db, workflow, monkeypatch):
+    async def test_annotation_failure_never_blocks_delivery(self, db, workflow, monkeypatch):
         monkeypatch.setattr("genesis.ledger.ws2_ledger_config.arbitration_mode", lambda: "shadow")
 
         async def _boom(*a, **k):
             raise RuntimeError("synthetic lookup failure")
 
         monkeypatch.setattr("genesis.db.crud.calibration_cells.list_cells", _boom)
-        _, ids, _created = await workflow.create_batch([_proposal("dispatch")])
-        assert len(ids) == 1
+        batch_id, _, _ = await workflow.create_batch([_proposal("dispatch")])
+        delivery_id = await workflow.send_digest(batch_id)
+        assert delivery_id is not None  # proposal shipped un-annotated
         assert arbitration_failure_counts().get("dispatch") == 1
+
+    async def test_create_batch_no_longer_annotates(self, db, workflow, monkeypatch):
+        """Annotation lives ONLY at the render boundary — create_batch must
+        not do calibration lookups (they would be invisible + stale)."""
+        monkeypatch.setattr("genesis.ledger.ws2_ledger_config.arbitration_mode", lambda: "shadow")
+        await _insert_cell(db, domain="ego.dispatch", mean_confidence=0.85, shrunk_estimate=0.62)
+        _, _, created = await workflow.create_batch([_proposal("dispatch", 0.9)])
+        assert "_calibrated_confidence" not in created[0]
+
+    async def test_counter_key_sanitized_for_llm_action_type(self, db, workflow, monkeypatch):
+        """Free-form LLM action_type is sanitized before entering the
+        counter / durable alert-id namespace."""
+
+        async def _boom(*a, **k):
+            raise RuntimeError("synthetic lookup failure")
+
+        monkeypatch.setattr("genesis.db.crud.calibration_cells.list_cells", _boom)
+        p = _proposal("Dispatch a Session <b>now</b>\nplease " + "x" * 100)
+        await annotate_calibration(db, p)
+        (key,) = arbitration_failure_counts()
+        assert re.fullmatch(r"[a-z0-9_.-]{1,48}", key)
+        assert key.startswith("dispatch_a_session")
 
 
 # ---------------------------------------------------------------------------
