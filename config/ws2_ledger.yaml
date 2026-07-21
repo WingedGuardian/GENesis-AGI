@@ -15,3 +15,14 @@ enabled: true
 #   off: no autonomy side-effect (the grader still grades predictions).
 # Autonomy is a Trap subsystem — this stays shadow until the operator flips it.
 autonomy_feed: shadow
+
+# ego-proposal arbitration discount (WS-2 P4, design §5.1). off | shadow | enforce.
+#   shadow (default): proposals whose domain has a healthy (ok) stated
+#     calibration cell with an overconfidence gap >0.15 get a digest badge
+#     ("⚖ stated 0.85 → track record 0.62 (n=41)"); thin/unknown cells get an
+#     escalation note. Sort order NEVER moves in shadow.
+#   enforce: the calibrated confidence (track record) additionally drives the
+#     digest sort order. Annotation-only otherwise — a proposal is never
+#     suppressed from the digest (sovereignty invariant).
+#   off: no calibration lookup at all.
+arbitration: shadow

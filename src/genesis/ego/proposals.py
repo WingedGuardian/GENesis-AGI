@@ -69,13 +69,25 @@ _EGO_LABELS = {
 }
 
 
-def _sort_proposals(proposals: list[dict]) -> list[dict]:
-    """Sort proposals by urgency (critical first) then confidence (desc)."""
+def _sort_proposals(proposals: list[dict], *, enforce_calibration: bool = False) -> list[dict]:
+    """Sort proposals by urgency (critical first) then confidence (desc).
+
+    With ``enforce_calibration`` the arbitration discount's
+    ``_calibrated_confidence`` (domain track record) outranks the stated
+    confidence — WS-2 P4 ``arbitration: enforce`` only. In shadow the stated
+    value always drives the sort (annotate-only).
+    """
+
+    def _conf(p: dict) -> float:
+        if enforce_calibration and p.get("_calibrated_confidence") is not None:
+            return float(p["_calibrated_confidence"])
+        return float(p.get("confidence", 0))
+
     return sorted(
         proposals,
         key=lambda p: (
             _URGENCY_ORDER.get(p.get("urgency", "normal"), 2),
-            -float(p.get("confidence", 0)),
+            -_conf(p),
         ),
     )
 
@@ -94,8 +106,17 @@ def _format_digest(
 
     Proposals are sorted by urgency x confidence before numbering.
     Fields map to: content → WHAT, rationale → WHY, execution_plan → HOW.
+
+    The calibrated track-record confidence drives the sort only under
+    ``arbitration: enforce`` (see :func:`annotate_calibration`).
     """
-    sorted_proposals = _sort_proposals(proposals)
+    try:
+        from genesis.ledger.ws2_ledger_config import arbitration_mode
+
+        enforce = arbitration_mode() == "enforce"
+    except Exception:  # noqa: BLE001 — formatting must never fail on config
+        enforce = False
+    sorted_proposals = _sort_proposals(proposals, enforce_calibration=enforce)
     label = _EGO_LABELS.get(ego_source or "", "Ego")
     lines = [f"<b>{_ESC(label)}</b> \u2014 {_ESC(batch_id[:8])}\n"]
 
@@ -105,9 +126,7 @@ def _format_digest(
         action_type = p.get("action_type", "?")
 
         # Header: number + urgency + action type
-        lines.append(
-            f"<b>{i}.</b> {_ESC(urgency_tag)}{_ESC(action_type)}"
-        )
+        lines.append(f"<b>{i}.</b> {_ESC(urgency_tag)}{_ESC(action_type)}")
 
         # WHAT (content)
         content = _truncate(p.get("content", ""), 400)
@@ -128,13 +147,101 @@ def _format_digest(
         # Confidence badge
         confidence = p.get("confidence", 0.0)
         lines.append(f"\n[{confidence:.2f} confidence]")
+
+        # WS-2 P4 arbitration annotations (annotate-only; never suppresses).
+        badge = p.get("_calibration_badge")
+        if badge:
+            lines.append(_ESC(badge))
+        note = p.get("_calibration_note")
+        if note:
+            lines.append(f"<i>{_ESC(note)}</i>")
         lines.append("")
 
     # Separator + compact reply instructions
-    lines.append(
-        "<i>ok \u2022 no \u2022 \"approve 1, reject 2\" \u2022 or talk</i>"
-    )
+    lines.append('<i>ok \u2022 no \u2022 "approve 1, reject 2" \u2022 or talk</i>')
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# WS-2 P4 arbitration discount (design \u00a75.1)
+# ---------------------------------------------------------------------------
+
+# Confidence-vs-track-record gap on ok stated cells that triggers the
+# discount (same floor as the calibration_status MCP ranking).
+_CALIBRATION_GAP_FLOOR = 0.15
+
+# Process-global count of calibration-lookup failures \u2014 surfaced as the
+# `ledger:arbitration_failed` WARNING by mcp/health/errors.py while nonzero
+# (writers.py counter idiom). A lookup failure never blocks proposal creation.
+_arbitration_failures: dict[str, int] = {}
+
+
+def arbitration_failure_counts() -> dict[str, int]:
+    """Snapshot of arbitration-lookup failure counts (read by health alerts)."""
+    return dict(_arbitration_failures)
+
+
+def _reset_arbitration_failures_for_tests() -> None:
+    _arbitration_failures.clear()
+
+
+async def annotate_calibration(db: aiosqlite.Connection, proposal: dict) -> None:
+    """Annotate ONE proposal dict (in place) with its domain's calibration.
+
+    Reads the stated-lane 90d ``calibration_cells`` row for
+    ``(ego.<action_type>, ego_proposal, approved_and_executes)`` \u2014 the exact
+    cell the ledger grades this proposal class into (writers.py stamps
+    ``domain=f"ego.{action_type}"``):
+
+    - no cell \u2192 nothing (no-data ego domains are the norm until rows grade);
+    - ``thin``/``unknown`` \u2192 ``_calibration_note`` escalation phrasing ONLY \u2014
+      never a discount on ignorance, never a bare percentage (design \u00a73.4);
+    - ``ok`` with overconfidence gap > 0.15 (cell mean stated \u2212 track record)
+      \u2192 ``_calibrated_confidence`` = shrunk track record + a digest badge
+      showing THIS proposal's stated confidence vs the domain track record.
+
+    Annotate-only: sort consumes ``_calibrated_confidence`` exclusively under
+    ``arbitration: enforce`` (see ``_sort_proposals``); delivery is never
+    gated. Raises never escape \u2014 failures count into
+    ``_arbitration_failures`` and the proposal ships un-annotated.
+    """
+    action_type = proposal.get("action_type", "unknown")
+    try:
+        from genesis.db.crud import calibration_cells as cc_crud
+
+        domain = f"ego.{action_type}"
+        cells = await cc_crud.list_cells(db, domain=domain, provenance="stated", window_days=90)
+        cell = next(
+            (
+                c
+                for c in cells
+                if c["domain"] == domain
+                and c["action_class"] == "ego_proposal"
+                and c["metric"] == "approved_and_executes"
+            ),
+            None,
+        )
+        if cell is None:
+            return
+        if cell["status"] in ("thin", "unknown"):
+            proposal["_calibration_note"] = (
+                f"calibration: {cell['status']} (n={cell['n']}) \u2014 escalate; "
+                "track record not yet trustworthy"
+            )
+            return
+        mean_conf = cell["mean_confidence"]
+        shrunk = cell["shrunk_estimate"]
+        if mean_conf is None or shrunk is None:
+            return
+        if (mean_conf - shrunk) > _CALIBRATION_GAP_FLOOR:
+            proposal["_calibrated_confidence"] = float(shrunk)
+            stated = float(proposal.get("confidence", 0.0))
+            proposal["_calibration_badge"] = (
+                f"\u2696 stated {stated:.2f} \u2192 track record {float(shrunk):.2f} (n={cell['n']})"
+            )
+    except Exception:  # noqa: BLE001 \u2014 annotation is best-effort, never blocking
+        _arbitration_failures[action_type] = _arbitration_failures.get(action_type, 0) + 1
+        logger.debug("arbitration calibration lookup failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +303,16 @@ class ProposalWorkflow:
         batch_id = uuid.uuid4().hex[:16]
         created_at = datetime.now(UTC).isoformat()
 
+        # WS-2 P4 arbitration mode — read live once per batch. `off` skips the
+        # calibration lookup entirely; shadow/enforce both annotate (the sort
+        # distinction lives in _sort_proposals). Fail-safe toward shadow.
+        try:
+            from genesis.ledger.ws2_ledger_config import arbitration_mode
+
+            annotate = arbitration_mode() != "off"
+        except Exception:  # noqa: BLE001 — config must never break the batch
+            annotate = True
+
         # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
         # hallucinated goal_ids from persisting).
         valid_goal_ids: set[str] | None = None
@@ -241,7 +358,8 @@ class ProposalWorkflow:
                 if not goal_id:
                     logger.warning(
                         "Proposal %s: dropping invalid goal_id %r",
-                        pid, raw_goal_id,
+                        pid,
+                        raw_goal_id,
                     )
             else:
                 goal_id = raw_goal_id
@@ -255,7 +373,8 @@ class ProposalWorkflow:
             if hash_val:
                 try:
                     if await ego_crud.has_pending_proposal_with_hash(
-                        self._db, hash_val,
+                        self._db,
+                        hash_val,
                     ):
                         logger.info(
                             "Proposal dedup: skipping exact duplicate (hash=%s)",
@@ -310,6 +429,10 @@ class ProposalWorkflow:
                 )
             except Exception:  # noqa: BLE001 — ledger is best-effort
                 logger.debug("ledger prediction hook failed", exc_info=True)
+
+            # WS-2 P4: calibration annotation (never raises, never blocks).
+            if annotate:
+                await annotate_calibration(self._db, p)
 
         logger.info(
             "Created ego proposal batch %s with %d proposals",
@@ -399,7 +522,8 @@ class ProposalWorkflow:
                     if last_dt > cutoff:
                         logger.info(
                             "Digest rate-limited for %s (last: %s, next eligible: %s)",
-                            ego_source, last_ts,
+                            ego_source,
+                            last_ts,
                             (last_dt + timedelta(hours=self._DIGEST_RATE_LIMIT_HOURS)).isoformat(),
                         )
                         return None
@@ -421,12 +545,10 @@ class ProposalWorkflow:
         # Show pending backlog from other batches (same ego only)
         try:
             all_pending = await ego_crud.list_pending_proposals(
-                self._db, ego_source=ego_source,
+                self._db,
+                ego_source=ego_source,
             )
-            other_pending = [
-                p for p in all_pending
-                if p.get("batch_id") != batch_id
-            ]
+            other_pending = [p for p in all_pending if p.get("batch_id") != batch_id]
             if other_pending:
                 summary_lines = []
                 for op in other_pending[:5]:
@@ -439,8 +561,7 @@ class ProposalWorkflow:
                 digest_html = (
                     f"<i>\U0001f4cb {len(other_pending)} older proposal(s) still "
                     f"awaiting response:</i>\n{backlog_text}\n"
-                    f"<i>Reply 'approve all pending' to resolve all.</i>\n\n"
-                    + digest_html
+                    f"<i>Reply 'approve all pending' to resolve all.</i>\n\n" + digest_html
                 )
         except Exception:
             pass  # Non-critical; skip header on error
@@ -472,6 +593,7 @@ class ProposalWorkflow:
         try:
             if ego_source:
                 from datetime import UTC, datetime
+
                 await ego_crud.set_state(
                     self._db,
                     key=f"last_digest_delivery:{ego_source}",
@@ -530,7 +652,9 @@ class ProposalWorkflow:
                 from genesis.ego.resolution import handle_proposal_resolution
 
                 await handle_proposal_resolution(
-                    self._db, prop, status,
+                    self._db,
+                    prop,
+                    status,
                     reason=reason,
                     source="telegram",
                     memory_store=self._memory_store,
@@ -659,12 +783,20 @@ _CANCEL_WORDS = {"cancel", "cancelled", "revoke", "revoked", "stop", "undo"}
 # shared normalize() strips trailing punctuation before matching, but this
 # parser's caller only lowercases/strips), so the historical dotted
 # variants are added back locally for byte-compatible matching.
-_BARE_APPROVE = _SHARED_BARE_APPROVE | frozenset({
-    "ok.", "okay.", "yes.", "yep.", "sure.",
-})
-_BARE_REJECT = _SHARED_BARE_REJECT | frozenset({
-    "no.",
-})
+_BARE_APPROVE = _SHARED_BARE_APPROVE | frozenset(
+    {
+        "ok.",
+        "okay.",
+        "yes.",
+        "yep.",
+        "sure.",
+    }
+)
+_BARE_REJECT = _SHARED_BARE_REJECT | frozenset(
+    {
+        "no.",
+    }
+)
 
 # Pattern: "1 approve" or "approve 1" or "1 yes" or "reject 2: reason"
 _NUMBERED_PATTERN = re.compile(

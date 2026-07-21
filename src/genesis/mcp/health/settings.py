@@ -108,9 +108,11 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         description=(
             "WS-2 cognitive-ledger consumer levers — master `enabled` + "
             "`autonomy_feed` off/shadow/live (P2b grader→autonomy earn-back "
-            "feed). Shadow (default) logs what it WOULD fire without writing "
-            "the autonomy Trap; an invalid value degrades to shadow. Read live "
-            "per grading pass by genesis.ledger.ws2_ledger_config (no restart)."
+            "feed) + `arbitration` off/shadow/enforce (P4 ego-proposal "
+            "calibration discount: shadow annotates digest badges only, "
+            "enforce lets calibrated confidence drive digest sort; never "
+            "suppresses a proposal). Invalid values degrade to shadow. Read "
+            "live per use by genesis.ledger.ws2_ledger_config (no restart)."
         ),
         config_filename="ws2_ledger.yaml",
         readonly=False,
@@ -845,15 +847,20 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
 def _validate_ws2_ledger(changes: dict) -> list[str]:
     """Validate ws2_ledger consumer-lever changes (see
     genesis.ledger.ws2_ledger_config)."""
-    from genesis.ledger.ws2_ledger_config import MODES
+    from genesis.ledger.ws2_ledger_config import ARBITRATION_MODES, MODES
 
     errors: list[str] = []
     for key, value in changes.items():
-        if key not in ("enabled", "autonomy_feed"):
-            errors.append(f"Unknown key '{key}'. Valid: enabled, autonomy_feed")
+        if key not in ("enabled", "autonomy_feed", "arbitration"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, autonomy_feed, arbitration")
         elif key == "enabled":
             if not isinstance(value, bool):
                 errors.append("'enabled' must be a boolean")
+        elif key == "arbitration":
+            if value not in ARBITRATION_MODES:
+                errors.append(
+                    f"'arbitration' must be one of {', '.join(ARBITRATION_MODES)}; got {value!r}"
+                )
         elif value not in MODES:
             errors.append(f"'autonomy_feed' must be one of {', '.join(MODES)}; got {value!r}")
     return errors
