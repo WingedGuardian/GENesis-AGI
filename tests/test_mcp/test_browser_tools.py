@@ -1293,6 +1293,26 @@ class TestTurnstileShortGrace:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_interstitial_widget_still_present_not_falsely_resolved(self):
+        # Real interstitial (cf-mitigated) that shows a bare widget with a
+        # non-English title and no chrome. A widget-click yields no token; the
+        # secondary "gone?" gate must NOT declare resolved while a widget remains.
+        page = _ts_page(selectors_present={_WIDGET_INPUT}, title="verificando")
+        resp = _ts_response({"cf-mitigated": "challenge"})
+        with patch.object(browser, "_poll_turnstile_token", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_click_turnstile_widget", new=AsyncMock(return_value=True)), \
+             patch.object(browser, "_solve_with_playwright_captcha", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_vnc_click_turnstile", new=AsyncMock(return_value=False)), \
+             patch.object(browser, "_ensure_vnc", new=AsyncMock()), \
+             patch.object(browser, "_send_turnstile_alert", new=AsyncMock()) as alert, \
+             patch("asyncio.sleep", new=AsyncMock()):
+            result = await browser._wait_for_turnstile(page, response=resp)
+        assert result != {"status": "resolved", "method": "iframe_click"}, \
+            "falsely reported resolved while a widget was still present"
+        assert result == {"status": "blocked", "method": "timeout"}
+        alert.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_interstitial_runs_full_ladder_to_alert(self):
         page = _ts_page(selectors_present={"#cf-challenge-running"}, title="Just a moment...")
         resp = _ts_response({"cf-mitigated": "challenge"})

@@ -1713,6 +1713,18 @@ async def _detect_widget(page) -> bool:
     return False
 
 
+async def _challenge_present(page) -> bool:
+    """Secondary "is a challenge still on the page?" check.
+
+    True if a blocking interstitial OR an embedded Turnstile widget is still
+    present. Used by the in-ladder "challenge gone?" gates so a still-unsolved
+    widget (chrome dismissed, non-English title, no token yet) is NOT mistaken
+    for a resolved challenge. The token poll remains the primary success signal;
+    this only guards the DOM-based early-exit.
+    """
+    return await _detect_interstitial(page) or await _detect_widget(page)
+
+
 async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> dict | None:
     """Detect and handle Cloudflare challenge (Turnstile or managed).
 
@@ -1774,7 +1786,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                     _ts_log.info("RESOLVED: widget_click (attempt %d)", click_attempt)
                     logger.info("Challenge resolved via widget click (attempt %d)", click_attempt)
                     return {"status": "resolved", "method": "iframe_click"}
-                if not await _detect_interstitial(page):
+                if not await _challenge_present(page):
                     _ts_log.info("RESOLVED: widget_click (challenge gone)")
                     return {"status": "resolved", "method": "iframe_click"}
                 _ts_log.info("Widget click %d: sent but not resolved", click_attempt)
@@ -1792,7 +1804,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                 _ts_log.info("RESOLVED: playwright_captcha")
                 logger.info("Challenge resolved via playwright-captcha")
                 return {"status": "resolved", "method": "playwright_captcha"}
-            if not await _detect_interstitial(page):
+            if not await _challenge_present(page):
                 _ts_log.info("RESOLVED: playwright_captcha (challenge gone)")
                 return {"status": "resolved", "method": "playwright_captcha"}
 
@@ -1812,7 +1824,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                     await asyncio.sleep(random.uniform(1.0, 3.0))
                     return {"status": "resolved", "method": "auto_delayed"}
 
-                if not await _detect_interstitial(page):
+                if not await _challenge_present(page):
                     logger.info("Challenge page gone — resolved")
                     return {"status": "resolved", "method": "external"}
 
