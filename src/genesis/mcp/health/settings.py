@@ -133,13 +133,15 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     "skill_evolution_gate": SettingsDomain(
         name="skill_evolution_gate",
         description=(
-            "Skill-edit Critic (WS1) — master `enabled` + `mode` off/shadow. "
-            "Shadow (default) screens self-proposed SKILL.md edits for "
-            "self-modification pathologies and LOGS a verdict observation "
-            "without blocking the auto-apply; off skips the Critic entirely. "
-            "No `enforce` mode yet. Read live per skill-evolution pass by "
-            "genesis.learning.skills.skill_gate_config (no restart); kill via "
-            "GENESIS_SKILL_EVOLUTION_GATE_OFF."
+            "Skill-evolution gates (WS1) — master `enabled`, the static Critic "
+            "`mode` off/shadow, and the held-out `replay` gate "
+            "(replay.mode off/shadow + epsilon/min_pairs). Shadow (default) "
+            "screens self-proposed SKILL.md edits — the Critic by static diff, "
+            "the replay by re-running a golden suite against OLD vs NEW — and "
+            "LOGS a verdict observation without blocking the auto-apply; off "
+            "skips a gate. No `enforce` mode yet. Read live per pass by "
+            "genesis.learning.skills.skill_gate_config (no restart); kill both "
+            "via GENESIS_SKILL_EVOLUTION_GATE_OFF."
         ),
         config_filename="skill_evolution_gate.yaml",
         readonly=False,
@@ -857,20 +859,45 @@ def _validate_ws2_ledger(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_skill_replay_subconfig(value, replay_modes) -> list[str]:
+    """Validate the ``replay`` sub-config of the skill-evolution gate."""
+    if not isinstance(value, dict):
+        return ["'replay' must be a mapping (mode/epsilon/min_pairs)"]
+    errors: list[str] = []
+    for k, v in value.items():
+        if k == "mode":
+            if v not in replay_modes:
+                errors.append(f"'replay.mode' must be one of {', '.join(replay_modes)}; got {v!r}")
+        elif k == "epsilon":
+            # bool is a subclass of int — reject it explicitly.
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0.0 <= v < 1.0):
+                errors.append("'replay.epsilon' must be a number in [0.0, 1.0)")
+        elif k == "min_pairs":
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                errors.append("'replay.min_pairs' must be an integer >= 1")
+        else:
+            errors.append(f"Unknown key 'replay.{k}'. Valid: mode, epsilon, min_pairs")
+    return errors
+
+
 def _validate_skill_evolution_gate(changes: dict) -> list[str]:
-    """Validate skill-edit Critic lever changes (see
-    genesis.learning.skills.skill_gate_config)."""
-    from genesis.learning.skills.skill_gate_config import MODES
+    """Validate skill-evolution gate lever changes — the static Critic (mode)
+    and the held-out replay gate (replay.*). See
+    genesis.learning.skills.skill_gate_config."""
+    from genesis.learning.skills.skill_gate_config import MODES, REPLAY_MODES
 
     errors: list[str] = []
     for key, value in changes.items():
-        if key not in ("enabled", "mode"):
-            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
-        elif key == "enabled":
+        if key == "enabled":
             if not isinstance(value, bool):
                 errors.append("'enabled' must be a boolean")
-        elif value not in MODES:
-            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "replay":
+            errors.extend(_validate_skill_replay_subconfig(value, REPLAY_MODES))
+        else:
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode, replay")
     return errors
 
 

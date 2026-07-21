@@ -162,6 +162,10 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     # adjudication window survives. NOT in INTERNAL_OBS_TYPES: flagged
     # (high-priority) verdicts stay visible during the bake.
     "skill_edit_critic": timedelta(days=30),
+    # skill-replay held-out gate verdicts (WS1) — same 30d shadow-bake window
+    # as the diff-screen critic; a regression verdict is high-priority so it
+    # stays visible for adjudication.
+    "skill_replay_verdict": timedelta(days=30),
     # ── 60-day (action-required, real issues) ──────────────────────────
     "bug_identified": timedelta(days=60),
     "tech_debt": timedelta(days=60),

@@ -1,0 +1,6 @@
+{"_meta": {"task_set_version": "fixture_v1"}}
+{"id": "t1", "category": "drafting", "prompt": "Task 1: write a one-line greeting in the user's voice.", "expected": "First person, warm, no AI cliches."}
+{"id": "t2", "category": "drafting", "prompt": "Task 2: rewrite a sentence to remove AI tells.", "expected": "No em-dash pileups, no 'it's not just X it's Y' construction."}
+{"id": "t3", "category": "drafting", "prompt": "Task 3: draft a short reply.", "expected": "Concise and direct."}
+{"id": "t4", "category": "drafting", "prompt": "Task 4: humanize a stiff paragraph.", "expected": "Varied rhythm, plain words."}
+{"id": "t5", "category": "drafting", "prompt": "Task 5: write a two-sentence intro.", "expected": "Specific, first person."}

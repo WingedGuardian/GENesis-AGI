@@ -87,6 +87,7 @@ from genesis.mcp.health import provider as _provider  # noqa: E402
 from genesis.mcp.health import session_charter_tools as _session_charter_tools  # noqa: E402
 from genesis.mcp.health import session_control as _session_control  # noqa: E402
 from genesis.mcp.health import settings as _settings  # noqa: E402
+from genesis.mcp.health import skill_replay_run as _skill_replay_run  # noqa: E402, F401
 from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
