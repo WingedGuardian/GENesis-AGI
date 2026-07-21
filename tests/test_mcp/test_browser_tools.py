@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +29,8 @@ def _clear_all_browser_state():
     browser._remote_page = None
     browser._remote_cdp_url = None
     browser._remote_last_url = None
+    # VNC verification flag — FIX 3 tests toggle it; reset to avoid leak
+    browser._vnc_verified = False
 
 
 @pytest.fixture(autouse=True)
@@ -988,3 +991,200 @@ class TestRemoteHelpers:
         browser._update_remote_url()
 
         assert browser._remote_last_url == "https://old.com"  # unchanged
+
+
+def _ss_line(pid, name="x11vnc", v6=False):
+    """One `ss -ltnpH` listener row for the VNC port."""
+    addr = "[::]:5999" if v6 else "0.0.0.0:5999"
+    peer = "[::]:*" if v6 else "0.0.0.0:*"
+    return f'LISTEN 0      32     {addr} {peer} users:(("{name}",pid={pid},fd=8))\n'
+
+
+class TestClickNavigationWait:
+    """FIX 2 (idx 39): _impl_browser_click waits for click-triggered navigation."""
+
+    @pytest.mark.asyncio
+    async def test_click_waits_for_load_state(self):
+        page = MagicMock()
+        page.url = "https://example.com/after"
+        page.is_closed.return_value = False
+        page.wait_for_load_state = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_stealth_click", new=AsyncMock()), patch.object(
+            browser, "_snapshot_page", new=AsyncMock(return_value="snap")
+        ), patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_click("#go")
+        page.wait_for_load_state.assert_awaited_once()
+        args, _ = page.wait_for_load_state.call_args
+        assert args and args[0] == "domcontentloaded"
+        assert result["clicked"] == "#go"
+
+    @pytest.mark.asyncio
+    async def test_click_survives_raising_load_state(self):
+        page = MagicMock()
+        page.url = "https://example.com/after"
+        page.is_closed.return_value = False
+        page.wait_for_load_state = AsyncMock(
+            side_effect=Exception("execution context destroyed")
+        )
+        browser._active_page = page
+        with patch.object(browser, "_stealth_click", new=AsyncMock()), patch.object(
+            browser, "_snapshot_page", new=AsyncMock(return_value="snap")
+        ), patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_click("#go")
+        assert result["clicked"] == "#go"
+        assert "error" not in result
+
+
+class TestReclaimVncPort:
+    """FIX 3 (idx 9): safe VNC stale-port reclaim (ss-primary, MainPID-guarded)."""
+
+    @staticmethod
+    def _fake_run(*, ss_out=None, ss_missing=False, ss_exc=None, fuser_out=None,
+                  fuser_missing=False, fuser_exc=None, active_state="inactive",
+                  active_exc=None, active_rc=0, main_pid="0", mainpid_exc=None,
+                  mainpid_rc=0, calls=None):
+        def _run(argv, **kwargs):
+            if calls is not None:
+                calls.append(list(argv))
+            cmd = argv[0]
+            if cmd == "ss":
+                if ss_missing:
+                    raise FileNotFoundError("ss")
+                if ss_exc is not None:
+                    raise ss_exc
+                return MagicMock(stdout=ss_out or "", stderr="", returncode=0)
+            if cmd == "fuser":
+                if fuser_missing:
+                    raise FileNotFoundError("fuser")
+                if fuser_exc is not None:
+                    raise fuser_exc
+                return MagicMock(stdout=fuser_out or "", stderr="", returncode=0)
+            if cmd == "systemctl":
+                prop = argv[4] if len(argv) > 4 else ""
+                if prop == "ActiveState":
+                    if active_exc is not None:
+                        raise active_exc
+                    out = "" if active_rc != 0 else active_state + "\n"
+                    return MagicMock(stdout=out, returncode=active_rc)
+                if prop == "MainPID":
+                    if mainpid_exc is not None:
+                        raise mainpid_exc
+                    out = "" if mainpid_rc != 0 else main_pid + "\n"
+                    return MagicMock(stdout=out, returncode=mainpid_rc)
+                return MagicMock(stdout="", returncode=0)
+            return MagicMock(stdout="", returncode=0)
+        return _run
+
+    def test_active_unit_not_killed(self):
+        run = self._fake_run(ss_out=_ss_line(1234), active_state="active", main_pid="1234")
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port(5999, "genesis-vnc")
+        kill.assert_not_called()
+
+    def test_activating_unit_not_killed(self):
+        run = self._fake_run(ss_out=_ss_line(1234), active_state="activating", main_pid="0")
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_holder_equals_mainpid_not_killed(self):
+        run = self._fake_run(ss_out=_ss_line(509730), active_state="inactive", main_pid="509730")
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_foreign_non_x11vnc_not_killed(self):
+        run = self._fake_run(ss_out=_ss_line(4242, name="nginx"), active_state="inactive", main_pid="0")
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_foreign_x11vnc_killed_specific_pid(self):
+        run = self._fake_run(ss_out=_ss_line(4242), active_state="inactive", main_pid="0")
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill, \
+             patch("time.sleep"):
+            browser._reclaim_vnc_port()
+        kill.assert_called_once_with(4242, signal.SIGKILL)
+
+    def test_pid_le_1_never_killed(self):
+        run = self._fake_run(ss_out=_ss_line(1), active_state="inactive", main_pid="0")
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_dual_stack_deduped_single_kill(self):
+        ss_out = _ss_line(4242, v6=False) + _ss_line(4242, v6=True)
+        run = self._fake_run(ss_out=ss_out, active_state="inactive", main_pid="0")
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill, \
+             patch("time.sleep"):
+            browser._reclaim_vnc_port()
+        kill.assert_called_once_with(4242, signal.SIGKILL)
+
+    def test_kill_processlookup_swallowed(self):
+        run = self._fake_run(ss_out=_ss_line(4242), active_state="inactive", main_pid="0")
+        with patch("subprocess.run", side_effect=run), \
+             patch("os.kill", side_effect=ProcessLookupError), patch("time.sleep"):
+            browser._reclaim_vnc_port()  # must not raise
+
+    def test_fuser_fallback_never_blanket_kill(self):
+        calls = []
+        run = self._fake_run(ss_missing=True, fuser_out="4242\n",
+                             active_state="inactive", main_pid="0", calls=calls)
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill, \
+             patch.object(browser, "_proc_comm", return_value="x11vnc"), patch("time.sleep"):
+            browser._reclaim_vnc_port()
+        kill.assert_called_once_with(4242, signal.SIGKILL)
+        assert not any(a[0] == "fuser" and "-k" in a for a in calls)
+
+    def test_neither_ss_nor_fuser(self):
+        run = self._fake_run(ss_missing=True, fuser_missing=True)
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_activestate_probe_raises_no_kill(self):
+        # systemctl ActiveState lookup fails -> can't verify unit is down -> fail-safe.
+        run = self._fake_run(ss_out=_ss_line(4242), active_exc=TimeoutError("dbus"))
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_mainpid_probe_raises_no_kill(self):
+        # systemctl MainPID lookup fails -> can't verify holder != MainPID -> fail-safe.
+        run = self._fake_run(ss_out=_ss_line(4242), active_state="inactive",
+                             mainpid_exc=TimeoutError("dbus"))
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_ss_generic_exception_no_kill(self):
+        run = self._fake_run(ss_exc=OSError("netlink"))
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_fuser_generic_exception_no_kill(self):
+        run = self._fake_run(ss_missing=True, fuser_exc=OSError("boom"))
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_activestate_nonzero_rc_no_kill(self):
+        # bus down -> systemctl exits 1 with empty stdout and does NOT raise.
+        run = self._fake_run(ss_out=_ss_line(4242), active_rc=1)
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_mainpid_nonzero_rc_no_kill(self):
+        run = self._fake_run(ss_out=_ss_line(4242), active_state="inactive", mainpid_rc=1)
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
+
+    def test_no_holder_no_kill(self):
+        run = self._fake_run(ss_out="", active_state="inactive", main_pid="0")
+        with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
+            browser._reclaim_vnc_port()
+        kill.assert_not_called()
