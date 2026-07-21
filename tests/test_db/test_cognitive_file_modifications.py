@@ -203,3 +203,34 @@ class TestPrune:
         kept_p = [r["applied_content"] for r in rows if r["target_path"] == "/p"]
         assert kept_p == ["4", "3"]  # the two most recent
         assert any(r["target_path"] == "/other" for r in rows)
+
+
+class TestLatestForTarget:
+    @pytest.mark.asyncio
+    async def test_returns_newest_for_path(self, db):
+        await cfm.record(
+            db, actor="skill_evolution", target_path="/p", prior_content="v1",
+            applied_content="v2", created_at="2026-01-01T00:00:00",
+        )
+        await cfm.record(
+            db, actor="skill_evolution", target_path="/p", prior_content="v2",
+            applied_content="v3", created_at="2026-01-02T00:00:00",
+        )
+        # A newer edit to a DIFFERENT path must not shadow /p's latest.
+        await cfm.record(
+            db, actor="skill_evolution", target_path="/other", prior_content="x",
+            applied_content="y", created_at="2026-01-03T00:00:00",
+        )
+        row = await cfm.latest_for_target(db, "/p", actor="skill_evolution")
+        assert row is not None
+        assert row["prior_content"] == "v2"  # pre-image of the newest /p edit
+
+    @pytest.mark.asyncio
+    async def test_actor_filter(self, db):
+        await cfm.record(db, actor="other", target_path="/p", applied_content="a")
+        assert await cfm.latest_for_target(db, "/p", actor="skill_evolution") is None
+        assert await cfm.latest_for_target(db, "/p") is not None  # unfiltered finds it
+
+    @pytest.mark.asyncio
+    async def test_unknown_path_returns_none(self, db):
+        assert await cfm.latest_for_target(db, "/nope") is None

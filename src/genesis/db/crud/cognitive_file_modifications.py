@@ -66,8 +66,14 @@ async def record(
                 change_summary, metadata, status, created_at, rolled_back_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'applied', ?, NULL)""",
         (
-            mod_id, actor, target_path, prior_content, applied_content,
-            change_summary, meta_json, created_at,
+            mod_id,
+            actor,
+            target_path,
+            prior_content,
+            applied_content,
+            change_summary,
+            meta_json,
+            created_at,
         ),
     )
     await db.commit()
@@ -77,14 +83,43 @@ async def record(
 async def get(db: aiosqlite.Connection, mod_id: str) -> dict | None:
     """Fetch one ledger row by id (metadata parsed to a dict)."""
     cur = await db.execute(
-        "SELECT * FROM cognitive_file_modifications WHERE id = ?", (mod_id,),
+        "SELECT * FROM cognitive_file_modifications WHERE id = ?",
+        (mod_id,),
     )
     row = await cur.fetchone()
     return _row_to_dict(cur, row) if row else None
 
 
+async def latest_for_target(
+    db: aiosqlite.Connection,
+    target_path: str,
+    *,
+    actor: str | None = None,
+) -> dict | None:
+    """The most-recent ledger row for a specific ``target_path`` (optionally
+    filtered by ``actor``), or None. Bounded by the path index — never scans a
+    global recency window that could miss an older per-target edit."""
+    if actor:
+        cur = await db.execute(
+            "SELECT * FROM cognitive_file_modifications WHERE target_path = ? AND actor = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (target_path, actor),
+        )
+    else:
+        cur = await db.execute(
+            "SELECT * FROM cognitive_file_modifications WHERE target_path = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (target_path,),
+        )
+    row = await cur.fetchone()
+    return _row_to_dict(cur, row) if row else None
+
+
 async def recent(
-    db: aiosqlite.Connection, *, limit: int = 20, actor: str | None = None,
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 20,
+    actor: str | None = None,
 ) -> list[dict]:
     """Most-recent ledger rows, newest first, optionally filtered by actor."""
     if actor:
@@ -95,8 +130,7 @@ async def recent(
         )
     else:
         cur = await db.execute(
-            "SELECT * FROM cognitive_file_modifications "
-            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            "SELECT * FROM cognitive_file_modifications ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit,),
         )
     rows = await cur.fetchall()
@@ -115,7 +149,10 @@ async def counts_by_target(db: aiosqlite.Connection) -> list[dict]:
 
 
 async def mark_rolled_back(
-    db: aiosqlite.Connection, mod_id: str, *, rolled_back_at: str | None = None,
+    db: aiosqlite.Connection,
+    mod_id: str,
+    *,
+    rolled_back_at: str | None = None,
 ) -> bool:
     """Mark a row rolled back. Returns True iff a row was updated."""
     rolled_back_at = rolled_back_at or datetime.now(UTC).isoformat()
@@ -129,7 +166,10 @@ async def mark_rolled_back(
 
 
 async def prune_keep_per_target(
-    db: aiosqlite.Connection, target_path: str, *, keep: int,
+    db: aiosqlite.Connection,
+    target_path: str,
+    *,
+    keep: int,
 ) -> int:
     """Delete all but the most-recent ``keep`` rows for ``target_path``.
 

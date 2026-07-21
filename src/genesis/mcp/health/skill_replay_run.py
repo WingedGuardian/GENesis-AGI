@@ -37,14 +37,13 @@ async def _resolve_ledger_old_content(db, target_path: str) -> str | None:
     try:
         from genesis.db.crud import cognitive_file_modifications as cfm
 
-        rows = await cfm.recent(db, limit=50, actor="skill_evolution")
+        # Bounded by target_path (not a global recency window) so an older
+        # per-skill edit is never missed behind a burst of other skills' edits.
+        row = await cfm.latest_for_target(db, target_path, actor="skill_evolution")
     except Exception:  # noqa: BLE001 — best-effort; caller falls back to explicit arg
         logger.warning("skill_replay_run: ledger pre-image lookup failed", exc_info=True)
         return None
-    for row in rows:
-        if row.get("target_path") == target_path:
-            return row.get("prior_content")
-    return None
+    return row.get("prior_content") if row else None
 
 
 def _err(message: str) -> dict:
