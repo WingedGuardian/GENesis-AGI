@@ -36,6 +36,13 @@ Dependency rule: module-level imports are stdlib + yaml + genesis.env +
 genesis._config_overlay only (the ws2_ledger_config rule) — DB CRUDs and the
 cognitive ledger import lazily inside functions, so the memory/awareness hot
 paths can import this module without dragging the learning stack.
+
+Cross-process caveat (for the future trigger builder): the activation blend
+is cached per process at import; ``reload_blend()`` only fires in the process
+that ran the change/rollback. Other processes computing activation (e.g. the
+memory MCP server) pick the new blend up at their next restart. Applies to
+concurrency too: ``apply_knob_change`` has no cross-process write lock — the
+trigger must serialize its applies (v1 has no autonomous writer).
 """
 
 from __future__ import annotations
@@ -58,7 +65,11 @@ logger = logging.getLogger(__name__)
 _CONFIG_NAME = "learned_knobs.yaml"
 
 # Shipped activation-blend constants (memory/activation.py's coefficients —
-# must sum to 1.0 at maximum; the file may retune within ±20% per component).
+# sum to 1.0 at maximum AS SHIPPED). Components are bounded independently
+# (±20% each), so a fully-retuned file can push the sum to 1.2: relative
+# ranking is unaffected, but ABSOLUTE-score consumers (e.g. the drift
+# archival gate's min_activation) shift with it — a deliberate part of the
+# knob's effect, not an accident.
 BLEND_DEFAULTS = {"base": 0.6, "access": 0.25, "connectivity": 0.15}
 
 # The CLOSED registry — key must match exactly one pattern (§5.3).
@@ -295,7 +306,11 @@ async def _sync_knob(db: aiosqlite.Connection, group: str, name: str, value: flo
     elif group == "depth_thresholds":
         from genesis.db.crud import depth_thresholds as dt_crud
 
-        await dt_crud.update_threshold(db, name, new_threshold=value)
+        # Absolute backstop mirroring the signal CRUD's SQL clamp: thresholds
+        # live in (0, 1] and the CRUD itself doesn't clamp — without this, a
+        # hand-edited overlay with a self-attested baseline could land an
+        # arbitrary value and make a depth unreachable in the scorer.
+        await dt_crud.update_threshold(db, name, new_threshold=max(0.01, min(1.0, value)))
     else:  # activation_blend — poke the module-level seam
         try:
             from genesis.memory.activation import reload_blend
@@ -336,6 +351,68 @@ async def apply_learned_knobs_to_db(db: aiosqlite.Connection) -> int:
             applied += 1
         if applied:
             logger.info("learned_knobs: applied %d knob(s) from file to DB", applied)
+        # Surface the reader/writer overlay asymmetry: a legacy repo-local
+        # overlay is silently shadowed once the user-dir file exists (the
+        # resolver picks one file, it does not merge the two).
+        legacy = _base_path().with_suffix(".local.yaml")
+        if legacy.is_file() and _overlay_path().is_file():
+            logger.warning(
+                "learned_knobs: BOTH %s and %s exist — only the user-dir file "
+                "is read; fold the repo-local entries in and delete it",
+                legacy,
+                _overlay_path(),
+            )
     except Exception:
         logger.warning("learned_knobs startup apply failed", exc_info=True)
     return applied
+
+
+async def resync_after_ledger_rollback(db: aiosqlite.Connection, row: dict) -> str:
+    """Re-converge knob consumers after a cognitive-ledger file rollback.
+
+    Called by ``cognitive_ledger.rollback`` for ``ws2_effector`` rows: the
+    ledger restores the FILE, but the knobs' consumers (DB rows, the cached
+    activation blend) would otherwise keep the un-rolled-back values until
+    the next restart. Two cases:
+
+    - entry survived with an older value (rollback of a later write) → the
+      normal applier re-converges it;
+    - entry VANISHED (rollback of the first-ever write deletes the overlay)
+      → the applier can't see it, so the pre-change value is restored from
+      the ledger row's own recorded ``metadata.previous`` — without this,
+      the DB would keep the learned value forever while the file says "no
+      learned state", and the next apply would re-pin the baseline at the
+      drifted value (compounding the ±20% window).
+    """
+    applied = await apply_learned_knobs_to_db(db)
+    # The file changed under the cached activation blend either way.
+    try:
+        from genesis.memory.activation import reload_blend
+
+        reload_blend()
+    except Exception:
+        logger.debug("activation blend reload failed", exc_info=True)
+
+    meta_raw = row.get("metadata")
+    meta: dict[str, Any] = {}
+    if isinstance(meta_raw, dict):
+        meta = meta_raw
+    elif isinstance(meta_raw, str) and meta_raw:
+        try:
+            import json
+
+            loaded = json.loads(meta_raw)
+            if isinstance(loaded, dict):
+                meta = loaded
+        except ValueError:
+            pass
+    knob = meta.get("knob")
+    parsed = parse_knob_key(str(knob)) if knob else None
+    if parsed and knob not in load_knobs() and "previous" in meta:
+        group, name = parsed
+        try:
+            await _sync_knob(db, group, name, float(meta["previous"]))
+            return f"resynced ({applied} from file; {knob} restored to previous)"
+        except (TypeError, ValueError):
+            logger.warning("learned_knobs: bad metadata.previous for %r", knob)
+    return f"resynced ({applied} from file)"

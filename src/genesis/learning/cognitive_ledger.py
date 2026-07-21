@@ -95,7 +95,8 @@ async def record_existing(
     except Exception:
         logger.warning(
             "cognitive_ledger: ledger insert failed for %s (write unaffected)",
-            path, exc_info=True,
+            path,
+            exc_info=True,
         )
         return None
     # Prune-on-write: bound table growth (self-bounding, no scheduler job).
@@ -124,13 +125,21 @@ async def record_file_modification(
     prior = _read_current(path)
     _atomic_write(path, new_content)  # primary op — may raise (preserves behavior)
     return await record_existing(
-        db, actor=actor, path=path, prior_content=prior,
-        applied_content=new_content, summary=summary, metadata=metadata,
+        db,
+        actor=actor,
+        path=path,
+        prior_content=prior,
+        applied_content=new_content,
+        summary=summary,
+        metadata=metadata,
     )
 
 
 async def rollback(
-    db: aiosqlite.Connection, mod_id: str, *, force: bool = False,
+    db: aiosqlite.Connection,
+    mod_id: str,
+    *,
+    force: bool = False,
 ) -> dict:
     """Revert a recorded cognitive file modification to its pre-image.
 
@@ -142,12 +151,15 @@ async def rollback(
     """
     row = await cfm_crud.get(db, mod_id)
     if row is None:
-        return {"ok": False, "refused": False, "mod_id": mod_id,
-                "reason": "no such modification"}
+        return {"ok": False, "refused": False, "mod_id": mod_id, "reason": "no such modification"}
     if row.get("status") == "rolled_back":
-        return {"ok": False, "refused": False, "mod_id": mod_id,
-                "target_path": row.get("target_path"),
-                "reason": "already rolled back"}
+        return {
+            "ok": False,
+            "refused": False,
+            "mod_id": mod_id,
+            "target_path": row.get("target_path"),
+            "reason": "already rolled back",
+        }
 
     path = Path(row["target_path"])
     current = _read_current(path)
@@ -155,10 +167,14 @@ async def rollback(
     # Drift guard — refuse if the file changed since this modification.
     if current != row.get("applied_content") and not force:
         result = {
-            "ok": False, "refused": True, "mod_id": mod_id,
+            "ok": False,
+            "refused": True,
+            "mod_id": mod_id,
             "target_path": row["target_path"],
-            "reason": ("file changed since this modification — a later write replaced "
-                       "it; roll back the newer entry, or pass force=True"),
+            "reason": (
+                "file changed since this modification — a later write replaced "
+                "it; roll back the newer entry, or pass force=True"
+            ),
         }
         await _emit_rollback_observation(db, row, result)
         return result
@@ -172,28 +188,58 @@ async def rollback(
             _atomic_write(path, row["prior_content"])
             restored = "prior"
     except OSError as exc:
-        result = {"ok": False, "refused": False, "mod_id": mod_id,
-                  "target_path": row["target_path"], "reason": f"restore failed: {exc}"}
+        result = {
+            "ok": False,
+            "refused": False,
+            "mod_id": mod_id,
+            "target_path": row["target_path"],
+            "reason": f"restore failed: {exc}",
+        }
         await _emit_rollback_observation(db, row, result)
         return result
 
     await cfm_crud.mark_rolled_back(db, mod_id)
-    result = {"ok": True, "refused": False, "mod_id": mod_id,
-              "target_path": row["target_path"], "restored_to": restored,
-              "forced": force}
+    result = {
+        "ok": True,
+        "refused": False,
+        "mod_id": mod_id,
+        "target_path": row["target_path"],
+        "restored_to": restored,
+        "forced": force,
+    }
+
+    # WS-2 B5: a knob-file rollback must also re-converge the knobs' CONSUMERS
+    # (DB rows / activation blend) — file restore alone leaves awareness
+    # scoring on the un-rolled-back values until the next restart, invisibly.
+    # Best-effort: a resync failure never un-rolls the file (it is already
+    # restored + marked); it is surfaced in the result instead.
+    if row.get("actor") == "ws2_effector":
+        try:
+            from genesis.ledger.learned_knobs import resync_after_ledger_rollback
+
+            result["knob_resync"] = await resync_after_ledger_rollback(db, row)
+        except Exception:
+            logger.warning("knob resync after rollback failed", exc_info=True)
+            result["knob_resync"] = "failed — DB re-converges at next restart"
+
     await _emit_rollback_observation(db, row, result)
     return result
 
 
 async def recent(
-    db: aiosqlite.Connection, *, limit: int = 20, actor: str | None = None,
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 20,
+    actor: str | None = None,
 ) -> list[dict]:
     """Most-recent ledger rows (newest first), optionally filtered by actor."""
     return await cfm_crud.recent(db, limit=limit, actor=actor)
 
 
 async def _emit_rollback_observation(
-    db: aiosqlite.Connection, row: dict, result: dict,
+    db: aiosqlite.Connection,
+    row: dict,
+    result: dict,
 ) -> None:
     """Best-effort observation so a rollback (or its refusal) is visible. Never raises."""
     try:
@@ -210,19 +256,22 @@ async def _emit_rollback_observation(
             id=str(uuid.uuid4()),
             source="cognitive_ledger",
             type="self_mod_rollback",
-            content=json.dumps({
-                "mod_id": result.get("mod_id"),
-                "actor": row.get("actor"),
-                "target_path": row.get("target_path"),
-                "outcome": outcome,
-                "reason": result.get("reason"),
-                "restored_to": result.get("restored_to"),
-                "forced": result.get("forced", False),
-            }),
+            content=json.dumps(
+                {
+                    "mod_id": result.get("mod_id"),
+                    "actor": row.get("actor"),
+                    "target_path": row.get("target_path"),
+                    "outcome": outcome,
+                    "reason": result.get("reason"),
+                    "restored_to": result.get("restored_to"),
+                    "forced": result.get("forced", False),
+                }
+            ),
             priority="high",
             created_at=datetime.now(UTC).isoformat(),
         )
     except Exception:
         logger.warning(
-            "cognitive_ledger: failed to emit rollback observation", exc_info=True,
+            "cognitive_ledger: failed to emit rollback observation",
+            exc_info=True,
         )

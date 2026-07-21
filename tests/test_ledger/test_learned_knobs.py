@@ -340,3 +340,84 @@ class TestStartupApplier:
             "SELECT current_weight FROM signal_weights WHERE signal_name='test_signal'"
         )
         assert (await cursor.fetchone())["current_weight"] == pytest.approx(0.51)
+
+
+# ---------------------------------------------------------------------------
+# Rollback resync hook (F2/F3 — ledger rollback re-converges consumers)
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackResync:
+    async def test_first_write_rollback_restores_db_from_metadata(self, db, knob_paths):
+        """Rolling back the FIRST knob write deletes the overlay (no
+        pre-image) — the DB row must still re-converge, via the ledger row's
+        recorded metadata.previous, not stay drifted forever."""
+        from genesis.learning.cognitive_ledger import rollback
+
+        mod_id = await lk.apply_knob_change(db, "awareness.depth_thresholds.Deep", 0.44)
+        result = await rollback(db, mod_id)
+        assert result["ok"] is True
+        assert not knob_paths["overlay"].exists()  # first write → file removed
+        assert "restored to previous" in result["knob_resync"]
+        cursor = await db.execute(
+            "SELECT threshold FROM depth_thresholds WHERE depth_name='Deep'"
+        )
+        assert (await cursor.fetchone())["threshold"] == pytest.approx(0.45)
+
+    async def test_later_write_rollback_resyncs_via_applier(self, db, knob_paths):
+        from genesis.learning.cognitive_ledger import rollback
+
+        await lk.apply_knob_change(db, "awareness.depth_thresholds.Deep", 0.44)
+        second = await lk.apply_knob_change(db, "awareness.depth_thresholds.Deep", 0.43)
+        result = await rollback(db, second)
+        assert result["ok"] is True
+        assert result["knob_resync"].startswith("resynced (1 from file")
+        cursor = await db.execute(
+            "SELECT threshold FROM depth_thresholds WHERE depth_name='Deep'"
+        )
+        assert (await cursor.fetchone())["threshold"] == pytest.approx(0.44)
+
+    async def test_baseline_not_repinned_after_first_write_rollback(self, db, knob_paths):
+        """The re-pin drift hole: after first-write rollback the next apply
+        must see the ORIGINAL value as baseline (0.45), not a drifted one."""
+        from genesis.learning.cognitive_ledger import rollback
+
+        mod_id = await lk.apply_knob_change(db, "awareness.depth_thresholds.Deep", 0.44)
+        await rollback(db, mod_id)
+        # DB is back at 0.45; a fresh apply pins baseline 0.45 again
+        await lk.apply_knob_change(db, "awareness.depth_thresholds.Deep", 0.46)
+        overlay = yaml.safe_load(knob_paths["overlay"].read_text())
+        assert overlay["knobs"]["awareness.depth_thresholds.Deep"]["baseline"] == 0.45
+
+    async def test_non_knob_rollback_untouched(self, db, tmp_path):
+        """Rollback of a non-ws2_effector row must not carry knob_resync."""
+        from genesis.learning.cognitive_ledger import record_file_modification, rollback
+
+        target = tmp_path / "other.md"
+        mod_id = await record_file_modification(
+            db, actor="skill_evolution", path=target, new_content="hello"
+        )
+        result = await rollback(db, mod_id)
+        assert result["ok"] is True
+        assert "knob_resync" not in result
+
+
+# ---------------------------------------------------------------------------
+# Depth absolute clamp (F4)
+# ---------------------------------------------------------------------------
+
+
+class TestDepthClamp:
+    async def test_hand_edited_out_of_domain_threshold_clamped(self, db, knob_paths):
+        """A self-attested baseline can pass the relative bound with an
+        absurd absolute value — the sync path clamps to (0, 1]."""
+        knob_paths["overlay"].write_text(
+            yaml.safe_dump(
+                {"knobs": {"awareness.depth_thresholds.Deep": {"baseline": 10.0, "current": 9.0}}}
+            )
+        )
+        await lk.apply_learned_knobs_to_db(db)
+        cursor = await db.execute(
+            "SELECT threshold FROM depth_thresholds WHERE depth_name='Deep'"
+        )
+        assert (await cursor.fetchone())["threshold"] == pytest.approx(1.0)
