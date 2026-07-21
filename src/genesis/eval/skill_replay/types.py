@@ -1,0 +1,44 @@
+"""Types for the skill-replay held-out regression gate (WS1).
+
+A proposed SKILL.md edit is screened by REPLAYING a frozen golden task suite
+against the OLD vs NEW skill content and comparing per-task judge scores —
+control = OLD, treatment = NEW. The verdict is recommend-only (it is logged as
+an observation and NEVER blocks an edit); the promotion posture it encodes is
+the spec's "promote only on zero-regression + net-positive". See ``verdict.py``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+# Verdict labels — the three outcomes of a replay comparison.
+VERDICT_NET_POSITIVE = "net_positive"  # zero regression AND at least one improvement
+VERDICT_REGRESSION = "regression"  # NEW lost on >=1 task, or pass-rate favours OLD
+VERDICT_INCONCLUSIVE = "inconclusive"  # all ties, or too few complete pairs to judge
+
+
+@dataclass(frozen=True)
+class SkillReplayConfig:
+    """Statistical knobs for the verdict (operator-tunable via skill_gate_config).
+
+    ``epsilon`` is the per-task judge-score margin a win must exceed
+    (``compute_score_winrate``); ``min_pairs`` is the minimum number of complete
+    (non-skipped) task pairs required before a verdict is anything but
+    ``inconclusive`` — below it the run has no power and says so honestly.
+    """
+
+    epsilon: float = 0.05
+    min_pairs: int = 5
+
+
+@dataclass(frozen=True)
+class SkillReplayVerdict:
+    """The recommend-only outcome of one OLD-vs-NEW replay comparison."""
+
+    verdict: str  # one of VERDICT_*
+    n_complete: int  # complete (non-skipped) pairs graded
+    n_regressions: int  # tasks where OLD beat NEW by > epsilon
+    n_improvements: int  # tasks where NEW beat OLD by > epsilon
+    score_winrate: dict = field(default_factory=dict)  # compute_score_winrate output
+    pass_winrate: dict = field(default_factory=dict)  # compute_winrate output
+    note: str = ""
