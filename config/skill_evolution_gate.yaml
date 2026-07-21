@@ -21,3 +21,20 @@ enabled: true
 # There is no "enforce" mode yet — the gate never blocks an edit while it bakes.
 # An invalid value degrades to shadow (observe-only, the safe baseline).
 mode: shadow
+
+# Held-out REPLAY gate (WS1). A second, complementary screen: instead of a
+# static diff, it REPLAYS a frozen per-skill golden task suite against the OLD
+# vs NEW SKILL.md content (control=OLD, treatment=NEW) and logs a recommend-only
+# verdict (net_positive / regression / inconclusive). It only fires where a
+# golden suite exists and is HEAVY (spawns CC sessions), so it runs out-of-band
+# (the skill_replay MCP tool / CLI), never in the auto-apply hot path.
+replay:
+  # off | shadow. shadow (default): run the replay and log the verdict
+  #   (source="skill_evolution_gate", type="skill_replay_verdict"); the edit is
+  #   never blocked. off: never run the replay. No "enforce" yet. Invalid → shadow.
+  mode: shadow
+  # Per-task judge-score margin a win must exceed (paired win-rate).
+  epsilon: 0.05
+  # Minimum complete (non-skipped) task pairs before the verdict is anything but
+  # "inconclusive" — below it the run has no statistical power.
+  min_pairs: 5
