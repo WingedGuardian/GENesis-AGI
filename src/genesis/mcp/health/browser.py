@@ -124,15 +124,24 @@ _vnc_verified = False
 
 # Cloudflare challenge detection constants (FlareSolverr-proven)
 _CHALLENGE_TITLES = ["just a moment", "ddos-guard"]
-_CHALLENGE_SELECTORS = [
-    'iframe[src*="challenges.cloudflare.com"]',
-    'input[name="cf-turnstile-response"]',
+# Interstitial (blocking full-page challenge) markers. A Cloudflare interstitial
+# INTERCEPTS the request and replaces the page; these appear only on the challenge
+# chrome, never on an embedded widget. The strongest signal is the cf-mitigated
+# response header (checked in _detect_interstitial).
+# NOTE: .ray_id excluded — appears on non-challenge CF error pages (403/502/520).
+_INTERSTITIAL_SELECTORS = [
     "#cf-challenge-running",
     "#challenge-spinner",
-    "#turnstile-wrapper",
     "#cf-please-wait",
-    # NOTE: .ray_id excluded — appears on non-challenge Cloudflare error
-    # pages (403, 502, 520) and would cause false-positive blocking.
+]
+# Embedded Turnstile widget markers. These appear on ordinary, already-loaded
+# pages (login/signup forms) that merely EMBED a widget — NOT a blocking
+# challenge. Detected separately (short-grace path), never escalated to VNC/alert.
+_WIDGET_SELECTORS = [
+    'iframe[src*="challenges.cloudflare.com"]',
+    'input[name="cf-turnstile-response"]',
+    "#turnstile-wrapper",
+    ".cf-turnstile",
 ]
 
 
@@ -1668,25 +1677,62 @@ async def _vnc_click_turnstile(page) -> bool:
         return False
 
 
-async def _detect_challenge(page) -> bool:
-    """Detect any Cloudflare challenge (iframe, managed, interstitial).
+async def _detect_interstitial(page, response=None) -> bool:
+    """Detect a BLOCKING Cloudflare interstitial (not an embedded widget).
 
-    Uses FlareSolverr-proven selectors plus page title check.
-    Returns True if a challenge is detected.
+    True only on interstitial evidence: the ``cf-mitigated`` response header
+    (Cloudflare's canonical challenge-response marker, language-independent),
+    full-page challenge chrome (``#cf-challenge-running`` etc.), or a "just a
+    moment" / "ddos-guard" title. A page that merely embeds a Turnstile widget
+    on already-loaded content is NOT an interstitial — see _detect_widget.
     """
-    # Check DOM selectors (fastest)
-    for selector in _CHALLENGE_SELECTORS:
-        el = await page.query_selector(selector)
-        if el is not None:
+    # Strongest signal: CF tags challenge responses with cf-mitigated. Best-effort
+    # (Camoufox proxying could hide it — the DOM/title checks below are the backstop).
+    if response is not None:
+        try:
+            if response.headers.get("cf-mitigated"):
+                return True
+        except Exception:
+            pass  # header access is best-effort
+
+    # Full-page challenge chrome (fastest DOM signal).
+    for selector in _INTERSTITIAL_SELECTORS:
+        if await page.query_selector(selector) is not None:
             return True
 
-    # Title-based detection for very early interstitials
+    # Interstitial title (English / DDoS-Guard; cf-mitigated is the i18n backstop).
     title = (await page.title()).lower()
     return any(ct in title for ct in _CHALLENGE_TITLES)
 
 
-async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
-    """Detect and handle Cloudflare challenge (Turnstile or managed).
+async def _detect_widget(page) -> bool:
+    """Detect an embedded Cloudflare Turnstile widget (non-blocking)."""
+    for selector in _WIDGET_SELECTORS:
+        if await page.query_selector(selector) is not None:
+            return True
+    return False
+
+
+async def _challenge_present(page) -> bool:
+    """Secondary "is a challenge still on the page?" check.
+
+    True if a blocking interstitial OR an embedded Turnstile widget is still
+    present. Used by the in-ladder "challenge gone?" gates so a still-unsolved
+    widget (chrome dismissed, non-English title, no token yet) is NOT mistaken
+    for a resolved challenge. The token poll remains the primary success signal;
+    this only guards the DOM-based early-exit.
+    """
+    return await _detect_interstitial(page) or await _detect_widget(page)
+
+
+async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> dict | None:
+    """Detect and handle a Cloudflare challenge (Turnstile or managed).
+
+    ``response`` is the ``page.goto`` Response when available; its ``cf-mitigated``
+    header is the strongest (language-independent) interstitial signal. Only a
+    real interstitial runs the full ladder below. A page that merely EMBEDS a
+    Turnstile widget (no interstitial) gets a short auto-resolve grace poll and
+    returns ``{"status": "embedded"}`` with no VNC/Telegram escalation.
 
     Phase 1 (auto-resolve): Polls for ``timeout_ms`` for automatic resolution.
 
@@ -1699,7 +1745,8 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
 
     No human escalation — Genesis handles this itself.
 
-    Returns None if no challenge detected, or a status dict.
+    Returns None if neither an interstitial nor a widget is present, else a
+    status dict (``resolved`` / ``embedded`` / ``blocked``).
     """
     try:
         # Brief delay for SPA-injected widgets to load
@@ -1708,14 +1755,40 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
         _ts_log.info("_wait_for_turnstile called — checking for challenge")
         _ts_log.info("Page URL: %s | Title: %s", page.url, await page.title())
 
-        if not await _detect_challenge(page):
-            _ts_log.info("_detect_challenge returned False — no challenge found")
+        if not await _detect_interstitial(page, response):
+            # No blocking interstitial. A page that merely EMBEDS a Turnstile
+            # widget (login/signup forms) is not a challenge: give it only a
+            # brief auto-resolve grace poll (in case it is a fast auto-solving
+            # variant), then return WITHOUT the VNC ladder or Telegram alert.
+            if await _detect_widget(page):
+                _ts_log.info("Widget present, no interstitial — short grace poll")
+                if await _poll_turnstile_token(page, timeout_ms / 1000, 1.0):
+                    _ts_log.info("RESOLVED: auto (embedded widget)")
+                    return {"status": "resolved", "method": "auto"}
+                _ts_log.info("Embedded widget only — not a blocking challenge")
+                return {"status": "embedded", "method": "widget_no_interstitial"}
+            _ts_log.info("No interstitial and no widget — no challenge found")
             return None
 
         _ts_log.info("=== CHALLENGE DETECTED — starting resolution ===")
         _ts_log.info("Page title: %s", await page.title())
         _ts_log.info("Page URL: %s", page.url)
         logger.info("Cloudflare challenge detected — waiting for auto-resolve")
+
+        # Track whether we ever actually observed the challenge in the DOM. A
+        # header-only detection (cf-mitigated with no chrome/widget that never
+        # renders) must NOT be treated as "gone" by the DOM-based gates below —
+        # that would falsely report resolved; it runs the ladder to a blocked
+        # result instead. A challenge we DID see and then watched disappear
+        # (e.g. a redirect interstitial) is a genuine resolution.
+        saw_challenge_dom = await _challenge_present(page)
+
+        async def _challenge_gone() -> bool:
+            nonlocal saw_challenge_dom
+            if await _challenge_present(page):
+                saw_challenge_dom = True
+                return False
+            return saw_challenge_dom
 
         # Phase 1: auto-resolve (3-5s for trusted browsers, 15s max)
         _ts_log.info("PHASE 1: auto-resolve (%.0fs)", timeout_ms / 1000)
@@ -1735,7 +1808,7 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
                     _ts_log.info("RESOLVED: widget_click (attempt %d)", click_attempt)
                     logger.info("Challenge resolved via widget click (attempt %d)", click_attempt)
                     return {"status": "resolved", "method": "iframe_click"}
-                if not await _detect_challenge(page):
+                if await _challenge_gone():
                     _ts_log.info("RESOLVED: widget_click (challenge gone)")
                     return {"status": "resolved", "method": "iframe_click"}
                 _ts_log.info("Widget click %d: sent but not resolved", click_attempt)
@@ -1753,7 +1826,7 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
                 _ts_log.info("RESOLVED: playwright_captcha")
                 logger.info("Challenge resolved via playwright-captcha")
                 return {"status": "resolved", "method": "playwright_captcha"}
-            if not await _detect_challenge(page):
+            if await _challenge_gone():
                 _ts_log.info("RESOLVED: playwright_captcha (challenge gone)")
                 return {"status": "resolved", "method": "playwright_captcha"}
 
@@ -1773,7 +1846,7 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
                     await asyncio.sleep(random.uniform(1.0, 3.0))
                     return {"status": "resolved", "method": "auto_delayed"}
 
-                if not await _detect_challenge(page):
+                if await _challenge_gone():
                     logger.info("Challenge page gone — resolved")
                     return {"status": "resolved", "method": "external"}
 
@@ -1884,9 +1957,10 @@ async def _impl_browser_navigate(
         # Skip goto only when TinyFish session was JUST created with this URL
         # (it already navigated on creation). Subsequent navigations must goto.
         skip_goto = is_new_tinyfish and url
+        response = None
         if not skip_goto:
             _ts_log.info("page.goto starting: %s", url)
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             _ts_log.info("page.goto completed — title: %s", await page.title())
 
         # Challenge detection for local browsers (Camoufox + Chromium).
@@ -1895,7 +1969,7 @@ async def _impl_browser_navigate(
         turnstile_result = None
         if not tinyfish and not remote:
             _ts_log.info("calling _wait_for_turnstile")
-            turnstile_result = await _wait_for_turnstile(page)
+            turnstile_result = await _wait_for_turnstile(page, response=response)
             _ts_log.info("_wait_for_turnstile returned: %s", turnstile_result)
 
         # Track URL for drift detection on remote sessions
