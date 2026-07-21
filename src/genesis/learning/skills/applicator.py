@@ -76,7 +76,10 @@ class SkillApplicator:
                 )
                 # Fall through to staging path
                 return await self._stage(
-                    proposal, db, validated=False, now=now,
+                    proposal,
+                    db,
+                    validated=False,
+                    now=now,
                     validation_detail=validation.test_results,
                 )
 
@@ -119,6 +122,35 @@ class SkillApplicator:
                 priority="medium",
                 created_at=now,
             )
+
+            # Shadow skill-edit Critic (WS1): screen the edit for self-modification
+            # pathologies AFTER it has been applied. Pure telemetry — a judge
+            # problem must never disturb the auto-apply, so the whole block is
+            # best-effort and the verdict NEVER gates the edit (shadow invariant).
+            try:
+                from genesis.learning.skills.skill_edit_critic import run_critic
+
+                critic = await run_critic(
+                    current_content=current_content,
+                    proposal=proposal,
+                    router=router,
+                )
+                if critic is not None:
+                    await observations.create(
+                        db,
+                        id=str(uuid.uuid4()),
+                        source="skill_evolution_gate",
+                        type="skill_edit_critic",
+                        content=json.dumps(critic),
+                        priority=("high" if critic.get("verdict") == "flagged" else "low"),
+                        created_at=now,
+                    )
+            except Exception:
+                logger.warning(
+                    "skill-edit Critic (shadow) failed for %s; edit already applied",
+                    proposal.skill_name,
+                    exc_info=True,
+                )
 
             logger.info("Auto-applied MINOR skill change to %s", proposal.skill_name)
             return {"action": "applied", "skill_name": proposal.skill_name}

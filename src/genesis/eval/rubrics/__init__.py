@@ -95,4 +95,5 @@ from genesis.eval.rubrics import (  # noqa: E402,F401
     memory_recall_grounding,
     output_quality,
     reflection_quality,
+    skill_edit_regression,
 )
