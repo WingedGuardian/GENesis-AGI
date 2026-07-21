@@ -652,7 +652,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 06c22c68 2026-07-20
+verified: fbcf8ee4 2026-07-21
 ```
 
 - **learning/** is the de-facto cron host: `rt._learning_scheduler` registers
@@ -666,8 +666,14 @@ verified: 06c22c68 2026-07-20
   (`skills/skill_edit_critic.py` + `eval/rubrics/skill_edit_regression.py`)
   now screens each auto-applied edit for self-modification pathologies via the
   `judge` call site and LOGS a verdict (`skill_evolution_gate` observations) —
-  it never blocks the edit (WS1 shadow). Levers: `skill_evolution_gate`
-  settings domain (off|shadow) + `GENESIS_SKILL_EVOLUTION_GATE_OFF`.
+  it never blocks the edit (WS1 shadow). A complementary **held-out replay
+  gate** (`eval/skill_replay/`, tool `skill_replay_run`) goes further — it
+  REPLAYS a frozen per-skill golden suite (`~/.genesis/eval/skill_golden/`,
+  authored via `eval/skill_golden_set.py`) against OLD vs NEW content in
+  bare-Claude isolation and logs a recommend-only zero-regression verdict
+  (`skill_replay_verdict` observations); also shadow, out-of-band, mutates
+  nothing. Levers: `skill_evolution_gate` settings domain (off|shadow for the
+  Critic + a `replay` off|shadow sub-config) + `GENESIS_SKILL_EVOLUTION_GATE_OFF`.
   `tool_discovery.py` static maps are deprecated (GROUNDWORK
   provider-migration) — use ProviderRegistry.
 - **eval/**: J9 = fire-and-forget emit hooks on live cognitive paths (the

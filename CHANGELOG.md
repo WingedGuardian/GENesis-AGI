@@ -21,6 +21,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   before the screen is ever given veto power. Tunable via the new
   `skill_evolution_gate` setting (`off` | `shadow`) with a
   `GENESIS_SKILL_EVOLUTION_GATE_OFF` kill switch.
+- **Genesis can now regression-test a skill edit by actually re-running it.**
+  Beyond reading the diff, Genesis can replay a frozen set of real tasks against
+  both the old and the new version of a skill and compare how well each does —
+  promoting the change only when it shows zero regressions and a real
+  improvement. Like the diff screen it starts in shadow: it records a
+  `net_positive` / `regression` / `inconclusive` verdict (surfaced when it finds
+  a regression) and never blocks or applies an edit. It runs on demand via the
+  new `skill_replay_run` tool against a per-skill task suite you author with
+  `python -m genesis.eval.skill_golden_set`, and shares the
+  `skill_evolution_gate` setting (a new `replay` section) and kill switch.
 - **Voice conversations now feed real memory extraction (W0.5).** S2S voice
   conversations used to land in episodic memory as one growing raw blob per
   session close — duplicated on replays, never mined for facts. They now
