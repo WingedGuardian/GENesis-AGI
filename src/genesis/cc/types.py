@@ -84,6 +84,40 @@ class EffortLevel(StrEnum):
     MAX = "max"
 
 
+class DeliveryMode(StrEnum):
+    """How a background (direct) session's terminal outcome is delivered.
+
+    - ``SILENT`` — no notification; the DB row is the only record.
+    - ``FAILURE_ONLY`` — failures are broadcast-alerted; success is silent.
+      The legacy default (success notifications were retired as noise).
+    - ``RESULT`` — the terminal outcome (success AND failure/truncation) is
+      delivered back to the ORIGIN conversation the session was dispatched
+      from. Requires ``DirectSessionRequest.origin_session_id`` (the foreground
+      ``cc_sessions`` row id captured at dispatch); falls back to the default
+      owner surface when the origin cannot be addressed.
+    """
+
+    SILENT = "silent"
+    FAILURE_ONLY = "failure_only"
+    RESULT = "result"
+
+    @classmethod
+    def from_legacy(cls, notify: bool, notify_on_failure_only: bool = False) -> DeliveryMode:
+        """Map the legacy ``notify`` / ``notify_on_failure_only`` bools to a mode.
+
+        Preserves today's behavior exactly: ``notify=False`` → SILENT; any
+        ``notify=True`` → FAILURE_ONLY (success has never notified — the runner
+        only sends on failure). ``notify_on_failure_only`` is accepted for
+        signature completeness but does not change the result: nothing in the
+        runner reads it today, so both ``notify=True`` combinations collapse to
+        FAILURE_ONLY. No legacy caller maps to RESULT — that mode is opt-in via
+        the ``deliver_to_origin`` dispatch path only.
+        """
+        if not notify:
+            return cls.SILENT
+        return cls.FAILURE_ONLY
+
+
 # Ordered list used for ceiling comparisons (low → max).
 _EFFORT_RANK: list[EffortLevel] = [
     EffortLevel.LOW,
