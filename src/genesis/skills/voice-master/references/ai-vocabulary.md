@@ -169,3 +169,21 @@ Vague upbeat endings.
 - "the possibilities are endless"
 - "poised for growth"
 - "watch this space"
+
+## Significance & structure inflation
+
+High-signal words and phrases that inflate importance or fake structure. Treat
+these like the Significance and Promotional lists above (added alongside the
+document-level structural tells in `anti-slop.md`).
+
+- "stands as" / "stands as a testament": inflated copula; prefer "is".
+- "at the forefront of" / "on the cutting edge of": press-release framing.
+- "sits at the intersection of": fake-profound positioning.
+- "a hallmark of" / "the epitome of" / "quintessential": significance puffery.
+- "a wealth of" / "a plethora of" / "a treasure trove of": quantity inflation; give the number or drop it.
+- "ever-evolving" / "ever-changing" / "rapidly evolving": filler dynamism.
+- "profound" / "profoundly": usually removable inflation.
+- "resonates with": vague emotional claim; say what actually lands.
+- "underpins" / "a cornerstone of": abstract structural filler.
+- "stark reminder" / "stark contrast": cliché intensifier; be concrete.
+- "rich history" / "rich tradition" / "rich tapestry": tourism-brochure filler.

@@ -128,7 +128,6 @@ not per paragraph. Stacking them is an AI fingerprint.
 
 ### Structural tells
 
-- Opening the first sentence with "I".
 - Three-part lists whose items share the exact same grammatical structure.
 - Uniform sentence length — vary it. Favor sentences under ~16 words but keep
   the user's natural longer reasoning chains; don't flatten everything to one
@@ -136,6 +135,45 @@ not per paragraph. Stacking them is an AI fingerprint.
 - Sycophantic acknowledgments before answering ("Great question", "Certainly",
   "Absolutely").
 - Hedging openers ("It's worth considering that…", "It's important to note…").
+
+### Raw markdown as a delivery format
+
+Shipping a *work deliverable* as a raw `.md` file is the single loudest "AI wrote
+this" signal: the format itself gives it away before a word is read. A person
+sends a PDF, a DOCX, a slide deck, or a spreadsheet; only an AI hands over raw
+markdown as the finished artifact. **Fail** any external or under-the-user's-name
+deliverable that ships as raw `.md`, and convert it to the format the audience
+expects (PDF / DOCX / XLSX / deck). **Exempt:** contexts where markdown is
+genuinely native: a repo, a README, a wiki, a blog or CMS draft, a chat reply.
+The tell is markdown *as the delivery envelope for finished work*, not markdown
+as an authoring or repo format.
+
+### Document-level structural tells
+
+These operate at the altitude of the whole document, not the sentence. A piece
+can pass every line-level check above and still read as machine-made because its
+*shape* is an AI reflex. Scan the finished document for:
+
+- **Meta-narration.** The document narrating its own structure: "In this section
+  we'll explore…", "This report is organized as follows…", "Having covered X, we
+  now turn to Y." A human just writes the section.
+- **Exhaustive-coverage-as-virtue.** Treating "I covered every possible angle" as
+  the goal. Humans pick the load-bearing points and cut the rest; AI enumerates.
+  Completeness is not insight.
+- **Equal-length sections.** Every section roughly the same size. Real documents
+  are lopsided: the part that mattered got three times the room.
+- **Relentless parallelism.** Every heading the same grammatical shape, every
+  bullet the same length and rhythm. Mechanical symmetry reads as generated.
+- **Table overload.** Reaching for a table (or a bulleted list) where prose would
+  carry the point better. Some ideas are paragraphs; AI over-structures.
+- **Absent point of view.** The "balanced overview" with no thesis and no stance.
+  A person writing about something they care about takes a position; a survey
+  that refuses to is itself a tell.
+
+Sources: Wikipedia *Signs of AI Writing*, the arXiv structural-fingerprint work,
+and the tells above (the Long-form section applies several of these to essays
+specifically). On a fail, don't just reformat: re-decide what the document is
+*for*, lead with that, and cut what exists only for coverage.
 
 ---
 
