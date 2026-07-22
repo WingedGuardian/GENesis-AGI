@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from genesis.db.data_migrations._util import commit_in_batches
 from genesis.ego.verification import (
     _resolve_path,
     parse_expected_outputs,
@@ -71,25 +72,38 @@ def _exact_pass(expected_outputs: str | None) -> bool:
 
 
 def migrate() -> dict:
-    """Flip each exact-pass false-failure to 'executed'; return counts."""
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    """Flip each exact-pass false-failure to 'executed'; return counts.
+
+    Two phases so the slow per-row file-existence checks (``_exact_pass`` does
+    disk I/O) run WITHOUT holding the write lock: gather the exact-pass ids on a
+    read-only connection first, then apply the UPDATEs in committed batches. A
+    single-transaction loop that did the disk checks inline would hold the WAL
+    write lock for the whole scan and starve the live server's writers (see
+    ``_util.commit_in_batches``)."""
+    ro = sqlite3.connect(f"file:{genesis_db_path()}?mode=ro", uri=True)
     try:
-        rows = db.execute(_SELECT).fetchall()
-        flipped = 0
-        for pid, _user_response, expected_outputs in rows:
-            if not _exact_pass(expected_outputs):
-                continue
-            db.execute(
-                "UPDATE ego_proposals SET status = 'executed', "
-                "user_response = COALESCE(user_response, '') || ? "
-                "WHERE id = ? AND status = 'failed'",
-                (_NOTE, pid),
-            )
-            flipped += 1
-        db.commit()
-        return {"flipped": flipped, "scanned": len(rows)}
+        rows = ro.execute(_SELECT).fetchall()
+    finally:
+        ro.close()
+    to_flip = [pid for pid, _ur, expected_outputs in rows if _exact_pass(expected_outputs)]
+    if not to_flip:
+        return {"flipped": 0, "scanned": len(rows)}
+
+    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+
+    def _flip(conn: sqlite3.Connection, pid: object) -> None:
+        conn.execute(
+            "UPDATE ego_proposals SET status = 'executed', "
+            "user_response = COALESCE(user_response, '') || ? "
+            "WHERE id = ? AND status = 'failed'",
+            (_NOTE, pid),
+        )
+
+    try:
+        flipped = commit_in_batches(db, to_flip, _flip)
     finally:
         db.close()
+    return {"flipped": flipped, "scanned": len(rows)}
 
 
 def verify() -> bool:

@@ -34,6 +34,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A large one-time data cleanup no longer briefly freezes the running system.**
+  Post-startup data migrations (one-off cleanups/backfills of stored knowledge and
+  history) run alongside the live system, which allows only one writer to the
+  database at a time. A big cleanup used to do all its work in a single long write,
+  briefly blocking every other write for ~10+ seconds — long enough that the system
+  logged "database is locked" errors and, in one case, had to re-run the cleanup
+  after a restart. Bulk cleanups now save their progress in small batches, releasing
+  the database between them, and the bookkeeping that records a migration as "done"
+  now retries briefly if it hits a momentary lock — so a cleanup is never
+  needlessly repeated. (Slow per-record checks were also moved out of the locked
+  window.)
+
 - **An interrupted update no longer leaves the server down.** If a self-update
   is interrupted after it has stopped the server (a Ctrl-C, a system shutdown,
   or an unexpected failure inside an internal step), it now rolls back to the

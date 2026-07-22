@@ -260,7 +260,7 @@ verified: 0e65071c 2026-07-21
   bookmark-enrichment) route to the KB; action/maintenance/monitor/pipeline-
   intermediate output is point-in-time OPERATIONAL TELEMETRY, gated OUT at
   `dispatch._route_insights` (before the gate it filled the KB with db-
-  maintenance/eval reports — 71% surplus; d0005 purged the historical rows).
+  maintenance/eval reports — 71% surplus; d0006 purged the historical rows).
   `source_pipeline` is per-source (`intake._pipeline_for_source`): Genesis-
   authored → `surplus`/first-party; crawled recon/model/github/web →
   distinct labels classified `external_untrusted` (wrapped on recall).
@@ -912,7 +912,11 @@ verified: b662f3e3 2026-07-17
   ones sit `operator_pending` and never auto-run. Shared file-discovery with the
   schema runner (`db/_migration_discovery.py`), deliberately NOT the atomic-txn
   proxy. Seed `d0001` mirrors SQLite `origin_class` onto Qdrant — idempotent, so
-  a lagging install self-heals on next pull+restart with no control plane.
+  a lagging install self-heals on next pull+restart with no control plane. Bulk
+  write/delete migrations MUST commit in batches (`_util.commit_in_batches`) so a
+  big backfill never holds the single WAL writer long enough to starve the live
+  server (which waits only 5s for the lock); the runner also retries a
+  lock-contended ledger write (#1179 regression guard).
 - **runtime/**: sequential bootstrap (secrets → db → … → sentinel, ~27 steps);
   each step records ok/degraded/failed in the manifest — only db aborts.
   `~/.genesis/capabilities.json` + `bootstrap_manifest.json` are projected at

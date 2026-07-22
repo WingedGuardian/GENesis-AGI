@@ -29,12 +29,14 @@ RESURFACING via degraded FTS5 recall (``memory_fts`` is cross-collection), so we
 reproduce the full cascade in raw SQL (``migrate()``/``verify()`` are SYNC with
 their own connections — they cannot call the async store).
 
-Ordering: the Qdrant point is deleted BEFORE the SQLite rows for that unit; if
-the Qdrant delete fails (transient), the unit's SQLite rows are LEFT intact so
-``verify()`` still sees it as a candidate → the migration is marked failed and
+Ordering: Qdrant points are deleted (phase 1) BEFORE any SQLite rows (phase 2),
+never while holding the SQLite write lock. If a unit's Qdrant delete fails
+(transient), that unit is dropped from phase 2 so its SQLite rows are LEFT intact
+— ``verify()`` still sees it as a candidate → the migration is marked failed and
 retries next boot (no half-deleted orphan vector). ``get_client()`` failing
-entirely raises → same retry. Idempotent: a missing point deletes as a no-op,
-and the DELETEs are no-ops once purged / on a fresh install (no such rows).
+entirely raises → same retry. Idempotent: a missing point deletes as a no-op, and
+the SQLite DELETEs are no-ops once purged / on a fresh install (no such rows) —
+so the intermediate "point gone, rows still present" window is simply re-run.
 
 migrate()/verify() are SYNC (framework contract, cf. d0003/d0004). Own
 connections only — never the runtime's async ``rt._db``.
@@ -45,6 +47,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
+from genesis.db.data_migrations._util import commit_in_batches
 from genesis.env import genesis_db_path
 from genesis.qdrant.collections import delete_point, get_client
 
@@ -103,7 +106,20 @@ def _candidate_ids(db: sqlite3.Connection) -> list[tuple[str, str]]:
 
 
 def migrate() -> dict:
-    """Purge surplus ops-telemetry KB units across all stores. Return counts."""
+    """Purge surplus ops-telemetry KB units across all stores. Return counts.
+
+    Two phases so the WAL write lock is never held during Qdrant network I/O
+    (holding it there is what let the original single-transaction form starve the
+    live server for ~13s, #1179):
+
+    Phase 1 (lock-free — no write connection open): delete each unit's Qdrant
+    point. A unit whose point-delete FAILS is dropped from phase 2, so its SQLite
+    rows stay put, verify() still sees it, and the migration retries — never a
+    half-deleted orphan vector.
+
+    Phase 2 (``commit_in_batches``): the fast raw-SQL cross-store cascade, holding
+    the write lock only for a bounded batch of quick DELETEs at a time.
+    """
     # Read candidates first (read-only conn) so a no-op run never touches Qdrant.
     ro = sqlite3.connect(f"file:{genesis_db_path()}?mode=ro", uri=True)
     try:
@@ -116,40 +132,45 @@ def migrate() -> dict:
     # Raises if Qdrant is unreachable → migration stays pending, retries next boot.
     client = get_client()
 
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
-    purged = 0
+    # Phase 1 — Qdrant deletes, no SQLite write lock held. Only units whose point
+    # is gone (or that never had one) advance to the SQLite cascade.
+    deletable: list[tuple[str, str]] = []
     qdrant_deleted = 0
     qdrant_failed = 0
-    try:
-        for unit_id, qdrant_id in targets:
-            if qdrant_id:
-                try:
-                    delete_point(client, collection="knowledge_base", point_id=qdrant_id)
-                    qdrant_deleted += 1
-                except Exception:
-                    # Leave this unit's SQLite rows intact so verify() still sees
-                    # it and the migration retries — never a half-deleted orphan.
-                    logger.warning(
-                        "d0006: Qdrant delete failed for %s — skipping SQLite purge",
-                        qdrant_id,
-                        exc_info=True,
-                    )
-                    qdrant_failed += 1
-                    continue
-            # Full MemoryStore.delete() cascade, in raw SQL.
-            db.execute("DELETE FROM knowledge_fts WHERE unit_id = ?", (unit_id,))
-            db.execute("DELETE FROM knowledge_units WHERE id = ?", (unit_id,))
-            if qdrant_id:
-                db.execute("DELETE FROM memory_fts WHERE memory_id = ?", (qdrant_id,))
-                db.execute("DELETE FROM memory_metadata WHERE memory_id = ?", (qdrant_id,))
-                db.execute(
-                    "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?",
-                    (qdrant_id, qdrant_id),
+    for unit_id, qdrant_id in targets:
+        if qdrant_id:
+            try:
+                delete_point(client, collection="knowledge_base", point_id=qdrant_id)
+                qdrant_deleted += 1
+            except Exception:
+                logger.warning(
+                    "d0006: Qdrant delete failed for %s — leaving SQLite rows for retry",
+                    qdrant_id,
+                    exc_info=True,
                 )
-                db.execute("DELETE FROM pending_embeddings WHERE memory_id = ?", (qdrant_id,))
-                db.execute("DELETE FROM entity_mentions WHERE memory_id = ?", (qdrant_id,))
-            purged += 1
-        db.commit()
+                qdrant_failed += 1
+                continue
+        deletable.append((unit_id, qdrant_id))
+
+    # Phase 2 — the full MemoryStore.delete() cascade in raw SQL, batched so the
+    # write lock is released between batches (see _util.commit_in_batches).
+    def _purge_sqlite(conn: sqlite3.Connection, target: tuple[str, str]) -> None:
+        unit_id, qdrant_id = target
+        conn.execute("DELETE FROM knowledge_fts WHERE unit_id = ?", (unit_id,))
+        conn.execute("DELETE FROM knowledge_units WHERE id = ?", (unit_id,))
+        if qdrant_id:
+            conn.execute("DELETE FROM memory_fts WHERE memory_id = ?", (qdrant_id,))
+            conn.execute("DELETE FROM memory_metadata WHERE memory_id = ?", (qdrant_id,))
+            conn.execute(
+                "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?",
+                (qdrant_id, qdrant_id),
+            )
+            conn.execute("DELETE FROM pending_embeddings WHERE memory_id = ?", (qdrant_id,))
+            conn.execute("DELETE FROM entity_mentions WHERE memory_id = ?", (qdrant_id,))
+
+    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    try:
+        purged = commit_in_batches(db, deletable, _purge_sqlite)
     finally:
         db.close()
 
