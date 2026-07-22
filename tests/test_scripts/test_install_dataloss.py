@@ -219,10 +219,14 @@ def test_b10_never_clobbers_newer_local(tmp_path):
 
 
 def test_b10_no_clobber_fallback_in_text():
-    """Extraction: the clobbering bare `cp -a` fallback is gone from the CODE
-    (comments may still describe it)."""
+    """Extraction: the clobbering `cp -an … || cp -a …` fallback is gone, and the
+    two modern paths (rsync, cp --update=none) propagate real errors via exit
+    code (no `|| true` masking) — the caller keys _CCMEM_RESTORED on our status."""
     code = "\n".join(
         ln for ln in RESTORE_CC.read_text().splitlines() if not ln.lstrip().startswith("#")
     )
-    assert "cp -a " not in code, code  # bare clobbering cp -a (cp -an is fine — trailing 'n')
-    assert "--ignore-existing" in code
+    assert "|| cp -a" not in code and "|| \\" not in code  # the old clobber fallback is gone
+    assert "--ignore-existing" in code  # rsync no-clobber
+    assert "--update=none" in code  # coreutils 9.3+ stable no-clobber (proper exit codes)
+    # The only best-effort `|| true` is the pre-9.3 cp -an fallback (last resort).
+    assert code.count("|| true") <= 1

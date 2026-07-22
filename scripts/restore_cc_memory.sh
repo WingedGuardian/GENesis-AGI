@@ -37,10 +37,24 @@ mkdir -p "$CC_MEMORY_DIR"
 # fall back to `cp -an` best-effort (its skip-as-failure exit is swallowed — a
 # skipped existing file is the intended outcome, not an error to "recover" from
 # by overwriting).
+# The caller (restore.sh §5) keys _CCMEM_RESTORED on this script's exit status,
+# so the copy must be no-clobber AND propagate a REAL failure (unreadable
+# source, permission, full disk) as a non-zero exit — while NOT failing merely
+# because it skipped an existing file.
 if command -v rsync >/dev/null 2>&1; then
+    # rsync: --ignore-existing is stable no-clobber with proper exit codes.
     rsync -a --ignore-existing "$BACKUP_DIR"/ "$CC_MEMORY_DIR/"
+elif cp --help 2>/dev/null | grep -q -- '--update'; then
+    # coreutils 9.3+: `--update=none` is the stable no-clobber flag (the one
+    # `cp -n`'s own deprecation warning points to). A skip exits 0, a real error
+    # exits non-zero — so let the exit status propagate under `set -e`. (cp -n on
+    # 9.1-9.2 counted a skip as failure and 9.3+ warns about it — both avoided.)
+    cp -a --update=none "$BACKUP_DIR"/. "$CC_MEMORY_DIR/"
 else
-    cp -an "$BACKUP_DIR"/. "$CC_MEMORY_DIR/" || true
+    # Pre-9.3 coreutils without --update=none: cp -an is no-clobber but its exit
+    # code can't distinguish a skip from a real error, so this path is
+    # best-effort only (the two paths above carry clean error propagation).
+    cp -an "$BACKUP_DIR"/. "$CC_MEMORY_DIR/" 2>/dev/null || true
 fi
 
 FILE_COUNT=$(find "$CC_MEMORY_DIR" -type f | wc -l)
