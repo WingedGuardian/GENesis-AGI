@@ -164,7 +164,16 @@ async def test_stats_carries_substage_timings(mock_qdrant, mock_crud, mock_links
 
     stats: dict = {}
     await retriever.recall("test", limit=5, stats=stats, defer_side_effects=True)
-    for key in ("vector_ms", "expand_ms", "fts_ms", "activation_ms"):
+    for key in (
+        "vector_ms",
+        "event_ms",
+        "expand_ms",
+        "fts_ms",
+        "expired_ms",
+        "activation_ms",
+        "breadcrumbs_ms",
+        "assembly_ms",
+    ):
         assert key in stats, f"missing {key} in {stats}"
         assert isinstance(stats[key], float)
 

@@ -20,7 +20,8 @@ logger = logging.getLogger("genesis.runtime")
 
 
 async def run_status_writer_loop(
-    runtime: GenesisRuntime, interval_s: float = _STATUS_WRITE_INTERVAL_S,
+    runtime: GenesisRuntime,
+    interval_s: float = _STATUS_WRITE_INTERVAL_S,
 ) -> None:
     """Background loop that refreshes status.json on a fixed cadence.
 
@@ -42,7 +43,8 @@ async def run_status_writer_loop(
         except Exception as exc:
             runtime.record_job_failure("status_writer_loop", str(exc))
             logger.error(
-                "Status writer loop iteration failed", exc_info=True,
+                "Status writer loop iteration failed",
+                exc_info=True,
             )
 
 
@@ -51,13 +53,14 @@ async def init(rt: GenesisRuntime) -> None:
     try:
         from qdrant_client import QdrantClient
 
-        from genesis.env import qdrant_url
+        from genesis.env import qdrant_url, recall_read_pool_off, recall_read_pool_size
         from genesis.memory.embeddings import EmbeddingProvider
         from genesis.memory.linker import MemoryLinker
         from genesis.memory.store import MemoryStore
 
         qdrant = QdrantClient(url=qdrant_url(), timeout=5)
         from genesis.qdrant.collections import ensure_collections
+
         ensure_collections(qdrant)
         logger.info("Qdrant collections ensured")
 
@@ -105,11 +108,38 @@ async def init(rt: GenesisRuntime) -> None:
         from genesis.memory.retrieval import HybridRetriever
 
         reranker = VoyageReranker()
+
+        # Dedicated read-only connection pool for recall's read stages
+        # (follow-up ac27b693): FTS5/activation/enrich/breadcrumbs run off the
+        # shared SerializedConnection write lock so they stop queuing behind the
+        # whole server's writes under concurrent sessions. Optional value-add —
+        # HybridRetriever falls back to rt._db on any pool miss, so a build
+        # failure (or the GENESIS_RECALL_READ_POOL_OFF kill) degrades to the
+        # pre-pool path rather than breaking recall.
+        rt._db_ro_pool = None
+        if not recall_read_pool_off():
+            try:
+                from genesis.db.connection import ReadConnectionPool
+                from genesis.env import genesis_db_path
+
+                pool = ReadConnectionPool(genesis_db_path(), size=recall_read_pool_size())
+                await pool.open()
+                rt._db_ro_pool = pool
+                logger.info("Recall read-only pool opened (size=%d)", pool.size)
+            except Exception:
+                logger.warning(
+                    "Recall read-only pool failed to open — recall reads use the "
+                    "shared connection (degraded, not broken)",
+                    exc_info=True,
+                )
+                rt._db_ro_pool = None
+
         rt._hybrid_retriever = HybridRetriever(
             embedding_provider=recall_embedder,
             qdrant_client=qdrant,
             db=rt._db,
             reranker=reranker,
+            read_pool=rt._db_ro_pool,
         )
         rt._context_injector = ContextInjector(
             retriever=rt._hybrid_retriever,
@@ -173,11 +203,13 @@ async def init(rt: GenesisRuntime) -> None:
                 await rt._status_writer.write()
             except Exception:
                 logger.warning(
-                    "Initial status writer write failed", exc_info=True,
+                    "Initial status writer write failed",
+                    exc_info=True,
                 )
 
             rt._status_writer_task = tracked_task(
-                run_status_writer_loop(rt), name="status-writer-loop",
+                run_status_writer_loop(rt),
+                name="status-writer-loop",
             )
             logger.info(
                 "Status writer loop started (interval=%ds)",
@@ -226,23 +258,29 @@ async def init(rt: GenesisRuntime) -> None:
 
     except (ConnectionError, TimeoutError) as exc:
         logger.error(
-            "MemoryStore creation failed (Qdrant down?) — "
-            "continuing without vector memory",
+            "MemoryStore creation failed (Qdrant down?) — continuing without vector memory",
             exc_info=True,
         )
         from genesis.runtime._degradation import record_init_degradation
-        await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")
+
+        await record_init_degradation(
+            rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error"
+        )
     except Exception as exc:
         logger.error(
             "MemoryStore creation failed — continuing without vector memory",
             exc_info=True,
         )
         from genesis.runtime._degradation import record_init_degradation
-        await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")
+
+        await record_init_degradation(
+            rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error"
+        )
 
 
 async def _migrate_reference_vectors(
-    qdrant: QdrantClient, db: aiosqlite.Connection,
+    qdrant: QdrantClient,
+    db: aiosqlite.Connection,
 ) -> None:
     """One-time migration: move reference vectors from knowledge_base → episodic_memory.
 
@@ -295,9 +333,7 @@ async def _migrate_reference_vectors(
         for p in to_migrate:
             payload = dict(p.payload) if p.payload else {}
             payload["memory_type"] = "episodic"
-            points_to_upsert.append(
-                PointStruct(id=str(p.id), vector=p.vector, payload=payload)
-            )
+            points_to_upsert.append(PointStruct(id=str(p.id), vector=p.vector, payload=payload))
 
         qdrant.upsert(
             collection_name="episodic_memory",
@@ -313,8 +349,7 @@ async def _migrate_reference_vectors(
         )
 
         logger.info(
-            "Reference vector migration: moved %d points from "
-            "knowledge_base → episodic_memory",
+            "Reference vector migration: moved %d points from knowledge_base → episodic_memory",
             len(to_migrate),
         )
     except Exception:

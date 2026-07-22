@@ -21,6 +21,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   background instead of stalling the first prompt after a restart. Recall quality
   is unchanged; it just stops dropping to the degraded path under concurrency.
 
+- **Memory recall reads no longer wait in line behind the rest of the system's
+  writes.** Everything Genesis does shared a single database connection, so when
+  it was busy writing (reflections, learning, other sessions), a prompt's memory
+  lookup could sit waiting for its turn — the main reason recall slowed down and
+  occasionally dropped to the weaker keyword-only memory when several sessions
+  were active. Memory lookups now read through a dedicated read-only connection
+  pool that runs alongside the writes instead of behind them, so recall stays
+  responsive under load. It falls back to the shared connection automatically if
+  the pool is ever unavailable, so nothing breaks — recall is never slower than
+  before. Recall quality is unchanged.
+
 ### Fixed
 
 - **Background sessions no longer get silently cut off after 10 minutes.** A
