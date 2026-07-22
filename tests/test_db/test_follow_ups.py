@@ -33,8 +33,7 @@ async def test_purge_completed_deletes_old(db):
 async def test_purge_completed_keeps_recent(db):
     """Recently completed follow-ups survive."""
     fid = await follow_ups.create(db, **_BASE)
-    await follow_ups.update_status(db, fid, status="completed",
-                                   resolution_notes="done")
+    await follow_ups.update_status(db, fid, status="completed", resolution_notes="done")
 
     count = await follow_ups.purge_completed(db)
     assert count == 0
@@ -89,7 +88,11 @@ async def test_purge_failed_old(db):
 async def test_create_with_kind_and_domain(db):
     """create() persists kind, domain, and goal_id."""
     fid = await follow_ups.create(
-        db, **_BASE, kind="tabled", domain="internal", goal_id="g1",
+        db,
+        **_BASE,
+        kind="tabled",
+        domain="internal",
+        goal_id="g1",
     )
     row = await follow_ups.get_by_id(db, fid)
     assert row["kind"] == "tabled"
@@ -155,10 +158,14 @@ async def test_delete_removes_row(db):
 
 async def test_query_page_filters_search_and_null_domain(db):
     await follow_ups.create(
-        db, **{**_BASE, "content": "alpha internal item"}, domain="internal",
+        db,
+        **{**_BASE, "content": "alpha internal item"},
+        domain="internal",
     )
     await follow_ups.create(
-        db, **{**_BASE, "content": "beta user item"}, domain="user_world",
+        db,
+        **{**_BASE, "content": "beta user item"},
+        domain="user_world",
     )
     await follow_ups.create(db, **{**_BASE, "content": "gamma unclassified"})
 
@@ -222,9 +229,10 @@ async def test_set_kind_batch_rejects_invalid(db):
 
 async def test_update_status_batch_stamps_completed_at(db):
     ids = [await follow_ups.create(db, **_BASE) for _ in range(2)]
-    assert await follow_ups.update_status_batch(
-        db, ids, "completed", resolution_notes="bulk done"
-    ) == 2
+    assert (
+        await follow_ups.update_status_batch(db, ids, "completed", resolution_notes="bulk done")
+        == 2
+    )
     for fid in ids:
         row = await follow_ups.get_by_id(db, fid)
         assert row["status"] == "completed"
@@ -312,13 +320,18 @@ async def _seed_pending_domains(db):
     """One pending follow-up per domain. Returns {domain_key: id}."""
     return {
         "internal": await follow_ups.create(
-            db, **{**_BASE, "content": "internal item"}, domain="internal",
+            db,
+            **{**_BASE, "content": "internal item"},
+            domain="internal",
         ),
         "user_world": await follow_ups.create(
-            db, **{**_BASE, "content": "user item"}, domain="user_world",
+            db,
+            **{**_BASE, "content": "user item"},
+            domain="user_world",
         ),
         "null": await follow_ups.create(
-            db, **{**_BASE, "content": "unclassified item"},
+            db,
+            **{**_BASE, "content": "unclassified item"},
         ),
     }
 
@@ -338,9 +351,7 @@ async def test_get_pending_domain_none_is_noop(db):
 
 async def test_get_by_status_domain_exact_match(db):
     ids = await _seed_pending_domains(db)
-    scoped = {
-        r["id"] for r in await follow_ups.get_by_status(db, "pending", domain="user_world")
-    }
+    scoped = {r["id"] for r in await follow_ups.get_by_status(db, "pending", domain="user_world")}
     assert scoped == {ids["user_world"]}
     unscoped = {r["id"] for r in await follow_ups.get_by_status(db, "pending")}
     assert unscoped == set(ids.values())  # backward-compat no-op
@@ -356,17 +367,23 @@ async def test_get_actionable_domain_exact_match(db):
 
 async def test_get_recently_completed_domain_exact_match(db):
     int_id = await follow_ups.create(
-        db, **{**_BASE, "content": "int done"}, domain="internal",
+        db,
+        **{**_BASE, "content": "int done"},
+        domain="internal",
     )
     uw_id = await follow_ups.create(
-        db, **{**_BASE, "content": "uw done"}, domain="user_world",
+        db,
+        **{**_BASE, "content": "uw done"},
+        domain="user_world",
     )
     null_id = await follow_ups.create(db, **{**_BASE, "content": "null done"})
     await follow_ups.update_status(db, int_id, "completed")
     await follow_ups.update_status(db, uw_id, "completed")
     await follow_ups.update_status(db, null_id, "completed")
 
-    scoped = [r["content"] for r in await follow_ups.get_recently_completed(db, domain="user_world")]
+    scoped = [
+        r["content"] for r in await follow_ups.get_recently_completed(db, domain="user_world")
+    ]
     assert scoped == ["uw done"]  # internal + NULL excluded (NB: result has no domain col)
     unscoped = {r["content"] for r in await follow_ups.get_recently_completed(db)}
     assert unscoped == {"int done", "uw done", "null done"}  # NULL survives unscoped no-op
@@ -377,10 +394,15 @@ async def test_get_actionable_domain_excludes_pinned_internal(db):
     PR3 decision that pinned/high-priority cross-domain items re-home to the
     cockpit, NOT the user (CEO) ego."""
     uw = await follow_ups.create(
-        db, **{**_BASE, "content": "user item"}, domain="user_world",
+        db,
+        **{**_BASE, "content": "user item"},
+        domain="user_world",
     )
     pinned_internal = await follow_ups.create(
-        db, **{**_BASE, "content": "pinned internal"}, domain="internal", pinned=True,
+        db,
+        **{**_BASE, "content": "pinned internal"},
+        domain="internal",
+        pinned=True,
     )
     ids = {r["id"] for r in await follow_ups.get_actionable(db, domain="user_world")}
     assert ids == {uw}
@@ -399,9 +421,7 @@ async def test_query_page_status_exclude_hides_terminal(db):
     rows = await follow_ups.query_page(db, status_exclude=["completed", "failed"])
     ids = {r["id"] for r in rows}
     assert keep in ids and done not in ids
-    assert await follow_ups.count_filtered(
-        db, status_exclude=["completed", "failed"]
-    ) == 1
+    assert await follow_ups.count_filtered(db, status_exclude=["completed", "failed"]) == 1
 
 
 async def test_query_page_explicit_status_overrides_exclude(db):
@@ -410,7 +430,9 @@ async def test_query_page_explicit_status_overrides_exclude(db):
     await follow_ups.update_status(db, done, status="completed")
 
     rows = await follow_ups.query_page(
-        db, status="completed", status_exclude=["completed"],
+        db,
+        status="completed",
+        status_exclude=["completed"],
     )
     assert {r["id"] for r in rows} == {done}
 
@@ -421,8 +443,7 @@ async def test_query_page_pinned_floats_to_top(db):
     await follow_ups.create(db, **{**_BASE, "content": "newer unpinned"})
     # Make the pinned row OLDER so a plain recency/priority sort would bury it.
     await db.execute(
-        "UPDATE follow_ups SET pinned = 1, "
-        "created_at = '2025-01-01T00:00:00+00:00' WHERE id = ?",
+        "UPDATE follow_ups SET pinned = 1, created_at = '2025-01-01T00:00:00+00:00' WHERE id = ?",
         (pinned_old,),
     )
     await db.commit()
@@ -448,13 +469,24 @@ async def test_query_page_status_sort_ranks_by_actionability(db):
 # ─── Inbox attention-marker decay (WATCH/BOOKMARK tabled lane) ────────────────
 
 
-async def _make_marker(db, *, age_days: int, kind="tabled",
-                       source="inbox_evaluation", content="[WATCH] x",
-                       status="pending"):
+async def _make_marker(
+    db,
+    *,
+    age_days: int,
+    kind="tabled",
+    source="inbox_evaluation",
+    content="[WATCH] x",
+    status="pending",
+):
     """Create a follow-up, backdate created_at by *age_days*, set *status*."""
     fid = await follow_ups.create(
-        db, source=source, content=content, reason="r",
-        strategy="ego_judgment", priority="low", kind=kind,
+        db,
+        source=source,
+        content=content,
+        reason="r",
+        strategy="ego_judgment",
+        priority="low",
+        kind=kind,
     )
     from datetime import UTC, datetime, timedelta
 
@@ -519,7 +551,10 @@ async def test_decay_keeps_recent_marker(db):
 async def test_decay_ignores_actionable_follow_up_lane(db):
     """An old ADOPT/ADAPT/EXPLORE follow_up (not tabled) is never decayed."""
     fid = await _make_marker(
-        db, age_days=200, kind="follow_up", content="[ADAPT] x",
+        db,
+        age_days=200,
+        kind="follow_up",
+        content="[ADAPT] x",
     )
 
     count = await follow_ups.decay_stale_inbox_markers(db, older_than_days=60)
@@ -549,10 +584,7 @@ async def test_get_recently_resolved_excludes_tabled(db):
     assert fu in ids
     assert marker not in ids
 
-    ids_all = {
-        r["id"]
-        for r in await follow_ups.get_recently_resolved(db, include_tabled=True)
-    }
+    ids_all = {r["id"] for r in await follow_ups.get_recently_resolved(db, include_tabled=True)}
     assert marker in ids_all
 
 
@@ -566,7 +598,9 @@ async def test_get_recently_completed_excludes_tabled(db):
     fu = (await follow_ups.get_pending(db))[0]["id"]
     await follow_ups.update_status(db, fu, status="completed")
     marker = await follow_ups.create(
-        db, **{**_BASE, "content": "[BOOKMARK] decayed"}, kind="tabled",
+        db,
+        **{**_BASE, "content": "[BOOKMARK] decayed"},
+        kind="tabled",
     )
     await follow_ups.update_status(db, marker, status="completed")
 
@@ -575,7 +609,63 @@ async def test_get_recently_completed_excludes_tabled(db):
     assert "[BOOKMARK] decayed" not in contents
 
     contents_all = {
-        r["content"]
-        for r in await follow_ups.get_recently_completed(db, include_tabled=True)
+        r["content"] for r in await follow_ups.get_recently_completed(db, include_tabled=True)
     }
     assert "[BOOKMARK] decayed" in contents_all
+
+
+# ─── d67c83c7: notes-only never touches status; reopen clears completed_at ────
+# Two hazards fixed together: (1) update_notes writes ONLY notes/blocked cols —
+# it must not re-apply a (possibly stale) status, which under Genesis's live
+# concurrent writers silently reverts their status change (lost update); and
+# (2) update_status clears completed_at on a transition BACK to a non-terminal
+# state, so a row wrongly completed then corrected doesn't keep a lying stamp.
+
+
+async def test_update_notes_leaves_status_and_completed_at_untouched(db):
+    """update_notes writes only resolution_notes — status/completed_at unchanged."""
+    fid = await follow_ups.create(db, **_BASE)
+    await db.execute("UPDATE follow_ups SET status = 'in_progress' WHERE id = ?", (fid,))
+    await db.commit()
+    assert await follow_ups.update_notes(db, fid, resolution_notes="progress note")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "in_progress"  # NOT reverted/clobbered
+    assert row["resolution_notes"] == "progress note"
+    assert row["completed_at"] is None
+
+
+async def test_update_notes_blocked_reason_only(db):
+    """update_notes can set blocked_reason alone, still not touching status."""
+    fid = await follow_ups.create(db, **_BASE)
+    assert await follow_ups.update_notes(db, fid, blocked_reason="waiting on X")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "pending"
+    assert row["blocked_reason"] == "waiting on X"
+
+
+async def test_update_notes_noop_when_nothing_given(db):
+    """No notes and no blocked_reason → no write, returns False."""
+    fid = await follow_ups.create(db, **_BASE)
+    assert await follow_ups.update_notes(db, fid) is False
+
+
+async def test_update_status_reopen_clears_orphaned_completed_at(db):
+    """completed→in_progress must NULL completed_at (the d67c83c7 orphan)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await _force_terminal(db, fid, "completed")  # completed_at = _OLD
+    await follow_ups.update_status(db, fid, "in_progress")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "in_progress"
+    assert row["completed_at"] is None  # orphan cleared
+
+
+async def test_update_status_batch_reopen_clears_completed_at(db):
+    """Batch reopen mirrors: a non-terminal batch transition clears completed_at."""
+    ids = [await follow_ups.create(db, **_BASE) for _ in range(2)]
+    for fid in ids:
+        await _force_terminal(db, fid, "completed")
+    await follow_ups.update_status_batch(db, ids, "pending")
+    for fid in ids:
+        row = await follow_ups.get_by_id(db, fid)
+        assert row["status"] == "pending"
+        assert row["completed_at"] is None
