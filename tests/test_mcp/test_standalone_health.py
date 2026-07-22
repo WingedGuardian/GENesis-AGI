@@ -309,6 +309,14 @@ class TestHealthBootstrapLifespan:
             patch("scripts.genesis_mcp_server._DEFAULT_DB", fake_db),
             patch("scripts.genesis_mcp_server._DEFAULT_STATUS", tmp_path / "status.json"),
             patch("genesis.mcp.health_mcp.mcp", mock_mcp),
+            # _bootstrap_health -> init_health_mcp sets these module globals;
+            # patching them here makes the mutation revert on exit instead of
+            # leaking a tmp-path service into later tests (their health_status
+            # then returns the normal-path dict and KeyErrors on "status").
+            patch("genesis.mcp.health_mcp._service", None),
+            patch("genesis.mcp.health_mcp._activity_tracker", None),
+            patch("genesis.mcp.health_mcp._event_bus", None),
+            patch("genesis.mcp.health_mcp._job_retry_registry", None),
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
@@ -331,6 +339,14 @@ class TestHealthBootstrapLifespan:
             patch("scripts.genesis_mcp_server._DEFAULT_DB", tmp_path / "nonexistent.db"),
             patch("scripts.genesis_mcp_server._DEFAULT_STATUS", tmp_path / "status.json"),
             patch("genesis.mcp.health_mcp.mcp", mock_mcp),
+            # _bootstrap_health -> init_health_mcp sets these module globals;
+            # patching them here makes the mutation revert on exit instead of
+            # leaking a tmp-path service into later tests (their health_status
+            # then returns the normal-path dict and KeyErrors on "status").
+            patch("genesis.mcp.health_mcp._service", None),
+            patch("genesis.mcp.health_mcp._activity_tracker", None),
+            patch("genesis.mcp.health_mcp._event_bus", None),
+            patch("genesis.mcp.health_mcp._job_retry_registry", None),
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
@@ -362,6 +378,14 @@ class TestHealthBootstrapLifespan:
             patch("scripts.genesis_mcp_server._DEFAULT_DB", fake_db),
             patch("scripts.genesis_mcp_server._DEFAULT_STATUS", tmp_path / "status.json"),
             patch("genesis.mcp.health_mcp.mcp", mock_mcp),
+            # _bootstrap_health -> init_health_mcp sets these module globals;
+            # patching them here makes the mutation revert on exit instead of
+            # leaking a tmp-path service into later tests (their health_status
+            # then returns the normal-path dict and KeyErrors on "status").
+            patch("genesis.mcp.health_mcp._service", None),
+            patch("genesis.mcp.health_mcp._activity_tracker", None),
+            patch("genesis.mcp.health_mcp._event_bus", None),
+            patch("genesis.mcp.health_mcp._job_retry_registry", None),
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
