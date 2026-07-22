@@ -42,6 +42,24 @@ def _is_non_actionable_infra_event(subsystem: str, event_type: str) -> bool:
     return subsystem in ("routing", "providers") and event_type == "all_exhausted"
 
 
+_REFLEX_OWNED_EVENT_TYPES = frozenset({"task.failed"})
+
+
+def _is_reflex_owned_event(event_type: str) -> bool:
+    """True for failure classes the reflex arc ingests, dedups, and cards.
+
+    ``task.failed`` was dark until the reflex arc installed the default event
+    bus (util/tasks.py) — the ego never reacted to it historically because
+    the events were never emitted. Reflex is the designed consumer: it
+    fingerprints recurrences into one signal and cards the user. A reactive
+    ego cycle per failure would re-run the event-burst storm mode (see the
+    push_reactive_event note in ego/cadence.py) with a message-keyed dedup
+    that variable exception payloads bypass. Module-level so it is
+    unit-testable.
+    """
+    return event_type in _REFLEX_OWNED_EVENT_TYPES
+
+
 async def init(rt: GenesisRuntime) -> None:
     """Initialize both egos: user ego + genesis ego."""
     # Hard dependencies — skip if unavailable
@@ -330,16 +348,16 @@ async def init(rt: GenesisRuntime) -> None:
                                         f"{_outcome} (session:{session_id[:8]})"
                                     )
                                 else:
-                                    _note = (
-                                        f"[{status}] {_content} "
-                                        f"(session:{session_id[:8]})"
-                                    )
+                                    _note = f"[{status}] {_content} (session:{session_id[:8]})"
                                 await user_goals.add_progress_note(
-                                    rt._db, _gid, _note,
+                                    rt._db,
+                                    _gid,
+                                    _note,
                                 )
                                 logger.info(
                                     "Recorded goal progress for %s via %s",
-                                    _gid[:12], _pid[:8],
+                                    _gid[:12],
+                                    _pid[:8],
                                 )
                         except Exception:
                             logger.debug(
@@ -364,13 +382,25 @@ async def init(rt: GenesisRuntime) -> None:
             # Route by subsystem — reliable field on every GenesisEvent.
             # User-facing subsystems trigger user ego; system subsystems
             # trigger Genesis ego.
-            _USER_SUBSYSTEMS = frozenset({
-                "outreach", "inbox", "mail", "recon",
-            })
-            _SYSTEM_SUBSYSTEMS = frozenset({
-                "health", "routing", "providers", "guardian",
-                "awareness", "surplus", "learning",
-            })
+            _USER_SUBSYSTEMS = frozenset(
+                {
+                    "outreach",
+                    "inbox",
+                    "mail",
+                    "recon",
+                }
+            )
+            _SYSTEM_SUBSYSTEMS = frozenset(
+                {
+                    "health",
+                    "routing",
+                    "providers",
+                    "guardian",
+                    "awareness",
+                    "surplus",
+                    "learning",
+                }
+            )
 
             async def _on_high_severity_event(event) -> None:
                 """Route high-severity events to the appropriate ego's signal queue.
@@ -385,6 +415,12 @@ async def init(rt: GenesisRuntime) -> None:
                 """
                 # Only react to ERROR+ events with actionable types
                 if event.event_type in ("heartbeat", "metric"):
+                    return
+
+                # REFLEX GATE: task.failed belongs to the reflex arc (signal
+                # store → dedup → user card) — never a per-failure reactive
+                # ego cycle. See _is_reflex_owned_event.
+                if _is_reflex_owned_event(event.event_type):
                     return
 
                 subsystem = str(getattr(event, "subsystem", ""))
@@ -413,10 +449,7 @@ async def init(rt: GenesisRuntime) -> None:
                     target = genesis_ego_cadence
 
                 # CRITICAL → escalation signal, ERROR → reactive signal
-                is_critical = (
-                    hasattr(event, "severity")
-                    and event.severity.name == "CRITICAL"
-                )
+                is_critical = hasattr(event, "severity") and event.severity.name == "CRITICAL"
                 if is_critical:
                     target.push_escalation_event(event_dict)
                 else:

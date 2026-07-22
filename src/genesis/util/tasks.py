@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,6 +22,48 @@ if TYPE_CHECKING:
     from genesis.observability.types import Subsystem
 
 _default_logger = logging.getLogger("genesis.tasks")
+
+# Process-wide fallback bus (reflex arc PR1). Most tracked_task call sites
+# never passed event_bus=, so their failures died in the logger — zero
+# task.failed events in 36 days of history. The default bus makes every
+# site (current and future) emit without per-call-site plumbing. Installed
+# by runtime init, gated on reflex ingestion config; an explicit event_bus
+# argument always wins.
+_default_event_bus: GenesisEventBus | None = None
+
+# Frames deeper than this carry diminishing identity and bloat the payload.
+_FRAME_TAIL_LEN = 3
+
+
+def set_default_event_bus(bus: GenesisEventBus | None) -> None:
+    """Install (or clear, with ``None``) the process-wide fallback bus."""
+    global _default_event_bus
+    _default_event_bus = bus
+
+
+def _normalized_frames(exc: BaseException) -> list[str]:
+    """Render the traceback tail as stable ``relpath:funcname`` strings.
+
+    - keeps only frames inside the genesis package (``/genesis/`` path
+      segment — package-relative, so it works on any install/CI checkout);
+      if none match, keeps the whole traceback with basename paths
+    - takes the deepest ``_FRAME_TAIL_LEN`` frames (closest to the raise)
+    - carries NO line numbers: they shift on every unrelated commit and
+      would split one bug into many fingerprints across deploys
+    """
+    tb = exc.__traceback__
+    if tb is None:
+        return []
+    frames = traceback.extract_tb(tb)
+    genesis_frames = [f for f in frames if "/genesis/" in f.filename]
+    selected = (genesis_frames or list(frames))[-_FRAME_TAIL_LEN:]
+    rendered = []
+    for frame in selected:
+        filename = frame.filename
+        idx = filename.rfind("/genesis/")
+        rel = filename[idx + len("/genesis/") :] if idx != -1 else filename.rsplit("/", 1)[-1]
+        rendered.append(f"{rel}:{frame.name}")
+    return rendered
 
 
 def tracked_task(
@@ -82,15 +125,21 @@ def _make_done_callback(
             exc_info=exc,
         )
 
-        if event_bus is not None:
+        # Explicit per-call bus wins; the module default covers the ~60
+        # call sites that never passed one. Read at fire time (not closure
+        # creation) so tasks started before runtime init still emit.
+        bus = event_bus if event_bus is not None else _default_event_bus
+        if bus is not None:
             emit_sync(
-                event_bus,
+                bus,
                 subsystem=subsystem,
                 severity_str="ERROR",
                 event_type="task.failed",
                 message=f"Background task {task_name!r} failed: {exc}",
                 task_name=task_name,
                 error=str(exc),
+                error_type=type(exc).__name__,
+                error_frames=_normalized_frames(exc),
             )
 
     return _on_done
@@ -127,5 +176,7 @@ def emit_sync(
     except RuntimeError:
         _default_logger.warning(
             "Cannot emit event (no loop): %s/%s: %s",
-            sub, event_type, message,
+            sub,
+            event_type,
+            message,
         )
