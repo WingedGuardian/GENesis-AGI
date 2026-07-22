@@ -187,8 +187,9 @@ Example: `[Sonnet 4.6 / medium]` or `[Opus 4.8 / high]`
 
 - **Model**: The Session Configuration block injected at the top of the session
   is authoritative — it carries your current model (from Claude Code's
-  session-start hook input, which stays correct across context compaction). Use
-  what it states. Only when that block does not name a model, derive it from
+  session-start hook input on startup and compaction, cached and replayed on
+  resume, so it stays correct across a compaction). Use what it states. Only
+  when that block does not name a model, derive it from
   your environment section ("You are powered by the model named...") using the
   exact model ID — but note that env line is *frozen at original session start*
   and goes stale after a `/model` switch or a compaction, which is exactly why

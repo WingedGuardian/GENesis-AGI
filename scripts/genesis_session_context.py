@@ -104,6 +104,46 @@ def _model_display_name(model_id: str) -> str | None:
     return table.get(mid)
 
 
+_MODEL_CACHE_FILE = Path.home() / ".genesis" / "cc_session_model.json"
+
+
+def _cache_session_model(session_id: str, model: str) -> None:
+    """Persist the current session's model (single O(1) slot, no retention).
+
+    Written whenever CC provides `model` (startup/compact) so that a later
+    `claude --resume` — where CC OMITS `model` — can recover it. Keyed by
+    session id: the reader only trusts the cache when the id matches, so a
+    stale entry from a different session is ignored, not mis-applied.
+    Fail-open: any error is swallowed (the header degrades to env derivation).
+    """
+    if not session_id or not model:
+        return
+    import contextlib
+    import json
+
+    with contextlib.suppress(OSError, ValueError):
+        _MODEL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MODEL_CACHE_FILE.write_text(json.dumps({"session_id": session_id, "model": model}))
+
+
+def _cached_session_model(session_id: str) -> str:
+    """Read back the cached model for `session_id`, or "" on any miss.
+
+    Guards on the id so a resume of session A never picks up session B's model.
+    """
+    if not session_id:
+        return ""
+    import json
+
+    try:
+        data = json.loads(_MODEL_CACHE_FILE.read_text())
+    except (OSError, ValueError):
+        return ""
+    if isinstance(data, dict) and data.get("session_id") == session_id:
+        return str(data.get("model") or "")
+    return ""
+
+
 def _session_config_block(effort: str, hook_model: str, roster_model: str) -> str:
     """Top Session Configuration block: effort + first-reply status-header directive.
 
@@ -214,11 +254,20 @@ def main() -> None:
         _hook_input = {}
     _hook_session_id = str(_hook_input.get("session_id", "") or "")
     _hook_source = str(_hook_input.get("source", "") or "")
-    # CC re-sends `model` on every SessionStart (startup/resume/clear/compact),
-    # so it is the ONE model source that survives a compaction — the baked
-    # "You are powered by …" env line does not. Not guaranteed present on older
-    # CC; empty string then falls back to env-line derivation.
+    # CC sends `model` on SessionStart for `startup` and `compact` — the two
+    # events that matter here, because it means the header stays correct across a
+    # compaction (the baked "You are powered by …" env line freezes at original
+    # start and does not). Per CC docs, `model` is OMITTED on `resume` (session
+    # recovery) and `clear`, and absent on older CC. When it is present we cache
+    # it (keyed by session id); when it is absent we read that cache back so a
+    # `claude --resume` of a session whose model we saw still gets the right
+    # header. Cache miss (e.g. a concurrent session overwrote the single-slot
+    # cache) falls through to env-line derivation — no worse than before.
     _hook_model = str(_hook_input.get("model", "") or "")
+    if _hook_model:
+        _cache_session_model(_hook_session_id, _hook_model)
+    elif _hook_session_id:
+        _hook_model = _cached_session_model(_hook_session_id)
 
     # Phase 6: self-heal Genesis git hooks before doing anything else.
     # Runs on every session start so community installs auto-pick up hook

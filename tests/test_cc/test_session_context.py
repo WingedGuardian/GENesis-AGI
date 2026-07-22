@@ -229,8 +229,57 @@ class TestSessionConfigBlock:
         assert "You are powered by" in block
 
 
+class TestSessionModelCache:
+    """Resume recovery: model cached on startup/compact, read back when absent."""
+
+    def test_cache_round_trip_keyed_by_session_id(self, tmp_path: Path, monkeypatch) -> None:
+        m = _load_context_module()
+        monkeypatch.setattr(m, "_MODEL_CACHE_FILE", tmp_path / "cc_session_model.json")
+        m._cache_session_model("sess-A", "claude-opus-4-8")
+        assert m._cached_session_model("sess-A") == "claude-opus-4-8"
+        # A different session id must NOT read session A's model.
+        assert m._cached_session_model("sess-B") == ""
+
+    def test_cache_miss_returns_empty(self, tmp_path: Path, monkeypatch) -> None:
+        m = _load_context_module()
+        monkeypatch.setattr(m, "_MODEL_CACHE_FILE", tmp_path / "absent.json")
+        assert m._cached_session_model("sess-A") == ""
+
+    def test_empty_inputs_are_noops(self, tmp_path: Path, monkeypatch) -> None:
+        m = _load_context_module()
+        cache = tmp_path / "cc_session_model.json"
+        monkeypatch.setattr(m, "_MODEL_CACHE_FILE", cache)
+        m._cache_session_model("", "claude-opus-4-8")  # no session id → skip
+        m._cache_session_model("sess-A", "")  # no model → skip
+        assert not cache.exists()
+        assert m._cached_session_model("") == ""
+
+
 class TestStatusHeaderStdinModel:
     """Integration: CC's SessionStart `model` field flows through to the header."""
+
+    def test_resume_without_model_recovers_from_cache(self, flag_dir: Path) -> None:
+        """startup writes the cache; a later resume (model omitted) reads it back."""
+        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        sid = "resume-sess-1"
+        subprocess.run(
+            [_PYTHON, str(_CONTEXT_SCRIPT)],
+            input=f'{{"model": "claude-sonnet-5", "source": "startup", "session_id": "{sid}"}}',
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+        resumed = subprocess.run(
+            [_PYTHON, str(_CONTEXT_SCRIPT)],
+            input=f'{{"source": "resume", "session_id": "{sid}"}}',
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+        assert "[Sonnet 5 / high]" in resumed.stdout
+        assert resumed.returncode == 0
 
     def test_hook_model_field_drives_header(self, flag_dir: Path) -> None:
         """A `model` in stdin JSON produces an exact, authoritative header."""
