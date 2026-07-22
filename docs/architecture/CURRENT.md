@@ -169,10 +169,10 @@ verified: 8cb9e8dc 2026-07-21
   now owns it, clamped below `timeout_s` so graceful truncation precedes the hard
   kill; the background lane (direct_session) sets it to the full budget so long work
   (deep-research) runs to completion. A hit sets `CCOutput.bg_truncated` → a visible
-  user notice + a `cc.bg_truncated` event. Foreground turns keep the 600s default and
-  instead route long research to the background lane (`conversation._BG_RESEARCH_ROUTING`,
-  non-terminal channels only). Origin: the 2026-07-20 silent-death of a Telegram
-  deep-research run.
+  user notice + a `cc.bg_truncated` event. Foreground turns keep the 600s default so a
+  conversational turn never lingers holding the per-session lock; routing long research
+  from a channel to the durable background lane (with result delivery) is a follow-up.
+  Origin: the 2026-07-20 silent-death of a Telegram deep-research run.
 
 ## 3. Autonomy & egress gating
 

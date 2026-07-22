@@ -16,24 +16,12 @@ Read this guide any time you're considering a background session or sub-agent.
 outlive this conversation → background session. If you just need an answer in
 the next few minutes → sub-agent.
 
-## Dispatched from a channel? Long work MUST be a background session
-
-When you are a foreground session driving a **Telegram/voice reply**, your turn
-**ends after you respond** — there is no live session left to report back when a
-later-finishing task completes. A deep-research `Workflow` (or any 100+-agent
-fan-out) run **inline** in such a turn is force-killed by the CLI's headless
-background-wait ceiling (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`, ~10 min) with only
-a partial result, and nothing delivers it. This silently killed a real Telegram
-deep-research request on 2026-07-20.
-
-So for a channel-dispatched request needing deep/multi-source research or any
-background work likely to exceed a few minutes: **do NOT run it inline — dispatch
-it via `direct_session_run` (`profile="research"`, `notify=true`) and reply that
-it's running in the background.** The background lane owns a longer wait ceiling
-(set to its full `timeout_s`), runs to completion, and delivers via the owner
-outreach path. Terminal/interactive sessions may still run Workflows inline (you're
-present to see them). The foreground system prompt (`conversation._BG_RESEARCH_ROUTING`)
-nudges this automatically for non-terminal channels.
+> **Note:** the background lane now owns a longer CC background-wait ceiling (set
+> to its full `timeout_s`), so a dispatched `Workflow` inside a background session
+> runs to completion instead of the CLI's default 600s truncation. Automatically
+> routing long research *from a channel turn* into this lane — with the result
+> delivered back to the requester — is a follow-up (needs the delivery model wired;
+> a background session's success output is not yet sent to the owner).
 
 ## Profiles
 
