@@ -81,3 +81,29 @@ class TestBuildDirectivesSection:
         )
         assert "## User Directives" in out
         assert "*directives unavailable*" in out
+
+    async def test_high_priority_never_hidden_behind_newer_low(self, db):
+        # Codex P2: an old high/critical directive must render before newer
+        # low/normal ones (priority-first), so it is never hidden — a hidden
+        # directive never exposes its id and can't be resolved.
+        await ego_crud.create_directive(
+            db,
+            content="OLD but CRITICAL",
+            priority="critical",
+            ego_target="genesis_ego",
+            source="user",
+        )
+        for n in range(8):
+            await ego_crud.create_directive(
+                db,
+                content=f"newer low {n}",
+                priority="low",
+                ego_target="genesis_ego",
+                source="user",
+            )
+        out = await build_directives_section(
+            db, "genesis_ego", framing=_GEN_FRAMING, error_body="*err*"
+        )
+        assert "OLD but CRITICAL" in out
+        # Critical renders before the low-priority rows.
+        assert out.index("OLD but CRITICAL") < out.index("newer low 0")

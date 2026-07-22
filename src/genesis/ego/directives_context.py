@@ -46,7 +46,7 @@ async def build_directives_section(
         directives = await ego_crud.list_active_directives(
             db,
             ego_target=ego_target,
-            limit=5,
+            limit=50,
         )
     except Exception:
         logger.warning("Failed to query %s directives", ego_target, exc_info=True)
@@ -54,6 +54,15 @@ async def build_directives_section(
 
     if not directives:
         return ""
+
+    # Priority-first ordering so a high/critical directive is never hidden
+    # behind newer low/normal ones. list_active_directives returns newest-first;
+    # a stable sort by priority rank preserves that recency order within each
+    # priority band. Without this, an old-but-important directive could fall
+    # off the render and — never exposing its id — stay active indefinitely,
+    # the exact immortality this PR removes.
+    _PRIO_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+    directives = sorted(directives, key=lambda d: _PRIO_RANK.get(d.get("priority", "normal"), 2))
 
     lines = [f"{_HEADER}\n", framing]
 
