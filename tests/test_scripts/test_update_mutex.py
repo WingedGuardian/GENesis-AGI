@@ -32,6 +32,16 @@ def test_flock_guard_present(text: str) -> None:
     assert 'flock -n "$_UPDATE_LOCK_FD"' in text
 
 
+def test_nohup_fallback_closes_lock_fd(text: str) -> None:
+    """The degraded nohup server OUTLIVES update.sh; it must not inherit the lock
+    FD, or the advisory lock stays held after exit and deadlocks every future
+    update. The nohup fallback closes the lock FD for that child."""
+    nohup = text.find('nohup "$VENV_DIR/bin/python" -m genesis serve')
+    assert nohup != -1, "nohup fallback not found"
+    block = text[nohup : nohup + 200]
+    assert "{_UPDATE_LOCK_FD}>&-" in block, "nohup fallback must close the lock FD for the child"
+
+
 def test_flock_after_worktree_refusal_before_backup(text: str) -> None:
     """Placement: after the worktree refusal (so worktree runs never take the
     lock) and before the rollback tag / pre-update backup (so the whole mutating

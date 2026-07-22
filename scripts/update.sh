@@ -651,8 +651,12 @@ _start_genesis_server() {
     # This bypasses systemd monitoring, so health dashboard will show red.
     echo "  WARNING: systemctl --user restart failed — falling back to direct start (degraded)"
     echo "  Health monitoring will not work correctly. Run: systemctl --user restart genesis-server.service"
+    # Close the update-lock FD in this long-lived child: nohup'd, it OUTLIVES
+    # update.sh, and an inherited lock FD would keep the advisory lock held after
+    # we exit — deadlocking every future update until this degraded server dies.
+    # (systemd-started servers don't inherit our FDs; only this nohup path does.)
     nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
-        >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
+        {_UPDATE_LOCK_FD}>&- >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     echo "  Started genesis-server in degraded mode (pid $!)"
     # Write marker so dashboard can detect degraded mode
     echo "nohup" > "$HOME/.genesis/server-start-mode"
