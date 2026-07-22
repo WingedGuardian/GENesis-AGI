@@ -2595,6 +2595,25 @@ monitoring, or internal maintenance.
    maintenance. Those belong to the Genesis ego (COO).
 """
 
+    # Operate-vs-develop rubric (genesis/operations ego only). Second gate
+    # behind the identity doc's "Operate, Don't Develop" mandate — catches a
+    # develop-class proposal (code/schema/install/config-value change) if one
+    # slips through drafting. Err toward the doc: reject only CLEAR develop
+    # work; remediation of a specific operational defect is operate, not
+    # develop.
+    operate_rule = ""
+    if ego_source == "genesis_ego_cycle":
+        operate_rule = """
+8. **Operate vs develop (operations ego only).** These proposals should
+   OPERATE the running system (diagnose, pull reversible operational levers,
+   dispatch remediation for a specific defect), NOT DEVELOP it. If a proposal
+   would write or refactor code, change a database schema, edit an install
+   script, or alter a configuration *value* (threshold, interval, routing
+   weight, budget cap), REJECT it: "Develop, not operate — escalate the
+   change to the user." A remediation dispatch for a specific operational
+   defect is fine; building a feature or redesigning a subsystem is not.
+"""
+
     # Build Rule #1 based on ego source — genesis ego is allowed to
     # propose investigation dispatches (background sessions for diagnosis),
     # while user ego should do read-only work in-cycle.
@@ -2671,7 +2690,7 @@ proposal and return a JSON array of verdicts.
    patterns in the history. A proposal that failed before may succeed
    now — circumstances change. Judge the proposal on its own merits,
    not on inferred system state.
-{domain_rule}
+{domain_rule}{operate_rule}
 ## Recent Proposal History (48h)
 {chr(10).join(history_lines)}
 

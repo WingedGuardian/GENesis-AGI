@@ -66,9 +66,31 @@ class TestDirectiveExemption:
 
     def test_backward_compatible_without_directives(self):
         # No directives → directive_section is empty → prompt is byte-identical
-        # to the pre-PR-3 form (interpolation is a no-op).
+        # to the pre-PR-3 form for the same ego (interpolation is a no-op).
         base = _build_realist_prompt(_props("X"), [], ego_source="genesis_ego_cycle")
         with_empty = _build_realist_prompt(
             _props("X"), [], ego_source="genesis_ego_cycle", active_directives=[]
         )
         assert base == with_empty
+
+
+class TestOperateVsDevelopRule:
+    """The genesis (COO) ego gets an operate-vs-develop realist rule; other
+    egos do not (it is a COO-specific jurisdiction constraint)."""
+
+    def test_genesis_ego_gets_operate_rule(self):
+        prompt = _build_realist_prompt(
+            _props("Refactor the router"), [], ego_source="genesis_ego_cycle"
+        )
+        assert "Operate vs develop" in prompt
+        assert "Develop, not operate" in prompt
+
+    def test_user_ego_has_no_operate_rule(self):
+        prompt = _build_realist_prompt(
+            _props("Publish an article"), [], ego_source="user_ego_cycle"
+        )
+        assert "Operate vs develop" not in prompt
+
+    def test_no_ego_source_has_no_operate_rule(self):
+        prompt = _build_realist_prompt(_props("Do X"), [])
+        assert "Operate vs develop" not in prompt
