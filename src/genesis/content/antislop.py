@@ -155,9 +155,6 @@ def detect(text: str) -> dict[str, object]:
         findings["contrast_structures"] = contrasts
 
     sents = _sentences(prose)
-    if sents and sents[0].lstrip().startswith("I "):
-        findings["opens_with_I"] = sents[0][:60]
-
     lengths = [len(s.split()) for s in sents]
     if len(lengths) > 3 and (max(lengths) - min(lengths) < 4):
         findings["uniform_sentence_length"] = len(lengths)
@@ -194,7 +191,7 @@ def scrub(text: str, *, is_voiced: bool = True) -> ScrubResult:
         findings = detect(cleaned)
         for key in (
             "spaced_ambiguous_dash", "banned_words", "banned_phrases",
-            "filler_openers", "contrast_structures", "opens_with_I",
+            "filler_openers", "contrast_structures",
             "uniform_sentence_length",
         ):
             if key in findings:

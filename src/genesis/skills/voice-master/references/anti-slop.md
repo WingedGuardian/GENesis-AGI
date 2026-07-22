@@ -128,7 +128,6 @@ not per paragraph. Stacking them is an AI fingerprint.
 
 ### Structural tells
 
-- Opening the first sentence with "I".
 - Three-part lists whose items share the exact same grammatical structure.
 - Uniform sentence length — vary it. Favor sentences under ~16 words but keep
   the user's natural longer reasoning chains; don't flatten everything to one

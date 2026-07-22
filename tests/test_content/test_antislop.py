@@ -150,3 +150,21 @@ class TestRealisticSlopRoundTrip:
         assert f" {EM} " not in r.cleaned_text
         assert f"here{EM}not" in r.cleaned_text
         assert r.fixes_applied == ["spaced_em_dash:1"]
+
+
+class TestFirstPersonOpenerAllowed:
+    """First person is encouraged by the voice-master style-guide, so an opener
+    starting with "I" is NOT an anti-slop tell (the old opens_with_I gate was
+    removed to stop it contradicting the guidance)."""
+
+    def test_detect_does_not_flag_first_person_opener(self):
+        assert "opens_with_I" not in detect(
+            "I keep coming back to the same failure mode."
+        )
+
+    def test_scrub_does_not_flag_first_person_opener(self):
+        r = scrub(
+            "I keep coming back to it. The failure bites every time, in new ways.",
+            is_voiced=True,
+        )
+        assert not any("opens_with_I" in f for f in r.flags)
