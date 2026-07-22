@@ -142,3 +142,45 @@ async def test_untargeted_category_path_unchanged(config, db, mock_formatter, mo
     args, kwargs = mock_channel.send_message.call_args
     assert args[0] == "12345"
     assert kwargs["message_thread_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_defer_carries_target_fields_for_retry(config, db, mock_formatter):
+    # A transient send failure defers the send; the origin-target fields MUST be
+    # serialized so a retry still reaches the exact origin thread (SHOULD-FIX 1).
+    import json
+
+    failing_adapter = AsyncMock()
+    failing_adapter.send_message.side_effect = RuntimeError("transient telegram error")
+    deferred_queue = AsyncMock()
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=AsyncMock(),
+        formatter=mock_formatter,
+        channels={"telegram": failing_adapter},
+        db=db,
+        config=config,
+        recipients={"telegram": "999"},
+        deferred_queue=deferred_queue,
+    )
+    await pipeline.submit_urgent(_targeted_req(chat_id="831453901", thread_id=None))
+
+    deferred_queue.enqueue.assert_awaited_once()
+    payload = json.loads(deferred_queue.enqueue.call_args.kwargs["payload"])
+    assert payload["target_chat_id"] == "831453901"
+    assert payload["target_thread_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_submit_raw_retry_path_honors_target(config, db, mock_formatter, mock_channel):
+    # The recovery worker retries via submit_raw(content, request); a request
+    # carrying the restored target fields must still deliver to the origin thread.
+    pipeline = _pipeline(config, db, mock_formatter, mock_channel, recipients={"telegram": "999"})
+    pipeline.set_forum_chat_id(-1002000)
+    req = _targeted_req(chat_id="-1002000", thread_id=110)
+    result = await pipeline.submit_raw("pre-formatted result", req)
+
+    assert result.status == OutreachStatus.DELIVERED
+    args, kwargs = mock_channel.send_message.call_args
+    assert args[0] == "-1002000"
+    assert kwargs["message_thread_id"] == 110

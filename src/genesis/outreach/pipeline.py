@@ -892,6 +892,11 @@ class OutreachPipeline:
                     "content": content,
                     "category": request.category.value,
                     "topic": request.topic,
+                    # Origin-targeted delivery must survive a transient-failure
+                    # retry, or a result that failed once lands in the default
+                    # surface instead of the exact origin thread it promised.
+                    "target_chat_id": request.target_chat_id,
+                    "target_thread_id": request.target_thread_id,
                 }),
                 reason=reason,
                 staleness_policy="drain",

@@ -137,7 +137,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 8cb9e8dc 2026-07-21
+verified: 3c5e1f24 2026-07-22
 ```
 
 - `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split

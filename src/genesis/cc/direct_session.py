@@ -1243,6 +1243,11 @@ class DirectSessionRunner:
         # narrow file-write or shell access (e.g., models.md weekly synthesis).
         if request.tool_exceptions:
             exceptions = set(request.tool_exceptions)
+            # Never let a background session re-enable recursive spawn via a
+            # tool_exception: the delivery model's foreground-origin-only
+            # invariant (GENESIS_SESSION_ID is always a foreground row) depends
+            # on direct_session_run staying unreachable from background sessions.
+            exceptions.discard("mcp__genesis-health__direct_session_run")
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile
@@ -1532,10 +1537,16 @@ class DirectSessionRunner:
                 else f"Task did not complete: {result.error or 'unknown error'}"
             )
             header = f"<b>{status} Background task complete</b>\n\n"
-            text = header + html_mod.escape(raw)
+            escaped = html_mod.escape(raw)
+            text = header + escaped
             if len(text) > _TG_MSG_CAP:
                 path = _write_result_artifact(result.session_id, raw)
-                head = html_mod.escape(raw[: _TG_MSG_CAP - 400])
+                # Budget on the ESCAPED length (entities expand up to ~4×), then
+                # trim any dangling partial entity at the cut so Telegram's HTML
+                # parser doesn't choke on a truncated "&amp;"-style sequence.
+                head = escaped[: _TG_MSG_CAP - 400]
+                if "&" in head[-6:]:
+                    head = head.rsplit("&", 1)[0]
                 pointer = html_mod.escape(str(path)) if path else "(disk write failed)"
                 text = header + head + f"\n\n… (truncated) — full result saved to {pointer}"
 
