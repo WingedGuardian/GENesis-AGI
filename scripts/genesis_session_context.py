@@ -105,16 +105,21 @@ def _model_display_name(model_id: str) -> str | None:
 
 
 _MODEL_CACHE_FILE = Path.home() / ".genesis" / "cc_session_model.json"
+# Bound the map so it self-evicts (no retention wiring needed). Genesis runs
+# several concurrent cc-N slot sessions, so a single slot would be clobbered by
+# whichever session started/compacted most recently — a per-session map keyed by
+# id keeps each session's model available for its own later resume.
+_MODEL_CACHE_MAX = 24
 
 
 def _cache_session_model(session_id: str, model: str) -> None:
-    """Persist the current session's model (single O(1) slot, no retention).
+    """Persist `model` under `session_id` in a bounded, self-evicting map.
 
     Written whenever CC provides `model` (startup/compact) so that a later
-    `claude --resume` — where CC OMITS `model` — can recover it. Keyed by
-    session id: the reader only trusts the cache when the id matches, so a
-    stale entry from a different session is ignored, not mis-applied.
-    Fail-open: any error is swallowed (the header degrades to env derivation).
+    `claude --resume` — where CC OMITS `model` — can recover it. Insertion-order
+    eviction keeps the map at `_MODEL_CACHE_MAX` most-recent sessions. Written
+    atomically (tmp + os.replace) so a concurrent reader never sees a partial
+    file. Fail-open: any error is swallowed (header degrades to env derivation).
     """
     if not session_id or not model:
         return
@@ -122,14 +127,28 @@ def _cache_session_model(session_id: str, model: str) -> None:
     import json
 
     with contextlib.suppress(OSError, ValueError):
+        data: dict = {}
+        if _MODEL_CACHE_FILE.exists():
+            try:
+                loaded = json.loads(_MODEL_CACHE_FILE.read_text())
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}  # corrupt cache — start fresh, never crash the hook
+        data.pop(session_id, None)  # re-insert at the end (most-recent)
+        data[session_id] = model
+        while len(data) > _MODEL_CACHE_MAX:
+            data.pop(next(iter(data)))  # evict oldest (insertion order)
         _MODEL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _MODEL_CACHE_FILE.write_text(json.dumps({"session_id": session_id, "model": model}))
+        _tmp = _MODEL_CACHE_FILE.with_name(_MODEL_CACHE_FILE.name + ".tmp")
+        _tmp.write_text(json.dumps(data))
+        os.replace(_tmp, _MODEL_CACHE_FILE)
 
 
 def _cached_session_model(session_id: str) -> str:
     """Read back the cached model for `session_id`, or "" on any miss.
 
-    Guards on the id so a resume of session A never picks up session B's model.
+    Keyed by id, so a resume of session A never picks up session B's model.
     """
     if not session_id:
         return ""
@@ -139,8 +158,8 @@ def _cached_session_model(session_id: str) -> str:
         data = json.loads(_MODEL_CACHE_FILE.read_text())
     except (OSError, ValueError):
         return ""
-    if isinstance(data, dict) and data.get("session_id") == session_id:
-        return str(data.get("model") or "")
+    if isinstance(data, dict):
+        return str(data.get(session_id) or "")
     return ""
 
 
@@ -259,10 +278,11 @@ def main() -> None:
     # compaction (the baked "You are powered by …" env line freezes at original
     # start and does not). Per CC docs, `model` is OMITTED on `resume` (session
     # recovery) and `clear`, and absent on older CC. When it is present we cache
-    # it (keyed by session id); when it is absent we read that cache back so a
+    # it (keyed by session id, in a bounded map so concurrent sessions don't
+    # clobber each other); when it is absent we read that cache back so a
     # `claude --resume` of a session whose model we saw still gets the right
-    # header. Cache miss (e.g. a concurrent session overwrote the single-slot
-    # cache) falls through to env-line derivation — no worse than before.
+    # header. Any cache miss falls through to env-line derivation — no worse
+    # than before.
     _hook_model = str(_hook_input.get("model", "") or "")
     if _hook_model:
         _cache_session_model(_hook_session_id, _hook_model)

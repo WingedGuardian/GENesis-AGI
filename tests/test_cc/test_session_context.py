@@ -240,6 +240,26 @@ class TestSessionModelCache:
         # A different session id must NOT read session A's model.
         assert m._cached_session_model("sess-B") == ""
 
+    def test_concurrent_sessions_do_not_clobber(self, tmp_path: Path, monkeypatch) -> None:
+        """Two sessions caching between them → BOTH remain retrievable."""
+        m = _load_context_module()
+        monkeypatch.setattr(m, "_MODEL_CACHE_FILE", tmp_path / "cc_session_model.json")
+        m._cache_session_model("sess-A", "claude-opus-4-8")
+        m._cache_session_model("sess-B", "claude-sonnet-5")  # would clobber a single slot
+        assert m._cached_session_model("sess-A") == "claude-opus-4-8"
+        assert m._cached_session_model("sess-B") == "claude-sonnet-5"
+
+    def test_map_self_evicts_at_cap(self, tmp_path: Path, monkeypatch) -> None:
+        m = _load_context_module()
+        monkeypatch.setattr(m, "_MODEL_CACHE_FILE", tmp_path / "cc_session_model.json")
+        monkeypatch.setattr(m, "_MODEL_CACHE_MAX", 3)
+        for i in range(5):
+            m._cache_session_model(f"sess-{i}", f"model-{i}")
+        # Oldest two evicted; newest three retained.
+        assert m._cached_session_model("sess-0") == ""
+        assert m._cached_session_model("sess-1") == ""
+        assert m._cached_session_model("sess-4") == "model-4"
+
     def test_cache_miss_returns_empty(self, tmp_path: Path, monkeypatch) -> None:
         m = _load_context_module()
         monkeypatch.setattr(m, "_MODEL_CACHE_FILE", tmp_path / "absent.json")
