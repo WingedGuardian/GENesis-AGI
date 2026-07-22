@@ -3350,6 +3350,32 @@
           return { state: "healthy", reason: worklist > 0 ? `queues clear — ${worklist} worklist item(s) in flight` : "queues are clear" };
         },
 
+        reflexSemantic() {
+          // Deliberately NOT part of overallHealthSemantic(): a new reflex
+          // signal means a bug was DETECTED — the subsystem working, not the
+          // system degrading. Only ingestion-pipeline problems (drops) mark
+          // this card degraded.
+          const reflex = this.health.reflex;
+          if (!reflex) return { state: "unknown", reason: "reflex data unavailable" };
+          const ing = reflex.ingestor;
+          if (!ing) {
+            const total = reflex.total_signals || 0;
+            return { state: "unknown", reason: `ingestor not running — ${total} stored signal(s)` };
+          }
+          if (ing.enabled === false) {
+            return { state: "unknown", reason: "ingestion disabled (nerve dark by config)" };
+          }
+          if ((ing.dropped || 0) > 0) {
+            return { state: "degraded", reason: `${ing.dropped} event(s) dropped (ingest queue overflow)` };
+          }
+          const newCount = (reflex.counts || {}).new || 0;
+          const total = reflex.total_signals || 0;
+          if (newCount > 0) {
+            return { state: "healthy", reason: `nerve live — ${newCount} new signal(s) awaiting the diagnose lane` };
+          }
+          return { state: "healthy", reason: total > 0 ? `nerve live — ${total} signal(s), none new` : "nerve live — no failures detected" };
+        },
+
         surplusSemantic() {
           const surplus = this.health.surplus;
           if (!surplus || surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
