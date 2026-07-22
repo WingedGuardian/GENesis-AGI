@@ -175,7 +175,8 @@ class HealthDataService:
 
             since = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
             return await events_crud.recent_provider_fallback_counts(
-                self._db, since=since,
+                self._db,
+                since=since,
             )
         except Exception:
             logger.debug("recent provider-fallback counts query failed", exc_info=True)
@@ -199,6 +200,7 @@ class HealthDataService:
             proactive_memory_metrics,
             provider_activity,
             queues,
+            reflex,
             services_async,
             surplus_status,
         )
@@ -223,8 +225,11 @@ class HealthDataService:
         # mcp_status) overlap with them and each other.
         results = await asyncio.gather(
             call_sites(
-                self._db, self._routing_config, self._breakers,
-                probe_results=probe_results, state_machine=self._state_machine,
+                self._db,
+                self._routing_config,
+                self._breakers,
+                probe_results=probe_results,
+                state_machine=self._state_machine,
             ),
             cc_sessions(self._db, self._cc_budget, self._state_machine),
             infrastructure(
@@ -253,17 +258,33 @@ class HealthDataService:
             # Deploy staleness — merged-vs-deployed drift (update.sh age, commits
             # behind, missing units, host guardian). Does its own to_thread.
             deploy_health(self._db),
+            # Reflex-arc nerve state (ingestor counters + signal aggregates).
+            reflex(self._db),
             return_exceptions=True,
         )
         # Isolate any failed section uniformly: one raising sub-snapshot degrades
         # to {"status": "error"} instead of taking down the whole snapshot.
         results = [_or_error(r) for r in results]
         (
-            r_call_sites, r_cc_sessions, r_infrastructure, r_queues, r_surplus,
-            r_cost, r_awareness, r_outreach, r_mcp, r_provider_activity,
-            r_memory_health, r_eval_staleness, r_vcr,
-            r_services, r_conversation, r_proactive, r_provider_fallbacks,
+            r_call_sites,
+            r_cc_sessions,
+            r_infrastructure,
+            r_queues,
+            r_surplus,
+            r_cost,
+            r_awareness,
+            r_outreach,
+            r_mcp,
+            r_provider_activity,
+            r_memory_health,
+            r_eval_staleness,
+            r_vcr,
+            r_services,
+            r_conversation,
+            r_proactive,
+            r_provider_fallbacks,
             r_deploy_health,
+            r_reflex,
         ) = results
 
         # Surface infra probe healthy<->unhealthy transitions to the activity
@@ -276,9 +297,7 @@ class HealthDataService:
         # Fallback counts feed the API-keys card. _recent_provider_fallbacks
         # self-isolates its errors to {}, so this is always a provider map; the
         # isinstance keeps the attach loop safe if that contract ever changes.
-        recent_fallbacks = (
-            r_provider_fallbacks if isinstance(r_provider_fallbacks, dict) else {}
-        )
+        recent_fallbacks = r_provider_fallbacks if isinstance(r_provider_fallbacks, dict) else {}
 
         return {
             "timestamp": now,
@@ -293,7 +312,8 @@ class HealthDataService:
             "outreach_stats": r_outreach,
             "services": r_services,
             "api_keys": api_key_health(
-                self._routing_config, breakers=self._breakers,
+                self._routing_config,
+                breakers=self._breakers,
                 recent_fallbacks=recent_fallbacks,
             ),
             "mcp_servers": r_mcp,
@@ -305,6 +325,7 @@ class HealthDataService:
             "eval_staleness": r_eval_staleness,
             "deploy_health": r_deploy_health,
             "vcr": r_vcr,
+            "reflex": r_reflex,
         }
 
     async def _emit_probe_transitions(self, infra: object) -> None:
@@ -375,6 +396,7 @@ class HealthDataService:
             return {}
         try:
             from genesis.db.crud.ego import compute_vcr
+
             return await compute_vcr(self._db, days=30)
         except Exception:
             logger.debug("VCR snapshot failed", exc_info=True)
