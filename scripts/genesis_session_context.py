@@ -76,6 +76,153 @@ def _routed_session_notice(model: str | None) -> str | None:
     )
 
 
+def _model_display_name(model_id: str) -> str | None:
+    """Map a Claude Code model identifier to its `Display Name Version` form.
+
+    Returns None when the id is empty or unrecognized — the caller then falls
+    back to injecting the raw id with a mapping instruction (robust to models
+    newer than this table), so a stale table degrades gracefully rather than
+    emitting a wrong header. Handles a bracketed context-window suffix
+    (``claude-opus-4-8[1m]``) and a trailing date stamp
+    (``claude-haiku-4-5-20251001``).
+    """
+    if not model_id:
+        return None
+    import re
+
+    mid = model_id.strip().lower()
+    mid = mid.split("[", 1)[0]  # drop "[1m]"-style context-window suffix
+    mid = re.sub(r"-\d{8}$", "", mid)  # drop trailing -YYYYMMDD date stamp
+    table = {
+        "claude-fable-5": "Fable 5",
+        "claude-opus-4-8": "Opus 4.8",
+        "claude-opus-4-7": "Opus 4.7",
+        "claude-sonnet-5": "Sonnet 5",
+        "claude-sonnet-4-6": "Sonnet 4.6",
+        "claude-haiku-4-5": "Haiku 4.5",
+    }
+    return table.get(mid)
+
+
+_MODEL_CACHE_FILE = Path.home() / ".genesis" / "cc_session_model.json"
+# Bound the map so it self-evicts (no retention wiring needed). Genesis runs
+# several concurrent cc-N slot sessions, so a single slot would be clobbered by
+# whichever session started/compacted most recently — a per-session map keyed by
+# id keeps each session's model available for its own later resume.
+_MODEL_CACHE_MAX = 24
+
+
+def _cache_session_model(session_id: str, model: str) -> None:
+    """Persist `model` under `session_id` in a bounded, self-evicting map.
+
+    Written whenever CC provides `model` (startup/compact) so that a later
+    `claude --resume` — where CC OMITS `model` — can recover it. Insertion-order
+    eviction keeps the map at `_MODEL_CACHE_MAX` most-recent sessions. Written
+    atomically (tmp + os.replace) so a concurrent reader never sees a partial
+    file. Fail-open: any error is swallowed (header degrades to env derivation).
+    """
+    if not session_id or not model:
+        return
+    import contextlib
+    import json
+
+    with contextlib.suppress(OSError, ValueError):
+        data: dict = {}
+        if _MODEL_CACHE_FILE.exists():
+            try:
+                loaded = json.loads(_MODEL_CACHE_FILE.read_text())
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}  # corrupt cache — start fresh, never crash the hook
+        data.pop(session_id, None)  # re-insert at the end (most-recent)
+        data[session_id] = model
+        while len(data) > _MODEL_CACHE_MAX:
+            data.pop(next(iter(data)))  # evict oldest (insertion order)
+        _MODEL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _tmp = _MODEL_CACHE_FILE.with_name(_MODEL_CACHE_FILE.name + ".tmp")
+        _tmp.write_text(json.dumps(data))
+        os.replace(_tmp, _MODEL_CACHE_FILE)
+
+
+def _cached_session_model(session_id: str) -> str:
+    """Read back the cached model for `session_id`, or "" on any miss.
+
+    Keyed by id, so a resume of session A never picks up session B's model.
+    """
+    if not session_id:
+        return ""
+    import json
+
+    try:
+        data = json.loads(_MODEL_CACHE_FILE.read_text())
+    except (OSError, ValueError):
+        return ""
+    if isinstance(data, dict):
+        return str(data.get(session_id) or "")
+    return ""
+
+
+def _session_config_block(effort: str, hook_model: str, roster_model: str) -> str:
+    """Top Session Configuration block: effort + first-reply status-header directive.
+
+    Model-identity precedence (highest first):
+      1. ``roster_model`` (``GENESIS_ROSTER_MODEL``) — a non-Anthropic peer set
+         by ``scripts/gmodel``; already a display name.
+      2. ``hook_model`` — the ``model`` field from CC's SessionStart stdin JSON.
+         Unlike the baked "You are powered by …" environment line, CC re-sends
+         this on EVERY SessionStart including ``compact``, so it stays correct
+         after a compaction (the env line is frozen at the original session
+         start and goes stale after a /model switch or a compact of an
+         already-switched session — the bug this fixes).
+      3. Neither present (older CC with no ``model`` field) — fall back to
+         env-line derivation, the legacy behavior.
+
+    A /model switch fires NO SessionStart event, so a switch AFTER this block is
+    injected can't be captured here — the precedence note covers it ("a /model
+    switch after this message wins").
+    """
+    tmpl = (
+        "Begin your first reply of this session with a one-line status header "
+        f"on its own line — `[{{model}} / {effort}]` — then your normal reply."
+    )
+    switch_note = (
+        " If you switch models with `/model` AFTER this message, use the "
+        "switched-to model on your next first-of-session header instead. "
+        "No emoji, no explanation.\n"
+    )
+    authoritative = roster_model or _model_display_name(hook_model)
+    if authoritative:
+        body = (
+            tmpl.replace("{model}", authoritative)
+            + " That model identity is authoritative for this window (from Claude "
+            "Code's session-start hook input / routing, which stays correct across "
+            'context compaction — unlike the "You are powered by …" environment '
+            "line, which can be stale)." + switch_note
+        )
+    elif hook_model:
+        # Present but unmapped (a model newer than the table above): inject the
+        # raw id as authoritative and let the model render its own display name.
+        body = (
+            tmpl.replace("{model}", "<model>")
+            + f" Your current model identifier is `{hook_model}` (authoritative for "
+            "this window — from Claude Code's session-start hook input, which stays "
+            'correct across context compaction, unlike the "You are powered by …" '
+            "environment line). Map it to its display name + version (e.g. "
+            "`claude-opus-4-8` → `Opus 4.8`)." + switch_note
+        )
+    else:
+        # No model field (older CC, or absent) — legacy env-line derivation.
+        body = (
+            tmpl.replace("{model}", "<model>")
+            + " Derive <model> from your environment's \"You are powered by the "
+            'model named …" line (e.g. `Opus 4.8`), per CONVERSATION.md → Session '
+            "Start. If you switched models with `/model` this session, use the "
+            "switched-to model. No emoji, no explanation.\n"
+        )
+    return f"## Session Configuration\n\n- Thinking effort: {effort}\n\n{body}"
+
+
 def _sync_genesis_hooks() -> None:
     """Self-heal Genesis git hooks at session start.
 
@@ -126,6 +273,21 @@ def main() -> None:
         _hook_input = {}
     _hook_session_id = str(_hook_input.get("session_id", "") or "")
     _hook_source = str(_hook_input.get("source", "") or "")
+    # CC sends `model` on SessionStart for `startup` and `compact` — the two
+    # events that matter here, because it means the header stays correct across a
+    # compaction (the baked "You are powered by …" env line freezes at original
+    # start and does not). Per CC docs, `model` is OMITTED on `resume` (session
+    # recovery) and `clear`, and absent on older CC. When it is present we cache
+    # it (keyed by session id, in a bounded map so concurrent sessions don't
+    # clobber each other); when it is absent we read that cache back so a
+    # `claude --resume` of a session whose model we saw still gets the right
+    # header. Any cache miss falls through to env-line derivation — no worse
+    # than before.
+    _hook_model = str(_hook_input.get("model", "") or "")
+    if _hook_model:
+        _cache_session_model(_hook_session_id, _hook_model)
+    elif _hook_session_id:
+        _hook_model = _cached_session_model(_hook_session_id)
 
     # Phase 6: self-heal Genesis git hooks before doing anything else.
     # Runs on every session start so community installs auto-pick up hook
@@ -146,15 +308,16 @@ def main() -> None:
 
         # 0.5. Session Configuration — inject the effort level AND the
         # first-reply status-header directive into the highest-salience slot
-        # (the very top of the injection). The header itself
-        # (`[<model> / <effort>]`) is fully specified in CONVERSATION.md →
-        # "Session Start", but that spec sits hundreds of lines deep in the
-        # identity block and gets buried under the user's first task, so it
-        # fired unreliably. Echoing the directive here — where the LLM reads it
-        # first — is what actually makes it emit. Model is NOT injected: it is
-        # derived from CC's always-accurate "You are powered by..." system text
-        # (the sidecar's model goes stale on a native /model switch). Effort
-        # comes from the sidecar (written by the session_config MCP tool).
+        # (the very top of the injection). The header (`[<model> / <effort>]`)
+        # is fully specified in CONVERSATION.md → "Session Start", but that spec
+        # sits hundreds of lines deep and gets buried under the user's first
+        # task, so it fired unreliably. Echoing the directive here — where the
+        # LLM reads it first — is what makes it emit. The MODEL is now injected
+        # authoritatively from CC's SessionStart `model` field (re-sent on every
+        # compact, unlike the "You are powered by …" env line, which freezes at
+        # original session start and goes stale after a /model switch or a
+        # compact) — see _session_config_block for the precedence. Effort comes
+        # from the sidecar (written by the session_config MCP tool).
         effort = "high"  # default — user's preferred effort level
         if _SESSION_CONFIG.exists():
             import json
@@ -165,13 +328,9 @@ def main() -> None:
             except Exception as exc:
                 print(f"[session_context] Failed to read session config: {exc}", file=sys.stderr)
         _emit(
-            "## Session Configuration\n\n"
-            f"- Thinking effort: {effort}\n\n"
-            "Begin your first reply of this session with a one-line status header "
-            f"on its own line — `[<model> / {effort}]` — then your normal reply. "
-            "Derive <model> from your environment's \"You are powered by the model "
-            'named …" line (e.g. `Opus 4.8`), per CONVERSATION.md → Session Start. '
-            "No emoji, no explanation.\n"
+            _session_config_block(
+                effort, _hook_model, os.environ.get("GENESIS_ROSTER_MODEL", "") or ""
+            )
         )
         first = False
 

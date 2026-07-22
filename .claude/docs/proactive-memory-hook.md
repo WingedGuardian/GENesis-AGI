@@ -68,10 +68,14 @@ fallback rate is directly observable. The health dashboard reads this file.
 
 The server response carries `timings_ms` with a per-stage breakdown —
 `embed`, `recall`, and (since ac27b693) the recall sub-stages `vector`,
-`expand`, `fts`, `activation`, plus `rerank`, `enrich`, `procedure`, `total`.
-When a call exceeds the slow-log threshold the server writes one
-`proactive recall slow: {…}` INFO line, so a latency regression is attributable
-to a stage from the journal alone without live probing.
+`event`, `expand`, `fts`, `expired`, `activation`, `breadcrumbs`, `assembly`,
+plus `rerank`, `enrich`, `procedure`, `total`. The read-stage timers
+(`event`/`fts`/`expired`/`activation`/`breadcrumbs`) decompose the `recall`
+bucket so what used to be an unaccounted residual — read-lock contention on the
+shared connection — is now attributable to a stage. When a call exceeds the
+slow-log threshold the server writes one `proactive recall slow: {…}` INFO line,
+so a latency regression is attributable to a stage from the journal alone
+without live probing.
 
 ## Latency: work off the hot path
 
@@ -89,6 +93,16 @@ does the least work needed to build the response and defers the rest:
   revalidate): a stale index never blocks a prompt on a full-corpus scroll; the
   current prompt uses whatever the index holds and a single background task
   rebuilds it.
+- **Recall reads run on a dedicated read-only connection pool** (`mode=ro`,
+  WAL-aware; `db/connection.py::ReadConnectionPool`, wired in `init/memory.py`).
+  All Genesis subsystems share one write connection behind a single lock, so
+  recall's read stages (FTS5, activation, enrich, breadcrumbs) otherwise queue
+  behind the whole server's writes under concurrent sessions. The pool gives
+  them genuinely-parallel readers off that lock. It is an **optional value-add**:
+  any pool miss or error falls back to the shared connection, so recall is never
+  worse than without it. Size: `GENESIS_RECALL_READ_POOL_SIZE` (default 4); kill
+  switch `GENESIS_RECALL_READ_POOL_OFF=1`. The query-embed call-site heartbeat
+  is also fired off the hot path, so `embed` no longer blocks on that write.
 
 ## Related
 

@@ -1116,14 +1116,14 @@ verified: 9037d45b 2026-07-07
 
 The afferent nerve for Genesis's own screaming bugs: detect `task.failed`
 exceptions, fingerprint/dedup them, and (later phases) diagnose → card →
-fix under a human-gated tier model. **PR1 only (dark)** — ingestion
-scaffolding, no cards/sessions/LLM yet. Spec:
-`docs/superpowers/specs/2026-07-21-reflex-arc-design.md`.
+fix under a human-gated tier model. **PR1 (dark) + PR1.5 (observability)**
+— ingestion scaffolding and its watch surface; no cards/sessions/LLM yet.
+Spec: `docs/superpowers/specs/2026-07-21-reflex-arc-design.md`.
 
 ```yaml subsystem-map
 entry: reflex-arc
 modules: [reflex]
-verified: bbe3a440 2026-07-21
+verified: 6fd98675 2026-07-21
 ```
 
 - **reflex/**: `fingerprint.py` (pure: normalize task name, line-number-free
@@ -1144,6 +1144,20 @@ verified: bbe3a440 2026-07-21
   (`runtime/init/ego._is_reflex_owned_event`) — reflex owns that class; the
   ego's message-keyed dedup can't absorb variable-payload failure bursts
   (a documented storm mode in `ego/cadence.py`).
+- **Observability (PR1.5)**: aggregates on `db/crud/reflex_signals`
+  (`count_by_status` / `top_class_keys` / `list_recent`) feed four surfaces —
+  the `reflex_status` MCP tool (process-portable: config + DB only), the
+  in-server health snapshot (`observability/snapshots/reflex.py`, reads live
+  ingestor counters via `GenesisRuntime.peek()`, degrades to DB-only),
+  a `reflex` block in `status.json` (isinstance-guarded; consumed by the
+  standalone health MCP), and a dashboard overview card (`reflexSemantic()` —
+  deliberately NOT in `overallHealthSemantic()`: a detected signal is the
+  subsystem working, not the system degrading).
+- **A4 sweep**: remaining fire-and-forget bare `create_task` sites wrapped in
+  `tracked_task` (`cc_fallback_probe`, `escalation` ×2); awaited-elsewhere
+  sites (`knowledge/orchestrator` tree_task, `health_data` single-flight,
+  `events._db_writer`) stay bare with in-code comments — wrapping would
+  double-report exceptions their callers already handle.
 - GROUNDWORK: diagnose lane (PR2), fix lane (PR3) — `reflex_diagnoses` /
   `reflex_verdicts` writers and the card/gate/dispatch flow are NOT yet
   built; the tables are inert scaffolding in PR1.

@@ -674,9 +674,21 @@ async def proactive_context(
     if "rerank_ms" in engine_stats:
         timings["rerank"] = engine_stats["rerank_ms"]
     # Sub-stage breakdown of the `recall` bucket (ac27b693): surfaced so a slow
-    # recall can be attributed to vector/FTS/expand/activation from the journal
-    # alone, instead of guessed. Present only when recall populated them.
-    for _k in ("vector_ms", "expand_ms", "fts_ms", "activation_ms"):
+    # recall can be attributed to a specific stage from the journal alone,
+    # instead of guessed. PR-4 added the read-stage timers (event/expired/
+    # breadcrumbs) + assembly so the previously-unaccounted recall residual
+    # (read-lock contention) is now attributable. Present only when recall
+    # populated them.
+    for _k in (
+        "vector_ms",
+        "event_ms",
+        "expand_ms",
+        "fts_ms",
+        "expired_ms",
+        "activation_ms",
+        "breadcrumbs_ms",
+        "assembly_ms",
+    ):
         if _k in engine_stats:
             timings[_k.removesuffix("_ms")] = engine_stats[_k]
     if total_ms > _SLOW_RECALL_LOG_MS:

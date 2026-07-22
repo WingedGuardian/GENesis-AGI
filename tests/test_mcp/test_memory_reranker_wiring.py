@@ -44,6 +44,7 @@ def _stub_init_deps(monkeypatch) -> dict:
         def __init__(self, **kwargs):
             captured.update(kwargs)
             self._reranker = kwargs.get("reranker")
+            self._read_pool = kwargs.get("read_pool")
 
     # Local imports inside init() resolve these attributes at call time, so
     # patching the source module attribute is sufficient.
@@ -87,3 +88,37 @@ def test_init_without_reranker_is_none(monkeypatch):
     )
 
     assert captured["reranker"] is None
+
+
+def test_init_threads_read_pool_into_retriever(monkeypatch):
+    """The proactive per-prompt path recalls through the MCP retriever
+    (memory/proactive.py uses genesis.mcp.memory._retriever), so the ac27b693
+    read-only pool MUST reach it here — wiring it only into rt._hybrid_retriever
+    would leave the very hot path the pool targets bypassing it (Codex #1189 P1).
+    """
+    captured = _stub_init_deps(monkeypatch)
+    sentinel = object()
+
+    mem.init(
+        db=MagicMock(),
+        qdrant_client=MagicMock(),
+        embedding_provider=MagicMock(),
+        read_pool=sentinel,
+    )
+
+    assert captured["read_pool"] is sentinel
+    assert mem._retriever._read_pool is sentinel
+
+
+def test_init_without_read_pool_is_none(monkeypatch):
+    # Legacy / eval call sites pass no pool — the retriever falls back to the
+    # shared connection (pre-pool behavior), byte-identical.
+    captured = _stub_init_deps(monkeypatch)
+
+    mem.init(
+        db=MagicMock(),
+        qdrant_client=MagicMock(),
+        embedding_provider=MagicMock(),
+    )
+
+    assert captured["read_pool"] is None

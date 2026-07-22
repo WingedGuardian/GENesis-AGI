@@ -11,7 +11,7 @@ import asyncio
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,19 @@ BUSY_TIMEOUT_MS = 5000
 # per *connection*, so the long-lived server + MCP connections each hold up to
 # this much — a few GiB total against a 36 GiB budget, comfortably within range.
 CACHE_SIZE_KIB = -262144
+
+# Read-only recall pool (follow-up ac27b693). Recall's read stages open a
+# dedicated mode=ro pool so they stop queuing behind the WHOLE server's write
+# traffic on the single SerializedConnection lock. Per-connection page cache is
+# deliberately MODEST here: the writer holds 256 MiB (CACHE_SIZE_KIB), but a read
+# pool multiplies the cache by its size, so bound each RO connection to keep the
+# pool cheap on small installs (64 MiB × a few connections stays comfortable).
+RO_CACHE_SIZE_KIB = -65536  # 64 MiB per read-only connection
+
+# Default read-pool size. Sized for the common "several concurrent CC sessions"
+# workload — reads are sub-second, so a handful of parallel readers clears the
+# checkout queue fast. Overridable via config; floor of 1 enforced in the pool.
+DEFAULT_READ_POOL_SIZE = 4
 
 # Schema migrations run rarely (deploy / server startup) but must win the write
 # lock even when other processes (concurrent CC-session MCP servers) are writing.
@@ -71,10 +84,15 @@ class SerializedConnection:
     """
 
     # Attributes that live on the proxy itself, not the wrapped connection.
-    _OWN_ATTRS = frozenset({
-        "_conn", "_lock", "_reconnect_fn",
-        "_consecutive_errors", "_max_errors",
-    })
+    _OWN_ATTRS = frozenset(
+        {
+            "_conn",
+            "_lock",
+            "_reconnect_fn",
+            "_consecutive_errors",
+            "_max_errors",
+        }
+    )
 
     _MAX_LOCK_ERRORS = 5
 
@@ -113,7 +131,8 @@ class SerializedConnection:
         if count >= self._max_errors and self._reconnect_fn is not None:
             logger.warning(
                 "DB lock error %d/%d — attempting reconnection",
-                count, self._max_errors,
+                count,
+                self._max_errors,
             )
             try:
                 old_conn = self._conn
@@ -132,7 +151,9 @@ class SerializedConnection:
     # -- Operations that return Result (support both await and async with) --
 
     def execute(
-        self, sql: str, parameters: Iterable[Any] | None = None,
+        self,
+        sql: str,
+        parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> aiosqlite.Cursor:
             async with self._lock:
@@ -144,10 +165,13 @@ class SerializedConnection:
                     if "locked" in str(e):
                         await self._handle_lock_error(e)
                     raise
+
         return Result(_locked())
 
     def executemany(
-        self, sql: str, parameters: Iterable[Iterable[Any]],
+        self,
+        sql: str,
+        parameters: Iterable[Iterable[Any]],
     ) -> Result:
         async def _locked() -> aiosqlite.Cursor:
             async with self._lock:
@@ -159,10 +183,13 @@ class SerializedConnection:
                     if "locked" in str(e):
                         await self._handle_lock_error(e)
                     raise
+
         return Result(_locked())
 
     def execute_fetchall(
-        self, sql: str, parameters: Iterable[Any] | None = None,
+        self,
+        sql: str,
+        parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> list[aiosqlite.Row]:
             async with self._lock:
@@ -174,10 +201,13 @@ class SerializedConnection:
                     if "locked" in str(e):
                         await self._handle_lock_error(e)
                     raise
+
         return Result(_locked())
 
     def execute_insert(
-        self, sql: str, parameters: Iterable[Any] | None = None,
+        self,
+        sql: str,
+        parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> tuple | None:
             async with self._lock:
@@ -189,6 +219,7 @@ class SerializedConnection:
                     if "locked" in str(e):
                         await self._handle_lock_error(e)
                     raise
+
         return Result(_locked())
 
     def executescript(self, sql: str) -> Result:
@@ -202,6 +233,7 @@ class SerializedConnection:
                     if "locked" in str(e):
                         await self._handle_lock_error(e)
                     raise
+
         return Result(_locked())
 
     # -- Simple async operations -------------------------------------------
@@ -317,6 +349,131 @@ async def get_raw_db(
         yield db
     finally:
         await db.close()
+
+
+async def open_ro_connection(
+    path: str | Path = DEFAULT_DB_PATH,
+    *,
+    cache_size_kib: int = RO_CACHE_SIZE_KIB,
+) -> aiosqlite.Connection:
+    """Open a standalone READ-ONLY aiosqlite connection (``mode=ro``, WAL-aware).
+
+    The shared seam for zero-write readers that need the live DB without
+    contending on the runtime's :class:`SerializedConnection` write lock.
+    ``mode=ro`` (NOT ``immutable=1``) reads the live ``-wal``, so it sees
+    committed writes — a change committed on the writer moments earlier IS
+    visible here.
+
+    Reader-safe pragmas ONLY: ``busy_timeout`` (a checkpoint's brief exclusive
+    moment can otherwise throw ``SQLITE_BUSY`` at a reader), a modest
+    ``cache_size``, and the ``Row`` factory for parity with :func:`get_db`.
+    Deliberately does NOT run ``journal_mode=WAL`` or ``synchronous`` — those
+    need write access to the DB header and are no-ops (or raise
+    ``SQLITE_READONLY`` on some builds) on a read-only handle.
+    """
+    uri = f"file:{Path(path)}?mode=ro"
+    conn = await aiosqlite.connect(uri, uri=True)
+    conn.row_factory = aiosqlite.Row
+    await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    await conn.execute(f"PRAGMA cache_size={cache_size_kib}")
+    return conn
+
+
+class ReadPoolClosed(Exception):
+    """Raised by :meth:`ReadConnectionPool.acquire` when the pool is closed or
+    was never opened. Callers treat it as "use the shared connection instead."
+    """
+
+
+class ReadConnectionPool:
+    """Small fixed pool of read-only aiosqlite connections for hot read paths.
+
+    Each connection is a ``mode=ro`` handle (:func:`open_ro_connection`). WAL
+    allows unlimited concurrent readers, so N connections give N genuinely-
+    parallel readers that never queue behind the ``SerializedConnection`` write
+    lock — the fix for recall reads stalling behind the whole server's writes
+    under concurrent sessions (follow-up ac27b693).
+
+    Checkout is **exclusive** (an ``asyncio.Queue``): ``async with
+    pool.acquire() as conn`` hands ONE connection to ONE coroutine at a time,
+    which is exactly why the pooled connections need no per-connection lock (a
+    raw aiosqlite connection is safe for a single owner; the ``SerializedConnection``
+    lock only exists because many coroutines share one connection). The
+    (size+1)th concurrent reader blocks on the queue until a slot frees —
+    natural backpressure; the route's own timeout is the ultimate bound.
+
+    A pooled ``mode=ro`` autocommit ``SELECT`` never opens a transaction, so a
+    read that errors or is cancelled leaves no dangling state — the connection
+    is always safe to return to the pool, so there is deliberately no
+    replace-on-error logic (which would ``await`` in a ``finally`` under route-
+    timeout cancellation).
+
+    The pool is an OPTIMIZATION, never a hard dependency: callers fall back to
+    the shared write connection on any pool miss/error, so it can never make a
+    read WORSE than the pre-pool behavior.
+    """
+
+    def __init__(
+        self,
+        path: str | Path = DEFAULT_DB_PATH,
+        *,
+        size: int = DEFAULT_READ_POOL_SIZE,
+        cache_size_kib: int = RO_CACHE_SIZE_KIB,
+    ) -> None:
+        self._path = str(Path(path))
+        self._size = max(1, size)
+        self._cache_size_kib = cache_size_kib
+        self._queue: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue()
+        self._all: list[aiosqlite.Connection] = []
+        self._closed = False
+        self._opened = False
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    async def open(self) -> None:
+        """Open all connections and fill the checkout queue. Idempotent."""
+        if self._opened:
+            return
+        for _ in range(self._size):
+            conn = await open_ro_connection(self._path, cache_size_kib=self._cache_size_kib)
+            self._all.append(conn)
+            self._queue.put_nowait(conn)
+        self._opened = True
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Check out one connection for the duration of the ``async with`` block.
+
+        Raises :class:`ReadPoolClosed` if the pool is closed or not yet opened
+        (the caller falls back to the shared connection). The connection is
+        returned to the queue on exit — including on error/cancellation, which
+        is safe for autocommit ``mode=ro`` reads (no dangling transaction). If
+        the pool was closed while the connection was held, it is dropped rather
+        than returned (``close()`` closes every ``self._all`` connection).
+        """
+        if self._closed or not self._opened:
+            raise ReadPoolClosed
+        conn = await self._queue.get()
+        try:
+            yield conn
+        finally:
+            # No ``await`` here: put_nowait can't fail (unbounded queue), so the
+            # slot is returned even under route-timeout cancellation. On a
+            # close() race we drop the handle — close() owns closing self._all.
+            if not self._closed:
+                self._queue.put_nowait(conn)
+
+    async def close(self) -> None:
+        """Close every connection. Idempotent; safe to call at shutdown."""
+        if self._closed:
+            return
+        self._closed = True
+        for conn in self._all:
+            with suppress(Exception):
+                await conn.close()
+        self._all.clear()
 
 
 async def init_db(path: str | Path = DEFAULT_DB_PATH) -> SerializedConnection:

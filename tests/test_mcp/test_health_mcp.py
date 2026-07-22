@@ -674,18 +674,28 @@ class TestBackupsEnabledHelper:
         assert _backups_enabled() is True
 
     def test_unset_everywhere(self, monkeypatch, tmp_path):
+        from pathlib import Path
+
         from genesis.mcp.health.errors import _backups_enabled
 
         monkeypatch.delenv("GENESIS_BACKUP_REPO", raising=False)
+        # Signal #3 (an existing backup clone under the real home) must not
+        # leak install state into the test — pin home to tmp_path.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setattr(
             "genesis.env.secrets_path", lambda: tmp_path / "secrets.env",
         )
         assert _backups_enabled() is False
 
     def test_secrets_file_fallback(self, monkeypatch, tmp_path):
+        from pathlib import Path
+
         from genesis.mcp.health.errors import _backups_enabled
 
         monkeypatch.delenv("GENESIS_BACKUP_REPO", raising=False)
+        # Signal #3 (an existing backup clone under the real home) must not
+        # leak install state into the test — pin home to tmp_path.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         secrets = tmp_path / "secrets.env"
         secrets.write_text(
             "API_KEY_DEEPINFRA=abc\n"
@@ -695,9 +705,14 @@ class TestBackupsEnabledHelper:
         assert _backups_enabled() is True
 
     def test_secrets_file_empty_value(self, monkeypatch, tmp_path):
+        from pathlib import Path
+
         from genesis.mcp.health.errors import _backups_enabled
 
         monkeypatch.delenv("GENESIS_BACKUP_REPO", raising=False)
+        # Signal #3 (an existing backup clone under the real home) must not
+        # leak install state into the test — pin home to tmp_path.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         secrets = tmp_path / "secrets.env"
         secrets.write_text("GENESIS_BACKUP_REPO=\n")
         monkeypatch.setattr("genesis.env.secrets_path", lambda: secrets)

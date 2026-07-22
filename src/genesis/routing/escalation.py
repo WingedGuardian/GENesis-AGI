@@ -5,7 +5,8 @@ trips its circuit breaker N times without recovery, creates a high-priority
 observation so the ego picks it up in its next cycle.
 
 The listener MUST be fast (event bus awaits listeners sequentially).
-Observation creation is deferred via asyncio.create_task().
+Observation creation is deferred via tracked_task (failures land on the
+event bus as task.failed — the reflex nerve — as well as in the log).
 """
 
 from __future__ import annotations
@@ -17,7 +18,8 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from genesis.observability.types import GenesisEvent, Severity
+from genesis.observability.types import GenesisEvent, Severity, Subsystem
+from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
 
@@ -48,23 +50,27 @@ class ProviderEscalation:
             return
 
         provider = event.details.get("provider", "unknown")
-        state = self._state.setdefault(provider, {
-            "trip_count": 0,
-            "first_trip_at": None,
-            "escalated": False,
-        })
+        state = self._state.setdefault(
+            provider,
+            {
+                "trip_count": 0,
+                "first_trip_at": None,
+                "escalated": False,
+            },
+        )
         state["trip_count"] += 1
         if state["first_trip_at"] is None:
             state["first_trip_at"] = self._clock().isoformat()
 
         if state["trip_count"] >= _TRIP_THRESHOLD and not state["escalated"]:
             state["escalated"] = True
-            # Defer DB write to a background task — don't block emit()
-            task = asyncio.create_task(
+            # Defer DB write to a tracked background task — don't block emit()
+            tracked_task(
                 self._create_observation(provider, state),
                 name=f"escalation-obs-{provider}",
+                event_bus=self._event_bus,
+                subsystem=Subsystem.ROUTING,
             )
-            task.add_done_callback(self._on_task_done)
 
     def record_recovery(self, provider: str) -> None:
         """Called when a provider recovers (breaker → CLOSED).
@@ -90,33 +96,36 @@ class ProviderEscalation:
         # present); a sync caller (e.g. a unit test) may have none — guard so we
         # never raise there, and defer the DB resolve like _create_observation does.
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             logger.debug(
                 "record_recovery('%s'): no running loop; skipping observation resolve",
                 provider,
             )
             return
-        task = loop.create_task(
+        tracked_task(
             self._resolve_observation(provider),
             name=f"escalation-resolve-{provider}",
+            event_bus=self._event_bus,
+            subsystem=Subsystem.ROUTING,
         )
-        task.add_done_callback(self._on_task_done)
 
     async def _create_observation(self, provider: str, state: dict) -> None:
         """Create a high-priority observation for a persistently failing provider."""
         from genesis.db.crud import observations
 
-        content = json.dumps({
-            "provider": provider,
-            "trip_count": state["trip_count"],
-            "first_trip_at": state["first_trip_at"],
-            "message": (
-                f"Provider '{provider}' has tripped its circuit breaker "
-                f"{state['trip_count']} times since {state['first_trip_at']} "
-                f"without recovery. All calls are falling back to other providers."
-            ),
-        })
+        content = json.dumps(
+            {
+                "provider": provider,
+                "trip_count": state["trip_count"],
+                "first_trip_at": state["first_trip_at"],
+                "message": (
+                    f"Provider '{provider}' has tripped its circuit breaker "
+                    f"{state['trip_count']} times since {state['first_trip_at']} "
+                    f"without recovery. All calls are falling back to other providers."
+                ),
+            }
+        )
         # Hash on provider name — one unresolved observation per provider.
         # Shared helper so the resolve-on-recovery path computes the SAME hash.
         content_hash = self._provider_content_hash(provider)
@@ -136,8 +145,7 @@ class ProviderEscalation:
             )
             if obs_id:
                 logger.warning(
-                    "Created observation %s for provider '%s' failure "
-                    "(%d trips since %s)",
+                    "Created observation %s for provider '%s' failure (%d trips since %s)",
                     obs_id,
                     provider,
                     state["trip_count"],
@@ -172,14 +180,12 @@ class ProviderEscalation:
                 content_hash=content_hash,
                 resolved_at=self._clock().isoformat(),
                 resolution_notes=(
-                    f"auto-resolved: provider '{provider}' recovered "
-                    f"(circuit breaker closed)"
+                    f"auto-resolved: provider '{provider}' recovered (circuit breaker closed)"
                 ),
             )
             if resolved:
                 logger.info(
-                    "Auto-resolved %d provider_failure observation(s) for "
-                    "recovered provider '%s'",
+                    "Auto-resolved %d provider_failure observation(s) for recovered provider '%s'",
                     resolved,
                     provider,
                 )
@@ -194,16 +200,3 @@ class ProviderEscalation:
     def _provider_content_hash(provider: str) -> str:
         """Deterministic per-provider hash — MUST match between create + resolve."""
         return hashlib.sha256(f"provider_failure:{provider}".encode()).hexdigest()
-
-    @staticmethod
-    def _on_task_done(task: asyncio.Task) -> None:
-        """Log exceptions from background observation tasks."""
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc:
-            logger.error(
-                "Escalation observation task failed: %s",
-                exc,
-                exc_info=exc,
-            )

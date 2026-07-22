@@ -16,7 +16,8 @@
 #   --post-merge  Skip fetch/merge (code already merged by CC conflict resolution);
 #                 run only bootstrap, migrations, health check, and service restart.
 
-set -euo pipefail
+set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
+                    # (see _on_err's BASH_SUBSHELL guard for the subshell case)
 
 # ── Copy-to-temp guard ──────────────────────────────────
 # The update script may update itself during git merge, which would corrupt
@@ -70,6 +71,37 @@ _write_state() {
     "timestamp": "$(date -Iseconds)"
 }
 SEOF
+}
+
+# Signal handler for the PRE-STOP window: an interrupt before services are
+# stopped has nothing to roll back (no merge, server still running), so just
+# clear this run's state/marker and exit. Swapped for _on_signal (rollback)
+# once the ERR trap arms. Defined here so it exists before its trap install.
+_on_signal_prestop() {
+    local sig="$1"
+    trap - INT TERM
+    echo "" >&2
+    echo "  Update interrupted by SIG$sig before the merge — restoring any stopped services and cleaning up." >&2
+    # The interrupt may have landed mid-stop (the stop polls up to ~10s), so a
+    # service may already be down. Restart exactly what was detected running —
+    # WERE_RUNNING is populated BEFORE the physical stop — so the server is never
+    # left down. For genesis-server, `_start_genesis_server` runs `systemctl
+    # restart`: it cleanly bounces the server if it never stopped, or starts it
+    # if the interrupt already took it down — either way it ends up running. The
+    # bridge uses `start`, a no-op when still running. No rollback is needed
+    # here: nothing has been merged yet.
+    local _svc
+    for _svc in "${WERE_RUNNING[@]:-}"; do
+        [ -n "$_svc" ] || continue
+        if [ "$_svc" = "genesis-server" ]; then
+            _start_genesis_server 2>/dev/null \
+                || systemctl --user restart genesis-server.service 2>/dev/null || true
+        else
+            systemctl --user start "$_svc.service" 2>/dev/null || true
+        fi
+    done
+    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid" 2>/dev/null || true
+    exit 1
 }
 
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
@@ -171,9 +203,10 @@ _guardian_redeploy_reason() {
 # previously failed sync, still needs healing on a no-op run.
 # Sets the global HOST_CC_DEGRADED (consumed by _record_update_history).
 _sync_deploy_targets() {
-    # Accumulates any host-side alignment failure so it is recorded as a degraded
-    # subsystem in update_history (surfaced by the dashboard) rather than silently
-    # skipped. Empty = host fully aligned (or no guardian configured).
+    # Accumulates any deploy-target alignment failure (host guardian/Node/CC pin
+    # AND the container's own CC pin) so it is recorded as a degraded subsystem
+    # in update_history (surfaced by the dashboard) rather than silently skipped.
+    # Empty = all deploy targets aligned (or no guardian configured).
     HOST_CC_DEGRADED=""
 
     # ── Update Guardian on host VM (if configured) ──────────
@@ -207,7 +240,12 @@ _sync_deploy_targets() {
             # ("$OLD_COMMIT"→HEAD) silently skipped the redeploy whenever the host
             # was last deployed from a since-rebased local HEAD (a no-op run has
             # OLD_COMMIT == HEAD), stranding it on an orphan commit indefinitely.
-            HOST_VER_RAW="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            # timeout 30: `version` is a fast JSON read. ServerAlive bounds a
+            # DEAD link; `timeout` also bounds a WEDGED remote command that still
+            # answers keepalives (ServerAlive alone would not). `|| true` keeps a
+            # timeout/kill from aborting — an empty result is handled below.
+            HOST_VER_RAW="$(timeout 30 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                 "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
             HOST_DEPLOYED_COMMIT="$(printf '%s' "$HOST_VER_RAW" \
                 | sed -n 's/.*"deployed_commit": "\([^"]*\)".*/\1/p' || true)"
@@ -257,7 +295,17 @@ _sync_deploy_targets() {
                 mkdir -p "$HOME/tmp" 2>/dev/null || true
                 _redeploy_ssh() {
                     # $1 = the redeploy command string; archive on stdin.
-                    ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                    # ServerAlive bounds a DEAD connection (~60s of silence →
+                    # ssh exits) without capping a legitimately slow redeploy:
+                    # while the host runs git/pip the SSH transport stays alive
+                    # and answers keepalives, so a working redeploy is never
+                    # killed — only a truly hung/dead link is. timeout 600 is the
+                    # backstop for a WEDGED redeploy that keeps answering
+                    # keepalives: 10 min is generous for archive-unpack + git +
+                    # pip on a slow host while still bounding an indefinite hang
+                    # (a killed redeploy is non-fatal — recorded as degraded).
+                    timeout 600 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                        -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                         "${HOST_USER}@${HOST_IP}" "$1" < "$GUARDIAN_ARCHIVE" 2>/dev/null
                 }
                 # Guard the mktemp itself: `if ! VAR=$(...)` branches on the
@@ -290,7 +338,10 @@ _sync_deploy_targets() {
                         # Gateway too old to know 'redeploy' at all — use 'update'
                         # to install the new gateway, then retry the verified form.
                         echo "  Redeploy not available — falling back to update + retry"
-                        if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                        # timeout 300: the gateway `update` verb does a host git
+                        # pull + reinstall — minutes at most; bounds a wedged one.
+                        if timeout 300 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                               -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                                "${HOST_USER}@${HOST_IP}" update 2>&1; then
                             echo "  Guardian updated via git pull — retrying redeploy..."
                             # Gateway is a static file invoked fresh per SSH connection.
@@ -317,7 +368,8 @@ _sync_deploy_targets() {
                 # the nightly align timer re-probes. Best-effort: an empty
                 # re-probe keeps the original payload rather than degrading
                 # the pin sync.
-                _post_redeploy_raw="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                _post_redeploy_raw="$(timeout 30 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                    -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                     "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
                 if [ -n "$_post_redeploy_raw" ]; then
                     HOST_VER_RAW="$_post_redeploy_raw"
@@ -378,7 +430,14 @@ _sync_deploy_targets() {
         unset CC_VERSION            # repo pin must win over any inherited override
         # shellcheck source=/dev/null
         source "$_cc_env"
-        cc_ensure_local || true
+        # Record a container CC sync failure as a degraded subsystem instead of
+        # swallowing it — symmetric with the host-side pin failures accumulated
+        # above, so a container left on a stale CC pin is surfaced in
+        # update_history, not silently dropped.
+        if ! cc_ensure_local; then
+            echo "  WARNING: container Claude Code sync failed"
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}container_cc_sync"
+        fi
         cc_shadow_scan || true
     else
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
@@ -480,10 +539,14 @@ echo ""
 # (empty here) — a fetch failure routed through it would leave the server DOWN.
 # On failure, delete this run's freshly-created rollback tag and exit clean with
 # the server untouched. POST_MERGE re-entry skips it (code already merged).
+# timeout 120: bound a hung TCP fetch (accepted then silent) so it can't block
+# the update forever; 120s is generous for the small repo (real fetches take
+# seconds). `timeout` exits non-zero on kill → the failure branch below cleans
+# up and exits with the server untouched.
 if [[ "$POST_MERGE" == "false" ]]; then
     echo "--- Fetching latest ---"
-    if ! git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
-        echo "  Fetch failed (network?) — server NOT stopped, nothing changed."
+    if ! timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
+        echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
         git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
         rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
         exit 1
@@ -491,6 +554,11 @@ if [[ "$POST_MERGE" == "false" ]]; then
 fi
 
 _write_state "fetching"
+
+# Catch an interrupt during the pre-stop window (fetch done, services still up).
+# Replaced by the rollback-capable _on_signal once the ERR trap arms post-stop.
+trap '_on_signal_prestop INT' INT
+trap '_on_signal_prestop TERM' TERM
 
 # ── Service stop/start helpers ───────────────────────────
 # Works with both systemd and bare-process environments.
@@ -505,7 +573,10 @@ _stop_genesis_server() {
         local pid
         pid=$(tr -d '\0' < "$lock_file" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill -TERM "$pid" 2>/dev/null
+            # `|| true`: the process can exit between the kill -0 check above and
+            # this signal (a race); a failed kill must not abort under set -e
+            # (and, once the ERR trap is armed in P4b, must not trigger rollback).
+            kill -TERM "$pid" 2>/dev/null || true
             # Wait up to 10s for graceful shutdown
             for i in $(seq 1 20); do
                 kill -0 "$pid" 2>/dev/null || return 0
@@ -578,18 +649,38 @@ DB_FILE="$GENESIS_ROOT/data/genesis.db"
 if [ -f "$DB_FILE" ]; then
     echo "--- Snapshotting database ---"
     sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
-    cp "$DB_FILE" "$DB_FILE.pre-update" 2>/dev/null && \
-        echo "  DB snapshot: $DB_FILE.pre-update" || \
+    # Use the online-backup API, not `cp`: this snapshot runs while the server
+    # is still up (before the stop, to avoid extending the downtime window), and
+    # a plain `cp` of a live WAL database yields a TORN copy if the server writes
+    # mid-copy — which is exactly the file _do_rollback later restores. sqlite3
+    # `.backup` takes a transactionally-consistent snapshot of a live database.
+    if sqlite3 "$DB_FILE" ".backup '$DB_FILE.pre-update'" 2>/dev/null; then
+        echo "  DB snapshot: $DB_FILE.pre-update"
+    else
         echo "  WARNING: DB snapshot failed (continuing anyway)"
+    fi
 fi
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
+# Detect what is running BEFORE stopping anything, so the pre-stop signal handler
+# can restart exactly what was running if an interrupt lands mid-stop (the stop
+# polls up to ~10s) — otherwise a Ctrl-C / shutdown during the stop would leave
+# the server down, the very thing the trap exists to prevent.
 WERE_RUNNING=()
-
-# Check genesis-server
 if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
    pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
+    WERE_RUNNING+=("genesis-server")
+fi
+for svc in genesis-bridge; do
+    if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
+        WERE_RUNNING+=("$svc")
+    fi
+done
+
+# Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
+# WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
+if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
     # back during the merge/migration window. The ERR-trap rollback is not armed
@@ -598,17 +689,15 @@ if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
         echo "  Aborting update — could not stop genesis-server; refusing to merge over a live process."
         echo "  genesis-server has been stopped and was NOT restarted. Bring it back with:"
         echo "    systemctl --user restart genesis-server.service"
+        # Deliberate: disarm the signal handler so it does NOT "restore" a server
+        # we are intentionally leaving stopped (we could not cleanly stop it).
+        trap - INT TERM
         exit 1
     fi
-    WERE_RUNNING+=("genesis-server")
 fi
-
-# Check genesis-bridge
-for svc in genesis-bridge; do
-    if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
-        systemctl --user stop "$svc.service" || true
-        WERE_RUNNING+=("$svc")
-    fi
+for svc in "${WERE_RUNNING[@]}"; do
+    [ "$svc" = "genesis-server" ] && continue
+    systemctl --user stop "$svc.service" || true
 done
 
 [[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped: ${WERE_RUNNING[*]}" || echo "  No services were running"
@@ -709,7 +798,7 @@ _do_rollback() {
     local degraded="${2:-}"
 
     # Disarm the ERR trap to prevent recursive rollback
-    trap - ERR
+    trap - ERR INT TERM
 
     echo ""
     echo "  UPDATE FAILED — $reason"
@@ -810,10 +899,32 @@ with open(sys.argv[11], 'w') as f:
 # Uses $BASH_COMMAND to report which command failed.
 _on_err() {
     local exit_code=$?
+    # Under `set -E` the ERR trap is inherited by command substitutions and
+    # subshells. Rollback must run ONLY at the top level: a failing `$(...)`
+    # would otherwise run _do_rollback (force-stop server + git reset) from
+    # INSIDE the subshell while the parent keeps executing. In a subshell just
+    # propagate the failure — the parent's own ERR trap handles it at depth 0.
+    if [ "${BASH_SUBSHELL:-0}" -ne 0 ]; then
+        exit "$exit_code"
+    fi
     _do_rollback "command failed (exit $exit_code): $BASH_COMMAND"
     exit 1
 }
+# Signal handler for the ARMED window (services stopped, mid-merge/migration):
+# an interrupt here must roll back, exactly like an unhandled error — otherwise
+# the server is left down. Disarm all traps first so a second signal can't
+# re-enter _do_rollback. Installed alongside the ERR trap below.
+_on_signal() {
+    local sig="$1"
+    trap - ERR INT TERM
+    echo "" >&2
+    echo "  Update interrupted by SIG$sig after services were stopped — rolling back." >&2
+    _do_rollback "update interrupted by SIG$sig"
+    exit 1
+}
 trap _on_err ERR
+trap '_on_signal INT' INT
+trap '_on_signal TERM' TERM
 
 if [[ "$POST_MERGE" == "false" ]]; then
 _write_state "merging"
@@ -888,21 +999,49 @@ if [[ $MERGE_RC -ne 0 ]]; then
 
         # Write conflict context for supervising CC session
         mkdir -p "$HOME/.genesis"
-        # Build JSON array of conflicted files
-        CONFLICT_JSON=$(echo "$CONFLICTED_FILES" | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
-        cat > "$HOME/.genesis/update_conflicts.json" << CEOF
-{
-    "old_tag": "$OLD_TAG",
-    "old_commit": "$OLD_COMMIT",
-    "target_tag": "$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')",
-    "target_commit": "$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')",
-    "conflicted_files": [$CONFLICT_JSON],
-    "merge_output": "$(echo "$MERGE_OUTPUT" | head -20 | sed 's/"/\\"/g')",
-    "timestamp": "$(date -Iseconds)"
+        # Build the context as VALID JSON via python (stdlib json). The old
+        # shell heredoc only escaped `"` in merge_output, so a multi-line merge
+        # message (the common case) embedded raw newlines and produced invalid
+        # JSON — the dashboard consumer's json.loads then silently swallowed the
+        # whole conflict context. Filenames with quotes broke the array the same
+        # way. Guarded with `if !` (ERR-trap-exempt): a failure to write this
+        # advisory supervisor context must NOT trip the armed rollback trap.
+        _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')"
+        _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')"
+        if ! UC_OLD_TAG="$OLD_TAG" UC_OLD_COMMIT="$OLD_COMMIT" \
+             UC_TARGET_TAG="$_uc_target_tag" UC_TARGET_COMMIT="$_uc_target_commit" \
+             UC_FILES="$CONFLICTED_FILES" UC_MERGE_OUTPUT="$MERGE_OUTPUT" \
+             "$VENV_DIR/bin/python" - > "$HOME/.genesis/update_conflicts.json.tmp" <<'PYEOF'
+import json
+import os
+from datetime import UTC, datetime
+
+files = [f for f in os.environ.get("UC_FILES", "").splitlines() if f.strip()]
+merge = "\n".join(os.environ.get("UC_MERGE_OUTPUT", "").splitlines()[:20])
+data = {
+    "old_tag": os.environ.get("UC_OLD_TAG", ""),
+    "old_commit": os.environ.get("UC_OLD_COMMIT", ""),
+    "target_tag": os.environ.get("UC_TARGET_TAG", ""),
+    "target_commit": os.environ.get("UC_TARGET_COMMIT", ""),
+    "conflicted_files": files,
+    "merge_output": merge,
+    "timestamp": datetime.now(UTC).isoformat(),
 }
-CEOF
-        echo ""
-        echo "  Conflict context written to ~/.genesis/update_conflicts.json"
+print(json.dumps(data, indent=2))
+PYEOF
+        then
+            echo "  WARNING: could not write structured conflict context (advisory)"
+            rm -f "$HOME/.genesis/update_conflicts.json.tmp" || true
+        elif mv "$HOME/.genesis/update_conflicts.json.tmp" "$HOME/.genesis/update_conflicts.json"; then
+            echo ""
+            echo "  Conflict context written to ~/.genesis/update_conflicts.json"
+        else
+            # The rename must stay non-fatal too (disk full / perms): it is still
+            # inside the armed ERR-trap window, and this is advisory supervisor
+            # context — a failure here must not escalate into a full rollback.
+            echo "  WARNING: could not finalize conflict context (advisory)"
+            rm -f "$HOME/.genesis/update_conflicts.json.tmp" || true
+        fi
 
         # Abort the merge — don't leave the working tree in a broken state.
         # CC will resolve conflicts in a worktree, not in the main checkout.
@@ -924,13 +1063,13 @@ CEOF
         echo "  A CC session will resolve conflicts in a worktree."
         _record_update_history "conflicts_pending" \
             "merge conflicts in: $(echo "$CONFLICTED_FILES" | tr '\n' ', ' | sed 's/, $//')" ""
-        trap - ERR
+        trap - ERR INT TERM
         exit 2
     else
         # Not a conflict — some other merge error. Call rollback directly so the
         # DB gets a meaningful reason instead of "command failed (exit 1): false".
         echo "  Merge failed: $MERGE_OUTPUT"
-        trap - ERR
+        trap - ERR INT TERM
         _do_rollback "git merge failed: $(echo "$MERGE_OUTPUT" | head -3 | tr '\n' ' ')"
         exit 1
     fi
@@ -983,7 +1122,7 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && _tier2_pending_since_baseline; then
 elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     echo "  Already up to date ($NEW_COMMIT)."
     # Clean up unnecessary rollback tag and disarm trap
-    trap - ERR
+    trap - ERR INT TERM
     git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
     # Restart services that we stopped (if any)
     for svc in "${WERE_RUNNING[@]}"; do
@@ -1116,15 +1255,51 @@ echo ""
 _write_state "migrations"
 
 # ── Run migrations (fatal on failure) ─────────────────────
-if "$VENV_DIR/bin/python" -c "import genesis.db.migrations" 2>/dev/null; then
-    echo "--- Running migrations ---"
-    if ! "$VENV_DIR/bin/python" -m genesis.db.migrations --apply 2>&1 | tail -10; then
-        _do_rollback "migration runner failed"
+# Distinguish a genuinely-ABSENT migrations module (a pre-migration install —
+# skipping is correct) from one that FAILS to import (an update-introduced
+# ImportError, e.g. a broken new migration file). The old `if import …; then`
+# collapsed BOTH into a silent skip, which would run the freshly-merged code
+# against an un-migrated schema. Probe exit codes: 0=present, 2=absent, 1=broken.
+# `|| _mig_probe_rc=$?` keeps the non-zero probe exit from tripping the armed
+# ERR trap; the `case` routes a broken module to an explicit rollback.
+_mig_probe_rc=0
+"$VENV_DIR/bin/python" - <<'PYEOF' || _mig_probe_rc=$?
+import importlib.util
+import sys
+
+try:
+    spec = importlib.util.find_spec("genesis.db.migrations")
+except Exception as exc:  # a parent package (genesis / genesis.db) is broken
+    print(f"migrations parent package import failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+if spec is None:
+    sys.exit(2)  # genuinely absent — pre-migration install
+try:
+    import genesis.db.migrations  # noqa: F401
+except Exception as exc:
+    print(f"migrations module import failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PYEOF
+case "$_mig_probe_rc" in
+    0)
+        echo "--- Running migrations ---"
+        if ! "$VENV_DIR/bin/python" -m genesis.db.migrations --apply 2>&1 | tail -10; then
+            _do_rollback "migration runner failed"
+            exit 1
+        fi
+        echo "  Migrations complete"
+        echo ""
+        ;;
+    2)
+        echo "  No migrations module in this build — skipping (pre-migration install)."
+        echo ""
+        ;;
+    *)
+        _do_rollback "migrations module failed to import after update (broken migration?)"
         exit 1
-    fi
-    echo "  Migrations complete"
-    echo ""
-fi
+        ;;
+esac
 
 # ── Refresh Network Identity in user-level CLAUDE.md ────
 # Always refresh ~/.claude/CLAUDE.md with current IPs (unconditional — the
@@ -1168,6 +1343,16 @@ fi
 _write_state "health_check"
 
 # ── Restart services ──────────────────────────────────────
+# P5 GUARDRAIL: this final restart runs while the armed `_on_signal TERM` trap is
+# STILL live (disarmed only at the success `trap - ERR INT TERM` below). That is
+# safe TODAY only because the completing update path (the dashboard orchestrator)
+# is cgroup-isolated via `systemd-run --scope`, so `_start_genesis_server`'s
+# internal `systemctl stop`/`restart` does NOT signal this process. The
+# `_apply_direct` path (dashboard, supervised=False) does NOT scope-isolate and
+# stays in genesis-server.service's cgroup — a pre-existing bug. When P5 fixes
+# `_apply_direct`, the fix MUST be scope isolation (systemd-run --scope), NOT a
+# handler tweak: otherwise this restart's stop-phase would self-SIGTERM →
+# _on_signal → a SPURIOUS rollback of a healthy, fully-migrated deploy.
 if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     echo "--- Restarting services ---"
 
@@ -1193,7 +1378,12 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
 
     for attempt in $(seq 1 12); do
         sleep 15
-        if curl -sf http://localhost:5000/api/genesis/health > /dev/null 2>&1; then
+        # --max-time 20: bound a hung connection (server accepts but never
+        # answers) so a single attempt can't block the update forever. Kept
+        # ABOVE the health route's own ~15s internal budget so a slow-but-
+        # responding check is never killed here (which would false-rollback a
+        # healthy server); a 503 at 15s still fails -f correctly on its own.
+        if curl -sf --max-time 20 http://localhost:5000/api/genesis/health > /dev/null 2>&1; then
             echo "  OK: Genesis health endpoint responding (attempt $attempt)"
             HEALTH_OK=true
             break
@@ -1203,7 +1393,7 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
 
     if [ "$HEALTH_OK" = "true" ]; then
         # Check for failed subsystems
-        DEGRADED=$(curl -sf http://localhost:5000/api/genesis/health 2>/dev/null | \
+        DEGRADED=$(curl -sf --max-time 20 http://localhost:5000/api/genesis/health 2>/dev/null | \
             "$VENV_DIR/bin/python" -c "
 import sys, json
 try:
@@ -1244,7 +1434,7 @@ except Exception:
 fi
 
 # ── Success: disarm trap ──────────────────────────────────
-trap - ERR
+trap - ERR INT TERM
 
 _sync_deploy_targets
 
@@ -1291,9 +1481,14 @@ echo ""
 # profile (content owner: genesis.infra_profile.claude_md — no collection, no
 # runtime import; safe while the server is down). Skips gracefully pre-first-
 # collection or on older checkouts without the module.
-"$VENV_DIR/bin/python" -m genesis.infra_profile --claude-md-block 2>/dev/null \
-    && echo "  Container specs refreshed in ~/.claude/CLAUDE.md" \
-    || echo "  Container specs refresh skipped (no profile yet)"
+# Capture stderr rather than discarding it: the old `2>/dev/null || echo "no
+# profile yet"` reported EVERY failure (module crash, write error) as the benign
+# "no profile yet", masking real errors. Show the actual reason instead.
+if _specs_err=$("$VENV_DIR/bin/python" -m genesis.infra_profile --claude-md-block 2>&1); then
+    echo "  Container specs refreshed in ~/.claude/CLAUDE.md"
+else
+    echo "  Container specs refresh skipped: ${_specs_err:-no profile yet}"
+fi
 echo ""
 set -e
 

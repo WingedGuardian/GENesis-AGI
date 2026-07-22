@@ -141,6 +141,44 @@ def memory_rerank_off() -> bool:
     )
 
 
+def recall_read_pool_off() -> bool:
+    """True when the recall read-connection pool must NOT be built (kill switch).
+
+    Recall's read stages (FTS5, activation, enrich, breadcrumbs) normally run on
+    a dedicated ``mode=ro`` connection pool so they stop queuing behind the whole
+    server's writes on the shared ``SerializedConnection`` (follow-up ac27b693).
+    This env kill makes the runtime skip building the pool — every recall read
+    falls back to the shared connection (the pre-pool behavior) — without a code
+    change. Default off: the pool is built.
+    """
+    return os.environ.get("GENESIS_RECALL_READ_POOL_OFF", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def recall_read_pool_size() -> int:
+    """Size of the recall read-only connection pool (default from
+    ``DEFAULT_READ_POOL_SIZE``).
+
+    Each connection is one genuinely-parallel reader plus one OS thread and a
+    modest page cache, so this bounds how many concurrent recall read-chains run
+    in parallel before the next blocks on checkout. Tunable per install via
+    ``GENESIS_RECALL_READ_POOL_SIZE``; the pool floors it at 1. A missing or
+    non-integer value falls back to the default.
+    """
+    from genesis.db.connection import DEFAULT_READ_POOL_SIZE
+
+    raw = os.environ.get("GENESIS_RECALL_READ_POOL_SIZE", "").strip()
+    if not raw:
+        return DEFAULT_READ_POOL_SIZE
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_READ_POOL_SIZE
+
+
 def skill_gate_off() -> bool:
     """True when the skill-edit Critic must be suppressed entirely (kill switch).
 

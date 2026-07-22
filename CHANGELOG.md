@@ -21,6 +21,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   background instead of stalling the first prompt after a restart. Recall quality
   is unchanged; it just stops dropping to the degraded path under concurrency.
 
+- **Memory recall reads no longer wait in line behind the rest of the system's
+  writes.** Everything Genesis does shared a single database connection, so when
+  it was busy writing (reflections, learning, other sessions), a prompt's memory
+  lookup could sit waiting for its turn — the main reason recall slowed down and
+  occasionally dropped to the weaker keyword-only memory when several sessions
+  were active. Memory lookups now read through a dedicated read-only connection
+  pool that runs alongside the writes instead of behind them, so recall stays
+  responsive under load. It falls back to the shared connection automatically if
+  the pool is ever unavailable, so nothing breaks — recall is never slower than
+  before. Recall quality is unchanged.
+
 ### Fixed
 
 - **A large one-time data cleanup no longer briefly freezes the running system.**
@@ -35,6 +46,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   needlessly repeated. (Slow per-record checks were also moved out of the locked
   window.)
 
+- **An interrupted update no longer leaves the server down.** If a self-update
+  is interrupted after it has stopped the server (a Ctrl-C, a system shutdown,
+  or an unexpected failure inside an internal step), it now rolls back to the
+  previous version and restarts the server instead of exiting with the service
+  stopped. An interrupt *before* the server is stopped simply cleans up and
+  exits, leaving the running system untouched.
 - **Background sessions no longer get silently cut off after 10 minutes.** A
   long background task (for example deep research running as a background
   session) used to be killed at about 10 minutes with only a partial result and
@@ -42,6 +59,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and if any background work is ever cut short by a time limit, the result is
   flagged as incomplete rather than delivered as if it were finished.
 
+- **Updates are more resilient to network stalls, bad merges, and mid-update
+  crashes.** Several robustness fixes to the self-update path (`update.sh`):
+  network operations (fetching the latest code, post-update health checks, and
+  guardian SSH) are now time-bounded, so a hung connection can no longer stall
+  an update indefinitely; the pre-update database snapshot is now a
+  transactionally-consistent SQLite backup instead of a plain file copy that
+  could be torn if the server wrote to it mid-copy; a merge conflict now records
+  complete, valid conflict details for the assisting session (multi-line git
+  output no longer corrupts that file); and an update that ships a broken
+  database-migration module now rolls back cleanly instead of silently skipping
+  migrations and running the new code against an old schema.
 - **Host setup no longer force-deletes a container it wrongly thinks is
   damaged, or hides an install behind a new disk.** Host-side hardening: a
   container flagged "damaged" is now **renamed aside** (its database, memory, and
