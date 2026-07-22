@@ -204,6 +204,37 @@ class TestValidateEgoConfig:
         assert cfg.capability_improvement_max_signals == 3
 
 
+class TestCapabilityImprovementSettingsWiring:
+    """The capability_improvement validators are reached by settings_update.
+
+    Proves the settings_update('ego', {...}) path dispatches to
+    validate_ego_config so an invalid capability field is rejected before it
+    can reach ego.yaml (where e.g. a negative max_signals would uncap the
+    SQLite LIMIT and silently disable the feature).
+    """
+
+    def test_ego_domain_dispatches_to_validate_ego_config(self):
+        from genesis.mcp.health.settings import _DOMAIN_VALIDATORS
+
+        assert "ego" in _DOMAIN_VALIDATORS
+        validator = _DOMAIN_VALIDATORS["ego"]
+        # Rejects a non-int max_signals (Codex's "many" case).
+        assert validator({"capability_improvement_max_signals": "many"})
+        # Rejects a negative max_signals (SQLite negative LIMIT = no limit).
+        assert validator({"capability_improvement_max_signals": -1})
+        # Rejects the truthy string "false" for the bool flag.
+        assert validator({"capability_improvement_enabled": "false"})
+        # Rejects an out-of-range threshold.
+        assert validator({"capability_weakness_threshold": 2.0})
+        # A fully-valid change set passes.
+        assert validator({
+            "capability_improvement_enabled": True,
+            "capability_weakness_threshold": 0.4,
+            "capability_improvement_min_sample_size": 5,
+            "capability_improvement_max_signals": 2,
+        }) == []
+
+
 class TestMaxActiveEgoGoalsValidation:
     def test_valid(self):
         assert validate_ego_config({"max_active_ego_goals": 3}) == []

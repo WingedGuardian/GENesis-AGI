@@ -56,7 +56,9 @@ class GenesisEgoContextBuilder:
             Keys that match genesis section names are applied; unknown
             keys are ignored (default to "deep").
         focus_id:
-            Accepted for API compatibility. Not used by Genesis ego.
+            The focused target for this cycle. On a capability_improvement
+            cycle it is the weak domain name, surfaced as a "Focused
+            deficiency" row in the capability performance section.
         """
         import asyncio
 
@@ -67,6 +69,13 @@ class GenesisEgoContextBuilder:
         for section in _ALWAYS_SECTIONS:
             if weights.get(section) in ("skip", "light"):
                 weights[section] = "deep"
+
+        # Capability-improvement cycles target a specific weak domain, carried
+        # as focus_id. Stash it for _capability_performance_section so the
+        # focused (low-confidence, hence off the top-N table) domain's row is
+        # always surfaced. Reset each build — a stale value would mislabel a
+        # later cycle's context.
+        self._focus_id = focus_id
 
         sections: list[str] = []
         sections.append("# GENESIS_EGO_CONTEXT — Operations Briefing\n")
@@ -690,6 +699,27 @@ class GenesisEgoContextBuilder:
             return "\n".join(lines)
 
         _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}
+
+        # Focused deficiency: a capability_improvement cycle targets a specific
+        # weak domain (self._focus_id). get_all is confidence-DESC and only the
+        # top 15 render below, so a low-confidence target is otherwise absent —
+        # surface its full row explicitly so the advisory names a deficiency the
+        # ego can actually see.
+        focus_id = getattr(self, "_focus_id", None)
+        focused = (
+            next((e for e in entries if e.get("domain") == focus_id), None)
+            if focus_id
+            else None
+        )
+        if focused is not None:
+            _fc = focused.get("confidence", 0.0)
+            _ft = focused.get("trend", "stable")
+            _fs = focused.get("sample_size", 0)
+            _fe = (focused.get("evidence_summary") or "")[:120].replace("|", "/")
+            lines.append(
+                f"**Focused deficiency — {focus_id}**: {_fc:.0%} confidence "
+                f"({_ft}, {_fs} samples). {_fe}\n"
+            )
 
         lines.append("| Domain | Confidence | Trend | Samples | Evidence |")
         lines.append("|--------|-----------|-------|---------|----------|")
