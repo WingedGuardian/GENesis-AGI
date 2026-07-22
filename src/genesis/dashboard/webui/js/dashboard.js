@@ -516,7 +516,11 @@
             case "chat":
               // Re-fit terminal on tab re-entry
               if (!first && this._xterm && this._fitAddon) { this._fitAddon.fit(); }
-              if (first) { this.fetchComms(); this.fetchApprovals(); this.fetchEgoDirectivesGoals(); }
+              if (first) { this.fetchComms(); this.fetchApprovals(); }
+              // Refresh directives/goals on every Chat activation (not just first)
+              // so re-entry can't show standing state that changed elsewhere while
+              // the dashboard stayed open. Rarely changes → refreshed here, not polled.
+              this.fetchEgoDirectivesGoals();
               this._commsInterval = setInterval(() => this.fetchComms(), 15000);
               this._approvalsInterval = setInterval(() => this.fetchApprovals(), 15000);
               break;
