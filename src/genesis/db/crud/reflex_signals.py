@@ -178,6 +178,7 @@ async def list_by_status(db: aiosqlite.Connection, status: str, *, limit: int = 
 
 
 async def list_recent(db: aiosqlite.Connection, *, limit: int = 10) -> list[dict]:
+    """Most-recently-seen signals across all statuses, newest first."""
     cursor = await db.execute(f"{_SELECT} ORDER BY last_seen_at DESC LIMIT ?", (limit,))
     rows = await cursor.fetchall()
     return [_row_to_dict(tuple(r)) for r in rows]
@@ -188,6 +189,7 @@ async def list_recent(db: aiosqlite.Connection, *, limit: int = 10) -> list[dict
 
 
 async def count_by_status(db: aiosqlite.Connection) -> dict[str, int]:
+    """Signal counts keyed by lifecycle status (statuses with zero rows omitted)."""
     cursor = await db.execute("SELECT status, COUNT(*) FROM reflex_signals GROUP BY status")
     rows = await cursor.fetchall()
     return {row[0]: row[1] for row in rows}
