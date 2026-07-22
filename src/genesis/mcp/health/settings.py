@@ -177,6 +177,19 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every drain run
     ),
+    "cc_rate_limit_resume": SettingsDomain(
+        name="cc_rate_limit_resume",
+        description=(
+            "Rate-limit park + auto-resume — master `enabled` + `mode` "
+            "off/propose_only/live, plus cadence/backoff/escalation knobs. "
+            "live (default) auto-resumes parked work at its reset time and "
+            "delivers to origin; propose_only pings to resume; off records only. "
+            "Read live each engine tick — takes effect next tick, no restart."
+        ),
+        config_filename="cc_rate_limit_resume.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every resume tick
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -1045,8 +1058,33 @@ def _validate_entity_adjudication(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_cc_rate_limit_resume(changes: dict) -> list[str]:
+    """Validate rate-limit resume lever changes (see
+    genesis.cc.rate_limit_resume_config)."""
+    from genesis.cc.rate_limit_resume_config import INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "conversation_resume_profile", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "conversation_resume_profile":
+            if not isinstance(value, str) or not value.strip():
+                errors.append("'conversation_resume_profile' must be a non-empty string")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "entity_adjudication": _validate_entity_adjudication,
+    "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,

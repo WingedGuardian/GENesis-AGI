@@ -139,6 +139,7 @@ async def test_no_unexpected_tables(db):
         "knowledge_uploads",
         "file_modifications",
         "direct_session_queue",
+        "cc_rate_limit_parks",
         "eval_events",
         "eval_snapshots",
         "memory_events",

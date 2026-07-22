@@ -535,7 +535,7 @@ class CCInvoker:
             "token limit exceeded",
         )
         if any(p in lower for p in _QUOTA_PATTERNS):
-            return CCQuotaExhaustedError(stderr_text or stdout_text)
+            return CCQuotaExhaustedError(stderr_text or stdout_text, raw_text=combined)
         # Transient rate limit (429, recovers in minutes)
         # CC CLI says "You've hit your limit · resets Xpm" — not "rate limit"
         _RATE_LIMIT_PATTERNS = (
@@ -546,7 +546,7 @@ class CCInvoker:
             "hit the limit",
         )
         if any(p in lower for p in _RATE_LIMIT_PATTERNS):
-            return CCRateLimitError(stderr_text or stdout_text)
+            return CCRateLimitError(stderr_text or stdout_text, raw_text=combined)
         # MCP server error
         source = stderr_text or stdout_text
         if "mcp" in lower or "mcp server" in lower:
@@ -904,6 +904,7 @@ class CCInvoker:
         result_data: dict | None = None
         collected_text: list[str] = []
         event_types: list[str] = []
+        rate_limit_raw: dict | None = None
         timed_out = False
         terminated_after_result = False
         line_count = 0
@@ -923,6 +924,10 @@ class CCInvoker:
 
                     etype = event_raw.get("type", "?")
                     event_types.append(etype)
+                    if etype == "rate_limit_event":
+                        # Retain the raw payload (otherwise discarded) so the
+                        # durability layer can parse a reset time off it.
+                        rate_limit_raw = event_raw
                     logger.debug("CC stream event #%d: type=%s", line_count, etype)
 
                     event = StreamEvent.from_raw(event_raw)
@@ -1060,12 +1065,17 @@ class CCInvoker:
                         "CC rate-limited but response has content (%d chars) — delivering",
                         len(output.text),
                     )
-                    err = CCRateLimitError("CC rate limited (stream event)")
+                    err = CCRateLimitError(
+                        "CC rate limited (stream event)", raw_event=rate_limit_raw
+                    )
                     await self._notify_status_change(err)
                     await self._fire_downgrade_callback(output)
                     return output
                 # Empty/no response — rate limit prevented a real answer
-                err = CCRateLimitError(output.text or "CC rate limited (stream event)")
+                err = CCRateLimitError(
+                    output.text or "CC rate limited (stream event)",
+                    raw_event=rate_limit_raw,
+                )
                 await self._notify_status_change(err)
                 raise err
 
