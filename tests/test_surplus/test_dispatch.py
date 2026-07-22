@@ -175,3 +175,62 @@ async def test_maybe_observe_failure_silent_below_threshold(monkeypatch):
     await dispatch.maybe_observe_failure(ctx, _Task(), "some reason")
 
     upsert_spy.assert_not_awaited()
+
+
+# ── KB-routing gate (_route_insights) ───────────────────────────────────
+# Non-KB-routing tasks (action/maintenance/monitor/pipeline-intermediate) must
+# NOT ingest their operational-telemetry output into the knowledge base; only
+# KB_ROUTING_TASK_TYPES (insight-producing + bookmark-enrichment) do.
+
+import types as _types  # noqa: E402
+
+from genesis.surplus import intake as _intake_mod  # noqa: E402
+from genesis.surplus import quality_judge as _judge_mod  # noqa: E402
+
+_LONG = "x" * 60  # clears the 50-char intake gate
+
+
+def _intake_ctx():
+    ctx = _make_ctx()
+    ctx._judge_router = None
+    return ctx
+
+
+async def _run_route(task_type, monkeypatch):
+    run_intake_spy = AsyncMock(
+        return_value=_types.SimpleNamespace(
+            findings_count=1, routed_knowledge=1, routed_observation=0, routed_discard=0
+        )
+    )
+    monkeypatch.setattr(_intake_mod, "run_intake", run_intake_spy)
+    monkeypatch.setattr(
+        _judge_mod, "run_quality_judge", AsyncMock(return_value=(None, None, None))
+    )
+    ctx = _intake_ctx()
+    result = _Result(insights=[{"generating_model": "m", "confidence": 0.6}], content=_LONG)
+    staging_id, *_ = await dispatch._route_insights(ctx, _Task(task_type), result)
+    return run_intake_spy, staging_id
+
+
+async def test_route_insights_skips_kb_intake_for_action_task(monkeypatch):
+    # DB_MAINTENANCE is operational telemetry — must NOT reach run_intake.
+    spy, staging_id = await _run_route(TaskType.DB_MAINTENANCE, monkeypatch)
+    spy.assert_not_awaited()
+    assert staging_id is not None  # still tracked
+
+
+async def test_route_insights_skips_kb_intake_for_pipeline_intermediate(monkeypatch):
+    spy, _ = await _run_route(TaskType.RESEARCH_QUERY_GEN, monkeypatch)
+    spy.assert_not_awaited()
+
+
+async def test_route_insights_ingests_insight_task(monkeypatch):
+    # BRAINSTORM_SELF produces durable knowledge — must reach run_intake.
+    spy, _ = await _run_route(TaskType.BRAINSTORM_SELF, monkeypatch)
+    spy.assert_awaited_once()
+
+
+async def test_route_insights_ingests_bookmark_enrichment(monkeypatch):
+    # In KB_ROUTING (enriched bookmarks are durable) though NOT judge-eligible.
+    spy, _ = await _run_route(TaskType.BOOKMARK_ENRICHMENT, monkeypatch)
+    spy.assert_awaited_once()

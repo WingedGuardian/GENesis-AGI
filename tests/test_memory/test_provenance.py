@@ -314,3 +314,36 @@ def test_provenance_descriptor_corrupt_origin_labels_external():
     assert provenance_descriptor(collection="episodic_memory", origin_class="garbage").startswith(
         "external-world knowledge"
     )
+
+
+# ── surplus-KB honest-label origin classification ───────────────────────
+# Genesis-authored surplus insight tasks stay first-party; crawled external
+# intelligence (model/github/web/recon) is classified external_untrusted so
+# recall wraps it as external content (correct injection-defense posture).
+
+from genesis.memory.provenance import derive_origin_class  # noqa: E402
+
+
+def test_surplus_label_is_first_party():
+    assert (
+        derive_origin_class(
+            collection="knowledge_base", source_pipeline="surplus", source_subsystem=None
+        )
+        == "first_party"
+    )
+
+
+def test_crawled_labels_are_external_untrusted():
+    for label in (
+        "model_intelligence",
+        "github_landscape",
+        "web_monitoring",
+        "source_discovery",
+        "email_recon",
+    ):
+        assert (
+            derive_origin_class(
+                collection="knowledge_base", source_pipeline=label, source_subsystem=None
+            )
+            == "external_untrusted"
+        ), label
