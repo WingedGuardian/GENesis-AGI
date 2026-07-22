@@ -127,3 +127,34 @@ async def test_list_status_filter_excludes_tabled(db):
             status_filter="pending", include_tabled=True,
         )
     assert sorted(f["kind"] for f in res_incl["follow_ups"]) == ["follow_up", "tabled"]
+
+
+async def test_notes_only_update_does_not_revert_concurrent_status(db):
+    """Regression: a notes-only follow_up_update must NOT re-assert the status it
+    read at entry. A concurrent (cross-process) status transition landing between
+    that read and the notes write was previously reverted (lost update)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="race target", reason="r", strategy="ego_judgment",
+        )
+        fid = created["id"]
+
+        # Flip status to in_progress in the gap between the handler's initial
+        # get_by_id (its status read) and its notes write, by hooking the FIRST
+        # get_by_id call to transition the row right after it returns the stale row.
+        real_get = follow_ups.get_by_id
+        seen = {"n": 0}
+
+        async def racing_get(conn, id_):
+            row = await real_get(conn, id_)
+            if seen["n"] == 0:
+                seen["n"] += 1
+                await follow_ups.update_status(conn, id_, "in_progress")
+            return row
+
+        with patch.object(follow_ups, "get_by_id", racing_get):
+            await follow_up_tools._impl_follow_up_update(fid, resolution_notes="a note")
+
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "in_progress"  # NOT reverted to the stale 'pending' read
+    assert row["resolution_notes"] == "a note"

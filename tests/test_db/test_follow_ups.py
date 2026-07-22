@@ -284,6 +284,40 @@ async def test_batch_notes_only_rewrite_preserves_completed_at(db):
         assert row["resolution_notes"] == "bulk note"
 
 
+# --- update_notes: targeted note write that never touches status ------------
+# The notes-only handler path (follow_up_update with resolution_notes but no
+# status) uses update_notes so it can no longer re-assert a stale status read
+# and revert a concurrent transition (lost update).
+
+
+async def test_update_notes_writes_notes_without_touching_status(db):
+    """update_notes sets notes but leaves status untouched."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fid, "in_progress")
+    assert await follow_ups.update_notes(db, fid, resolution_notes="progress")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "in_progress"  # NOT reverted to pending
+    assert row["resolution_notes"] == "progress"
+
+
+async def test_update_notes_preserves_completed_at(db):
+    """A notes-only write on a completed row disturbs neither status nor completed_at."""
+    fid = await follow_ups.create(db, **_BASE)
+    await _force_terminal(db, fid, "completed")
+    await follow_ups.update_notes(db, fid, resolution_notes="post-hoc note")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    assert row["completed_at"] == _OLD
+    assert row["resolution_notes"] == "post-hoc note"
+
+
+async def test_update_notes_no_fields_is_noop(db):
+    """No note fields supplied -> no-op returning False, nothing changed."""
+    fid = await follow_ups.create(db, **_BASE)
+    assert await follow_ups.update_notes(db, fid) is False
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "pending"
+
+
 async def test_batch_failed_to_completed_stamps_fresh(db):
     """update_status_batch: genuine failed→completed transition stamps fresh."""
     ids = [await follow_ups.create(db, **_BASE) for _ in range(2)]

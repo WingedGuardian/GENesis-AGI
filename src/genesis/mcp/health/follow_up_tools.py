@@ -217,10 +217,13 @@ async def _impl_follow_up_update(
             if not updated:
                 return {"error": "Update failed — row not modified"}
         elif resolution_notes or blocked_reason:
-            await follow_ups.update_status(
+            # Notes-only update: write ONLY the note columns. Do NOT re-assert
+            # existing["status"] (read at entry) -- a concurrent status
+            # transition landing between that read and this write would be
+            # reverted (lost update). See crud.follow_ups.update_notes.
+            await follow_ups.update_notes(
                 db,
                 follow_up_id,
-                existing["status"],
                 resolution_notes=resolution_notes,
                 blocked_reason=blocked_reason,
             )

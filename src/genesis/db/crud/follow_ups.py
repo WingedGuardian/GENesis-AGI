@@ -262,6 +262,41 @@ async def update_status(
     return cursor.rowcount > 0
 
 
+async def update_notes(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    resolution_notes: str | None = None,
+    blocked_reason: str | None = None,
+) -> bool:
+    """Update resolution_notes/blocked_reason WITHOUT touching status.
+
+    A targeted partial UPDATE of only the note columns the caller supplied.
+    The notes-only update path uses this instead of re-writing status: the
+    prior code re-asserted the status it had READ at entry, so a concurrent
+    (cross-process) status transition landing in that gap was silently
+    reverted -- a lost update. Touching neither status nor completed_at closes
+    that window. Returns True if a row was modified, False on a no-op (no note
+    fields supplied)."""
+    parts: list[str] = []
+    params: list[str | None] = []
+    if resolution_notes is not None:
+        parts.append("resolution_notes = ?")
+        params.append(resolution_notes)
+    if blocked_reason is not None:
+        parts.append("blocked_reason = ?")
+        params.append(blocked_reason)
+    if not parts:
+        return False
+    params.append(id)
+    cursor = await db.execute(
+        f"UPDATE follow_ups SET {', '.join(parts)} WHERE id = ?",
+        params,
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def link_task(
     db: aiosqlite.Connection,
     id: str,
