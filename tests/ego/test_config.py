@@ -169,6 +169,40 @@ class TestValidateEgoConfig:
         assert cfg.quiet_hours_end == 7
         assert cfg.quiet_hours_min_interval_minutes == 240
 
+    def test_capability_improvement_enabled_rejects_non_bool(self):
+        errors = validate_ego_config({"capability_improvement_enabled": "on"})
+        assert len(errors) == 1
+        assert "capability_improvement_enabled must be a boolean" in errors[0]
+
+    def test_capability_weakness_threshold_bounds(self):
+        assert validate_ego_config({"capability_weakness_threshold": 0.5}) == []
+        assert validate_ego_config({"capability_weakness_threshold": 0.0}) == []
+        assert validate_ego_config({"capability_weakness_threshold": 1.0}) == []
+        assert len(validate_ego_config({"capability_weakness_threshold": 1.5})) == 1
+        assert len(validate_ego_config({"capability_weakness_threshold": -0.1})) == 1
+        # bool must not sneak through the numeric check
+        assert len(validate_ego_config({"capability_weakness_threshold": True})) == 1
+
+    def test_capability_min_sample_size_rejects_bad(self):
+        assert validate_ego_config({"capability_improvement_min_sample_size": 3}) == []
+        # negative would defeat the fluke guard (sample_size >= -1 is always true)
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": 0})) == 1
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": -1})) == 1
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": 2.5})) == 1
+
+    def test_capability_max_signals_rejects_bad(self):
+        assert validate_ego_config({"capability_improvement_max_signals": 3}) == []
+        # negative LIMIT means "no limit" in SQLite — must be rejected
+        assert len(validate_ego_config({"capability_improvement_max_signals": 0})) == 1
+        assert len(validate_ego_config({"capability_improvement_max_signals": -1})) == 1
+
+    def test_capability_improvement_defaults(self):
+        cfg = EgoConfig()
+        assert cfg.capability_improvement_enabled is True
+        assert cfg.capability_weakness_threshold == 0.5
+        assert cfg.capability_improvement_min_sample_size == 3
+        assert cfg.capability_improvement_max_signals == 3
+
 
 class TestMaxActiveEgoGoalsValidation:
     def test_valid(self):

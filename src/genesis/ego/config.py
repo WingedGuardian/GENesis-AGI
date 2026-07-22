@@ -176,4 +176,25 @@ def validate_ego_config(changes: dict) -> list[str]:
         "suppress",
     ):
         errors.append("quiet_hours_mode must be 'floor' or 'suppress'")
+    # Capability-improvement scanner: invalid values must degrade toward LESS
+    # write authority, so reject the whole change rather than silently uncap.
+    # A negative LIMIT is "no limit" in SQLite and a negative min-sample defeats
+    # the fluke guard — both would widen advisory output, which is exactly what
+    # validation must prevent.
+    if "capability_improvement_enabled" in changes and not isinstance(
+        changes["capability_improvement_enabled"], bool
+    ):
+        errors.append("capability_improvement_enabled must be a boolean")
+    if "capability_weakness_threshold" in changes:
+        v = changes["capability_weakness_threshold"]
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not (0.0 <= v <= 1.0):
+            errors.append("capability_weakness_threshold must be a number in [0.0, 1.0]")
+    if "capability_improvement_min_sample_size" in changes:
+        v = changes["capability_improvement_min_sample_size"]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            errors.append("capability_improvement_min_sample_size must be integer >= 1")
+    if "capability_improvement_max_signals" in changes:
+        v = changes["capability_improvement_max_signals"]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            errors.append("capability_improvement_max_signals must be integer >= 1")
     return errors
