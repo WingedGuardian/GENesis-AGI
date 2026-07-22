@@ -47,6 +47,12 @@ def test_rollback_restores_db_only_when_migrated(text: str) -> None:
     assert 'cp "$DB_FILE.pre-update" "$DB_FILE"' in rb, (
         "restore copies the pre-update snapshot back"
     )
+    assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' in rb, (
+        "restore MUST clear the stale WAL/SHM or SQLite replays the migrated changes"
+    )
+    assert '[ "$server_down" != "true" ]' in rb, (
+        "DB restore must be skipped if the server is not confirmed down (don't cp a live DB)"
+    )
     assert '[ "$db_ok" = "true" ]' in rb, "db_ok must gate the rolled_back-vs-failed outcome"
     assert "systemctl --user daemon-reload" in rb, "rollback should daemon-reload for unit drift"
     assert "NOT reverted: installed systemd units" in rb, (

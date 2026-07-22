@@ -850,8 +850,12 @@ _do_rollback() {
     # Stop any running services first. _ensure_server_down also disarms the
     # on-failure restart timer so a stale instance can't come back mid-rollback
     # (best-effort here — the rollback continues even if it can't fully stop).
+    local server_down=true
     _stop_genesis_server
-    _ensure_server_down || echo "  WARNING: genesis-server may still be running during rollback"
+    if ! _ensure_server_down; then
+        echo "  WARNING: genesis-server may still be running during rollback"
+        server_down=false
+    fi
     systemctl --user stop genesis-bridge 2>/dev/null || true
 
     # Restore the original branch, then reset it to the rollback tag.
@@ -877,12 +881,23 @@ _do_rollback() {
 
     # Restore the pre-update DB — but ONLY if migrations actually ran this update.
     # Rolling back the code without the DB would leave the old code running
-    # against a migrated (newer) schema. Safe here: the server is stopped, so the
-    # DB is quiescent. If no migration ran, the DB is untouched and needs nothing.
+    # against a migrated (newer) schema. If no migration ran, the DB is untouched.
     local db_ok=true
     if [ "${MIGRATIONS_RAN:-0}" = "1" ] && [ -f "$DB_FILE.pre-update" ]; then
-        echo "  Restoring pre-migration database snapshot..."
-        if ! cp "$DB_FILE.pre-update" "$DB_FILE" 2>&1; then
+        if [ "$server_down" != "true" ]; then
+            # Refuse to overwrite a possibly-live database — a cp under a writing
+            # server corrupts it. Leave the migrated DB in place (schema mismatch,
+            # but recoverable) and flag for manual intervention.
+            echo "  WARNING: server not confirmed down — SKIPPING DB restore (won't overwrite a live DB)."
+            db_ok=false
+        elif cp "$DB_FILE.pre-update" "$DB_FILE" 2>&1 \
+            && rm -f "$DB_FILE-wal" "$DB_FILE-shm"; then
+            # Drop the stale WAL/SHM: they hold the MIGRATED changes, and SQLite
+            # would replay them over the restored old DB on reopen, resurrecting
+            # the migration. The `.backup` snapshot is self-contained, so removing
+            # them is correct. (server_down guarantees no live handle here.)
+            echo "  Restored pre-migration database snapshot (stale WAL cleared)."
+        else
             echo "  CRITICAL: failed to restore DB snapshot — old code may run against a migrated schema"
             db_ok=false
         fi
