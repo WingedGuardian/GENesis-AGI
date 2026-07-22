@@ -66,6 +66,30 @@ server path enforces. It self-heals on the next prompt once the server is back.
 `mode` (`server`/`degraded`/`local`/`off`) and `server_ms`, so the server-path
 fallback rate is directly observable. The health dashboard reads this file.
 
+The server response carries `timings_ms` with a per-stage breakdown —
+`embed`, `recall`, and (since ac27b693) the recall sub-stages `vector`,
+`expand`, `fts`, `activation`, plus `rerank`, `enrich`, `procedure`, `total`.
+When a call exceeds the slow-log threshold the server writes one
+`proactive recall slow: {…}` INFO line, so a latency regression is attributable
+to a stage from the journal alone without live probing.
+
+## Latency: work off the hot path
+
+The per-prompt path is latency-budgeted (the route's 4.5s bound), so the server
+does the least work needed to build the response and defers the rest:
+
+- **Write-backs and eval emits are deferred.** The `retrieved_count` bumps, the
+  J-9 `recall_fired` + diagnostics events, the entity-lane shadow probe, the
+  injection-gate immunity emit, and the procedure `surfaced_count` bump all run
+  on background tasks AFTER the response returns — they never affect what is
+  injected. A fixed in-flight backstop makes recall fall back to running them
+  inline (rather than piling up) if they ever drain slower than prompts arrive.
+  Deep-search recall (`memory_recall` MCP) keeps them inline.
+- **The tag co-occurrence index refreshes in the background** (stale-while-
+  revalidate): a stale index never blocks a prompt on a full-corpus scroll; the
+  current prompt uses whatever the index holds and a single background task
+  rebuilds it.
+
 ## Related
 
 - Endpoint + engine: `src/genesis/dashboard/routes/proactive.py`,
