@@ -498,6 +498,32 @@ async def test_record_outcome_advisory_keeps_executed(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_record_outcome_long_output_preserves_advisory(db, tmp_path):
+    """A long output_text must not truncate the advisory note off the summary —
+    the advisory is budgeted into the 1000-char cap."""
+    from genesis.db.crud.ego import create_proposal, get_proposal
+
+    f = tmp_path / "deliverable.md"
+    f.write_text("A real report body.\n")
+    await create_proposal(
+        db,
+        id="prop-long",
+        action_type="dispatch",
+        content="x",
+        status="executed",
+        expected_outputs=json.dumps({"files": [str(f)], "required_strings": ["## Not Present"]}),
+    )
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-long")
+    res = DirectSessionResult(session_id="s3", success=True, output_text="x" * 1500)
+    await _verif_runner(db)._record_proposal_outcome(req, res)
+    prop = await get_proposal(db, "prop-long")
+    ur = prop["user_response"] or ""
+    assert prop["status"] == "executed"
+    assert "|completed:" in ur  # polarity preserved
+    assert "verification advisories" in ur  # advisory survived the truncation
+
+
+@pytest.mark.asyncio
 async def test_record_outcome_missing_file_marks_failed(db, tmp_path):
     """A genuinely missing deliverable still hard-fails (regression guard)."""
     from genesis.db.crud.ego import create_proposal, get_proposal

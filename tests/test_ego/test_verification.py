@@ -110,6 +110,18 @@ def test_verify_file_too_small_is_advisory(tmp_path: Path):
     assert any("small" in a.lower() for a in result.advisories)
 
 
+def test_verify_directory_is_not_a_deliverable(tmp_path: Path):
+    """A directory at the expected path is not a produced file → hard fail
+    (guards against st_size on a dir reading as a non-empty 'file')."""
+    d = tmp_path / "output.md"  # a directory sitting where a file was expected
+    d.mkdir()
+    (d / "child.txt").write_text("x")  # non-empty dir → st_size != 0 (exposes the bug)
+    expected = ExpectedOutputs(files=[str(d)])
+    result = verify_outputs(expected)
+    assert result.passed is False
+    assert result.missing_files
+
+
 def test_verify_empty_file_is_hard_fail(tmp_path: Path):
     """A 0-byte file counts as 'not produced' — a hard failure."""
     f = tmp_path / "empty.md"

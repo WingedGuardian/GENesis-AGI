@@ -169,7 +169,9 @@ def verify_outputs(expected: ExpectedOutputs) -> VerificationResult:
     for filepath in expected.files:
         path = _resolve_path(filepath)
         fuzzy = False
-        if not path.exists():
+        # is_file() (not exists()) so a directory at the expected path is not
+        # mistaken for a deliverable (a dir's st_size reads as non-zero).
+        if not path.is_file():
             # Fuzzy fallback: search parent directory for similar files
             similar = _find_similar(path)
             if similar is not None:

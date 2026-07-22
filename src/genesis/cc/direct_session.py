@@ -1021,12 +1021,16 @@ class DirectSessionRunner:
                 if vres is not None:
                     advisories = list(vres.advisories)
 
-            summary = (result.output_text or result.error or "")[:1000]
+            base = result.output_text or result.error or ""
             if advisories:
                 # Informational only — never changes the |completed: polarity
-                # the feedback harvester reads from this suffix.
-                note = "; ".join(advisories)
-                summary = f"{summary}\n[verification advisories: {note}]"[:1000]
+                # the feedback harvester reads from this suffix. Budget the note
+                # into the 1000-char cap so a long output_text can't truncate
+                # the advisory away entirely (the whole point of surfacing it).
+                note = f"\n[verification advisories: {'; '.join(advisories)}]"[:500]
+                summary = base[: max(0, 1000 - len(note))] + note
+            else:
+                summary = base[:1000]
             await update_proposal_outcome(
                 db,
                 proposal_id,
