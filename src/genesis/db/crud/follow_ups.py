@@ -72,16 +72,30 @@ async def create(
             scheduled_at, status, priority, pinned, kind, domain, goal_id,
             dedup_key, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
-        (fid, source, source_session, content, reason, strategy,
-         _normalize_scheduled_at(scheduled_at), priority, int(pinned),
-         kind, domain, goal_id, dedup_key, _now_iso()),
+        (
+            fid,
+            source,
+            source_session,
+            content,
+            reason,
+            strategy,
+            _normalize_scheduled_at(scheduled_at),
+            priority,
+            int(pinned),
+            kind,
+            domain,
+            goal_id,
+            dedup_key,
+            _now_iso(),
+        ),
     )
     await db.commit()
     return fid
 
 
 async def exists_by_dedup_key(
-    db: aiosqlite.Connection, dedup_key: str,
+    db: aiosqlite.Connection,
+    dedup_key: str,
 ) -> bool:
     """Return True if any follow-up already exists with *dedup_key*.
 
@@ -150,15 +164,17 @@ async def get_by_status(
     dom_clause, dom_params = _domain_eq(domain)
     kind_and = "" if include_tabled else "AND kind = 'follow_up' "
     cursor = await db.execute(
-        f"SELECT * FROM follow_ups WHERE status = ?{dom_clause} {kind_and}"
-        "ORDER BY created_at ASC",
+        f"SELECT * FROM follow_ups WHERE status = ?{dom_clause} {kind_and}ORDER BY created_at ASC",
         (status, *dom_params),
     )
     return [dict(row) for row in await cursor.fetchall()]
 
 
 async def get_actionable(
-    db: aiosqlite.Connection, *, limit: int = 50, include_tabled: bool = False,
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 50,
+    include_tabled: bool = False,
     domain: str | None = None,
 ) -> list[dict]:
     """Get follow-ups needing attention: pending, failed, blocked.
@@ -183,7 +199,9 @@ async def get_actionable(
 
 
 async def get_scheduled_due(
-    db: aiosqlite.Connection, *, include_tabled: bool = False,
+    db: aiosqlite.Connection,
+    *,
+    include_tabled: bool = False,
 ) -> list[dict]:
     """Get scheduled follow-ups whose time has arrived.
 
@@ -202,7 +220,9 @@ async def get_scheduled_due(
 
 
 async def get_linked_active(
-    db: aiosqlite.Connection, *, include_tabled: bool = False,
+    db: aiosqlite.Connection,
+    *,
+    include_tabled: bool = False,
 ) -> list[dict]:
     """Get follow-ups linked to surplus tasks that are in flight.
 
@@ -241,6 +261,13 @@ async def update_status(
         parts.append("completed_at = CASE WHEN status = ? THEN completed_at ELSE ? END")
         params.append(status)
         params.append(_now_iso())
+    else:
+        # Non-terminal status: clear any completed_at left orphaned by a prior
+        # terminal→non-terminal transition (a row wrongly flipped to completed,
+        # then corrected back). completed_at means "reached terminal"; a
+        # non-terminal row must not carry one, or GC/report windows keyed off it
+        # mis-key the row (follow-up d67c83c7). No-op when already NULL.
+        parts.append("completed_at = NULL")
     if resolution_notes is not None:
         parts.append("resolution_notes = ?")
         params.append(resolution_notes)
@@ -253,6 +280,41 @@ async def update_status(
     if verification_notes is not None:
         parts.append("verification_notes = ?")
         params.append(verification_notes)
+    params.append(id)
+    cursor = await db.execute(
+        f"UPDATE follow_ups SET {', '.join(parts)} WHERE id = ?",
+        params,
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def update_notes(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    resolution_notes: str | None = None,
+    blocked_reason: str | None = None,
+) -> bool:
+    """Write resolution_notes / blocked_reason WITHOUT touching status.
+
+    A notes-only update must never re-write ``status``. The MCP follow_up_update
+    previously re-applied the status it had read moments earlier; against
+    Genesis's own live background writers (ego resolve_follow_ups, concurrent
+    sessions) racing the same row, that silently reverts a status change made in
+    between — a lost update (follow-up d67c83c7). This writes only the columns
+    actually provided, leaving status (and completed_at) untouched.
+    """
+    parts: list[str] = []
+    params: list[str | None] = []
+    if resolution_notes is not None:
+        parts.append("resolution_notes = ?")
+        params.append(resolution_notes)
+    if blocked_reason is not None:
+        parts.append("blocked_reason = ?")
+        params.append(blocked_reason)
+    if not parts:
+        return False
     params.append(id)
     cursor = await db.execute(
         f"UPDATE follow_ups SET {', '.join(parts)} WHERE id = ?",
@@ -305,7 +367,9 @@ async def set_pinned(
 
 
 async def get_summary_counts(
-    db: aiosqlite.Connection, *, include_tabled: bool = True,
+    db: aiosqlite.Connection,
+    *,
+    include_tabled: bool = True,
 ) -> dict[str, int]:
     """Get counts by status for dashboard badges.
 
@@ -540,7 +604,12 @@ _VALID_KIND = {"follow_up", "tabled"}
 _VALID_DOMAIN = {"internal", "user_world"}
 _VALID_PRIORITY = {"low", "medium", "high", "critical"}
 _VALID_STATUS = {
-    "pending", "scheduled", "in_progress", "completed", "failed", "blocked",
+    "pending",
+    "scheduled",
+    "in_progress",
+    "completed",
+    "failed",
+    "blocked",
 }
 
 # Allowlisted sort keys → ORDER BY fragment (never interpolate caller input).
@@ -579,7 +648,8 @@ async def set_kind(db: aiosqlite.Connection, id: str, kind: str) -> bool:
     if kind not in _VALID_KIND:
         raise ValueError(f"invalid kind {kind!r}; must be one of {sorted(_VALID_KIND)}")
     cursor = await db.execute(
-        "UPDATE follow_ups SET kind = ? WHERE id = ?", (kind, id),
+        "UPDATE follow_ups SET kind = ? WHERE id = ?",
+        (kind, id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -592,7 +662,8 @@ async def set_domain(db: aiosqlite.Connection, id: str, domain: str | None) -> b
             f"invalid domain {domain!r}; must be one of {sorted(_VALID_DOMAIN)} or None"
         )
     cursor = await db.execute(
-        "UPDATE follow_ups SET domain = ? WHERE id = ?", (domain, id),
+        "UPDATE follow_ups SET domain = ? WHERE id = ?",
+        (domain, id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -601,11 +672,10 @@ async def set_domain(db: aiosqlite.Connection, id: str, domain: str | None) -> b
 async def set_priority(db: aiosqlite.Connection, id: str, priority: str) -> bool:
     """Set a follow-up's priority (validated against the schema CHECK set)."""
     if priority not in _VALID_PRIORITY:
-        raise ValueError(
-            f"invalid priority {priority!r}; must be one of {sorted(_VALID_PRIORITY)}"
-        )
+        raise ValueError(f"invalid priority {priority!r}; must be one of {sorted(_VALID_PRIORITY)}")
     cursor = await db.execute(
-        "UPDATE follow_ups SET priority = ? WHERE id = ?", (priority, id),
+        "UPDATE follow_ups SET priority = ? WHERE id = ?",
+        (priority, id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -619,7 +689,8 @@ async def delete_batch(db: aiosqlite.Connection, ids: list[str]) -> int:
         return 0
     placeholders = ",".join("?" for _ in ids)
     cursor = await db.execute(
-        f"DELETE FROM follow_ups WHERE id IN ({placeholders})", ids,
+        f"DELETE FROM follow_ups WHERE id IN ({placeholders})",
+        ids,
     )
     await db.commit()
     return cursor.rowcount
@@ -652,9 +723,7 @@ async def update_status_batch(
     Mirrors update_status: stamps completed_at on terminal states.
     """
     if status not in _VALID_STATUS:
-        raise ValueError(
-            f"invalid status {status!r}; must be one of {sorted(_VALID_STATUS)}"
-        )
+        raise ValueError(f"invalid status {status!r}; must be one of {sorted(_VALID_STATUS)}")
     if not ids:
         return 0
     parts = ["status = ?"]
@@ -668,6 +737,10 @@ async def update_status_batch(
         parts.append("completed_at = CASE WHEN status = ? THEN completed_at ELSE ? END")
         params.append(status)
         params.append(_now_iso())
+    else:
+        # Mirror update_status: clear completed_at on a non-terminal transition
+        # so a bulk reopen never leaves orphaned terminal timestamps (d67c83c7).
+        parts.append("completed_at = NULL")
     if resolution_notes is not None:
         parts.append("resolution_notes = ?")
         params.append(resolution_notes)
@@ -682,9 +755,7 @@ async def update_status_batch(
 
 async def get_distinct_sources(db: aiosqlite.Connection) -> list[str]:
     """Distinct source values present, for cockpit filter dropdowns."""
-    cursor = await db.execute(
-        "SELECT DISTINCT source FROM follow_ups ORDER BY source"
-    )
+    cursor = await db.execute("SELECT DISTINCT source FROM follow_ups ORDER BY source")
     return [row[0] for row in await cursor.fetchall()]
 
 
@@ -746,7 +817,11 @@ async def count_filtered(
 ) -> int:
     """Count follow-ups matching the cockpit filters."""
     where, params = _build_filter_where(
-        kind=kind, domain=domain, status=status, source=source, search=search,
+        kind=kind,
+        domain=domain,
+        status=status,
+        source=source,
+        search=search,
         status_exclude=status_exclude,
     )
     cursor = await db.execute(f"SELECT COUNT(*) FROM follow_ups{where}", params)
@@ -774,7 +849,11 @@ async def query_page(
     ``status_exclude`` hides terminal states (ignored when ``status`` is set).
     """
     where, params = _build_filter_where(
-        kind=kind, domain=domain, status=status, source=source, search=search,
+        kind=kind,
+        domain=domain,
+        status=status,
+        source=source,
+        search=search,
         status_exclude=status_exclude,
     )
     order = _SORT_MAP.get(sort, _SORT_MAP["priority"])

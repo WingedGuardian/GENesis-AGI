@@ -16,7 +16,9 @@ async def test_create_default_kind_is_follow_up(db):
     """Without an explicit kind, a create lands in the actionable follow_up lane."""
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         res = await follow_up_tools._impl_follow_up_create(
-            content="do the thing", reason="because", strategy="ego_judgment",
+            content="do the thing",
+            reason="because",
+            strategy="ego_judgment",
         )
     assert "id" in res, res
     assert res["kind"] == "follow_up"
@@ -28,8 +30,10 @@ async def test_create_kind_tabled(db):
     """kind='tabled' routes a someday/maybe into the tabled lane, off the actionable queue."""
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         res = await follow_up_tools._impl_follow_up_create(
-            content="maybe explore idea Y someday", reason="interesting",
-            strategy="ego_judgment", kind="tabled",
+            content="maybe explore idea Y someday",
+            reason="interesting",
+            strategy="ego_judgment",
+            kind="tabled",
         )
     assert "id" in res, res
     assert res["kind"] == "tabled"
@@ -44,7 +48,10 @@ async def test_create_kind_tabled(db):
 async def test_create_invalid_kind_errors(db):
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         res = await follow_up_tools._impl_follow_up_create(
-            content="x", reason="y", strategy="ego_judgment", kind="bogus",
+            content="x",
+            reason="y",
+            strategy="ego_judgment",
+            kind="bogus",
         )
     assert "error" in res
     assert "kind" in res["error"].lower()
@@ -54,7 +61,9 @@ async def test_update_relanes_follow_up_to_tabled(db):
     """follow_up_update kind='tabled' demotes an actionable item into the tabled lane."""
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         created = await follow_up_tools._impl_follow_up_create(
-            content="reconsider later", reason="low priority", strategy="ego_judgment",
+            content="reconsider later",
+            reason="low priority",
+            strategy="ego_judgment",
         )
         fid = created["id"]
         res = await follow_up_tools._impl_follow_up_update(fid, kind="tabled")
@@ -66,7 +75,9 @@ async def test_update_relanes_follow_up_to_tabled(db):
 async def test_update_invalid_kind_errors(db):
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         created = await follow_up_tools._impl_follow_up_create(
-            content="z", reason="z", strategy="ego_judgment",
+            content="z",
+            reason="z",
+            strategy="ego_judgment",
         )
         res = await follow_up_tools._impl_follow_up_update(created["id"], kind="nope")
     assert "error" in res
@@ -77,10 +88,15 @@ async def test_list_excludes_tabled_by_default(db):
     """follow_up_list hides tabled items from the agent view and reports them separately."""
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         await follow_up_tools._impl_follow_up_create(
-            content="actionable thing", reason="r", strategy="ego_judgment",
+            content="actionable thing",
+            reason="r",
+            strategy="ego_judgment",
         )
         await follow_up_tools._impl_follow_up_create(
-            content="someday idea", reason="r", strategy="ego_judgment", kind="tabled",
+            content="someday idea",
+            reason="r",
+            strategy="ego_judgment",
+            kind="tabled",
         )
         res = await follow_up_tools._impl_follow_up_list()
 
@@ -95,10 +111,15 @@ async def test_list_include_tabled_shows_them(db):
     """Opting in surfaces tabled items alongside actionable ones."""
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         await follow_up_tools._impl_follow_up_create(
-            content="actionable thing", reason="r", strategy="ego_judgment",
+            content="actionable thing",
+            reason="r",
+            strategy="ego_judgment",
         )
         await follow_up_tools._impl_follow_up_create(
-            content="someday idea", reason="r", strategy="ego_judgment", kind="tabled",
+            content="someday idea",
+            reason="r",
+            strategy="ego_judgment",
+            kind="tabled",
         )
         res = await follow_up_tools._impl_follow_up_list(include_tabled=True)
 
@@ -110,12 +131,17 @@ async def test_list_status_filter_excludes_tabled(db):
     """The status_filter path (get_by_status) also excludes tabled by default."""
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         await follow_up_tools._impl_follow_up_create(
-            content="actionable pending", reason="r", strategy="ego_judgment",
+            content="actionable pending",
+            reason="r",
+            strategy="ego_judgment",
         )
         # tabled items keep their status ('pending' by default), so a naive
         # status filter would surface them without the kind exclusion.
         await follow_up_tools._impl_follow_up_create(
-            content="tabled pending", reason="r", strategy="ego_judgment", kind="tabled",
+            content="tabled pending",
+            reason="r",
+            strategy="ego_judgment",
+            kind="tabled",
         )
         res = await follow_up_tools._impl_follow_up_list(status_filter="pending")
     kinds = [f["kind"] for f in res["follow_ups"]]
@@ -124,6 +150,76 @@ async def test_list_status_filter_excludes_tabled(db):
     # ...unless the caller opts in.
     with patch.object(follow_up_tools, "_get_db", return_value=db):
         res_incl = await follow_up_tools._impl_follow_up_list(
-            status_filter="pending", include_tabled=True,
+            status_filter="pending",
+            include_tabled=True,
         )
     assert sorted(f["kind"] for f in res_incl["follow_ups"]) == ["follow_up", "tabled"]
+
+
+# ─── d67c83c7: notes-only preserves status; blocked_reason blocks; no revert ──
+
+
+async def test_update_notes_only_preserves_status(db):
+    """A notes-only follow_up_update must NOT change status (routes to update_notes)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="active work",
+            reason="r",
+            strategy="ego_judgment",
+        )
+        fid = created["id"]
+        await follow_up_tools._impl_follow_up_update(fid, status="in_progress")
+        res = await follow_up_tools._impl_follow_up_update(
+            fid,
+            resolution_notes="a progress note, no status",
+        )
+    assert res["status"] == "in_progress"  # preserved, not flipped
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "in_progress"
+    assert row["resolution_notes"] == "a progress note, no status"
+
+
+async def test_update_blocked_reason_sets_blocked(db):
+    """blocked_reason without an explicit status sets status='blocked' (documented contract)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="thing",
+            reason="r",
+            strategy="ego_judgment",
+        )
+        fid = created["id"]
+        res = await follow_up_tools._impl_follow_up_update(
+            fid,
+            blocked_reason="waiting on upstream PR",
+        )
+    assert res["status"] == "blocked"
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "blocked"
+    assert row["blocked_reason"] == "waiting on upstream PR"
+
+
+async def test_notes_only_does_not_write_stale_status(db):
+    """Lost-update regression (d67c83c7): with a STALE in_progress read but the DB
+    row already completed by a concurrent writer, a notes-only update must write
+    ONLY notes — never the stale status back. RED on the old elif branch (which
+    re-wrote existing['status'])."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="racy",
+            reason="r",
+            strategy="ego_judgment",
+        )
+        fid = created["id"]
+        # Concurrent writer (e.g. ego resolve_follow_ups) completes it.
+        await follow_ups.update_status(db, fid, "completed", resolution_notes="ego done")
+
+        # This call's reads all return a STALE in_progress snapshot.
+        async def _stale_get(_db, _id):
+            return {"id": fid, "status": "in_progress", "priority": "medium"}
+
+        with patch.object(follow_ups, "get_by_id", _stale_get):
+            await follow_up_tools._impl_follow_up_update(fid, resolution_notes="fg note")
+
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"  # stale in_progress NOT written back
+    assert row["resolution_notes"] == "fg note"

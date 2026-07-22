@@ -47,15 +47,21 @@ async def _impl_follow_up_create(
 
     valid_strategies = {"scheduled_task", "surplus_task", "ego_judgment", "user_input_needed"}
     if strategy not in valid_strategies:
-        return {"error": f"Invalid strategy '{strategy}'. Must be one of: {', '.join(sorted(valid_strategies))}"}
+        return {
+            "error": f"Invalid strategy '{strategy}'. Must be one of: {', '.join(sorted(valid_strategies))}"
+        }
 
     valid_priorities = {"low", "medium", "high", "critical"}
     if priority not in valid_priorities:
-        return {"error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}"}
+        return {
+            "error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}"
+        }
 
     valid_domains = {"internal", "user_world"}
     if domain is not None and domain not in valid_domains:
-        return {"error": f"Invalid domain '{domain}'. Must be one of: {', '.join(sorted(valid_domains))}"}
+        return {
+            "error": f"Invalid domain '{domain}'. Must be one of: {', '.join(sorted(valid_domains))}"
+        }
 
     valid_kinds = {"follow_up", "tabled"}
     if kind not in valid_kinds:
@@ -136,11 +142,15 @@ async def _impl_follow_up_list(
 
         if status_filter:
             items = await follow_ups.get_by_status(
-                db, status_filter, include_tabled=include_tabled,
+                db,
+                status_filter,
+                include_tabled=include_tabled,
             )
         else:
             items = await follow_ups.get_recent(
-                db, limit=limit, include_tabled=include_tabled,
+                db,
+                limit=limit,
+                include_tabled=include_tabled,
             )
 
         counts = await follow_ups.get_summary_counts(db, include_tabled=include_tabled)
@@ -176,11 +186,15 @@ async def _impl_follow_up_update(
 
     valid_statuses = {"pending", "scheduled", "in_progress", "completed", "failed", "blocked"}
     if status and status not in valid_statuses:
-        return {"error": f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid_statuses))}"}
+        return {
+            "error": f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid_statuses))}"
+        }
 
     valid_priorities = {"low", "medium", "high", "critical"}
     if priority and priority not in valid_priorities:
-        return {"error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}"}
+        return {
+            "error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}"
+        }
 
     valid_kinds = {"follow_up", "tabled"}
     if kind and kind not in valid_kinds:
@@ -216,13 +230,26 @@ async def _impl_follow_up_update(
             )
             if not updated:
                 return {"error": "Update failed — row not modified"}
-        elif resolution_notes or blocked_reason:
+        elif blocked_reason is not None:
+            # blocked_reason without an explicit status means "block this" — honor
+            # the documented contract (it previously silently kept the existing
+            # status). Any notes ride along on the same targeted status write.
             await follow_ups.update_status(
                 db,
                 follow_up_id,
-                existing["status"],
+                "blocked",
                 resolution_notes=resolution_notes,
                 blocked_reason=blocked_reason,
+            )
+        elif resolution_notes is not None:
+            # Notes-only update: write ONLY resolution_notes, never re-touch
+            # status. Re-applying the status read at the top of this call races
+            # Genesis's own live writers and silently reverts their change
+            # (lost update, follow-up d67c83c7).
+            await follow_ups.update_notes(
+                db,
+                follow_up_id,
+                resolution_notes=resolution_notes,
             )
 
         refreshed = await follow_ups.get_by_id(db, follow_up_id)
