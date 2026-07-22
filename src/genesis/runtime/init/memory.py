@@ -53,7 +53,13 @@ async def init(rt: GenesisRuntime) -> None:
     try:
         from qdrant_client import QdrantClient
 
-        from genesis.env import qdrant_url, recall_read_pool_off, recall_read_pool_size
+        from genesis.env import (
+            qdrant_url,
+            recall_read_pool_off,
+            recall_read_pool_size,
+            recall_rerank_gate_off,
+            recall_rerank_rpm,
+        )
         from genesis.memory.embeddings import EmbeddingProvider
         from genesis.memory.linker import MemoryLinker
         from genesis.memory.store import MemoryStore
@@ -134,12 +140,53 @@ async def init(rt: GenesisRuntime) -> None:
                 )
                 rt._db_ro_pool = None
 
+        # Shared rate gate + timeout-only circuit breaker guarding recall's Voyage
+        # rerank (follow-up ac27b693, PR-3). ONE gate + ONE breaker per process,
+        # shared by BOTH retrievers below, so Voyage's account-global RPM (free
+        # tier = 3) is enforced across every concurrent recall — two instances
+        # would each permit the full RPM. A gate-denied rerank skips instantly to
+        # the RRF+graph floor instead of burning a 429; the breaker trips only on
+        # a genuine rerank hang (timebox expiry), never on a 429. The
+        # GENESIS_RECALL_RERANK_GATE_OFF kill (or a build failure) leaves both None
+        # → recall reranks unguarded exactly as before the change.
+        rt._rerank_gate = None
+        rt._rerank_breaker = None
+        if not recall_rerank_gate_off():
+            try:
+                from genesis.routing.circuit_breaker import CircuitBreaker
+                from genesis.routing.rate_gate import ProviderRateGate
+                from genesis.routing.types import ProviderConfig
+
+                rerank_rpm = recall_rerank_rpm()
+                rt._rerank_gate = ProviderRateGate("voyage", rpm=rerank_rpm)
+                rt._rerank_breaker = CircuitBreaker(
+                    ProviderConfig(
+                        name="voyage",
+                        provider_type="rerank",
+                        model_id="rerank-2.5",
+                        is_free=True,
+                        rpm_limit=rerank_rpm,
+                        open_duration_s=120,
+                    )
+                )
+                logger.info("Recall rerank gate+breaker built (voyage, %d RPM)", rerank_rpm)
+            except Exception:
+                logger.warning(
+                    "Recall rerank gate/breaker failed to build — rerank runs "
+                    "unguarded (degraded, not broken)",
+                    exc_info=True,
+                )
+                rt._rerank_gate = None
+                rt._rerank_breaker = None
+
         rt._hybrid_retriever = HybridRetriever(
             embedding_provider=recall_embedder,
             qdrant_client=qdrant,
             db=rt._db,
             reranker=reranker,
             read_pool=rt._db_ro_pool,
+            rerank_gate=rt._rerank_gate,
+            rerank_breaker=rt._rerank_breaker,
         )
         rt._context_injector = ContextInjector(
             retriever=rt._hybrid_retriever,
@@ -162,6 +209,12 @@ async def init(rt: GenesisRuntime) -> None:
             # through the MCP retriever, so the pool must reach it here or the hot
             # path PR-4 targets would bypass it (ac27b693).
             read_pool=rt._db_ro_pool,
+            # Share the SAME rerank gate+breaker: the proactive per-prompt path is
+            # the dominant Voyage consumer and recalls through THIS retriever, so
+            # the gate must reach it here — and it must be the same instance as the
+            # runtime stack's, or each would permit the full RPM (ac27b693, PR-3).
+            rerank_gate=rt._rerank_gate,
+            rerank_breaker=rt._rerank_breaker,
         )
         logger.info("Memory MCP initialized (dual embedders, shared reranker)")
 
