@@ -5,8 +5,9 @@ import dataclasses
 import logging
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
+from typing import Any
 
 import aiosqlite
 from qdrant_client import QdrantClient
@@ -26,8 +27,55 @@ from genesis.memory.types import RetrievalResult
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.provider_activity import track_operation
 from genesis.qdrant import collections as qdrant_ops
+from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
+
+# Backstop for deferred recall side effects (follow-up ac27b693). Each deferred
+# task pins its recall's ``results`` + candidate maps until it drains, so an
+# unbounded pending set would leak memory under a sustained burst. This is a
+# task-COUNT backstop (not a hardware-scaled resource), so a fixed ceiling is
+# install-agnostic: past it, the defer path runs INLINE instead — never dropping
+# a write, only trading latency back. A steady state that regularly hits this
+# means the write-back path itself is too slow (surface, don't silently cap).
+_DEFERRED_SIDE_EFFECT_CAP = 256
+_deferred_side_effects_count = 0
+
+
+def _deferred_side_effects_inflight() -> int:
+    """Number of recall side-effect tasks reserved (scheduled or running)."""
+    return _deferred_side_effects_count
+
+
+def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: str) -> None:
+    """Reserve a backstop slot SYNCHRONOUSLY, then schedule ``coro`` as a
+    tracked task that releases the slot when it finishes.
+
+    Reserving before ``tracked_task`` (not inside the task body) is what makes
+    the cap real under a burst: several recalls resuming in the same event-loop
+    tick each increment the counter before yielding, so the (N+1)th correctly
+    sees the cap and runs inline instead of queueing an unbounded pile of
+    scheduled-but-not-yet-started tasks (Codex P2). A shutdown cancellation
+    before the task starts would skip the release, but that only leaks an
+    in-memory counter on a process that is already exiting — immaterial.
+    """
+    global _deferred_side_effects_count  # noqa: PLW0603
+    _deferred_side_effects_count += 1
+    if _deferred_side_effects_count == _DEFERRED_SIDE_EFFECT_CAP:
+        logger.warning(
+            "recall deferred-side-effect backstop reached (%d in flight) — "
+            "further recalls run write-backs inline until it drains",
+            _DEFERRED_SIDE_EFFECT_CAP,
+        )
+
+    async def _runner() -> None:
+        global _deferred_side_effects_count  # noqa: PLW0603
+        try:
+            await coro
+        finally:
+            _deferred_side_effects_count -= 1
+
+    tracked_task(_runner(), name=name)
 
 
 def _has_temporal_markers(query: str) -> bool:
@@ -634,6 +682,7 @@ class HybridRetriever:
         extra_fts_terms: list[str] | None = None,
         rerank_timeout_s: float | None = None,
         stats: dict | None = None,
+        defer_side_effects: bool = False,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 
@@ -645,9 +694,21 @@ class HybridRetriever:
         only bound.
 
         ``stats``: optional caller-owned dict populated with rerank stage
-        telemetry (``rerank_executed``, ``rerank_ms``, ``rerank_timed_out``).
-        Caller-owned so concurrent recalls on the shared retriever can never
-        race each other's numbers.
+        telemetry (``rerank_executed``, ``rerank_ms``, ``rerank_timed_out``)
+        plus per-stage read timings (``vector_ms``, ``expand_ms``, ``fts_ms``,
+        ``activation_ms``). Caller-owned so concurrent recalls on the shared
+        retriever can never race each other's numbers.
+
+        ``defer_side_effects``: when True, the post-result WRITE-BACKS and
+        eval/telemetry emits (retrieved_count bumps, ``recall_fired`` +
+        diagnostics, entity-lane shadow) are moved OFF the caller's latency
+        path into one background ``tracked_task`` — the results return
+        immediately. For the per-prompt proactive path (follow-up ac27b693),
+        where those writes were the dominant serialized cost under concurrent
+        sessions. Mutually exclusive with ``event_id_sink`` (which needs the
+        emitted id synchronously): a caller passing a sink keeps inline emits.
+        All deferred writes are already individually best-effort, so a shutdown
+        cancellation loses at most one prompt's usage bumps.
 
         Source selection:
             - ``source=None`` (default): classify the query's intent and
@@ -707,6 +768,7 @@ class HybridRetriever:
         qdrant_results: list[dict] = []
         qdrant_by_id: dict[str, dict] = {}
         if embedding_available and vector is not None:
+            _ts = time.monotonic()
             qdrant_results, qdrant_by_id = await self._gather_vector_candidates(
                 vector=vector,
                 collections=collections,
@@ -719,6 +781,8 @@ class HybridRetriever:
                 include_only_subsystems=include_only_subsystems,
                 include_deprecated=include_deprecated,
             )
+            if stats is not None:
+                stats["vector_ms"] = round((time.monotonic() - _ts) * 1000, 1)
 
         # 2b. Event-calendar search (temporal queries)
         event_memory_ids = await self._gather_event_candidates(
@@ -727,15 +791,20 @@ class HybridRetriever:
             candidate_limit,
         )
 
-        # 2c. Expand query via tag co-occurrence (opt-in, expensive index rebuild)
+        # 2c. Expand query via tag co-occurrence (SWR — stale index rebuilds in
+        # the background, never inline on this path; see intent.expand_query)
+        _ts = time.monotonic()
         fts_query = await self._expand_fts_query(
             query,
             collections,
             expand_query_terms=expand_query_terms,
             extra_fts_terms=extra_fts_terms,
         )
+        if stats is not None:
+            stats["expand_ms"] = round((time.monotonic() - _ts) * 1000, 1)
 
         # 3. FTS5 text search (using expanded query)
+        _ts = time.monotonic()
         fts_results, fts_by_id = await self._gather_fts_candidates(
             query=query,
             fts_query=fts_query,
@@ -745,6 +814,8 @@ class HybridRetriever:
             include_only_subsystems=include_only_subsystems,
             include_deprecated=include_deprecated,
         )
+        if stats is not None:
+            stats["fts_ms"] = round((time.monotonic() - _ts) * 1000, 1)
 
         # 4. Union of all candidate memory_ids
         all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
@@ -764,7 +835,7 @@ class HybridRetriever:
             # whether the entity lane would surface something — its highest-value
             # case (Codex #1121 P2: don't skip the zero-hit path). No ranked
             # lists exist here, so lane novelty = its valid candidates.
-            await self._maybe_entity_lane_shadow(
+            _zero_hit_shadow = self._maybe_entity_lane_shadow(
                 query=query,
                 ranked_lists=[],
                 all_ids=set(),
@@ -772,17 +843,33 @@ class HybridRetriever:
                 embedding_available=embedding_available,
                 recall_event_id=None,
             )
+            # Same deferral contract as the has-results path (ac27b693): the
+            # shadow probe is pure observation, so on the latency-budgeted
+            # proactive path it must not run inline here either. Inert today
+            # (entity_lane.mode: off), but keeps the zero-candidate prompt off
+            # the shared connection if that mode is ever flipped to shadow.
+            if (
+                defer_side_effects
+                and event_id_sink is None
+                and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
+            ):
+                _schedule_deferred_side_effects(_zero_hit_shadow, name="recall_zero_hit_shadow")
+            else:
+                await _zero_hit_shadow
             return []
 
         now_str = datetime.now(UTC).isoformat()
 
         # 5/5b. Batch-fetch link counts + compute activation scores
+        _ts = time.monotonic()
         (
             activation_by_id,
             inbound_by_id,
             retrieved_count_by_id,
             created_at_by_id,
         ) = await self._compute_activations(all_ids, qdrant_by_id, now_str)
+        if stats is not None:
+            stats["activation_ms"] = round((time.monotonic() - _ts) * 1000, 1)
 
         # 6. Build ranked lists for RRF (or FTS5-only if no embedding)
         vector_ranked_dedup: list[str] = []
@@ -925,83 +1012,117 @@ class HybridRetriever:
             except Exception:
                 logger.debug("skip_writeback predicate failed open", exc_info=True)
                 _wb_ids = top
-        await self._record_retrievals(_wb_ids, qdrant_by_id, fts_by_id, now_str)
 
-        # J-9 eval: log recall event for memory retrieval quality measurement
-        from genesis.eval.j9_hooks import (
-            emit_recall_diagnostics,
-            emit_recall_fired,
-        )
+        # Snapshot the recall latency NOW: when the side effects are deferred,
+        # the ``recall_fired`` emit runs later on a background task, so
+        # recomputing (now - _t0) there would record the deferral delay, not the
+        # actual recall time. Capture it here and pass the fixed value in.
+        _recall_latency_ms = (time.monotonic() - _t0) * 1000
 
-        # J-9 logs the PRE-diversity-penalty scores. ``score`` is an
-        # ordering value (echo penalty applied); logging it understated the
-        # quality of penalized results in top_scores/mean_score/score_spread
-        # and skewed the entrenchment correlation.
-        _scores = [r.retrieval_score for r in results]
-        # MEM-005: entrenchment signal (monitor-only) — see _entrenchment_metrics.
-        _entrenchment, _mean_retrieved, _mean_age_days = _entrenchment_metrics(
-            results,
-            _scores,
-            retrieved_count_by_id,
-            created_at_by_id,
-            now_str,
-        )
+        async def _run_side_effects() -> None:
+            """Post-result write-backs + J-9 emits + entity-lane shadow.
 
-        recall_event_id = await emit_recall_fired(
-            self._db,
-            query=query,
-            result_count=len(results),
-            top_scores=[r.retrieval_score for r in results[:5]],
-            memory_ids=[r.memory_id for r in results[:10]],
-            latency_ms=(time.monotonic() - _t0) * 1000,
-            source=source,
-            intent_category=intent.category,
-            graph_boost_applied=graph_boost_applied,
-            mean_score=sum(_scores) / len(_scores) if _scores else None,
-            wing=wing,
-            entrenchment_corr=_entrenchment,
-            mean_retrieved_count=_mean_retrieved,
-            mean_age_days=_mean_age_days,
-        )
+            Runs inline for deep-search callers (byte-for-byte the pre-change
+            behavior) or as ONE background ``tracked_task`` for the latency-
+            budgeted proactive path (``defer_side_effects``). Every step is
+            already individually best-effort — a failure never blocks results.
+            """
+            # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
+            # knowledge_units sync). Runs AFTER assembly + the 12b origin
+            # backfill so `skip_writeback` saw the STORED origin (Codex #1048).
+            await self._record_retrievals(_wb_ids, qdrant_by_id, fts_by_id, now_str)
 
-        # MEM-003: hand the emitted event id back to an MCP caller so it can
-        # enrich THIS event (mode / pipeline_used / post-filter counts) instead
-        # of emitting a second recall_fired that double-counts in the J-9
-        # aggregator and batch judge.
-        if event_id_sink is not None and recall_event_id is not None:
-            event_id_sink.append(recall_event_id)
+            # J-9 eval: log recall event for memory retrieval quality measurement
+            from genesis.eval.j9_hooks import (
+                emit_recall_diagnostics,
+                emit_recall_fired,
+            )
 
-        # Recall diagnostics: capture intermediate pipeline metrics
-        _overlap = len(set(qdrant_by_id) & set(fts_by_id))
-        await emit_recall_diagnostics(
-            self._db,
-            recall_event_id=recall_event_id,
-            qdrant_pool_size=len(qdrant_by_id),
-            fts_pool_size=len(fts_by_id),
-            event_pool_size=len(event_memory_ids),
-            total_candidates=len(all_ids),
-            overlap_count=_overlap,
-            score_spread=round(max(_scores) - min(_scores), 4) if _scores else None,
-            embedding_available=embedding_available,
-            intent_category=intent.category,
-            intent_confidence=intent.confidence,
-            query_expanded=fts_query != query,
-        )
+            # J-9 logs the PRE-diversity-penalty scores. ``score`` is an
+            # ordering value (echo penalty applied); logging it understated the
+            # quality of penalized results in top_scores/mean_score/score_spread
+            # and skewed the entrenchment correlation.
+            _scores = [r.retrieval_score for r in results]
+            # MEM-005: entrenchment signal (monitor-only) — see _entrenchment_metrics.
+            _entrenchment, _mean_retrieved, _mean_age_days = _entrenchment_metrics(
+                results,
+                _scores,
+                retrieved_count_by_id,
+                created_at_by_id,
+                now_str,
+            )
 
-        # Entity-lane SHADOW probe (off by default; entity_lane.mode: shadow).
-        # Measures whether resolving the query to entity nodes + walking the
-        # entity graph would surface novel valid candidates the vector/FTS lanes
-        # miss — pure observation that appends one eval_event and NEVER touches
-        # ``results``. Placed after the write-backs so its insert_event commit
-        # can't flush partial recall state. See also the zero-hit call above.
-        await self._maybe_entity_lane_shadow(
-            query=query,
-            ranked_lists=ranked_lists,
-            all_ids=all_ids,
-            limit=limit,
-            embedding_available=embedding_available,
-            recall_event_id=recall_event_id,
-        )
+            recall_event_id = await emit_recall_fired(
+                self._db,
+                query=query,
+                result_count=len(results),
+                top_scores=[r.retrieval_score for r in results[:5]],
+                memory_ids=[r.memory_id for r in results[:10]],
+                latency_ms=_recall_latency_ms,
+                source=source,
+                intent_category=intent.category,
+                graph_boost_applied=graph_boost_applied,
+                mean_score=sum(_scores) / len(_scores) if _scores else None,
+                wing=wing,
+                entrenchment_corr=_entrenchment,
+                mean_retrieved_count=_mean_retrieved,
+                mean_age_days=_mean_age_days,
+            )
+
+            # MEM-003: hand the emitted event id back to an MCP caller so it can
+            # enrich THIS event instead of emitting a second recall_fired. Only
+            # the inline path carries a sink — a deferred caller passes None
+            # (guaranteed by the defer guard below), so no id is lost.
+            if event_id_sink is not None and recall_event_id is not None:
+                event_id_sink.append(recall_event_id)
+
+            # Recall diagnostics: capture intermediate pipeline metrics
+            _overlap = len(set(qdrant_by_id) & set(fts_by_id))
+            await emit_recall_diagnostics(
+                self._db,
+                recall_event_id=recall_event_id,
+                qdrant_pool_size=len(qdrant_by_id),
+                fts_pool_size=len(fts_by_id),
+                event_pool_size=len(event_memory_ids),
+                total_candidates=len(all_ids),
+                overlap_count=_overlap,
+                score_spread=round(max(_scores) - min(_scores), 4) if _scores else None,
+                embedding_available=embedding_available,
+                intent_category=intent.category,
+                intent_confidence=intent.confidence,
+                query_expanded=fts_query != query,
+            )
+
+            # Entity-lane SHADOW probe (off by default; entity_lane.mode: shadow).
+            # Pure observation that appends one eval_event and NEVER touches
+            # ``results``. Placed after the write-backs so its insert_event
+            # commit can't flush partial recall state.
+            await self._maybe_entity_lane_shadow(
+                query=query,
+                ranked_lists=ranked_lists,
+                all_ids=all_ids,
+                limit=limit,
+                embedding_available=embedding_available,
+                recall_event_id=recall_event_id,
+            )
+
+        # Defer only when the caller opted in AND isn't waiting on the emitted
+        # event id (``event_id_sink`` needs it synchronously). Otherwise run
+        # inline — byte-for-byte the pre-change behavior for deep-search callers.
+        # Defer only when the caller opted in, isn't waiting on the emitted id,
+        # AND we're under the in-flight backstop. The backstop bounds memory:
+        # each deferred task pins ``results``/candidate maps until it drains, so
+        # a sustained burst that outruns the drain rate falls back to inline
+        # (graceful degradation to the pre-change behavior — a write is NEVER
+        # dropped, and the pending-task set can't grow without bound).
+        if (
+            defer_side_effects
+            and event_id_sink is None
+            and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
+        ):
+            _schedule_deferred_side_effects(_run_side_effects(), name="recall_side_effects")
+        else:
+            await _run_side_effects()
 
         return results
 
@@ -1441,10 +1562,20 @@ class HybridRetriever:
 
         if memory_writebacks_off():
             return
-        # 11. Increment retrieved_count + stamp last_retrieved_at
-        for mid in top:
-            qdrant_hit = qdrant_by_id.get(mid)
-            if qdrant_hit:
+
+        # 11. Increment retrieved_count + stamp last_retrieved_at. The Qdrant
+        # client is SYNCHRONOUS, so run the whole per-item write-back loop in a
+        # worker thread: otherwise these blocking HTTP calls stall the shared
+        # event loop when the deferred task runs, stealing time from concurrent
+        # recalls and from the request's own remaining work — which would leave
+        # Qdrant-backed prompts still paying the write-back cost on the loop even
+        # though the work is "deferred" (Codex P2 on the ac27b693 deferral). Each
+        # write stays individually swallowed.
+        def _write_qdrant_counts() -> None:
+            for mid in top:
+                qdrant_hit = qdrant_by_id.get(mid)
+                if not qdrant_hit:
+                    continue
                 coll = qdrant_hit.get("_collection", "episodic_memory")
                 old_count = qdrant_hit.get("payload", {}).get("retrieved_count", 0)
                 try:
@@ -1464,6 +1595,8 @@ class HybridRetriever:
                         coll,
                         exc_info=True,
                     )
+
+        await asyncio.to_thread(_write_qdrant_counts)
 
         # 11b. Sync observation retrieved_count in SQLite
         #       Extract obs:<uuid> tags from Qdrant payloads to find linked observations

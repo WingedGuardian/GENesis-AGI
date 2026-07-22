@@ -9,6 +9,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Proactive memory recall holds up better when several sessions are active at
+  once.** When multiple Claude Code sessions run side by side, each prompt's
+  memory recall used to spend much of its time-budget on bookkeeping (usage
+  counters, quality metrics) that has nothing to do with the answer — and under
+  that load it would sometimes time out and fall back to the weaker keyword-only
+  memory (`[Memory·degraded]`). That bookkeeping now runs in the background after
+  the results are returned, and the internal tag index refreshes in the
+  background instead of stalling the first prompt after a restart. Recall quality
+  is unchanged; it just stops dropping to the degraded path under concurrency.
+
 ### Fixed
 
 - **Host setup no longer force-deletes a container it wrongly thinks is

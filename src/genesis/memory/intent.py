@@ -11,6 +11,7 @@ OpenClaw QMD query expansion. See:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Intent classification
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class QueryIntent:
@@ -67,31 +69,55 @@ class IntentProfile:
 # Priority order matters: more specific intents first.
 # WHY before WHAT because "what was the reason" should match WHY.
 _INTENT_PATTERNS: list[tuple[str, re.Pattern[str], float]] = [
-    ("WHY", re.compile(
-        r"^(why\b|what.{0,20}reason|rationale\b|motivation\b|justification\b)",
-        re.IGNORECASE,
-    ), 0.85),
-    ("HOW", re.compile(
-        r"^(how\b|steps?\s+to\b|procedure\b|process\s+for\b|instructions?\b)",
-        re.IGNORECASE,
-    ), 0.85),
-    ("WHEN", re.compile(
-        r"^(when\b|timeline\b|history\s+of\b|last\s+time\b|first\s+time\b)",
-        re.IGNORECASE,
-    ), 0.85),
-    ("WHERE", re.compile(
-        r"^(where\b|location\s+of\b|which\s+file\b|find\s+the\b)",
-        re.IGNORECASE,
-    ), 0.85),
+    (
+        "WHY",
+        re.compile(
+            r"^(why\b|what.{0,20}reason|rationale\b|motivation\b|justification\b)",
+            re.IGNORECASE,
+        ),
+        0.85,
+    ),
+    (
+        "HOW",
+        re.compile(
+            r"^(how\b|steps?\s+to\b|procedure\b|process\s+for\b|instructions?\b)",
+            re.IGNORECASE,
+        ),
+        0.85,
+    ),
+    (
+        "WHEN",
+        re.compile(
+            r"^(when\b|timeline\b|history\s+of\b|last\s+time\b|first\s+time\b)",
+            re.IGNORECASE,
+        ),
+        0.85,
+    ),
+    (
+        "WHERE",
+        re.compile(
+            r"^(where\b|location\s+of\b|which\s+file\b|find\s+the\b)",
+            re.IGNORECASE,
+        ),
+        0.85,
+    ),
     # STATUS is not anchored — often appears mid-query
-    ("STATUS", re.compile(
-        r"(status\s+of\b|progress\s+on\b|current\s+state\b|update\s+on\b|is\s+it\s+done\b)",
-        re.IGNORECASE,
-    ), 0.80),
-    ("WHAT", re.compile(
-        r"^(what\b|define\b|describe\b|explain\s+what\b|tell\s+me\s+about\b)",
-        re.IGNORECASE,
-    ), 0.80),
+    (
+        "STATUS",
+        re.compile(
+            r"(status\s+of\b|progress\s+on\b|current\s+state\b|update\s+on\b|is\s+it\s+done\b)",
+            re.IGNORECASE,
+        ),
+        0.80,
+    ),
+    (
+        "WHAT",
+        re.compile(
+            r"^(what\b|define\b|describe\b|explain\s+what\b|tell\s+me\s+about\b)",
+            re.IGNORECASE,
+        ),
+        0.80,
+    ),
 ]
 
 INTENT_PROFILES: dict[str, IntentProfile] = {
@@ -140,7 +166,9 @@ def classify_intent(query: str) -> QueryIntent:
     cleaned = query.strip()
     if not cleaned:
         return QueryIntent(
-            category="GENERAL", confidence=0.0, matched_pattern="",
+            category="GENERAL",
+            confidence=0.0,
+            matched_pattern="",
             recommended_source=_INTENT_TO_SOURCE["GENERAL"],
         )
 
@@ -155,7 +183,9 @@ def classify_intent(query: str) -> QueryIntent:
             )
 
     return QueryIntent(
-        category="GENERAL", confidence=0.0, matched_pattern="",
+        category="GENERAL",
+        confidence=0.0,
+        matched_pattern="",
         recommended_source=_INTENT_TO_SOURCE["GENERAL"],
     )
 
@@ -176,14 +206,56 @@ STANCES: tuple[str, ...] = ("command", "chatter", "general", "question_decision"
 
 # Imperative verbs that, when they lead a non-interrogative prompt, mark it a
 # command (act-on-the-system, minimal recall). Kept broad but action-oriented.
-_COMMAND_VERBS = frozenset({
-    "restart", "run", "rerun", "deploy", "redeploy", "stop", "start", "commit",
-    "push", "pull", "fix", "install", "uninstall", "delete", "remove", "drop",
-    "add", "create", "update", "upgrade", "rebuild", "build", "revert", "merge",
-    "rebase", "kill", "enable", "disable", "set", "unset", "clear", "checkout",
-    "retry", "execute", "launch", "apply", "reset", "rollback", "bump",
-    "regenerate", "reload", "restore", "sync", "cancel", "abort", "purge",
-})
+_COMMAND_VERBS = frozenset(
+    {
+        "restart",
+        "run",
+        "rerun",
+        "deploy",
+        "redeploy",
+        "stop",
+        "start",
+        "commit",
+        "push",
+        "pull",
+        "fix",
+        "install",
+        "uninstall",
+        "delete",
+        "remove",
+        "drop",
+        "add",
+        "create",
+        "update",
+        "upgrade",
+        "rebuild",
+        "build",
+        "revert",
+        "merge",
+        "rebase",
+        "kill",
+        "enable",
+        "disable",
+        "set",
+        "unset",
+        "clear",
+        "checkout",
+        "retry",
+        "execute",
+        "launch",
+        "apply",
+        "reset",
+        "rollback",
+        "bump",
+        "regenerate",
+        "reload",
+        "restore",
+        "sync",
+        "cancel",
+        "abort",
+        "purge",
+    }
+)
 
 # "what did we decide/agree/choose …" and kin — history-recall questions that
 # deserve a wider budget even when ``classify_intent`` returns GENERAL.
@@ -373,14 +445,13 @@ class TagCooccurrenceIndex:
             # Normalize and deduplicate, excluding non-semantic prefixes
             # (obs: event tags + structural taxonomy tags that co-occur with
             # everything — see _INDEX_EXCLUDED_TAG_PREFIXES / MEM-001).
-            normalized = list({
-                t.lower() for t in tags
-                if t and not t.startswith(_INDEX_EXCLUDED_TAG_PREFIXES)
-            })
+            normalized = list(
+                {t.lower() for t in tags if t and not t.startswith(_INDEX_EXCLUDED_TAG_PREFIXES)}
+            )
             for i, tag_a in enumerate(normalized):
                 if tag_a not in cooc:
                     cooc[tag_a] = {}
-                for tag_b in normalized[i + 1:]:
+                for tag_b in normalized[i + 1 :]:
                     cooc[tag_a][tag_b] = cooc[tag_a].get(tag_b, 0) + 1
                     if tag_b not in cooc:
                         cooc[tag_b] = {}
@@ -391,7 +462,8 @@ class TagCooccurrenceIndex:
         self._built_at = time.monotonic()
         logger.info(
             "Tag co-occurrence index built: %d unique tags, %d memories",
-            len(cooc), memory_count,
+            len(cooc),
+            memory_count,
         )
 
     def expand(self, keywords: list[str], max_expansions: int = 5) -> list[str]:
@@ -420,22 +492,160 @@ class TagCooccurrenceIndex:
         return [tag for tag, _ in ranked[:max_expansions]]
 
 
-# Module-level singleton — rebuilt lazily when stale
+# Module-level singleton — refreshed in the BACKGROUND when stale (SWR).
 _tag_index = TagCooccurrenceIndex()
+
+# Stale-while-revalidate state for expand_query (proactive-recall latency,
+# follow-up ac27b693). The pre-SWR code rebuilt the index INLINE on the first
+# recall after every restart (and after >10% corpus growth) — a synchronous
+# scroll of the entire corpus (hundreds of sync HTTP pages) that ran on the
+# request's own event loop and could stall a single prompt for multiple
+# seconds. SWR fixes that: the count-check is time-gated, and a stale index is
+# refreshed by ONE background task (single-flight) while the current prompt
+# proceeds with whatever the index currently holds (worst case: one prompt's
+# FTS query is unexpanded — a marginal recall dip, not a multi-second stall).
+_COUNT_CHECK_INTERVAL_S = 300.0  # re-poll Qdrant point counts at most this often
+_last_count_check: float = 0.0  # monotonic ts of the last get_collection poll
+_cached_total_count: int = 0  # last observed corpus size (drives is_stale)
+_rebuild_in_flight: bool = False  # single-flight guard for the bg rebuild
+
+
+def _reset_tag_index_state() -> None:
+    """Test seam: reset the module-level SWR state to a cold start."""
+    global _last_count_check, _cached_total_count, _rebuild_in_flight  # noqa: PLW0603
+    _last_count_check = 0.0
+    _cached_total_count = 0
+    _rebuild_in_flight = False
+    _tag_index.__init__()  # type: ignore[misc]
+
+
+def _scan_tag_lists(qdrant_client: object, collections: list[str]) -> list[list[str]]:
+    """Scroll every point's tags for a co-occurrence rebuild (SYNC Qdrant).
+
+    Runs off the request path — invoked only inside the background rebuild task
+    (wrapped in a thread), never inline on a recall.
+    """
+    tag_lists: list[list[str]] = []
+    for coll in collections:
+        try:
+            offset = None
+            while True:
+                result = qdrant_client.scroll(  # type: ignore[union-attr]
+                    collection_name=coll,
+                    limit=500,
+                    offset=offset,
+                    with_payload=["tags"],
+                    with_vectors=False,
+                )
+                points, next_offset = result
+                for point in points:
+                    tags = (point.payload or {}).get("tags") or []
+                    if tags:
+                        tag_lists.append(tags)
+                if next_offset is None:
+                    break
+                offset = next_offset
+        except Exception:
+            logger.warning(
+                "Failed to scan tags from %s for co-occurrence index",
+                coll,
+                exc_info=True,
+            )
+    return tag_lists
+
+
+async def _rebuild_tag_index(
+    qdrant_client: object,
+    collections: list[str],
+    total_count: int,
+) -> None:
+    """Background SWR rebuild: scan tags in a thread, rebuild, clear the flag.
+
+    Single-flight — the caller sets ``_rebuild_in_flight`` before scheduling
+    this, and this clears it in a ``finally`` so a scan failure can't wedge the
+    index stale forever.
+    """
+    global _rebuild_in_flight  # noqa: PLW0603
+    try:
+        # The scroll is synchronous Qdrant I/O; keep it off the event loop so a
+        # large-corpus rebuild never blocks concurrent recalls.
+        tag_lists = await asyncio.to_thread(_scan_tag_lists, qdrant_client, collections)
+        _tag_index.build(tag_lists, total_count)
+        logger.info(
+            "Tag co-occurrence index rebuilt in background (%d tag-lists, corpus=%d)",
+            len(tag_lists),
+            total_count,
+        )
+    finally:
+        _rebuild_in_flight = False
 
 
 def _tokenize_query(query: str) -> list[str]:
     """Extract meaningful keywords from a query string."""
     # Remove common stop words and short tokens
     stop_words = {
-        "a", "an", "the", "is", "are", "was", "were", "be", "been",
-        "do", "does", "did", "have", "has", "had", "will", "would",
-        "can", "could", "should", "may", "might", "shall",
-        "in", "on", "at", "to", "for", "of", "with", "by", "from",
-        "it", "its", "this", "that", "these", "those",
-        "i", "we", "you", "he", "she", "they", "me", "us", "my",
-        "what", "why", "how", "when", "where", "which", "who",
-        "about", "and", "or", "not", "but", "so", "if", "then",
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "do",
+        "does",
+        "did",
+        "have",
+        "has",
+        "had",
+        "will",
+        "would",
+        "can",
+        "could",
+        "should",
+        "may",
+        "might",
+        "shall",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "by",
+        "from",
+        "it",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "i",
+        "we",
+        "you",
+        "he",
+        "she",
+        "they",
+        "me",
+        "us",
+        "my",
+        "what",
+        "why",
+        "how",
+        "when",
+        "where",
+        "which",
+        "who",
+        "about",
+        "and",
+        "or",
+        "not",
+        "but",
+        "so",
+        "if",
+        "then",
     }
     tokens = re.findall(r"\w+", query.lower())
     return [t for t in tokens if t not in stop_words and len(t) > 1]
@@ -450,53 +660,47 @@ async def expand_query(
 ) -> str:
     """Expand a query with co-occurring tags for improved FTS5 recall.
 
-    Builds/refreshes the tag co-occurrence index lazily from Qdrant,
-    then appends related terms to the query string.
+    Refreshes the tag co-occurrence index in the BACKGROUND when stale
+    (stale-while-revalidate — see the SWR state block above), then appends
+    related terms to the query string. NEVER rebuilds inline: this runs on the
+    per-prompt recall path, so a stale index triggers a single-flight background
+    rebuild and this call proceeds with the current index (follow-up ac27b693).
 
     Returns the original query if expansion produces no results or
     if Qdrant is unavailable.
     """
-    global _tag_index  # noqa: PLW0603
+    global _last_count_check, _cached_total_count, _rebuild_in_flight  # noqa: PLW0603
 
     try:
-        # Check if index needs rebuilding
-        total_count = 0
-        for coll in collections:
-            try:
-                info = qdrant_client.get_collection(coll)  # type: ignore[union-attr]
-                total_count += info.points_count or 0
-            except Exception:
-                continue
-
-        if _tag_index.is_stale(total_count) and total_count > 0:
-            # Rebuild index by scanning tag metadata
-            tag_lists: list[list[str]] = []
+        # Time-gate the Qdrant point-count poll: the pre-SWR code hit
+        # get_collection on EVERY recall (2 sync HTTP calls/prompt). Re-poll at
+        # most every _COUNT_CHECK_INTERVAL_S; reuse the cached count otherwise.
+        now = time.monotonic()
+        if _last_count_check == 0.0 or (now - _last_count_check) >= _COUNT_CHECK_INTERVAL_S:
+            total_count = 0
             for coll in collections:
                 try:
-                    offset = None
-                    while True:
-                        result = qdrant_client.scroll(  # type: ignore[union-attr]
-                            collection_name=coll,
-                            limit=500,
-                            offset=offset,
-                            with_payload=["tags"],
-                            with_vectors=False,
-                        )
-                        points, next_offset = result
-                        for point in points:
-                            tags = (point.payload or {}).get("tags") or []
-                            if tags:
-                                tag_lists.append(tags)
-                        if next_offset is None:
-                            break
-                        offset = next_offset
+                    info = qdrant_client.get_collection(coll)  # type: ignore[union-attr]
+                    total_count += info.points_count or 0
                 except Exception:
-                    logger.warning(
-                        "Failed to scan tags from %s for co-occurrence index",
-                        coll, exc_info=True,
-                    )
+                    continue
+            _cached_total_count = total_count
+            _last_count_check = now
+        else:
+            total_count = _cached_total_count
 
-            _tag_index.build(tag_lists, total_count)
+        # Stale index → kick ONE background rebuild (single-flight) and proceed
+        # with whatever the index currently holds. Worst case for THIS prompt:
+        # an unexpanded FTS query (a marginal recall dip) instead of a
+        # multi-second inline scroll stall.
+        if total_count > 0 and _tag_index.is_stale(total_count) and not _rebuild_in_flight:
+            _rebuild_in_flight = True
+            from genesis.util.tasks import tracked_task
+
+            tracked_task(
+                _rebuild_tag_index(qdrant_client, list(collections), total_count),
+                name="tag_index_rebuild",
+            )
 
         # Expand query
         keywords = _tokenize_query(query)

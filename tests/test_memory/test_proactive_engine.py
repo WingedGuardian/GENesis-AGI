@@ -293,11 +293,13 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
         kb_slots=None,
         rerank_timeout_s=None,
         stats=None,
+        defer_side_effects=False,
     ):
         captured["extra"] = extra_fts_terms
         captured["rerank"] = rerank
         captured["limit"] = limit
         captured["rerank_timeout_s"] = rerank_timeout_s
+        captured["defer_side_effects"] = defer_side_effects
         return []
 
     with (
@@ -313,6 +315,10 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
     assert captured["rerank"] is True  # cc_hook default
     assert captured["limit"] == 1  # command budget
     assert captured["rerank_timeout_s"] == P._RERANK_TIMEOUT_S  # hot-path timebox threaded
+    # Regression guard (ac27b693): the proactive path MUST defer side effects —
+    # a silent flip back to False reintroduces the concurrent-session latency
+    # regression this PR fixes.
+    assert captured["defer_side_effects"] is True
 
 
 async def test_proactive_context_bumps_surfaced_count_not_invocation():
@@ -352,6 +358,15 @@ async def test_proactive_context_bumps_surfaced_count_not_invocation():
         patch("genesis.memory.proactive._surface_procedure", new=AsyncMock(return_value=proc)),
     ):
         resp = await P.proactive_context(prompt="deploy the latest build", session_id="s")
+
+        # The surfaced_count bump is deferred off the latency path (ac27b693) —
+        # drain the background task before asserting it landed.
+        import asyncio
+
+        for _ in range(20):
+            if any("surfaced_count" in s.lower() for s, _ in mod._db.executed):
+                break
+            await asyncio.sleep(0.02)
 
     assert resp["procedure"] == {"id": "proc-abc", "tier": "CORE"}
     bumps = [(sql, params) for sql, params in mod._db.executed if "surfaced_count" in sql.lower()]
@@ -426,6 +441,7 @@ async def test_proactive_context_requests_noise_filter():
         kb_slots=None,
         rerank_timeout_s=None,
         stats=None,
+        defer_side_effects=False,
     ):
         captured["filter_noise"] = filter_noise
         return []
@@ -454,6 +470,7 @@ async def test_proactive_context_surfaces_engine_stats():
         kb_slots=None,
         rerank_timeout_s=None,
         stats=None,
+        defer_side_effects=False,
     ):
         if stats is not None:
             stats["rerank_executed"] = True
@@ -480,6 +497,7 @@ async def test_proactive_context_surfaces_engine_stats():
         kb_slots=None,
         rerank_timeout_s=None,
         stats=None,
+        defer_side_effects=False,
     ):
         if stats is not None:
             stats["rerank_executed"] = False
