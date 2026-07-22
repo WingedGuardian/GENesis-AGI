@@ -179,6 +179,41 @@ def recall_read_pool_size() -> int:
         return DEFAULT_READ_POOL_SIZE
 
 
+def recall_rerank_gate_off() -> bool:
+    """True when the recall rerank rate-gate + circuit-breaker must NOT be built
+    (kill switch).
+
+    Recall's Voyage rerank normally runs behind a shared rate gate (skip to the
+    RRF+graph floor instead of burning a 429 when over Voyage's RPM) and a
+    timeout-only circuit breaker (skip during a Voyage hang) — follow-up
+    ac27b693, PR-3. This env kill makes the runtime skip building them, so the
+    rerank call is unguarded exactly as before the change — no code change.
+    Default off: the gate+breaker are built.
+    """
+    return os.environ.get("GENESIS_RECALL_RERANK_GATE_OFF", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def recall_rerank_rpm() -> int:
+    """Requests-per-minute the recall rerank rate gate paces Voyage to.
+
+    Voyage's free tier (no payment method) is 3 RPM; paid usage tiers are higher,
+    so this is tunable per install via ``GENESIS_RECALL_RERANK_RPM`` rather than
+    hardcoded (generalizability). Floored at 1; a missing/non-integer value falls
+    back to the free-tier default of 3.
+    """
+    raw = os.environ.get("GENESIS_RECALL_RERANK_RPM", "").strip()
+    if not raw:
+        return 3
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 3
+
+
 def skill_gate_off() -> bool:
     """True when the skill-edit Critic must be suppressed entirely (kill switch).
 

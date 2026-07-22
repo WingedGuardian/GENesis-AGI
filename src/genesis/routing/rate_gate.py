@@ -42,6 +42,23 @@ class ProviderRateGate:
             self._last_request = time.monotonic()
             return max(wait, 0.0)
 
+    async def try_acquire(self) -> bool:
+        """Non-blocking variant of :meth:`acquire`.
+
+        Returns True and reserves the slot if the interval has elapsed; returns
+        False immediately (NO sleep) if a request would be too soon. Use this on
+        latency-critical paths where blocking up to ``interval`` (e.g. 20s at
+        3 RPM) is unacceptable — the caller skips the rate-limited work instead
+        of waiting. Slot accounting is identical to ``acquire`` (same lock, same
+        ``_last_request`` update), so the two may be mixed on one gate.
+        """
+        async with self._lock:
+            now = time.monotonic()
+            if now - self._last_request < self._interval:
+                return False
+            self._last_request = now
+            return True
+
     @property
     def interval(self) -> float:
         return self._interval
@@ -58,7 +75,9 @@ class RateGateRegistry:
         self._gates[provider] = ProviderRateGate(provider, rpm)
         logger.debug(
             "Rate gate registered for %s: %d RPM (%.1fs interval)",
-            provider, rpm, 60.0 / rpm,
+            provider,
+            rpm,
+            60.0 / rpm,
         )
 
     async def acquire(self, provider: str) -> float:

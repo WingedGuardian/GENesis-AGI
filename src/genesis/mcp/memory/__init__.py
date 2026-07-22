@@ -55,6 +55,8 @@ if TYPE_CHECKING:
 
     from genesis.db.connection import ReadConnectionPool
     from genesis.memory.reranker import VoyageReranker
+    from genesis.routing.circuit_breaker import CircuitBreaker
+    from genesis.routing.rate_gate import ProviderRateGate
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,8 @@ def init(
     activity_tracker: object | None = None,
     reranker: VoyageReranker | None = None,
     read_pool: ReadConnectionPool | None = None,
+    rerank_gate: ProviderRateGate | None = None,
+    rerank_breaker: CircuitBreaker | None = None,
     # Backward compat — old callers pass ``embedding_provider``
     embedding_provider: EmbeddingProvider | None = None,
 ) -> None:
@@ -118,12 +122,18 @@ def init(
     # read-only pool must reach it here — wiring it only into rt._hybrid_retriever
     # would leave the very hot path the pool targets bypassing it. Same shared
     # pool instance (bounded connections); None keeps the pre-pool behavior.
+    # rerank_gate/rerank_breaker: same rationale as read_pool — the proactive hot
+    # path reranks through THIS retriever, so the shared gate+breaker must reach it
+    # here (same instances as rt._hybrid_retriever) or Voyage's RPM would be
+    # enforced twice-over (ac27b693, PR-3). None keeps the unguarded behavior.
     _retriever = HybridRetriever(
         embedding_provider=recall_emb,
         qdrant_client=qdrant_client,
         db=db,
         reranker=reranker,
         read_pool=read_pool,
+        rerank_gate=rerank_gate,
+        rerank_breaker=rerank_breaker,
     )
     _user_model_evolver = UserModelEvolver(db=db)
     _bookmark_mgr = BookmarkManager(

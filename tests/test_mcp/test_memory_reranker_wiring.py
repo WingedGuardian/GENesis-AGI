@@ -45,6 +45,8 @@ def _stub_init_deps(monkeypatch) -> dict:
             captured.update(kwargs)
             self._reranker = kwargs.get("reranker")
             self._read_pool = kwargs.get("read_pool")
+            self._rerank_gate = kwargs.get("rerank_gate")
+            self._rerank_breaker = kwargs.get("rerank_breaker")
 
     # Local imports inside init() resolve these attributes at call time, so
     # patching the source module attribute is sufficient.
@@ -108,6 +110,31 @@ def test_init_threads_read_pool_into_retriever(monkeypatch):
 
     assert captured["read_pool"] is sentinel
     assert mem._retriever._read_pool is sentinel
+
+
+def test_init_threads_rerank_gate_and_breaker_into_retriever(monkeypatch):
+    """The proactive hot path is the dominant Voyage consumer and reranks through
+    the MCP retriever, so the shared rate gate + circuit breaker MUST reach it
+    here — and be the SAME instances as rt._hybrid_retriever's, or each retriever
+    would permit the full RPM (ac27b693, PR-3). Same two_retriever_wiring surface
+    as the reranker + read_pool guards above.
+    """
+    captured = _stub_init_deps(monkeypatch)
+    gate = object()
+    breaker = object()
+
+    mem.init(
+        db=MagicMock(),
+        qdrant_client=MagicMock(),
+        embedding_provider=MagicMock(),
+        rerank_gate=gate,
+        rerank_breaker=breaker,
+    )
+
+    assert captured["rerank_gate"] is gate
+    assert captured["rerank_breaker"] is breaker
+    assert mem._retriever._rerank_gate is gate
+    assert mem._retriever._rerank_breaker is breaker
 
 
 def test_init_without_read_pool_is_none(monkeypatch):

@@ -109,3 +109,45 @@ def test_rate_gate_interval():
 
     gate2 = ProviderRateGate("test", rpm=15)
     assert gate2.interval == 4.0
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_first_call_true_no_block():
+    """try_acquire grants the first request and never blocks."""
+    gate = ProviderRateGate("test", rpm=3)  # 20s interval
+    t0 = time.monotonic()
+    assert await gate.try_acquire() is True
+    assert time.monotonic() - t0 < 0.1
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_denies_within_interval_instantly():
+    """A second try_acquire inside the interval returns False IMMEDIATELY —
+    unlike acquire(), it must not sleep ~20s at 3 RPM."""
+    gate = ProviderRateGate("test", rpm=3)
+    assert await gate.try_acquire() is True
+    t0 = time.monotonic()
+    assert await gate.try_acquire() is False
+    assert time.monotonic() - t0 < 0.1  # returned instantly, did NOT block
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_grants_after_interval():
+    """Once the interval has elapsed, try_acquire grants again. Driven by
+    rewinding _last_request so the test is wall-clock-independent (no real sleep)."""
+    gate = ProviderRateGate("test", rpm=3)
+    assert await gate.try_acquire() is True
+    assert await gate.try_acquire() is False
+    gate._last_request = time.monotonic() - gate.interval - 0.01
+    assert await gate.try_acquire() is True
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_denial_does_not_advance_window():
+    """A denied try_acquire must NOT reserve the slot — otherwise repeated denials
+    would push _last_request forward and could starve the caller indefinitely."""
+    gate = ProviderRateGate("test", rpm=3)
+    assert await gate.try_acquire() is True
+    last = gate._last_request
+    assert await gate.try_acquire() is False
+    assert gate._last_request == last
