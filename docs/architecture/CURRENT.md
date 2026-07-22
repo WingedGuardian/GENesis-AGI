@@ -555,9 +555,10 @@ verified: b662f3e3 2026-07-17
   retrieves+ranks candidates over four lanes — vector, decisions
   (`tags~decision`, the OMI-incident class), entity-keyword drift, and
   the **entity lane** (ledger keywords → entity nodes → ≤2 typed hops →
-  mentions; `ranking.ENTITY_LANE_MODE`, SHADOW — entity-only hits ride
-  `entity_shadow` telemetry, never candidates, until the OMI-replay-
-  gated flip) — all Qdrant lanes EXACT search (filtered HNSW without
+  mentions; `ranking.ENTITY_LANE_MODE`, LIVE since the E4b flip (#993) —
+  entity hits rank normally with a reserved floor of 2, and the verdict's
+  `entity_candidates` count reports the live lane's contribution) — all
+  Qdrant lanes EXACT search (filtered HNSW without
   payload indexes drops valid results; found 2026-07-09). Headless-
   Haiku arbiter judges candidates per fire (fail-closed parse, group-
   kill on timeout). Verdicts → `ambient_verdict.json`, tuning →
