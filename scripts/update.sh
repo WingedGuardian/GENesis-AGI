@@ -1314,6 +1314,16 @@ fi
 _write_state "health_check"
 
 # ── Restart services ──────────────────────────────────────
+# P5 GUARDRAIL: this final restart runs while the armed `_on_signal TERM` trap is
+# STILL live (disarmed only at the success `trap - ERR INT TERM` below). That is
+# safe TODAY only because the completing update path (the dashboard orchestrator)
+# is cgroup-isolated via `systemd-run --scope`, so `_start_genesis_server`'s
+# internal `systemctl stop`/`restart` does NOT signal this process. The
+# `_apply_direct` path (dashboard, supervised=False) does NOT scope-isolate and
+# stays in genesis-server.service's cgroup — a pre-existing bug. When P5 fixes
+# `_apply_direct`, the fix MUST be scope isolation (systemd-run --scope), NOT a
+# handler tweak: otherwise this restart's stop-phase would self-SIGTERM →
+# _on_signal → a SPURIOUS rollback of a healthy, fully-migrated deploy.
 if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     echo "--- Restarting services ---"
 
