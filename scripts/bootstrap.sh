@@ -737,30 +737,65 @@ claude() {
 WRAPEOF
 touch "$BASHRC"
 if grep -qF "# >>> genesis tmux-wrap >>>" "$BASHRC" 2>/dev/null; then
-    # Replace the existing block in place (idempotent update path).
-    GENESIS_TMUX_WRAP_BLOCK="$TMUX_WRAP_BLOCK" python3 - "$BASHRC" <<'PYEOF'
+    # Replace the existing block in place (idempotent update path). Capture the
+    # python rc (`|| _tw_rc=$?` keeps set -e from aborting): 0 = rewritten,
+    # 2 = damaged block left untouched (do NOT claim it refreshed), other = a
+    # real write error to surface.
+    _tw_rc=0
+    GENESIS_TMUX_WRAP_BLOCK="$TMUX_WRAP_BLOCK" python3 - "$BASHRC" <<'PYEOF' || _tw_rc=$?
 import os
 import sys
+import tempfile
 
 path = sys.argv[1]
 begin = "# >>> genesis tmux-wrap >>>"
 end = "# <<< genesis tmux-wrap <<<"
 block = os.environ["GENESIS_TMUX_WRAP_BLOCK"]
 lines = open(path).read().splitlines()
-out, skipping = [], False
-for line in lines:
-    if line.strip() == begin:
-        skipping = True
-        continue
-    if line.strip() == end:
-        skipping = False
-        continue
-    if not skipping:
-        out.append(line)
+
+# Locate the FIRST well-formed begin..end pair and replace only that. A BEGIN
+# with NO matching END after it is a damaged/half-written block (e.g. a prior
+# crash mid-append) — the old code set `skipping=True` at BEGIN and cleared it
+# only at END, so a missing END swallowed everything from BEGIN to EOF,
+# DELETING any user content below the block. Refuse that: leave ~/.bashrc
+# untouched and warn.
+b = next((i for i, ln in enumerate(lines) if ln.strip() == begin), None)
+if b is not None:
+    e = next((i for i in range(b + 1, len(lines)) if lines[i].strip() == end), None)
+    if e is None:
+        sys.stderr.write(
+            "  WARNING: ~/.bashrc has an unterminated genesis tmux-wrap block "
+            "(missing end sentinel) — leaving it untouched; fix it manually.\n")
+        sys.exit(2)  # distinct rc: the caller must NOT claim it refreshed
+    out = lines[:b] + lines[e + 1:]
+else:
+    out = lines
+
 text = "\n".join(out).rstrip("\n")
-open(path, "w").write(text + "\n\n" + block + "\n")
+new = (text + "\n\n" if text else "") + block + "\n"
+
+# Atomic write: a temp file in the SAME dir + os.replace (atomic rename on
+# POSIX) so a crash between open and write can never leave ~/.bashrc truncated.
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".bashrc.genesis-tmp.")
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(new)
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PYEOF
-    echo "  tmux-wrap block refreshed in ~/.bashrc"
+    if [ "$_tw_rc" -eq 0 ]; then
+        echo "  tmux-wrap block refreshed in ~/.bashrc"
+    elif [ "$_tw_rc" -eq 2 ]; then
+        echo "  tmux-wrap block left untouched — ~/.bashrc has a damaged block; fix it manually (see warning above)"
+    else
+        echo "  WARNING: could not update tmux-wrap block in ~/.bashrc (rc=$_tw_rc)"
+    fi
 else
     printf '\n%s\n' "$TMUX_WRAP_BLOCK" >> "$BASHRC"
     echo "  tmux-wrap block installed in ~/.bashrc"
