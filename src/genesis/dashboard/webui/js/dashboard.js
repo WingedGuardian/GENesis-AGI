@@ -194,6 +194,12 @@
         commsRejectingId: null,
         commsRejectReason: '',
 
+        // ── Directives & goals (ego visibility — read + user retire) ──
+        // Shared by the Chat-tab strips and the ego-modal Overview card.
+        egoDirectives: { active: [], resolved: [] },
+        egoGoals: { user: [], genesis_ego: [] },
+        retiringDirectiveId: null,
+
         // ── Memory tab state ──────────────────────────────────────
         memorySearch: { query: "", results: [], loading: false },
         memoryRecent: { items: [], total: 0, loading: false },
@@ -510,7 +516,7 @@
             case "chat":
               // Re-fit terminal on tab re-entry
               if (!first && this._xterm && this._fitAddon) { this._fitAddon.fit(); }
-              if (first) { this.fetchComms(); this.fetchApprovals(); }
+              if (first) { this.fetchComms(); this.fetchApprovals(); this.fetchEgoDirectivesGoals(); }
               this._commsInterval = setInterval(() => this.fetchComms(), 15000);
               this._approvalsInterval = setInterval(() => this.fetchApprovals(), 15000);
               break;
@@ -3820,6 +3826,15 @@
           })[src] || "Ego";
         },
 
+        // Provenance labels for the directives/goals visibility panels.
+        // ego_target = which ego a directive steers; origin = who owns a goal.
+        egoTargetLabel(t) {
+          return ({ genesis_ego: "Genesis", user_ego: "User" })[t] || t || "?";
+        },
+        goalOriginLabel(o) {
+          return ({ genesis_ego: "Genesis", user: "User" })[o] || o || "?";
+        },
+
         // Acknowledge-only eval rows (j9/gauntlet) — never approvable. Kept in
         // sync with ego/types.py::INFORMATIONAL_ACTION_TYPES.
         isInformationalProposal(p) {
@@ -4153,6 +4168,8 @@
 
         async fetchEgoDetail() {
           this.startModalFetch("egoModal");
+          // Refresh the shared directives/goals panels alongside the modal open.
+          this.fetchEgoDirectivesGoals();
           try {
             const [statusR, cadenceR, cyclesR, proposalsR, followUpsR, vcrR] = await Promise.all([
               fetchApi("/api/genesis/ego/status"),
@@ -4187,6 +4204,37 @@
               await this.fetchEgoDetail();
             }
           } catch (e) { console.warn("Proposal resolve failed:", e); }
+        },
+
+        // Directives + own/user goals — populated on Chat-tab entry, on ego-modal
+        // open, and after a retire. Not polled: these change rarely, so a 15s
+        // loop would be wasted work.
+        async fetchEgoDirectivesGoals() {
+          try {
+            const [dR, gR] = await Promise.all([
+              fetchApi("/api/genesis/ego/directives"),
+              fetchApi("/api/genesis/ego/goals"),
+            ]);
+            if (dR?.ok) this.egoDirectives = await dR.json();
+            if (gR?.ok) this.egoGoals = await gR.json();
+          } catch { /* silent — panels show empty */ }
+        },
+
+        // User-driven retire of a standing directive (default: cancelled).
+        async retireDirective(id, status) {
+          this.retiringDirectiveId = id;
+          try {
+            const resp = await fetchApi("/api/genesis/ego/directives/" + id + "/resolve", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ status: status || "cancelled" }),
+            });
+            if (resp?.ok) { await this.fetchEgoDirectivesGoals(); }
+          } catch (e) {
+            console.warn("Directive retire failed:", e);
+          } finally {
+            this.retiringDirectiveId = null;
+          }
         },
 
         async fetchOutreachMessages() {
