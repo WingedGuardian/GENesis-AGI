@@ -300,8 +300,8 @@
                         <span style="font-weight: 600;">Response:</span> <span x-text="p.user_response"></span>
                       </div>
                     </template>
-                    <!-- Approve/Reject buttons (pending only) -->
-                    <template x-if="p.status === 'pending'">
+                    <!-- Approve/Reject buttons (pending, non-informational only) -->
+                    <template x-if="p.status === 'pending' && !$store.genesisDashboard.isInformationalProposal(p)">
                       <div style="margin-top: 0.5rem; display: flex; gap: 0.4rem; align-items: center;">
                         <button style="font-size: 0.72rem; padding: 0.25rem 0.8rem; border-radius: 4px; border: 1px solid #4caf50; background: rgba(76,175,80,0.1); color: #4caf50; cursor: pointer;"
                                 @click="$store.genesisDashboard.resolveEgoProposal(p.id, 'approved', '')">Approve</button>

@@ -696,6 +696,12 @@ class ProposalWorkflow:
         indexes into list_proposals_by_batch (ALL proposals, not just pending).
         """
         pending = await ego_crud.list_pending_proposals(self._db)
+        # Informational eval rows (j9/gauntlet) are acknowledge-only — a bulk
+        # "approve all pending" must never sweep them into a resolution. (Today
+        # they also carry a NULL batch_id and would fall out of the per-batch
+        # grouping below, but that is incidental; this makes the exclusion
+        # explicit so the no-approval invariant can't regress.)
+        pending, _informational = partition_informational(pending)
         if not pending:
             return {}
 

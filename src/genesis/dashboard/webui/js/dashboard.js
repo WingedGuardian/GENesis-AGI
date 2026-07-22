@@ -3794,6 +3794,14 @@
           })[src] || "Ego";
         },
 
+        // Acknowledge-only eval rows (j9/gauntlet) — never approvable. Kept in
+        // sync with ego/types.py::INFORMATIONAL_ACTION_TYPES.
+        isInformationalProposal(p) {
+          return ["j9_regression", "gauntlet_regression"].includes(
+            p && p.action_type,
+          );
+        },
+
         // 5-state chip helpers over the shared status semantics (spec §3.3).
         // Layered onto the existing .status-chip pill: chip--* supplies the
         // canonical color + background tint; the glyph is color-blind support.

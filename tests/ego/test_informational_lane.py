@@ -55,3 +55,43 @@ def test_partition_missing_action_type_is_approval():
     approval, informational = partition_informational([{"id": "x"}])
     assert [p["id"] for p in approval] == ["x"]
     assert informational == []
+
+
+async def test_bulk_approve_all_pending_skips_informational():
+    """`approve all pending` (cross-batch resolve) must not sweep acknowledge-only
+    eval rows into a resolution."""
+    import aiosqlite
+
+    from genesis.db.crud import ego as ego_crud
+    from genesis.db.schema import create_all_tables
+    from genesis.ego.proposals import ProposalWorkflow
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await create_all_tables(conn)
+    await ego_crud.create_proposal(
+        conn,
+        id="real1",
+        action_type="investigate",
+        content="real proposal",
+        batch_id="batch_a",
+    )
+    await ego_crud.create_proposal(
+        conn,
+        id="j9a",
+        action_type="j9_regression",
+        action_category="memory",
+        content="eval notice",
+        ego_source="j9_eval",
+    )
+    try:
+        results = await ProposalWorkflow(db=conn).resolve_all_pending_proposals(
+            "approved",
+        )
+        assert "real1" in results
+        assert "j9a" not in results
+        assert (await ego_crud.get_proposal(conn, "real1"))["status"] == "approved"
+        # Informational row untouched — still pending, never acknowledged.
+        assert (await ego_crud.get_proposal(conn, "j9a"))["status"] == "pending"
+    finally:
+        await conn.close()
