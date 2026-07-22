@@ -238,6 +238,7 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             on_event=on_event,
             thread_id=tid,
             session_key=interrupt_key(*ikey),
+            chat_id=str(msg.chat.id),
         )
         log.info("Response to %s (%d chars)", user.id, len(response or ""))
 
@@ -421,6 +422,7 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             on_event=on_event,
             thread_id=tid,
             session_key=interrupt_key(*ikey),
+            chat_id=str(msg.chat.id),
         )
         log.info("Voice response to %s (%d chars)", user.id, len(response or ""))
 
@@ -609,6 +611,7 @@ async def _handle_media_inner(
             on_event=on_event,
             thread_id=tid,
             session_key=interrupt_key(*ikey),
+            chat_id=str(msg.chat.id),
         )
         log.info("Media response to %s (%d chars)", user.id, len(response or ""))
 

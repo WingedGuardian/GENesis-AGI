@@ -46,6 +46,7 @@ class SessionManager:
         model: CCModel = CCModel.SONNET,
         effort: EffortLevel = EffortLevel.MEDIUM,
         thread_id: str | None = None,
+        chat_id: str | None = None,
     ) -> dict:
         ch = str(channel)
         existing = await cc_sessions.get_active_foreground(
@@ -74,6 +75,7 @@ class SessionManager:
             last_activity_at=now,
             source_tag="foreground",
             thread_id=thread_id,
+            chat_id=chat_id,
         )
         return await cc_sessions.get_by_id(self._db, sess_id)
 

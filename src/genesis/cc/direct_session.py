@@ -1450,6 +1450,7 @@ class DirectSessionRunner:
     @staticmethod
     def _resolve_origin_target(
         channel: str | None,
+        chat_id: str | None,
         user_id: str,
         thread_id_raw: object,
         forum_chat_id: str | None,
@@ -1457,25 +1458,31 @@ class DirectSessionRunner:
         """Resolve a Telegram ``(chat_id, message_thread_id)`` delivery target
         from an origin ``cc_sessions`` row.
 
-        Returns ``(None, None)`` when the origin cannot be addressed: a
-        non-telegram channel, a forum-topic origin with no forum chat
-        configured, or a DM whose numeric chat id isn't recoverable.
+        Prefers the persisted origin ``chat_id`` (captured at intake) — correct
+        for a DM, a group, AND a forum topic uniformly (a forum topic's
+        ``chat.id`` *is* the supergroup). Falls back to best-effort
+        reconstruction for legacy rows written before ``chat_id`` was captured.
+        Returns ``(None, None)`` when the origin cannot be addressed.
         """
         if channel != "telegram":
             return None, None
-        # Forum-topic origin: the chat is the forum supergroup and the thread is
-        # the persisted topic id (which provably exists — the origin message came
-        # from it). Requires forum_chat_id to be configured.
+        tid: int | None = None
         if thread_id_raw:
             try:
                 tid = int(thread_id_raw)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return None, None
-            if forum_chat_id:
-                return str(forum_chat_id), tid
-            return None, None
-        # DM origin (no forum thread): the chat id equals the Telegram user id,
-        # stored on the row as ``tg-<id>``.
+        # Preferred: the real origin chat id. Handles DM / group / forum topic.
+        if chat_id:
+            return str(chat_id), tid
+        # --- Legacy fallback (rows predating chat_id capture) ---
+        # Forum-topic origin without a persisted chat: the supergroup, if set.
+        if tid is not None:
+            return (str(forum_chat_id), tid) if forum_chat_id else (None, None)
+        # DM origin: the chat id equals the Telegram user id (``tg-<id>``).
+        # NOTE: a legacy no-thread GROUP origin is indistinguishable from a DM
+        # here and would resolve to the user's DM — the exact gap the persisted
+        # chat_id closes for all new sessions.
         if user_id.startswith("tg-"):
             num = user_id[3:]
             if num.lstrip("-").isdigit():
@@ -1525,6 +1532,7 @@ class DirectSessionRunner:
 
             chat_id, thread_id = self._resolve_origin_target(
                 origin.get("channel"),
+                origin.get("chat_id"),
                 origin.get("user_id") or "",
                 origin.get("thread_id"),
                 getattr(pipeline, "_forum_chat_id", None),

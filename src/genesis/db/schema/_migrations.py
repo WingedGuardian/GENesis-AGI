@@ -105,6 +105,13 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN thread_id TEXT",
         "cc_sessions.thread_id")
+    # Origin chat id (2026-07-22): the real Telegram chat.id at intake, so a
+    # background RESULT delivery reaches the exact origin (DM, group, or forum
+    # topic) instead of assuming every no-thread origin is a DM.
+    await _try_alter(
+        db,
+        "ALTER TABLE cc_sessions ADD COLUMN chat_id TEXT",
+        "cc_sessions.chat_id")
 
     # Phase 9: rate limit tracking on cc_sessions
     await _try_alter(db,

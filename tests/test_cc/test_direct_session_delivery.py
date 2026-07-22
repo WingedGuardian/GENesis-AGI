@@ -55,26 +55,46 @@ class TestDeliveryModeDerivation:
 class TestResolveOriginTarget:
     f = staticmethod(DirectSessionRunner._resolve_origin_target)
 
-    def test_dm_origin(self):
-        # No forum thread → DM; chat id == the numeric telegram user id.
-        assert self.f("telegram", "tg-12345678", None, "-100999") == ("12345678", None)
+    # --- Preferred path: persisted chat_id (all new sessions) ---
+    def test_dm_uses_persisted_chat_id(self):
+        assert self.f("telegram", "12345678", "tg-12345678", None, "-100999") == (
+            "12345678",
+            None,
+        )
 
-    def test_forum_topic_origin(self):
-        # Forum thread → the supergroup chat + the topic id.
-        assert self.f("telegram", "tg-12345678", "110", "-100999") == ("-100999", 110)
+    def test_group_uses_persisted_chat_id(self):
+        # A group chat (chat.id != user.id, no thread) delivers to the GROUP, not
+        # the user's DM — the exact misroute the persisted chat_id closes.
+        assert self.f("telegram", "-100555", "tg-12345678", None, "-100999") == (
+            "-100555",
+            None,
+        )
 
-    def test_forum_without_configured_chat_unaddressable(self):
-        assert self.f("telegram", "tg-12345678", "110", None) == (None, None)
+    def test_forum_uses_persisted_chat_id_and_thread(self):
+        assert self.f("telegram", "-100999", "tg-12345678", "110", "-100999") == (
+            "-100999",
+            110,
+        )
 
-    def test_non_numeric_user_unaddressable(self):
-        assert self.f("telegram", "tg-notanumber", None, "-100999") == (None, None)
-
-    def test_non_telegram_channel_unaddressable(self):
-        assert self.f("terminal", "tg-1", None, "-100999") == (None, None)
-        assert self.f(None, "tg-1", None, "-100999") == (None, None)
+    def test_non_telegram_unaddressable(self):
+        assert self.f("terminal", "999", "tg-1", None, "-100999") == (None, None)
+        assert self.f(None, "999", "tg-1", None, "-100999") == (None, None)
 
     def test_bad_thread_id_unaddressable(self):
-        assert self.f("telegram", "tg-1", "not-an-int", "-100999") == (None, None)
+        assert self.f("telegram", "999", "tg-1", "not-an-int", "-100999") == (None, None)
+
+    # --- Legacy fallback: chat_id absent (rows predating capture) ---
+    def test_legacy_dm_reconstructs_from_user_id(self):
+        assert self.f("telegram", None, "tg-12345678", None, "-100999") == ("12345678", None)
+
+    def test_legacy_forum_uses_forum_chat_id(self):
+        assert self.f("telegram", None, "tg-1", "110", "-100999") == ("-100999", 110)
+
+    def test_legacy_forum_without_chat_unaddressable(self):
+        assert self.f("telegram", None, "tg-1", "110", None) == (None, None)
+
+    def test_legacy_non_numeric_user_unaddressable(self):
+        assert self.f("telegram", None, "tg-notanumber", None, "-100999") == (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +119,7 @@ def _runner_with_pipeline(db):
     return runner, pipeline
 
 
-async def _make_origin(db, *, session_id, channel, user_id, thread_id=None):
+async def _make_origin(db, *, session_id, channel, user_id, thread_id=None, chat_id=None):
     await cc_sessions.create(
         db,
         id=session_id,
@@ -110,6 +130,7 @@ async def _make_origin(db, *, session_id, channel, user_id, thread_id=None):
         user_id=user_id,
         channel=channel,
         thread_id=thread_id,
+        chat_id=chat_id,
     )
 
 
@@ -146,6 +167,27 @@ class TestDeliverResultToOrigin:
         sent = pipeline.submit_urgent.call_args.args[0]
         assert sent.target_chat_id == "-1002000"  # the forum supergroup
         assert sent.target_thread_id == 110
+
+    async def test_group_chat_delivery_uses_persisted_chat_id(self, db):
+        # A group-chat origin (chat.id != user.id, no thread) must deliver to the
+        # GROUP, not the requesting user's DM. Regression guard for the Codex P2.
+        await _make_origin(
+            db,
+            session_id="o-grp",
+            channel="telegram",
+            user_id="tg-12345678",
+            chat_id="-100555",
+        )
+        runner, pipeline = _runner_with_pipeline(db)
+        req = DirectSessionRequest(
+            prompt="x", delivery_mode=DeliveryMode.RESULT, origin_session_id="o-grp"
+        )
+        res = DirectSessionResult(session_id="sg", success=True, output_text="group report")
+        await runner._deliver_result_to_origin(req, res)
+
+        sent = pipeline.submit_urgent.call_args.args[0]
+        assert sent.target_chat_id == "-100555"  # the group, NOT tg-12345678's DM
+        assert sent.target_thread_id is None
 
     async def test_failure_delivered_to_origin(self, db):
         await _make_origin(db, session_id="o-f", channel="telegram", user_id="tg-1")
