@@ -21,6 +21,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   overwrites a newer local file with an older backup copy (a `cp` quirk on newer
   systems used to); and local-config setup fails with a clear "install PyYAML"
   message up front instead of a raw traceback after you've answered every prompt.
+- **The knowledge base no longer fills with Genesis's own operational
+  telemetry.** Background maintenance and eval tasks (DB maintenance, disk
+  cleanup, model/J9 evals, backup verification, research/prompt-review
+  intermediates) were routing their point-in-time status reports into the
+  knowledge base as if they were durable, recallable knowledge — growing it to
+  ~71% operational noise and crowding out real ingested content. Those tasks no
+  longer write to the knowledge base, a one-time cleanup removes the historical
+  telemetry rows on the next restart, and crawled external intelligence
+  (model/GitHub/web scans) is now correctly labelled as external-world content
+  rather than Genesis's own memory.
 
 - **Per-prompt memory recall no longer silently degrades on busy installs.**
   The server-side recall budget behind the proactive memory hook was sized
