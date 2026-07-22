@@ -34,6 +34,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Two updates can no longer run at the same time.** If an update is already in
+  progress, a second `update.sh` (from another session, or the dashboard) now
+  refuses immediately instead of running concurrently — previously two updates
+  could overlap, each stopping the server and merging, and corrupt the deploy.
 - **An interrupted update no longer leaves the server down.** If a self-update
   is interrupted after it has stopped the server (a Ctrl-C, a system shutdown,
   or an unexpected failure inside an internal step), it now rolls back to the
