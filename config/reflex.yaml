@@ -1,0 +1,11 @@
+# Reflex arc — autonomous self-bug detection.
+# Spec: docs/superpowers/specs/2026-07-21-reflex-arc-design.md
+#
+# PR1 ships the afferent nerve DARK. `ingest_enabled` gates BOTH the
+# default-event-bus wiring for tracked_task failures AND reflex signal-store
+# ingestion (store-only — no cards, no sessions, no LLM calls in P0/PR1).
+#
+# Turning ON requires a server restart (the subscriber registers at init).
+# Turning OFF is honored live within ~30s. Env kill switch:
+# GENESIS_REFLEX_INGEST_OFF=1 wins over any value here.
+ingest_enabled: false

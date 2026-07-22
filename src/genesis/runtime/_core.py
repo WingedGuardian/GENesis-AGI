@@ -237,6 +237,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._task_dispatch_poll: asyncio.Task | None = None
         self._build_lane: object | None = None
         self._build_lane_poll: asyncio.Task | None = None
+        self._reflex_ingestor: object | None = None
         self._direct_session_runner: object | None = None
         self._direct_session_poll: asyncio.Task | None = None
         self._ego_session: object | None = None  # User ego (primary)
@@ -457,6 +458,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         if _full:
             await self._run_init_step_async("tasks", self._init_tasks)
+
+        if _full:
+            await self._run_init_step_async("reflex", self._init_reflex)
         self._run_init_step("guardian", self._probe_guardian_status)
 
         if _full:
@@ -469,7 +473,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # host plane; non-blocking (spawns a delayed background refresh).
         if _full:
             await self._run_init_step_async(
-                "infra_profile", self._init_infra_profile,
+                "infra_profile",
+                self._init_infra_profile,
             )
 
         if _full:
@@ -632,6 +637,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             ("campaign_runner", self._campaign_runner),
             ("awareness_loop", self._awareness_loop),
             ("cc_fallback_probe", self._cc_fallback_probe_worker),
+            ("reflex_ingestor", self._reflex_ingestor),
         ]:
             if component is None:
                 continue

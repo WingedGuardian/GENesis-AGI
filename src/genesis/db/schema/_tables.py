@@ -2000,6 +2000,86 @@ TABLES = {
             snapshot_at  TEXT NOT NULL
         )
     """,
+    # Reflex arc P0 (spec: docs/superpowers/specs/2026-07-21-reflex-arc-design.md).
+    # reflex_signals: one row per failure fingerprint, upsert-deduped
+    # (occurrence_count), full Tier-0 lifecycle in `status`. Later-phase
+    # statuses/columns (outcome_label, fix ids) ship now so the lifecycle
+    # CHECK never needs a rebuild migration.
+    "reflex_signals": """
+        CREATE TABLE IF NOT EXISTS reflex_signals (
+            id                  TEXT PRIMARY KEY,
+            fingerprint         TEXT NOT NULL UNIQUE,
+            class_key           TEXT NOT NULL,
+            task_name           TEXT NOT NULL,
+            subsystem           TEXT NOT NULL,
+            error_type          TEXT NOT NULL,
+            last_error_message  TEXT,
+            traceback_tail      TEXT,
+            status              TEXT NOT NULL DEFAULT 'new'
+                                  CHECK (status IN (
+                                    'new','carded_diagnose','diagnosing','diagnose_failed',
+                                    'diagnosed','carded_fix','fix_dispatched','fix_failed',
+                                    'pr_open','merged','resolved',
+                                    'dismissed_notbug','dismissed_wontfix','card_expired')),
+            occurrence_count    INTEGER NOT NULL DEFAULT 1,
+            first_seen_at       TEXT NOT NULL,
+            last_seen_at        TEXT NOT NULL,
+            reopen_count        INTEGER NOT NULL DEFAULT 0,
+            reopened_at         TEXT,
+            muted_until         TEXT,
+            active_diagnosis_id TEXT,
+            diagnose_request_id TEXT,
+            fix_request_id      TEXT,
+            task_id             TEXT,
+            pr_url              TEXT,
+            outcome_label       TEXT,
+            created_at          TEXT NOT NULL,
+            updated_at          TEXT NOT NULL
+        )
+    """,
+    # reflex_diagnoses: one row per Tier-0 diagnose session round (PR2 writes).
+    "reflex_diagnoses": """
+        CREATE TABLE IF NOT EXISTS reflex_diagnoses (
+            id                  TEXT PRIMARY KEY,
+            signal_id           TEXT NOT NULL,
+            session_id          TEXT,
+            status              TEXT NOT NULL DEFAULT 'running'
+                                  CHECK (status IN ('running','completed','failed','unparseable')),
+            artifact_json       TEXT,
+            artifact_text       TEXT,
+            root_cause          TEXT,
+            fix_plan_summary    TEXT,
+            blast_radius        TEXT,
+            stated_confidence   REAL,
+            predicted_success_p REAL,
+            prediction_features TEXT,
+            model_used          TEXT,
+            created_at          TEXT NOT NULL,
+            completed_at        TEXT
+        )
+    """,
+    # reflex_verdicts: the taste corpus — every human verdict in the arc as a
+    # self-contained (context, judgment) example. Never pruned by design
+    # (spec §9: "never throw away a verdict"); non-human rows (expiry) are
+    # filterable via resolved_by.
+    "reflex_verdicts": """
+        CREATE TABLE IF NOT EXISTS reflex_verdicts (
+            id                  TEXT PRIMARY KEY,
+            signal_id           TEXT NOT NULL,
+            diagnosis_id        TEXT,
+            verdict_point       TEXT NOT NULL
+                                  CHECK (verdict_point IN
+                                    ('diagnose_card','fix_card','pr_merge','promotion')),
+            verdict             TEXT NOT NULL
+                                  CHECK (verdict IN (
+                                    'execute','dismiss_notbug','dismiss_wontfix',
+                                    'expired','merged','closed_unmerged')),
+            resolved_by         TEXT NOT NULL,
+            approval_request_id TEXT,
+            context_snapshot    TEXT NOT NULL,
+            created_at          TEXT NOT NULL
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2328,6 +2408,11 @@ INDEXES = [
     # Voice graduation quarantine (W0) — serves the W2 drainer's pending scan
     # and the dispositioned-only prune
     "CREATE INDEX IF NOT EXISTS idx_graduation_events_disposition ON graduation_events(disposition, received_at)",
+    # Reflex arc P0 — lane polling scans by status; class analytics by class_key
+    "CREATE INDEX IF NOT EXISTS idx_reflex_signals_status ON reflex_signals(status)",
+    "CREATE INDEX IF NOT EXISTS idx_reflex_signals_class ON reflex_signals(class_key)",
+    "CREATE INDEX IF NOT EXISTS idx_reflex_diagnoses_signal ON reflex_diagnoses(signal_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_reflex_verdicts_signal ON reflex_verdicts(signal_id, created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

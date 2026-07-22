@@ -45,6 +45,7 @@ from genesis.runtime.init import (
     pipeline,
     providers,
     reflection,
+    reflex,
     router,
     secrets,
     surplus,
@@ -136,28 +137,37 @@ class _InitDelegatesMixin:
     async def _init_tasks(self) -> None:
         await tasks.init(self)
 
+    async def _init_reflex(self) -> None:
+        await reflex.init(self)
+
     def _selfheal_credentials_startup(self) -> None:
         from genesis.runtime.init.cred_integrity import selfheal_startup
+
         selfheal_startup(self)
 
     def _init_cred_integrity(self) -> None:
         from genesis.runtime.init.cred_integrity import wire
+
         wire(self)
 
     def _init_alert_drain(self) -> None:
         from genesis.runtime.init.alert_drain import wire
+
         wire(self)
 
     async def _init_guardian_monitoring(self) -> None:
         from genesis.runtime.init.guardian import init_guardian_monitoring
+
         await init_guardian_monitoring(self)
 
     async def _init_sentinel(self) -> None:
         from genesis.runtime.init.sentinel import init_sentinel
+
         await init_sentinel(self)
 
     async def _init_infra_profile(self) -> None:
         from genesis.runtime.init.infra_profile import init_infra_profile
+
         await init_infra_profile(self)
 
     def _probe_guardian_status(self) -> None:
@@ -171,6 +181,7 @@ class _InitDelegatesMixin:
         """
         import json
         from datetime import UTC, datetime
+
         heartbeat_path = Path.home() / ".genesis" / "guardian_heartbeat.json"
         try:
             data = json.loads(heartbeat_path.read_text())

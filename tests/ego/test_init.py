@@ -228,6 +228,7 @@ class TestReactiveDomainGate:
             patch("genesis.ego.dispatch.EgoDispatcher"),
         ):
             from genesis.ego.types import EgoConfig
+
             mock_config = EgoConfig(enabled=True)
             mock_load.return_value = mock_config
             mock_cadence = AsyncMock()
@@ -250,3 +251,56 @@ class TestReactiveDomainGate:
 
             await callback(_evt("routing", "budget.exceeded"))
             mock_cadence.push_reactive_event.assert_called_once()
+
+
+class TestReflexOwnedGate:
+    """task.failed belongs to the reflex arc — never a per-failure reactive
+    ego cycle. The ego's reactive dedup keys on the message (which embeds the
+    variable exception payload), so a fail-in-a-loop would bypass it and
+    re-run the event-burst storm mode (see ego/cadence.py)."""
+
+    def test_task_failed_is_reflex_owned(self):
+        assert ego._is_reflex_owned_event("task.failed") is True
+
+    def test_other_events_not_reflex_owned(self):
+        assert ego._is_reflex_owned_event("all_exhausted") is False
+        assert ego._is_reflex_owned_event("guardian.code_drift") is False
+
+    @pytest.mark.asyncio
+    async def test_wiring_gates_task_failed_any_subsystem_and_severity(self):
+        """Through the subscriber closure: task.failed never reaches the
+        reactive OR escalation path, regardless of subsystem or severity."""
+        rt = _make_runtime()
+        with (
+            patch("genesis.ego.config.load_ego_config") as mock_load,
+            patch("genesis.ego.session.EgoSession"),
+            patch("genesis.ego.cadence.EgoCadenceManager") as mock_cadence_cls,
+            patch("genesis.ego.compaction.CompactionEngine"),
+            patch("genesis.ego.context.EgoContextBuilder"),
+            patch("genesis.ego.proposals.ProposalWorkflow"),
+            patch("genesis.ego.dispatch.EgoDispatcher"),
+        ):
+            from genesis.ego.types import EgoConfig
+
+            mock_load.return_value = EgoConfig(enabled=True)
+            mock_cadence = AsyncMock()
+            mock_cadence.push_reactive_event = MagicMock()
+            mock_cadence.push_escalation_event = MagicMock()
+            mock_cadence_cls.return_value = mock_cadence
+
+            await ego.init(rt)
+            callback = rt._event_bus.subscribe.call_args.args[0]
+
+            def _evt(subsystem, severity):
+                e = MagicMock()
+                e.subsystem = subsystem
+                e.event_type = "task.failed"
+                e.severity.name = severity
+                e.message = f"Background task failed in {subsystem}"
+                return e
+
+            await callback(_evt("health", "ERROR"))
+            await callback(_evt("memory", "ERROR"))
+            await callback(_evt("awareness", "CRITICAL"))
+            mock_cadence.push_reactive_event.assert_not_called()
+            mock_cadence.push_escalation_event.assert_not_called()

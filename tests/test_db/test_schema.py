@@ -78,6 +78,9 @@ EXPECTED_TABLES = [
     "graduation_events",  # voice graduation quarantine (W0; drained in W2)
     "calibration_cells",  # WS-2 P3: per-(domain,class,metric,lane,window) calibration aggregates
     "calibration_cell_history",  # WS-2 P3: per-recompute snapshots (180d retention)
+    "reflex_signals",  # reflex arc P0: fingerprint-deduped task.failed signals + lifecycle
+    "reflex_diagnoses",  # reflex arc P0: Tier-0 diagnose session artifacts (PR2 writes)
+    "reflex_verdicts",  # reflex arc P0: taste corpus — every human verdict, never pruned
 ]
 
 
