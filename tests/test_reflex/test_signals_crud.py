@@ -181,3 +181,47 @@ class TestListByStatus:
         )
         rows = await crud.list_by_status(db, "new")
         assert [r["fingerprint"] for r in rows] == ["fp00000000000001"]
+
+
+class TestAggregates:
+    """PR1.5 observability aggregates — shared by the MCP tool and the snapshot."""
+
+    async def test_count_by_status(self, db):
+        await _upsert(db, fingerprint="fp00000000000001")
+        await _upsert(db, fingerprint="fp00000000000002")
+        row2 = await crud.get_by_fingerprint(db, "fp00000000000002")
+        await crud.set_status(
+            db, signal_id=row2["id"], expected_from="new", to="diagnosing", now=T1
+        )
+        counts = await crud.count_by_status(db)
+        assert counts == {"new": 1, "diagnosing": 1}
+
+    async def test_count_by_status_empty(self, db):
+        assert await crud.count_by_status(db) == {}
+
+    async def test_top_class_keys_orders_by_signal_count_then_occurrences(self, db):
+        # 2 distinct signals in KeyErrorxmemory; 1 signal (3 occurrences) in ValueErrorxrouting
+        await _upsert(db, fingerprint="fp00000000000001")
+        await _upsert(db, fingerprint="fp00000000000002")
+        for now in (T0, T1, T2):
+            await _upsert(
+                db, fingerprint="fp00000000000003", class_key="ValueErrorxrouting", now=now
+            )
+        top = await crud.top_class_keys(db, limit=8)
+        assert top[0] == {"class_key": "KeyErrorxmemory", "signals": 2, "occurrences": 2}
+        assert top[1] == {"class_key": "ValueErrorxrouting", "signals": 1, "occurrences": 3}
+
+    async def test_top_class_keys_respects_limit(self, db):
+        await _upsert(db, fingerprint="fp00000000000001", class_key="A")
+        await _upsert(db, fingerprint="fp00000000000002", class_key="B")
+        assert len(await crud.top_class_keys(db, limit=1)) == 1
+
+    async def test_list_recent_orders_by_last_seen_desc(self, db):
+        await _upsert(db, fingerprint="fp00000000000001", now=T0)
+        await _upsert(db, fingerprint="fp00000000000002", now=T2)
+        await _upsert(db, fingerprint="fp00000000000003", now=T1)
+        rows = await crud.list_recent(db, limit=2)
+        assert [r["fingerprint"] for r in rows] == [
+            "fp00000000000002",
+            "fp00000000000003",
+        ]
