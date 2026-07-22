@@ -71,6 +71,7 @@ def _exact_pass(expected_outputs: str | None) -> bool:
 
 
 def migrate() -> dict:
+    """Flip each exact-pass false-failure to 'executed'; return counts."""
     db = sqlite3.connect(genesis_db_path(), timeout=30.0)
     try:
         rows = db.execute(_SELECT).fetchall()
