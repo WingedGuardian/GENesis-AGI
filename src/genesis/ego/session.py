@@ -1369,11 +1369,16 @@ class EgoSession:
         # exemption on any error.
         active_directives: list[dict] = []
         try:
+            # Generous limit: list_directives orders newest-first and the
+            # critical/high filter runs in Python, so a small limit could drop
+            # an older critical/high directive behind a burst of newer
+            # low/normal ones. Active directives per ego are realistically a
+            # handful; 50 is ample headroom on a tiny indexed table.
             dirs = await ego_crud.list_directives(
                 self._db,
                 ego_target=self._source_tag.replace("_cycle", ""),
                 statuses=("active",),
-                limit=10,
+                limit=50,
             )
             active_directives = [
                 d for d in dirs if d.get("priority") in ("critical", "high")
