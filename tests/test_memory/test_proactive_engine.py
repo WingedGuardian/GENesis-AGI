@@ -299,6 +299,7 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
         captured["rerank"] = rerank
         captured["limit"] = limit
         captured["rerank_timeout_s"] = rerank_timeout_s
+        captured["defer_side_effects"] = defer_side_effects
         return []
 
     with (
@@ -314,6 +315,10 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
     assert captured["rerank"] is True  # cc_hook default
     assert captured["limit"] == 1  # command budget
     assert captured["rerank_timeout_s"] == P._RERANK_TIMEOUT_S  # hot-path timebox threaded
+    # Regression guard (ac27b693): the proactive path MUST defer side effects —
+    # a silent flip back to False reintroduces the concurrent-session latency
+    # regression this PR fixes.
+    assert captured["defer_side_effects"] is True
 
 
 async def test_proactive_context_bumps_surfaced_count_not_invocation():

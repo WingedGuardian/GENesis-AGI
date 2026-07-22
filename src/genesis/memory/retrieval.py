@@ -821,7 +821,7 @@ class HybridRetriever:
             # whether the entity lane would surface something — its highest-value
             # case (Codex #1121 P2: don't skip the zero-hit path). No ranked
             # lists exist here, so lane novelty = its valid candidates.
-            await self._maybe_entity_lane_shadow(
+            _zero_hit_shadow = self._maybe_entity_lane_shadow(
                 query=query,
                 ranked_lists=[],
                 all_ids=set(),
@@ -829,6 +829,22 @@ class HybridRetriever:
                 embedding_available=embedding_available,
                 recall_event_id=None,
             )
+            # Same deferral contract as the has-results path (ac27b693): the
+            # shadow probe is pure observation, so on the latency-budgeted
+            # proactive path it must not run inline here either. Inert today
+            # (entity_lane.mode: off), but keeps the zero-candidate prompt off
+            # the shared connection if that mode is ever flipped to shadow.
+            if (
+                defer_side_effects
+                and event_id_sink is None
+                and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
+            ):
+                tracked_task(
+                    _deferred_side_effects(_zero_hit_shadow),
+                    name="recall_zero_hit_shadow",
+                )
+            else:
+                await _zero_hit_shadow
             return []
 
         now_str = datetime.now(UTC).isoformat()
