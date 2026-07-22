@@ -54,6 +54,7 @@ class StatusFileWriter:
         embedding_count = 0
         if self._pending_embeddings_db is not None:
             from genesis.db.crud import pending_embeddings
+
             embedding_count = await pending_embeddings.count_pending(self._pending_embeddings_db)
 
         total_queued = deferred_count + dead_letter_count + embedding_count
@@ -86,6 +87,7 @@ class StatusFileWriter:
         # Pause state and workload info (if runtime available)
         try:
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             data["paused_state"] = {
                 "is_paused": rt.paused,
@@ -96,9 +98,7 @@ class StatusFileWriter:
             data["heavy_workload"] = rt.heavy_workload
             # Uptime since bootstrap — read by watchdog for stabilization
             if rt._bootstrap_completed_at is not None:
-                data["uptime_s"] = (
-                    datetime.now(UTC) - rt._bootstrap_completed_at
-                ).total_seconds()
+                data["uptime_s"] = (datetime.now(UTC) - rt._bootstrap_completed_at).total_seconds()
         except Exception:
             pass
 
@@ -122,6 +122,19 @@ class StatusFileWriter:
         if scheduler_heartbeats:
             data["scheduler_heartbeats"] = scheduler_heartbeats
 
+        # Reflex-arc ingestor counters — lets the standalone health MCP (a
+        # separate process reading this file) surface live nerve state. The
+        # isinstance guard is load-bearing: a non-dict (absent ingestor, mock
+        # runtime in tests) must never reach json.dumps and break the whole
+        # status write.
+        try:
+            ingestor = getattr(self._runtime, "_reflex_ingestor", None)
+            stats = getattr(ingestor, "stats", None)
+            if isinstance(stats, dict):
+                data["reflex"] = stats
+        except Exception:
+            pass
+
         # Merge bridge/adapter health if provided
         if self._extra_data:
             data.update(self._extra_data)
@@ -135,7 +148,8 @@ class StatusFileWriter:
 
             content = json.dumps(data, indent=2)
             fd, tmp_path = tempfile.mkstemp(
-                dir=str(self._path.parent), suffix=".tmp",
+                dir=str(self._path.parent),
+                suffix=".tmp",
             )
             fd_closed = False
             try:
@@ -153,7 +167,8 @@ class StatusFileWriter:
         except Exception:
             logger.error(
                 "Status file write FAILED at %s — external monitoring will see stale data",
-                self._path, exc_info=True,
+                self._path,
+                exc_info=True,
             )
 
     def _get_failing_jobs(self) -> list[str]:
@@ -165,12 +180,14 @@ class StatusFileWriter:
         except Exception:
             return []
         return [
-            name for name, entry in job_health.items()
-            if entry.get("consecutive_failures", 0) >= 2
+            name for name, entry in job_health.items() if entry.get("consecutive_failures", 0) >= 2
         ]
 
     def _build_summary(
-        self, state, total_queued: int, failing_jobs: list[str] | None = None,
+        self,
+        state,
+        total_queued: int,
+        failing_jobs: list[str] | None = None,
     ) -> str:
         """Describe the worst conditions concisely."""
         parts = []
