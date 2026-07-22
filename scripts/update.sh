@@ -16,7 +16,8 @@
 #   --post-merge  Skip fetch/merge (code already merged by CC conflict resolution);
 #                 run only bootstrap, migrations, health check, and service restart.
 
-set -euo pipefail
+set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
+                    # (see _on_err's BASH_SUBSHELL guard for the subshell case)
 
 # ── Copy-to-temp guard ──────────────────────────────────
 # The update script may update itself during git merge, which would corrupt
@@ -70,6 +71,19 @@ _write_state() {
     "timestamp": "$(date -Iseconds)"
 }
 SEOF
+}
+
+# Signal handler for the PRE-STOP window: an interrupt before services are
+# stopped has nothing to roll back (no merge, server still running), so just
+# clear this run's state/marker and exit. Swapped for _on_signal (rollback)
+# once the ERR trap arms. Defined here so it exists before its trap install.
+_on_signal_prestop() {
+    local sig="$1"
+    trap - INT TERM
+    echo "" >&2
+    echo "  Update interrupted by SIG$sig before services were stopped — nothing merged; cleaning up." >&2
+    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid" 2>/dev/null || true
+    exit 1
 }
 
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
@@ -523,6 +537,11 @@ fi
 
 _write_state "fetching"
 
+# Catch an interrupt during the pre-stop window (fetch done, services still up).
+# Replaced by the rollback-capable _on_signal once the ERR trap arms post-stop.
+trap '_on_signal_prestop INT' INT
+trap '_on_signal_prestop TERM' TERM
+
 # ── Service stop/start helpers ───────────────────────────
 # Works with both systemd and bare-process environments.
 _stop_genesis_server() {
@@ -750,7 +769,7 @@ _do_rollback() {
     local degraded="${2:-}"
 
     # Disarm the ERR trap to prevent recursive rollback
-    trap - ERR
+    trap - ERR INT TERM
 
     echo ""
     echo "  UPDATE FAILED — $reason"
@@ -851,10 +870,32 @@ with open(sys.argv[11], 'w') as f:
 # Uses $BASH_COMMAND to report which command failed.
 _on_err() {
     local exit_code=$?
+    # Under `set -E` the ERR trap is inherited by command substitutions and
+    # subshells. Rollback must run ONLY at the top level: a failing `$(...)`
+    # would otherwise run _do_rollback (force-stop server + git reset) from
+    # INSIDE the subshell while the parent keeps executing. In a subshell just
+    # propagate the failure — the parent's own ERR trap handles it at depth 0.
+    if [ "${BASH_SUBSHELL:-0}" -ne 0 ]; then
+        exit "$exit_code"
+    fi
     _do_rollback "command failed (exit $exit_code): $BASH_COMMAND"
     exit 1
 }
+# Signal handler for the ARMED window (services stopped, mid-merge/migration):
+# an interrupt here must roll back, exactly like an unhandled error — otherwise
+# the server is left down. Disarm all traps first so a second signal can't
+# re-enter _do_rollback. Installed alongside the ERR trap below.
+_on_signal() {
+    local sig="$1"
+    trap - ERR INT TERM
+    echo "" >&2
+    echo "  Update interrupted by SIG$sig after services were stopped — rolling back." >&2
+    _do_rollback "update interrupted by SIG$sig"
+    exit 1
+}
 trap _on_err ERR
+trap '_on_signal INT' INT
+trap '_on_signal TERM' TERM
 
 if [[ "$POST_MERGE" == "false" ]]; then
 _write_state "merging"
@@ -993,13 +1034,13 @@ PYEOF
         echo "  A CC session will resolve conflicts in a worktree."
         _record_update_history "conflicts_pending" \
             "merge conflicts in: $(echo "$CONFLICTED_FILES" | tr '\n' ', ' | sed 's/, $//')" ""
-        trap - ERR
+        trap - ERR INT TERM
         exit 2
     else
         # Not a conflict — some other merge error. Call rollback directly so the
         # DB gets a meaningful reason instead of "command failed (exit 1): false".
         echo "  Merge failed: $MERGE_OUTPUT"
-        trap - ERR
+        trap - ERR INT TERM
         _do_rollback "git merge failed: $(echo "$MERGE_OUTPUT" | head -3 | tr '\n' ' ')"
         exit 1
     fi
@@ -1052,7 +1093,7 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && _tier2_pending_since_baseline; then
 elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     echo "  Already up to date ($NEW_COMMIT)."
     # Clean up unnecessary rollback tag and disarm trap
-    trap - ERR
+    trap - ERR INT TERM
     git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
     # Restart services that we stopped (if any)
     for svc in "${WERE_RUNNING[@]}"; do
@@ -1354,7 +1395,7 @@ except Exception:
 fi
 
 # ── Success: disarm trap ──────────────────────────────────
-trap - ERR
+trap - ERR INT TERM
 
 _sync_deploy_targets
 
