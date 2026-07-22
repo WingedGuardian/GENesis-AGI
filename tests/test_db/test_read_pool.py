@@ -192,3 +192,30 @@ async def test_open_is_idempotent(db_path):
 async def test_size_floored_at_one(db_path):
     assert ReadConnectionPool(db_path, size=0).size == 1
     assert ReadConnectionPool(db_path, size=-3).size == 1
+
+
+def test_recall_read_pool_size_env(monkeypatch):
+    """The size env-reader parses an int and falls back to the default on a
+    missing/blank/non-integer value (a bad env value must never crash boot)."""
+    from genesis import env
+    from genesis.db.connection import DEFAULT_READ_POOL_SIZE
+
+    monkeypatch.delenv("GENESIS_RECALL_READ_POOL_SIZE", raising=False)
+    assert env.recall_read_pool_size() == DEFAULT_READ_POOL_SIZE
+    monkeypatch.setenv("GENESIS_RECALL_READ_POOL_SIZE", "7")
+    assert env.recall_read_pool_size() == 7
+    monkeypatch.setenv("GENESIS_RECALL_READ_POOL_SIZE", "not-an-int")
+    assert env.recall_read_pool_size() == DEFAULT_READ_POOL_SIZE  # ValueError → default
+    monkeypatch.setenv("GENESIS_RECALL_READ_POOL_SIZE", "   ")
+    assert env.recall_read_pool_size() == DEFAULT_READ_POOL_SIZE  # blank → default
+
+
+def test_recall_read_pool_off_env(monkeypatch):
+    from genesis import env
+
+    monkeypatch.delenv("GENESIS_RECALL_READ_POOL_OFF", raising=False)
+    assert env.recall_read_pool_off() is False
+    monkeypatch.setenv("GENESIS_RECALL_READ_POOL_OFF", "1")
+    assert env.recall_read_pool_off() is True
+    monkeypatch.setenv("GENESIS_RECALL_READ_POOL_OFF", "no")
+    assert env.recall_read_pool_off() is False
