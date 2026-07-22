@@ -81,6 +81,7 @@ class GenesisEgoContextBuilder:
         section_map: list[tuple[str, Any]] = [
             ("system_health", self._system_health_section),
             ("intentions", self._intentions_section),
+            ("directives", self._directives_section),
             ("settled_decisions", self._settled_decisions_section),
             ("signals", self._signals_section),
             ("observations", self._observations_section),
@@ -125,6 +126,67 @@ class GenesisEgoContextBuilder:
         """
         from genesis.ego.intentions_context import build_intentions_section
         return await build_intentions_section(self._db, "genesis_ego_cycle")
+
+    async def _directives_section(self, *, depth: str = "deep") -> str:
+        """User directives targeted at the Genesis (COO) ego.
+
+        Only rendered if there are active genesis_ego directives. Returns
+        empty string otherwise to avoid polluting context with empty
+        sections. Mirrors the user ego's directive section — the same
+        user-input framing applies to the COO.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            directives = await ego_crud.list_active_directives(
+                self._db,
+                ego_target="genesis_ego",
+                limit=5,
+            )
+        except Exception:
+            logger.warning("Failed to query genesis directives", exc_info=True)
+            return (
+                "## User Directives\n\n"
+                "*Directives unavailable (query error — see logs).*\n"
+            )
+
+        if not directives:
+            return ""
+
+        lines = ["## User Directives\n"]
+        lines.append(
+            "*The user flagged these for you (the operations ego). Factor "
+            "them into your thinking, act on or resolve them, or disagree "
+            "with reasoning — but never ignore one silently.*\n"
+        )
+
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC)
+        for d in directives:
+            priority = d.get("priority", "normal").upper()
+            content = d.get("content", "?")[:200]
+            directive_id = d.get("id", "?")
+            created_at = d.get("created_at", "")
+            age_str = ""
+            if created_at:
+                try:
+                    created = datetime.fromisoformat(created_at)
+                    delta = now - created
+                    if delta.days > 0:
+                        age_str = f"{delta.days}d ago"
+                    else:
+                        hours = int(delta.total_seconds() / 3600)
+                        age_str = f"{hours}h ago" if hours > 0 else "just now"
+                except (ValueError, TypeError):
+                    pass
+            age_part = f", {age_str}" if age_str else ""
+            lines.append(
+                f"- [{priority}] {content}\n  (id={directive_id}{age_part})"
+            )
+
+        lines.append("")
+        return "\n".join(lines)
 
     async def _system_health_section(self, *, depth: str = "deep") -> str:
         """Live system health from health_data snapshot."""
