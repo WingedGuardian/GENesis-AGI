@@ -170,9 +170,18 @@ verified: 8cb9e8dc 2026-07-21
   kill; the background lane (direct_session) sets it to the full budget so long work
   (deep-research) runs to completion. A hit sets `CCOutput.bg_truncated` → a visible
   user notice + a `cc.bg_truncated` event. Foreground turns keep the 600s default so a
-  conversational turn never lingers holding the per-session lock; routing long research
-  from a channel to the durable background lane (with result delivery) is a follow-up.
+  conversational turn never lingers holding the per-session lock.
   Origin: the 2026-07-20 silent-death of a Telegram deep-research run.
+- **Background-session delivery model** (`DeliveryMode`, direct_session.py): a
+  handed-off task can deliver its terminal outcome (success AND failure) back to the
+  conversation it was dispatched from. `direct_session_run(deliver_to_origin=True)`
+  captures the foreground origin via `GENESIS_SESSION_ID` (the foreground `cc_sessions`
+  row id the health-MCP child inherits), threaded through the queue onto the request;
+  `DirectSessionRunner._deliver_result_to_origin` resolves the origin's channel+thread
+  and delivers a targeted send (`OutreachRequest.target_chat_id`/`target_thread_id`,
+  honored in `_deliver` before category routing — DM or forum topic). Legacy callers
+  (all 8) derive `SILENT`/`FAILURE_ONLY` from their notify bools → unchanged. Fixes the
+  latent bug where a successful background result was saved but never sent.
 
 ## 3. Autonomy & egress gating
 

@@ -9,6 +9,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **When Genesis hands a long task off to run in the background and says "I'll
+  report back," it now actually does.** Ask for something heavy from Telegram — a
+  deep research run, a long analysis — and Genesis can dispatch it to a background
+  session and deliver the finished result straight back into the same
+  conversation (your DM or the same forum topic) when it's done, success or
+  failure. Previously a background task's successful result went nowhere: it was
+  saved to the database but never sent, so a promised "I'll get back to you"
+  silently never arrived (the cause behind a research request on 2026-07-20 that
+  vanished). Long results arrive as a short summary plus a saved file rather than
+  a wall of messages. Failures are reported in the same thread instead of
+  disappearing.
+
 ### Changed
 
 - **Proactive memory recall holds up better when several sessions are active at
