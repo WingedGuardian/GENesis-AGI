@@ -71,21 +71,19 @@ class TaskType(StrEnum):
 #   - BOOKMARK_ENRICHMENT: uses a dedicated executor whose intake routing is not
 #     yet validated (no live volume). Excluded NULL-on-uncertainty (matches the
 #     codebase's conservative-classification norm); add once its routing is proven.
-INSIGHT_PRODUCING_TASK_TYPES: frozenset[TaskType] = frozenset(
-    {
-        TaskType.BRAINSTORM_USER,
-        TaskType.BRAINSTORM_SELF,
-        TaskType.META_BRAINSTORM,
-        TaskType.MEMORY_AUDIT,
-        TaskType.PROCEDURE_AUDIT,
-        TaskType.GAP_CLUSTERING,
-        TaskType.SELF_UNBLOCK,
-        TaskType.ANTICIPATORY_RESEARCH,
-        TaskType.PROMPT_EFFECTIVENESS_REVIEW,
-        TaskType.CODE_AUDIT,
-        TaskType.WING_AUDIT,
-    }
-)
+INSIGHT_PRODUCING_TASK_TYPES: frozenset[TaskType] = frozenset({
+    TaskType.BRAINSTORM_USER,
+    TaskType.BRAINSTORM_SELF,
+    TaskType.META_BRAINSTORM,
+    TaskType.MEMORY_AUDIT,
+    TaskType.PROCEDURE_AUDIT,
+    TaskType.GAP_CLUSTERING,
+    TaskType.SELF_UNBLOCK,
+    TaskType.ANTICIPATORY_RESEARCH,
+    TaskType.PROMPT_EFFECTIVENESS_REVIEW,
+    TaskType.CODE_AUDIT,
+    TaskType.WING_AUDIT,
+})
 
 
 # Task types whose completed output should be routed to the KNOWLEDGE BASE via

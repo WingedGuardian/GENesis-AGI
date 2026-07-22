@@ -36,16 +36,16 @@ logger = logging.getLogger(__name__)
 class IntakeSource(StrEnum):
     """Source categories with pre-assigned confidence tiers."""
 
-    USER_DIRECTED = "user_directed"  # 0.9
-    FOREGROUND_WEB = "foreground_web"  # 0.75
-    BACKGROUND_TASK = "background_task"  # 0.7
-    EMAIL_RECON = "email_recon"  # 0.65
+    USER_DIRECTED = "user_directed"              # 0.9
+    FOREGROUND_WEB = "foreground_web"            # 0.75
+    BACKGROUND_TASK = "background_task"          # 0.7
+    EMAIL_RECON = "email_recon"                  # 0.65
     ANTICIPATORY_RESEARCH = "anticipatory_research"  # 0.6
-    MODEL_INTELLIGENCE = "model_intelligence"  # 0.6
-    GITHUB_LANDSCAPE = "github_landscape"  # 0.5 — needs LLM scoring
-    WEB_MONITORING = "web_monitoring"  # 0.5 — needs LLM scoring
+    MODEL_INTELLIGENCE = "model_intelligence"    # 0.6
+    GITHUB_LANDSCAPE = "github_landscape"        # 0.5 — needs LLM scoring
+    WEB_MONITORING = "web_monitoring"            # 0.5 — needs LLM scoring
     FREE_MODEL_INVENTORY = "free_model_inventory"  # 0.5 — needs LLM scoring
-    SOURCE_DISCOVERY = "source_discovery"  # 0.4 — needs LLM scoring
+    SOURCE_DISCOVERY = "source_discovery"        # 0.4 — needs LLM scoring
 
 
 # Sources that skip LLM scoring — already curated by an LLM upstream.
@@ -81,16 +81,14 @@ _TASK_TYPE_TO_SOURCE: dict[str, IntakeSource] = {
 }
 
 # Task types that typically produce multiple findings and should be atomized.
-MULTI_FINDING_TASK_TYPES = frozenset(
-    {
-        "anticipatory_research",
-        "code_audit",
-        "gap_clustering",
-        "brainstorm_user",
-        "brainstorm_self",
-        "wing_audit",
-    }
-)
+MULTI_FINDING_TASK_TYPES = frozenset({
+    "anticipatory_research",
+    "code_audit",
+    "gap_clustering",
+    "brainstorm_user",
+    "brainstorm_self",
+    "wing_audit",
+})
 
 
 @dataclass(frozen=True)
@@ -149,8 +147,8 @@ class IntakeStats:
 FENCE_RE = re.compile(r"^\s*```(?i:json)\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
 
 
-# Dict fields to pull, in priority order, when a findings item / bare JSON object
-# has no plain ``content`` field. Human-meaningful prose beats a raw JSON dump.
+# Dict fields to pull, in priority order, when a bare JSON object has no plain
+# ``content`` field. Human-meaningful prose beats a raw JSON dump.
 _FINDING_BODY_FIELDS = ("content", "summary", "description", "body", "text", "detail")
 # Keys that are structural metadata, not part of the readable body.
 _FINDING_META_KEYS = frozenset({"title", "file", "name", "sources", "relevance"})
@@ -161,10 +159,10 @@ def _render_finding_body(data: dict) -> str:
 
     Used by the ``atomize`` ``json_single`` path — a MULTI_FINDING task that
     returned a bare JSON OBJECT (no ``findings`` key). Instead of storing a raw
-    ``json.dumps`` blob (unreadable in the KB and a proactive-recall noise
-    source — the ``{...}`` bodies that motivated this fix), pull the
-    human-meaningful field in priority order, else fall back to a compact
-    ``key: value`` render of the remaining fields. Never returns a raw JSON dump.
+    ``json.dumps`` blob (unreadable in the KB and a proactive-recall noise source
+    — the ``{...}`` bodies that motivated this fix), pull the human-meaningful
+    field in priority order, else fall back to a compact ``key: value`` render of
+    the remaining fields. Never returns a raw JSON dump.
 
     Deliberately NOT used for structured findings-array items (``_finding_from_item``
     keeps every field via json.dumps — code_audit's severity must survive) nor for
@@ -193,10 +191,8 @@ def _finding_from_item(item: object, index: int, default_title: str) -> AtomicFi
     Handles both the ``{"findings": [...]}`` envelope item shape
     (title/content/sources/relevance) and bare-array shapes from task-specific
     prompts (e.g. code_audit's ``{"file", "severity", "description", ...}``) —
-    unknown dict shapes keep a title from their identity keys and the full item
-    as pretty-printed JSON content (STRUCTURED findings preserve every field —
-    e.g. code_audit's severity; do NOT prose-render here). Non-str scalars are
-    unusable.
+    unknown dict shapes keep a title from their identity keys and the full
+    item as pretty-printed JSON content. Scalars other than str are unusable.
     """
     if isinstance(item, dict):
         title = str(item.get("title") or item.get("file") or item.get("name") or "").strip()
@@ -240,12 +236,10 @@ def atomize(content: str, source_task_type: str) -> tuple[list[AtomicFinding], s
 
     # Single-output task types skip atomization entirely.
     if source_task_type not in MULTI_FINDING_TASK_TYPES:
-        return [
-            AtomicFinding(
-                title=source_task_type.replace("_", " ").title(),
-                content=content.strip(),
-            )
-        ], "single_item"
+        return [AtomicFinding(
+            title=source_task_type.replace("_", " ").title(),
+            content=content.strip(),
+        )], "single_item"
 
     # Attempt 1: Parse as JSON with findings array. Models routinely wrap the
     # payload in a ```json fence despite instructions — unwrap a whole-message
@@ -287,12 +281,10 @@ def atomize(content: str, source_task_type: str) -> tuple[list[AtomicFinding], s
         # Valid JSON but no findings key — treat as single item, rendering the
         # dict as readable prose rather than a raw json.dumps blob.
         if isinstance(data, dict):
-            return [
-                AtomicFinding(
-                    title=str(data.get("title", source_task_type.replace("_", " ").title()))[:200],
-                    content=_render_finding_body(data),
-                )
-            ], "json_single"
+            return [AtomicFinding(
+                title=str(data.get("title", source_task_type.replace("_", " ").title()))[:200],
+                content=_render_finding_body(data),
+            )], "json_single"
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
 
@@ -302,12 +294,10 @@ def atomize(content: str, source_task_type: str) -> tuple[list[AtomicFinding], s
         return findings, "markdown_split"
 
     # Attempt 3: Fall back to single item.
-    return [
-        AtomicFinding(
-            title=source_task_type.replace("_", " ").title(),
-            content=content.strip(),
-        )
-    ], "single_item"
+    return [AtomicFinding(
+        title=source_task_type.replace("_", " ").title(),
+        content=content.strip(),
+    )], "single_item"
 
 
 # Markdown heading pattern: ## Title or ### Title
@@ -442,10 +432,8 @@ async def score_batch_llm(
             logger.warning("Intake LLM scoring returned empty — using defaults")
             return [
                 ScoredFinding(
-                    finding=f,
-                    confidence=default_confidence,
-                    source=source,
-                    source_task_type=source_task_type,
+                    finding=f, confidence=default_confidence,
+                    source=source, source_task_type=source_task_type,
                     generating_model=generating_model,
                 )
                 for f in findings
@@ -456,26 +444,22 @@ async def score_batch_llm(
         scored = []
         for i, f in enumerate(findings):
             score_data = scores.get(i, {})
-            scored.append(
-                ScoredFinding(
-                    finding=f,
-                    confidence=float(score_data.get("score", default_confidence)),
-                    source=source,
-                    source_task_type=source_task_type,
-                    generating_model=generating_model,
-                    is_pattern_insight=bool(score_data.get("is_pattern", False)),
-                )
-            )
+            scored.append(ScoredFinding(
+                finding=f,
+                confidence=float(score_data.get("score", default_confidence)),
+                source=source,
+                source_task_type=source_task_type,
+                generating_model=generating_model,
+                is_pattern_insight=bool(score_data.get("is_pattern", False)),
+            ))
         return scored
 
     except Exception:
         logger.warning("Intake LLM scoring failed — using default confidence", exc_info=True)
         return [
             ScoredFinding(
-                finding=f,
-                confidence=default_confidence,
-                source=source,
-                source_task_type=source_task_type,
+                finding=f, confidence=default_confidence,
+                source=source, source_task_type=source_task_type,
                 generating_model=generating_model,
             )
             for f in findings
@@ -492,7 +476,9 @@ def _parse_score_response(content: str) -> dict[int, dict]:
         data = json.loads(content)
         if isinstance(data, list):
             return {
-                item.get("index", i): item for i, item in enumerate(data) if isinstance(item, dict)
+                item.get("index", i): item
+                for i, item in enumerate(data)
+                if isinstance(item, dict)
             }
     except (json.JSONDecodeError, ValueError):
         pass
@@ -565,9 +551,7 @@ async def run_intake(
     if needs_llm_scoring(source):
         if router is not None:
             scored_findings = await score_batch_llm(
-                findings,
-                source,
-                router,
+                findings, source, router,
                 source_task_type=source_task_type,
                 generating_model=generating_model,
             )
@@ -575,12 +559,14 @@ async def run_intake(
         else:
             logger.warning("No router available for LLM scoring — using defaults")
             scored_findings = [
-                score_finding(f, source, source_task_type, generating_model) for f in findings
+                score_finding(f, source, source_task_type, generating_model)
+                for f in findings
             ]
             stats.scoring_skipped = True
     else:
         scored_findings = [
-            score_finding(f, source, source_task_type, generating_model) for f in findings
+            score_finding(f, source, source_task_type, generating_model)
+            for f in findings
         ]
         stats.scoring_skipped = True
 
@@ -601,9 +587,7 @@ async def run_intake(
         except Exception as exc:
             logger.error(
                 "Intake routing failed for finding '%s': %s",
-                scored.finding.title[:50],
-                exc,
-                exc_info=True,
+                scored.finding.title[:50], exc, exc_info=True,
             )
             stats.errors.append(f"{scored.finding.title[:50]}: {exc}")
 
@@ -611,13 +595,9 @@ async def run_intake(
     logger.info(
         "Intake: source=%s, atomization=%s, findings=%d, "
         "knowledge=%d, observation=%d, discard=%d, scoring_skipped=%s",
-        stats.source,
-        stats.atomization_path,
-        stats.findings_count,
-        stats.routed_knowledge,
-        stats.routed_observation,
-        stats.routed_discard,
-        stats.scoring_skipped,
+        stats.source, stats.atomization_path, stats.findings_count,
+        stats.routed_knowledge, stats.routed_observation,
+        stats.routed_discard, stats.scoring_skipped,
     )
 
     # If ALL non-discard findings failed routing, raise so caller can fall back.
@@ -625,7 +605,8 @@ async def run_intake(
     actual_routes = stats.routed_knowledge + stats.routed_observation
     if expected_routes > 0 and actual_routes == 0 and stats.errors:
         raise RuntimeError(
-            f"Intake routing failed for all {expected_routes} findings: {stats.errors[0]}"
+            f"Intake routing failed for all {expected_routes} findings: "
+            f"{stats.errors[0]}"
         )
 
     return stats
@@ -657,7 +638,6 @@ async def _route_to_knowledge(
     if store is None:
         try:
             from genesis.runtime import GenesisRuntime
-
             rt = GenesisRuntime.instance()
             store = rt._memory_store
         except Exception:
@@ -708,7 +688,10 @@ async def _route_to_observation(
 
     obs_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
-    content = f"{scored.finding.title}\n\n{scored.finding.content}"
+    content = (
+        f"{scored.finding.title}\n\n"
+        f"{scored.finding.content}"
+    )
     if scored.finding.relevance:
         content += f"\n\nRelevance: {scored.finding.relevance}"
 
@@ -746,11 +729,11 @@ def _domain_for_source(source: IntakeSource, task_type: str) -> str:
 
 # Provenance ``source_pipeline`` label per IntakeSource. Two classes:
 #  - Genesis-AUTHORED intake (surplus insight tasks, background/user-directed
-#    research, user-mediated web capture) → "surplus" — first-party
+#    research, user-mediated web capture) -> "surplus" — first-party
 #    (provenance._FIRST_PARTY_PIPELINES), so recall treats it as Genesis's own.
 #  - CRAWLED external-world intelligence (model registries, GitHub landscape, web
-#    monitoring, email/source recon) → its own label, registered in
-#    provenance._EXTERNAL_PIPELINES → classified external_untrusted, so recall
+#    monitoring, email/source recon) -> its own label, registered in
+#    provenance._EXTERNAL_PIPELINES -> classified external_untrusted, so recall
 #    wraps it in <external-content> markers (the correct injection-defense posture
 #    for content pulled from outside; it is NOT Genesis's own memory).
 # This map — NOT ``source.value`` — is the authority for the label, because
@@ -809,7 +792,11 @@ async def capture_web_result(
     }
     source = source_map.get(session_type, IntakeSource.FOREGROUND_WEB)
 
-    content = f"Web result: {url}\n\nQuery: {query_context}\n\n{content_summary}"
+    content = (
+        f"Web result: {url}\n\n"
+        f"Query: {query_context}\n\n"
+        f"{content_summary}"
+    )
 
     return await run_intake(
         content=content,
