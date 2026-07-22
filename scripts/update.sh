@@ -81,7 +81,22 @@ _on_signal_prestop() {
     local sig="$1"
     trap - INT TERM
     echo "" >&2
-    echo "  Update interrupted by SIG$sig before services were stopped — nothing merged; cleaning up." >&2
+    echo "  Update interrupted by SIG$sig before the merge — restoring any stopped services and cleaning up." >&2
+    # The interrupt may have landed mid-stop (the stop polls up to ~10s), so a
+    # service may already be down. Restart exactly what was detected running —
+    # WERE_RUNNING is populated BEFORE the physical stop — so the server is never
+    # left down; `systemctl start` is a no-op if it never actually stopped. No
+    # rollback is needed here: nothing has been merged yet.
+    local _svc
+    for _svc in "${WERE_RUNNING[@]:-}"; do
+        [ -n "$_svc" ] || continue
+        if [ "$_svc" = "genesis-server" ]; then
+            _start_genesis_server 2>/dev/null \
+                || systemctl --user restart genesis-server.service 2>/dev/null || true
+        else
+            systemctl --user start "$_svc.service" 2>/dev/null || true
+        fi
+    done
     rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid" 2>/dev/null || true
     exit 1
 }
@@ -645,11 +660,24 @@ fi
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
+# Detect what is running BEFORE stopping anything, so the pre-stop signal handler
+# can restart exactly what was running if an interrupt lands mid-stop (the stop
+# polls up to ~10s) — otherwise a Ctrl-C / shutdown during the stop would leave
+# the server down, the very thing the trap exists to prevent.
 WERE_RUNNING=()
-
-# Check genesis-server
 if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
    pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
+    WERE_RUNNING+=("genesis-server")
+fi
+for svc in genesis-bridge; do
+    if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
+        WERE_RUNNING+=("$svc")
+    fi
+done
+
+# Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
+# WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
+if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
     # back during the merge/migration window. The ERR-trap rollback is not armed
@@ -658,17 +686,15 @@ if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
         echo "  Aborting update — could not stop genesis-server; refusing to merge over a live process."
         echo "  genesis-server has been stopped and was NOT restarted. Bring it back with:"
         echo "    systemctl --user restart genesis-server.service"
+        # Deliberate: disarm the signal handler so it does NOT "restore" a server
+        # we are intentionally leaving stopped (we could not cleanly stop it).
+        trap - INT TERM
         exit 1
     fi
-    WERE_RUNNING+=("genesis-server")
 fi
-
-# Check genesis-bridge
-for svc in genesis-bridge; do
-    if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
-        systemctl --user stop "$svc.service" || true
-        WERE_RUNNING+=("$svc")
-    fi
+for svc in "${WERE_RUNNING[@]}"; do
+    [ "$svc" = "genesis-server" ] && continue
+    systemctl --user stop "$svc.service" || true
 done
 
 [[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped: ${WERE_RUNNING[*]}" || echo "  No services were running"

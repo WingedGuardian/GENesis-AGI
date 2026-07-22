@@ -100,6 +100,10 @@ def _harness(text: str, scenario: str) -> str:
 set -Eeuo pipefail
 STATE_FILE="$STATE_FILE"
 _do_rollback() {{ echo "depth=$BASH_SUBSHELL reason=$1" >> "$RB_LOG"; }}
+# Stub the service-restart calls the real _on_signal_prestop makes, so the test
+# records intent without touching real systemd.
+_start_genesis_server() {{ echo "start:genesis-server" >> "$RESTART_LOG"; return 0; }}
+systemctl() {{ echo "systemctl $*" >> "$RESTART_LOG"; return 0; }}
 {on_err}
 {on_signal}
 {on_prestop}
@@ -124,6 +128,14 @@ case "{scenario}" in
     sleep 30 & wait $!         # `wait` is interruptible so the trap fires now
     ;;
   prestop_sig)
+    WERE_RUNNING=()            # nothing was running → nothing to restart
+    trap '_on_signal_prestop INT' INT
+    trap '_on_signal_prestop TERM' TERM
+    echo READY > "$READY"
+    sleep 30 & wait $!
+    ;;
+  prestop_running)
+    WERE_RUNNING=("genesis-server")   # server was running + (about to be) stopped
     trap '_on_signal_prestop INT' INT
     trap '_on_signal_prestop TERM' TERM
     echo READY > "$READY"
@@ -134,21 +146,32 @@ esac
 
 
 def _run(tmp_path: Path, text: str, scenario: str, *, signal_it: bool = False):
+    """Returns (rollback_log, state_path, restart_log)."""
     script = tmp_path / "harness.sh"
     script.write_text(_harness(text, scenario))
     rb_log = tmp_path / "rollback.log"
+    restart_log = tmp_path / "restart.log"
     state = tmp_path / "state.json"
     state.write_text("{}")
     ready = tmp_path / "ready"
     env = {
         **os.environ,
         "RB_LOG": str(rb_log),
+        "RESTART_LOG": str(restart_log),
         "STATE_FILE": str(state),
         "READY": str(ready),
     }
+
+    def _reads():
+        return (
+            rb_log.read_text() if rb_log.exists() else "",
+            state,
+            restart_log.read_text() if restart_log.exists() else "",
+        )
+
     if not signal_it:
         subprocess.run(["bash", str(script)], env=env, capture_output=True, timeout=15)
-        return rb_log.read_text() if rb_log.exists() else "", state
+        return _reads()
     proc = subprocess.Popen(
         ["bash", str(script)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
@@ -158,11 +181,11 @@ def _run(tmp_path: Path, text: str, scenario: str, *, signal_it: bool = False):
         time.sleep(0.05)
     proc.send_signal(signal.SIGTERM)
     proc.wait(timeout=15)
-    return (rb_log.read_text() if rb_log.exists() else ""), state
+    return _reads()
 
 
 def test_armed_function_failure_rolls_back(tmp_path: Path, text: str) -> None:
-    log, _ = _run(tmp_path, text, "armed_fn")
+    log, _, _ = _run(tmp_path, text, "armed_fn")
     assert "reason=" in log and "PARENT_CONTINUED" not in log
     assert log.count("depth=") == 1 and "depth=0" in log
 
@@ -170,22 +193,44 @@ def test_armed_function_failure_rolls_back(tmp_path: Path, text: str) -> None:
 def test_subshell_failure_does_not_rollback_in_subshell(tmp_path: Path, text: str) -> None:
     """The whole point of the -E guard: rollback runs ONCE, at depth 0, never
     from the subshell that actually failed."""
-    log, _ = _run(tmp_path, text, "subshell")
+    log, _, _ = _run(tmp_path, text, "subshell")
     assert "PARENT_CONTINUED" not in log, "parent must not continue past a subshell failure"
     depths = re.findall(r"depth=(\d+)", log)
     assert depths == ["0"], f"rollback must run exactly once at depth 0, got {depths}"
 
 
 def test_armed_sigterm_rolls_back(tmp_path: Path, text: str) -> None:
-    log, _ = _run(tmp_path, text, "armed_sig", signal_it=True)
+    log, _, _ = _run(tmp_path, text, "armed_sig", signal_it=True)
     assert "reason=update interrupted by SIGTERM" in log
     assert "depth=0" in log
 
 
 def test_prestop_sigterm_cleans_up_without_rollback(tmp_path: Path, text: str) -> None:
-    log, state = _run(tmp_path, text, "prestop_sig", signal_it=True)
+    """Interrupt BEFORE anything was running/stopped: no rollback, no restart,
+    state cleaned."""
+    log, state, restart = _run(tmp_path, text, "prestop_sig", signal_it=True)
     assert log == "", "pre-stop interrupt must NOT roll back (nothing merged yet)"
+    assert restart == "", "nothing was running → nothing to restart"
     assert not state.exists(), "pre-stop handler should remove the state file"
+
+
+def test_prestop_sigterm_restarts_stopped_services(tmp_path: Path, text: str) -> None:
+    """Codex P1: an interrupt mid-stop (server was running, WERE_RUNNING set) must
+    RESTART it, not leave it down — and still without a rollback (nothing merged)."""
+    log, state, restart = _run(tmp_path, text, "prestop_running", signal_it=True)
+    assert "start:genesis-server" in restart, "the stopped server must be restarted"
+    assert log == "", "still no rollback in the pre-merge window"
+    assert not state.exists()
+
+
+def test_services_detected_before_stop(text: str) -> None:
+    """WERE_RUNNING must be populated BEFORE the physical stop, so the pre-stop
+    handler knows what to restore."""
+    detect = text.find('WERE_RUNNING+=("genesis-server")')
+    stop_call = text.find("_stop_genesis_server\n")
+    assert -1 < detect < stop_call, (
+        "genesis-server must be added to WERE_RUNNING before it is stopped"
+    )
 
 
 if sys.platform.startswith("win"):  # pragma: no cover
