@@ -227,3 +227,5 @@ def test_i5_venv_gate_checks_interpreter_not_dir():
     assert 'if [ ! -x "$VENV_DIR/bin/python" ]; then' in code
     # The dir-existence gate (which skipped recreating a broken venv) is gone.
     assert 'if [ ! -d "$VENV_DIR" ]; then' not in code
+    # --clear so a dangling bin/python symlink is rebuilt, not skipped by venv.
+    assert '-m venv --clear "$VENV_DIR"' in code

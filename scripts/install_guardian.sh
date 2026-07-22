@@ -419,8 +419,11 @@ echo "[3/14] Creating virtual environment..."
 
 if [ ! -x "$VENV_DIR/bin/python" ]; then
     # Gate on the interpreter, not the directory: a partial/broken venv dir
-    # (interrupted create, missing bin/python) must be re-created, not skipped.
-    $PYTHON -m venv "$VENV_DIR"
+    # (interrupted create, missing OR dangling bin/python) must be rebuilt, not
+    # skipped. --clear wipes a partial dir so even a dangling symlink is repaired
+    # (a plain re-run of venv skips an existing-but-dangling bin/python link).
+    # Only reached when bin/python is already unusable, so nothing good is lost.
+    $PYTHON -m venv --clear "$VENV_DIR"
 fi
 
 # Debian creates venvs without pip even when ensurepip imports (ensurepip

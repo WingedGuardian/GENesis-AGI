@@ -578,10 +578,11 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     # On LVM-backed pools, the default thin volume is only 10GB.
     # "device override" resizes the underlying LV + filesystem.
     incus config device override "$CONTAINER_NAME" root size="$DISK" 2>/dev/null || true
-    # I/O limits (idempotent sets). The override above errors benignly when the
-    # device is already overridden on a re-run, so only the IOPS sets — which ARE
-    # idempotent — gate the success message; the echo must not claim limits that
-    # a pool without device-limit support silently rejected.
+    # I/O limits. Gate the success message on the IOPS sets, NOT the override: a
+    # storage pool that doesn't support device I/O limits rejects limits.read/write
+    # while the container is still created fine, so the echo must not claim limits
+    # that didn't apply. The override stays `|| true` — its failure is a
+    # pool-capability signal, not something the IOPS message should reflect.
     _io_limits_ok=true
     incus config device set "$CONTAINER_NAME" root limits.read 190MB 2>/dev/null || _io_limits_ok=false
     incus config device set "$CONTAINER_NAME" root limits.write 90MB 2>/dev/null || _io_limits_ok=false
