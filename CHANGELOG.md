@@ -22,6 +22,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   vanished). Long results arrive as a short summary plus a saved file rather than
   a wall of messages. Failures are reported in the same thread instead of
   disappearing.
+- **When Genesis hits a usage/rate limit, your request comes back on its own.**
+  Previously, hitting the limit dropped the work — and the message you got even
+  claimed "background tasks will resume automatically" when nothing would. Now
+  the request is saved the moment the limit is hit, and Genesis automatically
+  picks it back up once the limit resets and delivers the answer to the same
+  conversation. If capacity keeps being exhausted it backs off and eventually
+  tells you it needs a hand rather than retrying forever. (This closes the
+  other half of the 2026-07-20 disappearance.)
 
 ### Changed
 

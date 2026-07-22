@@ -8,15 +8,14 @@ Failure posture: a missing/corrupt config degrades to DEFAULTS; an invalid
 switch ``GENESIS_RATE_LIMIT_RESUME_DISABLED=1`` forces ``off`` regardless of the
 file — an operator's emergency brake against unattended re-dispatch.
 
-Default mode is ``off`` (DORMANT) until the resume engine lands (PR-2b): with no
-resumer wired, a parked request would sit ``status='parked'`` forever while the
-foreground copy promised auto-resume — recreating the very silent-death this
-fixes. Shipping the park substrate off-by-default (like the reaper's dry-run /
-entity-adjudication's shadow) keeps PR-2a inert-but-observable; PR-2b flips the
-default to ``live``. Once ``live``: a resume only completes work whose initiation
-was already user-approved (a foreground turn's typed prompt) or already
-gate-approved (a direct_session's original dispatch), so it is not new autonomous
-initiative — see ``rate_limit_resume`` module docstring.
+Default mode is ``live`` (auto-resume): the resume engine (``rate_limit_resume``)
+re-dispatches parked work at its reset time and delivers the result to origin. A
+resume only completes work whose initiation was already user-approved (a
+foreground turn's typed prompt) or already gate-approved (a direct_session's
+original dispatch), so it is not new autonomous initiative and does not re-enter
+``AutonomousCliApprovalGate`` — see the ``rate_limit_resume`` module docstring.
+(PR-2a shipped this off-by-default while the resumer did not yet exist; PR-2b
+wires it and flips the default here.)
 
 Dependency rule: stdlib + yaml + genesis.env + genesis._config_overlay only;
 ``genesis.mcp.health.settings`` imports the public ``MODES`` and ``INT_KNOBS``
@@ -46,9 +45,7 @@ _ENV_KILL_SWITCH = "GENESIS_RATE_LIMIT_RESUME_DISABLED"
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
-    # DORMANT until PR-2b wires the resume engine — see module docstring. PR-2b
-    # flips this to "live". off → parks nothing, honest "try again later" copy.
-    "mode": "off",
+    "mode": "live",
     # Scheduling
     "cadence_floor_minutes": 30,  # retry cadence when the reset time is unknown
     "backoff_base_minutes": 30,  # re-limit backoff base

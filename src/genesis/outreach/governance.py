@@ -67,6 +67,9 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "mail_follow_up": 24,  # Follow-up emails — one per day max per topic
     "discord_poll": 168,  # Discord polls — 7 days (matches default poll duration)
     "j9_regression_alert": 168,  # Weekly eval regressions — one alert/week max
+    # Rate-limit park alerts (needs_user escalation per park-topic; propose_only
+    # "ready" ping on a fixed topic) — re-remind at most twice a day.
+    "rate_limit_park": 12,
 }
 _DEFAULT_DEDUP_HOURS = 24
 

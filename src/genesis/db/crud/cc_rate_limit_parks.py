@@ -104,6 +104,24 @@ async def list_due(
     return [dict(r) for r in rows]
 
 
+async def list_by_status(
+    db: aiosqlite.Connection,
+    *,
+    status: str,
+    limit: int = 50,
+) -> list[dict]:
+    """Parks in a given status. Oldest first."""
+    cursor = await db.execute(
+        """SELECT * FROM cc_rate_limit_parks
+           WHERE status = ?
+           ORDER BY created_at
+           LIMIT ?""",
+        (status, limit),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
 async def claim(db: aiosqlite.Connection, park_id: str) -> bool:
     """Atomically claim a due park (parked→resuming). True iff this caller won."""
     now = _now()

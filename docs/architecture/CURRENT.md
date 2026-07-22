@@ -198,10 +198,13 @@ verified: 3c5e1f24 2026-07-22
   reachable. Gate posture: a resume completes already-approved work (a foreground prompt,
   or an already-gated dispatch), so it is not new autonomous initiative. Reflection-bridge
   and the task executor deliberately do NOT park (periodic self-retry / already durable via
-  `task_states`). Lever `cc_rate_limit_resume` (off|propose_only|live) +
-  `GENESIS_RATE_LIMIT_RESUME_DISABLED`; **default `off` (dormant) until PR-2b
-  wires the resume engine, then flipped to `live`** — shipping the park substrate
-  inert avoids promising a resume nothing yet delivers.
+  `task_states`). Resume engine (`cc/rate_limit_resume.py`, `_wire_rate_limit_resume`
+  on the learning scheduler, `CronTrigger */10`): reclaims stale claims → lists due
+  parks → claims + re-dispatches each via the queue (`delivery_mode=result`); the
+  re-run self-validates (re-limit → its own catch re-parks with backoff); exhausted
+  parks escalate to `needs_user` with a governed (`rate_limit_park` signal) alert.
+  Lever `cc_rate_limit_resume` (off|propose_only|**live**, default live) +
+  `GENESIS_RATE_LIMIT_RESUME_DISABLED`.
 
 ## 3. Autonomy & egress gating
 
