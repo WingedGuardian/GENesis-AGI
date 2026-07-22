@@ -686,6 +686,12 @@ _start_genesis_server() {
 # If the server is killed mid-write during the update, this backup
 # enables recovery without data loss.
 DB_FILE="$GENESIS_ROOT/data/genesis.db"
+MIGRATIONS_RAN=0  # set to 1 once the migration runner is invoked; gates the
+                  # pre-update DB restore in _do_rollback (rollback the schema
+                  # only if this update actually migrated it).
+DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's `.backup` succeeds; the
+                  # restore trusts this, not mere file existence, so a stale
+                  # snapshot from a prior run is never restored as if current.
 if [ -f "$DB_FILE" ]; then
     echo "--- Snapshotting database ---"
     sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
@@ -696,7 +702,12 @@ if [ -f "$DB_FILE" ]; then
     # `.backup` takes a transactionally-consistent snapshot of a live database.
     if sqlite3 "$DB_FILE" ".backup '$DB_FILE.pre-update'" 2>/dev/null; then
         echo "  DB snapshot: $DB_FILE.pre-update"
+        DB_SNAPSHOT_TAKEN=1
     else
+        # Leave any stale $DB_FILE.pre-update on disk untouched — DB_SNAPSHOT_TAKEN
+        # stays 0 so _do_rollback will NOT restore it (and will fail the rollback
+        # loudly if this run then migrates). Removing it would erase a prior valid
+        # snapshot for no gain.
         echo "  WARNING: DB snapshot failed (continuing anyway)"
     fi
 fi
@@ -847,8 +858,12 @@ _do_rollback() {
     # Stop any running services first. _ensure_server_down also disarms the
     # on-failure restart timer so a stale instance can't come back mid-rollback
     # (best-effort here — the rollback continues even if it can't fully stop).
+    local server_down=true
     _stop_genesis_server
-    _ensure_server_down || echo "  WARNING: genesis-server may still be running during rollback"
+    if ! _ensure_server_down; then
+        echo "  WARNING: genesis-server may still be running during rollback"
+        server_down=false
+    fi
     systemctl --user stop genesis-bridge 2>/dev/null || true
 
     # Restore the original branch, then reset it to the rollback tag.
@@ -872,6 +887,45 @@ _do_rollback() {
         pip_ok=false
     fi
 
+    # Restore the pre-update DB — but ONLY if migrations actually ran this update.
+    # Rolling back the code without the DB would leave the old code running
+    # against a migrated (newer) schema. If no migration ran, the DB is untouched.
+    local db_ok=true
+    if [ "${MIGRATIONS_RAN:-0}" = "1" ]; then
+        if [ "${DB_SNAPSHOT_TAKEN:-0}" != "1" ]; then
+            # Migrations ran but THIS run took no valid snapshot (the `.backup`
+            # failed, or only a stale prior-run file exists). We cannot roll the
+            # schema back, so the rollback is NOT clean — the old code will run
+            # against a migrated DB. Flag it loudly for manual intervention rather
+            # than report success or restore a stale snapshot.
+            echo "  CRITICAL: migrations ran but no current DB snapshot exists — cannot restore; old code may run against a migrated schema"
+            db_ok=false
+        elif [ "$server_down" != "true" ]; then
+            # Refuse to overwrite a possibly-live database — a cp under a writing
+            # server corrupts it. Leave the migrated DB in place (schema mismatch,
+            # but recoverable) and flag for manual intervention.
+            echo "  WARNING: server not confirmed down — SKIPPING DB restore (won't overwrite a live DB)."
+            db_ok=false
+        elif cp "$DB_FILE.pre-update" "$DB_FILE" 2>&1 \
+            && rm -f "$DB_FILE-wal" "$DB_FILE-shm"; then
+            # Drop the stale WAL/SHM: they hold the MIGRATED changes, and SQLite
+            # would replay them over the restored old DB on reopen, resurrecting
+            # the migration. The `.backup` snapshot is self-contained, so removing
+            # them is correct. (server_down guarantees no live handle here.)
+            echo "  Restored pre-migration database snapshot (stale WAL cleared)."
+        else
+            echo "  CRITICAL: failed to restore DB snapshot — old code may run against a migrated schema"
+            db_ok=false
+        fi
+    fi
+
+    # Reload systemd in case unit templates changed during the failed update's
+    # bootstrap. NOTE: rollback restores CODE, DEPS, and (if migrated) the DB —
+    # it does NOT re-render installed systemd units or hooks; those self-heal on
+    # the next successful update. daemon-reload picks up any unit-file drift left
+    # on disk so the restart below uses a consistent unit.
+    systemctl --user daemon-reload 2>/dev/null || true
+
     # Restart services with old code
     for svc in "${WERE_RUNNING[@]}"; do
         if [ "$svc" = "genesis-server" ]; then
@@ -882,12 +936,14 @@ _do_rollback() {
         fi
     done
 
-    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ]; then
-        echo "  Rolled back to $ROLLBACK_TAG"
+    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
+        echo "  Rolled back to $ROLLBACK_TAG (code, deps$([ "${MIGRATIONS_RAN:-0}" = "1" ] && echo ", database"))."
+        echo "  NOT reverted: installed systemd units and hooks (self-heal on the next update)."
         _record_update_history "rolled_back" "$reason" "$degraded"
     else
         echo "  ROLLBACK INCOMPLETE — manual intervention required"
         echo "  Last known good state: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
+        [ "$db_ok" = "true" ] || echo "  DB restore FAILED — old code may be running against a migrated schema."
         _record_update_history "failed" "$reason (rollback incomplete)" "$degraded"
     fi
 
@@ -1193,10 +1249,24 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
     _sync_deploy_targets
-    # Persist any host-side degradation the drift healing just found — this
-    # path exits before the success-path recording, so without this the flag
-    # would only ever reach stdout on no-op runs.
-    if [ -n "$HOST_CC_DEGRADED" ]; then
+    # Clear stale recovery signals. If genesis-server was up when THIS run
+    # started (present in WERE_RUNNING), any prior update failure was already
+    # resolved — the server recovered. Leaving last_update_failure.json (and the
+    # rolled_back/failed update_history row that a rollback writes alongside it)
+    # in place would let P6's recovery detection later force-restart a server the
+    # operator has since deliberately stopped, on a long-dead failure. Recording
+    # a fresh success supersedes that stale status row too (both signals move
+    # together in normal flows). GATED on server-was-up: a still-down server may
+    # be an UNRESOLVED failure whose artifact must survive to drive recovery, so
+    # we must not erase it. This path also exits before the success-path
+    # recording, so it doubles as the place to persist any host-side degradation
+    # the drift healing just found.
+    if [ -f "$HOME/.genesis/last_update_failure.json" ] \
+        && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+        rm -f "$HOME/.genesis/last_update_failure.json"
+        _record_update_history "success" "" "$HOST_CC_DEGRADED"
+        echo "  Cleared stale update-failure marker (server healthy, code current)."
+    elif [ -n "$HOST_CC_DEGRADED" ]; then
         echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
         _record_update_history "success" "" "$HOST_CC_DEGRADED"
     fi
@@ -1324,6 +1394,9 @@ PYEOF
 case "$_mig_probe_rc" in
     0)
         echo "--- Running migrations ---"
+        # Set BEFORE the runner: even a partial failure has altered the schema,
+        # so a rollback must restore the pre-update DB (see _do_rollback).
+        MIGRATIONS_RAN=1
         if ! "$VENV_DIR/bin/python" -m genesis.db.migrations --apply 2>&1 | tail -10; then
             _do_rollback "migration runner failed"
             exit 1
@@ -1381,6 +1454,48 @@ UCLSEED
 fi
 
 _write_state "health_check"
+
+# ── Recovery detection ────────────────────────────────────
+# An empty WERE_RUNNING means the server wasn't running when THIS update started.
+# Two very different causes: (a) a PRIOR failed update left it stopped and this is
+# a recovery re-run — the server SHOULD come back and be health-verified; or (b)
+# the operator deliberately stopped it before updating — respect that, don't
+# start what they stopped. Distinguish via failure artifacts: a leftover
+# last_update_failure.json, or a last update_history status of rolled_back/failed,
+# marks a recovery. Without the recovery push, the restart+health block below is
+# skipped and we'd record "success" with the server down and no health check.
+_OPERATOR_STOP=false
+if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
+    _recovery=false
+    if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
+        _recovery=true
+    else
+        _last_status="$("$VENV_DIR/bin/python" - <<'PYEOF' 2>/dev/null || true
+import os
+import sqlite3
+
+try:
+    con = sqlite3.connect(os.path.expanduser("~/genesis/data/genesis.db"), timeout=5)
+    row = con.execute(
+        "SELECT status FROM update_history ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    print(row[0] if row else "")
+except Exception:
+    print("")
+PYEOF
+)"
+        case "$_last_status" in
+            rolled_back | failed) _recovery=true ;;
+            *) : ;;
+        esac
+    fi
+    if [ "$_recovery" = "true" ]; then
+        echo "  Recovery run: a prior update did not complete cleanly — restoring genesis-server."
+        WERE_RUNNING+=("genesis-server")
+    else
+        _OPERATOR_STOP=true
+    fi
+fi
 
 # ── Restart services ──────────────────────────────────────
 # P5 GUARDRAIL: this final restart runs while the armed `_on_signal TERM` trap is
@@ -1544,7 +1659,15 @@ fi
 if [ -n "$HOST_CC_DEGRADED" ]; then
     echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
 fi
-_record_update_history "success" "" "$HOST_CC_DEGRADED"
+# If the server was operator-stopped (empty WERE_RUNNING, no recovery artifact),
+# it was intentionally NOT restarted or health-verified — record that in the
+# degraded column so this isn't a bare "success" that hides a down server.
+_p6_degraded="$HOST_CC_DEGRADED"
+if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
+    echo "  NOTE: server was not running at update start (operator-stopped) — not restarted."
+    _p6_degraded="${_p6_degraded:+$_p6_degraded,}genesis-server-not-restarted"
+fi
+_record_update_history "success" "" "$_p6_degraded"
 
 _write_state "done"
 

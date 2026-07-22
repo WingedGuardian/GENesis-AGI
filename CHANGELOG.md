@@ -48,6 +48,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A failed update that had already run database migrations now rolls the
+  database back too.** Previously a rollback restored the code and dependencies
+  but left the (newly migrated) database in place, so the rolled-back older code
+  ran against a newer schema. Rollback now restores the pre-update database
+  snapshot whenever migrations ran (the server is stopped at that point, so it's
+  a clean swap), reloads systemd units, and states plainly what it did and didn't
+  revert.
+- **Recovering from a failed update actually brings the server back.** If a
+  previous update failed and left the server stopped, the next update used to
+  finish and report "success" while the server stayed down and health was never
+  checked. It now detects a recovery run (from the leftover failure record) and
+  restarts + health-verifies the server. A server the operator deliberately
+  stopped is left alone, but recorded as not-running rather than a bare success.
 - **A large one-time data cleanup no longer briefly freezes the running system.**
   Post-startup data migrations (one-off cleanups/backfills of stored knowledge and
   history) run alongside the live system, which allows only one writer to the
