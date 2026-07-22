@@ -39,18 +39,20 @@ _LEDGER_LOCK_RETRIES = 5
 _LEDGER_RETRY_DELAY_S = 0.5
 
 
-async def _ledger_write(make_coro: Callable[[], Awaitable[None]], *, what: str) -> None:
+async def _ledger_write(make_coro: Callable[[], Awaitable[None]], *, what: str) -> bool:
     """Run a ledger bookkeeping write, retrying briefly on "database is locked".
 
-    Best-effort: never raises. The migrate()/verify() work has already happened by
-    the time we record its outcome, so a lost bookkeeping write only costs an
-    idempotent no-op re-run on the next boot — far better than raising and
-    aborting the runner's batch. ``make_coro`` must build a FRESH coroutine each
-    call (a coroutine can only be awaited once)."""
+    Returns ``True`` iff the write actually landed. Best-effort: never raises. The
+    migrate()/verify() work has already happened by the time we record its outcome,
+    so a lost bookkeeping write only costs an idempotent no-op re-run on the next
+    boot — far better than raising and aborting the runner's batch. The caller uses
+    the return so it never reports a durable success the ledger didn't record.
+    ``make_coro`` must build a FRESH coroutine each call (a coroutine can only be
+    awaited once)."""
     for attempt in range(1, _LEDGER_LOCK_RETRIES + 1):
         try:
             await make_coro()
-            return
+            return True
         except sqlite3.OperationalError as exc:
             if "locked" not in str(exc).lower() or attempt == _LEDGER_LOCK_RETRIES:
                 logger.error(
@@ -60,8 +62,9 @@ async def _ledger_write(make_coro: Callable[[], Awaitable[None]], *, what: str) 
                     _LEDGER_LOCK_RETRIES,
                     exc,
                 )
-                return
+                return False
             await asyncio.sleep(_LEDGER_RETRY_DELAY_S * attempt)
+    return False  # unreachable (loop always returns), but keeps the type honest
 
 
 class DataMigrationRunner:
@@ -139,10 +142,25 @@ class DataMigrationRunner:
                 return {"id": mid, "name": name, "success": False, "error": "verify failed"}
 
             summary_str = str(summary) if summary is not None else ""
-            await _ledger_write(
+            recorded = await _ledger_write(
                 lambda: crud.mark_completed(self._db, mid, summary=summary_str),
                 what="mark_completed",
             )
+            if not recorded:
+                # The migration's DATA work applied, but the 'completed' ledger
+                # write did not land (lock/operational error). Do NOT report a
+                # durable success: the row stays 'running' and replays (idempotent)
+                # on the next boot. Report failure honestly so the run is visible.
+                logger.error(
+                    "Data migration %s applied but ledger write failed — will replay next boot",
+                    name,
+                )
+                return {
+                    "id": mid,
+                    "name": name,
+                    "success": False,
+                    "error": "ledger write failed after completion; will replay next boot",
+                }
             logger.info("Data migration %s completed: %s", name, summary_str)
             return {"id": mid, "name": name, "success": True, "summary": summary}
         except Exception as exc:  # noqa: BLE001 — record + continue; never abort the batch

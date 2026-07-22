@@ -126,7 +126,7 @@ def test_ledger_write_retries_then_succeeds(monkeypatch):
         if calls["n"] < 3:
             raise sqlite3.OperationalError("database is locked")
 
-    asyncio.run(runner._ledger_write(_flaky, what="mark_completed"))
+    assert asyncio.run(runner._ledger_write(_flaky, what="mark_completed")) is True
     assert calls["n"] == 3  # failed twice on lock, succeeded on the third attempt
 
 
@@ -139,7 +139,8 @@ def test_ledger_write_gives_up_on_persistent_lock_without_raising(monkeypatch, c
         raise sqlite3.OperationalError("database is locked")
 
     with caplog.at_level(logging.ERROR, logger=runner.logger.name):
-        asyncio.run(runner._ledger_write(_always_locked, what="mark_failed"))  # must NOT raise
+        # must NOT raise, and reports it did not record
+        assert asyncio.run(runner._ledger_write(_always_locked, what="mark_failed")) is False
 
     assert calls["n"] == runner._LEDGER_LOCK_RETRIES  # exhausted the retry budget
     assert "ledger mark_failed write failed" in caplog.text
@@ -154,6 +155,35 @@ def test_ledger_write_does_not_retry_non_lock_errors(monkeypatch, caplog):
         raise sqlite3.OperationalError("no such table: data_migrations")
 
     with caplog.at_level(logging.ERROR, logger=runner.logger.name):
-        asyncio.run(runner._ledger_write(_other_error, what="mark_completed"))  # must NOT raise
+        # must NOT raise, reports failure, and does not retry a non-lock error
+        assert asyncio.run(runner._ledger_write(_other_error, what="mark_completed")) is False
 
     assert calls["n"] == 1  # a non-lock error is logged and NOT retried
+
+
+def test_run_one_reports_failure_when_completed_ledger_write_fails(monkeypatch, caplog):
+    # Codex P2 (#1190): when migrate()/verify() succeed but the 'completed' ledger
+    # write can't land (persistent lock), _run_one must NOT report success — the
+    # row stays 'running' and replays, so a false success would hide the failure.
+    from pathlib import Path
+
+    from genesis.db.data_migrations import d0006_purge_surplus_ops_telemetry as d6
+
+    monkeypatch.setattr(d6, "migrate", lambda: {"purged": 0})
+    monkeypatch.setattr(d6, "verify", lambda: True)
+    monkeypatch.setattr(runner, "_LEDGER_RETRY_DELAY_S", 0)
+
+    async def _locked(*_a, **_k) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(runner.crud, "mark_completed", _locked)
+
+    r = runner.DataMigrationRunner(db=object())  # _db unused (mark_completed stubbed)
+    with caplog.at_level(logging.ERROR, logger=runner.logger.name):
+        outcome = asyncio.run(
+            r._run_one("d0006", "d0006_purge_surplus_ops_telemetry", Path(d6.__file__))
+        )
+
+    assert outcome["success"] is False
+    assert "ledger write failed" in outcome["error"]
+    assert "will replay next boot" in caplog.text
