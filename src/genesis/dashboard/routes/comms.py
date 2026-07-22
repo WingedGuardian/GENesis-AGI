@@ -109,21 +109,36 @@ async def unified_comms():
         counts["outreach_total"] = 0
 
     # --- Ego proposals ---
+    informational: list[dict] = []
     try:
         from genesis.db.crud import ego
+        from genesis.ego.types import (
+            INFORMATIONAL_ACTION_TYPES,
+            partition_informational,
+        )
 
         if view == "pending":
-            proposals = await ego.list_pending_proposals(rt.db)
+            raw = await ego.list_pending_proposals(rt.db)
+            # Acknowledge-only eval rows (j9/gauntlet) are notifications, not
+            # approval items — split them into a separate informational lane.
+            proposals, informational = partition_informational(raw)
         else:
             proposals = await ego.list_proposals(rt.db, limit=limit)
 
         # Enrich executed proposals with session outcome data
         proposals = await _enrich_proposals_with_outcomes(rt.db, proposals)
 
+        # Pending APPROVAL count excludes informational rows (they carry no
+        # approve/reject decision). Built from the shared constant so it can
+        # never drift from the lane split above.
+        _info_placeholders = ",".join("?" for _ in INFORMATIONAL_ACTION_TYPES)
         pending_count_cursor = await rt.db.execute(
-            "SELECT COUNT(*) FROM ego_proposals WHERE status = 'pending'"
+            "SELECT COUNT(*) FROM ego_proposals WHERE status = 'pending' "
+            f"AND action_type NOT IN ({_info_placeholders})",
+            tuple(INFORMATIONAL_ACTION_TYPES),
         )
         counts["proposals_pending"] = (await pending_count_cursor.fetchone())[0]
+        counts["proposals_informational"] = len(informational)
 
         total_count_cursor = await rt.db.execute(
             "SELECT COUNT(*) FROM ego_proposals"
@@ -154,6 +169,7 @@ async def unified_comms():
     return jsonify({
         "outreach": outreach,
         "proposals": proposals,
+        "informational": informational,
         "pending_approvals": pending_approvals,
         "counts": counts,
     })

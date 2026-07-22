@@ -45,6 +45,43 @@ def _proposal_id(model_id: str, run_id: str) -> str:
     return hashlib.sha256(f"{_ACTION_TYPE}:{model_id}:{run_id}".encode()).hexdigest()[:16]
 
 
+async def _clear_recovered_gauntlet(db: aiosqlite.Connection, model_id: str) -> int:
+    """Withdraw pending ``gauntlet_regression`` rows for a recovered model.
+
+    Called when a model logs a genuine PASS: the pending row's premise
+    ("previously PASSED, now FAILED") is now false, so it must not keep sitting
+    as an informational item. Best-effort — never raises into the caller.
+    """
+    from genesis.db.crud import ego as ego_crud
+
+    cleared = 0
+    try:
+        pending = await ego_crud.list_proposals(db, status="pending", limit=200)
+    except Exception:
+        logger.warning("gauntlet auto-clear: pending read failed", exc_info=True)
+        return 0
+    for p in pending:
+        if p.get("action_type") != _ACTION_TYPE:
+            continue
+        # Match the load-bearing content format written in check_gauntlet_regression.
+        if f"gauntlet regression — {model_id}:" not in p.get("content", ""):
+            continue
+        try:
+            ok = await ego_crud.resolve_proposal(
+                db,
+                p["id"],
+                status="withdrawn",
+                user_response=f"auto-cleared: {model_id} gauntlet passed again",
+            )
+            if ok:
+                cleared += 1
+        except Exception:
+            logger.warning(
+                "gauntlet auto-clear: withdraw failed for %s", p.get("id"), exc_info=True
+            )
+    return cleared
+
+
 async def check_gauntlet_regression(
     db: aiosqlite.Connection,
     summary: EvalRunSummary,
@@ -60,8 +97,13 @@ async def check_gauntlet_regression(
         passed = summary.passed_cases
         failed = summary.failed_cases
 
-        # Not a genuine failure (all green, or all skipped/inconclusive) → no signal.
+        # Not a genuine failure (all green, or all skipped/inconclusive) → no
+        # regression signal. A genuine PASS (green, not all-skipped) is a
+        # RECOVERY: clear any pending gauntlet row for this model. An
+        # inconclusive/all-skipped run clears nothing.
         if failed <= 0:
+            if _is_pass(passed, failed):
+                await _clear_recovered_gauntlet(db, summary.model_id)
             return None
 
         # Cold-start guard: require a prior PASS so a never-trusted model does not

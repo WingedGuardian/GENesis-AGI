@@ -259,6 +259,9 @@
                       <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px; font-weight: 600;"
                             :style="`background: rgba(192,132,252,0.15); color: #c084fc;`"
                             x-text="p.action_type"></span>
+                      <span x-show="p.ego_source" style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase;"
+                            :style="p.ego_source === 'genesis_ego_cycle' ? 'background: rgba(156,39,176,0.2); color: #e1bee7;' : 'background: rgba(33,150,243,0.2); color: #90caf9;'"
+                            x-text="$store.genesisDashboard.egoSourceLabel(p.ego_source)"></span>
                       <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px;"
                             :style="`background: ${p.urgency === 'critical' ? 'rgba(217,83,79,0.15)' : p.urgency === 'high' ? 'rgba(240,173,78,0.15)' : p.urgency === 'normal' ? 'rgba(33,150,243,0.15)' : 'rgba(136,136,136,0.15)'}; color: ${p.urgency === 'critical' ? '#d9534f' : p.urgency === 'high' ? '#f0ad4e' : p.urgency === 'normal' ? '#2196F3' : '#888'}`"
                             x-text="p.urgency"></span>

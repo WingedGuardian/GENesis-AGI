@@ -86,6 +86,9 @@ async def check_and_alert_regressions(
     the caller; per-subsystem failures are logged and skipped.
     """
     handled: list[dict] = []
+    # Subsystems whose latest weekly grade is NOT a regression → any pending
+    # j9_regression row for them is stale and gets auto-cleared below.
+    clean_subs: set[str] = set()
     try:
         grades = await j9_eval.get_latest_subsystem_grades(db, period_type="weekly")
     except Exception:
@@ -113,6 +116,7 @@ async def check_and_alert_regressions(
 
         reason = _regression_reason(latest, prior)
         if not reason:
+            clean_subs.add(sub)
             continue
 
         pid = _proposal_id(sub, period_end)
@@ -127,10 +131,13 @@ async def check_and_alert_regressions(
             )
             continue
 
+        # NOTE: the "Cognitive subsystem regression — {sub}:" prefix is a
+        # load-bearing format — the auto-clear pass below matches pending rows by
+        # it. No prescriptive remedy: the confidence framework forbids naming a
+        # fix before any investigation. The remedy is the user's call.
         text = (
             f"Cognitive subsystem regression — {sub}: {reason} "
-            f"(week ending {period_end[:10]}). Investigate the {sub} pipeline; "
-            f"candidate remedy: an Evo experiment on the {sub} config."
+            f"(week ending {period_end[:10]}). Investigate the {sub} pipeline."
         )
 
         # 1. BLOCKER alert (best-effort; governance dedups within 168h).
@@ -179,8 +186,45 @@ async def check_and_alert_regressions(
             {"subsystem": sub, "period_end": period_end, "reason": reason, "proposal_id": pid},
         )
 
-    if handled:
+    # Auto-clear: withdraw pending j9_regression rows for subsystems that have
+    # since recovered (latest grade no longer a regression). The row's premise —
+    # "this subsystem is regressed" — is now false, so it must not keep sitting
+    # as an informational item. Best-effort; a failure never blocks the check.
+    cleared = 0
+    if clean_subs:
+        try:
+            pending = await ego_crud.list_proposals(db, status="pending", limit=200)
+        except Exception:
+            logger.warning("j9 auto-clear: pending read failed", exc_info=True)
+            pending = []
+        for p in pending:
+            if p.get("action_type") != _J9_REGRESSION_ACTION_TYPE:
+                continue
+            content = p.get("content", "")
+            # Match the load-bearing content prefix written above.
+            matched = next(
+                (s for s in clean_subs if f"regression — {s}:" in content), None
+            )
+            if not matched:
+                continue
+            try:
+                ok = await ego_crud.resolve_proposal(
+                    db,
+                    p["id"],
+                    status="withdrawn",
+                    user_response=f"auto-cleared: {matched} grade recovered",
+                )
+                if ok:
+                    cleared += 1
+            except Exception:
+                logger.warning(
+                    "j9 auto-clear: withdraw failed for %s", p.get("id"), exc_info=True
+                )
+
+    if handled or cleared:
         logger.info(
-            "J9 regression check: %d subsystem regression(s) surfaced", len(handled),
+            "J9 regression check: %d regression(s) surfaced, %d stale row(s) cleared",
+            len(handled),
+            cleared,
         )
     return handled

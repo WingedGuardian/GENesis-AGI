@@ -33,9 +33,11 @@ from genesis.cc.types import (
 )
 from genesis.db.crud import ego as ego_crud
 from genesis.ego.types import (
+    INFORMATIONAL_ACTION_TYPES,
     NEUTRAL_STATUS,
     EgoConfig,
     EgoCycle,
+    partition_informational,
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.observability.spans import SpanKind, start_span
@@ -75,12 +77,11 @@ _NEVER_DISPATCH_ACTION_TYPES = (
     "goal_status_change",
     "cell_promotion",
     "cognitive_variant_promotion",
-    # j9_regression is informational (NOTIFY_USER); its handler marks it executed
-    # on approval. Blocklisted so it can never be dispatched as a session.
-    "j9_regression",
-    # gauntlet_regression: same informational contract — the model-roster gauntlet
-    # flagged a PASS→FAIL; advisory only, never auto-acts. Blocklisted from dispatch.
-    "gauntlet_regression",
+    # The informational eval types (j9_regression, gauntlet_regression) are
+    # acknowledge-only — their handlers mark them 'executed' on approval with no
+    # side-effect. Sourced from the single INFORMATIONAL_ACTION_TYPES constant so
+    # the dispatch blocklist and the approval-queue exclusion never drift apart.
+    *INFORMATIONAL_ACTION_TYPES,
 )
 
 # MCP tools the ego CYCLE session must never call directly. In-cycle goal
@@ -1569,9 +1570,13 @@ class EgoSession:
             # Auto-table oldest unranked proposals when queue exceeds cap.
             # Respects the 24h guard — proposals < 24h old are not tabled.
             try:
-                pending = await ego_crud.list_pending_proposals(
+                all_pending = await ego_crud.list_pending_proposals(
                     self._db, ego_source=self._source_tag,
                 )
+                # Informational eval rows (j9/gauntlet) are acknowledge-only and
+                # must not consume the approval-queue cap — otherwise a burst of
+                # eval regressions could auto-table real, actionable proposals.
+                pending, _informational = partition_informational(all_pending)
                 max_pending = getattr(self._config, "max_pending_proposals", 15)
                 if len(pending) + len(proposals) > max_pending:
                     unranked = [

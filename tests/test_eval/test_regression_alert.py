@@ -148,3 +148,56 @@ async def test_week_over_week_drop_surfaces(db):
 
     assert len(handled) == 1
     assert "dropped" in handled[0]["reason"]
+
+
+# ── PR-1: no prescriptive remedy + auto-clear on recovery ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_proposal_text_has_no_prescriptive_remedy(db):
+    """The confidence framework forbids naming a fix before investigation —
+    the surfaced text must not prescribe an Evo experiment."""
+    await _grade(db, "memory", "F", 55.0, "2026-06-22T00:00:00Z")
+
+    await check_and_alert_regressions(db, None)
+
+    pid = _proposal_id("memory", "2026-06-22T00:00:00Z")
+    prop = await ego_crud.get_proposal(db, pid)
+    assert "Evo experiment" not in prop["content"]
+    assert "candidate remedy" not in prop["content"]
+    assert "Investigate the memory pipeline" in prop["content"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_auto_clears_stale_pending(db):
+    """A subsystem that regressed then recovered → its stale pending row is
+    auto-withdrawn (its premise is now false)."""
+    # Week 1: memory F → proposal filed, pending.
+    await _grade(db, "memory", "F", 55.0, "2026-06-15T00:00:00Z")
+    handled = await check_and_alert_regressions(db, None)
+    assert len(handled) == 1
+    pid = _proposal_id("memory", "2026-06-15T00:00:00Z")
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"
+
+    # Week 2: memory recovers to B → stale week-1 row auto-clears.
+    await _grade(db, "memory", "B", 84.0, "2026-06-22T00:00:00Z")
+    handled2 = await check_and_alert_regressions(db, None)
+    assert handled2 == []  # no new regression
+
+    prop = await ego_crud.get_proposal(db, pid)
+    assert prop["status"] == "withdrawn"
+    assert "auto-cleared" in (prop["user_response"] or "")
+
+
+@pytest.mark.asyncio
+async def test_still_regressed_does_not_auto_clear(db):
+    """A subsystem still at F does NOT get its pending row cleared."""
+    await _grade(db, "memory", "F", 55.0, "2026-06-15T00:00:00Z")
+    await check_and_alert_regressions(db, None)
+    pid = _proposal_id("memory", "2026-06-15T00:00:00Z")
+
+    # Week 2: still F (new period) → new row filed, old stays pending (not cleared).
+    await _grade(db, "memory", "F", 52.0, "2026-06-22T00:00:00Z")
+    await check_and_alert_regressions(db, None)
+
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"

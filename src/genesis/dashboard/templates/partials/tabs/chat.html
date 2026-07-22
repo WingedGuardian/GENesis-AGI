@@ -204,7 +204,7 @@
                         x-text="p.status"></span>
                   <span x-show="p.ego_source" style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase;"
                         :style="p.ego_source === 'genesis_ego_cycle' ? 'background:rgba(156,39,176,0.25); color:#e1bee7;' : 'background:rgba(33,150,243,0.25); color:#90caf9;'"
-                        x-text="p.ego_source === 'genesis_ego_cycle' ? 'Genesis' : p.ego_source === 'user_ego_cycle' ? 'User' : 'Ego'"></span>
+                        x-text="$store.genesisDashboard.egoSourceLabel(p.ego_source)"></span>
                   <span x-show="p.action_type" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px; background:rgba(33,150,243,0.1); color:#64b5f6;"
                         x-text="p.action_type"></span>
                   <span x-show="p.urgency && p.urgency !== 'normal'" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px;"
@@ -284,6 +284,31 @@
                               @click="$store.genesisDashboard.commsRejectingId = null; $store.genesisDashboard.commsRejectReason = ''">Cancel</button>
                     </div>
                   </template>
+                </div>
+              </template>
+            </div>
+          </template>
+
+          <!-- ── Informational (eval notifications, no approval) ── -->
+          <template x-if="$store.genesisDashboard.commsInformational.length > 0">
+            <div style="margin-top:1rem;">
+              <div style="font-size:0.68rem; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary); margin-bottom:0.4rem; display:flex; align-items:center; gap:0.35rem;">
+                <span>Informational</span>
+                <span style="font-size:0.6rem; color:var(--color-text-secondary); font-weight:400; text-transform:none;">— eval notifications, no approval needed</span>
+              </div>
+              <template x-for="p in $store.genesisDashboard.commsInformational" :key="p.id">
+                <div style="border:1px dashed var(--color-border); border-radius:6px; padding:0.6rem; margin-bottom:0.5rem; opacity:0.92;">
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.3rem;">
+                    <div style="display:flex; gap:0.3rem; align-items:center;">
+                      <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; background:rgba(158,158,158,0.2); color:#bdbdbd;"
+                            x-text="$store.genesisDashboard.egoSourceLabel(p.ego_source)"></span>
+                      <span x-show="p.action_type" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px; background:rgba(33,150,243,0.1); color:#64b5f6;"
+                            x-text="p.action_type"></span>
+                    </div>
+                    <span style="font-size:0.65rem; color:var(--color-text-secondary);"
+                          x-text="$store.genesisDashboard.formatDateTime(p.created_at)"></span>
+                  </div>
+                  <div style="font-size:0.78rem; line-height:1.4;" x-text="p.content"></div>
                 </div>
               </template>
             </div>
