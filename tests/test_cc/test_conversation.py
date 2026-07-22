@@ -613,3 +613,27 @@ async def test_streaming_omits_research_routing_for_terminal(loop):
     )
     assert sp is not None
     assert _BG_RESEARCH_ROUTING not in sp
+
+
+@pytest.mark.asyncio
+async def test_handle_message_appends_routing_for_web(loop, mock_invoker):
+    """Non-streaming path (OpenClaw/WEB) also gets the routing nudge (review Finding 1)."""
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    await loop.handle_message(
+        "please run deep research on X", user_id="web-1", channel=ChannelType.WEB
+    )
+    inv = mock_invoker.run.call_args[0][0]
+    assert inv.system_prompt is not None
+    assert _BG_RESEARCH_ROUTING in inv.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_handle_message_omits_routing_for_terminal(loop, mock_invoker):
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    await loop.handle_message(
+        "please run deep research on X", user_id="term-2", channel=ChannelType.TERMINAL
+    )
+    inv = mock_invoker.run.call_args[0][0]
+    assert _BG_RESEARCH_ROUTING not in (inv.system_prompt or "")

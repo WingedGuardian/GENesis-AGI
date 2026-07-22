@@ -65,6 +65,18 @@ _BG_RESEARCH_ROUTING = (
 )
 
 
+def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
+    """Append the long-research routing nudge for dispatched (non-terminal) channels.
+
+    Their turn ends after replying, so long inline work is killed at the CC bg-wait
+    ceiling with nothing left to report back — route it to the durable background lane
+    instead. Terminal is interactive (user present), so inline stays fine there.
+    """
+    if channel is None or channel == ChannelType.TERMINAL:
+        return system_prompt
+    return (system_prompt + _BG_RESEARCH_ROUTING) if system_prompt else _BG_RESEARCH_ROUTING
+
+
 class ConversationLoop:
     """Channel-agnostic conversation orchestrator.
 
@@ -224,6 +236,9 @@ class ConversationLoop:
                     system_prompt, prompt_text,
                 )
                 resume_id = None
+
+            # Non-terminal channels (e.g. OpenClaw/WEB) end the turn too — same nudge.
+            system_prompt = _apply_research_routing(system_prompt, channel)
 
             invocation = CCInvocation(
                 prompt=prompt_text,
@@ -514,16 +529,9 @@ class ConversationLoop:
                     else:
                         system_prompt = topic_ctx
 
-            # Dispatched channels (telegram/voice/etc.) end the turn after replying,
-            # so long inline work is killed at the CC bg-wait ceiling with nothing left
-            # to report back. Nudge the model to route such work to the durable
-            # background lane. Appended every turn (incl. resume) so it is present when
-            # a research request arrives. Terminal is interactive, so inline is fine.
-            if channel != ChannelType.TERMINAL:
-                if system_prompt:
-                    system_prompt += _BG_RESEARCH_ROUTING
-                else:
-                    system_prompt = _BG_RESEARCH_ROUTING
+            # Route long research off this turn to the durable background lane
+            # (dispatched channels end the turn). See _apply_research_routing.
+            system_prompt = _apply_research_routing(system_prompt, channel)
 
             invocation = CCInvocation(
                 prompt=prompt_text,
@@ -717,6 +725,7 @@ class ConversationLoop:
             fresh_inv = await self._build_fresh_invocation(
                 prompt_text, model=model, effort=effort,
                 session_id=session["id"], session_key=invocation.session_key,
+                channel=channel,
             )
             # Retry — if this also fails, the exception propagates to caller
             output = await self._invoker.run(fresh_inv)
@@ -754,6 +763,7 @@ class ConversationLoop:
             fresh_inv = await self._build_fresh_invocation(
                 prompt_text, model=model, effort=effort,
                 session_id=session["id"], session_key=invocation.session_key,
+                channel=channel,
             )
             output = await self._invoker.run_streaming(fresh_inv, on_event=on_event)
             return output, session
@@ -766,6 +776,7 @@ class ConversationLoop:
         effort: EffortLevel,
         session_id: str | None = None,
         session_key: str | None = None,
+        channel: ChannelType | None = None,
     ) -> CCInvocation:
         """Build a fresh invocation (with system prompt, no resume)."""
         system_prompt = await self._assembler.assemble(
@@ -773,6 +784,7 @@ class ConversationLoop:
             session_id=session_id,
         )
         system_prompt = await self._enrich_with_context(system_prompt, prompt_text)
+        system_prompt = _apply_research_routing(system_prompt, channel)
         return CCInvocation(
             prompt=prompt_text,
             model=model,

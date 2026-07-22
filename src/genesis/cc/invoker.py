@@ -425,8 +425,13 @@ class CCInvoker:
         # explicit env_overrides entry (applied last, below).
         if inv and inv.bg_wait_ceiling_ms is not None:
             hard_ms = inv.timeout_s * 1000
-            ceil_ms = min(inv.bg_wait_ceiling_ms, max(0, hard_ms - _BG_WAIT_HARD_MARGIN_MS))
-            env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", str(ceil_ms))
+            # Only set the ceiling when there's room to sit a full margin below the
+            # hard timeout. For a very short timeout_s the margin would drive it to
+            # <=0, and 0 means "wait indefinitely" to the CLI — the opposite of intent;
+            # leave the CLI default (600s) in that degenerate case.
+            if hard_ms > _BG_WAIT_HARD_MARGIN_MS:
+                ceil_ms = min(inv.bg_wait_ceiling_ms, hard_ms - _BG_WAIT_HARD_MARGIN_MS)
+                env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", str(ceil_ms))
         # Roster routing (base_url / auth_token / model slots) + credential
         # isolation. Shared with the foreground `gmodel` launcher via
         # roster.apply_routing_env so the contract lives in ONE place. Native
@@ -1088,7 +1093,10 @@ class CCInvoker:
             exit_code=proc.returncode or 0,
             model_requested=str(invocation.model),
             via_proxy=bool(invocation.anthropic_base_url),
+            bg_truncated=bg_truncated,
         )
+        if bg_truncated:
+            await _emit_bg_truncation_event(output.session_id)
         await self._fire_downgrade_callback(output)
         # Silent-cap detection (no-result path): also guard on rate_limit_event,
         # since the rate-limit branch above runs only inside the result_data block.
