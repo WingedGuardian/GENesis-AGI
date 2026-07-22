@@ -500,7 +500,11 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
             echo "    Reclaim its disk once you're satisfied the new one is good: incus delete $_new"
             return 0
         fi
-        echo "  WARNING: could not rename the old container aside — leaving it in place."
+        # Rename failed and we already force-stopped it above — restart it so a
+        # rare rename failure doesn't leave Genesis DOWN with no auto-restart
+        # (the recreate below is skipped because the container still exists).
+        echo "  WARNING: could not rename the old container aside — restarting it in place."
+        incus start "$CONTAINER_NAME" 2>/dev/null || true
         echo "    Inspect with 'incus list' and resolve manually; refusing to force-delete (data loss)."
         return 1
     }
@@ -627,13 +631,15 @@ if [ "$root_dev" != "$home_dev" ] && [ "${home_avail_kb:-0}" -gt "${root_avail_k
         # H7 GUARD: binding a fresh disk OVER a populated /home/ubuntu SHADOWS it
         # — the container's whole genesis install (repo, venv, DB, memory) would
         # "disappear" behind the empty disk (data not deleted, but invisible, and
-        # the next health probe would then see it as damaged). Only bind when the
-        # container home is effectively empty. An in-place migration across the
-        # unprivileged UID-shift is too risky to do unattended, so a populated
-        # home is left alone with clear guidance rather than shadowed.
-        _home_entries=$(incus exec "$CONTAINER_NAME" -- sh -c 'ls -A /home/ubuntu 2>/dev/null | wc -l' 2>/dev/null || echo "unknown")
-        if [ "$_home_entries" != "0" ]; then
-            echo "  Container /home/ubuntu is not empty (${_home_entries} entries) — NOT binding the larger disk"
+        # the next health probe would then see it as damaged). Discriminate on the
+        # actual INSTALL MARKER (the genesis repo), NOT on the home being empty: a
+        # fresh user home already contains /etc/skel dotfiles (.bashrc, .profile),
+        # so an "is it empty" test would false-refuse a legitimate fresh split-disk
+        # bind (→ the venv install then runs out of space on the tiny root). An
+        # in-place migration across the unprivileged UID-shift is too risky to do
+        # unattended, so a populated install is left alone with clear guidance.
+        if incus exec "$CONTAINER_NAME" -- test -e /home/ubuntu/genesis 2>/dev/null; then
+            echo "  Container /home/ubuntu already holds a genesis install — NOT binding the larger disk"
             echo "    (binding over it would hide the existing install). To use the split disk, migrate"
             echo "    /home/ubuntu into $_home_bind_src on the host first (preserving the container UID map), then re-run."
         else

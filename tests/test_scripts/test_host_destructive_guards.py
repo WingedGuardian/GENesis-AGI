@@ -48,6 +48,9 @@ def test_h4_retire_renames_not_force_deletes():
     assert 'incus delete "$CONTAINER_NAME" --force' not in code
     assert code.count("_retire_container_aside") >= 4  # 1 def + 3 call sites
     assert 'incus rename "$CONTAINER_NAME"' in code
+    # On a rename FAILURE the helper force-stopped the container, so it must
+    # restart it — never leave Genesis down with no auto-restart (architect fix).
+    assert "restarting it in place" in code and "incus start" in code
 
 
 def test_h4_health_probe_retries():
@@ -61,13 +64,15 @@ def test_h4_health_probe_retries():
 # ── H7: bind-mount only over an empty home ──────────────────────────
 
 
-def test_h7_bind_guarded_on_empty_home():
+def test_h7_bind_guarded_on_install_marker():
     code = _code(HOST_SETUP)
-    assert "_home_entries" in code
-    # The device add is gated on the home being empty ("0" entries).
     add_region = code.split("_home_bind_src", 1)[1]
-    assert 'if [ "$_home_entries" != "0" ]' in add_region
-    assert "homedisk disk source" in add_region  # still binds on the empty branch
+    # Discriminate on the actual INSTALL MARKER (the genesis repo), NOT on the
+    # home being empty — a fresh home has /etc/skel dotfiles, so an emptiness
+    # test would false-refuse a legitimate fresh split-disk bind (architect fix).
+    assert "test -e /home/ubuntu/genesis" in add_region
+    assert "_home_entries" not in code  # the fragile empty-count discriminator is gone
+    assert "homedisk disk source" in add_region  # still binds when no install is present
 
 
 # ── H5: operator home for guardian-state + chown ~/.claude ──────────
