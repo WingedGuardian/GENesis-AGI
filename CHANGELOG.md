@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Ambient capture now alerts when auto-recovery can't bring a wedged device
+  back.** For installs running the optional voice/ambient edge with device
+  auto-recovery armed, Genesis now raises a capture-health alert when the device
+  has been dark for hours *and* the automatic reboots failed to restore it — the
+  one case that means a real fault rather than a device simply being switched off.
+  Installs without auto-recovery are unchanged: a merely-absent device still never
+  alerts (nothing on the network distinguishes "unplugged" from "crashed", so the
+  signal fires only where arming recovery already asserts the device should be up).
+  The alert names how long it's been dark and how many reboot attempts failed, with
+  no device address or key ever included.
+
 - **When Genesis hands a long task off to run in the background and says "I'll
   report back," it now actually does.** Ask for something heavy from Telegram — a
   deep research run, a long analysis — and Genesis can dispatch it to a background

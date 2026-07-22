@@ -171,12 +171,18 @@ def evaluate_ambient_health(
       (the bridge process is dead/hung — it stopped writing the health file).
     - ``diar_worker_alive`` False while ``diar_enabled`` -> ``degraded`` (the
       diarization worker crashed).
+    - ``recovery_failing`` True -> ``degraded`` (the edge auto-recovery is armed,
+      engaged, and STILL could not restore the device). This is the ONE darkness
+      signal we act on, and only because it is self-selecting: it is emitted solely
+      when the operator ARMED auto-recovery (asserting the device is expected up).
     - otherwise -> ``ok`` — INCLUDING when the device is offline
       (``active_connections == 0``): an absent device is not a software bug.
 
-    Deliberately does NOT consider ``active_connections`` or ``last_ts``: a device
-    that is unplugged/idle, or a quiet room with no recent utterance, is normal —
-    not a fault to alert on.
+    Deliberately does NOT consider ``active_connections`` or ``last_ts`` on their own:
+    a device that is unplugged/idle, or a quiet room with no recent utterance, is
+    normal — not a fault to alert on. Sustained darkness alone is NOT alerted (no
+    network signal distinguishes "unplugged" from "crashed"); only ``recovery_failing``
+    (which encodes the operator's always-on intent) crosses that line.
     """
     if data is None:
         return AmbientVerdict(
@@ -225,6 +231,33 @@ def evaluate_ambient_health(
             causes.append(cause)
             if status == "ok":
                 status = "degraded"
+
+    # Recovery-failing: the edge auto-recovery is armed, engaged, and the device is
+    # STILL dark long after recovery gave up (past recovery_seen_window). This is the
+    # ONE ambient-darkness signal that distinguishes a real fault from a merely-absent
+    # device — it fires ONLY when someone ARMED auto-recovery (asserting the device is
+    # expected up) and recovery could not restore it. On installs without recovery armed
+    # the field is never emitted, so an absent/off device stays silent (the "never alert
+    # on an absent device" invariant, docstring above, is preserved). Only upgrades
+    # ok -> degraded (bridge alive, capture impaired); a dead bridge stays "down" with
+    # the reason still appended.
+    if data.get("recovery_failing") is True:
+        count = data.get("failed_reboot_count")
+        since = data.get("device_dark_since")
+        err = data.get("last_reboot_error")
+        detail = (
+            f"{count} reboot attempt(s) failed"
+            if isinstance(count, int)
+            else "reboot attempts failed"
+        )
+        if since:
+            detail += f", dark since {since}"
+        if err:
+            detail += f" (last error: {err})"
+        reasons.append(f"auto-recovery exhausted — {detail}")
+        causes.append("recovery-failing")
+        if status == "ok":
+            status = "degraded"
 
     if status == "ok":
         reasons.append("healthy")
