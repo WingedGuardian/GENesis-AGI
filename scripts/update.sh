@@ -150,6 +150,17 @@ if ! flock -n "$_UPDATE_LOCK_FD"; then
     exit 1
 fi
 
+# Dashboard DIRECT path: the dashboard spawns us via `systemd-run --scope`, whose
+# PID it writes to the marker — and that PID is OUR $PPID. Adopt the marker as our
+# own ($$) so _clear_deploy_state can clean it at exit (its owner-check needs
+# marker==$$); otherwise systemd-run's PID leaks as a stale marker until the next
+# deploy. Gated on $PPID so we NEVER adopt a restore's marker (its own $$) or the
+# supervised orchestrator's marker (held by a CC session's parent, not ours).
+_own_marker="$HOME/.genesis/update_in_progress.pid"
+if [ -f "$_own_marker" ] && [ "$(cat "$_own_marker" 2>/dev/null || true)" = "$PPID" ]; then
+    echo "$$" > "$_own_marker"
+fi
+
 echo ""
 echo "  Genesis Update"
 echo "  ──────────────────────────────────────"
