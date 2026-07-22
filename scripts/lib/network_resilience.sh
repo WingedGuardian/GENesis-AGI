@@ -131,15 +131,29 @@ _netres_install_watchdog() {
     if ((_NETRES_WROTE > before)); then
         sudo systemctl daemon-reload 2>/dev/null || true
     fi
-    # ALWAYS ensure the timer is active (self-heal), decoupled from whether a file
-    # changed: a re-run must re-enable a timer that was disabled/stopped/masked
-    # externally since install — not skip just because the units are unchanged.
-    # The probe is a read (no sudo) and silent, so a healthy timer causes ZERO
-    # churn; only a genuinely-down timer triggers enable/start. NR1.
-    if ! systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1; then
+    # ALWAYS ensure the timer is active AND enabled (self-heal), decoupled from
+    # whether a file changed: a re-run must re-establish a timer that was disabled/
+    # stopped/masked externally since install — not skip just because the units are
+    # unchanged. Both states matter: `is-active` alone misses an active-but-DISABLED
+    # timer (e.g. `systemctl disable` without --now), which would silently fail to
+    # persist across a reboot. Both probes are reads (no sudo) and silent, so a
+    # healthy timer causes ZERO churn; only a down/unpersisted timer heals. NR1.
+    if ! systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
+        || ! systemctl is-enabled genesis-network-watchdog.timer >/dev/null 2>&1; then
+        # A masked timer can't be enabled/started until unmasked, and systemd never
+        # auto-unmasks — so unmask first, then enable+start, then VERIFY. Never claim
+        # a heal that didn't take: a still-down/unpersisted timer surfaces as a
+        # failure (WARNING + _NETRES_FAILED), not a false "re-enabled" success.
+        sudo systemctl unmask genesis-network-watchdog.timer 2>/dev/null || true
         sudo systemctl enable genesis-network-watchdog.timer 2>/dev/null || true
         sudo systemctl start genesis-network-watchdog.timer 2>/dev/null || true
-        _NETRES_HEALED=1
+        if systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
+            && systemctl is-enabled genesis-network-watchdog.timer >/dev/null 2>&1; then
+            _NETRES_HEALED=1
+        else
+            echo "  WARNING: watchdog timer could not be re-enabled (may be masked or broken)."
+            _NETRES_FAILED=1
+        fi
     fi
 }
 

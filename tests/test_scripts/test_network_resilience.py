@@ -29,22 +29,39 @@ exec "$@"
 """
 
 _SYSTEMCTL_STUB = """#!/bin/bash
-# is-active is keyed on the UNIT ($2) so the watchdog timer's state is
-# independently controllable. The timer is "active" iff a prior `start` ran this
-# test (models real start->active), UNLESS a test forces WATCHDOG_TIMER_ACTIVE_RC
-# to simulate an externally-stopped timer. systemd-networkd keeps the shared
-# NETWORKD_ACTIVE_RC. is-active never logs (a silent probe must not churn).
-_tstate="${SYSTEMCTL_LOG%.log}.timerstate"
+# Stateful stub for genesis-network-watchdog.timer, modelling real systemd:
+# `enable`->enabled, `start`->active, `mask`->(enable/start fail until `unmask`).
+# is-active / is-enabled are keyed on the UNIT ($2) and SILENT (never log — a
+# probe must not churn); tests can force states via WATCHDOG_TIMER_ACTIVE_RC /
+# WATCHDOG_TIMER_ENABLED_RC (or by deleting the .timer{started,enabled} state
+# files). systemd-networkd keeps the shared NETWORKD_* vars.
+_b="${SYSTEMCTL_LOG%.log}"
+_T=genesis-network-watchdog.timer
+_masked() { [ -f "$_b.timermasked" ]; }
 if [ "$1" = "is-active" ]; then
-    case "$2" in
-        genesis-network-watchdog.timer)
-            [ -n "${WATCHDOG_TIMER_ACTIVE_RC:-}" ] && exit "$WATCHDOG_TIMER_ACTIVE_RC"
-            [ -f "$_tstate" ] && exit 0 || exit 3 ;;
-        *) exit "${NETWORKD_ACTIVE_RC:-0}" ;;
-    esac
+    if [ "$2" = "$_T" ]; then
+        [ -n "${WATCHDOG_TIMER_ACTIVE_RC:-}" ] && exit "$WATCHDOG_TIMER_ACTIVE_RC"
+        { _masked || [ ! -f "$_b.timerstarted" ]; } && exit 3 || exit 0
+    fi
+    exit "${NETWORKD_ACTIVE_RC:-0}"
 fi
-if [ "$1" = "is-enabled" ]; then printf '%s' "${NETWORKD_ENABLED-enabled}"; exit 0; fi
-[ "$1" = "start" ] && : > "$_tstate"
+if [ "$1" = "is-enabled" ]; then
+    if [ "$2" = "$_T" ]; then
+        [ -n "${WATCHDOG_TIMER_ENABLED_RC:-}" ] && exit "$WATCHDOG_TIMER_ENABLED_RC"
+        { _masked || [ ! -f "$_b.timerenabled" ]; } && exit 1 || exit 0
+    fi
+    printf '%s' "${NETWORKD_ENABLED-enabled}"; exit 0
+fi
+[ "$1" = "mask" ] && [ "$2" = "$_T" ] && : > "$_b.timermasked"
+[ "$1" = "unmask" ] && rm -f "$_b.timermasked"
+if [ "$1" = "enable" ] && [ "$2" = "$_T" ]; then
+    _masked && { echo "$@" >> "$SYSTEMCTL_LOG"; exit 1; }
+    : > "$_b.timerenabled"
+fi
+if [ "$1" = "start" ] && [ "$2" = "$_T" ]; then
+    _masked && { echo "$@" >> "$SYSTEMCTL_LOG"; exit 1; }
+    : > "$_b.timerstarted"
+fi
 echo "$@" >> "$SYSTEMCTL_LOG"
 exit 0
 """
@@ -149,22 +166,52 @@ def test_second_run_is_a_noop(tmp_path):
     assert Path(env["SYSTEMCTL_LOG"]).read_text() == ""
 
 
-def test_second_run_heals_externally_disabled_timer(tmp_path):
-    """NR1: a re-run must RE-ENABLE a watchdog timer that was disabled/stopped/
-    masked externally since install — not skip just because the unit files are
-    unchanged this run. This is the gap the old `_NETRES_WROTE`-gated enable had."""
+def test_second_run_heals_disabled_timer(tmp_path):
+    """NR1 + Codex P2: an active-but-DISABLED timer (e.g. `systemctl disable`
+    without --now — won't persist across reboot) must heal, even though
+    `is-active` alone would report it fine. The self-heal probes enablement too."""
     env = _stage(tmp_path)
-    _run_apply(env)  # fresh install: timer active
+    _run_apply(env)  # fresh install: active + enabled
     Path(env["SYSTEMCTL_LOG"]).write_text("")
 
-    # Simulate the timer going down between runs (external disable/stop/mask).
-    env["WATCHDOG_TIMER_ACTIVE_RC"] = "3"
+    Path(env["SYSTEMCTL_LOG"][:-4] + ".timerenabled").unlink()  # externally disabled
     result = _run_apply(env)
     assert result.returncode == 0, result.stderr
     calls = Path(env["SYSTEMCTL_LOG"]).read_text()
-    assert "enable genesis-network-watchdog.timer" in calls  # re-enabled …
-    assert "start genesis-network-watchdog.timer" in calls  # … and restarted
+    assert "enable genesis-network-watchdog.timer" in calls  # re-enabled for persistence
     assert "re-enabled a stopped/disabled watchdog timer" in result.stdout
+
+
+def test_second_run_unmasks_and_heals_masked_timer(tmp_path):
+    """A masked timer can't be enabled/started until unmasked; the self-heal
+    unmasks first, then re-enables — and genuinely heals (code-reviewer)."""
+    env = _stage(tmp_path)
+    _run_apply(env)
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+
+    Path(env["SYSTEMCTL_LOG"][:-4] + ".timermasked").write_text("")  # externally masked
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    calls = Path(env["SYSTEMCTL_LOG"]).read_text()
+    assert "unmask genesis-network-watchdog.timer" in calls  # unmasked first …
+    assert "enable genesis-network-watchdog.timer" in calls  # … then re-enabled
+    assert "re-enabled a stopped/disabled watchdog timer" in result.stdout
+
+
+def test_unhealable_timer_reports_failure_not_false_heal(tmp_path):
+    """code-reviewer SHOULD-FIX: if enable/start don't take (broken/permanently
+    down unit), the heal must VERIFY and report failure — never a false
+    're-enabled' success on a state that's still broken."""
+    env = _stage(tmp_path)
+    _run_apply(env)
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+
+    env["WATCHDOG_TIMER_ACTIVE_RC"] = "3"  # stays down through the post-heal verify
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    assert "could not be re-enabled" in result.stdout  # honest WARNING
+    assert "re-enabled a stopped/disabled watchdog timer" not in result.stdout
+    assert "NOT fully applied" in result.stdout  # routed to the _NETRES_FAILED path
 
 
 def test_no_systemd_skips_cleanly(tmp_path):
