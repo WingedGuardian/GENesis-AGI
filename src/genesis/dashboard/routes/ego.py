@@ -488,3 +488,131 @@ async def ego_vcr():
 
     data = await compute_vcr(rt._db, days=30)
     return jsonify(data)
+
+
+# ── Directives & goals visibility (read + user-driven retire) ──────────
+
+
+def _directive_view(d: dict) -> dict:
+    """Project a directive row to the dashboard payload."""
+    return {
+        "id": d["id"],
+        "content": d["content"],
+        "priority": d["priority"],
+        "source": d["source"],
+        "ego_target": d["ego_target"],
+        "status": d["status"],
+        "created_at": d["created_at"],
+        "resolved_at": d.get("resolved_at"),
+        "resolution": d.get("resolution"),
+        "reaffirm_count": d.get("reaffirm_count", 0),
+        "last_reaffirmed_at": d.get("last_reaffirmed_at"),
+    }
+
+
+def _goal_view(g: dict) -> dict:
+    """Project a goal row to the dashboard payload."""
+    return {
+        "id": g["id"],
+        "title": g["title"],
+        "description": g.get("description"),
+        "category": g["category"],
+        "priority": g["priority"],
+        "status": g["status"],
+        "timeline": g.get("timeline"),
+        "confidence": g.get("confidence"),
+        "goal_type": g.get("goal_type"),
+        "origin": g.get("origin"),
+        "created_at": g["created_at"],
+        "updated_at": g.get("updated_at"),
+    }
+
+
+@blueprint.route("/api/genesis/ego/directives")
+@_async_route
+async def ego_directives():
+    """Active directives (both egos) + recently-resolved history.
+
+    Visibility surface so the user can see — and via the resolve endpoint,
+    retire — the standing directives driving each ego. Decision rows
+    (kind='decision') are excluded; they have their own lifecycle.
+    """
+    from genesis.db.crud import ego as ego_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"active": [], "resolved": []})
+
+    active = await ego_crud.list_directives(rt._db, statuses=("active",), limit=50)
+    resolved = await ego_crud.list_directives(rt._db, statuses=("completed", "cancelled"), limit=5)
+    return jsonify(
+        {
+            "active": [_directive_view(d) for d in active],
+            "resolved": [_directive_view(d) for d in resolved],
+        }
+    )
+
+
+@blueprint.route("/api/genesis/ego/goals")
+@_async_route
+async def ego_goals():
+    """Active goals split by provenance — user directives vs ego own-goals.
+
+    Read-only visibility (no goal mutation here). ``genesis_ego`` is the ego's
+    own-goal lane; ``user`` are the user's goals. Either list may be empty on a
+    fresh install.
+    """
+    from genesis.db.crud import user_goals as goals_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"user": [], "genesis_ego": []})
+
+    goals = await goals_crud.list_active(rt._db, limit=50, origin=None)
+    return jsonify(
+        {
+            "user": [_goal_view(g) for g in goals if g.get("origin") == "user"],
+            "genesis_ego": [_goal_view(g) for g in goals if g.get("origin") == "genesis_ego"],
+        }
+    )
+
+
+@blueprint.route("/api/genesis/ego/directives/<directive_id>/resolve", methods=["POST"])
+@_async_route
+async def ego_directive_resolve(directive_id: str):
+    """Retire a standing directive from the dashboard (a user action).
+
+    Default is a 'cancelled' retire (no longer relevant); pass
+    status='completed' to mark it done instead. Decision rows are structurally
+    refused by ``resolve_directive`` (kind != 'decision').
+    """
+    from genesis.db.crud import ego as ego_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"ok": False, "error": "not bootstrapped"}), 503
+
+    body = request.get_json(silent=True) or {}
+    status = body.get("status", "cancelled")
+    if status not in ("completed", "cancelled"):
+        return jsonify({"ok": False, "error": "status must be 'completed' or 'cancelled'"}), 400
+    resolution = body.get("resolution") or "Retired via dashboard"
+
+    updated = await ego_crud.resolve_directive(
+        rt._db,
+        directive_id,
+        status=status,
+        resolution=resolution,
+    )
+    if not updated:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "directive not found, already resolved, or a decision row",
+            }
+        ), 404
+
+    return jsonify({"ok": True, "id": directive_id, "status": status})
