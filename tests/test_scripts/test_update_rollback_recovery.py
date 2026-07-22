@@ -43,9 +43,21 @@ def test_migrations_ran_flag_set_before_runner(text: str) -> None:
 def test_rollback_restores_db_only_when_migrated(text: str) -> None:
     rb = text[text.find("_do_rollback() {") : text.find("To diagnose")]
     assert '[ "${MIGRATIONS_RAN:-0}" = "1" ]' in rb, "DB restore must be gated on MIGRATIONS_RAN"
-    assert '[ -f "$DB_FILE.pre-update" ]' in rb, "and on the snapshot existing"
+    assert '[ "${DB_SNAPSHOT_TAKEN:-0}" != "1" ]' in rb, (
+        "restore must trust the THIS-RUN snapshot flag, not mere file existence "
+        "(a stale prior-run snapshot must not be restored as if current)"
+    )
+    assert "migrations ran but no current DB snapshot exists" in rb, (
+        "migrated-but-no-snapshot must be a LOUD rollback failure, not a silent success"
+    )
     assert 'cp "$DB_FILE.pre-update" "$DB_FILE"' in rb, (
         "restore copies the pre-update snapshot back"
+    )
+    # The snapshot flag is set ONLY on a successful `.backup` this run.
+    snap = text[text.find("--- Snapshotting database ---") : text.find("_do_rollback() {")]
+    assert "DB_SNAPSHOT_TAKEN=1" in snap, "flag set on successful .backup"
+    assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index('".backup'), (
+        "flag set AFTER the .backup succeeds, inside the success branch"
     )
     assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' in rb, (
         "restore MUST clear the stale WAL/SHM or SQLite replays the migrated changes"
@@ -76,6 +88,27 @@ def test_recovery_detection_forces_server_restart(text: str) -> None:
 
 def test_operator_stop_recorded_as_degraded_not_bare_success(text: str) -> None:
     assert "genesis-server-not-restarted" in text, "operator-stop must flag the not-running server"
+
+
+def test_noop_path_clears_stale_failure_signals_when_server_was_up(text: str) -> None:
+    """The 'Already up to date' no-op path must clear a stale
+    last_update_failure.json (and supersede the rolled_back status) when the
+    server was up at start — else a long-resolved failure later force-restarts an
+    operator-stopped server. Gated on server-was-up so an UNRESOLVED failure's
+    artifact survives to drive recovery."""
+    noop = text[text.find("Already up to date") : text.find("Nothing to do")]
+    assert 'rm -f "$HOME/.genesis/last_update_failure.json"' in noop, (
+        "no-op path must clear the stale failure marker"
+    )
+    assert '[[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]' in noop, (
+        "the clear must be gated on genesis-server having been up at start"
+    )
+    # The clear and the status supersession happen together.
+    clear_at = noop.find('rm -f "$HOME/.genesis/last_update_failure.json"')
+    record_at = noop.find('_record_update_history "success"', clear_at)
+    assert clear_at < record_at < clear_at + 200, (
+        "clearing the artifact must record a fresh success to supersede the stale status row"
+    )
 
 
 def _extract_recovery_block(text: str) -> str:

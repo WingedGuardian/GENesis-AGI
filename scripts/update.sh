@@ -689,6 +689,9 @@ DB_FILE="$GENESIS_ROOT/data/genesis.db"
 MIGRATIONS_RAN=0  # set to 1 once the migration runner is invoked; gates the
                   # pre-update DB restore in _do_rollback (rollback the schema
                   # only if this update actually migrated it).
+DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's `.backup` succeeds; the
+                  # restore trusts this, not mere file existence, so a stale
+                  # snapshot from a prior run is never restored as if current.
 if [ -f "$DB_FILE" ]; then
     echo "--- Snapshotting database ---"
     sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
@@ -699,7 +702,12 @@ if [ -f "$DB_FILE" ]; then
     # `.backup` takes a transactionally-consistent snapshot of a live database.
     if sqlite3 "$DB_FILE" ".backup '$DB_FILE.pre-update'" 2>/dev/null; then
         echo "  DB snapshot: $DB_FILE.pre-update"
+        DB_SNAPSHOT_TAKEN=1
     else
+        # Leave any stale $DB_FILE.pre-update on disk untouched — DB_SNAPSHOT_TAKEN
+        # stays 0 so _do_rollback will NOT restore it (and will fail the rollback
+        # loudly if this run then migrates). Removing it would erase a prior valid
+        # snapshot for no gain.
         echo "  WARNING: DB snapshot failed (continuing anyway)"
     fi
 fi
@@ -883,8 +891,16 @@ _do_rollback() {
     # Rolling back the code without the DB would leave the old code running
     # against a migrated (newer) schema. If no migration ran, the DB is untouched.
     local db_ok=true
-    if [ "${MIGRATIONS_RAN:-0}" = "1" ] && [ -f "$DB_FILE.pre-update" ]; then
-        if [ "$server_down" != "true" ]; then
+    if [ "${MIGRATIONS_RAN:-0}" = "1" ]; then
+        if [ "${DB_SNAPSHOT_TAKEN:-0}" != "1" ]; then
+            # Migrations ran but THIS run took no valid snapshot (the `.backup`
+            # failed, or only a stale prior-run file exists). We cannot roll the
+            # schema back, so the rollback is NOT clean — the old code will run
+            # against a migrated DB. Flag it loudly for manual intervention rather
+            # than report success or restore a stale snapshot.
+            echo "  CRITICAL: migrations ran but no current DB snapshot exists — cannot restore; old code may run against a migrated schema"
+            db_ok=false
+        elif [ "$server_down" != "true" ]; then
             # Refuse to overwrite a possibly-live database — a cp under a writing
             # server corrupts it. Leave the migrated DB in place (schema mismatch,
             # but recoverable) and flag for manual intervention.
@@ -1233,10 +1249,24 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
     _sync_deploy_targets
-    # Persist any host-side degradation the drift healing just found — this
-    # path exits before the success-path recording, so without this the flag
-    # would only ever reach stdout on no-op runs.
-    if [ -n "$HOST_CC_DEGRADED" ]; then
+    # Clear stale recovery signals. If genesis-server was up when THIS run
+    # started (present in WERE_RUNNING), any prior update failure was already
+    # resolved — the server recovered. Leaving last_update_failure.json (and the
+    # rolled_back/failed update_history row that a rollback writes alongside it)
+    # in place would let P6's recovery detection later force-restart a server the
+    # operator has since deliberately stopped, on a long-dead failure. Recording
+    # a fresh success supersedes that stale status row too (both signals move
+    # together in normal flows). GATED on server-was-up: a still-down server may
+    # be an UNRESOLVED failure whose artifact must survive to drive recovery, so
+    # we must not erase it. This path also exits before the success-path
+    # recording, so it doubles as the place to persist any host-side degradation
+    # the drift healing just found.
+    if [ -f "$HOME/.genesis/last_update_failure.json" ] \
+        && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+        rm -f "$HOME/.genesis/last_update_failure.json"
+        _record_update_history "success" "" "$HOST_CC_DEGRADED"
+        echo "  Cleared stale update-failure marker (server healthy, code current)."
+    elif [ -n "$HOST_CC_DEGRADED" ]; then
         echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
         _record_update_history "success" "" "$HOST_CC_DEGRADED"
     fi
