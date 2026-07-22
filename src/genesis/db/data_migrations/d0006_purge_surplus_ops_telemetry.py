@@ -1,4 +1,4 @@
-"""d0005 — purge operational-telemetry rows that polluted the knowledge base.
+"""d0006 — purge operational-telemetry rows that polluted the knowledge base.
 
 Non-KB-routing surplus tasks (action/maintenance/monitor/pipeline-intermediate:
 db_maintenance, disk_cleanup, model_eval, j9_eval_batch, backup_verification,
@@ -19,7 +19,7 @@ AND the deterministic machine-report opener the executor writes (e.g.
 makes it safe against a legitimate insight an LLM happened to title "Model Eval"
 in the same scope (Codex P2, #1179) — an insight's prose body lacks the machine
 prefix. Insight-producing tasks are never matched (their titles are disjoint from
-the signatures — asserted by test_d0005_purge_surplus_ops_telemetry).
+the signatures — asserted by test_d0006_purge_surplus_ops_telemetry).
 
 Cross-store: a KB unit lives in Qdrant + memory_metadata + memory_fts +
 knowledge_units + knowledge_fts (+ memory_links / pending_embeddings /
@@ -130,7 +130,7 @@ def migrate() -> dict:
                     # Leave this unit's SQLite rows intact so verify() still sees
                     # it and the migration retries — never a half-deleted orphan.
                     logger.warning(
-                        "d0005: Qdrant delete failed for %s — skipping SQLite purge",
+                        "d0006: Qdrant delete failed for %s — skipping SQLite purge",
                         qdrant_id,
                         exc_info=True,
                     )
@@ -154,7 +154,7 @@ def migrate() -> dict:
         db.close()
 
     logger.info(
-        "d0005: purged %d surplus ops-telemetry KB units (%d Qdrant points, "
+        "d0006: purged %d surplus ops-telemetry KB units (%d Qdrant points, "
         "%d Qdrant-delete failures left for retry)",
         purged,
         qdrant_deleted,
