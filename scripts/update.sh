@@ -85,8 +85,11 @@ _on_signal_prestop() {
     # The interrupt may have landed mid-stop (the stop polls up to ~10s), so a
     # service may already be down. Restart exactly what was detected running —
     # WERE_RUNNING is populated BEFORE the physical stop — so the server is never
-    # left down; `systemctl start` is a no-op if it never actually stopped. No
-    # rollback is needed here: nothing has been merged yet.
+    # left down. For genesis-server, `_start_genesis_server` runs `systemctl
+    # restart`: it cleanly bounces the server if it never stopped, or starts it
+    # if the interrupt already took it down — either way it ends up running. The
+    # bridge uses `start`, a no-op when still running. No rollback is needed
+    # here: nothing has been merged yet.
     local _svc
     for _svc in "${WERE_RUNNING[@]:-}"; do
         [ -n "$_svc" ] || continue
