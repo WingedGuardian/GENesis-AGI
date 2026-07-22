@@ -616,16 +616,31 @@ async def test_streaming_omits_research_routing_for_terminal(loop):
 
 
 @pytest.mark.asyncio
-async def test_handle_message_appends_routing_for_web(loop, mock_invoker):
-    """Non-streaming path (OpenClaw/WEB) also gets the routing nudge."""
+async def test_handle_message_appends_routing_for_telegram(loop, mock_invoker):
+    """Non-streaming path gets the nudge on a delivery-addressable (Telegram) channel."""
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    await loop.handle_message(
+        "please run deep research on X", user_id="tg-2", channel=ChannelType.TELEGRAM
+    )
+    inv = mock_invoker.run.call_args[0][0]
+    assert inv.system_prompt is not None
+    assert _BG_RESEARCH_ROUTING in inv.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_handle_message_omits_routing_for_web(loop, mock_invoker):
+    """WEB/OpenClaw is NOT addressable by deliver_to_origin (the resolver only
+    resolves Telegram), so the nudge is withheld — promising a report-back the
+    delivery model would silently redirect to the owner surface is the exact
+    silent-loss class this feature prevents."""
     from genesis.cc.conversation import _BG_RESEARCH_ROUTING
 
     await loop.handle_message(
         "please run deep research on X", user_id="web-1", channel=ChannelType.WEB
     )
     inv = mock_invoker.run.call_args[0][0]
-    assert inv.system_prompt is not None
-    assert _BG_RESEARCH_ROUTING in inv.system_prompt
+    assert _BG_RESEARCH_ROUTING not in (inv.system_prompt or "")
 
 
 @pytest.mark.asyncio
@@ -637,6 +652,21 @@ async def test_handle_message_omits_routing_for_terminal(loop, mock_invoker):
     )
     inv = mock_invoker.run.call_args[0][0]
     assert _BG_RESEARCH_ROUTING not in (inv.system_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_origin_delivery_supported_matches_addressable_set():
+    """The reroute gate and the delivery resolver share one source of truth: only
+    Telegram origins can actually be delivered back to (see
+    DirectSessionRunner._resolve_origin_target)."""
+    from genesis.cc.types import ChannelType as CT
+    from genesis.cc.types import origin_delivery_supported
+
+    assert origin_delivery_supported(CT.TELEGRAM) is True
+    assert origin_delivery_supported("telegram") is True
+    for ch in (CT.WEB, CT.WHATSAPP, CT.VOICE, CT.TERMINAL):
+        assert origin_delivery_supported(ch) is False
+    assert origin_delivery_supported(None) is False
 
 
 @pytest.mark.asyncio

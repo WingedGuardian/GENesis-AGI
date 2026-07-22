@@ -53,6 +53,25 @@ class ChannelType(StrEnum):
     VOICE = "voice"
 
 
+def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
+    """Whether ``direct_session_run(deliver_to_origin=True)`` can actually deliver a
+    background result back to an origin on this channel.
+
+    Single source of truth, mirrored by ``DirectSessionRunner._resolve_origin_target``:
+    that resolver returns a real ``(chat_id, thread_id)`` target ONLY for Telegram
+    origins (a Telegram voice message arrives on the ``telegram`` channel — the
+    ``VOICE`` channel is the separate S2S surface, which has no addressable thread).
+    Every other channel (WEB/OpenClaw, WhatsApp, VOICE, terminal) falls back to the
+    default owner surface. The channel research-reroute nudge is gated on this so it
+    never promises "I'll report back to this conversation" on a channel where the
+    delivery model would silently redirect the result to the owner surface instead.
+    """
+    if channel is None:
+        return False
+    value = channel.value if isinstance(channel, ChannelType) else str(channel)
+    return value == ChannelType.TELEGRAM.value
+
+
 class CCModel(StrEnum):
     SONNET = "sonnet"
     OPUS = "opus"

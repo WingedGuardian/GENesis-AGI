@@ -48,7 +48,11 @@ that it's running in the background.** The background lane owns a longer wait ce
 delivers the finished outcome back to this exact conversation (the delivery model
 merged in #1192). Terminal/interactive sessions may still run Workflows inline (you're
 present to see them). The foreground system prompt (`conversation._BG_RESEARCH_ROUTING`)
-nudges this automatically for non-terminal channels.
+nudges this automatically — but only for channels the delivery model can actually
+report back to (**Telegram**, per `origin_delivery_supported`). On channels the
+resolver can't address (WEB/OpenClaw, WhatsApp, VOICE) the result would fall back to
+the owner surface, so the nudge is withheld rather than promise a report-back that
+lands elsewhere.
 
 ## Profiles
 

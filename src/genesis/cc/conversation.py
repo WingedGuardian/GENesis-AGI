@@ -23,7 +23,14 @@ from genesis.cc.formatter import ResponseFormatter
 from genesis.cc.intent import IntentParser
 from genesis.cc.session_manager import SessionManager
 from genesis.cc.system_prompt import SystemPromptAssembler
-from genesis.cc.types import CCInvocation, CCModel, ChannelType, EffortLevel, StreamEvent
+from genesis.cc.types import (
+    CCInvocation,
+    CCModel,
+    ChannelType,
+    EffortLevel,
+    StreamEvent,
+    origin_delivery_supported,
+)
 from genesis.db.crud import cc_sessions
 from genesis.observability.call_site_recorder import record_last_run
 
@@ -48,7 +55,7 @@ def _bg_notice(output) -> str:
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
 
 
-# Nudge for dispatched (turn-ends) channels: route long research/background work to the
+# Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
 # durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
 # kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
 # Pairs with the merged delivery model (PR #1192): deliver_to_origin=true sends the
@@ -70,13 +77,20 @@ _BG_RESEARCH_ROUTING = (
 
 
 def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
-    """Append the long-research routing nudge for dispatched (non-terminal) channels.
+    """Append the long-research routing nudge for channels the delivery model can
+    actually report back to.
 
-    Their turn ends after replying, so long inline work is killed at the CC bg-wait
-    ceiling with nothing left to report back — route it to the durable background lane
-    instead. Terminal is interactive (user present), so inline stays fine there.
+    The nudge tells the model to hand long research to the background lane with
+    ``deliver_to_origin=true`` and promise "I'll report back to this conversation."
+    That promise is only keepable where ``direct_session`` can resolve an origin
+    target — i.e. Telegram (see ``origin_delivery_supported``, the single source of
+    truth shared with ``DirectSessionRunner._resolve_origin_target``). On any other
+    channel (WEB/OpenClaw, WhatsApp, VOICE) the result would silently fall back to the
+    owner surface, so the nudge is withheld rather than promise a report-back the
+    delivery model cannot keep. Terminal is interactive anyway (user present), so
+    inline work is fine there.
     """
-    if channel is None or channel == ChannelType.TERMINAL:
+    if not origin_delivery_supported(channel):
         return system_prompt
     return (system_prompt + _BG_RESEARCH_ROUTING) if system_prompt else _BG_RESEARCH_ROUTING
 
