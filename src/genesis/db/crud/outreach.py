@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import aiosqlite
 
 from genesis.outreach.types import POSITIVE_ENGAGEMENT_SQL_IN as _POSITIVE_IN
@@ -224,3 +226,41 @@ async def count_recent(
     )
     row = await cursor.fetchone()
     return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Sync version (for hook context)
+# ---------------------------------------------------------------------------
+
+
+def get_notifications_by_topic_sync(
+    db_path: str,
+    *,
+    topic_like: str,
+    timeout: float = 2.0,
+) -> list[dict]:
+    """Delivered owner-notifications whose topic matches ``topic_like`` (SQL
+    LIKE), newest first. Read-only (``mode=ro``, WAL-safe). Returns [] on any
+    error.
+
+    Sync sibling of the async readers above -- mirrors the session_heartbeats
+    async+sync split: a SessionStart hook needs a fast synchronous read and
+    cannot drive the async runtime connection.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=timeout)
+        try:
+            conn.execute("PRAGMA busy_timeout=300")
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, topic, delivered_at FROM outreach_history "
+                "WHERE category = 'notification' AND topic LIKE ? "
+                "AND delivered_at IS NOT NULL "
+                "ORDER BY delivered_at DESC",
+                (topic_like,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+    except Exception:
+        return []

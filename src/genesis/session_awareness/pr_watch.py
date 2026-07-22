@@ -29,12 +29,12 @@ import contextlib
 import json
 import logging
 import os
-import sqlite3
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from genesis.db.crud import outreach as outreach_crud
 from genesis.env import genesis_home
 
 logger = logging.getLogger(__name__)
@@ -84,32 +84,25 @@ def _parse_ts(value: Any) -> datetime | None:
 def read_steward_notifications(
     db_file: Path, lookback_days: int, now: datetime
 ) -> list[dict[str, Any]]:
-    """Recent steward owner-notifications, newest first. Any error -> []."""
-    cutoff = now.timestamp() - lookback_days * 86400
-    try:
-        if not db_file.exists():
-            return []
-        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=2)
-        try:
-            conn.execute("PRAGMA busy_timeout=300")
-            rows = conn.execute(
-                "SELECT id, topic, delivered_at FROM outreach_history "
-                "WHERE category = 'notification' AND topic LIKE ? "
-                "AND delivered_at IS NOT NULL "
-                "ORDER BY delivered_at DESC",
-                (_TOPIC_LIKE,),
-            ).fetchall()
-        finally:
-            conn.close()
-    except Exception:
-        return []
+    """Recent steward owner-notifications, newest first. Any error -> [].
 
+    The DB read is delegated to the crud layer
+    (``db.crud.outreach.get_notifications_by_topic_sync`` — a read-only sync
+    reader, the hook-context sibling of the async outreach readers). This
+    function keeps only the lookback windowing (tz-safe via ``_parse_ts``).
+    """
+    if not db_file.exists():
+        return []
+    cutoff = now.timestamp() - lookback_days * 86400
+    rows = outreach_crud.get_notifications_by_topic_sync(str(db_file), topic_like=_TOPIC_LIKE)
     out: list[dict[str, Any]] = []
-    for rid, topic, delivered_at in rows:
-        ts = _parse_ts(delivered_at)
+    for r in rows:
+        ts = _parse_ts(r.get("delivered_at"))
         if ts is None or ts.timestamp() < cutoff:
             continue
-        out.append({"id": rid, "topic": topic or "", "delivered_at": delivered_at})
+        out.append(
+            {"id": r["id"], "topic": r.get("topic") or "", "delivered_at": r["delivered_at"]}
+        )
     return out
 
 
