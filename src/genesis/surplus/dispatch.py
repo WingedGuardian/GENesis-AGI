@@ -26,7 +26,11 @@ from typing import TYPE_CHECKING, Protocol
 
 from genesis.db.crud import surplus as surplus_crud
 from genesis.observability.types import Severity, Subsystem
-from genesis.surplus.types import INSIGHT_PRODUCING_TASK_TYPES, TaskType
+from genesis.surplus.types import (
+    INSIGHT_PRODUCING_TASK_TYPES,
+    KB_ROUTING_TASK_TYPES,
+    TaskType,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -77,7 +81,11 @@ def _select_executor(sched: DispatchContext, task) -> SurplusExecutor:
 
 
 async def _handle_failure(
-    sched: DispatchContext, task, reason: str, *, emit_event: bool,
+    sched: DispatchContext,
+    task,
+    reason: str,
+    *,
+    emit_event: bool,
 ) -> None:
     """Shared failure path: mark failed, optionally emit, signal autonomy,
     maybe observe.
@@ -89,18 +97,22 @@ async def _handle_failure(
     await sched._queue.mark_failed(task.id, reason=reason)
     if emit_event and sched._event_bus:
         await sched._event_bus.emit(
-            Subsystem.SURPLUS, Severity.WARNING,
+            Subsystem.SURPLUS,
+            Severity.WARNING,
             "task.failed",
             f"Surplus task {task.id} failed with exception",
-            task_id=task.id, task_type=str(task.task_type),
+            task_id=task.id,
+            task_type=str(task.task_type),
         )
     # Signal autonomy correction for background cognitive failure
     try:
         from genesis.runtime import GenesisRuntime
+
         rt = GenesisRuntime.instance()
         mgr = getattr(rt, "_autonomy_manager", None)
         if mgr is not None:
             from datetime import UTC, datetime
+
             await mgr.record_correction(
                 "background_cognitive",
                 corrected_at=datetime.now(UTC).isoformat(),
@@ -111,7 +123,9 @@ async def _handle_failure(
 
 
 async def _route_insights(
-    sched: DispatchContext, task, result,
+    sched: DispatchContext,
+    task,
+    result,
 ) -> tuple[str | None, str | None, float | None, str | None]:
     """Step 6 — route through intake pipeline (atomize → score → route to
     knowledge) and run the measurement-only quality judge.
@@ -136,7 +150,8 @@ async def _route_insights(
         if len(content.strip()) < 50:
             logger.warning(
                 "Surplus insight too short, skipping (%d chars, task=%s)",
-                len(content.strip()), task.id[:8],
+                len(content.strip()),
+                task.id[:8],
             )
         else:
             if task.task_type == TaskType.CODE_AUDIT:
@@ -148,12 +163,30 @@ async def _route_insights(
                 # for tracking; the quality judge below still runs.
                 content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
                 staging_id = f"{task.task_type.value}-{content_hash}"
+            elif task.task_type not in KB_ROUTING_TASK_TYPES:
+                # Non-KB-routing task (action/maintenance/monitor/pipeline-
+                # intermediate — e.g. DB_MAINTENANCE, DISK_CLEANUP, MODEL_EVAL,
+                # J9_EVAL_BATCH): its output is point-in-time OPERATIONAL
+                # TELEMETRY (a maintenance report, an eval-batch summary), NOT
+                # durable knowledge. Never ingest it into the knowledge base —
+                # doing so is what polluted the KB to 71% surplus. The task's
+                # outcome is still recorded via the normal outcome-bus path; we
+                # keep a synthetic staging_id for tracking only. The quality
+                # judge below stays gated on INSIGHT_PRODUCING and no-ops here.
+                content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                staging_id = f"{task.task_type.value}-{content_hash}"
+                logger.debug(
+                    "Skipping KB intake for non-KB-routing task %s (%s)",
+                    task.task_type.value,
+                    task.id[:8],
+                )
             else:
                 try:
                     from genesis.surplus.intake import (
                         run_intake,
                         source_for_task_type,
                     )
+
                     source = source_for_task_type(str(task.task_type))
                     intake_stats = await run_intake(
                         content=content,
@@ -205,10 +238,11 @@ async def _route_insights(
             # a judge outage yields a NULL verdict, never a false 'hollow'.
             if task.task_type in INSIGHT_PRODUCING_TASK_TYPES:
                 from genesis.surplus.quality_judge import run_quality_judge
-                outcome_quality, judge_score, judge_detail = (
-                    await run_quality_judge(
-                        content, task.task_type, sched._judge_router,
-                    )
+
+                outcome_quality, judge_score, judge_detail = await run_quality_judge(
+                    content,
+                    task.task_type,
+                    sched._judge_router,
                 )
     return staging_id, outcome_quality, judge_score, judge_detail
 
@@ -229,6 +263,7 @@ async def _chain_pipeline(sched: DispatchContext, task, result) -> None:
             is_pipeline_task,
             parse_pipeline_payload,
         )
+
         if is_pipeline_task(task.payload):
             try:
                 meta = parse_pipeline_payload(task.payload)
@@ -240,7 +275,8 @@ async def _chain_pipeline(sched: DispatchContext, task, result) -> None:
                     if defn and step < len(defn.steps):
                         next_step = defn.steps[step]  # 0-indexed, step is 1-based
                         next_payload = build_next_step_payload(
-                            meta, result.content or "",
+                            meta,
+                            result.content or "",
                         )
                         await sched._queue.enqueue(
                             next_step.task_type,
@@ -251,17 +287,23 @@ async def _chain_pipeline(sched: DispatchContext, task, result) -> None:
                         )
                         logger.info(
                             "Pipeline %s: step %d/%d complete, enqueued step %d",
-                            pipeline_name, step, total, step + 1,
+                            pipeline_name,
+                            step,
+                            total,
+                            step + 1,
                         )
                     else:
                         logger.warning(
                             "Pipeline %s: step %d references missing definition",
-                            pipeline_name, step + 1,
+                            pipeline_name,
+                            step + 1,
                         )
                 else:
                     logger.info(
                         "Pipeline %s: final step %d/%d complete",
-                        pipeline_name, step, total,
+                        pipeline_name,
+                        step,
+                        total,
                     )
             except Exception:
                 logger.error("Pipeline chaining failed", exc_info=True)
@@ -272,8 +314,9 @@ async def _bridge_code_audit_findings(task, result) -> None:
     if task.task_type == TaskType.CODE_AUDIT and result.insights:
         try:
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
-            if hasattr(rt, '_findings_bridge') and rt._findings_bridge is not None:
+            if hasattr(rt, "_findings_bridge") and rt._findings_bridge is not None:
                 bridged = await rt._findings_bridge.bridge_findings(result.insights)
                 logger.info("Bridged %d code audit findings to observations", bridged)
         except Exception:
@@ -281,7 +324,10 @@ async def _bridge_code_audit_findings(task, result) -> None:
 
 
 async def _log_brainstorm(
-    sched: DispatchContext, task, result, staging_id: str | None,
+    sched: DispatchContext,
+    task,
+    result,
+    staging_id: str | None,
 ) -> None:
     """Write to brainstorm_log for brainstorm-type tasks."""
     if task.task_type in (TaskType.BRAINSTORM_USER, TaskType.BRAINSTORM_SELF):
@@ -314,6 +360,7 @@ async def _signal_autonomy_success() -> None:
     """Signal autonomy calibration for background cognitive work."""
     try:
         from genesis.runtime import GenesisRuntime
+
         rt = GenesisRuntime.instance()
         mgr = getattr(rt, "_autonomy_manager", None)
         if mgr is not None:
@@ -365,12 +412,17 @@ async def dispatch_once(sched: DispatchContext) -> bool:
 
     # 6. Route through intake pipeline (atomize → score → route to knowledge)
     staging_id, outcome_quality, judge_score, judge_detail = await _route_insights(
-        sched, task, result,
+        sched,
+        task,
+        result,
     )
 
     await sched._queue.mark_completed(
-        task.id, staging_id=staging_id, outcome_quality=outcome_quality,
-        judge_score=judge_score, judge_detail=judge_detail,
+        task.id,
+        staging_id=staging_id,
+        outcome_quality=outcome_quality,
+        judge_score=judge_score,
+        judge_detail=judge_detail,
     )
 
     await _chain_pipeline(sched, task, result)
@@ -388,7 +440,8 @@ async def maybe_observe_failure(sched: DispatchContext, task, reason: str) -> No
         from genesis.db.crud import observations, surplus_tasks
 
         count = await surplus_tasks.consecutive_failures(
-            sched._db, str(task.task_type),
+            sched._db,
+            str(task.task_type),
         )
         if count >= 3:
             obs_id = f"surplus_failing_{task.task_type}"
@@ -407,7 +460,8 @@ async def maybe_observe_failure(sched: DispatchContext, task, reason: str) -> No
             )
             logger.warning(
                 "Surplus task %s: %d consecutive failures, observation created",
-                task.task_type, count,
+                task.task_type,
+                count,
             )
     except Exception:
         logger.debug("Failed to create failure observation", exc_info=True)
