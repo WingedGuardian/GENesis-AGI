@@ -23,6 +23,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Background sessions no longer get silently cut off after 10 minutes.** A
+  long background task (for example deep research running as a background
+  session) used to be killed at about 10 minutes with only a partial result and
+  no signal. Background sessions now run to completion within their time budget,
+  and if any background work is ever cut short by a time limit, the result is
+  flagged as incomplete rather than delivered as if it were finished.
+
 - **Host setup no longer force-deletes a container it wrongly thinks is
   damaged, or hides an install behind a new disk.** Host-side hardening: a
   container flagged "damaged" is now **renamed aside** (its database, memory, and

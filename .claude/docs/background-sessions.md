@@ -16,6 +16,13 @@ Read this guide any time you're considering a background session or sub-agent.
 outlive this conversation → background session. If you just need an answer in
 the next few minutes → sub-agent.
 
+> **Note:** the background lane now owns a longer CC background-wait ceiling (set
+> to its full `timeout_s`), so a dispatched `Workflow` inside a background session
+> runs to completion instead of the CLI's default 600s truncation. Automatically
+> routing long research *from a channel turn* into this lane — with the result
+> delivered back to the requester — is a follow-up (needs the delivery model wired;
+> a background session's success output is not yet sent to the owner).
+
 ## Profiles
 
 | Profile | Browser | observation_write | outreach_send | follow_up_create | Web search |

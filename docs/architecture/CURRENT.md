@@ -137,7 +137,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: e01e0c49 2026-07-09
+verified: 8cb9e8dc 2026-07-21
 ```
 
 - `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split
@@ -163,6 +163,16 @@ verified: e01e0c49 2026-07-09
 - `cc/context_injector.py` (memory→session injection) lives HERE, not in
   memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
   `session_config.py` (hook-inheritance).
+- **Background-wait ceiling ownership** (invoker.py): the CLI's headless
+  `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 600s) SIGKILLs a dispatched
+  Workflow/subagent mid-run with a partial result. `CCInvocation.bg_wait_ceiling_ms`
+  now owns it, clamped below `timeout_s` so graceful truncation precedes the hard
+  kill; the background lane (direct_session) sets it to the full budget so long work
+  (deep-research) runs to completion. A hit sets `CCOutput.bg_truncated` → a visible
+  user notice + a `cc.bg_truncated` event. Foreground turns keep the 600s default so a
+  conversational turn never lingers holding the per-session lock; routing long research
+  from a channel to the durable background lane (with result delivery) is a follow-up.
+  Origin: the 2026-07-20 silent-death of a Telegram deep-research run.
 
 ## 3. Autonomy & egress gating
 

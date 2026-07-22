@@ -33,6 +33,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Appended to a delivered reply when the CLI truncated dispatched background work
+# at its wait ceiling (CCOutput.bg_truncated). Surfaces the 2026-07-20 silent-death
+# class to the user instead of shipping a partial answer as if it were complete.
+_BG_TRUNCATION_NOTICE = (
+    "\n\n⚠️ Heads up: some background work hit a time limit and was cut off "
+    "before finishing, so this reply may be incomplete. For long research, ask me "
+    "to run it as a background task so it can finish and report back."
+)
+
+
+def _bg_notice(output) -> str:
+    """The truncation notice when a reply's background work was cut off, else ''."""
+    return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
+
 
 class ConversationLoop:
     """Channel-agnostic conversation orchestrator.
@@ -314,7 +328,7 @@ class ConversationLoop:
                 output_tokens=output.output_tokens,
             )
 
-            parts = self._formatter.format(output.text, channel=channel)
+            parts = self._formatter.format(output.text + _bg_notice(output), channel=channel)
 
             if self._triage_pipeline is not None:
                 from genesis.observability.types import Subsystem
@@ -483,6 +497,7 @@ class ConversationLoop:
                     else:
                         system_prompt = topic_ctx
 
+
             invocation = CCInvocation(
                 prompt=prompt_text,
                 model=model,
@@ -619,7 +634,7 @@ class ConversationLoop:
                 output_tokens=output.output_tokens,
             )
 
-            parts = self._formatter.format(output.text, channel=channel)
+            parts = self._formatter.format(output.text + _bg_notice(output), channel=channel)
 
             if self._triage_pipeline is not None:
                 from genesis.observability.types import Subsystem
@@ -940,7 +955,7 @@ class ConversationLoop:
                             f"Genesis returns to {home} automatically on recovery."
                         ),
                     )
-                parts = self._formatter.format(output.text, channel=channel)
+                parts = self._formatter.format(output.text + _bg_notice(output), channel=channel)
                 return "\n".join(parts)
             return None
         except Exception:

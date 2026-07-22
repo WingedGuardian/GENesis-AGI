@@ -1701,3 +1701,176 @@ async def test_run_streaming_cancelled_kills_subprocess(invoker):
 
     # getpgid(99999) raises ProcessLookupError -> falls back to proc.kill()
     assert mock_proc.kill.called, "cancelled streaming run must kill the CC subprocess"
+
+
+# --- Background-wait ceiling ownership + truncation detection (D1) ---
+
+
+def test_stderr_bg_truncated_detects_marker():
+    from genesis.cc.invoker import _stderr_bg_truncated
+
+    assert _stderr_bg_truncated("Background tasks still running after 600s; terminating.")
+    assert not _stderr_bg_truncated("some unrelated stderr noise")
+    assert not _stderr_bg_truncated("")
+    assert not _stderr_bg_truncated(None)
+
+
+def test_build_env_sets_bg_wait_ceiling(invoker):
+    """A field value well below the hard timeout is exported verbatim (ms)."""
+    inv = CCInvocation(prompt="hi", timeout_s=7200, bg_wait_ceiling_ms=300_000)
+    with patch.dict("os.environ", {}, clear=False):
+        import os
+
+        os.environ.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
+        env = invoker._build_env(inv)
+    assert env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == "300000"
+
+
+def test_build_env_clamps_bg_ceiling_below_hard_timeout(invoker):
+    """A ceiling >= timeout_s is clamped to timeout_s*1000 - margin so the CLI's
+    graceful truncation always precedes the asyncio SIGKILL."""
+    from genesis.cc.invoker import _BG_WAIT_HARD_MARGIN_MS
+
+    inv = CCInvocation(prompt="hi", timeout_s=600, bg_wait_ceiling_ms=600 * 1000)
+    with patch.dict("os.environ", {}, clear=False):
+        import os
+
+        os.environ.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
+        env = invoker._build_env(inv)
+    assert env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == str(600 * 1000 - _BG_WAIT_HARD_MARGIN_MS)
+
+
+def test_build_env_bg_ceiling_operator_override_wins(invoker):
+    """An operator's inherited env value beats the field (setdefault)."""
+    inv = CCInvocation(prompt="hi", timeout_s=7200, bg_wait_ceiling_ms=300_000)
+    with patch.dict("os.environ", {"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "42"}):
+        env = invoker._build_env(inv)
+    assert env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == "42"
+
+
+def test_build_env_omits_bg_ceiling_when_field_none(invoker):
+    """No field + no inherited value -> the var is absent (CLI default stands)."""
+    inv = CCInvocation(prompt="hi")
+    with patch.dict("os.environ", {}, clear=False):
+        import os
+
+        os.environ.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
+        env = invoker._build_env(inv)
+    assert "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" not in env
+
+
+def _bg_result_events():
+    return [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "partial"}]}},
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "partial",
+            "session_id": "s1",
+            "total_cost_usd": 0.0,
+            "duration_ms": 10,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_sets_bg_truncated_on_ceiling_marker():
+    """The 'Background tasks still running...' stderr marker sets bg_truncated,
+    and the partial result is still delivered (not dropped)."""
+    inv = CCInvoker(claude_path="claude")
+    data = _make_stream_lines(*_bg_result_events())
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(data)
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr(
+        b"Background tasks still running after 600s; terminating.\n"
+    )
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.pid = 4242
+    mock_proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await inv.run_streaming(CCInvocation(prompt="test"))
+
+    assert output.bg_truncated is True
+    assert output.text == "partial"
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_no_bg_truncated_without_marker():
+    inv = CCInvoker(claude_path="claude")
+    data = _make_stream_lines(*_bg_result_events())
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(data)
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr(b"")
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.pid = 4242
+    mock_proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await inv.run_streaming(CCInvocation(prompt="test"))
+
+    assert output.bg_truncated is False
+
+
+# --- D1 review fixes: no-result truncation + short-timeout clamp ---
+
+
+@pytest.mark.asyncio
+async def test_run_streaming_bg_truncated_on_no_result_branch():
+    """Whole-tree kill before a result line flushes: the no-result branch must
+    still mark bg_truncated (review Finding 2)."""
+    inv = CCInvoker(claude_path="claude")
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "partial"}]}},
+    ]
+    data = _make_stream_lines(*events)
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(data)
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr(
+        b"Background tasks still running after 600s; terminating.\n"
+    )
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.pid = 4243
+    mock_proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await inv.run_streaming(CCInvocation(prompt="test"))
+
+    assert output.bg_truncated is True
+    assert output.text == "partial"
+
+
+def test_build_env_skips_bg_ceiling_when_timeout_too_short(invoker):
+    """timeout_s at/under the margin must NOT emit the ceiling env (0 = the CLI's
+    'wait indefinitely', the opposite of intent) — leave the CLI default (Finding 3)."""
+    inv = CCInvocation(prompt="hi", timeout_s=60, bg_wait_ceiling_ms=60_000)
+    with patch.dict("os.environ", {}, clear=False):
+        import os
+
+        os.environ.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
+        env = invoker._build_env(inv)
+    assert "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" not in env
+
+
+def test_build_env_bg_ceiling_just_above_margin(invoker):
+    """timeout_s just above the margin still emits a clamped ceiling."""
+    from genesis.cc.invoker import _BG_WAIT_HARD_MARGIN_MS
+
+    inv = CCInvocation(prompt="hi", timeout_s=120, bg_wait_ceiling_ms=120 * 1000)
+    with patch.dict("os.environ", {}, clear=False):
+        import os
+
+        os.environ.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
+        env = invoker._build_env(inv)
+    assert env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == str(120 * 1000 - _BG_WAIT_HARD_MARGIN_MS)
