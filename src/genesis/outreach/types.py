@@ -119,6 +119,14 @@ class OutreachRequest:
     # at delivery; None → the prediction rides the policy_prior lane (a
     # measured base-rate seed, NOT 0.5 — see ledger/writers.py).
     stated_confidence: float | None = None
+    # Origin-targeted TELEGRAM delivery: when set, ``_deliver`` sends this
+    # message to THIS chat + forum topic instead of the category→topic routing.
+    # Used to deliver a background session's result back to the exact
+    # conversation it was requested in. ``target_chat_id`` is a numeric chat id
+    # as a string (a DM user id, or the forum supergroup id); ``target_thread_id``
+    # is the forum topic id (None for a DM). Ignored for non-telegram channels.
+    target_chat_id: str | None = None
+    target_thread_id: int | None = None
 
 
 @dataclass(frozen=True)

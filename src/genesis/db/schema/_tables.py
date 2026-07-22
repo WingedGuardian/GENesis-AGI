@@ -500,7 +500,8 @@ TABLES = {
             thread_id        TEXT,
             rate_limited_at  TEXT,
             rate_limit_resumes_at TEXT,
-            origin_class     TEXT
+            origin_class     TEXT,
+            chat_id          TEXT
         )
     """,
     "inbox_items": """

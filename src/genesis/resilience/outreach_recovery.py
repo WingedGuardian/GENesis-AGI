@@ -139,6 +139,10 @@ class OutreachRecoveryWorker:
                 salience_score=0.9,
                 signal_type="deferred_retry",
                 channel=payload.get("channel"),
+                # Preserve origin-targeted telegram delivery across the retry so a
+                # once-failed background result still reaches its exact origin thread.
+                target_chat_id=payload.get("target_chat_id"),
+                target_thread_id=payload.get("target_thread_id"),
             )
             content = payload.get("content", "")
             if not content:

@@ -25,13 +25,14 @@ async def create(
     metadata: str | None = None,
     thread_id: str | None = None,
     origin_class: str | None = None,
+    chat_id: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO cc_sessions
            (id, session_type, user_id, channel, model, effort, status,
             pid, started_at, last_activity_at, source_tag, metadata, thread_id,
-            origin_class)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            origin_class, chat_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             id,
             session_type,
@@ -47,6 +48,7 @@ async def create(
             metadata,
             thread_id,
             origin_class,
+            chat_id,
         ),
     )
     await db.commit()

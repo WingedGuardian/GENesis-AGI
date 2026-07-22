@@ -35,6 +35,7 @@ from genesis.cc.types import (
     CCInvocation,
     CCModel,
     CCOutput,
+    DeliveryMode,
     EffortLevel,
     SessionType,
     StreamEvent,
@@ -60,6 +61,32 @@ _BG_TRUNCATION_NOTICE = (
     "\n\n⚠️ Note: this run reached its time budget and some background work was "
     "cut off before finishing, so the results below may be incomplete."
 )
+
+# Soft cap for a single Telegram delivery of a RESULT-mode outcome. Below the
+# 4096-char hard limit, leaving room for the header + HTML entity expansion.
+# Larger output is written to a file and delivered as a head + pointer.
+_TG_MSG_CAP = 3500
+
+
+def _write_result_artifact(session_id: str, raw: str) -> str | None:
+    """Write a background session's full result to ``~/.genesis/output`` so an
+    oversized outcome can be delivered as a head + file pointer instead of a
+    wall of Telegram messages. Returns the path, or None if the write failed
+    (delivery still proceeds with just the truncated head).
+    """
+    try:
+        out_dir = Path.home() / ".genesis" / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"bg-session-{session_id}.md"
+        path.write_text(raw, encoding="utf-8")
+        return str(path)
+    except Exception:
+        logger.error(
+            "Failed to write result artifact for %s",
+            session_id[:8],
+            exc_info=True,
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -559,12 +586,30 @@ class DirectSessionRequest:
     # (e.g. "glm-5.2") to run this background session on instead of the global
     # default. None → the chokepoint applies the active default as usual.
     roster_model: str | None = None
+    # Delivery of the terminal outcome. None → derived from the legacy
+    # notify/notify_on_failure_only bools in __post_init__ (SILENT/FAILURE_ONLY),
+    # so existing callers are unchanged. RESULT is set only by the
+    # deliver_to_origin dispatch path and requires origin_session_id.
+    delivery_mode: DeliveryMode | None = None
+    # The foreground cc_sessions row id this session was dispatched from, used
+    # to route a RESULT delivery back to that conversation. Captured from
+    # GENESIS_SESSION_ID at dispatch (see direct_session_run). None otherwise.
+    origin_session_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.profile not in VALID_PROFILES:
             raise ValueError(
                 f"Invalid profile {self.profile!r}. "
                 f"Must be one of: {', '.join(sorted(VALID_PROFILES))}"
+            )
+        # Frozen dataclass: derive the delivery mode from the legacy bools when
+        # not explicitly set, so every existing constructor keeps its behavior
+        # without an edit. object.__setattr__ is required under frozen=True.
+        if self.delivery_mode is None:
+            object.__setattr__(
+                self,
+                "delivery_mode",
+                DeliveryMode.from_legacy(self.notify, self.notify_on_failure_only),
             )
 
 
@@ -870,6 +915,11 @@ class DirectSessionRunner:
                 output_tokens=output.output_tokens,
             )
 
+            # RESULT-mode: deliver the finished outcome back to the origin
+            # conversation. Best-effort (own try/except) — never fails the run.
+            if request.delivery_mode == DeliveryMode.RESULT:
+                await self._deliver_result_to_origin(request, result)
+
             logger.info(
                 "Direct session %s completed: %.1fs, $%.4f, %d tools",
                 session_id[:8],
@@ -944,7 +994,13 @@ class DirectSessionRunner:
                     exc_info=True,
                 )
 
-            if request.notify:
+            # RESULT-mode delivers the failure to the origin thread (a promised
+            # report that failed is still owed to the requester); otherwise the
+            # legacy broadcast failure alert fires. _deliver_result_to_origin
+            # swallows its own errors, so no extra guard is needed here.
+            if request.delivery_mode == DeliveryMode.RESULT:
+                await self._deliver_result_to_origin(request, error_result)
+            elif request.notify:
                 try:
                     await self._notify(request, error_result, success=False)
                 except Exception:
@@ -1187,6 +1243,11 @@ class DirectSessionRunner:
         # narrow file-write or shell access (e.g., models.md weekly synthesis).
         if request.tool_exceptions:
             exceptions = set(request.tool_exceptions)
+            # Never let a background session re-enable recursive spawn via a
+            # tool_exception: the delivery model's foreground-origin-only
+            # invariant (GENESIS_SESSION_ID is always a foreground row) depends
+            # on direct_session_run staying unreachable from background sessions.
+            exceptions.discard("mcp__genesis-health__direct_session_run")
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile
@@ -1385,3 +1446,146 @@ class DirectSessionRunner:
             )
         except Exception:
             logger.error("Outreach submit failed", exc_info=True)
+
+    @staticmethod
+    def _resolve_origin_target(
+        channel: str | None,
+        chat_id: str | None,
+        user_id: str,
+        thread_id_raw: object,
+        forum_chat_id: str | None,
+    ) -> tuple[str | None, int | None]:
+        """Resolve a Telegram ``(chat_id, message_thread_id)`` delivery target
+        from an origin ``cc_sessions`` row.
+
+        Prefers the persisted origin ``chat_id`` (captured at intake) — correct
+        for a DM, a group, AND a forum topic uniformly (a forum topic's
+        ``chat.id`` *is* the supergroup). Falls back to best-effort
+        reconstruction for legacy rows written before ``chat_id`` was captured.
+        Returns ``(None, None)`` when the origin cannot be addressed.
+        """
+        if channel != "telegram":
+            return None, None
+        tid: int | None = None
+        if thread_id_raw:
+            try:
+                tid = int(thread_id_raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None, None
+        # Preferred: the real origin chat id. Handles DM / group / forum topic.
+        if chat_id:
+            return str(chat_id), tid
+        # --- Legacy fallback (rows predating chat_id capture) ---
+        # Forum-topic origin without a persisted chat: the supergroup, if set.
+        if tid is not None:
+            return (str(forum_chat_id), tid) if forum_chat_id else (None, None)
+        # DM origin: the chat id equals the Telegram user id (``tg-<id>``).
+        # NOTE: a legacy no-thread GROUP origin is indistinguishable from a DM
+        # here and would resolve to the user's DM — the exact gap the persisted
+        # chat_id closes for all new sessions.
+        if user_id.startswith("tg-"):
+            num = user_id[3:]
+            if num.lstrip("-").isdigit():
+                return num, None
+        return None, None
+
+    async def _deliver_result_to_origin(
+        self,
+        request: DirectSessionRequest,
+        result: DirectSessionResult,
+    ) -> None:
+        """Deliver a RESULT-mode session's terminal outcome to its origin thread.
+
+        Routes the finished output (success) or the error (failure/truncation)
+        back to the exact conversation the session was dispatched from — the
+        channel + thread on the origin foreground ``cc_sessions`` row
+        (``request.origin_session_id``). Best-effort: any failure is logged, never
+        raised, so a delivery problem cannot fail the session handler. Oversized
+        output is written to ``~/.genesis/output`` and delivered as a head +
+        pointer. Delivered via ``submit_urgent(verbatim=True)`` so a promised
+        result is never suppressed by governance/dedup or reworded by the drafter.
+        """
+        origin_id = request.origin_session_id
+        if not origin_id:
+            logger.warning(
+                "RESULT delivery for session %s has no origin_session_id — skipping",
+                result.session_id[:8],
+            )
+            return
+        try:
+            import html as html_mod
+
+            pipeline = getattr(self._rt, "_outreach_pipeline", None)
+            db = getattr(self._rt, "_db", None)
+            if pipeline is None or db is None:
+                logger.warning("RESULT delivery: outreach pipeline or DB unavailable")
+                return
+
+            from genesis.db.crud import cc_sessions as cs_crud
+
+            origin = await cs_crud.get_by_id(db, origin_id) or {}
+            if not origin:
+                logger.warning(
+                    "RESULT delivery: origin session %s not found — using fallback surface",
+                    origin_id[:8],
+                )
+
+            chat_id, thread_id = self._resolve_origin_target(
+                origin.get("channel"),
+                origin.get("chat_id"),
+                origin.get("user_id") or "",
+                origin.get("thread_id"),
+                getattr(pipeline, "_forum_chat_id", None),
+            )
+
+            status = "✓" if result.success else "✗"
+            raw = (
+                (result.output_text or "(no output)")
+                if result.success
+                else f"Task did not complete: {result.error or 'unknown error'}"
+            )
+            header = f"<b>{status} Background task complete</b>\n\n"
+            escaped = html_mod.escape(raw)
+            text = header + escaped
+            if len(text) > _TG_MSG_CAP:
+                path = _write_result_artifact(result.session_id, raw)
+                # Budget on the ESCAPED length (entities expand up to ~4×), then
+                # trim any dangling partial entity at the cut so Telegram's HTML
+                # parser doesn't choke on a truncated "&amp;"-style sequence.
+                head = escaped[: _TG_MSG_CAP - 400]
+                if "&" in head[-6:]:
+                    head = head.rsplit("&", 1)[0]
+                pointer = html_mod.escape(str(path)) if path else "(disk write failed)"
+                text = header + head + f"\n\n… (truncated) — full result saved to {pointer}"
+
+            if not chat_id:
+                # Origin unaddressable (non-telegram, or a chat we don't persist):
+                # deliver to the default owner surface rather than drop the
+                # promised result silently.
+                text += (
+                    "\n\n<i>(origin conversation could not be addressed — "
+                    "delivered to the default surface)</i>"
+                )
+
+            from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+            await pipeline.submit_urgent(
+                OutreachRequest(
+                    category=OutreachCategory.ALERT,
+                    # Unique per session so governance dedup never collides with
+                    # another delivery.
+                    topic=f"bg_result:{result.session_id}",
+                    context=text,
+                    salience_score=0.9,
+                    channel="telegram" if chat_id else None,
+                    verbatim=True,
+                    target_chat_id=chat_id,
+                    target_thread_id=thread_id,
+                )
+            )
+        except Exception:
+            logger.error(
+                "Failed to deliver RESULT to origin for session %s",
+                result.session_id[:8],
+                exc_info=True,
+            )

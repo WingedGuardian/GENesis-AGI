@@ -16,12 +16,19 @@ Read this guide any time you're considering a background session or sub-agent.
 outlive this conversation → background session. If you just need an answer in
 the next few minutes → sub-agent.
 
-> **Note:** the background lane now owns a longer CC background-wait ceiling (set
-> to its full `timeout_s`), so a dispatched `Workflow` inside a background session
-> runs to completion instead of the CLI's default 600s truncation. Automatically
-> routing long research *from a channel turn* into this lane — with the result
-> delivered back to the requester — is a follow-up (needs the delivery model wired;
-> a background session's success output is not yet sent to the owner).
+> **Note:** the background lane owns a longer CC background-wait ceiling (set to its
+> full `timeout_s`), so a dispatched `Workflow` inside a background session runs to
+> completion instead of the CLI's default 600s truncation.
+>
+> **Origin delivery:** pass `deliver_to_origin=True` to `direct_session_run` (from a
+> channel/foreground turn) and the session's terminal outcome — success *or* failure
+> — is delivered back to the exact conversation it was dispatched from (the DM or
+> forum topic). This is how you hand off long work from a channel and actually
+> "report back." Without it, a successful background run is silent (only failures
+> raise a Telegram alert); poll `direct_session_status` for the output. Delivery is
+> framework-owned (the session need not — and for `observe`/`research` cannot — send
+> its own report); oversized output is saved under `~/.genesis/output/` and delivered
+> as a summary + file pointer.
 
 ## Profiles
 

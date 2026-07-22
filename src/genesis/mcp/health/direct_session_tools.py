@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 
 from genesis.mcp.health import mcp
 
@@ -57,6 +58,7 @@ async def _impl_direct_session_run(
     timeout_minutes: int = 15,
     notify: bool = True,
     roster_model: str | None = None,
+    deliver_to_origin: bool = False,
 ) -> dict:
     """Enqueue a directed background CC session for dispatch."""
     if _db is None:
@@ -95,6 +97,25 @@ async def _impl_direct_session_run(
             known = ", ".join((_roster.load_roster().get("models") or {}).keys())
             return {"error": f"Unknown roster_model '{roster_model}'. Known: {known}"}
 
+    # deliver_to_origin: capture the foreground origin so the server can route
+    # the result back to the calling conversation. GENESIS_SESSION_ID is the
+    # foreground cc_sessions row id, set by the CCInvoker and inherited into this
+    # MCP child process. Only foreground/interactive sessions can reach this tool
+    # (it is in the background disallow list), so this id is always a foreground
+    # origin — never a background session (which would be circular).
+    origin_session_id = None
+    delivery_mode = None
+    if deliver_to_origin:
+        origin_session_id = os.environ.get("GENESIS_SESSION_ID") or None
+        if origin_session_id:
+            delivery_mode = "result"
+        else:
+            logger.warning(
+                "direct_session_run(deliver_to_origin=True) with no "
+                "GENESIS_SESSION_ID in env — falling back to default notification "
+                "(no origin delivery)"
+            )
+
     try:
         from genesis.db.crud import direct_session_queue as dsq
 
@@ -108,6 +129,8 @@ async def _impl_direct_session_run(
             notify=notify,
             caller_context="mcp_tool",
             roster_model=roster_model,
+            origin_session_id=origin_session_id,
+            delivery_mode=delivery_mode,
         )
         return {
             "queue_id": queue_id,
@@ -116,7 +139,13 @@ async def _impl_direct_session_run(
             "message": (
                 f"Session queued with '{profile}' profile. "
                 "The Genesis server will dispatch it within seconds. "
-                "You'll be notified via Telegram when it completes."
+                + (
+                    "The result will be delivered back to this conversation "
+                    "when it completes."
+                    if delivery_mode == "result"
+                    else "You'll get a Telegram alert if it fails (successful "
+                    "runs are silent — poll direct_session_status for output)."
+                )
             ),
         }
     except Exception as exc:
@@ -287,11 +316,17 @@ async def direct_session_run(
     timeout_minutes: int = 15,
     notify: bool = True,
     roster_model: str | None = None,
+    deliver_to_origin: bool = False,
 ) -> dict:
     """Spawn a directed background CC session with profile-based tool restrictions.
 
     The session is queued and dispatched by the Genesis server, so it
-    outlives this MCP session. Results are reported via Telegram.
+    outlives this MCP session. By default the session is FIRE-AND-FORGET:
+    successful runs are silent (poll ``direct_session_status`` for output) and
+    only failures raise a Telegram alert. Set ``deliver_to_origin=True`` to have
+    the terminal outcome (success AND failure) delivered back to THIS
+    conversation when it finishes — use this whenever you hand off long work from
+    a channel and tell the user you'll report back.
 
     Profiles control what the session can do:
     - observe: Read everything, change nothing. Browser viewing, memory reads, web search.
@@ -307,14 +342,26 @@ async def direct_session_run(
         model: LLM model (sonnet, opus, haiku, fable)
         effort: Effort level (low, medium, high, xhigh, max)
         timeout_minutes: Max runtime in minutes (default 15, max 60)
-        notify: Send Telegram notification on completion/failure
+        notify: Send a Telegram alert if the session FAILS (successful runs are
+            silent unless deliver_to_origin is set). Has no effect when
+            deliver_to_origin=True.
+        deliver_to_origin: Deliver the terminal outcome (success and failure)
+            back to the conversation this tool was called from. Requires a
+            foreground channel session as the caller.
         roster_model: Optionally run this session on a specific roster model
             (e.g. "glm-5.2") instead of the default — intentional model
             selection. Omit/None to use the active default. Fails the session
             if the named model is unknown or its API key is not configured.
     """
     return await _impl_direct_session_run(
-        prompt, profile, model, effort, timeout_minutes, notify, roster_model,
+        prompt,
+        profile,
+        model,
+        effort,
+        timeout_minutes,
+        notify,
+        roster_model,
+        deliver_to_origin,
     )
 
 

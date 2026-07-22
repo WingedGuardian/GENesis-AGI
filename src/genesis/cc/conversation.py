@@ -116,6 +116,7 @@ class ConversationLoop:
         user_id: str,
         channel: ChannelType,
         thread_id: str | None = None,
+        chat_id: str | None = None,
     ) -> str:
         """Process a user message and return the response text."""
         try:
@@ -172,7 +173,7 @@ class ConversationLoop:
         # Get or create session, persist any model/effort changes
         session = await self._session_mgr.get_or_create_foreground(
             user_id=user_id, channel=channel, model=model, effort=effort,
-            thread_id=thread_id,
+            thread_id=thread_id, chat_id=chat_id,
         )
 
         # Set session context so downstream code (CCInvoker, eval hooks)
@@ -351,6 +352,7 @@ class ConversationLoop:
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
         thread_id: str | None = None,
         session_key: str | None = None,
+        chat_id: str | None = None,
     ) -> str:
         """Like handle_message but uses streaming for live progress.
 
@@ -410,7 +412,7 @@ class ConversationLoop:
 
         session = await self._session_mgr.get_or_create_foreground(
             user_id=user_id, channel=channel, model=model, effort=effort,
-            thread_id=thread_id,
+            thread_id=thread_id, chat_id=chat_id,
         )
 
         # Set session context for eval attribution (same as handle_message).

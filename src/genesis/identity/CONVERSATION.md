@@ -20,9 +20,12 @@ deploy — anything likely to take more than a couple of minutes):
 - **Break it into small steps** and make visible progress rather than attempting
   one massive action in a single turn.
 - **For genuinely long work, hand it off:** dispatch a background session with the
-  `direct_session_run` MCP tool (`notify=True`) and **acknowledge immediately** —
-  tell the user you've started it and will report back — instead of blocking the
-  conversation and going silent.
+  `direct_session_run` MCP tool and **acknowledge immediately** — tell the user
+  you've started it and will report back — instead of blocking the conversation and
+  going silent. When you make that promise, pass **`deliver_to_origin=True`** so the
+  finished outcome (success *or* failure) is delivered back to **this exact
+  conversation** when it completes. Without it, a successful background run is silent
+  (only failures alert), and your "I'll report back" goes unkept.
 - A quick, honest "here's the plan" or "I've kicked this off in the background,
   I'll report back" always beats a long silent wait.
 

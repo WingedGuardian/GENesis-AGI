@@ -483,7 +483,11 @@ class OutreachPipeline:
         gate_cleared: bool = False,
     ) -> OutreachResult:
         adapter = self._channels.get(channel)
-        recipient = request.validated_recipient or self._recipients.get(channel, "")
+        recipient = (
+            request.validated_recipient
+            or request.target_chat_id
+            or self._recipients.get(channel, "")
+        )
 
         # Email self-send / no-recipient terminal skip (WS-8 spam-loop fix). A
         # send to the agent's OWN address, or an email with no resolved
@@ -580,7 +584,14 @@ class OutreachPipeline:
         thread_id = None
         topic_cat: str | None = None
         delivery_recipient = recipient
-        if channel == "telegram":
+        # Origin-targeted telegram delivery (a background result routed back to
+        # the exact conversation it was requested in): the caller already
+        # resolved the chat + topic, so bypass the category->forum-topic routing
+        # entirely and deliver straight to that chat/thread.
+        if channel == "telegram" and request.target_chat_id:
+            delivery_recipient = request.target_chat_id
+            thread_id = request.target_thread_id
+        elif channel == "telegram":
             if routing in ("supergroup", "both") and self._topic_manager is not None:
                 topic_cat = self._topic_manager.resolve_outreach_category(
                     request.category.value,
@@ -881,6 +892,11 @@ class OutreachPipeline:
                     "content": content,
                     "category": request.category.value,
                     "topic": request.topic,
+                    # Origin-targeted delivery must survive a transient-failure
+                    # retry, or a result that failed once lands in the default
+                    # surface instead of the exact origin thread it promised.
+                    "target_chat_id": request.target_chat_id,
+                    "target_thread_id": request.target_thread_id,
                 }),
                 reason=reason,
                 staleness_policy="drain",
