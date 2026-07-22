@@ -137,7 +137,10 @@ class HealthDataService:
         if inflight is not None and not inflight.done():
             return await asyncio.shield(inflight)
         # No await between the done() check and the assignment below → race-free
-        # on the single-threaded loop.
+        # on the single-threaded loop. Bare create_task BY DESIGN (reflex A4
+        # sweep, 2026-07-21): every caller awaits via asyncio.shield and the
+        # orphan case retrieves the exception in _release_inflight —
+        # tracked_task would double-report handled snapshot failures.
         task = asyncio.create_task(self._compute_snapshot())
         self._inflight = task
         task.add_done_callback(self._release_inflight)
