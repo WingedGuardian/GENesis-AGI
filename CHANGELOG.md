@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Deep research requested from a chat now runs to completion and reports
+  back, instead of silently going quiet.** Long or multi-source research (and
+  other long-running background tasks) launched from a Telegram/voice message
+  used to be cut off after about 10 minutes with nothing ever delivered. They
+  now run in a durable background session that finishes the work and sends you
+  the results when done. And if any background work is ever cut short by a time
+  limit, the reply now tells you plainly rather than looking complete.
+
 - **Host setup no longer force-deletes a container it wrongly thinks is
   damaged, or hides an install behind a new disk.** Host-side hardening: a
   container flagged "damaged" is now **renamed aside** (its database, memory, and
