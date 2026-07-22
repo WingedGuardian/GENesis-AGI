@@ -42,7 +42,7 @@ def _extract_bashrc_heredoc() -> str:
     """Pull the exact python heredoc that rewrites ~/.bashrc out of bootstrap.sh
     so the test runs the SHIPPED code, not a copy."""
     text = BOOTSTRAP.read_text()
-    m = re.search(r'python3 - "\$BASHRC" <<\'PYEOF\'\n(.*?)\nPYEOF', text, re.DOTALL)
+    m = re.search(r"python3 - \"\$BASHRC\" <<'PYEOF'.*?\n(.*?)\nPYEOF", text, re.DOTALL)
     assert m, "could not find the bashrc-rewriter heredoc in bootstrap.sh"
     return m.group(1)
 
@@ -71,11 +71,23 @@ def test_b4_atomic_and_endmarker_in_text():
     assert "os.replace(" in heredoc and "mkstemp(" in heredoc
     assert "unterminated genesis tmux-wrap block" in heredoc
     assert 'open(path, "w").write' not in heredoc  # the old non-atomic write is gone
+    assert "sys.exit(2)" in heredoc  # bail signals a distinct rc to the caller
+
+
+def test_b4_bash_reports_bail_distinctly():
+    """The outer bash must NOT print 'refreshed' on the missing-END bail: it
+    captures the python rc and branches (0=refreshed, 2=left-untouched,
+    other=warning)."""
+    text = BOOTSTRAP.read_text()
+    assert "<<'PYEOF' || _tw_rc=$?" in text  # captures rc without set -e aborting
+    assert '[ "$_tw_rc" -eq 2 ]' in text and "left untouched" in text  # distinct bail message
+    assert "(rc=$_tw_rc)" in text  # a genuine write error surfaces too
 
 
 def test_b4_missing_end_preserves_user_content(tmp_path):
     """A damaged block (BEGIN, no END) with user content BELOW it must NOT be
-    swallowed to EOF — the file is left untouched and warned about."""
+    swallowed to EOF — the file is left untouched, warned about, and the
+    rewriter exits with the distinct bail code (2), not 0."""
     bashrc = (
         "export USER_VAR=1\n"
         "# >>> genesis tmux-wrap >>>\n"
@@ -83,8 +95,9 @@ def test_b4_missing_end_preserves_user_content(tmp_path):
         "export IMPORTANT_USER_LINE=keep-me\n"
     )
     proc, out = _run_bashrc_rewriter(tmp_path, bashrc)
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 2, proc.stderr
     assert "IMPORTANT_USER_LINE=keep-me" in out.read_text(), "user content was destroyed"
+    assert out.read_text() == bashrc, "file must be byte-identical (untouched) on bail"
     assert "unterminated" in proc.stderr
 
 

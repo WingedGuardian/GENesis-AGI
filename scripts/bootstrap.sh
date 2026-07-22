@@ -737,8 +737,12 @@ claude() {
 WRAPEOF
 touch "$BASHRC"
 if grep -qF "# >>> genesis tmux-wrap >>>" "$BASHRC" 2>/dev/null; then
-    # Replace the existing block in place (idempotent update path).
-    GENESIS_TMUX_WRAP_BLOCK="$TMUX_WRAP_BLOCK" python3 - "$BASHRC" <<'PYEOF'
+    # Replace the existing block in place (idempotent update path). Capture the
+    # python rc (`|| _tw_rc=$?` keeps set -e from aborting): 0 = rewritten,
+    # 2 = damaged block left untouched (do NOT claim it refreshed), other = a
+    # real write error to surface.
+    _tw_rc=0
+    GENESIS_TMUX_WRAP_BLOCK="$TMUX_WRAP_BLOCK" python3 - "$BASHRC" <<'PYEOF' || _tw_rc=$?
 import os
 import sys
 import tempfile
@@ -762,7 +766,7 @@ if b is not None:
         sys.stderr.write(
             "  WARNING: ~/.bashrc has an unterminated genesis tmux-wrap block "
             "(missing end sentinel) — leaving it untouched; fix it manually.\n")
-        sys.exit(0)
+        sys.exit(2)  # distinct rc: the caller must NOT claim it refreshed
     out = lines[:b] + lines[e + 1:]
 else:
     out = lines
@@ -785,7 +789,13 @@ except BaseException:
         pass
     raise
 PYEOF
-    echo "  tmux-wrap block refreshed in ~/.bashrc"
+    if [ "$_tw_rc" -eq 0 ]; then
+        echo "  tmux-wrap block refreshed in ~/.bashrc"
+    elif [ "$_tw_rc" -eq 2 ]; then
+        echo "  tmux-wrap block left untouched — ~/.bashrc has a damaged block; fix it manually (see warning above)"
+    else
+        echo "  WARNING: could not update tmux-wrap block in ~/.bashrc (rc=$_tw_rc)"
+    fi
 else
     printf '\n%s\n' "$TMUX_WRAP_BLOCK" >> "$BASHRC"
     echo "  tmux-wrap block installed in ~/.bashrc"
