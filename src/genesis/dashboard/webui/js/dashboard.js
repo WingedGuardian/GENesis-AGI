@@ -4215,19 +4215,21 @@
               fetchApi("/api/genesis/ego/directives"),
               fetchApi("/api/genesis/ego/goals"),
             ]);
-            if (dR?.ok) this.egoDirectives = await dR.json();
-            if (gR?.ok) this.egoGoals = await gR.json();
+            // Normalize to the guaranteed {active,resolved} / {user,genesis_ego}
+            // shape so a drifted payload can never break the panel templates.
+            if (dR?.ok) { const d = await dR.json(); this.egoDirectives = { active: d.active || [], resolved: d.resolved || [] }; }
+            if (gR?.ok) { const g = await gR.json(); this.egoGoals = { user: g.user || [], genesis_ego: g.genesis_ego || [] }; }
           } catch { /* silent — panels show empty */ }
         },
 
-        // User-driven retire of a standing directive (default: cancelled).
-        async retireDirective(id, status) {
+        // User-driven retire of a standing directive (marks it cancelled).
+        async retireDirective(id) {
           this.retiringDirectiveId = id;
           try {
             const resp = await fetchApi("/api/genesis/ego/directives/" + id + "/resolve", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ status: status || "cancelled" }),
+              body: JSON.stringify({ status: "cancelled" }),
             });
             if (resp?.ok) { await this.fetchEgoDirectivesGoals(); }
           } catch (e) {

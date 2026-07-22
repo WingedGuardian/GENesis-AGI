@@ -570,11 +570,14 @@ async def ego_goals():
     if not rt.is_bootstrapped or rt._db is None:
         return jsonify({"user": [], "genesis_ego": []})
 
-    goals = await goals_crud.list_active(rt._db, limit=50, origin=None)
+    # Query each lane separately so a busy user-goal lane can't starve the
+    # own-goal lane under a shared LIMIT, and only the two known origins render.
+    user_goals = await goals_crud.list_active(rt._db, limit=50, origin="user")
+    own_goals = await goals_crud.list_active(rt._db, limit=50, origin="genesis_ego")
     return jsonify(
         {
-            "user": [_goal_view(g) for g in goals if g.get("origin") == "user"],
-            "genesis_ego": [_goal_view(g) for g in goals if g.get("origin") == "genesis_ego"],
+            "user": [_goal_view(g) for g in user_goals],
+            "genesis_ego": [_goal_view(g) for g in own_goals],
         }
     )
 

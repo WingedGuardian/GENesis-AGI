@@ -1105,13 +1105,9 @@ async def list_active_directives(
     ``kind`` defaults to plain directives so pre-decision callers are
     unchanged; decision rows have their own accessors below.
     """
-    cursor = await db.execute(
-        "SELECT * FROM ego_directives "
-        "WHERE status = 'active' AND ego_target = ? AND kind = ? "
-        "ORDER BY created_at DESC LIMIT ?",
-        (ego_target, kind, limit),
+    return await list_directives(
+        db, ego_target=ego_target, statuses=("active",), kind=kind, limit=limit
     )
-    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def resolve_directive(

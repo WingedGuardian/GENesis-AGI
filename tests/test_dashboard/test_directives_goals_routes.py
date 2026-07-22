@@ -98,15 +98,29 @@ class TestEgoDirectives:
             assert data == {"active": [], "resolved": []}
 
 
+def _goals_by_origin(by_origin):
+    """Build a list_active side_effect returning per-origin rows (the route
+    now queries each lane separately, so a busy lane can't starve the other)."""
+
+    def _side_effect(db, *, limit=20, origin=None):
+        return list(by_origin.get(origin, []))
+
+    return _side_effect
+
+
 class TestEgoGoals:
     def test_split_by_origin(self, client):
-        goals = [_grow("g1", "user"), _grow("g2", "genesis_ego"), _grow("g3", "user")]
+        side = _goals_by_origin(
+            {
+                "user": [_grow("g1", "user"), _grow("g3", "user")],
+                "genesis_ego": [_grow("g2", "genesis_ego")],
+            }
+        )
         with (
             patch("genesis.runtime.GenesisRuntime") as MockRT,
             patch(
                 "genesis.db.crud.user_goals.list_active",
-                new_callable=AsyncMock,
-                return_value=goals,
+                new=AsyncMock(side_effect=side),
             ),
         ):
             MockRT.instance.return_value = _rt()
@@ -116,13 +130,10 @@ class TestEgoGoals:
 
     def test_empty_own_goal_lane_renders(self, client):
         # fresh-install state: only user goals, empty own-goal lane
+        side = _goals_by_origin({"user": [_grow("g1", "user")], "genesis_ego": []})
         with (
             patch("genesis.runtime.GenesisRuntime") as MockRT,
-            patch(
-                "genesis.db.crud.user_goals.list_active",
-                new_callable=AsyncMock,
-                return_value=[_grow("g1", "user")],
-            ),
+            patch("genesis.db.crud.user_goals.list_active", new=AsyncMock(side_effect=side)),
         ):
             MockRT.instance.return_value = _rt()
             data = client.get("/api/genesis/ego/goals").get_json()
