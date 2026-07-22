@@ -127,10 +127,19 @@ _netres_install_watchdog() {
     _netres_put_file "$dst" "$(cat "$NETRES_WATCHDOG_SRC")" "0755"
     _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.service" "$(_netres_service_content "$dst")" "0644"
     _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.timer" "$_NETRES_WATCHDOG_TIMER" "0644"
+    # Reload only when a unit file actually changed this run.
     if ((_NETRES_WROTE > before)); then
         sudo systemctl daemon-reload 2>/dev/null || true
+    fi
+    # ALWAYS ensure the timer is active (self-heal), decoupled from whether a file
+    # changed: a re-run must re-enable a timer that was disabled/stopped/masked
+    # externally since install — not skip just because the units are unchanged.
+    # The probe is a read (no sudo) and silent, so a healthy timer causes ZERO
+    # churn; only a genuinely-down timer triggers enable/start. NR1.
+    if ! systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1; then
         sudo systemctl enable genesis-network-watchdog.timer 2>/dev/null || true
         sudo systemctl start genesis-network-watchdog.timer 2>/dev/null || true
+        _NETRES_HEALED=1
     fi
 }
 
@@ -166,6 +175,7 @@ network_resilience_apply() {
 
     _NETRES_WROTE=0
     _NETRES_FAILED=""
+    _NETRES_HEALED=""
     _netres_apply_keepconfig
     _netres_install_watchdog
 
@@ -173,6 +183,8 @@ network_resilience_apply() {
         echo "  Network resilience NOT fully applied — see warnings above."
     elif ((_NETRES_WROTE > 0)); then
         echo "  Network resilience applied (KeepConfiguration + watchdog timer active)."
+    elif [[ -n "$_NETRES_HEALED" ]]; then
+        echo "  Network resilience: re-enabled a stopped/disabled watchdog timer."
     else
         echo "  Network resilience already in place."
     fi

@@ -29,8 +29,22 @@ exec "$@"
 """
 
 _SYSTEMCTL_STUB = """#!/bin/bash
-if [ "$1" = "is-active" ]; then exit "${NETWORKD_ACTIVE_RC:-0}"; fi
+# is-active is keyed on the UNIT ($2) so the watchdog timer's state is
+# independently controllable. The timer is "active" iff a prior `start` ran this
+# test (models real start->active), UNLESS a test forces WATCHDOG_TIMER_ACTIVE_RC
+# to simulate an externally-stopped timer. systemd-networkd keeps the shared
+# NETWORKD_ACTIVE_RC. is-active never logs (a silent probe must not churn).
+_tstate="${SYSTEMCTL_LOG%.log}.timerstate"
+if [ "$1" = "is-active" ]; then
+    case "$2" in
+        genesis-network-watchdog.timer)
+            [ -n "${WATCHDOG_TIMER_ACTIVE_RC:-}" ] && exit "$WATCHDOG_TIMER_ACTIVE_RC"
+            [ -f "$_tstate" ] && exit 0 || exit 3 ;;
+        *) exit "${NETWORKD_ACTIVE_RC:-0}" ;;
+    esac
+fi
 if [ "$1" = "is-enabled" ]; then printf '%s' "${NETWORKD_ENABLED-enabled}"; exit 0; fi
+[ "$1" = "start" ] && : > "$_tstate"
 echo "$@" >> "$SYSTEMCTL_LOG"
 exit 0
 """
@@ -121,14 +135,36 @@ def test_fresh_apply_writes_dropin_units_and_reloads(tmp_path):
 
 
 def test_second_run_is_a_noop(tmp_path):
+    """A re-run with a HEALTHY (active) timer stays churn-free: the self-heal
+    probe (`is-active`) is silent, so no reload/enable/start is logged. NR1's
+    self-heal must not turn a healthy re-run into churn."""
     env = _stage(tmp_path)
-    _run_apply(env)
+    _run_apply(env)  # fresh install: timer written + started → now active
     Path(env["SYSTEMCTL_LOG"]).write_text("")
 
     result = _run_apply(env)
     assert result.returncode == 0
     assert "already in place" in result.stdout
-    assert Path(env["SYSTEMCTL_LOG"]).read_text() == ""  # no reload/daemon churn
+    # The silent is-active probe finds the timer active → no reload/enable/start.
+    assert Path(env["SYSTEMCTL_LOG"]).read_text() == ""
+
+
+def test_second_run_heals_externally_disabled_timer(tmp_path):
+    """NR1: a re-run must RE-ENABLE a watchdog timer that was disabled/stopped/
+    masked externally since install — not skip just because the unit files are
+    unchanged this run. This is the gap the old `_NETRES_WROTE`-gated enable had."""
+    env = _stage(tmp_path)
+    _run_apply(env)  # fresh install: timer active
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+
+    # Simulate the timer going down between runs (external disable/stop/mask).
+    env["WATCHDOG_TIMER_ACTIVE_RC"] = "3"
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    calls = Path(env["SYSTEMCTL_LOG"]).read_text()
+    assert "enable genesis-network-watchdog.timer" in calls  # re-enabled …
+    assert "start genesis-network-watchdog.timer" in calls  # … and restarted
+    assert "re-enabled a stopped/disabled watchdog timer" in result.stdout
 
 
 def test_no_systemd_skips_cleanly(tmp_path):
