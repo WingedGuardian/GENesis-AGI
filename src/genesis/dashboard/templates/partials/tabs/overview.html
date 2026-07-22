@@ -346,6 +346,53 @@
             <div class="health-card-reason" x-text="$store.genesisDashboard.queuesSemantic().reason"></div>
           </div>
 
+          <!-- Reflex arc -->
+          <div class="health-card" title="Reflex arc: fingerprint-deduped record of Genesis's own background-task crashes.">
+            <div class="health-card-header">
+              <div class="health-card-title">Reflex</div>
+              <span class="status-chip"
+                    :class="$store.genesisDashboard.semanticChipClass($store.genesisDashboard.reflexSemantic().state)"
+                    x-text="`${$store.genesisDashboard.semanticChipGlyph($store.genesisDashboard.reflexSemantic().state)} ${$store.genesisDashboard.reflexSemantic().state}`"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.health.reflex">
+                <div>
+                  <div style="font-size: 0.82rem; cursor: default;"
+                       title="Distinct failure fingerprints awaiting the diagnose lane">
+                    New Signals:
+                    <span x-text="$store.genesisDashboard.health.reflex.counts?.new ?? 0"
+                          :style="($store.genesisDashboard.health.reflex.counts?.new || 0) > 0 ? 'color: #f0ad4e; font-weight: 700' : 'color: #4caf50'"></span>
+                    <span style="font-size: 0.68rem; color: var(--color-text-secondary);"
+                          x-text="'(' + ($store.genesisDashboard.health.reflex.total_signals ?? 0) + ' total)'"></span>
+                  </div>
+                  <template x-if="$store.genesisDashboard.health.reflex.ingestor">
+                    <div style="font-size: 0.82rem; cursor: default;"
+                         title="Live ingestor counters (this server process)">
+                      Ingested:
+                      <span x-text="$store.genesisDashboard.health.reflex.ingestor.processed ?? 0" style="color: #4caf50"></span>
+                      <template x-if="($store.genesisDashboard.health.reflex.ingestor.dropped || 0) > 0">
+                        <span style="color: #d9534f; font-weight: 700;"
+                              x-text="'(' + $store.genesisDashboard.health.reflex.ingestor.dropped + ' dropped)'"></span>
+                      </template>
+                    </div>
+                  </template>
+                  <template x-if="($store.genesisDashboard.health.reflex.top_classes?.length || 0) > 0">
+                    <div style="margin-top: 0.3rem; font-size: 0.68rem;">
+                      <template x-for="cls in $store.genesisDashboard.health.reflex.top_classes.slice(0, 3)" :key="cls.class_key">
+                        <div style="color: var(--color-text-secondary); margin: 0.1rem 0;">
+                          <span x-text="cls.class_key"></span>
+                          (<span x-text="cls.signals + ' signal' + (cls.signals === 1 ? '' : 's')"></span>,
+                          <span x-text="cls.occurrences + '×'"></span>)
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.reflexSemantic().reason"></div>
+          </div>
+
           <!-- Surplus -->
           <div class="health-card" title="Surplus compute: opportunistic background tasks during idle time."
                style="cursor: pointer;" @click="$store.genesisDashboard.surplusModal.open = true; $store.genesisDashboard.fetchSurplusDetail()">

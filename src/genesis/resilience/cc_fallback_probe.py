@@ -18,6 +18,7 @@ fallback far sooner in an active system, so this is purely the idle backstop. A
 probe during an outage just fails fast with a rate-limit error (cheap); it only
 costs a real (minimal) Claude call on the cycle where recovery is detected.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -42,9 +43,14 @@ class CCFallbackProbeWorker:
     def start(self) -> None:
         """Start the probe loop (idempotent — no-op if a task is already running)."""
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._loop())
+            from genesis.util.tasks import tracked_task
+
+            # tracked_task (not bare create_task): only stop() ever awaits this
+            # loop, so an unexpected loop death would otherwise be silent.
+            self._task = tracked_task(self._loop(), name="cc-fallback-probe")
             logger.info(
-                "CC fallback probe worker started (interval=%ds)", self._interval_s,
+                "CC fallback probe worker started (interval=%ds)",
+                self._interval_s,
             )
 
     async def stop(self) -> None:
@@ -115,5 +121,6 @@ class CCFallbackProbeWorker:
 
             if await note_home_recovery():
                 logger.info(
-                    "CC fallback probe: home model %r recovered — fallback cleared", home,
+                    "CC fallback probe: home model %r recovered — fallback cleared",
+                    home,
                 )

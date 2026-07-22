@@ -24,6 +24,7 @@ from genesis.observability.snapshots.outreach import outreach_stats
 from genesis.observability.snapshots.proactive_memory import proactive_memory_metrics
 from genesis.observability.snapshots.provider_activity import provider_activity
 from genesis.observability.snapshots.queues import queues
+from genesis.observability.snapshots.reflex import reflex
 from genesis.observability.snapshots.services import mcp_status, services, services_async
 from genesis.observability.snapshots.surplus import surplus_status
 
@@ -43,6 +44,7 @@ __all__ = [
     "proactive_memory_metrics",
     "provider_activity",
     "queues",
+    "reflex",
     "resilience_state",
     "resilience_state_detail",
     "services",

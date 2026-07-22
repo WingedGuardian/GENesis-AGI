@@ -84,11 +84,39 @@ class TestStandaloneHealthDataService:
         assert snap["resilience_state"]["embedding"] == "FALLBACK"
         assert snap["queue_depths"]["deferred_work"] == 5
 
+    async def test_snapshot_maps_reflex_block(self, tmp_path: Path) -> None:
+        """A reflex block in status.json surfaces under the same .reflex.ingestor
+        shape the in-server snapshot uses."""
+        from genesis.mcp.standalone_health import StandaloneHealthDataService
+
+        data = {
+            "timestamp": "2026-07-21T00:00:00+00:00",
+            "resilience_state": {},
+            "queue_depths": {},
+            "human_summary": "ok",
+            "reflex": {"enabled": True, "queued": 0, "processed": 4, "dropped": 0},
+        }
+        path = tmp_path / "status.json"
+        path.write_text(json.dumps(data))
+        svc = StandaloneHealthDataService(status_path=path, db=None)
+        snap = await svc.snapshot()
+        assert snap["reflex"] == {
+            "ingestor": {"enabled": True, "queued": 0, "processed": 4, "dropped": 0}
+        }
+
+    async def test_snapshot_without_reflex_block_is_empty_dict(self, status_json: Path) -> None:
+        from genesis.mcp.standalone_health import StandaloneHealthDataService
+
+        svc = StandaloneHealthDataService(status_path=status_json, db=None)
+        snap = await svc.snapshot()
+        assert snap["reflex"] == {}
+
     async def test_snapshot_missing_file(self, tmp_path: Path) -> None:
         from genesis.mcp.standalone_health import StandaloneHealthDataService
 
         svc = StandaloneHealthDataService(
-            status_path=tmp_path / "nonexistent.json", db=None,
+            status_path=tmp_path / "nonexistent.json",
+            db=None,
         )
         snap = await svc.snapshot()
 
@@ -108,7 +136,8 @@ class TestStandaloneHealthDataService:
         assert "parse" in snap["message"].lower() or "json" in snap["message"].lower()
 
     async def test_health_status_uses_standalone_snapshot(
-        self, status_json: Path,
+        self,
+        status_json: Path,
     ) -> None:
         """When wired with StandaloneHealthDataService, health_status returns file data."""
         import genesis.mcp.health_mcp as health_mcp_mod
@@ -144,12 +173,19 @@ class TestStandaloneBootstrapAndJobHealth:
         from genesis.mcp.health import manifest as manifest_mod
 
         mf = tmp_path / "bootstrap_manifest.json"
-        mf.write_text(json.dumps({
-            "bootstrapped": True,
-            "manifest": {"db": "ok", "outreach": "degraded: no token",
-                         "voice": "failed: no api key"},
-            "persisted_at": "2026-07-06T01:00:00+00:00",
-        }))
+        mf.write_text(
+            json.dumps(
+                {
+                    "bootstrapped": True,
+                    "manifest": {
+                        "db": "ok",
+                        "outreach": "degraded: no token",
+                        "voice": "failed: no api key",
+                    },
+                    "persisted_at": "2026-07-06T01:00:00+00:00",
+                }
+            )
+        )
         monkeypatch.setattr(manifest_mod, "_MANIFEST_FILE", mf)
 
         result = manifest_mod._read_persisted_manifest()
@@ -172,9 +208,7 @@ class TestStandaloneBootstrapAndJobHealth:
         """No persisted file → reader declines (caller reports empty manifest)."""
         from genesis.mcp.health import manifest as manifest_mod
 
-        monkeypatch.setattr(
-            manifest_mod, "_MANIFEST_FILE", tmp_path / "nope.json"
-        )
+        monkeypatch.setattr(manifest_mod, "_MANIFEST_FILE", tmp_path / "nope.json")
         assert manifest_mod._read_persisted_manifest() is None
 
     async def test_bootstrap_manifest_corrupt_file_returns_none(
@@ -258,7 +292,8 @@ class TestHealthBootstrapLifespan:
     """Test that health bootstrap opens and closes DB via lifespan."""
 
     async def test_bootstrap_uses_lifespan_when_db_exists(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """When DB file exists, _bootstrap_health sets mcp._lifespan."""
         from unittest.mock import MagicMock, patch
@@ -274,6 +309,14 @@ class TestHealthBootstrapLifespan:
             patch("scripts.genesis_mcp_server._DEFAULT_DB", fake_db),
             patch("scripts.genesis_mcp_server._DEFAULT_STATUS", tmp_path / "status.json"),
             patch("genesis.mcp.health_mcp.mcp", mock_mcp),
+            # _bootstrap_health -> init_health_mcp sets these module globals;
+            # patching them here makes the mutation revert on exit instead of
+            # leaking a tmp-path service into later tests (their health_status
+            # then returns the normal-path dict and KeyErrors on "status").
+            patch("genesis.mcp.health_mcp._service", None),
+            patch("genesis.mcp.health_mcp._activity_tracker", None),
+            patch("genesis.mcp.health_mcp._event_bus", None),
+            patch("genesis.mcp.health_mcp._job_retry_registry", None),
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
@@ -284,7 +327,8 @@ class TestHealthBootstrapLifespan:
         mock_mcp.run.assert_called_once_with(transport="stdio")
 
     async def test_bootstrap_no_lifespan_when_db_missing(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """When DB file is missing, falls back to db=None (no lifespan)."""
         from unittest.mock import MagicMock, patch
@@ -295,6 +339,14 @@ class TestHealthBootstrapLifespan:
             patch("scripts.genesis_mcp_server._DEFAULT_DB", tmp_path / "nonexistent.db"),
             patch("scripts.genesis_mcp_server._DEFAULT_STATUS", tmp_path / "status.json"),
             patch("genesis.mcp.health_mcp.mcp", mock_mcp),
+            # _bootstrap_health -> init_health_mcp sets these module globals;
+            # patching them here makes the mutation revert on exit instead of
+            # leaking a tmp-path service into later tests (their health_status
+            # then returns the normal-path dict and KeyErrors on "status").
+            patch("genesis.mcp.health_mcp._service", None),
+            patch("genesis.mcp.health_mcp._activity_tracker", None),
+            patch("genesis.mcp.health_mcp._event_bus", None),
+            patch("genesis.mcp.health_mcp._job_retry_registry", None),
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
@@ -304,7 +356,8 @@ class TestHealthBootstrapLifespan:
         mock_mcp.run.assert_called_once_with(transport="stdio")
 
     async def test_lifespan_opens_and_closes_db(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """The lifespan context manager opens DB on enter and closes on exit."""
         from unittest.mock import AsyncMock, MagicMock, patch
@@ -325,6 +378,14 @@ class TestHealthBootstrapLifespan:
             patch("scripts.genesis_mcp_server._DEFAULT_DB", fake_db),
             patch("scripts.genesis_mcp_server._DEFAULT_STATUS", tmp_path / "status.json"),
             patch("genesis.mcp.health_mcp.mcp", mock_mcp),
+            # _bootstrap_health -> init_health_mcp sets these module globals;
+            # patching them here makes the mutation revert on exit instead of
+            # leaking a tmp-path service into later tests (their health_status
+            # then returns the normal-path dict and KeyErrors on "status").
+            patch("genesis.mcp.health_mcp._service", None),
+            patch("genesis.mcp.health_mcp._activity_tracker", None),
+            patch("genesis.mcp.health_mcp._event_bus", None),
+            patch("genesis.mcp.health_mcp._job_retry_registry", None),
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
@@ -383,7 +444,8 @@ class TestStandaloneServiceDetection:
         assert snap["services"]["watchdog_timer"]["active_state"] == "active"
 
     async def test_snapshot_services_degrades_gracefully(
-        self, status_json: Path,
+        self,
+        status_json: Path,
     ) -> None:
         """If collect_service_status raises, services should be empty dict."""
         from unittest.mock import patch
@@ -426,7 +488,8 @@ class TestHeartbeatQueriesWithDB:
         )
 
         svc = StandaloneHealthDataService(
-            status_path="/tmp/nonexistent.json", db=db,
+            status_path="/tmp/nonexistent.json",
+            db=db,
         )
 
         old_service = health_mcp_mod._service
@@ -450,7 +513,8 @@ class TestHeartbeatQueriesWithDB:
         from genesis.mcp.standalone_health import StandaloneHealthDataService
 
         svc = StandaloneHealthDataService(
-            status_path="/tmp/nonexistent.json", db=None,
+            status_path="/tmp/nonexistent.json",
+            db=None,
         )
 
         old_service = health_mcp_mod._service
@@ -488,7 +552,8 @@ class TestHeartbeatQueriesWithDB:
         )
 
         svc = StandaloneHealthDataService(
-            status_path="/tmp/nonexistent.json", db=db,
+            status_path="/tmp/nonexistent.json",
+            db=db,
         )
 
         old_service = health_mcp_mod._service
@@ -610,8 +675,15 @@ class TestEnrichFromDB:
             "(call_site_id, last_run_at, provider_used, model_id, "
             "input_tokens, output_tokens, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("test_site", "2026-03-27T04:00:00+00:00", "openrouter", "gpt-4",
-             100, 50, "2026-03-27T04:00:00+00:00"),
+            (
+                "test_site",
+                "2026-03-27T04:00:00+00:00",
+                "openrouter",
+                "gpt-4",
+                100,
+                50,
+                "2026-03-27T04:00:00+00:00",
+            ),
         )
         await db.commit()
 
@@ -629,7 +701,8 @@ class TestEnrichFromDB:
         assert site["last_tokens"] == 150
 
     async def test_enrich_failure_does_not_corrupt_snapshot(
-        self, status_json: Path,
+        self,
+        status_json: Path,
     ) -> None:
         """If enrichment fails, the snapshot should still return valid data."""
         from unittest.mock import AsyncMock, patch
@@ -654,7 +727,9 @@ class TestEnrichFromDB:
         assert isinstance(snap["cost"], dict)
 
     async def test_enrich_cost_uses_real_cost_events_not_shadow(
-        self, db, status_json: Path,
+        self,
+        db,
+        status_json: Path,
     ) -> None:
         """The cost field must report REAL spend from cost_events with a real
         budget_status — NOT the shadow 'if-CC-were-API-billed' figure from
@@ -742,8 +817,10 @@ class TestReflectionHeartbeatEmission:
         # A critical signal is required to trigger the LLM reflection path
         # (PR #404: silent micro ticks unless critical signals are present)
         critical_signal = SignalReading(
-            name="software_error_spike", value=1.0,
-            source="test", collected_at="2026-01-01T00:00:00Z",
+            name="software_error_spike",
+            value=1.0,
+            source="test",
+            collected_at="2026-01-01T00:00:00Z",
         )
         tick = MagicMock(spec=TickResult)
         tick.classified_depth = Depth.MICRO
@@ -753,8 +830,10 @@ class TestReflectionHeartbeatEmission:
         await loop._dispatch_reflection(tick)
 
         mock_bus.emit.assert_awaited_once_with(
-            Subsystem.REFLECTION, Severity.DEBUG,
-            "heartbeat", "micro-reflection completed",
+            Subsystem.REFLECTION,
+            Severity.DEBUG,
+            "heartbeat",
+            "micro-reflection completed",
         )
 
     async def test_heartbeat_not_emitted_on_failure(self) -> None:
@@ -781,8 +860,10 @@ class TestReflectionHeartbeatEmission:
         # Provide a critical signal so we enter the reflect path,
         # but reflect returns success=False → no heartbeat
         critical_signal = SignalReading(
-            name="software_error_spike", value=1.0,
-            source="test", collected_at="2026-01-01T00:00:00Z",
+            name="software_error_spike",
+            value=1.0,
+            source="test",
+            collected_at="2026-01-01T00:00:00Z",
         )
         tick = MagicMock(spec=TickResult)
         tick.classified_depth = Depth.MICRO
@@ -822,8 +903,10 @@ class TestReflectionHeartbeatEmission:
         # and NO LLM reflection runs. value=0.0 keeps it structurally non-critical
         # even if its name is ever added to _MICRO_CRITICAL_SIGNALS.
         routine_signal = SignalReading(
-            name="container_memory_pct", value=0.0,
-            source="test", collected_at="2026-01-01T00:00:00Z",
+            name="container_memory_pct",
+            value=0.0,
+            source="test",
+            collected_at="2026-01-01T00:00:00Z",
         )
         tick = MagicMock(spec=TickResult)
         tick.classified_depth = Depth.MICRO
@@ -834,8 +917,10 @@ class TestReflectionHeartbeatEmission:
 
         mock_engine.reflect.assert_not_awaited()
         mock_bus.emit.assert_awaited_once_with(
-            Subsystem.REFLECTION, Severity.DEBUG,
-            "heartbeat", "reflection idle (no critical signals)",
+            Subsystem.REFLECTION,
+            Severity.DEBUG,
+            "heartbeat",
+            "reflection idle (no critical signals)",
         )
 
 
@@ -858,8 +943,15 @@ class TestReflectionHeartbeatThreshold:
         await db.execute(
             "INSERT INTO events (id, timestamp, subsystem, severity, event_type, "
             "message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("ev-refl-hb", ts, "reflection", "DEBUG", "heartbeat",
-             "reflection idle (no critical signals)", ts),
+            (
+                "ev-refl-hb",
+                ts,
+                "reflection",
+                "DEBUG",
+                "heartbeat",
+                "reflection idle (no critical signals)",
+                ts,
+            ),
         )
         await db.commit()
 

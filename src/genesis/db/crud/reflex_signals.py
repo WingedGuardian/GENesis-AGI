@@ -175,3 +175,39 @@ async def list_by_status(db: aiosqlite.Connection, status: str, *, limit: int = 
     )
     rows = await cursor.fetchall()
     return [_row_to_dict(tuple(r)) for r in rows]
+
+
+async def list_recent(db: aiosqlite.Connection, *, limit: int = 10) -> list[dict]:
+    """Most-recently-seen signals across all statuses, newest first."""
+    cursor = await db.execute(f"{_SELECT} ORDER BY last_seen_at DESC LIMIT ?", (limit,))
+    rows = await cursor.fetchall()
+    return [_row_to_dict(tuple(r)) for r in rows]
+
+
+# ── observability aggregates (PR1.5) — shared by the reflex_status MCP tool
+#    and the in-server health snapshot; read-only ────────────────────────────
+
+
+async def count_by_status(db: aiosqlite.Connection) -> dict[str, int]:
+    """Signal counts keyed by lifecycle status (statuses with zero rows omitted)."""
+    cursor = await db.execute("SELECT status, COUNT(*) FROM reflex_signals GROUP BY status")
+    rows = await cursor.fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+async def top_class_keys(db: aiosqlite.Connection, *, limit: int = 8) -> list[dict]:
+    """Class keys ranked by distinct-signal count, occurrence volume as tiebreak.
+
+    Signal count leads (how many distinct bugs in this class), occurrence sum
+    breaks ties (how loud they are) — the ordering the §7.2 taxonomy work reads.
+    """
+    cursor = await db.execute(
+        """SELECT class_key, COUNT(*) AS signals, SUM(occurrence_count) AS occurrences
+           FROM reflex_signals
+           GROUP BY class_key
+           ORDER BY signals DESC, occurrences DESC
+           LIMIT ?""",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [{"class_key": row[0], "signals": row[1], "occurrences": row[2]} for row in rows]

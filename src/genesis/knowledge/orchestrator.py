@@ -96,7 +96,8 @@ class KnowledgeOrchestrator:
             if self._manifest.has_source(source):
                 logger.warning(
                     "Re-ingest of %s failed extraction (%s) — serving cached units",
-                    source, exc,
+                    source,
+                    exc,
                 )
                 return IngestResult(
                     source=source,
@@ -150,7 +151,8 @@ class KnowledgeOrchestrator:
         except Exception:
             logger.warning(
                 "Injection scan failed for %s (fail-open, ingest continues)",
-                source, exc_info=True,
+                source,
+                exc_info=True,
             )
 
         # 3b. Kick off tree indexing in parallel (if applicable)
@@ -170,6 +172,10 @@ class KnowledgeOrchestrator:
             and source_resolved.exists()
         )
         if should_tree_index:
+            # Bare create_task BY DESIGN (reflex A4 sweep, 2026-07-21): this
+            # task is awaited downstream (_collect_tree_result) and
+            # cancelled+awaited on every error path, so exceptions propagate
+            # to the caller — tracked_task would double-report them.
             tree_task = asyncio.create_task(
                 self._tree_index_source(source),
                 name=f"tree-index-{Path(source).name}",
@@ -193,7 +199,9 @@ class KnowledgeOrchestrator:
 
             # 6. Distill
             units = await self._distillation.distill(
-                content, project_type=project_type, domain=domain,
+                content,
+                project_type=project_type,
+                domain=domain,
                 user_context=user_context,
                 on_chunk_done=on_chunk_done,
                 content_source=content_source,
@@ -232,8 +240,11 @@ class KnowledgeOrchestrator:
         try:
             async with self._store_lock:
                 unit_ids = await self._store_units(
-                    units, project_type=project_type, source=source,
-                    content=content, purpose=purpose,
+                    units,
+                    project_type=project_type,
+                    source=source,
+                    content=content,
+                    purpose=purpose,
                 )
         except Exception as exc:
             logger.error("Storage failed for %s: %s", source, exc)
@@ -268,7 +279,9 @@ class KnowledgeOrchestrator:
             )
             logger.warning(
                 "Injection patterns in ingested source %s: %s (risk=%.3f)",
-                source, scan_result.detected_patterns, scan_result.risk_score,
+                source,
+                scan_result.detected_patterns,
+                scan_result.risk_score,
             )
 
         low_conf = [u for u in units if u.confidence < 0.5]
@@ -306,10 +319,14 @@ class KnowledgeOrchestrator:
         """Batch-ingest all supported files from a directory."""
         dir_path = Path(directory)
         if not dir_path.is_dir():
-            return [IngestResult(
-                source=directory, source_type="error", units_created=0,
-                error=f"Not a directory: {directory}",
-            )]
+            return [
+                IngestResult(
+                    source=directory,
+                    source_type="error",
+                    units_created=0,
+                    error=f"Not a directory: {directory}",
+                )
+            ]
 
         results: list[IngestResult] = []
         supported = set(extensions) if extensions else set(self._registry.supported_extensions())
@@ -352,7 +369,8 @@ class KnowledgeOrchestrator:
         except Exception as exc:
             logger.warning(
                 "Tree indexing failed for %s (non-blocking): %s",
-                source, exc,
+                source,
+                exc,
             )
             return None
 
@@ -400,9 +418,7 @@ class KnowledgeOrchestrator:
         qdrant_ids: list[str] = []  # Track for compensation on failure
         purpose_json = json.dumps(purpose) if purpose else None
         now_iso = datetime.now(UTC).isoformat()
-        embedding_model = getattr(
-            memory_mod._store._embeddings, "model_name", "unknown"
-        )
+        embedding_model = getattr(memory_mod._store._embeddings, "model_name", "unknown")
 
         try:
             for unit in units:
@@ -422,7 +438,8 @@ class KnowledgeOrchestrator:
                 from genesis.memory.provenance import derive_origin_class
 
                 resolved_origin = derive_origin_class(
-                    source_pipeline="curated", collection="knowledge_base",
+                    source_pipeline="curated",
+                    collection="knowledge_base",
                 )
                 qdrant_id = await memory_mod._store.store(
                     unit.body,
@@ -484,7 +501,10 @@ class KnowledgeOrchestrator:
         except Exception:
             logger.error(
                 "Batch storage failed after %d/%d units (%d qdrant vectors) from %s — rolling back",
-                len(unit_ids), len(units), len(qdrant_ids), source,
+                len(unit_ids),
+                len(units),
+                len(qdrant_ids),
+                source,
                 exc_info=True,
             )
             # Roll back SQLite to release the write lock immediately

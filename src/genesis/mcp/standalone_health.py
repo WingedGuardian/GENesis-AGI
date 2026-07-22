@@ -77,6 +77,9 @@ class StandaloneHealthDataService:
             "surplus": {},
             "awareness": {},
             "outreach_stats": {},
+            # Reflex ingestor counters written by StatusFileWriter (live in
+            # the server process; slightly stale here by design).
+            "reflex": {"ingestor": data.get("reflex")} if data.get("reflex") else {},
         }
 
         # Enrich from DB where possible (capped at 5s to avoid stalling CC)

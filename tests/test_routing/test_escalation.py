@@ -101,8 +101,7 @@ class TestRecovery:
             "INSERT INTO observations "
             "(id, source, type, content, priority, resolved, content_hash, created_at) "
             "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, datetime('now'))",
-            (oid, f"{provider} failing",
-             escalation._provider_content_hash(provider)),
+            (oid, f"{provider} failing", escalation._provider_content_hash(provider)),
         )
         await empty_db.commit()
 
@@ -110,7 +109,8 @@ class TestRecovery:
         # Raw read of (resolved, resolution_notes) — independent of obs_crud so the
         # assertion can't be defeated by a leaked CRUD mock elsewhere in the suite.
         cur = await empty_db.execute(
-            "SELECT resolved, resolution_notes FROM observations WHERE id = ?", (oid,),
+            "SELECT resolved, resolution_notes FROM observations WHERE id = ?",
+            (oid,),
         )
         return await cur.fetchone()
 
@@ -136,10 +136,7 @@ class TestRecovery:
 
         await self._make_pf(escalation, empty_db, "prov-y", "pf-y")
         escalation.record_recovery("prov-y")
-        pending = [
-            t for t in asyncio.all_tasks()
-            if t.get_name() == "escalation-resolve-prov-y"
-        ]
+        pending = [t for t in asyncio.all_tasks() if t.get_name() == "escalation-resolve-prov-y"]
         assert pending, "record_recovery did not schedule the resolve task"
         await asyncio.gather(*pending)
         assert (await self._pf_state(empty_db, "pf-y"))["resolved"] == 1
@@ -173,6 +170,79 @@ class TestEventBusIntegration:
         initial_count = len(event_bus._listeners)
         escalation.attach()
         assert len(event_bus._listeners) == initial_count + 1
+
+
+class TestTaskFailureReporting:
+    """The tracked_task swap (reflex A4): a crash in a deferred escalation
+    task must land on the event bus as task.failed — the log-only
+    _on_task_done callback it replaced reported to nobody. The inner DB
+    helpers swallow their own errors, so these tests inject the failure at
+    the coroutine boundary (the escape path the wrapper exists for)."""
+
+    async def _settle(self):
+        import asyncio
+
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    def _capture(self, event_bus):
+        captured: list = []
+
+        async def listener(event):
+            captured.append(event)
+
+        event_bus.subscribe(listener, min_severity=Severity.ERROR)
+        return captured
+
+    async def test_create_observation_crash_emits_task_failed(
+        self, escalation, event_bus, monkeypatch
+    ):
+        captured = self._capture(event_bus)
+
+        async def _boom(provider, state):
+            raise RuntimeError("obs write exploded")
+
+        monkeypatch.setattr(escalation, "_create_observation", _boom)
+        for _ in range(_TRIP_THRESHOLD):
+            await escalation._on_event(_make_event())
+        await self._settle()
+
+        failed = [e for e in captured if e.event_type == "task.failed"]
+        assert len(failed) == 1
+        assert failed[0].details["task_name"] == "escalation-obs-test-provider"
+        assert failed[0].details["error_type"] == "RuntimeError"
+        assert failed[0].subsystem == Subsystem.ROUTING
+
+    async def test_resolve_observation_crash_emits_task_failed(
+        self, escalation, event_bus, monkeypatch
+    ):
+        captured = self._capture(event_bus)
+
+        async def _boom(provider):
+            raise RuntimeError("resolve exploded")
+
+        monkeypatch.setattr(escalation, "_resolve_observation", _boom)
+        # Seed state so record_recovery has something to clear, then recover.
+        for _ in range(_TRIP_THRESHOLD):
+            await escalation._on_event(_make_event())
+        escalation.record_recovery("test-provider")
+        await self._settle()
+
+        failed = [
+            e
+            for e in captured
+            if e.event_type == "task.failed"
+            and e.details.get("task_name") == "escalation-resolve-test-provider"
+        ]
+        assert len(failed) == 1
+        assert failed[0].details["error_type"] == "RuntimeError"
+
+    async def test_successful_task_emits_nothing(self, escalation, event_bus):
+        captured = self._capture(event_bus)
+        for _ in range(_TRIP_THRESHOLD):
+            await escalation._on_event(_make_event())
+        await self._settle()
+        assert [e for e in captured if e.event_type == "task.failed"] == []
 
 
 class TestCircuitBreakerRecoveryCallback:

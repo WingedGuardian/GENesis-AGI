@@ -131,3 +131,48 @@ class TestStatusFileWriter:
         # pending_embeddings comes from actual db (should be 0 in empty db)
         assert data["queue_depths"]["pending_embeddings"] == 0
         assert "15 items queued" in data["human_summary"]
+
+
+class TestReflexBlock:
+    """The reflex block only appears when a real dict of stats exists —
+    a mock runtime / absent ingestor must never poison the JSON write."""
+
+    async def test_real_stats_dict_included(self, sm, tmp_path):
+        from unittest.mock import MagicMock
+
+        rt = MagicMock()
+        rt.job_health = {}
+        rt._reflex_ingestor.stats = {
+            "enabled": True,
+            "queued": 2,
+            "processed": 7,
+            "dropped": 0,
+        }
+        path = tmp_path / "status.json"
+        writer = StatusFileWriter(state_machine=sm, runtime=rt, path=str(path))
+        await writer.write()
+        data = json.loads(path.read_text())
+        assert data["reflex"] == {
+            "enabled": True,
+            "queued": 2,
+            "processed": 7,
+            "dropped": 0,
+        }
+
+    async def test_mock_runtime_without_real_stats_omits_block(self, sm, tmp_path):
+        from unittest.mock import MagicMock
+
+        rt = MagicMock()  # .stats resolves to a MagicMock, not a dict
+        rt.job_health = {}
+        path = tmp_path / "status.json"
+        writer = StatusFileWriter(state_machine=sm, runtime=rt, path=str(path))
+        await writer.write()
+        data = json.loads(path.read_text())
+        assert "reflex" not in data
+
+    async def test_no_runtime_omits_block(self, sm, tmp_path):
+        path = tmp_path / "status.json"
+        writer = StatusFileWriter(state_machine=sm, path=str(path))
+        await writer.write()
+        data = json.loads(path.read_text())
+        assert "reflex" not in data
