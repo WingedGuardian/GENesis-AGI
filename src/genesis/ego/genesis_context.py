@@ -81,6 +81,7 @@ class GenesisEgoContextBuilder:
         section_map: list[tuple[str, Any]] = [
             ("system_health", self._system_health_section),
             ("intentions", self._intentions_section),
+            ("directives", self._directives_section),
             ("settled_decisions", self._settled_decisions_section),
             ("signals", self._signals_section),
             ("observations", self._observations_section),
@@ -125,6 +126,26 @@ class GenesisEgoContextBuilder:
         """
         from genesis.ego.intentions_context import build_intentions_section
         return await build_intentions_section(self._db, "genesis_ego_cycle")
+
+    async def _directives_section(self, *, depth: str = "deep") -> str:
+        """User directives targeted at the Genesis (COO) ego.
+
+        Renders active genesis_ego directives (empty string when none). The
+        query + render live in the shared build_directives_section helper; the
+        COO differs only in framing.
+        """
+        from genesis.ego.directives_context import build_directives_section
+
+        return await build_directives_section(
+            self._db,
+            "genesis_ego",
+            framing=(
+                "*The user flagged these for you (the operations ego). Factor "
+                "them into your thinking, act on or resolve them, or disagree "
+                "with reasoning — but never ignore one silently.*\n"
+            ),
+            error_body="*Directives unavailable (query error — see logs).*",
+        )
 
     async def _system_health_section(self, *, depth: str = "deep") -> str:
         """Live system health from health_data snapshot."""
