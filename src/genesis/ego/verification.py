@@ -181,6 +181,18 @@ def verify_outputs(expected: ExpectedOutputs) -> VerificationResult:
         # Use the resolved path in messages so operators can find the file
         label = f"{path} (fuzzy match for {filepath})" if fuzzy else filepath
 
+        # A fuzzy match means the EXACT expected path was absent. No heuristic
+        # (name-similarity OR content) reliably tells a rename from an unrelated
+        # similarly-named file, so we still count it as produced (never a
+        # false-fail on a real rename) but flag it LOUDLY — a possibly-wrong
+        # file must never pass silently. The LLM semantic verifier is the real
+        # disambiguation.
+        if fuzzy:
+            advisories.append(
+                f"Fuzzy filename match — expected {filepath!r}, used "
+                f"{path.name!r}; verify this is the intended deliverable"
+            )
+
         try:
             size = path.stat().st_size
         except OSError as exc:

@@ -233,8 +233,10 @@ def test_find_similar_nonexistent_parent():
 # --- verify_outputs with fuzzy matching ---
 
 
-def test_verify_fuzzy_match_passes(tmp_path: Path):
-    """Missing exact file but fuzzy match found — should pass cleanly."""
+def test_verify_fuzzy_match_passes_but_flagged(tmp_path: Path):
+    """Missing exact file but fuzzy match found — passes (never false-fails a
+    real rename), but the fuzzy substitution is flagged as an advisory so a
+    possibly-wrong file never passes silently."""
     actual = tmp_path / "arxiv-related-work-draft-v1.md"
     actual.write_text("## Related Work\nGenesis is a cognitive architecture.")
     expected = ExpectedOutputs(
@@ -245,23 +247,44 @@ def test_verify_fuzzy_match_passes(tmp_path: Path):
     result = verify_outputs(expected)
     assert result.passed is True
     assert result.missing_files == []
-    assert result.advisories == []
+    # Content matched, but the fuzzy substitution itself is still surfaced.
+    assert any("fuzzy filename match" in a.lower() for a in result.advisories)
 
 
-def test_verify_fuzzy_match_content_miss_is_advisory(tmp_path: Path):
-    """A fuzzy-matched file that misses a content string → advisory, not fail."""
+def test_verify_fuzzy_match_never_silent(tmp_path: Path):
+    """Any fuzzy substitution is surfaced as an advisory, even when the content
+    check also passes — a possibly-wrong similarly-named file must never mark a
+    proposal produced silently. No heuristic (name OR content) reliably
+    separates a rename from an unrelated file, so we flag rather than gate.
+    """
     actual = tmp_path / "report-v2.md"
-    actual.write_text("Some content without the required heading.")
+    actual.write_text("Some reworded content without the exact heading.")
     expected = ExpectedOutputs(
         files=[str(tmp_path / "report.md")],
         required_strings=["## Summary"],
     )
     result = verify_outputs(expected)
+    # Still passes (never a false-fail on a possible rename)...
     assert result.passed is True
     assert result.missing_files == []
-    assert any("## Summary" in a for a in result.advisories)
-    # Advisory should reference the fuzzy-matched path for debugging
-    assert any("fuzzy match" in a for a in result.advisories)
+    # ...but the fuzzy substitution is loudly flagged for verification.
+    assert any("fuzzy filename match" in a.lower() for a in result.advisories)
+    assert any("report-v2.md" in a for a in result.advisories)
+
+
+def test_verify_fuzzy_partial_string_match_accepted(tmp_path: Path):
+    """A fuzzy rename that shares AT LEAST ONE anchor is accepted; the missing
+    anchors are advisory only (it is the deliverable, just partially reworded)."""
+    actual = tmp_path / "report-v2.md"
+    actual.write_text("## Summary\nReal reworded body.\n")
+    expected = ExpectedOutputs(
+        files=[str(tmp_path / "report.md")],
+        required_strings=["## Summary", "## Appendix"],  # one present, one absent
+    )
+    result = verify_outputs(expected)
+    assert result.passed is True
+    assert result.missing_files == []
+    assert any("## Appendix" in a for a in result.advisories)
 
 
 def test_verify_no_fuzzy_for_exact_match(tmp_path: Path):
