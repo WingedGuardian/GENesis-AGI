@@ -34,7 +34,9 @@ def test_apply_direct_uses_systemd_run_scope(tmp_path, _passthrough_jsonify):
     assert argv[0] == "systemd-run"
     assert "--user" in argv and "--scope" in argv
     assert "bash" in argv and any(str(updates._UPDATE_SCRIPT) == a for a in argv)
-    assert pid_file.read_text() == "12345"
+    # The direct path deliberately does NOT write the marker (signals via the
+    # state file + flock); it must not create it here.
+    assert not pid_file.exists()
 
 
 def test_apply_direct_falls_back_when_scope_unavailable(tmp_path, _passthrough_jsonify):
@@ -52,7 +54,7 @@ def test_apply_direct_falls_back_when_scope_unavailable(tmp_path, _passthrough_j
     kwargs = popen.call_args_list[0][1]
     assert argv[0] == "bash"
     assert kwargs.get("start_new_session") is True
-    assert pid_file.read_text() == "999"
+    assert not pid_file.exists()  # no marker written on the direct path
 
 
 def test_systemd_run_scope_probe():

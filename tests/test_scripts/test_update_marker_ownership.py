@@ -40,54 +40,16 @@ def test_no_unconditional_marker_rm_remains(text: str) -> None:
     `rm -f ... update_in_progress.pid` outside `_clear_deploy_state`."""
     body = _extract_func(text, "_clear_deploy_state")
     outside = text.replace(body, "")
-    # No raw DELETE of the marker may survive outside the helper (the adoption
-    # block writes it, which is fine — only unconditional rm is the hazard).
+    # No raw DELETE of the marker may survive outside the helper.
     assert not re.search(r"rm -f[^\n]*update_in_progress\.pid", outside), (
         "a raw marker rm survives outside the helper"
     )
     assert text.count("_clear_deploy_state\n") >= 5, "helper must be called at every cleanup site"
-
-
-def test_direct_path_adopts_marker_by_ppid(text: str) -> None:
-    """The direct-dashboard path adopts the marker (systemd-run's PID == our
-    $PPID) as our own $$, so _clear_deploy_state can clean it — gated on $PPID so
-    a restore/orchestrator marker is never adopted."""
-    assert '_own_marker="$HOME/.genesis/update_in_progress.pid"' in text
-    assert '= "$PPID" ]' in text and 'echo "$$" > "$_own_marker"' in text
-
-
-def _extract_adoption(text: str) -> str:
-    m = re.search(
-        r'(_own_marker="\$HOME.*?\n    echo "\$\$" > "\$_own_marker"\nfi)', text, re.DOTALL
+    # The direct path no longer adopts/writes a marker (it signals via the state
+    # file), so update.sh must NOT reference the marker outside the helper at all.
+    assert "update_in_progress.pid" not in outside, (
+        "no marker use should survive outside the helper"
     )
-    assert m, "adoption block not found"
-    return m.group(1)
-
-
-def test_direct_run_marker_cleaned_no_leak(tmp_path: Path, text: str) -> None:
-    """End-to-end: with the marker holding our parent PID (the direct path), after
-    adoption + _clear_deploy_state the marker is GONE — no systemd-run-PID leak."""
-    home = tmp_path / "home"
-    (home / ".genesis").mkdir(parents=True)
-    marker = home / ".genesis" / "update_in_progress.pid"
-    state = tmp_path / "s.json"
-    state.write_text("{}")
-    harness = f"""#!/bin/bash
-set -Eeuo pipefail
-STATE_FILE="{state}"
-echo "$PPID" > "{marker}"          # dashboard wrote our (systemd-run) parent's PID
-{_extract_adoption(text)}
-{_extract_func(text, "_clear_deploy_state")}
-_clear_deploy_state
-"""
-    (tmp_path / "h.sh").write_text(harness)
-    subprocess.run(
-        ["bash", str(tmp_path / "h.sh")],
-        env={**os.environ, "HOME": str(home)},
-        timeout=10,
-        check=True,
-    )
-    assert not marker.exists(), "direct-path marker must be cleaned (adopted then owner-deleted)"
 
 
 def _run_clear(tmp_path: Path, text: str, marker_pid: str | None) -> tuple[bool, bool]:

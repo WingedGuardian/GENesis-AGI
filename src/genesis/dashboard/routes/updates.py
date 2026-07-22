@@ -307,13 +307,12 @@ def _apply_direct(pid_file: Path) -> tuple:
                 start_new_session=True,
             )
         log_fh.close()  # child inherited the fd; parent can close its copy
-        pid_file.parent.mkdir(parents=True, exist_ok=True)
-        # NOTE: on the systemd-run path proc.pid is systemd-run's PID (it stays
-        # alive as the scope parent for the run's duration, then exits). update.sh
-        # owner-checks the marker (delete if ==$$ OR holder dead), so it is cleaned
-        # by the next run; env.update_in_progress() reads a dead marker as "no
-        # deploy" in the interim.
-        pid_file.write_text(str(proc.pid))
+        # Deliberately DON'T write the PID marker here: on the systemd-run path
+        # proc.pid is systemd-run's (a scope wrapper), which update.sh can't own,
+        # and racing to write it after the child starts leaks a stale marker.
+        # The direct run signals "in progress" via update.sh's state file (exactly
+        # like a CLI run — env.update_in_progress() honors both), and the flock in
+        # update.sh is the hard mutual-exclusion guarantee. `pid_file` is unused.
         logger.info("Direct update triggered (pid %d)", proc.pid)
         return jsonify({"status": "triggered", "pid": proc.pid, "supervised": False})
     except Exception as exc:
