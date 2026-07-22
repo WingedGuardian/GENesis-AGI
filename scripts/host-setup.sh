@@ -381,13 +381,16 @@ vm.min_free_kbytes = $_min_free_kb
 vm.watermark_scale_factor = 50
 vm.oom_kill_allocating_task = 1
 SYSCTL
-    sudo sysctl --system > /dev/null 2>&1
-    echo "  + OOM tuning applied (min_free=${_min_free_mb}MB for ${host_mem_gb}GB host)"
+    if sudo sysctl --system > /dev/null 2>&1; then
+        echo "  + OOM tuning applied (min_free=${_min_free_mb}MB for ${host_mem_gb}GB host)"
+    else
+        echo "  WARNING: OOM sysctl apply failed (non-fatal) — verify with 'sudo sysctl --system'"
+    fi
 fi
 
 # Find the managed bridge (not the host NIC). Column order: NAME,TYPE,MANAGED,...
 # Filter for MANAGED=YES to avoid trying to modify physical interfaces like ens4.
-_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
+_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1 || true)
 if [ -n "$_INCUS_BRIDGE" ]; then
     _NAT_STATUS=$(incus network get "$_INCUS_BRIDGE" ipv4.nat 2>/dev/null || echo "")
     if [ "$_NAT_STATUS" != "true" ]; then
@@ -405,7 +408,7 @@ fi
 # Rather than trying to detect which firewall is active and failing
 # silently, just run ALL commands unconditionally. They're idempotent
 # and fail harmlessly when the tool isn't installed.
-_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
+_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1 || true)
 if [ -n "$_INCUS_BRIDGE" ]; then
     echo "  Configuring firewall for container traffic on $_INCUS_BRIDGE..."
 
@@ -575,10 +578,18 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     # On LVM-backed pools, the default thin volume is only 10GB.
     # "device override" resizes the underlying LV + filesystem.
     incus config device override "$CONTAINER_NAME" root size="$DISK" 2>/dev/null || true
-    # I/O limits
-    incus config device set "$CONTAINER_NAME" root limits.read 190MB 2>/dev/null || true
-    incus config device set "$CONTAINER_NAME" root limits.write 90MB 2>/dev/null || true
-    echo "  + Disk: $DISK, IOPS limits applied"
+    # I/O limits (idempotent sets). The override above errors benignly when the
+    # device is already overridden on a re-run, so only the IOPS sets — which ARE
+    # idempotent — gate the success message; the echo must not claim limits that
+    # a pool without device-limit support silently rejected.
+    _io_limits_ok=true
+    incus config device set "$CONTAINER_NAME" root limits.read 190MB 2>/dev/null || _io_limits_ok=false
+    incus config device set "$CONTAINER_NAME" root limits.write 90MB 2>/dev/null || _io_limits_ok=false
+    if [ "$_io_limits_ok" = true ]; then
+        echo "  + Disk: $DISK, IOPS limits applied"
+    else
+        echo "  + Disk: $DISK (WARNING: IOPS limits not applied — pool may not support device limits)"
+    fi
 
     # Wait for container to be ready
     echo "  Waiting for container to initialize..."
@@ -729,7 +740,7 @@ _final_tz="UTC"
 
 # Try IP geolocation (the install requires internet, so this should work)
 _detected_tz=$(curl -sf --max-time 5 "http://ip-api.com/json?fields=timezone" 2>/dev/null | \
-    grep -o '"timezone":"[^"]*"' | cut -d'"' -f4)
+    grep -o '"timezone":"[^"]*"' | cut -d'"' -f4) || _detected_tz=""
 
 # Fallback: host system timezone (may be UTC on fresh cloud VMs)
 if [ -z "$_detected_tz" ]; then

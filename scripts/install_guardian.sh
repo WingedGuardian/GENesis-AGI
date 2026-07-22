@@ -417,7 +417,9 @@ fi
 echo ""
 echo "[3/14] Creating virtual environment..."
 
-if [ ! -d "$VENV_DIR" ]; then
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    # Gate on the interpreter, not the directory: a partial/broken venv dir
+    # (interrupted create, missing bin/python) must be re-created, not skipped.
     $PYTHON -m venv "$VENV_DIR"
 fi
 
@@ -677,6 +679,10 @@ SYSCTL
     if [ -d "$INSTALL_DIR/config" ] && [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
         sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ || true
         sudo udevadm control --reload-rules 2>/dev/null || true
+        # trigger re-applies the scheduler rule to existing block devices
+        # (reload only refreshes the rules DB); scoped to block to avoid
+        # re-triggering unrelated subsystems on the host.
+        sudo udevadm trigger --subsystem-match=block 2>/dev/null || true
         echo "  + BFQ I/O scheduler rule installed"
     fi
 else
