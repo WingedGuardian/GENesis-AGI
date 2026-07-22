@@ -161,14 +161,12 @@ async def run_worker(
             qdrant = QdrantClient(url=url, timeout=10)
             provider = EmbeddingProvider()
             entity_query = " ".join(top_entities(state, ENTITY_QUERY_TERMS))
-            entity_shadow: list[dict] = []
             candidates = await rank_candidates(
                 ema=state["ema"],
                 entity_query=entity_query,
                 db=db,
                 qdrant_client=qdrant,
                 embedding_provider=provider,
-                entity_shadow_out=entity_shadow,
                 # Keys verbatim — alias-normalized ledger keys can be
                 # multi-word ("claude code") and must not be re-split.
                 entity_terms=top_entities(state, ENTITY_RESOLVE_TERMS),
@@ -182,14 +180,17 @@ async def run_worker(
             "fired_count": state.get("fired_count", 0),
             "outlier_skips": state.get("outlier_skips", 0),
         }
+        # E4 live-lane telemetry: how many surfaced candidates carry the
+        # entity lane. 0 is a real signal here — a dead live entity lane,
+        # indistinguishable from a healthy one under the old shadow-only
+        # ``entity_shadow`` field (always [] since the E4b live flip, #993).
+        entity_candidates = sum(1 for c in candidates if "entity" in (c.get("lanes") or []))
         verdict: dict = {
             "status": "no_arbiter" if no_arbiter else "judged",
             "theme": theme_stats,
             "entity_query": entity_query,
             "candidates": candidates,
-            # E4 shadow telemetry: what the entity lane would have added
-            # (empty once the lane goes live — hits then ride candidates).
-            "entity_shadow": entity_shadow,
+            "entity_candidates": entity_candidates,
         }
         if not no_arbiter:
             # Deferred: --no-arbiter runs never load the subprocess

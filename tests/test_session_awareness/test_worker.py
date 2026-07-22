@@ -172,3 +172,58 @@ async def test_arbiter_path_records_picks(tmp_path):
     judge.assert_awaited_once()
     v = _verdict(sessions)
     assert v["picked_memory_ids"] == ["m2"]
+
+
+@pytest.mark.asyncio
+async def test_entity_candidates_count_replaces_dead_shadow_field(tmp_path):
+    """Live-mode entity-lane observability: the verdict reports how many
+    surfaced candidates carry the entity lane. 0 is a real signal (a dead
+    live entity lane), distinct from a healthy one — the old shadow-only
+    ``entity_shadow`` field was always [] post-E4b flip, so a broken and a
+    healthy live lane looked identical. That field is gone; ``entity_candidates``
+    replaces it."""
+    sessions, state = tmp_path / "s", tmp_path / "sa"
+    _seed_theme(sessions)
+    fake = [
+        {"memory_id": "m1", "score": 0.9, "lanes": ["vector"]},
+        {"memory_id": "m2", "score": 0.8, "lanes": ["entity"]},
+        {"memory_id": "m3", "score": 0.7, "lanes": ["decision", "entity"]},
+    ]
+    with patch.object(
+        worker_mod, "rank_candidates", new=AsyncMock(return_value=fake),
+    ):
+        result = await run_worker(
+            SID,
+            no_arbiter=True,
+            sessions_root=sessions,
+            state_root=state,
+            db_path=_tmp_db(tmp_path),
+            qdrant_url="http://127.0.0.1:1",
+        )
+    # Two of the three surfaced candidates carry the entity lane.
+    assert result["entity_candidates"] == 2
+    assert "entity_shadow" not in result
+    v = _verdict(sessions)
+    assert v["entity_candidates"] == 2
+    assert "entity_shadow" not in v
+
+
+@pytest.mark.asyncio
+async def test_entity_candidates_zero_when_no_entity_lane(tmp_path):
+    """A candidate set with no entity-tagged rows reports 0 — the dead-lane
+    signal the old always-[] field could never surface."""
+    sessions, state = tmp_path / "s", tmp_path / "sa"
+    _seed_theme(sessions)
+    fake = [{"memory_id": "m1", "score": 0.9, "lanes": ["vector"]}]
+    with patch.object(
+        worker_mod, "rank_candidates", new=AsyncMock(return_value=fake),
+    ):
+        result = await run_worker(
+            SID,
+            no_arbiter=True,
+            sessions_root=sessions,
+            state_root=state,
+            db_path=_tmp_db(tmp_path),
+            qdrant_url="http://127.0.0.1:1",
+        )
+    assert result["entity_candidates"] == 0
