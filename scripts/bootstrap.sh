@@ -334,8 +334,19 @@ echo "--- Installing code intelligence tools ---"
 # in ~/.claude/.mcp.json, bypassing our 2G-capped launcher. We register the
 # capped wrapper below via _register_mcp, so the installer must NOT self-register.
 echo "  codebase-memory-mcp: installing/upgrading..."
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui --skip-config \
-    || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
+# Download-to-temp before executing: `curl … | bash` runs bytes as they stream,
+# so a mid-transfer connection drop executes a truncated script. -f fails the
+# download on a partial transfer; running from a file executes only a fully
+# downloaded installer. B9.
+_cbm_installer=$(mktemp 2>/dev/null) || _cbm_installer=""
+if [[ -n "$_cbm_installer" ]] \
+    && curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh -o "$_cbm_installer" 2>/dev/null; then
+    bash "$_cbm_installer" --ui --skip-config \
+        || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
+else
+    echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)"
+fi
+[[ -n "$_cbm_installer" ]] && rm -f "$_cbm_installer"
 if command -v codebase-memory-mcp &>/dev/null; then
     echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
 fi
@@ -360,8 +371,16 @@ fi
 # Serena (Python LSP — symbols, references, rename)
 if ! command -v uv &>/dev/null; then
     echo "  uv not found — installing..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh 2>/dev/null \
-        || echo "  WARNING: uv install failed (non-critical)"
+    # Download-to-temp before executing (see B9 note above): avoids running a
+    # truncated installer if the transfer drops mid-stream.
+    _uv_installer=$(mktemp 2>/dev/null) || _uv_installer=""
+    if [[ -n "$_uv_installer" ]] \
+        && curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
+        sh "$_uv_installer" 2>/dev/null || echo "  WARNING: uv install failed (non-critical)"
+    else
+        echo "  WARNING: uv installer download failed (non-critical)"
+    fi
+    [[ -n "$_uv_installer" ]] && rm -f "$_uv_installer"
     export PATH="$HOME/.local/bin:$PATH"
 fi
 if command -v uv &>/dev/null; then
@@ -383,13 +402,17 @@ SKILLSPECTOR_DIR="$HOME/.genesis/deps/skillspector"
 if [[ ! -x "$SKILLSPECTOR_DIR/.venv/bin/skillspector" ]]; then
     echo "  SkillSpector not found — installing..."
     mkdir -p "$HOME/.genesis/deps"
+    # timeout guards a hung TCP connection (else bootstrap stalls indefinitely on
+    # this OPTIONAL dep); one retry rides out a transient blip. 300s ≈ 5x a normal
+    # --depth 1 clone / small pip install; on failure bootstrap continues. B8.
+    _ss_clone() { timeout 300 git clone --depth 1 https://github.com/NVIDIA/SkillSpector.git "$SKILLSPECTOR_DIR" 2>/dev/null; }
     if [[ ! -d "$SKILLSPECTOR_DIR/.git" ]]; then
-        git clone --depth 1 https://github.com/NVIDIA/SkillSpector.git "$SKILLSPECTOR_DIR" 2>/dev/null \
+        _ss_clone || { sleep 2; _ss_clone; } \
             || echo "  WARNING: SkillSpector clone failed (skill-security scan will no-op until installed)"
     fi
     if [[ -d "$SKILLSPECTOR_DIR" ]]; then
         "$PYTHON_BIN" -m venv "$SKILLSPECTOR_DIR/.venv" 2>/dev/null \
-            && "$SKILLSPECTOR_DIR/.venv/bin/pip" install -q "$SKILLSPECTOR_DIR" 2>/dev/null \
+            && timeout 300 "$SKILLSPECTOR_DIR/.venv/bin/pip" install -q "$SKILLSPECTOR_DIR" 2>/dev/null \
             || echo "  WARNING: SkillSpector install failed (non-critical)"
     fi
 fi
@@ -563,7 +586,10 @@ if command -v codebase-memory-mcp &>/dev/null; then
     _register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
 fi
 if command -v serena &>/dev/null; then
-    _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT"
+    # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
+    # flag overrides this), so register from the repo root regardless of the
+    # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
+    ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
 fi
 echo
 
@@ -598,6 +624,16 @@ if [[ -z "$GENESIS_TIMEZONE" ]]; then
         echo "  Using timezone: $GENESIS_TIMEZONE (non-interactive)"
     fi
 fi
+# Validate the resolved timezone against the system's known zones — but only when
+# timedatectl can enumerate them (a minimal image may not), so we never force UTC
+# on a box we simply couldn't validate against. B6.
+if command -v timedatectl &>/dev/null; then
+    _tz_list=$(timedatectl list-timezones 2>/dev/null || true)
+    if [[ -n "$_tz_list" ]] && ! grep -qxF "$GENESIS_TIMEZONE" <<<"$_tz_list"; then
+        echo "  WARNING: '$GENESIS_TIMEZONE' is not a recognized timezone — falling back to UTC"
+        GENESIS_TIMEZONE="UTC"
+    fi
+fi
 if command -v timedatectl &>/dev/null; then
     sudo timedatectl set-timezone "$GENESIS_TIMEZONE" 2>/dev/null && \
         echo "  System timezone set to $GENESIS_TIMEZONE" || \
@@ -607,6 +643,9 @@ else
 fi
 # Persist to secrets.env for future runs
 if [[ -f "$SECRETS_FILE" ]] && ! grep -q "^GENESIS_TIMEZONE=" "$SECRETS_FILE" 2>/dev/null; then
+    # Ensure a trailing newline before appending, else a secrets.env that doesn't
+    # end in \n concatenates the new key onto the last existing line. B7.
+    [[ -s "$SECRETS_FILE" && -n "$(tail -c1 "$SECRETS_FILE")" ]] && printf '\n' >> "$SECRETS_FILE"
     echo "GENESIS_TIMEZONE=$GENESIS_TIMEZONE" >> "$SECRETS_FILE"
     echo "  Saved to secrets.env"
 fi
@@ -615,7 +654,10 @@ echo
 # --- Runtime state ---
 echo "--- Initializing runtime state ---"
 mkdir -p "$HOME/.genesis"
-touch "$HOME/.genesis/setup-complete"
+# The setup-complete marker is written at the VERY END (after "Bootstrap
+# complete"), NOT here: it gates the fresh-install onboarding prompt
+# (genesis_session_context.py) and ego cadence, so a bootstrap that crashes
+# mid-run must not leave the box looking fully onboarded. B1.
 
 # SQLite data dir — set nodatacow (chattr +C) at creation. On btrfs, CoW +
 # SQLite WAL means write-amplification and chronic fragmentation; the flag only
@@ -898,9 +940,12 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
             SERVICES_UPDATED=1
         fi
     done
+    # Always reload before enabling — cheap + idempotent, and covers a prior run
+    # that wrote a unit then crashed before reloading (files unchanged this run,
+    # but systemd's in-memory view stale). B3.
+    systemctl --user daemon-reload 2>/dev/null || true
     if [[ "$SERVICES_UPDATED" = "1" ]]; then
-        systemctl --user daemon-reload 2>/dev/null || true
-        echo "  systemd daemon reloaded"
+        echo "  systemd daemon reloaded (units changed)"
     fi
 
     # Enable + start every rendered timer (idempotent), EXCEPT timers that are a
@@ -1054,6 +1099,11 @@ if [[ -z "$MISSING_CRITICAL" && -z "$MISSING_HELPFUL" ]]; then
     echo "  All recommended plugins installed."
 fi
 echo
+
+# setup-complete written only now that all bootstrap work has finished (B1) — the
+# marker gates the fresh-install onboarding prompt + ego cadence, so an interrupted
+# bootstrap must not have written it early.
+touch "$HOME/.genesis/setup-complete"
 
 echo "=== Bootstrap complete ==="
 echo "Start Claude Code: claude"

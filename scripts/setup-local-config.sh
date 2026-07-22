@@ -15,7 +15,6 @@ set -euo pipefail
 GENESIS_HOME="${HOME}/.genesis"
 CONFIG_DIR="${GENESIS_HOME}/config"
 LOCAL_CONFIG="${CONFIG_DIR}/genesis.yaml"
-REPO_EXAMPLE="$(dirname "$(readlink -f "$0")")/../config/genesis.yaml.example"
 
 NON_INTERACTIVE=false
 if [[ "${1:-}" == "--non-interactive" ]]; then
@@ -83,7 +82,7 @@ echo "  settings (timezone, service URLs, GitHub identity)."
 echo "  The file is NEVER committed to git."
 echo ""
 
-# ── Migrate from repo YAML if this is an existing install ────────────────────
+# ── Reuse existing config values as prompt defaults (no migration happens) ───
 
 if [[ -f "$LOCAL_CONFIG" ]]; then
     _ok "Existing config found at $LOCAL_CONFIG — showing current values as defaults."
