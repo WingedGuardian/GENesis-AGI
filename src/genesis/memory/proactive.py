@@ -605,6 +605,10 @@ async def proactive_context(
         kb_slots=kb_slots,
         rerank_timeout_s=_RERANK_TIMEOUT_S,
         stats=engine_stats,
+        # This is THE latency-budgeted per-prompt path: push recall's
+        # write-backs/emits + the immunity emit off the request path so the
+        # 4.5s route budget isn't spent on post-result DB writes (ac27b693).
+        defer_side_effects=True,
     )
     recall_ms = (time.monotonic() - t_recall) * 1000
 
@@ -635,15 +639,24 @@ async def proactive_context(
             # line was never injected. Accepted — surfaced_count is advisory (never
             # feeds promotion) and the window is a narrow race; a perfect fix would
             # need the client to report surfaced-shown back (tracked follow-up).
-            # Best-effort: a bump failure must never fail recall.
-            try:
-                await db.execute(
-                    "UPDATE procedural_memory SET surfaced_count = surfaced_count + 1 WHERE id = ?",
-                    (procedure["id"],),
-                )
-                await db.commit()
-            except Exception:
-                logger.debug("surfaced_count bump failed", exc_info=True)
+            # Best-effort: a bump failure must never fail recall. Deferred off
+            # the latency path (ac27b693) — this is an advisory funnel counter,
+            # never read synchronously, so a background write is strictly safe.
+            _proc_id = procedure["id"]
+
+            async def _bump_surfaced(proc_id: str = _proc_id) -> None:
+                try:
+                    await db.execute(
+                        "UPDATE procedural_memory SET surfaced_count = surfaced_count + 1 WHERE id = ?",
+                        (proc_id,),
+                    )
+                    await db.commit()
+                except Exception:
+                    logger.debug("surfaced_count bump failed", exc_info=True)
+
+            from genesis.util.tasks import tracked_task
+
+            tracked_task(_bump_surfaced(), name="proactive_surfaced_count")
 
     procedure_ms = (time.monotonic() - t_proc) * 1000
 
@@ -660,6 +673,12 @@ async def proactive_context(
     }
     if "rerank_ms" in engine_stats:
         timings["rerank"] = engine_stats["rerank_ms"]
+    # Sub-stage breakdown of the `recall` bucket (ac27b693): surfaced so a slow
+    # recall can be attributed to vector/FTS/expand/activation from the journal
+    # alone, instead of guessed. Present only when recall populated them.
+    for _k in ("vector_ms", "expand_ms", "fts_ms", "activation_ms"):
+        if _k in engine_stats:
+            timings[_k.removesuffix("_ms")] = engine_stats[_k]
     if total_ms > _SLOW_RECALL_LOG_MS:
         # One INFO line per slow call so a latency regression is diagnosable
         # from the journal alone (the 503 path discards timings_ms entirely —

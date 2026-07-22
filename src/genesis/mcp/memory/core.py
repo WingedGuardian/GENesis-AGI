@@ -820,6 +820,7 @@ async def _proactive_impl(
     kb_slots: int | None = None,
     rerank_timeout_s: float | None = None,
     stats: dict | None = None,
+    defer_side_effects: bool = False,
 ) -> list[dict]:
     """Cross-session context injection for prompts — shared engine.
 
@@ -841,6 +842,12 @@ async def _proactive_impl(
     drops garbage + non-intentional knowledge_base and ``kb_slots`` caps KB — so
     the two callers do NOT get identical injected results; the MCP tool is
     intentionally left unfiltered. No duplicated orchestration.
+
+    ``defer_side_effects``: proactive-endpoint only (the MCP tool leaves it
+    False → byte-for-byte unchanged). Moves recall's write-backs/emits AND this
+    function's ``record_would_block`` immunity emit off the request's latency
+    path into background tasks, so the per-prompt path returns without waiting
+    on those DB writes (follow-up ac27b693). All best-effort.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -871,6 +878,7 @@ async def _proactive_impl(
         rerank_timeout_s=rerank_timeout_s,
         stats=stats,
         extra_fts_terms=extra_fts_terms,
+        defer_side_effects=defer_side_effects,
         skip_writeback=lambda r: (
             immunity_shadow.should_enforce_drop(
                 gate="injection",
@@ -1002,13 +1010,16 @@ async def _proactive_impl(
         out.append(nd)
         if nr.collection == "knowledge_base":
             kb_count += 1
+
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # proactive-recall prompt (observe-only). db=memory_mod._db when set, else
     # the emit self-resolves a short-lived connection. `enforced_drops` in the
     # detail is the auto-demote signal — wrap-only observations must never
     # count toward demotion (Codex round-6: a normal explicit-recall session
     # would otherwise flip the gate back to shadow).
-    await immunity_shadow.record_would_block(
+    # Build the emit coroutine HERE (call stays lexically in _proactive_impl so
+    # the injection-gate coverage guard still sees this function emit gate 4).
+    _would_block = immunity_shadow.record_would_block(
         gate="injection",
         source_kind="recall_inject",
         source_ref="mcp/memory/core.py::_proactive_impl",
@@ -1017,6 +1028,15 @@ async def _proactive_impl(
         db=memory_mod._db,
         detail={"enforced_drops": dropped} if dropped else None,
     )
+    # Latency-budgeted proactive path defers this DB write off the hot path
+    # (follow-up ac27b693); the MCP tool (defer_side_effects=False) keeps it
+    # inline — byte-for-byte unchanged. Best-effort either way.
+    if defer_side_effects:
+        from genesis.util.tasks import tracked_task
+
+        tracked_task(_would_block, name="proactive_would_block")
+    else:
+        await _would_block
     return out
 
 

@@ -375,7 +375,7 @@ KNOWN_QDRANT_READ_SITES: dict[str, tuple[str, str]] = {
         "infra",
         "duplicate-detection metric; content hashed, never prompted",
     ),
-    "memory/intent.py::expand_query": ("infra", "tag-index rebuild; with_payload=[tags] only"),
+    "memory/intent.py::_scan_tag_lists": ("infra", "tag-index rebuild; with_payload=[tags] only"),
     "qdrant/collections.py::batch_retrieve_vectors": (
         "library",
         "shared helper; callers classified individually",

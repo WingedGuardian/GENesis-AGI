@@ -293,6 +293,7 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
         kb_slots=None,
         rerank_timeout_s=None,
         stats=None,
+        defer_side_effects=False,
     ):
         captured["extra"] = extra_fts_terms
         captured["rerank"] = rerank
@@ -352,6 +353,15 @@ async def test_proactive_context_bumps_surfaced_count_not_invocation():
         patch("genesis.memory.proactive._surface_procedure", new=AsyncMock(return_value=proc)),
     ):
         resp = await P.proactive_context(prompt="deploy the latest build", session_id="s")
+
+        # The surfaced_count bump is deferred off the latency path (ac27b693) —
+        # drain the background task before asserting it landed.
+        import asyncio
+
+        for _ in range(20):
+            if any("surfaced_count" in s.lower() for s, _ in mod._db.executed):
+                break
+            await asyncio.sleep(0.02)
 
     assert resp["procedure"] == {"id": "proc-abc", "tier": "CORE"}
     bumps = [(sql, params) for sql, params in mod._db.executed if "surfaced_count" in sql.lower()]
@@ -426,6 +436,7 @@ async def test_proactive_context_requests_noise_filter():
         kb_slots=None,
         rerank_timeout_s=None,
         stats=None,
+        defer_side_effects=False,
     ):
         captured["filter_noise"] = filter_noise
         return []
@@ -454,6 +465,7 @@ async def test_proactive_context_surfaces_engine_stats():
         kb_slots=None,
         rerank_timeout_s=None,
         stats=None,
+        defer_side_effects=False,
     ):
         if stats is not None:
             stats["rerank_executed"] = True
@@ -480,6 +492,7 @@ async def test_proactive_context_surfaces_engine_stats():
         kb_slots=None,
         rerank_timeout_s=None,
         stats=None,
+        defer_side_effects=False,
     ):
         if stats is not None:
             stats["rerank_executed"] = False
