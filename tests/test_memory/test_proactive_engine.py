@@ -190,11 +190,6 @@ def test_render_procedure_line_dormant_labeled_unproven():
 # --- full engine wiring (faked deps) ----------------------------------------
 
 
-class _FakeRetriever:
-    async def _embed_query(self, _q):
-        return ([0.1] * 8, True)
-
-
 class _FakeDB:
     async def execute_fetchall(self, sql, params=()):
         s = sql.lower()
@@ -203,9 +198,27 @@ class _FakeDB:
         return []  # memory_links + procedural_memory → nothing
 
 
+# In production retriever._db IS memory_mod._db (same connection object); the fake
+# shares one instance so the invariant holds and _ro_read's no-pool fallback path
+# reads the same rows the engine's own db reads (procedure/bump).
+_FAKE_DB = _FakeDB()
+
+
+class _FakeRetriever:
+    _db = _FAKE_DB
+
+    async def _embed_query(self, _q):
+        return ([0.1] * 8, True)
+
+    async def _ro_read(self, fn, *args, **kwargs):
+        # Mirror HybridRetriever._ro_read's no-pool path (PR-4b): with no pool the
+        # read runs on the shared db, byte-identical to the pre-pool call.
+        return await fn(self._db, *args, **kwargs)
+
+
 class _FakeMod:
     _retriever = _FakeRetriever()
-    _db = _FakeDB()
+    _db = _FAKE_DB
 
     @staticmethod
     def _require_init():
@@ -278,6 +291,51 @@ async def test_proactive_context_end_to_end_faked():
     # Per-stage timings present (values are wall-clock, just assert shape).
     for key in ("embed", "recall", "enrich", "procedure", "total"):
         assert key in resp["timings_ms"]
+
+
+async def test_proactive_context_routes_enrich_breadcrumbs_through_ro_read():
+    """PR-4b: the post-recall ``_enrich`` + ``_breadcrumbs`` reads must run through
+    the retriever's ``_ro_read`` pool seam, not straight on the shared write
+    connection — otherwise they keep queuing behind server writes (the residual
+    PR-4b targets). Regression guard against reverting to bare ``_enrich(db, …)``.
+    """
+    routed: list[str] = []
+
+    class _SpyRetriever(_FakeRetriever):
+        async def _ro_read(self, fn, *args, **kwargs):
+            routed.append(fn.__name__)
+            return await fn(self._db, *args, **kwargs)
+
+    class _SpyMod:
+        _retriever = _SpyRetriever()
+        _db = _FAKE_DB
+
+        @staticmethod
+        def _require_init():
+            return None
+
+    delivered = [
+        {
+            "memory_id": "aaaaaaaa1111",
+            "content": "a delivered memory",
+            "collection": "episodic_memory",
+            "memory_class": "fact",
+            "origin_class": None,
+            "source_pipeline": None,
+            "score": 0.1,
+            "payload": {"wing": "voice"},
+            "via_graph": False,
+        }
+    ]
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_SpyMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=delivered)),
+    ):
+        resp = await P.proactive_context(prompt="what did we decide", session_id="s")
+
+    assert resp["status"] == "ok"
+    # BOTH post-recall reads went through the pool seam (order: enrich then breadcrumbs).
+    assert routed == ["_enrich", "_breadcrumbs"], routed
 
 
 async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():

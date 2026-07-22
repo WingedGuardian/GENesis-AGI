@@ -185,6 +185,29 @@ verified: 3c5e1f24 2026-07-22
   honored in `_deliver` before category routing — DM or forum topic). Legacy callers
   (all 8) derive `SILENT`/`FAILURE_ONLY` from their notify bools → unchanged. Fixes the
   latent bug where a successful background result was saved but never sent.
+- **Rate-limit park + auto-resume** (`cc/rate_limit_park.py`, `cc/rate_limit_reset.py`,
+  `crud/cc_rate_limit_parks.py`, config `cc_rate_limit_resume`): the durability half of
+  the same 2026-07-20 incident. When a CC call hits a rate/usage limit, the work is
+  PARKED (a `cc_rate_limit_parks` row — the durable lineage object) instead of dying —
+  foreground turns (after failover+contingency both fail) and background `direct_session`s
+  (a new catch before the generic `except`). The park stores a parsed `reset_at`
+  (`rate_limit_reset.parse_reset` off the annotated `CCRateLimitError.raw_event`/`raw_text`,
+  previously discarded); `cc_sessions.rate_limit_resumes_at` finally gets a producer, and
+  the foreground copy is mode-aware (no longer promises resume nothing backed). A
+  `CronTrigger` engine (PR-2b) re-dispatches the actual parked work at reset via the
+  delivery model (`delivery_mode=result` + `origin_session_id`); a still-limited retry
+  re-limits its OWN park in place (attempts+1, backoff) — resolved by `park_id` threaded
+  in `caller_context="rate_limit_resume:<id>"` — so the `needs_user` escalation stays
+  reachable. Gate posture: a resume completes already-approved work (a foreground prompt,
+  or an already-gated dispatch), so it is not new autonomous initiative. Reflection-bridge
+  and the task executor deliberately do NOT park (periodic self-retry / already durable via
+  `task_states`). Resume engine (`cc/rate_limit_resume.py`, `_wire_rate_limit_resume`
+  on the learning scheduler, `CronTrigger */10`): reclaims stale claims → lists due
+  parks → claims + re-dispatches each via the queue (`delivery_mode=result`); the
+  re-run self-validates (re-limit → its own catch re-parks with backoff); exhausted
+  parks escalate to `needs_user` with a governed (`rate_limit_park` signal) alert.
+  Lever `cc_rate_limit_resume` (off|propose_only|**live**, default live) +
+  `GENESIS_RATE_LIMIT_RESUME_DISABLED`.
 
 ## 3. Autonomy & egress gating
 

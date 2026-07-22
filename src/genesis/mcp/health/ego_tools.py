@@ -147,7 +147,11 @@ async def ego_directive(
         "content": content[:100],
         "priority": priority,
         "ego_target": ego_target,
-        "note": "The ego will see this in its next thinking cycle.",
+        "note": (
+            f"The {ego_target} will see this directive in its next thinking "
+            "cycle (rendered into its context) and can act on it, resolve it, "
+            "or disagree with reasoning."
+        ),
         "timestamp": datetime.now(UTC).isoformat(),
     }
 

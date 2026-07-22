@@ -425,59 +425,21 @@ class UserEgoContextBuilder:
     async def _user_directives_section(self, *, depth: str = "deep") -> str:
         """User directives — explicit user instructions for the ego.
 
-        Only rendered if there are active directives. Returns empty string
-        otherwise to avoid polluting context with empty sections.
+        Renders active user_ego directives (empty string when none). The query
+        + age computation + render live in the shared build_directives_section
+        helper.
         """
-        try:
-            from genesis.db.crud import ego as ego_crud
+        from genesis.ego.directives_context import build_directives_section
 
-            directives = await ego_crud.list_active_directives(
-                self._db,
-                ego_target="user_ego",
-                limit=5,
-            )
-        except Exception:
-            logger.warning("Failed to query ego directives", exc_info=True)
-            return (
-                "## User Directives\n\n"
-                "*User directives unavailable (query error — see logs).*\n"
-            )
-
-        if not directives:
-            return ""
-
-        lines = ["## User Directives\n"]
-        lines.append(
-            "*The user flagged these as important. Factor them into your "
-            "thinking — but you decide what to propose.*\n"
+        return await build_directives_section(
+            self._db,
+            "user_ego",
+            framing=(
+                "*The user flagged these as important. Factor them into your "
+                "thinking — but you decide what to propose.*\n"
+            ),
+            error_body="*User directives unavailable (query error — see logs).*",
         )
-
-        from datetime import UTC, datetime
-
-        now = datetime.now(UTC)
-        for d in directives:
-            priority = d.get("priority", "normal").upper()
-            content = d.get("content", "?")[:200]
-            directive_id = d.get("id", "?")
-            created_at = d.get("created_at", "")
-            # Compute age
-            age_str = ""
-            if created_at:
-                try:
-                    created = datetime.fromisoformat(created_at)
-                    delta = now - created
-                    if delta.days > 0:
-                        age_str = f"{delta.days}d ago"
-                    else:
-                        hours = int(delta.total_seconds() / 3600)
-                        age_str = f"{hours}h ago" if hours > 0 else "just now"
-                except (ValueError, TypeError):
-                    pass
-            age_part = f", {age_str}" if age_str else ""
-            lines.append(f"- [{priority}] {content}\n  (id={directive_id}{age_part})")
-
-        lines.append("")
-        return "\n".join(lines)
 
     async def _settled_decisions_section(self, *, depth: str = "deep") -> str:
         """Settled user decisions — durable rulings from proposal rejections

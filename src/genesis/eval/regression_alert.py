@@ -39,6 +39,10 @@ _J9_REGRESSION_ACTION_TYPE = "j9_regression"
 # score drop regardless of grade. Tunable down toward D once variance is known.
 _ABSOLUTE_FLOOR_GRADE = "F"
 _DELTA_DROP_POINTS = 15.0
+# Auto-clear a standing regression row only on AFFIRMATIVE health — never on
+# mere "no fresh regression" (a subsystem that dropped and holds at a degraded
+# grade, or a no-data week, is still regressed).
+_HEALTHY_GRADES = {"A", "B"}
 
 
 def _proposal_id(subsystem: str, period_end: str) -> str:
@@ -86,6 +90,9 @@ async def check_and_alert_regressions(
     the caller; per-subsystem failures are logged and skipped.
     """
     handled: list[dict] = []
+    # Subsystems whose latest weekly grade is NOT a regression → any pending
+    # j9_regression row for them is stale and gets auto-cleared below.
+    clean_subs: set[str] = set()
     try:
         grades = await j9_eval.get_latest_subsystem_grades(db, period_type="weekly")
     except Exception:
@@ -113,6 +120,11 @@ async def check_and_alert_regressions(
 
         reason = _regression_reason(latest, prior)
         if not reason:
+            # Recovery = affirmatively healthy grade, NOT merely "no fresh
+            # regression": a subsystem holding at a degraded grade after a drop
+            # (or a no-data week, grade None) is still regressed.
+            if latest.get("grade") in _HEALTHY_GRADES:
+                clean_subs.add(sub)
             continue
 
         pid = _proposal_id(sub, period_end)
@@ -127,10 +139,11 @@ async def check_and_alert_regressions(
             )
             continue
 
+        # No prescriptive remedy: the confidence framework forbids naming a fix
+        # before any investigation. The remedy is the user's call.
         text = (
             f"Cognitive subsystem regression — {sub}: {reason} "
-            f"(week ending {period_end[:10]}). Investigate the {sub} pipeline; "
-            f"candidate remedy: an Evo experiment on the {sub} config."
+            f"(week ending {period_end[:10]}). Investigate the {sub} pipeline."
         )
 
         # 1. BLOCKER alert (best-effort; governance dedups within 168h).
@@ -158,6 +171,7 @@ async def check_and_alert_regressions(
                 db,
                 id=pid,
                 action_type=_J9_REGRESSION_ACTION_TYPE,
+                action_category=sub,
                 content=text,
                 rationale=(
                     "J-9 weekly eval flagged a cognitive-subsystem quality "
@@ -179,8 +193,22 @@ async def check_and_alert_regressions(
             {"subsystem": sub, "period_end": period_end, "reason": reason, "proposal_id": pid},
         )
 
-    if handled:
+    # Auto-clear: withdraw pending j9_regression rows for subsystems that have
+    # affirmatively recovered (healthy latest grade — see the _HEALTHY_GRADES
+    # gate above). Matched by the queryable action_category subject, not text.
+    from genesis.eval.regression_common import withdraw_recovered_proposals
+
+    cleared = await withdraw_recovered_proposals(
+        db,
+        action_type=_J9_REGRESSION_ACTION_TYPE,
+        recovered_subjects=clean_subs,
+        reason="grade recovered",
+    )
+
+    if handled or cleared:
         logger.info(
-            "J9 regression check: %d subsystem regression(s) surfaced", len(handled),
+            "J9 regression check: %d regression(s) surfaced, %d stale row(s) cleared",
+            len(handled),
+            cleared,
         )
     return handled

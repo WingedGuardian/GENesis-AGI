@@ -401,7 +401,11 @@ class MorningReportGenerator:
             logger.warning("Ground truth: follow-up counts failed", exc_info=True)
 
         try:
-            proposals = await ego_crud.list_pending_proposals(self._db)
+            from genesis.ego.types import partition_informational
+
+            raw_props = await ego_crud.list_pending_proposals(self._db)
+            # Informational eval rows (j9/gauntlet) aren't approval work.
+            proposals, _informational = partition_informational(raw_props)
             lines.append(f"- Pending ego proposals: {len(proposals)}")
         except Exception:
             logger.warning("Ground truth: proposal count failed", exc_info=True)
@@ -716,7 +720,11 @@ class MorningReportGenerator:
 
         # Pending ego proposals (user needs to approve/reject on dashboard)
         try:
-            proposals = await ego_crud.list_pending_proposals(self._db)
+            from genesis.ego.types import partition_informational
+
+            raw_props = await ego_crud.list_pending_proposals(self._db)
+            # Informational eval rows (j9/gauntlet) aren't approve/reject work.
+            proposals, _informational = partition_informational(raw_props)
             total_proposals = len(proposals)
             proposals = proposals[:5]
             if proposals:

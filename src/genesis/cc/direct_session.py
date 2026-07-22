@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.cc import roster
+from genesis.cc import rate_limit_park, roster
+from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -921,6 +922,12 @@ class DirectSessionRunner:
             if request.delivery_mode == DeliveryMode.RESULT:
                 await self._deliver_result_to_origin(request, result)
 
+            # If this session was a rate-limit resume, close its park now that the
+            # result is delivered (no-op unless caller_context carries a park id).
+            _db = getattr(self._rt, "_db", None)
+            if _db is not None:
+                await rate_limit_park.mark_resumed_if_lineage(_db, request.caller_context)
+
             logger.info(
                 "Direct session %s completed: %.1fs, $%.4f, %d tools",
                 session_id[:8],
@@ -970,60 +977,117 @@ class DirectSessionRunner:
             )
             raise
 
-        except Exception as exc:
-            elapsed = time.monotonic() - start
-            error_result = DirectSessionResult(
-                session_id=session_id,
-                success=False,
-                error=f"{type(exc).__name__}: {exc}",
-                duration_s=round(elapsed, 1),
-                tools_called=telemetry,
-            )
-
-            # Best-effort: persist failure and notify
-            try:
-                await self._store_result(session_id, request, error_result)
-                await self._record_proposal_outcome(request, error_result)
-                await self._session_manager.fail(
-                    session_id,
-                    reason=str(exc)[:500],
+        except (CCRateLimitError, CCQuotaExhaustedError) as exc:
+            # A rate/quota limit is NOT a real failure — park the work durably so
+            # it auto-resumes when capacity returns, instead of the misleading
+            # "FAILED" alert the generic handler emits. If this session was itself
+            # a resume, park_direct_session re-limits its own park in place
+            # (preserving the attempts/escalation lineage). mode=off or no db →
+            # fall through to the generic failure path (current behavior).
+            db = getattr(self._rt, "_db", None)
+            park_id = None
+            if db is not None:
+                park_id = await rate_limit_park.park_direct_session(db, request=request, exc=exc)
+            if park_id is not None:
+                elapsed = time.monotonic() - start
+                parked_result = DirectSessionResult(
+                    session_id=session_id,
+                    success=False,
+                    error=f"rate_limited: parked for resume ({park_id})",
+                    duration_s=round(elapsed, 1),
+                    tools_called=telemetry,
                 )
-            except Exception:
-                logger.error(
-                    "Failed to record session %s failure",
-                    session_id[:8],
-                    exc_info=True,
-                )
-
-            # RESULT-mode delivers the failure to the origin thread (a promised
-            # report that failed is still owed to the requester); otherwise the
-            # legacy broadcast failure alert fires. _deliver_result_to_origin
-            # swallows its own errors, so no extra guard is needed here.
-            if request.delivery_mode == DeliveryMode.RESULT:
-                await self._deliver_result_to_origin(request, error_result)
-            elif request.notify:
                 try:
-                    await self._notify(request, error_result, success=False)
+                    await self._store_result(session_id, request, parked_result)
+                    await self._session_manager.fail(
+                        session_id,
+                        reason="rate_limited_parked",
+                    )
                 except Exception:
                     logger.error(
-                        "Failed to send failure notification for %s",
+                        "Failed to record parked session %s",
                         session_id[:8],
                         exc_info=True,
                     )
+                logger.info(
+                    "Direct session %s rate-limited → parked %s for resume",
+                    session_id[:8],
+                    park_id,
+                )
+                return parked_result
+            # Parking disabled/failed — treat as a normal failure (re-raises).
+            await self._finalize_failure(session_id, request, exc, telemetry, start)
 
-            logger.error(
-                "Direct session %s failed after %.1fs: %s",
-                session_id[:8],
-                elapsed,
-                exc,
-            )
-            raise
+        except Exception as exc:
+            await self._finalize_failure(session_id, request, exc, telemetry, start)
 
         finally:
             # Remove this session's isolated CC sandbox (created off cc-tmp just
             # before the run above). Best-effort; the disk-hygiene reaper catches
             # any orphans left by a hard SIGKILL that skips this finally.
             shutil.rmtree(_bg_session_root(session_id), ignore_errors=True)
+
+    async def _finalize_failure(
+        self,
+        session_id: str,
+        request: DirectSessionRequest,
+        exc: BaseException,
+        telemetry: list[dict],
+        start: float,
+    ) -> None:
+        """Record + deliver a genuine session failure, then re-raise.
+
+        Extracted from the generic ``except`` so the rate-limit catch can reuse
+        the exact same path when parking is disabled (mode=off). Ends with
+        ``raise`` to preserve the original propagate-after-record contract.
+        """
+        elapsed = time.monotonic() - start
+        error_result = DirectSessionResult(
+            session_id=session_id,
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+            duration_s=round(elapsed, 1),
+            tools_called=telemetry,
+        )
+
+        # Best-effort: persist failure and notify
+        try:
+            await self._store_result(session_id, request, error_result)
+            await self._record_proposal_outcome(request, error_result)
+            await self._session_manager.fail(
+                session_id,
+                reason=str(exc)[:500],
+            )
+        except Exception:
+            logger.error(
+                "Failed to record session %s failure",
+                session_id[:8],
+                exc_info=True,
+            )
+
+        # RESULT-mode delivers the failure to the origin thread (a promised
+        # report that failed is still owed to the requester); otherwise the
+        # legacy broadcast failure alert fires. _deliver_result_to_origin
+        # swallows its own errors, so no extra guard is needed here.
+        if request.delivery_mode == DeliveryMode.RESULT:
+            await self._deliver_result_to_origin(request, error_result)
+        elif request.notify:
+            try:
+                await self._notify(request, error_result, success=False)
+            except Exception:
+                logger.error(
+                    "Failed to send failure notification for %s",
+                    session_id[:8],
+                    exc_info=True,
+                )
+
+        logger.error(
+            "Direct session %s failed after %.1fs: %s",
+            session_id[:8],
+            elapsed,
+            exc,
+        )
+        raise
 
     async def _record_proposal_outcome(
         self,

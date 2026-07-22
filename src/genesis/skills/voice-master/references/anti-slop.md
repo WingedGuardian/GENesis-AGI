@@ -128,7 +128,6 @@ not per paragraph. Stacking them is an AI fingerprint.
 
 ### Structural tells
 
-- Opening the first sentence with "I".
 - Three-part lists whose items share the exact same grammatical structure.
 - Uniform sentence length — vary it. Favor sentences under ~16 words but keep
   the user's natural longer reasoning chains; don't flatten everything to one
@@ -136,6 +135,45 @@ not per paragraph. Stacking them is an AI fingerprint.
 - Sycophantic acknowledgments before answering ("Great question", "Certainly",
   "Absolutely").
 - Hedging openers ("It's worth considering that…", "It's important to note…").
+
+### Deliverable shipped as raw .md
+
+A finished deliverable — a report, proposal, take-home, one-pager, brief —
+handed back as a raw `.md` file with literal `#`/`##` headers, `**bold**`, and
+`-` bullets visible on the page is a tell that a model generated it and nobody
+repackaged it. People send the format the context expects: a `.docx`, a PDF, a
+slide deck, a formatted email. Markdown syntax showing through in the final
+artifact means the deliverable was never actually finished. (Sending markdown
+is native where markdown *is* the medium — a README, a GitHub comment, a chat
+message — so scope this to things going out as a document under someone's name.)
+
+### Document-level structural tells
+
+The sentence- and paragraph-level tells above miss AI slop that only shows at
+the whole-document scale. These apply to any structured deliverable — report,
+essay, proposal, deck — regardless of medium, not just LinkedIn:
+
+- **Meta-narration.** The document narrates its own structure: "This report
+  covers three areas…", "In the following sections we will…", "Having
+  established X, we now turn to Y." Real writers just write the thing.
+- **Exhaustive-coverage-as-virtue.** Every angle covered, every subtopic given
+  its own section, nothing left out — comprehensiveness treated as the goal.
+  Humans prioritize: they omit what doesn't matter and spend the room on what
+  does.
+- **Equal-length sections.** Every section roughly the same size because the
+  outline had N headings and each got filled to the same depth. Real documents
+  are lopsided; the part that matters is longer.
+- **Relentless parallelism.** Every heading the same grammatical shape, every
+  bullet the same length and structure, every section opening the same way.
+  Mechanical symmetry across the whole document reads as generated.
+- **Table overload.** Reaching for a table (or a bulleted matrix) whenever
+  information *could* be a table, rather than when prose would be worse. One
+  well-placed table earns its keep; five in a two-page document is an assistant
+  reflex.
+- **Absent point of view.** The document reports and organizes but never takes
+  a position — never says what matters most, what's weak, or what the writer
+  would actually do. AI defaults to a neutral survey; a real deliverable has a
+  recommendation.
 
 ---
 

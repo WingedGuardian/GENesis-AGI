@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from genesis.cc import roster
+from genesis.cc import rate_limit_park, roster
 from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
     CCError,
@@ -325,10 +325,19 @@ class ConversationLoop:
                     "Contingency fallback failed after rate limit: %s", e,
                     exc_info=True,
                 )
-                return (
-                    "[Rate limit reached — Genesis is temporarily running in reduced mode. "
-                    "Background tasks are queued and will resume automatically.]"
+                # Both fallbacks failed → the user got no answer. Park the turn
+                # durably so it auto-resumes when capacity returns (rate_limit_park
+                # owns the reset parse, the cc_sessions resume-time write, and the
+                # mode-aware copy — replacing the old sentence nothing backed).
+                outcome = await rate_limit_park.park_conversation(
+                    self._db,
+                    prompt=prompt_text,
+                    origin_session_id=session["id"],
+                    exc=e,
+                    model=model,
+                    effort=effort,
                 )
+                return outcome.copy
             except CCMCPError as e:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
@@ -635,10 +644,19 @@ class ConversationLoop:
                     "Contingency fallback failed after rate limit: %s", e,
                     exc_info=True,
                 )
-                return (
-                    "[Rate limit reached — Genesis is temporarily running in reduced mode. "
-                    "Background tasks are queued and will resume automatically.]"
+                # Both fallbacks failed → the user got no answer. Park the turn
+                # durably so it auto-resumes when capacity returns (rate_limit_park
+                # owns the reset parse, the cc_sessions resume-time write, and the
+                # mode-aware copy — replacing the old sentence nothing backed).
+                outcome = await rate_limit_park.park_conversation(
+                    self._db,
+                    prompt=prompt_text,
+                    origin_session_id=session["id"],
+                    exc=e,
+                    model=model,
+                    effort=effort,
                 )
+                return outcome.copy
             except CCMCPError as e:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""

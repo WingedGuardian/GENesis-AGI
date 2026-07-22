@@ -524,3 +524,49 @@ async def test_ambient_rss_alert_text_names_leak_not_down(config, db):
     text = scheduler._pipeline.submit_raw.call_args[0][0]
     assert "down/hung" not in text  # the bridge is alive — don't misdiagnose
     assert "RSS" in text
+
+
+@pytest.mark.parametrize(
+    ("causes", "expected"),
+    [
+        (("bridge-dead",), "ambient-bridge.service"),
+        (("recovery-failing",), "auto-recovery exhausted"),
+        (("diar-worker",), "diarization worker"),
+        (("rss-total",), "leak regression"),
+        (("rss-diar-child",), "leak regression"),
+        ((), "journalctl"),  # default fallback when no known cause
+    ],
+)
+def test_ambient_remedy_hint_per_cause(causes, expected):
+    assert expected in OutreachScheduler._ambient_remedy_hint(causes)
+
+
+def test_ambient_remedy_hint_precedence():
+    # bridge-dead outranks recovery-failing; recovery-failing outranks diar/rss.
+    assert "ambient-bridge.service" in OutreachScheduler._ambient_remedy_hint(
+        ("bridge-dead", "recovery-failing")
+    )
+    assert "auto-recovery exhausted" in OutreachScheduler._ambient_remedy_hint(
+        ("recovery-failing", "diar-worker", "rss-total")
+    )
+
+
+@pytest.mark.asyncio
+async def test_ambient_recovery_failing_alerts_with_remedy(config, db):
+    # End-to-end job path: a recovery_failing snapshot degrades and alerts, and the
+    # alert text carries both the reason and the recovery-failing remedy hint.
+    scheduler = _make_scheduler(config, db)
+    await _ambient_tick(
+        scheduler,
+        _ambient_snapshot(
+            active_connections=0,
+            recovery_failing=True,
+            failed_reboot_count=2,
+            device_dark_since="2026-06-18T06:00:00+00:00",
+            last_reboot_error="ConnectionError",
+        ),
+    )
+    scheduler._pipeline.submit_raw.assert_called_once()
+    text = scheduler._pipeline.submit_raw.call_args[0][0]
+    assert "auto-recovery exhausted" in text
+    assert "ESPHome API" in text  # the recovery-failing remedy hint

@@ -19,6 +19,7 @@ async def ego_status():
 
     from genesis.db.crud import ego as ego_crud
     from genesis.ego.config import load_ego_config
+    from genesis.ego.types import partition_informational
     from genesis.runtime import GenesisRuntime
 
     rt = GenesisRuntime.instance()
@@ -29,7 +30,10 @@ async def ego_status():
     daily_cost = await ego_crud.daily_ego_cost(rt._db)
     focus = await ego_crud.get_state(rt._db, "ego_focus_summary")
     recent = await ego_crud.list_recent_cycles(rt._db, limit=1)
-    pending = await ego_crud.list_pending_proposals(rt._db)
+    # Approval-queue counts exclude acknowledge-only eval rows (j9/gauntlet) —
+    # they are surfaced separately as informational, never as pending approvals.
+    all_pending = await ego_crud.list_pending_proposals(rt._db)
+    pending, informational = partition_informational(all_pending)
     uncompacted = await ego_crud.count_uncompacted(rt._db)
 
     last_cycle = None
@@ -137,6 +141,7 @@ async def ego_status():
             "focus_summary": focus,
             "last_cycle": last_cycle,
             "pending_proposals": len(pending),
+            "informational_count": len(informational),
             "uncompacted_cycles": uncompacted,
             "shadow_morning_report": config.shadow_morning_report,
             "board_size": config.board_size,
@@ -216,15 +221,21 @@ async def ego_cycles():
 @blueprint.route("/api/genesis/ego/proposals")
 @_async_route
 async def ego_proposals():
-    """Return pending ego proposals."""
+    """Return pending ego proposals (approval items only).
+
+    Acknowledge-only eval rows (j9/gauntlet) are excluded here and served by
+    :func:`ego_informational` — they carry no approve/reject decision.
+    """
     from genesis.db.crud import ego as ego_crud
+    from genesis.ego.types import partition_informational
     from genesis.runtime import GenesisRuntime
 
     rt = GenesisRuntime.instance()
     if not rt.is_bootstrapped or rt._db is None:
         return jsonify([])
 
-    pending = await ego_crud.list_pending_proposals(rt._db)
+    all_pending = await ego_crud.list_pending_proposals(rt._db)
+    pending, _informational = partition_informational(all_pending)
     return jsonify(
         [
             {
@@ -244,6 +255,42 @@ async def ego_proposals():
                 "realist_verdict": p.get("realist_verdict"),
             }
             for p in pending
+        ]
+    )
+
+
+@blueprint.route("/api/genesis/ego/informational")
+@_async_route
+async def ego_informational():
+    """Return pending acknowledge-only eval rows (j9/gauntlet).
+
+    These are notifications, not approval items: they render in a distinct
+    informational strip with no approve/reject controls.
+    """
+    from genesis.db.crud import ego as ego_crud
+    from genesis.ego.types import partition_informational
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify([])
+
+    all_pending = await ego_crud.list_pending_proposals(rt._db)
+    _pending, informational = partition_informational(all_pending)
+    return jsonify(
+        [
+            {
+                "id": p["id"],
+                "action_type": p["action_type"],
+                "content": p["content"],
+                "rationale": p.get("rationale"),
+                "confidence": p["confidence"],
+                "urgency": p["urgency"],
+                "status": p["status"],
+                "created_at": p["created_at"],
+                "ego_source": p.get("ego_source"),
+            }
+            for p in informational
         ]
     )
 
@@ -441,3 +488,134 @@ async def ego_vcr():
 
     data = await compute_vcr(rt._db, days=30)
     return jsonify(data)
+
+
+# ── Directives & goals visibility (read + user-driven retire) ──────────
+
+
+def _directive_view(d: dict) -> dict:
+    """Project a directive row to the dashboard payload."""
+    return {
+        "id": d["id"],
+        "content": d["content"],
+        "priority": d["priority"],
+        "source": d["source"],
+        "ego_target": d["ego_target"],
+        "status": d["status"],
+        "created_at": d["created_at"],
+        "resolved_at": d.get("resolved_at"),
+        "resolution": d.get("resolution"),
+        "reaffirm_count": d.get("reaffirm_count", 0),
+        "last_reaffirmed_at": d.get("last_reaffirmed_at"),
+    }
+
+
+def _goal_view(g: dict) -> dict:
+    """Project a goal row to the dashboard payload."""
+    return {
+        "id": g["id"],
+        "title": g["title"],
+        "description": g.get("description"),
+        "category": g["category"],
+        "priority": g["priority"],
+        "status": g["status"],
+        "timeline": g.get("timeline"),
+        "confidence": g.get("confidence"),
+        "goal_type": g.get("goal_type"),
+        "origin": g.get("origin"),
+        "created_at": g["created_at"],
+        "updated_at": g.get("updated_at"),
+    }
+
+
+@blueprint.route("/api/genesis/ego/directives")
+@_async_route
+async def ego_directives():
+    """Active directives (both egos) + recently-resolved history.
+
+    Visibility surface so the user can see — and via the resolve endpoint,
+    retire — the standing directives driving each ego. Decision rows
+    (kind='decision') are excluded; they have their own lifecycle.
+    """
+    from genesis.db.crud import ego as ego_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"active": [], "resolved": []})
+
+    active = await ego_crud.list_directives(rt._db, statuses=("active",), limit=50)
+    resolved = await ego_crud.list_directives(rt._db, statuses=("completed", "cancelled"), limit=5)
+    return jsonify(
+        {
+            "active": [_directive_view(d) for d in active],
+            "resolved": [_directive_view(d) for d in resolved],
+        }
+    )
+
+
+@blueprint.route("/api/genesis/ego/goals")
+@_async_route
+async def ego_goals():
+    """Active goals split by provenance — user directives vs ego own-goals.
+
+    Read-only visibility (no goal mutation here). ``genesis_ego`` is the ego's
+    own-goal lane; ``user`` are the user's goals. Either list may be empty on a
+    fresh install.
+    """
+    from genesis.db.crud import user_goals as goals_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"user": [], "genesis_ego": []})
+
+    # Query each lane separately so a busy user-goal lane can't starve the
+    # own-goal lane under a shared LIMIT, and only the two known origins render.
+    user_goals = await goals_crud.list_active(rt._db, limit=50, origin="user")
+    own_goals = await goals_crud.list_active(rt._db, limit=50, origin="genesis_ego")
+    return jsonify(
+        {
+            "user": [_goal_view(g) for g in user_goals],
+            "genesis_ego": [_goal_view(g) for g in own_goals],
+        }
+    )
+
+
+@blueprint.route("/api/genesis/ego/directives/<directive_id>/resolve", methods=["POST"])
+@_async_route
+async def ego_directive_resolve(directive_id: str):
+    """Retire a standing directive from the dashboard (a user action).
+
+    Default is a 'cancelled' retire (no longer relevant); pass
+    status='completed' to mark it done instead. Decision rows are structurally
+    refused by ``resolve_directive`` (kind != 'decision').
+    """
+    from genesis.db.crud import ego as ego_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"ok": False, "error": "not bootstrapped"}), 503
+
+    body = request.get_json(silent=True) or {}
+    status = body.get("status", "cancelled")
+    if status not in ("completed", "cancelled"):
+        return jsonify({"ok": False, "error": "status must be 'completed' or 'cancelled'"}), 400
+    resolution = body.get("resolution") or "Retired via dashboard"
+
+    updated = await ego_crud.resolve_directive(
+        rt._db,
+        directive_id,
+        status=status,
+        resolution=resolution,
+    )
+    if not updated:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "directive not found, already resolved, or a decision row",
+            }
+        ), 404
+
+    return jsonify({"ok": True, "id": directive_id, "status": status})

@@ -401,7 +401,14 @@ def _render_procedure_line(proc: dict) -> str:
 
 
 async def _enrich(db: Any, dicts: list[dict]) -> None:
-    """Backfill ``_created_at`` + ``_wing`` from memory_metadata (in place)."""
+    """Backfill ``_created_at`` + ``_wing`` from memory_metadata (in place).
+
+    Lets a DB read error PROPAGATE — the caller routes this through
+    ``HybridRetriever._ro_read``, whose fallback retries on the shared connection,
+    and guards the whole enrichment step best-effort. Swallowing here would defeat
+    that fallback on a transient pooled-read failure (Codex #1197 P2). Idempotent,
+    so a fallback re-run is safe.
+    """
     ids = [
         d["memory_id"]
         for d in dicts
@@ -409,46 +416,44 @@ async def _enrich(db: Any, dicts: list[dict]) -> None:
     ]
     if not ids:
         return
-    try:
-        placeholders = ",".join("?" for _ in ids)
-        rows = await db.execute_fetchall(
-            f"SELECT memory_id, created_at, wing FROM memory_metadata "  # noqa: S608
-            f"WHERE memory_id IN ({placeholders})",
-            ids,
-        )
-        meta = {row[0]: (row[1], row[2]) for row in rows}
-        for d in dicts:
-            created_at, wing = meta.get(d.get("memory_id"), (None, None))
-            d["_created_at"] = created_at
-            # Prefer a wing already on the recall payload; fall back to metadata.
-            payload_wing = (d.get("payload") or {}).get("wing")
-            d["_wing"] = payload_wing or wing
-    except Exception:
-        logger.debug("proactive metadata enrichment failed", exc_info=True)
+    placeholders = ",".join("?" for _ in ids)
+    rows = await db.execute_fetchall(
+        f"SELECT memory_id, created_at, wing FROM memory_metadata "  # noqa: S608
+        f"WHERE memory_id IN ({placeholders})",
+        ids,
+    )
+    meta = {row[0]: (row[1], row[2]) for row in rows}
+    for d in dicts:
+        created_at, wing = meta.get(d.get("memory_id"), (None, None))
+        d["_created_at"] = created_at
+        # Prefer a wing already on the recall payload; fall back to metadata.
+        payload_wing = (d.get("payload") or {}).get("wing")
+        d["_wing"] = payload_wing or wing
 
 
 async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
     """Attach up to 2 strongly-linked neighbor id-prefixes to the top 3
-    delivered memories (``related_ids``), for memory_expand follow-up."""
+    delivered memories (``related_ids``), for memory_expand follow-up.
+
+    Lets a DB read error PROPAGATE (see :func:`_enrich`): the caller's ``_ro_read``
+    fallback + best-effort guard handle it, and the writes are idempotent.
+    """
     if not dicts:
         return
     seen = {d.get("memory_id") for d in dicts}
-    try:
-        for d in dicts[:3]:
-            mid = d.get("memory_id")
-            if not mid:
-                continue
-            rows = await db.execute_fetchall(
-                "SELECT target_id FROM memory_links "
-                "WHERE source_id = ? AND strength >= 0.5 "
-                "ORDER BY strength DESC LIMIT 2",
-                (mid,),
-            )
-            related = [row[0][:8] for row in rows if row[0] not in seen]
-            if related:
-                d["related_ids"] = related
-    except Exception:
-        logger.debug("proactive breadcrumbs failed", exc_info=True)
+    for d in dicts[:3]:
+        mid = d.get("memory_id")
+        if not mid:
+            continue
+        rows = await db.execute_fetchall(
+            "SELECT target_id FROM memory_links "
+            "WHERE source_id = ? AND strength >= 0.5 "
+            "ORDER BY strength DESC LIMIT 2",
+            (mid,),
+        )
+        related = [row[0][:8] for row in rows if row[0] not in seen]
+        if related:
+            d["related_ids"] = related
 
 
 # ---------------------------------------------------------------------------
@@ -613,8 +618,23 @@ async def proactive_context(
     recall_ms = (time.monotonic() - t_recall) * 1000
 
     t_enrich = time.monotonic()
-    await _enrich(db, dicts)
-    await _breadcrumbs(db, dicts)
+    # PR-4b (ac27b693): route these post-recall reads off the shared write lock
+    # onto recall's read-only pool via the same _ro_read seam recall's own reads
+    # use. Both are pure indexed SELECTs (memory_metadata PK / memory_links
+    # source_id), so under concurrency they were queuing behind server writes,
+    # not query cost. _ro_read runs fn(pooled_conn, *args) and, on any pool
+    # miss/error, retries on the shared connection — so the helpers deliberately
+    # do NOT swallow their own DB errors (that would hide a transient pooled-read
+    # failure from the fallback; Codex #1197 P2). The best-effort catch lives HERE
+    # so that if BOTH the pooled and shared reads fail, enrichment degrades to
+    # nothing rather than failing recall (the pre-pool best-effort contract).
+    # retriever is genesis.mcp.memory._retriever (see CC memory two_retriever_wiring)
+    # — the same instance the pool was wired into in PR-4.
+    try:
+        await retriever._ro_read(_enrich, dicts)
+        await retriever._ro_read(_breadcrumbs, dicts)
+    except Exception:
+        logger.debug("post-recall enrichment/breadcrumbs failed", exc_info=True)
     enrich_ms = (time.monotonic() - t_enrich) * 1000
 
     lines = prof.renderer(dicts)

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from genesis.env import cc_project_dir, user_timezone
 from genesis.runtime.init.process_reaper import _wire_process_reaper
+from genesis.runtime.init.rate_limit_resume import _wire_rate_limit_resume
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
@@ -1282,6 +1283,10 @@ async def init(rt: GenesisRuntime) -> None:
         # policy — activity markers + live-terminal gate, dry-run→auto-arm).
         # Extracted to a testable seam; see process_reaper.py.
         _wire_process_reaper(rt._learning_scheduler, rt)
+
+        # Rate-limit resume engine (re-dispatch parked CC work at reset; gated
+        # per-tick by cc_rate_limit_resume mode). Testable seam; CronTrigger */10.
+        _wire_rate_limit_resume(rt._learning_scheduler, rt)
 
         # ── Skill evolution pipeline (weekly backup trigger) ────────────────
         async def _run_skill_evolution() -> None:

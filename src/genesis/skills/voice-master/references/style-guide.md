@@ -30,9 +30,9 @@ Real humans have mixed feelings. "This is impressive but also kind of unsettling
 
 **Human:** It's clever, but it makes me nervous. The failure modes aren't well understood.
 
-## Use first person when it fits
+## First person is encouraged
 
-"I" isn't unprofessional — it's honest.
+"I" is a good word; use it. First person isn't unprofessional, it's honest. Don't contort a sentence to avoid it.
 
 - "I keep coming back to..."
 - "Here's what gets me..."

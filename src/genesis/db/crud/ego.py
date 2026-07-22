@@ -1105,13 +1105,9 @@ async def list_active_directives(
     ``kind`` defaults to plain directives so pre-decision callers are
     unchanged; decision rows have their own accessors below.
     """
-    cursor = await db.execute(
-        "SELECT * FROM ego_directives "
-        "WHERE status = 'active' AND ego_target = ? AND kind = ? "
-        "ORDER BY created_at DESC LIMIT ?",
-        (ego_target, kind, limit),
+    return await list_directives(
+        db, ego_target=ego_target, statuses=("active",), kind=kind, limit=limit
     )
-    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def resolve_directive(
@@ -1135,6 +1131,43 @@ async def resolve_directive(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def list_directives(
+    db: aiosqlite.Connection,
+    *,
+    ego_target: str | None = None,
+    statuses: tuple[str, ...] = ("active",),
+    kind: str = "directive",
+    limit: int = 20,
+) -> list[dict]:
+    """Directives filtered by status (and optionally ego_target).
+
+    Generalizes :func:`list_active_directives` for the dashboard, which needs a
+    cross-target active view plus recently-resolved history. Ordered by
+    ``COALESCE(resolved_at, created_at) DESC`` so a homogeneous call sorts
+    correctly either way — active rows (resolved_at NULL) by creation, resolved
+    rows by resolution time. ``kind`` defaults to plain directives; decision
+    rows are excluded (they have their own accessors).
+    """
+    if not statuses:
+        return []
+    placeholders = ",".join("?" for _ in statuses)
+    params: list[object] = [kind, *statuses]
+    target_clause = ""
+    if ego_target is not None:
+        target_clause = "AND ego_target = ? "
+        params.append(ego_target)
+    params.append(limit)
+    cursor = await db.execute(
+        f"""SELECT * FROM ego_directives
+           WHERE kind = ? AND status IN ({placeholders})
+           {target_clause}
+           ORDER BY COALESCE(resolved_at, created_at) DESC
+           LIMIT ?""",  # noqa: S608 — placeholders count-derived, all values bound
+        params,
+    )
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 # ── Decision rows (kind='decision') — durable user rulings ──────────────

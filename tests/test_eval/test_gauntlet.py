@@ -326,3 +326,90 @@ async def test_regression_idempotent_when_proposal_exists(monkeypatch):
     assert reg is None
     assert create_calls == []
     assert pipe.alerts == []
+
+
+# ---- PR-1: auto-clear a pending gauntlet row when the model recovers ----
+
+
+async def _db_with_pending_gauntlet(model: str):
+    """In-memory DB seeded with one pending gauntlet_regression row for *model*."""
+    import aiosqlite
+
+    from genesis.db.crud import ego as ego_crud
+    from genesis.db.schema import create_all_tables
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await create_all_tables(conn)
+    await ego_crud.create_proposal(
+        conn,
+        id="p1",
+        action_type="gauntlet_regression",
+        action_category=model,
+        content=(
+            f"Model-roster gauntlet regression — {model}: previously PASSED, "
+            f"now FAILED 1/2 fixtures."
+        ),
+        rationale="advisory",
+        confidence=1.0,
+        urgency="high",
+        status="pending",
+        ego_source="gauntlet",
+    )
+    return conn
+
+
+async def test_genuine_pass_auto_clears_pending_gauntlet():
+    from genesis.db.crud import ego as ego_crud
+
+    model = "glm-5.2"
+    conn = await _db_with_pending_gauntlet(model)
+    try:
+        # A genuine PASS (green, not all-skipped) is a recovery.
+        reg = await GR.check_gauntlet_regression(
+            db=conn,
+            summary=_summary(model, "run2", passed=3, failed=0),
+            outreach_pipeline=None,
+        )
+        assert reg is None
+        prop = await ego_crud.get_proposal(conn, "p1")
+        assert prop["status"] == "withdrawn"
+        assert "auto-cleared" in (prop["user_response"] or "")
+    finally:
+        await conn.close()
+
+
+async def test_all_skipped_does_not_clear_pending_gauntlet():
+    from genesis.db.crud import ego as ego_crud
+
+    model = "glm-5.2"
+    conn = await _db_with_pending_gauntlet(model)
+    try:
+        # Inconclusive (all skipped) → NOT a recovery, must not clear.
+        reg = await GR.check_gauntlet_regression(
+            db=conn,
+            summary=_summary(model, "run2", passed=0, failed=0, skipped=3),
+            outreach_pipeline=None,
+        )
+        assert reg is None
+        prop = await ego_crud.get_proposal(conn, "p1")
+        assert prop["status"] == "pending"  # untouched
+    finally:
+        await conn.close()
+
+
+async def test_pass_only_clears_matching_model():
+    from genesis.db.crud import ego as ego_crud
+
+    conn = await _db_with_pending_gauntlet("glm-5.2")
+    try:
+        # A different model passing must not clear glm-5.2's row.
+        await GR.check_gauntlet_regression(
+            db=conn,
+            summary=_summary("other-model", "run2", passed=3, failed=0),
+            outreach_pipeline=None,
+        )
+        prop = await ego_crud.get_proposal(conn, "p1")
+        assert prop["status"] == "pending"
+    finally:
+        await conn.close()

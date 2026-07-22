@@ -1322,6 +1322,28 @@ TABLES = {
             dispatched_at   TEXT
         )
     """,
+    "cc_rate_limit_parks": """
+        CREATE TABLE IF NOT EXISTS cc_rate_limit_parks (
+            id                TEXT PRIMARY KEY,
+            kind              TEXT NOT NULL
+                              CHECK (kind IN ('conversation', 'direct_session')),
+            dedup_key         TEXT NOT NULL,
+            payload_json      TEXT NOT NULL,
+            origin_session_id TEXT,
+            limit_kind        TEXT NOT NULL DEFAULT 'unknown'
+                              CHECK (limit_kind IN ('session', 'weekly', 'unknown')),
+            raw_signal        TEXT,
+            reset_at          TEXT,
+            status            TEXT NOT NULL DEFAULT 'parked'
+                              CHECK (status IN ('parked', 'resuming', 'resumed',
+                                                'needs_user', 'cancelled', 'expired')),
+            attempts          INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at   TEXT,
+            claimed_at        TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        )
+    """,
     "eval_events": """
         CREATE TABLE IF NOT EXISTS eval_events (
             id           TEXT PRIMARY KEY,
@@ -2340,6 +2362,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_cog_file_mods_status ON cognitive_file_modifications(status)",
     # direct session queue
     "CREATE INDEX IF NOT EXISTS idx_dsq_status_created ON direct_session_queue(status, created_at)",
+    # cc rate-limit parks (durable park + reset-time resume) — partial-unique on
+    # OPEN parks makes concurrent same-work parks idempotent (upsert target).
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_rlp_open_dedup ON cc_rate_limit_parks(dedup_key) WHERE status IN ('parked', 'resuming')",
+    "CREATE INDEX IF NOT EXISTS idx_rlp_status_next ON cc_rate_limit_parks(status, next_attempt_at)",
     # J-9 eval infrastructure
     "CREATE INDEX IF NOT EXISTS idx_eval_events_dimension ON eval_events(dimension, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_eval_events_type ON eval_events(event_type, timestamp)",

@@ -603,11 +603,18 @@ class OutreachScheduler:
     def _ambient_remedy_hint(causes: tuple[str, ...]) -> str:
         """Cause-aware remediation line for the ambient alert (worst cause wins).
 
-        "degraded" is a multi-cause bucket (dead diar worker, RSS regression) —
-        a fixed "process down/hung" suffix misdiagnoses a live-but-leaking bridge.
+        "degraded" is a multi-cause bucket (dead diar worker, RSS regression,
+        auto-recovery exhausted) — a fixed "process down/hung" suffix misdiagnoses a
+        live-but-leaking bridge. Precedence: bridge-dead > recovery-failing > diar >
+        rss (most-specific/actionable wins).
         """
         if "bridge-dead" in causes:
             return "(ambient bridge process down/hung — check/restart ambient-bridge.service)"
+        if "recovery-failing" in causes:
+            return (
+                "(auto-recovery exhausted — the device is dark and reboot attempts failed; "
+                "check the device's power/network or the ESPHome API on the Voice PE)"
+            )
         if "diar-worker" in causes:
             return "(diarization worker crashed — a bridge restart respawns it: systemctl --user restart ambient-bridge)"
         if "rss-total" in causes or "rss-diar-child" in causes:

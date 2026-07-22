@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Ambient capture now alerts when auto-recovery can't bring a wedged device
+  back.** For installs running the optional voice/ambient edge with device
+  auto-recovery armed, Genesis now raises a capture-health alert when the device
+  has been dark for hours *and* the automatic reboots failed to restore it — the
+  one case that means a real fault rather than a device simply being switched off.
+  Installs without auto-recovery are unchanged: a merely-absent device still never
+  alerts (nothing on the network distinguishes "unplugged" from "crashed", so the
+  signal fires only where arming recovery already asserts the device should be up).
+  The alert names how long it's been dark and how many reboot attempts failed, with
+  no device address or key ever included.
+
 - **When Genesis hands a long task off to run in the background and says "I'll
   report back," it now actually does.** Ask for something heavy from Telegram — a
   deep research run, a long analysis — and Genesis can dispatch it to a background
@@ -22,6 +33,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   vanished). Long results arrive as a short summary plus a saved file rather than
   a wall of messages. Failures are reported in the same thread instead of
   disappearing.
+- **When Genesis hits a usage/rate limit, your request comes back on its own.**
+  Previously, hitting the limit dropped the work — and the message you got even
+  claimed "background tasks will resume automatically" when nothing would. Now
+  the request is saved the moment the limit is hit, and Genesis automatically
+  picks it back up once the limit resets and delivers the answer to the same
+  conversation. If capacity keeps being exhausted it backs off and eventually
+  tells you it needs a hand rather than retrying forever. (This closes the
+  other half of the 2026-07-20 disappearance.)
 
 ### Changed
 
@@ -48,6 +67,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A failed update that had already run database migrations now rolls the
+  database back too.** Previously a rollback restored the code and dependencies
+  but left the (newly migrated) database in place, so the rolled-back older code
+  ran against a newer schema. Rollback now restores the pre-update database
+  snapshot whenever migrations ran (the server is stopped at that point, so it's
+  a clean swap), reloads systemd units, and states plainly what it did and didn't
+  revert.
+- **Recovering from a failed update actually brings the server back.** If a
+  previous update failed and left the server stopped, the next update used to
+  finish and report "success" while the server stayed down and health was never
+  checked. It now detects a recovery run (from the leftover failure record) and
+  restarts + health-verifies the server. A server the operator deliberately
+  stopped is left alone, but recorded as not-running rather than a bare success.
 - **A large one-time data cleanup no longer briefly freezes the running system.**
   Post-startup data migrations (one-off cleanups/backfills of stored knowledge and
   history) run alongside the live system, which allows only one writer to the
@@ -60,6 +92,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   needlessly repeated. (Slow per-record checks were also moved out of the locked
   window.)
 
+- **The dashboard now recognizes updates started from the command line.** Its
+  "update in progress" checks previously only saw dashboard-triggered updates,
+  so a command-line `update.sh` run could be interrupted (its state wiped) or a
+  second update launched over it. The dashboard now consults the same
+  deploy-in-progress signal the rest of the system uses, and a dashboard-started
+  update no longer runs in the server's own service group (where the update
+  stopping the server could kill the update itself).
+- **Two updates can no longer run at the same time.** If an update is already in
+  progress, a second `update.sh` (from another session, or the dashboard) now
+  refuses immediately instead of running concurrently — previously two updates
+  could overlap, each stopping the server and merging, and corrupt the deploy.
 - **An interrupted update no longer leaves the server down.** If a self-update
   is interrupted after it has stopped the server (a Ctrl-C, a system shutdown,
   or an unexpected failure inside an internal step), it now rolls back to the
