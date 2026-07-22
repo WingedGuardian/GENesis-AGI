@@ -148,3 +148,101 @@ async def test_week_over_week_drop_surfaces(db):
 
     assert len(handled) == 1
     assert "dropped" in handled[0]["reason"]
+
+
+# ── PR-1: no prescriptive remedy + auto-clear on recovery ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_proposal_text_has_no_prescriptive_remedy(db):
+    """The confidence framework forbids naming a fix before investigation —
+    the surfaced text must not prescribe an Evo experiment."""
+    await _grade(db, "memory", "F", 55.0, "2026-06-22T00:00:00Z")
+
+    await check_and_alert_regressions(db, None)
+
+    pid = _proposal_id("memory", "2026-06-22T00:00:00Z")
+    prop = await ego_crud.get_proposal(db, pid)
+    assert "Evo experiment" not in prop["content"]
+    assert "candidate remedy" not in prop["content"]
+    assert "Investigate the memory pipeline" in prop["content"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_auto_clears_stale_pending(db):
+    """A subsystem that regressed then recovered → its stale pending row is
+    auto-withdrawn (its premise is now false)."""
+    # Week 1: memory F → proposal filed, pending.
+    await _grade(db, "memory", "F", 55.0, "2026-06-15T00:00:00Z")
+    handled = await check_and_alert_regressions(db, None)
+    assert len(handled) == 1
+    pid = _proposal_id("memory", "2026-06-15T00:00:00Z")
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"
+
+    # Week 2: memory recovers to B → stale week-1 row auto-clears.
+    await _grade(db, "memory", "B", 84.0, "2026-06-22T00:00:00Z")
+    handled2 = await check_and_alert_regressions(db, None)
+    assert handled2 == []  # no new regression
+
+    prop = await ego_crud.get_proposal(db, pid)
+    assert prop["status"] == "withdrawn"
+    assert "auto-cleared" in (prop["user_response"] or "")
+
+
+@pytest.mark.asyncio
+async def test_still_regressed_does_not_auto_clear(db):
+    """A subsystem still at F does NOT get its pending row cleared."""
+    await _grade(db, "memory", "F", 55.0, "2026-06-15T00:00:00Z")
+    await check_and_alert_regressions(db, None)
+    pid = _proposal_id("memory", "2026-06-15T00:00:00Z")
+
+    # Week 2: still F (new period) → new row filed, old stays pending (not cleared).
+    await _grade(db, "memory", "F", 52.0, "2026-06-22T00:00:00Z")
+    await check_and_alert_regressions(db, None)
+
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_no_data_week_does_not_clear(db):
+    """An insufficient-data week (grade None) is unknown, not recovered — the
+    standing row must NOT be auto-cleared."""
+    await _grade(db, "memory", "F", 55.0, "2026-06-15T00:00:00Z")
+    await check_and_alert_regressions(db, None)
+    pid = _proposal_id("memory", "2026-06-15T00:00:00Z")
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"
+
+    # Next week: grade None (too few samples) — premise unknown, not disproven.
+    await _grade(db, "memory", None, None, "2026-06-22T00:00:00Z")
+    await check_and_alert_regressions(db, None)
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_dropped_then_stable_does_not_clear(db):
+    """A delta-drop row must NOT auto-clear just because there's no FRESH drop —
+    a subsystem holding at a degraded grade is still regressed."""
+    # A(90) → C(70) is a >=15pt drop → files a delta-drop row.
+    await _grade(db, "memory", "A", 90.0, "2026-06-08T00:00:00Z")
+    await _grade(db, "memory", "C", 70.0, "2026-06-15T00:00:00Z")
+    handled = await check_and_alert_regressions(db, None)
+    assert len(handled) == 1
+    pid = _proposal_id("memory", "2026-06-15T00:00:00Z")
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"
+
+    # Next week holds at C — no fresh drop, but grade C is NOT healthy → the row
+    # stays standing (the bug was clearing it here as "recovered").
+    await _grade(db, "memory", "C", 70.0, "2026-06-22T00:00:00Z")
+    await check_and_alert_regressions(db, None)
+    assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_filed_row_carries_subsystem_in_action_category(db):
+    """The subject key that auto-clear matches on is the queryable
+    action_category column, not free-text content."""
+    await _grade(db, "memory", "F", 55.0, "2026-06-22T00:00:00Z")
+    await check_and_alert_regressions(db, None)
+    pid = _proposal_id("memory", "2026-06-22T00:00:00Z")
+    prop = await ego_crud.get_proposal(db, pid)
+    assert prop["action_category"] == "memory"

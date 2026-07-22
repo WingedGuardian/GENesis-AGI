@@ -60,8 +60,22 @@ async def check_gauntlet_regression(
         passed = summary.passed_cases
         failed = summary.failed_cases
 
-        # Not a genuine failure (all green, or all skipped/inconclusive) → no signal.
+        # Not a genuine failure (all green, or all skipped/inconclusive) → no
+        # regression signal. A genuine PASS (green, not all-skipped) is a
+        # RECOVERY: clear any pending gauntlet row for this model. An
+        # inconclusive/all-skipped run clears nothing.
         if failed <= 0:
+            if _is_pass(passed, failed):
+                from genesis.eval.regression_common import (
+                    withdraw_recovered_proposals,
+                )
+
+                await withdraw_recovered_proposals(
+                    db,
+                    action_type=_ACTION_TYPE,
+                    recovered_subjects={summary.model_id},
+                    reason="gauntlet passed again",
+                )
             return None
 
         # Cold-start guard: require a prior PASS so a never-trusted model does not
@@ -135,6 +149,7 @@ async def check_gauntlet_regression(
                 db,
                 id=pid,
                 action_type=_ACTION_TYPE,
+                action_category=summary.model_id,
                 content=text,
                 rationale=(
                     "The model-roster gauntlet flagged a PASS→FAIL regression. "

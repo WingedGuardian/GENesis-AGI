@@ -60,6 +60,44 @@ class ProposalUrgency(StrEnum):
     CRITICAL = "critical"
 
 
+# Informational proposal action_types: acknowledge-only rows filed by eval
+# subsystems (J-9 subsystem-grade regressions, the model-roster gauntlet).
+# They are notifications wearing a proposal's clothes — the ego_proposals row
+# exists ONLY as the per-period idempotency marker; approving one merely
+# acknowledges (its resolution handler marks it 'executed', no side-effect) and
+# it is never dispatched as a session. They must NOT be counted or surfaced as
+# pending-APPROVAL work: no approve/reject decision changes system state, so
+# presenting them on the approval queue is a category error (and inflating the
+# ego's pending-cap with them can auto-table real proposals). Single source of
+# truth; ``session._NEVER_DISPATCH_ACTION_TYPES`` is a strict superset (it also
+# blocks decision-carrying inline-applied types like cell_promotion, which DO
+# belong on the approval queue).
+INFORMATIONAL_ACTION_TYPES: tuple[str, ...] = ("j9_regression", "gauntlet_regression")
+
+
+def is_informational(action_type: str | None) -> bool:
+    """True if *action_type* is an acknowledge-only eval notification."""
+    return action_type in INFORMATIONAL_ACTION_TYPES
+
+
+def partition_informational(
+    proposals: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Split proposals into (approval_items, informational_items).
+
+    Order-preserving. A row is informational iff its ``action_type`` is in
+    :data:`INFORMATIONAL_ACTION_TYPES`.
+    """
+    approval: list[dict] = []
+    informational: list[dict] = []
+    for p in proposals:
+        if is_informational(p.get("action_type")):
+            informational.append(p)
+        else:
+            approval.append(p)
+    return approval, informational
+
+
 @dataclass(frozen=True)
 class EgoProposal:
     """A single action the ego wants to take, pending user approval."""

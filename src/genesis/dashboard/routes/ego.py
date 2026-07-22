@@ -19,6 +19,7 @@ async def ego_status():
 
     from genesis.db.crud import ego as ego_crud
     from genesis.ego.config import load_ego_config
+    from genesis.ego.types import partition_informational
     from genesis.runtime import GenesisRuntime
 
     rt = GenesisRuntime.instance()
@@ -29,7 +30,10 @@ async def ego_status():
     daily_cost = await ego_crud.daily_ego_cost(rt._db)
     focus = await ego_crud.get_state(rt._db, "ego_focus_summary")
     recent = await ego_crud.list_recent_cycles(rt._db, limit=1)
-    pending = await ego_crud.list_pending_proposals(rt._db)
+    # Approval-queue counts exclude acknowledge-only eval rows (j9/gauntlet) —
+    # they are surfaced separately as informational, never as pending approvals.
+    all_pending = await ego_crud.list_pending_proposals(rt._db)
+    pending, informational = partition_informational(all_pending)
     uncompacted = await ego_crud.count_uncompacted(rt._db)
 
     last_cycle = None
@@ -137,6 +141,7 @@ async def ego_status():
             "focus_summary": focus,
             "last_cycle": last_cycle,
             "pending_proposals": len(pending),
+            "informational_count": len(informational),
             "uncompacted_cycles": uncompacted,
             "shadow_morning_report": config.shadow_morning_report,
             "board_size": config.board_size,
@@ -216,15 +221,21 @@ async def ego_cycles():
 @blueprint.route("/api/genesis/ego/proposals")
 @_async_route
 async def ego_proposals():
-    """Return pending ego proposals."""
+    """Return pending ego proposals (approval items only).
+
+    Acknowledge-only eval rows (j9/gauntlet) are excluded here and served by
+    :func:`ego_informational` — they carry no approve/reject decision.
+    """
     from genesis.db.crud import ego as ego_crud
+    from genesis.ego.types import partition_informational
     from genesis.runtime import GenesisRuntime
 
     rt = GenesisRuntime.instance()
     if not rt.is_bootstrapped or rt._db is None:
         return jsonify([])
 
-    pending = await ego_crud.list_pending_proposals(rt._db)
+    all_pending = await ego_crud.list_pending_proposals(rt._db)
+    pending, _informational = partition_informational(all_pending)
     return jsonify(
         [
             {
@@ -244,6 +255,42 @@ async def ego_proposals():
                 "realist_verdict": p.get("realist_verdict"),
             }
             for p in pending
+        ]
+    )
+
+
+@blueprint.route("/api/genesis/ego/informational")
+@_async_route
+async def ego_informational():
+    """Return pending acknowledge-only eval rows (j9/gauntlet).
+
+    These are notifications, not approval items: they render in a distinct
+    informational strip with no approve/reject controls.
+    """
+    from genesis.db.crud import ego as ego_crud
+    from genesis.ego.types import partition_informational
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify([])
+
+    all_pending = await ego_crud.list_pending_proposals(rt._db)
+    _pending, informational = partition_informational(all_pending)
+    return jsonify(
+        [
+            {
+                "id": p["id"],
+                "action_type": p["action_type"],
+                "content": p["content"],
+                "rationale": p.get("rationale"),
+                "confidence": p["confidence"],
+                "urgency": p["urgency"],
+                "status": p["status"],
+                "created_at": p["created_at"],
+                "ego_source": p.get("ego_source"),
+            }
+            for p in informational
         ]
     )
 

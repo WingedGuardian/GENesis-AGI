@@ -184,6 +184,7 @@
         // ── Comms state (on Chat tab) ────────────────────────────
         commsOutreach: [],
         commsProposals: [],
+        commsInformational: [],
         commsPendingApprovals: [],
         commsCounts: {},
         commsView: 'pending',
@@ -1424,6 +1425,7 @@
               const data = await resp.json();
               this.commsOutreach = data.outreach || [];
               this.commsProposals = data.proposals || [];
+              this.commsInformational = data.informational || [];
               this.commsPendingApprovals = data.pending_approvals || [];
               this.commsCounts = data.counts || {};
               this.finishFetch("comms");
@@ -3804,6 +3806,26 @@
           // Delegates to the shared fmtAge contract (spec §3.4):
           // just now (<90s) / Nm / Nh / Nd — no "ago" suffix, one format everywhere.
           return fmtAge(value);
+        },
+
+        // Map an ego proposal's ego_source to a display label. Eval sources
+        // (j9_eval, gauntlet) get real names so they never render as a bare
+        // "Ego". Kept in sync with ego/proposals.py::_EGO_LABELS.
+        egoSourceLabel(src) {
+          return ({
+            genesis_ego_cycle: "Genesis",
+            user_ego_cycle: "User",
+            j9_eval: "Eval",
+            gauntlet: "Gauntlet",
+          })[src] || "Ego";
+        },
+
+        // Acknowledge-only eval rows (j9/gauntlet) — never approvable. Kept in
+        // sync with ego/types.py::INFORMATIONAL_ACTION_TYPES.
+        isInformationalProposal(p) {
+          return ["j9_regression", "gauntlet_regression"].includes(
+            p && p.action_type,
+          );
         },
 
         // 5-state chip helpers over the shared status semantics (spec §3.3).

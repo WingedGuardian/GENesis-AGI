@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
+from genesis.ego.types import partition_informational
 from genesis.util.approval_words import (
     APPROVE_PHRASES as _SHARED_BARE_APPROVE,
 )
@@ -66,6 +67,9 @@ _URGENCY_TAGS = {"critical": "[CRITICAL] ", "high": "[HIGH] "}
 _EGO_LABELS = {
     "user_ego_cycle": "User Ego",
     "genesis_ego_cycle": "Genesis Ego",
+    # Informational eval sources — named so they never render as a bare "Ego".
+    "j9_eval": "Eval",
+    "gauntlet": "Gauntlet",
 }
 
 
@@ -547,13 +551,16 @@ class ProposalWorkflow:
             warn_lines = "\n".join(f"  - {w}" for w in validation_warnings)
             digest_html = f"\u26a0\ufe0f <b>Validation:</b>\n{warn_lines}\n\n{digest_html}"
 
-        # Show pending backlog from other batches (same ego only)
+        # Show pending backlog from other batches (same ego only). Exclude
+        # acknowledge-only eval rows (j9/gauntlet) — they are notifications, not
+        # approval work, and "approve all pending" never touches them.
         try:
             all_pending = await ego_crud.list_pending_proposals(
                 self._db,
                 ego_source=ego_source,
             )
-            other_pending = [p for p in all_pending if p.get("batch_id") != batch_id]
+            approval_pending, _informational = partition_informational(all_pending)
+            other_pending = [p for p in approval_pending if p.get("batch_id") != batch_id]
             if other_pending:
                 summary_lines = []
                 for op in other_pending[:5]:
@@ -689,6 +696,12 @@ class ProposalWorkflow:
         indexes into list_proposals_by_batch (ALL proposals, not just pending).
         """
         pending = await ego_crud.list_pending_proposals(self._db)
+        # Informational eval rows (j9/gauntlet) are acknowledge-only — a bulk
+        # "approve all pending" must never sweep them into a resolution. (Today
+        # they also carry a NULL batch_id and would fall out of the per-batch
+        # grouping below, but that is incidental; this makes the exclusion
+        # explicit so the no-approval invariant can't regress.)
+        pending, _informational = partition_informational(pending)
         if not pending:
             return {}
 
