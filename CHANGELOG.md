@@ -30,6 +30,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and if any background work is ever cut short by a time limit, the result is
   flagged as incomplete rather than delivered as if it were finished.
 
+- **Updates are more resilient to network stalls, bad merges, and mid-update
+  crashes.** Several robustness fixes to the self-update path (`update.sh`):
+  network operations (fetching the latest code, post-update health checks, and
+  guardian SSH) are now time-bounded, so a hung connection can no longer stall
+  an update indefinitely; the pre-update database snapshot is now a
+  transactionally-consistent SQLite backup instead of a plain file copy that
+  could be torn if the server wrote to it mid-copy; a merge conflict now records
+  complete, valid conflict details for the assisting session (multi-line git
+  output no longer corrupts that file); and an update that ships a broken
+  database-migration module now rolls back cleanly instead of silently skipping
+  migrations and running the new code against an old schema.
 - **Host setup no longer force-deletes a container it wrongly thinks is
   damaged, or hides an install behind a new disk.** Host-side hardening: a
   container flagged "damaged" is now **renamed aside** (its database, memory, and

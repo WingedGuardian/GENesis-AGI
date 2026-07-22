@@ -171,9 +171,10 @@ _guardian_redeploy_reason() {
 # previously failed sync, still needs healing on a no-op run.
 # Sets the global HOST_CC_DEGRADED (consumed by _record_update_history).
 _sync_deploy_targets() {
-    # Accumulates any host-side alignment failure so it is recorded as a degraded
-    # subsystem in update_history (surfaced by the dashboard) rather than silently
-    # skipped. Empty = host fully aligned (or no guardian configured).
+    # Accumulates any deploy-target alignment failure (host guardian/Node/CC pin
+    # AND the container's own CC pin) so it is recorded as a degraded subsystem
+    # in update_history (surfaced by the dashboard) rather than silently skipped.
+    # Empty = all deploy targets aligned (or no guardian configured).
     HOST_CC_DEGRADED=""
 
     # ── Update Guardian on host VM (if configured) ──────────
@@ -208,6 +209,7 @@ _sync_deploy_targets() {
             # was last deployed from a since-rebased local HEAD (a no-op run has
             # OLD_COMMIT == HEAD), stranding it on an orphan commit indefinitely.
             HOST_VER_RAW="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                 "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
             HOST_DEPLOYED_COMMIT="$(printf '%s' "$HOST_VER_RAW" \
                 | sed -n 's/.*"deployed_commit": "\([^"]*\)".*/\1/p' || true)"
@@ -257,7 +259,13 @@ _sync_deploy_targets() {
                 mkdir -p "$HOME/tmp" 2>/dev/null || true
                 _redeploy_ssh() {
                     # $1 = the redeploy command string; archive on stdin.
+                    # ServerAlive bounds a DEAD connection (~60s of silence →
+                    # ssh exits) without capping a legitimately slow redeploy:
+                    # while the host runs git/pip the SSH transport stays alive
+                    # and answers keepalives, so a working redeploy is never
+                    # killed — only a truly hung/dead link is.
                     ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                        -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                         "${HOST_USER}@${HOST_IP}" "$1" < "$GUARDIAN_ARCHIVE" 2>/dev/null
                 }
                 # Guard the mktemp itself: `if ! VAR=$(...)` branches on the
@@ -291,6 +299,7 @@ _sync_deploy_targets() {
                         # to install the new gateway, then retry the verified form.
                         echo "  Redeploy not available — falling back to update + retry"
                         if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                               -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                                "${HOST_USER}@${HOST_IP}" update 2>&1; then
                             echo "  Guardian updated via git pull — retrying redeploy..."
                             # Gateway is a static file invoked fresh per SSH connection.
@@ -318,6 +327,7 @@ _sync_deploy_targets() {
                 # re-probe keeps the original payload rather than degrading
                 # the pin sync.
                 _post_redeploy_raw="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                    -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                     "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
                 if [ -n "$_post_redeploy_raw" ]; then
                     HOST_VER_RAW="$_post_redeploy_raw"
@@ -378,7 +388,14 @@ _sync_deploy_targets() {
         unset CC_VERSION            # repo pin must win over any inherited override
         # shellcheck source=/dev/null
         source "$_cc_env"
-        cc_ensure_local || true
+        # Record a container CC sync failure as a degraded subsystem instead of
+        # swallowing it — symmetric with the host-side pin failures accumulated
+        # above, so a container left on a stale CC pin is surfaced in
+        # update_history, not silently dropped.
+        if ! cc_ensure_local; then
+            echo "  WARNING: container Claude Code sync failed"
+            HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}container_cc_sync"
+        fi
         cc_shadow_scan || true
     else
         echo "  WARNING: $_cc_env missing — skipping container CC sync"
@@ -480,10 +497,14 @@ echo ""
 # (empty here) — a fetch failure routed through it would leave the server DOWN.
 # On failure, delete this run's freshly-created rollback tag and exit clean with
 # the server untouched. POST_MERGE re-entry skips it (code already merged).
+# timeout 120: bound a hung TCP fetch (accepted then silent) so it can't block
+# the update forever; 120s is generous for the small repo (real fetches take
+# seconds). `timeout` exits non-zero on kill → the failure branch below cleans
+# up and exits with the server untouched.
 if [[ "$POST_MERGE" == "false" ]]; then
     echo "--- Fetching latest ---"
-    if ! git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
-        echo "  Fetch failed (network?) — server NOT stopped, nothing changed."
+    if ! timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
+        echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
         git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
         rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
         exit 1
@@ -505,7 +526,10 @@ _stop_genesis_server() {
         local pid
         pid=$(tr -d '\0' < "$lock_file" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill -TERM "$pid" 2>/dev/null
+            # `|| true`: the process can exit between the kill -0 check above and
+            # this signal (a race); a failed kill must not abort under set -e
+            # (and, once the ERR trap is armed in P4b, must not trigger rollback).
+            kill -TERM "$pid" 2>/dev/null || true
             # Wait up to 10s for graceful shutdown
             for i in $(seq 1 20); do
                 kill -0 "$pid" 2>/dev/null || return 0
@@ -578,9 +602,16 @@ DB_FILE="$GENESIS_ROOT/data/genesis.db"
 if [ -f "$DB_FILE" ]; then
     echo "--- Snapshotting database ---"
     sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
-    cp "$DB_FILE" "$DB_FILE.pre-update" 2>/dev/null && \
-        echo "  DB snapshot: $DB_FILE.pre-update" || \
+    # Use the online-backup API, not `cp`: this snapshot runs while the server
+    # is still up (before the stop, to avoid extending the downtime window), and
+    # a plain `cp` of a live WAL database yields a TORN copy if the server writes
+    # mid-copy — which is exactly the file _do_rollback later restores. sqlite3
+    # `.backup` takes a transactionally-consistent snapshot of a live database.
+    if sqlite3 "$DB_FILE" ".backup '$DB_FILE.pre-update'" 2>/dev/null; then
+        echo "  DB snapshot: $DB_FILE.pre-update"
+    else
         echo "  WARNING: DB snapshot failed (continuing anyway)"
+    fi
 fi
 
 # ── Stop services for update ──────────────────────────────
@@ -888,19 +919,42 @@ if [[ $MERGE_RC -ne 0 ]]; then
 
         # Write conflict context for supervising CC session
         mkdir -p "$HOME/.genesis"
-        # Build JSON array of conflicted files
-        CONFLICT_JSON=$(echo "$CONFLICTED_FILES" | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
-        cat > "$HOME/.genesis/update_conflicts.json" << CEOF
-{
-    "old_tag": "$OLD_TAG",
-    "old_commit": "$OLD_COMMIT",
-    "target_tag": "$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')",
-    "target_commit": "$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')",
-    "conflicted_files": [$CONFLICT_JSON],
-    "merge_output": "$(echo "$MERGE_OUTPUT" | head -20 | sed 's/"/\\"/g')",
-    "timestamp": "$(date -Iseconds)"
+        # Build the context as VALID JSON via python (stdlib json). The old
+        # shell heredoc only escaped `"` in merge_output, so a multi-line merge
+        # message (the common case) embedded raw newlines and produced invalid
+        # JSON — the dashboard consumer's json.loads then silently swallowed the
+        # whole conflict context. Filenames with quotes broke the array the same
+        # way. Guarded with `if !` (ERR-trap-exempt): a failure to write this
+        # advisory supervisor context must NOT trip the armed rollback trap.
+        _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')"
+        _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')"
+        if ! UC_OLD_TAG="$OLD_TAG" UC_OLD_COMMIT="$OLD_COMMIT" \
+             UC_TARGET_TAG="$_uc_target_tag" UC_TARGET_COMMIT="$_uc_target_commit" \
+             UC_FILES="$CONFLICTED_FILES" UC_MERGE_OUTPUT="$MERGE_OUTPUT" \
+             "$VENV_DIR/bin/python" - > "$HOME/.genesis/update_conflicts.json.tmp" <<'PYEOF'
+import json
+import os
+from datetime import UTC, datetime
+
+files = [f for f in os.environ.get("UC_FILES", "").splitlines() if f.strip()]
+merge = "\n".join(os.environ.get("UC_MERGE_OUTPUT", "").splitlines()[:20])
+data = {
+    "old_tag": os.environ.get("UC_OLD_TAG", ""),
+    "old_commit": os.environ.get("UC_OLD_COMMIT", ""),
+    "target_tag": os.environ.get("UC_TARGET_TAG", ""),
+    "target_commit": os.environ.get("UC_TARGET_COMMIT", ""),
+    "conflicted_files": files,
+    "merge_output": merge,
+    "timestamp": datetime.now(UTC).isoformat(),
 }
-CEOF
+print(json.dumps(data, indent=2))
+PYEOF
+        then
+            echo "  WARNING: could not write structured conflict context (advisory)"
+            rm -f "$HOME/.genesis/update_conflicts.json.tmp"
+        else
+            mv "$HOME/.genesis/update_conflicts.json.tmp" "$HOME/.genesis/update_conflicts.json"
+        fi
         echo ""
         echo "  Conflict context written to ~/.genesis/update_conflicts.json"
 
@@ -1116,15 +1170,51 @@ echo ""
 _write_state "migrations"
 
 # ── Run migrations (fatal on failure) ─────────────────────
-if "$VENV_DIR/bin/python" -c "import genesis.db.migrations" 2>/dev/null; then
-    echo "--- Running migrations ---"
-    if ! "$VENV_DIR/bin/python" -m genesis.db.migrations --apply 2>&1 | tail -10; then
-        _do_rollback "migration runner failed"
+# Distinguish a genuinely-ABSENT migrations module (a pre-migration install —
+# skipping is correct) from one that FAILS to import (an update-introduced
+# ImportError, e.g. a broken new migration file). The old `if import …; then`
+# collapsed BOTH into a silent skip, which would run the freshly-merged code
+# against an un-migrated schema. Probe exit codes: 0=present, 2=absent, 1=broken.
+# `|| _mig_probe_rc=$?` keeps the non-zero probe exit from tripping the armed
+# ERR trap; the `case` routes a broken module to an explicit rollback.
+_mig_probe_rc=0
+"$VENV_DIR/bin/python" - <<'PYEOF' || _mig_probe_rc=$?
+import importlib.util
+import sys
+
+try:
+    spec = importlib.util.find_spec("genesis.db.migrations")
+except Exception as exc:  # a parent package (genesis / genesis.db) is broken
+    print(f"migrations parent package import failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+if spec is None:
+    sys.exit(2)  # genuinely absent — pre-migration install
+try:
+    import genesis.db.migrations  # noqa: F401
+except Exception as exc:
+    print(f"migrations module import failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PYEOF
+case "$_mig_probe_rc" in
+    0)
+        echo "--- Running migrations ---"
+        if ! "$VENV_DIR/bin/python" -m genesis.db.migrations --apply 2>&1 | tail -10; then
+            _do_rollback "migration runner failed"
+            exit 1
+        fi
+        echo "  Migrations complete"
+        echo ""
+        ;;
+    2)
+        echo "  No migrations module in this build — skipping (pre-migration install)."
+        echo ""
+        ;;
+    *)
+        _do_rollback "migrations module failed to import after update (broken migration?)"
         exit 1
-    fi
-    echo "  Migrations complete"
-    echo ""
-fi
+        ;;
+esac
 
 # ── Refresh Network Identity in user-level CLAUDE.md ────
 # Always refresh ~/.claude/CLAUDE.md with current IPs (unconditional — the
@@ -1193,7 +1283,12 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
 
     for attempt in $(seq 1 12); do
         sleep 15
-        if curl -sf http://localhost:5000/api/genesis/health > /dev/null 2>&1; then
+        # --max-time 20: bound a hung connection (server accepts but never
+        # answers) so a single attempt can't block the update forever. Kept
+        # ABOVE the health route's own ~15s internal budget so a slow-but-
+        # responding check is never killed here (which would false-rollback a
+        # healthy server); a 503 at 15s still fails -f correctly on its own.
+        if curl -sf --max-time 20 http://localhost:5000/api/genesis/health > /dev/null 2>&1; then
             echo "  OK: Genesis health endpoint responding (attempt $attempt)"
             HEALTH_OK=true
             break
@@ -1203,7 +1298,7 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
 
     if [ "$HEALTH_OK" = "true" ]; then
         # Check for failed subsystems
-        DEGRADED=$(curl -sf http://localhost:5000/api/genesis/health 2>/dev/null | \
+        DEGRADED=$(curl -sf --max-time 20 http://localhost:5000/api/genesis/health 2>/dev/null | \
             "$VENV_DIR/bin/python" -c "
 import sys, json
 try:
@@ -1291,9 +1386,14 @@ echo ""
 # profile (content owner: genesis.infra_profile.claude_md — no collection, no
 # runtime import; safe while the server is down). Skips gracefully pre-first-
 # collection or on older checkouts without the module.
-"$VENV_DIR/bin/python" -m genesis.infra_profile --claude-md-block 2>/dev/null \
-    && echo "  Container specs refreshed in ~/.claude/CLAUDE.md" \
-    || echo "  Container specs refresh skipped (no profile yet)"
+# Capture stderr rather than discarding it: the old `2>/dev/null || echo "no
+# profile yet"` reported EVERY failure (module crash, write error) as the benign
+# "no profile yet", masking real errors. Show the actual reason instead.
+if _specs_err=$("$VENV_DIR/bin/python" -m genesis.infra_profile --claude-md-block 2>&1); then
+    echo "  Container specs refreshed in ~/.claude/CLAUDE.md"
+else
+    echo "  Container specs refresh skipped: ${_specs_err:-no profile yet}"
+fi
 echo ""
 set -e
 
