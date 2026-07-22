@@ -313,6 +313,83 @@
               </template>
             </div>
           </template>
+
+          <!-- ── Directives (steering the ego — user may retire) ── -->
+          <template x-if="$store.genesisDashboard.egoDirectives.active.length > 0 || $store.genesisDashboard.egoDirectives.resolved.length > 0">
+            <div style="margin-top:1rem;">
+              <div style="font-size:0.68rem; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary); margin-bottom:0.4rem; display:flex; align-items:center; gap:0.35rem;">
+                <span style="color:#c084fc;">Directives</span>
+                <span style="font-size:0.6rem; color:var(--color-text-secondary); font-weight:400; text-transform:none;">— standing instructions steering each ego</span>
+              </div>
+              <!-- Active directives -->
+              <template x-for="d in $store.genesisDashboard.egoDirectives.active" :key="d.id">
+                <div style="border:1px solid var(--color-border); border-left:3px solid #c084fc; border-radius:6px; padding:0.6rem; margin-bottom:0.5rem;">
+                  <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; margin-bottom:0.3rem;">
+                    <div style="display:flex; gap:0.3rem; align-items:center; flex-wrap:wrap;">
+                      <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; background:rgba(192,132,252,0.2); color:#e1bee7;"
+                            x-text="$store.genesisDashboard.egoTargetLabel(d.ego_target)"></span>
+                      <span style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px; text-transform:uppercase;"
+                            :style="(d.priority === 'critical' || d.priority === 'high') ? 'background:rgba(244,67,54,0.15); color:#ef9a9a;' : 'background:rgba(158,158,158,0.15); color:#bdbdbd;'"
+                            x-text="d.priority"></span>
+                      <span x-show="d.reaffirm_count > 0" style="font-size:0.6rem; color:var(--color-text-secondary);"
+                            x-text="'reaffirmed ×' + d.reaffirm_count"></span>
+                    </div>
+                    <button @click="$store.genesisDashboard.retireDirective(d.id)"
+                            :disabled="$store.genesisDashboard.retiringDirectiveId === d.id"
+                            style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; border:1px solid var(--color-border); background:transparent; color:var(--color-text-secondary); cursor:pointer; white-space:nowrap;"
+                            x-text="$store.genesisDashboard.retiringDirectiveId === d.id ? 'Retiring…' : 'Retire'"></button>
+                  </div>
+                  <div style="font-size:0.78rem; line-height:1.4;" x-text="d.content"></div>
+                  <div style="font-size:0.6rem; color:var(--color-text-secondary); margin-top:0.25rem;"
+                       x-text="'since ' + $store.genesisDashboard.formatDateTime(d.created_at)"></div>
+                </div>
+              </template>
+              <!-- Recently resolved (de-emphasized) -->
+              <template x-for="d in $store.genesisDashboard.egoDirectives.resolved" :key="d.id">
+                <div style="border:1px dashed var(--color-border); border-radius:6px; padding:0.5rem 0.6rem; margin-bottom:0.4rem; opacity:0.6;">
+                  <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
+                    <span style="font-size:0.72rem; line-height:1.35;" x-text="d.content"></span>
+                    <span style="font-size:0.6rem; color:var(--color-text-secondary); white-space:nowrap;"
+                          x-text="d.status + (d.resolved_at ? ' ' + $store.genesisDashboard.formatDateTime(d.resolved_at) : '')"></span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+
+          <!-- ── Goals (read-only — user goals + ego own-goals) ── -->
+          <template x-if="$store.genesisDashboard.egoGoals.user.length > 0 || $store.genesisDashboard.egoGoals.genesis_ego.length > 0">
+            <div style="margin-top:1rem;">
+              <div style="font-size:0.68rem; text-transform:uppercase; letter-spacing:0.04em; color:var(--color-text-secondary); margin-bottom:0.4rem;">
+                <span style="color:#c084fc;">Goals</span>
+              </div>
+              <template x-for="g in $store.genesisDashboard.egoGoals.user" :key="g.id">
+                <div style="border:1px solid var(--color-border); border-radius:6px; padding:0.5rem 0.6rem; margin-bottom:0.4rem;">
+                  <div style="display:flex; gap:0.3rem; align-items:center; flex-wrap:wrap; margin-bottom:0.2rem;">
+                    <span style="font-size:0.62rem; padding:0.08rem 0.35rem; border-radius:3px; text-transform:uppercase; background:rgba(33,150,243,0.15); color:#90caf9;"
+                          x-text="$store.genesisDashboard.goalOriginLabel(g.origin)"></span>
+                    <span style="font-size:0.62rem; color:var(--color-text-secondary); text-transform:uppercase;" x-text="g.priority"></span>
+                  </div>
+                  <div style="font-size:0.78rem; line-height:1.35;" x-text="g.title"></div>
+                </div>
+              </template>
+              <!-- Ego own-goals (may be empty on a fresh install) -->
+              <div style="font-size:0.6rem; color:var(--color-text-secondary); margin:0.35rem 0 0.3rem;">Genesis own-goals</div>
+              <template x-if="$store.genesisDashboard.egoGoals.genesis_ego.length === 0">
+                <div style="font-size:0.7rem; color:var(--color-text-secondary); font-style:italic; padding:0.3rem 0.1rem;">No autonomous goals yet.</div>
+              </template>
+              <template x-for="g in $store.genesisDashboard.egoGoals.genesis_ego" :key="g.id">
+                <div style="border:1px solid var(--color-border); border-left:3px solid #e1bee7; border-radius:6px; padding:0.5rem 0.6rem; margin-bottom:0.4rem;">
+                  <div style="display:flex; gap:0.3rem; align-items:center; flex-wrap:wrap; margin-bottom:0.2rem;">
+                    <span style="font-size:0.62rem; padding:0.08rem 0.35rem; border-radius:3px; text-transform:uppercase; background:rgba(192,132,252,0.2); color:#e1bee7;"
+                          x-text="$store.genesisDashboard.goalOriginLabel(g.origin)"></span>
+                    <span style="font-size:0.62rem; color:var(--color-text-secondary); text-transform:uppercase;" x-text="g.priority"></span>
+                  </div>
+                  <div style="font-size:0.78rem; line-height:1.35;" x-text="g.title"></div>
+                </div>
+              </template>
+            </div>
+          </template>
         </div>
 
         <!-- ── Approvals ────────────────────────────────── -->
