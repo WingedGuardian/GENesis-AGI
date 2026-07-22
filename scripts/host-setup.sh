@@ -57,7 +57,11 @@ REPO_URL=""
 BRANCH="main"
 NON_INTERACTIVE=0
 INCUS_POOL_DIR=""  # auto-detected: set to /home/incus-data on split-disk VMs
-_ORIG_ARGS="$*"
+# Shell-quote each arg (printf %q) so the group-activation re-exec below
+# (`sg incus-admin -c "…$_ORIG_ARGS"`) preserves args containing spaces/quotes;
+# a bare "$*" flattens them and would split/mangle such an arg on re-exec.
+_ORIG_ARGS=""
+for _a in "$@"; do _ORIG_ARGS+="$(printf '%q ' "$_a")"; done
 _install_ok=1      # tracks install.sh success
 _guardian_ok=1     # tracks Guardian install success
 _RAM_EXPLICIT=0    # set to 1 if user passed --ram
@@ -445,19 +449,33 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
     _container_state=$(incus info "$CONTAINER_NAME" 2>/dev/null | grep -oP 'Status: \K\w+' || echo "unknown")
 
     if [ "$_container_state" = "RUNNING" ]; then
-        # Check critical paths (timeout prevents hang on unresponsive containers)
-        timeout 10 incus exec "$CONTAINER_NAME" -- test -w /tmp 2>/dev/null || {
-            _container_healthy=0
-            _container_issues="${_container_issues}    - /tmp is missing or not writable\n"
-        }
-        timeout 10 incus exec "$CONTAINER_NAME" -- test -d /home/ubuntu/genesis 2>/dev/null || {
-            _container_healthy=0
-            _container_issues="${_container_issues}    - Genesis repo not found\n"
-        }
-        timeout 10 incus exec "$CONTAINER_NAME" -- test -x /home/ubuntu/genesis/.venv/bin/python 2>/dev/null || {
-            _container_healthy=0
-            _container_issues="${_container_issues}    - Python venv missing or broken\n"
-        }
+        # Probe critical paths, RETRYING transient failures. A busy host can make
+        # an otherwise-healthy container's `incus exec` time out or error for a
+        # single sweep; that must NOT misclassify it as "damaged", because the
+        # damaged path retires the container. Conclude damaged only after 3
+        # consecutive failed sweeps. (timeout prevents a hang on a truly
+        # unresponsive container.)
+        for _hp_attempt in 1 2 3; do
+            _container_healthy=1
+            _container_issues=""
+            timeout 10 incus exec "$CONTAINER_NAME" -- test -w /tmp 2>/dev/null || {
+                _container_healthy=0
+                _container_issues="${_container_issues}    - /tmp is missing or not writable\n"
+            }
+            timeout 10 incus exec "$CONTAINER_NAME" -- test -d /home/ubuntu/genesis 2>/dev/null || {
+                _container_healthy=0
+                _container_issues="${_container_issues}    - Genesis repo not found\n"
+            }
+            timeout 10 incus exec "$CONTAINER_NAME" -- test -x /home/ubuntu/genesis/.venv/bin/python 2>/dev/null || {
+                _container_healthy=0
+                _container_issues="${_container_issues}    - Python venv missing or broken\n"
+            }
+            [ "$_container_healthy" = "1" ] && break
+            if [ "$_hp_attempt" -lt 3 ]; then
+                echo "  Container health probe inconclusive (attempt $_hp_attempt/3) — a busy host can transiently fail an exec; retrying in 20s..."
+                sleep 20
+            fi
+        done
     elif [ "$_container_state" = "STOPPED" ]; then
         echo "  Container is stopped — will start it."
         incus start "$CONTAINER_NAME" 2>/dev/null || true
@@ -466,6 +484,30 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
         _container_healthy=0
         _container_issues="${_container_issues}    - Container in unexpected state: $_container_state\n"
     fi
+
+    # Retire the container by RENAMING it aside instead of `incus delete --force`.
+    # A container — even a misclassified-damaged one, or a healthy one an operator
+    # opts to recreate — holds the SQLite DB, memory, and transcripts; a
+    # force-delete is unrecoverable. Rename is zero-copy and reversible, and frees
+    # the name so the recreate below proceeds. Requires the container stopped.
+    _retire_container_aside() {
+        local _ts _new
+        _ts="$(date +%Y%m%d-%H%M%S)"
+        _new="${CONTAINER_NAME}-retired-${_ts}"
+        incus stop "$CONTAINER_NAME" --force 2>/dev/null || true
+        if incus rename "$CONTAINER_NAME" "$_new" 2>/dev/null; then
+            echo "  + Old container RENAMED aside (data preserved, NOT deleted): $_new"
+            echo "    Reclaim its disk once you're satisfied the new one is good: incus delete $_new"
+            return 0
+        fi
+        # Rename failed and we already force-stopped it above — restart it so a
+        # rare rename failure doesn't leave Genesis DOWN with no auto-restart
+        # (the recreate below is skipped because the container still exists).
+        echo "  WARNING: could not rename the old container aside — restarting it in place."
+        incus start "$CONTAINER_NAME" 2>/dev/null || true
+        echo "    Inspect with 'incus list' and resolve manually; refusing to force-delete (data loss)."
+        return 1
+    }
 
     if [ "$_container_healthy" = "0" ]; then
         echo ""
@@ -482,8 +524,7 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
     if [ "$NON_INTERACTIVE" = "1" ]; then
         if [ "$_container_healthy" = "0" ]; then
             echo "  Container is damaged — recreating (non-interactive mode)."
-            incus delete "$CONTAINER_NAME" --force
-            echo "  + Old container deleted"
+            _retire_container_aside
         else
             echo "  Continuing with existing container."
         fi
@@ -491,16 +532,14 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
         if [ "$_container_healthy" = "0" ]; then
             read -rp "  Delete and recreate? [Y/n] " _recreate || true
             if [ "${_recreate:-Y}" != "n" ] && [ "${_recreate:-Y}" != "N" ]; then
-                incus delete "$CONTAINER_NAME" --force
-                echo "  + Old container deleted"
+                _retire_container_aside
             else
                 echo "  Continuing with existing container (repair attempt)."
             fi
         else
             read -rp "  Delete and recreate? [y/N] " _recreate || true
             if [ "${_recreate:-N}" = "y" ] || [ "${_recreate:-N}" = "Y" ]; then
-                incus delete "$CONTAINER_NAME" --force
-                echo "  + Old container deleted"
+                _retire_container_aside
             else
                 echo "  Continuing with existing container."
             fi
@@ -511,7 +550,11 @@ fi
 if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     # Reset Guardian state — stale state from a previous container causes
     # "confirmed_dead" to persist even after a fresh container is created.
-    _guardian_state="$HOME/.local/state/genesis-guardian/state.json"
+    # Use the OPERATOR's home, not $HOME: under sudo $HOME is /root, but the
+    # guardian runs as $SUDO_USER and its state lives under that user's home, so
+    # targeting $HOME would miss the real stale state and leave it un-reset.
+    _gs_home="$(eval echo "~${SUDO_USER:-$(whoami)}")"
+    _guardian_state="$_gs_home/.local/state/genesis-guardian/state.json"
     if [ -f "$_guardian_state" ]; then
         echo '{}' > "$_guardian_state"
         echo "  + Guardian state reset (stale from previous container)"
@@ -584,20 +627,36 @@ if [ "$root_dev" != "$home_dev" ] && [ "${home_avail_kb:-0}" -gt "${root_avail_k
     if [ "${_container_home_kb:-0}" -lt 10485760 ]; then  # < 10GB free in container home
         echo ""
         echo "  Split disk: /home disk has more space than root ($(df -h /home | tail -1 | awk '{print $4}') vs $(df -h / | tail -1 | awk '{print $4}') free)."
-        echo "  Container home has only $(( ${_container_home_kb:-0} / 1048576 ))GB free — binding larger disk in..."
         _home_bind_src="/home/genesis-home"
-        sudo mkdir -p "$_home_bind_src"
-        # Unprivileged Incus containers shift UIDs: container UID N → host UID (1000000 + N).
-        # The container's ubuntu user (UID 1000) maps to host UID 1001000.
-        _ubuntu_uid=$(incus exec "$CONTAINER_NAME" -- id -u ubuntu 2>/dev/null || echo "1000")
-        _host_mapped_uid=$((1000000 + _ubuntu_uid))
-        sudo chown "$_host_mapped_uid:$_host_mapped_uid" "$_home_bind_src"
-        incus config device remove "$CONTAINER_NAME" homedisk 2>/dev/null || true
-        incus config device add "$CONTAINER_NAME" homedisk disk source="$_home_bind_src" path=/home/ubuntu
-        incus restart "$CONTAINER_NAME"
-        sleep 3
-        _post_kb=$(incus exec "$CONTAINER_NAME" -- df --output=avail /home/ubuntu 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
-        echo "  + Home disk bound ($(( ${_post_kb:-0} / 1048576 ))GB now free in container home)"
+        # H7 GUARD: binding a fresh disk OVER a populated /home/ubuntu SHADOWS it
+        # — the container's whole genesis install (repo, venv, DB, memory) would
+        # "disappear" behind the empty disk (data not deleted, but invisible, and
+        # the next health probe would then see it as damaged). Discriminate on the
+        # actual INSTALL MARKER (the genesis repo), NOT on the home being empty: a
+        # fresh user home already contains /etc/skel dotfiles (.bashrc, .profile),
+        # so an "is it empty" test would false-refuse a legitimate fresh split-disk
+        # bind (→ the venv install then runs out of space on the tiny root). An
+        # in-place migration across the unprivileged UID-shift is too risky to do
+        # unattended, so a populated install is left alone with clear guidance.
+        if incus exec "$CONTAINER_NAME" -- test -e /home/ubuntu/genesis 2>/dev/null; then
+            echo "  Container /home/ubuntu already holds a genesis install — NOT binding the larger disk"
+            echo "    (binding over it would hide the existing install). To use the split disk, migrate"
+            echo "    /home/ubuntu into $_home_bind_src on the host first (preserving the container UID map), then re-run."
+        else
+            echo "  Container home has only $(( ${_container_home_kb:-0} / 1048576 ))GB free — binding larger disk in..."
+            sudo mkdir -p "$_home_bind_src"
+            # Unprivileged Incus containers shift UIDs: container UID N → host UID (1000000 + N).
+            # The container's ubuntu user (UID 1000) maps to host UID 1001000.
+            _ubuntu_uid=$(incus exec "$CONTAINER_NAME" -- id -u ubuntu 2>/dev/null || echo "1000")
+            _host_mapped_uid=$((1000000 + _ubuntu_uid))
+            sudo chown "$_host_mapped_uid:$_host_mapped_uid" "$_home_bind_src"
+            incus config device remove "$CONTAINER_NAME" homedisk 2>/dev/null || true
+            incus config device add "$CONTAINER_NAME" homedisk disk source="$_home_bind_src" path=/home/ubuntu
+            incus restart "$CONTAINER_NAME"
+            sleep 3
+            _post_kb=$(incus exec "$CONTAINER_NAME" -- df --output=avail /home/ubuntu 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
+            echo "  + Home disk bound ($(( ${_post_kb:-0} / 1048576 ))GB now free in container home)"
+        fi
     fi
 fi
 
@@ -1244,6 +1303,12 @@ _host_user="${SUDO_USER:-$(whoami)}"
 _host_home=$(eval echo "~$_host_user")
 _host_settings_file="$_host_home/.claude/settings.json"
 mkdir -p "$_host_home/.claude"
+# Under sudo this mkdir runs as root → a root-owned ~/.claude that the operator's
+# CC can't write (it creates projects/todos/settings there). chown the DIR to the
+# operator, not just the files placed inside it.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    chown "$_host_user:" "$_host_home/.claude" 2>/dev/null || true
+fi
 if [ ! -f "$_host_settings_file" ]; then
     cat > "$_host_settings_file" <<'CCSETTINGS'
 {

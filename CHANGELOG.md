@@ -11,6 +11,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Host setup no longer force-deletes a container it wrongly thinks is
+  damaged, or hides an install behind a new disk.** Host-side hardening: a
+  container flagged "damaged" is now **renamed aside** (its database, memory, and
+  transcripts preserved and reclaimable) instead of force-deleted, and a single
+  transient health-probe blip no longer misclassifies a healthy container (the
+  probes retry). A split-disk resize only binds the larger disk when the
+  container does not already hold an install — never over an existing one, which
+  would make it "disappear." Also: the guardian-state reset and `~/.claude`
+  ownership now use the real operator account under `sudo` (not root); an
+  existing operator-edited `guardian.yaml` is preserved on re-run instead of
+  overwritten; a failed shared-mount step degrades gracefully instead of aborting
+  the installer mid-way; and re-launching setup to pick up group membership no
+  longer mangles arguments containing spaces.
+
 - **Setup and restore scripts no longer risk destroying user data on a re-run
   or crash.** Three install-surface fixes: re-running local-config setup now
   preserves your existing `github.private_repo` and any custom keys (it rebuilt
