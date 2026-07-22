@@ -77,9 +77,7 @@ class TestDeepInfraBackend:
     @pytest.mark.asyncio
     async def test_embed_success(self) -> None:
         client = MagicMock()
-        client.post = AsyncMock(
-            return_value=_ok_response({"data": [{"embedding": VEC_1024}]})
-        )
+        client.post = AsyncMock(return_value=_ok_response({"data": [{"embedding": VEC_1024}]}))
         backend = DeepInfraBackend(api_key="test-key", client=client)
         result = await backend.embed("test")
         assert result == VEC_1024
@@ -89,9 +87,7 @@ class TestDeepInfraBackend:
     @pytest.mark.asyncio
     async def test_auth_header(self) -> None:
         client = MagicMock()
-        client.post = AsyncMock(
-            return_value=_ok_response({"data": [{"embedding": VEC_1024}]})
-        )
+        client.post = AsyncMock(return_value=_ok_response({"data": [{"embedding": VEC_1024}]}))
         backend = DeepInfraBackend(api_key="my-secret", client=client)
         await backend.embed("test")
         headers = client.post.call_args[1]["headers"]
@@ -102,9 +98,7 @@ class TestDashScopeBackend:
     @pytest.mark.asyncio
     async def test_embed_success(self) -> None:
         client = MagicMock()
-        client.post = AsyncMock(
-            return_value=_ok_response({"data": [{"embedding": VEC_1024}]})
-        )
+        client.post = AsyncMock(return_value=_ok_response({"data": [{"embedding": VEC_1024}]}))
         backend = DashScopeBackend(api_key="test-key", client=client)
         result = await backend.embed("test")
         assert result == VEC_1024
@@ -114,9 +108,7 @@ class TestDashScopeBackend:
     @pytest.mark.asyncio
     async def test_dimensions_param(self) -> None:
         client = MagicMock()
-        client.post = AsyncMock(
-            return_value=_ok_response({"data": [{"embedding": VEC_1024}]})
-        )
+        client.post = AsyncMock(return_value=_ok_response({"data": [{"embedding": VEC_1024}]}))
         backend = DashScopeBackend(api_key="key", dimensions=1024, client=client)
         await backend.embed("test")
         body = client.post.call_args[1]["json"]
@@ -272,3 +264,71 @@ class TestOllamaRetry:
         with pytest.raises(httpx.ConnectError):
             await backend.embed("test")
         assert client.post.call_count == 1  # no retry
+
+
+class TestConnectionReuse:
+    """Backends build warm-reuse AsyncClients (kills the 5s-expiry re-handshake).
+
+    Asserts the tuned httpx.Limits / keepalive_expiry are applied and that
+    HTTP/2 is negotiated only for the TLS cloud backends when ``h2`` is
+    importable (never for cleartext Ollama).
+    """
+
+    @staticmethod
+    def _pool(client: httpx.AsyncClient):
+        # httpx AsyncClient -> AsyncHTTPTransport -> httpcore AsyncConnectionPool
+        return client._transport._pool
+
+    def test_embed_limits_are_tuned(self) -> None:
+        from genesis.memory.embeddings import (
+            _EMBED_KEEPALIVE_EXPIRY_S,
+            _EMBED_MAX_KEEPALIVE_CONNECTIONS,
+            _embed_limits,
+        )
+
+        limits = _embed_limits()
+        assert limits.keepalive_expiry == _EMBED_KEEPALIVE_EXPIRY_S
+        assert limits.keepalive_expiry >= 30.0  # survives sparse recall gaps
+        assert limits.max_keepalive_connections == _EMBED_MAX_KEEPALIVE_CONNECTIONS
+        # httpx default keepalive_expiry is 5s; we must beat it decisively.
+        assert limits.keepalive_expiry > 5.0
+
+    def test_deepinfra_client_tuned_and_http2(self) -> None:
+        from genesis.memory.embeddings import (
+            _EMBED_KEEPALIVE_EXPIRY_S,
+            _EMBED_MAX_KEEPALIVE_CONNECTIONS,
+            _http2_available,
+        )
+
+        backend = DeepInfraBackend(api_key="k")
+        pool = self._pool(backend._client)
+        assert pool._keepalive_expiry == _EMBED_KEEPALIVE_EXPIRY_S
+        assert pool._max_keepalive_connections == _EMBED_MAX_KEEPALIVE_CONNECTIONS
+        # HTTP/2 iff the optional h2 package is present in the venv.
+        assert pool._http2 is _http2_available()
+
+    def test_dashscope_client_tuned_and_http2(self) -> None:
+        from genesis.memory.embeddings import (
+            _EMBED_KEEPALIVE_EXPIRY_S,
+            _http2_available,
+        )
+
+        backend = DashScopeBackend(api_key="k")
+        pool = self._pool(backend._client)
+        assert pool._keepalive_expiry == _EMBED_KEEPALIVE_EXPIRY_S
+        assert pool._http2 is _http2_available()
+
+    def test_ollama_client_tuned_but_no_http2(self) -> None:
+        from genesis.memory.embeddings import _EMBED_KEEPALIVE_EXPIRY_S
+
+        backend = OllamaBackend(url="http://fake:11434")
+        pool = self._pool(backend._client)
+        # Warm-reuse limits still apply to the local backend...
+        assert pool._keepalive_expiry == _EMBED_KEEPALIVE_EXPIRY_S
+        # ...but HTTP/2 must never be forced on the cleartext local endpoint.
+        assert pool._http2 is False
+
+    def test_injected_client_is_not_overridden(self) -> None:
+        sentinel = MagicMock()
+        backend = DeepInfraBackend(api_key="k", client=sentinel)
+        assert backend._client is sentinel

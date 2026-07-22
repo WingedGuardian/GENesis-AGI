@@ -39,6 +39,58 @@ _HTTPX_ERRORS = (
     httpx.HTTPStatusError,
 )
 
+# ---------------------------------------------------------------------------
+# Connection reuse tuning for embedding backends
+# ---------------------------------------------------------------------------
+# The recall embedder is a long-lived singleton whose backends each hold one
+# AsyncClient for their lifetime, so the underlying TLS connection *can* be
+# reused across proactive recalls. httpx's default keepalive_expiry is only 5s,
+# though — between the sparse per-prompt recalls that drive proactive memory,
+# the warm connection to DeepInfra/DashScope expires and each cold embed pays a
+# fresh TLS handshake (the ~2357ms embed spikes seen in prod). Extending
+# keepalive_expiry keeps the connection warm across that gap; the connection
+# counts stay small because a single recall issues one embed at a time.
+_EMBED_KEEPALIVE_EXPIRY_S = 60.0
+_EMBED_MAX_KEEPALIVE_CONNECTIONS = 8
+_EMBED_MAX_CONNECTIONS = 16
+
+
+def _embed_limits() -> httpx.Limits:
+    """httpx connection-pool limits tuned for warm-connection reuse."""
+    return httpx.Limits(
+        max_connections=_EMBED_MAX_CONNECTIONS,
+        max_keepalive_connections=_EMBED_MAX_KEEPALIVE_CONNECTIONS,
+        keepalive_expiry=_EMBED_KEEPALIVE_EXPIRY_S,
+    )
+
+
+def _http2_available() -> bool:
+    """True only if the optional ``h2`` package is importable.
+
+    httpx raises if ``http2=True`` is requested without ``h2`` installed, so we
+    gate on import rather than adding a hard dependency.
+    """
+    try:
+        import h2  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _build_embed_client(timeout: float, *, http2: bool = False) -> httpx.AsyncClient:
+    """Build an AsyncClient with warm-reuse limits (and HTTP/2 when available).
+
+    ``http2`` is only honoured for TLS (https) cloud backends where it is
+    negotiated via ALPN and falls back cleanly to HTTP/1.1. It is left off for
+    cleartext local endpoints (Ollama), where enabling it would force h2 with
+    prior knowledge and could break servers that only speak HTTP/1.1.
+    """
+    return httpx.AsyncClient(
+        timeout=timeout,
+        limits=_embed_limits(),
+        http2=http2 and _http2_available(),
+    )
+
 
 class EmbeddingUnavailableError(Exception):
     """Raised when all embedding backends are unavailable."""
@@ -75,7 +127,9 @@ class OllamaBackend:
     ) -> None:
         self._url = url
         self._model = model
-        self._client = client or httpx.AsyncClient(timeout=60.0)
+        # Local cleartext endpoint — warm-reuse limits, but HTTP/2 stays off
+        # (h2 with prior knowledge would break HTTP/1.1-only Ollama servers).
+        self._client = client or _build_embed_client(60.0)
         self._avail_cache: bool | None = None
         self._avail_cache_at: float = 0.0
 
@@ -134,7 +188,7 @@ class DeepInfraBackend:
     ) -> None:
         self._api_key = api_key
         self._model = model
-        self._client = client or httpx.AsyncClient(timeout=30.0)
+        self._client = client or _build_embed_client(30.0, http2=True)
 
     @property
     def name(self) -> str:
@@ -174,7 +228,7 @@ class DashScopeBackend:
         self._api_key = api_key
         self._model = model
         self._dimensions = dimensions
-        self._client = client or httpx.AsyncClient(timeout=30.0)
+        self._client = client or _build_embed_client(30.0, http2=True)
 
     @property
     def name(self) -> str:
