@@ -114,6 +114,23 @@ if [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || \
     exit 1
 fi
 
+# ── Mutual exclusion: only one update.sh at a time ────────
+# CLI runs, the dashboard direct path, and the orchestrator all reach this
+# script; without a shared lock two could overlap (both stop the server, both
+# merge) and corrupt the deploy — observed live via a concurrent session. Held
+# whole-run on a dedicated FD (auto-released on any exit). `flock -n`: a second
+# run refuses immediately rather than queuing. Placed AFTER the worktree refusal
+# (worktree runs never take it) and BEFORE the rollback tag / backup and the
+# ERR/signal traps — a contention exit leaves the running server untouched.
+UPDATE_LOCK_FILE="$HOME/.genesis/locks/update.lock"
+mkdir -p "$(dirname "$UPDATE_LOCK_FILE")"
+exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"
+if ! flock -n "$_UPDATE_LOCK_FD"; then
+    echo "ERROR: another Genesis update is already in progress ($UPDATE_LOCK_FILE)."
+    echo "       Refusing to run a second update concurrently."
+    exit 1
+fi
+
 echo ""
 echo "  Genesis Update"
 echo "  ──────────────────────────────────────"
@@ -634,8 +651,12 @@ _start_genesis_server() {
     # This bypasses systemd monitoring, so health dashboard will show red.
     echo "  WARNING: systemctl --user restart failed — falling back to direct start (degraded)"
     echo "  Health monitoring will not work correctly. Run: systemctl --user restart genesis-server.service"
+    # Close the update-lock FD in this long-lived child: nohup'd, it OUTLIVES
+    # update.sh, and an inherited lock FD would keep the advisory lock held after
+    # we exit — deadlocking every future update until this degraded server dies.
+    # (systemd-started servers don't inherit our FDs; only this nohup path does.)
     nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
-        >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
+        {_UPDATE_LOCK_FD}>&- >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     echo "  Started genesis-server in degraded mode (pid $!)"
     # Write marker so dashboard can detect degraded mode
     echo "nohup" > "$HOME/.genesis/server-start-mode"
