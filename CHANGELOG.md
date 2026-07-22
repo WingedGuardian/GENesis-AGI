@@ -34,6 +34,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **An interrupted update no longer leaves the server down.** If a self-update
+  is interrupted after it has stopped the server (a Ctrl-C, a system shutdown,
+  or an unexpected failure inside an internal step), it now rolls back to the
+  previous version and restarts the server instead of exiting with the service
+  stopped. An interrupt *before* the server is stopped simply cleans up and
+  exits, leaving the running system untouched.
 - **Background sessions no longer get silently cut off after 10 minutes.** A
   long background task (for example deep research running as a background
   session) used to be killed at about 10 minutes with only a partial result and
