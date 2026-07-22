@@ -12,9 +12,9 @@ from unittest.mock import MagicMock, patch
 
 import aiosqlite
 import pytest
-from genesis.observability.snapshots.reflex import reflex
 
 from genesis.db.crud import reflex_signals as crud
+from genesis.observability.snapshots.reflex import reflex
 
 M70 = importlib.import_module("genesis.db.migrations.0070_reflex_arc")
 
