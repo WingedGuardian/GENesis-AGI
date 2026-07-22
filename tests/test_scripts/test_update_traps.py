@@ -96,6 +96,7 @@ def _harness(text: str, scenario: str) -> str:
     on_err = _extract_func(text, "_on_err")
     on_signal = _extract_func(text, "_on_signal")
     on_prestop = _extract_func(text, "_on_signal_prestop")
+    on_clear = _extract_func(text, "_clear_deploy_state")
     return f"""#!/bin/bash
 set -Eeuo pipefail
 STATE_FILE="$STATE_FILE"
@@ -104,6 +105,7 @@ _do_rollback() {{ echo "depth=$BASH_SUBSHELL reason=$1" >> "$RB_LOG"; }}
 # records intent without touching real systemd.
 _start_genesis_server() {{ echo "start:genesis-server" >> "$RESTART_LOG"; return 0; }}
 systemctl() {{ echo "systemctl $*" >> "$RESTART_LOG"; return 0; }}
+{on_clear}
 {on_err}
 {on_signal}
 {on_prestop}
@@ -154,8 +156,12 @@ def _run(tmp_path: Path, text: str, scenario: str, *, signal_it: bool = False):
     state = tmp_path / "state.json"
     state.write_text("{}")
     ready = tmp_path / "ready"
+    # Isolate HOME so _clear_deploy_state's marker path
+    # ($HOME/.genesis/update_in_progress.pid) is a tmp, never the real marker.
+    (tmp_path / ".genesis").mkdir(exist_ok=True)
     env = {
         **os.environ,
+        "HOME": str(tmp_path),
         "RB_LOG": str(rb_log),
         "RESTART_LOG": str(restart_log),
         "STATE_FILE": str(state),

@@ -73,6 +73,25 @@ _write_state() {
 SEOF
 }
 
+# Clear this run's deploy state files. The state file is ours (we wrote it) so
+# always remove it. The PID marker is NOT necessarily ours to delete: only the
+# dashboard DIRECT path makes it our $$; the supervised orchestrator holds it
+# with ITS pid ACROSS tiers, and scripts/restore.sh holds it with its own pid
+# while it rebuilds the DB. So delete the marker ONLY if we own it ($$) OR its
+# holder PID is dead — never strip a LIVE foreign holder's watchdog inhibitor
+# (mirrors restore.sh's owner-check). The "dead" clause also cleans a stale
+# marker left by a prior direct run (its systemd-run parent PID is dead once
+# that run finished); env.update_in_progress() reads such a dead marker as "no
+# deploy", so the window before it is cleaned is harmless.
+_clear_deploy_state() {
+    rm -f "$STATE_FILE" 2>/dev/null || true
+    local _m="$HOME/.genesis/update_in_progress.pid" _pid
+    _pid="$(cat "$_m" 2>/dev/null || true)"
+    if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; }; then
+        rm -f "$_m" 2>/dev/null || true
+    fi
+}
+
 # Signal handler for the PRE-STOP window: an interrupt before services are
 # stopped has nothing to roll back (no merge, server still running), so just
 # clear this run's state/marker and exit. Swapped for _on_signal (rollback)
@@ -100,7 +119,7 @@ _on_signal_prestop() {
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
     done
-    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid" 2>/dev/null || true
+    _clear_deploy_state
     exit 1
 }
 
@@ -565,7 +584,7 @@ if [[ "$POST_MERGE" == "false" ]]; then
     if ! timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
         echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
         git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
-        rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+        _clear_deploy_state
         exit 1
     fi
 fi
@@ -904,7 +923,7 @@ with open(sys.argv[11], 'w') as f:
     # leftover entry can't suppress the watchdog's deploy-restart guard after a
     # rollback. The server is back up (above); once this invocation exits its PID
     # dies anyway, but removing the files closes the PID-reuse window proactively.
-    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+    _clear_deploy_state
 
     echo ""
     echo "  ──────────────────────────────────────"
@@ -1151,7 +1170,7 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     done
     # Nothing changed and no --post-merge continuation follows, so clear the
     # in-progress signals (like the success path) — a leftover must never linger.
-    rm -f "$STATE_FILE" "$HOME/.genesis/update_in_progress.pid"
+    _clear_deploy_state
     # Transitional: the pre-merge step may have cleared live settings.local.json
     # or .serena/project.yml edits — put them back even though no merge landed.
     if [ -f "$SETTINGS_LOCAL_BAK" ]; then
@@ -1530,7 +1549,7 @@ rm -f "$STATE_FILE"
 rm -f "$HOME/.genesis/update_conflicts.json"
 rm -f "$HOME/.genesis/last_update_summary.txt"
 # Clean up PID file
-rm -f "$HOME/.genesis/update_in_progress.pid"
+_clear_deploy_state
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"
