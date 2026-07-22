@@ -48,6 +48,23 @@ def _bg_notice(output) -> str:
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
 
 
+# Nudge for dispatched (turn-ends) channels: route long research/background work to the
+# durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
+# kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
+_BG_RESEARCH_ROUTING = (
+    "\n\n## Dispatching long-running work from this channel\n"
+    "Your turn here ends after you reply, and any deep-research or Workflow you run "
+    "inline is force-killed after about 10 minutes with only a partial result, with no "
+    "live session left to report back. So when a request needs deep or multi-source "
+    "research, or background work likely to run more than a few minutes, do NOT run it "
+    "inline. Call the `mcp__genesis-health__direct_session_run` tool "
+    '(profile="research", notify=true) with a clear task prompt, then reply that it is '
+    "running in the background and will report back with results when done. That "
+    "background session runs to completion and delivers the results to you here. Keep "
+    "quick answers and short tool use inline as usual."
+)
+
+
 class ConversationLoop:
     """Channel-agnostic conversation orchestrator.
 
@@ -496,6 +513,17 @@ class ConversationLoop:
                         system_prompt += topic_ctx
                     else:
                         system_prompt = topic_ctx
+
+            # Dispatched channels (telegram/voice/etc.) end the turn after replying,
+            # so long inline work is killed at the CC bg-wait ceiling with nothing left
+            # to report back. Nudge the model to route such work to the durable
+            # background lane. Appended every turn (incl. resume) so it is present when
+            # a research request arrives. Terminal is interactive, so inline is fine.
+            if channel != ChannelType.TERMINAL:
+                if system_prompt:
+                    system_prompt += _BG_RESEARCH_ROUTING
+                else:
+                    system_prompt = _BG_RESEARCH_ROUTING
 
             invocation = CCInvocation(
                 prompt=prompt_text,
