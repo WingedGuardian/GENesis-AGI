@@ -25,12 +25,13 @@ Design notes:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sqlite3
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,9 +70,15 @@ def _parse_ts(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value)
     except (ValueError, TypeError):
         return None
+    # Coerce naive timestamps to UTC so .timestamp() comparisons never skew by
+    # the local offset (mirrors check_stale_pending.py). outreach_history writes
+    # tz-aware ISO today, but a legacy/naive row must not silently mis-window.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
 
 
 def read_steward_notifications(
@@ -194,13 +201,23 @@ def select_to_surface(
 
 
 def format_injection(lines: list[str]) -> str:
-    """The single line injected into the session. Empty -> ''."""
+    """The single line injected into the session. Empty -> ''.
+
+    The header count is the TRUE total (shown clauses + any "+N more"
+    overflow), so a capped list still reports how many updates there are.
+    """
     if not lines:
         return ""
-    n = len([ln for ln in lines if not ln.startswith("+")])
-    noun = "update" if n == 1 else "updates"
+    shown = [ln for ln in lines if not ln.startswith("+")]
+    overflow = 0
+    for ln in lines:
+        if ln.startswith("+") and ln.endswith(" more"):
+            with contextlib.suppress(ValueError):
+                overflow = int(ln[1 : -len(" more")])
+    total = len(shown) + overflow
+    noun = "update" if total == 1 else "updates"
     return (
-        f"[PRs] {n} external-PR {noun} you may not have seen — "
+        f"[PRs] {total} external-PR {noun} you may not have seen — "
         + " · ".join(lines)
         + '. Ask "show PRs" to review.'
     )

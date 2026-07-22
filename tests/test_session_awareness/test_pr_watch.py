@@ -201,6 +201,7 @@ def test_format_injection_singular_plural_and_overflow():
     assert "1 external-PR update " in pr_watch.format_injection(["one (Jul 1)"])
     two = pr_watch.format_injection(["a (Jul 1)", "b (Jul 2)"])
     assert "2 external-PR updates " in two
-    # Overflow marker does not inflate the count.
+    # Header count is the TRUE total: 1 shown + 4 overflow = 5.
     with_overflow = pr_watch.format_injection(["a (Jul 1)", "+4 more"])
-    assert "1 external-PR update " in with_overflow
+    assert "5 external-PR updates " in with_overflow
+    assert "+4 more" in with_overflow
