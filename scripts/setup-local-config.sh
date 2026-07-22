@@ -45,8 +45,9 @@ _read_yaml_value() {
     local key="$1"
     [[ -f "$LOCAL_CONFIG" ]] || { echo ""; return; }
     python3 - "$LOCAL_CONFIG" "$key" <<'PYEOF'
-import sys, yaml
+import sys
 try:
+    import yaml  # inside the try: a missing PyYAML degrades to an empty default
     with open(sys.argv[1]) as f:
         data = yaml.safe_load(f) or {}
     parts = sys.argv[2].split(".")
@@ -60,6 +61,16 @@ except Exception:
     print("")
 PYEOF
 }
+
+# PyYAML is required to WRITE the config below (unlike the read above, the write
+# cannot degrade). On a minimal image it may be absent — fail with a clear,
+# actionable message up front rather than a raw traceback after the operator has
+# answered every prompt.
+if ! python3 -c 'import yaml' 2>/dev/null; then
+    _warn "PyYAML is required but not importable by python3."
+    _warn "Install it first, e.g.:  sudo apt-get install -y python3-yaml   (or: python3 -m pip install pyyaml)"
+    exit 1
+fi
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 
@@ -140,7 +151,11 @@ mkdir -p "$CONFIG_DIR"
 python3 - "$LOCAL_CONFIG" \
     "$OLLAMA_URL" "$OLLAMA_ENABLED" "$LM_STUDIO_URL" \
     "$USER_TIMEZONE" "$GH_USER" "$GH_PUBLIC_REPO" << 'PYEOF'
-import sys, yaml
+import os
+import sys
+import tempfile
+
+import yaml
 
 out_path = sys.argv[1]
 ollama_url, ollama_enabled_str, lm_studio_url = sys.argv[2], sys.argv[3], sys.argv[4]
@@ -149,28 +164,58 @@ timezone, gh_user, gh_public_repo = sys.argv[5], sys.argv[6], sys.argv[7]
 # Parse ollama_enabled: accept "true"/"false"/1/0 strings
 ollama_enabled = ollama_enabled_str.lower() in {"true", "1", "yes"}
 
-data = {
-    "network": {
-        "ollama_url": ollama_url,
-        "ollama_enabled": ollama_enabled,
-        "lm_studio_url": lm_studio_url,
-    },
-    "timezone": timezone,
-    "github": {
-        "user": gh_user,
-        "public_repo": gh_public_repo,
-        "private_repo": "",
-    },
-}
+# Load the existing config FIRST and update only the leaves this script manages,
+# so a re-run preserves github.private_repo (never prompted here) and any key a
+# user or another tool added. The old code built a fresh literal dict and wiped
+# everything it didn't know about.
+data = {}
+if os.path.exists(out_path):
+    try:
+        with open(out_path) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        data = {}
+if not isinstance(data, dict):
+    data = {}
+
+net = data.get("network")
+if not isinstance(net, dict):
+    net = data["network"] = {}
+net["ollama_url"] = ollama_url
+net["ollama_enabled"] = ollama_enabled
+net["lm_studio_url"] = lm_studio_url
+
+data["timezone"] = timezone
+
+gh = data.get("github")
+if not isinstance(gh, dict):
+    gh = data["github"] = {}
+gh["user"] = gh_user
+gh["public_repo"] = gh_public_repo
+gh.setdefault("private_repo", "")  # keep an existing value; default only if absent
 
 header = (
     "# Genesis local configuration — machine-specific, never committed to git.\n"
     "# Regenerate: ./scripts/setup-local-config.sh\n"
     "# Env var overrides take precedence over values here.\n\n"
 )
-with open(out_path, "w") as f:
-    f.write(header)
-    yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+# Atomic write: temp file in the SAME dir + os.replace, so a mid-write kill can
+# never corrupt genesis.yaml (which would also destroy the values the next run
+# reads back as defaults).
+d = os.path.dirname(out_path) or "."
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".genesis.yaml-tmp.")
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(header)
+        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    os.replace(tmp, out_path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PYEOF
 
 _ok "Config written to $LOCAL_CONFIG"

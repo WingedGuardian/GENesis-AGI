@@ -28,10 +28,20 @@ echo "Backup source:    $BACKUP_DIR"
 
 mkdir -p "$CC_MEMORY_DIR"
 
-# Copy without overwriting newer files (preserve work done on this machine)
-# Using cp -an (no-clobber) to avoid overwriting existing files
-cp -an "$BACKUP_DIR"/. "$CC_MEMORY_DIR/" 2>/dev/null || \
-    cp -a "$BACKUP_DIR"/. "$CC_MEMORY_DIR/"
+# Copy files the machine doesn't already have, NEVER overwriting existing ones
+# (preserve work done on this machine). The old `cp -an … || cp -a …` was a
+# data-loss trap: coreutils 9.1+ makes `cp -an` return NON-ZERO when it SKIPS an
+# existing file (skip-counts-as-failure), so on a normal run the `|| cp -a`
+# fallback fired and CLOBBERED the newer local files `-n` exists to protect.
+# Prefer rsync --ignore-existing (stable, version-independent skip semantics);
+# fall back to `cp -an` best-effort (its skip-as-failure exit is swallowed — a
+# skipped existing file is the intended outcome, not an error to "recover" from
+# by overwriting).
+if command -v rsync >/dev/null 2>&1; then
+    rsync -a --ignore-existing "$BACKUP_DIR"/ "$CC_MEMORY_DIR/"
+else
+    cp -an "$BACKUP_DIR"/. "$CC_MEMORY_DIR/" || true
+fi
 
 FILE_COUNT=$(find "$CC_MEMORY_DIR" -type f | wc -l)
 TOTAL_SIZE=$(du -sh "$CC_MEMORY_DIR" | cut -f1)

@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Setup and restore scripts no longer risk destroying user data on a re-run
+  or crash.** Three install-surface fixes: re-running local-config setup now
+  preserves your existing `github.private_repo` and any custom keys (it rebuilt
+  the file from scratch before, wiping them) and writes atomically; the shell
+  wrapper that setup installs in `~/.bashrc` is rewritten atomically and, if it
+  finds a half-written block from an earlier interrupted run, leaves the file
+  untouched instead of deleting everything below it; the CC-memory restore never
+  overwrites a newer local file with an older backup copy (a `cp` quirk on newer
+  systems used to); and local-config setup fails with a clear "install PyYAML"
+  message up front instead of a raw traceback after you've answered every prompt.
+
 - **Per-prompt memory recall no longer silently degrades on busy installs.**
   The server-side recall budget behind the proactive memory hook was sized
   against a dev install that (unnoticed) ran no reranker and a half-size
