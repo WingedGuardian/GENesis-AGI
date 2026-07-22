@@ -17,6 +17,7 @@ queue then fills and drops — no recursion, no loop.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from datetime import UTC, datetime
@@ -50,13 +51,15 @@ class ReflexIngestor:
         self,
         db: aiosqlite.Connection,
         *,
-        config_loader: Callable[[], ReflexConfig] = load_reflex_config,
+        config_loader: Callable[[], ReflexConfig] | None = None,
         queue_size: int = _QUEUE_SIZE,
         refresh_interval_s: float = _REFRESH_INTERVAL_S,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._db = db
-        self._config_loader = config_loader
+        # Resolve the loader at call time (not a def-time default) so it stays
+        # patchable and never freezes an import-time reference.
+        self._config_loader = config_loader or load_reflex_config
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=queue_size)
         self._refresh_interval_s = refresh_interval_s
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -65,6 +68,7 @@ class ReflexIngestor:
         self._dropped = 0
         self._processed = 0
         self._worker_task: asyncio.Task | None = None
+        self._event_bus: Any = None
 
     # ── bus side (runs inside emit() — fast, never raises) ──────────────
 
@@ -95,11 +99,12 @@ class ReflexIngestor:
     # ── worker side (off the dispatch path) ─────────────────────────────
 
     def start(self, event_bus: Any) -> None:
-        """Subscribe to the bus and start the drain worker."""
+        """Subscribe to the bus, start the drain worker, own the default bus."""
         from genesis.observability.types import Severity
         from genesis.util.tasks import tracked_task
 
-        self.refresh_enabled()
+        self._event_bus = event_bus
+        self.refresh_enabled()  # sets _enabled AND installs/clears the default bus
         event_bus.subscribe(self.handle_event, min_severity=Severity.ERROR)
         self._worker_task = tracked_task(
             self._worker(),
@@ -112,15 +117,39 @@ class ReflexIngestor:
             self._queue.maxsize,
         )
 
+    async def stop(self) -> None:
+        """Cancel the drain worker and unwire the default bus (runtime shutdown)."""
+        self._set_default_bus(None)
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_task
+        logger.info("Reflex ingestion stopped")
+
     def refresh_enabled(self) -> None:
-        """Re-read config (incl. env kill). OFF takes effect without restart."""
+        """Re-read config (incl. env kill) and (un)install the default bus.
+
+        This is what makes the kill switch fully effective live: when
+        ingestion flips OFF, the default event bus is cleared so tracked_task
+        stops emitting task.failed at the source (not just dropped at the
+        handler) — no wasted bus/DB traffic. On (re-)enable it is reinstalled.
+        """
         try:
             self._enabled = self._config_loader().ingest_enabled
         except Exception:
             logger.warning(
                 "Reflex config refresh failed — keeping enabled=%s", self._enabled, exc_info=True
             )
+        self._set_default_bus(self._event_bus if self._enabled else None)
         self._last_refresh = time.monotonic()
+
+    def _set_default_bus(self, bus: Any) -> None:
+        """Install/clear the process-wide tracked_task default bus (idempotent)."""
+        if self._event_bus is None:
+            return  # not started yet — nothing to install
+        from genesis.util.tasks import set_default_event_bus
+
+        set_default_event_bus(bus)
 
     async def _worker(self) -> None:
         while True:

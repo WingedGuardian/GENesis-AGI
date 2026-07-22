@@ -43,10 +43,11 @@ async def init(rt: GenesisRuntime) -> None:
         return
 
     from genesis.reflex.ingest import ReflexIngestor
-    from genesis.util.tasks import set_default_event_bus
 
     ingestor = ReflexIngestor(rt._db)
     rt._reflex_ingestor = ingestor
+    # start() subscribes, launches the drain worker, AND installs the default
+    # event bus for tracked_task (it owns that lifecycle so a live disable can
+    # unwind it). Cancelled + unwired via ingestor.stop() in runtime shutdown.
     ingestor.start(rt._event_bus)
-    set_default_event_bus(rt._event_bus)
     logger.info("Reflex ingestion ACTIVE — default event bus installed for tracked_task")

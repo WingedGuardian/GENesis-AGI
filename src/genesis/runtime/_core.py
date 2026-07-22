@@ -637,6 +637,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             ("campaign_runner", self._campaign_runner),
             ("awareness_loop", self._awareness_loop),
             ("cc_fallback_probe", self._cc_fallback_probe_worker),
+            ("reflex_ingestor", self._reflex_ingestor),
         ]:
             if component is None:
                 continue

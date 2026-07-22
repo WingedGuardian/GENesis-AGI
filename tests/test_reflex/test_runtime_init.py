@@ -54,9 +54,17 @@ class TestGating:
     @pytest.mark.asyncio
     async def test_enabled_wires_everything(self):
         rt = _rt()
-        with patch(
-            "genesis.reflex.config.load_reflex_config",
-            return_value=ReflexConfig(ingest_enabled=True),
+        # patch BOTH the init-path read and the ingestor's own bound reference
+        # (the ingestor re-reads config for live toggling) so both see enabled
+        with (
+            patch(
+                "genesis.reflex.config.load_reflex_config",
+                return_value=ReflexConfig(ingest_enabled=True),
+            ),
+            patch(
+                "genesis.reflex.ingest.load_reflex_config",
+                return_value=ReflexConfig(ingest_enabled=True),
+            ),
         ):
             await reflex_init.init(rt)
         # subscriber registered at ERROR floor

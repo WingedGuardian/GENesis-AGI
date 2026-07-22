@@ -10,11 +10,30 @@ from types import SimpleNamespace
 import aiosqlite
 import pytest
 
+import genesis.util.tasks as tasks_mod
 from genesis.db.crud import reflex_signals as crud
 from genesis.reflex.config import ReflexConfig
 from genesis.reflex.ingest import ReflexIngestor
 
 M70 = importlib.import_module("genesis.db.migrations.0070_reflex_arc")
+
+
+class _FakeBus:
+    """Minimal bus: records the subscribe call, satisfies tracked_task."""
+
+    def __init__(self):
+        self.subscribed = None
+
+    def subscribe(self, listener, *, min_severity=None):
+        self.subscribed = listener
+
+
+@pytest.fixture(autouse=True)
+def _reset_default_bus():
+    tasks_mod.set_default_event_bus(None)
+    yield
+    tasks_mod.set_default_event_bus(None)
+
 
 FIXED_NOW = datetime(2026, 7, 21, 12, 0, 0, tzinfo=UTC)
 
@@ -207,3 +226,71 @@ class TestWorker:
             assert ing.stats["queued"] == 0
         finally:
             worker.cancel()
+
+
+class TestDefaultBusLifecycle:
+    """start() installs the default bus when enabled; live-disable and stop()
+    unwind it so tracked_task stops emitting at the source."""
+
+    async def test_start_enabled_installs_default_bus(self, db):
+        bus = _FakeBus()
+        ing = ReflexIngestor(
+            db, config_loader=lambda: ReflexConfig(ingest_enabled=True), clock=lambda: FIXED_NOW
+        )
+        ing.start(bus)
+        try:
+            assert tasks_mod._default_event_bus is bus
+        finally:
+            ing._worker_task.cancel()
+
+    async def test_start_disabled_leaves_default_bus_clear(self, db):
+        bus = _FakeBus()
+        ing = ReflexIngestor(
+            db, config_loader=lambda: ReflexConfig(ingest_enabled=False), clock=lambda: FIXED_NOW
+        )
+        ing.start(bus)
+        try:
+            assert tasks_mod._default_event_bus is None
+        finally:
+            ing._worker_task.cancel()
+
+    async def test_live_disable_clears_default_bus(self, db):
+        flag = {"enabled": True}
+        bus = _FakeBus()
+        ing = ReflexIngestor(
+            db,
+            config_loader=lambda: ReflexConfig(ingest_enabled=flag["enabled"]),
+            clock=lambda: FIXED_NOW,
+            refresh_interval_s=0.02,
+        )
+        ing.start(bus)
+        try:
+            assert tasks_mod._default_event_bus is bus
+            flag["enabled"] = False
+            for _ in range(100):
+                if tasks_mod._default_event_bus is None:
+                    break
+                await asyncio.sleep(0.01)
+            # kill switch fully unwound: emission stops at the source
+            assert tasks_mod._default_event_bus is None
+        finally:
+            ing._worker_task.cancel()
+
+    async def test_stop_cancels_worker_and_clears_bus(self, db):
+        bus = _FakeBus()
+        ing = ReflexIngestor(
+            db, config_loader=lambda: ReflexConfig(ingest_enabled=True), clock=lambda: FIXED_NOW
+        )
+        ing.start(bus)
+        assert tasks_mod._default_event_bus is bus
+        await ing.stop()
+        assert tasks_mod._default_event_bus is None
+        assert ing._worker_task.cancelled() or ing._worker_task.done()
+
+    async def test_unit_ingestor_without_start_does_not_touch_global(self, db):
+        # tests that drive process()/handle_event directly must never mutate
+        # the process-global default bus (isolation guard)
+        ing = _ingestor(db, enabled=True)
+        assert tasks_mod._default_event_bus is None
+        await ing.handle_event(_event())
+        assert tasks_mod._default_event_bus is None
