@@ -1,0 +1,58 @@
+# Rate-limit park + auto-resume — writable, DORMANT (off) by default until the
+# resume engine lands.
+#
+# When a CC session hits a rate/usage limit, the work is PARKED durably
+# (cc_rate_limit_parks) and a CronTrigger job re-dispatches the actual parked
+# work at the error's reset time, delivering the result back to its origin
+# conversation. The engine re-reads this merged config (this file +
+# ~/.genesis/config/cc_rate_limit_resume.local.yaml) every tick, so a
+# settings_update("cc_rate_limit_resume", {...}) or hand edit takes effect on
+# the next tick — no restart.
+#
+# Master switch: false stops both parking-copy mode-awareness and the resumer.
+enabled: true
+
+# Mode: off | propose_only | live
+#   off          — never auto-resume (parks still recorded; copy says "try later")
+#   propose_only — park the work and PING the user ("ready — reply 'resume'");
+#                  the user's reply is the dispatch approval. Not hands-off.
+#   live         — (default) auto-resume: re-dispatch the parked work at reset
+#                  and deliver to origin. A resume only completes work whose
+#                  initiation was ALREADY approved (a foreground turn's typed
+#                  prompt, or a direct_session's already-gated original dispatch),
+#                  so it is not new autonomous initiative and does not re-enter
+#                  the autonomous-CLI approval gate.
+#
+# Hook/env kill switch (separate lever): GENESIS_RATE_LIMIT_RESUME_DISABLED=1
+# forces the resumer to no-op regardless of this file.
+#
+# DORMANT until the resume engine is wired (PR-2b): with no resumer, `live`/
+# `propose_only` would promise a resume nothing delivers. PR-2b flips this to
+# `live`. Until then `off` parks nothing and shows an honest "try again later".
+mode: off
+
+# Retry cadence (minutes) when the reset time could not be parsed (e.g. a
+# day-ambiguous weekly limit) — the park is retried on this floor instead.
+cadence_floor_minutes: 30
+
+# Re-limit backoff: a resumed retry that hits the limit AGAIN backs off
+# exponentially from base toward the cap before the next attempt.
+backoff_base_minutes: 30
+backoff_cap_minutes: 240
+
+# Jitter (seconds) added to each next-attempt time to avoid a thundering herd
+# when many parks share one reset window.
+jitter_seconds: 60
+
+# Parks resumed per engine tick (the account-wide limit means they clear in
+# order; this bounds per-tick dispatch).
+max_due_per_tick: 50
+
+# Give up after this many attempts → escalate to needs_user (one alert, no more
+# auto-retries). At ~worst-case 4h backoff this is roughly a week of retries.
+needs_user_attempts: 40
+
+# Capability pinning: a resumed conversation-origin turn runs under this bounded
+# background profile (a subset of the foreground tool surface). Direct-session
+# parks re-run under their own original profile, unchanged.
+conversation_resume_profile: research
