@@ -1,5 +1,4 @@
-# Rate-limit park + auto-resume — writable, DORMANT (off) by default until the
-# resume engine lands.
+# Rate-limit park + auto-resume — writable, LIVE by default.
 #
 # When a CC session hits a rate/usage limit, the work is PARKED durably
 # (cc_rate_limit_parks) and a CronTrigger job re-dispatches the actual parked
@@ -25,11 +24,7 @@ enabled: true
 #
 # Hook/env kill switch (separate lever): GENESIS_RATE_LIMIT_RESUME_DISABLED=1
 # forces the resumer to no-op regardless of this file.
-#
-# DORMANT until the resume engine is wired (PR-2b): with no resumer, `live`/
-# `propose_only` would promise a resume nothing delivers. PR-2b flips this to
-# `live`. Until then `off` parks nothing and shows an honest "try again later".
-mode: off
+mode: live
 
 # Retry cadence (minutes) when the reset time could not be parsed (e.g. a
 # day-ambiguous weekly limit) — the park is retried on this floor instead.
