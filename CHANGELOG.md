@@ -155,6 +155,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Restore fails loudly instead of silently doing nothing, and decrypted
+  secrets are never briefly world-readable.** Disaster-recovery hygiene fixes:
+  an unattended restore with no terminal (and no `--force`) now aborts with a
+  clear message instead of declining every prompt and reporting success; a
+  restore pointed at an empty or wrong backup fails instead of exiting "success"
+  having restored nothing; a failed pull of the two largest payloads (vectors,
+  transcripts) is now reported rather than silently skipped; decrypted
+  secrets/transcripts/memory are written private-by-default (no world-readable
+  window); the backup-failed alert now fires even when a backup aborts early;
+  and the plaintext database dump is cleaned up even if a backup dies mid-run.
+
 - **Backups now verify the database archive is restorable, can't collide with a
   restore, and never re-badge stale data as fresh.** Three disaster-recovery
   integrity fixes: the 6-hourly backup now decrypt-verifies the SQLite archive

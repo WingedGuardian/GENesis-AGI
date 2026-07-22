@@ -115,7 +115,13 @@ _release_deploy_marker() {
         rm -f "$_UPDATE_PID_FILE"
     fi
 }
-trap '_write_status; _release_deploy_marker; backend_cleanup' EXIT
+# N2: the credential-bearing plaintext SQL dump and decrypted Qdrant snapshot
+# temps are `rm`'d inline, but a mid-section death would leave them in ~/tmp —
+# trap-protect them. (Empty-string default → no-op before they're assigned.)
+_SQL_TMP=""
+_QDRANT_TMP=""
+_cleanup_plaintext() { rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" 2>/dev/null || true; }
+trap '_write_status; _release_deploy_marker; backend_cleanup; _cleanup_plaintext' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
@@ -151,6 +157,16 @@ if ! flock -w "$_LOCK_WAIT" "$DR_LOCK_FD"; then
     die "backup-restore lock still held by ${_holder:-unknown} after ${_LOCK_WAIT}s — a backup is likely running; wait for it to finish and re-run (or set GENESIS_RESTORE_LOCK_WAIT higher)"
 fi
 dr_lock_stamp restore
+
+# Private-by-default for every plaintext this restore writes (SF7): gpg -d and
+# cp otherwise honor the inherited umask (typically 0022 → world-readable), so a
+# decrypted secrets.env / transcript / memory file (all PII-bearing) would be
+# briefly readable by other users on a multi-user host between write and any
+# chmod. Set once here — before the first write — so no section carries that
+# window. (§8 creds still sets its own umask 077 for defence in depth.) The
+# restored DB and config overlays become 0600 too, which is strictly correct;
+# genesis-server reads them as the same user.
+umask 077
 
 # Large intermediate files (the ~269MB decrypted SQLite .dump, decrypted Qdrant snapshots)
 # must NOT land in the inherited TMPDIR (cc-tmp = the watchgod "oxygen" folder for a CC run;
@@ -247,10 +263,16 @@ resolve_payload() {
 
 # Confirm prompt (skipped with --force or --dry-run).
 confirm() {
-    local prompt="$1"
+    local prompt="$1" reply
     $FORCE && return 0
     $DRY_RUN && return 0
-    read -r -p "$prompt [y/N] " reply
+    # `read` returning non-zero means EOF (no TTY to answer), NOT a decline —
+    # without this, an unattended run (e.g. `python -m genesis restore` with no
+    # --force) has EVERY confirm silently return false, skips every section, and
+    # exits 0 "success" having restored nothing. Refuse loudly instead. (N4)
+    if ! read -r -p "$prompt [y/N] " reply; then
+        die "no TTY to confirm '$prompt' — re-run with --force for an unattended restore"
+    fi
     [[ "$reply" =~ ^[yY]([eE][sS])?$ ]]
 }
 
@@ -344,21 +366,26 @@ _pull_from_offsite() {
     else
         warn "off-site: failed to pull genesis.sql.gpg from snapshot $latest — the database will not be restored from off-site"
     fi
-    # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg. The
-    # staging dir is created only when there's actually something to pull, so an
-    # empty set doesn't make the restore sections below run (and e.g. warn that
-    # Qdrant isn't reachable yet → spurious failure).
+    # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg.
+    # Process substitution (not `list | grep | while`): a failed backend_get of
+    # these — the two LARGEST DR payloads (vectors + the "permanent archive"
+    # transcripts) — must `warn` (→ _FAILURES → non-zero restore), matching the
+    # memory/config/secrets pulls below. A pipe-into-while runs the body in a
+    # SUBSHELL where the _FAILURES append is lost, and its `|| true` masked the
+    # failure entirely — the silent-DR-footgun this converts away from. The
+    # `|| true` on the process-substitution input still absorbs an empty-subdir
+    # grep-miss (staging dir created only when something is actually pulled).
     for sub in qdrant transcripts; do
         dst="$BACKUP_DIR/data/qdrant"
         [ "$sub" = transcripts ] && dst="$BACKUP_DIR/transcripts"
-        # `|| true`: an empty subdir makes `grep` exit non-zero → pipefail would
-        # otherwise abort the whole restore.
-        backend_list "$snap/$sub" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u | while read -r fname; do
+        while read -r fname; do
             mkdir -p "$dst"
             if backend_get "$snap/$sub/$fname" "$dst/$fname"; then
                 log "  off-site: pulled $sub/$fname"
+            else
+                warn "off-site: failed to pull $sub/$fname from snapshot $latest"
             fi
-        done || true
+        done < <(backend_list "$snap/$sub" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u || true)
     done
 
     # memory / config overlays / secrets — previously only in the Tier-1 git clone. Pull
@@ -426,6 +453,42 @@ _pull_from_offsite() {
 }
 _pull_from_offsite
 
+# N5: a restore that finds NO payloads at all (empty/wrong BACKUP_DIR, no
+# off-site) used to log "no payload" per section and exit 0 "success" having
+# restored nothing — dangerous for an unattended DR run pointed at the wrong
+# place. Fail loudly up front instead. (A backup that IS present but whose
+# destinations are all newer legitimately no-ops later — that's found-but-
+# skipped, not this empty case, so it still succeeds.)
+# Any-file (not just *.gpg): §4/§4b restore memory/eval with `find -type f`, so a
+# legacy plaintext memory file (arbitrary extension) IS restorable and must count
+# here — matching what the sections actually accept, or the guard false-fails a
+# valid legacy backup.
+_dir_has_file() { [ -d "$1" ] && find "$1" -type f -print -quit 2>/dev/null | grep -q .; }
+_backup_has_payload() {
+    local d="$BACKUP_DIR" _m
+    { [ -f "$d/data/genesis.sql.gpg" ] || [ -f "$d/data/genesis.sql" ]; } && return 0
+    _dir_has_file "$d/data/qdrant" && return 0
+    _dir_has_file "$d/transcripts" && return 0
+    _dir_has_file "$d/memory" && return 0
+    _dir_has_file "$d/eval" && return 0
+    _dir_has_file "$d/creds" && return 0
+    [ -f "$d/secrets/secrets.env.gpg" ] && return 0
+    find "$d/config_overrides" -type f -name '*.local.yaml' -print -quit 2>/dev/null | grep -q . && return 0
+    # §7/§8 also restore secrets/creds from the host-side credential MIRROR when
+    # BACKUP_DIR lacks them (a no-git DR box whose only surviving copy is the
+    # guardian mirror) — so a mirror payload counts too, or the guard would
+    # wrongly refuse that recovery path.
+    while IFS= read -r _m; do
+        [ -n "$_m" ] || continue
+        [ -f "$_m/secrets/secrets.env.gpg" ] && return 0
+        _dir_has_file "$_m/creds" && return 0
+    done < <(_cred_fallback_sources)
+    return 1
+}
+if ! $DRY_RUN && ! _backup_has_payload; then
+    die "no restorable payloads found under $BACKUP_DIR (empty or wrong backup source, and no off-site snapshot pulled) — nothing to restore"
+fi
+
 # Check encrypted payloads exist without passphrase → fail fast.
 _has_encrypted=false
 for candidate in "$BACKUP_DIR"/data/genesis.sql.gpg "$BACKUP_DIR"/secrets/secrets.env.gpg; do
@@ -490,7 +553,12 @@ if resolve_payload "$BACKUP_DIR/data/genesis.sql"; then
                         log "SQLite: restored → $DB_FILE"
                         # Verify the restored DB is structurally sound — loud on failure.
                         # 2>&1 so a sqlite3 error (can't open, etc.) surfaces in the warn.
-                        _ic=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;" 2>&1 | head -1)
+                        # `|| true`: a HARD sqlite3 error (can't reopen the DB)
+                        # fails the pipeline; under set -e the assignment would
+                        # abort the script BEFORE the warn below, skipping the
+                        # rest of the restore. Capture the error text (2>&1) as
+                        # _ic and let the not-"ok" branch surface it. (N6)
+                        _ic=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;" 2>&1 | head -1) || true
                         if [ "$_ic" = "ok" ]; then
                             log "SQLite: integrity_check ok"
                         else

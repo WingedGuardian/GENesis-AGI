@@ -137,11 +137,13 @@ def test_skips_incomplete_latest_snapshot(sandbox):
 
 
 def test_no_complete_snapshot_skips_pull(sandbox):
-    """No COMPLETE snapshot anywhere → pull skipped, no crash."""
+    """No COMPLETE snapshot anywhere → pull skipped; then the empty backup
+    correctly fails the N5 guard (nothing to restore) rather than exiting 0."""
     _snapshot(sandbox, "sourcebox", _NEW, complete=False)
     proc = _run(sandbox, host_override="sourcebox")
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert "no COMPLETE dated snapshot" in proc.stdout, proc.stdout
+    assert proc.returncode != 0, proc.stdout
+    assert "no restorable payloads found" in proc.stdout, proc.stdout
 
 
 def test_explicit_host_override(sandbox):
@@ -178,12 +180,13 @@ def test_autodetect_ignores_stray_file_under_genesis(sandbox):
 
 
 def test_no_backend_configured_skips_pull(sandbox):
-    """backend=none → no off-site pull, no payload, no crash."""
+    """backend=none → no off-site pull attempted; with an otherwise-empty local
+    backup dir that leaves nothing to restore, so the N5 guard fails loudly
+    (rather than the old silent exit-0 'success')."""
     _snapshot(sandbox, "sourcebox", _NEW)
     proc = _run(sandbox, backend="none", host_override="sourcebox")
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    # nothing pulled → restore finds no SQL payload
-    assert "no backup payload" in proc.stdout.lower() or _db_value(sandbox) != "99"
+    assert proc.returncode != 0, proc.stdout
+    assert "no restorable payloads found" in proc.stdout, proc.stdout
 
 
 def test_pulls_and_rehydrates_memory_config_secrets(sandbox):

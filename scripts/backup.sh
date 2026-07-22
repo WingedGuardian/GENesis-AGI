@@ -88,6 +88,7 @@ _SQL_RESTORABLE=false   # AND round-trip-verified → eligible for off-site COMP
 _SQL_ESCROW_DRIFT=false # env-decryptable but escrow stale → off-site DR degraded
 _QDRANT_FRESH=""    # space-separated collections snapshotted+encrypted this run
 _QDRANT_FAILED=""   # collections that EXIST (HTTP 200) but failed to snapshot this run
+_SQL_TMP=""         # plaintext ~269MB dump temp — trap-cleaned (N2, credential-bearing)
 # Tier-1 replication: true once the local repo is in sync with the GitHub remote.
 _TIER1_PUSHED=false
 # Off-site snapshot bookkeeping. _T2_SNAPSHOT_COUNT / _T2_PRUNED stay UNSET until
@@ -110,7 +111,46 @@ _write_status() {
 {"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
-trap '_write_status; backend_cleanup' EXIT
+
+# BK-N1: fire the backup-FAILED Telegram alert from the EXIT trap, not inline at
+# the end — so an abort OUTSIDE the handled git block (mktemp, git add, clone,
+# an unexpected `set -e` death) still alerts instead of only writing
+# success:false to the status file. Fires exactly once (the inline 🚨 block was
+# removed); the off-site ⚠️ alert stays inline (only reachable on a completed
+# run, and its dedup must read the prior status before _write_status rewrites it).
+_alert_backup_failed() {
+    [ "$_SUCCESS" = "true" ] && return 0
+    # `set -e` stays active inside the EXIT trap, and this is the FIRST step of
+    # _on_exit — so it must never abort _on_exit (which would skip _write_status
+    # + the plaintext cleanup below). Two ways it could: (a) an abort in the
+    # narrow window before _send_telegram is defined (a 0-byte secrets.env
+    # failing load_secrets_file) → `declare -F` guard skips the call, and
+    # _write_status still records success:false for the health-alert path;
+    # (b) _send_telegram → queue_alert returning non-zero → `|| true`. Always
+    # returns 0.
+    if declare -F _send_telegram >/dev/null 2>&1; then
+        _send_telegram "🚨 *Backup failed*
+
+Reason: ${_FAILURE_REASON:-unknown (aborted before completion)}
+Time: $(date -Is)
+SQLite lines: $_SQLITE_LINES
+Duration: $(( $(date +%s) - _STARTED_AT ))s" || true
+    fi
+    return 0
+}
+
+_on_exit() {
+    # Exit handler: every step best-effort so a failure in one never skips the
+    # rest (status write + plaintext cleanup must always run).
+    _alert_backup_failed || true
+    _write_status || true
+    backend_cleanup || true
+    # N2: the credential-bearing plaintext SQL dump must not outlive the script
+    # if it died mid-section (before its inline rm).
+    rm -f "${_SQL_TMP:-}" 2>/dev/null || true
+    return 0
+}
+trap _on_exit EXIT
 
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
@@ -365,8 +405,12 @@ for collection in episodic_memory knowledge_base; do
     # as "may not exist" and every backup reported success with zero fresh
     # Qdrant payloads, forever (the audit's exact hole). --max-time 10: a
     # localhost liveness GET, not a transfer.
+    # curl -w already prints "000" on a connection failure AND exits non-zero,
+    # so `|| echo 000` would double-append → "000000"; swallow the exit with
+    # `|| true` and default only a genuinely-empty capture (curl absent).
     _probe_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-        "$QDRANT_URL/collections/$collection" 2>/dev/null || echo 000)
+        "$QDRANT_URL/collections/$collection" 2>/dev/null || true)
+    _probe_code=${_probe_code:-000}
     if [ "$_probe_code" = "404" ]; then
         log "Qdrant: collection $collection does not exist — skipping"
         continue
@@ -921,15 +965,8 @@ else
     log "WARNING: Backup incomplete — marking as failure (reason: $_FAILURE_REASON)"
 fi
 
-# --- Alert on failure via Telegram ---
-if [ "$_SUCCESS" != "true" ]; then
-    _send_telegram "🚨 *Backup failed*
-
-Reason: ${_FAILURE_REASON:-unknown}
-Time: $(date -Is)
-SQLite lines: $_SQLITE_LINES
-Duration: $(( $(date +%s) - _STARTED_AT ))s"
-fi
+# The backup-FAILED alert now fires from the EXIT trap (_alert_backup_failed),
+# so it covers early aborts too (BK-N1) and fires exactly once here.
 
 # --- Alert on off-site replication failure (local backup still OK) ---
 # Distinct from a backup failure: the local + Tier-1 backup succeeded, but the
