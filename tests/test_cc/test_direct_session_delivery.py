@@ -57,14 +57,14 @@ class TestResolveOriginTarget:
 
     def test_dm_origin(self):
         # No forum thread → DM; chat id == the numeric telegram user id.
-        assert self.f("telegram", "tg-831453901", None, "-100999") == ("831453901", None)
+        assert self.f("telegram", "tg-12345678", None, "-100999") == ("12345678", None)
 
     def test_forum_topic_origin(self):
         # Forum thread → the supergroup chat + the topic id.
-        assert self.f("telegram", "tg-831453901", "110", "-100999") == ("-100999", 110)
+        assert self.f("telegram", "tg-12345678", "110", "-100999") == ("-100999", 110)
 
     def test_forum_without_configured_chat_unaddressable(self):
-        assert self.f("telegram", "tg-831453901", "110", None) == (None, None)
+        assert self.f("telegram", "tg-12345678", "110", None) == (None, None)
 
     def test_non_numeric_user_unaddressable(self):
         assert self.f("telegram", "tg-notanumber", None, "-100999") == (None, None)
@@ -115,7 +115,7 @@ async def _make_origin(db, *, session_id, channel, user_id, thread_id=None):
 
 class TestDeliverResultToOrigin:
     async def test_dm_delivery(self, db):
-        await _make_origin(db, session_id="o-dm", channel="telegram", user_id="tg-831453901")
+        await _make_origin(db, session_id="o-dm", channel="telegram", user_id="tg-12345678")
         runner, pipeline = _runner_with_pipeline(db)
         req = DirectSessionRequest(
             prompt="x", delivery_mode=DeliveryMode.RESULT, origin_session_id="o-dm"
@@ -125,7 +125,7 @@ class TestDeliverResultToOrigin:
 
         pipeline.submit_urgent.assert_awaited_once()
         sent = pipeline.submit_urgent.call_args.args[0]
-        assert sent.target_chat_id == "831453901"
+        assert sent.target_chat_id == "12345678"
         assert sent.target_thread_id is None
         assert sent.channel == "telegram"
         assert sent.verbatim is True

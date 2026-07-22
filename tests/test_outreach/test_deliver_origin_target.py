@@ -91,11 +91,11 @@ def _targeted_req(*, chat_id, thread_id):
 @pytest.mark.asyncio
 async def test_targeted_dm_delivery(config, db, mock_formatter, mock_channel):
     pipeline = _pipeline(config, db, mock_formatter, mock_channel, recipients={"telegram": "999"})
-    result = await pipeline.submit_urgent(_targeted_req(chat_id="831453901", thread_id=None))
+    result = await pipeline.submit_urgent(_targeted_req(chat_id="12345678", thread_id=None))
 
     assert result.status == OutreachStatus.DELIVERED
     args, kwargs = mock_channel.send_message.call_args
-    assert args[0] == "831453901"  # delivered to the target chat, NOT the default "999"
+    assert args[0] == "12345678"  # delivered to the target chat, NOT the default "999"
     assert kwargs["message_thread_id"] is None
 
 
@@ -163,11 +163,11 @@ async def test_defer_carries_target_fields_for_retry(config, db, mock_formatter)
         recipients={"telegram": "999"},
         deferred_queue=deferred_queue,
     )
-    await pipeline.submit_urgent(_targeted_req(chat_id="831453901", thread_id=None))
+    await pipeline.submit_urgent(_targeted_req(chat_id="12345678", thread_id=None))
 
     deferred_queue.enqueue.assert_awaited_once()
     payload = json.loads(deferred_queue.enqueue.call_args.kwargs["payload"])
-    assert payload["target_chat_id"] == "831453901"
+    assert payload["target_chat_id"] == "12345678"
     assert payload["target_thread_id"] is None
 
 
