@@ -147,6 +147,44 @@ class IntakeStats:
 FENCE_RE = re.compile(r"^\s*```(?i:json)\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
 
 
+# Dict fields to pull, in priority order, when a bare JSON object has no plain
+# ``content`` field. Human-meaningful prose beats a raw JSON dump.
+_FINDING_BODY_FIELDS = ("content", "summary", "description", "body", "text", "detail")
+# Keys that are structural metadata, not part of the readable body.
+_FINDING_META_KEYS = frozenset({"title", "file", "name", "sources", "relevance"})
+
+
+def _render_finding_body(data: dict) -> str:
+    """Render a bare-object finding as readable prose for the knowledge-base body.
+
+    Used by the ``atomize`` ``json_single`` path — a MULTI_FINDING task that
+    returned a bare JSON OBJECT (no ``findings`` key). Instead of storing a raw
+    ``json.dumps`` blob (unreadable in the KB and a proactive-recall noise source
+    — the ``{...}`` bodies that motivated this fix), pull the human-meaningful
+    field in priority order, else fall back to a compact ``key: value`` render of
+    the remaining fields. Never returns a raw JSON dump.
+
+    Deliberately NOT used for structured findings-array items (``_finding_from_item``
+    keeps every field via json.dumps — code_audit's severity must survive) nor for
+    the ``single_item`` path (which stores model-intelligence's intentional
+    ``prefix + JSON`` body, parsed downstream by models_md_synthesis).
+    """
+    for key in _FINDING_BODY_FIELDS:
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    parts = [
+        f"{k}: {v}"
+        for k, v in data.items()
+        if k not in _FINDING_META_KEYS and v not in (None, "", [], {})
+    ]
+    if parts:
+        return "\n".join(parts)
+    # Degenerate: nothing renderable beyond a title/identity key. Fall back to the
+    # title so the unit is at least labelled, never a raw JSON dump.
+    return str(data.get("title") or data.get("file") or data.get("name") or "").strip()
+
+
 def _finding_from_item(item: object, index: int, default_title: str) -> AtomicFinding | None:
     """Build a finding from one entry of a findings array.
 
@@ -240,11 +278,12 @@ def atomize(content: str, source_task_type: str) -> tuple[list[AtomicFinding], s
             # unusable entry shapes) is a no-op result — never store the
             # raw envelope as a single unit.
             return [], "empty_findings"
-        # Valid JSON but no findings key — treat as single item.
+        # Valid JSON but no findings key — treat as single item, rendering the
+        # dict as readable prose rather than a raw json.dumps blob.
         if isinstance(data, dict):
             return [AtomicFinding(
                 title=str(data.get("title", source_task_type.replace("_", " ").title()))[:200],
-                content=json.dumps(data, indent=2) if not isinstance(data, str) else data,
+                content=_render_finding_body(data),
             )], "json_single"
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
@@ -610,10 +649,13 @@ async def _route_to_knowledge(
 
     from genesis.memory.knowledge_ingest import ingest_knowledge_unit
 
-    # Build provenance.
+    # Build provenance. source_pipeline is derived from the real IntakeSource
+    # (NOT hardcoded "surplus") so crawled external-world intelligence
+    # (model/github/web/recon) carries an honest label + external classification,
+    # while Genesis-authored insight tasks stay "surplus"/first-party.
     provenance = {
         "source_doc": f"intake:{scored.source.value}",
-        "source_pipeline": "surplus",
+        "source_pipeline": _pipeline_for_source(scored.source),
         "ingested_at": datetime.now(UTC).isoformat(),
     }
     if scored.generating_model:
@@ -683,6 +725,45 @@ def _domain_for_source(source: IntakeSource, task_type: str) -> str:
     if "code" in task_type:
         return "intelligence.code"
     return "intelligence.surplus"
+
+
+# Provenance ``source_pipeline`` label per IntakeSource. Two classes:
+#  - Genesis-AUTHORED intake (surplus insight tasks, background/user-directed
+#    research, user-mediated web capture) -> "surplus" — first-party
+#    (provenance._FIRST_PARTY_PIPELINES), so recall treats it as Genesis's own.
+#  - CRAWLED external-world intelligence (model registries, GitHub landscape, web
+#    monitoring, email/source recon) -> its own label, registered in
+#    provenance._EXTERNAL_PIPELINES -> classified external_untrusted, so recall
+#    wraps it in <external-content> markers (the correct injection-defense posture
+#    for content pulled from outside; it is NOT Genesis's own memory).
+# This map — NOT ``source.value`` — is the authority for the label, because
+# ``source_for_task_type`` collapses ALL surplus insight task types onto
+# ANTICIPATORY_RESEARCH; a naive ``.value`` would mislabel every Genesis insight
+# "anticipatory_research" and (being in no first-party set) flip it to
+# external_untrusted. Keep the crawled labels in lockstep with
+# provenance._EXTERNAL_PIPELINES.
+_PIPELINE_FOR_SOURCE: dict[IntakeSource, str] = {
+    IntakeSource.USER_DIRECTED: "surplus",
+    IntakeSource.FOREGROUND_WEB: "surplus",
+    IntakeSource.BACKGROUND_TASK: "surplus",
+    IntakeSource.ANTICIPATORY_RESEARCH: "surplus",
+    IntakeSource.EMAIL_RECON: "email_recon",
+    IntakeSource.MODEL_INTELLIGENCE: "model_intelligence",
+    IntakeSource.FREE_MODEL_INVENTORY: "model_intelligence",
+    IntakeSource.GITHUB_LANDSCAPE: "github_landscape",
+    IntakeSource.WEB_MONITORING: "web_monitoring",
+    IntakeSource.SOURCE_DISCOVERY: "source_discovery",
+}
+
+
+def _pipeline_for_source(source: IntakeSource) -> str:
+    """``source_pipeline`` provenance label for a KB unit ingested from ``source``.
+
+    Defaults to "surplus" (first-party) for any unmapped source — the safe,
+    backward-compatible choice; a NEW crawled source added later must be mapped
+    here AND registered in provenance._EXTERNAL_PIPELINES to classify correctly.
+    """
+    return _PIPELINE_FOR_SOURCE.get(source, "surplus")
 
 
 # ── Web search capture ───────────────────────────────────────────────────

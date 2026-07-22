@@ -86,6 +86,29 @@ INSIGHT_PRODUCING_TASK_TYPES: frozenset[TaskType] = frozenset({
 })
 
 
+# Task types whose completed output should be routed to the KNOWLEDGE BASE via
+# the intake pipeline (surplus/dispatch.py::_route_insights). This is a DISTINCT
+# concern from INSIGHT_PRODUCING_TASK_TYPES above (the measurement-JUDGE set):
+# KB-routing asks "does this task produce durable knowledge worth ingesting?",
+# whereas the judge set asks "can this task's output be graded for verified
+# correctness?". They mostly overlap, but BOOKMARK_ENRICHMENT is deliberately
+# EXCLUDED from the judge set (no live volume to validate its routing — see the
+# note above) while it DOES produce KB-bound content (enriched user bookmarks), so
+# it belongs here. Keeping the two sets separate avoids silently dropping
+# bookmark-enrichment KB writes when the judge set changes.
+#
+# Everything NOT in this set — action/maintenance tasks (MODEL_EVAL, DISK_CLEANUP,
+# DB_MAINTENANCE, DEAD_LETTER_REPLAY, BACKUP_VERIFICATION, J9_EVAL_BATCH,
+# FRESH_SESSION_TEST), monitors (INFRASTRUCTURE_MONITOR, CC_MEMORY_STALENESS), and
+# pipeline intermediates (RESEARCH_QUERY_GEN, PROMPT_REVIEW_*) — produces
+# point-in-time OPERATIONAL TELEMETRY, not durable knowledge: its output must NOT
+# be ingested into the knowledge base (it polluted the KB to 71% surplus before
+# this gate; the types' own docstring already says they "don't target the KB").
+KB_ROUTING_TASK_TYPES: frozenset[TaskType] = INSIGHT_PRODUCING_TASK_TYPES | {
+    TaskType.BOOKMARK_ENRICHMENT,
+}
+
+
 class ComputeTier(StrEnum):
     LOCAL_30B = "local_30b"
     FREE_API = "free_api"

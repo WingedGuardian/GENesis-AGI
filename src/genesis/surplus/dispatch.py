@@ -26,7 +26,11 @@ from typing import TYPE_CHECKING, Protocol
 
 from genesis.db.crud import surplus as surplus_crud
 from genesis.observability.types import Severity, Subsystem
-from genesis.surplus.types import INSIGHT_PRODUCING_TASK_TYPES, TaskType
+from genesis.surplus.types import (
+    INSIGHT_PRODUCING_TASK_TYPES,
+    KB_ROUTING_TASK_TYPES,
+    TaskType,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -148,6 +152,22 @@ async def _route_insights(
                 # for tracking; the quality judge below still runs.
                 content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
                 staging_id = f"{task.task_type.value}-{content_hash}"
+            elif task.task_type not in KB_ROUTING_TASK_TYPES:
+                # Non-KB-routing task (action/maintenance/monitor/pipeline-
+                # intermediate — e.g. DB_MAINTENANCE, DISK_CLEANUP, MODEL_EVAL,
+                # J9_EVAL_BATCH): its output is point-in-time OPERATIONAL
+                # TELEMETRY (a maintenance report, an eval-batch summary), NOT
+                # durable knowledge. Never ingest it into the knowledge base —
+                # doing so is what polluted the KB to 71% surplus. The task's
+                # outcome is still recorded via the normal outcome-bus path; we
+                # keep a synthetic staging_id for tracking only. The quality
+                # judge below stays gated on INSIGHT_PRODUCING and no-ops here.
+                content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                staging_id = f"{task.task_type.value}-{content_hash}"
+                logger.debug(
+                    "Skipping KB intake for non-KB-routing task %s (%s)",
+                    task.task_type.value, task.id[:8],
+                )
             else:
                 try:
                     from genesis.surplus.intake import (

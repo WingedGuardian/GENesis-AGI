@@ -42,6 +42,11 @@ _PIPELINE_FRIENDLY: dict[str, str] = {
     "extraction_job": "auto-extracted",
     "crag_web": "web",  # CRAG web-fallback augmentation — live internet content
     "recon": "recon/web",
+    "model_intelligence": "model intel",
+    "github_landscape": "github",
+    "web_monitoring": "web monitor",
+    "source_discovery": "source scan",
+    "email_recon": "email recon",
     "surplus": "surplus insight",
 }
 
@@ -54,6 +59,11 @@ _PIPELINE_SHORT: dict[str, str] = {
     "extraction_job": "extracted",
     "crag_web": "web",
     "recon": "recon",
+    "model_intelligence": "modelint",
+    "github_landscape": "github",
+    "web_monitoring": "webmon",
+    "source_discovery": "srcscan",
+    "email_recon": "emailrecon",
     "surplus": "surplus",
 }
 
@@ -105,10 +115,19 @@ def is_garbage(content: str | None) -> bool:
 # knowledge_base rows representing INTENTIONAL ingestions (user-requested docs,
 # references, structured extractions, dashboard file/URL uploads). Everything else
 # in knowledge_base is noisy pipeline output (surplus insights, recon/web crawl)
-# that must not surface into a proactive prompt. (Live: knowledge_base is ~71%
-# surplus.) ``curated`` is the dashboard upload / orchestrator ingestion pipeline
-# (genesis.knowledge.ingest_upload) — intentional user content, so it belongs here
-# even though it is external_untrusted (it still surfaces, labelled external).
+# that must not surface into a proactive prompt. ``curated`` is the dashboard
+# upload / orchestrator ingestion pipeline (genesis.knowledge.ingest_upload) —
+# intentional user content, so it belongs here even though it is
+# external_untrusted (it still surfaces, labelled external).
+#
+# TWO AXES — do NOT "reconcile" this set with _FIRST_PARTY_PIPELINES /
+# _EXTERNAL_PIPELINES above. This set = "proactive-WORTHY" (surface it unprompted).
+# Those sets = "provenance" (first-party vs external-world, for injection defense).
+# They are orthogonal: ``surplus`` is deliberately FIRST-PARTY (Genesis authored
+# it) yet NOT proactive-worthy (auto-generated insight, lower-trust than a
+# user-ingested doc), so it is absent HERE but present in _FIRST_PARTY_PIPELINES.
+# The crawled labels (model_intelligence/github_landscape/…) are external AND not
+# proactive-worthy → absent from both this set and _FIRST_PARTY_PIPELINES.
 _KB_INTENTIONAL_PIPELINES = frozenset(
     {
         "extraction_job",
@@ -190,6 +209,16 @@ _EXTERNAL_PIPELINES = frozenset(
         "inbox",
         "web_search",
         "web_fetch",
+        # Surplus/recon intake crawlers — external-world intelligence pulled off
+        # model registries, GitHub, the web, and email. Labelled by
+        # surplus/intake.py::_PIPELINE_FOR_SOURCE (keep the two in lockstep).
+        # Genesis-AUTHORED surplus insight tasks keep the "surplus" label and
+        # stay first-party below — only the crawled sources are external.
+        "model_intelligence",
+        "github_landscape",
+        "web_monitoring",
+        "source_discovery",
+        "email_recon",
     }
 )
 

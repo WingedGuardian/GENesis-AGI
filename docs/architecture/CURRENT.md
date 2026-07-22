@@ -215,7 +215,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 3403599d 2026-07-16
+verified: 0e65071c 2026-07-21
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -246,7 +246,14 @@ verified: 3403599d 2026-07-16
 - **`surplus/intake.py`** (intelligence intake: atomize → score → route)
   auto-ingests curated sources into the knowledge base with NO manifest gate —
   an INTENTIONAL bypass of the conversational confirm-first path; don't "fix"
-  it.
+  it. BUT only tasks in `types.KB_ROUTING_TASK_TYPES` (insight-producing +
+  bookmark-enrichment) route to the KB; action/maintenance/monitor/pipeline-
+  intermediate output is point-in-time OPERATIONAL TELEMETRY, gated OUT at
+  `dispatch._route_insights` (before the gate it filled the KB with db-
+  maintenance/eval reports — 71% surplus; d0005 purged the historical rows).
+  `source_pipeline` is per-source (`intake._pipeline_for_source`): Genesis-
+  authored → `surplus`/first-party; crawled recon/model/github/web →
+  distinct labels classified `external_untrusted` (wrapped on recall).
 - **`scheduler/` (top-level package) is the UserJobScheduler** — user-authored
   cron jobs (via MCP) that dispatch background DirectSessions. Distinct from
   `surplus/scheduler.py`.

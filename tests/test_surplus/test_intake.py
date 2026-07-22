@@ -107,8 +107,7 @@ class TestItemRobustness:
         assert findings[0].sources == []
 
     def test_string_sources_wrapped_not_char_iterated(self):
-        payload = ('{"findings": [{"title": "A", "content": "x",'
-                   ' "sources": "http://example.test"}]}')
+        payload = '{"findings": [{"title": "A", "content": "x", "sources": "http://example.test"}]}'
         findings, path = atomize(payload, "anticipatory_research")
         assert path == "json_findings"
         assert findings[0].sources == ["http://example.test"]
@@ -149,12 +148,24 @@ class TestFenceVariants:
 class TestBareArrayPayload:
     """code_audit-style prompts return a bare top-level array, not an envelope."""
 
-    _AUDIT_JSON = json.dumps([
-        {"file": "src/x.py", "line": 3, "severity": "high",
-         "description": "desc one", "confidence": 0.8},
-        {"file": "src/y.py", "line": None, "severity": "low",
-         "description": "desc two", "confidence": 0.6},
-    ])
+    _AUDIT_JSON = json.dumps(
+        [
+            {
+                "file": "src/x.py",
+                "line": 3,
+                "severity": "high",
+                "description": "desc one",
+                "confidence": 0.8,
+            },
+            {
+                "file": "src/y.py",
+                "line": None,
+                "severity": "low",
+                "description": "desc two",
+                "confidence": 0.6,
+            },
+        ]
+    )
 
     def test_fenced_bare_array_atomized(self):
         findings, path = atomize(f"```json\n{self._AUDIT_JSON}\n```", "code_audit")
@@ -223,3 +234,50 @@ class TestKbContent:
     def test_minimal_shape(self):
         f = AtomicFinding(title="T", content="C")
         assert kb_content_for_finding(f) == "T\n\nC"
+
+
+# ── source_pipeline honest labels + json_single prose render ─────────────
+
+from genesis.surplus.intake import (  # noqa: E402
+    _pipeline_for_source,
+    _render_finding_body,
+)
+
+
+class TestPipelineForSource:
+    def test_genesis_authored_is_surplus(self):
+        for src in (
+            IntakeSource.ANTICIPATORY_RESEARCH,
+            IntakeSource.BACKGROUND_TASK,
+            IntakeSource.USER_DIRECTED,
+            IntakeSource.FOREGROUND_WEB,
+        ):
+            assert _pipeline_for_source(src) == "surplus"
+
+    def test_crawled_sources_get_distinct_labels(self):
+        assert _pipeline_for_source(IntakeSource.MODEL_INTELLIGENCE) == "model_intelligence"
+        assert _pipeline_for_source(IntakeSource.FREE_MODEL_INVENTORY) == "model_intelligence"
+        assert _pipeline_for_source(IntakeSource.GITHUB_LANDSCAPE) == "github_landscape"
+        assert _pipeline_for_source(IntakeSource.WEB_MONITORING) == "web_monitoring"
+        assert _pipeline_for_source(IntakeSource.SOURCE_DISCOVERY) == "source_discovery"
+        assert _pipeline_for_source(IntakeSource.EMAIL_RECON) == "email_recon"
+
+
+class TestJsonSingleProseRender:
+    def test_bare_object_renders_summary_not_raw_json(self):
+        # A MULTI_FINDING task returning a bare object (no findings key) →
+        # json_single. The body must be readable prose, never a JSON dump.
+        findings, path = atomize(
+            '{"title": "Idea", "summary": "a readable summary line"}', "brainstorm_self"
+        )
+        assert path == "json_single"
+        assert findings[0].content == "a readable summary line"
+        assert "{" not in findings[0].content
+
+    def test_render_finding_body_falls_back_to_key_values(self):
+        body = _render_finding_body({"analysis": "x found", "recommendation": "do y"})
+        assert body == "analysis: x found\nrecommendation: do y"
+
+    def test_render_finding_body_skips_meta_keys(self):
+        # title/file/sources/relevance are structural, not body.
+        assert _render_finding_body({"title": "T", "detail": "the detail"}) == "the detail"
