@@ -108,3 +108,38 @@ async def test_list_by_channel_filters_by_person_id(db):
     rows = await outreach.list_by_channel(db, "discord", person_id="alice")
     assert len(rows) == 1
     assert rows[0]["id"] == "ohpid3"
+
+
+# --- sync reader (hook context) ---------------------------------------------
+
+
+def _seed_notifications(path):
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE outreach_history "
+        "(id TEXT PRIMARY KEY, topic TEXT, category TEXT, delivered_at TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO outreach_history (id, topic, category, delivered_at) VALUES (?,?,?,?)",
+        [
+            ("a", "PR steward: #1 closed", "notification", "2026-07-20T00:00:00+00:00"),
+            ("b", "Billy update", "notification", "2026-07-20T00:00:00+00:00"),  # topic
+            ("c", "PR steward tick", "digest", "2026-07-20T00:00:00+00:00"),  # category
+            ("d", "PR steward: #2", "notification", None),  # null delivered_at
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_get_notifications_by_topic_sync_filters(tmp_path):
+    db = tmp_path / "g.db"
+    _seed_notifications(db)
+    rows = outreach.get_notifications_by_topic_sync(str(db), topic_like="%steward%")
+    assert [r["id"] for r in rows] == ["a"]  # topic+category+non-null delivered_at
+
+
+def test_get_notifications_by_topic_sync_missing_db_returns_empty(tmp_path):
+    assert (
+        outreach.get_notifications_by_topic_sync(str(tmp_path / "nope.db"), topic_like="%x%") == []
+    )

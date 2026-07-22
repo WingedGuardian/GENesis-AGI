@@ -1,0 +1,27 @@
+# PR-watch inline surface — read live by the surface_pr_updates SessionStart
+# hook (this file + ~/.genesis/config/pr_watch.local.yaml), so a
+# settings_update("pr_watch", {...}) or a hand edit takes effect at the next
+# session start — no restart.
+#
+# What it does: mirrors the upstream-pr-steward campaign's own owner
+# notifications (already in outreach_history) inline, as a one-line nudge, so a
+# tracked-PR status change you missed on Telegram still reaches you next
+# foreground session.
+#
+# Master switch: false stops the hook before any DB/sidecar work.
+# Hook-level kill switch (separate, stdlib-cheap): GENESIS_PR_WATCH_DISABLED=1
+# short-circuits the hook before it imports anything.
+enabled: true
+
+# How far back to scan outreach_history for steward notifications to surface.
+# Also the sidecar-prune horizon (entries for pings older than this fall out of
+# the scan and are dropped from the sidecar automatically).
+lookback_days: 30
+
+# A surfaced update keeps reappearing at session start until it is this many
+# days old, then it stops nagging. "Surface until you notice it, not forever."
+resurface_days: 10
+
+# Max distinct updates rendered on the nudge line; overflow collapses to
+# "+N more".
+max_surface: 5

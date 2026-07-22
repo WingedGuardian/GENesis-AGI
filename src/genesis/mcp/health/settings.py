@@ -132,6 +132,20 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "pr_watch": SettingsDomain(
+        name="pr_watch",
+        description=(
+            "PR-watch inline surface — master `enabled` plus lookback/resurface/"
+            "max_surface knobs. Mirrors the upstream-pr-steward campaign's own "
+            "owner notifications into foreground CC sessions as a one-line nudge, "
+            "so a tracked-PR status change missed on Telegram still reaches the "
+            "user next session. Read live by the SessionStart hook — takes effect "
+            "next session start. Hook kill switch: GENESIS_PR_WATCH_DISABLED=1."
+        ),
+        config_filename="pr_watch.yaml",
+        readonly=False,
+        needs_restart=False,  # read fresh by each SessionStart hook invocation
+    ),
     "skill_evolution_gate": SettingsDomain(
         name="skill_evolution_gate",
         description=(
@@ -936,6 +950,24 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_pr_watch(changes: dict) -> list[str]:
+    """Validate pr-watch lever changes (see
+    genesis.session_awareness.pr_watch_config)."""
+    from genesis.session_awareness.pr_watch_config import _INT_KNOBS
+
+    errors: list[str] = []
+    valid_keys = ("enabled", *_INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 def _validate_memory_recall(changes: dict) -> list[str]:
     """Validate memory_recall changes (see genesis.memory.graph_expansion).
 
@@ -1021,6 +1053,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
+    "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,
     "cc_roster": _validate_cc_roster,
     "resilience": _validate_resilience,

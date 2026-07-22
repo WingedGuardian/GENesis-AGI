@@ -479,9 +479,26 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: b662f3e3 2026-07-17
+verified: 6d79e097 2026-07-21
 ```
 
+- **PR-watch inline surface (2026-07-21)**: a SessionStart hook
+  (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
+  `upstream-pr-steward` campaign's own owner notifications — the ones it already
+  logs to `outreach_history` (category `notification`, topic `%steward%`) when a
+  tracked EXTERNAL PR changes — into foreground CC sessions as a one-line
+  `[PRs] …` nudge, so a status change missed on Telegram still reaches the user.
+  Read-only, **home-anchored DB** (NOT `genesis_db_path()`/`repo_root()`, which
+  would read an empty `<worktree>/data/` — the same trap `_charter_db_path`
+  avoids). Seen-state is a home-anchored JSON sidecar
+  (`~/.genesis/pr_watch/seen.json`), NOT `outreach_history.opened_at` (that
+  column is unwired, always NULL); a change resurfaces each session for
+  `resurface_days` then stops, and the sidecar self-prunes to the `lookback_days`
+  window (no retention step). Lever: settings domain `pr_watch`
+  (`config/pr_watch.yaml` + `pr_watch_config.py`) + `GENESIS_PR_WATCH_DISABLED`
+  kill switch; skips dispatched sessions (`GENESIS_CC_SESSION=1`) so the human's
+  next foreground session still gets the nudge. The campaign's discovery/notify
+  behavior lives in its install-local strategy doc (campaigns ship zero defaults).
 - **Infra protection posture (2026-07-16; network plane 2026-07-17)**: hourly
   `_check_infra_protection_posture` reads the infra profile's effective facts
   and raises one `high` `infrastructure_alert` when a memory-plane protection
