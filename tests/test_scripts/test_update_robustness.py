@@ -97,12 +97,14 @@ def test_health_curls_have_max_time(text: str) -> None:
     assert re.search(rf"curl -sf {re.escape(health)}", text) is None
 
 
-def test_ssh_legs_use_serveralive_not_blanket_timeout(text: str) -> None:
-    # All four guardian ssh invocations bound a DEAD connection via ServerAlive.
+def test_ssh_legs_bound_dead_links_and_wedged_commands(text: str) -> None:
+    # All four guardian ssh invocations keep a DEAD connection bounded via
+    # ServerAlive AND cap a WEDGED-but-keepalive-answering remote command via a
+    # per-operation `timeout` (ServerAlive alone can't bound the latter).
     assert text.count("-o ServerAliveInterval=15 -o ServerAliveCountMax=4") == 4
-    # A blanket `timeout N ssh` would wrongly kill a slow-but-alive redeploy.
-    assert "timeout 60 ssh" not in text
-    assert re.search(r"timeout \d+ ssh ", text) is None
+    assert text.count("timeout 30 ssh -i") == 2  # the two fast `version` reads
+    assert "timeout 600 ssh -i" in text  # the slow redeploy (generous ceiling)
+    assert "timeout 300 ssh -i" in text  # the `update` verb
 
 
 # ── #8 — consistent DB snapshot ────────────────────────────────────────────

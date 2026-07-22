@@ -208,7 +208,11 @@ _sync_deploy_targets() {
             # ("$OLD_COMMIT"→HEAD) silently skipped the redeploy whenever the host
             # was last deployed from a since-rebased local HEAD (a no-op run has
             # OLD_COMMIT == HEAD), stranding it on an orphan commit indefinitely.
-            HOST_VER_RAW="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            # timeout 30: `version` is a fast JSON read. ServerAlive bounds a
+            # DEAD link; `timeout` also bounds a WEDGED remote command that still
+            # answers keepalives (ServerAlive alone would not). `|| true` keeps a
+            # timeout/kill from aborting — an empty result is handled below.
+            HOST_VER_RAW="$(timeout 30 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
                 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                 "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
             HOST_DEPLOYED_COMMIT="$(printf '%s' "$HOST_VER_RAW" \
@@ -263,8 +267,12 @@ _sync_deploy_targets() {
                     # ssh exits) without capping a legitimately slow redeploy:
                     # while the host runs git/pip the SSH transport stays alive
                     # and answers keepalives, so a working redeploy is never
-                    # killed — only a truly hung/dead link is.
-                    ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                    # killed — only a truly hung/dead link is. timeout 600 is the
+                    # backstop for a WEDGED redeploy that keeps answering
+                    # keepalives: 10 min is generous for archive-unpack + git +
+                    # pip on a slow host while still bounding an indefinite hang
+                    # (a killed redeploy is non-fatal — recorded as degraded).
+                    timeout 600 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
                         -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                         "${HOST_USER}@${HOST_IP}" "$1" < "$GUARDIAN_ARCHIVE" 2>/dev/null
                 }
@@ -298,7 +306,9 @@ _sync_deploy_targets() {
                         # Gateway too old to know 'redeploy' at all — use 'update'
                         # to install the new gateway, then retry the verified form.
                         echo "  Redeploy not available — falling back to update + retry"
-                        if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                        # timeout 300: the gateway `update` verb does a host git
+                        # pull + reinstall — minutes at most; bounds a wedged one.
+                        if timeout 300 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
                                -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                                "${HOST_USER}@${HOST_IP}" update 2>&1; then
                             echo "  Guardian updated via git pull — retrying redeploy..."
@@ -326,7 +336,7 @@ _sync_deploy_targets() {
                 # the nightly align timer re-probes. Best-effort: an empty
                 # re-probe keeps the original payload rather than degrading
                 # the pin sync.
-                _post_redeploy_raw="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                _post_redeploy_raw="$(timeout 30 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
                     -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
                     "${HOST_USER}@${HOST_IP}" version 2>/dev/null || true)"
                 if [ -n "$_post_redeploy_raw" ]; then
@@ -951,12 +961,17 @@ print(json.dumps(data, indent=2))
 PYEOF
         then
             echo "  WARNING: could not write structured conflict context (advisory)"
-            rm -f "$HOME/.genesis/update_conflicts.json.tmp"
+            rm -f "$HOME/.genesis/update_conflicts.json.tmp" || true
+        elif mv "$HOME/.genesis/update_conflicts.json.tmp" "$HOME/.genesis/update_conflicts.json"; then
+            echo ""
+            echo "  Conflict context written to ~/.genesis/update_conflicts.json"
         else
-            mv "$HOME/.genesis/update_conflicts.json.tmp" "$HOME/.genesis/update_conflicts.json"
+            # The rename must stay non-fatal too (disk full / perms): it is still
+            # inside the armed ERR-trap window, and this is advisory supervisor
+            # context — a failure here must not escalate into a full rollback.
+            echo "  WARNING: could not finalize conflict context (advisory)"
+            rm -f "$HOME/.genesis/update_conflicts.json.tmp" || true
         fi
-        echo ""
-        echo "  Conflict context written to ~/.genesis/update_conflicts.json"
 
         # Abort the merge — don't leave the working tree in a broken state.
         # CC will resolve conflicts in a worktree, not in the main checkout.
