@@ -1,4 +1,4 @@
-"""d0005 — purge surplus operational-telemetry rows from the knowledge base.
+"""d0006 — purge surplus operational-telemetry rows from the knowledge base.
 
 Non-KB-routing surplus tasks (action/maintenance/monitor/pipeline-intermediate)
 wrote single_item ops-telemetry KB units before the KB_ROUTING gate. This purges
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 
-import genesis.db.data_migrations.d0005_purge_surplus_ops_telemetry as d0005
+import genesis.db.data_migrations.d0006_purge_surplus_ops_telemetry as d0006
 
 # Minimal slices of the tables the migration touches (columns it reads/deletes).
 _SCHEMA = """
@@ -87,8 +87,8 @@ def _seed(path) -> None:
 
 
 def _patch(monkeypatch, path, *, deleted=None, qdrant_fail_ids=()):
-    monkeypatch.setattr(d0005, "genesis_db_path", lambda: str(path))
-    monkeypatch.setattr(d0005, "get_client", lambda: "FAKE_CLIENT")
+    monkeypatch.setattr(d0006, "genesis_db_path", lambda: str(path))
+    monkeypatch.setattr(d0006, "get_client", lambda: "FAKE_CLIENT")
 
     def _fake_delete(client, *, collection, point_id):
         if point_id in qdrant_fail_ids:
@@ -96,7 +96,7 @@ def _patch(monkeypatch, path, *, deleted=None, qdrant_fail_ids=()):
         if deleted is not None:
             deleted.append((collection, point_id))
 
-    monkeypatch.setattr(d0005, "delete_point", _fake_delete)
+    monkeypatch.setattr(d0006, "delete_point", _fake_delete)
 
 
 def test_purges_only_ops_telemetry_in_surplus_domain(tmp_path, monkeypatch):
@@ -105,10 +105,10 @@ def test_purges_only_ops_telemetry_in_surplus_domain(tmp_path, monkeypatch):
     deleted: list = []
     _patch(monkeypatch, path, deleted=deleted)
 
-    assert d0005.verify() is False
-    summary = d0005.migrate()
+    assert d0006.verify() is False
+    summary = d0006.migrate()
     assert summary["purged"] == 2  # u1 (Db Maintenance) + u3 (Research Query Gen)
-    assert d0005.verify() is True
+    assert d0006.verify() is True
 
     db = sqlite3.connect(path)
     units = {r[0] for r in db.execute("SELECT id FROM knowledge_units").fetchall()}
@@ -131,9 +131,9 @@ def test_migrate_is_idempotent(tmp_path, monkeypatch):
     path = tmp_path / "genesis.db"
     _seed(path)
     _patch(monkeypatch, path)
-    assert d0005.migrate()["purged"] == 2
-    assert d0005.migrate()["purged"] == 0
-    assert d0005.verify() is True
+    assert d0006.migrate()["purged"] == 2
+    assert d0006.migrate()["purged"] == 0
+    assert d0006.verify() is True
 
 
 def test_qdrant_failure_leaves_unit_for_retry(tmp_path, monkeypatch):
@@ -142,10 +142,10 @@ def test_qdrant_failure_leaves_unit_for_retry(tmp_path, monkeypatch):
     path = tmp_path / "genesis.db"
     _seed(path)
     _patch(monkeypatch, path, qdrant_fail_ids={"q1"})
-    summary = d0005.migrate()
+    summary = d0006.migrate()
     assert summary["purged"] == 1  # only u3 (q3) purged; u1 (q1) failed
     assert summary["qdrant_failed"] == 1
-    assert d0005.verify() is False  # u1 still present → will retry next boot
+    assert d0006.verify() is False  # u1 still present → will retry next boot
 
     db = sqlite3.connect(path)
     units = {r[0] for r in db.execute("SELECT id FROM knowledge_units").fetchall()}
@@ -160,8 +160,8 @@ def test_empty_db_verifies_clean(tmp_path, monkeypatch):
     db.commit()
     db.close()
     _patch(monkeypatch, path)
-    assert d0005.verify() is True
-    assert d0005.migrate() == {"purged": 0, "qdrant_deleted": 0}
+    assert d0006.verify() is True
+    assert d0006.migrate() == {"purged": 0, "qdrant_deleted": 0}
 
 
 def test_signature_titles_are_all_non_kb_routing():
@@ -173,7 +173,7 @@ def test_signature_titles_are_all_non_kb_routing():
     non_kb_titles = {
         tt.value.replace("_", " ").title() for tt in TaskType if tt not in KB_ROUTING_TASK_TYPES
     }
-    assert set(d0005._OPS_SIGNATURES) <= non_kb_titles
+    assert set(d0006._OPS_SIGNATURES) <= non_kb_titles
 
 
 def test_generic_title_with_prose_body_is_not_purged(tmp_path, monkeypatch):
@@ -190,5 +190,5 @@ def test_generic_title_with_prose_body_is_not_purged(tmp_path, monkeypatch):
     db.commit()
     db.close()
     _patch(monkeypatch, path)
-    assert d0005.migrate()["purged"] == 0
-    assert d0005.verify() is True
+    assert d0006.migrate()["purged"] == 0
+    assert d0006.verify() is True
