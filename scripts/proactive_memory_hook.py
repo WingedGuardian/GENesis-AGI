@@ -983,18 +983,50 @@ def _ensure_knowledge_retrieved_count(db_path: Path) -> None:
         pass  # Never block
 
 
+def _server_failure_reason(
+    *, status: int | None = None, detail: str = "", exc: BaseException | None = None
+) -> str:
+    """Human-readable cause for the degraded banner.
+
+    Distinguishes a genuinely unreachable server (connection refused / connect
+    timeout — e.g. mid-restart) from a server that IS reachable but whose recall
+    call failed or ran past its 4.5s budget (a 503 / read-timeout). Calling the
+    latter "unreachable" both misleads and masks the real latency story, so the
+    banner names the actual cause instead.
+    """
+    import httpx
+
+    if exc is not None:
+        # ConnectTimeout is ALSO a TimeoutException, so the connect cases must be
+        # tested before the generic timeout branch or a failed connect would be
+        # mislabeled as a slow-but-reachable recall.
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+            return "genesis-server unreachable (connection refused — likely restarting or down)"
+        if isinstance(exc, httpx.TimeoutException):
+            return f"recall timed out after {_SERVER_TIMEOUT_S:g}s (server reachable, under load)"
+        return "recall call failed (server reachable)"
+    if status is not None and status != 200:
+        base = f"server returned HTTP {status} (reachable"
+        if status == 503:
+            base += ", over budget or still booting"
+        base += ")"
+        return f"{base}: {detail}" if detail else base
+    return "genesis-server unavailable"
+
+
 async def _call_server(
     prompt: str,
     session_id: str,
     file_keywords: list[str],
     suppress_ids: frozenset[str],
-) -> dict | None:
+) -> tuple[dict | None, str | None]:
     """POST the prompt to the genesis-server proactive recall endpoint.
 
-    Returns the parsed JSON dict on a 200 (status ``ok`` or ``disabled``), or
-    None on ANY failure (connection refused, timeout, non-200, bad JSON) so the
-    caller falls back to the degraded FTS5 path. Never raises — a down or slow
-    server must never block the user's prompt.
+    Returns ``(data, None)`` with the parsed JSON dict on a 200 (status ``ok`` or
+    ``disabled``), or ``(None, reason)`` on ANY failure — where ``reason`` is a
+    short human-readable cause (see :func:`_server_failure_reason`) used for the
+    degraded banner. The caller falls back to the degraded FTS5 path either way.
+    Never raises — a down or slow server must never block the user's prompt.
     """
     import httpx
 
@@ -1015,32 +1047,45 @@ async def _call_server(
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             resp = await client.post(_RECALL_ENDPOINT, json=payload)
         if resp.status_code != 200:
-            return None
+            detail = ""
+            try:
+                body = resp.json()
+                if isinstance(body, dict) and isinstance(body.get("error"), str):
+                    detail = body["error"]
+            except Exception:
+                pass
+            return None, _server_failure_reason(status=resp.status_code, detail=detail)
         data = resp.json()
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+        if isinstance(data, dict):
+            return data, None
+        return None, "server returned an unexpected (non-dict) response"
+    except Exception as exc:
+        return None, _server_failure_reason(exc=exc)
 
 
-def _format_degraded(results: list[dict], *, forced_local: bool = False) -> str:
+def _format_degraded(
+    results: list[dict], *, forced_local: bool = False, reason: str | None = None
+) -> str:
     """Render FTS5/code fallback hits with a visible degraded marker.
 
     Used ONLY when the server recall path is unavailable (server down/slow) or
     deliberately bypassed (``GENESIS_PROACTIVE_HOOK_MODE=local``). Reuses the
     offline SQLite enrichment (_enrich_with_metadata) + age formatting, but tags
     every line ``[Memory·degraded | …]`` so the model knows this is keyword-only
-    recall, not the full engine. No write-backs happen on this path.
+    recall, not the full engine. ``reason`` names the actual server-path failure
+    (unreachable vs reachable-but-slow/errored) so the banner never mislabels a
+    503/timeout as "unreachable". No write-backs happen on this path.
     """
     if not results:
         return ""
     _enrich_with_metadata(results)
     from genesis.security.sanitizer import strip_boundary_markers
 
-    banner = (
-        "[Memory recall in local keyword-only mode (GENESIS_PROACTIVE_HOOK_MODE=local)]"
-        if forced_local
-        else "[Memory recall degraded — genesis-server unreachable; keyword-only results]"
-    )
+    if forced_local:
+        banner = "[Memory recall in local keyword-only mode (GENESIS_PROACTIVE_HOOK_MODE=local)]"
+    else:
+        cause = reason or "genesis-server unavailable"
+        banner = f"[Memory recall degraded — {cause}; keyword-only results]"
     lines = [banner]
     for rank, r in enumerate(results):
         max_len = 300 if rank == 0 else 200
@@ -1384,9 +1429,12 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # ── Delegated recall: server engine (default) with FTS5 fallback ─
     server_data: dict | None = None
     server_ms: float | None = None
+    server_reason: str | None = None
     if _HOOK_MODE != "local":
         _t_srv = time.monotonic()
-        server_data = await _call_server(prompt, session_id, file_keywords, suppress_ids)
+        server_data, server_reason = await _call_server(
+            prompt, session_id, file_keywords, suppress_ids
+        )
         server_ms = (time.monotonic() - _t_srv) * 1000
 
     if server_data is not None:
@@ -1486,7 +1534,9 @@ async def _run(prompt: str, session_id: str = "") -> None:
         fused += code_results[: _MAX_RESULTS - len(fused)]
 
     if fused:
-        output = _format_degraded(fused, forced_local=(fallback_mode == "local"))
+        output = _format_degraded(
+            fused, forced_local=(fallback_mode == "local"), reason=server_reason
+        )
         if output:
             print(output)
             sys.stdout.flush()

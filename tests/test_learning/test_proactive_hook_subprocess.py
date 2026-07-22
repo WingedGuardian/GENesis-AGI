@@ -321,6 +321,34 @@ def test_server_down_falls_back_to_fts5(fts_db: Path, tmp_path: Path):
     assert m["fts_only_fallback"] is True
 
 
+def test_server_503_banner_says_reachable_not_unreachable(fts_db: Path, tmp_path: Path):
+    """A REACHABLE server returning 503 (recall over its 4.5s budget) must fall back
+    with a banner that names the real cause — HTTP 503, server reachable — and must
+    NOT mislabel it 'unreachable'. Regression guard for the blanket-'unreachable' bug.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    with _stub_server({"error": "recall over budget"}, status=503) as base_url:
+        result = _run_hook(
+            _PROMPT,
+            _SESSION,
+            {
+                "GENESIS_DB_PATH": str(fts_db),
+                "GENESIS_PROACTIVE_HOOK_URL": base_url,
+                "GENESIS_PROACTIVE_HOOK_MODE": "server",
+            },
+            home,
+        )
+    assert result.returncode == 0, result.stderr[:2000]
+    out = result.stdout
+    assert "Memory recall degraded" in out
+    assert "unreachable" not in out  # the fix: a reachable 503 is not "unreachable"
+    assert "503" in out and "reachable" in out
+    assert f"id:{_FTS_ID[:8]}" in out  # FTS5 fallback still surfaced
+    m = _metrics(home)
+    assert m["mode"] == "degraded"
+
+
 def test_mode_off_no_recall(fts_db: Path, tmp_path: Path):
     """GENESIS_PROACTIVE_HOOK_MODE=off → no memory recall (no server, no FTS5)."""
     home = tmp_path / "home"

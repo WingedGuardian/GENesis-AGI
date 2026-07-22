@@ -54,7 +54,14 @@ local genesis-server; override it if you run the server on a non-default port.
 
 On any server failure (connection refused, timeout, non-200, bad JSON) the hook
 falls back to a **keyword-only FTS5 search** of `episodic_memory` and prints a
-visible banner + `[Memory·degraded | …]` tags. The fallback does **no**
+visible banner + `[Memory·degraded | …]` tags. The banner **names the actual
+cause** rather than always saying "unreachable": a genuinely down/restarting
+server (connection refused / connect timeout) reads `genesis-server unreachable`,
+while a *reachable* server that returned a 503 (recall over its 4.5s budget or
+still booting), timed out, or errored reads `server returned HTTP 503
+(reachable …)` / `recall timed out … (server reachable …)`. This stops a slow-or-
+busy recall from being mislabeled as a dead server (and from masking the latency
+signal). The fallback does **no**
 write-backs, but it still re-applies the external-world provenance label
 (`Memory·external`) and emits the gate-4 injection-shadow record for any
 blockable content it injects locally — the same injection-defense invariant the
