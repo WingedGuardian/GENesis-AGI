@@ -1073,6 +1073,42 @@ verified: 9037d45b 2026-07-07
 - **workflows/**: YAML DAG executor — GROUNDWORK(workflow-engine), built with
   NO runtime caller. Not live; do not treat as a capability.
 
+## 14. Reflex arc — self-bug detection & repair
+
+The afferent nerve for Genesis's own screaming bugs: detect `task.failed`
+exceptions, fingerprint/dedup them, and (later phases) diagnose → card →
+fix under a human-gated tier model. **PR1 only (dark)** — ingestion
+scaffolding, no cards/sessions/LLM yet. Spec:
+`docs/superpowers/specs/2026-07-21-reflex-arc-design.md`.
+
+```yaml subsystem-map
+entry: reflex-arc
+modules: [reflex]
+verified: bbe3a440 2026-07-21
+```
+
+- **reflex/**: `fingerprint.py` (pure: normalize task name, line-number-free
+  frame tail → stable sha, `class_key = ErrorType×subsystem` from the deepest
+  genesis frame), `config.py` (`ingest_enabled` gate, default OFF +
+  `GENESIS_REFLEX_INGEST_OFF` env kill), `ingest.py` (`ReflexIngestor` —
+  bus subscriber ENQUEUES only to a bounded queue; a `tracked_task` worker
+  drains + upserts off the event-bus dispatch path). Wired at
+  `runtime/init/reflex.py` (after `tasks`), which installs the **default
+  event bus** for `tracked_task` (`util/tasks.set_default_event_bus`) ONLY
+  when ingestion is enabled — before this, ~63 of 66 `tracked_task` sites
+  emitted no failure event.
+- **Tables** (`reflex_signals` upsert-deduped by `fingerprint`;
+  `reflex_diagnoses`; `reflex_verdicts` = the taste corpus, never pruned).
+  Later-phase columns/statuses ship now so the lifecycle CHECK never needs a
+  rebuild migration.
+- **Trap**: `task.failed` is carved out of the ego reactive path
+  (`runtime/init/ego._is_reflex_owned_event`) — reflex owns that class; the
+  ego's message-keyed dedup can't absorb variable-payload failure bursts
+  (a documented storm mode in `ego/cadence.py`).
+- GROUNDWORK: diagnose lane (PR2), fix lane (PR3) — `reflex_diagnoses` /
+  `reflex_verdicts` writers and the card/gate/dispatch flow are NOT yet
+  built; the tables are inert scaffolding in PR1.
+
 ---
 
 *Maintenance: run `python scripts/check_subsystem_map.py` from the repo root;
