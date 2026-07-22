@@ -613,8 +613,16 @@ async def proactive_context(
     recall_ms = (time.monotonic() - t_recall) * 1000
 
     t_enrich = time.monotonic()
-    await _enrich(db, dicts)
-    await _breadcrumbs(db, dicts)
+    # PR-4b (ac27b693): route these post-recall reads off the shared write lock
+    # onto recall's read-only pool — the same _ro_read seam recall's own reads
+    # use. Both are pure indexed SELECTs (memory_metadata PK / memory_links
+    # source_id), so under concurrency they were queuing behind server writes,
+    # not query cost. _ro_read runs fn(pooled_conn, *args) and falls back to the
+    # shared connection on any pool miss/error, so this is never worse than the
+    # pre-pool path. retriever is genesis.mcp.memory._retriever (see CC memory
+    # two_retriever_wiring) — the same instance the pool was wired into in PR-4.
+    await retriever._ro_read(_enrich, dicts)
+    await retriever._ro_read(_breadcrumbs, dicts)
     enrich_ms = (time.monotonic() - t_enrich) * 1000
 
     lines = prof.renderer(dicts)

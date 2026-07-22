@@ -10,10 +10,12 @@ pool error re-reads real data instead of fail-open ``None``.
 
 from __future__ import annotations
 
+import sqlite3
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
-from genesis.db.connection import ReadPoolClosed
+from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
+from genesis.memory.proactive import _breadcrumbs, _enrich
 from genesis.memory.retrieval import HybridRetriever
 
 
@@ -97,3 +99,44 @@ async def test_ro_read_falls_back_on_readpoolclosed():
 
     assert await retriever._ro_read(fn, 1) == 1
     assert seen["conn"] is retriever._db
+
+
+async def test_enrich_and_breadcrumbs_run_through_pool(tmp_path):
+    """PR-4b functional: the proactive engine's post-recall reads (``_enrich`` +
+    ``_breadcrumbs``) execute correctly on a POOLED ``mode=ro`` connection via
+    ``_ro_read`` — backfilling ``_created_at``/``_wing`` and attaching
+    ``related_ids`` off the shared write lock, exactly as the engine now calls
+    them. Both queries are indexed seeks; this pins that they read real rows
+    through the pool, not just that ``_ro_read`` forwards a connection.
+    """
+    db_path = tmp_path / "engine.db"
+    con = sqlite3.connect(str(db_path))
+    con.executescript(
+        "CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, created_at TEXT, wing TEXT);"
+        "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, strength REAL);"
+    )
+    con.execute(
+        "INSERT INTO memory_metadata VALUES ('mem1', '2024-01-01T00:00:00+00:00', 'routing')"
+    )
+    con.executemany(
+        "INSERT INTO memory_links (source_id, target_id, strength) VALUES (?, ?, ?)",
+        [("mem1", "aaaaaaaa01", 0.9), ("mem1", "bbbbbbbb02", 0.7), ("mem1", "cccccccc03", 0.3)],
+    )
+    con.commit()
+    con.close()
+
+    pool = ReadConnectionPool(db_path, size=2)
+    await pool.open()
+    retriever = _retriever(read_pool=pool)
+    try:
+        dicts = [{"memory_id": "mem1", "payload": {}}]
+
+        await retriever._ro_read(_enrich, dicts)
+        assert dicts[0]["_created_at"] == "2024-01-01T00:00:00+00:00"
+        assert dicts[0]["_wing"] == "routing"  # payload wing empty → metadata wing
+
+        await retriever._ro_read(_breadcrumbs, dicts)
+        # top-2 neighbors with strength >= 0.5, DESC; the 0.3 link is excluded.
+        assert dicts[0]["related_ids"] == ["aaaaaaaa", "bbbbbbbb"]
+    finally:
+        await pool.close()
