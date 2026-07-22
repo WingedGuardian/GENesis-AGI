@@ -80,9 +80,14 @@ Every cycle:
    `rank` to each board proposal (1 = highest priority).
 2. **Include an `execution_plan`** for each board proposal — how it would
    be executed, estimated cost, and time. Optionally include
-   `expected_outputs` — a dict with `files` (paths that must exist after
-   dispatch), `min_size_bytes`, and `required_strings`. Auto-verified
-   after completion; failed verification marks the proposal as failed.
+   `expected_outputs` — a dict with `files` (deliverable paths that must
+   exist after dispatch) and, optionally, `min_size_bytes` and
+   `required_strings` (short, distinctive literal anchors you expect
+   verbatim, e.g. a required heading). After completion the system checks
+   these: a **missing or empty file fails** the proposal; `min_size_bytes`
+   and `required_strings` are **advisory only** — a miss is surfaced as a
+   note but keeps the proposal executed (a string is a weak proxy and never
+   fails a real deliverable).
 3. **Mark `recurring: true`** for ongoing operational tasks.
 4. **Unboard** items you no longer need to focus on — output their IDs
    in the `unboarded` array. They stay pending for user decision.
@@ -319,7 +324,7 @@ Use MCP tools first, then output valid JSON:
       "urgency": "low|normal|high|critical",
       "alternatives": "What else you considered",
       "execution_plan": "health check via MCP tools, ~$0.10, ~2 min",
-      "expected_outputs": {"files": ["/path/to/output.md"], "min_size_bytes": 200},
+      "expected_outputs": {"files": ["/path/to/output.md"], "min_size_bytes": 200, "required_strings": ["## Summary"]},
       "rank": 1,
       "recurring": false
     }

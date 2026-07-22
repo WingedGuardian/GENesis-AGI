@@ -194,10 +194,14 @@ Every brainstorming cycle:
    to each board proposal (1 = highest priority).
 2. **Include an `execution_plan`** for each board proposal — brief
    description of how it would be executed, estimated cost, and time.
-   Optionally include `expected_outputs` — a dict with `files` (paths
-   that must exist after dispatch), `min_size_bytes`, and
-   `required_strings`. The system auto-verifies these after completion;
-   failed verification marks the proposal as failed and resurfaces it.
+   Optionally include `expected_outputs` — a dict with `files` (deliverable
+   paths that must exist after dispatch) and, optionally, `min_size_bytes`
+   and `required_strings` (short, distinctive literal anchors you expect
+   verbatim, e.g. a required heading). After completion the system checks
+   these: a **missing or empty file fails** the proposal (and resurfaces
+   it); `min_size_bytes` and `required_strings` are **advisory only** — a
+   miss is surfaced as a note but keeps the proposal executed (a string is a
+   weak proxy and never fails a real deliverable).
 3. **Mark `recurring: true`** for proposals that imply ongoing work.
 4. **Unboard** items you no longer want to focus on — output their IDs
    in the `unboarded` array. Unboarded proposals stay pending in the

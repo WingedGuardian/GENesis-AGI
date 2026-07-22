@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from genesis.cc.direct_session import DirectSessionRequest, DirectSessionRunner
+from genesis.cc.direct_session import (
+    DirectSessionRequest,
+    DirectSessionResult,
+    DirectSessionRunner,
+)
 from genesis.cc.session_manager import SessionManager
 from genesis.db.crud import cc_sessions
 
@@ -115,10 +119,14 @@ class TestSpawnRecordsSkillSignal:
             skill_tags=["voice-master"],
         )
         req = DirectSessionRequest(
-            prompt="x", profile="research", skills=["voice-master"],
+            prompt="x",
+            profile="research",
+            skills=["voice-master"],
         )
         result = DirectSessionResult(
-            session_id=sess["id"], success=True, output_text="done",
+            session_id=sess["id"],
+            success=True,
+            output_text="done",
         )
         await runner._store_result(sess["id"], req, result)
 
@@ -191,19 +199,31 @@ class TestBackgroundFallbackRecovery:
 
         sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
         invoker = AsyncMock()
-        invoker.run_streaming = AsyncMock(return_value=CCOutput(
-            session_id="cc-bg", text="done", model_used=roster_model or "claude",
-            cost_usd=0.0, input_tokens=1, output_tokens=1, duration_ms=1, exit_code=0,
-            is_error=False, roster_model=roster_model,
-        ))
+        invoker.run_streaming = AsyncMock(
+            return_value=CCOutput(
+                session_id="cc-bg",
+                text="done",
+                model_used=roster_model or "claude",
+                cost_usd=0.0,
+                input_tokens=1,
+                output_tokens=1,
+                duration_ms=1,
+                exit_code=0,
+                is_error=False,
+                roster_model=roster_model,
+            )
+        )
         runner = DirectSessionRunner(
-            invoker=invoker, session_manager=sm, config_builder=AsyncMock(),
+            invoker=invoker,
+            session_manager=sm,
+            config_builder=AsyncMock(),
             runtime=SimpleNamespace(_db=db),
         )
         runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
         sess = await sm.create_background(
             session_type=SessionType.BACKGROUND_TASK,
-            model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+            model=CCModel.SONNET,
+            effort=EffortLevel.MEDIUM,
         )
         result = await runner._run_session(DirectSessionRequest(prompt="t"), sess["id"])
         assert result.success is True
@@ -228,7 +248,9 @@ class TestBackgroundFallbackRecovery:
         assert state.is_fallback is False
 
     @pytest.mark.asyncio
-    async def test_native_claude_success_with_peer_home_does_not_clear(self, db, tmp_path, monkeypatch):
+    async def test_native_claude_success_with_peer_home_does_not_clear(
+        self, db, tmp_path, monkeypatch
+    ):
         # The bug case: home is glm-5.2 (down); an intentional native-Claude run
         # succeeds but must NOT clear the glm fallback (Claude is ~always up).
         state = await self._run(db, tmp_path, monkeypatch, home="glm-5.2", roster_model="claude")
@@ -257,25 +279,36 @@ async def test_run_session_isolates_and_cleans_sandbox(db, tmp_path, monkeypatch
         captured["existed_at_run"] = p.exists()
         captured["path"] = str(p)
         return CCOutput(
-            session_id="cc-bg", text="done", model_used="sonnet",
-            cost_usd=0.0, input_tokens=1, output_tokens=1, duration_ms=1,
-            exit_code=0, is_error=False, roster_model=None,
+            session_id="cc-bg",
+            text="done",
+            model_used="sonnet",
+            cost_usd=0.0,
+            input_tokens=1,
+            output_tokens=1,
+            duration_ms=1,
+            exit_code=0,
+            is_error=False,
+            roster_model=None,
         )
 
     sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
     invoker = AsyncMock()
     invoker.run_streaming = _check_sandbox_live
     runner = DirectSessionRunner(
-        invoker=invoker, session_manager=sm, config_builder=AsyncMock(),
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
         runtime=SimpleNamespace(_db=db),
     )
     # Mirror the real _build_invocation: wire the per-session sandbox tmpdir.
     runner._build_invocation = lambda _req, sid: CCInvocation(
-        prompt="x", claude_code_tmpdir=_bg_session_sandbox(sid),
+        prompt="x",
+        claude_code_tmpdir=_bg_session_sandbox(sid),
     )
     sess = await sm.create_background(
         session_type=SessionType.BACKGROUND_TASK,
-        model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
     )
     result = await runner._run_session(DirectSessionRequest(prompt="t"), sess["id"])
 
@@ -403,3 +436,83 @@ async def test_run_session_cancelled_records_proposal_outcome(db):
     runner._record_proposal_outcome.assert_awaited_once()
     result = runner._record_proposal_outcome.await_args.args[1]
     assert result.success is False
+
+
+# --- post-dispatch verification routing (advisory vs hard-fail) ---
+
+
+def _verif_runner(db):
+    from types import SimpleNamespace
+
+    return DirectSessionRunner(
+        invoker=AsyncMock(),
+        session_manager=AsyncMock(),
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db, _memory_store=None),
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_proposal_outputs_content_miss_is_advisory(db, tmp_path):
+    """A file that exists but misses a required string → advisory, not missing."""
+    from genesis.db.crud.ego import create_proposal
+
+    f = tmp_path / "deliverable.md"
+    f.write_text("A real report body that addresses the ask.\n")
+    await create_proposal(
+        db,
+        id="prop-adv",
+        action_type="dispatch",
+        content="x",
+        status="executed",
+        expected_outputs=json.dumps({"files": [str(f)], "required_strings": ["## Summary"]}),
+    )
+    vres = await _verif_runner(db)._verify_proposal_outputs(db, "prop-adv")
+    assert vres is not None
+    assert vres.missing_files == []
+    assert vres.advisories  # a note, but not a failure
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_advisory_keeps_executed(db, tmp_path):
+    """A content-only miss keeps the proposal 'executed' (positive learning
+    signal via |completed:), NOT flipped to 'failed'."""
+    from genesis.db.crud.ego import create_proposal, get_proposal
+
+    f = tmp_path / "deliverable.md"
+    f.write_text("A real report body.\n")
+    await create_proposal(
+        db,
+        id="prop-exec",
+        action_type="dispatch",
+        content="x",
+        status="executed",
+        expected_outputs=json.dumps({"files": [str(f)], "required_strings": ["## Summary"]}),
+    )
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-exec")
+    res = DirectSessionResult(session_id="s1", success=True, output_text="done")
+    await _verif_runner(db)._record_proposal_outcome(req, res)
+    prop = await get_proposal(db, "prop-exec")
+    assert prop["status"] == "executed"
+    assert "|completed:" in (prop["user_response"] or "")
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_missing_file_marks_failed(db, tmp_path):
+    """A genuinely missing deliverable still hard-fails (regression guard)."""
+    from genesis.db.crud.ego import create_proposal, get_proposal
+
+    await create_proposal(
+        db,
+        id="prop-miss",
+        action_type="dispatch",
+        content="x",
+        status="executed",
+        expected_outputs=json.dumps({"files": [str(tmp_path / "never-written.md")]}),
+    )
+    req = DirectSessionRequest(prompt="t", caller_context="ego_proposal:prop-miss")
+    res = DirectSessionResult(session_id="s2", success=True, output_text="claims done")
+    await _verif_runner(db)._record_proposal_outcome(req, res)
+    prop = await get_proposal(db, "prop-miss")
+    assert prop["status"] == "failed"
+    assert "verification_failed" in (prop["user_response"] or "")
