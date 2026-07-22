@@ -1284,6 +1284,17 @@ class EgoSession:
                 "\n\nThis is an ESCALATION cycle. Assess the health issue "
                 "or system alert and propose remediation actions."
             )
+        elif focus.focus_type == "capability_improvement":
+            directive += (
+                "\n\nThis is a CAPABILITY IMPROVEMENT cycle (ADVISORY). A "
+                "capability domain is scoring low in your self-model. You MAY "
+                "consider — but are not required to propose — a concrete "
+                "improvement for that domain: a better procedure, a skill "
+                "refinement, or a targeted experiment. This is a nudge to "
+                "reflect on a deficiency, never a mandate to act, and NEVER a "
+                "reason to do less, lower your standards, or propose fewer "
+                "actions elsewhere."
+            )
 
         return f"{directive}\n\n---\n\n{dynamic_context}"
 

@@ -5,6 +5,7 @@ Owns an APScheduler with jobs:
 2. CronTrigger for the mandatory morning report
 3. IntervalTrigger for the 30-min mechanical sweep (proposal expiry/dispatch)
 4. CronTrigger for goal staleness scanning (user ego only, twice daily)
+5. CronTrigger for the advisory capability-improvement scan (genesis ego only)
 
 All cycle types (proactive, morning report, reactive, escalation) flow
 through the unified signal consumer loop: signal sources push EgoSignal
@@ -264,6 +265,24 @@ class EgoCadenceManager:
                 self._check_stale_goals,
                 CronTrigger(hour="10,16", timezone=user_timezone()),
                 id="ego_goal_staleness",
+                max_instances=1,
+                misfire_grace_time=600,
+            )
+        # Capability-improvement scanner (advisory): read the weakest domains
+        # from the capability map and push priority=low capability_improvement
+        # signals for the ego to CONSIDER. Genesis ego only — the COO owns
+        # operational self-improvement, and gating to one ego stops both from
+        # pushing duplicate deficiency signals for the shared self-model. Cron
+        # (not Interval) per the >1h reset trap; phased just after the twice-
+        # daily capability_map refresh (09:15/21:15) so it reads fresh scores.
+        if (
+            self._session._source_tag == "genesis_ego_cycle"
+            and self._config.capability_improvement_enabled
+        ):
+            self._scheduler.add_job(
+                self._check_weak_capabilities,
+                CronTrigger(hour="10,22", timezone=user_timezone()),
+                id="ego_capability_improvement",
                 max_instances=1,
                 misfire_grace_time=600,
             )
@@ -586,6 +605,80 @@ class EgoCadenceManager:
                 )
         except Exception:
             logger.debug("Goal staleness scanner failed", exc_info=True)
+
+    # -- Capability improvement scanner (advisory) -------------------------
+
+    async def _check_weak_capabilities(self) -> None:
+        """Push advisory capability_improvement signals for the weakest domains.
+
+        Reads the capability map (Genesis's self-model, refreshed twice daily by
+        the learning scheduler) and surfaces domains whose composite confidence
+        is below ``capability_weakness_threshold`` — so the ego can CONSIDER
+        proposing an improvement. ADVISORY ONLY: the signal is priority=low, it
+        never throttles, gates, or auto-dispatches a loop, and it never asks the
+        ego to propose less (hard quality-over-cost rule). Genesis ego only —
+        registration is gated in start(), but we re-check source_tag here as
+        defense-in-depth. Best-effort — a query failure logs and no-ops.
+        """
+        if self._session._source_tag != "genesis_ego_cycle":
+            return
+        if not self._config.capability_improvement_enabled:
+            return
+        if not self._should_run(skip_idle_check=True):
+            return
+
+        try:
+            from genesis.db.crud import capability_map as cap_crud
+
+            weak = await cap_crud.get_weakest(
+                self._session._db,
+                max_confidence=self._config.capability_weakness_threshold,
+                min_sample_size=self._config.capability_improvement_min_sample_size,
+                limit=self._config.capability_improvement_max_signals,
+            )
+            if not weak:
+                return
+
+            pushed = 0
+            for entry in weak:
+                domain = entry.get("domain")
+                if not domain:
+                    continue
+                confidence = entry.get("confidence") or 0.0
+                trend = entry.get("trend") or "stable"
+                sample = entry.get("sample_size") or 0
+                sig_summary = (
+                    f"Capability deficiency: {domain} at {confidence:.0%} "
+                    f"confidence ({trend}, n={sample})"
+                )
+                signal = EgoSignal(
+                    signal_type="timer",
+                    focus_category="capability_improvement",
+                    summary=sig_summary,
+                    priority="low",
+                    focus_id=domain,
+                    metadata={
+                        # Advisory marker — a consumer must never read this as a
+                        # directive to throttle or auto-act.
+                        "advisory": True,
+                        "confidence": confidence,
+                        "trend": trend,
+                        "sample_size": sample,
+                        "evidence": entry.get("evidence_summary", ""),
+                    },
+                    # 24h: the next capability scan re-detects anything still weak.
+                    expires_at=_expires_in(24 * 60),
+                )
+                if self._signal_queue.push(signal):
+                    pushed += 1
+
+            if pushed:
+                logger.info(
+                    "Capability improvement scanner: %d advisory signal(s) pushed",
+                    pushed,
+                )
+        except Exception:
+            logger.debug("Capability improvement scanner failed", exc_info=True)
 
     # -- Autonomy earn-back ------------------------------------------------
 
