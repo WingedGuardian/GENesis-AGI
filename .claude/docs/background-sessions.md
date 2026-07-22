@@ -30,6 +30,26 @@ the next few minutes → sub-agent.
 > its own report); oversized output is saved under `~/.genesis/output/` and delivered
 > as a summary + file pointer.
 
+## Dispatched from a channel? Long work MUST be a background session
+
+When you are a foreground session driving a **Telegram/voice/OpenClaw reply**, your
+turn **ends after you respond** — there is no live session left to report back when a
+later-finishing task completes. A deep-research `Workflow` (or any 100+-agent fan-out)
+run **inline** in such a turn is force-killed by the CLI's headless background-wait
+ceiling (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`, ~10 min) with only a partial result,
+and nothing delivers it. This silently killed a real Telegram deep-research request on
+2026-07-20.
+
+So for a channel-dispatched request needing deep/multi-source research or any
+background work likely to exceed a few minutes: **do NOT run it inline — dispatch it
+via `direct_session_run` (`profile="research"`, `deliver_to_origin=true`) and reply
+that it's running in the background.** The background lane owns a longer wait ceiling
+(set to its full `timeout_s`), runs to completion, and — with `deliver_to_origin` —
+delivers the finished outcome back to this exact conversation (the delivery model
+merged in #1192). Terminal/interactive sessions may still run Workflows inline (you're
+present to see them). The foreground system prompt (`conversation._BG_RESEARCH_ROUTING`)
+nudges this automatically for non-terminal channels.
+
 ## Profiles
 
 | Profile | Browser | observation_write | outreach_send | follow_up_create | Web search |
