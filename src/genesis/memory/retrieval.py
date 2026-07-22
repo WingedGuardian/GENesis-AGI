@@ -43,13 +43,22 @@ _deferred_side_effects_count = 0
 
 
 def _deferred_side_effects_inflight() -> int:
-    """Number of recall side-effect tasks currently pending/running."""
+    """Number of recall side-effect tasks reserved (scheduled or running)."""
     return _deferred_side_effects_count
 
 
-async def _deferred_side_effects(coro: Coroutine[Any, Any, None]) -> None:
-    """Run a deferred side-effect coroutine while accounting it against the
-    in-flight backstop (increment on entry, decrement in ``finally``)."""
+def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: str) -> None:
+    """Reserve a backstop slot SYNCHRONOUSLY, then schedule ``coro`` as a
+    tracked task that releases the slot when it finishes.
+
+    Reserving before ``tracked_task`` (not inside the task body) is what makes
+    the cap real under a burst: several recalls resuming in the same event-loop
+    tick each increment the counter before yielding, so the (N+1)th correctly
+    sees the cap and runs inline instead of queueing an unbounded pile of
+    scheduled-but-not-yet-started tasks (Codex P2). A shutdown cancellation
+    before the task starts would skip the release, but that only leaks an
+    in-memory counter on a process that is already exiting — immaterial.
+    """
     global _deferred_side_effects_count  # noqa: PLW0603
     _deferred_side_effects_count += 1
     if _deferred_side_effects_count == _DEFERRED_SIDE_EFFECT_CAP:
@@ -58,10 +67,15 @@ async def _deferred_side_effects(coro: Coroutine[Any, Any, None]) -> None:
             "further recalls run write-backs inline until it drains",
             _DEFERRED_SIDE_EFFECT_CAP,
         )
-    try:
-        await coro
-    finally:
-        _deferred_side_effects_count -= 1
+
+    async def _runner() -> None:
+        global _deferred_side_effects_count  # noqa: PLW0603
+        try:
+            await coro
+        finally:
+            _deferred_side_effects_count -= 1
+
+    tracked_task(_runner(), name=name)
 
 
 def _has_temporal_markers(query: str) -> bool:
@@ -839,10 +853,7 @@ class HybridRetriever:
                 and event_id_sink is None
                 and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
             ):
-                tracked_task(
-                    _deferred_side_effects(_zero_hit_shadow),
-                    name="recall_zero_hit_shadow",
-                )
+                _schedule_deferred_side_effects(_zero_hit_shadow, name="recall_zero_hit_shadow")
             else:
                 await _zero_hit_shadow
             return []
@@ -1109,7 +1120,7 @@ class HybridRetriever:
             and event_id_sink is None
             and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
         ):
-            tracked_task(_deferred_side_effects(_run_side_effects()), name="recall_side_effects")
+            _schedule_deferred_side_effects(_run_side_effects(), name="recall_side_effects")
         else:
             await _run_side_effects()
 
@@ -1551,10 +1562,20 @@ class HybridRetriever:
 
         if memory_writebacks_off():
             return
-        # 11. Increment retrieved_count + stamp last_retrieved_at
-        for mid in top:
-            qdrant_hit = qdrant_by_id.get(mid)
-            if qdrant_hit:
+
+        # 11. Increment retrieved_count + stamp last_retrieved_at. The Qdrant
+        # client is SYNCHRONOUS, so run the whole per-item write-back loop in a
+        # worker thread: otherwise these blocking HTTP calls stall the shared
+        # event loop when the deferred task runs, stealing time from concurrent
+        # recalls and from the request's own remaining work — which would leave
+        # Qdrant-backed prompts still paying the write-back cost on the loop even
+        # though the work is "deferred" (Codex P2 on the ac27b693 deferral). Each
+        # write stays individually swallowed.
+        def _write_qdrant_counts() -> None:
+            for mid in top:
+                qdrant_hit = qdrant_by_id.get(mid)
+                if not qdrant_hit:
+                    continue
                 coll = qdrant_hit.get("_collection", "episodic_memory")
                 old_count = qdrant_hit.get("payload", {}).get("retrieved_count", 0)
                 try:
@@ -1574,6 +1595,8 @@ class HybridRetriever:
                         coll,
                         exc_info=True,
                     )
+
+        await asyncio.to_thread(_write_qdrant_counts)
 
         # 11b. Sync observation retrieved_count in SQLite
         #       Extract obs:<uuid> tags from Qdrant payloads to find linked observations

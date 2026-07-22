@@ -126,6 +126,37 @@ async def test_backstop_falls_back_to_inline_at_cap(mock_qdrant, mock_crud, mock
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
+async def test_backstop_slot_reserved_synchronously(mock_qdrant, mock_crud, mock_links, _exp):
+    """The in-flight slot is reserved when the task is SCHEDULED (before it
+    runs), not when its body starts — so a same-tick burst can't queue past the
+    cap. After recall returns the count is already >=1; it drains back to the
+    starting value once the task completes."""
+    from genesis.memory import retrieval
+
+    retriever = _build_retriever()
+    _wire(mock_qdrant, mock_crud, mock_links)
+
+    start = retrieval._deferred_side_effects_count
+    await retriever.recall("test", limit=5, defer_side_effects=True)
+    # Reserved synchronously at schedule time — the task has not been awaited yet.
+    assert retrieval._deferred_side_effects_count == start + 1
+    # Write-back also hasn't run yet (task not started).
+    assert mock_qdrant.update_payload.call_count == 0
+
+    # Drain: the task runs, does the write-back, and releases the slot.
+    for _ in range(20):
+        if retrieval._deferred_side_effects_count == start:
+            break
+        await asyncio.sleep(0.02)
+    assert retrieval._deferred_side_effects_count == start
+    assert mock_qdrant.update_payload.call_count >= 1
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
 async def test_stats_carries_substage_timings(mock_qdrant, mock_crud, mock_links, _exp):
     """A caller-owned stats dict is populated with per-stage read timings."""
     retriever = _build_retriever()
