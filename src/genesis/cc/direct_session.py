@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from genesis.cc import AgentProvider
     from genesis.cc.session_config import SessionConfigBuilder
     from genesis.cc.session_manager import SessionManager
+    from genesis.ego.verification import VerificationResult
 
 logger = logging.getLogger(__name__)
 
@@ -965,6 +966,7 @@ class DirectSessionRunner:
         if not request.caller_context or not request.caller_context.startswith("ego_proposal:"):
             return
         proposal_id = request.caller_context.split(":", 1)[1]
+        advisories: list[str] = []
         try:
             from genesis.db.crud.ego import (
                 mark_proposal_verification_failed,
@@ -976,19 +978,19 @@ class DirectSessionRunner:
                 return
 
             # Post-dispatch verification: if the session succeeded and the
-            # proposal defines expected_outputs, verify deliverables before
-            # recording the outcome.
+            # proposal defines expected_outputs, check deliverables. Missing or
+            # empty files are hard failures; size/content misses are advisories
+            # that KEEP the proposal executed — a real deliverable was produced,
+            # and a string/size miss is a failure of the proxy, not the work.
             if result.success:
-                verification_failed = await self._verify_proposal_outputs(
-                    db,
-                    proposal_id,
-                )
-                if verification_failed:
-                    # Mark as failed + store observation; skip normal outcome
+                vres = await self._verify_proposal_outputs(db, proposal_id)
+                if vres is not None and vres.missing_files:
+                    # Deliverable not produced → hard fail + observation.
+                    fail_summary = "; ".join(vres.missing_files)
                     await mark_proposal_verification_failed(
                         db,
                         proposal_id,
-                        summary=verification_failed,
+                        summary=fail_summary,
                     )
                     try:
                         store = getattr(self._rt, "_memory_store", None)
@@ -996,7 +998,7 @@ class DirectSessionRunner:
                             await store.store(
                                 content=(
                                     f"Ego dispatch VERIFICATION FAILED for "
-                                    f"proposal {proposal_id}: {verification_failed}"
+                                    f"proposal {proposal_id}: {fail_summary}"
                                 ),
                                 source="ego_dispatch_verification",
                                 tags=["ego", "verification_failure"],
@@ -1016,8 +1018,19 @@ class DirectSessionRunner:
                         result,
                     )
                     return
+                if vres is not None:
+                    advisories = list(vres.advisories)
 
-            summary = (result.output_text or result.error or "")[:1000]
+            base = result.output_text or result.error or ""
+            if advisories:
+                # Informational only — never changes the |completed: polarity
+                # the feedback harvester reads from this suffix. Budget the note
+                # into the 1000-char cap so a long output_text can't truncate
+                # the advisory away entirely (the whole point of surfacing it).
+                note = f"\n[verification advisories: {'; '.join(advisories)}]"[:500]
+                summary = base[: max(0, 1000 - len(note))] + note
+            else:
+                summary = base[:1000]
             await update_proposal_outcome(
                 db,
                 proposal_id,
@@ -1047,17 +1060,19 @@ class DirectSessionRunner:
                 exc_info=True,
             )
         # Debrief is best-effort, fully self-contained (own try/except)
-        await self._notify_dispatch_debrief(proposal_id, request, result)
+        await self._notify_dispatch_debrief(proposal_id, request, result, advisories=advisories)
 
     async def _verify_proposal_outputs(
         self,
         db: object,
         proposal_id: str,
-    ) -> str | None:
-        """Check expected outputs for a completed proposal.
+    ) -> VerificationResult | None:
+        """Run post-dispatch verification for a completed proposal.
 
-        Returns a failure summary string if verification fails,
-        or ``None`` if verification passes or is not configured.
+        Returns the :class:`~genesis.ego.verification.VerificationResult`
+        (inspect ``missing_files`` for hard failures and ``advisories`` for
+        non-fatal size/content notes), or ``None`` if the proposal has no
+        ``expected_outputs`` or verification could not run.
         """
         try:
             from genesis.db.crud.ego import get_proposal
@@ -1069,24 +1084,28 @@ class DirectSessionRunner:
             expected = parse_expected_outputs(proposal.get("expected_outputs"))
             if expected is None:
                 return None  # no verification configured
-            result = verify_outputs(expected)
-            if not result.passed:
-                return "; ".join(result.failures)
+            return verify_outputs(expected)
         except Exception:
             logger.warning(
                 "Post-dispatch verification error for %s (skipping)",
                 proposal_id,
                 exc_info=True,
             )
-        return None
+            return None
 
     async def _notify_dispatch_debrief(
         self,
         proposal_id: str,
         request: DirectSessionRequest,
         result: DirectSessionResult,
+        advisories: list[str] | None = None,
     ) -> None:
-        """Send after-action report to ego_dispatches Telegram topic."""
+        """Send after-action report to ego_dispatches Telegram topic.
+
+        ``advisories`` are non-fatal verification notes (a content/size proxy
+        that didn't match a still-accepted deliverable); surfaced as an FYI,
+        never as a failure.
+        """
         try:
             import html as html_mod
 
@@ -1108,6 +1127,9 @@ class DirectSessionRunner:
                 f"<i>Duration:</i> {dur_str} | <i>Cost:</i> {cost_str}\n\n"
                 f"<b>Outcome:</b>\n{outcome_escaped}"
             )
+            if advisories:
+                adv_escaped = html_mod.escape("; ".join(advisories))
+                msg += f"\n\n<i>Advisory (deliverable accepted):</i>\n{adv_escaped}"
             await tm.send_to_category("ego_dispatches", msg)
         except Exception:
             logger.debug("Failed to send dispatch debrief", exc_info=True)
