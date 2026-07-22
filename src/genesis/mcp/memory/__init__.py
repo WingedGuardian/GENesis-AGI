@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     import aiosqlite
     from qdrant_client import QdrantClient
 
+    from genesis.db.connection import ReadConnectionPool
     from genesis.memory.reranker import VoyageReranker
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ def init(
     recall_embedding_provider: EmbeddingProvider | None = None,
     activity_tracker: object | None = None,
     reranker: VoyageReranker | None = None,
+    read_pool: ReadConnectionPool | None = None,
     # Backward compat — old callers pass ``embedding_provider``
     embedding_provider: EmbeddingProvider | None = None,
 ) -> None:
@@ -111,11 +113,17 @@ def init(
         db=db,
         linker=linker,
     )
+    # read_pool: the proactive per-prompt path recalls through THIS retriever
+    # (memory/proactive.py uses genesis.mcp.memory._retriever), so the ac27b693
+    # read-only pool must reach it here — wiring it only into rt._hybrid_retriever
+    # would leave the very hot path the pool targets bypassing it. Same shared
+    # pool instance (bounded connections); None keeps the pre-pool behavior.
     _retriever = HybridRetriever(
         embedding_provider=recall_emb,
         qdrant_client=qdrant_client,
         db=db,
         reranker=reranker,
+        read_pool=read_pool,
     )
     _user_model_evolver = UserModelEvolver(db=db)
     _bookmark_mgr = BookmarkManager(

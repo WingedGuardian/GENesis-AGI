@@ -158,6 +158,10 @@ async def init(rt: GenesisRuntime) -> None:
             # tools (memory_recall / knowledge_recall) actually rerank instead
             # of silently building a reranker-less retriever.
             reranker=reranker,
+            # Share the SAME read-only pool: the proactive per-prompt path recalls
+            # through the MCP retriever, so the pool must reach it here or the hot
+            # path PR-4 targets would bypass it (ac27b693).
+            read_pool=rt._db_ro_pool,
         )
         logger.info("Memory MCP initialized (dual embedders, shared reranker)")
 
