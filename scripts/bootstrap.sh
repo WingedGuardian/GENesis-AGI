@@ -405,12 +405,16 @@ if [[ ! -x "$SKILLSPECTOR_DIR/.venv/bin/skillspector" ]]; then
     # timeout guards a hung TCP connection (else bootstrap stalls indefinitely on
     # this OPTIONAL dep); one retry rides out a transient blip. 300s ≈ 5x a normal
     # --depth 1 clone / small pip install; on failure bootstrap continues. B8.
-    _ss_clone() { timeout 300 git clone --depth 1 https://github.com/NVIDIA/SkillSpector.git "$SKILLSPECTOR_DIR" 2>/dev/null; }
-    if [[ ! -d "$SKILLSPECTOR_DIR/.git" ]]; then
+    # A clone that dies mid-transfer leaves a PARTIAL .git, so clear the dir before
+    # each attempt and gate on a completion marker (pyproject.toml/setup.py — a
+    # populated worktree), NOT bare .git, else a partial clone wedges every future
+    # run (skip-because-.git-exists → pip against an incomplete tree, forever).
+    _ss_clone() { rm -rf "$SKILLSPECTOR_DIR"; timeout 300 git clone --depth 1 https://github.com/NVIDIA/SkillSpector.git "$SKILLSPECTOR_DIR" 2>/dev/null; }
+    if [[ ! -f "$SKILLSPECTOR_DIR/pyproject.toml" && ! -f "$SKILLSPECTOR_DIR/setup.py" ]]; then
         _ss_clone || { sleep 2; _ss_clone; } \
             || echo "  WARNING: SkillSpector clone failed (skill-security scan will no-op until installed)"
     fi
-    if [[ -d "$SKILLSPECTOR_DIR" ]]; then
+    if [[ -f "$SKILLSPECTOR_DIR/pyproject.toml" || -f "$SKILLSPECTOR_DIR/setup.py" ]]; then
         "$PYTHON_BIN" -m venv "$SKILLSPECTOR_DIR/.venv" 2>/dev/null \
             && timeout 300 "$SKILLSPECTOR_DIR/.venv/bin/pip" install -q "$SKILLSPECTOR_DIR" 2>/dev/null \
             || echo "  WARNING: SkillSpector install failed (non-critical)"

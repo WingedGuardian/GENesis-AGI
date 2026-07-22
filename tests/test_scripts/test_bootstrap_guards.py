@@ -117,6 +117,12 @@ def test_b8_skillspector_install_is_bounded():
     assert "timeout 300 git clone --depth 1 https://github.com/NVIDIA/SkillSpector.git" in code
     assert "_ss_clone || { sleep 2; _ss_clone; }" in code  # one retry rides out a blip
     assert 'timeout 300 "$SKILLSPECTOR_DIR/.venv/bin/pip" install' in code
+    # A partial clone (mid-transfer failure leaves a stub .git) must be cleared
+    # before each attempt and must not wedge future runs: rm -rf before cloning,
+    # and gate on a completion marker (pyproject.toml/setup.py), not bare .git.
+    assert 'rm -rf "$SKILLSPECTOR_DIR"; timeout 300 git clone' in code
+    assert '! -f "$SKILLSPECTOR_DIR/pyproject.toml"' in code
+    assert '"$SKILLSPECTOR_DIR/.git"' not in code  # the wedge-prone bare-.git gate is gone
 
 
 # ── B9: remote installers download-to-temp, never pipe to a shell ───
