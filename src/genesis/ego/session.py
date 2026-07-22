@@ -998,27 +998,13 @@ class EgoSession:
             # persisted to ego_state. It controls THIS cycle's delivery only.
             comm_decision = parsed.get("communication_decision", "send_digest")
             if proposals:
-                # Bypass realist gate when critical directives are active —
-                # the user explicitly told the ego to propose something.
-                # The realist's zombie detection would incorrectly block
-                # re-proposals that were rejected for fixable reasons.
-                has_critical_directive = False
-                try:
-                    active_dirs = await ego_crud.list_active_directives(
-                        self._db, self._source_tag.replace("_cycle", ""),
-                    )
-                    has_critical_directive = any(
-                        d.get("priority") == "critical"
-                        for d in active_dirs
-                    )
-                except Exception:
-                    pass
-                if has_critical_directive:
-                    logger.info(
-                        "Realist bypassed — active critical directive(s)",
-                    )
-                else:
-                    proposals = await self._filter_proposals(proposals)
+                # Realist ALWAYS runs — no blanket directive bypass. The
+                # directive-scoped exemption is applied INSIDE the realist:
+                # active critical/high directives are shown to it, and it
+                # suspends zombie/duplicate rejection only for drafts that
+                # actually address one (see _filter_proposals). Feasibility,
+                # actionability, and domain-boundary checks always apply.
+                proposals = await self._filter_proposals(proposals)
                 # Log realist cost for observability (cycle dataclass is frozen,
                 # so cost is tracked via logging; negligible vs ego cycle cost)
                 if self._last_realist_cost_usd > 0:
@@ -1377,7 +1363,30 @@ class EgoSession:
             logger.warning("Realist: failed to fetch history, passing through")
             return proposals
 
-        prompt = _build_realist_prompt(proposals, recent, ego_source=self._source_tag)
+        # Directive-scoped exemption: fetch active critical/high directives for
+        # THIS ego so the realist can suspend zombie/duplicate rejection for
+        # drafts that address an explicit user directive. Fail-open to no
+        # exemption on any error.
+        active_directives: list[dict] = []
+        try:
+            dirs = await ego_crud.list_directives(
+                self._db,
+                ego_target=self._source_tag.replace("_cycle", ""),
+                statuses=("active",),
+                limit=10,
+            )
+            active_directives = [
+                d for d in dirs if d.get("priority") in ("critical", "high")
+            ]
+        except Exception:
+            logger.warning("Realist: failed to fetch directives, no exemption")
+
+        prompt = _build_realist_prompt(
+            proposals,
+            recent,
+            ego_source=self._source_tag,
+            active_directives=active_directives,
+        )
 
         try:
             invocation = CCInvocation(
@@ -2515,6 +2524,7 @@ def _build_realist_prompt(
     recent_history: list[dict],
     *,
     ego_source: str = "",
+    active_directives: list[dict] | None = None,
 ) -> str:
     """Build the realist evaluation prompt.
 
@@ -2605,9 +2615,32 @@ monitoring, or internal maintenance.
    purely investigative with no write/action/outreach component, REJECT it:
    "Read operation — do this during your cycle, don't propose it.\""""
 
+    # Directive exemption block — only when active critical/high directives
+    # exist for this ego. The realist itself judges whether a draft addresses
+    # a directive; the ego cannot self-grant an exemption.
+    directive_section = ""
+    _dir_lines = []
+    for d in active_directives or []:
+        _prio = str(d.get("priority", "?")).upper()
+        _content = (d.get("content") or "")[:200].replace("\n", " ").replace("|", "/")
+        _did = d.get("id", "?")
+        _dir_lines.append(f"- [{_prio}] (id={_did}) {_content}")
+    if _dir_lines:
+        directive_section = (
+            "\n## Active User Directives\n"
+            "The user explicitly flagged these as important for this ego:\n"
+            + "\n".join(_dir_lines)
+            + "\n\n**Directive exemption:** If a proposal DIRECTLY ADDRESSES "
+            "one of the directives above, do NOT reject it as a Zombie or "
+            "Duplicate (Rule #2) — the user explicitly wants this work, even if "
+            "a similar proposal was tried before. Judge the match yourself. All "
+            "other rules (feasibility, actionability, domain boundary) still "
+            "apply.\n"
+        )
+
     return f"""You are the Realist — a quality gate for ego proposals. Evaluate each
 proposal and return a JSON array of verdicts.
-{ego_section}
+{ego_section}{directive_section}
 ## Rules
 {rule_1}
 
