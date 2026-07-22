@@ -13,6 +13,8 @@ import asyncio
 import importlib
 import logging
 import re
+import sqlite3
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import aiosqlite
@@ -24,6 +26,42 @@ logger = logging.getLogger(__name__)
 
 _DATA_MIGRATIONS_DIR = Path(__file__).parent
 _DATA_MIGRATION_PATTERN = re.compile(r"^(d\d{4})_\w+\.py$")
+
+# The ledger bookkeeping (mark_completed / mark_failed) writes through the shared
+# server connection, which waits only BUSY_TIMEOUT_MS (5s) for the write lock. A
+# bulk migration that briefly holds the WAL write lock can make these fail with
+# "database is locked", leaving the row 'running' — it self-heals via
+# reset_running_to_pending on the next boot, but at the cost of an unnecessary
+# idempotent re-run (observed: d0006, #1179). Batching the migrations
+# (commit_in_batches) is the primary fix; retrying the ledger write is
+# defense-in-depth for the bookkeeping itself.
+_LEDGER_LOCK_RETRIES = 5
+_LEDGER_RETRY_DELAY_S = 0.5
+
+
+async def _ledger_write(make_coro: Callable[[], Awaitable[None]], *, what: str) -> None:
+    """Run a ledger bookkeeping write, retrying briefly on "database is locked".
+
+    Best-effort: never raises. The migrate()/verify() work has already happened by
+    the time we record its outcome, so a lost bookkeeping write only costs an
+    idempotent no-op re-run on the next boot — far better than raising and
+    aborting the runner's batch. ``make_coro`` must build a FRESH coroutine each
+    call (a coroutine can only be awaited once)."""
+    for attempt in range(1, _LEDGER_LOCK_RETRIES + 1):
+        try:
+            await make_coro()
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == _LEDGER_LOCK_RETRIES:
+                logger.error(
+                    "data-migration ledger %s write failed (attempt %d/%d): %s",
+                    what,
+                    attempt,
+                    _LEDGER_LOCK_RETRIES,
+                    exc,
+                )
+                return
+            await asyncio.sleep(_LEDGER_RETRY_DELAY_S * attempt)
 
 
 class DataMigrationRunner:
@@ -91,18 +129,28 @@ class DataMigrationRunner:
             summary = await asyncio.to_thread(mod.migrate)
             verified = await asyncio.to_thread(mod.verify)
             if not verified:
-                await crud.mark_failed(
-                    self._db, mid, error="verify() returned False after migrate()"
+                await _ledger_write(
+                    lambda: crud.mark_failed(
+                        self._db, mid, error="verify() returned False after migrate()"
+                    ),
+                    what="mark_failed",
                 )
                 logger.error("Data migration %s did not verify — marked failed", name)
                 return {"id": mid, "name": name, "success": False, "error": "verify failed"}
 
             summary_str = str(summary) if summary is not None else ""
-            await crud.mark_completed(self._db, mid, summary=summary_str)
+            await _ledger_write(
+                lambda: crud.mark_completed(self._db, mid, summary=summary_str),
+                what="mark_completed",
+            )
             logger.info("Data migration %s completed: %s", name, summary_str)
             return {"id": mid, "name": name, "success": True, "summary": summary}
         except Exception as exc:  # noqa: BLE001 — record + continue; never abort the batch
-            await crud.mark_failed(self._db, mid, error=repr(exc))
+            err = repr(exc)  # bind before the closure (exc is except-scoped, del'd on exit)
+            await _ledger_write(
+                lambda: crud.mark_failed(self._db, mid, error=err),
+                what="mark_failed",
+            )
             logger.error("Data migration %s failed: %s", name, exc, exc_info=True)
             return {"id": mid, "name": name, "success": False, "error": str(exc)}
 

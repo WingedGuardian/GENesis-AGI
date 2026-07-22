@@ -92,3 +92,23 @@ def test_fresh_install_is_noop(tmp_path, monkeypatch):
 
     assert d0005.verify() is True
     assert d0005.migrate() == {"flipped": 0, "scanned": 0}
+
+
+def test_flips_many_rows_across_batch_boundaries(tmp_path, monkeypatch):
+    # The read-first-then-batched-write restructure must flip correctly when the
+    # candidate set spans multiple commit batches. _exact_pass is stubbed (the
+    # disk check itself is covered by the real-file tests above) so we can seed
+    # far more rows than one batch cheaply.
+    rows = [(f"p{i}", "failed", "x|verification_failed:z", '{"files": []}') for i in range(250)]
+    _seed(tmp_path / "genesis.db", rows)
+    monkeypatch.setattr(d0005, "genesis_db_path", lambda: str(tmp_path / "genesis.db"))
+    monkeypatch.setattr(d0005, "_exact_pass", lambda eo: True)
+
+    assert d0005.migrate() == {"flipped": 250, "scanned": 250}
+    db = sqlite3.connect(tmp_path / "genesis.db")
+    remaining = db.execute("SELECT COUNT(*) FROM ego_proposals WHERE status = 'failed'").fetchone()[
+        0
+    ]
+    db.close()
+    assert remaining == 0
+    assert d0005.verify() is True

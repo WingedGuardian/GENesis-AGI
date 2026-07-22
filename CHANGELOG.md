@@ -23,6 +23,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A large one-time data cleanup no longer briefly freezes the running system.**
+  Post-startup data migrations (one-off cleanups/backfills of stored knowledge and
+  history) run alongside the live system, which allows only one writer to the
+  database at a time. A big cleanup used to do all its work in a single long write,
+  briefly blocking every other write for ~10+ seconds — long enough that the system
+  logged "database is locked" errors and, in one case, had to re-run the cleanup
+  after a restart. Bulk cleanups now save their progress in small batches, releasing
+  the database between them, and the bookkeeping that records a migration as "done"
+  now retries briefly if it hits a momentary lock — so a cleanup is never
+  needlessly repeated. (Slow per-record checks were also moved out of the locked
+  window.)
+
 - **Background sessions no longer get silently cut off after 10 minutes.** A
   long background task (for example deep research running as a background
   session) used to be killed at about 10 minutes with only a partial result and
