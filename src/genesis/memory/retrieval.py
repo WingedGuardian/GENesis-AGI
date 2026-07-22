@@ -1243,8 +1243,18 @@ class HybridRetriever:
         qdrant_results: list[dict] = []
         qdrant_by_id: dict[str, dict] = {}
         for coll in collections:
+            # Qdrant's client is SYNCHRONOUS (no AsyncQdrantClient exists in
+            # Genesis), so offload each blocking search to a worker thread — it
+            # must never block the shared event loop while other coroutines (other
+            # recalls, the rest of the server) are waiting, which matters under
+            # Jay's 5-7 concurrent-session norm (ac27b693, PR-2). track_operation
+            # stays ON the event loop wrapping the await, so per-collection
+            # "qdrant.search" telemetry (the provider:qdrant_unreachable signal in
+            # mcp/health/errors.py) is byte-identical to the inline version, and
+            # asyncio.to_thread re-raises so a Qdrant error propagates unchanged.
             with track_operation(self._embeddings.tracker, "qdrant.search"):
-                hits = qdrant_ops.search(
+                hits = await asyncio.to_thread(
+                    qdrant_ops.search,
                     self._qdrant,
                     collection=coll,
                     query_vector=vector,
