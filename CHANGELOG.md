@@ -60,6 +60,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   needlessly repeated. (Slow per-record checks were also moved out of the locked
   window.)
 
+- **The dashboard now recognizes updates started from the command line.** Its
+  "update in progress" checks previously only saw dashboard-triggered updates,
+  so a command-line `update.sh` run could be interrupted (its state wiped) or a
+  second update launched over it. The dashboard now consults the same
+  deploy-in-progress signal the rest of the system uses, and a dashboard-started
+  update no longer runs in the server's own service group (where the update
+  stopping the server could kill the update itself).
 - **Two updates can no longer run at the same time.** If an update is already in
   progress, a second `update.sh` (from another session, or the dashboard) now
   refuses immediately instead of running concurrently — previously two updates

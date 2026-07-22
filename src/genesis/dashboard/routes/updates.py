@@ -15,6 +15,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
+from genesis.env import update_in_progress
 
 logger = logging.getLogger(__name__)
 
@@ -230,20 +231,15 @@ def update_apply():
     if not _UPDATE_SCRIPT.is_file():
         return jsonify({"error": "Update script not found"}), 404
 
-    # Check if an update is already in progress (simple PID file guard)
-    if _PID_FILE.is_file():
-        try:
-            old_pid = int(_PID_FILE.read_text().strip())
-            result = subprocess.run(["kill", "-0", str(old_pid)],
-                                    capture_output=True, timeout=2)
-            if result.returncode == 0:
-                return jsonify({
-                    "error": "Update already in progress",
-                    "pid": old_pid,
-                }), 409
-            _PID_FILE.unlink(missing_ok=True)
-        except (ValueError, subprocess.TimeoutExpired, OSError):
-            _PID_FILE.unlink(missing_ok=True)
+    # An update already in progress? Use the canonical liveness check
+    # (env.update_in_progress) so this also catches a CLI `update.sh` run and
+    # restore.sh -- which signal via the state file / marker, not the dashboard's
+    # own PID file -- instead of launching a second run that update.sh's flock
+    # would reject anyway.
+    if update_in_progress():
+        return jsonify({"error": "Update already in progress"}), 409
+    # Not in progress -> any lingering dashboard PID file holds a dead PID; tidy it.
+    _PID_FILE.unlink(missing_ok=True)
 
     use_cc = request.get_json(silent=True) or {}
     supervised = use_cc.get("supervised", True)
@@ -254,19 +250,50 @@ def update_apply():
 
 
 def _apply_direct(pid_file: Path) -> tuple:
-    """Run update.sh directly (no CC supervision)."""
+    """Run update.sh directly (no CC supervision), in its OWN systemd scope.
+
+    Without a scope, update.sh stays in genesis-server.service's cgroup; its own
+    `systemctl stop genesis-server` then SIGTERMs update.sh via the default
+    KillMode=control-group -- aborting the update, or (at the final restart)
+    self-SIGTERMing into a spurious rollback of a healthy deploy. `systemd-run
+    --user --scope` gives it its own cgroup (mirrors the supervised orchestrator
+    spawn); `start_new_session` alone changes only the session, not the cgroup.
+    """
     try:
         log_path = _HOME / ".genesis" / "update_direct.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(log_path, "w")  # noqa: SIM115
-        proc = subprocess.Popen(
-            ["bash", str(_UPDATE_SCRIPT)],
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        try:
+            env = os.environ.copy()
+            uid = os.getuid()
+            env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+            env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+            proc = subprocess.Popen(
+                ["systemd-run", "--user", "--scope", "--", "bash", str(_UPDATE_SCRIPT)],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                env=env,
+            )
+            logger.info("Direct update spawned via systemd-run --scope (pid %d)", proc.pid)
+        except (FileNotFoundError, OSError) as exc:
+            # systemd-run unavailable (e.g. container restrictions): fall back to
+            # a new session. update.sh may then be killed if it stops the server
+            # from inside the shared cgroup -- but its P4b prestop/rollback traps
+            # keep the server from being left down.
+            logger.warning("systemd-run failed (%s), falling back to start_new_session", exc)
+            proc = subprocess.Popen(
+                ["bash", str(_UPDATE_SCRIPT)],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
         log_fh.close()  # child inherited the fd; parent can close its copy
         pid_file.parent.mkdir(parents=True, exist_ok=True)
+        # NOTE: on the systemd-run path proc.pid is systemd-run's PID (it stays
+        # alive as the scope parent for the run's duration, then exits). update.sh
+        # owner-checks the marker (delete if ==$$ OR holder dead), so it is cleaned
+        # by the next run; env.update_in_progress() reads a dead marker as "no
+        # deploy" in the interim.
         pid_file.write_text(str(proc.pid))
         logger.info("Direct update triggered (pid %d)", proc.pid)
         return jsonify({"status": "triggered", "pid": proc.pid, "supervised": False})
@@ -625,17 +652,10 @@ log.info("Orchestrator finished")
 @blueprint.route("/api/genesis/updates/dismiss", methods=["POST"])
 def update_dismiss():
     """Clear stale update state files so the dashboard returns to normal."""
-    # Don't delete PID file if a process is still alive — prevents
-    # removing the concurrency guard during a slow-but-active update.
-    pid_alive = False
-    if _PID_FILE.is_file():
-        with contextlib.suppress(ValueError, subprocess.TimeoutExpired, OSError):
-            pid = int(_PID_FILE.read_text().strip())
-            result = subprocess.run(["kill", "-0", str(pid)],
-                                    capture_output=True, timeout=2)
-            pid_alive = result.returncode == 0
-
-    if pid_alive:
+    # Refuse while any deploy is live (marker OR CLI state file) -- don't clear a
+    # slow-but-active update's state out from under it. Canonical liveness check
+    # so a CLI `update.sh` run counts too, not just the dashboard's PID file.
+    if update_in_progress():
         return jsonify({"error": "Update still in progress"}), 409
 
     for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE, _PID_FILE):
@@ -654,20 +674,12 @@ def update_resolve():
     if not has_escalation and not has_conflicts:
         return jsonify({"error": "No conflicts pending"}), 404
 
-    # Check if something is already running
-    if _PID_FILE.is_file():
-        try:
-            old_pid = int(_PID_FILE.read_text().strip())
-            result = subprocess.run(["kill", "-0", str(old_pid)],
-                                    capture_output=True, timeout=2)
-            if result.returncode == 0:
-                return jsonify({
-                    "error": "Update session already in progress",
-                    "pid": old_pid,
-                }), 409
-            _PID_FILE.unlink(missing_ok=True)
-        except (ValueError, subprocess.TimeoutExpired, OSError):
-            _PID_FILE.unlink(missing_ok=True)
+    # An update session already running? Canonical liveness (marker + state file)
+    # so a CLI run counts too, not just the dashboard's own PID file.
+    if update_in_progress():
+        return jsonify({"error": "Update session already in progress"}), 409
+    # Not in progress -> any lingering PID file is stale; tidy it.
+    _PID_FILE.unlink(missing_ok=True)
 
     tier3_prompt = _TIER3_PROMPT.format(
         escalation_file=_ESCALATION_FILE,
@@ -732,16 +744,10 @@ def update_progress():
             state_data = json.loads(_STATE_FILE.read_text())
             phase = state_data.get("phase")
 
-    # Check if an update process is still running
-    in_progress = False
-    if _PID_FILE.is_file():
-        try:
-            pid = int(_PID_FILE.read_text().strip())
-            result = subprocess.run(["kill", "-0", str(pid)],
-                                    capture_output=True, timeout=2)
-            in_progress = result.returncode == 0
-        except (ValueError, subprocess.TimeoutExpired, OSError):
-            pass
+    # Is an update process still running? Canonical liveness check (marker AND
+    # state file) so a CLI `update.sh` run counts too -- which also keeps the
+    # state-file GC below from unlinking a live CLI run's crash-recovery state.
+    in_progress = update_in_progress()
 
     # Detect failed/stale states.
     # Guard against false positives during the brief window at update end:
