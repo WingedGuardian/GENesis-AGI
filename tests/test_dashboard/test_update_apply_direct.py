@@ -25,6 +25,7 @@ def test_apply_direct_uses_systemd_run_scope(tmp_path, _passthrough_jsonify):
     fake_proc = MagicMock(pid=12345)
     pid_file = tmp_path / ".genesis" / "update_in_progress.pid"
     with (
+        patch.object(updates, "_systemd_run_scope_available", return_value=True),
         patch.object(updates.subprocess, "Popen", return_value=fake_proc) as popen,
         patch.object(updates, "_HOME", tmp_path),
     ):
@@ -36,22 +37,32 @@ def test_apply_direct_uses_systemd_run_scope(tmp_path, _passthrough_jsonify):
     assert pid_file.read_text() == "12345"
 
 
-def test_apply_direct_falls_back_when_systemd_run_missing(tmp_path, _passthrough_jsonify):
+def test_apply_direct_falls_back_when_scope_unavailable(tmp_path, _passthrough_jsonify):
+    """systemd-run absent OR the user manager/D-Bus unreachable (probe False) →
+    plain bash + start_new_session, never a silent no-op."""
     fake_proc = MagicMock(pid=999)
     pid_file = tmp_path / ".genesis" / "update_in_progress.pid"
     with (
-        patch.object(
-            updates.subprocess, "Popen", side_effect=[FileNotFoundError(), fake_proc]
-        ) as popen,
+        patch.object(updates, "_systemd_run_scope_available", return_value=False),
+        patch.object(updates.subprocess, "Popen", return_value=fake_proc) as popen,
         patch.object(updates, "_HOME", tmp_path),
     ):
         updates._apply_direct(pid_file)
-    # Second call is the fallback — a plain bash spawn with start_new_session.
-    fallback_argv = popen.call_args_list[1][0][0]
-    fallback_kwargs = popen.call_args_list[1][1]
-    assert fallback_argv[0] == "bash"
-    assert fallback_kwargs.get("start_new_session") is True
+    argv = popen.call_args_list[0][0][0]
+    kwargs = popen.call_args_list[0][1]
+    assert argv[0] == "bash"
+    assert kwargs.get("start_new_session") is True
     assert pid_file.read_text() == "999"
+
+
+def test_systemd_run_scope_probe():
+    """The viability probe: 0 → True; non-zero (D-Bus down) → False; missing → False."""
+    with patch.object(updates.subprocess, "run", return_value=MagicMock(returncode=0)):
+        assert updates._systemd_run_scope_available({}) is True
+    with patch.object(updates.subprocess, "run", return_value=MagicMock(returncode=1)):
+        assert updates._systemd_run_scope_available({}) is False
+    with patch.object(updates.subprocess, "run", side_effect=FileNotFoundError()):
+        assert updates._systemd_run_scope_available({}) is False
 
 
 def test_apply_guard_and_status_use_update_in_progress():

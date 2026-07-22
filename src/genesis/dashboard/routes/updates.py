@@ -249,6 +249,24 @@ def update_apply():
     return _apply_direct(_PID_FILE)
 
 
+def _systemd_run_scope_available(env: dict) -> bool:
+    """True only if `systemd-run --user --scope` can actually start a scope here.
+
+    systemd-run can be present but unusable when the user manager / D-Bus is
+    unreachable: `Popen` would succeed yet the child dies with "Failed to connect
+    to bus", silently no-op'ing the update. Probe with a no-op scope so we can
+    fall back deterministically instead of trusting Popen not to raise.
+    """
+    try:
+        r = subprocess.run(
+            ["systemd-run", "--user", "--scope", "--", "true"],
+            capture_output=True, timeout=10, env=env,
+        )
+        return r.returncode == 0
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _apply_direct(pid_file: Path) -> tuple:
     """Run update.sh directly (no CC supervision), in its OWN systemd scope.
 
@@ -263,11 +281,11 @@ def _apply_direct(pid_file: Path) -> tuple:
         log_path = _HOME / ".genesis" / "update_direct.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(log_path, "w")  # noqa: SIM115
-        try:
-            env = os.environ.copy()
-            uid = os.getuid()
-            env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
-            env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+        env = os.environ.copy()
+        uid = os.getuid()
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+        if _systemd_run_scope_available(env):
             proc = subprocess.Popen(
                 ["systemd-run", "--user", "--scope", "--", "bash", str(_UPDATE_SCRIPT)],
                 stdout=log_fh,
@@ -275,12 +293,13 @@ def _apply_direct(pid_file: Path) -> tuple:
                 env=env,
             )
             logger.info("Direct update spawned via systemd-run --scope (pid %d)", proc.pid)
-        except (FileNotFoundError, OSError) as exc:
-            # systemd-run unavailable (e.g. container restrictions): fall back to
-            # a new session. update.sh may then be killed if it stops the server
-            # from inside the shared cgroup -- but its P4b prestop/rollback traps
-            # keep the server from being left down.
-            logger.warning("systemd-run failed (%s), falling back to start_new_session", exc)
+        else:
+            # systemd-run absent OR the user manager/D-Bus is unreachable (a scope
+            # can't start -- Popen would succeed but the child dies "Failed to
+            # connect to bus"). Fall back to a new session in the shared cgroup;
+            # update.sh's P4b prestop/rollback traps keep the server from being
+            # left down if it self-SIGTERMs at the server stop.
+            logger.warning("systemd-run --scope unavailable; falling back to start_new_session")
             proc = subprocess.Popen(
                 ["bash", str(_UPDATE_SCRIPT)],
                 stdout=log_fh,
