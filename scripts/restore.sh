@@ -459,14 +459,30 @@ _pull_from_offsite
 # place. Fail loudly up front instead. (A backup that IS present but whose
 # destinations are all newer legitimately no-ops later — that's found-but-
 # skipped, not this empty case, so it still succeeds.)
+# Any-file (not just *.gpg): §4/§4b restore memory/eval with `find -type f`, so a
+# legacy plaintext memory file (arbitrary extension) IS restorable and must count
+# here — matching what the sections actually accept, or the guard false-fails a
+# valid legacy backup.
+_dir_has_file() { [ -d "$1" ] && find "$1" -type f -print -quit 2>/dev/null | grep -q .; }
 _backup_has_payload() {
-    local d="$BACKUP_DIR"
-    [ -f "$d/data/genesis.sql.gpg" ] || [ -f "$d/data/genesis.sql" ] && return 0
+    local d="$BACKUP_DIR" _m
+    { [ -f "$d/data/genesis.sql.gpg" ] || [ -f "$d/data/genesis.sql" ]; } && return 0
+    _dir_has_file "$d/data/qdrant" && return 0
+    _dir_has_file "$d/transcripts" && return 0
+    _dir_has_file "$d/memory" && return 0
+    _dir_has_file "$d/eval" && return 0
+    _dir_has_file "$d/creds" && return 0
     [ -f "$d/secrets/secrets.env.gpg" ] && return 0
-    find "$d/data/qdrant" "$d/transcripts" "$d/memory" "$d/eval" "$d/creds" \
-        -type f \( -name '*.gpg' -o -name '*.snapshot' -o -name '*.jsonl' \) \
-        -print -quit 2>/dev/null | grep -q . && return 0
     find "$d/config_overrides" -type f -name '*.local.yaml' -print -quit 2>/dev/null | grep -q . && return 0
+    # §7/§8 also restore secrets/creds from the host-side credential MIRROR when
+    # BACKUP_DIR lacks them (a no-git DR box whose only surviving copy is the
+    # guardian mirror) — so a mirror payload counts too, or the guard would
+    # wrongly refuse that recovery path.
+    while IFS= read -r _m; do
+        [ -n "$_m" ] || continue
+        [ -f "$_m/secrets/secrets.env.gpg" ] && return 0
+        _dir_has_file "$_m/creds" && return 0
+    done < <(_cred_fallback_sources)
     return 1
 }
 if ! $DRY_RUN && ! _backup_has_payload; then

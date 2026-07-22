@@ -120,21 +120,34 @@ STATUSEOF
 # run, and its dedup must read the prior status before _write_status rewrites it).
 _alert_backup_failed() {
     [ "$_SUCCESS" = "true" ] && return 0
-    _send_telegram "🚨 *Backup failed*
+    # `set -e` stays active inside the EXIT trap, and this is the FIRST step of
+    # _on_exit — so it must never abort _on_exit (which would skip _write_status
+    # + the plaintext cleanup below). Two ways it could: (a) an abort in the
+    # narrow window before _send_telegram is defined (a 0-byte secrets.env
+    # failing load_secrets_file) → `declare -F` guard skips the call, and
+    # _write_status still records success:false for the health-alert path;
+    # (b) _send_telegram → queue_alert returning non-zero → `|| true`. Always
+    # returns 0.
+    if declare -F _send_telegram >/dev/null 2>&1; then
+        _send_telegram "🚨 *Backup failed*
 
 Reason: ${_FAILURE_REASON:-unknown (aborted before completion)}
 Time: $(date -Is)
 SQLite lines: $_SQLITE_LINES
-Duration: $(( $(date +%s) - _STARTED_AT ))s"
+Duration: $(( $(date +%s) - _STARTED_AT ))s" || true
+    fi
+    return 0
 }
 
 _on_exit() {
-    _alert_backup_failed
-    _write_status
-    backend_cleanup
+    # Exit handler: every step best-effort so a failure in one never skips the
+    # rest (status write + plaintext cleanup must always run).
+    _alert_backup_failed || true
+    _write_status || true
+    backend_cleanup || true
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
-    [ -n "${_SQL_TMP:-}" ] && rm -f "$_SQL_TMP"
+    rm -f "${_SQL_TMP:-}" 2>/dev/null || true
     return 0
 }
 trap _on_exit EXIT

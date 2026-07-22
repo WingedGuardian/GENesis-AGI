@@ -59,6 +59,12 @@ def test_backup_alert_fires_from_exit_trap():
     assert on_exit.index("_alert_backup_failed") < on_exit.index("_write_status")
     # No second, inline '🚨 *Backup failed*' emission outside the alert function.
     assert text.count("🚨 *Backup failed*") == 1
+    # Robustness (review fix): the trap must not abort mid-way under set -e —
+    # the alert is guarded against an undefined _send_telegram (early abort) and
+    # every step is `|| true` so _write_status + cleanup always run.
+    alert = text.split("_alert_backup_failed()", 1)[1].split("_on_exit()", 1)[0]
+    assert "declare -F _send_telegram" in alert
+    assert on_exit.count("|| true") >= 3  # alert / write_status / backend_cleanup
 
 
 def test_backup_sql_tmp_trap_cleaned():
@@ -66,7 +72,7 @@ def test_backup_sql_tmp_trap_cleaned():
     the not-yet-assigned case."""
     text = _BACKUP.read_text()
     on_exit = text.split("_on_exit()", 1)[1].split("trap _on_exit", 1)[0]
-    assert 'rm -f "$_SQL_TMP"' in on_exit
+    assert 'rm -f "${_SQL_TMP:-}"' in on_exit
     assert '_SQL_TMP=""' in text  # initialized before the trap can fire
 
 
@@ -170,6 +176,47 @@ def test_n5_empty_backup_fails(restore_sandbox):
     assert "no restorable payloads found" in proc.stdout, proc.stdout
     status = json.loads((sb["home"] / ".genesis" / "restore_status.json").read_text())
     assert status["success"] is False, status
+
+
+def test_n5_legacy_plaintext_memory_counts(restore_sandbox):
+    """Review fix: the N5 guard must count a legacy plaintext memory file (§4
+    restores any file, not just .gpg) — else it false-fails a valid legacy
+    backup. Presence of the payload → the guard passes (no 'nothing to restore'
+    die); the run proceeds (and legitimately finds nothing NEW to do)."""
+    sb = restore_sandbox
+    (sb["backup"] / "memory").mkdir()
+    (sb["backup"] / "memory" / "note.md").write_text("plaintext-legacy\n")  # no .gpg
+    proc = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(sb["backup"]), "--force"],
+        env=sb["env"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert "no restorable payloads found" not in proc.stdout, proc.stdout
+    assert proc.returncode == 0, proc.stdout
+
+
+def test_n5_credential_mirror_counts(restore_sandbox):
+    """Review fix: with an empty BACKUP_DIR but a host-side credential mirror
+    holding secrets (§7 restores from it), the N5 guard must NOT die — that
+    mirror-only recovery is a real DR path."""
+    sb = restore_sandbox
+    mirror = sb["home"] / ".genesis" / "shared" / "guardian" / "creds-mirror"
+    (mirror / "secrets").mkdir(parents=True)
+    (mirror / "secrets" / "secrets.env.gpg").write_bytes(b"encrypted-blob")
+    proc = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(sb["backup"]), "--force"],
+        env={
+            **sb["env"],
+            "GENESIS_BACKUP_PASSPHRASE": _TEST_PASSPHRASE,
+            "GNUPGHOME": str(sb["home"] / ".gnupg"),
+        },
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert "no restorable payloads found" not in proc.stdout, proc.stdout
 
 
 def test_n4_no_tty_no_force_fails(restore_sandbox):
