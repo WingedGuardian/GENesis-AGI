@@ -12,6 +12,7 @@ from typing import Any
 import aiosqlite
 from qdrant_client import QdrantClient
 
+from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
 from genesis.memory.activation import compute_activation
@@ -624,11 +625,50 @@ class HybridRetriever:
         qdrant_client: QdrantClient,
         db: aiosqlite.Connection,
         reranker: VoyageReranker | None = None,
+        read_pool: ReadConnectionPool | None = None,
     ) -> None:
         self._embeddings = embedding_provider
         self._qdrant = qdrant_client
         self._db = db
         self._reranker = reranker
+        # Optional read-only pool for recall's read stages (follow-up ac27b693).
+        # When wired (server path), pure-read helpers run on a dedicated mode=ro
+        # connection off the shared write lock; None (eval, tests, other callers)
+        # keeps every read on self._db — byte-identical to the pre-pool path.
+        self._read_pool = read_pool
+
+    async def _ro_read(
+        self,
+        fn: Callable[..., Coroutine[Any, Any, Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a pure-read helper on a pooled read-only connection, off the
+        shared write lock. Called as ``fn(conn, *args, **kwargs)``.
+
+        Falls back to ``self._db`` on any pool miss/error — the pool is an
+        OPTIMIZATION, never a hard dependency, so a read is never WORSE than the
+        pre-pool path. This also means a security-relevant read (the WS-3
+        origin_class backfill) that hits a transient pool error is re-run on the
+        real write connection and returns true data, NOT a fail-open ``None``.
+
+        NOTE: a pooled read sees only COMMITTED state (mode=ro snapshot). Every
+        current recall read is safe (none depends on an uncommitted write made
+        earlier in the same recall); a future read that does must not route here.
+        """
+        pool = self._read_pool
+        if pool is not None:
+            try:
+                async with pool.acquire() as ro:
+                    return await fn(ro, *args, **kwargs)
+            except ReadPoolClosed:
+                pass  # pool closed / not opened — use the shared connection
+            except Exception:
+                logger.debug(
+                    "recall RO-pool read failed; retrying on shared connection",
+                    exc_info=True,
+                )
+        return await fn(self._db, *args, **kwargs)
 
     async def _maybe_entity_lane_shadow(
         self,
@@ -695,9 +735,12 @@ class HybridRetriever:
 
         ``stats``: optional caller-owned dict populated with rerank stage
         telemetry (``rerank_executed``, ``rerank_ms``, ``rerank_timed_out``)
-        plus per-stage read timings (``vector_ms``, ``expand_ms``, ``fts_ms``,
-        ``activation_ms``). Caller-owned so concurrent recalls on the shared
-        retriever can never race each other's numbers.
+        plus per-stage read timings (``vector_ms``, ``event_ms``, ``expand_ms``,
+        ``fts_ms``, ``expired_ms``, ``activation_ms``, ``breadcrumbs_ms``,
+        ``assembly_ms``). These decompose the ``recall`` wall-time so a residual
+        (e.g. read-lock contention) is attributable to a stage from the journal
+        alone. Caller-owned so concurrent recalls on the shared retriever can
+        never race each other's numbers.
 
         ``defer_side_effects``: when True, the post-result WRITE-BACKS and
         eval/telemetry emits (retrieved_count bumps, ``recall_fired`` +
@@ -785,11 +828,14 @@ class HybridRetriever:
                 stats["vector_ms"] = round((time.monotonic() - _ts) * 1000, 1)
 
         # 2b. Event-calendar search (temporal queries)
+        _ts = time.monotonic()
         event_memory_ids = await self._gather_event_candidates(
             query,
             intent,
             candidate_limit,
         )
+        if stats is not None:
+            stats["event_ms"] = round((time.monotonic() - _ts) * 1000, 1)
 
         # 2c. Expand query via tag co-occurrence (SWR — stale index rebuilds in
         # the background, never inline on this path; see intent.expand_query)
@@ -824,12 +870,15 @@ class HybridRetriever:
         # (No-op on an empty set — guard the call so both empty exits share one
         # path below.)
         if all_ids:
+            _ts = time.monotonic()
             all_ids, event_memory_ids = await self._filter_expired_candidates(
                 all_ids,
                 qdrant_by_id,
                 fts_by_id,
                 event_memory_ids,
             )
+            if stats is not None:
+                stats["expired_ms"] = round((time.monotonic() - _ts) * 1000, 1)
         if not all_ids:
             # No organic candidates from vector/FTS/event lanes. Still measure
             # whether the entity lane would surface something — its highest-value
@@ -920,9 +969,13 @@ class HybridRetriever:
 
         # 7b. Graph boost: backlink + adjacency (floor-gated); mutates
         # ``fused`` in place.
+        _ts = time.monotonic()
         graph_boost_applied = await self._apply_graph_boost(fused, inbound_by_id)
+        if stats is not None:
+            stats["breadcrumbs_ms"] = round((time.monotonic() - _ts) * 1000, 1)
 
         # 8. Filter by min_activation
+        _ts_asm = time.monotonic()
         candidates = [mid for mid in fused if activation_by_id.get(mid, 0.0) >= min_activation]
 
         # 8b. Diversity penalty — collapse echo clusters
@@ -987,7 +1040,10 @@ class HybridRetriever:
         _no_origin = [r.memory_id for r in results if r.origin_class is None]
         if _no_origin:
             try:
-                _origin_by_id = await memory_crud.origin_class_by_ids(self._db, _no_origin)
+                # RO-pool read (WS-3 injection-gate backfill): _ro_read re-reads
+                # on self._db if the pool errs, so a transient pool miss returns
+                # true origin data, never the fail-open None in the except below.
+                _origin_by_id = await self._ro_read(memory_crud.origin_class_by_ids, _no_origin)
                 results = [
                     dataclasses.replace(r, origin_class=_origin_by_id.get(r.memory_id))
                     if r.origin_class is None and _origin_by_id.get(r.memory_id)
@@ -996,6 +1052,9 @@ class HybridRetriever:
                 ]
             except Exception:
                 logger.debug("origin_class backfill on recall failed", exc_info=True)
+
+        if stats is not None:
+            stats["assembly_ms"] = round((time.monotonic() - _ts_asm) * 1000, 1)
 
         # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
         # knowledge_units sync) — each individually swallowed. Runs AFTER
@@ -1142,12 +1201,20 @@ class HybridRetriever:
         vector = None
         try:
             vector = await self._embeddings.embed(query)
-            await record_last_run(
-                self._db,
-                "21b_query_embedding",
-                provider="embedding",
-                model_id="cloud-primary",
-                response_text=f"Query embed: {query[:60]}",
+            # Fire the call-site heartbeat OFF the hot path (ac27b693): it's
+            # best-effort telemetry, and blocking embed_ms on this write — which
+            # queues behind the whole server's writes under load — is pure
+            # latency waste. Nothing reads call_site_last_run synchronously
+            # during recall, so a fire-and-forget task is correct here.
+            tracked_task(
+                record_last_run(
+                    self._db,
+                    "21b_query_embedding",
+                    provider="embedding",
+                    model_id="cloud-primary",
+                    response_text=f"Query embed: {query[:60]}",
+                ),
+                name="embed_last_run",
             )
         except EmbeddingUnavailableError:
             embedding_available = False
@@ -1222,8 +1289,8 @@ class HybridRetriever:
                 if time_range:
                     from genesis.db.crud import memory_events
 
-                    event_memory_ids = await memory_events.get_memory_ids_in_range(
-                        self._db,
+                    event_memory_ids = await self._ro_read(
+                        memory_events.get_memory_ids_in_range,
                         time_range[0],
                         time_range[1],
                         limit=candidate_limit,
@@ -1293,8 +1360,8 @@ class HybridRetriever:
         """
         fts_is_boolean = fts_query != query  # expansion produced boolean syntax
         fts_collection = collections[0] if len(collections) == 1 else None
-        fts_results = await memory_crud.search_ranked(
-            self._db,
+        fts_results = await self._ro_read(
+            memory_crud.search_ranked,
             query=fts_query,
             collection=fts_collection,
             limit=candidate_limit,
@@ -1332,7 +1399,7 @@ class HybridRetriever:
         ids); returns the shrunk ``(all_ids, event_memory_ids)``.
         """
         try:
-            expired = await _expired_candidate_ids(self._db, all_ids)
+            expired = await self._ro_read(_expired_candidate_ids, all_ids)
         except Exception:
             logger.warning(
                 "invalid_at filter failed, returning unfiltered candidates",
@@ -1362,7 +1429,7 @@ class HybridRetriever:
         (not act on) whether the activation loop entrenches frequently-
         retrieved memories.
         """
-        link_counts = await memory_links.batch_link_counts(self._db, list(all_ids))
+        link_counts = await self._ro_read(memory_links.batch_link_counts, list(all_ids))
 
         # FTS-only rows (no Qdrant hit) otherwise fall back to now_str for
         # created_at, giving them an unearned recency = exp(0) = 1.0 and a
@@ -1371,7 +1438,7 @@ class HybridRetriever:
         # ghosts with no metadata row keep the now_str fallback below.
         fts_only_ids = [mid for mid in all_ids if mid not in qdrant_by_id]
         meta_created_at = (
-            await memory_crud.batch_created_at(self._db, fts_only_ids) if fts_only_ids else {}
+            await self._ro_read(memory_crud.batch_created_at, fts_only_ids) if fts_only_ids else {}
         )
 
         activation_by_id: dict[str, float] = {}
@@ -1524,8 +1591,8 @@ class HybridRetriever:
             top_k = boosted_ranked[:_ADJACENCY_TOP_K]
             if len(top_k) >= 3:
                 try:
-                    edges = await memory_links.inter_candidate_links(
-                        self._db,
+                    edges = await self._ro_read(
+                        memory_links.inter_candidate_links,
                         top_k,
                     )
                     intra_inbound: dict[str, int] = {}

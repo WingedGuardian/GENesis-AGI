@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from genesis.cc.context_injector import ContextInjector
     from genesis.cc.reflection_bridge import CCReflectionBridge
     from genesis.cc.session_manager import SessionManager
+    from genesis.db.connection import ReadConnectionPool
     from genesis.inbox.monitor import InboxMonitor
     from genesis.learning.pipeline import TriagePipeline
     from genesis.mail.monitor import MailMonitor
@@ -174,6 +175,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._bootstrapped = False
 
         self._db: aiosqlite.Connection | None = None
+        # Dedicated read-only pool for recall's read stages (follow-up ac27b693);
+        # wired in _init_memory, closed before self._db at shutdown.
+        self._db_ro_pool: ReadConnectionPool | None = None
         self._event_bus: GenesisEventBus | None = None
         self._awareness_loop: AwarenessLoop | None = None
         self._router: Router | None = None
@@ -679,6 +683,16 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 await self._event_bus.stop()
             except Exception:
                 logger.exception("Failed to stop event bus")
+
+        # Close the recall read-only pool BEFORE the writer — readers stop
+        # first (follow-up ac27b693). Idempotent; a failed memory init leaves
+        # this None, so the guard also covers the pool-never-built case.
+        if self._db_ro_pool is not None:
+            try:
+                await self._db_ro_pool.close()
+                logger.info("Recall read-only pool closed")
+            except Exception:
+                logger.exception("Failed to close recall read-only pool")
 
         if self._db is not None:
             try:
