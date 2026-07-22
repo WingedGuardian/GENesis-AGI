@@ -140,3 +140,34 @@ async def test_enrich_and_breadcrumbs_run_through_pool(tmp_path):
         assert dicts[0]["related_ids"] == ["aaaaaaaa", "bbbbbbbb"]
     finally:
         await pool.close()
+
+
+async def test_enrich_read_error_on_pool_falls_back_to_shared_db():
+    """Codex #1197 P2: when the pool hands out a connection but its SELECT fails
+    (stale/closed conn, SQLITE_BUSY after the read timeout), the read must fall
+    back to the shared connection and STILL enrich — _enrich no longer swallows
+    the error internally, so _ro_read's fallback fires. Under the old
+    swallow-inside behavior enrichment would silently vanish on a transient pool
+    read failure; this guards against regressing to that.
+    """
+
+    class _BadConn:
+        async def execute_fetchall(self, sql, params=()):
+            raise sqlite3.OperationalError("database is locked")
+
+    class _GoodConn:
+        async def execute_fetchall(self, sql, params=()):
+            if "memory_metadata" in sql.lower():
+                return [("mem1", "2024-01-01T00:00:00+00:00", "routing")]
+            return []
+
+    # Pool yields a connection whose SELECT raises; the shared _db is healthy.
+    retriever = _retriever(read_pool=_FakePool(_BadConn()))
+    retriever._db = _GoodConn()
+    dicts = [{"memory_id": "mem1", "payload": {}}]
+
+    await retriever._ro_read(_enrich, dicts)
+
+    # Fell back to the shared DB and enriched, rather than silently losing it.
+    assert dicts[0]["_wing"] == "routing"
+    assert dicts[0]["_created_at"] == "2024-01-01T00:00:00+00:00"
