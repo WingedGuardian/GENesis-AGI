@@ -29,18 +29,34 @@ def _seed(path) -> None:
     db = sqlite3.connect(path)
     db.executescript(_SCHEMA)
     units = [
-        # (unit_id, qdrant_id, source_pipeline, domain, body) — first line = title
-        # PURGE: action-task telemetry
-        ("u1", "q1", "surplus", "intelligence.surplus", "Db Maintenance\n\nDB size 266MB"),
-        # PURGE: pipeline-intermediate telemetry
+        # (unit_id, qdrant_id, source_pipeline, domain, body) — first line = title,
+        # then the machine-report body prefix the signature requires.
+        # PURGE: action-task telemetry (title + machine prefix)
+        (
+            "u1",
+            "q1",
+            "surplus",
+            "intelligence.surplus",
+            "Db Maintenance\n\nDatabase maintenance report:   DB file size 266MB",
+        ),
+        # PURGE: pipeline-intermediate telemetry (specific title, no prefix guard)
         ("u3", "q3", "surplus", "intelligence.surplus", "Research Query Gen\n\nq1; q2; q3"),
         # KEEP: genuine insight (real LLM title, same pipeline/domain)
         ("u2", "q2", "surplus", "intelligence.surplus", "Optimize Memory and Process\n\n…"),
         # KEEP: crawled external intelligence (different domain — not matched)
         ("u4", "q4", "model_intelligence", "intelligence.models", "Model Intelligence\n\n{...}"),
-        # KEEP: a title collision guard — "Model Eval" is an ops title, but this
-        # row is in a different domain, so the domain scope must protect it.
+        # KEEP: domain-scope guard — "Model Eval" title but in intelligence.models.
         ("u5", "q5", "surplus", "intelligence.models", "Model Eval\n\nnot telemetry here"),
+        # KEEP: Codex-P2 false-delete guard — an INSIGHT finding an LLM titled
+        # "Model Eval" in the SAME surplus/intelligence.surplus scope, but with a
+        # prose body (no "Model evaluation:" machine prefix) → must survive.
+        (
+            "u6",
+            "q6",
+            "surplus",
+            "intelligence.surplus",
+            "Model Eval\n\nA brainstorm on how we should evaluate candidate models next quarter.",
+        ),
     ]
     db.executemany(
         "INSERT INTO knowledge_units (id, qdrant_id, source_pipeline, domain, body) "
@@ -102,10 +118,12 @@ def test_purges_only_ops_telemetry_in_surplus_domain(tmp_path, monkeypatch):
     kfts = {r[0] for r in db.execute("SELECT unit_id FROM knowledge_fts").fetchall()}
     db.close()
 
-    assert units == {"u2", "u4", "u5"}  # insight + crawled + domain-guarded kept
-    assert fts == {"q2", "q4", "q5"}  # memory_fts cascade removed q1/q3
-    assert meta == {"q2", "q4", "q5"}  # memory_metadata cascade removed q1/q3
-    assert kfts == {"u2", "u4", "u5"}
+    # Kept: insight (u2) + crawled (u4) + domain-guarded (u5) + the prose-body
+    # "Model Eval" insight (u6, the Codex-P2 false-delete guard).
+    assert units == {"u2", "u4", "u5", "u6"}
+    assert fts == {"q2", "q4", "q5", "q6"}  # memory_fts cascade removed q1/q3
+    assert meta == {"q2", "q4", "q5", "q6"}  # memory_metadata cascade removed q1/q3
+    assert kfts == {"u2", "u4", "u5", "u6"}
     assert set(deleted) == {("knowledge_base", "q1"), ("knowledge_base", "q3")}
 
 
@@ -146,12 +164,31 @@ def test_empty_db_verifies_clean(tmp_path, monkeypatch):
     assert d0005.migrate() == {"purged": 0, "qdrant_deleted": 0}
 
 
-def test_purge_titles_match_live_enum_derivation():
-    # The hardcoded signature list must equal the non-KB-routing task titles, so
-    # it can't silently drift from the dispatch gate.
+def test_signature_titles_are_all_non_kb_routing():
+    # Every purge signature title must be a non-KB-routing task's title() — so the
+    # migration can NEVER match an insight-producing task's title. Guards against a
+    # future edit adding an insight title to the signature map.
     from genesis.surplus.types import KB_ROUTING_TASK_TYPES, TaskType
 
-    derived = {
+    non_kb_titles = {
         tt.value.replace("_", " ").title() for tt in TaskType if tt not in KB_ROUTING_TASK_TYPES
     }
-    assert derived == d0005._OPS_TELEMETRY_TITLES
+    assert set(d0005._OPS_SIGNATURES) <= non_kb_titles
+
+
+def test_generic_title_with_prose_body_is_not_purged(tmp_path, monkeypatch):
+    # Codex-P2 guard: a generic ops title ("Model Eval") on a real insight with a
+    # prose body (no machine-report prefix) must NOT be purged.
+    path = tmp_path / "genesis.db"
+    db = sqlite3.connect(path)
+    db.executescript(_SCHEMA)
+    db.execute(
+        "INSERT INTO knowledge_units (id, qdrant_id, source_pipeline, domain, body) "
+        "VALUES ('x', 'qx', 'surplus', 'intelligence.surplus', "
+        "'Model Eval\n\nMy analysis of which models to evaluate.')"
+    )
+    db.commit()
+    db.close()
+    _patch(monkeypatch, path)
+    assert d0005.migrate()["purged"] == 0
+    assert d0005.verify() is True

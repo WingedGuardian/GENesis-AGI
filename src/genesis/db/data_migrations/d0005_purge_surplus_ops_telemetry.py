@@ -12,12 +12,14 @@ code since 2026-06-10, so peer installs carry it too; no per-install hand-fix.
 
 Match is deterministic + tightly scoped (near-zero false-delete): a
 ``knowledge_unit`` whose ``source_pipeline='surplus'`` AND
-``domain='intelligence.surplus'`` AND whose body's FIRST LINE equals a
-non-KB-routing task's ``single_item`` title (``task_type.replace("_"," ").title()``,
-e.g. "Db Maintenance", "Research Query Gen"). Insight-producing tasks kept in the
-KB (brainstorm/audit/anticipatory/self_unblock/prompt_effectiveness_review) have
-DISTINCT titles or real LLM-authored titles, so they are never matched (the
-title sets are disjoint — asserted by test_d0005_purge_surplus_ops_telemetry).
+``domain='intelligence.surplus'`` AND whose body is ``"<title>\n\n<prefix>…"`` for
+an entry in ``_OPS_SIGNATURES`` — the exact non-KB-routing ``single_item`` title
+AND the deterministic machine-report opener the executor writes (e.g.
+"Db Maintenance" + "Database maintenance report:"). The body-prefix guard is what
+makes it safe against a legitimate insight an LLM happened to title "Model Eval"
+in the same scope (Codex P2, #1179) — an insight's prose body lacks the machine
+prefix. Insight-producing tasks are never matched (their titles are disjoint from
+the signatures — asserted by test_d0005_purge_surplus_ops_telemetry).
 
 Cross-store: a KB unit lives in Qdrant + memory_metadata + memory_fts +
 knowledge_units + knowledge_fts (+ memory_links / pending_embeddings /
@@ -50,38 +52,41 @@ logger = logging.getLogger(__name__)
 
 requires_operator = False
 
-# First-line title signatures of the single_item ops-telemetry rows to purge =
-# ``task_type.replace("_"," ").title()`` for every TaskType NOT in
-# ``surplus.types.KB_ROUTING_TASK_TYPES`` (action/maintenance/monitor/pipeline-
-# intermediate). Snapshotted here as an explicit, auditable list for a DESTRUCTIVE
-# migration; test_d0005_purge_surplus_ops_telemetry asserts this equals the live
-# enum derivation, so it cannot silently drift from the gate.
-_OPS_TELEMETRY_TITLES = frozenset(
-    {
-        "Backup Verification",
-        "Cc Memory Staleness",
-        "Code Index",
-        "Db Maintenance",
-        "Dead Letter Replay",
-        "Disk Cleanup",
-        "Fresh Session Test",
-        "Infrastructure Monitor",
-        "J9 Eval Batch",
-        "Model Eval",
-        "Prompt Review Catalog",
-        "Prompt Review Sample",
-        "Research Query Gen",
-    }
-)
+# Purge signatures: ``{first-line title -> required body prefix}``. A row is
+# telemetry only if its body is ``"<title>\n\n<prefix>…"`` — i.e. the exact
+# single_item title AND the deterministic machine-report opener the executor
+# writes. Every title here is a non-KB-routing task's ``task_type.title()``
+# (asserted by test) so it can never name an insight-producing task.
+#
+# The body-prefix guard exists because title-alone is unsafe for GENERIC
+# operational names: an insight-producing task could produce a finding an LLM
+# titled "Model Eval" or "Db Maintenance" in the same surplus/intelligence.surplus
+# scope, and a title-only match would false-delete it (Codex P2, PR #1179). The
+# machine-report prefix an LLM insight would never reproduce makes the match safe.
+# Pipeline-intermediate titles (RESEARCH_QUERY_GEN / PROMPT_REVIEW_*) are SPECIFIC
+# internal step-names no insight would ever carry, and their bodies are free-form
+# LLM prose with no stable prefix, so they use ``""`` (title-only — still safe).
+_OPS_SIGNATURES: dict[str, str] = {
+    "Backup Verification": "Backup verification:",
+    "Cc Memory Staleness": "CC Memory Staleness Scan:",
+    "Db Maintenance": "Database maintenance report:",
+    "Disk Cleanup": "Disk cleanup scan",
+    "Fresh Session Test": "Fresh Session Test completed",
+    "J9 Eval Batch": "J9 eval batch:",
+    "Model Eval": "Model evaluation:",
+    "Research Query Gen": "",  # specific pipeline-step name — title-only is safe
+    "Prompt Review Sample": "",  # specific pipeline-step name — title-only is safe
+    "Prompt Review Catalog": "",  # specific pipeline-step name — title-only is safe
+}
 
 
 def _candidate_ids(db: sqlite3.Connection) -> list[tuple[str, str]]:
     """Return ``(unit_id, qdrant_id)`` for every surplus ops-telemetry KB unit.
 
     Scoped to ``source_pipeline='surplus' AND domain='intelligence.surplus'``,
-    then filtered in Python to units whose body first line is an exact ops-title
-    match — the deterministic signature that separates telemetry from the
-    real-titled insights sharing the same pipeline/domain.
+    then filtered in Python to units whose body is ``"<title>\\n\\n<prefix>…"`` for
+    an entry in ``_OPS_SIGNATURES`` — the deterministic title+machine-report
+    signature that separates telemetry from real insights in the same scope.
     """
     rows = db.execute(
         "SELECT id, qdrant_id, body FROM knowledge_units "
@@ -89,9 +94,11 @@ def _candidate_ids(db: sqlite3.Connection) -> list[tuple[str, str]]:
     ).fetchall()
     out: list[tuple[str, str]] = []
     for unit_id, qdrant_id, body in rows:
-        first_line = (body or "").split("\n", 1)[0].strip()
-        if first_line in _OPS_TELEMETRY_TITLES:
-            out.append((unit_id, qdrant_id or ""))
+        b = body or ""
+        for title, prefix in _OPS_SIGNATURES.items():
+            if b.startswith(f"{title}\n\n{prefix}"):
+                out.append((unit_id, qdrant_id or ""))
+                break
     return out
 
 
