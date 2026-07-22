@@ -345,6 +345,7 @@ async def _db_with_pending_gauntlet(model: str):
         conn,
         id="p1",
         action_type="gauntlet_regression",
+        action_category=model,
         content=(
             f"Model-roster gauntlet regression — {model}: previously PASSED, "
             f"now FAILED 1/2 fixtures."

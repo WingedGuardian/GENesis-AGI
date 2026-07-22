@@ -77,8 +77,8 @@ async def unified_comms():
     rt = GenesisRuntime.instance()
     if not rt.is_bootstrapped or rt.db is None:
         return jsonify({
-            "outreach": [], "proposals": [], "pending_approvals": [],
-            "counts": {},
+            "outreach": [], "proposals": [], "informational": [],
+            "pending_approvals": [], "counts": {},
         })
 
     view = request.args.get("view", "pending")
@@ -109,35 +109,52 @@ async def unified_comms():
         counts["outreach_total"] = 0
 
     # --- Ego proposals ---
+    # Acknowledge-only eval rows (j9/gauntlet) are notifications, not approval
+    # items — they never render with approve/reject and never count as pending
+    # approvals, in EITHER view. In the pending view the approval count is just
+    # the approval-lane length; in the history view the page is limited, so the
+    # full pending-approval count comes from a COUNT query (built from the shared
+    # constant so it can't drift from the split).
     informational: list[dict] = []
     try:
         from genesis.db.crud import ego
         from genesis.ego.types import (
             INFORMATIONAL_ACTION_TYPES,
+            is_informational,
             partition_informational,
         )
 
         if view == "pending":
             raw = await ego.list_pending_proposals(rt.db)
-            # Acknowledge-only eval rows (j9/gauntlet) are notifications, not
-            # approval items — split them into a separate informational lane.
             proposals, informational = partition_informational(raw)
+            counts["proposals_pending"] = len(proposals)
         else:
-            proposals = await ego.list_proposals(rt.db, limit=limit)
+            raw = await ego.list_proposals(rt.db, limit=limit)
+            # Keep resolved rows (incl. resolved informational) in history, but
+            # pull still-PENDING informational rows into the informational lane so
+            # they never render as approvable in the history view.
+            proposals = [
+                p for p in raw
+                if not (
+                    p.get("status") == "pending"
+                    and is_informational(p.get("action_type"))
+                )
+            ]
+            informational = [
+                p for p in raw
+                if p.get("status") == "pending"
+                and is_informational(p.get("action_type"))
+            ]
+            _info_placeholders = ",".join("?" for _ in INFORMATIONAL_ACTION_TYPES)
+            pending_count_cursor = await rt.db.execute(
+                "SELECT COUNT(*) FROM ego_proposals WHERE status = 'pending' "
+                f"AND action_type NOT IN ({_info_placeholders})",
+                tuple(INFORMATIONAL_ACTION_TYPES),
+            )
+            counts["proposals_pending"] = (await pending_count_cursor.fetchone())[0]
 
         # Enrich executed proposals with session outcome data
         proposals = await _enrich_proposals_with_outcomes(rt.db, proposals)
-
-        # Pending APPROVAL count excludes informational rows (they carry no
-        # approve/reject decision). Built from the shared constant so it can
-        # never drift from the lane split above.
-        _info_placeholders = ",".join("?" for _ in INFORMATIONAL_ACTION_TYPES)
-        pending_count_cursor = await rt.db.execute(
-            "SELECT COUNT(*) FROM ego_proposals WHERE status = 'pending' "
-            f"AND action_type NOT IN ({_info_placeholders})",
-            tuple(INFORMATIONAL_ACTION_TYPES),
-        )
-        counts["proposals_pending"] = (await pending_count_cursor.fetchone())[0]
         counts["proposals_informational"] = len(informational)
 
         total_count_cursor = await rt.db.execute(
@@ -148,6 +165,7 @@ async def unified_comms():
         # Ego tables may be empty if ego hasn't run — that's fine
         logger.debug("Ego proposals unavailable for comms view", exc_info=True)
         counts["proposals_pending"] = 0
+        counts["proposals_informational"] = 0
         counts["proposals_total"] = 0
 
     # --- Pending approvals ---

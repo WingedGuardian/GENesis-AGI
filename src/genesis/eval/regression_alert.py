@@ -39,6 +39,10 @@ _J9_REGRESSION_ACTION_TYPE = "j9_regression"
 # score drop regardless of grade. Tunable down toward D once variance is known.
 _ABSOLUTE_FLOOR_GRADE = "F"
 _DELTA_DROP_POINTS = 15.0
+# Auto-clear a standing regression row only on AFFIRMATIVE health — never on
+# mere "no fresh regression" (a subsystem that dropped and holds at a degraded
+# grade, or a no-data week, is still regressed).
+_HEALTHY_GRADES = {"A", "B"}
 
 
 def _proposal_id(subsystem: str, period_end: str) -> str:
@@ -116,7 +120,11 @@ async def check_and_alert_regressions(
 
         reason = _regression_reason(latest, prior)
         if not reason:
-            clean_subs.add(sub)
+            # Recovery = affirmatively healthy grade, NOT merely "no fresh
+            # regression": a subsystem holding at a degraded grade after a drop
+            # (or a no-data week, grade None) is still regressed.
+            if latest.get("grade") in _HEALTHY_GRADES:
+                clean_subs.add(sub)
             continue
 
         pid = _proposal_id(sub, period_end)
@@ -131,10 +139,8 @@ async def check_and_alert_regressions(
             )
             continue
 
-        # NOTE: the "Cognitive subsystem regression — {sub}:" prefix is a
-        # load-bearing format — the auto-clear pass below matches pending rows by
-        # it. No prescriptive remedy: the confidence framework forbids naming a
-        # fix before any investigation. The remedy is the user's call.
+        # No prescriptive remedy: the confidence framework forbids naming a fix
+        # before any investigation. The remedy is the user's call.
         text = (
             f"Cognitive subsystem regression — {sub}: {reason} "
             f"(week ending {period_end[:10]}). Investigate the {sub} pipeline."
@@ -165,6 +171,7 @@ async def check_and_alert_regressions(
                 db,
                 id=pid,
                 action_type=_J9_REGRESSION_ACTION_TYPE,
+                action_category=sub,
                 content=text,
                 rationale=(
                     "J-9 weekly eval flagged a cognitive-subsystem quality "
@@ -187,39 +194,16 @@ async def check_and_alert_regressions(
         )
 
     # Auto-clear: withdraw pending j9_regression rows for subsystems that have
-    # since recovered (latest grade no longer a regression). The row's premise —
-    # "this subsystem is regressed" — is now false, so it must not keep sitting
-    # as an informational item. Best-effort; a failure never blocks the check.
-    cleared = 0
-    if clean_subs:
-        try:
-            pending = await ego_crud.list_proposals(db, status="pending", limit=200)
-        except Exception:
-            logger.warning("j9 auto-clear: pending read failed", exc_info=True)
-            pending = []
-        for p in pending:
-            if p.get("action_type") != _J9_REGRESSION_ACTION_TYPE:
-                continue
-            content = p.get("content", "")
-            # Match the load-bearing content prefix written above.
-            matched = next(
-                (s for s in clean_subs if f"regression — {s}:" in content), None
-            )
-            if not matched:
-                continue
-            try:
-                ok = await ego_crud.resolve_proposal(
-                    db,
-                    p["id"],
-                    status="withdrawn",
-                    user_response=f"auto-cleared: {matched} grade recovered",
-                )
-                if ok:
-                    cleared += 1
-            except Exception:
-                logger.warning(
-                    "j9 auto-clear: withdraw failed for %s", p.get("id"), exc_info=True
-                )
+    # affirmatively recovered (healthy latest grade — see the _HEALTHY_GRADES
+    # gate above). Matched by the queryable action_category subject, not text.
+    from genesis.eval.regression_common import withdraw_recovered_proposals
+
+    cleared = await withdraw_recovered_proposals(
+        db,
+        action_type=_J9_REGRESSION_ACTION_TYPE,
+        recovered_subjects=clean_subs,
+        reason="grade recovered",
+    )
 
     if handled or cleared:
         logger.info(

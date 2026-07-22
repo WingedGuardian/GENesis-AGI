@@ -1075,9 +1075,17 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
                 is_approve = any(s == "approved" for s, _ in decisions.values())
                 if is_approve:
                     try:
+                        from genesis.ego.types import is_informational
+
                         recent_withdrawn = await ego_crud.list_proposals(
-                            ctx.db, status="withdrawn", limit=1,
+                            ctx.db, status="withdrawn", limit=5,
                         )
+                        # Skip auto-cleared informational eval rows (j9/gauntlet)
+                        # — they were never user-facing approvals to re-propose.
+                        recent_withdrawn = [
+                            w for w in recent_withdrawn
+                            if not is_informational(w.get("action_type"))
+                        ]
                         if recent_withdrawn:
                             top = recent_withdrawn[0]
                             await ego_crud.create_directive(
