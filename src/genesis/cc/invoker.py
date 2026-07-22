@@ -101,6 +101,50 @@ def _get_scope_args() -> list[str]:
 # committed; regenerated idempotently (see cc_span_settings_path).
 _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 
+# Keep an owned background-wait ceiling strictly below the hard timeout_s SIGKILL
+# so the CLI ends bg-wait + flushes a partial result (and prints its "terminating"
+# marker) BEFORE our asyncio watchdog kills the process group. One source of truth
+# for the "graceful truncation beats hard kill" invariant.
+_BG_WAIT_HARD_MARGIN_MS = 60_000
+# Stable prefix of the CLI's headless bg-ceiling message (the numeric duration
+# varies): "Background tasks still running after 600s; terminating." Matching the
+# prefix is version-drift-tolerant — a miss degrades to no truncation notice
+# (never a crash). See CCOutput.bg_truncated.
+_BG_TRUNCATION_MARKER = "Background tasks still running after"
+
+
+def _stderr_bg_truncated(stderr_text: str | None) -> bool:
+    """True if CC's stderr shows it SIGKILLed background tasks at the wait ceiling."""
+    return bool(stderr_text) and _BG_TRUNCATION_MARKER in stderr_text
+
+
+async def _emit_bg_truncation_event(cc_session_id: str) -> None:
+    """Fire a ``cc.bg_truncated`` observability event via the runtime singleton.
+
+    Central awareness signal that a dispatched Workflow/subagent was SIGKILLed at
+    the background-wait ceiling with only a partial result. Reaches the bus through
+    the runtime singleton (the invoker holds no bus ref); no-ops cleanly when the
+    runtime/bus is absent (tests, early startup) and never raises.
+    """
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        bus = getattr(GenesisRuntime.instance(), "_event_bus", None)
+        if bus is None:
+            return
+        from genesis.observability.types import Severity, Subsystem
+
+        await bus.emit(
+            Subsystem.PROVIDERS,
+            Severity.WARNING,
+            "cc.bg_truncated",
+            "CC background tasks truncated at the wait ceiling — dispatched work "
+            "was killed mid-run with a partial result",
+            cc_session_id=cc_session_id,
+        )
+    except Exception:
+        logger.debug("cc.bg_truncated event emit failed", exc_info=True)
+
 
 def cc_span_settings_path() -> str | None:
     """Generate (idempotently) a minimal CC settings file that registers ONLY
@@ -374,6 +418,15 @@ class CCInvoker:
             env.pop("GENESIS_PARENT_SPAN_ID", None)
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
+        # Own the headless background-task wait ceiling for lanes that run long
+        # dispatched work. Clamp strictly below the hard timeout_s so the CLI's
+        # graceful truncation + partial flush always precedes our SIGKILL. An
+        # operator's value inherited from os.environ wins (setdefault); so does an
+        # explicit env_overrides entry (applied last, below).
+        if inv and inv.bg_wait_ceiling_ms is not None:
+            hard_ms = inv.timeout_s * 1000
+            ceil_ms = min(inv.bg_wait_ceiling_ms, max(0, hard_ms - _BG_WAIT_HARD_MARGIN_MS))
+            env.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", str(ceil_ms))
         # Roster routing (base_url / auth_token / model slots) + credential
         # isolation. Shared with the foreground `gmodel` launcher via
         # roster.apply_routing_env so the contract lives in ONE place. Native
@@ -704,6 +757,14 @@ class CCInvoker:
             raise err
 
         output = self._parse_output(stdout.decode(errors="replace"), invocation, elapsed)
+        if _stderr_bg_truncated(stderr.decode(errors="replace")):
+            output = replace(output, bg_truncated=True)
+            logger.warning(
+                "CC background tasks truncated at wait ceiling (PID %s) — "
+                "dispatched work SIGKILLed mid-run; result is partial",
+                proc.pid,
+            )
+            await _emit_bg_truncation_event(output.session_id)
         if output.is_error:
             error_text = output.error_message or output.text or "CC error"
             err = self._classify_error(error_text)
@@ -934,8 +995,16 @@ class CCInvoker:
         stderr_data = b""
         if proc.stderr:
             stderr_data = await proc.stderr.read()
-        if stderr_data:
-            logger.warning("CC stderr: %s", stderr_data.decode(errors="replace")[:500])
+        stderr_str = stderr_data.decode(errors="replace") if stderr_data else ""
+        if stderr_str:
+            logger.warning("CC stderr: %s", stderr_str[:500])
+        bg_truncated = _stderr_bg_truncated(stderr_str)
+        if bg_truncated:
+            logger.warning(
+                "CC background tasks truncated at wait ceiling (PID %s) — "
+                "dispatched work SIGKILLed mid-run; result is partial",
+                proc.pid,
+            )
 
         logger.info(
             "CC streaming finished (PID %s, exit=%s, lines=%d, has_result=%s, "
@@ -962,9 +1031,10 @@ class CCInvoker:
             # When CC uses extended thinking, the result field can be empty
             # but the actual response was emitted as text events during streaming
             if not output.text and collected_text:
-                from dataclasses import replace
-
                 output = replace(output, text="".join(collected_text))
+            if bg_truncated:
+                output = replace(output, bg_truncated=True)
+                await _emit_bg_truncation_event(output.session_id)
             if output.is_error:
                 stderr_hint = stderr_data.decode(errors="replace") if stderr_data else ""
                 error_text = output.error_message or output.text or stderr_hint or "CC error"

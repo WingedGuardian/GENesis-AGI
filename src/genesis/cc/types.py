@@ -204,6 +204,18 @@ class CCInvocation:
     strict_mcp_config: bool = False
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
+    # Headless CC (-p) waits for dispatched background Workflow/subagent tasks
+    # to finish before emitting the final result, capped by the CLI's
+    # CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (default 600_000ms = 10min, v2.1.182+).
+    # At the cap the CLI SIGKILLs the whole tree and flushes a PARTIAL result —
+    # this silently truncated a 100+-agent deep-research run on 2026-07-20. Set
+    # this (ms) to own the ceiling for lanes that legitimately run long background
+    # work (e.g. direct_session). The invoker clamps it to stay strictly below
+    # timeout_s so the CLI's graceful truncation always beats the hard SIGKILL,
+    # and an operator's inherited env var wins (set via env, not this field).
+    # None → CLI default (600s) stands; correct for foreground turns, which must
+    # never linger (long work is routed to the background lane instead).
+    bg_wait_ceiling_ms: int | None = None
     anthropic_base_url: str | None = None  # Proxy URL override (ANTHROPIC_BASE_URL)
     # Model-roster routing (model diversification). When set, the CC subprocess
     # is pointed at a non-Anthropic provider via its native Anthropic-compatible
@@ -337,6 +349,13 @@ class CCOutput:
     # apply_active), independent of the provider's self-reported model_used, which
     # may be a variant string or empty. Used for resume-endpoint persistence.
     roster_model: str = ""
+    # True when the CLI hit its background-task wait ceiling and SIGKILLed
+    # dispatched Workflow/subagent work mid-run, flushing only a PARTIAL result
+    # (detected from the "Background tasks still running after …; terminating"
+    # stderr marker). Callers surface this — a visible truncation notice to the
+    # user and/or a cc.bg_truncated observability event — so the silent-death
+    # class (2026-07-20 deep-research) can never recur unremarked.
+    bg_truncated: bool = False
 
 
 @dataclass(frozen=True)

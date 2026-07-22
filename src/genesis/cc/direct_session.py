@@ -52,6 +52,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Appended to a background session's delivered result when the CLI truncated its
+# dispatched Workflow/subagent work at the wait ceiling (CCOutput.bg_truncated).
+# The run still delivers its partial output (success stays True — a deliverable
+# was produced); the notice keeps that honest rather than shipping it as complete.
+_BG_TRUNCATION_NOTICE = (
+    "\n\n⚠️ Note: this run reached its time budget and some background work was "
+    "cut off before finishing, so the results below may be incomplete."
+)
+
 
 # ---------------------------------------------------------------------------
 # Per-session CC Bash-sandbox isolation (background dispatch sessions)
@@ -788,7 +797,9 @@ class DirectSessionRunner:
                 session_id=session_id,
                 cc_session_id=output.session_id,
                 success=not output.is_error,
-                output_text=output.text,
+                output_text=(
+                    output.text + _BG_TRUNCATION_NOTICE if output.bg_truncated else output.text
+                ),
                 error=output.error_message if output.is_error else None,
                 cost_usd=output.cost_usd,
                 input_tokens=output.input_tokens,
@@ -1232,6 +1243,12 @@ class DirectSessionRunner:
             system_prompt=system_prompt,
             append_system_prompt=True,
             timeout_s=request.timeout_s,
+            # Background lane may legitimately own long dispatched Workflow work
+            # (e.g. deep-research, 100+ agents). Let the CLI wait for bg tasks up
+            # to the full budget instead of the default 600s truncation; the
+            # invoker clamps this below timeout_s so the graceful CLI truncation
+            # + partial flush always precedes the hard SIGKILL.
+            bg_wait_ceiling_ms=request.timeout_s * 1000,
             skip_permissions=True,
             disallowed_tools=disallowed,
             working_dir=background_session_dir(),
