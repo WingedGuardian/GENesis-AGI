@@ -15,6 +15,7 @@ from genesis.mcp.health.settings import (
     _impl_settings_get,
     _impl_settings_list,
     _impl_settings_update,
+    _validate_cc_foreground_reaper,
     _validate_inbox_monitor,
     _validate_resilience,
     _validate_tts,
@@ -78,10 +79,14 @@ async def test_settings_list_outreach_is_writable():
 
 
 async def test_settings_get_tts(config_dir: Path):
-    _write_config(config_dir, "tts.yaml", {
-        "provider": "elevenlabs",
-        "elevenlabs": {"stability": 0.9, "speed": 1.1},
-    })
+    _write_config(
+        config_dir,
+        "tts.yaml",
+        {
+            "provider": "elevenlabs",
+            "elevenlabs": {"stability": 0.9, "speed": 1.1},
+        },
+    )
     result = await _impl_settings_get("tts")
     assert result["domain"] == "tts"
     assert result["config"]["provider"] == "elevenlabs"
@@ -120,13 +125,20 @@ async def test_settings_get_missing_file():
 
 
 async def test_settings_update_tts(config_dir: Path):
-    _write_config(config_dir, "tts.yaml", {
-        "provider": "elevenlabs",
-        "elevenlabs": {"stability": 0.85, "speed": 1.1},
-    })
-    result = await _impl_settings_update("tts", {
-        "elevenlabs": {"stability": 0.9},
-    })
+    _write_config(
+        config_dir,
+        "tts.yaml",
+        {
+            "provider": "elevenlabs",
+            "elevenlabs": {"stability": 0.85, "speed": 1.1},
+        },
+    )
+    result = await _impl_settings_update(
+        "tts",
+        {
+            "elevenlabs": {"stability": 0.9},
+        },
+    )
     assert result["status"] == "applied"
     assert result["needs_restart"] is False
     assert "local_override_file" in result
@@ -140,6 +152,7 @@ async def test_settings_update_tts(config_dir: Path):
 
     # Merged view (via settings_get) should show updated value
     from genesis.mcp.health.settings import _load_yaml_merged
+
     merged = _load_yaml_merged("tts.yaml")
     assert merged["elevenlabs"]["stability"] == 0.9
     assert merged["elevenlabs"]["speed"] == 1.1  # Preserved from base
@@ -148,48 +161,67 @@ async def test_settings_update_tts(config_dir: Path):
 
 async def test_settings_update_tts_validation_error(config_dir: Path):
     _write_config(config_dir, "tts.yaml", {"provider": "elevenlabs"})
-    result = await _impl_settings_update("tts", {
-        "elevenlabs": {"stability": 5.0},
-    })
+    result = await _impl_settings_update(
+        "tts",
+        {
+            "elevenlabs": {"stability": 5.0},
+        },
+    )
     assert result["error"] == "validation failed"
     assert any("stability" in e for e in result["validation_errors"])
 
 
 async def test_settings_update_resilience(config_dir: Path):
-    _write_config(config_dir, "resilience.yaml", {
-        "flapping": {"transition_count": 3, "window_seconds": 900},
-        "cc": {"max_sessions_per_hour": 20},
-    })
-    result = await _impl_settings_update("resilience", {
-        "cc": {"max_sessions_per_hour": 30},
-    })
+    _write_config(
+        config_dir,
+        "resilience.yaml",
+        {
+            "flapping": {"transition_count": 3, "window_seconds": 900},
+            "cc": {"max_sessions_per_hour": 20},
+        },
+    )
+    result = await _impl_settings_update(
+        "resilience",
+        {
+            "cc": {"max_sessions_per_hour": 30},
+        },
+    )
     assert result["status"] == "applied"
     assert result["needs_restart"] is True
     assert "note" in result  # Restart note
 
     # Changes in .local.yaml; merged view has both
     from genesis.mcp.health.settings import _load_yaml_merged
+
     merged = _load_yaml_merged("resilience.yaml")
     assert merged["cc"]["max_sessions_per_hour"] == 30
     assert merged["flapping"]["transition_count"] == 3  # Preserved from base
 
 
 async def test_settings_update_inbox_monitor(config_dir: Path):
-    _write_config(config_dir, "inbox_monitor.yaml", {
-        "inbox_monitor": {
-            "enabled": True,
-            "batch_size": 1,
-            "model": "sonnet",
-            "timezone": "America/New_York",
+    _write_config(
+        config_dir,
+        "inbox_monitor.yaml",
+        {
+            "inbox_monitor": {
+                "enabled": True,
+                "batch_size": 1,
+                "model": "sonnet",
+                "timezone": "America/New_York",
+            },
         },
-    })
-    result = await _impl_settings_update("inbox_monitor", {
-        "inbox_monitor": {"batch_size": 3, "model": "opus"},
-    })
+    )
+    result = await _impl_settings_update(
+        "inbox_monitor",
+        {
+            "inbox_monitor": {"batch_size": 3, "model": "opus"},
+        },
+    )
     assert result["status"] == "applied"
     assert result["needs_restart"] is True
 
     from genesis.mcp.health.settings import _load_yaml_merged
+
     merged = _load_yaml_merged("inbox_monitor.yaml")
     assert merged["inbox_monitor"]["batch_size"] == 3
     assert merged["inbox_monitor"]["model"] == "opus"
@@ -198,12 +230,19 @@ async def test_settings_update_inbox_monitor(config_dir: Path):
 
 async def test_settings_update_inbox_timezone_ignored(config_dir: Path):
     """Timezone field is silently ignored — uses system timezone now."""
-    _write_config(config_dir, "inbox_monitor.yaml", {
-        "inbox_monitor": {"enabled": True},
-    })
-    result = await _impl_settings_update("inbox_monitor", {
-        "inbox_monitor": {"timezone": "Mars/Olympus_Mons"},
-    })
+    _write_config(
+        config_dir,
+        "inbox_monitor.yaml",
+        {
+            "inbox_monitor": {"enabled": True},
+        },
+    )
+    result = await _impl_settings_update(
+        "inbox_monitor",
+        {
+            "inbox_monitor": {"timezone": "Mars/Olympus_Mons"},
+        },
+    )
     # No validation error — timezone key is ignored, passes through as unknown YAML
     assert "error" not in result
 
@@ -229,9 +268,13 @@ async def test_settings_update_unknown_domain():
 
 async def test_settings_update_dry_run(config_dir: Path):
     _write_config(config_dir, "tts.yaml", {"provider": "elevenlabs"})
-    result = await _impl_settings_update("tts", {
-        "elevenlabs": {"stability": 0.9},
-    }, dry_run=True)
+    result = await _impl_settings_update(
+        "tts",
+        {
+            "elevenlabs": {"stability": 0.9},
+        },
+        dry_run=True,
+    )
     assert result["status"] == "dry_run_ok"
     assert result["changes_applied"] == {"elevenlabs": {"stability": 0.9}}
 
@@ -265,13 +308,18 @@ async def test_settings_update_write_failure(config_dir: Path):
 
 async def test_settings_update_inbox_flat_changes_auto_wrapped(config_dir: Path):
     """Flat changes (without inbox_monitor wrapper) are auto-wrapped."""
-    _write_config(config_dir, "inbox_monitor.yaml", {
-        "inbox_monitor": {"enabled": True, "batch_size": 1},
-    })
+    _write_config(
+        config_dir,
+        "inbox_monitor.yaml",
+        {
+            "inbox_monitor": {"enabled": True, "batch_size": 1},
+        },
+    )
     result = await _impl_settings_update("inbox_monitor", {"batch_size": 5})
     assert result["status"] == "applied"
 
     from genesis.mcp.health.settings import _load_yaml_merged
+
     merged = _load_yaml_merged("inbox_monitor.yaml")
     assert merged["inbox_monitor"]["batch_size"] == 5
     assert merged["inbox_monitor"]["enabled"] is True  # Preserved from base
@@ -340,21 +388,25 @@ class TestValidateTTS:
         assert "Unknown key" in errs[0]
 
     def test_multiple_errors(self):
-        errs = _validate_tts({
-            "provider": "bad",
-            "elevenlabs": {"stability": 5.0, "speed": 0.1},
-        })
+        errs = _validate_tts(
+            {
+                "provider": "bad",
+                "elevenlabs": {"stability": 5.0, "speed": 0.1},
+            }
+        )
         assert len(errs) == 3
 
     def test_valid_full_elevenlabs(self):
-        errs = _validate_tts({
-            "elevenlabs": {
-                "stability": 0.85,
-                "similarity_boost": 0.7,
-                "style": 0.3,
-                "speed": 1.1,
-            },
-        })
+        errs = _validate_tts(
+            {
+                "elevenlabs": {
+                    "stability": 0.85,
+                    "similarity_boost": 0.7,
+                    "style": 0.3,
+                    "speed": 1.1,
+                },
+            }
+        )
         assert errs == []
 
 
@@ -432,3 +484,26 @@ async def test_settings_tools_registered():
     tools = await mcp.get_tools()
     for name in ["settings_list", "settings_get", "settings_update"]:
         assert name in tools, f"Missing tool: {name}"
+
+
+class TestValidateCcForegroundReaper:
+    def test_valid_changes(self):
+        assert _validate_cc_foreground_reaper({"mode": "notify", "idle_hours": 12}) == []
+
+    def test_invalid_mode(self):
+        errs = _validate_cc_foreground_reaper({"mode": "notfy"})
+        assert len(errs) == 1 and "mode" in errs[0]
+
+    def test_non_positive_int(self):
+        errs = _validate_cc_foreground_reaper({"idle_hours": 0})
+        assert len(errs) == 1 and "idle_hours" in errs[0]
+
+    def test_unknown_key(self):
+        errs = _validate_cc_foreground_reaper({"nope": 1})
+        assert len(errs) == 1 and "nope" in errs[0]
+
+    def test_registered(self):
+        from genesis.mcp.health.settings import _DOMAIN_REGISTRY, _DOMAIN_VALIDATORS
+
+        assert "cc_foreground_reaper" in _DOMAIN_REGISTRY
+        assert "cc_foreground_reaper" in _DOMAIN_VALIDATORS

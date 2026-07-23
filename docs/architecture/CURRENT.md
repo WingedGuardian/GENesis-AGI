@@ -137,7 +137,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 3c5e1f24 2026-07-22
+verified: 0a3fc19d 2026-07-23
 ```
 
 - `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split
@@ -157,6 +157,20 @@ verified: 3c5e1f24 2026-07-22
   .shutdown`, 10s grace) BEFORE closing the DB so that handler can persist
   (2026-07-09; the old crud `reap_stale`, which relabeled orphans
   'completed', is deleted). J-9 counts only `completed` as success.
+- **Foreground liveness (D3)** (`cc/foreground_reaper.py`): foreground rows stay
+  `active` by design so the next turn can `--resume`, so a crash/restart mid-turn
+  leaves one `active` forever — `query_stale` excludes foreground, so nothing
+  reaped them. The `session_reaper` job now ALSO runs `reap_dark_foreground`
+  (its own inner try/except — a notify failure can't abort stale-session
+  cleanup): foreground rows idle >24h → `checkpointed` via `checkpoint_dark`
+  (non-destructive — `get_active_foreground` matches `checkpointed` and
+  `get_or_create_foreground` flips it back to `active` on reuse, so `--resume` is
+  intact). On the CRISP "unanswered user turn" transcript signal (age-guarded to
+  exclude a mid-flight turn, and not already covered by a rate-limit park or
+  dispatch) it notifies the origin user their request was interrupted; the FUZZY
+  "I'll report back" signal is shadow-logged only until its precision is measured.
+  Observability-only (never re-dispatches). Lever: `cc_foreground_reaper`
+  (`off|observe|notify`, default `notify`) + `GENESIS_FOREGROUND_REAPER_DISABLED`.
 - **Perimeter-session hardening:** `_NO_WEB_TOOLS` / `_NO_OUTREACH_EXTRAS`
   blocklists strip risky tools from perimeter profiles — a security edge, not
   configuration convenience.

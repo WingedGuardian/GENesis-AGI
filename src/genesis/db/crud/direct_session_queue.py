@@ -110,7 +110,8 @@ async def mark_failed(
 async def get_by_id(db: aiosqlite.Connection, queue_id: str) -> dict | None:
     """Fetch a queue item by ID."""
     cursor = await db.execute(
-        "SELECT * FROM direct_session_queue WHERE id = ?", (queue_id,),
+        "SELECT * FROM direct_session_queue WHERE id = ?",
+        (queue_id,),
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
@@ -142,3 +143,23 @@ async def count_pending(db: aiosqlite.Connection) -> int:
     )
     row = await cursor.fetchone()
     return row[0] if row else 0
+
+
+async def has_open_for_origin(db: aiosqlite.Connection, origin_session_id: str) -> bool:
+    """True iff a not-yet-run queued session (pending/claimed) exists for this
+    origin — work that WILL deliver its outcome to the origin (delivery model)
+    but hasn't yet, so the foreground-liveness reaper (D3) must not also notify.
+
+    NOTE: 'dispatched' is deliberately EXCLUDED — a queue row is left in
+    'dispatched' permanently after its background session completes (there is no
+    terminal 'completed' status), so treating it as open would suppress the
+    dark-session notify FOREVER for any origin that ever dispatched work.
+    """
+    # origin_session_id is stored inside payload_json (not a column), so extract it.
+    cursor = await db.execute(
+        "SELECT 1 FROM direct_session_queue "
+        "WHERE json_extract(payload_json, '$.origin_session_id') = ? "
+        "AND status IN ('pending', 'claimed') LIMIT 1",
+        (origin_session_id,),
+    )
+    return await cursor.fetchone() is not None
