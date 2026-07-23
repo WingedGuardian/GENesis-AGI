@@ -10,7 +10,7 @@ dependencies = [
     "apscheduler>=3.11,<4",
     "tzlocal>=5",  # transitive dep of apscheduler (ego/cadence uses the local-timezone path); declare so a clean/cached install can't drop it
     "python-telegram-bot>=21.0",
-    "litellm==1.78.7",  # pinned — 1.82.7/1.82.8 contain malware. Its open advisories are all
+    "litellm==1.84.0",  # pinned — 1.82.7/1.82.8 contain malware. Its open advisories are all
                        # proxy-server / JWT / OIDC / UI vulns (see the ci.yml dependency-audit
                        # ignore-list); not reachable — Genesis uses acompletion/completion_cost only.
     "qdrant-client",
