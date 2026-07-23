@@ -143,12 +143,12 @@ _JOB_HEALTH_DDL = """
         last_success     TEXT,
         last_failure     TEXT,
         last_error       TEXT,
-        error_type       TEXT,
         consecutive_failures INTEGER NOT NULL DEFAULT 0,
         total_runs       INTEGER NOT NULL DEFAULT 0,
         total_successes  INTEGER NOT NULL DEFAULT 0,
         total_failures   INTEGER NOT NULL DEFAULT 0,
-        updated_at       TEXT NOT NULL
+        updated_at       TEXT NOT NULL,
+        error_type       TEXT
     )
 """
 

@@ -325,15 +325,21 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             last_success     TEXT,
             last_failure     TEXT,
             last_error       TEXT,
-            -- Exception class name when an exception caused the failure, else
-            -- NULL (a semantic failure — e.g. an external quota block). Cleared
-            -- on recovery alongside last_error.
-            error_type       TEXT,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             total_runs       INTEGER NOT NULL DEFAULT 0,
             total_successes  INTEGER NOT NULL DEFAULT 0,
             total_failures   INTEGER NOT NULL DEFAULT 0,
-            updated_at       TEXT NOT NULL
+            updated_at       TEXT NOT NULL,
+            -- Exception class name when an exception caused the failure, else
+            -- NULL (a semantic failure — e.g. an external quota block). Cleared
+            -- on recovery alongside last_error.
+            --
+            -- LAST on purpose: ALTER TABLE ADD COLUMN appends, so declaring it
+            -- last here keeps a fresh install's column ORDER identical to an
+            -- upgraded one. Both dashboard readers use SELECT * with dict(row)
+            -- (name-based) today, but a positional reader would otherwise
+            -- silently disagree between fresh and migrated installs.
+            error_type       TEXT
         )
     """)
 
