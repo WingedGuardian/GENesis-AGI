@@ -123,6 +123,14 @@ _netres_install_watchdog() {
         return 0
     fi
     local dst="$NETRES_LIBEXEC_DIR/network-watchdog.sh"
+    # If the timer unit is MASKED, its unit path is a symlink to /dev/null — the
+    # writes below use `tee`, which follows the symlink and would write to
+    # /dev/null (the real unit file is never created, and a later unmask then
+    # leaves nothing to enable). Unmask FIRST, and only when actually masked, so
+    # the rewrite recreates a real unit file and healthy runs stay churn-free. NR1.
+    if [ "$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null)" = "masked" ]; then
+        sudo systemctl unmask genesis-network-watchdog.timer 2>/dev/null || true
+    fi
     local before=$_NETRES_WROTE
     _netres_put_file "$dst" "$(cat "$NETRES_WATCHDOG_SRC")" "0755"
     _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.service" "$(_netres_service_content "$dst")" "0644"
@@ -140,11 +148,10 @@ _netres_install_watchdog() {
     # healthy timer causes ZERO churn; only a down/unpersisted timer heals. NR1.
     if ! systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
         || ! systemctl is-enabled genesis-network-watchdog.timer >/dev/null 2>&1; then
-        # A masked timer can't be enabled/started until unmasked, and systemd never
-        # auto-unmasks — so unmask first, then enable+start, then VERIFY. Never claim
-        # a heal that didn't take: a still-down/unpersisted timer surfaces as a
-        # failure (WARNING + _NETRES_FAILED), not a false "re-enabled" success.
-        sudo systemctl unmask genesis-network-watchdog.timer 2>/dev/null || true
+        # (A masked timer was already unmasked + its unit rewritten above, before
+        # these writes, so enable now has a real unit file to act on.) enable+start,
+        # then VERIFY — never claim a heal that didn't take: a still-down/unpersisted
+        # timer surfaces as WARNING + _NETRES_FAILED, not a false "re-enabled" success.
         sudo systemctl enable genesis-network-watchdog.timer 2>/dev/null || true
         sudo systemctl start genesis-network-watchdog.timer 2>/dev/null || true
         if systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \

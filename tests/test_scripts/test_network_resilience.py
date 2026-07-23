@@ -37,7 +37,8 @@ _SYSTEMCTL_STUB = """#!/bin/bash
 # files). systemd-networkd keeps the shared NETWORKD_* vars.
 _b="${SYSTEMCTL_LOG%.log}"
 _T=genesis-network-watchdog.timer
-_masked() { [ -f "$_b.timermasked" ]; }
+_TU="${NETRES_ETC_ROOT:-/nonexistent}/systemd/system/$_T"
+_masked() { [ -L "$_TU" ]; }   # real systemd: a masked unit path is a symlink to /dev/null
 if [ "$1" = "is-active" ]; then
     if [ "$2" = "$_T" ]; then
         [ -n "${WATCHDOG_TIMER_ACTIVE_RC:-}" ] && exit "$WATCHDOG_TIMER_ACTIVE_RC"
@@ -48,12 +49,12 @@ fi
 if [ "$1" = "is-enabled" ]; then
     if [ "$2" = "$_T" ]; then
         [ -n "${WATCHDOG_TIMER_ENABLED_RC:-}" ] && exit "$WATCHDOG_TIMER_ENABLED_RC"
-        { _masked || [ ! -f "$_b.timerenabled" ]; } && exit 1 || exit 0
+        _masked && { printf 'masked'; exit 1; }
+        [ -f "$_b.timerenabled" ] && exit 0 || exit 1
     fi
     printf '%s' "${NETWORKD_ENABLED-enabled}"; exit 0
 fi
-[ "$1" = "mask" ] && [ "$2" = "$_T" ] && : > "$_b.timermasked"
-[ "$1" = "unmask" ] && rm -f "$_b.timermasked"
+[ "$1" = "unmask" ] && _masked && rm -f "$_TU"   # real unmask removes the /dev/null symlink
 if [ "$1" = "enable" ] && [ "$2" = "$_T" ]; then
     _masked && { echo "$@" >> "$SYSTEMCTL_LOG"; exit 1; }
     : > "$_b.timerenabled"
@@ -182,20 +183,36 @@ def test_second_run_heals_disabled_timer(tmp_path):
     assert "re-enabled a stopped/disabled watchdog timer" in result.stdout
 
 
-def test_second_run_unmasks_and_heals_masked_timer(tmp_path):
-    """A masked timer can't be enabled/started until unmasked; the self-heal
-    unmasks first, then re-enables — and genuinely heals (code-reviewer)."""
+def test_masked_timer_unit_is_recreated_before_enable(tmp_path):
+    """Codex P2: a masked timer's unit path is a symlink to /dev/null, and the
+    unit writes use `tee` (which follows the symlink). The self-heal must UNMASK
+    (remove the symlink) BEFORE rewriting the unit — else the write goes to
+    /dev/null and enable has no unit file. After apply the unit must be a REAL
+    file (not the symlink), unmask must precede enable, and the heal must NOT
+    report failure."""
     env = _stage(tmp_path)
-    _run_apply(env)
+    _run_apply(env)  # fresh: real unit files + active/enabled
+    timer = _paths(env)["timer"]
+    assert not timer.is_symlink()  # sanity: fresh install wrote a real file
+
+    # Simulate `systemctl mask`: the unit path becomes a /dev/null symlink, and
+    # the unit is thereby stopped + disabled.
+    timer.unlink()
+    timer.symlink_to("/dev/null")
+    base = env["SYSTEMCTL_LOG"][:-4]
+    Path(base + ".timerstarted").unlink(missing_ok=True)
+    Path(base + ".timerenabled").unlink(missing_ok=True)
     Path(env["SYSTEMCTL_LOG"]).write_text("")
 
-    Path(env["SYSTEMCTL_LOG"][:-4] + ".timermasked").write_text("")  # externally masked
     result = _run_apply(env)
     assert result.returncode == 0, result.stderr
+    # Unmasked + rewritten as a real file (the write did NOT go to /dev/null).
+    assert not timer.is_symlink(), "masked unit must be unmasked+rewritten as a real file"
+    assert "[Timer]" in timer.read_text()
     calls = Path(env["SYSTEMCTL_LOG"]).read_text()
-    assert "unmask genesis-network-watchdog.timer" in calls  # unmasked first …
-    assert "enable genesis-network-watchdog.timer" in calls  # … then re-enabled
-    assert "re-enabled a stopped/disabled watchdog timer" in result.stdout
+    assert "unmask genesis-network-watchdog.timer" in calls
+    assert calls.index("unmask") < calls.index("enable genesis-network-watchdog.timer")
+    assert "could not be re-enabled" not in result.stdout  # genuinely healed
 
 
 def test_unhealable_timer_reports_failure_not_false_heal(tmp_path):
