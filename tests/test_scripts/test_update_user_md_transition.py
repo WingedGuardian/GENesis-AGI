@@ -160,3 +160,18 @@ def test_dirty_guard_excuses_user_md_porcelain_path():
     excused = re.compile(pattern)
     assert excused.search(" M src/genesis/identity/USER.md")
     assert not excused.search(" M docs/identity/USER.md")
+
+
+def test_no_op_update_path_also_restores_user_md():
+    """The 'Already up to date' early-exit branch restores the pre-merge backups
+    inline (it returns before the common restore blocks). USER.md must be
+    restored there too — otherwise a no-op update run after premerge cleared the
+    live file strands the filled profile as the template. Regression guard for
+    the exact gap where the transition was added to the merge path but not the
+    no-op path."""
+    text = UPDATE_SH.read_text()
+    assert "Already up to date" in text
+    branch = text.split("Already up to date", 1)[1].split("_sync_deploy_targets", 1)[0]
+    # The sibling transitions anchor the branch; USER.md must be restored alongside.
+    assert "SETTINGS_LOCAL_BAK" in branch and "SERENA_YML_BAK" in branch
+    assert "USER_MD_BAK" in branch, "no-op update path must restore the USER.md backup"

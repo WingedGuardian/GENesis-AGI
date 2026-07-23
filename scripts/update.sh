@@ -1269,6 +1269,12 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
         rm -f "$SERENA_YML_BAK"
         echo "  (restored live $SERENA_YML from pre-merge backup)"
     fi
+    if [ -f "$USER_MD_BAK" ]; then
+        mkdir -p "$(dirname "$GENESIS_ROOT/$USER_MD")"
+        cp "$USER_MD_BAK" "$GENESIS_ROOT/$USER_MD"
+        rm -f "$USER_MD_BAK"
+        echo "  (restored live $USER_MD from pre-merge backup)"
+    fi
     # Even with no repo delta, heal deploy-target drift (host/container CC + Node
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
