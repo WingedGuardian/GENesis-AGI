@@ -1577,12 +1577,12 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ego_proposals.expected_outputs")
 
     # PR-4 (ego proposal-lifecycle redesign, dark schema): revision +
-    # revalidation tracking. Unindexed additive columns added on the base
-    # path (every boot) rather than in a numbered migration to avoid the
-    # double-add boot-crash class — a bare ADD COLUMN in the numbered runner
-    # AFTER this _try_alter already ran would raise (see
-    # test_schema_base_path_parity.py). The paired ego_proposal_revisions
-    # table is created by create_all_tables + numbered migration 0071.
+    # revalidation tracking. Added on the base path here (every boot) AND by
+    # numbered migration 0071 (PRAGMA-guarded) so the migration ledger is never
+    # marked applied with the columns still absent (0071 also runs standalone
+    # via `python -m genesis.db.migrations`, without this base path). Both are
+    # idempotent: _try_alter suppresses duplicate-column, 0071 skips on PRAGMA —
+    # whichever runs first, the other no-ops (no double-add crash).
     await _try_alter(db,
         "ALTER TABLE ego_proposals ADD COLUMN revision_num INTEGER DEFAULT 1",
         "ego_proposals.revision_num")

@@ -317,3 +317,46 @@ async def test_knowledge_units_rebuild_dedups_first_wins():
         assert (await cur.fetchone())[0] == "FIRST"  # first row won
     finally:
         await conn.close()
+
+
+# ── Migration 0071 self-contains its schema on the standalone runner path ──
+
+
+async def test_migration_0071_adds_columns_standalone_and_is_double_add_safe():
+    # Codex P2 regression: the numbered runner can apply 0071 WITHOUT
+    # create_all_tables (python -m genesis.db.migrations --apply, used by
+    # update.sh). 0071 must add the 3 columns itself — else the migration ledger
+    # marks 0071 applied while revision_num/revalidate_at/last_validated_at are
+    # still absent — AND must no-op (not 'duplicate column' crash) when
+    # _migrate_add_columns already added them on the base path.
+    mod = importlib.import_module("genesis.db.migrations.0071_ego_proposal_revisions")
+
+    # (a) Standalone path: a legacy ego_proposals with none of the 3 columns.
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        await conn.execute(
+            "CREATE TABLE ego_proposals (id TEXT PRIMARY KEY, status TEXT, created_at TEXT)"
+        )
+        await conn.commit()
+        await mod.up(conn)
+        cur = await conn.execute("PRAGMA table_info(ego_proposals)")
+        cols = {r[1] for r in await cur.fetchall()}
+        assert {"revision_num", "revalidate_at", "last_validated_at"} <= cols
+        cur = await conn.execute("PRAGMA table_info(ego_proposal_revisions)")
+        assert len(list(await cur.fetchall())) == 11
+        await mod.up(conn)  # (b) idempotent second run — no duplicate-column error
+    finally:
+        await conn.close()
+
+    # (c) After the base path already added them (canonical DDL has the 3 cols):
+    #     0071 must skip via its PRAGMA guard, not raise duplicate-column.
+    conn2 = await aiosqlite.connect(":memory:")
+    try:
+        await conn2.execute(TABLES["ego_proposals"])
+        await conn2.commit()
+        await mod.up(conn2)
+        cur = await conn2.execute("PRAGMA table_info(ego_proposals)")
+        cols = {r[1] for r in await cur.fetchall()}
+        assert {"revision_num", "revalidate_at", "last_validated_at"} <= cols
+    finally:
+        await conn2.close()
