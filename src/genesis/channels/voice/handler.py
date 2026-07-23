@@ -44,6 +44,39 @@ Voice rules:
 """
 
 
+def _humanize_age(created_at: str | None, *, now=None) -> str:
+    """Coarse, spoken-safe age (e.g. '3d ago') from an ISO timestamp.
+
+    Returns '' when the timestamp is missing or unparseable — the caller then
+    emits the provenance label alone, never a fabricated age. ``now`` is
+    injectable so the mapping is testable without depending on the wall clock.
+    """
+    if not created_at:
+        return ""
+    from datetime import UTC, datetime
+
+    try:
+        ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return ""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    ref = now or datetime.now(UTC)
+    secs = (ref - ts).total_seconds()
+    if secs < 0:
+        return ""
+    if secs < 3600:
+        return "just now"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    days = int(secs // 86400)
+    if days < 14:
+        return f"{days}d ago"
+    if days < 60:
+        return f"{days // 7}w ago"
+    return f"{days // 30}mo ago"
+
+
 class VoiceConversationHandler:
     """Handles voice transcripts: recall context, call LLM, return response."""
 
@@ -63,7 +96,11 @@ class VoiceConversationHandler:
         return self._sessions
 
     async def handle(
-        self, transcript: str, session_id: str, *, raw_snippets: bool = False,
+        self,
+        transcript: str,
+        session_id: str,
+        *,
+        raw_snippets: bool = False,
     ) -> str:
         """Process a voice transcript and return a spoken response.
 
@@ -118,37 +155,56 @@ class VoiceConversationHandler:
                             origin_class=getattr(r, "origin_class", None),
                         )
                         external = _blockable or is_external(getattr(r, "collection", ""))
-                        prefix = "[external-world knowledge] " if external else ""
-                        spoken_snippets.append(f"- {prefix}{content[:300]}")
+                        # Spoken-safe provenance label + coarse age (§3.2): the S2S
+                        # model needs first-party vs external-world and recency.
+                        label = "external-world knowledge" if external else "first-party"
+                        payload = getattr(r, "payload", None)
+                        age = _humanize_age(
+                            payload.get("created_at") if isinstance(payload, dict) else None
+                        )
+                        tag = f"[{label} | {age}]" if age else f"[{label}]"
                         if external:
-                            llm_snippets.append(
-                                "- " + wrap_external_recall(
-                                    content[:300], source_pipeline=source_pipeline,
-                                )
+                            # Fence external/untrusted recall in BOTH views so it
+                            # reads as data, not instructions (injection defense).
+                            # The raw path now feeds GPT-Realtime via ask_genesis,
+                            # so it must be fenced too — the S2S system prompt tells
+                            # the model to treat <external-content> as untrusted.
+                            fenced = wrap_external_recall(
+                                content[:300], source_pipeline=source_pipeline
                             )
+                            spoken_snippets.append(f"- {tag} {fenced}")
+                            llm_snippets.append(f"- {fenced}")
                             if _blockable:
                                 blockable += 1
                         else:
+                            spoken_snippets.append(f"- {tag} {content[:300]}")
                             llm_snippets.append(f"- {content[:300]}")
                 if spoken_snippets:
-                    memories_text = "Recalled memories:\n" + "\n".join(spoken_snippets)
-                    llm_memories_text = "Recalled memories:\n" + "\n".join(llm_snippets)
+                    _hdr = f"Recalled ({len(spoken_snippets)}):"
+                    memories_text = _hdr + "\n" + "\n".join(spoken_snippets)
+                    llm_memories_text = _hdr + "\n" + "\n".join(llm_snippets)
             # WS-3 B1 gate 4 (injection): shadow-record external content reaching
             # the voice LLM system prompt (observe-only; db=None -> self-resolve).
             await immunity_shadow.record_would_block(
-                gate="injection", source_kind="recall_inject",
-                source_ref="channels/voice/handler.py::handle", process="server",
-                blockable_count=blockable, db=None,
+                gate="injection",
+                source_kind="recall_inject",
+                source_ref="channels/voice/handler.py::handle",
+                process="server",
+                blockable_count=blockable,
+                db=None,
             )
         except Exception:
             logger.warning(
                 "Memory recall failed for voice session %s",
-                session_id[:12], exc_info=True,
+                session_id[:12],
+                exc_info=True,
             )
 
-        # Raw snippets path — return memories directly for S2S synthesis
+        # Raw snippets path — return memories directly for S2S synthesis.
+        # Explicit empty marker (§3.2): never silence — the S2S model must be
+        # able to tell "nothing relevant found" apart from a dropped tool result.
         if raw_snippets:
-            return memories_text or "No relevant memories found for this query."
+            return memories_text or "Recalled (0): (nothing relevant)"
 
         # Full path: session + context assembly + LLM call
 
@@ -192,14 +248,16 @@ class VoiceConversationHandler:
             )
             if not result.success:
                 logger.error(
-                    "Voice router call failed: %s", result.error,
+                    "Voice router call failed: %s",
+                    result.error,
                 )
                 return "I'm having trouble thinking right now. Try again in a moment."
             response = result.content or "I processed your request but don't have a response."
         except Exception:
             logger.error(
                 "Voice handler exception for session %s",
-                session_id[:12], exc_info=True,
+                session_id[:12],
+                exc_info=True,
             )
             return "Something went wrong on my end. Try again."
 

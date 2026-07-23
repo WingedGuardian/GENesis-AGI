@@ -506,7 +506,12 @@ _sync_deploy_targets() {
 # release de-tracks it (`.serena/` is already .gitignored); the entry below plus
 # its backup/restore pair carry the live copy through the upstream deletion.
 # Serena autogenerates the file when missing, so fresh clones need nothing.)
-EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$| \.claude/settings\.local\.json$| \.serena/project\.yml$'
+# (`src/genesis/identity/USER.md` is the same failure mode: it shipped as a
+# TRACKED user-editable template, so installs that filled it in (as the file's
+# own comment instructed) go permanently dirty. This release de-tracks it — the
+# real per-install USER.md is now .gitignored and seeded from USER.md.example —
+# and the user-md backup/restore pair carries the filled copy through the rename.)
+EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$| \.claude/settings\.local\.json$| \.serena/project\.yml$| src/genesis/identity/USER\.md$'
 if [[ "$POST_MERGE" == "false" ]]; then
     DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null \
         | grep -v "^??" \
@@ -1070,6 +1075,25 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SERENA_YML" &>/dev/null \
 fi
 # END serena-yml-premerge
 
+# Transitional (USER.md de-track): same pattern as the two above. USER.md shipped
+# as a TRACKED user-editable template; installs that filled it in go dirty and
+# would abort at the clean-tree gate. While it is still TRACKED (pre-de-track
+# install), back up the filled copy outside the repo and clear local edits so the
+# upstream rename (USER.md -> USER.md.example) merges clean. Restored (untracked;
+# now .gitignored) after the merge join point below. Steady state (already
+# untracked): ls-files fails -> no-op. Fresh installs seed from USER.md.example.
+# BEGIN user-md-premerge (extracted by tests/test_scripts/test_update_user_md_transition.py)
+USER_MD="src/genesis/identity/USER.md"
+USER_MD_BAK="$HOME/.genesis/USER.md.premerge"
+if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$USER_MD" &>/dev/null \
+   && [ -f "$GENESIS_ROOT/$USER_MD" ]; then
+    mkdir -p "$HOME/.genesis"
+    cp "$GENESIS_ROOT/$USER_MD" "$USER_MD_BAK"
+    git -C "$GENESIS_ROOT" checkout HEAD -- "$USER_MD" 2>/dev/null \
+        && echo "  (backed up live $USER_MD; cleared local edits pre-merge)"
+fi
+# END user-md-premerge
+
 for _eph in AGENTS.md config/procedure_triggers.yaml; do
     if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_eph" &>/dev/null \
        && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$_eph" 2>/dev/null; then
@@ -1245,6 +1269,12 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
         rm -f "$SERENA_YML_BAK"
         echo "  (restored live $SERENA_YML from pre-merge backup)"
     fi
+    if [ -f "$USER_MD_BAK" ]; then
+        mkdir -p "$(dirname "$GENESIS_ROOT/$USER_MD")"
+        cp "$USER_MD_BAK" "$GENESIS_ROOT/$USER_MD"
+        rm -f "$USER_MD_BAK"
+        echo "  (restored live $USER_MD from pre-merge backup)"
+    fi
     # Even with no repo delta, heal deploy-target drift (host/container CC + Node
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
@@ -1304,6 +1334,20 @@ if [ -f "$SERENA_YML_BAK" ]; then
     echo "  (restored live $SERENA_YML from pre-merge backup)"
 fi
 # END serena-yml-restore
+
+# Transitional (USER.md de-track): restore the pre-merge filled copy as an
+# UNTRACKED file (now .gitignored) after the upstream rename applied. See the
+# premerge block. No-op once installs are past the transition.
+# BEGIN user-md-restore (extracted by tests/test_scripts/test_update_user_md_transition.py)
+USER_MD="${USER_MD:-src/genesis/identity/USER.md}"
+USER_MD_BAK="${USER_MD_BAK:-$HOME/.genesis/USER.md.premerge}"
+if [ -f "$USER_MD_BAK" ]; then
+    mkdir -p "$(dirname "$GENESIS_ROOT/$USER_MD")"
+    cp "$USER_MD_BAK" "$GENESIS_ROOT/$USER_MD"
+    rm -f "$USER_MD_BAK"
+    echo "  (restored live $USER_MD from pre-merge backup)"
+fi
+# END user-md-restore
 
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)

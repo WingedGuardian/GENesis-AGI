@@ -497,7 +497,7 @@ echo
 
 # --- Identity seed files (auto-generated at runtime, gitignored) ---
 echo "--- Checking identity seed files ---"
-for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md; do
+for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md USER.md; do
     if [[ ! -f "$GENESIS_ROOT/src/genesis/identity/$f" ]]; then
         if [[ -f "$GENESIS_ROOT/src/genesis/identity/$f.example" ]]; then
             cp "$GENESIS_ROOT/src/genesis/identity/$f.example" "$GENESIS_ROOT/src/genesis/identity/$f"
