@@ -170,8 +170,11 @@ def test_no_op_update_path_also_restores_user_md():
     the exact gap where the transition was added to the merge path but not the
     no-op path."""
     text = UPDATE_SH.read_text()
-    assert "Already up to date" in text
-    branch = text.split("Already up to date", 1)[1].split("_sync_deploy_targets", 1)[0]
+    # Anchor on the echo (`Already up to date (`), NOT the bare phrase — the
+    # latter also appears in an earlier comment. End at the branch's
+    # _sync_deploy_targets CALL (the function def lives before this point).
+    assert "Already up to date (" in text
+    branch = text.split("Already up to date (", 1)[1].split("_sync_deploy_targets", 1)[0]
     # The sibling transitions anchor the branch; USER.md must be restored alongside.
     assert "SETTINGS_LOCAL_BAK" in branch and "SERENA_YML_BAK" in branch
     assert "USER_MD_BAK" in branch, "no-op update path must restore the USER.md backup"
