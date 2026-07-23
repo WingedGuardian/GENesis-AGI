@@ -568,15 +568,28 @@ async def resolve_proposal(
     status: str,
     user_response: str | None = None,
     resolved_at: str | None = None,
+    expected_revision: int | None = None,
 ) -> bool:
-    """Update a proposal's status. Returns True if a row was updated."""
+    """Update a proposal's status. Returns True if a row was updated.
+
+    ``expected_revision`` (PR-4 dark plumbing — no live caller until PR-6): when
+    provided, the update applies only if the proposal's ``revision_num`` still
+    matches, an optimistic-concurrency guard against a revise/resolve race. The
+    MCP resolve path runs over a SEPARATE non-serialized connection, so this
+    atomic WHERE clause is the only defense against resolving a stale revision.
+    Absent (the default) the behavior is unchanged.
+    """
     if resolved_at is None:
         resolved_at = datetime.now(UTC).isoformat()
-    cursor = await db.execute(
+    sql = (
         "UPDATE ego_proposals SET status = ?, user_response = ?, resolved_at = ? "
-        "WHERE id = ? AND status = 'pending'",
-        (status, user_response, resolved_at, id),
+        "WHERE id = ? AND status = 'pending'"
     )
+    params: list = [status, user_response, resolved_at, id]
+    if expected_revision is not None:
+        sql += " AND revision_num = ?"
+        params.append(expected_revision)
+    cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount > 0
 

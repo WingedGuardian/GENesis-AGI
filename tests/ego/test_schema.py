@@ -118,6 +118,44 @@ class TestEgoSchema:
                     "VALUES ('p2', 'test', 'test', 'BOGUS', '2026-03-28')"
                 )
 
+    def test_ego_proposal_revisions_table_in_schema(self):
+        assert "ego_proposal_revisions" in TABLES
+
+    @pytest.mark.asyncio
+    async def test_ego_proposals_revision_columns_present(self):
+        """PR-4 dark schema: revision + revalidation columns on ego_proposals."""
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute(TABLES["ego_proposals"])
+            cursor = await db.execute("PRAGMA table_info(ego_proposals)")
+            info = {row[1]: row for row in await cursor.fetchall()}
+            assert "revision_num" in info
+            assert "revalidate_at" in info
+            assert "last_validated_at" in info
+            # PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk).
+            # revision_num defaults to 1 so existing rows read as revision 1.
+            assert info["revision_num"][4] == "1"
+            assert info["revision_num"][2] == "INTEGER"
+
+    @pytest.mark.asyncio
+    async def test_ego_proposal_revisions_table_creation(self):
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute(TABLES["ego_proposal_revisions"])
+            cursor = await db.execute("PRAGMA table_info(ego_proposal_revisions)")
+            cols = {row[1] for row in await cursor.fetchall()}
+            assert cols == {
+                "id",
+                "proposal_id",
+                "revision_num",
+                "content",
+                "rationale",
+                "confidence",
+                "execution_plan",
+                "expected_outputs",
+                "revised_at",
+                "revised_by",
+                "reason",
+            }
+
     def test_ego_indexes_present(self):
         idx_names = [idx for idx in INDEXES if "ego_" in idx]
         assert len(idx_names) >= 9  # 8 original + rank index

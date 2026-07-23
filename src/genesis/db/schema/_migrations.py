@@ -56,6 +56,78 @@ async def _try_alter(db: aiosqlite.Connection, sql: str, label: str) -> None:
             logger.error("Migration %s failed: %s", label, exc, exc_info=True)
 
 
+async def _intersection_copy(
+    db: aiosqlite.Connection,
+    *,
+    src: str,
+    dst: str,
+    or_ignore: bool = False,
+) -> None:
+    """Copy rows ``src`` -> ``dst`` over the intersection of their columns, by NAME.
+
+    Used by table-rebuild migrations (SQLite can't ALTER a CHECK/UNIQUE, so the
+    table is rebuilt as ``dst`` then renamed over ``src``). Computing the copy
+    column list at runtime from ``PRAGMA table_info`` — instead of a hardcoded
+    list frozen at some past column set — means a rebuild can never silently
+    DROP a column's data: whatever the live table actually has, if ``dst`` also
+    declares it, it is copied; columns only ``dst`` has take their DEFAULT.
+
+    Drift guard: if the LIVE table has any column ``dst`` does NOT (a rebuild
+    target that has fallen behind the canonical DDL), this RAISES rather than
+    dropping that column's data. Both callers wrap the rebuild in a fail-soft
+    try/except that leaves the ORIGINAL table intact and logs — so genuine drift
+    (a dev error that escaped the base-vs-rebuild parity test) fails the CHECK/
+    UNIQUE upgrade for that one boot but never loses data, and self-heals once
+    the rebuild CREATE is corrected. Dropping-then-logging would be the "mute the
+    symptom" antipattern; preserving irreversible data and failing loud is the
+    right default.
+
+    ``or_ignore`` copies with INSERT OR IGNORE (rebuilds that add a UNIQUE
+    constraint dedup on it — first row per key wins); the number of rows dropped
+    by that dedup is logged so the row-level loss the column drift-guard cannot
+    see is still surfaced.
+
+    Table/column names are schema identifiers (from PRAGMA or in-repo string
+    literals), never user input, so the f-string interpolation is safe.
+    """
+    cur = await db.execute(f"PRAGMA table_info({src})")  # noqa: S608
+    src_cols = [r[1] for r in await cur.fetchall()]
+    cur = await db.execute(f"PRAGMA table_info({dst})")  # noqa: S608
+    dst_cols = {r[1] for r in await cur.fetchall()}
+
+    dropped = [c for c in src_cols if c not in dst_cols]
+    if dropped:
+        # Refuse to proceed: copying only the shared columns would permanently
+        # drop `dropped`'s data. Raise so the caller's fail-soft handler keeps
+        # the original table (recoverable) instead of losing data (irreversible).
+        raise RuntimeError(
+            f"Table-rebuild drift: column(s) {dropped} exist on live '{src}' but "
+            f"not on rebuild target '{dst}'; refusing to copy and drop their "
+            f"data. Add them to the '{dst}' CREATE in _migrations.py to match the "
+            f"canonical _tables.py DDL."
+        )
+
+    shared = [c for c in src_cols if c in dst_cols]
+    collist = ", ".join(shared)
+    verb = "INSERT OR IGNORE INTO" if or_ignore else "INSERT INTO"
+    await db.execute(f"{verb} {dst} ({collist}) SELECT {collist} FROM {src}")  # noqa: S608
+
+    if or_ignore:
+        # dst was freshly created empty before this copy, so its row count is the
+        # number actually inserted; the shortfall vs src is what OR IGNORE dropped.
+        cur = await db.execute(f"SELECT COUNT(*) FROM {src}")  # noqa: S608
+        src_count = (await cur.fetchone())[0]
+        cur = await db.execute(f"SELECT COUNT(*) FROM {dst}")  # noqa: S608
+        dst_count = (await cur.fetchone())[0]
+        merged = src_count - dst_count
+        if merged > 0:
+            logger.info(
+                "Table-rebuild dedup: %s row(s) in '%s' collided on the new "
+                "UNIQUE constraint and were dropped (first row per key wins).",
+                merged, src,
+            )
+
+
 async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     """Idempotent ALTER TABLE migrations for columns added after Phase 0."""
 
@@ -847,6 +919,15 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         )
         row = await cursor.fetchone()
         if row and "UNIQUE(project_type, domain, concept)" not in (row[0] or ""):
+            # Clear any orphaned temp table from a prior failed/aborted attempt
+            # so the rebuild is retry-safe (mirrors ego_proposals_rebuild).
+            await db.execute("DROP TABLE IF EXISTS knowledge_units_new")
+            # Rebuild target mirrors the canonical knowledge_units CREATE in
+            # _tables.py (all 21 columns incl. source_pipeline/purpose/
+            # ingestion_source/origin_class) so no column data is dropped; the
+            # row copy is a runtime column-name intersection with OR IGNORE dedup
+            # (first row per (project_type,domain,concept) wins). A drift canary
+            # in _intersection_copy logs any live column this target lacks.
             await db.execute("""
                 CREATE TABLE knowledge_units_new (
                     id               TEXT PRIMARY KEY,
@@ -866,21 +947,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                     qdrant_id        TEXT,
                     embedding_model  TEXT,
                     retrieved_count  INTEGER NOT NULL DEFAULT 0,
+                    source_pipeline  TEXT,
+                    purpose          TEXT,
+                    ingestion_source TEXT,
+                    origin_class     TEXT,
                     UNIQUE(project_type, domain, concept)
                 )
             """)
-            await db.execute("""
-                INSERT OR IGNORE INTO knowledge_units_new
-                    (id, project_type, domain, source_doc, source_platform,
-                     section_title, concept, body, relationships, caveats, tags,
-                     confidence, source_date, ingested_at, qdrant_id,
-                     embedding_model, retrieved_count)
-                SELECT id, project_type, domain, source_doc, source_platform,
-                       section_title, concept, body, relationships, caveats, tags,
-                       confidence, source_date, ingested_at, qdrant_id,
-                       embedding_model, retrieved_count
-                FROM knowledge_units
-            """)
+            await _intersection_copy(
+                db, src="knowledge_units", dst="knowledge_units_new", or_ignore=True
+            )
             await db.execute("DROP TABLE knowledge_units")
             await db.execute(
                 "ALTER TABLE knowledge_units_new RENAME TO knowledge_units"
@@ -890,6 +966,8 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                 "knowledge_units table rebuilt with UNIQUE(project_type, domain, concept)"
             )
     except Exception:
+        with contextlib.suppress(Exception):
+            await db.execute("DROP TABLE IF EXISTS knowledge_units_new")
         logger.error(
             "knowledge_units UNIQUE constraint migration failed", exc_info=True
         )
@@ -1498,6 +1576,23 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN expected_outputs TEXT",
         "ego_proposals.expected_outputs")
 
+    # PR-4 (ego proposal-lifecycle redesign, dark schema): revision +
+    # revalidation tracking. Added on the base path here (every boot) AND by
+    # numbered migration 0071 (PRAGMA-guarded) so the migration ledger is never
+    # marked applied with the columns still absent (0071 also runs standalone
+    # via `python -m genesis.db.migrations`, without this base path). Both are
+    # idempotent: _try_alter suppresses duplicate-column, 0071 skips on PRAGMA —
+    # whichever runs first, the other no-ops (no double-add crash).
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN revision_num INTEGER DEFAULT 1",
+        "ego_proposals.revision_num")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN revalidate_at TEXT",
+        "ego_proposals.revalidate_at")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN last_validated_at TEXT",
+        "ego_proposals.last_validated_at")
+
     # surplus_tasks.not_before — existed in CREATE TABLE DDL but lacked
     # ALTER TABLE migration for installs created before the column was added.
     await _try_alter(db,
@@ -1767,6 +1862,19 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
 
     SQLite doesn't support ALTER CHECK — must rebuild the table.
     Idempotent: skips if the constraint already includes the new statuses.
+
+    Does NOT recreate indexes: its sole caller (create_all_tables via
+    _migrate_add_columns) runs the module-level INDEXES pass immediately after,
+    re-applying all 8 idx_ego_proposals_*. Do not call this standalone in a
+    context that needs indexes present.
+
+    LOAD-BEARING ORDER: this runs on the base path BEFORE the numbered-migration
+    runner, so it flips the CHECK first and the numbered ego_proposals rebuilds
+    (0007/0012) early-return as no-ops. Those numbered migrations still carry
+    frozen, column-incomplete copy lists; do NOT remove or reorder this base-path
+    rebuild after them, or they could fire on a legacy DB and drop columns
+    (locked by test_rebuild_column_preservation.py
+    ::test_numbered_ego_rebuilds_stay_inert_on_current_db).
     """
     try:
         cursor = await db.execute(
@@ -1780,6 +1888,13 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
             return  # Already up to date
 
         await db.execute("DROP TABLE IF EXISTS ego_proposals_rebuild")
+        # The rebuild target MUST mirror the canonical ego_proposals CREATE in
+        # _tables.py exactly (same columns/types/defaults), differing only by the
+        # corrected status CHECK — that parity is asserted by the Unit-D
+        # base-vs-rebuild schema test. The row copy below is a runtime
+        # column-name intersection (_intersection_copy), NOT a frozen hardcoded
+        # list, so a column added to the live table after this CREATE was written
+        # can never be silently dropped (a drift canary logs any this lacks).
         await db.execute("""
             CREATE TABLE ego_proposals_rebuild (
                 id              TEXT PRIMARY KEY,
@@ -1808,40 +1923,25 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
                 realist_verdict  TEXT,
                 realist_reasoning TEXT,
                 ego_source       TEXT,
-                goal_id          TEXT
+                goal_id          TEXT,
+                content_hash     TEXT,
+                content_size     INTEGER,
+                original_content TEXT,
+                expected_outputs TEXT,
+                revision_num      INTEGER DEFAULT 1,
+                revalidate_at     TEXT,
+                last_validated_at TEXT
             )
         """)
-        await db.execute("""
-            INSERT INTO ego_proposals_rebuild
-                (id, action_type, action_category, content, rationale,
-                 confidence, urgency, alternatives, status, user_response,
-                 cycle_id, batch_id, created_at, resolved_at, expires_at,
-                 rank, execution_plan, recurring, memory_basis,
-                 realist_verdict, realist_reasoning, ego_source, goal_id)
-            SELECT
-                id, action_type, action_category, content, rationale,
-                confidence, urgency, alternatives, status, user_response,
-                cycle_id, batch_id, created_at, resolved_at, expires_at,
-                rank, execution_plan, recurring, memory_basis,
-                realist_verdict, realist_reasoning, ego_source, goal_id
-            FROM ego_proposals
-        """)
+        await _intersection_copy(db, src="ego_proposals", dst="ego_proposals_rebuild")
         await db.execute("DROP TABLE ego_proposals")
         await db.execute(
             "ALTER TABLE ego_proposals_rebuild RENAME TO ego_proposals"
         )
-        # Recreate indexes
-        for idx_sql in [
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_status ON ego_proposals(status)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_created ON ego_proposals(created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_cycle ON ego_proposals(cycle_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_category ON ego_proposals(action_category, status)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_batch ON ego_proposals(batch_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
-            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_goal ON ego_proposals(goal_id)",
-        ]:
-            await db.execute(idx_sql)
+        # Indexes are (re)created by create_all_tables' trailing INDEXES pass —
+        # this migration's sole caller runs it right after _migrate_add_columns,
+        # and all 8 idx_ego_proposals_* live in the module-level INDEXES list —
+        # so no inline recreation is needed here.
         await db.commit()
         logger.info("ego_proposals table rebuilt with 'tabled'/'withdrawn' statuses")
     except Exception:
