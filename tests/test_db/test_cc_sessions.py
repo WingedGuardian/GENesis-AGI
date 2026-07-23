@@ -52,7 +52,9 @@ async def test_update_status(db, sess_fields):
 async def test_update_activity(db, sess_fields):
     await cc_sessions.create(db, **sess_fields)
     ok = await cc_sessions.update_activity(
-        db, "sess-1", last_activity_at="2026-03-07T09:00:00",
+        db,
+        "sess-1",
+        last_activity_at="2026-03-07T09:00:00",
     )
     assert ok
     row = await cc_sessions.get_by_id(db, "sess-1")
@@ -86,7 +88,10 @@ async def test_roster_persist_reconstruct_loop(db, sess_fields, monkeypatch):
 
     # (chokepoint) a pre-stamped routed resume is respected, never rerouted:
     inv = CCInvocation(
-        prompt="x", roster_eligible=True, resume_session_id="cc-x", **overrides,
+        prompt="x",
+        roster_eligible=True,
+        resume_session_id="cc-x",
+        **overrides,
     )
     out_inv, name = roster.apply_active(inv)
     assert out_inv is inv and name == "glm-5.2"
@@ -96,11 +101,14 @@ async def test_merge_metadata_round_trip(db, sess_fields):
     # roster-endpoint persistence: shallow merge into JSON metadata, no migration.
     await cc_sessions.create(db, **{**sess_fields, "metadata": '{"existing": 1}'})
     ok = await cc_sessions.merge_metadata(
-        db, "sess-1", {"roster_endpoint": {"model_id": "glm-5.2"}},
+        db,
+        "sess-1",
+        {"roster_endpoint": {"model_id": "glm-5.2"}},
     )
     assert ok
     row = await cc_sessions.get_by_id(db, "sess-1")
     import json
+
     md = json.loads(row["metadata"])
     assert md["existing"] == 1  # preserved
     assert md["roster_endpoint"] == {"model_id": "glm-5.2"}  # merged
@@ -111,6 +119,7 @@ async def test_merge_metadata_tolerates_corrupt_and_missing(db, sess_fields):
     ok = await cc_sessions.merge_metadata(db, "sess-1", {"k": "v"})
     assert ok
     import json
+
     row = await cc_sessions.get_by_id(db, "sess-1")
     assert json.loads(row["metadata"]) == {"k": "v"}  # corrupt treated as {}
     # missing row → False, no raise
@@ -128,8 +137,11 @@ async def test_query_stale(db, sess_fields):
     # Background sessions should appear in stale results
     await cc_sessions.create(
         db,
-        **{**sess_fields, "session_type": "background_task",
-           "last_activity_at": "2026-03-07T06:00:00"},
+        **{
+            **sess_fields,
+            "session_type": "background_task",
+            "last_activity_at": "2026-03-07T06:00:00",
+        },
     )
     rows = await cc_sessions.query_stale(db, older_than="2026-03-07T07:00:00")
     assert len(rows) == 1
@@ -139,8 +151,7 @@ async def test_query_stale_excludes_foreground(db, sess_fields):
     """Foreground sessions must never appear in stale query results."""
     await cc_sessions.create(
         db,
-        **{**sess_fields, "session_type": "foreground",
-           "last_activity_at": "2026-03-07T06:00:00"},
+        **{**sess_fields, "session_type": "foreground", "last_activity_at": "2026-03-07T06:00:00"},
     )
     rows = await cc_sessions.query_stale(db, older_than="2026-03-07T07:00:00")
     assert len(rows) == 0
@@ -175,8 +186,7 @@ async def test_check_constraint_status(db, sess_fields):
 @pytest.mark.asyncio
 async def test_update_cc_session_id(db, sess_fields):
     await cc_sessions.create(db, **sess_fields)
-    ok = await cc_sessions.update_cc_session_id(
-        db, "sess-1", cc_session_id="cc-cli-uuid-123")
+    ok = await cc_sessions.update_cc_session_id(db, "sess-1", cc_session_id="cc-cli-uuid-123")
     assert ok
     row = await cc_sessions.get_by_id(db, "sess-1")
     assert row["cc_session_id"] == "cc-cli-uuid-123"
@@ -194,15 +204,61 @@ async def test_get_by_session_types(db, sess_fields):
     """Filters to the requested session_types; empty input returns []."""
     await cc_sessions.create(db, **sess_fields)  # foreground
     await cc_sessions.create(
-        db, **{**sess_fields, "id": "sess-2", "session_type": "background_task"})
+        db, **{**sess_fields, "id": "sess-2", "session_type": "background_task"}
+    )
     await cc_sessions.create(
-        db, **{**sess_fields, "id": "sess-3", "session_type": "background_task"})
+        db, **{**sess_fields, "id": "sess-3", "session_type": "background_task"}
+    )
 
     bg = await cc_sessions.get_by_session_types(db, {"background_task"})
     assert {r["id"] for r in bg} == {"sess-2", "sess-3"}
 
-    both = await cc_sessions.get_by_session_types(
-        db, {"background_task", "foreground"})
+    both = await cc_sessions.get_by_session_types(db, {"background_task", "foreground"})
     assert {r["id"] for r in both} == {"sess-1", "sess-2", "sess-3"}
 
     assert await cc_sessions.get_by_session_types(db, set()) == []
+
+
+@pytest.mark.asyncio
+async def test_get_active_foreground_returns_checkpointed(db, sess_fields):
+    """D3: a reaped (checkpointed) foreground row is still resumable — the
+    widened query must return it (not just 'active')."""
+    await cc_sessions.create(db, **{**sess_fields, "status": "checkpointed"})
+    row = await cc_sessions.get_active_foreground(db, user_id="user-1", channel="telegram")
+    assert row is not None and row["id"] == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_query_stale_foreground(db, sess_fields):
+    """Selects idle foreground rows; excludes non-foreground, voice, and fresh."""
+    old = "2020-01-01T00:00:00+00:00"
+    await cc_sessions.create(db, **{**sess_fields, "id": "fg-old", "last_activity_at": old})
+    await cc_sessions.create(
+        db, **{**sess_fields, "id": "fg-fresh", "last_activity_at": "2099-01-01T00:00:00+00:00"}
+    )
+    await cc_sessions.create(
+        db, **{**sess_fields, "id": "voice", "source_tag": "voice", "last_activity_at": old}
+    )
+    await cc_sessions.create(
+        db,
+        **{**sess_fields, "id": "bg", "session_type": "background_task", "last_activity_at": old},
+    )
+    rows = await cc_sessions.query_stale_foreground(db, older_than="2021-01-01T00:00:00+00:00")
+    assert {r["id"] for r in rows} == {"fg-old"}
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_dark_and_race_guard(db, sess_fields):
+    await cc_sessions.create(db, **sess_fields)  # active
+    won = await cc_sessions.checkpoint_dark(
+        db, "sess-1", checkpointed_at="2026-07-22T12:00:00+00:00"
+    )
+    assert won is True
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    assert row["status"] == "checkpointed"
+    assert row["checkpointed_at"] == "2026-07-22T12:00:00+00:00"
+    # Race guard: a second checkpoint on the now-non-active row is a no-op.
+    again = await cc_sessions.checkpoint_dark(
+        db, "sess-1", checkpointed_at="2026-07-22T13:00:00+00:00"
+    )
+    assert again is False

@@ -249,3 +249,20 @@ async def prune_terminal(db: aiosqlite.Connection, *, older_than_days: int = 45)
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def has_open_for_origin(db: aiosqlite.Connection, origin_session_id: str) -> bool:
+    """True iff an OPEN park (parked/resuming/needs_user) exists for this origin.
+
+    An open park means the rate-limit machinery still owns notifying the user
+    about this session's work (auto-resume delivery or a needs_user escalation),
+    so the foreground-liveness reaper (D3) must not ALSO notify. Terminal parks
+    (resumed/cancelled/expired) are done and do not suppress.
+    """
+    cursor = await db.execute(
+        "SELECT 1 FROM cc_rate_limit_parks "
+        "WHERE origin_session_id = ? "
+        "AND status IN ('parked', 'resuming', 'needs_user') LIMIT 1",
+        (origin_session_id,),
+    )
+    return await cursor.fetchone() is not None

@@ -1036,6 +1036,29 @@ async def init(rt: GenesisRuntime) -> None:
                         max_idle_minutes=360,
                     )
                 cleaned = await cleanup_stale_heartbeats(rt._db)
+
+                # D3 — foreground-session liveness reaper. Isolated in its OWN
+                # try/except so a notify/observation failure can NEVER abort the
+                # stale-session / heartbeat cleanup above (which is the job's
+                # primary contract).
+                try:
+                    from genesis.cc.foreground_reaper import reap_dark_foreground
+
+                    fg = await reap_dark_foreground(rt)
+                    if fg.get("reaped"):
+                        logger.info(
+                            "Session reaper: checkpointed %d dark foreground "
+                            "session(s) (notified=%d, shadow=%d)",
+                            fg["reaped"],
+                            fg.get("notified", 0),
+                            fg.get("shadow", 0),
+                        )
+                except Exception:
+                    logger.warning(
+                        "Foreground liveness reaper failed (stale-session cleanup unaffected)",
+                        exc_info=True,
+                    )
+
                 rt.record_job_success("session_reaper")
                 if reaped:
                     logger.info("Session reaper: expired %d stale sessions", reaped)

@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **An interrupted request no longer vanishes silently.** If a message you sent
+  on Telegram was cut off before Genesis finished answering — a crash, a
+  restart, or the session going dark mid-turn — Genesis now notices the
+  abandoned session on its next hygiene pass and tells you it was interrupted so
+  you can re-send, instead of leaving you waiting on a reply that never comes.
+  Configurable via `cc_foreground_reaper` (`off` / `observe` / `notify`, default
+  `notify`); observability-only — it never silently re-runs the lost work.
 - **Ambient capture now alerts when auto-recovery can't bring a wedged device
   back.** For installs running the optional voice/ambient edge with device
   auto-recovery armed, Genesis now raises a capture-health alert when the device

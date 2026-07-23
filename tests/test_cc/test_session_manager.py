@@ -22,7 +22,8 @@ async def manager(db, mock_invoker):
 
 async def test_create_foreground(db, manager):
     sess = await manager.get_or_create_foreground(
-        user_id="u1", channel=ChannelType.TELEGRAM,
+        user_id="u1",
+        channel=ChannelType.TELEGRAM,
     )
     assert sess is not None
     assert sess["session_type"] == "foreground"
@@ -31,12 +32,32 @@ async def test_create_foreground(db, manager):
 
 async def test_get_existing_foreground(db, manager):
     s1 = await manager.get_or_create_foreground(
-        user_id="u1", channel=ChannelType.TELEGRAM,
+        user_id="u1",
+        channel=ChannelType.TELEGRAM,
     )
     s2 = await manager.get_or_create_foreground(
-        user_id="u1", channel=ChannelType.TELEGRAM,
+        user_id="u1",
+        channel=ChannelType.TELEGRAM,
     )
     assert s1["id"] == s2["id"]
+
+
+async def test_get_or_create_flips_checkpointed_to_active(db, manager):
+    """A reaped (checkpointed) foreground session is revived to 'active' on
+    reuse, preserving its id so --resume continues (D3 resume safety)."""
+    s1 = await manager.get_or_create_foreground(
+        user_id="u1",
+        channel=ChannelType.TELEGRAM,
+    )
+    await cc_sessions.checkpoint_dark(db, s1["id"], checkpointed_at="2026-07-22T12:00:00+00:00")
+    assert (await cc_sessions.get_by_id(db, s1["id"]))["status"] == "checkpointed"
+    s2 = await manager.get_or_create_foreground(
+        user_id="u1",
+        channel=ChannelType.TELEGRAM,
+    )
+    assert s2["id"] == s1["id"]
+    assert s2["status"] == "active"
+    assert (await cc_sessions.get_by_id(db, s1["id"]))["status"] == "active"
 
 
 async def test_create_background(db, manager):
@@ -109,7 +130,8 @@ async def test_create_background_no_profile(db, manager):
 
 async def test_checkpoint(db, manager):
     sess = await manager.get_or_create_foreground(
-        user_id="u1", channel=ChannelType.TELEGRAM,
+        user_id="u1",
+        channel=ChannelType.TELEGRAM,
     )
     await manager.checkpoint(sess["id"])
     row = await cc_sessions.get_by_id(db, sess["id"])
@@ -118,7 +140,8 @@ async def test_checkpoint(db, manager):
 
 async def test_complete(db, manager):
     sess = await manager.get_or_create_foreground(
-        user_id="u1", channel=ChannelType.TELEGRAM,
+        user_id="u1",
+        channel=ChannelType.TELEGRAM,
     )
     await manager.complete(sess["id"])
     row = await cc_sessions.get_by_id(db, sess["id"])
@@ -237,7 +260,8 @@ async def test_create_background_origin_defaults_null(db, manager):
 
 async def test_foreground_origin_stays_null(db, manager):
     sess = await manager.get_or_create_foreground(
-        user_id="u1", channel=ChannelType.TELEGRAM,
+        user_id="u1",
+        channel=ChannelType.TELEGRAM,
     )
     row = await cc_sessions.get_by_id(db, sess["id"])
     assert row["origin_class"] is None  # owner-supervised, read first_party

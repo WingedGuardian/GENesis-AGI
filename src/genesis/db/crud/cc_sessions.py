@@ -85,7 +85,7 @@ async def get_active_foreground(
         cursor = await db.execute(
             """SELECT * FROM cc_sessions
                WHERE session_type = 'foreground'
-                 AND status = 'active'
+                 AND status IN ('active', 'checkpointed')
                  AND user_id = ?
                  AND channel = ?
                  AND thread_id = ?
@@ -96,7 +96,7 @@ async def get_active_foreground(
         cursor = await db.execute(
             """SELECT * FROM cc_sessions
                WHERE session_type = 'foreground'
-                 AND status = 'active'
+                 AND status IN ('active', 'checkpointed')
                  AND user_id = ?
                  AND channel = ?
                  AND thread_id IS NULL
@@ -161,6 +161,57 @@ async def query_stale(
         (older_than,),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def query_stale_foreground(
+    db: aiosqlite.Connection,
+    *,
+    older_than: str,
+) -> list[dict]:
+    """Return active FOREGROUND sessions idle since before *older_than*.
+
+    The inverse of :func:`query_stale` (which excludes foreground). Used by
+    the foreground-liveness reaper (D3): a foreground row stays ``active`` by
+    design so the next turn can ``--resume`` it, so a crash / OOM / restart
+    mid-turn leaves it ``active`` forever — indistinguishable from a healthy
+    resumable session. Voice foreground rows are excluded (they have their own
+    orphan sweep, :func:`complete_orphaned_voice_sessions`); a NULL source_tag
+    is treated as non-voice so legacy foreground rows are still swept.
+    """
+    cursor = await db.execute(
+        """SELECT * FROM cc_sessions
+           WHERE status = 'active'
+             AND session_type = 'foreground'
+             AND COALESCE(source_tag, '') != 'voice'
+             AND last_activity_at < ?
+           ORDER BY last_activity_at ASC""",
+        (older_than,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def checkpoint_dark(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    checkpointed_at: str,
+) -> bool:
+    """Relabel a dark (abandoned) foreground row ``active`` → ``checkpointed``.
+
+    Non-destructive: touches only ``status`` / ``checkpointed_at``, never
+    ``cc_session_id`` / model / effort / metadata, so the row stays resumable
+    (``get_active_foreground`` matches ``checkpointed`` and
+    ``get_or_create_foreground`` flips it back to ``active`` on reuse). The
+    ``status = 'active'`` guard makes this a no-op (rowcount 0) when a
+    concurrent turn revived the row between the reaper's read and this write.
+    """
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET status = 'checkpointed', checkpointed_at = ? "
+        "WHERE id = ? AND status = 'active'",
+        (checkpointed_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 # reap_stale (bulk UPDATE → 'completed') was deleted. It relabeled
@@ -422,7 +473,9 @@ async def register_voice_session(
 
 
 async def complete_orphaned_voice_sessions(
-    db: aiosqlite.Connection, *, idle_before: str,
+    db: aiosqlite.Connection,
+    *,
+    idle_before: str,
 ) -> int:
     """Mark ``active`` voice sessions idle since before ``idle_before`` completed.
 

@@ -190,6 +190,20 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every resume tick
     ),
+    "cc_foreground_reaper": SettingsDomain(
+        name="cc_foreground_reaper",
+        description=(
+            "Foreground-session liveness reaper (D3) — master `enabled` + `mode` "
+            "off/observe/notify, plus idle_hours/max_per_tick. notify (default) "
+            "reaps abandoned foreground sessions to 'checkpointed' and tells the "
+            "origin user their request was interrupted (crisp unanswered-user "
+            "signal only); observe reaps + records without notifying; off does "
+            "nothing. Read live each reaper pass — takes effect next pass, no restart."
+        ),
+        config_filename="cc_foreground_reaper.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every reaper pass
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -1082,9 +1096,31 @@ def _validate_cc_rate_limit_resume(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_cc_foreground_reaper(changes: dict) -> list[str]:
+    """Validate foreground-liveness reaper lever changes (see
+    genesis.cc.foreground_reaper_config)."""
+    from genesis.cc.foreground_reaper_config import INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
+    "cc_foreground_reaper": _validate_cc_foreground_reaper,
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,
