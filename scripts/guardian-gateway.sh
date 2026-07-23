@@ -288,7 +288,7 @@ except Exception:
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
         if [ -d "$INSTALL_DIR/.git" ]; then
             cd "$INSTALL_DIR"
-            OLD=$(git rev-parse --short HEAD 2>/dev/null)
+            OLD=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
             # Discard CLAUDE.md before pull — it's a generated file that the
             # repo's version would overwrite with the wrong content (container
             # dev instructions vs Guardian diagnostic instructions). We
@@ -361,6 +361,10 @@ except Exception:
                     if [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
                         sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ 2>/dev/null || true
                         sudo udevadm control --reload-rules 2>/dev/null || true
+                        # reload alone only refreshes the rules DB; trigger re-applies
+                        # the scheduler rule to already-present block devices (scoped to
+                        # block so a live host's network/other udev isn't re-triggered).
+                        sudo udevadm trigger --subsystem-match=block 2>/dev/null || true
                     fi
                     # Regenerate I/O sysctl from canonical values
                     sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null 2>&1 << 'IOSYSCTL' || true

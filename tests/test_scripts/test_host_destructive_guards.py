@@ -1,7 +1,29 @@
-"""Host destructive-path guards (deploy-audit H4/H5/H7/I2/I3/H8).
+"""Host destructive-path guards (deploy-audit H4/H5/H7/I2/I3/H8) plus the
+P7 robustness/abort guards (H1/H2/H3/H6/G2/I4/I5).
 
-These fixes harden host-side operations in scripts/host-setup.sh and
-scripts/install_guardian.sh that can destroy data or strip a working config:
+These fixes harden host-side operations in scripts/host-setup.sh,
+scripts/install_guardian.sh, and scripts/guardian-gateway.sh that can destroy
+data, strip a working config, abort the whole script under `set -euo pipefail`,
+or claim success that didn't happen:
+
+* **H1** IP-geolocation TZ pipeline aborted host-setup on a curl failure / grep
+  no-match (pipefail) before its own fallback could run — now `|| _detected_tz=""`.
+* **H2** the managed-bridge detect (`incus … | grep ",YES," | …`) aborted on a
+  no-match host (grep→1 under pipefail) before the `[ -n ]` skip — now `|| true`.
+* **H3** the OOM `sudo sysctl --system` aborted on failure and lied about success —
+  now an `if … then/else` that neither aborts nor over-claims.
+* **H6** the "IOPS limits applied" echo was unconditional after `|| true` device
+  commands — now gated on the idempotent IOPS sets (NOT the override, which errors
+  benignly on a re-run).
+* **G2** the guardian `update` verb's `OLD=$(git rev-parse …)` had no fallback —
+  now `|| echo "unknown"` matching its siblings.
+* **I4** udev rules were reloaded but never `trigger`ed, so the BFQ scheduler rule
+  never reached existing block devices — now `udevadm trigger --subsystem-match=block`
+  at BOTH sites (install_guardian.sh + guardian-gateway.sh's update mirror).
+* **I5** the venv gate tested `-d "$VENV_DIR"` so a partial/broken venv was skipped —
+  now `-x "$VENV_DIR/bin/python"`.
+
+The original destructive-path guards:
 
 * **H4** a "damaged" container was force-DELETED (unrecoverable — DB, memory,
   transcripts gone), and a single transient `incus exec` failure could
@@ -30,6 +52,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HOST_SETUP = REPO_ROOT / "scripts" / "host-setup.sh"
 INSTALL_GUARDIAN = REPO_ROOT / "scripts" / "install_guardian.sh"
+GUARDIAN_GATEWAY = REPO_ROOT / "scripts" / "guardian-gateway.sh"
 
 
 def _code(path: Path) -> str:
@@ -123,3 +146,86 @@ def test_h8_reexec_quotes_args():
     code = _code(HOST_SETUP)
     assert 'for _a in "$@"; do _ORIG_ARGS+="$(printf \'%q \' "$_a")"; done' in code
     assert '_ORIG_ARGS="$*"' not in code  # the flattening form is gone
+
+
+# ── P7: robustness / abort / honesty guards (H1/H2/H3/H6/G2/I4/I5) ────
+
+
+def test_p7_host_setup_runs_under_pipefail():
+    """The abort-guards (H1/H2/H3) only matter under pipefail — lock that the
+    script still declares it, so a future `set -e`→`set +o pipefail` change can't
+    silently make these guards dead weight."""
+    assert "set -euo pipefail" in HOST_SETUP.read_text()
+
+
+def test_h1_timezone_pipeline_has_fallback():
+    code = _code(HOST_SETUP)
+    # curl-fail / grep-no-match must fall through to the timedatectl fallback,
+    # not abort at the assignment under pipefail.
+    assert '|| _detected_tz=""' in code
+    # The fallback block that the guard protects must still be reachable.
+    assert 'if [ -z "$_detected_tz" ]; then' in code
+
+
+def test_h2_bridge_detect_no_match_is_survivable():
+    code = _code(HOST_SETUP)
+    # BOTH detect sites (NAT + firewall) guard the grep-no-match abort …
+    assert code.count("cut -d, -f1 || true)") == 2
+    # … and the unguarded form is gone entirely.
+    assert "cut -d, -f1)" not in code
+    # The "no managed bridge" skip path is now reachable.
+    assert "No managed Incus bridge found" in HOST_SETUP.read_text()
+
+
+def test_h3_oom_sysctl_neither_aborts_nor_lies():
+    code = _code(HOST_SETUP)
+    assert "if sudo sysctl --system > /dev/null 2>&1; then" in code
+    # The bare, abort-prone form is gone.
+    assert "\n    sudo sysctl --system > /dev/null 2>&1\n" not in "\n" + code + "\n"
+    assert "OOM sysctl apply failed" in HOST_SETUP.read_text()  # honest failure branch
+
+
+def test_h6_iops_message_gated_on_idempotent_sets():
+    code = _code(HOST_SETUP)
+    # The success echo is now conditional on the two idempotent IOPS sets …
+    assert "_io_limits_ok=true" in code
+    assert code.count("_io_limits_ok=false") == 2  # one per limits.read / limits.write set
+    assert 'if [ "$_io_limits_ok" = true ]; then' in code
+    # … NOT on the override, which errors benignly on a re-run (must stay `|| true`).
+    assert (
+        'incus config device override "$CONTAINER_NAME" root size="$DISK" 2>/dev/null || true'
+        in code
+    )
+    assert "IOPS limits not applied" in HOST_SETUP.read_text()  # honest else branch
+
+
+def test_g2_guardian_update_rev_parse_has_fallback():
+    code = _code(GUARDIAN_GATEWAY)
+    assert 'OLD=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")' in code
+    # The unguarded form is gone (would abort a corrupt-repo update under set -e).
+    assert "OLD=$(git rev-parse --short HEAD 2>/dev/null)" not in code
+
+
+def test_i4_udev_reload_is_followed_by_trigger():
+    """reload alone refreshes the rules DB but never re-applies to existing
+    block devices; the scheduler rule needs a `trigger`. Scoped to `block` so a
+    live host's other subsystems aren't re-triggered. Both sites must have it."""
+    trigger = "sudo udevadm trigger --subsystem-match=block 2>/dev/null || true"
+    assert trigger in _code(INSTALL_GUARDIAN)
+    assert trigger in _code(GUARDIAN_GATEWAY)
+    # A reload with NO following trigger is the bug — assert the trigger count
+    # matches the reload count at each site.
+    for path in (INSTALL_GUARDIAN, GUARDIAN_GATEWAY):
+        c = _code(path)
+        assert c.count("udevadm control --reload-rules") == c.count(
+            "udevadm trigger --subsystem-match=block"
+        )
+
+
+def test_i5_venv_gate_checks_interpreter_not_dir():
+    code = _code(INSTALL_GUARDIAN)
+    assert 'if [ ! -x "$VENV_DIR/bin/python" ]; then' in code
+    # The dir-existence gate (which skipped recreating a broken venv) is gone.
+    assert 'if [ ! -d "$VENV_DIR" ]; then' not in code
+    # --clear so a dangling bin/python symlink is rebuilt, not skipped by venv.
+    assert '-m venv --clear "$VENV_DIR"' in code
