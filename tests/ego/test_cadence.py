@@ -1419,6 +1419,154 @@ class TestGoalStaleness:
         assert goal_cadence._signal_queue.empty()
 
 
+class TestCapabilityImprovement:
+    """Tests for _check_weak_capabilities() — advisory capability_improvement scanner."""
+
+    @pytest.fixture
+    async def cap_db(self):
+        """DB with the capability_map table."""
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            for table in ("ego_cycles", "ego_state", "cc_sessions", "capability_map"):
+                await conn.execute(TABLES[table])
+            await conn.commit()
+            yield conn
+
+    @pytest.fixture
+    def cap_cadence(self, mock_session, config, mock_idle_detector, cap_db):
+        # Genesis ego owns the capability-improvement scanner.
+        mock_session._source_tag = "genesis_ego_cycle"
+        mock_session._db = cap_db
+        return EgoCadenceManager(
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=cap_db,
+        )
+
+    @staticmethod
+    async def _insert_domain(db, domain, confidence, sample_size=5, trend="stable"):
+        from datetime import datetime as _dt
+
+        await db.execute(
+            "INSERT INTO capability_map "
+            "(id, domain, confidence, sample_size, trend, evidence_summary, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                domain,  # id doubles as a unique key for the test
+                domain,
+                confidence,
+                sample_size,
+                trend,
+                f"{domain} evidence",
+                _dt.now(UTC).isoformat(),
+            ),
+        )
+        await db.commit()
+
+    async def test_weak_domain_pushes_advisory_signal(self, cap_cadence, cap_db):
+        """A weak domain surfaces a priority=low advisory capability_improvement signal."""
+        await self._insert_domain(cap_db, "outreach", 0.30, sample_size=8)
+
+        await cap_cadence._check_weak_capabilities()
+
+        assert not cap_cadence._signal_queue.empty()
+        signals = cap_cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.focus_category == "capability_improvement"
+        assert sig.priority == "low"
+        assert sig.focus_id == "outreach"
+        assert sig.metadata.get("advisory") is True
+        assert "outreach" in sig.summary
+
+    async def test_strong_domain_no_signal(self, cap_cadence, cap_db):
+        """A domain above the weakness threshold does NOT surface a signal."""
+        await self._insert_domain(cap_db, "investigate", 0.90, sample_size=8)
+
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_low_sample_domain_skipped(self, cap_cadence, cap_db):
+        """A weak-but-low-n domain is ignored as a fluke (min_sample_size gate)."""
+        await self._insert_domain(cap_db, "flaky", 0.10, sample_size=1)
+
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_weakest_first_and_capped(self, cap_cadence, cap_db):
+        """Signals come from the weakest domains, capped at max_signals."""
+        cap_cadence._config.capability_improvement_max_signals = 2
+        await self._insert_domain(cap_db, "d1", 0.10)
+        await self._insert_domain(cap_db, "d2", 0.20)
+        await self._insert_domain(cap_db, "d3", 0.40)
+        await self._insert_domain(cap_db, "d4", 0.95)  # strong — excluded
+
+        await cap_cadence._check_weak_capabilities()
+
+        signals = cap_cadence._signal_queue.drain()
+        assert len(signals) == 2
+        focus_ids = {s.focus_id for s in signals}
+        assert focus_ids == {"d1", "d2"}  # two weakest, d4 excluded
+
+    async def test_user_ego_skipped(self, cap_cadence, cap_db):
+        """The user ego does NOT run the capability scanner (genesis ego only)."""
+        cap_cadence._session._source_tag = "user_ego_cycle"
+        await self._insert_domain(cap_db, "outreach", 0.30, sample_size=8)
+
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_disabled_config_skips(self, cap_cadence, cap_db):
+        """capability_improvement_enabled=False silences the scanner."""
+        cap_cadence._config.capability_improvement_enabled = False
+        await self._insert_domain(cap_db, "outreach", 0.30, sample_size=8)
+
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_empty_map_no_signal(self, cap_cadence, cap_db):
+        """Empty capability map (fresh install) is a clean no-op."""
+        await cap_cadence._check_weak_capabilities()
+        assert cap_cadence._signal_queue.empty()
+
+    async def test_job_registered_for_genesis_ego(
+        self, mock_session, config, mock_idle_detector, cap_db,
+    ):
+        """start() registers the ego_capability_improvement job for the genesis ego."""
+        mock_session._source_tag = "genesis_ego_cycle"
+        mock_session._db = cap_db
+        mgr = EgoCadenceManager(
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=cap_db,
+        )
+        try:
+            await mgr.start()
+            assert mgr._scheduler.get_job("ego_capability_improvement") is not None
+        finally:
+            await mgr.stop()
+
+    async def test_job_not_registered_for_user_ego(
+        self, mock_session, config, mock_idle_detector, cap_db,
+    ):
+        """The user ego cadence does NOT register the capability scanner job."""
+        mock_session._source_tag = "user_ego_cycle"
+        mock_session._db = cap_db
+        mgr = EgoCadenceManager(
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=cap_db,
+        )
+        try:
+            await mgr.start()
+            assert mgr._scheduler.get_job("ego_capability_improvement") is None
+        finally:
+            await mgr.stop()
+
+
 class TestJobHealthKeyPerEgo:
     """Each ego records job health under its OWN key, never a shared 'ego_cycle'.
 

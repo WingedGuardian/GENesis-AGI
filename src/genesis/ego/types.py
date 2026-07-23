@@ -21,6 +21,10 @@ class FocusCategory(StrEnum):
     GOAL_REVIEW = "goal_review"
     DISPATCH_OUTCOME = "dispatch_outcome"
     ESCALATION = "escalation"
+    # Advisory self-improvement: a scanned capability deficiency surfaced for
+    # the ego to CONSIDER. Never throttles/gates/auto-dispatches a loop, and
+    # never a mandate to "propose less" (hard quality-over-cost rule).
+    CAPABILITY_IMPROVEMENT = "capability_improvement"
 
 
 class ProposalStatus(StrEnum):
@@ -199,6 +203,15 @@ class EgoConfig:
     # display-only (rendered into ego-context sections, no code gate), so even ON
     # only nudges the numbers the ego sees about itself. Live-read each refresh.
     outcome_bus_capability_feed: bool = False
+    # Capability-improvement scanner (advisory; genesis ego only). A twice-daily
+    # job reads the weakest domains from the capability map and pushes a
+    # priority=low FocusCategory.CAPABILITY_IMPROVEMENT signal for the ego to
+    # CONSIDER. ADVISORY ONLY — it never throttles, gates, or auto-dispatches a
+    # loop, and never proposes doing less. Set enabled=False to silence it.
+    capability_improvement_enabled: bool = True
+    capability_weakness_threshold: float = 0.5  # domains below this confidence are "weak"
+    capability_improvement_min_sample_size: int = 3  # ignore low-n flukes
+    capability_improvement_max_signals: int = 3  # cap advisory signals per scan
     # Quiet-hours floor (circadian model): during the overnight window, throttle
     # PROACTIVE ticks to at most one per quiet_hours_min_interval_minutes. Morning
     # report, reactive, and escalation paths are never gated by this. Local time

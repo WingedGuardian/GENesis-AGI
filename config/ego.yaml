@@ -66,3 +66,15 @@ calibration_injection_enabled: true
 # NOTE: settings_update marks the whole ego domain "restart required"; that is
 # not true for THIS field — the refresh job re-reads the config each run.
 outcome_bus_capability_feed: false
+
+# Capability-improvement scanner (ADVISORY; Genesis ego / COO only). A twice-
+# daily cadence job reads the weakest domains from the capability map and pushes
+# a priority=low capability_improvement signal for the ego to CONSIDER. It never
+# throttles, gates, or auto-dispatches a loop, and never asks the ego to propose
+# less — surfacing a deficiency is the whole job. Set enabled=false to silence
+# the scanner (takes effect on next server restart — job registration is at
+# cadence start()).
+capability_improvement_enabled: true
+capability_weakness_threshold: 0.5        # domains scoring below this are "weak"
+capability_improvement_min_sample_size: 3  # ignore low-n flukes
+capability_improvement_max_signals: 3      # cap advisory signals per scan
