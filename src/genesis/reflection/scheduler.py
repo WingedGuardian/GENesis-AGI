@@ -134,9 +134,13 @@ class ReflectionScheduler:
         if error or exc is not None:
             from genesis.observability.failure_details import error_summary, failure_details
 
+            # One detail string for both sinks, so job_health.last_error and the
+            # event message agree — and so passing only *exc* (no *error*) can
+            # never render the message as "failed: None".
+            detail = error_summary(exc, error) or "unknown"
             rt.record_job_failure(
                 name,
-                error_summary(exc, error) or "unknown",
+                detail,
                 error_type=type(exc).__name__ if exc is not None else None,
             )
             if self._event_bus:
@@ -144,7 +148,7 @@ class ReflectionScheduler:
 
                 await self._event_bus.emit(
                     Subsystem.REFLECTION, Severity.ERROR,
-                    f"{name}.failed", f"Scheduled job {name} failed: {error}",
+                    f"{name}.failed", f"Scheduled job {name} failed: {detail}",
                     **failure_details(exc=exc, reason=None if exc is not None else error),
                 )
         else:

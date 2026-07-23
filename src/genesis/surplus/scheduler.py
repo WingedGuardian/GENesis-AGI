@@ -14,6 +14,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.env import user_timezone
 from genesis.observability.events import GenesisEventBus
+from genesis.observability.failure_details import error_summary, failure_details
 from genesis.observability.types import Severity, Subsystem
 from genesis.surplus import dispatch as dispatch_engine
 from genesis.surplus.brainstorm import BrainstormRunner
@@ -602,8 +603,6 @@ class SurplusScheduler:
         # exception TYPE — APScheduler exceptions here routinely render as an
         # empty str(), which is exactly when the type carries all the signal
         # (live: last_error was recorded as "" for months).
-        from genesis.observability.failure_details import error_summary, failure_details
-
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()

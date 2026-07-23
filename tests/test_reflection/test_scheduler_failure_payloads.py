@@ -118,6 +118,22 @@ class TestExceptionPath:
         assert call["error"].startswith("ValueError:"), "blank str(exc) must still be diagnosable"
 
 
+class TestMessageDetail:
+    @pytest.mark.asyncio
+    async def test_exc_only_never_renders_none(self, db, bus, _stub_runtime):
+        """Passing only *exc* (no *error*) must not render "failed: None" — the
+        message and job_health.last_error both come from one detail string."""
+        sched = _scheduler(db, bus, AsyncMock())
+        await sched._record_job_result("weekly_assessment", exc=TypeError("bad float"))
+
+        failures = bus.failures()
+        assert len(failures) == 1
+        assert "None" not in failures[0]["message"]
+        assert "TypeError: bad float" in failures[0]["message"]
+        # Both sinks agree.
+        assert _stub_runtime.calls[0]["error"] == "TypeError: bad float"
+
+
 class TestSemanticPath:
     @pytest.mark.asyncio
     async def test_quota_block_carries_no_error_type(self, db, bus, _stub_runtime):
