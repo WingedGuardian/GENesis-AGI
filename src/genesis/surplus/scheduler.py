@@ -589,8 +589,16 @@ class SurplusScheduler:
         """Emit observability event for a failed or missed scheduled job."""
         exception = getattr(event, "exception", None)
         is_error = exception is not None
+        # error_summary prefixes the exception TYPE — APScheduler exceptions here
+        # routinely render as an empty str(), which is exactly when the type
+        # carries all the signal (live: last_error was recorded as "" for
+        # months). Build the message from the SAME summary that goes to
+        # job_health so the message-only surfaces — health_errors output and the
+        # grouped-error UI, which key on the event MESSAGE not its details —
+        # are diagnosable too, not just the job_health row.
+        detail = error_summary(exception, "missed") or "missed"
         msg = (
-            f"Scheduled job '{job_id}' failed: {exception}"
+            f"Scheduled job '{job_id}' failed: {detail}"
             if is_error
             else f"Scheduled job '{job_id}' missed (past misfire grace time)"
         )
@@ -599,16 +607,13 @@ class SurplusScheduler:
         else:
             logger.warning(msg)
 
-        # Record failure in job health tracking. error_summary prefixes the
-        # exception TYPE — APScheduler exceptions here routinely render as an
-        # empty str(), which is exactly when the type carries all the signal
-        # (live: last_error was recorded as "" for months).
+        # Record failure in job health tracking.
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
             rt.record_job_failure(
                 job_id,
-                error_summary(exception, "missed") or "missed",
+                detail,
                 error_type=type(exception).__name__ if exception is not None else None,
             )
         except Exception:
