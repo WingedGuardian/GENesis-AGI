@@ -222,6 +222,16 @@
                 ]
             },
             {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cc-deploy-timeout-guard",
+                        "timeout": 5
+                    }
+                ]
+            },
+            {
                 "matcher": "WebFetch",
                 "hooks": [
                     {

@@ -74,6 +74,21 @@ is raw subprocess calls with no external watchdog (e.g., deterministic
 executor steps), where a hung process blocks shared resources (executor
 semaphore) with no other recovery mechanism.
 
+**The Bash TOOL's own timeout is separate — and defaults to 120s.** An inner
+`timeout N …` INSIDE the command does NOT extend it: the tool wrapper SIGTERMs the
+whole call at its own `timeout` param (default 120000ms → exit 143). To allow
+longer, set the Bash tool's `timeout` PARAMETER explicitly. For long or unbounded
+work — above all deploys (`scripts/update.sh`, `bootstrap.sh`, `host-setup.sh`:
+container align + guardian redeploy + host `update-node`/`update-cc`, run
+sequentially — can exceed even 900s) — run via **`run_in_background: true`**
+(harness-tracked, notifies on completion, no timeout ceiling), NEVER a foreground
+timeout or `nohup … &` (detached but untracked → no completion signal, so you end
+up hand-polling anyway). `update.sh` has SIGTERM/INT rollback traps, so a mid-run
+kill is not a no-op — verify state (server active, no mid-rebase, pin, both CC
+versions) before re-running; it is idempotent. (A non-blocking PreToolUse advisory
+hook, `.claude/hooks/cc-deploy-timeout-guard`, nudges toward this when a deploy is
+run in the foreground.)
+
 ### Verify Outcomes, Not Just Tests
 
 `ruff check . && pytest -v` is the minimum bar, not the finish line.
