@@ -1263,11 +1263,15 @@ if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
     echo "    + Suppressed CC native installer prompt (npm-only)"
 fi
 
-# Suppress CC auto-updater via user-level ~/.claude/settings.json.
-# Repo-level .claude/settings.json is NOT sufficient — it only applies when
-# CC is launched from the project directory. The auto-updater runs in
-# contexts where repo settings don't apply, so we set it at the user level.
-# See docs/reference/cc-compatibility.md for the discovery.
+# Seed user-level ~/.claude/settings.json with two CC defaults: (1) suppress the
+# auto-updater, and (2) Genesis's subagent-nesting depth. CC 2.1.217+ made nested
+# subagent spawning opt-in (default 1 = no nesting); Genesis allows ONE level
+# (session->subagent->subagent = 3 tiers) via CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2.
+# Repo-level .claude/settings.json is NOT sufficient — it only applies when CC is
+# launched from the project directory, and the auto-updater runs in contexts where
+# repo settings don't apply, so we set these at the user level. (The host VM's own
+# recovery `claude -p` is single-brain and never nests, so host-setup.sh deliberately
+# does NOT set the nesting default.) See docs/reference/cc-compatibility.md.
 _settings_file="$HOME/.claude/settings.json"
 mkdir -p "$HOME/.claude"
 if [ ! -f "$_settings_file" ]; then
@@ -1275,11 +1279,12 @@ if [ ! -f "$_settings_file" ]; then
 {
   "env": {
     "DISABLE_AUTOUPDATER": "1",
-    "DISABLE_UPDATES": "1"
+    "DISABLE_UPDATES": "1",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2"
   }
 }
 CCSETTINGS
-    echo "    + Created $_settings_file with auto-updater suppression"
+    echo "    + Created $_settings_file with auto-updater suppression + subagent-nesting default"
 else
     # Merge — preserves any existing env vars and other top-level keys.
     if python3 - "$_settings_file" <<'PYEOF' 2>/dev/null
@@ -1300,6 +1305,12 @@ for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
     if env.get(key) != "1":
         env[key] = "1"
         changed = True
+# Genesis default: allow ONE level of subagent nesting (session->subagent->subagent
+# = 3 tiers) on CC 2.1.217+, which made nested spawning opt-in (default 1 = none).
+# Set-if-absent so a deliberate operator override (0 to disable, or higher) is kept.
+if "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH" not in env:
+    env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "2"
+    changed = True
 if changed:
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -1308,10 +1319,10 @@ else:
     print("unchanged")
 PYEOF
     then
-        echo "    + Auto-updater suppression set in $_settings_file"
+        echo "    + Auto-updater suppression + subagent-nesting default set in $_settings_file"
     else
         echo "    WARNING: Could not merge auto-updater settings into $_settings_file"
-        echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
+        echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\", \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
     fi
 fi
 
