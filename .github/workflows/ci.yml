@@ -45,9 +45,18 @@ jobs:
         run: |
           # Triaged --ignore-vuln IDs (rationale of record: pyproject.toml pins).
           # A NEW / untriaged advisory is NOT in this list and so fails the job.
-          #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI vuln;
-          #     Genesis uses acompletion/completion_cost only (no proxy server),
-          #     so none are reachable. Pinned <1.83 also dodges 1.82.x malware.
+          #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI /
+          #     MCP-gateway vuln; Genesis uses acompletion/completion_cost only
+          #     (no proxy server), so none are reachable. Pinned <1.83 also dodges
+          #     1.82.x malware. The 2026-11 batch is the same class, each gated on
+          #     running the proxy Genesis never starts (advisory-verified):
+          #       CVE-2026-59819 — /health/test_connection OIDC file-read (proxy).
+          #       CVE-2026-59820 — /v1/skills archive path-traversal (proxy route).
+          #       CVE-2026-59821 — Guardrails create/update code-exec (proxy).
+          #       CVE-2026-59822 — MCP Streamable-HTTP OAuth2 auth bypass (proxy MCP
+          #         gateway; Genesis's own MCP servers are fastmcp, not litellm's).
+          #     grep-verified: only litellm.acompletion / completion_cost /
+          #     model_cost + exception types are imported — no proxy surface.
           #   diskcache 5.6.3 (CVE-2025-69872) — pickle-by-default RCE, no fixed
           #     release. Genesis's only diskcache use (memory/embeddings.py) is a
           #     JSON-only _SafeDisk subclass, so the vulnerable pickle path is unused.
@@ -72,6 +81,10 @@ jobs:
             --ignore-vuln CVE-2026-42271 \
             --ignore-vuln CVE-2026-47102 \
             --ignore-vuln CVE-2026-47101 \
+            --ignore-vuln CVE-2026-59819 \
+            --ignore-vuln CVE-2026-59820 \
+            --ignore-vuln CVE-2026-59821 \
+            --ignore-vuln CVE-2026-59822 \
             --ignore-vuln CVE-2025-69872 \
             --ignore-vuln PYSEC-2026-2475 \
             --ignore-vuln PYSEC-2026-2476
