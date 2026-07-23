@@ -678,7 +678,7 @@ fi
 
 # Identity seed files (runtime-generated, gitignored) — mirror bootstrap.sh so
 # install.sh-only setups don't triage/act with empty calibration until first regen.
-for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md; do
+for f in TRIAGE_CALIBRATION.md USER_KNOWLEDGE.md USER.md; do
     if [ ! -f "$REPO_DIR/src/genesis/identity/$f" ] && [ -f "$REPO_DIR/src/genesis/identity/$f.example" ]; then
         cp "$REPO_DIR/src/genesis/identity/$f.example" "$REPO_DIR/src/genesis/identity/$f"
         echo "    + Seeded $f from template"

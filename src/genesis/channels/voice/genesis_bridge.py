@@ -27,11 +27,37 @@ logger = logging.getLogger(__name__)
 _ESSENTIAL_KNOWLEDGE_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
 
 # Tool declarations for the S2S model session config.
-# NOTE: ask_genesis is intentionally DISABLED here pending the voice-memory
-# refactor — the raw-snippet dump it returned was poor input for the S2S model.
-# Its dispatch in handle_tool_call() and the _ask_genesis() implementation are
-# kept below, so re-enabling is just restoring its schema to this list.
+# ask_genesis is the delegation channel: the voice model hands any query about
+# the user's past, memory, or personal context to the full Genesis, which decides
+# how to handle it (recall, knowledge lookup, etc.) and returns what it found.
+# Dispatch lives in handle_tool_call() -> _ask_genesis().
 TOOL_DECLARATIONS = [
+    {
+        "type": "function",
+        "name": "ask_genesis",
+        "description": (
+            "Ask Genesis about the user's past, history, prior conversations, "
+            "stored memories, decisions, projects, preferences, or any personal "
+            "context — or to look something up in Genesis's knowledge. Genesis "
+            "decides how to handle it and returns what it found. Call this "
+            "whenever the user asks what you discussed or worked on before, what "
+            "they told you, what they like, or anything about their own history "
+            "you weren't already given here."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "The user's question or request in natural language, "
+                        "phrased as what to find out from Genesis."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
     {
         "type": "function",
         "name": "web_search",
@@ -86,7 +112,7 @@ TOOL_DECLARATIONS = [
 # System instructions for the S2S model
 SYSTEM_INSTRUCTIONS = """\
 You are Genesis, a cognitive AI partner, speaking through a voice interface.
-You have two tools — web search and approvals. Use them.
+You have three tools — ask Genesis, web search, and approvals. Use them.
 
 TOOL RULES (important — follow these strictly):
 - "what time is it / what's the date / what day is it" → answer from the \
@@ -94,10 +120,10 @@ Current time in your context. No tool call needed.
 - "search / look up / what's the weather / news" → ALWAYS call web_search.
 - "can you search the web" or similar capability questions → call web_search \
 with a relevant query to demonstrate the capability.
-- You do NOT currently have access to past conversations, stored memories, or \
-the user's history. If asked what you discussed or worked on before, or for \
-personal context you weren't given here, say plainly that you don't have that \
-available right now — never invent it.
+- The user's past, memories, prior conversations, what they told you, their \
+projects, decisions, preferences, or personal history → ALWAYS call ask_genesis \
+and answer from what it returns. You DO have access to all of this through \
+Genesis — never say you don't, and never invent an answer.
 - General knowledge you're confident about → answer directly, no tool call.
 - When in doubt between answering directly and calling a tool → call the tool. \
 Better to be thorough than to guess wrong.
@@ -154,7 +180,11 @@ class GenesisBridge:
         self._approval_gate = approval_gate
 
     async def handle_tool_call(
-        self, name: str, arguments: str, *, satellite_id: str = "s2s-default",
+        self,
+        name: str,
+        arguments: str,
+        *,
+        satellite_id: str = "s2s-default",
     ) -> str:
         """Dispatch a tool call and return the result as JSON string."""
         try:
@@ -164,19 +194,24 @@ class GenesisBridge:
 
         if name == "ask_genesis":
             return await self._ask_genesis(
-                args.get("query", ""), satellite_id=satellite_id,
+                args.get("query", ""),
+                satellite_id=satellite_id,
             )
         if name == "web_search":
             return await self._web_search(args.get("query", ""))
         if name == "approve_pending":
             return await self._approve_pending(
-                args.get("decision", ""), request_id=args.get("request_id"),
+                args.get("decision", ""),
+                request_id=args.get("request_id"),
             )
 
         return json.dumps({"error": f"Unknown tool: {name}"})
 
     async def _ask_genesis(
-        self, query: str, *, satellite_id: str = "s2s-default",
+        self,
+        query: str,
+        *,
+        satellite_id: str = "s2s-default",
     ) -> str:
         """Recall memories and return raw snippets for S2S synthesis.
 
@@ -213,12 +248,12 @@ class GenesisBridge:
         """Handle web_search tool call — quick factual lookup."""
         try:
             from genesis.mcp.health.web_tools import _impl_web_search
+
             result = await _impl_web_search(query, backend="brave", max_results=3)
             search_results = result.get("results", [])
             if search_results:
                 snippets = [
-                    f"{r.get('title', '')}: {r.get('snippet', '')}"
-                    for r in search_results[:3]
+                    f"{r.get('title', '')}: {r.get('snippet', '')}" for r in search_results[:3]
                 ]
                 return json.dumps({"results": snippets})
             return json.dumps({"results": [], "note": "No results found"})
@@ -230,7 +265,10 @@ class GenesisBridge:
         return json.dumps({"error": "Web search unavailable"})
 
     async def _approve_pending(
-        self, decision: str, *, request_id: str | None = None,
+        self,
+        decision: str,
+        *,
+        request_id: str | None = None,
     ) -> str:
         """Approve or reject a voice-gated pending approval.
 
@@ -245,7 +283,9 @@ class GenesisBridge:
 
         try:
             result = await self._approval_gate.resolve_pending_voice(
-                decision=decision, resolved_by="voice:s2s", request_id=request_id,
+                decision=decision,
+                resolved_by="voice:s2s",
+                request_id=request_id,
             )
         except Exception:
             logger.exception("Voice approval failed")
@@ -253,23 +293,26 @@ class GenesisBridge:
 
         status = result.get("status")
         if status == "resolved":
-            return json.dumps({
-                "result": f"Request {decision}",
-                "action": result.get("label", ""),
-                "request_id": str(result.get("request_id", ""))[:8],
-            })
+            return json.dumps(
+                {
+                    "result": f"Request {decision}",
+                    "action": result.get("label", ""),
+                    "request_id": str(result.get("request_id", ""))[:8],
+                }
+            )
         if status == "ambiguous":
             options = [
-                {"request_id": c["id"], "action": c["label"]}
-                for c in result.get("candidates", [])
+                {"request_id": c["id"], "action": c["label"]} for c in result.get("candidates", [])
             ]
-            return json.dumps({
-                "needs_clarification": (
-                    "More than one action is pending. Ask the user which one, "
-                    "then call approve_pending again with its request_id."
-                ),
-                "pending": options,
-            })
+            return json.dumps(
+                {
+                    "needs_clarification": (
+                        "More than one action is pending. Ask the user which one, "
+                        "then call approve_pending again with its request_id."
+                    ),
+                    "pending": options,
+                }
+            )
         if status == "not_found":
             return json.dumps({"error": "That request is no longer pending"})
         if status == "invalid_decision":
@@ -297,8 +340,11 @@ class GenesisBridge:
                 _ESSENTIAL_KNOWLEDGE_PATH.read_text(),
             )
 
+        identity = _extract_user_identity()
+
         # Current time in user's timezone
         import zoneinfo
+
         try:
             tz = zoneinfo.ZoneInfo(user_timezone())
             now = datetime.now(tz)
@@ -307,6 +353,10 @@ class GenesisBridge:
             time_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p UTC")
 
         ctx_parts = [f"\nCurrent time: {time_str}"]
+        if identity:
+            ctx_parts.append(
+                f"Who you are speaking with:\n{identity}",
+            )
         if voice_ctx:
             ctx_parts.append(
                 f"What the user has been working on recently:\n{voice_ctx}",
@@ -315,6 +365,52 @@ class GenesisBridge:
         return SYSTEM_INSTRUCTIONS.format(
             voice_context="\n".join(ctx_parts),
         )
+
+
+def _extract_user_identity(max_chars: int = 600, *, loader=None) -> str:
+    """Return a spoken-safe user-identity slice from USER.md, or '' if unset.
+
+    Reads the per-install USER.md via IdentityLoader (the gitignored source-tree
+    file, seeded from USER.md.example and hand-edited by the user). Every line
+    left verbatim from the seed template is dropped, so a partially-filled
+    profile never ships unedited placeholder sentences (e.g. "Background: What
+    you do, your expertise areas") to the S2S provider. Fail-closed: if the seed
+    template can't be read we can't tell placeholder from real content, so we
+    inject nothing. ``loader`` is injectable for tests. This slice is sent to the
+    S2S provider, so keep USER.md free of anything you would not send there.
+    """
+    import re
+
+    try:
+        if loader is None:
+            from genesis.identity.loader import IdentityLoader
+
+            loader = IdentityLoader()
+        text = loader.user()
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    # The seed template's content lines are the placeholder set — any USER.md
+    # line still matching one verbatim is unedited and must be dropped. Without
+    # the seed we fail closed (inject nothing) rather than risk leaking it.
+    try:
+        example = (loader._dir / "USER.md.example").read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    template_lines = {ln.strip() for ln in example.splitlines() if ln.strip()}
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    lines = []
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#") or "_[" in s:
+            continue
+        if s in template_lines:  # line copied verbatim from the seed — unedited
+            continue
+        s = s.lstrip("-* ").strip()
+        if s:
+            lines.append(s)
+    return "\n".join(lines)[:max_chars]
 
 
 def _extract_voice_context(ek_text: str, max_chars: int = 500) -> str:
