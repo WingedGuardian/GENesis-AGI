@@ -30,11 +30,12 @@ exec "$@"
 
 _SYSTEMCTL_STUB = """#!/bin/bash
 # Stateful stub for genesis-network-watchdog.timer, modelling real systemd:
-# `enable`->enabled, `start`->active, `mask`->(enable/start fail until `unmask`).
-# is-active / is-enabled are keyed on the UNIT ($2) and SILENT (never log — a
-# probe must not churn); tests can force states via WATCHDOG_TIMER_ACTIVE_RC /
-# WATCHDOG_TIMER_ENABLED_RC (or by deleting the .timer{started,enabled} state
-# files). systemd-networkd keeps the shared NETWORKD_* vars.
+# `enable`->enabled, `start`->active, mask (unit path = /dev/null symlink) ->
+# enable/start fail until `unmask`. is-enabled echoes the real state string
+# (enabled / enabled-runtime / disabled / masked); is-active/is-enabled are
+# keyed on the UNIT ($2) and SILENT (never log — a probe must not churn). Tests
+# drive state via the .timer{started,enabled,enabledruntime} files, the /dev/null
+# symlink, or WATCHDOG_TIMER_ACTIVE_RC. systemd-networkd keeps the NETWORKD_* vars.
 _b="${SYSTEMCTL_LOG%.log}"
 _T=genesis-network-watchdog.timer
 _TU="${NETRES_ETC_ROOT:-/nonexistent}/systemd/system/$_T"
@@ -48,9 +49,10 @@ if [ "$1" = "is-active" ]; then
 fi
 if [ "$1" = "is-enabled" ]; then
     if [ "$2" = "$_T" ]; then
-        [ -n "${WATCHDOG_TIMER_ENABLED_RC:-}" ] && exit "$WATCHDOG_TIMER_ENABLED_RC"
         _masked && { printf 'masked'; exit 1; }
-        [ -f "$_b.timerenabled" ] && exit 0 || exit 1
+        [ -f "$_b.timerenabled" ] && { printf 'enabled'; exit 0; }
+        [ -f "$_b.timerenabledruntime" ] && { printf 'enabled-runtime'; exit 0; }
+        printf 'disabled'; exit 1
     fi
     printf '%s' "${NETWORKD_ENABLED-enabled}"; exit 0
 fi
@@ -213,6 +215,26 @@ def test_masked_timer_unit_is_recreated_before_enable(tmp_path):
     assert "unmask genesis-network-watchdog.timer" in calls
     assert calls.index("unmask") < calls.index("enable genesis-network-watchdog.timer")
     assert "could not be re-enabled" not in result.stdout  # genuinely healed
+
+
+def test_runtime_enabled_timer_is_re_enabled_persistently(tmp_path):
+    """Codex P2: `enabled-runtime` (systemctl enable --runtime) is transient — it
+    lives under /run and vanishes on reboot, yet `is-enabled` exits 0 for it. An
+    exit-code check would wrongly treat it as persistent and skip enable; the heal
+    keys on stdout == exactly 'enabled', so a runtime-only enablement re-enables
+    persistently."""
+    env = _stage(tmp_path)
+    _run_apply(env)  # fresh: persistently enabled + active
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+
+    base = env["SYSTEMCTL_LOG"][:-4]
+    Path(base + ".timerenabled").unlink(missing_ok=True)  # not persistently enabled …
+    Path(base + ".timerenabledruntime").write_text("")  # … only transiently enabled
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    calls = Path(env["SYSTEMCTL_LOG"]).read_text()
+    assert "enable genesis-network-watchdog.timer" in calls  # re-enabled persistently
+    assert "could not be re-enabled" not in result.stdout  # and it took
 
 
 def test_unhealable_timer_reports_failure_not_false_heal(tmp_path):

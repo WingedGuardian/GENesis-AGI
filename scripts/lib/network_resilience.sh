@@ -146,16 +146,23 @@ _netres_install_watchdog() {
     # timer (e.g. `systemctl disable` without --now), which would silently fail to
     # persist across a reboot. Both probes are reads (no sudo) and silent, so a
     # healthy timer causes ZERO churn; only a down/unpersisted timer heals. NR1.
+    # Heal unless the timer is active AND *persistently* enabled. `is-enabled`
+    # exits 0 for BOTH "enabled" and "enabled-runtime" — but the latter is
+    # transient (stored under /run, gone on reboot), exactly what persistence must
+    # prevent — so key on stdout being EXACTLY "enabled" (matching the posture
+    # collector's network_watchdog_enabled signal), not the exit status.
+    local _wd_enabled
+    _wd_enabled="$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null || true)"
     if ! systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
-        || ! systemctl is-enabled genesis-network-watchdog.timer >/dev/null 2>&1; then
+        || [ "$_wd_enabled" != "enabled" ]; then
         # (A masked timer was already unmasked + its unit rewritten above, before
         # these writes, so enable now has a real unit file to act on.) enable+start,
-        # then VERIFY — never claim a heal that didn't take: a still-down/unpersisted
-        # timer surfaces as WARNING + _NETRES_FAILED, not a false "re-enabled" success.
+        # then VERIFY — never claim a heal that didn't take: a still-down or
+        # not-persistently-enabled timer surfaces as WARNING + _NETRES_FAILED.
         sudo systemctl enable genesis-network-watchdog.timer 2>/dev/null || true
         sudo systemctl start genesis-network-watchdog.timer 2>/dev/null || true
         if systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
-            && systemctl is-enabled genesis-network-watchdog.timer >/dev/null 2>&1; then
+            && [ "$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null || true)" = "enabled" ]; then
             _NETRES_HEALED=1
         else
             echo "  WARNING: watchdog timer could not be re-enabled (may be masked or broken)."
