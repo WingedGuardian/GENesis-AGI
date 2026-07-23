@@ -775,3 +775,54 @@ class TestOwnGoalsSection:
         assert "## Your Own Goals" in context
         assert "own_goal_creations" in context   # output contract
         assert "own_goal_reviews" in context
+
+
+class TestCapabilityPerformanceFocusedDeficiency:
+    """The focused weak domain is surfaced even when it's off the top-N table."""
+
+    @pytest.fixture
+    async def cap_db(self):
+        from genesis.db.schema import TABLES
+
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(TABLES["capability_map"])
+            await conn.commit()
+            yield conn
+
+    @staticmethod
+    async def _insert(db, domain, confidence):
+        from datetime import UTC, datetime
+
+        await db.execute(
+            "INSERT INTO capability_map "
+            "(id, domain, confidence, sample_size, trend, evidence_summary, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (domain, domain, confidence, 8, "declining",
+             f"{domain}-evidence", datetime.now(UTC).isoformat()),
+        )
+        await db.commit()
+
+    async def test_weak_focus_row_surfaced_when_off_top15(self, cap_db):
+        # 20 strong domains crowd out the weakest one from the top-15 table.
+        for i in range(20):
+            await self._insert(cap_db, f"strong{i:02d}", 0.90)
+        await self._insert(cap_db, "weakling", 0.12)
+
+        builder = GenesisEgoContextBuilder(db=cap_db)
+        builder._focus_id = "weakling"
+        section = await builder._capability_performance_section()
+
+        # Weakest domain is absent from the confidence-DESC top-15 table...
+        assert "| weakling |" not in section
+        # ...but its Focused deficiency line names it with its evidence.
+        assert "Focused deficiency — weakling" in section
+        assert "12%" in section
+        assert "weakling-evidence" in section
+
+    async def test_no_focus_id_no_deficiency_line(self, cap_db):
+        await self._insert(cap_db, "outreach", 0.30)
+        builder = GenesisEgoContextBuilder(db=cap_db)
+        builder._focus_id = None
+        section = await builder._capability_performance_section()
+        assert "Focused deficiency" not in section

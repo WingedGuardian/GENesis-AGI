@@ -89,3 +89,39 @@ class TestGetByDomain:
     async def test_not_found(self, db):
         entry = await cap_crud.get_by_domain(db, "nonexistent")
         assert entry is None
+
+
+
+class TestGetWeakest:
+    @pytest.mark.asyncio
+    async def test_weakest_first_below_threshold(self, db):
+        await cap_crud.upsert(db, domain="strong", confidence=0.9, sample_size=10)
+        await cap_crud.upsert(db, domain="weak1", confidence=0.2, sample_size=8)
+        await cap_crud.upsert(db, domain="weak2", confidence=0.35, sample_size=8)
+
+        weak = await cap_crud.get_weakest(db, max_confidence=0.5)
+        assert [e["domain"] for e in weak] == ["weak1", "weak2"]
+
+    @pytest.mark.asyncio
+    async def test_min_sample_size_filters_flukes(self, db):
+        await cap_crud.upsert(db, domain="fluke", confidence=0.1, sample_size=1)
+        await cap_crud.upsert(db, domain="real", confidence=0.3, sample_size=5)
+
+        weak = await cap_crud.get_weakest(db, max_confidence=0.5, min_sample_size=3)
+        assert [e["domain"] for e in weak] == ["real"]
+
+    @pytest.mark.asyncio
+    async def test_limit_caps_results(self, db):
+        for i in range(5):
+            await cap_crud.upsert(
+                db, domain=f"d{i}", confidence=0.1 + i * 0.05, sample_size=5,
+            )
+        weak = await cap_crud.get_weakest(db, max_confidence=0.5, limit=2)
+        assert len(weak) == 2
+        assert weak[0]["domain"] == "d0"  # lowest confidence first
+
+    @pytest.mark.asyncio
+    async def test_empty_when_all_strong(self, db):
+        await cap_crud.upsert(db, domain="strong", confidence=0.95, sample_size=10)
+        weak = await cap_crud.get_weakest(db, max_confidence=0.5)
+        assert weak == []

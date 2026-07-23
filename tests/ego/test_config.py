@@ -169,6 +169,71 @@ class TestValidateEgoConfig:
         assert cfg.quiet_hours_end == 7
         assert cfg.quiet_hours_min_interval_minutes == 240
 
+    def test_capability_improvement_enabled_rejects_non_bool(self):
+        errors = validate_ego_config({"capability_improvement_enabled": "on"})
+        assert len(errors) == 1
+        assert "capability_improvement_enabled must be a boolean" in errors[0]
+
+    def test_capability_weakness_threshold_bounds(self):
+        assert validate_ego_config({"capability_weakness_threshold": 0.5}) == []
+        assert validate_ego_config({"capability_weakness_threshold": 0.0}) == []
+        assert validate_ego_config({"capability_weakness_threshold": 1.0}) == []
+        assert len(validate_ego_config({"capability_weakness_threshold": 1.5})) == 1
+        assert len(validate_ego_config({"capability_weakness_threshold": -0.1})) == 1
+        # bool must not sneak through the numeric check
+        assert len(validate_ego_config({"capability_weakness_threshold": True})) == 1
+
+    def test_capability_min_sample_size_rejects_bad(self):
+        assert validate_ego_config({"capability_improvement_min_sample_size": 3}) == []
+        # negative would defeat the fluke guard (sample_size >= -1 is always true)
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": 0})) == 1
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": -1})) == 1
+        assert len(validate_ego_config({"capability_improvement_min_sample_size": 2.5})) == 1
+
+    def test_capability_max_signals_rejects_bad(self):
+        assert validate_ego_config({"capability_improvement_max_signals": 3}) == []
+        # negative LIMIT means "no limit" in SQLite — must be rejected
+        assert len(validate_ego_config({"capability_improvement_max_signals": 0})) == 1
+        assert len(validate_ego_config({"capability_improvement_max_signals": -1})) == 1
+
+    def test_capability_improvement_defaults(self):
+        cfg = EgoConfig()
+        assert cfg.capability_improvement_enabled is True
+        assert cfg.capability_weakness_threshold == 0.5
+        assert cfg.capability_improvement_min_sample_size == 3
+        assert cfg.capability_improvement_max_signals == 3
+
+
+class TestCapabilityImprovementSettingsWiring:
+    """The capability_improvement validators are reached by settings_update.
+
+    Proves the settings_update('ego', {...}) path dispatches to
+    validate_ego_config so an invalid capability field is rejected before it
+    can reach ego.yaml (where e.g. a negative max_signals would uncap the
+    SQLite LIMIT and silently disable the feature).
+    """
+
+    def test_ego_domain_dispatches_to_validate_ego_config(self):
+        from genesis.mcp.health.settings import _DOMAIN_VALIDATORS
+
+        assert "ego" in _DOMAIN_VALIDATORS
+        validator = _DOMAIN_VALIDATORS["ego"]
+        # Rejects a non-int max_signals (Codex's "many" case).
+        assert validator({"capability_improvement_max_signals": "many"})
+        # Rejects a negative max_signals (SQLite negative LIMIT = no limit).
+        assert validator({"capability_improvement_max_signals": -1})
+        # Rejects the truthy string "false" for the bool flag.
+        assert validator({"capability_improvement_enabled": "false"})
+        # Rejects an out-of-range threshold.
+        assert validator({"capability_weakness_threshold": 2.0})
+        # A fully-valid change set passes.
+        assert validator({
+            "capability_improvement_enabled": True,
+            "capability_weakness_threshold": 0.4,
+            "capability_improvement_min_sample_size": 5,
+            "capability_improvement_max_signals": 2,
+        }) == []
+
 
 class TestMaxActiveEgoGoalsValidation:
     def test_valid(self):

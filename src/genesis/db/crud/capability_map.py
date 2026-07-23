@@ -84,6 +84,33 @@ async def get_all(db: aiosqlite.Connection) -> list[dict]:
     return [dict(zip(cols, r, strict=False)) for r in rows]
 
 
+async def get_weakest(
+    db: aiosqlite.Connection,
+    *,
+    max_confidence: float = 0.5,
+    min_sample_size: int = 3,
+    limit: int = 3,
+) -> list[dict]:
+    """Return the weakest capability domains (lowest confidence first).
+
+    Filters to domains scoring below *max_confidence* with at least
+    *min_sample_size* aggregated data points — so a single low-n fluke never
+    surfaces as a deficiency. Ordered by confidence ascending and capped at
+    *limit*. Feeds the advisory capability-improvement scanner in the ego
+    cadence manager; read-only, never mutates the map.
+    """
+    cur = await db.execute(
+        "SELECT domain, confidence, sample_size, trend, evidence_summary, updated_at "
+        "FROM capability_map "
+        "WHERE confidence < ? AND sample_size >= ? "
+        "ORDER BY confidence ASC LIMIT ?",
+        (max_confidence, min_sample_size, limit),
+    )
+    rows = await cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r, strict=False)) for r in rows]
+
+
 async def get_by_domain(db: aiosqlite.Connection, domain: str) -> dict | None:
     """Fetch a single domain's capability entry."""
     cur = await db.execute(

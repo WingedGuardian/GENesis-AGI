@@ -177,6 +177,26 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
         "recurring_patterns": "skip",
     }),
 
+    # Capability improvement (advisory): self-model performance sections deep so
+    # the ego can reason about the weak domain, everything else light/skip.
+    "capability_improvement": _make_weights({
+        "capability_performance": "deep",
+        "capabilities": "deep",
+        "execution_outcomes": "deep",
+        "recurring_patterns": "deep",
+        "proposal_history": "light",
+        "proposal_board": "light",
+        "follow_ups": "light",
+        "goals": "light",
+        "goal_progress": "light",
+        "goal_deep_dive": "skip",
+        "world_snapshot": "light",
+        "activity_pulse": "light",
+        "recent_conversations": "light",
+        "backlog_summary": "light",
+        "escalations": "light",
+    }),
+
     # Escalation: escalations deep, system context deep, others light
     "escalation": _make_weights({
         "escalations": "deep",

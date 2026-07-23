@@ -1029,7 +1029,30 @@ TABLES = {
             content_hash     TEXT,                    -- SHA-256 of content at creation time
             content_size     INTEGER,                 -- byte count of content at creation time
             original_content TEXT,                    -- pre-realist-amendment content (NULL if not amended)
-            expected_outputs TEXT                     -- JSON: post-dispatch verification criteria (files, min_size, required_strings)
+            expected_outputs TEXT,                    -- JSON: post-dispatch verification criteria (files, min_size, required_strings)
+            revision_num      INTEGER DEFAULT 1,      -- PR-4 dark: current revision number; PR-5 reconcile bumps on revise
+            revalidate_at     TEXT,                   -- PR-4 dark: when the premise is next due for re-validation (set in PR-6)
+            last_validated_at TEXT                    -- PR-4 dark: when the premise was last reaffirmed (set in PR-5)
+        )
+    """,
+    # PR-4 (ego proposal-lifecycle redesign): prior-value audit trail for
+    # versioned proposal revision. One row per superseded revision (surrogate
+    # id PK, no FK — mirrors calibration_cell_history; SQLite FK enforcement is
+    # PRAGMA-gated, so proposal_id is a documented soft reference). Dark in PR-4
+    # (no writer); the PR-5 reconcile stage writes prior values here on revise.
+    "ego_proposal_revisions": """
+        CREATE TABLE IF NOT EXISTS ego_proposal_revisions (
+            id               TEXT PRIMARY KEY,
+            proposal_id      TEXT NOT NULL,           -- ego_proposals.id this revision belongs to (soft ref)
+            revision_num     INTEGER NOT NULL,        -- the prior revision number these snapshotted values represent
+            content          TEXT,                    -- prior content
+            rationale        TEXT,                    -- prior rationale
+            confidence       REAL,                    -- prior confidence
+            execution_plan   TEXT,                    -- prior dispatch instructions (dispatch consumes these)
+            expected_outputs TEXT,                    -- prior post-dispatch verification criteria (JSON)
+            revised_at       TEXT NOT NULL,           -- when the superseding revision was made
+            revised_by       TEXT,                    -- ego_source / reconcile stage that made the revision
+            reason           TEXT                     -- why the revision was made
         )
     """,
     "ego_state": """

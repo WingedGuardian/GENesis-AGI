@@ -1270,6 +1270,23 @@ class EgoSession:
                 "\n\nThis is an ESCALATION cycle. Assess the health issue "
                 "or system alert and propose remediation actions."
             )
+        elif focus.focus_type == "capability_improvement":
+            # Name the exact weak domain (focus.focus_id) — the capability map
+            # renders only the top rows BY CONFIDENCE, so the weakest (target)
+            # domain is otherwise absent from the context. The genesis context
+            # builder also surfaces its row via the "Focused deficiency" line.
+            target = focus.focus_id or "one of your capabilities"
+            directive += (
+                "\n\nThis is a CAPABILITY IMPROVEMENT cycle (ADVISORY). Your "
+                f"**{target}** capability is scoring low in your self-model "
+                "(see the Focused deficiency line under Capability Performance "
+                "for its confidence, trend, and evidence). You MAY consider — "
+                "but are not required to propose — a concrete improvement for "
+                f"{target}: a better procedure, a skill refinement, or a "
+                "targeted experiment. This is a nudge to reflect on a "
+                "deficiency, never a mandate to act, and NEVER a reason to do "
+                "less, lower your standards, or propose fewer actions elsewhere."
+            )
 
         return f"{directive}\n\n---\n\n{dynamic_context}"
 

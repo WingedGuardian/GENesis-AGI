@@ -17,7 +17,7 @@
 # removes the incident-recovery downgrade path and can brick CC.
 #
 # Honors an inherited CC_VERSION (e.g. `CC_VERSION=2.1.180 ./install.sh`).
-CC_VERSION="${CC_VERSION:-2.1.201}"
+CC_VERSION="${CC_VERSION:-2.1.218}"
 
 # Node.js major that the pinned Claude Code requires — derived from the CC pin's
 # engines.node (e.g. `@anthropic-ai/claude-code@2.1.201` declares node >=22).

@@ -157,6 +157,36 @@ class TestProposalCRUD:
         ok = await ego_crud.resolve_proposal(db, "p1", status="rejected")
         assert ok is False
 
+    async def test_resolve_expected_revision_absent_behaves_as_today(self, db):
+        """PR-4 TOCTOU guard is inert by default: no expected_revision resolves."""
+        await ego_crud.create_proposal(db, id="p1", action_type="t", content="c")
+        ok = await ego_crud.resolve_proposal(db, "p1", status="approved")
+        assert ok is True
+        row = await ego_crud.get_proposal(db, "p1")
+        assert row["status"] == "approved"
+
+    async def test_resolve_expected_revision_match_updates(self, db):
+        """Matching revision_num -> the guarded update applies."""
+        await ego_crud.create_proposal(db, id="p1", action_type="t", content="c")
+        # Fresh proposals default to revision_num = 1 (ego_proposals DEFAULT).
+        ok = await ego_crud.resolve_proposal(
+            db, "p1", status="approved", expected_revision=1,
+        )
+        assert ok is True
+        row = await ego_crud.get_proposal(db, "p1")
+        assert row["status"] == "approved"
+
+    async def test_resolve_expected_revision_mismatch_refuses(self, db):
+        """Stale revision -> refused, row untouched (optimistic-concurrency guard)."""
+        await ego_crud.create_proposal(db, id="p1", action_type="t", content="c")
+        ok = await ego_crud.resolve_proposal(
+            db, "p1", status="approved", expected_revision=2,
+        )
+        assert ok is False
+        row = await ego_crud.get_proposal(db, "p1")
+        assert row["status"] == "pending"
+        assert row["resolved_at"] is None
+
     async def test_batch_delivery_mapping(self, db):
         await ego_crud.set_state(
             db, key="delivery_batch:msg123", value="batch_abc",

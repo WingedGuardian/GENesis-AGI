@@ -81,6 +81,7 @@ EXPECTED_TABLES = [
     "reflex_signals",  # reflex arc P0: fingerprint-deduped task.failed signals + lifecycle
     "reflex_diagnoses",  # reflex arc P0: Tier-0 diagnose session artifacts (PR2 writes)
     "reflex_verdicts",  # reflex arc P0: taste corpus — every human verdict, never pruned
+    "ego_proposal_revisions",  # ego lifecycle PR-4: prior-value audit trail for versioned revision (dark)
 ]
 
 
