@@ -28,5 +28,12 @@ esac
 BG=$(printf '%s' "$IN" | jq -r '.tool_input.run_in_background // false' 2>/dev/null)
 [ "$BG" = "true" ] && exit 0
 
-printf '%s\n' "ADVISORY: this looks like a long deploy (update.sh / bootstrap.sh / host-setup.sh) in the FOREGROUND. It aligns the container + redeploys the guardian + syncs the host (update-node up to 600s, update-cc up to 300s, sequential) and routinely exceeds the Bash tool's 120s DEFAULT timeout — an inner 'timeout N' does NOT extend it, and a SIGTERM at 120s makes update.sh roll back mid-deploy. Prefer run_in_background: true (harness-tracked, no timeout ceiling), or set the Bash tool 'timeout' param generously (>=900000ms)." >&2
+# Surface the nudge via PreToolUse structured stdout (additionalContext) — exit 0
+# + stderr is treated as "no objection" and is NOT shown to the model, which would
+# make this guard invisible in the exact path it protects.
+ADVISORY="ADVISORY: this looks like a long deploy (update.sh / bootstrap.sh / host-setup.sh) in the FOREGROUND. It aligns the container + redeploys the guardian + syncs the host (update-node up to 600s, update-cc up to 300s, sequential) and routinely exceeds the Bash tool's 120s DEFAULT timeout — an inner 'timeout N' does NOT extend it, and a SIGTERM at 120s makes update.sh roll back mid-deploy. Prefer run_in_background: true (harness-tracked, no timeout ceiling), or set the Bash tool 'timeout' param generously (>=900000ms)."
+# jq builds valid JSON (escapes the message). If jq somehow fails, fall back to
+# stderr so the nudge is at least not lost, and still exit 0 (never block).
+jq -n --arg c "$ADVISORY" '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$c}}' 2>/dev/null \
+    || printf '%s\n' "$ADVISORY" >&2
 exit 0
