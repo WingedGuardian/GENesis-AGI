@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -20,10 +21,28 @@ import aiosqlite
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
+def _resolve_db_path() -> Path:
+    """Resolve the DB to migrate.
+
+    ``GENESIS_DB_PATH`` wins when set — WITHOUT it, migrating a copy is
+    impossible and the obvious ``GENESIS_DB_PATH=~/tmp/copy.db python -m
+    genesis.db.migrations --apply`` silently rewrites PRODUCTION (this bit us
+    2026-07-23). The fallback stays HOME-anchored (not ``repo_root()/data``) so
+    a run from a worktree checkout still targets the real production DB rather
+    than an empty ``<worktree>/data`` — the trap ``genesis_db_path()`` walks
+    into (see feedback_hook_prod_db_home_anchored). update.sh runs this from
+    ~/genesis, so production behaviour is unchanged.
+    """
+    value = os.environ.get("GENESIS_DB_PATH")
+    if value:
+        return Path(value).expanduser()
+    return Path.home() / "genesis" / "data" / "genesis.db"
+
+
 async def _run(args: argparse.Namespace) -> int:
     from genesis.db.migrations.runner import MigrationRunner
 
-    db_path = Path.home() / "genesis" / "data" / "genesis.db"
+    db_path = _resolve_db_path()
     if not db_path.exists():
         print(f"Database not found: {db_path}", file=sys.stderr)
         return 1
