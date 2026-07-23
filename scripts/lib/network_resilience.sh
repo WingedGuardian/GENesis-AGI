@@ -123,12 +123,17 @@ _netres_install_watchdog() {
         return 0
     fi
     local dst="$NETRES_LIBEXEC_DIR/network-watchdog.sh"
-    # If the timer unit is MASKED, its unit path is a symlink to /dev/null — the
-    # writes below use `tee`, which follows the symlink and would write to
-    # /dev/null (the real unit file is never created, and a later unmask then
-    # leaves nothing to enable). Unmask FIRST, and only when actually masked, so
-    # the rewrite recreates a real unit file and healthy runs stay churn-free. NR1.
-    if [ "$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null)" = "masked" ]; then
+    # If the timer unit is MASKED, unmask FIRST (only when actually masked, so
+    # healthy runs stay churn-free). Two variants, both handled:
+    #  • "masked" (persistent): the /etc unit path is a symlink to /dev/null, and
+    #    the writes below use `tee` (follows symlinks) → they'd hit /dev/null and
+    #    never create the real unit; unmasking first lets the rewrite recreate it.
+    #  • "masked-runtime" (`mask --runtime`): a /run symlink shadows the unit so
+    #    enable/start fail until it's removed.
+    # `is-enabled` reports "masked" or "masked-runtime"; match both. NR1.
+    local _wd_state
+    _wd_state="$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null || true)"
+    if [[ "$_wd_state" == masked* ]]; then
         sudo systemctl unmask genesis-network-watchdog.timer 2>/dev/null || true
     fi
     local before=$_NETRES_WROTE

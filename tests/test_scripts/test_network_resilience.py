@@ -39,30 +39,32 @@ _SYSTEMCTL_STUB = """#!/bin/bash
 _b="${SYSTEMCTL_LOG%.log}"
 _T=genesis-network-watchdog.timer
 _TU="${NETRES_ETC_ROOT:-/nonexistent}/systemd/system/$_T"
-_masked() { [ -L "$_TU" ]; }   # real systemd: a masked unit path is a symlink to /dev/null
+_masked() { [ -L "$_TU" ]; }                   # persistent mask: /etc unit path is a /dev/null symlink
+_rmasked() { [ -f "$_b.timermaskruntime" ]; }  # runtime mask (`mask --runtime`): /run shadow, modeled as a flag
 if [ "$1" = "is-active" ]; then
     if [ "$2" = "$_T" ]; then
         [ -n "${WATCHDOG_TIMER_ACTIVE_RC:-}" ] && exit "$WATCHDOG_TIMER_ACTIVE_RC"
-        { _masked || [ ! -f "$_b.timerstarted" ]; } && exit 3 || exit 0
+        { _masked || _rmasked || [ ! -f "$_b.timerstarted" ]; } && exit 3 || exit 0
     fi
     exit "${NETWORKD_ACTIVE_RC:-0}"
 fi
 if [ "$1" = "is-enabled" ]; then
     if [ "$2" = "$_T" ]; then
         _masked && { printf 'masked'; exit 1; }
+        _rmasked && { printf 'masked-runtime'; exit 1; }
         [ -f "$_b.timerenabled" ] && { printf 'enabled'; exit 0; }
         [ -f "$_b.timerenabledruntime" ] && { printf 'enabled-runtime'; exit 0; }
         printf 'disabled'; exit 1
     fi
     printf '%s' "${NETWORKD_ENABLED-enabled}"; exit 0
 fi
-[ "$1" = "unmask" ] && _masked && rm -f "$_TU"   # real unmask removes the /dev/null symlink
+if [ "$1" = "unmask" ]; then _masked && rm -f "$_TU"; rm -f "$_b.timermaskruntime"; fi  # clears both variants
 if [ "$1" = "enable" ] && [ "$2" = "$_T" ]; then
-    _masked && { echo "$@" >> "$SYSTEMCTL_LOG"; exit 1; }
+    { _masked || _rmasked; } && { echo "$@" >> "$SYSTEMCTL_LOG"; exit 1; }
     : > "$_b.timerenabled"
 fi
 if [ "$1" = "start" ] && [ "$2" = "$_T" ]; then
-    _masked && { echo "$@" >> "$SYSTEMCTL_LOG"; exit 1; }
+    { _masked || _rmasked; } && { echo "$@" >> "$SYSTEMCTL_LOG"; exit 1; }
     : > "$_b.timerstarted"
 fi
 echo "$@" >> "$SYSTEMCTL_LOG"
@@ -235,6 +237,27 @@ def test_runtime_enabled_timer_is_re_enabled_persistently(tmp_path):
     calls = Path(env["SYSTEMCTL_LOG"]).read_text()
     assert "enable genesis-network-watchdog.timer" in calls  # re-enabled persistently
     assert "could not be re-enabled" not in result.stdout  # and it took
+
+
+def test_runtime_masked_timer_is_unmasked_and_healed(tmp_path):
+    """Codex P2: `mask --runtime` reports is-enabled 'masked-runtime' (a /run
+    shadow), not 'masked'. The unmask guard must match BOTH variants, else a
+    runtime-masked timer is never unmasked and the heal fails until reboot."""
+    env = _stage(tmp_path)
+    _run_apply(env)
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+
+    base = env["SYSTEMCTL_LOG"][:-4]
+    Path(base + ".timermaskruntime").write_text("")  # `systemctl mask --runtime`
+    Path(base + ".timerstarted").unlink(missing_ok=True)
+    Path(base + ".timerenabled").unlink(missing_ok=True)
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    calls = Path(env["SYSTEMCTL_LOG"]).read_text()
+    assert "unmask genesis-network-watchdog.timer" in calls  # runtime mask detected + cleared
+    assert "enable genesis-network-watchdog.timer" in calls
+    assert calls.index("unmask") < calls.index("enable genesis-network-watchdog.timer")
+    assert "could not be re-enabled" not in result.stdout  # genuinely healed
 
 
 def test_unhealable_timer_reports_failure_not_false_heal(tmp_path):
