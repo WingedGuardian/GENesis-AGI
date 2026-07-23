@@ -72,10 +72,20 @@ async def _intersection_copy(
     DROP a column's data: whatever the live table actually has, if ``dst`` also
     declares it, it is copied; columns only ``dst`` has take their DEFAULT.
 
-    A drift canary logs any LIVE column absent from ``dst`` (a column that WOULD
-    be dropped because the rebuild target has fallen behind the canonical DDL).
-    That is the exact data-loss class this helper exists to prevent — surfaced
-    loudly, but never aborting the boot.
+    Drift guard: if the LIVE table has any column ``dst`` does NOT (a rebuild
+    target that has fallen behind the canonical DDL), this RAISES rather than
+    dropping that column's data. Both callers wrap the rebuild in a fail-soft
+    try/except that leaves the ORIGINAL table intact and logs — so genuine drift
+    (a dev error that escaped the base-vs-rebuild parity test) fails the CHECK/
+    UNIQUE upgrade for that one boot but never loses data, and self-heals once
+    the rebuild CREATE is corrected. Dropping-then-logging would be the "mute the
+    symptom" antipattern; preserving irreversible data and failing loud is the
+    right default.
+
+    ``or_ignore`` copies with INSERT OR IGNORE (rebuilds that add a UNIQUE
+    constraint dedup on it — first row per key wins); the number of rows dropped
+    by that dedup is logged so the row-level loss the column drift-guard cannot
+    see is still surfaced.
 
     Table/column names are schema identifiers (from PRAGMA or in-repo string
     literals), never user input, so the f-string interpolation is safe.
@@ -87,17 +97,35 @@ async def _intersection_copy(
 
     dropped = [c for c in src_cols if c not in dst_cols]
     if dropped:
-        logger.warning(
-            "Table-rebuild drift: column(s) %s exist on live '%s' but not on "
-            "rebuild target '%s' — their data would be dropped. Add them to the "
-            "'%s' CREATE in _migrations.py to match the canonical _tables.py DDL.",
-            dropped, src, dst, dst,
+        # Refuse to proceed: copying only the shared columns would permanently
+        # drop `dropped`'s data. Raise so the caller's fail-soft handler keeps
+        # the original table (recoverable) instead of losing data (irreversible).
+        raise RuntimeError(
+            f"Table-rebuild drift: column(s) {dropped} exist on live '{src}' but "
+            f"not on rebuild target '{dst}'; refusing to copy and drop their "
+            f"data. Add them to the '{dst}' CREATE in _migrations.py to match the "
+            f"canonical _tables.py DDL."
         )
 
     shared = [c for c in src_cols if c in dst_cols]
     collist = ", ".join(shared)
     verb = "INSERT OR IGNORE INTO" if or_ignore else "INSERT INTO"
     await db.execute(f"{verb} {dst} ({collist}) SELECT {collist} FROM {src}")  # noqa: S608
+
+    if or_ignore:
+        # dst was freshly created empty before this copy, so its row count is the
+        # number actually inserted; the shortfall vs src is what OR IGNORE dropped.
+        cur = await db.execute(f"SELECT COUNT(*) FROM {src}")  # noqa: S608
+        src_count = (await cur.fetchone())[0]
+        cur = await db.execute(f"SELECT COUNT(*) FROM {dst}")  # noqa: S608
+        dst_count = (await cur.fetchone())[0]
+        merged = src_count - dst_count
+        if merged > 0:
+            logger.info(
+                "Table-rebuild dedup: %s row(s) in '%s' collided on the new "
+                "UNIQUE constraint and were dropped (first row per key wins).",
+                merged, src,
+            )
 
 
 async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
@@ -891,6 +919,9 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         )
         row = await cursor.fetchone()
         if row and "UNIQUE(project_type, domain, concept)" not in (row[0] or ""):
+            # Clear any orphaned temp table from a prior failed/aborted attempt
+            # so the rebuild is retry-safe (mirrors ego_proposals_rebuild).
+            await db.execute("DROP TABLE IF EXISTS knowledge_units_new")
             # Rebuild target mirrors the canonical knowledge_units CREATE in
             # _tables.py (all 21 columns incl. source_pipeline/purpose/
             # ingestion_source/origin_class) so no column data is dropped; the
@@ -935,6 +966,8 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                 "knowledge_units table rebuilt with UNIQUE(project_type, domain, concept)"
             )
     except Exception:
+        with contextlib.suppress(Exception):
+            await db.execute("DROP TABLE IF EXISTS knowledge_units_new")
         logger.error(
             "knowledge_units UNIQUE constraint migration failed", exc_info=True
         )
@@ -1829,6 +1862,19 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
 
     SQLite doesn't support ALTER CHECK — must rebuild the table.
     Idempotent: skips if the constraint already includes the new statuses.
+
+    Does NOT recreate indexes: its sole caller (create_all_tables via
+    _migrate_add_columns) runs the module-level INDEXES pass immediately after,
+    re-applying all 8 idx_ego_proposals_*. Do not call this standalone in a
+    context that needs indexes present.
+
+    LOAD-BEARING ORDER: this runs on the base path BEFORE the numbered-migration
+    runner, so it flips the CHECK first and the numbered ego_proposals rebuilds
+    (0007/0012) early-return as no-ops. Those numbered migrations still carry
+    frozen, column-incomplete copy lists; do NOT remove or reorder this base-path
+    rebuild after them, or they could fire on a legacy DB and drop columns
+    (locked by test_rebuild_column_preservation.py
+    ::test_numbered_ego_rebuilds_stay_inert_on_current_db).
     """
     try:
         cursor = await db.execute(

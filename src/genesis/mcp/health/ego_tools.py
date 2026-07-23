@@ -506,6 +506,10 @@ async def _resolve_one_proposal(
     # and this write and resolve a stale revision. resolve_proposal already
     # accepts expected_revision (PR-4 unit B, inert until wired); PR-6 passes
     # prop["revision_num"] here to make the update atomic. Not passed yet (dark).
+    # NOTE for PR-6: with expected_revision set, a False return conflates
+    # stale-revision, already-resolved, and missing-id. PR-6 must re-read the row
+    # to distinguish a race refusal (re-surface the fresh revision) from a benign
+    # already-resolved before reporting to the user.
     updated = await ego_crud.resolve_proposal(
         db,
         prop["id"],

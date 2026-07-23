@@ -20,6 +20,7 @@ import importlib
 import logging
 
 import aiosqlite
+import pytest
 
 from genesis.db.schema._migrations import (
     _intersection_copy,
@@ -160,6 +161,12 @@ async def test_knowledge_units_rebuild_preserves_newer_column_data():
 
 
 async def test_base_vs_rebuild_schema_parity():
+    # SCOPE: this locks the two rebuilds PR-4 hardened with _intersection_copy
+    # (ego_proposals, knowledge_units) + the new ego_proposal_revisions table.
+    # The other ~5 boot-path rebuild sites in _migrations.py (outreach_history,
+    # telegram_messages, tool_registry, cognitive_state) still use frozen copy
+    # lists; they are column-complete today but carry no parity/drift guard.
+    # Generalizing drift-safety to them is tracked as a follow-up, not PR-4.
     fresh = await aiosqlite.connect(":memory:")
     legacy = await aiosqlite.connect(":memory:")
     try:
@@ -225,18 +232,40 @@ async def test_ego_rebuild_idempotent_noop_on_current_ddl():
 # ── Drift canary ──
 
 
-async def test_intersection_copy_drift_canary_fires_and_copies(caplog):
+async def test_intersection_copy_raises_on_drift_and_copies_nothing():
+    # Drift (src has a column dst lacks) must RAISE — refusing to drop the
+    # column's data — not copy-the-rest-and-log. The caller's fail-soft handler
+    # then preserves the original table (recoverable) rather than losing the
+    # column (irreversible). No partial write to dst.
     conn = await aiosqlite.connect(":memory:")
     try:
         await conn.execute("CREATE TABLE src (a TEXT, b TEXT, extra TEXT)")
         await conn.execute("CREATE TABLE dst (a TEXT, b TEXT)")
         await conn.execute("INSERT INTO src (a, b, extra) VALUES ('1','2','LOST')")
         await conn.commit()
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError, match="extra"):
             await _intersection_copy(conn, src="src", dst="dst")
-        assert "extra" in caplog.text and "would be dropped" in caplog.text
-        cur = await conn.execute("SELECT a, b FROM dst")
-        assert await cur.fetchone() == ("1", "2")
+        cur = await conn.execute("SELECT COUNT(*) FROM dst")
+        assert (await cur.fetchone())[0] == 0  # nothing copied
+    finally:
+        await conn.close()
+
+
+async def test_intersection_copy_or_ignore_logs_dropped_rows(caplog):
+    # Row-level loss from OR IGNORE dedup (invisible to the column drift guard)
+    # is surfaced in the logs so a silent merge never ships unnoticed.
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        await conn.execute("CREATE TABLE src (id TEXT, k TEXT, v TEXT)")
+        await conn.execute("CREATE TABLE dst (id TEXT, k TEXT, v TEXT, UNIQUE(k))")
+        await conn.execute("INSERT INTO src (id, k, v) VALUES ('1','K','first')")
+        await conn.execute("INSERT INTO src (id, k, v) VALUES ('2','K','second')")
+        await conn.commit()
+        with caplog.at_level(logging.INFO):
+            await _intersection_copy(conn, src="src", dst="dst", or_ignore=True)
+        assert "1 row" in caplog.text and "dedup" in caplog.text.lower()
+        cur = await conn.execute("SELECT COUNT(*) FROM dst")
+        assert (await cur.fetchone())[0] == 1  # one collided row dropped
     finally:
         await conn.close()
 
