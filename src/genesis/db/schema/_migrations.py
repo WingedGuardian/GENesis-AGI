@@ -1498,6 +1498,23 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN expected_outputs TEXT",
         "ego_proposals.expected_outputs")
 
+    # PR-4 (ego proposal-lifecycle redesign, dark schema): revision +
+    # revalidation tracking. Unindexed additive columns added on the base
+    # path (every boot) rather than in a numbered migration to avoid the
+    # double-add boot-crash class — a bare ADD COLUMN in the numbered runner
+    # AFTER this _try_alter already ran would raise (see
+    # test_schema_base_path_parity.py). The paired ego_proposal_revisions
+    # table is created by create_all_tables + numbered migration 0071.
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN revision_num INTEGER DEFAULT 1",
+        "ego_proposals.revision_num")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN revalidate_at TEXT",
+        "ego_proposals.revalidate_at")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN last_validated_at TEXT",
+        "ego_proposals.last_validated_at")
+
     # surplus_tasks.not_before — existed in CREATE TABLE DDL but lacked
     # ALTER TABLE migration for installs created before the column was added.
     await _try_alter(db,
