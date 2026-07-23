@@ -325,6 +325,10 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             last_success     TEXT,
             last_failure     TEXT,
             last_error       TEXT,
+            -- Exception class name when an exception caused the failure, else
+            -- NULL (a semantic failure — e.g. an external quota block). Cleared
+            -- on recovery alongside last_error.
+            error_type       TEXT,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             total_runs       INTEGER NOT NULL DEFAULT 0,
             total_successes  INTEGER NOT NULL DEFAULT 0,
@@ -332,6 +336,12 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             updated_at       TEXT NOT NULL
         )
     """)
+
+    # Failure-emitter payloads: error_type on job_health for DBs created before
+    # the column existed (the CREATE above only applies to fresh installs).
+    await _try_alter(db,
+        "ALTER TABLE job_health ADD COLUMN error_type TEXT",
+        "job_health.error_type")
 
     # Dashboard Phase 4: manual error resolution tracking
     # CREATE TABLE IF NOT EXISTS is inherently idempotent — no suppress needed

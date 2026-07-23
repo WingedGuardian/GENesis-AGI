@@ -598,11 +598,20 @@ class SurplusScheduler:
         else:
             logger.warning(msg)
 
-        # Record failure in job health tracking
+        # Record failure in job health tracking. error_summary prefixes the
+        # exception TYPE — APScheduler exceptions here routinely render as an
+        # empty str(), which is exactly when the type carries all the signal
+        # (live: last_error was recorded as "" for months).
+        from genesis.observability.failure_details import error_summary, failure_details
+
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
-            rt.record_job_failure(job_id, str(exception or "missed")[:500])
+            rt.record_job_failure(
+                job_id,
+                error_summary(exception, "missed") or "missed",
+                error_type=type(exception).__name__ if exception is not None else None,
+            )
         except Exception:
             logger.warning("Failed to record job failure for %s", job_id, exc_info=True)
 
@@ -617,6 +626,7 @@ class SurplusScheduler:
                     "scheduler.job_failed" if is_error else "scheduler.job_missed",
                     msg,
                     job_id=job_id,
+                    **failure_details(exc=exception),
                 )
         except Exception:
             logger.warning("Failed to emit scheduler error event", exc_info=True)

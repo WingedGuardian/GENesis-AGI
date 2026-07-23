@@ -19,7 +19,7 @@ import asyncio
 import pytest
 
 from genesis.util.tasks import (
-    _normalized_frames,
+    normalized_frames,
     set_default_event_bus,
     tracked_task,
 )
@@ -70,11 +70,11 @@ def _raise_at(filename: str, funcname: str, exc_type: type[Exception] = KeyError
 class TestNormalizedFrames:
     def test_relpath_from_genesis_segment(self):
         exc = _raise_at("/install/src/genesis/memory/sync.py", "_apply_delta")
-        assert _normalized_frames(exc) == ["memory/sync.py:_apply_delta"]
+        assert normalized_frames(exc) == ["memory/sync.py:_apply_delta"]
 
     def test_no_line_numbers_anywhere(self):
         exc = _raise_at("/install/src/genesis/memory/sync.py", "_apply_delta")
-        for frame in _normalized_frames(exc):
+        for frame in normalized_frames(exc):
             assert frame.count(":") == 1  # exactly relpath:funcname, no :lineno
 
     def test_non_genesis_frames_dropped_when_genesis_present(self):
@@ -88,7 +88,7 @@ class TestNormalizedFrames:
         try:
             outer()
         except ValueError as exc:
-            frames = _normalized_frames(exc)
+            frames = normalized_frames(exc)
         # this test function's own frame (repo path, install-specific) may or
         # may not carry a /genesis/ segment; the synthetic genesis frame must
         # be the LAST (deepest) either way
@@ -96,7 +96,7 @@ class TestNormalizedFrames:
 
     def test_all_foreign_frames_kept_as_basenames(self):
         exc = _raise_at("/usr/lib/python3.12/threading.py", "run")
-        assert _normalized_frames(exc) == ["threading.py:run"]
+        assert normalized_frames(exc) == ["threading.py:run"]
 
     def test_last_three_only(self):
         src = (
@@ -110,7 +110,7 @@ class TestNormalizedFrames:
         try:
             ns["f4"]()
         except KeyError as exc:
-            frames = _normalized_frames(exc)
+            frames = normalized_frames(exc)
         # call chain f4→f3→f2→f1 = 4 genesis frames; keep the DEEPEST three
         assert frames == [
             "ego/session.py:f3",
@@ -119,7 +119,7 @@ class TestNormalizedFrames:
         ]
 
     def test_no_traceback_yields_empty(self):
-        assert _normalized_frames(KeyError("bare")) == []
+        assert normalized_frames(KeyError("bare")) == []
 
 
 async def _fail(exc: Exception):

@@ -117,18 +117,35 @@ class ReflectionScheduler:
             self._scheduler = None
             logger.info("Reflection scheduler stopped")
 
-    async def _record_job_result(self, name: str, *, error: str | None = None) -> None:
+    async def _record_job_result(
+        self, name: str, *, error: str | None = None, exc: BaseException | None = None
+    ) -> None:
+        """Record a job outcome.
+
+        Pass *exc* whenever an exception caused the failure — it is what makes
+        the event diagnosable (``error_type`` + frames). A failure reported only
+        as a semantic *error* string (a job result's ``reason``, e.g. a provider
+        quota block) carries no ``error_type``, which is how consumers tell an
+        internal defect from an external blocker.
+        """
         from genesis.runtime import GenesisRuntime
 
         rt = GenesisRuntime.instance()
-        if error:
-            rt.record_job_failure(name, error)
+        if error or exc is not None:
+            from genesis.observability.failure_details import error_summary, failure_details
+
+            rt.record_job_failure(
+                name,
+                error_summary(exc, error) or "unknown",
+                error_type=type(exc).__name__ if exc is not None else None,
+            )
             if self._event_bus:
                 from genesis.observability.types import Severity, Subsystem
 
                 await self._event_bus.emit(
                     Subsystem.REFLECTION, Severity.ERROR,
                     f"{name}.failed", f"Scheduled job {name} failed: {error}",
+                    **failure_details(exc=exc, reason=None if exc is not None else error),
                 )
         else:
             rt.record_job_success(name)
@@ -164,7 +181,7 @@ class ReflectionScheduler:
                 await self._record_job_result("weekly_assessment", error=result.reason or "unknown")
         except Exception as exc:
             logger.exception("Weekly self-assessment error")
-            await self._record_job_result("weekly_assessment", error=str(exc))
+            await self._record_job_result("weekly_assessment", error=str(exc), exc=exc)
 
     async def _run_calibration(self) -> None:
         """Run quality calibration + regression check."""
@@ -202,7 +219,7 @@ class ReflectionScheduler:
                 await self._record_job_result("weekly_calibration", error=result.reason or "unknown")
         except Exception as exc:
             logger.exception("Quality calibration error")
-            await self._record_job_result("weekly_calibration", error=str(exc))
+            await self._record_job_result("weekly_calibration", error=str(exc), exc=exc)
 
     async def _already_ran_this_week(self, *obs_types: str) -> bool:
         """Check if an observation of any of these types exists from this week.

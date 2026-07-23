@@ -119,6 +119,11 @@ async def load_persisted_job_health(rt: GenesisRuntime) -> None:
         import aiosqlite
 
         async with rt._db.execute(
+            # error_type is deliberately NOT selected: it is only read by the
+            # persist path, which re-supplies it on every write (set on failure,
+            # popped on success/clear), so nothing goes stale by omitting it —
+            # and selecting a column added by a later migration would fail this
+            # whole load, not just one field.
             "SELECT job_name, last_run, last_success, last_failure, "
             "last_error, consecutive_failures FROM job_health"
         ) as cur:
@@ -169,6 +174,7 @@ def clear_stale_job_failures(rt: GenesisRuntime) -> int:
         entry["consecutive_failures"] = 0
         entry.pop("last_failure", None)
         entry.pop("last_error", None)
+        entry.pop("error_type", None)
         persist_job_health(rt, job_name, entry, now_iso)
         cleared += 1
 
@@ -199,9 +205,9 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
             await rt._db.execute(
                 """INSERT INTO job_health
                    (job_name, last_run, last_success, last_failure, last_error,
-                    consecutive_failures, total_runs, total_successes,
+                    error_type, consecutive_failures, total_runs, total_successes,
                     total_failures, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                    ON CONFLICT(job_name) DO UPDATE SET
                        last_run = excluded.last_run,
                        last_success = COALESCE(excluded.last_success, last_success),
@@ -210,6 +216,9 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
                        -- recovery; the failure path always supplies both (WS-3b).
                        last_failure = excluded.last_failure,
                        last_error = excluded.last_error,
+                       -- Same clear-on-recovery contract as last_error: a stale
+                       -- error_type would mislabel a recovered job.
+                       error_type = excluded.error_type,
                        consecutive_failures = excluded.consecutive_failures,
                        total_runs = total_runs + 1,
                        total_successes = total_successes + CASE WHEN excluded.last_success IS NOT NULL THEN 1 ELSE 0 END,
@@ -222,6 +231,7 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
                     snapshot.get("last_success"),
                     snapshot.get("last_failure"),
                     snapshot.get("last_error"),
+                    snapshot.get("error_type"),
                     snapshot.get("consecutive_failures", 0),
                     1 if snapshot.get("last_success") else 0,
                     1 if snapshot.get("last_failure") else 0,
@@ -312,6 +322,7 @@ def record_job_success(rt: GenesisRuntime, job_name: str) -> None:
     # failures in the SQL CASE WHEN excluded.last_failure IS NOT NULL check.
     entry.pop("last_failure", None)
     entry.pop("last_error", None)
+    entry.pop("error_type", None)
     rt._persist_job_health(job_name, entry, now)
 
     # WS-2 M9: debounced success run-event — first success ever, or >= 1h since
@@ -331,11 +342,19 @@ def record_job_success(rt: GenesisRuntime, job_name: str) -> None:
         )
 
 
-def record_job_failure(rt: GenesisRuntime, job_name: str, error: str) -> None:
+def record_job_failure(
+    rt: GenesisRuntime, job_name: str, error: str, *, error_type: str | None = None
+) -> None:
     """Record a failed scheduled job execution (in-memory + DB).
 
     When consecutive failures reach the retry threshold (3), triggers
     an automatic retry via the JobRetryRegistry if one is wired.
+
+    *error_type* is the exception class name when an exception caused the
+    failure, else ``None`` (a semantic failure — e.g. an external quota block
+    surfaced as a result reason). Keyword-only and optional so the ~110 existing
+    call sites keep working untouched; only callers that actually hold the
+    exception need to pass it.
     """
     now = datetime.now(UTC).isoformat()
     entry = rt._job_health.setdefault(job_name, {"consecutive_failures": 0})
@@ -345,6 +364,10 @@ def record_job_failure(rt: GenesisRuntime, job_name: str, error: str) -> None:
     entry["last_run"] = now
     entry["last_failure"] = now
     entry["last_error"] = error
+    # Always assign (even None) so a semantic failure overwrites a previous
+    # exception's type instead of inheriting it — a stale error_type would
+    # mislabel an external blocker as an internal defect.
+    entry["error_type"] = error_type
     entry["consecutive_failures"] = prev_consecutive + 1
     rt._persist_job_health(job_name, entry, now)
 

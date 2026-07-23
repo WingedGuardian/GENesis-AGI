@@ -41,8 +41,14 @@ def set_default_event_bus(bus: GenesisEventBus | None) -> None:
     _default_event_bus = bus
 
 
-def _normalized_frames(exc: BaseException) -> list[str]:
+def normalized_frames(exc: BaseException) -> list[str]:
     """Render the traceback tail as stable ``relpath:funcname`` strings.
+
+    Public because it is the single identity basis for failure fingerprints.
+    Every failure emitter must use THIS function (see
+    ``genesis.observability.failure_details``) — a second normalizer would
+    render the same bug two different ways and split one signal into two
+    fingerprints.
 
     - keeps only frames inside the genesis package (``/genesis/`` path
       segment — package-relative, so it works on any install/CI checkout);
@@ -139,7 +145,7 @@ def _make_done_callback(
                 task_name=task_name,
                 error=str(exc),
                 error_type=type(exc).__name__,
-                error_frames=_normalized_frames(exc),
+                error_frames=normalized_frames(exc),
             )
 
     return _on_done
