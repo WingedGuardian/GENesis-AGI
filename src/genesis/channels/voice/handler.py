@@ -156,26 +156,28 @@ class VoiceConversationHandler:
                         )
                         external = _blockable or is_external(getattr(r, "collection", ""))
                         # Spoken-safe provenance label + coarse age (§3.2): the S2S
-                        # model needs first-party vs external-world and recency,
-                        # without XML boundary markers it would read aloud.
+                        # model needs first-party vs external-world and recency.
                         label = "external-world knowledge" if external else "first-party"
                         payload = getattr(r, "payload", None)
                         age = _humanize_age(
                             payload.get("created_at") if isinstance(payload, dict) else None
                         )
                         tag = f"[{label} | {age}]" if age else f"[{label}]"
-                        spoken_snippets.append(f"- {tag} {content[:300]}")
                         if external:
-                            llm_snippets.append(
-                                "- "
-                                + wrap_external_recall(
-                                    content[:300],
-                                    source_pipeline=source_pipeline,
-                                )
+                            # Fence external/untrusted recall in BOTH views so it
+                            # reads as data, not instructions (injection defense).
+                            # The raw path now feeds GPT-Realtime via ask_genesis,
+                            # so it must be fenced too — the S2S system prompt tells
+                            # the model to treat <external-content> as untrusted.
+                            fenced = wrap_external_recall(
+                                content[:300], source_pipeline=source_pipeline
                             )
+                            spoken_snippets.append(f"- {tag} {fenced}")
+                            llm_snippets.append(f"- {fenced}")
                             if _blockable:
                                 blockable += 1
                         else:
+                            spoken_snippets.append(f"- {tag} {content[:300]}")
                             llm_snippets.append(f"- {content[:300]}")
                 if spoken_snippets:
                     _hdr = f"Recalled ({len(spoken_snippets)}):"
