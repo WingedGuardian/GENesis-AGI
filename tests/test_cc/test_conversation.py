@@ -569,3 +569,136 @@ async def test_streaming_quota_contingency(loop_with_contingency, mock_invoker):
     )
     assert "Contingency mode" in result
     contingency.dispatch_conversation.assert_awaited_once()
+
+
+# --- Channel research-reroute nudge (delivery-model re-land, ledger 24a6857a) ---
+
+
+async def _capture_streaming_system_prompt(loop, *, channel, user_id):
+    """Drive handle_message_streaming, capturing the CCInvocation.system_prompt."""
+    captured = {}
+
+    async def _fake_try(invocation, *, session, **kw):
+        captured["system_prompt"] = invocation.system_prompt
+        return _make_output(), session
+
+    loop._try_invoke_streaming = _fake_try
+    await loop.handle_message_streaming(
+        "please run deep research on SOC AI agents",
+        user_id=user_id,
+        channel=channel,
+        thread_id=None,
+    )
+    return captured["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_appends_research_routing_for_telegram(loop):
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    sp = await _capture_streaming_system_prompt(
+        loop, channel=ChannelType.TELEGRAM, user_id="tg-1"
+    )
+    assert sp is not None
+    assert _BG_RESEARCH_ROUTING in sp
+    assert "direct_session_run" in sp
+
+
+@pytest.mark.asyncio
+async def test_streaming_omits_research_routing_for_terminal(loop):
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    sp = await _capture_streaming_system_prompt(
+        loop, channel=ChannelType.TERMINAL, user_id="term-1"
+    )
+    assert sp is not None
+    assert _BG_RESEARCH_ROUTING not in sp
+
+
+@pytest.mark.asyncio
+async def test_handle_message_appends_routing_for_telegram(loop, mock_invoker):
+    """Non-streaming path gets the nudge on a delivery-addressable (Telegram) channel."""
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    await loop.handle_message(
+        "please run deep research on X", user_id="tg-2", channel=ChannelType.TELEGRAM
+    )
+    inv = mock_invoker.run.call_args[0][0]
+    assert inv.system_prompt is not None
+    assert _BG_RESEARCH_ROUTING in inv.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_handle_message_omits_routing_for_web(loop, mock_invoker):
+    """WEB/OpenClaw is NOT addressable by deliver_to_origin (the resolver only
+    resolves Telegram), so the nudge is withheld — promising a report-back the
+    delivery model would silently redirect to the owner surface is the exact
+    silent-loss class this feature prevents."""
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    await loop.handle_message(
+        "please run deep research on X", user_id="web-1", channel=ChannelType.WEB
+    )
+    inv = mock_invoker.run.call_args[0][0]
+    assert _BG_RESEARCH_ROUTING not in (inv.system_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_handle_message_omits_routing_for_terminal(loop, mock_invoker):
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    await loop.handle_message(
+        "please run deep research on X", user_id="term-2", channel=ChannelType.TERMINAL
+    )
+    inv = mock_invoker.run.call_args[0][0]
+    assert _BG_RESEARCH_ROUTING not in (inv.system_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_origin_delivery_supported_matches_addressable_set():
+    """The reroute gate and the delivery resolver share one source of truth: only
+    Telegram origins can actually be delivered back to (see
+    DirectSessionRunner._resolve_origin_target)."""
+    from genesis.cc.types import ChannelType as CT
+    from genesis.cc.types import origin_delivery_supported
+
+    assert origin_delivery_supported(CT.TELEGRAM) is True
+    assert origin_delivery_supported("telegram") is True
+    for ch in (CT.WEB, CT.WHATSAPP, CT.VOICE, CT.TERMINAL):
+        assert origin_delivery_supported(ch) is False
+    assert origin_delivery_supported(None) is False
+
+
+@pytest.mark.asyncio
+async def test_research_routing_nudge_uses_delivery_model():
+    """The re-landed nudge routes via deliver_to_origin (delivery model), NOT the
+    removed notify boolean — otherwise a successful run would go silent."""
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    assert "deliver_to_origin=true" in _BG_RESEARCH_ROUTING
+    assert "notify=true" not in _BG_RESEARCH_ROUTING
+    assert 'profile="research"' in _BG_RESEARCH_ROUTING
+
+
+@pytest.mark.asyncio
+async def test_build_fresh_invocation_applies_routing_for_channel(loop):
+    """Stale-resume recovery rebuilds the prompt from scratch — the routing nudge
+    must survive onto the fresh (retry) invocation for a dispatched channel."""
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    inv = await loop._build_fresh_invocation(
+        "deep research please",
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+        channel=ChannelType.TELEGRAM,
+    )
+    assert inv.system_prompt is not None
+    assert _BG_RESEARCH_ROUTING in inv.system_prompt
+
+    inv_term = await loop._build_fresh_invocation(
+        "deep research please",
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+        channel=ChannelType.TERMINAL,
+    )
+    assert _BG_RESEARCH_ROUTING not in (inv_term.system_prompt or "")

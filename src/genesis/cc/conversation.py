@@ -23,7 +23,14 @@ from genesis.cc.formatter import ResponseFormatter
 from genesis.cc.intent import IntentParser
 from genesis.cc.session_manager import SessionManager
 from genesis.cc.system_prompt import SystemPromptAssembler
-from genesis.cc.types import CCInvocation, CCModel, ChannelType, EffortLevel, StreamEvent
+from genesis.cc.types import (
+    CCInvocation,
+    CCModel,
+    ChannelType,
+    EffortLevel,
+    StreamEvent,
+    origin_delivery_supported,
+)
 from genesis.db.crud import cc_sessions
 from genesis.observability.call_site_recorder import record_last_run
 
@@ -46,6 +53,46 @@ _BG_TRUNCATION_NOTICE = (
 def _bg_notice(output) -> str:
     """The truncation notice when a reply's background work was cut off, else ''."""
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
+
+
+# Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
+# durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
+# kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
+# Pairs with the merged delivery model (PR #1192): deliver_to_origin=true sends the
+# finished outcome back to THIS conversation, so the "I'll report back" promise is kept
+# instead of a successful background run going silent (the deferral condition in d7aedfdf).
+_BG_RESEARCH_ROUTING = (
+    "\n\n## Dispatching long-running work from this channel\n"
+    "Your turn here ends after you reply, and any deep-research or Workflow you run "
+    "inline is force-killed after about 10 minutes with only a partial result, with no "
+    "live session left to report back. So when a request needs deep or multi-source "
+    "research, or background work likely to run more than a few minutes, do NOT run it "
+    "inline. Call the `mcp__genesis-health__direct_session_run` tool "
+    '(profile="research", deliver_to_origin=true) with a clear task prompt, then reply '
+    "that it is running in the background and will report back with results when done. "
+    "That background session runs to completion and delivers the finished outcome — "
+    "success or failure — back to this exact conversation. Keep quick answers and short "
+    "tool use inline as usual."
+)
+
+
+def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
+    """Append the long-research routing nudge for channels the delivery model can
+    actually report back to.
+
+    The nudge tells the model to hand long research to the background lane with
+    ``deliver_to_origin=true`` and promise "I'll report back to this conversation."
+    That promise is only keepable where ``direct_session`` can resolve an origin
+    target — i.e. Telegram (see ``origin_delivery_supported``, the single source of
+    truth shared with ``DirectSessionRunner._resolve_origin_target``). On any other
+    channel (WEB/OpenClaw, WhatsApp, VOICE) the result would silently fall back to the
+    owner surface, so the nudge is withheld rather than promise a report-back the
+    delivery model cannot keep. Terminal is interactive anyway (user present), so
+    inline work is fine there.
+    """
+    if not origin_delivery_supported(channel):
+        return system_prompt
+    return (system_prompt + _BG_RESEARCH_ROUTING) if system_prompt else _BG_RESEARCH_ROUTING
 
 
 class ConversationLoop:
@@ -208,6 +255,13 @@ class ConversationLoop:
                     system_prompt, prompt_text,
                 )
                 resume_id = None
+
+            # Non-terminal (dispatched) channels end the turn after replying, so long
+            # inline work is killed at the CC bg-wait ceiling with nothing left to report
+            # back — nudge routing to the durable background lane (delivers back via
+            # deliver_to_origin). Applied on resume too (append_system_prompt=True carries
+            # it into the resumed session). See _apply_research_routing.
+            system_prompt = _apply_research_routing(system_prompt, channel)
 
             invocation = CCInvocation(
                 prompt=prompt_text,
@@ -508,6 +562,9 @@ class ConversationLoop:
                     else:
                         system_prompt = topic_ctx
 
+            # Route long research off this turn to the durable background lane
+            # (dispatched channels end the turn). See _apply_research_routing.
+            system_prompt = _apply_research_routing(system_prompt, channel)
 
             invocation = CCInvocation(
                 prompt=prompt_text,
@@ -710,6 +767,7 @@ class ConversationLoop:
             fresh_inv = await self._build_fresh_invocation(
                 prompt_text, model=model, effort=effort,
                 session_id=session["id"], session_key=invocation.session_key,
+                channel=channel,
             )
             # Retry — if this also fails, the exception propagates to caller
             output = await self._invoker.run(fresh_inv)
@@ -747,6 +805,7 @@ class ConversationLoop:
             fresh_inv = await self._build_fresh_invocation(
                 prompt_text, model=model, effort=effort,
                 session_id=session["id"], session_key=invocation.session_key,
+                channel=channel,
             )
             output = await self._invoker.run_streaming(fresh_inv, on_event=on_event)
             return output, session
@@ -759,6 +818,7 @@ class ConversationLoop:
         effort: EffortLevel,
         session_id: str | None = None,
         session_key: str | None = None,
+        channel: ChannelType | None = None,
     ) -> CCInvocation:
         """Build a fresh invocation (with system prompt, no resume)."""
         system_prompt = await self._assembler.assemble(
@@ -766,6 +826,9 @@ class ConversationLoop:
             session_id=session_id,
         )
         system_prompt = await self._enrich_with_context(system_prompt, prompt_text)
+        # A stale-resume retry rebuilds the prompt from scratch — re-apply the
+        # dispatched-channel research routing so the nudge isn't lost on recovery.
+        system_prompt = _apply_research_routing(system_prompt, channel)
         return CCInvocation(
             prompt=prompt_text,
             model=model,

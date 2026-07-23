@@ -170,7 +170,10 @@ verified: 3c5e1f24 2026-07-22
   kill; the background lane (direct_session) sets it to the full budget so long work
   (deep-research) runs to completion. A hit sets `CCOutput.bg_truncated` → a visible
   user notice + a `cc.bg_truncated` event. Foreground turns keep the 600s default so a
-  conversational turn never lingers holding the per-session lock.
+  conversational turn never lingers holding the per-session lock, and instead route long
+  research to the background lane (`conversation._BG_RESEARCH_ROUTING`, gated on
+  `origin_delivery_supported` = Telegram-only, matching the delivery resolver, via
+  `direct_session_run(profile="research", deliver_to_origin=true)`).
   Origin: the 2026-07-20 silent-death of a Telegram deep-research run.
 - **Background-session delivery model** (`DeliveryMode`, direct_session.py): a
   handed-off task can deliver its terminal outcome (success AND failure) back to the

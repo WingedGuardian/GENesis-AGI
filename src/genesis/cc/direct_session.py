@@ -42,6 +42,7 @@ from genesis.cc.types import (
     StreamEvent,
     background_session_dir,
     cc_project_key,
+    origin_delivery_supported,
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.util.tasks import tracked_task
@@ -1526,9 +1527,11 @@ class DirectSessionRunner:
         for a DM, a group, AND a forum topic uniformly (a forum topic's
         ``chat.id`` *is* the supergroup). Falls back to best-effort
         reconstruction for legacy rows written before ``chat_id`` was captured.
-        Returns ``(None, None)`` when the origin cannot be addressed.
+        Returns ``(None, None)`` when the origin cannot be addressed. The
+        addressable-channel test is shared with the reroute nudge via
+        ``origin_delivery_supported`` (single source of truth).
         """
-        if channel != "telegram":
+        if not origin_delivery_supported(channel):
             return None, None
         tid: int | None = None
         if thread_id_raw:
