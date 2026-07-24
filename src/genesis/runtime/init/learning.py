@@ -217,7 +217,9 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
 
     scheduler.add_job(
         _prune_events,
-        CronTrigger(hour=5, minute=50, timezone=user_timezone()),
+        # 06:00 — the drip slots 05:00–05:50 are taken (…graduation 05:40,
+        # voice_hygiene 05:50); a fresh slot avoids two DB-writing jobs at once.
+        CronTrigger(hour=6, minute=0, timezone=user_timezone()),
         id="events_prune",
         max_instances=1,
         misfire_grace_time=3600,
