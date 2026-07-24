@@ -20,9 +20,15 @@ Blocked with warning:
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 
-from hook_input import field, read_payload
+# Self-locate so `from hook_input import …` resolves both when CC runs this as a
+# script and when it is imported as a module for tests (importlib does not add
+# the file's dir to sys.path).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import field, read_payload  # noqa: E402
 
 # Flags that pytest accepts (non-exhaustive but covers common ones).
 # Used to distinguish "pytest -v" (no path) from "pytest tests/foo.py -v".

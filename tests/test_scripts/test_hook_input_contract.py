@@ -147,3 +147,23 @@ def test_no_hook_reads_dead_env_var_directly():
         "These hooks read a dead payload env var via os.environ instead of "
         f"scripts/hooks/hook_input.read_payload(): {offenders}"
     )
+
+
+def test_no_settings_json_pipes_dead_env_var():
+    """Static guard: no settings JSON wraps a hook in `echo $CLAUDE_TOOL_INPUT |`.
+
+    That wrapper clobbers CC's real stdin with the dead env var — the exact
+    landmine that silently disabled the guards. Covers the live settings and the
+    install-time template.
+    """
+    offenders = []
+    for rel in (".claude/settings.json", "config/claude-settings.json.template"):
+        path = _REPO / rel
+        if not path.exists():
+            continue
+        if "CLAUDE_TOOL_INPUT" in path.read_text(encoding="utf-8", errors="ignore"):
+            offenders.append(rel)
+    assert not offenders, (
+        "These settings files still reference the dead CLAUDE_TOOL_INPUT env var "
+        f"(hooks must read the payload from stdin): {offenders}"
+    )

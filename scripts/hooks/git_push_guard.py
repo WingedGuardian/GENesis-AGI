@@ -15,12 +15,17 @@ Stdlib-only. Fail-open on parse errors (don't block legitimate work).
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
 
-from hook_input import field, read_payload
+# Self-locate so `from hook_input import …` resolves both when CC runs this as a
+# script (sys.path[0] is this dir) AND when it is imported as a module for tests
+# (importlib does not add the file's dir to sys.path).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import field, read_payload  # noqa: E402
 
 
 def _current_branch() -> str | None:

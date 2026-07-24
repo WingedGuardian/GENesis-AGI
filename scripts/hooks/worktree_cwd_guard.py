@@ -36,7 +36,9 @@ import os
 import re
 import sys
 
-from hook_input import read_payload, tool_input
+# Self-locate so hook_input resolves whether run as a script or imported (tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import read_payload, tool_input  # noqa: E402
 
 # Matches 'git worktree remove' with optional flags
 _WORKTREE_REMOVE = re.compile(r"\bgit\s+worktree\s+remove\b")

@@ -48,7 +48,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hook_input import field, read_payload
+# Self-locate so hook_input resolves whether run as a script or imported (tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import field, read_payload  # noqa: E402
 
 _OVERRIDE_RE = re.compile(r"#\s*repo-routing-override\b")
 

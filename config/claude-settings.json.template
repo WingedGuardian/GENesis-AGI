@@ -66,7 +66,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'CMD=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .command 2>/dev/null); if echo \"$CMD\" | grep -qE \"pip install.*((-e|--editable) +[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"rm -rf /\"*|*\"rm -rf ~\"*|*\"rm -rf .\"*|*\"rm -rf ..\"*) echo \"BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user.\" >&2; exit 2;; *\"git push\"*\"--force\"*|*\"git push\"*\"-f\"*) echo \"BLOCKED: Force push not allowed. Use a PR.\" >&2; exit 2;; *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"git clean -f\"*|*\"git clean -fd\"*) echo \"BLOCKED: git clean removes untracked files permanently. Ask the user first.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; *\"git worktree remove\"*\"--force\"*|*\"git worktree remove\"*\"-f \"*) echo \"BLOCKED: git worktree remove --force destroys uncommitted work.\" >&2; echo \"Use git worktree remove (without --force) instead.\" >&2; exit 2;; esac'"
+            "command": "bash -c 'CMD=$(cat | jq -r .tool_input.command 2>/dev/null); if echo \"$CMD\" | grep -qE \"pip install.*((-e|--editable) +[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"rm -rf /\"*|*\"rm -rf ~\"*|*\"rm -rf .\"*|*\"rm -rf ..\"*) echo \"BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user.\" >&2; exit 2;; *\"git push\"*\"--force\"*|*\"git push\"*\"-f\"*) echo \"BLOCKED: Force push not allowed. Use a PR.\" >&2; exit 2;; *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"git clean -f\"*|*\"git clean -fd\"*) echo \"BLOCKED: git clean removes untracked files permanently. Ask the user first.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; *\"git worktree remove\"*\"--force\"*|*\"git worktree remove\"*\"-f \"*) echo \"BLOCKED: git worktree remove --force destroys uncommitted work.\" >&2; echo \"Use git worktree remove (without --force) instead.\" >&2; exit 2;; esac'"
           }
         ]
       },
@@ -85,7 +85,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'URL=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .url 2>/dev/null); if echo \"$URL\" | grep -qiE \"(youtube\\.com|youtu\\.be)\"; then echo \"BLOCKED: YouTube URLs fail with SSL certificate errors in this environment.\" >&2; echo \"\" >&2; echo \"Use yt-dlp via Bash instead (installed and on PATH):\" >&2; echo \"  Metadata: yt-dlp --skip-download --print \\\"%(title)s|||%(uploader)s|||%(view_count)s|||%(duration)s|||%(description)s\\\" URL\" >&2; echo \"  Transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o \\\"$HOME/tmp/%(id)s\\\" URL\" >&2; echo \"  Then read $HOME/tmp/VIDEO_ID.en.vtt for the full transcript.\" >&2; exit 2; fi'"
+            "command": "bash -c 'URL=$(cat | jq -r .tool_input.url 2>/dev/null); if echo \"$URL\" | grep -qiE \"(youtube\\.com|youtu\\.be)\"; then echo \"BLOCKED: YouTube URLs fail with SSL certificate errors in this environment.\" >&2; echo \"\" >&2; echo \"Use yt-dlp via Bash instead (installed and on PATH):\" >&2; echo \"  Metadata: yt-dlp --skip-download --print \\\"%(title)s|||%(uploader)s|||%(view_count)s|||%(duration)s|||%(description)s\\\" URL\" >&2; echo \"  Transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o \\\"$HOME/tmp/%(id)s\\\" URL\" >&2; echo \"  Then read $HOME/tmp/VIDEO_ID.en.vtt for the full transcript.\" >&2; exit 2; fi'"
           }
         ]
       },
@@ -94,11 +94,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo \"$CLAUDE_TOOL_INPUT\" | {{VENV_PYTHON}} {{GENESIS_ROOT}}/scripts/pretool_check.py"
+            "command": "{{VENV_PYTHON}} {{GENESIS_ROOT}}/scripts/pretool_check.py"
           },
           {
             "type": "command",
-            "command": "echo \"$CLAUDE_TOOL_INPUT\" | {{VENV_PYTHON}} {{GENESIS_ROOT}}/scripts/behavioral_linter.py"
+            "command": "{{VENV_PYTHON}} {{GENESIS_ROOT}}/scripts/behavioral_linter.py"
           }
         ]
       }

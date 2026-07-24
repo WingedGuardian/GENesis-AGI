@@ -15,7 +15,9 @@ import os
 import sys
 import tempfile
 
-from hook_input import read_payload, session_id, tool_response
+# Self-locate so hook_input resolves whether run as a script or imported (tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import read_payload, session_id, tool_response  # noqa: E402
 
 _SENTINEL_PREFIX = "genesis_stealth_nudge_"
 
