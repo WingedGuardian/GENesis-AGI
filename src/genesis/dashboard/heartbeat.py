@@ -60,13 +60,13 @@ class DashboardHeartbeat:
                     finally:
                         loop.close()
                     rt.record_job_success("dashboard_heartbeat")
-            except Exception:
+            except Exception as exc:
                 logger.error("Dashboard heartbeat failed", exc_info=True)
                 try:
                     from genesis.runtime import GenesisRuntime
 
                     rt = GenesisRuntime.instance()
-                    rt.record_job_failure("dashboard_heartbeat", "heartbeat emission failed")
+                    rt.record_job_failure("dashboard_heartbeat", "heartbeat emission failed", exc=exc)
                 except Exception:
                     pass
             self._stop_event.wait(self._interval)

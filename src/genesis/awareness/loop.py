@@ -1927,7 +1927,7 @@ class AwarenessLoop:
                     )
                 try:
                     from genesis.runtime import GenesisRuntime
-                    GenesisRuntime.instance().record_job_failure("awareness_tick", str(exc))
+                    GenesisRuntime.instance().record_job_failure("awareness_tick", exc=exc)
                 except Exception:
                     pass
                 # Even on unexpected failure, don't leave _last_tick_at stale

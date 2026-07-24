@@ -41,7 +41,7 @@ async def run_status_writer_loop(
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            runtime.record_job_failure("status_writer_loop", str(exc))
+            runtime.record_job_failure("status_writer_loop", exc=exc)
             logger.error(
                 "Status writer loop iteration failed",
                 exc_info=True,

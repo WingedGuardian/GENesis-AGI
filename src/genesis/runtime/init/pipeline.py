@@ -34,7 +34,7 @@ async def run_pipeline_cycle(rt: GenesisRuntime, profile_name: str) -> None:
             result.discarded,
         )
     except Exception as exc:
-        rt.record_job_failure(job_name, str(exc))
+        rt.record_job_failure(job_name, exc=exc)
         logger.error("Pipeline cycle %s failed", profile_name, exc_info=True)
 
 

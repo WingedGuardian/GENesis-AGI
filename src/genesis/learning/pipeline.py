@@ -116,9 +116,9 @@ def build_triage_pipeline(
             if runtime is not None:
                 runtime.record_job_success("retrospective_triage")
             _record_call_site(triage_depth=None)
-        except Exception:
+        except Exception as exc:
             if runtime is not None:
-                runtime.record_job_failure("retrospective_triage", "pipeline exception")
+                runtime.record_job_failure("retrospective_triage", "pipeline exception", exc=exc, emit_event=False)
             raise
 
     async def _run_pipeline(output: Any, user_text: str, channel: str) -> None:

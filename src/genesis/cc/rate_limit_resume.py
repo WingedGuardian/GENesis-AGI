@@ -184,5 +184,5 @@ async def run_resume_tick(rt, *, now: datetime | None = None) -> None:
             logger.info("rate_limit_resume: re-dispatched %d/%d due park(s)", dispatched, len(due))
         rt.record_job_success("rate_limit_resume")
     except Exception as exc:  # noqa: BLE001 — job boundary
-        rt.record_job_failure("rate_limit_resume", str(exc))
+        rt.record_job_failure("rate_limit_resume", exc=exc)
         logger.exception("rate_limit_resume tick failed")

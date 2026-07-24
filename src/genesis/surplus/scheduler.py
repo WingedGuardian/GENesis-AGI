@@ -799,7 +799,7 @@ class SurplusScheduler:
                 )
             try:
                 from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("surplus_dispatch", str(exc))
+                GenesisRuntime.instance().record_job_failure("surplus_dispatch", exc=exc)
             except Exception:
                 pass
 

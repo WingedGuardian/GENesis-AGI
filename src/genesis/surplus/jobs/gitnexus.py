@@ -100,7 +100,7 @@ async def run_gitnexus_reindex() -> None:
         with contextlib.suppress(Exception):
             GenesisRuntime.instance().record_job_failure(
                 "gitnexus_reindex",
-                str(exc),
+                exc=exc,
             )
 
 
