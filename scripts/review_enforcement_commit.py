@@ -5,7 +5,7 @@ Two enforcement rules:
 1. Block ALL commits directly to main — always require a branch.
 2. Block commits on branches if review marker is not current.
 
-Reads CLAUDE_TOOL_INPUT from environment (set by CC hook framework).
+Reads the CC hook payload from stdin (via hook_input).
 
 Exit codes:
   0 = allow (tool proceeds)
@@ -14,10 +14,14 @@ Exit codes:
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
+
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
+from hook_input import field, read_payload  # noqa: E402
 
 # Pattern to detect git commit commands (but not git commit --amend, etc. — those
 # are also commits and should be blocked)
@@ -41,16 +45,7 @@ def _extract_working_dir(command: str) -> str | None:
 
 def main() -> None:
     # Parse tool input
-    tool_input_raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-    if not tool_input_raw:
-        sys.exit(0)  # No input, allow
-
-    try:
-        tool_input = json.loads(tool_input_raw)
-    except json.JSONDecodeError:
-        sys.exit(0)  # Can't parse, allow
-
-    command = tool_input.get("command", "")
+    command = field(read_payload(), "command")
     if not _COMMIT_PATTERN.search(command):
         sys.exit(0)  # Not a commit, allow
 

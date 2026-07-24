@@ -15,11 +15,12 @@ Stdlib-only. Fail-open on parse errors (don't block legitimate work).
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 import subprocess
 import sys
+
+from hook_input import field, read_payload
 
 
 def _current_branch() -> str | None:
@@ -27,7 +28,9 @@ def _current_branch() -> str | None:
     try:
         result = subprocess.run(
             ["git", "branch", "--show-current"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
@@ -127,7 +130,9 @@ def _resolve_pr_number(cmd: str) -> str | None:
     try:
         result = subprocess.run(
             ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         resolved = result.stdout.strip()
         if result.returncode == 0 and resolved.isdigit():
@@ -142,7 +147,9 @@ def _check_mergeable(pr_num: str) -> str | None:
     try:
         result = subprocess.run(
             ["gh", "pr", "view", pr_num, "--json", "mergeable", "--jq", ".mergeable"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
@@ -194,7 +201,9 @@ def _inline_title(body: str) -> str:
 
 
 def _check_inline_review_findings(
-    pr_num: str, *, force: bool = False,
+    pr_num: str,
+    *,
+    force: bool = False,
 ) -> tuple[bool, str]:
     """Scan INLINE review comments for P1/P2 badge findings.
 
@@ -212,22 +221,21 @@ def _check_inline_review_findings(
         # compact JSON object per line across ALL pages.
         result = subprocess.run(
             [
-                "gh", "api",
+                "gh",
+                "api",
                 f"repos/:owner/:repo/pulls/{pr_num}/comments",
                 "--paginate",
                 "--jq",
-                '.[] | {id: .id, reply_to: .in_reply_to_id, '
-                'login: .user.login, type: .user.type, body: .body}',
+                ".[] | {id: .id, reply_to: .in_reply_to_id, "
+                "login: .user.login, type: .user.type, body: .body}",
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if result.returncode != 0:
             return False, ""
-        raw = [
-            json.loads(line)
-            for line in result.stdout.splitlines()
-            if line.strip()
-        ]
+        raw = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     except Exception:
         return False, ""
 
@@ -276,8 +284,7 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
     """
     if force:
         print(
-            f"NOTE: Review gate override for PR #{pr_num}. "
-            "Findings acknowledged by session.",
+            f"NOTE: Review gate override for PR #{pr_num}. Findings acknowledged by session.",
             file=sys.stderr,
         )
         return False, ""
@@ -286,11 +293,15 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
         # Fetch comments as JSON array with author info
         result = subprocess.run(
             [
-                "gh", "api",
+                "gh",
+                "api",
                 f"repos/:owner/:repo/issues/{pr_num}/comments",
-                "--jq", '[.[] | {login: .user.login, type: .user.type, body: .body}]',
+                "--jq",
+                "[.[] | {login: .user.login, type: .user.type, body: .body}]",
             ],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if result.returncode != 0:
             return False, ""  # Fail-open on API error
@@ -311,8 +322,7 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
     # use `or ""` to coerce None to empty string (get's default only
     # fires when the key is absent, not when the value is None).
     comments: list[tuple[str, str, str]] = [
-        (c.get("login") or "", c.get("type") or "", c.get("body") or "")
-        for c in raw_comments
+        (c.get("login") or "", c.get("type") or "", c.get("body") or "") for c in raw_comments
     ]
 
     if not comments:
@@ -357,12 +367,7 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
 
 def main() -> int:
     try:
-        raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-        if not raw:
-            return 0
-
-        data = json.loads(raw)
-        cmd = data.get("command", "")
+        cmd = field(read_payload(), "command")
         if not cmd:
             return 0
 
@@ -397,8 +402,7 @@ def main() -> int:
         # ── gh pr create ───────────────────────────────────────────
         if "gh pr create" in cmd:
             print(
-                "BLOCKED: Creating a PR requires user approval before "
-                "publishing externally.",
+                "BLOCKED: Creating a PR requires user approval before publishing externally.",
                 file=sys.stderr,
             )
             print(
@@ -444,15 +448,13 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(
-                        "GitHub hasn't finished conflict analysis. "
-                        "Wait and retry.",
+                        "GitHub hasn't finished conflict analysis. Wait and retry.",
                         file=sys.stderr,
                     )
                     return 2
                 if mergeable == "CONFLICTING":
                     print(
-                        f"BLOCKED: PR #{pr_num} has merge conflicts. "
-                        "Resolve before merging.",
+                        f"BLOCKED: PR #{pr_num} has merge conflicts. Resolve before merging.",
                         file=sys.stderr,
                     )
                     return 2
@@ -460,7 +462,8 @@ def main() -> int:
                 # Check for unresolved review findings
                 force_override = bool(re.search(r"#\s*review-override\b", cmd))
                 should_block, review_msg = _check_pr_review_findings(
-                    pr_num, force=force_override,
+                    pr_num,
+                    force=force_override,
                 )
                 if should_block:
                     print(
@@ -473,12 +476,12 @@ def main() -> int:
                 # Inline review comments (Codex P1/P2 badges) — separate
                 # endpoint, separate check. P1 blocks; P2 warns.
                 should_block, inline_msg = _check_inline_review_findings(
-                    pr_num, force=force_override,
+                    pr_num,
+                    force=force_override,
                 )
                 if should_block:
                     print(
-                        f"BLOCKED: PR #{pr_num} has unresolved INLINE "
-                        f"review findings.",
+                        f"BLOCKED: PR #{pr_num} has unresolved INLINE review findings.",
                         file=sys.stderr,
                     )
                     print(inline_msg, file=sys.stderr)
@@ -486,7 +489,9 @@ def main() -> int:
 
         # ── sqlite3 write operations ────────────────────────────────
         if "sqlite3" in cmd and re.search(
-            r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b", cmd, re.IGNORECASE,
+            r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b",
+            cmd,
+            re.IGNORECASE,
         ):
             print(
                 "BLOCKED: Direct database writes via sqlite3 are not allowed. "
@@ -507,8 +512,7 @@ def main() -> int:
         # ── Process kill (soft warn) ──────────────────────────────
         if re.search(r"(?:^|\s|&&|;)\s*(?:kill|killall|pkill)\s", cmd):
             print(
-                "⚠️  STOP: Process kill detected. "
-                "Have you received explicit user approval?",
+                "⚠️  STOP: Process kill detected. Have you received explicit user approval?",
                 file=sys.stderr,
             )
 
@@ -518,11 +522,11 @@ def main() -> int:
             and not re.search(r"git config\s+(--get|--list|-l|--show)\b", cmd)
             and re.search(r"git config\s+[\w.-]+\s+\S", cmd)
         ):
-                print(
-                    "⚠️  STOP: git config modification detected. "
-                    "Have you received explicit user approval?",
-                    file=sys.stderr,
-                )
+            print(
+                "⚠️  STOP: git config modification detected. "
+                "Have you received explicit user approval?",
+                file=sys.stderr,
+            )
 
     except Exception:
         pass  # Fail-open on any error — never block legitimate work

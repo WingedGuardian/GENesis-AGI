@@ -193,8 +193,8 @@ class TestSubprocessEdgeCases:
         """Malformed stdin -> fail-open (exit 0)."""
         result = _run_subprocess("not json at all {{{{")
         assert result.returncode == 0
+        # Malformed (non-empty) payload is surfaced, not silently swallowed.
         assert "WARNING" in result.stderr
-        assert "parse failed" in result.stderr
 
     def test_empty_stdin_allows(self):
         """Empty string stdin -> fail-open (exit 0)."""
@@ -258,12 +258,8 @@ class TestMatchesFunction:
     def test_glob_star_deep_nesting(self):
         """src/genesis/channels/** matches deeply nested files."""
         patterns = ["src/genesis/channels/**"]
-        assert _matches(
-            "src/genesis/channels/telegram/handlers.py", patterns
-        ) is not None
-        assert _matches(
-            "src/genesis/channels/a/b/c/d.py", patterns
-        ) is not None
+        assert _matches("src/genesis/channels/telegram/handlers.py", patterns) is not None
+        assert _matches("src/genesis/channels/a/b/c/d.py", patterns) is not None
 
     def test_glob_star_no_match_sibling(self):
         """src/genesis/channels/** does NOT match src/genesis/runtime.py."""
@@ -291,9 +287,7 @@ class TestMatchesFunction:
     def test_backslash_normalization(self):
         r"""Backslashes in path get normalized to forward slashes."""
         patterns = ["src/genesis/channels/**"]
-        assert _matches(
-            "src\\genesis\\channels\\telegram\\handler.py", patterns
-        ) is not None
+        assert _matches("src\\genesis\\channels\\telegram\\handler.py", patterns) is not None
 
     def test_backslash_normalization_exact(self):
         r"""Backslash in exact match."""
@@ -320,9 +314,10 @@ class TestMatchesFunction:
         assert _matches("scripts/systemd/genesis-watchdog.service.template", patterns) is not None
         assert _matches("scripts/systemd/genesis-watchdog.timer.template", patterns) is not None
         assert _matches("scripts/systemd/genesis-server.service.template", patterns) is not None
-        assert _matches(
-            "scripts/systemd/genesis-watchdog.service.template", ["*.service", "*.timer"]
-        ) is None
+        assert (
+            _matches("scripts/systemd/genesis-watchdog.service.template", ["*.service", "*.timer"])
+            is None
+        )
 
 
 # ===================================================================
@@ -385,13 +380,15 @@ class TestLoadCriticalPatterns:
     def test_custom_config(self, tmp_path):
         """Verify loading from a custom config with known patterns."""
         custom = tmp_path / "custom.yaml"
-        custom.write_text(textwrap.dedent("""\
+        custom.write_text(
+            textwrap.dedent("""\
             critical:
               - pattern: "my/custom/path.py"
                 reason: "test"
               - pattern: "other/*.txt"
                 reason: "test2"
-        """))
+        """)
+        )
         with patch.object(_mod, "_CONFIG_PATH", custom):
             patterns = _load_critical_patterns()
         assert patterns == ["my/custom/path.py", "other/*.txt"]
@@ -469,9 +466,10 @@ class TestSubprocessFallback:
     def wrapper_script(self, tmp_path):
         """Create a wrapper script that runs pretool_check with a bad config path."""
         wrapper = tmp_path / "wrapper.py"
-        wrapper.write_text(textwrap.dedent(f"""\
+        wrapper.write_text(
+            textwrap.dedent(f"""\
             import sys
-            sys.path.insert(0, "{_WORKTREE / 'scripts'}")
+            sys.path.insert(0, "{_WORKTREE / "scripts"}")
             import importlib.util
             from pathlib import Path
 
@@ -482,10 +480,11 @@ class TestSubprocessFallback:
             spec.loader.exec_module(mod)
 
             # Override config path to a nonexistent file
-            mod._CONFIG_PATH = Path("{tmp_path / 'nonexistent.yaml'}")
+            mod._CONFIG_PATH = Path("{tmp_path / "nonexistent.yaml"}")
 
             sys.exit(mod.main())
-        """))
+        """)
+        )
         return wrapper
 
     def test_fallback_blocks_secrets_env(self, wrapper_script):
@@ -624,9 +623,7 @@ class TestConfigCompleteness:
             "config/resilience.yaml",
         ]
         for pat in sensitive_examples:
-            assert pat not in patterns, (
-                f"Sensitive pattern {pat!r} should not be in critical list"
-            )
+            assert pat not in patterns, f"Sensitive pattern {pat!r} should not be in critical list"
 
 
 # ===================================================================
@@ -682,28 +679,32 @@ class TestBoundaryRegressions:
     def test_json_with_extra_fields_still_works(self):
         """JSON payload with extra fields beyond file_path still works."""
         result = _run_subprocess(
-            json.dumps({
-                "file_path": "config/autonomy.yaml",
-                "old_string": "foo",
-                "new_string": "bar",
-            })
+            json.dumps(
+                {
+                    "file_path": "config/autonomy.yaml",
+                    "old_string": "foo",
+                    "new_string": "bar",
+                }
+            )
         )
         assert result.returncode == 2
 
     def test_json_array_fails_open(self):
-        """JSON array instead of object — .get() would fail → fail-open."""
-        # json.loads('[]') succeeds but [].get() → AttributeError
-        # This is NOT caught by JSONDecodeError handler.
-        # It would be an unhandled exception → non-zero exit.
-        # Let's test actual behavior.
+        """JSON array instead of object → fail-open cleanly (exit 0), never crash.
+
+        The shared hook_input helper coerces any non-dict payload to {}, so a
+        malformed array is treated as "no file_path" and allowed, rather than
+        raising an unhandled AttributeError.
+        """
         result = _run_subprocess(json.dumps(["not", "an", "object"]))
-        # list doesn't have .get() → AttributeError → unhandled → exit 1
-        assert result.returncode != 0
+        assert result.returncode == 0
 
     def test_numeric_file_path_fails_gracefully(self):
-        """Numeric file_path — str operations should still work or fail-open."""
-        # data.get("file_path", "") returns an int → `not file_path` is False
-        # for nonzero int → _matches gets an int → .replace() fails
+        """Non-string file_path → fail-open cleanly (exit 0), never crash.
+
+        hook_input.field() returns "" for a non-string value, so a numeric
+        file_path is treated as absent and allowed rather than crashing on a
+        str-only operation.
+        """
         result = _run_subprocess(json.dumps({"file_path": 12345}))
-        # int doesn't have .replace() → AttributeError → unhandled → exit 1
-        assert result.returncode != 0
+        assert result.returncode == 0

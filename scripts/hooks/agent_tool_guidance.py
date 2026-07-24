@@ -17,6 +17,8 @@ import re
 import sys
 import tempfile
 
+from hook_input import field, read_payload, session_id
+
 _SENTINEL_PREFIX = "genesis_agent_guidance_"
 
 # Keywords that suggest the agent will need web or code discovery tools
@@ -27,24 +29,20 @@ _RESEARCH_KEYWORDS = re.compile(
 )
 
 
-def _session_sentinel_path() -> str:
-    session_id = os.environ.get("CLAUDE_SESSION_ID", "unknown")
-    return os.path.join(tempfile.gettempdir(), f"{_SENTINEL_PREFIX}{session_id}")
+def _session_sentinel_path(sid: str) -> str:
+    return os.path.join(tempfile.gettempdir(), f"{_SENTINEL_PREFIX}{sid}")
 
 
 def main() -> int:
+    payload = read_payload()
+
     # Only nudge once per session
-    sentinel = _session_sentinel_path()
+    sentinel = _session_sentinel_path(session_id(payload))
     if os.path.exists(sentinel):
         return 0
 
     try:
-        raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-        if not raw:
-            return 0
-
-        data = json.loads(raw)
-        prompt = data.get("prompt", "")
+        prompt = field(payload, "prompt")
 
         # Only nudge for research/exploration-type prompts
         if not _RESEARCH_KEYWORDS.search(prompt):

@@ -15,24 +15,26 @@ import os
 import sys
 import tempfile
 
+from hook_input import read_payload, session_id
+
 _SENTINEL_PREFIX = "genesis_web_nudge_"
 
 
-def _session_sentinel_path() -> str:
+def _session_sentinel_path(sid: str) -> str:
     """Path to a sentinel file that tracks whether we've nudged this session."""
-    session_id = os.environ.get("CLAUDE_SESSION_ID", "unknown")
-    return os.path.join(tempfile.gettempdir(), f"{_SENTINEL_PREFIX}{session_id}")
+    return os.path.join(tempfile.gettempdir(), f"{_SENTINEL_PREFIX}{sid}")
 
 
 def main() -> int:
+    payload = read_payload()
+
     # Only nudge once per session
-    sentinel = _session_sentinel_path()
+    sentinel = _session_sentinel_path(session_id(payload))
     if os.path.exists(sentinel):
         return 0
 
     try:
-        raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-        if not raw:
+        if not payload:
             return 0
 
         # Create sentinel — we've nudged

@@ -17,9 +17,7 @@ def _load_settings() -> dict:
         candidate = ancestor / ".claude" / "settings.json"
         if candidate.exists():
             return json.loads(candidate.read_text())
-    raise FileNotFoundError(
-        "Could not find .claude/settings.json in any parent directory"
-    )
+    raise FileNotFoundError("Could not find .claude/settings.json in any parent directory")
 
 
 def _find_hook_command(settings: dict, matcher: str) -> str:
@@ -36,9 +34,7 @@ def _find_hook_command(settings: dict, matcher: str) -> str:
                     cmd = hook["command"]
                     # Inline hooks start with "bash -c"; external scripts don't.
                     return cmd
-    raise ValueError(
-        f"No hook command found for matcher '{matcher}' in settings.json"
-    )
+    raise ValueError(f"No hook command found for matcher '{matcher}' in settings.json")
 
 
 @pytest.fixture(scope="session")
@@ -77,27 +73,32 @@ def webfetch_hook_command(settings: dict) -> str:
     return _find_hook_command(settings, "WebFetch")
 
 
-def run_hook(hook_command: str, tool_input: dict) -> subprocess.CompletedProcess:
-    """Run an inline hook command with CLAUDE_TOOL_INPUT set.
+def run_hook(
+    hook_command: str, tool_input: dict, *, tool_name: str = "Bash"
+) -> subprocess.CompletedProcess:
+    """Run an inline hook command with the real CC payload on stdin.
 
-    Mirrors how Claude Code invokes PreToolUse hooks: it sets the
-    CLAUDE_TOOL_INPUT env var to the JSON-serialized tool input, then
-    runs the hook command via the shell.
+    Mirrors how current Claude Code invokes PreToolUse hooks: the full payload
+    (``{"tool_name": ..., "tool_input": {...}}``) is delivered as JSON on
+    **stdin**, NOT via a ``CLAUDE_TOOL_INPUT`` env var (which CC no longer sets).
+    The legacy env var is scrubbed so a stray value can't mask a regression.
 
     Args:
         hook_command: The full "bash -c '...'" command from settings.json.
-        tool_input: Dict to serialize as JSON into CLAUDE_TOOL_INPUT env var.
+        tool_input: The tool-input dict (nested under ``tool_input`` in the payload).
+        tool_name: The tool name for the payload envelope (default "Bash").
 
     Returns:
         CompletedProcess with returncode, stdout, stderr.
     """
-    env = {
-        **os.environ,
-        "CLAUDE_TOOL_INPUT": json.dumps(tool_input),
-    }
+    payload = json.dumps(
+        {"hook_event_name": "PreToolUse", "tool_name": tool_name, "tool_input": tool_input}
+    )
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
     result = subprocess.run(
         hook_command,
         shell=True,
+        input=payload,
         env=env,
         capture_output=True,
         text=True,

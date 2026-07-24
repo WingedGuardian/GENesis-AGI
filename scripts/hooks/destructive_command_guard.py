@@ -27,6 +27,8 @@ import re
 import shlex
 import sys
 
+from hook_input import field, read_payload
+
 # Legacy single-token pattern — kept as the fallback when shlex cannot
 # tokenize the command (unmatched quotes etc.).
 _RM_RF_PATTERN = re.compile(
@@ -120,12 +122,7 @@ def _rm_violations(cmd: str) -> list[str] | None:
 
 def main() -> int:
     try:
-        raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-        if not raw:
-            return 0
-
-        data = json.loads(raw)
-        cmd = data.get("command", "")
+        cmd = field(read_payload(), "command")
         if not cmd or "rm" not in cmd:
             return 0
 
@@ -136,8 +133,7 @@ def main() -> int:
             if not _RM_RF_PATTERN.search(cmd):
                 return 0
             violations = [
-                "recursive+force rm inside an unparseable command — "
-                "blocked conservatively."
+                "recursive+force rm inside an unparseable command — blocked conservatively."
             ]
 
         if violations:
