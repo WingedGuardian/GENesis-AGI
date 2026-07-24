@@ -42,7 +42,7 @@ def _is_non_actionable_infra_event(subsystem: str, event_type: str) -> bool:
     return subsystem in ("routing", "providers") and event_type == "all_exhausted"
 
 
-_REFLEX_OWNED_EVENT_TYPES = frozenset({"task.failed"})
+_REFLEX_OWNED_EVENT_TYPES = frozenset({"task.failed", "job.failed"})
 
 
 def _is_reflex_owned_event(event_type: str) -> bool:
@@ -50,12 +50,15 @@ def _is_reflex_owned_event(event_type: str) -> bool:
 
     ``task.failed`` was dark until the reflex arc installed the default event
     bus (util/tasks.py) — the ego never reacted to it historically because
-    the events were never emitted. Reflex is the designed consumer: it
-    fingerprints recurrences into one signal and cards the user. A reactive
-    ego cycle per failure would re-run the event-burst storm mode (see the
-    push_reactive_event note in ego/cadence.py) with a message-keyed dedup
-    that variable exception payloads bypass. Module-level so it is
-    unit-testable.
+    the events were never emitted. ``job.failed`` is the same shape from the
+    other direction: the funnel in ``runtime/_job_health.record_job_failure``
+    now emits it for exception-driven background-job failures (the largest
+    class of internal defects, previously invisible to the bus). Both belong to
+    the reflex arc, which fingerprints recurrences into one signal and cards
+    the user. A reactive ego cycle per failure would re-run the event-burst
+    storm mode (see the push_reactive_event note in ego/cadence.py) with a
+    message-keyed dedup that variable exception payloads bypass. Module-level so
+    it is unit-testable.
     """
     return event_type in _REFLEX_OWNED_EVENT_TYPES
 
