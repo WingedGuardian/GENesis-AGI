@@ -1,6 +1,6 @@
 """Registration coverage for the genesis.db drip-table retention jobs (D3).
 
-Locks that ``_wire_drip_retention_jobs`` actually registers all three prune jobs — if an
+Locks that ``_wire_drip_retention_jobs`` actually registers every prune job — if an
 ``add_job`` call were dropped or a job id changed, this fails (the crud prunes themselves
 are covered separately). Uses a real AsyncIOScheduler + a stub runtime; no full runtime init.
 """
@@ -21,6 +21,7 @@ _EXPECTED = (
     "alert_events_prune",
     "deferred_work_prune",
     "graduation_events_prune",
+    "events_prune",
     "voice_hygiene",
 )
 

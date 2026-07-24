@@ -614,7 +614,11 @@ verified: 302066ad 2026-07-23
   failure on streak onset + hourly heartbeat — so a stuck sub-hourly poll costs
   ~24 rows/day. `duration_ms` is honest-or-NULL (only from an explicit
   `record_job_start` marker; never derived from `last_run`). 90-day prune via
-  `_wire_drip_retention_jobs`. **Failure payloads (2026-07-23):** the three
+  `_wire_drip_retention_jobs` — which (2026-07-24) also prunes the observability
+  `events` bus table itself (`events_prune`, the last high-volume table with no
+  retention: 45k+ rows / ~108d). `crud.events.prune` takes an ISO cutoff, not
+  `days=`; the DELETE's lexical `timestamp < cutoff` is chronological because
+  every `events.timestamp` is a UTC isoformat. **Failure payloads (2026-07-23):** the three
   scheduler emitters (reflection, outreach, surplus) thread the exception into
   `observability/failure_details.py`, which sets `error_type` **IFF** a real
   exception caused the failure — a semantic failure (external blocker, e.g. a

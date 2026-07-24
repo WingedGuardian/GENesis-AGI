@@ -191,6 +191,38 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         misfire_grace_time=3600,
     )
 
+    async def _prune_events() -> None:
+        # The observability event bus is the ONLY high-volume table with no
+        # retention (45k+ rows / ~108d, growing ~12x month-over-month). Unlike
+        # the sibling prunes, crud.events.prune takes an ISO cutoff, not days=;
+        # every events.timestamp is stored as UTC isoformat (…+00:00), so the
+        # DELETE's lexical `timestamp < cutoff` is a correct chronological
+        # comparison. Consumers only ever read recent rows (ORDER BY timestamp
+        # DESC LIMIT), so a 90-day window breaks nothing.
+        if rt._db is None:
+            return
+        try:
+            from datetime import timedelta
+
+            from genesis.db.crud import events as _ev
+
+            cutoff = (datetime.now(UTC) - timedelta(days=90)).isoformat()
+            removed = await _ev.prune(rt._db, older_than=cutoff)
+            rt.record_job_success("events_prune")
+            if removed:
+                logger.info("events prune: removed %d rows (>90d)", removed)
+        except Exception as exc:
+            rt.record_job_failure("events_prune", exc=exc)
+            logger.exception("events prune failed")
+
+    scheduler.add_job(
+        _prune_events,
+        CronTrigger(hour=5, minute=50, timezone=user_timezone()),
+        id="events_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
     async def _voice_hygiene() -> None:
         # Three observable-state duties (channels/voice/hygiene.py):
         # transcript files past the 1-year retention, legacy one-blob voice
