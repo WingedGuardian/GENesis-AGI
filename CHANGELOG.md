@@ -97,6 +97,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   intended, with a regression test that feeds each guard a real payload so a
   future Claude Code change can't quietly disable them again.
 
+- **Those revived guardrails no longer block harmless commands.** With the guards
+  working again, two pre-existing over-eager checks surfaced: the `rm -rf` guard
+  mis-read the *rest* of a command — a `2>/dev/null`, a `> log`, or a second line
+  — as if it were another path to delete, so a perfectly safe deep-path cleanup
+  got blocked; and the "don't pipe a backgrounded command" check counted a
+  logical-OR (`a || b`) as a pipe and blocked it too. Both now parse the shell
+  correctly, so legitimate commands go through while genuinely dangerous ones
+  (`rm -rf /` with or without a redirect, a real pipe in the background) are still
+  stopped — covered by regression tests for each construct.
+
 - **When a scheduled job fails, Genesis now records what actually went wrong.**
   Job failures were logged with only the job's name and whatever text the error
   happened to carry — and for the most common failures that text was *empty*, so

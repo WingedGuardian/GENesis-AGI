@@ -332,6 +332,192 @@ class TestBashHookRmRf:
         )
         assert result.returncode == 0
 
+    # -- Regression: shell metacharacters (redirections, newlines, line
+    # -- continuations) were parsed as rm operands and spuriously blocked a
+    # -- SAFE deep path, once #1227 revived the guard (found live 2026-07-24).
+    # -- The fix must never let a dangerous rm through, so each 'allow' case is
+    # -- paired with the dangerous variant that must still block.
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "rm -rf /home/u/proj/node_modules 2>/dev/null",  # stderr redirect
+            "rm -rf /a/b/c/d >log 2>&1",  # stdout redirect + fd dup
+            "rm -rf /a/b/c/d 2>>errors.log",  # append redirect
+            "rm -rf /a/b/c/d &>/dev/null",  # both-streams redirect
+            "rm -rf /a/b/c/d <input",  # input redirect (glued)
+        ],
+    )
+    def test_rm_rf_redirect_deep_path_allowed(self, rm_rf_hook_command: str, cmd: str) -> None:
+        """A glued redirect after a safe deep path must not be read as a target."""
+        result = run_hook(rm_rf_hook_command, {"command": cmd})
+        assert result.returncode == 0, f"redirect false-positive: {cmd!r}\n{result.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "rm -rf / 2>/dev/null",  # dangerous target, redirect stripped
+            "rm -rf ~ >log",
+            "rm -rf ../../../etc 2>/dev/null",  # upward traversal + redirect
+        ],
+    )
+    def test_rm_rf_dangerous_with_redirect_still_blocked(
+        self, rm_rf_hook_command: str, cmd: str
+    ) -> None:
+        """Stripping the redirect must not weaken the block on a real target."""
+        result = run_hook(rm_rf_hook_command, {"command": cmd})
+        assert result.returncode == 2, f"redirect strip weakened block: {cmd!r}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            'rm -r -f "a\\">"',  # backslash-escaped quote inside "..." (shlex: a">)
+            'rm --recursive --force "a\\">"',  # same, long flags
+            'rm -Rf "a>b"',  # operand does NOT start with a redirect op
+        ],
+    )
+    def test_rm_rf_non_redirect_shaped_operand_still_blocked(
+        self, rm_rf_hook_command: str, cmd: str
+    ) -> None:
+        """An operand that merely CONTAINS a redirect char but does not START with
+        one (e.g. shlex resolves `"a\\">"` to `a">`) is a normal path and is still
+        depth-checked and blocked.
+
+        Regression: earlier fixes hand-rolled a pre-shlex redirect parser that
+        diverged from shlex's quote/escape rules across three review rounds
+        (2026-07-24), each a bypass. The final design delegates ALL quoting to
+        shlex and skips a token only when it *starts with* a redirect operator."""
+        result = run_hook(rm_rf_hook_command, {"command": cmd})
+        assert result.returncode == 2, f"non-redirect-shaped operand allowed: {cmd!r}"
+
+    def test_rm_rf_redirect_then_real_target_still_blocked(self, rm_rf_hook_command: str) -> None:
+        """CRITICAL: skipping a redirect-shaped token must NEVER skip the FOLLOWING
+        token — `rm -rf ">" /etc` must still depth-check and block `/etc`."""
+        result = run_hook(rm_rf_hook_command, {"command": 'rm -rf ">" /etc'})
+        assert result.returncode == 2
+
+    def test_rm_rf_digit_glued_background_second_rm_blocked(self, rm_rf_hook_command: str) -> None:
+        """A background `&` glued to a digit-ending word must still split, so a
+        second `rm -rf /` after it is caught (not swallowed as one glued token).
+
+        The separator lookbehind is `(?<![<>])` (no `\\d`): a bare digit before
+        `&` is never part of a redirection, so the `&` is correctly spaced."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf /a/b/c/d5&rm -rf /"})
+        assert result.returncode == 2
+
+    def test_rm_rf_redirect_target_deep_allowed(self, rm_rf_hook_command: str) -> None:
+        """A quoted redirect TARGET glued to the operator after a safe deep path
+        is still recognized as a redirect and skipped."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": 'rm -rf /home/u/proj/build >"my file"'},
+        )
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize(
+        "cmd", ['rm -rf ">log"', 'rm -r -f ">"', 'rm -rf ">etc"', 'rm -rf "<in"']
+    )
+    def test_rm_rf_redirect_shaped_filename_allowed(
+        self, rm_rf_hook_command: str, cmd: str
+    ) -> None:
+        """DESIGN (user decision 2026-07-24, "simple + catastrophe-safe"): shlex
+        erases the quoted/unquoted distinction, so a token that STARTS WITH a
+        redirect operator is uniformly treated as a redirect and skipped — even a
+        quoted file literally named `>etc`/`>`. This is deliberately accepted:
+        such a token starts with `<`/`>`/`&>`, which no catastrophic target
+        (`. .. / ~ *` or any real path) ever does, so nothing dangerous is
+        missed; and blocking these would re-break the real `rm -rf /deep >log`
+        false-positive. See _REDIR_TOKEN's safety proof in the guard."""
+        result = run_hook(rm_rf_hook_command, {"command": cmd})
+        assert result.returncode == 0, result.stderr
+
+    def test_rm_rf_newline_separated_deep_allowed(self, rm_rf_hook_command: str) -> None:
+        """A follow-on command after a newline must not fold into rm's operands.
+
+        shlex drops a bare newline as whitespace, so before the fix `echo done`
+        was depth-checked as a shallow rm target."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm -rf /home/u/proj/build\necho done"},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_rm_rf_line_continuation_deep_allowed(self, rm_rf_hook_command: str) -> None:
+        r"""A `\`-newline continuation inside one rm invocation stays one path."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm -rf \\\n/home/u/proj/build"},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_rm_rf_background_deep_allowed(self, rm_rf_hook_command: str) -> None:
+        """A trailing `&` (background) must not be read as an rm target."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf /a/b/c/d &"})
+        assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Bash hook: piped background command (empty-output trap)
+# ---------------------------------------------------------------------------
+
+
+class TestBashHookBackgroundPipe:
+    """Block a real pipe in a run_in_background command (produces empty output).
+
+    Regression: the check was `grep -qF "|"`, which also matched the `|` inside
+    a logical-OR `||` — so a backgrounded `a || b` was falsely blocked once
+    #1227 revived the guard. The fix strips `||` before testing for a pipe.
+    """
+
+    def test_logical_or_background_allowed(self, bash_hook_command: str) -> None:
+        """`grep ... || echo` with run_in_background=true -> allowed (no pipe)."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "grep -q foo file || echo none", "run_in_background": True},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_logical_or_foreground_allowed(self, bash_hook_command: str) -> None:
+        """`a || b` foreground -> allowed (the guard only fires on background)."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "a || b", "run_in_background": False},
+        )
+        assert result.returncode == 0
+
+    def test_real_pipe_background_blocked(self, bash_hook_command: str) -> None:
+        """A genuine pipe with run_in_background=true -> BLOCKED (empty output)."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "cat x | grep y", "run_in_background": True},
+        )
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
+
+    def test_pipe_both_streams_background_blocked(self, bash_hook_command: str) -> None:
+        """`|&` (pipe stdout+stderr) with run_in_background=true -> BLOCKED."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "make |& tee log", "run_in_background": True},
+        )
+        assert result.returncode == 2
+
+    def test_logical_or_then_pipe_background_blocked(self, bash_hook_command: str) -> None:
+        """`a || b | c` background -> BLOCKED (a real pipe survives the || strip)."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "a || b | c", "run_in_background": True},
+        )
+        assert result.returncode == 2
+
+    def test_real_pipe_foreground_allowed(self, bash_hook_command: str) -> None:
+        """A pipe in the FOREGROUND is fine — the trap is background-only."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "cat x | grep y", "run_in_background": False},
+        )
+        assert result.returncode == 0
+
 
 # ---------------------------------------------------------------------------
 # Bash hook: git push --force / -f

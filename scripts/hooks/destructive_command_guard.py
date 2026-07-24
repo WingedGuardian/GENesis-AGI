@@ -46,6 +46,34 @@ _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 # string. Tokens matching these end an rm invocation's argument list.
 _SEPARATORS = {"|", "||", "&&", ";", "&", "\n"}
 
+# A redirection-shaped rm-operand token to SKIP: one that starts with a
+# redirection operator — optional fd digits then `<`/`>` (`>`, `>log`,
+# `2>/dev/null`, `2>&1`), or `&>` (`&>/dev/null`). Used with .match(), so it is
+# anchored at the start and the WHOLE token is skipped. These are not rm targets;
+# left in the operand list they are depth-checked as bogus shallow paths
+# (`2>/dev/null` → depth 3 → spurious block).
+#
+# DESIGN (user decision 2026-07-24, "simple + catastrophe-safe" — see the code
+# review saga in this file's git history): shlex erases the quoted/unquoted
+# distinction (a file literally named `>` and a real redirect both tokenize to
+# `>`), so redirect-shaped tokens are treated UNIFORMLY as redirects and skipped.
+# The tradeoff is that a bizarrely-named file starting with `<`/`>` (e.g.
+# `rm -rf ">etc"`) is allowed — deliberately accepted, because:
+#   SAFETY PROOF — a skipped token always starts with `<`, `>`, or `&>` (or fd
+#   digits then `<`/`>`). The always-block targets (`. .. / ~ *`) and every real
+#   filesystem path never start that way, so skipping can NEVER drop a genuinely
+#   dangerous target. And the guard never skips a token *following* a redirect,
+#   so `rm -rf ">" /etc` still depth-checks and blocks `/etc`. All quote/escape
+#   handling is left to shlex — no second, divergent parser (three such
+#   divergences were bypasses across three review rounds, 2026-07-24).
+_REDIR_TOKEN = re.compile(r"\d*[<>]|&>")
+
+# A separator that ends an rm invocation's argument list, spaced into a
+# standalone token below so shlex splits it. A lone `&` is spaced (background /
+# new command) EXCEPT when it is part of a redirection: preceded by `<`/`>`
+# (`2>&1`, `>&2`) or followed by `>` (`&>`). (`&&` is matched as a unit first.)
+_SEPARATOR_SPACING = re.compile(r"(\|\||&&|[|;]|(?<![<>])&(?!>))")
+
 
 def _check_target(target: str) -> str | None:
     """Reason string if *target* is too broad to rm recursively."""
@@ -70,8 +98,17 @@ def _check_target(target: str) -> str | None:
 
 def _rm_violations(cmd: str) -> list[str] | None:
     """Reasons to block, or None when the command cannot be tokenized."""
-    # Make separators standalone tokens so `rm -rf x; other` parses.
-    spaced = re.sub(r"(\|\||&&|[|;&\n])", r" \1 ", cmd)
+    # Line-continuations and bare newlines must be handled BEFORE shlex, which
+    # drops a bare newline as whitespace (so a following command would fold into
+    # the first rm's operands). These replacements only ever insert spaces/`;`,
+    # never quote or escape characters, so they cannot corrupt shlex's quote
+    # balance. Redirections are NOT stripped here — they are recognized at the
+    # token level after shlex (see _REDIR_TOKEN), so shlex stays the sole
+    # authority on quoting/escaping.
+    cmd = cmd.replace("\\\n", " ").replace("\n", " ; ")
+    # Space glued command separators (`x;y`, `a&&b`) into standalone tokens so
+    # the operand loop stops at them; a redirection `&` is preserved.
+    spaced = _SEPARATOR_SPACING.sub(r" \1 ", cmd)
     try:
         tokens = shlex.split(spaced)
     except ValueError:
@@ -111,6 +148,13 @@ def _rm_violations(cmd: str) -> list[str] | None:
                     recursive = True
                 if "f" in arg[1:]:
                     force = True
+                continue
+            # A glued redirection token (`2>/dev/null`, `>log`, `2>&1`) is not
+            # an rm operand — skip it rather than depth-check it. See _REDIR_TOKEN
+            # for the safety argument (a match always starts with an operator
+            # char no dangerous target contains, and the following token is
+            # never skipped).
+            if _REDIR_TOKEN.match(arg):
                 continue
             operands.append(arg)
 
