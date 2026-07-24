@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **When a background job fails, Genesis now records what actually broke.** The
+  scheduled jobs that quietly keep Genesis healthy — pruning, sweeps, harvests,
+  reconnaissance — used to log a failure with the details thrown away, leaving a
+  blank error behind. They now capture the real exception type and a compact
+  traceback, so a recurring internal bug becomes diagnosable instead of
+  invisible. The same failures are now surfaced onto Genesis's internal event
+  stream, laying the groundwork for it to detect and eventually help fix its own
+  bugs — kept deliberately dormant for now (it observes, it does not act).
 - **An interrupted request no longer vanishes silently.** If a message you sent
   on Telegram was cut off before Genesis finished answering — a crash, a
   restart, or the session going dark mid-turn — Genesis now notices the

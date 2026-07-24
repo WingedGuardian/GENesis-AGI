@@ -304,9 +304,22 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         record_job_success(self, job_name)
 
     def record_job_failure(
-        self, job_name: str, error: str, *, error_type: str | None = None
+        self,
+        job_name: str,
+        error: str | None = None,
+        *,
+        exc: BaseException | None = None,
+        error_type: str | None = None,
+        emit_event: bool = True,
     ) -> None:
-        record_job_failure(self, job_name, error, error_type=error_type)
+        record_job_failure(
+            self,
+            job_name,
+            error,
+            exc=exc,
+            error_type=error_type,
+            emit_event=emit_event,
+        )
 
     async def _load_persisted_job_health(self) -> None:
         # Thin wrapper: preserves the class-level patch surface for tests

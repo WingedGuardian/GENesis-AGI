@@ -393,7 +393,7 @@ async def init(rt: GenesisRuntime) -> None:
                     rt.record_job_success("extraction_calibration")
                 except Exception as exc:
                     logger.exception("Extraction calibration failed")
-                    rt.record_job_failure("extraction_calibration", str(exc))
+                    rt.record_job_failure("extraction_calibration", exc=exc)
 
             rt._surplus_scheduler._scheduler.add_job(
                 _calibration_job,

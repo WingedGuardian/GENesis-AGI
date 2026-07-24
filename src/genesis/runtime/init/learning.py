@@ -42,7 +42,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("execution_traces prune: removed %d rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("execution_traces_prune", str(exc))
+            rt.record_job_failure("execution_traces_prune", exc=exc)
             logger.exception("execution_traces prune failed")
 
     scheduler.add_job(
@@ -64,7 +64,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("cost_events prune: removed %d rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("cost_events_prune", str(exc))
+            rt.record_job_failure("cost_events_prune", exc=exc)
             logger.exception("cost_events prune failed")
 
     scheduler.add_job(
@@ -86,7 +86,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("file_modifications prune: removed %d rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("file_modifications_prune", str(exc))
+            rt.record_job_failure("file_modifications_prune", exc=exc)
             logger.exception("file_modifications prune failed")
 
     scheduler.add_job(
@@ -108,7 +108,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("job_run_events prune: removed %d rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("job_run_events_prune", str(exc))
+            rt.record_job_failure("job_run_events_prune", exc=exc)
             logger.exception("job_run_events prune failed")
 
     scheduler.add_job(
@@ -130,7 +130,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("alert_events prune: removed %d resolved rows (>90d)", removed)
         except Exception as exc:
-            rt.record_job_failure("alert_events_prune", str(exc))
+            rt.record_job_failure("alert_events_prune", exc=exc)
             logger.exception("alert_events prune failed")
 
     scheduler.add_job(
@@ -155,7 +155,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             if removed:
                 logger.info("deferred_work prune: removed %d terminal rows (>45d)", removed)
         except Exception as exc:
-            rt.record_job_failure("deferred_work_prune", str(exc))
+            rt.record_job_failure("deferred_work_prune", exc=exc)
             logger.exception("deferred_work prune failed")
 
     scheduler.add_job(
@@ -180,7 +180,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
                     removed,
                 )
         except Exception as exc:
-            rt.record_job_failure("graduation_events_prune", str(exc))
+            rt.record_job_failure("graduation_events_prune", exc=exc)
             logger.exception("graduation_events prune failed")
 
     scheduler.add_job(
@@ -225,7 +225,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
                     healed,
                 )
         except Exception as exc:
-            rt.record_job_failure("voice_hygiene", str(exc))
+            rt.record_job_failure("voice_hygiene", exc=exc)
             logger.exception("voice hygiene failed")
 
     scheduler.add_job(
@@ -408,7 +408,7 @@ async def init(rt: GenesisRuntime) -> None:
                 else:
                     rt.record_job_success("triage_calibration_daily")
             except Exception as exc:
-                rt.record_job_failure("triage_calibration_daily", str(exc))
+                rt.record_job_failure("triage_calibration_daily", exc=exc)
                 raise
 
         rt._learning_scheduler.add_job(
@@ -441,7 +441,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if n:
                     logger.info("Email gate drain resolved %d held send(s)", n)
             except Exception as exc:
-                rt.record_job_failure("email_gate_drain", str(exc))
+                rt.record_job_failure("email_gate_drain", exc=exc)
                 raise
 
         rt._learning_scheduler.add_job(
@@ -480,7 +480,7 @@ async def init(rt: GenesisRuntime) -> None:
                         ", ".join(decayed),
                     )
             except Exception as exc:
-                rt.record_job_failure("capability_decay_sweep", str(exc))
+                rt.record_job_failure("capability_decay_sweep", exc=exc)
                 raise
 
         rt._learning_scheduler.add_job(
@@ -547,7 +547,7 @@ async def init(rt: GenesisRuntime) -> None:
                     )
                 rt.record_job_success("auto_memory_harvest")
             except Exception as exc:
-                rt.record_job_failure("auto_memory_harvest", str(exc))
+                rt.record_job_failure("auto_memory_harvest", exc=exc)
                 logger.exception("Auto-memory harvest failed")
 
         rt._learning_scheduler.add_job(
@@ -570,7 +570,7 @@ async def init(rt: GenesisRuntime) -> None:
                         stale,
                     )
             except Exception as exc:
-                rt.record_job_failure("observation_expiry_sweep", str(exc))
+                rt.record_job_failure("observation_expiry_sweep", exc=exc)
                 logger.exception("Observation expiry sweep failed")
 
         rt._learning_scheduler.add_job(
@@ -593,7 +593,7 @@ async def init(rt: GenesisRuntime) -> None:
                         count,
                     )
             except Exception as exc:
-                rt.record_job_failure("follow_up_retention_sweep", str(exc))
+                rt.record_job_failure("follow_up_retention_sweep", exc=exc)
                 logger.exception("Follow-up retention sweep failed")
 
         rt._learning_scheduler.add_job(
@@ -629,7 +629,7 @@ async def init(rt: GenesisRuntime) -> None:
                         decayed,
                     )
             except Exception as exc:
-                rt.record_job_failure("inbox_marker_decay", str(exc))
+                rt.record_job_failure("inbox_marker_decay", exc=exc)
                 logger.exception("Inbox marker decay sweep failed")
 
         rt._learning_scheduler.add_job(
@@ -652,8 +652,8 @@ async def init(rt: GenesisRuntime) -> None:
                             report.embeddings_recovered,
                             report.items_pending,
                         )
-                except Exception:
-                    rt.record_job_failure("recovery_orchestrator", "recovery failed")
+                except Exception as exc:
+                    rt.record_job_failure("recovery_orchestrator", "recovery failed", exc=exc)
                     logger.exception("Recovery orchestrator failed")
 
         rt._learning_scheduler.add_job(
@@ -669,8 +669,8 @@ async def init(rt: GenesisRuntime) -> None:
                 try:
                     await rt._health_data.validate_api_keys()
                     rt.record_job_success("api_key_validation")
-                except Exception:
-                    rt.record_job_failure("api_key_validation", "validation failed")
+                except Exception as exc:
+                    rt.record_job_failure("api_key_validation", "validation failed", exc=exc)
                     logger.exception("API key validation failed")
 
         rt._learning_scheduler.add_job(
@@ -696,8 +696,8 @@ async def init(rt: GenesisRuntime) -> None:
                     rt.record_job_success("dead_letter_expiry")
                     if expired:
                         logger.info("Expired %d dead letter items (>72h)", expired)
-                except Exception:
-                    rt.record_job_failure("dead_letter_expiry", "expiry failed")
+                except Exception as exc:
+                    rt.record_job_failure("dead_letter_expiry", "expiry failed", exc=exc)
                     logger.exception("Dead letter expiry failed")
 
         rt._learning_scheduler.add_job(
@@ -722,7 +722,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if expired:
                     logger.info("Expired %d stale message queue items (>7d)", expired)
             except Exception as exc:
-                rt.record_job_failure("message_queue_expiry", str(exc))
+                rt.record_job_failure("message_queue_expiry", exc=exc)
                 logger.exception("Message queue expiry failed")
 
         rt._learning_scheduler.add_job(
@@ -755,10 +755,11 @@ async def init(rt: GenesisRuntime) -> None:
                             ok,
                             fail,
                         )
-                except Exception:
+                except Exception as exc:
                     rt.record_job_failure(
                         "dead_letter_redispatch",
                         "redispatch failed",
+                        exc=exc,
                     )
                     logger.exception("Dead letter redispatch failed")
 
@@ -811,7 +812,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if counts.get("judged") or counts.get("merged") or counts.get("proposed"):
                     logger.info("entity_adjudication drain (mode=%s): %s", mode, counts)
             except Exception as exc:
-                rt.record_job_failure("entity_adjudication_drain", str(exc))
+                rt.record_job_failure("entity_adjudication_drain", exc=exc)
                 logger.exception("entity_adjudication drain failed")
 
         # CronTrigger (not IntervalTrigger — resets on restart). :25 is a clean
@@ -833,7 +834,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if any(v > 0 for v in result.values()):
                     logger.info("Procedure promotion: %s", result)
             except Exception as exc:
-                rt.record_job_failure("procedure_promotion", str(exc))
+                rt.record_job_failure("procedure_promotion", exc=exc)
                 logger.exception("Procedure promotion failed")
             # Self-healing embedding backfill — independent of promotion so a
             # backfill failure never fails the promotion job. Repairs procedures
@@ -1003,7 +1004,7 @@ async def init(rt: GenesisRuntime) -> None:
                             logger.exception("Failed to synthesize USER_KNOWLEDGE.md")
                 rt.record_job_success("user_model_evolution")
             except Exception as exc:
-                rt.record_job_failure("user_model_evolution", str(exc))
+                rt.record_job_failure("user_model_evolution", exc=exc)
                 logger.exception("User model evolution failed")
 
         rt._learning_scheduler.add_job(
@@ -1065,7 +1066,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if cleaned:
                     logger.info("Session reaper: cleaned %d stale heartbeats", cleaned)
             except Exception as exc:
-                rt.record_job_failure("session_reaper", str(exc))
+                rt.record_job_failure("session_reaper", exc=exc)
                 logger.exception("Session reaper failed")
 
         rt._learning_scheduler.add_job(
@@ -1092,7 +1093,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if count:
                     logger.info("Capability map refreshed: %d domains", count)
             except Exception as exc:
-                rt.record_job_failure("capability_map_refresh", str(exc))
+                rt.record_job_failure("capability_map_refresh", exc=exc)
                 logger.exception("Capability map refresh failed")
 
         rt._learning_scheduler.add_job(
@@ -1125,7 +1126,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if any(incremental.values()):
                     logger.info("Outcome harvest: %s", incremental)
             except Exception as exc:
-                rt.record_job_failure("outcome_harvest", str(exc))
+                rt.record_job_failure("outcome_harvest", exc=exc)
                 logger.exception("Outcome harvest failed")
 
         rt._learning_scheduler.add_job(
@@ -1164,7 +1165,7 @@ async def init(rt: GenesisRuntime) -> None:
                         " (low-confidence)" if snap["low_confidence"] else "",
                     )
             except Exception as exc:
-                rt.record_job_failure("ego_calibration", str(exc))
+                rt.record_job_failure("ego_calibration", exc=exc)
                 logger.exception("Ego calibration failed")
 
         rt._learning_scheduler.add_job(
@@ -1200,7 +1201,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if report.scanned:
                     logger.info("Ledger grader: %s", report.summary())
             except Exception as exc:
-                rt.record_job_failure("ledger_grader", str(exc))
+                rt.record_job_failure("ledger_grader", exc=exc)
                 logger.exception("Ledger grader failed")
 
         rt._learning_scheduler.add_job(
@@ -1233,7 +1234,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if reaped:
                     logger.info("Activity log reaper: deleted %d old records", reaped)
             except Exception as exc:
-                rt.record_job_failure("activity_log_reaper", str(exc))
+                rt.record_job_failure("activity_log_reaper", exc=exc)
                 logger.exception("Activity log reaper failed")
 
         rt._learning_scheduler.add_job(
@@ -1256,7 +1257,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if n:
                     logger.debug("CC span ingest: %d spans", n)
             except Exception as exc:
-                rt.record_job_failure("cc_span_ingest", str(exc))
+                rt.record_job_failure("cc_span_ingest", exc=exc)
                 logger.exception("CC span ingest failed")
 
         # Frequent (every 2 min) so dispatched-session tool spans land in the
@@ -1283,7 +1284,7 @@ async def init(rt: GenesisRuntime) -> None:
                 if removed:
                     logger.info("otel_spans prune: removed %d old spans", removed)
             except Exception as exc:
-                rt.record_job_failure("otel_span_prune", str(exc))
+                rt.record_job_failure("otel_span_prune", exc=exc)
                 logger.exception("otel_spans prune failed")
 
         rt._learning_scheduler.add_job(
@@ -1331,7 +1332,7 @@ async def init(rt: GenesisRuntime) -> None:
                     logger.info("Skill evolution completed: %s", result)
                 rt.record_job_success("skill_evolution")
             except Exception as exc:
-                rt.record_job_failure("skill_evolution", str(exc))
+                rt.record_job_failure("skill_evolution", exc=exc)
                 logger.exception("Skill evolution pipeline failed")
 
         rt._learning_scheduler.add_job(
@@ -1374,7 +1375,7 @@ async def init(rt: GenesisRuntime) -> None:
                     logger.warning("J9 regression check failed", exc_info=True)
                 rt.record_job_success("j9_eval_aggregation")
             except Exception as exc:
-                rt.record_job_failure("j9_eval_aggregation", str(exc))
+                rt.record_job_failure("j9_eval_aggregation", exc=exc)
                 logger.exception("J9 weekly aggregation failed")
 
         rt._learning_scheduler.add_job(
@@ -1410,7 +1411,7 @@ async def init(rt: GenesisRuntime) -> None:
                 )
                 rt.record_job_success("pr_review_harvest")
             except Exception as exc:
-                rt.record_job_failure("pr_review_harvest", str(exc))
+                rt.record_job_failure("pr_review_harvest", exc=exc)
                 logger.exception("PR review harvest failed")
 
         rt._learning_scheduler.add_job(
@@ -1480,7 +1481,7 @@ async def init(rt: GenesisRuntime) -> None:
                 logger.info("Model gauntlet: ran %d/%d roster model(s)", ran, len(models))
                 rt.record_job_success("model_gauntlet")
             except Exception as exc:
-                rt.record_job_failure("model_gauntlet", str(exc))
+                rt.record_job_failure("model_gauntlet", exc=exc)
                 logger.exception("Model gauntlet job failed")
 
         rt._learning_scheduler.add_job(

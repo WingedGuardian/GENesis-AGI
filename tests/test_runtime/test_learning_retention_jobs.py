@@ -31,7 +31,7 @@ class _StubRT:
     def record_job_success(self, *_a):
         pass
 
-    def record_job_failure(self, *_a):
+    def record_job_failure(self, *_a, **_kw):
         pass
 
 

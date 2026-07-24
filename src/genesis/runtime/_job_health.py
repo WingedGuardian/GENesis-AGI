@@ -169,7 +169,9 @@ def clear_stale_job_failures(rt: GenesisRuntime) -> int:
             continue
         logger.info(
             "Cleared stale failures for job %s (last_failure=%s, was=%d)",
-            job_name, last_failure, entry["consecutive_failures"],
+            job_name,
+            last_failure,
+            entry["consecutive_failures"],
         )
         entry["consecutive_failures"] = 0
         entry.pop("last_failure", None)
@@ -343,19 +345,52 @@ def record_job_success(rt: GenesisRuntime, job_name: str) -> None:
 
 
 def record_job_failure(
-    rt: GenesisRuntime, job_name: str, error: str, *, error_type: str | None = None
+    rt: GenesisRuntime,
+    job_name: str,
+    error: str | None = None,
+    *,
+    exc: BaseException | None = None,
+    error_type: str | None = None,
+    emit_event: bool = True,
 ) -> None:
     """Record a failed scheduled job execution (in-memory + DB).
 
     When consecutive failures reach the retry threshold (3), triggers
     an automatic retry via the JobRetryRegistry if one is wired.
 
+    *exc* is the exception object when one caused the failure. Pass it in
+    preference to a pre-stringified *error*: it is the single richest artifact,
+    and it is what turns a background-job failure into a diagnosable **reflex
+    signal**. When *exc* is given, *error* and *error_type* are derived from it
+    (an explicit *error* still wins for the human message).
+
     *error_type* is the exception class name when an exception caused the
     failure, else ``None`` (a semantic failure — e.g. an external quota block
     surfaced as a result reason). Keyword-only and optional so the ~110 existing
     call sites keep working untouched; only callers that actually hold the
     exception need to pass it.
+
+    The funnel (WS-reflex): when *exc* is present this ALSO emits a throttled
+    ``job.failed`` event onto the bus (see the emit block below) so the reflex
+    arc — which subscribes to the bus, not this table — can see the largest
+    class of internal Genesis defects (background-job exceptions). Semantic /
+    no-exception failures stay off the bus: an external blocker is not a Genesis
+    bug the reflex arc can act on. Set *emit_event=False* to suppress the emit
+    for callers that already emit their own richer domain ``.failed`` event
+    (the reflection/outreach/surplus schedulers), so one failure is not counted
+    twice.
     """
+    # Derive the human/DB fields from the exception when one was supplied, so
+    # every exc-bearing caller records a typed error even when str(exc) is blank
+    # (a bare TypeError renders "" — the type is then the only signal).
+    if exc is not None:
+        from genesis.observability.failure_details import error_summary
+
+        if error is None:
+            error = error_summary(exc)
+        if error_type is None:
+            error_type = type(exc).__name__
+
     now = datetime.now(UTC).isoformat()
     entry = rt._job_health.setdefault(job_name, {"consecutive_failures": 0})
     prev_consecutive = entry.get("consecutive_failures", 0)  # 0 → this is a streak ONSET
@@ -390,6 +425,34 @@ def record_job_failure(
             error=error,
             now=now,
         )
+        # Reflex funnel: surface exception-driven job failures onto the event
+        # bus so the reflex arc (and health/ego consumers) can see them. Shares
+        # the run-event throttle above → bounded ~24/day/job. Gated on an actual
+        # exception (semantic/external failures stay off the bus) and on a live
+        # bus. Fully fire-and-forget: a broken emit must NEVER stop the
+        # job_health record above from being written. getattr (not rt._event_bus
+        # directly) so a bare test runtime built via __new__ — with no
+        # _event_bus attribute set — degrades to no-emit instead of raising.
+        bus = getattr(rt, "_event_bus", None)
+        if exc is not None and emit_event and bus is not None:
+            try:
+                from genesis.observability.failure_details import failure_details
+                from genesis.util.tasks import emit_sync
+
+                emit_sync(
+                    bus,
+                    severity_str="ERROR",
+                    event_type="job.failed",
+                    message=f"Scheduled job {job_name!r} failed: {error}",
+                    task_name=job_name,
+                    **failure_details(exc=exc),
+                )
+            except Exception:
+                logger.warning(
+                    "job.failed emit failed for %r (job_health still recorded)",
+                    job_name,
+                    exc_info=True,
+                )
 
     consecutive = entry["consecutive_failures"]
     if consecutive >= 3 and rt._job_retry_registry is not None:
@@ -409,7 +472,6 @@ def register_channel(
         rt._outreach_pipeline._channels[name] = adapter
         if recipient:
             rt._outreach_pipeline._recipients[name] = recipient
-    if (rt._outreach_scheduler is not None
-            and not rt._outreach_scheduler.is_running):
+    if rt._outreach_scheduler is not None and not rt._outreach_scheduler.is_running:
         logger.info("First outreach channel '%s' registered — starting scheduler", name)
         rt._outreach_scheduler.start()

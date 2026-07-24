@@ -141,8 +141,8 @@ class _FakeRT:
     def record_job_success(self, name):
         self.successes.append(name)
 
-    def record_job_failure(self, name, err):
-        self.failures.append((name, err))
+    def record_job_failure(self, name, error=None, *, exc=None, error_type=None, emit_event=True):
+        self.failures.append((name, error if error is not None else (str(exc) if exc else None)))
 
 
 def _patch_io(
@@ -425,7 +425,7 @@ class _StubRT:
     def record_job_success(self, *_a):
         pass
 
-    def record_job_failure(self, *_a):
+    def record_job_failure(self, *_a, **_kw):
         pass
 
 

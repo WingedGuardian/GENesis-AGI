@@ -15,34 +15,8 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from genesis.db.schema import create_all_tables
 from genesis.runtime import GenesisRuntime
-
-_CREATE_JOB_HEALTH = """
-    CREATE TABLE IF NOT EXISTS job_health (
-        job_name         TEXT PRIMARY KEY,
-        last_run         TEXT,
-        last_success     TEXT,
-        last_failure     TEXT,
-        last_error       TEXT,
-        consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        total_runs       INTEGER NOT NULL DEFAULT 0,
-        total_successes  INTEGER NOT NULL DEFAULT 0,
-        total_failures   INTEGER NOT NULL DEFAULT 0,
-        updated_at       TEXT NOT NULL,
-        error_type       TEXT
-    )
-"""
-_CREATE_JOB_RUN_EVENTS = """
-    CREATE TABLE IF NOT EXISTS job_run_events (
-        id             TEXT PRIMARY KEY,
-        job_name       TEXT NOT NULL,
-        status         TEXT NOT NULL CHECK (status IN ('success', 'failed')),
-        run_started_at TEXT,
-        duration_ms    INTEGER,
-        error          TEXT,
-        recorded_at    TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-"""
 
 
 async def _drain_pending() -> None:
@@ -70,8 +44,7 @@ async def _events(db: aiosqlite.Connection, job_name: str) -> list[tuple]:
 
 async def _setup() -> aiosqlite.Connection:
     db = await aiosqlite.connect(":memory:")
-    await db.execute(_CREATE_JOB_HEALTH)
-    await db.execute(_CREATE_JOB_RUN_EVENTS)
+    await create_all_tables(db)
     await db.commit()
     return db
 
@@ -201,7 +174,10 @@ async def test_run_event_write_failure_never_throws():
     """A missing table (write path broken) must not propagate into the ~62 callers."""
     db = await aiosqlite.connect(":memory:")
     try:
-        await db.execute(_CREATE_JOB_HEALTH)  # job_health exists, job_run_events does NOT
+        # job_health exists (full canonical schema), job_run_events does NOT —
+        # the write path is deliberately broken to prove failures are swallowed.
+        await create_all_tables(db)
+        await db.execute("DROP TABLE job_run_events")
         await db.commit()
         rt = _make_runtime(db)
         # Must not raise despite the missing job_run_events table.

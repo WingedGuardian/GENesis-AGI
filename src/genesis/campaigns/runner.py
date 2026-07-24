@@ -142,7 +142,7 @@ class CampaignRunner:
         except Exception as exc:
             logger.exception("Campaign tick failed for %s", campaign_id)
             with contextlib.suppress(Exception):
-                GenesisRuntime.instance().record_job_failure(job_id, str(exc)[:500])
+                GenesisRuntime.instance().record_job_failure(job_id, exc=exc)
             return
         with contextlib.suppress(Exception):
             GenesisRuntime.instance().record_job_success(job_id)

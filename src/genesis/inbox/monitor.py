@@ -26,6 +26,7 @@ from genesis.inbox.scanner import (
     segment_items,
 )
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
+from genesis.observability.failure_details import failure_details
 from genesis.security import ContentSanitizer, ContentSource
 from genesis.util.tz import parse_utc_iso
 
@@ -1912,7 +1913,7 @@ class InboxMonitor:
                     "heartbeat",
                     "inbox_monitor check completed",
                 )
-        except Exception:
+        except Exception as exc:
             logger.exception("Inbox check failed")
             if self._event_bus:
                 from genesis.observability.types import Severity, Subsystem
@@ -1922,6 +1923,7 @@ class InboxMonitor:
                     Severity.ERROR,
                     "check.failed",
                     "Inbox check failed with exception",
+                    **failure_details(exc=exc),
                 )
 
     # ------------------------------------------------------------------

@@ -538,7 +538,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 483469d7 2026-07-23
+verified: 302066ad 2026-07-23
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -625,7 +625,18 @@ verified: 483469d7 2026-07-23
   quota block). `job_health.error_type` mirrors it and clears on recovery
   alongside `last_error`. Frames come only from
   `util/tasks.normalized_frames` — a second normalizer would split one bug
-  into two fingerprints.
+  into two fingerprints. **The funnel (2026-07-23):** `record_job_failure`
+  gained an `exc=` param and, when an exception caused the failure, ALSO emits
+  a throttled `job.failed` event (via `util/tasks.emit_sync`, sharing the
+  run-event throttle -> ~24/day/job). This bridges the ~50 background-job loops
+  that wrote only to `job_health` onto the event bus, where the reflex arc (a
+  bus subscriber) can reach the largest class of internal defects - previously
+  invisible. Semantic/no-exception failures stay off the bus; callers that emit
+  their own domain `.failed` pass `emit_event=False` to avoid double-counting.
+  Fire-and-forget (a broken emit never blocks the `job_health` write), and
+  `job.failed` is in the ego's `_REFLEX_OWNED_EVENT_TYPES` so it never spins a
+  reactive ego cycle. Dark until reflex intake widens (`ingest.py` still drops
+  non-`task.failed`).
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
   reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate
@@ -1183,7 +1194,7 @@ Spec: `docs/superpowers/specs/2026-07-21-reflex-arc-design.md`.
 ```yaml subsystem-map
 entry: reflex-arc
 modules: [reflex]
-verified: 6fd98675 2026-07-21
+verified: 302066ad 2026-07-23
 ```
 
 - **reflex/**: `fingerprint.py` (pure: normalize task name, line-number-free
@@ -1200,10 +1211,19 @@ verified: 6fd98675 2026-07-21
   `reflex_diagnoses`; `reflex_verdicts` = the taste corpus, never pruned).
   Later-phase columns/statuses ship now so the lifecycle CHECK never needs a
   rebuild migration.
-- **Trap**: `task.failed` is carved out of the ego reactive path
-  (`runtime/init/ego._is_reflex_owned_event`) — reflex owns that class; the
-  ego's message-keyed dedup can't absorb variable-payload failure bursts
-  (a documented storm mode in `ego/cadence.py`).
+- **Afferent sources**: `task.failed` (from `tracked_task`) is the original
+  nerve, but it is a near-empty channel — Genesis's background loops catch their
+  own exceptions and never reach the `tracked_task` done-callback (0 events in
+  108d, verified two installs). The **funnel (2026-07-23)** adds the real
+  stream: `runtime/_job_health.record_job_failure` emits a throttled
+  `job.failed` for every exception-driven background-job failure (see the
+  scheduled-job telemetry entry). Emitted now but NOT yet ingested —
+  `ingest.py` still drops non-`task.failed`; widening intake to `job.failed` is
+  the gated PR-2b.
+- **Trap**: BOTH `task.failed` and `job.failed` are carved out of the ego
+  reactive path (`runtime/init/ego._is_reflex_owned_event`) — reflex owns that
+  class; the ego's message-keyed dedup can't absorb variable-payload failure
+  bursts (a documented storm mode in `ego/cadence.py`).
 - **Observability (PR1.5)**: aggregates on `db/crud/reflex_signals`
   (`count_by_status` / `top_class_keys` / `list_recent`) feed four surfaces —
   the `reflex_status` MCP tool (process-portable: config + DB only), the
