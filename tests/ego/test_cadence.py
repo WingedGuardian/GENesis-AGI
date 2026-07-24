@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiosqlite
 import pytest
 
-from genesis.db.schema import TABLES
+from genesis.db.schema import TABLES, create_all_tables
 from genesis.ego.cadence import _RECENCY_TIERS, EgoCadenceManager
 from genesis.ego.session import CycleBlockedError
 from genesis.ego.types import EgoConfig, EgoCycle
@@ -136,26 +136,10 @@ class TestCadenceLifecycle:
 # Restart-safe boot first-fire (B1): anchor ego_cycle to job_health.last_success
 # ---------------------------------------------------------------------------
 
-_JOB_HEALTH_DDL = """
-    CREATE TABLE IF NOT EXISTS job_health (
-        job_name         TEXT PRIMARY KEY,
-        last_run         TEXT,
-        last_success     TEXT,
-        last_failure     TEXT,
-        last_error       TEXT,
-        consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        total_runs       INTEGER NOT NULL DEFAULT 0,
-        total_successes  INTEGER NOT NULL DEFAULT 0,
-        total_failures   INTEGER NOT NULL DEFAULT 0,
-        updated_at       TEXT NOT NULL,
-        error_type       TEXT
-    )
-"""
-
 
 async def _seed_last_success(conn, job_name: str, last_success: datetime) -> None:
     """Create job_health (not in TABLES) and seed one ego's last_success row."""
-    await conn.execute(_JOB_HEALTH_DDL)
+    await create_all_tables(conn)
     iso = last_success.isoformat()
     await conn.execute(
         "INSERT INTO job_health "
@@ -195,7 +179,7 @@ class TestBootFirstFire:
 
     async def test_no_row_returns_none(self, cadence, mock_session, db):
         mock_session._source_tag = "genesis_ego_cycle"
-        await db.execute(_JOB_HEALTH_DDL)  # table exists, no row for this ego
+        await create_all_tables(db)  # table exists, no row for this ego
         await db.commit()
         assert await cadence._compute_boot_first_fire() is None
 
@@ -1532,7 +1516,11 @@ class TestCapabilityImprovement:
         assert cap_cadence._signal_queue.empty()
 
     async def test_job_registered_for_genesis_ego(
-        self, mock_session, config, mock_idle_detector, cap_db,
+        self,
+        mock_session,
+        config,
+        mock_idle_detector,
+        cap_db,
     ):
         """start() registers the ego_capability_improvement job for the genesis ego."""
         mock_session._source_tag = "genesis_ego_cycle"
@@ -1550,7 +1538,11 @@ class TestCapabilityImprovement:
             await mgr.stop()
 
     async def test_job_not_registered_for_user_ego(
-        self, mock_session, config, mock_idle_detector, cap_db,
+        self,
+        mock_session,
+        config,
+        mock_idle_detector,
+        cap_db,
     ):
         """The user ego cadence does NOT register the capability scanner job."""
         mock_session._source_tag = "user_ego_cycle"
@@ -1876,10 +1868,17 @@ class TestQuietHours:
         return _dt.datetime(2026, 1, 1, hour, 0, tzinfo=_dt.UTC)
 
     def test_suppress_mode_skips_entire_window(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(
-            db, mock_session, mock_idle_detector, quiet_hours_mode="suppress",
+            db,
+            mock_session,
+            mock_idle_detector,
+            quiet_hours_mode="suppress",
         )
         now = self._at(2)
         monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)
@@ -1891,7 +1890,11 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is True
 
     def test_floor_mode_is_default_and_throttles(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         mgr = self._mgr(db, mock_session, mock_idle_detector)  # default mode
         assert mgr._config.quiet_hours_mode == "floor"
@@ -1904,12 +1907,19 @@ class TestQuietHours:
         assert mgr._quiet_hours_suppresses_tick() is False
 
     def test_suppress_mode_reschedules_past_window(
-        self, db, mock_session, mock_idle_detector, monkeypatch,
+        self,
+        db,
+        mock_session,
+        mock_idle_detector,
+        monkeypatch,
     ):
         from unittest.mock import MagicMock
 
         mgr = self._mgr(
-            db, mock_session, mock_idle_detector, quiet_hours_mode="suppress",
+            db,
+            mock_session,
+            mock_idle_detector,
+            quiet_hours_mode="suppress",
         )
         now = self._at(2)  # inside the 23→7 window
         monkeypatch.setattr("genesis.ego.cadence._local_now", lambda tz: now)

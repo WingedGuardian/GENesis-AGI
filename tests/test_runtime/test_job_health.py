@@ -15,25 +15,9 @@ import asyncio
 
 import aiosqlite
 
+from genesis.db.schema import create_all_tables
 from genesis.runtime import GenesisRuntime
 from genesis.runtime._job_health import clear_stale_job_failures
-
-# Mirror of the job_health schema (src/genesis/db/schema/_migrations.py).
-_CREATE_JOB_HEALTH = """
-    CREATE TABLE IF NOT EXISTS job_health (
-        job_name         TEXT PRIMARY KEY,
-        last_run         TEXT,
-        last_success     TEXT,
-        last_failure     TEXT,
-        last_error       TEXT,
-        consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        total_runs       INTEGER NOT NULL DEFAULT 0,
-        total_successes  INTEGER NOT NULL DEFAULT 0,
-        total_failures   INTEGER NOT NULL DEFAULT 0,
-        updated_at       TEXT NOT NULL,
-        error_type       TEXT
-    )
-"""
 
 
 async def _drain_pending() -> None:
@@ -64,7 +48,7 @@ async def _fetch(db: aiosqlite.Connection, job_name: str):
 async def test_success_clears_persisted_failure():
     """A job that fails then succeeds must not retain a stale last_failure/last_error."""
     async with aiosqlite.connect(":memory:") as db:
-        await db.execute(_CREATE_JOB_HEALTH)
+        await create_all_tables(db)
         await db.commit()
         rt = _make_runtime(db)
 
@@ -96,7 +80,7 @@ async def test_failure_path_unbroken_and_success_preserved():
     real failure, while COALESCE on last_success still preserves a prior success.
     """
     async with aiosqlite.connect(":memory:") as db:
-        await db.execute(_CREATE_JOB_HEALTH)
+        await create_all_tables(db)
         await db.commit()
         rt = _make_runtime(db)
 
@@ -120,7 +104,7 @@ async def test_clear_stale_failures_clears_persisted_failure():
     signal recovery; it persists via the same UPSERT and must not retain stale failures.
     """
     async with aiosqlite.connect(":memory:") as db:
-        await db.execute(_CREATE_JOB_HEALTH)
+        await create_all_tables(db)
         await db.commit()
         rt = _make_runtime(db)
 

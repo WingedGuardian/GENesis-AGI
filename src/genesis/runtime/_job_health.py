@@ -430,14 +430,17 @@ def record_job_failure(
         # the run-event throttle above → bounded ~24/day/job. Gated on an actual
         # exception (semantic/external failures stay off the bus) and on a live
         # bus. Fully fire-and-forget: a broken emit must NEVER stop the
-        # job_health record above from being written.
-        if exc is not None and emit_event and rt._event_bus is not None:
+        # job_health record above from being written. getattr (not rt._event_bus
+        # directly) so a bare test runtime built via __new__ — with no
+        # _event_bus attribute set — degrades to no-emit instead of raising.
+        bus = getattr(rt, "_event_bus", None)
+        if exc is not None and emit_event and bus is not None:
             try:
                 from genesis.observability.failure_details import failure_details
                 from genesis.util.tasks import emit_sync
 
                 emit_sync(
-                    rt._event_bus,
+                    bus,
                     severity_str="ERROR",
                     event_type="job.failed",
                     message=f"Scheduled job {job_name!r} failed: {error}",
