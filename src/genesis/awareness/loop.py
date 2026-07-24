@@ -33,6 +33,7 @@ from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.db.crud import awareness_ticks, observations
 from genesis.infra_profile.store import load_profile
 from genesis.observability.events import GenesisEventBus
+from genesis.observability.failure_details import failure_details
 from genesis.observability.types import Severity, Subsystem
 from genesis.resilience.state import CloudStatus
 from genesis.routing.types import DegradationLevel
@@ -1924,10 +1925,11 @@ class AwarenessLoop:
                         Subsystem.AWARENESS, Severity.ERROR,
                         "tick.failed",
                         "Awareness tick failed with exception",
+                        **failure_details(exc=exc),
                     )
                 try:
                     from genesis.runtime import GenesisRuntime
-                    GenesisRuntime.instance().record_job_failure("awareness_tick", exc=exc)
+                    GenesisRuntime.instance().record_job_failure("awareness_tick", exc=exc, emit_event=False)
                 except Exception:
                     pass
                 # Even on unexpected failure, don't leave _last_tick_at stale

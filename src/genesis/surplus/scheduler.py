@@ -96,7 +96,10 @@ class SurplusScheduler:
         self._compute = compute_availability
         self._executor = executor or StubExecutor()
         self._brainstorm_runner = brainstorm_runner or BrainstormRunner(
-            db, queue, executor=self._executor, clock=clock,
+            db,
+            queue,
+            executor=self._executor,
+            clock=clock,
         )
         self._dispatch_interval = dispatch_interval_minutes
         self._brainstorm_interval = brainstorm_check_hours
@@ -170,6 +173,7 @@ class SurplusScheduler:
         # Late-registration: if scheduler already started, add the job now
         if self._scheduler.running and not self._scheduler.get_job("schedule_fresh_session_test"):
             from apscheduler.triggers.cron import CronTrigger
+
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
                 CronTrigger(day_of_week="sat", hour=9, timezone=user_timezone()),
@@ -263,6 +267,7 @@ class SurplusScheduler:
         # restart.  Config param brainstorm_check_hours is unused since this
         # conversion; the fixed schedule replaces the interval cadence.
         from apscheduler.triggers.cron import CronTrigger
+
         self._scheduler.add_job(
             self.brainstorm_check,
             CronTrigger(hour="1,13", minute=0, timezone=user_timezone()),
@@ -351,6 +356,7 @@ class SurplusScheduler:
             )
         # Dream cycle: weekly Sunday 4am — clustering + worklist persist
         from apscheduler.triggers.cron import CronTrigger
+
         self._scheduler.add_job(
             self.run_dream_cycle,
             CronTrigger(day_of_week="sun", hour=4, timezone=user_timezone()),
@@ -450,6 +456,7 @@ class SurplusScheduler:
             # restarts more frequently.  Fixed hour ensures the batch runs
             # daily regardless of restart cadence.
             from apscheduler.triggers.cron import CronTrigger
+
             self._scheduler.add_job(
                 self.schedule_j9_eval_batch,
                 CronTrigger(hour=3, timezone=user_timezone()),  # 3 AM local daily
@@ -493,6 +500,7 @@ class SurplusScheduler:
         # pattern (see genesis.awareness.loop._on_scheduler_job_event).
         try:
             from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+
             self._job_event_loop = asyncio.get_running_loop()
             self._scheduler.add_listener(
                 self._on_scheduler_job_event,
@@ -507,6 +515,7 @@ class SurplusScheduler:
         # timestamps from the previous process and trigger a restart.
         try:
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             rt.record_job_success("surplus_dispatch")
             logger.info("Surplus scheduler: initial heartbeat emitted")
@@ -517,6 +526,7 @@ class SurplusScheduler:
         try:
             from genesis.memory.dream_cycle import check_incomplete_runs
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             if rt.db is not None:
                 await check_incomplete_runs(rt.db)
@@ -529,7 +539,8 @@ class SurplusScheduler:
         # and don't count the restart toward the task's retry budget.
         try:
             requeued, _ = await self._queue.recover_stuck(
-                older_than_hours=0, bump_attempt=False,
+                older_than_hours=0,
+                bump_attempt=False,
             )
             if requeued:
                 logger.info("Boot sweep: reclaimed %d orphaned running task(s)", requeued)
@@ -553,7 +564,8 @@ class SurplusScheduler:
         await self.run_gitnexus_strip()
         logger.info(
             "Surplus scheduler started (dispatch=%dm, brainstorm=%dh)",
-            self._dispatch_interval, self._brainstorm_interval,
+            self._dispatch_interval,
+            self._brainstorm_interval,
         )
 
     async def stop(self) -> None:
@@ -581,7 +593,8 @@ class SurplusScheduler:
             )
         except Exception:
             logger.warning(
-                "Failed to hand off scheduler event for %s", job_id,
+                "Failed to hand off scheduler event for %s",
+                job_id,
                 exc_info=True,
             )
 
@@ -610,6 +623,7 @@ class SurplusScheduler:
         # Record failure in job health tracking.
         try:
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             rt.record_job_failure(
                 job_id,
@@ -622,6 +636,7 @@ class SurplusScheduler:
         # Emit to event bus for dashboard / alerting
         try:
             from genesis.runtime import GenesisRuntime
+
             rt = GenesisRuntime.instance()
             if rt.event_bus:
                 await rt.event_bus.emit(
@@ -647,7 +662,9 @@ class SurplusScheduler:
         await gate_jobs.brainstorm_check(self)
 
     async def _recently_completed(
-        self, task_type, cooldown_hours: int | float,
+        self,
+        task_type,
+        cooldown_hours: int | float,
     ) -> bool:
         """Return ``True`` if *task_type* completed within *cooldown_hours*."""
         return await gate_jobs.recently_completed(self, task_type, cooldown_hours)
@@ -761,6 +778,7 @@ class SurplusScheduler:
         """Scheduled dispatch callback."""
         try:
             from genesis.runtime import GenesisRuntime
+
             if GenesisRuntime.instance().paused:
                 logger.debug("Surplus dispatch skipped (Genesis paused)")
                 return
@@ -772,6 +790,7 @@ class SurplusScheduler:
             # (sequential task execution + intake pipeline overhead).
             try:
                 from genesis.runtime import GenesisRuntime
+
                 GenesisRuntime.instance().record_job_success("surplus_dispatch")
             except Exception:
                 pass
@@ -786,20 +805,26 @@ class SurplusScheduler:
 
             if self._event_bus:
                 await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.DEBUG,
-                    "heartbeat", "surplus_scheduler dispatch completed",
+                    Subsystem.SURPLUS,
+                    Severity.DEBUG,
+                    "heartbeat",
+                    "surplus_scheduler dispatch completed",
                 )
         except Exception as exc:
             logger.exception("Surplus dispatch loop failed")
             if self._event_bus:
                 await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.ERROR,
+                    Subsystem.SURPLUS,
+                    Severity.ERROR,
                     "dispatch.failed",
                     "Surplus dispatch loop failed with exception",
+                    **failure_details(exc=exc),
                 )
             try:
                 from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("surplus_dispatch", exc=exc)
+
+                GenesisRuntime.instance().record_job_failure(
+                    "surplus_dispatch", exc=exc, emit_event=False
+                )
             except Exception:
                 pass
-

@@ -15,6 +15,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from genesis.observability.failure_details import failure_details
 from genesis.observability.types import Severity, Subsystem
 from genesis.surplus.jobs._guard import record_failure, record_success
 
@@ -82,6 +83,7 @@ async def run_recon_gather(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "recon_gather.failed",
                 "Recon gather failed with exception",
+                **failure_details(exc=exc),
             )
         record_failure("recon_gather", str(exc))
 
@@ -108,6 +110,7 @@ async def run_model_intelligence(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "model_intelligence.failed",
                 "Model intelligence scan failed",
+                **failure_details(exc=exc),
             )
         record_failure("model_intelligence", str(exc))
 
@@ -134,6 +137,7 @@ async def run_skill_security_scan(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "skill_security_scan.failed",
                 "Skill-security scan failed",
+                **failure_details(exc=exc),
             )
         record_failure("skill_security_scan", str(exc))
 
@@ -167,6 +171,7 @@ async def run_github_discovery(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "github_discovery.failed",
                 "GitHub Discovery failed",
+                **failure_details(exc=exc),
             )
         record_failure("github_discovery", str(exc))
 
@@ -212,6 +217,7 @@ async def run_models_md_synthesis(sched: SchedulerContext) -> None:
                 Subsystem.RECON, Severity.ERROR,
                 "models_md_synthesis.failed",
                 "Models.md synthesis failed",
+                **failure_details(exc=exc),
             )
         record_failure("models_md_synthesis", str(exc))
 
@@ -320,5 +326,6 @@ async def run_memory_extraction(sched: SchedulerContext) -> None:
                 Subsystem.SURPLUS, Severity.ERROR,
                 "memory_extraction.failed",
                 "Memory extraction failed with exception",
+                **failure_details(exc=exc),
             )
         record_failure("memory_extraction", str(exc))
