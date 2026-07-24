@@ -513,6 +513,46 @@ async def test_alarm_db_integrity_writes_observation_and_emits(db):
     assert call.args[1] == Severity.ERROR
 
 
+class _FailedEvent:
+    """Stand-in for an APScheduler EVENT_JOB_ERROR with an empty-str exception —
+    the live case: the TYPE is the only signal and str(exception) is blank."""
+
+    def __init__(self, exc):
+        self.job_id = "memory_extraction"
+        self.exception = exc
+
+
+async def test_emit_job_error_event_message_carries_type(db):
+    """Codex P2 (#1225): the emitted event MESSAGE — not just job_health — must
+    carry the exception type, because health_errors output and the grouped-error
+    UI key on the message, not the details dict."""
+    from genesis.observability.types import Subsystem
+
+    sched, _ = _make_scheduler(db)
+    sched._event_bus = AsyncMock()
+
+    rt = AsyncMock()
+    rt.event_bus = sched._event_bus
+    captured: dict = {}
+    rt.record_job_failure = lambda job_id, detail, error_type=None: captured.update(
+        job_id=job_id, detail=detail, error_type=error_type
+    )
+
+    with patch("genesis.runtime.GenesisRuntime.instance", return_value=rt):
+        await sched._emit_job_error_event("memory_extraction", _FailedEvent(ValueError()))
+
+    # Event message is diagnosable even though str(ValueError()) is empty.
+    call = sched._event_bus.emit.await_args
+    assert call.args[0] == Subsystem.SURPLUS
+    message = call.args[3]
+    assert "ValueError" in message
+    assert not message.rstrip().endswith("failed:"), "message must not be a bare 'failed:'"
+    # details still carry the structured type, and both sinks agree.
+    assert call.kwargs["error_type"] == "ValueError"
+    assert captured["error_type"] == "ValueError"
+    assert captured["detail"] in message
+
+
 async def test_run_db_integrity_check_healthy_db_no_alarm(db):
     """On a healthy DB the weekly job completes and raises no alarm."""
     sched, _ = _make_scheduler(db)

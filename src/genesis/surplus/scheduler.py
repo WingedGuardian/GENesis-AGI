@@ -14,6 +14,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.env import user_timezone
 from genesis.observability.events import GenesisEventBus
+from genesis.observability.failure_details import error_summary, failure_details
 from genesis.observability.types import Severity, Subsystem
 from genesis.surplus import dispatch as dispatch_engine
 from genesis.surplus.brainstorm import BrainstormRunner
@@ -588,8 +589,16 @@ class SurplusScheduler:
         """Emit observability event for a failed or missed scheduled job."""
         exception = getattr(event, "exception", None)
         is_error = exception is not None
+        # error_summary prefixes the exception TYPE — APScheduler exceptions here
+        # routinely render as an empty str(), which is exactly when the type
+        # carries all the signal (live: last_error was recorded as "" for
+        # months). Build the message from the SAME summary that goes to
+        # job_health so the message-only surfaces — health_errors output and the
+        # grouped-error UI, which key on the event MESSAGE not its details —
+        # are diagnosable too, not just the job_health row.
+        detail = error_summary(exception, "missed") or "missed"
         msg = (
-            f"Scheduled job '{job_id}' failed: {exception}"
+            f"Scheduled job '{job_id}' failed: {detail}"
             if is_error
             else f"Scheduled job '{job_id}' missed (past misfire grace time)"
         )
@@ -598,11 +607,15 @@ class SurplusScheduler:
         else:
             logger.warning(msg)
 
-        # Record failure in job health tracking
+        # Record failure in job health tracking.
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
-            rt.record_job_failure(job_id, str(exception or "missed")[:500])
+            rt.record_job_failure(
+                job_id,
+                detail,
+                error_type=type(exception).__name__ if exception is not None else None,
+            )
         except Exception:
             logger.warning("Failed to record job failure for %s", job_id, exc_info=True)
 
@@ -617,6 +630,7 @@ class SurplusScheduler:
                     "scheduler.job_failed" if is_error else "scheduler.job_missed",
                     msg,
                     job_id=job_id,
+                    **failure_details(exc=exception),
                 )
         except Exception:
             logger.warning("Failed to emit scheduler error event", exc_info=True)

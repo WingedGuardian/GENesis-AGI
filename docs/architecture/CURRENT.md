@@ -538,7 +538,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 6d79e097 2026-07-21
+verified: 483469d7 2026-07-23
 ```
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
@@ -614,7 +614,18 @@ verified: 6d79e097 2026-07-21
   failure on streak onset + hourly heartbeat — so a stuck sub-hourly poll costs
   ~24 rows/day. `duration_ms` is honest-or-NULL (only from an explicit
   `record_job_start` marker; never derived from `last_run`). 90-day prune via
-  `_wire_drip_retention_jobs`.
+  `_wire_drip_retention_jobs`. **Failure payloads (2026-07-23):** the three
+  scheduler emitters (reflection, outreach, surplus) thread the exception into
+  `observability/failure_details.py`, which sets `error_type` **IFF** a real
+  exception caused the failure — a semantic failure (external blocker, e.g. a
+  429 quota result) carries `error_reason` and no `error_type`. That presence
+  test is the structural internal-vs-external discriminator; do NOT infer it by
+  pattern-matching the message, because ONE event type carries both kinds
+  (`weekly_assessment.failed` fires for a genuine TypeError *and* for a provider
+  quota block). `job_health.error_type` mirrors it and clears on recovery
+  alongside `last_error`. Frames come only from
+  `util/tasks.normalized_frames` — a second normalizer would split one bug
+  into two fingerprints.
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
   reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate

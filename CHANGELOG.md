@@ -74,6 +74,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **When a scheduled job fails, Genesis now records what actually went wrong.**
+  Job failures were logged with only the job's name and whatever text the error
+  happened to carry — and for the most common failures that text was *empty*, so
+  the record read "Scheduled job 'memory_extraction' failed:" with nothing after
+  it. Failures now carry the error type and the code location, in both the event
+  log and the job-health view, which is the difference between a failure you can
+  diagnose and one you can only count. Genesis also now distinguishes a bug in
+  its own code from an outside blocker (a provider outage, a rate limit) rather
+  than filing both the same way — so "the API was down" no longer looks like
+  something to go fix in the code.
 - **A failed update that had already run database migrations now rolls the
   database back too.** Previously a rollback restored the code and dependencies
   but left the (newly migrated) database in place, so the rolled-back older code

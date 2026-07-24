@@ -169,13 +169,31 @@ class OutreachScheduler:
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
 
-    async def _record_job_result(self, name: str, *, error: str | None = None) -> None:
-        """Record success/failure in runtime + emit event."""
+    async def _record_job_result(
+        self, name: str, *, error: str | None = None, exc: BaseException | None = None
+    ) -> None:
+        """Record success/failure in runtime + emit event.
+
+        Pass *exc* whenever an exception caused the failure — it is what makes
+        the event diagnosable (``error_type`` + frames). A failure reported only
+        as a semantic *error* string carries no ``error_type``, which is how
+        consumers tell an internal defect from an external blocker.
+        """
         from genesis.runtime import GenesisRuntime
 
         rt = GenesisRuntime.instance()
-        if error:
-            rt.record_job_failure(name, error)
+        if error or exc is not None:
+            from genesis.observability.failure_details import error_summary, failure_details
+
+            # One detail string for both sinks, so job_health.last_error and the
+            # event message agree — and so passing only *exc* (no *error*) can
+            # never render the message as "failed: None".
+            detail = error_summary(exc, error) or "unknown"
+            rt.record_job_failure(
+                name,
+                detail,
+                error_type=type(exc).__name__ if exc is not None else None,
+            )
             if self._event_bus:
                 from genesis.observability.types import Severity, Subsystem
 
@@ -183,7 +201,8 @@ class OutreachScheduler:
                     Subsystem.OUTREACH,
                     Severity.ERROR,
                     f"{name}.failed",
-                    f"Scheduled job {name} failed: {error}",
+                    f"Scheduled job {name} failed: {detail}",
+                    **failure_details(exc=exc, reason=None if exc is not None else error),
                 )
         else:
             rt.record_job_success(name)
@@ -243,7 +262,7 @@ class OutreachScheduler:
             await self._record_job_result("morning_report")
         except Exception as exc:
             logger.exception("Morning report job failed")
-            await self._record_job_result("morning_report", error=str(exc))
+            await self._record_job_result("morning_report", error=str(exc), exc=exc)
 
     async def _surplus_outreach_job(self) -> None:
         if self._is_paused():
@@ -277,7 +296,7 @@ class OutreachScheduler:
             await self._record_job_result("surplus_outreach")
         except Exception as exc:
             logger.exception("Surplus outreach job failed")
-            await self._record_job_result("surplus_outreach", error=str(exc))
+            await self._record_job_result("surplus_outreach", error=str(exc), exc=exc)
 
     async def _engagement_poll_job(self) -> None:
         if self._is_paused():
@@ -291,7 +310,7 @@ class OutreachScheduler:
             await self._record_job_result("engagement_poll")
         except Exception as exc:
             logger.exception("Engagement poll failed")
-            await self._record_job_result("engagement_poll", error=str(exc))
+            await self._record_job_result("engagement_poll", error=str(exc), exc=exc)
 
     async def _health_check_job(self) -> None:
         """Check health alerts and send outreach for critical issues.
@@ -383,7 +402,7 @@ class OutreachScheduler:
             await self._record_job_result("health_check")
         except Exception as exc:
             logger.exception("Health check outreach job failed")
-            await self._record_job_result("health_check", error=str(exc))
+            await self._record_job_result("health_check", error=str(exc), exc=exc)
 
     async def _critical_observations_job(self) -> None:
         """Alert user via Telegram when critical observations are created.
@@ -511,7 +530,7 @@ class OutreachScheduler:
             await self._record_job_result("critical_observations")
         except Exception as exc:
             logger.exception("Critical observations outreach job failed")
-            await self._record_job_result("critical_observations", error=str(exc))
+            await self._record_job_result("critical_observations", error=str(exc), exc=exc)
 
     async def _ambient_health_job(self) -> None:
         """Alert when the edge ambient-capture bridge goes dark or regresses.
@@ -597,7 +616,7 @@ class OutreachScheduler:
             await self._record_job_result("ambient_health")
         except Exception as exc:
             logger.exception("Ambient health monitor job failed")
-            await self._record_job_result("ambient_health", error=str(exc))
+            await self._record_job_result("ambient_health", error=str(exc), exc=exc)
 
     @staticmethod
     def _ambient_remedy_hint(causes: tuple[str, ...]) -> str:
@@ -639,7 +658,7 @@ class OutreachScheduler:
             await self._record_job_result("calibration")
         except Exception as exc:
             logger.exception("Calibration job failed")
-            await self._record_job_result("calibration", error=str(exc))
+            await self._record_job_result("calibration", error=str(exc), exc=exc)
 
     async def _mark_row_delivered(self, row: dict, delivered_at: str) -> None:
         """Mark a drained row delivered, keying on ``id`` or falling back to
@@ -785,7 +804,7 @@ class OutreachScheduler:
             await self._record_job_result("drain_pending")
         except Exception as exc:
             logger.exception("Drain pending outreach job failed")
-            await self._record_job_result("drain_pending", error=str(exc))
+            await self._record_job_result("drain_pending", error=str(exc), exc=exc)
 
     async def _pick_best_insight(self) -> dict | None:
         cursor = await self._db.execute(
