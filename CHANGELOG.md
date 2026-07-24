@@ -74,6 +74,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Genesis's safety guardrails work again.** The hooks that block dangerous
+  actions in Claude Code sessions — force-pushing, `rm -rf` on your data
+  directories or database, committing to `main` without a review, writing to
+  protected files, booting Genesis against a worktree — had gone silently inert:
+  a change in how Claude Code hands data to hooks meant they read an empty input
+  and waved everything through. They now read the input correctly and block as
+  intended, with a regression test that feeds each guard a real payload so a
+  future Claude Code change can't quietly disable them again.
+
 - **When a scheduled job fails, Genesis now records what actually went wrong.**
   Job failures were logged with only the job's name and whatever text the error
   happened to carry — and for the most common failures that text was *empty*, so

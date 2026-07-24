@@ -139,6 +139,27 @@ reinstalled forever.
 - Turn limits (`--max-turns`) and strict MCP config (`--strict-mcp-config`) for Guardian diagnosis
 - PreToolUse / PostToolUse / SessionStart / Stop / UserPromptSubmit hooks
 
+#### Hook input contract (load-bearing — a silent-failure class)
+
+CC passes each hook its payload as **JSON on stdin**
+(`{"tool_name": ..., "tool_input": {...}, "tool_response": {...}, "session_id": ...}`).
+The `CLAUDE_TOOL_INPUT` / `CLAUDE_TOOL_USE_RESULT` / `CLAUDE_SESSION_ID` **env
+vars are a dead legacy contract** — current CC does not set them. A hook that
+reads them sees an empty value and **fails open silently**. This went unnoticed
+because the hooks' own tests fed the dead env var and passed against an interface
+CC no longer uses (2026-07-23: `git push`, `rm -rf`, worktree `pip install -e`,
+and CRITICAL-path writes were all unguarded; every guard's block *logic* was
+fine — only the input read was dead).
+
+Genesis hooks read input through `scripts/hooks/hook_input.py`
+(`read_payload()` / `field()` / `tool_response()` / `session_id()`), which reads
+stdin, extracts the `tool_input`-nested fields, and warns on a malformed payload
+so a broken contract can't silently fail open again.
+`tests/test_scripts/test_hook_input_contract.py` feeds each guard a real payload
+and statically forbids any hook from reading a dead payload env var. See
+`.claude/hooks/README.md` for the authoring rule. **A CC bump that changes the
+hook payload shape must re-run that test** (checklist item below).
+
 ### Planned to Use (Phase 6-7)
 - **Skills system** — Load Genesis skills into CC background sessions
 - **Hooks in frontmatter** (CC 2.1) — Per-session hook configuration via session_config.py
@@ -189,7 +210,11 @@ When a new CC version is released, run through this:
 5. **Obsolescence check:** Does this make something we built unnecessary?
 6. **Interactive UX check:** Does this change the foreground session experience?
    Rendering, scrollback, terminal behavior, keyboard shortcuts?
-7. **Test impact:** Run Genesis CC integration tests after update.
+7. **Test impact:** Run Genesis CC integration tests after update. **Always run
+   `pytest tests/test_scripts/test_hook_input_contract.py`** — it feeds each
+   safety guard a real payload, so it catches a changed hook payload shape that
+   would otherwise silently disable the guards (see the hook input contract
+   under "Actively Used" above).
 8. **Update this document** with findings.
 
 ---
