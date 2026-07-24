@@ -65,16 +65,21 @@ def _run(script_rel: str, stdin: str, *, env_var: str | None = None):
     )
 
 
+# Install-agnostic triggers: the destructive guard blocks by path breadth (home
+# is a shallow path on any runner); the protected-paths guard matches the `~`
+# alias, so neither case hardcodes this box's `/home/ubuntu`.
+_HOME = str(Path.home())
+
 # (script, tool_name, tool_input, must_block) — the safety-critical exit-2 guards.
 _BLOCKING_CASES = [
     ("hooks/git_push_guard.py", "Bash", {"command": "git push origin main"}, True),
     ("hooks/git_push_guard.py", "Bash", {"command": "ls -la"}, False),
-    ("hooks/destructive_command_guard.py", "Bash", {"command": "rm -rf /home/ubuntu"}, True),
+    ("hooks/destructive_command_guard.py", "Bash", {"command": f"rm -rf {_HOME}"}, True),
     ("hooks/destructive_command_guard.py", "Bash", {"command": "rm file.txt"}, False),
     (
         "hooks/protected_paths_guard.py",
         "Bash",
-        {"command": "rm -rf /home/ubuntu/.claude/projects"},
+        {"command": "rm -rf ~/.claude/projects"},
         True,
     ),
     (
