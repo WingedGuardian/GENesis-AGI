@@ -118,7 +118,11 @@ def build_triage_pipeline(
             _record_call_site(triage_depth=None)
         except Exception as exc:
             if runtime is not None:
-                runtime.record_job_failure("retrospective_triage", "pipeline exception", exc=exc, emit_event=False)
+                # _fire_triage (inbox/monitor + cc/conversation) wraps this in a
+                # tracked_task but SWALLOWS the re-raise with a bare except+log,
+                # so no task.failed is ever emitted for this path. Let the funnel
+                # emit job.failed — it is the only bus signal this failure gets.
+                runtime.record_job_failure("retrospective_triage", "pipeline exception", exc=exc)
             raise
 
     async def _run_pipeline(output: Any, user_text: str, channel: str) -> None:
