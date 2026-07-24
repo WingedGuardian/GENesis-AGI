@@ -49,13 +49,19 @@ class TestCampaignTick:
 
         # Burn through the budget
         from genesis.db.crud import campaigns as crud
+
         await crud.create_run(
-            db, id="r-budget", campaign_id=campaign_in_db,
+            db,
+            id="r-budget",
+            campaign_id=campaign_in_db,
             started_at=datetime.now(UTC).isoformat(),
             trigger_type="scheduled",
         )
         await crud.complete_run(
-            db, "r-budget", outcome="success", cost_usd=5.0,
+            db,
+            "r-budget",
+            outcome="success",
+            cost_usd=5.0,
             finished_at=datetime.now(UTC).isoformat(),
         )
 
@@ -78,12 +84,14 @@ class TestCampaignTick:
         # Write a minimal strategy doc
         import os
         import tempfile
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write("# Test Strategy\nPost something useful.\n")
             strategy_path = f.name
 
         try:
             from genesis.db.crud import campaigns as crud
+
             await crud.update_campaign(db, campaign_in_db, strategy_doc_path=strategy_path)
 
             result = await runner.campaign_tick(campaign_in_db)
@@ -110,6 +118,7 @@ class TestCampaignTick:
 
         # Set state to indicate a pending session
         from genesis.db.crud import campaigns as crud
+
         state = {"posts_today": 0, "total_posts": 0, "_pending_session_id": "sess-old"}
         await crud.update_campaign_state(db, campaign_in_db, json.dumps(state))
 
@@ -135,6 +144,7 @@ class TestCampaignTick:
 
         # Set state with a completed pending session
         from genesis.db.crud import campaigns as crud
+
         state = {
             "posts_today": 0,
             "total_posts": 0,
@@ -145,17 +155,22 @@ class TestCampaignTick:
 
         # Create the pending run in DB
         await crud.create_run(
-            db, id="run-done", campaign_id=campaign_in_db,
-            started_at="2026-06-07T00:30:00Z", trigger_type="scheduled",
+            db,
+            id="run-done",
+            campaign_id=campaign_in_db,
+            started_at="2026-06-07T00:30:00Z",
+            trigger_type="scheduled",
         )
 
         # Mock session as completed with structured output
         completed_result = {
             "success": True,
-            "output_text": json.dumps({
-                "state_updates": {"posts_today": 1, "total_posts": 1},
-                "summary": "Posted to #dev-discussion",
-            }),
+            "output_text": json.dumps(
+                {
+                    "state_updates": {"posts_today": 1, "total_posts": 1},
+                    "summary": "Posted to #dev-discussion",
+                }
+            ),
             "cost_usd": 0.03,
         }
 
@@ -164,6 +179,7 @@ class TestCampaignTick:
 
             import os
             import tempfile
+
             with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
                 f.write("# Test\n")
                 strategy_path = f.name
@@ -287,9 +303,10 @@ class TestTickWrapperJobHealth:
             await runner._tick_wrapper("camp-1", "campaign_test")
 
         inst.record_job_failure.assert_called_once()
-        job_id, err = inst.record_job_failure.call_args[0][:2]
-        assert job_id == "campaign_test"
-        assert "boom" in err
+        call = inst.record_job_failure.call_args
+        assert call.args[0] == "campaign_test"
+        # The exception is now threaded through (exc=), not pre-stringified.
+        assert "boom" in str(call.kwargs["exc"])
         inst.record_job_success.assert_not_called()
 
     @pytest.mark.anyio
