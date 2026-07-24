@@ -9,7 +9,7 @@ CURRENT repo by its ``origin`` remote, then flags staged/added files whose path
 ``repo_topology.yaml``.
 
 Contract (matches the other Genesis PreToolUse hooks):
-- Input via ``CLAUDE_TOOL_INPUT`` env (JSON with a ``command`` field).
+- Input via the CC hook payload on stdin (JSON with a ``command`` field).
 - STRONG match -> BLOCK: message to stderr, exit 2.
 - WEAK match  -> ADVISORY: ``hookSpecificOutput.additionalContext`` on stdout, exit 0.
 - No match / not a git add|commit / anything unexpected -> exit 0 (fail-open).
@@ -47,6 +47,10 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+# Self-locate so hook_input resolves whether run as a script or imported (tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import field, read_payload  # noqa: E402
 
 _OVERRIDE_RE = re.compile(r"#\s*repo-routing-override\b")
 
@@ -144,7 +148,9 @@ def _parse_git_invocations(cmd: str) -> list[tuple[str, list[str], str]]:
 def _git(git_dir: str, args: list[str], timeout: int) -> str:
     r = subprocess.run(
         ["git", "-C", git_dir, *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
     )
     return r.stdout if r.returncode == 0 else ""
 
@@ -163,7 +169,9 @@ def _normalize_remote(url: str | None) -> str | None:
 
 
 def _porcelain_files(
-    git_dir: str, pathspecs: list[str], timeout: int,
+    git_dir: str,
+    pathspecs: list[str],
+    timeout: int,
 ) -> tuple[set[str], set[str]]:
     """(all_files, new_files) that a status/add would touch, via git porcelain."""
     # --untracked-files=all expands fully-untracked directories into individual
@@ -194,7 +202,9 @@ def _porcelain_files(
 
 
 def _commit_files(
-    git_dir: str, args: list[str], timeout: int,
+    git_dir: str,
+    args: list[str],
+    timeout: int,
 ) -> tuple[set[str], set[str]]:
     """(all_files, new_files) a commit would include."""
     files, new = set(), set()
@@ -209,8 +219,10 @@ def _commit_files(
         if status.startswith("A"):
             new.add(path)
     # `commit -a` / `-am` also stages tracked modifications (never new files).
-    if any(a in ("-a", "--all") or (a.startswith("-") and not a.startswith("--") and "a" in a)
-           for a in args):
+    if any(
+        a in ("-a", "--all") or (a.startswith("-") and not a.startswith("--") and "a" in a)
+        for a in args
+    ):
         for line in _git(git_dir, ["diff", "HEAD", "--name-status"], timeout).splitlines():
             parts = line.split("\t")
             if len(parts) < 2 or parts[0].startswith("D"):
@@ -220,7 +232,9 @@ def _commit_files(
 
 
 def _add_files(
-    git_dir: str, args: list[str], timeout: int,
+    git_dir: str,
+    args: list[str],
+    timeout: int,
 ) -> tuple[set[str], set[str]]:
     pathspecs = [a for a in args if not a.startswith("-")]
     broad = (not pathspecs) or any(p in (".", ":/", "-A", "--all") for p in pathspecs)
@@ -265,7 +279,11 @@ def _has_content_marker(git_dir: str, path: str, markers: list[str], max_bytes: 
 
 
 _DEFAULT_CONTENT_EXCLUDE = [
-    "*.md", "**/*.md", "docs/**", "tests/**", "**/repo_topology.yaml",
+    "*.md",
+    "**/*.md",
+    "docs/**",
+    "tests/**",
+    "**/repo_topology.yaml",
 ]
 
 
@@ -274,8 +292,12 @@ def _path_excluded(path: str, globs: list[str]) -> bool:
 
 
 def _classify(
-    files: set[str], new_files: set[str], git_dir: str,
-    cur_allow: list[str], foreign: dict[str, dict], settings: dict,
+    files: set[str],
+    new_files: set[str],
+    git_dir: str,
+    cur_allow: list[str],
+    foreign: dict[str, dict],
+    settings: dict,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Return (strong_hits, weak_hits) as lists of (path, foreign_repo_name)."""
     max_files = int(settings.get("max_files", 200))
@@ -295,10 +317,14 @@ def _classify(
                 strong.append((path, name))
                 matched_strong = True
                 break
-            if (path in new_files and reads < max_content
-                    and not _path_excluded(path, content_exclude)
-                    and _has_content_marker(
-                        git_dir, path, sig.get("strong_content_markers", []) or [], max_bytes)):
+            if (
+                path in new_files
+                and reads < max_content
+                and not _path_excluded(path, content_exclude)
+                and _has_content_marker(
+                    git_dir, path, sig.get("strong_content_markers", []) or [], max_bytes
+                )
+            ):
                 reads += 1
                 strong.append((path, name))
                 matched_strong = True
@@ -317,10 +343,9 @@ def _classify(
 def main() -> int:
     """Entry point: parse hook input, classify staged files, block or advise."""
     try:
-        raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-        if not raw:
+        cmd = field(read_payload(), "command")
+        if not cmd:
             return 0
-        cmd = (json.loads(raw) or {}).get("command", "")
         # Cheap pre-filter: skip clearly non-git commands. Do NOT match "git add"
         # as a substring — `git -C <dir> add` splits it. _parse_git_invocation
         # is the accurate check (returns None for non add/commit).
@@ -349,21 +374,30 @@ def main() -> int:
         cur_key = None
         for sub, args, git_dir in invocations:
             origin = _normalize_remote(
-                _git(git_dir, ["config", "--get", "remote.origin.url"], timeout).strip())
+                _git(git_dir, ["config", "--get", "remote.origin.url"], timeout).strip()
+            )
             if not origin:
                 continue
             key = next(
-                (k for k, v in repos.items()
-                 if origin in {_normalize_remote(r) for r in (v.get("remotes") or [])}),
+                (
+                    k
+                    for k, v in repos.items()
+                    if origin in {_normalize_remote(r) for r in (v.get("remotes") or [])}
+                ),
                 None,
             )
             if key is None:
                 continue  # unknown repo — don't guard this invocation
             foreign = {
-                k: v for k, v in repos.items()
-                if k != key and (
-                    v.get("strong_path_segments") or v.get("strong_path_globs")
-                    or v.get("strong_content_markers") or v.get("weak_path_segments"))
+                k: v
+                for k, v in repos.items()
+                if k != key
+                and (
+                    v.get("strong_path_segments")
+                    or v.get("strong_path_globs")
+                    or v.get("strong_content_markers")
+                    or v.get("weak_path_segments")
+                )
             }
             if not foreign:
                 continue
@@ -407,17 +441,21 @@ def main() -> int:
         if weak:
             belongs = sorted({name for _, name in weak})
             shown = ", ".join(p for p, _ in weak[:5])
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": (
-                        f"NOTE: {len(weak)} file(s) look voice/edge-related "
-                        f"({shown}) and may belong to {', '.join(belongs)} rather "
-                        f"than {cur_key}. Proceed if this is legitimately internal "
-                        f"channel code; otherwise commit it in the right repo."
-                    ),
-                }
-            }))
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "additionalContext": (
+                                f"NOTE: {len(weak)} file(s) look voice/edge-related "
+                                f"({shown}) and may belong to {', '.join(belongs)} rather "
+                                f"than {cur_key}. Proceed if this is legitimately internal "
+                                f"channel code; otherwise commit it in the right repo."
+                            ),
+                        }
+                    }
+                )
+            )
             return 0
 
     except Exception:

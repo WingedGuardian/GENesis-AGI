@@ -2,7 +2,7 @@
 """PreToolUse hook — blocks Write/Edit to CRITICAL protected paths.
 
 Called by CC CLI via .claude/settings.json PreToolUse hook.
-Reads CLAUDE_TOOL_INPUT JSON from stdin, extracts file_path,
+Reads the CC hook payload from stdin (via hook_input), extracts file_path,
 checks against CRITICAL patterns from config/protected_paths.yaml.
 
 Exit codes:
@@ -12,12 +12,16 @@ Exit codes:
 Emits SteerMessage for unified enforcement feedback.
 """
 
-import json
 import sys
 from fnmatch import fnmatch
 from pathlib import Path
 
 import yaml
+
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import field, read_payload  # noqa: E402
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "protected_paths.yaml"
 
@@ -64,14 +68,7 @@ def _matches(path: str, patterns: list[str]) -> str | None:
 
 
 def main() -> int:
-    tool_input = sys.stdin.read()
-    try:
-        data = json.loads(tool_input)
-    except json.JSONDecodeError as exc:
-        print(f"WARNING: pretool_check stdin parse failed ({exc})", file=sys.stderr)
-        return 0  # Can't parse — fail open
-
-    file_path = data.get("file_path", "")
+    file_path = field(read_payload(), "file_path")
     if not file_path:
         return 0
 
@@ -89,7 +86,7 @@ def main() -> int:
             title="CRITICAL protected path",
             context=f"Matches pattern '{matched}'",
             suggestion="This path cannot be modified from a relay/chat channel. "
-                       "Use a direct CC CLI session instead.",
+            "Use a direct CC CLI session instead.",
             tool_name="Write",
             file_path=file_path,
         )

@@ -36,17 +36,19 @@ import os
 import re
 import sys
 
+# Self-locate so hook_input resolves whether run as a script or imported (tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import read_payload, tool_input  # noqa: E402
+
 # Matches 'git worktree remove' with optional flags
-_WORKTREE_REMOVE = re.compile(
-    r"\bgit\s+worktree\s+remove\b"
-)
+_WORKTREE_REMOVE = re.compile(r"\bgit\s+worktree\s+remove\b")
 
 
 def _extract_worktree_targets(cmd: str) -> list[str]:
     """Extract target paths from git worktree remove commands."""
     targets: list[str] = []
     for match in _WORKTREE_REMOVE.finditer(cmd):
-        rest = cmd[match.end():]
+        rest = cmd[match.end() :]
         # Skip flags, grab paths
         for token in rest.split():
             token = token.strip("'\"")
@@ -114,8 +116,7 @@ def _block_with_pids(target: str, pids: list[int]) -> int:
     )
     print(f"PIDs: {pid_str}", file=sys.stderr)
     print(
-        "This would brick those sessions. Wait for them to finish "
-        "or use the lifecycle manager.",
+        "This would brick those sessions. Wait for them to finish or use the lifecycle manager.",
         file=sys.stderr,
     )
     return 2
@@ -268,22 +269,15 @@ def _handle_enter_worktree(data: dict) -> int:
 def main() -> int:
     # EnterWorktree is hard-blocked UNCONDITIONALLY: it relocates the session
     # regardless of arguments or input, so block before any parse that could
-    # otherwise fail-open (empty/missing/malformed CLAUDE_TOOL_INPUT) and let
+    # otherwise fail-open (empty/missing/malformed payload) and let
     # the relocation through. Input is parsed only to name the worktree in the
     # message; failure to parse still blocks.
     if "--enter-worktree" in sys.argv:
-        try:
-            data = json.loads(os.environ.get("CLAUDE_TOOL_INPUT") or "{}")
-        except (json.JSONDecodeError, ValueError):
-            data = {}
-        return _handle_enter_worktree(data)
+        return _handle_enter_worktree(tool_input(read_payload()))
 
     try:
-        raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-        if not raw:
-            return 0
-
-        data = json.loads(raw)
+        # Handlers operate on the tool-input dict (command / action fields).
+        data = tool_input(read_payload())
 
         # Determine mode from CLI args
         if "--exit-worktree" in sys.argv:

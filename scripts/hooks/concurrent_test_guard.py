@@ -13,11 +13,14 @@ Catches all invocation patterns:
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
 import sys
+
+# Self-locate so hook_input resolves whether run as a script or imported (tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import field, read_payload  # noqa: E402
 
 
 def _command_runs_pytest(cmd: str) -> bool:
@@ -27,9 +30,7 @@ def _command_runs_pytest(cmd: str) -> bool:
     # and env-var prefixed invocations (PYTHONPATH=src pytest ...).
     # Does NOT match: "grep pytest", "cat pytest.ini", etc. — requires word boundary.
     # The (?:\w+=\S*\s+)* handles env var assignments before the command.
-    return bool(re.search(
-        r'(?:^|&&|;|\|)\s*(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b', cmd
-    ))
+    return bool(re.search(r"(?:^|&&|;|\|)\s*(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b", cmd))
 
 
 def _pytest_already_running() -> bool:
@@ -40,7 +41,9 @@ def _pytest_already_running() -> bool:
         # Match "pytest" followed by space, end-of-string, or common flag chars.
         result = subprocess.run(
             ["pgrep", "-f", "pytest( |$)"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True,
+            text=True,
+            timeout=3,
         )
         if result.returncode != 0:
             return False
@@ -57,13 +60,7 @@ def _pytest_already_running() -> bool:
 
 
 def main() -> None:
-    tool_input = os.environ.get("CLAUDE_TOOL_INPUT", "{}")
-    try:
-        data = json.loads(tool_input)
-    except json.JSONDecodeError:
-        return
-
-    cmd = data.get("command", "")
+    cmd = field(read_payload(), "command")
     if not cmd:
         return
 

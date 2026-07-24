@@ -20,15 +20,19 @@ import os
 import re
 import sys
 
+# Self-locate so hook_input resolves whether run as a script or imported (tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import field, read_payload  # noqa: E402
+
 # Directories that must never be deleted.  Relative to $HOME.
 # Each entry is joined with os.path.expanduser("~") at runtime.
 _PROTECTED_RELATIVE = [
-    ".claude/projects",       # CC session transcripts (JSONL)
-    "backups",                # Encrypted Genesis backups
-    "snapshots",              # Qdrant snapshots
+    ".claude/projects",  # CC session transcripts (JSONL)
+    "backups",  # Encrypted Genesis backups
+    "snapshots",  # Qdrant snapshots
     ".genesis/camoufox-profile",  # Camoufox browser profile
-    ".genesis/browser-profile",   # Chromium browser profile
-    "genesis/data",           # Production database (genesis.db)
+    ".genesis/browser-profile",  # Chromium browser profile
+    "genesis/data",  # Production database (genesis.db)
 ]
 
 # Matches rm or rmdir as a word boundary
@@ -51,12 +55,7 @@ def _build_protected_paths() -> list[str]:
 
 def main() -> int:
     try:
-        raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
-        if not raw:
-            return 0
-
-        data = json.loads(raw)
-        cmd = data.get("command", "")
+        cmd = field(read_payload(), "command")
         if not cmd:
             return 0
 

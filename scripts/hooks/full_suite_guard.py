@@ -22,25 +22,33 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
+
+# Self-locate so `from hook_input import …` resolves both when CC runs this as a
+# script and when it is imported as a module for tests (importlib does not add
+# the file's dir to sys.path).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import field, read_payload  # noqa: E402
 
 # Flags that pytest accepts (non-exhaustive but covers common ones).
 # Used to distinguish "pytest -v" (no path) from "pytest tests/foo.py -v".
 _PYTEST_FLAGS = re.compile(
-    r'^-[a-zA-Z]'      # short flags: -v, -x, -q, -s, etc.
-    r'|^--[a-z]'       # long flags: --verbose, --tb=short, etc.
-    r'|^[0-9]'         # bare numbers (unlikely but safe to skip)
+    r"^-[a-zA-Z]"  # short flags: -v, -x, -q, -s, etc.
+    r"|^--[a-z]"  # long flags: --verbose, --tb=short, etc.
+    r"|^[0-9]"  # bare numbers (unlikely but safe to skip)
 )
 
 
 def _is_full_suite(cmd: str) -> bool:
     """Return True if cmd runs pytest without a specific test path."""
     # Split on && and ; to handle chained commands
-    parts = re.split(r'&&|;', cmd)
+    parts = re.split(r"&&|;", cmd)
     for part in parts:
         part = part.strip()
         # Find the pytest invocation
         match = re.search(
-            r'(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b(.*)', part,
+            r"(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b(.*)",
+            part,
         )
         if not match:
             continue
@@ -55,14 +63,24 @@ def _is_full_suite(cmd: str) -> bool:
         i = 0
         while i < len(args):
             arg = args[i]
-            if arg in ('>', '2>&1', '|'):
+            if arg in (">", "2>&1", "|"):
                 break  # redirection/pipe — stop parsing
-            if arg.startswith('-'):
+            if arg.startswith("-"):
                 # Flag — skip it (and its value if it takes one)
-                if arg in ('-k', '-m', '--tb', '-p', '--timeout',
-                           '--rootdir', '-c', '--co', '-W', '--override-ini'):
+                if arg in (
+                    "-k",
+                    "-m",
+                    "--tb",
+                    "-p",
+                    "--timeout",
+                    "--rootdir",
+                    "-c",
+                    "--co",
+                    "-W",
+                    "--override-ini",
+                ):
                     i += 1  # skip the next arg too (flag value)
-            elif '/' in arg or arg.endswith('.py'):
+            elif "/" in arg or arg.endswith(".py"):
                 has_path = True
                 break
             i += 1
@@ -74,33 +92,29 @@ def _is_full_suite(cmd: str) -> bool:
 
 
 def main() -> None:
-    tool_input = os.environ.get("CLAUDE_TOOL_INPUT", "{}")
-    try:
-        data = json.loads(tool_input)
-    except json.JSONDecodeError:
-        return
-
-    cmd = data.get("command", "")
+    cmd = field(read_payload(), "command")
     if not cmd:
         return
 
     # Only care about commands that run pytest
-    if not re.search(r'(?:^|&&|;|\|)\s*(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b', cmd):
+    if not re.search(r"(?:^|&&|;|\|)\s*(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b", cmd):
         return
 
     if _is_full_suite(cmd):
-        msg = json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "additionalContext": (
-                    "WARNING: You are about to run the FULL test suite (5900+ tests, ~10 min). "
-                    "During development, run only the specific test files for your changes. "
-                    "The full suite should run ONCE at pre-commit time, not during iteration. "
-                    "If this IS the pre-commit run, proceed. Otherwise, target your tests: "
-                    "pytest tests/path/to/specific_test.py -v"
-                ),
+        msg = json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": (
+                        "WARNING: You are about to run the FULL test suite (5900+ tests, ~10 min). "
+                        "During development, run only the specific test files for your changes. "
+                        "The full suite should run ONCE at pre-commit time, not during iteration. "
+                        "If this IS the pre-commit run, proceed. Otherwise, target your tests: "
+                        "pytest tests/path/to/specific_test.py -v"
+                    ),
+                }
             }
-        })
+        )
         print(msg)
 
 

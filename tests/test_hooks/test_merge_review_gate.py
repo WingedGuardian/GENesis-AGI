@@ -21,24 +21,27 @@ _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
 _GUARD = _SCRIPTS / "git_push_guard.py"
 
 
-def _run_guard(command: str, *, mock_gh_output: str = "", mock_gh_rc: int = 0) -> subprocess.CompletedProcess:
+def _run_guard(
+    command: str, *, mock_gh_output: str = "", mock_gh_rc: int = 0
+) -> subprocess.CompletedProcess:
     """Run git_push_guard.py with a mock gh api response.
 
     We patch subprocess.run inside the hook to intercept gh api calls
     while still letting other subprocess calls (like git branch) work.
     """
-    env = {
-        **os.environ,
-        "CLAUDE_TOOL_INPUT": json.dumps({"command": command}),
-        # Inject mock response via env var — the test wrapper reads it
-        "_TEST_GH_API_OUTPUT": mock_gh_output,
-        "_TEST_GH_API_RC": str(mock_gh_rc),
-    }
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
+    # Inject mock response via env var — the test wrapper reads it
+    env["_TEST_GH_API_OUTPUT"] = mock_gh_output
+    env["_TEST_GH_API_RC"] = str(mock_gh_rc)
 
-    # We can't easily mock subprocess inside a subprocess, so we test
-    # the _check_pr_review_findings function directly via import instead.
+    # Deliver the command via the real contract: full payload on stdin, nested
+    # under tool_input.
+    payload = json.dumps(
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
+    )
     result = subprocess.run(
         [sys.executable, str(_GUARD)],
+        input=payload,
         env=env,
         capture_output=True,
         text=True,
@@ -48,6 +51,7 @@ def _run_guard(command: str, *, mock_gh_output: str = "", mock_gh_rc: int = 0) -
 
 
 # ── Import the module directly for unit testing ──────────────────────
+
 
 @pytest.fixture(scope="module")
 def guard_module():
@@ -62,21 +66,24 @@ def guard_module():
 
 # ── _check_pr_review_findings tests ─────────────────────────────────
 
+
 class TestCheckPrReviewFindings:
     """Unit tests for _check_pr_review_findings()."""
 
     def _make_gh_output(self, comments: list[tuple[str, str, str]]) -> str:
         """Build mock gh api JSON output: [{login, type, body}, ...]."""
-        return json.dumps([
-            {"login": login, "type": utype, "body": body}
-            for login, utype, body in comments
-        ])
+        return json.dumps(
+            [{"login": login, "type": utype, "body": body} for login, utype, body in comments]
+        )
 
     def test_no_comments_allows_merge(self, guard_module):
         """No review comments at all → fail-open (quota exhausted case)."""
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr="",
+                args=[],
+                returncode=0,
+                stdout="",
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
@@ -84,28 +91,44 @@ class TestCheckPrReviewFindings:
 
     def test_clean_review_allows_merge(self, guard_module):
         """Review comment with CLEAN verdict → allow."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "## Structural Review\n\nNo issues.\n\n## PII / Secrets / Wording scan: **CLEAN**"),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "## Structural Review\n\nNo issues.\n\n## PII / Secrets / Wording scan: **CLEAN**",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
 
     def test_error_finding_blocks_merge(self, guard_module):
         """Review with ### ERROR blocks merge."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "## Structural Review\n\n### ERROR — Raw SQL in production code\n\n"
-             "`src/genesis/foo.py` uses raw SQL.\n\n"
-             "## PII scan: not performed"),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "## Structural Review\n\n### ERROR — Raw SQL in production code\n\n"
+                    "`src/genesis/foo.py` uses raw SQL.\n\n"
+                    "## PII scan: not performed",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert should_block
@@ -113,42 +136,65 @@ class TestCheckPrReviewFindings:
 
     def test_p1_finding_blocks_merge(self, guard_module):
         """Review with [P1] marker blocks merge."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "[P1] Logic bug: session_id always None\n"
-             "[P2] Missing docstring on helper"),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "[P1] Logic bug: session_id always None\n[P2] Missing docstring on helper",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert should_block
 
     def test_hard_block_blocks_merge(self, guard_module):
         """Review with HARD BLOCK blocks merge."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "### 🔴 HARD BLOCK\n\nPrivate IP found in config file."),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "### 🔴 HARD BLOCK\n\nPrivate IP found in config file.",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert should_block
 
     def test_warning_only_allows_merge(self, guard_module):
         """Review with only WARNINGs (no ERRORs) → allow."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "## Structural Review\n\n### WARNING — Missing test coverage\n\n"
-             "No test for new function.\n\n"
-             "## PII / Secrets / Wording scan: **CLEAN**"),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "## Structural Review\n\n### WARNING — Missing test coverage\n\n"
+                    "No test for new function.\n\n"
+                    "## PII / Secrets / Wording scan: **CLEAN**",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
@@ -162,7 +208,10 @@ class TestCheckPrReviewFindings:
         """gh api returning error → fail-open (allow merge)."""
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=1, stdout="", stderr="API error",
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="API error",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
@@ -176,102 +225,155 @@ class TestCheckPrReviewFindings:
 
     def test_newer_clean_review_overrides_old_error(self, guard_module):
         """When latest bot comment is clean, old ERROR is considered resolved."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "## Structural Review\n\n### ERROR — Raw SQL\n\nFix needed."),
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "## Structural Review\n\nPASS — no issues.\n\n"
-             "## PII / Secrets / Wording scan: **CLEAN**\n\nVERDICT: PASS"),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "## Structural Review\n\n### ERROR — Raw SQL\n\nFix needed.",
+                ),
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "## Structural Review\n\nPASS — no issues.\n\n"
+                    "## PII / Secrets / Wording scan: **CLEAN**\n\nVERDICT: PASS",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
 
     def test_human_comments_ignored(self, guard_module):
         """Human comments with 'ERROR' in text are not checked."""
-        output = self._make_gh_output([
-            ("octocat", "User",
-             "### ERROR — I think this is wrong\n\nJust my opinion."),
-        ])
+        output = self._make_gh_output(
+            [
+                ("octocat", "User", "### ERROR — I think this is wrong\n\nJust my opinion."),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
 
     def test_codex_quota_message_not_treated_as_review(self, guard_module):
         """Codex quota-exhausted message without findings → not a review."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "You have reached your Codex usage limits for code reviews. "
-             "You can see your limits in the Codex usage dashboard."),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "You have reached your Codex usage limits for code reviews. "
+                    "You can see your limits in the Codex usage dashboard.",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
 
     def test_error_in_clean_comment_does_not_block(self, guard_module):
         """Comment mentions ERROR category but scan is CLEAN → no block."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "**Structural review:** No ERRORs found.\n\n"
-             "## PII / Secrets / Wording scan: **CLEAN**"),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "**Structural review:** No ERRORs found.\n\n"
+                    "## PII / Secrets / Wording scan: **CLEAN**",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
 
     def test_error_plus_incidental_clean_phrase_blocks(self, guard_module):
         """A real ERROR heading with incidental prose should still block."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "### ERROR — hardcoded credential\n\nUse env vars.\n\n"
-             "No issues found in the formatting section."),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "### ERROR — hardcoded credential\n\nUse env vars.\n\n"
+                    "No issues found in the formatting section.",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert should_block
 
     def test_null_body_fails_open(self, guard_module):
         """GitHub API returning body: null should not crash."""
-        output = json.dumps([
-            {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": None},
-        ])
+        output = json.dumps(
+            [
+                {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": None},
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
 
     def test_p2_only_allows_merge(self, guard_module):
         """Review with only [P2] markers → allow."""
-        output = self._make_gh_output([
-            ("chatgpt-codex-connector[bot]", "Bot",
-             "[P2] Missing docstring\n[P2] Inline import"),
-        ])
+        output = self._make_gh_output(
+            [
+                (
+                    "chatgpt-codex-connector[bot]",
+                    "Bot",
+                    "[P2] Missing docstring\n[P2] Inline import",
+                ),
+            ]
+        )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=output, stderr="",
+                args=[],
+                returncode=0,
+                stdout=output,
+                stderr="",
             )
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
 
 
 # ── Integration: full hook invocation ────────────────────────────────
+
 
 class TestMergeGateIntegration:
     """Test the full hook via subprocess invocation."""
@@ -348,9 +450,11 @@ class TestCheckInlineReviewFindings:
         # gh api --paginate with a per-element jq filter emits one
         # compact JSON object per line across ALL result pages.
         return patch.object(
-            guard_module.subprocess, "run",
+            guard_module.subprocess,
+            "run",
             return_value=subprocess.CompletedProcess(
-                args=[], returncode=rc,
+                args=[],
+                returncode=rc,
                 stdout="\n".join(json.dumps(c) for c in comments),
                 stderr="",
             ),
@@ -358,8 +462,10 @@ class TestCheckInlineReviewFindings:
 
     def _codex(self, cid, body, reply_to=None):
         return {
-            "id": cid, "reply_to": reply_to,
-            "login": "chatgpt-codex-connector[bot]", "type": "Bot",
+            "id": cid,
+            "reply_to": reply_to,
+            "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot",
             "body": body,
         }
 
@@ -379,8 +485,13 @@ class TestCheckInlineReviewFindings:
     def test_replied_p1_is_acknowledged(self, guard_module):
         comments = [
             self._codex(1, _P1_BODY),
-            {"id": 2, "reply_to": 1, "login": "WingedGuardian",
-             "type": "User", "body": "Fixed in abc123."},
+            {
+                "id": 2,
+                "reply_to": 1,
+                "login": "WingedGuardian",
+                "type": "User",
+                "body": "Fixed in abc123.",
+            },
         ]
         with self._mock(guard_module, comments):
             block, _ = guard_module._check_inline_review_findings("100")
@@ -388,7 +499,8 @@ class TestCheckInlineReviewFindings:
 
     def test_force_override_allows(self, guard_module):
         block, _ = guard_module._check_inline_review_findings(
-            "100", force=True,
+            "100",
+            force=True,
         )
         assert not block
 
@@ -411,10 +523,15 @@ class TestCheckInlineReviewFindings:
         assert block
 
     def test_human_inline_comments_ignored(self, guard_module):
-        comments = [{
-            "id": 1, "reply_to": None, "login": "WingedGuardian",
-            "type": "User", "body": _P1_BODY,
-        }]
+        comments = [
+            {
+                "id": 1,
+                "reply_to": None,
+                "login": "WingedGuardian",
+                "type": "User",
+                "body": _P1_BODY,
+            }
+        ]
         with self._mock(guard_module, comments):
             block, _ = guard_module._check_inline_review_findings("100")
         # type=User AND not in the inline bot set → not an automated finding
@@ -461,18 +578,26 @@ class TestResolvePrNumber:
 
     def test_resolves_current_branch_pr(self, guard_module):
         with patch.object(
-            guard_module.subprocess, "run",
+            guard_module.subprocess,
+            "run",
             return_value=subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="88\n", stderr="",
+                args=[],
+                returncode=0,
+                stdout="88\n",
+                stderr="",
             ),
         ):
             assert guard_module._resolve_pr_number("gh pr merge --squash") == "88"
 
     def test_unresolvable_returns_none(self, guard_module):
         with patch.object(
-            guard_module.subprocess, "run",
+            guard_module.subprocess,
+            "run",
             return_value=subprocess.CompletedProcess(
-                args=[], returncode=1, stdout="", stderr="no pr",
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="no pr",
             ),
         ):
             assert guard_module._resolve_pr_number("gh pr merge --squash") is None

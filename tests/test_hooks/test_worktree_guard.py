@@ -40,14 +40,23 @@ def guard_cmd() -> str:
 
 
 def _run_guard(
-    cmd: str, tool_input: dict, extra_args: str = "", cwd: str | None = None,
+    cmd: str,
+    tool_input: dict,
+    extra_args: str = "",
+    cwd: str | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run the guard hook with CLAUDE_TOOL_INPUT set."""
+    """Run the guard hook with the real CC payload piped on stdin."""
     full_cmd = f"{cmd} {extra_args}".strip()
-    env = {**os.environ, "CLAUDE_TOOL_INPUT": json.dumps(tool_input)}
+    # Deliver via the real contract: full payload on stdin, tool args nested
+    # under tool_input; scrub the dead legacy env var.
+    payload = json.dumps(
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": tool_input}
+    )
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
     return subprocess.run(
         full_cmd,
         shell=True,
+        input=payload,
         env=env,
         capture_output=True,
         text=True,
@@ -181,7 +190,9 @@ class TestExitWorktree:
     def test_keep_action_allowed(self, guard_cmd: str) -> None:
         """ExitWorktree with action 'keep' always passes."""
         result = _run_guard(
-            guard_cmd, {"action": "keep"}, extra_args="--exit-worktree",
+            guard_cmd,
+            {"action": "keep"},
+            extra_args="--exit-worktree",
         )
         assert result.returncode == 0
 
@@ -193,8 +204,10 @@ class TestExitWorktree:
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             result = _run_guard(
-                guard_cmd, {"action": "remove"},
-                extra_args="--exit-worktree", cwd=tmpdir,
+                guard_cmd,
+                {"action": "remove"},
+                extra_args="--exit-worktree",
+                cwd=tmpdir,
             )
             assert result.returncode == 2
             assert "BLOCKED" in result.stderr
@@ -214,8 +227,10 @@ class TestExitWorktree:
             try:
                 time.sleep(0.1)
                 result = _run_guard(
-                    guard_cmd, {"action": "remove"},
-                    extra_args="--exit-worktree", cwd=tmpdir,
+                    guard_cmd,
+                    {"action": "remove"},
+                    extra_args="--exit-worktree",
+                    cwd=tmpdir,
                 )
                 assert result.returncode == 2
                 assert "BLOCKED" in result.stderr
@@ -234,7 +249,9 @@ class TestEnterWorktree:
     def test_enter_with_name_blocked(self, guard_cmd: str) -> None:
         """EnterWorktree creating a named worktree is hard-blocked."""
         result = _run_guard(
-            guard_cmd, {"name": "my-feature"}, extra_args="--enter-worktree",
+            guard_cmd,
+            {"name": "my-feature"},
+            extra_args="--enter-worktree",
         )
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
@@ -257,32 +274,45 @@ class TestEnterWorktree:
         assert "BLOCKED" in result.stderr
 
     def test_block_message_redirects_to_findable_pattern(
-        self, guard_cmd: str,
+        self,
+        guard_cmd: str,
     ) -> None:
         """Message must point to the non-relocating alternative + /resume."""
         result = _run_guard(
-            guard_cmd, {"name": "x"}, extra_args="--enter-worktree",
+            guard_cmd,
+            {"name": "x"},
+            extra_args="--enter-worktree",
         )
         err = result.stderr.lower()
         assert "git worktree add" in err
         assert "/resume" in err
 
-    def test_enter_blocked_with_missing_env(self, guard_cmd: str) -> None:
-        """Hard block holds even when CLAUDE_TOOL_INPUT is unset (no fail-open)."""
+    def test_enter_blocked_with_empty_stdin(self, guard_cmd: str) -> None:
+        """Hard block holds even with no payload on stdin (no fail-open)."""
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
         result = subprocess.run(
             f"{guard_cmd} --enter-worktree",
-            shell=True, env=env, capture_output=True, text=True, timeout=10,
+            shell=True,
+            input="",
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
-    def test_enter_blocked_with_malformed_env(self, guard_cmd: str) -> None:
-        """Hard block holds even when CLAUDE_TOOL_INPUT is not valid JSON."""
-        env = {**os.environ, "CLAUDE_TOOL_INPUT": "not-json"}
+    def test_enter_blocked_with_malformed_stdin(self, guard_cmd: str) -> None:
+        """Hard block holds even when the stdin payload is not valid JSON."""
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
         result = subprocess.run(
             f"{guard_cmd} --enter-worktree",
-            shell=True, env=env, capture_output=True, text=True, timeout=10,
+            shell=True,
+            input="not-json",
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr

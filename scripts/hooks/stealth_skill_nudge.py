@@ -15,27 +15,31 @@ import os
 import sys
 import tempfile
 
+# Self-locate so hook_input resolves whether run as a script or imported (tests).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hook_input import read_payload, session_id, tool_response  # noqa: E402
+
 _SENTINEL_PREFIX = "genesis_stealth_nudge_"
 
 
-def _session_sentinel_path() -> str:
+def _session_sentinel_path(sid: str) -> str:
     """Path to a sentinel file that tracks whether we've nudged this session."""
-    session_id = os.environ.get("CLAUDE_SESSION_ID", "unknown")
-    return os.path.join(tempfile.gettempdir(), f"{_SENTINEL_PREFIX}{session_id}")
+    return os.path.join(tempfile.gettempdir(), f"{_SENTINEL_PREFIX}{sid}")
 
 
 def main() -> int:
+    payload = read_payload()
+
     # Only nudge once per session
-    sentinel = _session_sentinel_path()
+    sentinel = _session_sentinel_path(session_id(payload))
     if os.path.exists(sentinel):
         return 0
 
     try:
-        raw = os.environ.get("CLAUDE_TOOL_USE_RESULT", "")
-        if not raw:
+        result = tool_response(payload)
+        if not result:
             return 0
 
-        result = json.loads(raw)
         layer = result.get("layer", "")
 
         # Only nudge for Camoufox (stealth) sessions, not Playwright/Chromium

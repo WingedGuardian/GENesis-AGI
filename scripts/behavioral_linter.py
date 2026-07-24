@@ -2,7 +2,7 @@
 """Behavioral linter — enforces anti-pattern rules on Write/Edit operations.
 
 Called by CC CLI via .claude/settings.json PreToolUse hook.
-Reads CLAUDE_TOOL_INPUT JSON from stdin, loads all rule YAML files from
+Reads the CC hook payload from stdin (via hook_input), loads all rule YAML files from
 config/behavioral_rules/, and checks the content being written.
 
 Exit codes:
@@ -16,12 +16,16 @@ audit trail — the user approved the exception.
 Emits SteerMessage for unified enforcement feedback.
 """
 
-import json
 import re
 import sys
 from pathlib import Path
 
 import yaml
+
+# The shared hook-input helper lives in scripts/hooks/; this script runs from
+# scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_input import field, read_payload  # noqa: E402
 
 _RULES_DIR = Path(__file__).resolve().parent.parent / "config" / "behavioral_rules"
 
@@ -74,36 +78,34 @@ def _to_steer_messages(violations: list[tuple[dict, dict]], file_path: str) -> l
     for rule, pattern_def in violations:
         severity = rule.get("severity", "warn")
         name = rule.get("name", "unnamed")
-        messages.append(SteerMessage(
-            layer=EnforcementLayer.HARD_BLOCK,
-            rule_id=name,
-            decision=ApprovalDecision.BLOCK if severity == "block" else ApprovalDecision.ACT,
-            severity="critical" if severity == "block" else "medium",
-            title=f"Behavioral rule '{name}' violated",
-            context=pattern_def.get("context", ""),
-            suggestion=rule.get("description", "") + ("\n  " + rule.get("suggestion", "") if rule.get("suggestion") else ""),
-            tool_name="Write",
-            file_path=file_path,
-            can_suppress=True,
-            suppress_key=f"# behavioral-lint: ignore {name}",
-        ))
+        messages.append(
+            SteerMessage(
+                layer=EnforcementLayer.HARD_BLOCK,
+                rule_id=name,
+                decision=ApprovalDecision.BLOCK if severity == "block" else ApprovalDecision.ACT,
+                severity="critical" if severity == "block" else "medium",
+                title=f"Behavioral rule '{name}' violated",
+                context=pattern_def.get("context", ""),
+                suggestion=rule.get("description", "")
+                + ("\n  " + rule.get("suggestion", "") if rule.get("suggestion") else ""),
+                tool_name="Write",
+                file_path=file_path,
+                can_suppress=True,
+                suppress_key=f"# behavioral-lint: ignore {name}",
+            )
+        )
     return messages
 
 
 def main() -> int:
-    tool_input = sys.stdin.read()
-    try:
-        data = json.loads(tool_input)
-    except json.JSONDecodeError as exc:
-        print(f"WARNING: behavioral_linter stdin parse failed ({exc})", file=sys.stderr)
-        return 0  # Can't parse — fail open
+    payload = read_payload()
 
     # Extract the content being written
-    content = data.get("content", "") or data.get("new_string", "")
+    content = field(payload, "content") or field(payload, "new_string")
     if not content:
         return 0  # No content to check (e.g., delete operation)
 
-    file_path = data.get("file_path", "")
+    file_path = field(payload, "file_path")
 
     rules = _load_rules()
     if not rules:

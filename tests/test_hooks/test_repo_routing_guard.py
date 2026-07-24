@@ -72,14 +72,23 @@ def _write(repo: Path, rel: str, content: str = "x\n") -> None:
 
 
 def _run(cmd: str, cwd: Path, topology: str | None) -> subprocess.CompletedProcess:
-    env = {**os.environ, "CLAUDE_TOOL_INPUT": json.dumps({"command": cmd})}
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
     if topology is not None:
         env["REPO_TOPOLOGY_PATH"] = topology
     else:
         env.pop("REPO_TOPOLOGY_PATH", None)
+    # Real contract: full payload on stdin, command nested under tool_input.
+    payload = json.dumps(
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}}
+    )
     return subprocess.run(
         [sys.executable, str(_guard_script())],
-        env=env, cwd=str(cwd), capture_output=True, text=True, timeout=20,
+        input=payload,
+        env=env,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=20,
     )
 
 
@@ -92,6 +101,7 @@ def agi_repo(tmp_path) -> Path:
 
 
 # ── STRONG → block ──────────────────────────────────────────────────────
+
 
 def test_firmware_add_blocks(agi_repo, topology):
     _write(agi_repo, "firmware/boot.py")
@@ -148,6 +158,7 @@ def test_cd_prefix_blocks(agi_repo, topology, tmp_path):
 
 # ── WEAK → advisory (exit 0, additionalContext) ─────────────────────────
 
+
 def test_weak_marker_advises(agi_repo, topology):
     _write(agi_repo, "docs/satellite/notes.md")
     r = _run("git add docs/satellite/notes.md", agi_repo, topology)
@@ -157,6 +168,7 @@ def test_weak_marker_advises(agi_repo, topology):
 
 
 # ── allow_paths silence WEAK, clean files silent ────────────────────────
+
 
 def test_allow_path_voice_api_silent(agi_repo, topology):
     _write(agi_repo, "dashboard/routes/voice_api.py")
@@ -189,6 +201,7 @@ def test_strong_still_fires_under_allow_path(agi_repo, topology):
 
 
 # ── compound-command parsing (review findings 1-3) ──────────────────────
+
 
 def test_semicolon_in_commit_message_still_detects(agi_repo, topology):
     # A ';' inside the -m message must NOT be treated as a command separator.
@@ -225,11 +238,15 @@ def test_newline_separated_cd_then_git(agi_repo, topology, tmp_path):
 
 # ── content-marker false positives (review finding 4) ───────────────────
 
+
 def test_ruleset_config_not_content_blocked(agi_repo, topology):
     # A file literally named repo_topology.yaml (contains markers as data) must
     # not self-block on content scan.
-    _write(agi_repo, "config/repo_topology.yaml",
-           'strong_content_markers: ["ESP32", "esphome:", "platformio"]\n')
+    _write(
+        agi_repo,
+        "config/repo_topology.yaml",
+        'strong_content_markers: ["ESP32", "esphome:", "platformio"]\n',
+    )
     r = _run("git add config/repo_topology.yaml", agi_repo, topology)
     assert r.returncode == 0
     assert r.stdout.strip() == ""
@@ -256,6 +273,7 @@ def test_code_file_with_markers_still_blocks(agi_repo, topology):
 
 # ── deletions are never blocked (review finding 5) ──────────────────────
 
+
 def test_deleting_foreign_file_not_blocked(agi_repo, topology):
     # Removing wrong-repo content (the incident cleanup) must never be blocked.
     _write(agi_repo, "firmware/boot.py")
@@ -268,6 +286,7 @@ def test_deleting_foreign_file_not_blocked(agi_repo, topology):
 
 # ── override ────────────────────────────────────────────────────────────
 
+
 def test_override_bypasses(agi_repo, topology):
     _write(agi_repo, "firmware/boot.py")
     r = _run("git add firmware/boot.py  # repo-routing-override", agi_repo, topology)
@@ -276,6 +295,7 @@ def test_override_bypasses(agi_repo, topology):
 
 
 # ── fail-open cases (all exit 0) ────────────────────────────────────────
+
 
 def test_non_git_command_passes(agi_repo, topology):
     assert _run("ls -la", agi_repo, topology).returncode == 0
@@ -304,10 +324,15 @@ def test_missing_topology_falls_back_to_in_repo(agi_repo, tmp_path):
 
 
 def test_malformed_tool_input_fails_open(agi_repo, topology):
-    env = {**os.environ, "CLAUDE_TOOL_INPUT": "{not json",
-           "REPO_TOPOLOGY_PATH": topology}
-    r = subprocess.run([sys.executable, str(_guard_script())], env=env,
-                       cwd=str(agi_repo), capture_output=True, text=True, timeout=20)
+    env = {**os.environ, "CLAUDE_TOOL_INPUT": "{not json", "REPO_TOPOLOGY_PATH": topology}
+    r = subprocess.run(
+        [sys.executable, str(_guard_script())],
+        env=env,
+        cwd=str(agi_repo),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
     assert r.returncode == 0
 
 
@@ -330,6 +355,12 @@ def test_no_remote_fails_open(tmp_path, topology):
 def test_empty_tool_input_passes(agi_repo, topology):
     env = {**os.environ, "REPO_TOPOLOGY_PATH": topology}
     env.pop("CLAUDE_TOOL_INPUT", None)
-    r = subprocess.run([sys.executable, str(_guard_script())], env=env,
-                       cwd=str(agi_repo), capture_output=True, text=True, timeout=20)
+    r = subprocess.run(
+        [sys.executable, str(_guard_script())],
+        env=env,
+        cwd=str(agi_repo),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
     assert r.returncode == 0

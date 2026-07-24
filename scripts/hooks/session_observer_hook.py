@@ -23,25 +23,27 @@ if os.environ.get("GENESIS_CC_SESSION") == "1":
     sys.exit(0)
 
 # Tools that produce low-signal observations — not worth capturing
-_SKIP_TOOLS = frozenset({
-    "AskUserQuestion",
-    "TodoWrite",
-    "ListMcpResourcesTool",
-    "Skill",
-    "TaskCreate",
-    "TaskUpdate",
-    "TaskGet",
-    "TaskList",
-    "TaskOutput",
-    "TaskStop",
-    "ToolSearch",
-    "EnterPlanMode",
-    "ExitPlanMode",
-    "EnterWorktree",
-    "ExitWorktree",
-    "SendMessage",
-    "NotebookEdit",
-})
+_SKIP_TOOLS = frozenset(
+    {
+        "AskUserQuestion",
+        "TodoWrite",
+        "ListMcpResourcesTool",
+        "Skill",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskGet",
+        "TaskList",
+        "TaskOutput",
+        "TaskStop",
+        "ToolSearch",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "EnterWorktree",
+        "ExitWorktree",
+        "SendMessage",
+        "NotebookEdit",
+    }
+)
 
 # Max chars to capture from tool output
 _OUTPUT_CAP = 2000
@@ -127,8 +129,10 @@ def _process(data: dict) -> None:
     if not isinstance(tool_input, dict):
         tool_input = {}
 
-    # Get tool output from environment (CC PostToolUse contract)
-    output_raw = os.environ.get("CLAUDE_TOOL_USE_RESULT", "")
+    # Tool result travels in the stdin payload (CC PostToolUse contract); the
+    # old CLAUDE_TOOL_USE_RESULT env var is no longer set.
+    _resp = data.get("tool_response")
+    output_raw = json.dumps(_resp) if _resp else ""
 
     observation = {
         "ts": time.time(),
