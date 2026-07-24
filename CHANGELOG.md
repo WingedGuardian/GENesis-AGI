@@ -59,6 +59,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Genesis now keeps its own internal event log from growing without bound.**
+  The observability event stream — the record of everything Genesis notices and
+  does — was the last high-volume table with no cleanup, growing steadily on
+  disk. A daily maintenance pass now trims events older than 90 days, matching
+  the retention already applied to Genesis's other internal logs. No visible
+  change to day-to-day use; it just stops a slow disk leak.
 - **Proactive memory recall holds up better when several sessions are active at
   once.** When multiple Claude Code sessions run side by side, each prompt's
   memory recall used to spend much of its time-budget on bookkeeping (usage
