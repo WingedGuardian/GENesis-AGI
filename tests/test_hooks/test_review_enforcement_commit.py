@@ -179,6 +179,38 @@ def test_no_verify_mentioned_in_message_not_blocked(repo: Path, home: Path) -> N
     assert res.returncode == 0, res.stderr
 
 
+# ── shell_parse retrofit: the Codex-flagged parsing cases ────────────────
+
+
+def test_no_verify_glued_to_operator_not_overridable(repo: Path, home: Path) -> None:
+    """-n glued to a shell operator is still a real flag → Rule 0 blocks."""
+    res = _run_hook("git commit -m wip -n&&echo done  # review-override", repo, home)
+    assert res.returncode == 2
+    assert "no-verify" in res.stderr
+
+
+def test_no_verify_in_bash_c_not_overridable(repo: Path, home: Path) -> None:
+    """The commit inside bash -c is executed → its -n must be seen and blocked."""
+    res = _run_hook("bash -c 'git commit -n -m wip'  # review-override", repo, home)
+    assert res.returncode == 2
+    assert "no-verify" in res.stderr
+
+
+def test_attached_message_not_treated_as_no_verify(repo: Path, home: Path) -> None:
+    """git commit -minitial is `-m initial`, not -n: allowed once reviewed."""
+    assert _mark(repo, home).returncode == 0
+    res = _run_hook("git commit -minitial", repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+def test_override_on_other_segment_does_not_authorize(repo: Path, home: Path) -> None:
+    """An override token that isn't a trailing comment on the commit segment
+    (here it's inside an echo) must not clear Rule 2 — the commit stays blocked."""
+    res = _run_hook("echo '# review-override' && git commit -m wip", repo, home)
+    assert res.returncode == 2
+    assert "honored" not in res.stderr  # not authorized
+
+
 def test_main_branch_not_overridable(repo: Path, home: Path) -> None:
     _git(repo, "checkout", "-q", "main")
     (repo / "f.txt").write_text("main-change\n")
