@@ -1134,7 +1134,41 @@ def _validate_cc_foreground_reaper(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_memory_integrity(changes: dict) -> list[str]:
+    """Validate memory-integrity lever changes (see
+    genesis.memory.integrity_config). Runtime already fail-safe-coerces at read
+    time; this rejects bad WRITES so settings_update reports the error instead of
+    silently persisting e.g. `enabled: "false"` (truthy) or `rerank: "false"`."""
+    from genesis.memory.integrity_config import _FLOAT01_KNOBS, _INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "rerank", "rerank_timeout_s", *_INT_KNOBS, *_FLOAT01_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key in ("enabled", "rerank"):
+            if not isinstance(value, bool):
+                errors.append(f"'{key}' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "rerank_timeout_s":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                errors.append("'rerank_timeout_s' must be a positive number")
+        elif key in _FLOAT01_KNOBS:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 <= value <= 1
+            ):
+                errors.append(f"'{key}' must be a number in 0..1")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
+    "memory_integrity": _validate_memory_integrity,
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "cc_foreground_reaper": _validate_cc_foreground_reaper,

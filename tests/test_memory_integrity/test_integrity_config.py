@@ -47,6 +47,30 @@ def test_knob_coercion_on_damaged_values():
     assert ic.knob_float(cfg, "rerank_timeout_s") == ic.DEFAULTS["rerank_timeout_s"]
 
 
+def test_settings_validator_rejects_invalid():
+    """settings_update must reject bad writes instead of silently persisting them
+    (P2) — e.g. a string 'false' that is truthy at runtime."""
+    from genesis.mcp.health.settings import _validate_memory_integrity
+
+    assert _validate_memory_integrity({"mode": "bogus"})  # bad enum
+    assert _validate_memory_integrity({"enabled": "false"})  # string, not bool
+    assert _validate_memory_integrity({"rerank": "false"})  # string, not bool
+    assert _validate_memory_integrity({"unknown_key": 1})  # unknown key
+    assert _validate_memory_integrity({"drift_band": 5.0})  # out of 0..1
+    assert _validate_memory_integrity({"severe_min_count": -1})  # not positive
+    # a fully-valid change set passes
+    assert not _validate_memory_integrity(
+        {
+            "enabled": True,
+            "mode": "passive",
+            "rerank": False,
+            "drift_band": 0.2,
+            "severe_min_count": 5,
+            "rerank_timeout_s": 10.0,
+        }
+    )
+
+
 def test_defaults_are_fresh_install_safe():
     # A fresh clone with no overlay must resolve to passive + sane knobs.
     cfg = ic.load_config()

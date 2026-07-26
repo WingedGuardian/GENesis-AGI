@@ -29,6 +29,33 @@ async def test_empty_state_is_healthy(tmp_path):
     assert rep.total_findings == 0
 
 
+async def test_empty_metadata_with_orphan_points_not_healthy(tmp_path):
+    """Metadata wiped/restored-stale but Qdrant still holds points → ghost_points
+    surfaced, NOT a false 'healthy' early return (P1: don't skip the scan on an
+    empty corpus)."""
+    path = await _db(tmp_path)  # zero memory rows
+    pts = {"episodic_memory": {f"orphan{i}": {} for i in range(60)}, "knowledge_base": {}}
+    rep = await _run(path, FakeQdrantClient(pts))
+    assert rep.counts["ghost_points"] == 60
+    assert rep.total_rows == 0
+    assert rep.status == "degraded"  # 60 >= pollution floor (50)
+
+
+async def test_empty_everything_is_healthy(tmp_path):
+    """Genuinely empty install (no metadata, no points) → healthy, no alarm."""
+    path = await _db(tmp_path)
+    rep = await _run(path, FakeQdrantClient({"episodic_memory": {}, "knowledge_base": {}}))
+    assert rep.status == "healthy"
+    assert rep.total_findings == 0
+
+
+async def test_empty_metadata_qdrant_down_is_unknown(tmp_path):
+    """Empty metadata + Qdrant unreachable must be 'unknown', never 'healthy'."""
+    path = await _db(tmp_path)
+    rep = await _run(path, FakeQdrantClient(raise_on="scroll"))
+    assert rep.status == "unknown"
+
+
 async def test_all_consistent_is_healthy(tmp_path):
     path = await _db(tmp_path)
     pts = {"episodic_memory": {}, "knowledge_base": {}}

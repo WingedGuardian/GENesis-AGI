@@ -802,12 +802,11 @@ async def _check_memory_integrity_posture(db) -> None:
                 )
             )
 
-        # Stale/stuck checker: no non-unknown report within the window AND the
-        # checker has been running LONGER than the window (its earliest report
-        # predates the window) — so this is a genuinely dead or unknown-stuck
-        # job, not a fresh install whose first run happened to be 'unknown'.
-        # Only when mode != off.
-        if latest_consistency is not None and integrity_config.effective_mode() != "off":
+        # Stale/stuck detection: a signal that has run LONGER than the window
+        # (earliest row predates it) yet produced no conclusive run within it is
+        # dead or wedged-on-unknown — NOT a fresh install. Applies to both the
+        # consistency checker AND the recall probe. Only when mode != off.
+        if integrity_config.effective_mode() != "off":
             cfg = integrity_config.load_config()
             stale_days = integrity_config.knob_int(cfg, "stale_report_days")
             # Match the stored `datetime('now')` format (space-separated, no tz)
@@ -817,22 +816,60 @@ async def _check_memory_integrity_posture(db) -> None:
             since_iso = (datetime.now(UTC) - timedelta(days=stale_days)).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
-            earliest = await mi_crud.earliest_report_at(db)
-            checker_older_than_window = earliest is not None and earliest < since_iso
-            if checker_older_than_window and not await mi_crud.has_recent_non_unknown_report(
-                db, since_iso=since_iso
-            ):
-                findings.append(
-                    (
-                        "reports_stale",
-                        f"the consistency checker has produced no conclusive "
-                        f"(non-unknown) report in {stale_days}d — the job is dead or "
-                        f"stuck reporting 'unknown' (e.g. Qdrant persistently "
-                        f"unreachable); memory integrity is currently UNVERIFIED",
+            # Consistency checker staleness.
+            if latest_consistency is not None:
+                earliest = await mi_crud.earliest_report_at(db)
+                if (
+                    earliest is not None
+                    and earliest < since_iso
+                    and not await mi_crud.has_recent_non_unknown_report(db, since_iso=since_iso)
+                ):
+                    findings.append(
+                        (
+                            "reports_stale",
+                            f"the consistency checker has produced no conclusive "
+                            f"(non-unknown) report in {stale_days}d — the job is dead or "
+                            f"stuck reporting 'unknown' (e.g. Qdrant persistently "
+                            f"unreachable); memory integrity is currently UNVERIFIED",
+                        )
                     )
-                )
+            # Recall-probe staleness — EXEMPT a never-configured/unseeded golden
+            # set (latest unknown='golden_set_too_small' is needs-setup, not a
+            # failure); only a real measurement failure (retriever error) escalates.
+            if latest_probe is not None and not (
+                latest_probe.get("status") == "unknown"
+                and latest_probe.get("unknown_reason") == "golden_set_too_small"
+            ):
+                earliest_p = await mi_crud.earliest_probe_run_at(db)
+                if (
+                    earliest_p is not None
+                    and earliest_p < since_iso
+                    and not await mi_crud.has_recent_conclusive_probe(db, since_iso=since_iso)
+                ):
+                    findings.append(
+                        (
+                            "recall_stale",
+                            f"the recall-health probe has produced no conclusive run in "
+                            f"{stale_days}d — the retriever is failing or the probe is "
+                            f"wedged; recall health is currently UNVERIFIED",
+                        )
+                    )
 
         if not findings:
+            # Do NOT treat an inconclusive measurement as recovery. If the latest
+            # consistency report is 'unknown' (Qdrant down), or the latest probe
+            # is 'unknown' for a real reason (not needs-setup), a prior degraded
+            # posture must PERSIST until a conclusive healthy run demonstrates it.
+            consistency_inconclusive = (
+                latest_consistency is not None and latest_consistency.get("status") == "unknown"
+            )
+            probe_inconclusive = (
+                latest_probe is not None
+                and latest_probe.get("status") == "unknown"
+                and latest_probe.get("unknown_reason") != "golden_set_too_small"
+            )
+            if consistency_inconclusive or probe_inconclusive:
+                return  # hold the current posture — recovery not demonstrated
             await _resolve_memory_integrity_posture(db)
             return
 

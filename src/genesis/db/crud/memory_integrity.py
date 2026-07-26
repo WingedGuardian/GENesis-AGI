@@ -193,13 +193,16 @@ async def trailing_hit_rate(
     window: int,
     exclude_current_id: str | None = None,
 ) -> tuple[float | None, int]:
-    """Return ``(mean_hit_rate, n_runs)`` over the last *window* non-unknown runs.
+    """Return ``(mean_hit_rate, n_runs)`` over the last *window* HEALTHY runs.
 
-    Only ``status != 'unknown'`` rows with a non-NULL ``hit_rate`` count toward
-    the baseline (an unknown run measured nothing). ``exclude_current_id`` omits
-    the just-inserted row so a run never baselines against itself. Returns
-    ``(None, n)`` when no qualifying runs exist — the caller treats that as the
-    observation period (no drift verdict yet).
+    Baseline = KNOWN-GOOD only: ``status = 'healthy'`` with a non-NULL
+    ``hit_rate``. Deliberately NOT ``status != 'unknown'`` — including degraded
+    runs would let a sustained hit-rate fall gradually normalize itself into the
+    rolling baseline (drift → 0 → false 'healthy'). Because this selects the last
+    N *healthy* runs (not the healthy runs among the last N), a run of degraded
+    results never displaces the known-good baseline; the bar stays put until a
+    genuinely healthy run replaces it. ``exclude_current_id`` omits the
+    just-inserted row. ``(None, n)`` = observation period (no verdict yet).
     """
     if not await _tables_available(db):
         return None, 0
@@ -211,7 +214,7 @@ async def trailing_hit_rate(
     params.append(window)
     cursor = await db.execute(
         "SELECT hit_rate FROM recall_probe_runs "
-        "WHERE status != 'unknown' AND hit_rate IS NOT NULL "  # noqa: S608 - static fragment
+        "WHERE status = 'healthy' AND hit_rate IS NOT NULL "  # noqa: S608 - static fragment
         f"{exclude_clause}"
         "ORDER BY created_at DESC, rowid DESC LIMIT ?",
         params,
@@ -221,6 +224,43 @@ async def trailing_hit_rate(
     if not rates:
         return None, 0
     return sum(rates) / len(rates), len(rates)
+
+
+async def earliest_probe_run_at(db: aiosqlite.Connection) -> str | None:
+    """Oldest recall-probe ``created_at`` (or None). Staleness uses it to tell a
+    fresh install from a genuinely dead/stuck probe (same as earliest_report_at)."""
+    if not await _tables_available(db):
+        return None
+    cursor = await db.execute("SELECT MIN(created_at) FROM recall_probe_runs")
+    row = await cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
+async def has_recent_conclusive_probe(db: aiosqlite.Connection, *, since_iso: str) -> bool:
+    """True if a probe run with status in (healthy, degraded) exists at/after
+    *since_iso*. A probe frozen on 'unknown' (retriever error) is inconclusive;
+    'golden_set_too_small' is needs-setup, not a failure — both are excluded so
+    the staleness check can distinguish a wedged probe from an unseeded one.
+    Pre-migration -> True (nothing to alert on yet)."""
+    if not await _tables_available(db):
+        return True
+    cursor = await db.execute(
+        "SELECT 1 FROM recall_probe_runs "
+        "WHERE status IN ('healthy', 'degraded') AND created_at >= ? "
+        "LIMIT 1",
+        (since_iso,),
+    )
+    return await cursor.fetchone() is not None
+
+
+async def fetch_consistency_metadata(db: aiosqlite.Connection) -> list:
+    """Return all ``memory_metadata`` rows the consistency checker needs
+    (memory_id, collection, embedding_status, deprecated). Centralizes the
+    full-corpus read so the checker doesn't inline SQL (crud convention); the
+    checker passes its own read-only ``mode=ro`` connection."""
+    return await db.execute_fetchall(
+        "SELECT memory_id, collection, embedding_status, deprecated FROM memory_metadata"
+    )
 
 
 async def has_recent_non_unknown_report(

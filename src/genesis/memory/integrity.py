@@ -151,20 +151,18 @@ async def run_consistency_check(
     start = time.monotonic()
     conn = await open_ro_connection(db_path) if db_path else await open_ro_connection()
     try:
-        rows = await conn.execute_fetchall(
-            "SELECT memory_id, collection, embedding_status, deprecated FROM memory_metadata"
-        )
+        from genesis.db.crud import memory_integrity as _mi_crud
+
+        rows = await _mi_crud.fetch_consistency_metadata(conn)
         total_rows = len(rows)
-        if total_rows == 0:
-            # Empty install / fresh state: nothing to be inconsistent about.
-            return MemoryConsistencyReport(
-                status="healthy",
-                counts={c: 0 for c in _CLASSES},
-                total_rows=0,
-                sampled_rows=0,
-                sample_fraction=sample_fraction,
-                duration_ms=int((time.monotonic() - start) * 1000),
-            )
+        # NOTE: do NOT early-return 'healthy' on total_rows == 0. Empty metadata
+        # does not mean "nothing to check" — if metadata was wiped/restored from
+        # an older backup while Qdrant or FTS retained data, the orphaned points
+        # (ghost_points) and FTS rows (fts_ghosts) are exactly what we must
+        # surface. The full scan below yields all-zero counts (→ healthy) for a
+        # genuinely empty install, and flags orphans otherwise. It also lets a
+        # Qdrant outage during an empty-metadata run report 'unknown', not
+        # 'healthy'.
 
         meta_ids: set[str] = set()
         embedded_ids: set[str] = set()

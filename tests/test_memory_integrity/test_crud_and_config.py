@@ -109,6 +109,36 @@ async def test_latest_is_deterministic_same_second(tmp_path):
     await conn.close()
 
 
+async def test_trailing_hit_rate_excludes_degraded(tmp_path):
+    """Baseline is KNOWN-GOOD only — degraded runs must not lower the bar and
+    normalize a sustained drop (P2)."""
+    conn = await _conn(tmp_path)
+    for i in range(3):
+        await mi.insert_recall_probe_run(
+            conn,
+            status="healthy",
+            probes_total=10,
+            probes_hit=9,
+            hit_rate=0.9,
+            mean_rr=0.9,
+            created_at=f"2026-07-2{i} 03:00:00",
+        )
+    for i in range(3):
+        await mi.insert_recall_probe_run(
+            conn,
+            status="degraded",
+            probes_total=10,
+            probes_hit=5,
+            hit_rate=0.5,
+            mean_rr=0.5,
+            created_at=f"2026-07-2{i + 3} 03:00:00",
+        )
+    mean, n = await mi.trailing_hit_rate(conn, window=7)
+    assert n == 3  # only the healthy runs
+    assert abs(mean - 0.9) < 1e-9  # degraded 0.5s excluded → baseline stays 0.9
+    await conn.close()
+
+
 async def test_trailing_hit_rate_no_runs_is_none(tmp_path):
     conn = await _conn(tmp_path)
     mean, n = await mi.trailing_hit_rate(conn, window=7)
