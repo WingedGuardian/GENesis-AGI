@@ -12,6 +12,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiosqlite
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_mi_table_cache():
+    """The crud module caches table-existence in a process global; a bare-DB
+    (pre-migration) test can leave it False and bleed into a later test under
+    CI's randomized order. Reset around every integrity test."""
+    from genesis.db.crud import memory_integrity as _mi
+
+    _mi._tables_verified = False
+    yield
+    _mi._tables_verified = False
 
 
 @dataclass

@@ -105,8 +105,11 @@ async def latest_consistency_report(db: aiosqlite.Connection) -> dict | None:
     """Return the most recent consistency report row as a dict, or None."""
     if not await _tables_available(db):
         return None
+    # Tiebreak on rowid (monotonic insertion order), NOT id: ids are random
+    # uuids, so two reports written in the same second would order
+    # nondeterministically and "latest" could return the older row.
     cursor = await db.execute(
-        "SELECT * FROM memory_consistency_reports ORDER BY created_at DESC, id DESC LIMIT 1"
+        "SELECT * FROM memory_consistency_reports ORDER BY created_at DESC, rowid DESC LIMIT 1"
     )
     row = await cursor.fetchone()
     return _row_to_dict(cursor, row) if row else None
@@ -176,8 +179,9 @@ async def latest_recall_probe_run(db: aiosqlite.Connection) -> dict | None:
     """Return the most recent recall-probe row as a dict, or None."""
     if not await _tables_available(db):
         return None
+    # rowid tiebreak (see latest_consistency_report) — deterministic "latest".
     cursor = await db.execute(
-        "SELECT * FROM recall_probe_runs ORDER BY created_at DESC, id DESC LIMIT 1"
+        "SELECT * FROM recall_probe_runs ORDER BY created_at DESC, rowid DESC LIMIT 1"
     )
     row = await cursor.fetchone()
     return _row_to_dict(cursor, row) if row else None
@@ -209,7 +213,7 @@ async def trailing_hit_rate(
         "SELECT hit_rate FROM recall_probe_runs "
         "WHERE status != 'unknown' AND hit_rate IS NOT NULL "  # noqa: S608 - static fragment
         f"{exclude_clause}"
-        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        "ORDER BY created_at DESC, rowid DESC LIMIT ?",
         params,
     )
     rows = await cursor.fetchall()
@@ -238,6 +242,18 @@ async def has_recent_non_unknown_report(
         (since_iso,),
     )
     return await cursor.fetchone() is not None
+
+
+async def earliest_report_at(db: aiosqlite.Connection) -> str | None:
+    """Return the oldest consistency-report ``created_at``, or None if there are
+    no reports. Used by the staleness posture to distinguish a fresh install
+    (checker younger than the stale window → silent) from a genuinely
+    dead/stuck checker (running longer than the window with no good report)."""
+    if not await _tables_available(db):
+        return None
+    cursor = await db.execute("SELECT MIN(created_at) FROM memory_consistency_reports")
+    row = await cursor.fetchone()
+    return row[0] if row and row[0] else None
 
 
 async def prune_memory_integrity(

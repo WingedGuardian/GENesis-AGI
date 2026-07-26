@@ -78,6 +78,37 @@ async def test_trailing_hit_rate_excludes_unknown(tmp_path):
     await conn.close()
 
 
+async def test_latest_is_deterministic_same_second(tmp_path):
+    """Two reports written in the same second must resolve 'latest' by insertion
+    order (rowid), not by random uuid id — regression for a resolve flake."""
+    conn = await _conn(tmp_path)
+    for _ in range(20):
+        await mi.insert_consistency_report(
+            conn,
+            status="degraded",
+            counts={"lying_mirror": 9},
+            total_rows=100,
+            sampled_rows=100,
+            sample_fraction=1.0,
+            truncated=False,
+        )
+        await mi.insert_consistency_report(
+            conn,
+            status="healthy",
+            counts={},
+            total_rows=100,
+            sampled_rows=100,
+            sample_fraction=1.0,
+            truncated=False,
+        )
+        latest = await mi.latest_consistency_report(conn)
+        # healthy was inserted last → must always be latest
+        assert latest["status"] == "healthy"
+        await conn.execute("DELETE FROM memory_consistency_reports")
+        await conn.commit()
+    await conn.close()
+
+
 async def test_trailing_hit_rate_no_runs_is_none(tmp_path):
     conn = await _conn(tmp_path)
     mean, n = await mi.trailing_hit_rate(conn, window=7)

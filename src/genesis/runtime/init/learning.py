@@ -1333,6 +1333,12 @@ async def init(rt: GenesisRuntime) -> None:
         # testable seam so the registration is covered, not just the crud prunes).
         _wire_drip_retention_jobs(rt._learning_scheduler, rt)
 
+        # Memory integrity Phase 0 — read-only consistency check + recall-health
+        # probe (off-peak CronTrigger; mode-gated, self-persisting).
+        from genesis.runtime.init.memory_integrity import _wire_memory_integrity_jobs
+
+        _wire_memory_integrity_jobs(rt._learning_scheduler, rt)
+
         # NOTE: the daily deep `git fsck --full` (F.1) is NOT wired here. It runs
         # from the awareness loop (`_check_git_health_deep`) on a ~daily guard so
         # it survives a router-degraded startup that skips this learning init.

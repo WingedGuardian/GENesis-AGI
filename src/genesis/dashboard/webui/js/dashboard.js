@@ -204,6 +204,7 @@
         memorySearch: { query: "", results: [], loading: false },
         memoryRecent: { items: [], total: 0, loading: false },
         memoryStats: {},
+        memoryIntegrity: {},
         memoryDetail: null,
         knowledgeQuery: "",
         knowledgeSearchResults: [],
@@ -550,7 +551,7 @@
               this._autonomyInterval = setInterval(() => { this.fetchAutonomyGrants(); this.fetchAutonomySends(); }, 30000);
               break;
             case "memory":
-              if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
+              if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); this.fetchMemoryIntegrity(); }
               break;
             case "knowledge":
               if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); this.fetchKnowledgeUploads(); this.fetchKnowledgeTaxonomy(); this.fetchWatchlist(); }
@@ -1478,6 +1479,12 @@
             const resp = await fetchApi("/api/genesis/memory/stats");
             if (resp && resp.ok) { this.memoryStats = await resp.json(); }
           } catch (e) { console.warn("Memory stats failed:", e); }
+        },
+        async fetchMemoryIntegrity() {
+          try {
+            const resp = await fetchApi("/api/genesis/memory/integrity");
+            if (resp && resp.ok) { this.memoryIntegrity = await resp.json(); }
+          } catch (e) { console.warn("Memory integrity failed:", e); }
         },
         async searchMemory() {
           if (!this.memorySearch.query.trim()) return;

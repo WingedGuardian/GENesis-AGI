@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Genesis now notices when its own memory quietly degrades.** Memory is stored
+  across three backends that have to agree; when they silently drift — a memory
+  that still exists but has become unfindable by search, or a leftover vector
+  with no memory behind it — recall just gets quietly worse, with no error and
+  no signal. Genesis now runs two nightly read-only checks: one verifies the
+  three stores still agree, the other replays a set of known good recalls and
+  watches whether their quality slips over time. If either degrades, it raises a
+  standing alert and shows the state on a new Memory Integrity tile in the
+  dashboard, instead of the rot staying invisible. Detection-only for now
+  (it reports; it does not yet repair), read-only, and off-peak. Controlled by
+  the `memory_integrity` setting (`off` / `passive` / `active`, default
+  `passive`); the recall check stays quiet until you seed it a few known
+  query→memory pairs (`scripts/seed_recall_golden_set.py`).
 - **When a background job fails, Genesis now records what actually broke.** The
   scheduled jobs that quietly keep Genesis healthy — pruning, sweeps, harvests,
   reconnaissance — used to log a failure with the details thrown away, leaving a

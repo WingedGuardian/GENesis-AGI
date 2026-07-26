@@ -149,6 +149,17 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
 
 ### Common Traps
 
+- **Fail-closed data access.** A data-access boundary must RAISE (or return a
+  clearly-typed "unknown/unavailable") on missing scope or an unavailable
+  dependency — it must NEVER silently return the wrong data, the singleton's
+  data, or an empty result that reads as "all clear". A monitoring/consistency
+  check whose dependency (Qdrant, FTS, a remote) is down reports `unknown`, never
+  `healthy`/`degraded` — a dependency outage that masquerades as data
+  corruption (or as cleanliness) is worse than a loud error. Prefer a helper
+  that raises over one that swallows (the `batch_retrieve_point_ids`-raises vs
+  `batch_retrieve_vectors`-swallows split exists for exactly this). Origin: the
+  home-anchored-DB reads that silently returned no data from an empty worktree
+  path, and the memory-integrity checker (2026-07).
 - **Ego sessions are ACTIVE.** `src/genesis/ego/` is live (v3.0a11).
   Two egos: user ego (CEO, Opus) and Genesis ego (COO, Sonnet). Both
   run on adaptive cadence via the awareness loop. Changes here are
@@ -334,6 +345,17 @@ Verify before any commit:
 - `git status --short` — check untracked files (should be staged or ignored)
 - Review level applied matches the adaptive protocol above
 - Staged files do not include secrets (`secrets.env`, `.env`, credentials)
+- **New-Store Gate (anti-proliferation).** A new persistent store — a DB table, a
+  Qdrant collection, a file-plane under `~/.genesis/` — needs a written
+  justification for why an existing store cannot hold it, plus a note on how it
+  stays consistent with related stores (and its retention + backup path). The
+  memory subsystem already sprawls across ~9 logical systems / 3 physical planes
+  because this gate did not exist; a table that "felt cleaner" is how store #10
+  is born. Reuse an existing store or an existing convention (e.g. the
+  `~/.genesis/eval/golden/` install-local golden-set convention, #1143) unless
+  the justification is real. Prefer NOT reusing a store whose SEMANTICS differ
+  (don't shoehorn a store-health row into the model-eval `eval_runs` table just
+  because it is "a table that exists").
 - **Private-data scan before every push (public repo).** Grep the ENTIRE diff
   (`git diff origin/main...HEAD`) for private/identifying data — real names,
   company/product names, emails, IPs, private career/project specifics, verbatim
@@ -393,6 +415,17 @@ defaults, or tests. Resolve repo paths via `genesis.env.repo_root()` /
 (`gh repo view --json nameWithOwner`) — a configured slug can name a
 real-but-wrong repo and return plausible stale data. Shipped config defaults
 must work on a fresh install with ZERO overlay.
+
+**Tenant-neutral, not tenant-shaped.** Genesis is a single-user sovereign
+system. Build clean single-user code; do NOT pre-genericise for multi-tenancy —
+no `tenant_id` columns, ACL tables, or context objects that always resolve to
+one identity — absent a committed multi-tenant requirement. Premature
+genericisation taxes every change with abstraction for a customer that may never
+exist, and the reliability work that WOULD precede multi-tenancy (a fail-closed
+data boundary, consolidated stores, provenance) is worth doing on its own
+single-user merits and makes the eventual retrofit easier as a side effect.
+When that requirement lands, tenancy is a well-understood retrofit — not
+insurance to carry now.
 
 **Deploy-path answer required — "how does this reach other installs?"**
 Every PR must have an answer for both an EXISTING install and a FRESH clone.
