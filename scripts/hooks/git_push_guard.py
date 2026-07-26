@@ -26,72 +26,12 @@ import sys
 # (importlib does not add the file's dir to sys.path).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
-
-# Quoted-region matcher: double-quoted (with backslash escapes) or single-quoted
-# (literal per POSIX). Used to blank out quoted spans so a subcommand mentioned
-# inside a string (a commit message, an echo, a --body) is not mistaken for the
-# real invocation.
-_QUOTED = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
-
-
-def _unquoted(cmd: str) -> str:
-    """``cmd`` with quoted regions removed.
-
-    So ``echo "git push"`` or ``git commit -m "mentions --no-verify"`` no longer
-    trip the guards that look for those subcommands. Fail-open: returns the
-    input unchanged on any regex error.
-    """
-    try:
-        return _QUOTED.sub("", cmd)
-    except re.error:
-        return cmd
-
-
-def _has_override(cmd: str) -> bool:
-    """Whether the command carries a deliberate ``# review-override`` trailing
-    shell comment (outside quotes).
-
-    This is the in-session-approval signal — the same token the merge gate and
-    the commit gate honor. The caller logs a NOTE when it fires. Matched on the
-    unquoted command so a token buried in a quoted string does not count.
-    """
-    return bool(re.search(r"(?:^|\s)#\s*review-override\b", _unquoted(cmd)))
-
-
-# git global options that consume the FOLLOWING token as their value, so the
-# real subcommand is the first non-option token AFTER them.
-_GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
-
-
-def _git_subcommands(cmd: str) -> set[str]:
-    """The set of git subcommands (push/merge/commit/…) invoked in ``cmd``.
-
-    Splits on shell separators and, for each ``git …`` segment, skips git's
-    global options — including ``-c KEY=VAL`` / ``-C DIR`` which take a value —
-    to find the real subcommand. This catches ``git -c credential.helper=… push``
-    (the repo's documented push idiom), which a naive ``git push`` adjacency
-    check misses entirely. Fail-open: a segment that won't tokenize is skipped.
-    """
-    subs: set[str] = set()
-    for segment in re.split(r"&&|\|\||[;&|\n]", cmd):
-        try:
-            toks = shlex.split(segment)
-        except ValueError:
-            toks = segment.split()
-        if not toks or toks[0] != "git":
-            continue
-        i = 1
-        while i < len(toks):
-            t = toks[i]
-            if t in _GIT_OPTS_WITH_ARG:
-                i += 2  # skip the option and its value token
-                continue
-            if t.startswith("-"):
-                i += 1  # some other global flag (e.g. --no-pager, --opt=val)
-                continue
-            subs.add(t)  # first non-option token is the subcommand
-            break
-    return subs
+from shell_parse import (  # noqa: E402
+    analyze,
+    commit_skips_hooks,
+    gh_pr_subcommand,
+    git_subcommand,
+)
 
 
 def _current_branch() -> str | None:
@@ -442,16 +382,19 @@ def main() -> int:
         if not cmd:
             return 0
 
-        # Match subcommands on the quote-stripped command so a mention inside a
-        # string (commit message, echo, --body) never trips a guard. The
-        # override is the in-session-approval signal, logged where honored.
-        uq = _unquoted(cmd)
-        override = _has_override(cmd)
-        git_subs = _git_subcommands(cmd)
+        # Analyze the command into the segments it actually executes (wrappers
+        # like sudo/env and /path/to/git stripped, nested `bash -c` recursed,
+        # quoted mentions excluded). Each guarded subcommand is matched on real
+        # argv, and the `# review-override` approval binds to its OWN segment.
+        segs = analyze(cmd)
+        push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
+        merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
+        create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
+        merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
         # ── git push (any branch) ──────────────────────────────────
-        if "push" in git_subs:
-            if override:
+        if push_segs:
+            if all(s.override for s in push_segs):
                 print(
                     "NOTE: git push override honored — user approved in-session.",
                     file=sys.stderr,
@@ -471,7 +414,7 @@ def main() -> int:
                 return 2
 
         # ── git merge into main ─────────────────────────────────────
-        if "merge" in git_subs:
+        if merge_git_segs:
             current = _current_branch()
             if current in ("main", "master"):
                 print(
@@ -485,8 +428,8 @@ def main() -> int:
                 return 2
 
         # ── gh pr create ───────────────────────────────────────────
-        if re.search(r"\bgh\s+pr\s+create\b", uq):
-            if override:
+        if create_segs:
+            if all(s.override for s in create_segs):
                 print(
                     "NOTE: gh pr create override honored — user approved in-session.",
                     file=sys.stderr,
@@ -504,8 +447,9 @@ def main() -> int:
                 return 2
 
         # ── gh pr merge ────────────────────────────────────────────
-        if re.search(r"\bgh\s+pr\s+merge\b", uq):
-            if "--admin" not in uq:
+        if merge_pr_segs:
+            merge_seg = merge_pr_segs[0]
+            if "--admin" not in merge_seg.argv:
                 print(
                     "BLOCKED: gh pr merge without --admin is not allowed.",
                     file=sys.stderr,
@@ -552,7 +496,7 @@ def main() -> int:
                     return 2
 
                 # Check for unresolved review findings
-                force_override = override
+                force_override = merge_seg.override
                 should_block, review_msg = _check_pr_review_findings(
                     pr_num,
                     force=force_override,
@@ -594,11 +538,11 @@ def main() -> int:
             )
             return 2
 
-        # ── git commit --no-verify ────────────────────────────────
-        if "commit" in git_subs and re.search(r"(?:^|\s)--no-verify\b", uq):
+        # ── git commit --no-verify / -n (any executed segment) ─────
+        if any(commit_skips_hooks(s.argv) for s in segs):
             print(
-                "BLOCKED: --no-verify bypasses review enforcement hooks. "
-                "Remove --no-verify and run /review first.",
+                "BLOCKED: --no-verify / -n bypasses review enforcement hooks. "
+                "Remove it and run /review first.",
                 file=sys.stderr,
             )
             return 2

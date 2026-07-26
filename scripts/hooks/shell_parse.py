@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""Shared shell-command analysis for guard hooks.
+
+A security guard must classify what a Bash command ACTUALLY executes — its real
+subcommands and flags — not what a substring or a naive regex suggests. The
+naive approaches fail on, e.g.:
+
+* a commit message that merely *mentions* ``git push`` (must NOT match),
+* a quoted flag ``git commit '--no-verify'`` that the shell still passes (MUST
+  match),
+* a wrapper prefix ``sudo git push`` / ``env X=1 git push`` / ``/usr/bin/git
+  push`` (MUST match),
+* a nested script ``bash -c 'git commit -n …'`` (the inner command MUST be
+  seen),
+* an approval comment ``# review-override`` that belongs to ONE command segment
+  and must not authorize the next.
+
+This module centralizes that parsing so ``git_push_guard``,
+``review_enforcement_commit``, and the destructive/path guards agree. Stdlib
+only; fail-open (a segment that won't tokenize degrades to a naive split rather
+than raising) — a guard must never crash the tool.
+"""
+
+from __future__ import annotations
+
+import shlex
+from dataclasses import dataclass
+
+# Leading wrappers whose trailing arguments are the real command to inspect.
+# Per wrapper: (option flags that consume a following value token, count of bare
+# positional args that precede the command). Lets `timeout 5 git push`,
+# `sudo -u root git push`, `nice -n 10 git push` resolve to the real executable.
+_WRAPPER_SPEC = {
+    "sudo": (
+        {
+            "-u",
+            "-g",
+            "-p",
+            "-C",
+            "-U",
+            "-R",
+            "-h",
+            "-t",
+            "--user",
+            "--group",
+            "--prompt",
+            "--chdir",
+            "--close-from",
+            "--role",
+            "--type",
+        },
+        0,
+    ),
+    "doas": ({"-u", "-C"}, 0),
+    "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
+    "nice": ({"-n", "--adjustment"}, 0),
+    "ionice": ({"-c", "--class", "-n", "--classdata", "-p", "--pid"}, 0),
+    "chrt": (set(), 1),
+    "timeout": ({"-s", "--signal", "-k", "--kill-after"}, 1),
+    "stdbuf": ({"-i", "-o", "-e", "--input", "--output", "--error"}, 0),
+    "nohup": (set(), 0),
+    "setsid": (set(), 0),
+    "time": ({"-o", "--output", "-f", "--format"}, 0),
+    "command": (set(), 0),
+    "exec": ({"-a"}, 0),
+    "xargs": (
+        {
+            "-I",
+            "-i",
+            "-n",
+            "--max-args",
+            "-P",
+            "--max-procs",
+            "-s",
+            "--max-chars",
+            "-E",
+            "-L",
+            "--max-lines",
+            "-d",
+            "--delimiter",
+            "-a",
+            "--arg-file",
+            "-e",
+            "--eof",
+            "--replace",
+        },
+        0,
+    ),
+}
+_WRAPPERS = set(_WRAPPER_SPEC)
+# Interpreters that run a script string passed after -c; recurse into it.
+_NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
+# git global options that consume the FOLLOWING token as their value.
+_GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+# git-commit short flags that consume the REST of their short-bundle as a value
+# (so -minitial is `-m initial`, not a bundle containing -n).
+_COMMIT_ARG_FLAGS = "mFCc"
+
+
+@dataclass
+class Segment:
+    """One executed command segment."""
+
+    exe: str  # resolved executable basename (e.g. "git", "gh"), "" if unknown
+    argv: list[str]  # argv with wrappers/env-assignments stripped
+    override: bool  # a trailing `# review-override` shell comment on this segment
+    raw: str  # the raw segment text (for messages)
+    depth: int = 0  # 0 = top level, >0 = inside a sh -c script
+
+
+def split_segments(command: str) -> list[str]:
+    """Split a command line into executed segments on shell operators.
+
+    Quote-aware: an operator inside a quoted string does not split. Splits on
+    ``&&``, ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened
+    outside quotes) runs to end-of-line and is retained in the segment text so
+    override detection can see it.
+    """
+    segs: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(command)
+    quote: str | None = None
+    while i < n:
+        c = command[i]
+        if quote:
+            buf.append(c)
+            if quote == '"' and c == "\\" and i + 1 < n:
+                buf.append(command[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            buf.append(c)
+            i += 1
+            continue
+        two = command[i : i + 2]
+        if two in ("&&", "||"):
+            segs.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if c in (";", "|", "&", "\n"):
+            segs.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    segs.append("".join(buf))
+    return [s.strip() for s in segs if s.strip()]
+
+
+def _strip_trailing_comment(seg: str) -> str:
+    """Remove an unquoted ``#`` comment (whitespace-preceded or at start) to EOL."""
+    out: list[str] = []
+    quote: str | None = None
+    prev_ws = True  # start-of-string counts as preceding whitespace
+    i, n = 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if quote:
+            out.append(c)
+            if quote == '"' and c == "\\" and i + 1 < n:
+                out.append(seg[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            prev_ws = False
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            out.append(c)
+            prev_ws = False
+            i += 1
+            continue
+        if c == "#" and prev_ws:
+            break  # comment to end of segment
+        out.append(c)
+        prev_ws = c.isspace()
+        i += 1
+    return "".join(out)
+
+
+def _has_trailing_override(seg: str) -> bool:
+    """Whether the segment carries a genuine ``# review-override`` comment.
+
+    The ``#`` must open a real comment (outside quotes, preceded by whitespace),
+    so a token buried in a quoted message word does not count.
+    """
+    quote: str | None = None
+    prev_ws = True
+    i, n = 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if quote:
+            if quote == '"' and c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            prev_ws = False
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            prev_ws = False
+            i += 1
+            continue
+        if c == "#" and prev_ws:
+            rest = seg[i + 1 :].strip()
+            return rest.split()[0:1] == ["review-override"]  # exact first token
+        prev_ws = c.isspace()
+        i += 1
+    return False
+
+
+def _argv(seg: str) -> list[str]:
+    """shlex argv of a comment-stripped segment; naive split on tokenizer error."""
+    core = _strip_trailing_comment(seg)
+    try:
+        return shlex.split(core)
+    except ValueError:
+        return core.split()
+
+
+def _basename(token: str) -> str:
+    """Executable basename: /usr/bin/git → git, ./foo → foo."""
+    return token.rsplit("/", 1)[-1]
+
+
+def _strip_wrappers(argv: list[str]) -> list[str]:
+    """Drop leading env-assignments (VAR=x) and wrapper commands (sudo/env/…).
+
+    Returns the argv of the actual command. ``env`` / ``sudo`` may be followed
+    by their own ``VAR=x`` assignments and flags before the real command.
+    """
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+            i += 1  # leading VAR=value assignment
+            continue
+        spec = _WRAPPER_SPEC.get(_basename(tok))
+        if spec is None:
+            break
+        argflags, positional = spec
+        i += 1
+        # consume the wrapper's own value-flags and leading positional args
+        while i < n:
+            t = argv[i]
+            if t == "--":
+                i += 1
+                break
+            if t.startswith("-"):
+                if t in argflags and "=" not in t:
+                    i += 2  # flag + its separate value token
+                else:
+                    i += 1
+                continue
+            if "=" in t and t.split("=", 1)[0].isidentifier():
+                i += 1
+                continue
+            if positional > 0:
+                positional -= 1
+                i += 1
+                continue
+            break  # this bare word is the wrapped command
+    return argv[i:]
+
+
+def analyze(command: str) -> list[Segment]:
+    """Parse a Bash command into executed Segments (nested scripts flattened).
+
+    Each Segment reports the resolved executable basename, its argv (wrappers
+    and env-assignments stripped), and whether a ``# review-override`` comment
+    is bound to that segment. ``bash -c 'script'`` is recursed into so the inner
+    commands are surfaced (the parent's override propagates to them).
+    """
+    out: list[Segment] = []
+    for raw in split_segments(command):
+        override = _has_trailing_override(raw)
+        argv = _strip_wrappers(_argv(raw))
+        exe = _basename(argv[0]) if argv else ""
+        out.append(Segment(exe=exe, argv=argv, override=override, raw=raw))
+        nested = []
+        if exe in _NESTED:
+            script = _nested_script(argv)
+            if script:
+                nested.append(script)
+        nested.extend(_substitutions(raw))  # $(...) / `...` bodies also execute
+        for script in nested:
+            for inner in analyze(script):
+                out.append(
+                    Segment(
+                        exe=inner.exe,
+                        argv=inner.argv,
+                        override=override or inner.override,
+                        raw=inner.raw,
+                        depth=inner.depth + 1,
+                    )
+                )
+    return out
+
+
+def _substitutions(text: str) -> list[str]:
+    """Command-substitution bodies — ``$(…)`` and ``` `…` ``` — which also run.
+
+    Only single-quoted spans block substitution (``$()`` still expands inside
+    double quotes). Nested ``$()`` is balanced by paren depth. Best-effort:
+    exotic forms (process substitution ``<(…)``, ANSI-C ``$'…'`` scripts, ``env
+    -S`` string-splitting, shell aliases/functions) are NOT parsed — this guard
+    is an approval/friction layer, not a sandbox, and fails toward over-matching
+    on the common forms rather than pretending to cover every shell construct.
+    """
+    subs: list[str] = []
+    i, n = 0, len(text)
+    in_sq = False
+    while i < n:
+        c = text[i]
+        if in_sq:
+            if c == "'":
+                in_sq = False
+            i += 1
+            continue
+        if c == "'":
+            in_sq = True
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            depth, j = 1, i + 2
+            start = j
+            while j < n and depth > 0:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                j += 1
+            subs.append(text[start : j - 1])
+            i = j
+            continue
+        if c == "`":
+            j = text.find("`", i + 1)
+            if j != -1:
+                subs.append(text[i + 1 : j])
+                i = j + 1
+                continue
+        i += 1
+    return subs
+
+
+def _nested_script(argv: list[str]) -> str:
+    """The script string passed to an interpreter's ``-c``, else ''.
+
+    Handles a bare ``-c`` (script is the next token), a combined short bundle
+    where ``c`` is last (``-lc 'script'`` → next token), and an inline value
+    (``-c'script'`` → the rest of the token after ``c``).
+    """
+    for i, tok in enumerate(argv[1:], 1):
+        if not tok.startswith("-") or tok.startswith("--"):
+            continue
+        pos = tok.find("c")
+        if pos <= 0:
+            continue
+        if pos == len(tok) - 1:  # 'c' is the last flag in the bundle
+            if i + 1 < len(argv):
+                return argv[i + 1]
+        else:  # inline script glued after the 'c'
+            return tok[pos + 1 :]
+    return ""
+
+
+# ── git-specific helpers ────────────────────────────────────────────────
+
+
+def git_subcommand(argv: list[str]) -> str | None:
+    """The git subcommand for an argv whose executable is git, skipping git
+    global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
+    if not argv or _basename(argv[0]) != "git":
+        return None
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_OPTS_WITH_ARG:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        return t
+    return None
+
+
+def gh_pr_subcommand(argv: list[str]) -> str | None:
+    """For a ``gh`` argv, the subcommand after ``pr`` (create/merge/…), else None.
+
+    Scans for the ``pr`` token so a global flag before it
+    (``gh --repo o/r pr merge``) does not evade detection.
+    """
+    if not argv or _basename(argv[0]) != "gh":
+        return None
+    for i, t in enumerate(argv[1:], 1):
+        if t == "pr":
+            for u in argv[i + 1 :]:
+                if not u.startswith("-"):
+                    return u
+            return None
+    return None
+
+
+def commit_skips_hooks(argv: list[str]) -> bool:
+    """Whether a ``git commit`` argv carries --no-verify / -n (bundled or not).
+
+    Parses real argv tokens, so a quoted ``'--no-verify'`` counts and an
+    attached message ``-minitial`` does NOT (that is ``-m initial``).
+    """
+    if git_subcommand(argv) != "commit":
+        return False
+    # Advance past git global options (+ their values) to the "commit" token.
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_OPTS_WITH_ARG:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        break  # argv[i] == "commit"
+    i += 1  # move past "commit"
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break  # everything after -- is a pathspec, not a flag
+        if tok == "--no-verify":
+            return True
+        if tok.startswith("--"):
+            i += 1
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            consumes_next = False
+            j = 1
+            while j < len(tok):
+                ch = tok[j]
+                if ch == "n":
+                    return True
+                if ch in _COMMIT_ARG_FLAGS:
+                    # a message/file flag: its value is the rest of this token,
+                    # or — if it is the last char — the NEXT token (skip it, so a
+                    # message beginning with "-n…" is not re-scanned as a flag).
+                    consumes_next = j == len(tok) - 1
+                    break
+                j += 1
+            i += 2 if consumes_next else 1
+            continue
+        break  # a bare positional (pathspec) — no more flags
+    return False
+
+
+def executes(command: str, exe: str, subcommand: str | None = None) -> list[Segment]:
+    """All segments running ``exe`` (optionally with a given git subcommand)."""
+    hits = []
+    for seg in analyze(command):
+        if seg.exe != exe:
+            continue
+        if subcommand is not None and git_subcommand(seg.argv) != subcommand:
+            continue
+        hits.append(seg)
+    return hits

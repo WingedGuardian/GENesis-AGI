@@ -119,3 +119,102 @@ def test_no_verify_flag_blocked():
 def test_no_verify_mentioned_in_message_not_blocked():
     res = _run('git commit -m "document the --no-verify footgun"')
     assert res.returncode == 0, res.stderr
+
+
+# ── shell-parse hardening: wrappers, quoted flags, per-segment override ──
+
+
+def test_push_via_sudo_blocked():
+    res = _run("sudo git push origin main")
+    assert res.returncode == 2
+    assert "git push requires user approval" in res.stderr
+
+
+def test_push_via_env_prefix_blocked():
+    res = _run("env FOO=1 git push origin main")
+    assert res.returncode == 2
+
+
+def test_push_via_absolute_path_blocked():
+    res = _run("/usr/bin/git push origin main")
+    assert res.returncode == 2
+
+
+def test_quoted_no_verify_flag_blocked():
+    """The shell still passes a quoted '--no-verify' to git → must block."""
+    res = _run("git commit '--no-verify' -m wip")
+    assert res.returncode == 2
+    assert "no-verify" in res.stderr
+
+
+def test_no_verify_bundled_with_operator_blocked():
+    """-n glued to a shell operator is still a real flag → must block."""
+    res = _run("git commit -m wip -n&&echo done")
+    assert res.returncode == 2
+
+
+def test_no_verify_in_bash_c_script_blocked():
+    """The inner command of bash -c is executed → must be seen."""
+    res = _run("bash -c 'git commit -n -m wip'")
+    assert res.returncode == 2
+
+
+def test_commit_attached_message_not_false_blocked():
+    """git commit -minitial is `-m initial`, not a -n bundle → must not block."""
+    res = _run("git commit -minitial")
+    assert res.returncode == 0, res.stderr
+
+
+def test_override_does_not_span_to_next_command():
+    """A push override must not authorize a following pr-create (own segment)."""
+    res = _run("git push origin feat # review-override\ngh pr create --title x --body y")
+    assert res.returncode == 2
+    assert "Creating a PR requires user approval" in res.stderr
+
+
+# ── second-review hardening: wrapper args, substitutions, gh global flag ──
+
+
+def test_push_via_timeout_positional_blocked():
+    """timeout's DURATION positional must not be mistaken for the executable."""
+    res = _run("timeout 5 git push origin main")
+    assert res.returncode == 2
+
+
+def test_push_via_sudo_user_flag_blocked():
+    res = _run("sudo -u root git push origin main")
+    assert res.returncode == 2
+
+
+def test_push_via_nice_flag_blocked():
+    res = _run("nice -n 10 git push origin main")
+    assert res.returncode == 2
+
+
+def test_push_in_command_substitution_blocked():
+    res = _run('echo "$(git push origin main)"')
+    assert res.returncode == 2
+
+
+def test_no_verify_via_bash_lc_bundle_blocked():
+    """Combined interpreter flags (bash -lc) must still recurse into the script."""
+    res = _run("bash -lc 'git commit -n -m wip'")
+    assert res.returncode == 2
+
+
+def test_pr_create_with_global_flag_before_pr_blocked():
+    """A gh global flag before `pr` must not evade the create gate."""
+    res = _run("gh --repo o/r pr create --title x --body y")
+    assert res.returncode == 2
+    assert "Creating a PR requires user approval" in res.stderr
+
+
+def test_commit_message_starting_with_dash_n_not_false_blocked():
+    """A -m message value beginning with -n is a message, not a flag."""
+    res = _run("git commit -m '-not ready yet'")
+    assert res.returncode == 0, res.stderr
+
+
+def test_commit_pathspec_after_double_dash_not_false_blocked():
+    res = _run("git commit -- -n")
+    assert res.returncode == 0, res.stderr
