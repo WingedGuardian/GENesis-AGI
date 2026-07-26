@@ -460,14 +460,20 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - Best for burst scenarios or when Mistral's 2 RPM limit is too slow
 
 ### OpenRouter Free Tier
-- ~26 models available as free variants (`:free` suffix) on OpenRouter
+- ~18 models available as free variants (`:free` suffix) on OpenRouter
+  (down from ~26 — the free-variant pool contracted sharply in July 2026)
 - **Base rate limits:** 20 RPM, 200 RPD (shared across all free models)
 - **With $10 balance:** 1,000 RPD (5x increase, balance is not consumed by free models)
-- Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Qwen3-Coder 480B, Nemotron 3 Ultra 550B, various community models
+- Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Nemotron 3 Ultra 550B, various community models
 - Note: DeepSeek V4 Flash free variant removed as of June 2026; Kimi K2.6 and
   GLM-4.5-Air free variants removed June 2026; Nex-N2-Pro (`nex-agi/nex-n2-pro:free`)
-  removed June 2026; Poolside Laguna XS 2 (`poolside/laguna-xs.2:free`) removed July 2026
-- Use as overflow when other free sources are exhausted, or as primary diversity source
+  removed June 2026; Poolside Laguna XS 2 (`poolside/laguna-xs.2:free`) removed July 2026.
+  Seven more free variants delisted July 2026: Qwen3-Coder (`qwen/qwen3-coder:free`),
+  Tencent Hy3 (`tencent/hy3:free`), Qwen3-Next 80B (`qwen/qwen3-next-80b-a3b-instruct:free`),
+  Hermes 3 Llama 3.1 405B, Llama 3.3 70B and Llama 3.2 3B (`:free` OpenRouter variants —
+  Groq's Llama 3.3 70B is unaffected), and Dolphin-Mistral 24B Venice. Two new free
+  variants appeared: Poolside Laguna S 2.1 (`poolside/laguna-s-2.1:free`) and
+  Ling-3.0-flash (`inclusionai/ling-3.0-flash:free`), both 262k context.
 - Free models use `pricing.prompt == "0"` in API — detectable programmatically
 
 ### Cerebras Free Tier
@@ -512,7 +518,7 @@ routing decisions — eval harness (Phase 3) provides Genesis-specific validatio
 | o3-mini | GitHub Models | — | 74.9 | 96.3 (HE) | 97.3 | 50 RPD |
 | DeepSeek-R1 | OpenRouter | 84.0 | 71.5 | 65.9 | 87.5 | 1,000 RPD ($10 bal.) |
 | Qwen3-235B *(no thinking)* | Cerebras | ~75 | ~70 | ~62 | ~60 | 14,400 RPD |
-| Qwen3-Coder 480B | OpenRouter | — | — | SWE 69.6 | — | free `:free` |
+| Qwen3-Coder 480B | OpenRouter | — | — | SWE 69.6 | — | `:free` removed July 2026 (paid only) |
 | Llama 3.3 70B | Groq | 68.9 | 50.5 | 88.4 (HE) | ~30 | 1,000 RPD |
 | Mistral Large 3 | Mistral | ~75† | 43.9 | 90.2 (HE) | — | ~1,440 RPD (2 RPM) |
 | Mistral Small 3.2 | Mistral | 69.1 | — | 92.9 (HE+) | — | ~43,200 RPD (30 RPM) |
@@ -550,18 +556,14 @@ Models requiring benchmark or free-tier verification before routing decisions:
   reranking only. Evaluate for memory recall chain improvement.
 - **Cohere North Mini Code (free)** — `cohere/north-mini-code:free`, 256k context,
   free on OpenRouter (detected June 2026). Coding-focused small model from a major
-  provider. Benchmark scores unverified — evaluate as a free coding fallback against
-  Qwen3-Coder 480B before routing.
+  provider. Benchmark scores unverified — evaluate as a free coding fallback before
+  routing (its prior comparison target, Qwen3-Coder 480B `:free`, was delisted July 2026).
 - **Voyage AI voyage-3** — 200M token one-time free embeddings. Evaluate for
   Qdrant embedding quality vs. current embeddings.
 - **NVIDIA Nemotron 3 Ultra 550B (free)** — 550B A55B MoE, 1M context, free on
   OpenRouter (`nvidia/nemotron-3-ultra-550b-a55b:free`). Largest free model
   available. Benchmark scores unverified — needs evaluation against existing
   heavy lifters for quality routing.
-- **Tencent Hy3 (free)** — `tencent/hy3:free`, 262k context, free on OpenRouter
-  (detected July 2026). New free model from a major provider (Tencent Hunyuan
-  line). Benchmark scores and capability profile unverified — evaluate before
-  routing; low priority given the roster already has ample free coverage.
 
 ---
 
@@ -662,7 +664,18 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
-**2026-07-12** — OpenRouter free model count held at 26 (automated inventory:
+**2026-07-26** — OpenRouter free model count dropped sharply ~26→18 (automated
+inventory: 18 free, +2 new, −7 removed). Seven free variants delisted July 2026:
+Qwen3-Coder (`qwen/qwen3-coder:free`), Tencent Hy3 (`tencent/hy3:free`), Qwen3-Next
+80B (`qwen/qwen3-next-80b-a3b-instruct:free`), Hermes 3 Llama 3.1 405B, Llama 3.3 70B
+and Llama 3.2 3B (`:free` OpenRouter variants — Groq's Llama 3.3 70B is unaffected),
+and Dolphin-Mistral 24B Venice. Retired the Tencent Hy3 Pending Evaluation entry
+(added 2026-07-12, delisted a week later before it could be benchmarked). Updated the
+Qwen3-Coder 480B benchmark-table row (`:free` removed, paid only) and the OpenRouter
+"Includes" list to drop it. Two new free variants detected (Poolside Laguna S 2.1,
+Ling-3.0-flash, both 262k) — not promoted to a tier (Poolside variants churn weekly,
+roster already well-covered on free tier); noted both in OpenRouter Free Tier terms.
+2026-07-12 — OpenRouter free model count held at 26 (automated inventory:
 26 free, +1 new, −1 removed); removed Poolside Laguna XS 2
 (`poolside/laguna-xs.2:free`, delisted July 2026) — was never promoted to a
 tier or Pending Evaluation, so no roster entry to retire; noted the removal in
