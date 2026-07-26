@@ -26,6 +26,12 @@ import sys
 # (importlib does not add the file's dir to sys.path).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
+from shell_parse import (  # noqa: E402
+    analyze,
+    commit_skips_hooks,
+    gh_pr_subcommand,
+    git_subcommand,
+)
 
 
 def _current_branch() -> str | None:
@@ -376,22 +382,39 @@ def main() -> int:
         if not cmd:
             return 0
 
+        # Analyze the command into the segments it actually executes (wrappers
+        # like sudo/env and /path/to/git stripped, nested `bash -c` recursed,
+        # quoted mentions excluded). Each guarded subcommand is matched on real
+        # argv, and the `# review-override` approval binds to its OWN segment.
+        segs = analyze(cmd)
+        push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
+        merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
+        create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
+        merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+
         # ── git push (any branch) ──────────────────────────────────
-        if "git push" in cmd:
-            _remote, branch = _get_push_remote_and_branch(cmd)
-            print(
-                f"BLOCKED: git push requires user approval before "
-                f"publishing code externally (target: {branch or 'default'}).",
-                file=sys.stderr,
-            )
-            print(
-                "Ask the user: 'Ready to push?' before proceeding.",
-                file=sys.stderr,
-            )
-            return 2
+        if push_segs:
+            if all(s.override for s in push_segs):
+                print(
+                    "NOTE: git push override honored — user approved in-session.",
+                    file=sys.stderr,
+                )
+            else:
+                _remote, branch = _get_push_remote_and_branch(cmd)
+                print(
+                    f"BLOCKED: git push requires user approval before "
+                    f"publishing code externally (target: {branch or 'default'}).",
+                    file=sys.stderr,
+                )
+                print(
+                    "Ask the user 'Ready to push?'; once approved, append a "
+                    "trailing '  # review-override' comment to proceed.",
+                    file=sys.stderr,
+                )
+                return 2
 
         # ── git merge into main ─────────────────────────────────────
-        if "git merge" in cmd:
+        if merge_git_segs:
             current = _current_branch()
             if current in ("main", "master"):
                 print(
@@ -405,20 +428,28 @@ def main() -> int:
                 return 2
 
         # ── gh pr create ───────────────────────────────────────────
-        if "gh pr create" in cmd:
-            print(
-                "BLOCKED: Creating a PR requires user approval before publishing externally.",
-                file=sys.stderr,
-            )
-            print(
-                "Ask the user: 'Ready to create the PR?' before proceeding.",
-                file=sys.stderr,
-            )
-            return 2
+        if create_segs:
+            if all(s.override for s in create_segs):
+                print(
+                    "NOTE: gh pr create override honored — user approved in-session.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "BLOCKED: Creating a PR requires user approval before publishing externally.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Ask the user 'Ready to create the PR?'; once approved, "
+                    "append a trailing '  # review-override' comment to proceed.",
+                    file=sys.stderr,
+                )
+                return 2
 
         # ── gh pr merge ────────────────────────────────────────────
-        if "gh pr merge" in cmd:
-            if "--admin" not in cmd:
+        if merge_pr_segs:
+            merge_seg = merge_pr_segs[0]
+            if "--admin" not in merge_seg.argv:
                 print(
                     "BLOCKED: gh pr merge without --admin is not allowed.",
                     file=sys.stderr,
@@ -465,7 +496,7 @@ def main() -> int:
                     return 2
 
                 # Check for unresolved review findings
-                force_override = bool(re.search(r"#\s*review-override\b", cmd))
+                force_override = merge_seg.override
                 should_block, review_msg = _check_pr_review_findings(
                     pr_num,
                     force=force_override,
@@ -493,6 +524,8 @@ def main() -> int:
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
+        # NB: match on the raw command, not the unquoted one — the DML keyword
+        # lives inside the quoted SQL argument (sqlite3 db "DELETE FROM ...").
         if "sqlite3" in cmd and re.search(
             r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b",
             cmd,
@@ -505,11 +538,11 @@ def main() -> int:
             )
             return 2
 
-        # ── git commit --no-verify ────────────────────────────────
-        if "git commit" in cmd and "--no-verify" in cmd:
+        # ── git commit --no-verify / -n (any executed segment) ─────
+        if any(commit_skips_hooks(s.argv) for s in segs):
             print(
-                "BLOCKED: --no-verify bypasses review enforcement hooks. "
-                "Remove --no-verify and run /review first.",
+                "BLOCKED: --no-verify / -n bypasses review enforcement hooks. "
+                "Remove it and run /review first.",
                 file=sys.stderr,
             )
             return 2
