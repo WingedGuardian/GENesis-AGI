@@ -89,7 +89,9 @@ def ensure_payload_indexes(client: QdrantClient) -> None:
                 )
             except Exception:
                 logger.warning(
-                    "payload index %s.%s not created", collection, field,
+                    "payload index %s.%s not created",
+                    collection,
+                    field,
                     exc_info=True,
                 )
 
@@ -186,30 +188,18 @@ def search(
     # must_not only excludes points where the field exists AND matches.
     # Pass include_deprecated=True for audit/history queries.
     if not include_deprecated:
-        must_not_conditions.append(
-            FieldCondition(key="deprecated", match=MatchValue(value=True))
-        )
+        must_not_conditions.append(FieldCondition(key="deprecated", match=MatchValue(value=True)))
 
     if source_type:
-        conditions.append(
-            FieldCondition(key="source_type", match=MatchValue(value=source_type))
-        )
+        conditions.append(FieldCondition(key="source_type", match=MatchValue(value=source_type)))
     if wing:
-        conditions.append(
-            FieldCondition(key="wing", match=MatchValue(value=wing))
-        )
+        conditions.append(FieldCondition(key="wing", match=MatchValue(value=wing)))
     if room:
-        conditions.append(
-            FieldCondition(key="room", match=MatchValue(value=room))
-        )
+        conditions.append(FieldCondition(key="room", match=MatchValue(value=room)))
     if life_domain:
-        conditions.append(
-            FieldCondition(key="life_domain", match=MatchValue(value=life_domain))
-        )
+        conditions.append(FieldCondition(key="life_domain", match=MatchValue(value=life_domain)))
     if project_type:
-        conditions.append(
-            FieldCondition(key="project_type", match=MatchValue(value=project_type))
-        )
+        conditions.append(FieldCondition(key="project_type", match=MatchValue(value=project_type)))
     if include_only_subsystems:
         conditions.append(
             FieldCondition(
@@ -225,15 +215,14 @@ def search(
             )
         )
     if tags_any:
-        conditions.append(
-            FieldCondition(key="tags", match=MatchAny(any=list(tags_any)))
-        )
+        conditions.append(FieldCondition(key="tags", match=MatchAny(any=list(tags_any))))
     if created_before:
         from qdrant_client.models import DatetimeRange
 
         conditions.append(
             FieldCondition(
-                key="created_at", range=DatetimeRange(lte=created_before),
+                key="created_at",
+                range=DatetimeRange(lte=created_before),
             )
         )
     query_filter = Filter(
@@ -253,14 +242,11 @@ def search(
         search_params=search_params,
     )
     return [
-        {"id": str(hit.id), "score": hit.score, "payload": hit.payload}
-        for hit in results.points
+        {"id": str(hit.id), "score": hit.score, "payload": hit.payload} for hit in results.points
     ]
 
 
-def delete_point(
-    client: QdrantClient, *, collection: str, point_id: str
-) -> None:
+def delete_point(client: QdrantClient, *, collection: str, point_id: str) -> None:
     """Delete a point by ID."""
     from qdrant_client.models import PointIdsList
 
@@ -324,6 +310,38 @@ def batch_retrieve_vectors(
     return vector_map
 
 
+def batch_retrieve_point_ids(
+    client: QdrantClient,
+    point_ids: list[str],
+    *,
+    collection: str,
+    batch_size: int = 100,
+) -> set[str]:
+    """Return the SUBSET of *point_ids* that EXIST in *collection*.
+
+    Unlike :func:`batch_retrieve_vectors`, this RAISES on any transport/protocol
+    failure instead of swallowing it. The distinction is load-bearing for the
+    consistency checker: a swallowed error makes "Qdrant is unreachable" look
+    identical to "every vector is missing" — a false data-corruption alarm. The
+    checker must be able to tell those apart (unreachable → status 'unknown';
+    genuinely-absent → a real finding), so it needs a helper that fails loud.
+
+    Existence-only: requests neither payload nor vectors (cheapest retrieve).
+    """
+    present: set[str] = set()
+    for i in range(0, len(point_ids), batch_size):
+        batch = point_ids[i : i + batch_size]
+        results = client.retrieve(
+            collection_name=collection,
+            ids=batch,
+            with_payload=False,
+            with_vectors=False,
+        )
+        for r in results:
+            present.add(str(r.id))
+    return present
+
+
 def scroll_points(
     client: QdrantClient,
     *,
@@ -341,8 +359,7 @@ def scroll_points(
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         conditions = [
-            FieldCondition(key=k, match=MatchValue(value=v))
-            for k, v in payload_filter.items()
+            FieldCondition(key=k, match=MatchValue(value=v)) for k, v in payload_filter.items()
         ]
         scroll_filter = Filter(must=conditions)
 
@@ -354,16 +371,11 @@ def scroll_points(
         with_payload=True,
         with_vectors=False,
     )
-    points = [
-        {"id": str(point.id), "payload": point.payload}
-        for point in results
-    ]
+    points = [{"id": str(point.id), "payload": point.payload} for point in results]
     return points, str(next_offset) if next_offset else None
 
 
-def delete_collection(
-    client: QdrantClient, collection: str, *, force: bool = False
-) -> bool:
+def delete_collection(client: QdrantClient, collection: str, *, force: bool = False) -> bool:
     """Delete a Qdrant collection.
 
     Refuses to delete production collections (episodic_memory, knowledge_base)
@@ -372,8 +384,7 @@ def delete_collection(
     """
     if collection in _PROTECTED_COLLECTIONS and not force:
         raise ValueError(
-            f"Refusing to delete protected collection '{collection}'. "
-            f"Pass force=True to override."
+            f"Refusing to delete protected collection '{collection}'. Pass force=True to override."
         )
     return client.delete_collection(collection)
 

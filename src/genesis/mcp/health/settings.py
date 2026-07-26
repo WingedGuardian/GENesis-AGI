@@ -132,6 +132,23 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "memory_integrity": SettingsDomain(
+        name="memory_integrity",
+        description=(
+            "Memory integrity Phase 0 (make silence loud) — master `enabled` "
+            "+ `mode` off/passive/active plus checker/probe knobs. Passive "
+            "(default) runs two read-only jobs: a cross-backend consistency "
+            "check (memory_metadata <-> Qdrant <-> memory_fts) and a recall-"
+            "health probe over an install-local golden set, surfacing findings "
+            "via a posture alert + dashboard tile. `active` is reserved for "
+            "Phase 1 repair (coerced to passive). Read live per run — takes "
+            "effect next scheduled run. Kill switch: "
+            "GENESIS_MEMORY_INTEGRITY_DISABLED=1."
+        ),
+        config_filename="memory_integrity.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per scheduled run
+    ),
     "pr_watch": SettingsDomain(
         name="pr_watch",
         description=(
