@@ -109,6 +109,13 @@ KNOWN_RECALL_SITES: dict[str, tuple[str, str]] = {
         "the result is discarded (never rendered, reaches no prompt) and "
         "skip_writeback drops all write-backs — no injection sink",
     ),
+    "memory/recall_probe.py::run_recall_probe": (
+        "pipeline-internal",
+        "memory-integrity recall-health probe: reads ONLY result memory_ids to "
+        "compute hit-rate/rank against a curated install-local golden set; result "
+        "CONTENT never reaches a prompt, and skip_writeback drops all "
+        "write-backs — no injection sink",
+    ),
 }
 
 # NOTE: memory_expand and memory_core_facts (mcp/memory/core.py) are ALSO

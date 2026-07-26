@@ -324,38 +324,6 @@ def batch_retrieve_vectors(
     return vector_map
 
 
-def batch_retrieve_point_ids(
-    client: QdrantClient,
-    point_ids: list[str],
-    *,
-    collection: str,
-    batch_size: int = 100,
-) -> set[str]:
-    """Return the SUBSET of *point_ids* that EXIST in *collection*.
-
-    Unlike :func:`batch_retrieve_vectors`, this RAISES on any transport/protocol
-    failure instead of swallowing it. The distinction is load-bearing for the
-    consistency checker: a swallowed error makes "Qdrant is unreachable" look
-    identical to "every vector is missing" — a false data-corruption alarm. The
-    checker must be able to tell those apart (unreachable → status 'unknown';
-    genuinely-absent → a real finding), so it needs a helper that fails loud.
-
-    Existence-only: requests neither payload nor vectors (cheapest retrieve).
-    """
-    present: set[str] = set()
-    for i in range(0, len(point_ids), batch_size):
-        batch = point_ids[i : i + batch_size]
-        results = client.retrieve(
-            collection_name=collection,
-            ids=batch,
-            with_payload=False,
-            with_vectors=False,
-        )
-        for r in results:
-            present.add(str(r.id))
-    return present
-
-
 def scroll_points(
     client: QdrantClient,
     *,
