@@ -450,6 +450,21 @@ _INFRA_POSTURE_SUPERSEDED_NOTE = "superseded: protection posture changed"
 _last_infra_posture_alert_at: float = 0.0
 _last_infra_posture_key: str = ""
 
+# Memory integrity posture (Phase 0 "make silence loud"): reads the LATEST
+# persisted consistency-report / recall-probe rows (the jobs never alert
+# themselves — decoupled surfacing) and raises ONE standing 'high'
+# infrastructure_alert describing the current state. Fires on: a degraded
+# consistency report, a degraded recall probe, OR a stale/stuck checker (the
+# checker has run before but produced no non-unknown report within the window —
+# a checker stuck on 'unknown' is itself a silent failure and must escalate).
+# 'unknown' single runs never alert; pre-migration / no-run-yet is silent.
+_MEMORY_INTEGRITY_SOURCE = "memory_integrity_posture_monitor"
+_MEMORY_INTEGRITY_COOLDOWN_S = 86400.0
+_MEMORY_INTEGRITY_SUPERSEDED_NOTE = "superseded: memory integrity posture changed"
+_last_memory_integrity_alert_at: float = 0.0
+_last_memory_integrity_key: str = ""
+
+
 # Human-readable defect + remediation per rule slug (alert content).
 _INFRA_POSTURE_DETAIL = {
     "container_swap_disabled": (
@@ -729,6 +744,200 @@ async def _resolve_infra_protection_posture(db) -> None:
             logger.info("Auto-resolved %d infra protection posture alert(s)", resolved)
     except Exception:
         logger.debug("Failed to resolve infra posture alerts", exc_info=True)
+
+
+async def _check_memory_integrity_posture(db) -> None:
+    """Alert when memory storage consistency or recall health has degraded.
+
+    Reads the LATEST persisted memory_consistency_reports / recall_probe_runs
+    rows (the jobs self-persist; this is the decoupled alerting layer, matching
+    infra posture). One 'high' infrastructure_alert = the current state; a
+    posture change supersedes the prior row. Fires on: a degraded consistency
+    report, a degraded recall probe, or a stale/stuck checker (has run before
+    but no non-unknown consistency report within stale_report_days — a checker
+    frozen on 'unknown' is itself a silent failure). 'unknown' single runs never
+    alert; pre-migration / no-run-yet is silent. Auto-resolves when clear.
+    Best-effort; never raises into the tick."""
+    global _last_memory_integrity_alert_at, _last_memory_integrity_key
+    if db is None:
+        return
+    try:
+        from genesis.db.crud import memory_integrity as mi_crud
+        from genesis.memory import integrity_config
+
+        latest_consistency = await mi_crud.latest_consistency_report(db)
+        latest_probe = await mi_crud.latest_recall_probe_run(db)
+        # Pre-migration or no run yet → nothing to assert (silent, not "healthy").
+        if latest_consistency is None and latest_probe is None:
+            return
+
+        findings: list[tuple[str, str]] = []
+
+        if latest_consistency is not None and latest_consistency.get("status") == "degraded":
+            try:
+                counts = json.loads(latest_consistency.get("counts_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                counts = {}
+            nonzero = ", ".join(
+                f"{k}={v}" for k, v in sorted(counts.items()) if isinstance(v, int) and v > 0
+            )
+            findings.append(
+                (
+                    "consistency_degraded",
+                    f"cross-backend consistency DEGRADED ({nonzero or 'see report'}) — "
+                    f"memories exist that are silently unreachable via a retrieval lane "
+                    f"or points with no owning row",
+                )
+            )
+
+        if latest_probe is not None and latest_probe.get("status") == "degraded":
+            hr = latest_probe.get("hit_rate")
+            base = latest_probe.get("baseline_hit_rate")
+            findings.append(
+                (
+                    "recall_degraded",
+                    f"recall-health DEGRADED (hit_rate={hr}, baseline={base}) — golden "
+                    f"queries are returning their expected memories less often than the "
+                    f"trailing baseline",
+                )
+            )
+
+        # Stale/stuck detection: a signal that has run LONGER than the window
+        # (earliest row predates it) yet produced no conclusive run within it is
+        # dead or wedged-on-unknown — NOT a fresh install. Applies to both the
+        # consistency checker AND the recall probe. Only when mode != off.
+        if integrity_config.effective_mode() != "off":
+            cfg = integrity_config.load_config()
+            stale_days = integrity_config.knob_int(cfg, "stale_report_days")
+            # Match the stored `datetime('now')` format (space-separated, no tz)
+            # so BOTH the SQL `created_at >= ?` and the Python `earliest < since`
+            # comparisons sort lexically = chronologically. isoformat()'s 'T' +
+            # offset would break same-date lexical ordering.
+            since_iso = (datetime.now(UTC) - timedelta(days=stale_days)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            # Consistency checker staleness.
+            if latest_consistency is not None:
+                earliest = await mi_crud.earliest_report_at(db)
+                if (
+                    earliest is not None
+                    and earliest < since_iso
+                    and not await mi_crud.has_recent_non_unknown_report(db, since_iso=since_iso)
+                ):
+                    findings.append(
+                        (
+                            "reports_stale",
+                            f"the consistency checker has produced no conclusive "
+                            f"(non-unknown) report in {stale_days}d — the job is dead or "
+                            f"stuck reporting 'unknown' (e.g. Qdrant persistently "
+                            f"unreachable); memory integrity is currently UNVERIFIED",
+                        )
+                    )
+            # Recall-probe staleness — EXEMPT a never-configured/unseeded golden
+            # set (latest unknown='golden_set_too_small' is needs-setup, not a
+            # failure); only a real measurement failure (retriever error) escalates.
+            if latest_probe is not None and not (
+                latest_probe.get("status") == "unknown"
+                and latest_probe.get("unknown_reason") == "golden_set_too_small"
+            ):
+                earliest_p = await mi_crud.earliest_probe_run_at(db)
+                if (
+                    earliest_p is not None
+                    and earliest_p < since_iso
+                    and not await mi_crud.has_recent_conclusive_probe(db, since_iso=since_iso)
+                ):
+                    findings.append(
+                        (
+                            "recall_stale",
+                            f"the recall-health probe has produced no conclusive run in "
+                            f"{stale_days}d — the retriever is failing or the probe is "
+                            f"wedged; recall health is currently UNVERIFIED",
+                        )
+                    )
+
+        if not findings:
+            # Do NOT treat an inconclusive measurement as recovery. If the latest
+            # consistency report is 'unknown' (Qdrant down), or the latest probe
+            # is 'unknown' for a real reason (not needs-setup), a prior degraded
+            # posture must PERSIST until a conclusive healthy run demonstrates it.
+            consistency_inconclusive = (
+                latest_consistency is not None and latest_consistency.get("status") == "unknown"
+            )
+            probe_inconclusive = (
+                latest_probe is not None
+                and latest_probe.get("status") == "unknown"
+                and latest_probe.get("unknown_reason") != "golden_set_too_small"
+            )
+            if consistency_inconclusive or probe_inconclusive:
+                return  # hold the current posture — recovery not demonstrated
+            await _resolve_memory_integrity_posture(db)
+            return
+
+        key = ",".join(slug for slug, _ in findings)
+        now = time.monotonic()
+        if (
+            _last_memory_integrity_alert_at
+            and now - _last_memory_integrity_alert_at < _MEMORY_INTEGRITY_COOLDOWN_S
+            and key == _last_memory_integrity_key
+        ):
+            return
+        details = "; ".join(detail for _, detail in findings)
+        content = (
+            f"Memory integrity posture: {details}. Recall silently degrades when "
+            f"these drift — this is the 'make silence loud' signal (Phase 0 is "
+            f"detect-only; repair is a separate lane)."
+        )
+        content_hash = hashlib.sha256(f"memory_integrity:{key}".encode()).hexdigest()
+        await observations.supersede_except_hash(
+            db,
+            source=_MEMORY_INTEGRITY_SOURCE,
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=_MEMORY_INTEGRITY_SUPERSEDED_NOTE,
+        )
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source=_MEMORY_INTEGRITY_SOURCE,
+            type="infrastructure_alert",
+            content=content,
+            priority="high",
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        _last_memory_integrity_alert_at = now
+        _last_memory_integrity_key = key
+        if created is not None:
+            logger.warning("Memory integrity posture alert: %s", key)
+    except Exception:
+        logger.debug("Failed memory integrity posture check", exc_info=True)
+
+
+async def _resolve_memory_integrity_posture(db) -> None:
+    """Resolve standing memory-integrity alerts once posture is clear.
+
+    Unconditional (survives restart); a cheap no-op when nothing matches."""
+    global _last_memory_integrity_alert_at, _last_memory_integrity_key
+    if db is None:
+        return
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source=_MEMORY_INTEGRITY_SOURCE,
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: memory consistency and recall health nominal",
+        )
+        if resolved:
+            _last_memory_integrity_alert_at = 0.0
+            _last_memory_integrity_key = ""
+            logger.info("Auto-resolved %d memory integrity posture alert(s)", resolved)
+    except Exception:
+        logger.debug("Failed to resolve memory integrity posture alerts", exc_info=True)
+
+
 
 
 # Deploy staleness (WS-B): merged ≠ deployed. A bare git-merge between
@@ -2075,6 +2284,10 @@ class AwarenessLoop:
                     # 'high' infrastructure_alert; self-resolves on recovery.
                     # Facts change at most ~daily (profile refresh) → hourly.
                     await _check_infra_protection_posture(self._db)
+                    # Memory integrity posture: reads the latest persisted
+                    # consistency/recall-probe rows; slow-moving (daily jobs) →
+                    # hourly is ample.
+                    await _check_memory_integrity_posture(self._db)
                 await _check_wal_health(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires

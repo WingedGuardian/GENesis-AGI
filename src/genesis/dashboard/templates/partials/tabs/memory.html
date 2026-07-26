@@ -9,6 +9,54 @@
         Memory Browser
       </div>
       <div class="panel-body">
+        <!-- Memory integrity tile (Phase 0 "make silence loud") -->
+        <div style="margin-bottom:1rem; padding:0.75rem 1rem; border:1px solid var(--border, #2a2a2a); border-radius:6px;" x-data
+             x-show="$store.genesisDashboard.memoryIntegrity && Object.keys($store.genesisDashboard.memoryIntegrity).length">
+          <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
+            <span class="material-symbols-outlined" style="font-size:1.1rem;">frame_inspect</span>
+            <strong>Memory Integrity</strong>
+            <span style="font-size:0.75rem; opacity:0.6;" x-text="'mode: ' + ($store.genesisDashboard.memoryIntegrity.mode || '?')"></span>
+          </div>
+          <!-- not-configured / awaiting first run -->
+          <template x-if="!$store.genesisDashboard.memoryIntegrity.configured">
+            <div style="font-size:0.85rem; opacity:0.7;">
+              No integrity report yet — the read-only checks run nightly (or seed the
+              recall golden set via <code>scripts/seed_recall_golden_set.py</code>).
+            </div>
+          </template>
+          <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
+            <!-- consistency -->
+            <template x-if="$store.genesisDashboard.memoryIntegrity.consistency">
+              <div>
+                <div style="font-size:0.7rem; text-transform:uppercase; opacity:0.6;">Storage consistency</div>
+                <div style="font-weight:600;"
+                     :style="{color: $store.genesisDashboard.memoryIntegrity.consistency.status==='degraded' ? '#e5534b' : ($store.genesisDashboard.memoryIntegrity.consistency.status==='unknown' ? '#c9a227' : '#3fb950')}"
+                     x-text="$store.genesisDashboard.memoryIntegrity.consistency.status + ($store.genesisDashboard.memoryIntegrity.consistency.truncated ? ' (sampled)' : '')"></div>
+                <div style="font-size:0.8rem; opacity:0.8;"
+                     x-text="Object.entries($store.genesisDashboard.memoryIntegrity.consistency.counts || {}).filter(([k,v]) => v > 0).map(([k,v]) => k+'='+v).join(', ') || 'no findings'"></div>
+                <template x-if="$store.genesisDashboard.memoryIntegrity.consistency.unknown_reason">
+                  <div style="font-size:0.75rem; color:#c9a227;" x-text="'reason: ' + $store.genesisDashboard.memoryIntegrity.consistency.unknown_reason"></div>
+                </template>
+              </div>
+            </template>
+            <!-- recall health -->
+            <template x-if="$store.genesisDashboard.memoryIntegrity.recall">
+              <div>
+                <div style="font-size:0.7rem; text-transform:uppercase; opacity:0.6;">Recall health</div>
+                <div style="font-weight:600;"
+                     :style="{color: $store.genesisDashboard.memoryIntegrity.recall.status==='degraded' ? '#e5534b' : ($store.genesisDashboard.memoryIntegrity.recall.status==='unknown' ? '#c9a227' : '#3fb950')}"
+                     x-text="$store.genesisDashboard.memoryIntegrity.recall.status"></div>
+                <template x-if="$store.genesisDashboard.memoryIntegrity.recall.hit_rate != null">
+                  <div style="font-size:0.8rem; opacity:0.8;"
+                       x-text="'hit-rate ' + (100*$store.genesisDashboard.memoryIntegrity.recall.hit_rate).toFixed(0) + '%' + ($store.genesisDashboard.memoryIntegrity.recall.drift != null ? ' (drift ' + (100*$store.genesisDashboard.memoryIntegrity.recall.drift).toFixed(0) + '%)' : '')"></div>
+                </template>
+                <template x-if="$store.genesisDashboard.memoryIntegrity.recall.unknown_reason">
+                  <div style="font-size:0.75rem; color:#c9a227;" x-text="$store.genesisDashboard.memoryIntegrity.recall.unknown_reason + ' (golden: ' + ($store.genesisDashboard.memoryIntegrity.golden_count||0) + ')'"></div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </div>
         <!-- Stats row -->
         <div style="display:flex; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;" x-data>
           <template x-if="$store.genesisDashboard.memoryStats.total != null">

@@ -159,6 +159,68 @@ async def memory_delete(memory_id: str):
         return jsonify({"error": "Delete failed"}), 500
 
 
+@blueprint.route("/api/genesis/memory/integrity")
+@_async_route
+async def memory_integrity_status():
+    """Phase 0 memory-integrity tile: latest consistency report + recall probe.
+
+    A static route — registered ahead of the ``/<memory_id>`` converter in
+    Werkzeug's specificity ordering, so ``integrity`` is never read as an id.
+    """
+    import json as _json
+
+    from genesis.db.crud import memory_integrity as mi_crud
+    from genesis.memory import integrity_config
+    from genesis.memory.recall_probe import load_golden_set
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        return jsonify({"error": "Not bootstrapped"}), 503
+
+    report = await mi_crud.latest_consistency_report(rt.db)
+    probe = await mi_crud.latest_recall_probe_run(rt.db)
+    try:
+        golden_count = len(load_golden_set())
+    except Exception:
+        golden_count = 0
+
+    result: dict = {
+        # configured=False means no run has produced a row yet (pre-migration or
+        # awaiting the first nightly run) — the tile shows an explicit
+        # needs-setup state, never a fake "healthy".
+        "configured": report is not None or probe is not None,
+        "mode": integrity_config.effective_mode(),
+        "golden_count": golden_count,
+        "consistency": None,
+        "recall": None,
+    }
+    if report is not None:
+        try:
+            counts = _json.loads(report.get("counts_json") or "{}")
+        except (_json.JSONDecodeError, TypeError):
+            counts = {}
+        result["consistency"] = {
+            "status": report["status"],
+            "counts": counts,
+            "total_rows": report["total_rows"],
+            "truncated": bool(report["truncated"]),
+            "unknown_reason": report["unknown_reason"],
+            "created_at": report["created_at"],
+        }
+    if probe is not None:
+        result["recall"] = {
+            "status": probe["status"],
+            "hit_rate": probe["hit_rate"],
+            "mean_rr": probe["mean_rr"],
+            "baseline_hit_rate": probe["baseline_hit_rate"],
+            "drift": probe["drift"],
+            "unknown_reason": probe["unknown_reason"],
+            "created_at": probe["created_at"],
+        }
+    return jsonify(result)
+
+
 @blueprint.route("/api/genesis/memory/stats")
 @_async_route
 async def memory_stats():

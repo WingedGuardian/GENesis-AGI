@@ -1,0 +1,20 @@
+# Golden set TEMPLATE for the memory-integrity recall-health probe.
+#
+# This committed file is a TEMPLATE ONLY — it carries ZERO real cases. Real
+# cases reference recalled-memory ids (PII-adjacent) and live install-local at
+#   ~/.genesis/eval/golden/memory_integrity_recall.jsonl
+# (encrypted-backed-up via scripts/backup.sh per the #1143 convention; never in
+# the repo). Seed the real file with:
+#   python scripts/seed_recall_golden_set.py --suggest 20
+#
+# One case per line. Lines starting with "#" and blank lines are skipped.
+# Schema:
+#   {"id": "<stable case id>",
+#    "query": "<the query text to run through the real recall pipeline>",
+#    "expected_memory_ids": ["<memory_id that SHOULD be retrieved>", ...],
+#    "notes": "<optional: why this pair is a good stable probe>"}
+#
+# A case "hits" if ANY expected_memory_id appears in the top-N recall results;
+# rank is the 1-based position of the first expected id (drives mean reciprocal
+# rank). The probe reports 'unknown' (needs setup) until at least
+# min_golden_for_status (default 5) real cases exist.

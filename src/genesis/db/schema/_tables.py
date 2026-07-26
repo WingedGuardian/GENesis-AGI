@@ -2126,6 +2126,49 @@ TABLES = {
             created_at          TEXT NOT NULL
         )
     """,
+    # ── Memory integrity Phase 0 — "make silence loud" ───────────────────
+    # One row per read-only cross-backend consistency check. The episodic
+    # write path fans out to Qdrant + memory_metadata + memory_fts with no
+    # cross-store transaction; these snapshots turn silent drift (a memory
+    # marked embedded whose vector is gone, a ghost point, FTS drift) into a
+    # standing signal. status='unknown' when a dependency was unavailable — a
+    # dependency failure must never look like data corruption. 90-day prune.
+    "memory_consistency_reports": """
+        CREATE TABLE IF NOT EXISTS memory_consistency_reports (
+            id                   TEXT PRIMARY KEY,          -- uuid4 hex
+            created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+            status               TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unknown')),
+            sample_fraction      REAL,                      -- 0..1 fraction of rows scanned
+            sampled_rows         INTEGER,                   -- metadata rows actually checked
+            total_rows           INTEGER,                   -- total memory_metadata rows
+            truncated            INTEGER NOT NULL DEFAULT 0, -- 1 = a scan hit its budget cap
+            counts_json          TEXT NOT NULL,             -- {class: count} for all classes
+            offender_sample_json TEXT,                      -- {class: [ids...]} capped sample
+            unknown_reason       TEXT,                      -- set iff status='unknown'
+            duration_ms          INTEGER
+        )
+    """,
+    # One row per recall-health probe: an install-local golden query->expected
+    # -memory set run through the REAL recall pipeline. Records hit-rate + mean
+    # reciprocal rank + drift vs a trailing baseline. status='unknown' when the
+    # golden set is too small to judge. Golden set is a FILE (~/.genesis/eval/
+    # golden/), not a table (#1143 convention). 90-day prune.
+    "recall_probe_runs": """
+        CREATE TABLE IF NOT EXISTS recall_probe_runs (
+            id                TEXT PRIMARY KEY,             -- uuid4 hex
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            status            TEXT NOT NULL CHECK (status IN ('healthy', 'degraded', 'unknown')),
+            probes_total      INTEGER,                      -- golden cases attempted
+            probes_hit        INTEGER,                      -- cases where an expected id was retrieved
+            hit_rate          REAL,                         -- probes_hit / probes_total
+            mean_rr           REAL,                         -- mean reciprocal rank of first expected hit
+            baseline_hit_rate REAL,                         -- trailing-window mean, NULL during observation
+            drift             REAL,                         -- baseline_hit_rate - hit_rate, NULL if no baseline
+            details_json      TEXT,                         -- per-case {id, hit, rank}
+            unknown_reason    TEXT,                         -- set iff status='unknown'
+            duration_ms       INTEGER
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2463,6 +2506,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_reflex_signals_class ON reflex_signals(class_key)",
     "CREATE INDEX IF NOT EXISTS idx_reflex_diagnoses_signal ON reflex_diagnoses(signal_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_reflex_verdicts_signal ON reflex_verdicts(signal_id, created_at)",
+    # Memory integrity Phase 0 — latest-row-by-time and status filters
+    "CREATE INDEX IF NOT EXISTS idx_mcr_created ON memory_consistency_reports(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_mcr_status ON memory_consistency_reports(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_rpr_created ON recall_probe_runs(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_rpr_status ON recall_probe_runs(status, created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

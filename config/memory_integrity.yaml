@@ -1,0 +1,46 @@
+# Memory integrity Phase 0 — "make silence loud".
+#
+# Two scheduled read-only jobs consult this file (merged with
+# ~/.genesis/config/memory_integrity.local.yaml) on EVERY run, so a
+# settings_update("memory_integrity", {...}) or hand edit takes effect at the
+# next scheduled run — no restart:
+#   - memory_consistency_check (03:50 local) — verifies memory_metadata <-> Qdrant
+#     <-> memory_fts agree.
+#   - recall_health_probe (03:20 local) — runs an install-local golden query set
+#     through the real recall pipeline and tracks hit-rate / rank drift.
+#
+# Master switch: false stops both jobs before any work.
+enabled: true
+
+# Mode: off | passive | active
+#   off     — jobs do not run.
+#   passive — (default) run the read-only checks and surface findings (persist +
+#             posture alert + dashboard tile). NEVER repairs. All of Phase 0.
+#   active  — RESERVED for Phase 1 (write-path/reconcile repair). Not yet
+#             implemented; coerced to passive with a warning.
+# An invalid value degrades to passive (still observing) — never a silent off.
+mode: passive
+
+# ── consistency checker ──────────────────────────────────────────────────
+sample_fraction: 1.0        # 1.0 = exact full scan (a few seconds at ~30k memories)
+max_points: 500000          # Qdrant scroll budget; exceeding it sets truncated=1
+severe_min_count: 5         # lying_mirror + fts_invisible >= this → degraded
+pollution_min_count: 50     # ghost/unexpected/deprecated floor
+pollution_fraction: 0.01    # ...or this fraction of the corpus, whichever is higher
+max_offender_sample: 25     # capped offending ids per class stored in the report
+
+# ── recall-health probe ──────────────────────────────────────────────────
+# Golden set is an install-local FILE: ~/.genesis/eval/golden/memory_integrity_recall.jsonl
+# (seed it with `python scripts/seed_recall_golden_set.py --suggest N`).
+probe_limit: 10             # results retrieved per golden query
+max_probes_per_run: 25      # cap golden cases exercised per run
+rerank: true                # exercise the real cross-encoder rerank stage
+rerank_timeout_s: 10.0      # wall-clock bound on rerank per query
+min_golden_for_status: 5    # below this the run is 'unknown' (needs setup), not alarmed
+baseline_window_runs: 7     # trailing non-unknown runs averaged for the drift baseline
+baseline_min_runs: 3        # below this: observation period, no drift verdict yet
+drift_band: 0.2             # degraded if baseline_hit_rate - hit_rate > this
+
+# ── shared ───────────────────────────────────────────────────────────────
+stale_report_days: 3        # no non-unknown consistency report within → staleness alert
+retention_days: 90          # prune reports / probe runs older than this

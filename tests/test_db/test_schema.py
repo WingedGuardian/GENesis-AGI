@@ -165,6 +165,8 @@ async def test_no_unexpected_tables(db):
         "entity_links",  # entity layer (WS-H P2)
         "job_run_events",
         "alert_events",  # WS-2 sensor fabric (M9/M10)
+        "memory_consistency_reports",
+        "recall_probe_runs",  # memory integrity Phase 0 ("make silence loud")
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"
