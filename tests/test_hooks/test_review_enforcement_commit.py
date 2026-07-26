@@ -107,6 +107,13 @@ def test_plain_commit_blocked_without_review(repo: Path, home: Path) -> None:
     assert "without review" in res.stderr
 
 
+def test_git_commit_only_mentioned_in_string_not_gated(repo: Path, home: Path) -> None:
+    """A command that merely MENTIONS 'git commit' (no executed commit) must
+    not be gated — the cheap regex early-out is confirmed against real segments."""
+    res = _run_hook("echo 'reminder: run git commit later'", repo, home)
+    assert res.returncode == 0, res.stderr
+
+
 def test_trailing_override_allows(repo: Path, home: Path) -> None:
     res = _run_hook('git commit -m "wip"  # review-override', repo, home)
     assert res.returncode == 0, res.stderr

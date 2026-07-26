@@ -75,6 +75,12 @@ def main() -> None:
     # add-chain detection, and the override binding.
     segs = analyze(command)
 
+    # The cheap _COMMIT_PATTERN early-out can match "git commit" mentioned in a
+    # string (a reply body, an echo). Confirm a REAL executed commit segment
+    # before applying the branch/review rules, else allow.
+    if not any(git_subcommand(s.argv) == "commit" for s in segs):
+        sys.exit(0)
+
     # Rule 0: Block --no-verify / -n on ANY executed commit segment — it
     # bypasses ALL pre-commit hooks (review enforcement AND the native secrets /
     # large-file / direct-to-main guards). shell_parse parses real argv, so a
