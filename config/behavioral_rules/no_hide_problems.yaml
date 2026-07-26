@@ -12,6 +12,14 @@
 
 name: no-hide-problems
 severity: block
+# Doc formats are excluded: a markdown/rst/txt file that merely QUOTES the
+# CSS/Alpine patterns (an audit report, a PR body, a code fence) must not be
+# hard-blocked for describing the anti-pattern. Real markup lives in
+# .css/.html/.js/.vue files, which stay in scope.
+excludes:
+  - "*.md"
+  - "*.rst"
+  - "*.txt"
 description: >
   Never hide, suppress, or work around broken things — fix them.
   This applies to code, UI, plans, and reasoning. When something
@@ -43,15 +51,15 @@ patterns:
     context: Alpine conditional hiding error/unknown states
 
   # Reasoning-level patterns (plans, comments, proposals) — WARN only
-  - regex: '\b(?:hide|skip|remove|suppress|omit)\b.{0,40}\b(?:unknown|error|broken|stale|failed|placeholder|not.configured|not.available)\b'
+  - regex: '\b(?:hide|skip|remove|suppress|omit)\b.{0,40}\b(?:unknown|error|broken|stale|failed|placeholder|not.configured|not.available)'
     severity: warn
     context: Proposing to hide/skip broken or unknown data
-  - regex: '\b(?:unknown|error|broken|stale|failed|placeholder)\b.{0,40}\b(?:hide|skip|remove|suppress|omit)\b'
+  - regex: '\b(?:unknown|error|broken|stale|failed|placeholder).{0,40}\b(?:hide|skip|remove|suppress|omit)\b'
     severity: warn
     context: Proposing to suppress display of broken state
-  - regex: '\b(?:don.?t|do not|never|avoid)\s+(?:show|display|render|expose)\b.{0,40}\b(?:error|unknown|broken|stale|failed)\b'
+  - regex: '\b(?:don.?t|do not|never|avoid)\s+(?:show|display|render|expose)\b.{0,40}\b(?:error|unknown|broken|stale|failed)'
     severity: warn
     context: Proposing to not show error/broken state
-  - regex: '\b(?:only show|skip showing)\b.{0,40}(?:when|if|unless).{0,40}\b(?:available|configured|exists|ready|healthy)\b'
+  - regex: '\b(?:only show|skip showing)\b.{0,40}(?:when|if|unless).{0,40}\b(?:available|configured|exists|ready|healthy)'
     severity: warn
     context: Conditional display that omits broken states instead of showing them honestly

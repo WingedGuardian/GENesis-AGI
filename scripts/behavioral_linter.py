@@ -16,6 +16,7 @@ audit trail — the user approved the exception.
 Emits SteerMessage for unified enforcement feedback.
 """
 
+import json
 import re
 import sys
 from fnmatch import fnmatch
@@ -172,6 +173,8 @@ def _emit(violations: list[tuple[dict, dict, str]], file_path: str) -> int:
         use_steer = False
 
     exit_code = 0
+    block_texts: list[str] = []
+    warn_texts: list[str] = []
     for rule, pattern_def, severity in violations:
         name = rule.get("name", "unnamed")
         is_block = severity == "block"
@@ -190,13 +193,34 @@ def _emit(violations: list[tuple[dict, dict, str]], file_path: str) -> int:
                 can_suppress=True,
                 suppress_key=f"# behavioral-lint: ignore {name}",
             )
-            print(msg.to_stderr(), file=sys.stderr)
+            text = msg.to_stderr()
             code = msg.to_exit_code()
         else:
-            print(_plain_stderr(rule, pattern_def, severity, name, file_path), file=sys.stderr)
+            text = _plain_stderr(rule, pattern_def, severity, name, file_path)
             code = 2 if is_block else 0
+        (block_texts if is_block else warn_texts).append(text)
         if code > exit_code:
             exit_code = code
+
+    if exit_code == 2:
+        # A block fired: exit 2 delivers stderr to the model, so surface every
+        # message (blocks and any warns) there.
+        for text in block_texts + warn_texts:
+            print(text, file=sys.stderr)
+    elif warn_texts:
+        # Warn-only: PreToolUse stderr on exit 0 is DISCARDED by Claude Code, so
+        # the advisory must ride hookSpecificOutput.additionalContext (stdout),
+        # which is delivered to the model.
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": "\n".join(warn_texts),
+                    }
+                }
+            )
+        )
     return exit_code
 
 

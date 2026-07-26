@@ -98,6 +98,19 @@ class TestNoHideProblemsCodeBlocks:
         assert result.returncode == 2
         assert "no-hide-problems" in result.stderr
 
+    def test_markdown_quoting_css_not_blocked(self):
+        """P2 regression: a .md/.rst doc quoting the CSS must not hard-block.
+
+        A doc merely describing the anti-pattern (an audit report, a PR body, a
+        code fence) is excluded; real markup lives in .css/.html/.js. Fixture is
+        concatenated so this file has no literal trigger.
+        behavioral-lint: ignore no-hide-problems
+        """
+        css = ".err" + "or { display: none; }"
+        content = "The anti-pattern to avoid:\n```css\n" + css + "\n```\n"
+        result = _run_linter({"content": content, "file_path": "docs/hooks-audit.md"})
+        assert result.returncode == 0, result.stdout + result.stderr
+
 
 # ---------------------------------------------------------------------------
 # no-hide-problems — reasoning/prose patterns WARN (exit 0)
@@ -113,14 +126,17 @@ class TestNoHideProblemsProseWarns:
     """
 
     def _assert_warns(self, result):
+        # Warn advisories ride hookSpecificOutput.additionalContext on STDOUT
+        # (exit-0 stderr is discarded by Claude Code), never a hard block.
         assert result.returncode == 0, result.stderr
-        assert "WARNING" in result.stderr
-        assert "no-hide-problems" in result.stderr
-        assert "BLOCKED" not in result.stderr
+        assert "additionalContext" in result.stdout
+        assert "WARNING" in result.stdout
+        assert "no-hide-problems" in result.stdout
+        assert "BLOCKED" not in result.stdout and "BLOCKED" not in result.stderr
 
     def test_propose_hide_broken_data(self):
         content = "# We should hide the broken data for now"
-        self._assert_warns(_run_linter({"content": content, "file_path": "plan.md"}))
+        self._assert_warns(_run_linter({"content": content, "file_path": "plan.py"}))
 
     def test_propose_skip_unknown(self):
         content = "# skip the unknown values until we figure it out"
@@ -509,9 +525,9 @@ class TestMultipleRules:
         content = "# hide the broken dashboard widget"
         result = _run_linter({"content": content, "file_path": "hide_only.py"})
         assert result.returncode == 0, result.stderr
-        assert "WARNING" in result.stderr
-        assert "no-hide-problems" in result.stderr
-        assert "no-unguarded-kill" not in result.stderr
+        assert "WARNING" in result.stdout  # warn rides additionalContext
+        assert "no-hide-problems" in result.stdout
+        assert "no-unguarded-kill" not in result.stdout
 
     def test_prose_warn_and_kill_block(self):
         """Prose hide (warn) + kill (block) → exit 2, both reported.
@@ -551,22 +567,32 @@ class TestViolationMessages:
         assert "Escape:" in stderr
         assert "behavioral-lint: ignore no-unguarded-kill" in stderr
 
-    def test_warn_message_structure(self):
-        """Prose warn messages use WARNING (not BLOCKED) and still carry Fix/Escape."""
+    def test_warn_rides_additional_context(self):
+        """A warn advisory is delivered via additionalContext (stdout), exit 0.
+
+        Regression: exit-0 stderr is discarded by Claude Code, so a warn printed
+        only to stderr would be invisible to the model. It must ride
+        hookSpecificOutput.additionalContext instead.
+        """
         content = "# suppress the failed records"
-        result = _run_linter(
-            {
-                "content": content,
-                "file_path": "src/data.py",
-            }
-        )
+        result = _run_linter({"content": content, "file_path": "src/data.py"})
         assert result.returncode == 0, result.stderr
-        stderr = result.stderr
-        assert "WARNING" in stderr
-        assert "BLOCKED" not in stderr
-        assert "no-hide-problems" in stderr
-        assert "src/data.py" in stderr
-        assert "behavioral-lint: ignore no-hide-problems" in stderr
+        payload = json.loads(result.stdout)
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
+        assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+        assert "WARNING" in ctx
+        assert "no-hide-problems" in ctx
+        assert "src/data.py" in ctx
+        assert "behavioral-lint: ignore no-hide-problems" in ctx
+
+    def test_block_plus_warn_all_on_stderr(self):
+        """When a block co-occurs with a warn, exit 2 and both ride stderr."""
+        kill = "os.kill(-" + "1, signal.SIGKILL)"  # avoid the literal in source
+        content = "# hide the broken data\n" + kill + "\n"
+        result = _run_linter({"content": content, "file_path": "mix.py"})
+        assert result.returncode == 2
+        assert "no-unguarded-kill" in result.stderr
+        assert "no-hide-problems" in result.stderr
 
 
 # ---------------------------------------------------------------------------
