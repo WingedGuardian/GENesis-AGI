@@ -12,9 +12,14 @@ only) at the time review was done.  If staged content changes, the marker
 becomes stale and review is required again.  Unstaged working-tree edits
 (e.g. from Codex) do not trigger review enforcement.
 
+Review evidence: the authoritative signal is the code-reviewer agent output
+(``~/.genesis/last_code_review.txt``). gstack skill-usage telemetry, when
+present, is recorded as advisory corroboration but never gates marking — it is
+not installed on many hosts.
+
 CLI usage:
     python3 review_state.py status     # prints current review state
-    python3 review_state.py mark --review-log <path> --agent-output <path>
+    python3 review_state.py mark --agent-output <path>
     python3 review_state.py diff-hash  # prints current diff hash
 """
 
@@ -47,7 +52,10 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
     try:
         result = subprocess.run(
             ["git", "diff", "--cached", "--stat"],
-            capture_output=True, text=True, timeout=10, cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=cwd,
         )
         content = result.stdout.strip()
         if not content:
@@ -98,9 +106,17 @@ def has_valid_review_marker() -> bool:
 
 
 def _verify_review_log() -> tuple[bool, str]:
-    """Verify gstack /review ran recently (via skill-usage.jsonl)."""
+    """Corroborate a recent /review from gstack telemetry — ADVISORY ONLY.
+
+    gstack (the skill-usage logger that writes ``skill-usage.jsonl``) is not
+    installed on many hosts, so this must NEVER gate ``mark_reviewed``. The
+    authoritative review evidence is the code-reviewer agent output checked by
+    ``_verify_agent_output``; this only annotates the marker with whatever
+    corroboration it can find. The returned bool is informational (recorded in
+    ``review_evidence``), never a refusal signal.
+    """
     if not _GSTACK_ANALYTICS.exists():
-        return False, "No gstack analytics file found"
+        return False, "gstack analytics absent — agent-output evidence authoritative"
     try:
         lines = _GSTACK_ANALYTICS.read_text().strip().splitlines()
         now = time.time()
@@ -112,12 +128,12 @@ def _verify_review_log() -> tuple[bool, str]:
                     ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                     age = now - ts.timestamp()
                     if age <= _MAX_EVIDENCE_AGE_SECONDS:
-                        return True, f"Review ran {int(age)}s ago"
+                        return True, f"gstack /review ran {int(age)}s ago"
             except (json.JSONDecodeError, ValueError, KeyError):
                 continue
-        return False, "No recent /review entry in gstack analytics (within 30 min)"
+        return False, "no recent gstack /review entry — agent-output evidence authoritative"
     except OSError as e:
-        return False, f"Cannot read analytics: {e}"
+        return False, f"gstack analytics unreadable ({e}) — agent-output evidence authoritative"
 
 
 def _verify_agent_output(path: str) -> tuple[bool, str]:
@@ -136,16 +152,17 @@ def _verify_agent_output(path: str) -> tuple[bool, str]:
 def mark_reviewed(agent_output_path: str | None = None) -> bool:
     """Write review marker after verifying evidence.
 
-    Returns True if marker was written, False if evidence checks failed.
-    """
-    # Check 1: gstack /review must have run recently
-    review_ok, review_msg = _verify_review_log()
-    if not review_ok:
-        print(f"REFUSED: {review_msg}", file=sys.stderr)
-        print("Run /review first, then try again.", file=sys.stderr)
-        return False
+    The authoritative gate is Check 2 (code-reviewer agent output). Check 1
+    (gstack telemetry) is advisory — it annotates the marker but never refuses,
+    because gstack is not installed on many hosts (see ``_verify_review_log``).
 
-    # Check 2: code-reviewer agent output must exist and be recent
+    Returns True if the marker was written, False if the authoritative evidence
+    check failed.
+    """
+    # Check 1 (advisory): gstack corroboration — recorded, never refuses.
+    _review_found, review_msg = _verify_review_log()
+
+    # Check 2 (authoritative): code-reviewer agent output must exist and be recent.
     agent_path = agent_output_path or str(Path.home() / ".genesis" / "last_code_review.txt")
     agent_ok, agent_msg = _verify_agent_output(agent_path)
     if not agent_ok:
@@ -153,12 +170,12 @@ def mark_reviewed(agent_output_path: str | None = None) -> bool:
         print("Dispatch the superpowers:code-reviewer agent first.", file=sys.stderr)
         return False
 
-    # Both checks passed — write marker
+    # Authoritative evidence present — write marker.
     _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     state = {
         "diff_hash": get_current_diff_hash(),
         "reviewed_at": datetime.now(UTC).isoformat(),
-        "review_evidence": review_msg,
+        "review_evidence": review_msg,  # advisory annotation (gstack corroboration)
         "agent_evidence": agent_msg,
     }
     _STATE_FILE.write_text(json.dumps(state, indent=2))
@@ -171,7 +188,10 @@ def get_current_branch(cwd: str | None = None) -> str:
     try:
         result = subprocess.run(
             ["git", "branch", "--show-current"],
-            capture_output=True, text=True, timeout=5, cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=cwd,
         )
         return result.stdout.strip() or "unknown"
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
