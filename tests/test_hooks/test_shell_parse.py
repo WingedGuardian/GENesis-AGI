@@ -101,6 +101,11 @@ class TestOverride:
 
     def test_exact_token_only(self):
         assert not sp.analyze("git push # review-override-x")[0].override
+        assert not sp.analyze("git push # review-overridexyz")[0].override
+
+    def test_trailing_comment_text_allowed(self):
+        assert sp.analyze("git push # review-override: accepted P2s")[0].override
+        assert sp.analyze("git push # review-override — notes")[0].override
 
 
 # ── commit hook-skip flag detection ─────────────────────────────────────

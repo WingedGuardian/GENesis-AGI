@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 _LEGACY_INPUT_ENV = "CLAUDE_TOOL_INPUT"
@@ -125,3 +126,25 @@ def session_id(payload: dict, default: str = "unknown") -> str:
             return sid
     env_sid = os.environ.get("CLAUDE_SESSION_ID", "")
     return env_sid or default
+
+
+def strip_quoted(command: str) -> str:
+    """Return ``command`` with quoted regions removed.
+
+    Removes double-quoted (``"…"``, honoring backslash escapes) and
+    single-quoted (``'…'``, literal per POSIX) spans, so a caller can test for
+    shell syntax that only counts OUTSIDE quotes — a trailing ``# comment``, an
+    operator. A token found only inside the removed spans (e.g. inside a
+    ``git commit -m "…"`` message, where it would be committed into history) is
+    absent from the result, so ``strip_quoted(cmd)`` vs the raw ``cmd`` lets a
+    guard distinguish a genuine trailing-comment override from a token buried in
+    a commit message.
+
+    Stdlib-only, fail-open: returns the input unchanged on any error.
+    """
+    if not command:
+        return command
+    try:
+        return re.sub(r"\"(?:\\.|[^\"\\])*\"|'[^']*'", "", command)
+    except (re.error, TypeError):
+        return command

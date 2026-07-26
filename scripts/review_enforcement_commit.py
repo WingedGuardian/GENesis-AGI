@@ -22,11 +22,32 @@ import sys
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks"))
 from hook_input import field, read_payload  # noqa: E402
+from shell_parse import analyze, commit_skips_hooks, git_subcommand  # noqa: E402
 
-# Pattern to detect git commit commands (but not git commit --amend, etc. — those
-# are also commits and should be blocked)
+# Cheap early-out: a raw command that never mentions "git commit" is not a
+# commit. Actual detection (through wrappers, bash -c, etc.) uses shell_parse.
 _COMMIT_PATTERN = re.compile(r"\bgit\s+commit\b")
-_ADD_PATTERN = re.compile(r"\bgit\s+add\b")
+
+
+def _commit_override(command: str, segs: list) -> str:
+    """Classify the ``# review-override`` approval for the git-commit segment(s).
+
+    Returns:
+      ``"valid"``    — every executed ``git commit`` segment carries a genuine
+                       trailing ``# review-override`` shell comment (bound to
+                       that segment by shell_parse): an intentional override.
+      ``"in_quote"`` — the token appears in the command (e.g. inside the ``-m``
+                       message or a heredoc body) but not as a clean trailing
+                       comment on the commit, where it would leak into public
+                       history and does NOT override.
+      ``"none"``     — no override token present.
+    """
+    commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
+    if commit_segs and all(s.override for s in commit_segs):
+        return "valid"
+    if re.search(r"#\s*review-override\b", command):
+        return "in_quote"
+    return "none"
 
 
 def _extract_working_dir(command: str) -> str | None:
@@ -49,14 +70,28 @@ def main() -> None:
     if not _COMMIT_PATTERN.search(command):
         sys.exit(0)  # Not a commit, allow
 
-    # Rule 0: Block --no-verify — it bypasses all pre-commit hooks
-    # including review enforcement. There is no legitimate reason to
-    # skip review hooks. Check for both long and short (-n) forms,
-    # but only after we've confirmed this is a git commit command.
-    if "--no-verify" in command:
+    # Parse the command into the segments it actually executes (through
+    # wrappers, bash -c, command substitutions). Reused for Rule 0, the
+    # add-chain detection, and the override binding.
+    segs = analyze(command)
+
+    # The cheap _COMMIT_PATTERN early-out can match "git commit" mentioned in a
+    # string (a reply body, an echo). Confirm a REAL executed commit segment
+    # before applying the branch/review rules, else allow.
+    if not any(git_subcommand(s.argv) == "commit" for s in segs):
+        sys.exit(0)
+
+    # Rule 0: Block --no-verify / -n on ANY executed commit segment — it
+    # bypasses ALL pre-commit hooks (review enforcement AND the native secrets /
+    # large-file / direct-to-main guards). shell_parse parses real argv, so a
+    # flag mentioned inside the commit message doesn't false-block and a bundled
+    # / operator-glued / bash -c-nested form isn't missed. Runs BEFORE the
+    # override check, so it can never be bypassed by '# review-override'.
+    if any(commit_skips_hooks(s.argv) for s in segs):
         _deny(
-            "BLOCKED: --no-verify bypasses review enforcement hooks. "
-            "Remove --no-verify and establish a review first via /review."
+            "BLOCKED: --no-verify / -n bypasses review enforcement AND the "
+            "native pre-commit guards (secrets, large files, direct-to-main). "
+            "Remove it and establish a review first via /review."
         )
         return
 
@@ -93,23 +128,42 @@ def main() -> None:
     # staged yet at hook time because git add hasn't run. Detect git add in
     # the same command chain — if present, require the marker file to exist
     # (the PostToolUse hook deletes it after every commit).
-    stages_in_same_command = bool(_ADD_PATTERN.search(command))
-
+    stages_in_same_command = any(git_subcommand(s.argv) == "add" for s in segs)
     if stages_in_same_command:
-        # Can't check diff hash (staging hasn't happened yet).
-        # Just require the marker file to exist and not be expired.
-        if not has_valid_review_marker():
+        # Can't check diff hash (staging hasn't happened yet) — require the
+        # marker file to exist and not be expired.
+        rule2_blocks = not has_valid_review_marker()
+    else:
+        rule2_blocks = has_code_changes(cwd=cwd) and not is_review_current()
+
+    if rule2_blocks:
+        # A trailing '# review-override' comment (outside quotes) acknowledges
+        # accepted findings and bypasses ONLY this review gate — never Rule 0
+        # (--no-verify) or Rule 1 (main-branch), which are checked above.
+        override = _commit_override(command, segs)
+        if override == "valid":
+            print(
+                "NOTE: review-override honored — commit review gate bypassed. "
+                "Findings acknowledged by session.",
+                file=sys.stderr,
+            )
+            sys.exit(0)
+        if override == "in_quote":
             _deny(
-                "BLOCKED: No current review marker. "
-                "Run /review and dispatch the superpowers:code-reviewer agent first, "
-                "then run: python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt"
+                "BLOCKED: '# review-override' is not a clean trailing shell "
+                "comment — it sits inside quotes (e.g. the commit message) or is "
+                "followed by more command, so it does NOT override and could be "
+                "committed into public history. Put it at the very END, outside "
+                "any quotes:\n"
+                '  git commit -m "your message"  # review-override'
             )
             return
-    elif has_code_changes(cwd=cwd) and not is_review_current():
         _deny(
             "BLOCKED: Code changes exist without review. "
             "Run /review and dispatch the superpowers:code-reviewer agent first, "
-            "then run: python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt"
+            "then run: python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt\n"
+            "If findings are intentionally accepted, append a trailing shell "
+            "comment (outside any quotes): '  # review-override'"
         )
         return
 

@@ -23,6 +23,7 @@ than raising) — a guard must never crash the tool.
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 
@@ -214,7 +215,10 @@ def _has_trailing_override(seg: str) -> bool:
             continue
         if c == "#" and prev_ws:
             rest = seg[i + 1 :].strip()
-            return rest.split()[0:1] == ["review-override"]  # exact first token
+            # The sigil must be the token, optionally followed by punctuation /
+            # comment text (`# review-override: accepted P2s`), but NOT be a
+            # prefix of a longer token (`review-override-x`, `review-overridexyz`).
+            return bool(re.match(r"review-override(?![-\w])", rest))
         prev_ws = c.isspace()
         i += 1
     return False
