@@ -27,6 +27,72 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
 
+# Quoted-region matcher: double-quoted (with backslash escapes) or single-quoted
+# (literal per POSIX). Used to blank out quoted spans so a subcommand mentioned
+# inside a string (a commit message, an echo, a --body) is not mistaken for the
+# real invocation.
+_QUOTED = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
+
+
+def _unquoted(cmd: str) -> str:
+    """``cmd`` with quoted regions removed.
+
+    So ``echo "git push"`` or ``git commit -m "mentions --no-verify"`` no longer
+    trip the guards that look for those subcommands. Fail-open: returns the
+    input unchanged on any regex error.
+    """
+    try:
+        return _QUOTED.sub("", cmd)
+    except re.error:
+        return cmd
+
+
+def _has_override(cmd: str) -> bool:
+    """Whether the command carries a deliberate ``# review-override`` trailing
+    shell comment (outside quotes).
+
+    This is the in-session-approval signal — the same token the merge gate and
+    the commit gate honor. The caller logs a NOTE when it fires. Matched on the
+    unquoted command so a token buried in a quoted string does not count.
+    """
+    return bool(re.search(r"(?:^|\s)#\s*review-override\b", _unquoted(cmd)))
+
+
+# git global options that consume the FOLLOWING token as their value, so the
+# real subcommand is the first non-option token AFTER them.
+_GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+
+
+def _git_subcommands(cmd: str) -> set[str]:
+    """The set of git subcommands (push/merge/commit/…) invoked in ``cmd``.
+
+    Splits on shell separators and, for each ``git …`` segment, skips git's
+    global options — including ``-c KEY=VAL`` / ``-C DIR`` which take a value —
+    to find the real subcommand. This catches ``git -c credential.helper=… push``
+    (the repo's documented push idiom), which a naive ``git push`` adjacency
+    check misses entirely. Fail-open: a segment that won't tokenize is skipped.
+    """
+    subs: set[str] = set()
+    for segment in re.split(r"&&|\|\||[;&|\n]", cmd):
+        try:
+            toks = shlex.split(segment)
+        except ValueError:
+            toks = segment.split()
+        if not toks or toks[0] != "git":
+            continue
+        i = 1
+        while i < len(toks):
+            t = toks[i]
+            if t in _GIT_OPTS_WITH_ARG:
+                i += 2  # skip the option and its value token
+                continue
+            if t.startswith("-"):
+                i += 1  # some other global flag (e.g. --no-pager, --opt=val)
+                continue
+            subs.add(t)  # first non-option token is the subcommand
+            break
+    return subs
+
 
 def _current_branch() -> str | None:
     """Get current git branch name."""
@@ -376,22 +442,36 @@ def main() -> int:
         if not cmd:
             return 0
 
+        # Match subcommands on the quote-stripped command so a mention inside a
+        # string (commit message, echo, --body) never trips a guard. The
+        # override is the in-session-approval signal, logged where honored.
+        uq = _unquoted(cmd)
+        override = _has_override(cmd)
+        git_subs = _git_subcommands(cmd)
+
         # ── git push (any branch) ──────────────────────────────────
-        if "git push" in cmd:
-            _remote, branch = _get_push_remote_and_branch(cmd)
-            print(
-                f"BLOCKED: git push requires user approval before "
-                f"publishing code externally (target: {branch or 'default'}).",
-                file=sys.stderr,
-            )
-            print(
-                "Ask the user: 'Ready to push?' before proceeding.",
-                file=sys.stderr,
-            )
-            return 2
+        if "push" in git_subs:
+            if override:
+                print(
+                    "NOTE: git push override honored — user approved in-session.",
+                    file=sys.stderr,
+                )
+            else:
+                _remote, branch = _get_push_remote_and_branch(cmd)
+                print(
+                    f"BLOCKED: git push requires user approval before "
+                    f"publishing code externally (target: {branch or 'default'}).",
+                    file=sys.stderr,
+                )
+                print(
+                    "Ask the user 'Ready to push?'; once approved, append a "
+                    "trailing '  # review-override' comment to proceed.",
+                    file=sys.stderr,
+                )
+                return 2
 
         # ── git merge into main ─────────────────────────────────────
-        if "git merge" in cmd:
+        if "merge" in git_subs:
             current = _current_branch()
             if current in ("main", "master"):
                 print(
@@ -405,20 +485,27 @@ def main() -> int:
                 return 2
 
         # ── gh pr create ───────────────────────────────────────────
-        if "gh pr create" in cmd:
-            print(
-                "BLOCKED: Creating a PR requires user approval before publishing externally.",
-                file=sys.stderr,
-            )
-            print(
-                "Ask the user: 'Ready to create the PR?' before proceeding.",
-                file=sys.stderr,
-            )
-            return 2
+        if re.search(r"\bgh\s+pr\s+create\b", uq):
+            if override:
+                print(
+                    "NOTE: gh pr create override honored — user approved in-session.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "BLOCKED: Creating a PR requires user approval before publishing externally.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Ask the user 'Ready to create the PR?'; once approved, "
+                    "append a trailing '  # review-override' comment to proceed.",
+                    file=sys.stderr,
+                )
+                return 2
 
         # ── gh pr merge ────────────────────────────────────────────
-        if "gh pr merge" in cmd:
-            if "--admin" not in cmd:
+        if re.search(r"\bgh\s+pr\s+merge\b", uq):
+            if "--admin" not in uq:
                 print(
                     "BLOCKED: gh pr merge without --admin is not allowed.",
                     file=sys.stderr,
@@ -465,7 +552,7 @@ def main() -> int:
                     return 2
 
                 # Check for unresolved review findings
-                force_override = bool(re.search(r"#\s*review-override\b", cmd))
+                force_override = override
                 should_block, review_msg = _check_pr_review_findings(
                     pr_num,
                     force=force_override,
@@ -493,6 +580,8 @@ def main() -> int:
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
+        # NB: match on the raw command, not the unquoted one — the DML keyword
+        # lives inside the quoted SQL argument (sqlite3 db "DELETE FROM ...").
         if "sqlite3" in cmd and re.search(
             r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b",
             cmd,
@@ -506,7 +595,7 @@ def main() -> int:
             return 2
 
         # ── git commit --no-verify ────────────────────────────────
-        if "git commit" in cmd and "--no-verify" in cmd:
+        if "commit" in git_subs and re.search(r"(?:^|\s)--no-verify\b", uq):
             print(
                 "BLOCKED: --no-verify bypasses review enforcement hooks. "
                 "Remove --no-verify and run /review first.",
