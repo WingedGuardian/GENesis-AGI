@@ -1179,3 +1179,233 @@ class TestRawSnippetRendering:
         assert "external-world knowledge" in out  # labeled external
         assert "<external-content" in out  # opening fence (carries attributes)
         assert "</external-content>" in out  # closing fence — content is bounded
+
+
+# ─── Voice ACT: remember / remind tools (Step 2a, Design B) ──────────────────
+
+
+def _act_runtime(*, memory_store=None, db=None, bootstrapped=True):
+    """A fake GenesisRuntime exposing only what the ACT handlers touch."""
+    return MagicMock(
+        is_bootstrapped=bootstrapped,
+        memory_store=memory_store,
+        db=db,
+    )
+
+
+class TestVoiceActConfig:
+    """voice_act_config.effective_mode: default off, env kill, degrade-to-off."""
+
+    def _pin(self, monkeypatch, tmp_path, body: str | None):
+        from genesis.channels.voice import voice_act_config
+
+        monkeypatch.delenv("GENESIS_VOICE_ACT_DISABLED", raising=False)
+        path = tmp_path / "voice_act.yaml"
+        if body is not None:
+            path.write_text(body, encoding="utf-8")
+        monkeypatch.setattr(voice_act_config, "_base_path", lambda: path)
+        return voice_act_config
+
+    def test_default_off_when_no_config(self, monkeypatch, tmp_path):
+        cfg = self._pin(monkeypatch, tmp_path, None)
+        assert cfg.effective_mode() == "off"
+
+    def test_env_kill_forces_off(self, monkeypatch, tmp_path):
+        cfg = self._pin(monkeypatch, tmp_path, "mode: live\n")
+        monkeypatch.setenv("GENESIS_VOICE_ACT_DISABLED", "1")
+        assert cfg.effective_mode() == "off"
+
+    def test_live_respected(self, monkeypatch, tmp_path):
+        cfg = self._pin(monkeypatch, tmp_path, "mode: live\n")
+        assert cfg.effective_mode() == "live"
+
+    def test_invalid_mode_degrades_to_off(self, monkeypatch, tmp_path):
+        cfg = self._pin(monkeypatch, tmp_path, "mode: bananas\n")
+        assert cfg.effective_mode() == "off"
+
+    def test_enabled_false_forces_off(self, monkeypatch, tmp_path):
+        cfg = self._pin(monkeypatch, tmp_path, "mode: live\nenabled: false\n")
+        assert cfg.effective_mode() == "off"
+
+
+class TestToUtcIsoIfFuture:
+    """_to_utc_iso_if_future: future→UTC ISO, else None (never fire 'now')."""
+
+    def test_future_offset_normalized_to_utc(self):
+        from genesis.channels.voice.genesis_bridge import _to_utc_iso_if_future
+
+        assert _to_utc_iso_if_future("2099-06-01T09:00:00-04:00") == "2099-06-01T13:00:00+00:00"
+
+    def test_naive_future_attaches_tz_and_is_utc(self):
+        from genesis.channels.voice.genesis_bridge import _to_utc_iso_if_future
+
+        out = _to_utc_iso_if_future("2099-01-01T09:00:00")
+        assert out is not None and out.endswith("+00:00")
+
+    def test_past_returns_none(self):
+        from genesis.channels.voice.genesis_bridge import _to_utc_iso_if_future
+
+        assert _to_utc_iso_if_future("2000-01-01T00:00:00+00:00") is None
+
+    def test_unparseable_and_empty_return_none(self):
+        from genesis.channels.voice.genesis_bridge import _to_utc_iso_if_future
+
+        assert _to_utc_iso_if_future("next thursday") is None
+        assert _to_utc_iso_if_future("") is None
+
+
+class TestGetToolDeclarations:
+    """Act tools are offered only when voice_act is live."""
+
+    def test_off_omits_act_tools(self, monkeypatch):
+        from genesis.channels.voice import genesis_bridge, voice_act_config
+
+        monkeypatch.setattr(voice_act_config, "effective_mode", lambda: "off")
+        names = {t["name"] for t in genesis_bridge.get_tool_declarations()}
+        assert "ask_genesis" in names
+        assert "remember" not in names
+        assert "remind" not in names
+
+    def test_live_includes_act_tools(self, monkeypatch):
+        from genesis.channels.voice import genesis_bridge, voice_act_config
+
+        monkeypatch.setattr(voice_act_config, "effective_mode", lambda: "live")
+        names = {t["name"] for t in genesis_bridge.get_tool_declarations()}
+        assert {"ask_genesis", "remember", "remind"} <= names
+
+
+class TestVoiceActTools:
+    """remember / remind dispatch, guards, and off-mode refusal."""
+
+    def _live(self, monkeypatch):
+        from genesis.channels.voice import voice_act_config
+
+        monkeypatch.setattr(voice_act_config, "effective_mode", lambda: "live")
+
+    async def test_remember_stores_episodic_voice_memory(self, monkeypatch):
+        self._live(monkeypatch)
+        store = AsyncMock(return_value="mem-1")
+        rt = _act_runtime(memory_store=MagicMock(store=store), db=object())
+        bridge = GenesisBridge(runtime=rt)
+
+        out = await bridge.handle_tool_call(
+            "remember", json.dumps({"fact": "The user prefers morning meetings"})
+        )
+        assert json.loads(out)["result"]
+        store.assert_awaited_once()
+        kwargs = store.await_args.kwargs
+        assert kwargs["content"] == "The user prefers morning meetings"
+        assert kwargs["source"] == "voice"
+        assert kwargs["memory_type"] == "episodic"
+        assert "voice" in kwargs["tags"]
+
+    async def test_remember_refuses_trivial_content(self, monkeypatch):
+        self._live(monkeypatch)
+        store = AsyncMock()
+        rt = _act_runtime(memory_store=MagicMock(store=store), db=object())
+        bridge = GenesisBridge(runtime=rt)
+
+        out = await bridge.handle_tool_call("remember", json.dumps({"fact": "ok"}))
+        store.assert_not_awaited()
+        assert "didn't catch" in json.loads(out)["result"]
+
+    async def test_remember_refused_when_off(self, monkeypatch):
+        from genesis.channels.voice import voice_act_config
+
+        monkeypatch.setattr(voice_act_config, "effective_mode", lambda: "off")
+        store = AsyncMock()
+        rt = _act_runtime(memory_store=MagicMock(store=store), db=object())
+        bridge = GenesisBridge(runtime=rt)
+
+        await bridge.handle_tool_call(
+            "remember", json.dumps({"fact": "The user prefers morning meetings"})
+        )
+        store.assert_not_awaited()
+
+    async def test_remind_enqueues_high_urgency_future(self, monkeypatch):
+        self._live(monkeypatch)
+        from genesis.db.crud import pending_outreach
+
+        enqueue = AsyncMock(return_value="pid")
+        monkeypatch.setattr(pending_outreach, "enqueue", enqueue)
+        rt = _act_runtime(db=object())
+        bridge = GenesisBridge(runtime=rt)
+
+        out = await bridge.handle_tool_call(
+            "remind",
+            json.dumps({"text": "call the plumber", "when": "2099-01-01T09:00:00+00:00"}),
+        )
+        assert json.loads(out)["result"]
+        enqueue.assert_awaited_once()
+        kwargs = enqueue.await_args.kwargs
+        assert kwargs["urgency"] == "high"
+        assert kwargs["category"] == "notification"
+        assert kwargs["deliver_after"].startswith("2099-01-01T09:00:00")
+        assert "plumber" in kwargs["message"]
+        # channel omitted → inherits the pending_outreach 'telegram' default
+        assert "channel" not in kwargs
+
+    async def test_remind_refuses_past_time(self, monkeypatch):
+        self._live(monkeypatch)
+        from genesis.db.crud import pending_outreach
+
+        enqueue = AsyncMock()
+        monkeypatch.setattr(pending_outreach, "enqueue", enqueue)
+        rt = _act_runtime(db=object())
+        bridge = GenesisBridge(runtime=rt)
+
+        out = await bridge.handle_tool_call(
+            "remind",
+            json.dumps({"text": "old thing", "when": "2000-01-01T09:00:00+00:00"}),
+        )
+        enqueue.assert_not_awaited()
+        assert "When should I remind" in json.loads(out)["result"]
+
+    async def test_remind_refuses_missing_time(self, monkeypatch):
+        self._live(monkeypatch)
+        from genesis.db.crud import pending_outreach
+
+        enqueue = AsyncMock()
+        monkeypatch.setattr(pending_outreach, "enqueue", enqueue)
+        rt = _act_runtime(db=object())
+        bridge = GenesisBridge(runtime=rt)
+
+        out = await bridge.handle_tool_call(
+            "remind", json.dumps({"text": "some thing", "when": ""})
+        )
+        enqueue.assert_not_awaited()
+        assert "When should I remind" in json.loads(out)["result"]
+
+    async def test_remind_refused_when_off(self, monkeypatch):
+        from genesis.channels.voice import voice_act_config
+
+        monkeypatch.setattr(voice_act_config, "effective_mode", lambda: "off")
+        from genesis.db.crud import pending_outreach
+
+        enqueue = AsyncMock()
+        monkeypatch.setattr(pending_outreach, "enqueue", enqueue)
+        rt = _act_runtime(db=object())
+        bridge = GenesisBridge(runtime=rt)
+
+        await bridge.handle_tool_call(
+            "remind",
+            json.dumps({"text": "call the plumber", "when": "2099-01-01T09:00:00+00:00"}),
+        )
+        enqueue.assert_not_awaited()
+
+
+class TestVoiceActValidator:
+    """settings _validate_voice_act accepts off|live, rejects junk."""
+
+    def test_accepts_valid(self):
+        from genesis.mcp.health.settings import _validate_voice_act
+
+        assert _validate_voice_act({"mode": "live"}) == []
+        assert _validate_voice_act({"mode": "off", "enabled": True}) == []
+
+    def test_rejects_bad_values_and_keys(self):
+        from genesis.mcp.health.settings import _validate_voice_act
+
+        assert _validate_voice_act({"mode": "bananas"})
+        assert _validate_voice_act({"enabled": "false"})
+        assert _validate_voice_act({"bogus": 1})
