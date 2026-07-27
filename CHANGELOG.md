@@ -9,6 +9,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deleting a memory no longer risks leaving an orphaned vector behind.** A
+  memory lives across SQLite and a vector store; if the vector store hiccupped
+  mid-delete, Genesis used to remove the memory's records but leave its vector
+  stranded — invisible bloat that could subtly pollute search, and it never
+  cleaned itself up. Deletes are now ordered vector-first and fail closed: if the
+  vector store is unavailable the whole delete is deferred and retried, so a
+  memory is never left half-removed. A one-time startup cleanup removes any
+  existing orphaned vectors (their contents are exported to `~/.genesis/output`
+  first) and restores memories that had lost their vector back to full search —
+  healing the drift the new Memory Integrity checks surface.
+
 ### Added
 
 - **Genesis now notices when its own memory quietly degrades.** Memory is stored
