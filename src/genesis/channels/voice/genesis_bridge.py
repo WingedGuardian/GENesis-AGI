@@ -411,6 +411,10 @@ def _extract_user_identity(max_chars: int = 600, *, loader=None) -> str:
             continue
         if s in template_lines:  # line copied verbatim from the seed — unedited
             continue
+        # Strip markdown bold before the list-marker lstrip: "- **Name**: Jay"
+        # otherwise renders "Name**: Jay" (lstrip removes only the leading "**",
+        # leaving the trailing pair) and that "**" is spoken/garbled by the S2S model.
+        s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
         s = s.lstrip("-* ").strip()
         if s:
             lines.append(s)

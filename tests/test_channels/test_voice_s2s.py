@@ -1065,6 +1065,15 @@ class TestUserIdentitySlice:
         bad.user.side_effect = RuntimeError("boom")
         assert _extract_user_identity(loader=bad) == ""
 
+    def test_markdown_bold_stripped(self, tmp_path):
+        # "- **Name**: Jamie" must render "Name: Jamie", not "Name**: Jamie" —
+        # the list-marker lstrip alone leaves a trailing "**" the S2S model speaks.
+        user = "# User Profile\n- **Name**: Jamie\n- **Timezone**: UTC\n"
+        out = self._extract(tmp_path, user, self._EXAMPLE)
+        assert "*" not in out
+        assert "Name: Jamie" in out
+        assert "Timezone: UTC" in out
+
 
 # ─── Coarse age humanizer (§3.2 recall labels) ──────────────────────────
 
