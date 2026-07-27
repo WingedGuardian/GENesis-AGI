@@ -29,6 +29,7 @@ from genesis.dashboard.auth import is_authenticated
 from genesis.memory.reference_ops import (
     REFERENCE_KINDS,
     REFERENCE_PROJECT,
+    ReferenceStoreUnavailable,
     delete_reference_entry,
     parse_reference_body,
 )
@@ -253,6 +254,10 @@ async def references_delete(unit_id: str):
     except ValueError:
         # Not a reference entry — refuse.
         return jsonify({"error": "Not a reference entry"}), 400
+    except ReferenceStoreUnavailable:
+        # Vector store down → delete deferred (reference retained). Retryable,
+        # NOT a 404 "not found".
+        return jsonify({"error": "Vector store unavailable; delete deferred, retry later"}), 503
     except Exception:
         logger.exception("Reference delete failed")
         return jsonify({"error": "Delete failed"}), 500

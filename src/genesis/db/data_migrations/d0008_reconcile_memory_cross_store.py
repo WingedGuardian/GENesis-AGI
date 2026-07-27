@@ -215,7 +215,7 @@ def migrate() -> dict:
         def _requeue_mirror(conn: sqlite3.Connection, row: tuple[str, str]) -> None:
             mid, coll = row
             frow = conn.execute(
-                "SELECT content FROM memory_fts WHERE memory_id = ?", (mid,)
+                "SELECT content, tags FROM memory_fts WHERE memory_id = ?", (mid,)
             ).fetchone()
             content = frow[0] if frow else None
             if not content:
@@ -226,16 +226,32 @@ def migrate() -> dict:
                     (mid,),
                 )
                 return
+            # memory_fts stores tags space-separated; pending_embeddings stores them
+            # comma-separated (store.py), and the recovery worker rebuilds the
+            # life_domain:/project_type: facet payload keys from that comma list —
+            # so translate the format or those facets are silently lost on re-embed.
+            tags = ",".join((frow[1] or "").split()) or None
             crow = conn.execute(
                 "SELECT created_at FROM memory_metadata WHERE memory_id = ?", (mid,)
             ).fetchone()
             created_at = crow[0] if crow and crow[0] else _now().isoformat()
             memory_type = "knowledge" if coll == "knowledge_base" else "episodic"
-            # Idempotent: don't stack duplicate queue rows on a re-run.
+            # A retained queue row (e.g. a reaped 'failed'/'embedded' item) must be
+            # RESET to a drainable 'pending' — the recovery worker only drains
+            # status='pending', so merely flipping the metadata mirror to 'pending'
+            # while a stale queue row sits there would let verify() pass yet never
+            # rebuild the vector. Refresh content/tags too so the rebuild is faithful.
             exists = conn.execute(
                 "SELECT 1 FROM pending_embeddings WHERE memory_id = ?", (mid,)
             ).fetchone()
-            if not exists:
+            if exists:
+                conn.execute(
+                    "UPDATE pending_embeddings SET status = 'pending', "
+                    "error_message = NULL, content = ?, tags = ?, memory_type = ?, "
+                    "collection = ? WHERE memory_id = ?",
+                    (content, tags, memory_type, coll, mid),
+                )
+            else:
                 conn.execute(
                     "INSERT INTO pending_embeddings "
                     "(id, memory_id, content, memory_type, tags, collection, "
@@ -248,7 +264,7 @@ def migrate() -> dict:
                         mid,
                         content,
                         memory_type,
-                        None,
+                        tags,
                         coll,
                         created_at,
                         "pending",

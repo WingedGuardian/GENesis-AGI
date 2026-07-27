@@ -496,49 +496,49 @@ class MemoryStore:
     async def delete(self, memory_id: str) -> dict:
         """Delete a memory from all layers. Returns per-layer status.
 
-        **Point-first, fail-closed.** The Qdrant point is deleted from BOTH
-        collections (the metadata ``collection`` column is unreliable —
-        memory.py:72-73) BEFORE any SQLite row is removed. ``delete_point`` is
-        idempotent on a missing id and raises only on a real vector-store error:
-
-        - both deletes return cleanly → point gone → drop the SQLite rows.
-        - either delete raises (Qdrant unreachable) → **defer**: touch no SQLite
-          layer and return ``deferred=True``. The memory stays coherent and
-          retryable instead of leaving an orphaned "ghost" point with no
-          metadata row (the class that accumulated when metadata was deleted
-          first and the best-effort Qdrant delete then failed).
-
-        A memory that never had a vector (``fts5_only``/``pending``/``failed``)
-        still deletes cleanly — ``delete_point`` on an absent id succeeds.
+        **Point-first, fail-closed, atomic on the point's real collection.** The
+        metadata ``collection`` column is unreliable (memory.py:72-73), so the
+        point is first LOCATED by a by-id retrieve against both collections, then
+        deleted only from the collection(s) that actually hold it — never a blind
+        delete against both (a transient failure on the collection that did NOT
+        hold the point would otherwise strand the one that did). A ``retrieve`` or
+        ``delete`` that raises means Qdrant is unreachable → **defer**: touch no
+        SQLite layer and return ``deferred=True`` so the memory stays coherent and
+        retryable rather than leaving an orphaned "ghost" point. A memory that
+        never had a vector (``fts5_only``/``pending``/``failed``) locates to
+        nothing and deletes cleanly.
         """
         results: dict[str, bool | int] = {}
 
-        # 1. Qdrant FIRST — both collections must delete without error before any
-        # SQLite row is removed, or a transient Qdrant failure strands the point
-        # as a ghost. (Collection column unreliable → try both.)
-        qdrant_ok = True
-        for coll in ("episodic_memory", "knowledge_base"):
-            try:
+        # 1. Locate the point (unreliable collection column → check both) and
+        # delete only where it lives. retrieve/delete raise on a real Qdrant error
+        # → defer; an empty locate means the point is absent (nothing to delete).
+        try:
+            present: list[str] = []
+            for coll in ("episodic_memory", "knowledge_base"):
+                got = await asyncio.to_thread(
+                    self._qdrant.retrieve,
+                    collection_name=coll,
+                    ids=[memory_id],
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                if got:
+                    present.append(coll)
+            for coll in present:  # atomic on the point's real collection
                 await asyncio.to_thread(
                     delete_point, self._qdrant, collection=coll, point_id=memory_id,
                 )
-                results[f"qdrant_{coll}"] = True
-            except Exception:
-                logger.error(
-                    "Qdrant delete failed for %s in %s — deferring delete to keep "
-                    "stores consistent (no orphan)", memory_id, coll,
-                    exc_info=True,
-                )
-                results[f"qdrant_{coll}"] = False
-                qdrant_ok = False
-
-        if not qdrant_ok:
-            # Fail-closed: leave every SQLite layer intact. The memory remains
-            # live and coherent; a later delete retries. Never orphan a point.
+        except Exception:
+            logger.error(
+                "Qdrant unavailable during delete of %s — deferring to keep stores "
+                "consistent (no orphan)", memory_id, exc_info=True,
+            )
             results["deferred"] = True
             results["metadata"] = False
             results["fts5"] = False
             return results
+        results["qdrant_deleted"] = len(present)
 
         # 2. memory_metadata companion table (point confirmed gone → safe)
         results["metadata"] = await memory_crud.delete_metadata(

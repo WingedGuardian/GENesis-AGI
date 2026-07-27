@@ -164,3 +164,22 @@ class TestDeleteFailClosedOrdering:
             ("mem-y",),
         )
         assert fts[0][0] == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_defers_when_locate_raises(self, db):
+        # If the point-location retrieve itself fails (Qdrant unreachable), the
+        # delete must defer without touching SQLite — we cannot prove the point is
+        # gone, so we must not drop the rows.
+        await memory_crud.create(db, memory_id="mem-z", content="keep me")
+        await memory_crud.create_metadata(
+            db,
+            memory_id="mem-z",
+            created_at="2026-03-11T12:00:00",
+        )
+        store = _store(db)
+        store._qdrant.retrieve = MagicMock(side_effect=RuntimeError("qdrant down"))
+
+        results = await store.delete("mem-z")
+
+        assert results["deferred"] is True
+        assert await memory_crud.get_metadata(db, "mem-z") is not None

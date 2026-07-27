@@ -24,6 +24,7 @@ from genesis.memory.reference_extraction import (
 )
 from genesis.memory.reference_ops import (
     REFERENCE_PROJECT,
+    ReferenceStoreUnavailable,
     delete_reference_entry,
     parse_reference_body,
 )
@@ -79,12 +80,8 @@ def test_parse_roundtrip_extraction_formatter(description, value):
 
 def test_parse_no_tags_no_source():
     body = fmt_mcp(
-        kind="url",
-        identifier="Docs",
-        description="API docs",
-        value="https://example.com/docs",
-        tags=None,
-        source=None,
+        kind="url", identifier="Docs", description="API docs",
+        value="https://example.com/docs", tags=None, source=None,
     )
     parsed = parse_reference_body(body)
     assert parsed["value"] == "https://example.com/docs"
@@ -94,8 +91,7 @@ def test_parse_no_tags_no_source():
 def test_parse_fails_closed_on_unknown_shape():
     # No canonical "\n\nValue: " marker → both fields empty (no leak).
     assert parse_reference_body("some legacy freeform body with a secret xyz") == {
-        "description": "",
-        "value": "",
+        "description": "", "value": "",
     }
     assert parse_reference_body("") == {"description": "", "value": ""}
     assert parse_reference_body(None) == {"description": "", "value": ""}
@@ -147,22 +143,22 @@ async def test_delete_removes_row_and_qdrant(_db):
     assert await kc.get(_db, unit_id) is None  # SQLite row gone
     # FTS row gone too
     rows = await _db.execute_fetchall(
-        "SELECT COUNT(*) FROM knowledge_fts WHERE unit_id = ?",
-        (unit_id,),
+        "SELECT COUNT(*) FROM knowledge_fts WHERE unit_id = ?", (unit_id,),
     )
     assert rows[0][0] == 0
 
 
-async def test_delete_deferred_keeps_unit_for_retry(_db):
+async def test_delete_deferred_raises_and_keeps_unit(_db):
     # When store.delete DEFERS (Qdrant down → point + metadata retained), the
-    # knowledge_units row must NOT be dropped, or it would orphan from its record.
+    # helper must RAISE a retryable error (distinct from "not found") and leave
+    # the knowledge_units row intact for retry.
     unit_id = await _insert_ref(_db)
     store = AsyncMock()
     store.delete = AsyncMock(return_value={"deferred": True, "metadata": False, "fts5": False})
 
-    deleted = await delete_reference_entry(_db, store, unit_id)
+    with pytest.raises(ReferenceStoreUnavailable):
+        await delete_reference_entry(_db, store, unit_id)
 
-    assert deleted is False  # deferred → not deleted
     assert await kc.get(_db, unit_id) is not None  # unit row survives for retry
 
 

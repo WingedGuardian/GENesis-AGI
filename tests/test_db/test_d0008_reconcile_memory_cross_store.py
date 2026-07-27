@@ -24,13 +24,13 @@ def _recent() -> str:
 _SCHEMA = """
 CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, collection TEXT,
     created_at TEXT, embedding_status TEXT);
-CREATE TABLE memory_fts (memory_id TEXT, content TEXT, collection TEXT);
+CREATE TABLE memory_fts (memory_id TEXT, content TEXT, tags TEXT, collection TEXT);
 CREATE TABLE memory_links (source_id TEXT, target_id TEXT, link_type TEXT);
 CREATE TABLE pending_embeddings (id TEXT, memory_id TEXT, content TEXT,
     memory_type TEXT, tags TEXT, collection TEXT, created_at TEXT, status TEXT,
     source TEXT, confidence REAL, source_session_id TEXT, transcript_path TEXT,
     source_line_range TEXT, extraction_timestamp TEXT, source_pipeline TEXT,
-    source_subsystem TEXT);
+    source_subsystem TEXT, error_message TEXT);
 CREATE TABLE entity_mentions (memory_id TEXT, entity_id TEXT);
 """
 
@@ -88,17 +88,22 @@ def _seed(path) -> None:
     db.execute(
         "INSERT INTO memory_metadata VALUES ('ok', 'episodic_memory', ?, 'embedded')", (_OLD,)
     )
-    db.execute("INSERT INTO memory_fts VALUES ('ok', 'ok content', 'episodic_memory')")
-    # OLD lying mirror (embedded metadata + FTS, no point) — re-queued
+    db.execute("INSERT INTO memory_fts VALUES ('ok', 'ok content', '', 'episodic_memory')")
+    # OLD lying mirror (embedded metadata + FTS, no point) — re-queued. Its FTS
+    # tags carry facet breadcrumbs that must survive the re-embed (space-separated
+    # in FTS → comma-separated in the queue row).
     db.execute(
         "INSERT INTO memory_metadata VALUES ('mir_old', 'episodic_memory', ?, 'embedded')", (_OLD,)
     )
-    db.execute("INSERT INTO memory_fts VALUES ('mir_old', 'restore me', 'episodic_memory')")
+    db.execute(
+        "INSERT INTO memory_fts VALUES ('mir_old', 'restore me', "
+        "'life_domain:work project_type:genesis', 'episodic_memory')"
+    )
     # RECENT mirror (embedded, no point, but just written) — SPARED
     db.execute(
         "INSERT INTO memory_metadata VALUES ('mir_new', 'episodic_memory', ?, 'embedded')", (now,)
     )
-    db.execute("INSERT INTO memory_fts VALUES ('mir_new', 'in flight', 'episodic_memory')")
+    db.execute("INSERT INTO memory_fts VALUES ('mir_new', 'in flight', '', 'episodic_memory')")
     db.commit()
     db.close()
 
@@ -143,9 +148,16 @@ def test_reconciles_aged_offenders_spares_recent(tmp_path, monkeypatch):
     ).fetchone()[0]
     assert status == "pending"
     pend = db.execute(
-        "SELECT content, memory_type, source FROM pending_embeddings WHERE memory_id = 'mir_old'"
+        "SELECT content, memory_type, source, tags FROM pending_embeddings "
+        "WHERE memory_id = 'mir_old'"
     ).fetchone()
-    assert pend == ("restore me", "episodic", "d0008_reconcile")
+    # facet tags carried through, space→comma translated for the recovery worker.
+    assert pend == (
+        "restore me",
+        "episodic",
+        "d0008_reconcile",
+        "life_domain:work,project_type:genesis",
+    )
     # mir_new (recent) spared — still embedded, no queue row.
     assert (
         db.execute(
@@ -201,6 +213,53 @@ def test_qdrant_delete_failure_leaves_ghost_for_retry(tmp_path, monkeypatch):
     assert d0008.verify() is False
     # the mirror still got re-queued (independent lane).
     assert summary["mirrors_requeued"] == 1
+
+
+def test_stale_queue_row_reset_to_drainable_pending(tmp_path, monkeypatch):
+    # A lying mirror that still has a reaped 'failed' queue row: the migration must
+    # RESET that row to a drainable 'pending' (the recovery worker only drains
+    # status='pending'), not skip it while flipping the metadata mirror — otherwise
+    # verify() passes but the vector is never rebuilt.
+    path = tmp_path / "genesis.db"
+    db = sqlite3.connect(path)
+    db.executescript(_SCHEMA)
+    db.execute(
+        "INSERT INTO memory_metadata VALUES ('m_stale', 'episodic_memory', ?, 'embedded')", (_OLD,)
+    )
+    db.execute(
+        "INSERT INTO memory_fts VALUES ('m_stale', 'body', 'wing:memory', 'episodic_memory')"
+    )
+    db.execute(
+        "INSERT INTO pending_embeddings (id, memory_id, content, memory_type, collection, "
+        "created_at, status, error_message) "
+        "VALUES ('old-id', 'm_stale', 'stale', 'episodic', 'episodic_memory', ?, 'failed', 'boom')",
+        (_OLD,),
+    )
+    db.commit()
+    db.close()
+    client = _FakeClient({"episodic_memory": {}, "knowledge_base": {}})
+    _patch(monkeypatch, path, client, tmp_path / "exp.jsonl")
+    d0008.migrate()
+    db = sqlite3.connect(path)
+    row = db.execute(
+        "SELECT status, error_message, content, tags FROM pending_embeddings "
+        "WHERE memory_id = 'm_stale'"
+    ).fetchone()
+    assert row == ("pending", None, "body", "wing:memory")  # reset + refreshed
+    # exactly one queue row (existing reset, not a duplicate insert)
+    assert (
+        db.execute(
+            "SELECT COUNT(*) FROM pending_embeddings WHERE memory_id = 'm_stale'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        db.execute(
+            "SELECT embedding_status FROM memory_metadata WHERE memory_id = 'm_stale'"
+        ).fetchone()[0]
+        == "pending"
+    )
+    db.close()
 
 
 def test_mirror_without_content_marked_failed(tmp_path, monkeypatch):
