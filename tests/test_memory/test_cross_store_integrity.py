@@ -112,3 +112,55 @@ class TestHotPathOffloadedToThread:
 
         # delete_point dispatched through to_thread (both collections)
         assert mock_del in seen
+
+
+class TestDeleteFailClosedOrdering:
+    """Point-first, fail-closed: a Qdrant delete failure must NOT drop the
+    SQLite rows (which would orphan the point as a ghost). Prevention half of
+    the cross-store consistency work."""
+
+    @pytest.mark.asyncio
+    async def test_delete_defers_when_qdrant_raises(self, db):
+        # A fully-embedded memory: metadata + FTS both present.
+        await memory_crud.create(db, memory_id="mem-x", content="keep me")
+        await memory_crud.create_metadata(
+            db,
+            memory_id="mem-x",
+            created_at="2026-03-11T12:00:00",
+        )
+
+        with patch.object(store_mod, "delete_point", side_effect=RuntimeError("qdrant down")):
+            results = await _store(db).delete("mem-x")
+
+        # Deferred — nothing in SQLite was touched, memory stays coherent.
+        assert results["deferred"] is True
+        assert results["metadata"] is False
+        assert results["fts5"] is False
+        meta = await memory_crud.get_metadata(db, "mem-x")
+        assert meta is not None  # metadata row survived
+        fts = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM memory_fts WHERE memory_id = ?",
+            ("mem-x",),
+        )
+        assert fts[0][0] == 1  # FTS row survived
+
+    @pytest.mark.asyncio
+    async def test_delete_proceeds_when_point_gone(self, db):
+        # delete_point (MagicMock) does not raise → point confirmed gone →
+        # the SQLite layers are removed as normal.
+        await memory_crud.create(db, memory_id="mem-y", content="remove me")
+        await memory_crud.create_metadata(
+            db,
+            memory_id="mem-y",
+            created_at="2026-03-11T12:00:00",
+        )
+
+        results = await _store(db).delete("mem-y")
+
+        assert "deferred" not in results
+        assert await memory_crud.get_metadata(db, "mem-y") is None
+        fts = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM memory_fts WHERE memory_id = ?",
+            ("mem-y",),
+        )
+        assert fts[0][0] == 0

@@ -133,6 +133,28 @@ class TestSweepBlobMemories:
         assert await sweep_blob_memories(db, store) == 0
         store.delete.assert_not_awaited()
 
+    async def test_deferred_delete_leaves_events_and_is_not_counted(self, db):
+        # Qdrant down → store.delete DEFERS (memory retained). The sweep must
+        # skip the memory_events delete and not count the memory as swept, so a
+        # later sweep retries instead of stranding the events row.
+        await self._seed_fts(
+            db,
+            "blob-1",
+            "Voice conversation [s2s-default]:\nUser: hi",
+            _BLOB_TAGS,
+        )
+        await db.execute(
+            "INSERT INTO memory_events (id, memory_id, subject, verb) "
+            "VALUES ('ev1', 'blob-1', 's', 'v')",
+        )
+        await db.commit()
+        store = MagicMock()
+        store.delete = AsyncMock(return_value={"deferred": True})
+
+        assert await sweep_blob_memories(db, store) == 0  # deferred → not swept
+        cur = await db.execute("SELECT COUNT(*) FROM memory_events WHERE memory_id='blob-1'")
+        assert (await cur.fetchone())[0] == 1  # events row left for retry
+
     async def test_sweep_logs_loudly(self, db, caplog):
         await self._seed_fts(
             db,

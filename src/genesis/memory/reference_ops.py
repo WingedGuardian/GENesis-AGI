@@ -127,12 +127,23 @@ async def delete_reference_entry(
     qdrant_id = row.get("qdrant_id")
     if qdrant_id and store is not None:
         try:
-            await store.delete(qdrant_id)
+            res = await store.delete(qdrant_id)
         except Exception:
             logger.error(
                 "delete_reference_entry: Qdrant cleanup failed for unit %s "
-                "(qdrant_id=%s)", unit_id, qdrant_id, exc_info=True,
+                "(qdrant_id=%s) — deferring, leaving unit for retry",
+                unit_id, qdrant_id, exc_info=True,
             )
+            return False
+        if res.get("deferred"):
+            # Vector store unavailable → store.delete kept the point + metadata
+            # intact. Do NOT drop the knowledge_units row, or we would orphan it
+            # from its record. Retry the whole delete later.
+            logger.warning(
+                "delete_reference_entry: vector store unavailable, deferring "
+                "delete of unit %s (qdrant_id=%s)", unit_id, qdrant_id,
+            )
+            return False
 
     deleted = await knowledge_crud.delete(db, unit_id)
     logger.info("Reference entry %s deleted: %s", unit_id, deleted)

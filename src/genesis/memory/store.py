@@ -496,23 +496,27 @@ class MemoryStore:
     async def delete(self, memory_id: str) -> dict:
         """Delete a memory from all layers. Returns per-layer status.
 
-        Tries all layers independently — partial failure is acceptable.
-        Qdrant deletes try both collections since the FTS5 collection column
-        is unreliable (documented in memory.py:72-73).
+        **Point-first, fail-closed.** The Qdrant point is deleted from BOTH
+        collections (the metadata ``collection`` column is unreliable —
+        memory.py:72-73) BEFORE any SQLite row is removed. ``delete_point`` is
+        idempotent on a missing id and raises only on a real vector-store error:
+
+        - both deletes return cleanly → point gone → drop the SQLite rows.
+        - either delete raises (Qdrant unreachable) → **defer**: touch no SQLite
+          layer and return ``deferred=True``. The memory stays coherent and
+          retryable instead of leaving an orphaned "ghost" point with no
+          metadata row (the class that accumulated when metadata was deleted
+          first and the best-effort Qdrant delete then failed).
+
+        A memory that never had a vector (``fts5_only``/``pending``/``failed``)
+        still deletes cleanly — ``delete_point`` on an absent id succeeds.
         """
         results: dict[str, bool | int] = {}
 
-        # 1. memory_metadata companion table
-        results["metadata"] = await memory_crud.delete_metadata(
-            self._db, memory_id=memory_id,
-        )
-
-        # 2. FTS5 text index
-        results["fts5"] = await memory_crud.delete(
-            self._db, memory_id=memory_id,
-        )
-
-        # 3. Qdrant — try both collections (collection column unreliable)
+        # 1. Qdrant FIRST — both collections must delete without error before any
+        # SQLite row is removed, or a transient Qdrant failure strands the point
+        # as a ghost. (Collection column unreliable → try both.)
+        qdrant_ok = True
         for coll in ("episodic_memory", "knowledge_base"):
             try:
                 await asyncio.to_thread(
@@ -521,10 +525,30 @@ class MemoryStore:
                 results[f"qdrant_{coll}"] = True
             except Exception:
                 logger.error(
-                    "Qdrant delete failed for %s in %s", memory_id, coll,
+                    "Qdrant delete failed for %s in %s — deferring delete to keep "
+                    "stores consistent (no orphan)", memory_id, coll,
                     exc_info=True,
                 )
                 results[f"qdrant_{coll}"] = False
+                qdrant_ok = False
+
+        if not qdrant_ok:
+            # Fail-closed: leave every SQLite layer intact. The memory remains
+            # live and coherent; a later delete retries. Never orphan a point.
+            results["deferred"] = True
+            results["metadata"] = False
+            results["fts5"] = False
+            return results
+
+        # 2. memory_metadata companion table (point confirmed gone → safe)
+        results["metadata"] = await memory_crud.delete_metadata(
+            self._db, memory_id=memory_id,
+        )
+
+        # 3. FTS5 text index
+        results["fts5"] = await memory_crud.delete(
+            self._db, memory_id=memory_id,
+        )
 
         # 4. Cascade: memory_links
         results["links_deleted"] = await memory_links_crud.delete_by_memory(
