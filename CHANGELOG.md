@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Talk to Genesis by voice to remember things and set reminders.** When
+  enabled, you can tell the voice assistant "remember I prefer morning meetings"
+  and it stores that for later, or "remind me to call the plumber Thursday at
+  9am" and it delivers the reminder to you at that time. Ships off by default —
+  turn it on with the `voice_act` setting (or `GENESIS_VOICE_ACT_DISABLED` to
+  force it off). Asking the voice assistant about your past and memories is
+  unchanged and always available.
 - **Genesis now notices when its own memory quietly degrades.** Memory is stored
   across three backends that have to agree; when they silently drift — a memory
   that still exists but has become unfindable by search, or a leftover vector

@@ -1227,6 +1227,19 @@ class TestVoiceActConfig:
         cfg = self._pin(monkeypatch, tmp_path, "mode: live\nenabled: false\n")
         assert cfg.effective_mode() == "off"
 
+    def test_shipped_default_config_is_off(self, monkeypatch):
+        # The shipped config/voice_act.yaml uses quoted `mode: "off"` — guard that
+        # it parses to off (an unquoted `off` would be YAML boolean False; both
+        # degrade to off, but the shipped default must be unambiguous).
+        from pathlib import Path
+
+        from genesis.channels.voice import voice_act_config
+
+        shipped = Path(__file__).resolve().parents[2] / "config" / "voice_act.yaml"
+        monkeypatch.delenv("GENESIS_VOICE_ACT_DISABLED", raising=False)
+        monkeypatch.setattr(voice_act_config, "_base_path", lambda: shipped)
+        assert voice_act_config.effective_mode() == "off"
+
 
 class TestToUtcIsoIfFuture:
     """_to_utc_iso_if_future: future→UTC ISO, else None (never fire 'now')."""
