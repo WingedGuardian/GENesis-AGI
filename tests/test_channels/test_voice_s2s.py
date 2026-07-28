@@ -1045,10 +1045,17 @@ class TestUserIdentitySlice:
         assert "__" not in out
 
     def test_single_underscore_identifier_preserved(self, tmp_path):
-        # Only PAIRS are stripped — a lone underscore in an identifier survives.
+        # Only matched pairs are stripped — a lone underscore in an identifier survives.
         user = "# User Profile\n- **Handle**: user_name_42\n"
         out = self._extract(tmp_path, user, self._EXAMPLE)
         assert "user_name_42" in out
+
+    def test_double_underscore_in_value_preserved(self, tmp_path):
+        # A double underscore inside a VALUE with no closing pair is NOT a markdown
+        # emphasis span → preserved (jay__smith must not become jaysmith). Codex P2.
+        user = "# User Profile\n- **Handle**: jay__smith\n"
+        out = self._extract(tmp_path, user, self._EXAMPLE)
+        assert "Handle: jay__smith" in out
         assert "*" not in out
 
     def test_partial_fill_drops_unedited_template_lines(self, tmp_path):
