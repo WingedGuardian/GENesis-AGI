@@ -31,6 +31,7 @@ from shell_parse import (  # noqa: E402
     commit_skips_hooks,
     gh_pr_subcommand,
     git_subcommand,
+    has_trailing_override,
 )
 
 
@@ -165,6 +166,97 @@ def _check_mergeable(pr_num: str) -> str | None:
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
         return None  # Fail-open
+
+
+# Check-run conclusions / statuses that mean the CI is NOT green.
+_CI_RED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+_CI_RED_STATES = {"FAILURE", "ERROR"}  # legacy StatusContext state
+_CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL"}
+_CI_GREEN = {"SUCCESS"}
+
+
+def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
+    """Classify a PR's CI check-runs.
+
+    Returns ``(state, problem_checks)`` where state is one of:
+      * ``"green"``   — every non-skipped check concluded SUCCESS
+      * ``"red"``     — at least one check failed/cancelled/timed-out
+      * ``"pending"`` — a check is still queued/running (and none are red)
+      * ``"unknown"`` — could not determine (API error, no checks, or an
+                        unrecognized payload shape) → callers FAIL OPEN, because
+                        blocking a merge on our own inability to read CI would be
+                        worse than the gap this gate closes.
+
+    Tests inject via the ``_TEST_GH_CI_ROLLUP`` env var (a JSON array like
+    ``gh pr view --json statusCheckRollup``) so no network is needed.
+    """
+    raw = os.environ.get("_TEST_GH_CI_ROLLUP")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_num,
+                    "--json",
+                    "statusCheckRollup",
+                    "--jq",
+                    ".statusCheckRollup",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                return "unknown", []
+            raw = result.stdout.strip()
+        except Exception:
+            return "unknown", []
+    try:
+        checks = json.loads(raw) if raw else []
+    except Exception:
+        return "unknown", []
+    if not isinstance(checks, list) or not checks:
+        return "unknown", []
+
+    red: list[str] = []
+    pending: list[str] = []
+    saw_recognized = False
+    for c in checks:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name") or c.get("context") or "check"
+        conclusion = c.get("conclusion")  # CheckRun
+        status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED
+        state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+        if conclusion in _CI_SKIP_CONCLUSIONS:
+            saw_recognized = True
+            continue
+        if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
+            saw_recognized = True
+            red.append(name)
+        elif status in ("QUEUED", "IN_PROGRESS") or state == "PENDING":
+            saw_recognized = True
+            pending.append(name)
+        elif conclusion in _CI_GREEN or state in _CI_GREEN:
+            saw_recognized = True
+        # else: unrecognized shape — ignore this entry
+
+    if red:
+        return "red", sorted(set(red))
+    if pending:
+        return "pending", sorted(set(pending))
+    if not saw_recognized:
+        return "unknown", []  # payload had no CI-shaped entries
+    return "green", []
+
+
+# The CI-status gate is waived only by a genuine ``# ci-override`` trailing
+# comment on the merge segment itself — detected with the same quote-aware,
+# segment-bound parser as ``# review-override`` (shell_parse.has_trailing_override)
+# so it cannot be spoofed from inside a quoted --body or a different chained
+# command. Distinct from --admin and # review-override; waives ONLY this gate.
 
 
 # ── Review findings detection ──────────────────────────────────────────
@@ -602,6 +694,40 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     return 2
+
+                # CI-status gate. On an unprotected default branch,
+                # mergeStateStatus=CLEAN is NOT a CI verdict (it only means "no
+                # conflict / no REQUIRED check blocking", and nothing is required
+                # when the branch is unprotected). So --admin merges would sail
+                # past a red `test` job — exactly how main was broken on
+                # 2026-07-28. Block red/pending CI unless a conscious, separate
+                # `# ci-override` is appended (never waived by --admin or
+                # # review-override). Fail-OPEN on "unknown" so a transient API
+                # hiccup can't wedge merges.
+                ci_state, ci_bad = _pr_ci_status(pr_num)
+                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                if ci_state in ("red", "pending") and not ci_override:
+                    print(
+                        f"BLOCKED: PR #{pr_num} CI is {ci_state.upper()} "
+                        f"({', '.join(ci_bad[:6])}).",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"Do NOT merge red/pending CI. Wait for green "
+                        f"(gh pr checks {pr_num}). If these checks are a known, "
+                        "documented pre-existing flake you are consciously "
+                        "accepting, append a trailing '# ci-override' to merge "
+                        "anyway (logged).",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if ci_state in ("red", "pending"):
+                    print(
+                        f"NOTE: CI {ci_state.upper()} on #{pr_num} "
+                        f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
 
                 # Check for unresolved review findings
                 force_override = merge_seg.override
