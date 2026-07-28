@@ -1763,8 +1763,13 @@ class InboxMonitor:
             from genesis.observability.types import Subsystem
             from genesis.util.tasks import tracked_task
 
+            # Prefer the CC-generated session id (output.session_id) for
+            # source_session_id — that's what transcript tracing and every other
+            # extraction path key on (extraction_job uses cc_session_id). Fall
+            # back to the internal cc_sessions.id lifecycle UUID if absent.
+            cc_sid = getattr(output, "session_id", "") or session_id
             tracked_task(
-                self._persist_eval_memories(output_text, batch_id, session_id, [item.file_path]),
+                self._persist_eval_memories(output_text, batch_id, cc_sid, [item.file_path]),
                 name="inbox-eval-memory",
                 event_bus=self._event_bus,
                 subsystem=Subsystem.INBOX,

@@ -847,6 +847,9 @@ async def test_eval_memory_persistence_fired_after_evaluation(
     await asyncio.sleep(0.05)  # let the fire-and-forget task run
     assert called, "eval-memory persistence was not fired"
     assert called.get("evaluation_text")  # the curated output text
+    # Provenance: the CC-generated session id (output.session_id) is forwarded,
+    # not the internal cc_sessions.id — so memories link to the real transcript.
+    assert called.get("session_id") == "cc-sess-1"
 
 
 @pytest.mark.asyncio
