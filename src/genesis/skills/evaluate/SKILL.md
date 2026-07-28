@@ -40,8 +40,15 @@ to Genesis. Produce a structured evaluation with clear recommendations.
      of prose claims like "we already have this." Required whenever rigor gap
      is not "N/A — no Genesis equivalent."
 4. **Recommend** — One of: ADOPT, WATCH, IGNORE, ADAPT (take the idea, not the tool).
-   ADAPT is the most common valuable outcome — stealing patterns, measurement
-   approaches, or architectural rigor from a reference without adopting its code.
+   **Disposition posture:** Genesis's scope is everything digital — default toward
+   ADOPT/ADAPT and acting now. "No current use case", "out of our wheelhouse", and
+   "not obviously valuable" are NOT valid grounds for WATCH/IGNORE. A weaker
+   existing Genesis version means UPGRADE (do the rigor-gap / Overlap comparison),
+   never dismiss. WATCH requires a named re-activation trigger; a trigger-less
+   WATCH is a disguised IGNORE — write it as an honest IGNORE with a reason. ADAPT
+   (stealing patterns/rigor without adopting the code) is common and valuable, but
+   it is not a polite default for "I don't want to act" — reach for ADOPT when the
+   thing itself fits.
 5. **Write output** — Structured evaluation in the format below.
 
 ## Output Format
@@ -66,10 +73,10 @@ a scoring axis is unremarkable, skip it here.}
 ### Recommendation
 
 ```yaml
-action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE
+action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE (default toward ADOPT/ADAPT; WATCH needs a named trigger)
 next_step: "One concrete sentence — what specifically to do next"
 effort: Small              # Trivial | Small | Medium | Large
-scope: V4                  # V4 (current) | V5 (next) | Future | Never
+scope: V4                  # V4 (do now — DEFAULT) | V5 (sequenced behind named work) | Future (named blocker) | Never (philosophy conflict)
 confidence: high           # low | medium | high
 architecture_impact: extends  # validates | extends | challenges | irrelevant
 ```
@@ -135,5 +142,10 @@ rigor the reference describes.}
 ## References
 
 - `docs/architecture/genesis-v3-vision.md` — Core philosophy for fit assessment
-- `docs/architecture/genesis-v3-gap-assessment.md` — Known gaps to check against
-- `docs/architecture/genesis-v3-autonomous-behavior-design.md` — System design
+- `docs/architecture/CURRENT.md` — the live subsystem map (what Genesis actually
+  has today, with per-entry freshness stamps). Consult this for any "does Genesis
+  already have X?" judgment BEFORE claiming a gap or an overlap.
+- **Enumerate, don't spot-check.** Before concluding Genesis "lacks X" or is
+  "weaker at X", verify by enumeration against CURRENT.md and the actual code —
+  a negative from one search is not evidence of absence. Confidence is capped by
+  how completely you enumerated.
