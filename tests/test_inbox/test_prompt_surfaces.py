@@ -39,9 +39,29 @@ def test_scope_tokens_present_in_both_surfaces():
         assert not missing, f"{rel} missing scope tokens: {missing}"
 
 
+def _declared_action_enum(rel: str) -> set[str]:
+    """Extract the action enum a prompt surface actually DECLARES — the
+    ``action: X  # A | B | C ...`` YAML comment. Returns the uppercase tokens
+    before any parenthetical note. Empty set if no such line is found."""
+    import re
+
+    tokens: set[str] = set()
+    for line in _read(rel).splitlines():
+        m = re.search(r"action:\s*\w+\s*#\s*([^(]+)", line)
+        if not m:
+            continue
+        for part in m.group(1).split("|"):
+            word = part.strip().split()[0] if part.strip() else ""
+            if word.isalpha() and word.isupper():
+                tokens.add(word)
+    return tokens
+
+
 def test_action_tokens_match_parser_vocabulary():
-    """Prompt action tokens must all be understood by the parser — else a
-    recommendation routes nowhere (or is silently skipped)."""
+    """Every action token the prompt surfaces DECLARE (parsed from the YAML
+    enum comment, not just a substring check) must be understood by the parser —
+    else a recommendation routes nowhere or is silently skipped. This catches a
+    token ADDED to the prompt enum that the parser doesn't handle."""
     from genesis.inbox.monitor import InboxMonitor
     from genesis.inbox.recommendation import _SKIP_ACTIONS
 
@@ -49,13 +69,17 @@ def test_action_tokens_match_parser_vocabulary():
         set(InboxMonitor._ACTION_MAP)
         | {a.replace(" ", "_") for a in _SKIP_ACTIONS}
         | set(_SKIP_ACTIONS)
+        | {"build"}  # capability-build verb, handled by the BUILD lane
     )
-    for tok in _ACTION_TOKENS:
-        low = tok.lower()
-        assert low in handled, (
-            f"action token {tok!r} is in the prompt but neither routed by "
-            f"_ACTION_MAP nor listed in _SKIP_ACTIONS"
-        )
+    declared: set[str] = set()
+    for rel in (_INBOX, _SKILL):
+        declared |= _declared_action_enum(rel)
+    assert declared >= _ACTION_TOKENS, (
+        f"a prompt surface's declared action enum is missing core tokens: "
+        f"{sorted(_ACTION_TOKENS - declared)}"
+    )
+    unhandled = sorted(t for t in declared if t.lower() not in handled)
+    assert not unhandled, f"prompt declares action token(s) the parser can't route: {unhandled}"
 
 
 def test_disposition_rebias_present():
@@ -68,11 +92,11 @@ def test_disposition_rebias_present():
         assert "named trigger" in text, f"{rel}: WATCH-trigger rule missing"
 
 
-def test_stale_v3_docs_not_referenced_in_evaluator_surfaces():
-    """The evaluator surfaces must not point at the retired March-v3 docs;
-    CURRENT.md is the live subsystem-map reference."""
+def test_stale_gap_assessment_dropped_and_current_added():
+    """The evaluator surfaces must not point at the retired March-v3
+    gap-assessment doc, and must reference the live CURRENT.md subsystem map.
+    (autonomous-behavior-design.md is still maintained, so it is NOT dropped.)"""
     for rel in (_SKILL, "src/genesis/skills/research/SKILL.md"):
         text = _read(rel)
         assert "genesis-v3-gap-assessment.md" not in text, f"{rel}: stale doc ref"
-        assert "genesis-v3-autonomous-behavior-design.md" not in text, f"{rel}: stale doc ref"
         assert "CURRENT.md" in text, f"{rel}: missing CURRENT.md reference"

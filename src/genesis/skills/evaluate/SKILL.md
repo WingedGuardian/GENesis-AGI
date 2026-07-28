@@ -142,6 +142,7 @@ rigor the reference describes.}
 ## References
 
 - `docs/architecture/genesis-v3-vision.md` — Core philosophy for fit assessment
+- `docs/architecture/genesis-v3-autonomous-behavior-design.md` — System design
 - `docs/architecture/CURRENT.md` — the live subsystem map (what Genesis actually
   has today, with per-entry freshness stamps). Consult this for any "does Genesis
   already have X?" judgment BEFORE claiming a gap or an overlap.
