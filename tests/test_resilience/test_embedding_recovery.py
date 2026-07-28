@@ -266,3 +266,67 @@ class TestDrainPending:
         assert await w.reconcile_orphaned_metadata() == 0
         meta = await memory_crud.get_metadata(db, "fresh-orph")
         assert meta["embedding_status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_skips_upsert_when_deleted_mid_embed(self, db, worker):
+        """A concurrent MemoryStore.delete() that removes the pending row WHILE we
+        are embedding must abort the upsert — never strand a Qdrant-only ghost for
+        a memory the user just deleted. The pre-upsert existence re-check is the
+        fail-closed guard."""
+        w, embedder, qdrant = worker
+        await crud.create(
+            db, id="pe-del", memory_id="mem-del", content="racing",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+
+        # Simulate delete()'s cascade landing DURING the embed: drop the pending
+        # row so the pre-upsert existence check fails.
+        async def embed_then_delete(_content):
+            await crud.delete_by_memory(db, memory_id="mem-del")
+            return [0.1] * 1024
+
+        embedder.embed = AsyncMock(side_effect=embed_then_delete)
+
+        assert await w.drain_pending() == 0
+        qdrant.upsert.assert_not_called()  # no ghost point written
+
+    @pytest.mark.asyncio
+    async def test_deprecated_memory_restamped_on_reembed(self, db, worker):
+        """A memory superseded WHILE its embed was still pending keeps deprecated=1
+        in metadata (MemoryStore._mark_superseded only touches Qdrant for an
+        existing point). On re-embed the worker must re-stamp the payload as
+        excluded-from-recall (deprecated=True + merged_into) so the superseded
+        memory is not resurrected as a live vector."""
+        from genesis.db.crud import memory as memory_crud
+
+        w, _, qdrant = worker
+        await memory_crud.create_metadata(
+            db, memory_id="mem-dep", created_at="2026-03-11T12:00:00",
+            wing="memory", embedding_status="pending",
+        )
+        await memory_crud.mark_superseded(db, "mem-dep", "mem-new", "2026-03-12T00:00:00")
+        await crud.create(
+            db, id="pe-dep", memory_id="mem-dep", content="superseded body",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+        assert await w.drain_pending() == 1
+        payload = qdrant.upsert.call_args.kwargs["points"][0].payload
+        assert payload["deprecated"] is True
+        assert payload["merged_into"] == "mem-new"
+
+    @pytest.mark.asyncio
+    async def test_zero_confidence_not_coerced_to_default(self, db, worker):
+        """A legitimate 0.0 confidence must survive re-embed, not be coerced to the
+        0.5 default (recall activation multiplies by payload confidence, so a 0.0
+        flattened to 0.5 mis-ranks the point)."""
+        w, _, qdrant = worker
+        await crud.create(
+            db, id="pe-z", memory_id="mem-z", content="zero conf",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00", confidence=0.0,
+        )
+        assert await w.drain_pending() == 1
+        payload = qdrant.upsert.call_args.kwargs["points"][0].payload
+        assert payload["confidence"] == 0.0

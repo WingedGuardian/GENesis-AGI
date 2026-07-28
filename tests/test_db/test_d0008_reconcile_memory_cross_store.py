@@ -23,7 +23,8 @@ def _recent() -> str:
 
 _SCHEMA = """
 CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, collection TEXT,
-    created_at TEXT, embedding_status TEXT);
+    created_at TEXT, embedding_status TEXT, confidence REAL,
+    deprecated INTEGER DEFAULT 0);
 CREATE TABLE memory_fts (memory_id TEXT, content TEXT, tags TEXT, collection TEXT);
 CREATE TABLE memory_links (source_id TEXT, target_id TEXT, link_type TEXT);
 CREATE TABLE pending_embeddings (id TEXT, memory_id TEXT, content TEXT,
@@ -86,14 +87,20 @@ def _seed(path) -> None:
     now = _recent()
     # healthy pair (metadata + point) — untouched
     db.execute(
-        "INSERT INTO memory_metadata VALUES ('ok', 'episodic_memory', ?, 'embedded')", (_OLD,)
+        "INSERT INTO memory_metadata (memory_id, collection, created_at, embedding_status) "
+        "VALUES ('ok', 'episodic_memory', ?, 'embedded')",
+        (_OLD,),
     )
     db.execute("INSERT INTO memory_fts VALUES ('ok', 'ok content', '', 'episodic_memory')")
     # OLD lying mirror (embedded metadata + FTS, no point) — re-queued. Its FTS
     # tags carry facet breadcrumbs that must survive the re-embed (space-separated
-    # in FTS → comma-separated in the queue row).
+    # in FTS → comma-separated in the queue row), and its real confidence (0.9)
+    # must be carried into the queue row, NOT reset to the worker's 0.5 default.
     db.execute(
-        "INSERT INTO memory_metadata VALUES ('mir_old', 'episodic_memory', ?, 'embedded')", (_OLD,)
+        "INSERT INTO memory_metadata "
+        "(memory_id, collection, created_at, embedding_status, confidence) "
+        "VALUES ('mir_old', 'episodic_memory', ?, 'embedded', 0.9)",
+        (_OLD,),
     )
     db.execute(
         "INSERT INTO memory_fts VALUES ('mir_old', 'restore me', "
@@ -101,7 +108,9 @@ def _seed(path) -> None:
     )
     # RECENT mirror (embedded, no point, but just written) — SPARED
     db.execute(
-        "INSERT INTO memory_metadata VALUES ('mir_new', 'episodic_memory', ?, 'embedded')", (now,)
+        "INSERT INTO memory_metadata (memory_id, collection, created_at, embedding_status) "
+        "VALUES ('mir_new', 'episodic_memory', ?, 'embedded')",
+        (now,),
     )
     db.execute("INSERT INTO memory_fts VALUES ('mir_new', 'in flight', '', 'episodic_memory')")
     db.commit()
@@ -148,15 +157,17 @@ def test_reconciles_aged_offenders_spares_recent(tmp_path, monkeypatch):
     ).fetchone()[0]
     assert status == "pending"
     pend = db.execute(
-        "SELECT content, memory_type, source, tags FROM pending_embeddings "
+        "SELECT content, memory_type, source, tags, confidence FROM pending_embeddings "
         "WHERE memory_id = 'mir_old'"
     ).fetchone()
-    # facet tags carried through, space→comma translated for the recovery worker.
+    # facet tags carried through, space→comma translated for the recovery worker;
+    # the real metadata confidence (0.9) is carried, NOT reset to the 0.5 default.
     assert pend == (
         "restore me",
         "episodic",
         "d0008_reconcile",
         "life_domain:work,project_type:genesis",
+        0.9,
     )
     # mir_new (recent) spared — still embedded, no queue row.
     assert (
@@ -224,7 +235,9 @@ def test_stale_queue_row_reset_to_drainable_pending(tmp_path, monkeypatch):
     db = sqlite3.connect(path)
     db.executescript(_SCHEMA)
     db.execute(
-        "INSERT INTO memory_metadata VALUES ('m_stale', 'episodic_memory', ?, 'embedded')", (_OLD,)
+        "INSERT INTO memory_metadata (memory_id, collection, created_at, embedding_status) "
+        "VALUES ('m_stale', 'episodic_memory', ?, 'embedded')",
+        (_OLD,),
     )
     db.execute(
         "INSERT INTO memory_fts VALUES ('m_stale', 'body', 'wing:memory', 'episodic_memory')"
@@ -268,7 +281,9 @@ def test_mirror_without_content_marked_failed(tmp_path, monkeypatch):
     db.executescript(_SCHEMA)
     # embedded metadata, aged, but NO FTS content to re-embed from.
     db.execute(
-        "INSERT INTO memory_metadata VALUES ('m_nc', 'episodic_memory', ?, 'embedded')", (_OLD,)
+        "INSERT INTO memory_metadata (memory_id, collection, created_at, embedding_status) "
+        "VALUES ('m_nc', 'episodic_memory', ?, 'embedded')",
+        (_OLD,),
     )
     db.commit()
     db.close()
@@ -313,3 +328,85 @@ def test_ghost_without_created_at_is_spared(tmp_path, monkeypatch):
     _patch(monkeypatch, path, client, tmp_path / "exp.jsonl")
     assert d0008.migrate()["ghosts_deleted"] == 0
     assert "ageless" in client._points["episodic_memory"]
+
+
+def test_deprecated_mirror_is_requeued_worker_restamps(tmp_path, monkeypatch):
+    # A deprecated (superseded) lying mirror is requeued like any other mirror —
+    # d0008 does NOT special-case it. Deprecation handling lives in the recovery
+    # worker, which re-stamps the rebuilt payload as excluded-from-recall
+    # (deprecated=True via get_taxonomy), so a normal requeue yields a correctly
+    # flagged point rather than resurrecting the superseded memory. Keeping it in
+    # ONE place (the worker) also closes the live superseded-while-pending path,
+    # which d0008 never touches. See the worker test for the re-stamp itself.
+    path = tmp_path / "genesis.db"
+    db = sqlite3.connect(path)
+    db.executescript(_SCHEMA)
+    db.execute(
+        "INSERT INTO memory_metadata "
+        "(memory_id, collection, created_at, embedding_status, deprecated) "
+        "VALUES ('m_dep', 'episodic_memory', ?, 'embedded', 1)",
+        (_OLD,),
+    )
+    db.execute("INSERT INTO memory_fts VALUES ('m_dep', 'superseded body', '', 'episodic_memory')")
+    db.commit()
+    db.close()
+    client = _FakeClient({"episodic_memory": {}, "knowledge_base": {}})
+    _patch(monkeypatch, path, client, tmp_path / "exp.jsonl")
+    d0008.migrate()
+    db = sqlite3.connect(path)
+    # Requeued: metadata flipped to 'pending', a drainable queue row created.
+    assert (
+        db.execute(
+            "SELECT embedding_status FROM memory_metadata WHERE memory_id = 'm_dep'"
+        ).fetchone()[0]
+        == "pending"
+    )
+    assert (
+        db.execute("SELECT status FROM pending_embeddings WHERE memory_id = 'm_dep'").fetchone()[0]
+        == "pending"
+    )
+    db.close()
+
+
+def test_concurrent_metadata_delete_skips_requeue(tmp_path, monkeypatch):
+    # Data migrations run concurrently with the live server. If MemoryStore.delete()
+    # completes its SQLite cascade between _enumerate (which listed this mirror) and
+    # _requeue_mirror reading the metadata row, the row is gone — the migration must
+    # SKIP, never synthesize a pending row that the recovery worker would turn into a
+    # Qdrant-only ghost for a memory the user just deleted.
+    path = tmp_path / "genesis.db"
+    db = sqlite3.connect(path)
+    db.executescript(_SCHEMA)
+    db.execute(
+        "INSERT INTO memory_metadata (memory_id, collection, created_at, embedding_status) "
+        "VALUES ('m_race', 'episodic_memory', ?, 'embedded')",
+        (_OLD,),
+    )
+    db.execute("INSERT INTO memory_fts VALUES ('m_race', 'body', '', 'episodic_memory')")
+    db.commit()
+    db.close()
+    client = _FakeClient({"episodic_memory": {}, "knowledge_base": {}})
+    _patch(monkeypatch, path, client, tmp_path / "exp.jsonl")
+
+    # Simulate the concurrent delete landing between enumerate and requeue: drop the
+    # mirror's metadata row just before the mirrors batch is applied.
+    real_cib = d0008.commit_in_batches
+
+    def racing_cib(conn, items, apply, **kw):
+        if ("m_race", "episodic_memory") in list(items):
+            conn.execute("DELETE FROM memory_metadata WHERE memory_id = 'm_race'")
+            conn.commit()
+        return real_cib(conn, items, apply, **kw)
+
+    monkeypatch.setattr(d0008, "commit_in_batches", racing_cib)
+    d0008.migrate()
+
+    db = sqlite3.connect(path)
+    # No pending row synthesized for the concurrently-deleted memory.
+    assert (
+        db.execute("SELECT COUNT(*) FROM pending_embeddings WHERE memory_id = 'm_race'").fetchone()[
+            0
+        ]
+        == 0
+    )
+    db.close()

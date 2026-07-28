@@ -21,6 +21,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   existing orphaned vectors (their contents are exported to `~/.genesis/output`
   first) and restores memories that had lost their vector back to full search —
   healing the drift the new Memory Integrity checks surface.
+- **Rebuilding a memory's vector no longer resurrects a superseded one.** When a
+  missing vector is rebuilt, Genesis re-stamps it with the memory's current
+  state — so a memory that was retired or superseded while its vector was still
+  pending stays excluded from recall instead of quietly reappearing, and its real
+  confidence is preserved rather than reset to a default.
 
 ### Added
 

@@ -89,7 +89,11 @@ class EmbeddingRecoveryWorker:
                     "source": item.get("source") or "embedding_recovery",
                     "source_type": "memory",
                     "tags": tag_list,
-                    "confidence": item.get("confidence") or 0.5,
+                    "confidence": (
+                        item.get("confidence")
+                        if item.get("confidence") is not None
+                        else 0.5
+                    ),
                     "created_at": item.get("created_at", datetime.now(UTC).isoformat()),
                     "retrieved_count": 0,
                     "scope": "external" if collection == "knowledge_base" else "user",
@@ -105,6 +109,17 @@ class EmbeddingRecoveryWorker:
                     # (legacy row) → key omitted; gates fail closed on it.
                     if taxo.get("origin_class"):
                         payload["origin_class"] = taxo["origin_class"]
+                    # A memory superseded/deprecated WHILE its embed was still
+                    # pending keeps deprecated=1 in metadata: _mark_superseded only
+                    # updates Qdrant when a point already exists, so the pending
+                    # row is left deprecation-blind. Re-stamp the rebuilt payload as
+                    # excluded-from-recall (mirrors _mark_superseded's Qdrant
+                    # payload) instead of resurfacing the superseded memory as a
+                    # live vector on re-embed.
+                    if taxo.get("deprecated"):
+                        payload["deprecated"] = True
+                        if taxo.get("superseded_by"):
+                            payload["merged_into"] = taxo["superseded_by"]
                 if life_domain:
                     payload["life_domain"] = life_domain
                 if project_type:
@@ -129,6 +144,19 @@ class EmbeddingRecoveryWorker:
                     source=payload.get("source", ""),
                     source_pipeline=payload.get("source_pipeline", ""),
                 )
+
+                # Fail-closed against a concurrent delete. We pulled `item` from
+                # query_pending BEFORE the (slow, network) embed above; MemoryStore
+                # .delete() cascades removal of this memory's pending_embeddings row
+                # (with metadata + FTS). If that row is gone now, the memory was
+                # deleted mid-embed and upserting would strand a Qdrant-only ghost.
+                # store() writes the pending row and delete() removes it, so a
+                # legitimately in-flight store keeps the row present — this only
+                # fires on a real concurrent delete, right before the write.
+                if not await crud.exists_for_memory(
+                    self._db, memory_id=item["memory_id"]
+                ):
+                    continue
 
                 upsert_point(
                     self._qdrant,

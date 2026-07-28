@@ -155,6 +155,21 @@ async def delete_by_memory(db: aiosqlite.Connection, *, memory_id: str) -> int:
     return cursor.rowcount
 
 
+async def exists_for_memory(db: aiosqlite.Connection, *, memory_id: str) -> bool:
+    """True if any pending_embeddings row exists for *memory_id*.
+
+    Used by the recovery worker as a fail-closed re-check immediately before an
+    upsert: MemoryStore.delete() cascades this row away, so its absence means the
+    memory was deleted mid-embed and the point must NOT be written (it would be a
+    Qdrant-only ghost).
+    """
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM pending_embeddings WHERE memory_id = ? LIMIT 1",
+        (memory_id,),
+    )
+    return bool(rows)
+
+
 async def purge_completed(
     db: aiosqlite.Connection,
     *,

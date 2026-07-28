@@ -214,6 +214,30 @@ def migrate() -> dict:
 
         def _requeue_mirror(conn: sqlite3.Connection, row: tuple[str, str]) -> None:
             mid, coll = row
+            # Re-read the authoritative metadata row FIRST. Data migrations run
+            # concurrently with the live server, so between _enumerate and here a
+            # MemoryStore.delete() may have removed this memory (its cascade drops
+            # metadata + FTS + pending together). Two signals gate the requeue:
+            #   * row gone   → deleted mid-migration; skip entirely. Re-queuing
+            #                  would recreate a Qdrant-only ghost for a memory the
+            #                  user just deleted (never synthesize a row).
+            #   * confidence → carried into the queue row so the rebuilt payload
+            #                  keeps the memory's real activation weight; the worker
+            #                  reads confidence ONLY from the queue row and defaults
+            #                  a NULL to 0.5, which would silently re-rank every
+            #                  repaired memory to mid-confidence.
+            # A deprecated (superseded) mirror is NOT special-cased here: the
+            # recovery worker re-stamps a re-embedded deprecated memory's payload as
+            # excluded-from-recall (deprecated=True/merged_into, via get_taxonomy),
+            # so a normal requeue produces a correctly-flagged point — the same fix
+            # also closes the live superseded-while-pending path in the worker.
+            mrow = conn.execute(
+                "SELECT created_at, confidence FROM memory_metadata WHERE memory_id = ?",
+                (mid,),
+            ).fetchone()
+            if mrow is None:
+                return  # deleted concurrently — do not resurrect as a ghost
+            meta_created_at, confidence = mrow
             frow = conn.execute(
                 "SELECT content, tags FROM memory_fts WHERE memory_id = ?", (mid,)
             ).fetchone()
@@ -231,10 +255,7 @@ def migrate() -> dict:
             # life_domain:/project_type: facet payload keys from that comma list —
             # so translate the format or those facets are silently lost on re-embed.
             tags = ",".join((frow[1] or "").split()) or None
-            crow = conn.execute(
-                "SELECT created_at FROM memory_metadata WHERE memory_id = ?", (mid,)
-            ).fetchone()
-            created_at = crow[0] if crow and crow[0] else _now().isoformat()
+            created_at = meta_created_at or _now().isoformat()
             memory_type = "knowledge" if coll == "knowledge_base" else "episodic"
             # A retained queue row (e.g. a reaped 'failed'/'embedded' item) must be
             # RESET to a drainable 'pending' — the recovery worker only drains
@@ -248,8 +269,8 @@ def migrate() -> dict:
                 conn.execute(
                     "UPDATE pending_embeddings SET status = 'pending', "
                     "error_message = NULL, content = ?, tags = ?, memory_type = ?, "
-                    "collection = ? WHERE memory_id = ?",
-                    (content, tags, memory_type, coll, mid),
+                    "collection = ?, confidence = ? WHERE memory_id = ?",
+                    (content, tags, memory_type, coll, confidence, mid),
                 )
             else:
                 conn.execute(
@@ -269,7 +290,7 @@ def migrate() -> dict:
                         created_at,
                         "pending",
                         "d0008_reconcile",
-                        None,
+                        confidence,  # carry the real activation weight, not NULL→0.5
                         None,
                         None,
                         None,
