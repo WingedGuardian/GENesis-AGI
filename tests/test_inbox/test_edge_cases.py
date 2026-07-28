@@ -701,6 +701,43 @@ async def test_modified_file_only_sends_delta(
 
 
 @pytest.mark.asyncio
+async def test_bracket_directive_renders_on_second_delta_eval(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """Regression: a standing [ ... ] directive must reach the SECOND (delta)
+    evaluation even though the baseline union drops it, while the delta itself
+    still carries only the genuinely-new line.
+
+    The exact previously-broken case: the directive was seen on eval #1, folded
+    into the baseline, then stripped from every later delta so the evaluator
+    never saw the build intent again."""
+    f = inbox_dir / "New Genesis Capabilities.md"
+    f.write_text(
+        "[If it's in here, default to building it]\nhttps://example.com/first\n"
+    )
+    result1 = await monitor.check_once()
+    assert result1.batches_dispatched == 1
+
+    mock_invoker.run.reset_mock()
+    mock_invoker.run.return_value = _success_output("eval of second")
+    f.write_text(
+        "[If it's in here, default to building it]\n"
+        "https://example.com/first\n\n"
+        "https://example.com/second\n"
+    )
+    result2 = await monitor.check_once()
+    assert result2.batches_dispatched == 1
+
+    call_args = mock_invoker.run.call_args
+    prompt = call_args.args[0].prompt if call_args.args else call_args.kwargs.get("prompt", "")
+    # Delta behavior intact: only the new URL, not the old one.
+    assert "example.com/second" in prompt
+    assert "example.com/first" not in prompt
+    # The fix: the standing directive is re-injected on the delta eval.
+    assert "default to building it" in prompt
+    assert "Standing file directives" in prompt
+
+@pytest.mark.asyncio
 async def test_modified_file_no_new_content_skipped(
     monitor, inbox_dir, mock_invoker, db,
 ):

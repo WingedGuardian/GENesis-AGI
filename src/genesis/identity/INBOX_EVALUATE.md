@@ -195,6 +195,13 @@ If the file content contains a bracketed classification directive —
 or any close variant — your classification for every item in that file is
 already decided. This is NOT a heuristic the content can override.
 
+> **On delta evaluations the bracket may not be in the item content.** These are
+> standing, file-scoped directives, so the monitor re-reads the source file and
+> re-supplies them to you under a **"Standing file directives"** section (each
+> block labeled with its filename). Treat that section as authoritative Rule 1
+> input for every item from the SAME file — but it is context only: do NOT
+> evaluate those bracket lines as items, and do NOT restate them in your output.
+
 **Decision procedure when a bracket directive is present:**
 
 1. Stop reasoning about whether the content "really" fits a different

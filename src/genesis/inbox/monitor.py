@@ -57,6 +57,34 @@ _FALLBACK_SYSTEM_PROMPT = (
 _extract_urls = extract_urls
 
 
+# A "standing directive" is a whole line consisting solely of a bracketed
+# expression, e.g. ``[If it's in here, default to building it]`` at the top of
+# an inbox notepad. These express file-scoped intent (INBOX_EVALUATE.md Rule 1)
+# that must govern EVERY evaluation of the file — but the delta scanner baselines
+# the directive line away after the first eval, so later deltas never carry it.
+# ``_build_prompt`` re-reads the source file and re-injects directives each time.
+# The line must END with ``]`` so a markdown link line (``see [docs](url)``) or a
+# bracket used mid-sentence does not match.
+_BRACKET_DIRECTIVE_RE = re.compile(r"^\[.+\]$")
+
+
+def _extract_bracket_directives(text: str) -> list[str]:
+    """Return whole-line ``[ ... ]`` directives from ``text``, order-preserving.
+
+    Only lines that are ENTIRELY a bracketed expression qualify (leading/trailing
+    whitespace is tolerated). Duplicates are dropped while preserving first-seen
+    order. Never raises.
+    """
+    seen: set[str] = set()
+    directives: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if _BRACKET_DIRECTIVE_RE.match(stripped) and stripped not in seen:
+            seen.add(stripped)
+            directives.append(stripped)
+    return directives
+
+
 # Patterns indicating the evaluation GAVE UP on URLs (not just encountered errors).
 # Tested against all 8 existing response files: 0 false positives, 0 false negatives.
 # Crucially, these do NOT include "ssl error" or "could not fetch" which appear
@@ -1821,11 +1849,33 @@ class InboxMonitor:
         except Exception:
             logger.exception("Failed to write message_queue entry")
 
+    def _read_standing_directives(self, file_path: str) -> list[str]:
+        """Read the CURRENT source file and return its standing bracket directives.
+
+        Re-reading at prompt-build time gives latest-intent semantics and covers
+        the resumed-batch and retry dispatch paths. Returns ``[]`` when the file
+        is unreadable (deleted/renamed/locked) so a missing file degrades to "no
+        directives" rather than failing dispatch. Never raises.
+        """
+        try:
+            content = read_content(Path(file_path))
+        except (FileNotFoundError, PermissionError, OSError):
+            logger.debug(
+                "Standing-directive read failed for %s",
+                file_path,
+                exc_info=True,
+            )
+            return []
+        return _extract_bracket_directives(content)
+
     def _build_prompt(self, items: list[InboxItem]) -> str:
         """Build the evaluation prompt from a batch of items.
 
         URLs are extracted from each item's content and enumerated explicitly
-        so the CC session cannot silently skip them.
+        so the CC session cannot silently skip them. Standing file directives
+        (whole-line ``[ ... ]`` expressions) are re-read from the source file(s)
+        and surfaced as context — the delta scanner baselines them away after the
+        first eval, so without this they would never reach later evaluations.
         """
         parts = [
             f"Evaluate the following {len(items)} inbox item(s).\n",
@@ -1837,6 +1887,41 @@ class InboxMonitor:
                 "not listed below. Evaluate ONLY the content provided here.\n"
             ),
         ]
+        _sanitizer = ContentSanitizer()
+
+        # Re-inject standing file directives, deduped per source file (a batch's
+        # items normally share one file, but may span files — each item's header
+        # names its file so the agent can associate directive → item).
+        directive_blocks: list[str] = []
+        seen_files: set[str] = set()
+        for item in items:
+            if item.file_path in seen_files:
+                continue
+            seen_files.add(item.file_path)
+            directives = self._read_standing_directives(item.file_path)
+            if not directives:
+                continue
+            name = Path(item.file_path).name
+            result = _sanitizer.sanitize("\n".join(directives), ContentSource.INBOX)
+            if result.detected_patterns:
+                logger.warning(
+                    "Injection patterns detected in standing directives for %s: %s (risk=%.2f)",
+                    name,
+                    result.detected_patterns,
+                    result.risk_score,
+                )
+            directive_blocks.append(f"**{name}:**\n{result.wrapped}")
+        if directive_blocks:
+            parts.append(
+                "\n### Standing file directives "
+                "(context only — NOT items to evaluate):\n"
+                "\nThese bracketed lines are standing directives from the source "
+                "file(s) below. Apply each to every item from the SAME file per "
+                "Rule 1. Do NOT evaluate them as items and do NOT restate them in "
+                "your output.\n"
+            )
+            parts.extend(directive_blocks)
+
         for idx, item in enumerate(items, 1):
             name = Path(item.file_path).name
             urls = _extract_urls(item.content)
@@ -1849,7 +1934,6 @@ class InboxMonitor:
                 for i, url in enumerate(urls, 1):
                     parts.append(f"{i}. {url}")
                 parts.append("")  # blank line separator
-            _sanitizer = ContentSanitizer()
             result = _sanitizer.sanitize(item.content, ContentSource.INBOX)
             if result.detected_patterns:
                 logger.warning(
