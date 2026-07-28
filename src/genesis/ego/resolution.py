@@ -34,7 +34,7 @@ _DECISION_CONTENT_MAX = 500
 
 def decision_prefix(proposal: dict) -> str:
     """Stable dedup prefix for a proposal's theme: ``[action_type/category]``,
-    refined with a goal discriminator (``/goal:<id8>``) when the proposal
+    refined with a goal discriminator (``/goal:<goal_id>``) when the proposal
     targets a goal.
 
     Without the goal segment, two rulings that share an action_type/category
@@ -54,7 +54,7 @@ def decision_prefix(proposal: dict) -> str:
     category = proposal.get("action_category") or "general"
     goal_id = proposal.get("goal_id")
     if goal_id:
-        return f"[{action_type}/{category}/goal:{goal_id[:8]}]"
+        return f"[{action_type}/{category}/goal:{goal_id}]"
     return f"[{action_type}/{category}]"
 
 

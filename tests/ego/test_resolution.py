@@ -302,7 +302,7 @@ def test_decision_prefix_goal_aware():
             "action_category": "goal_management",
             "goal_id": "abcd1234-eeee-ffff",
         }
-    ) == "[goal_status_change/goal_management/goal:abcd1234]"
+    ) == "[goal_status_change/goal_management/goal:abcd1234-eeee-ffff]"
     # No goal_id keeps the bare key (backward compatible).
     assert decision_prefix(
         {"action_type": "goal_status_change", "action_category": "goal_management"}
