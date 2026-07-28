@@ -1031,6 +1031,25 @@ class TestUserIdentitySlice:
         assert "Systems engineer" in out
         assert "#" not in out  # markdown headers stripped
         assert "guidance" not in out  # HTML comments stripped
+        assert "*" not in out  # markdown emphasis stripped — no asterisks to S2S
+
+    def test_markdown_emphasis_pairs_stripped(self, tmp_path):
+        # "- **Name**: Jamie": lstrip removes the leading "- **" but the trailing
+        # "**" used to survive, so the S2S provider spoke the asterisks. Both the
+        # ** pair and any __ pair must be gone.
+        user = "# User Profile\n- **Name**: Jamie\n- __Role__: Engineer\n"
+        out = self._extract(tmp_path, user, self._EXAMPLE)
+        assert "Name: Jamie" in out  # emphasis pair removed, not just the leading
+        assert "Role: Engineer" in out
+        assert "*" not in out
+        assert "__" not in out
+
+    def test_single_underscore_identifier_preserved(self, tmp_path):
+        # Only PAIRS are stripped — a lone underscore in an identifier survives.
+        user = "# User Profile\n- **Handle**: user_name_42\n"
+        out = self._extract(tmp_path, user, self._EXAMPLE)
+        assert "user_name_42" in out
+        assert "*" not in out
 
     def test_partial_fill_drops_unedited_template_lines(self, tmp_path):
         # Name/Timezone edited; Background/Communication left as the seed — those

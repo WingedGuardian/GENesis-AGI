@@ -412,6 +412,11 @@ def _extract_user_identity(max_chars: int = 600, *, loader=None) -> str:
         if s in template_lines:  # line copied verbatim from the seed — unedited
             continue
         s = s.lstrip("-* ").strip()
+        # Strip markdown emphasis PAIRS (** / __) that lstrip leaves behind on a
+        # line like "- **Name**: Jay" (lstrip removes the leading "- **" but not
+        # the trailing "**"), so the S2S provider doesn't speak the asterisks.
+        # Scoped to pairs so a lone underscore in an identifier survives.
+        s = re.sub(r"\*\*|__", "", s).strip()
         if s:
             lines.append(s)
     return "\n".join(lines)[:max_chars]
