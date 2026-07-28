@@ -59,17 +59,20 @@ def _decision(res: subprocess.CompletedProcess) -> str | None:
 # ── gh pr create ────────────────────────────────────────────────────
 
 
-def test_pr_create_interactive_asks():
+def test_pr_create_not_gated_interactive():
+    """gh pr create is NOT gated — opening a PR on already-pushed code is a
+    review request, not a code-publish (the push is what's gated). No prompt."""
     res = _run("gh pr create --title x --body y")
     assert res.returncode == 0, res.stderr
-    assert _decision(res) == "ask"
-
-
-def test_pr_create_dispatched_denied():
-    res = _run("gh pr create --title x --body y", dispatched=True)
-    assert res.returncode == 2
     assert _decision(res) is None
-    assert "Creating a PR requires user approval" in res.stderr
+
+
+def test_pr_create_not_gated_dispatched():
+    """Un-gated in every session: a dispatched session cannot push code (that is
+    denied), so a PR-create on already-pushed code needs no separate gate."""
+    res = _run("gh pr create --title x --body y", dispatched=True)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) is None
 
 
 def test_pr_create_mention_in_string_not_tripped():
@@ -78,11 +81,10 @@ def test_pr_create_mention_in_string_not_tripped():
     assert _decision(res) is None
 
 
-def test_pr_create_with_global_flag_before_pr_detected():
-    """A gh global flag before `pr` must not evade the create gate."""
-    res = _run("gh --repo o/r pr create --title x --body y", dispatched=True)
-    assert res.returncode == 2
-    assert "Creating a PR requires user approval" in res.stderr
+def test_pr_create_with_global_flag_not_gated():
+    res = _run("gh --repo o/r pr create --title x --body y")
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) is None
 
 
 # ── git push ────────────────────────────────────────────────────────
@@ -208,27 +210,31 @@ def test_force_push_mirror_blocked_even_dispatched():
     assert res.returncode == 2
 
 
-# ── compound with >1 gated publish op → hard-block (each needs its own approval) ──
+# ── compound: multiple PUSHES block (each needs own approval); a push + an
+#    un-gated pr-create asks ONCE (for the push), and the pr-create rides along ──
 
 
-def test_push_and_pr_create_compound_blocked():
-    """push && gh pr create must not share ONE approval prompt — approving the
-    push's ask would also create the PR (Codex P1) → hard-block, require split."""
+def test_push_and_pr_create_compound_asks_once():
+    """push && gh pr create is ONE prompt — for the push. gh pr create is not a
+    code-publish (it opens a review request on already-pushed code), so it rides
+    on the push's approval instead of demanding its own (user direction)."""
     res = _run("git push origin feat && gh pr create --title x --body y")
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_two_pushes_compound_blocked():
+    """Two real pushes still block — each publishes code and needs its own
+    approval, so they cannot share a single prompt."""
+    res = _run("git push origin a && git push origin b")
     assert res.returncode == 2
     assert _decision(res) is None
     assert "separate" in res.stderr
 
 
-def test_two_pushes_compound_blocked():
-    res = _run("git push origin a && git push origin b")
-    assert res.returncode == 2
-    assert _decision(res) is None
-
-
-def test_two_pr_creates_compound_blocked():
+def test_two_pr_creates_not_gated():
     res = _run("gh pr create --title a --body b && gh pr create --title c --body d")
-    assert res.returncode == 2
+    assert res.returncode == 0, res.stderr
     assert _decision(res) is None
 
 
@@ -257,10 +263,11 @@ def test_push_override_token_cannot_self_approve_dispatched():
     assert _decision(res) is None
 
 
-def test_pr_create_override_token_is_inert_interactive():
+def test_pr_create_not_gated_with_token():
+    """gh pr create is un-gated regardless of any trailing token — no prompt."""
     res = _run("gh pr create --title x --body-file /tmp/b.md  # review-override")
     assert res.returncode == 0, res.stderr
-    assert _decision(res) == "ask"
+    assert _decision(res) is None
 
 
 # ── shell-parse bypass-hardening preserved (dispatched → still hard-denied) ──

@@ -468,27 +468,28 @@ def main() -> int:
         segs = analyze(cmd)
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
-        create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
-        # Each push / PR-create is a SEPARATE external-publish action needing its
-        # own approval. A single Bash command carrying more than one would
+        # Each git push is a SEPARATE external-publish action needing its own
+        # approval. A single Bash command carrying more than one push would
         # collapse into ONE ask (mentioning only the first), so approving that
-        # prompt would run every publish behind it. Reject the compound and
-        # require each to be its own separately-approved tool call.
-        if len(push_segs) + len(create_segs) > 1:
+        # prompt would run every push behind it. Reject the compound and require
+        # each push to be its own separately-approved tool call. (gh pr create is
+        # NOT gated — it opens a review request on already-pushed code, not a
+        # code-publish — so it may ride along on a push's approval.)
+        if len(push_segs) > 1:
             print(
-                "BLOCKED: multiple publish operations (git push / gh pr create) "
-                "in one command would share a single approval prompt. Run each "
-                "as its own command so each is approved separately.",
+                "BLOCKED: multiple git push operations in one command would "
+                "share a single approval prompt. Run each push as its own "
+                "command so each is approved separately.",
                 file=sys.stderr,
             )
             return 2
 
-        # An interactive push / PR-create defers to a native approve/deny
-        # dialog at the END of main(), so every hard-block below (merge-into-
-        # main, the pr-merge gates, sqlite, --no-verify) still takes precedence
-        # — a compound `git push && git commit --no-verify` blocks, never asks.
+        # An interactive push defers to a native approve/deny dialog at the END
+        # of main(), so every hard-block below (merge-into-main, the pr-merge
+        # gates, sqlite, --no-verify) still takes precedence — a compound
+        # `git push && git commit --no-verify` blocks, never asks.
         ask_reason: str | None = None
 
         # ── git push (any branch) ──────────────────────────────────
@@ -539,20 +540,10 @@ def main() -> int:
                 )
                 return 2
 
-        # ── gh pr create ───────────────────────────────────────────
-        if create_segs:
-            if _is_dispatched():
-                print(
-                    "BLOCKED: Creating a PR requires user approval before publishing externally.",
-                    file=sys.stderr,
-                )
-                print(
-                    "Autonomous/dispatched sessions cannot open PRs directly.",
-                    file=sys.stderr,
-                )
-                return 2
-            if ask_reason is None:
-                ask_reason = "gh pr create needs your approval before publishing externally."
+        # ── gh pr create ── NOT gated: opening a PR is a review request on
+        # already-pushed code, not a code-publish (the push is what publishes,
+        # and it is gated above). So `git push && gh pr create` prompts once —
+        # for the push — and the PR-create rides along on that approval.
 
         # ── gh pr merge ────────────────────────────────────────────
         if merge_pr_segs:

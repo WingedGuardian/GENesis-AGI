@@ -94,19 +94,24 @@ over.
 ## Push/Merge Enforcement
 
 `git_push_guard.py` (PreToolUse hook) gates:
-- `git push` (any branch) — an **interactive** session gets a native
-  approve/deny dialog (`permissionDecision:ask`) that only *you* can satisfy;
-  a Genesis-**dispatched** session (`GENESIS_CC_SESSION=1`) is **hard-denied**
-  (no human to prompt; real autonomous delivery goes through the scope-gated
-  server path, not the CC Bash tool).
-- `gh pr create` — same interactive prompt / dispatched deny.
+- `git push` (any branch) — the one action that publishes code externally. An
+  **interactive** session gets a native approve/deny dialog
+  (`permissionDecision:ask`) that only *you* can satisfy; a Genesis-**dispatched**
+  session (`GENESIS_CC_SESSION=1`) is **hard-denied** (no human to prompt; real
+  autonomous delivery goes through the scope-gated server path, not the CC Bash
+  tool). Force push (`--force` / `--force-with-lease` / `-f` / `+refspec` /
+  `--mirror`) is **hard-blocked** in every session. Multiple pushes in one
+  command are blocked — each push needs its own approval.
+- `gh pr create` — **NOT gated**. Opening a PR is a review request on
+  already-pushed code, not a code-publish (the push is what's gated), so it
+  needs no separate prompt; a `git push && gh pr create` prompts once — for the
+  push — and the PR-create rides along.
 - `git merge` into main/master — **hard-blocked** (use the PR workflow).
 - `gh pr merge` without `--admin`, or with unresolved review findings —
   **hard-blocked** (a `# review-override` trailing comment acknowledges
   intentionally-accepted findings on the *merge* command only).
 
-The push/PR-create dialog replaced the old `# review-override` token for those
-two gates — the agent can no longer self-approve a push. All code changes go
-through PRs; the only merge path is `gh pr merge --squash --admin` after
-explicit user approval. Each step (commit → push branch → create PR → merge)
-needs your confirmation.
+The push dialog replaced the old `# review-override` token for the push gate —
+the agent can no longer self-approve a push. All code changes go through PRs;
+the only merge path is `gh pr merge --squash --admin` after explicit user
+approval.
