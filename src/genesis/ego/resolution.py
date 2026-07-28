@@ -33,9 +33,28 @@ _DECISION_CONTENT_MAX = 500
 
 
 def decision_prefix(proposal: dict) -> str:
-    """Stable dedup prefix for a proposal's theme: ``[action_type/category]``."""
+    """Stable dedup prefix for a proposal's theme: ``[action_type/category]``,
+    refined with a goal discriminator (``/goal:<id8>``) when the proposal
+    targets a goal.
+
+    Without the goal segment, two rulings that share an action_type/category
+    but concern DIFFERENT goals (e.g. deprioritize goal A vs pause goal B, both
+    ``goal_status_change/goal_management``) collide: ``find_active_decision``
+    matches the first by content prefix and the second REAFFIRMS it instead of
+    capturing its distinct ruling, silently dropping the second (2026-07-28).
+    Goal-scoping the key keeps per-goal rulings separate while still deduping
+    repeat rulings about the SAME goal.
+
+    (A ``goal_status_change`` proposal with NO goal_id is degenerate; it keeps
+    the bare ``[type/category]`` key and could still prefix-match a goal-scoped
+    decision under ``find_active_decision``'s ``LIKE prefix%`` — accepted, as
+    that path carries no distinct per-goal ruling to lose.)
+    """
     action_type = proposal.get("action_type") or "unknown"
     category = proposal.get("action_category") or "general"
+    goal_id = proposal.get("goal_id")
+    if goal_id:
+        return f"[{action_type}/{category}/goal:{goal_id[:8]}]"
     return f"[{action_type}/{category}]"
 
 

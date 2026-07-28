@@ -27,15 +27,25 @@ async def db():
     await conn.close()
 
 
-async def _proposal(db, *, pid="p1", ego_source="user_ego_cycle", status="rejected"):
+async def _proposal(
+    db,
+    *,
+    pid="p1",
+    ego_source="user_ego_cycle",
+    status="rejected",
+    action_type="content_publishing",
+    action_category="marketing",
+    goal_id=None,
+):
     await ego_crud.create_proposal(
         db,
         id=pid,
-        action_type="content_publishing",
-        action_category="marketing",
+        action_type=action_type,
+        action_category=action_category,
         content="Republish the launch post under a de-identified handle.",
         confidence=0.8,
         ego_source=ego_source,
+        goal_id=goal_id,
     )
     await ego_crud.resolve_proposal(db, pid, status=status, user_response="r")
     return await ego_crud.get_proposal(db, pid)
@@ -280,3 +290,78 @@ def test_decision_prefix_defaults():
     assert decision_prefix(
         {"action_type": "a", "action_category": "b"}
     ) == "[a/b]"
+
+
+# ── decision_prefix goal-scoping (2026-07-28 collision fix) ─────────────────
+
+
+def test_decision_prefix_goal_aware():
+    assert decision_prefix(
+        {
+            "action_type": "goal_status_change",
+            "action_category": "goal_management",
+            "goal_id": "abcd1234-eeee-ffff",
+        }
+    ) == "[goal_status_change/goal_management/goal:abcd1234]"
+    # No goal_id keeps the bare key (backward compatible).
+    assert decision_prefix(
+        {"action_type": "goal_status_change", "action_category": "goal_management"}
+    ) == "[goal_status_change/goal_management]"
+    # Same action/category, different goals -> different keys (no collision).
+    a = decision_prefix(
+        {"action_type": "x", "action_category": "y", "goal_id": "aaaa0000-a"}
+    )
+    b = decision_prefix(
+        {"action_type": "x", "action_category": "y", "goal_id": "bbbb1111-b"}
+    )
+    assert a != b
+
+
+async def test_different_goals_same_action_do_not_collide(db):
+    """Two rejections sharing action_type/category but on DIFFERENT goals each
+    capture their own decision instead of reaffirm-collapsing (2026-07-28 bug:
+    the TL-deprioritize ruling reaffirmed the Medium-pause decision and was
+    silently dropped)."""
+    pa = await _proposal(
+        db,
+        pid="pa",
+        action_type="goal_status_change",
+        action_category="goal_management",
+        goal_id="aaaa0000-goalA",
+    )
+    await handle_proposal_resolution(
+        db, pa, "rejected", reason="user rejected", standing_rule="Goal A stays active.", source="mcp"
+    )
+    pb = await _proposal(
+        db,
+        pid="pb",
+        action_type="goal_status_change",
+        action_category="goal_management",
+        goal_id="bbbb1111-goalB",
+    )
+    await handle_proposal_resolution(
+        db, pb, "rejected", reason="user rejected", standing_rule="Goal B stays high, ramp up.", source="mcp"
+    )
+    rows, total = await _decisions(db)
+    assert total == 2
+    joined = " ".join(r["content"] for r in rows)
+    assert "Goal A stays active" in joined
+    assert "Goal B stays high" in joined
+
+
+async def test_same_goal_same_action_reaffirms(db):
+    """Repeat rulings on the SAME goal still dedup (reaffirm, not duplicate)."""
+    for i in range(2):
+        p = await _proposal(
+            db,
+            pid=f"pg{i}",
+            action_type="goal_status_change",
+            action_category="goal_management",
+            goal_id="cccc2222-goalC",
+        )
+        await handle_proposal_resolution(
+            db, p, "rejected", reason="user rejected", standing_rule="Goal C ruling.", source="mcp"
+        )
+    rows, total = await _decisions(db)
+    assert total == 1
+    assert rows[0]["reaffirm_count"] == 1
