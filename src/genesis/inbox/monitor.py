@@ -214,6 +214,8 @@ class InboxMonitor:
         clock=None,
         prompt_dir: Path | None = None,
         triage_pipeline: Callable[..., Coroutine[Any, Any, None]] | None = None,
+        router=None,
+        memory_store=None,
     ):
         self._db = db
         self._invoker = invoker
@@ -231,6 +233,11 @@ class InboxMonitor:
         self._triage_pipeline = triage_pipeline
         self._autonomous_dispatcher = None
         self._build_lane = None
+        # Deterministic inbox-eval memory persistence (inbox.eval_memory). No-op
+        # unless BOTH are wired — every existing caller/test omits them, so the
+        # feature stays inert without them.
+        self._router = router
+        self._memory_store = memory_store
 
     def set_build_lane(self, build_lane: object) -> None:
         """Wire the capability-build lane (late-bound after autonomy+tasks init)."""
@@ -1749,6 +1756,19 @@ class InboxMonitor:
                 event_bus=self._event_bus,
                 subsystem=Subsystem.INBOX,
             )
+        # Deterministic memory persistence over the curated output text. Detached
+        # and isolated — fires AFTER baseline+complete so it can never affect the
+        # batch. No-op unless router+store are wired (see __init__).
+        if output_text and self._router is not None and self._memory_store is not None:
+            from genesis.observability.types import Subsystem
+            from genesis.util.tasks import tracked_task
+
+            tracked_task(
+                self._persist_eval_memories(output_text, batch_id, session_id, [item.file_path]),
+                name="inbox-eval-memory",
+                event_bus=self._event_bus,
+                subsystem=Subsystem.INBOX,
+            )
         if self._event_bus:
             from genesis.observability.types import Severity, Subsystem
 
@@ -1959,6 +1979,46 @@ class InboxMonitor:
             await self._triage_pipeline(output, user_text, "inbox")
         except Exception:
             logger.exception("Inbox triage pipeline failed (non-fatal)")
+
+    async def _persist_eval_memories(
+        self,
+        evaluation_text: str,
+        batch_id: str,
+        session_id: str | None,
+        source_files: list[str],
+    ) -> None:
+        """Fire-and-forget deterministic memory persistence over the eval output.
+
+        Whole body guarded — this runs detached and must NEVER crash or affect
+        the batch. Emits a ``memory.persisted`` event when anything is stored.
+        """
+        try:
+            from genesis.inbox.eval_memory import extract_and_store_eval_memories
+
+            count = await extract_and_store_eval_memories(
+                db=self._db,
+                store=self._memory_store,
+                router=self._router,
+                evaluation_text=evaluation_text,
+                source_files=source_files,
+                session_id=session_id,
+            )
+            if count and self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+
+                await self._event_bus.emit(
+                    Subsystem.INBOX,
+                    Severity.INFO,
+                    "memory.persisted",
+                    f"Stored {count} memory(ies) from inbox eval {batch_id[:8]}",
+                    batch_id=batch_id,
+                    count=count,
+                )
+        except Exception:
+            logger.warning(
+                "Inbox eval-memory persistence failed (non-fatal)",
+                exc_info=True,
+            )
 
     async def _check_inbox(self) -> None:
         """Scheduled callback — wraps check_once with error handling."""

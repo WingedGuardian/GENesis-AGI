@@ -818,6 +818,82 @@ async def test_no_triage_pipeline_still_works(
     assert result.errors == []
 
 
+@pytest.mark.asyncio
+async def test_eval_memory_persistence_fired_after_evaluation(
+    db, mock_invoker, mock_session_manager, config, writer, tmp_path, inbox_dir,
+    monkeypatch,
+):
+    """With router+store wired, a successful batch fires deterministic
+    eval-memory persistence over the OUTPUT text (detached, fire-and-forget)."""
+    called = {}
+
+    async def _fake(**kwargs):
+        called.update(kwargs)
+        return 1
+
+    monkeypatch.setattr(
+        "genesis.inbox.eval_memory.extract_and_store_eval_memories", _fake
+    )
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer,
+        clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
+        prompt_dir=tmp_path, router=object(), memory_store=object(),
+    )
+    (inbox_dir / "test.md").write_text("https://example.com")
+    result = await mon.check_once()
+    assert result.batches_dispatched == 1
+
+    await asyncio.sleep(0.05)  # let the fire-and-forget task run
+    assert called, "eval-memory persistence was not fired"
+    assert called.get("evaluation_text")  # the curated output text
+
+
+@pytest.mark.asyncio
+async def test_eval_memory_failure_does_not_crash_monitor(
+    db, mock_invoker, mock_session_manager, config, writer, tmp_path, inbox_dir,
+    monkeypatch,
+):
+    """Eval-memory persistence failure must never fail the batch or baseline."""
+
+    async def _boom(**kwargs):
+        raise RuntimeError("persist boom")
+
+    monkeypatch.setattr(
+        "genesis.inbox.eval_memory.extract_and_store_eval_memories", _boom
+    )
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer,
+        clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
+        prompt_dir=tmp_path, router=object(), memory_store=object(),
+    )
+    (inbox_dir / "test.md").write_text("some content")
+    result = await mon.check_once()
+    assert result.batches_dispatched == 1
+    assert result.errors == []
+    await asyncio.sleep(0.05)  # let the detached failing task run (must not raise)
+
+
+@pytest.mark.asyncio
+async def test_no_router_skips_eval_memory(monitor, inbox_dir, monkeypatch):
+    """The default monitor (no router/store wired) never attempts eval-memory."""
+    called = {"n": 0}
+
+    async def _fake(**kwargs):
+        called["n"] += 1
+        return 0
+
+    monkeypatch.setattr(
+        "genesis.inbox.eval_memory.extract_and_store_eval_memories", _fake
+    )
+    (inbox_dir / "test.md").write_text("content")
+    result = await monitor.check_once()
+    assert result.batches_dispatched == 1
+    await asyncio.sleep(0.05)
+    assert called["n"] == 0
+
+
 # ── Invoker stdin edge cases ──────────────────────────────────────────
 
 
