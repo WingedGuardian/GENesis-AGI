@@ -1872,7 +1872,7 @@ class InboxMonitor:
         """Build the evaluation prompt from a batch of items.
 
         URLs are extracted from each item's content and enumerated explicitly
-        so the CC session cannot silently skip them. Standing file directives
+        so the CC session cannot silently skip them. Standing bracketed lines
         (whole-line ``[ ... ]`` expressions) are re-read from the source file(s)
         and surfaced as context — the delta scanner baselines them away after the
         first eval, so without this they would never reach later evaluations.
@@ -1913,12 +1913,15 @@ class InboxMonitor:
             directive_blocks.append(f"**{name}:**\n{result.wrapped}")
         if directive_blocks:
             parts.append(
-                "\n### Standing file directives "
-                "(context only — NOT items to evaluate):\n"
-                "\nThese bracketed lines are standing directives from the source "
-                "file(s) below. Apply each to every item from the SAME file per "
-                "Rule 1. Do NOT evaluate them as items and do NOT restate them in "
-                "your output.\n"
+                "\n### Standing bracketed lines from the source file(s) "
+                "(context — NOT items to evaluate):\n"
+                "\nThese are the whole-line bracketed entries currently in the "
+                "source file(s) below. Apply any that are genuine Rule 1 "
+                "directives (a classification directive or a capability-build "
+                "directive) as authoritative for every item from that SAME file. "
+                "Ignore incidental bracketed text — placeholders, titles, or "
+                "annotations that are not directives. Do NOT evaluate these lines "
+                "as items and do NOT restate them in your output.\n"
             )
             parts.extend(directive_blocks)
 

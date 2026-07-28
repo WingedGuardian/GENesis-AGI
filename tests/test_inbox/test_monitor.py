@@ -613,7 +613,7 @@ async def test_build_prompt_includes_delta_instruction(monitor, inbox_dir):
     assert "ONLY" in prompt
 
 
-# --- Standing file directives (bracket re-injection) ---
+# --- Standing bracketed lines (bracket re-injection) ---
 
 
 def test_extract_bracket_directives_shapes():
@@ -660,9 +660,9 @@ async def test_build_prompt_injects_standing_directives(monitor, inbox_dir):
         content_hash="h", detected_at="2026-07-27",
     )
     prompt = monitor._build_prompt([item])
-    assert "Standing file directives" in prompt
+    assert "Standing bracketed lines" in prompt
     assert "default to building it" in prompt
-    assert "context only" in prompt.lower()
+    assert "context" in prompt.lower()
 
 
 @pytest.mark.asyncio
@@ -676,7 +676,7 @@ async def test_build_prompt_no_directive_section_without_brackets(monitor, inbox
         content_hash="h", detected_at="2026-07-27",
     )
     prompt = monitor._build_prompt([item])
-    assert "Standing file directives" not in prompt
+    assert "Standing bracketed lines" not in prompt
 
 
 @pytest.mark.asyncio
@@ -689,7 +689,7 @@ async def test_build_prompt_directives_missing_file_graceful(monitor, inbox_dir)
         content="https://example.com/x", content_hash="h", detected_at="2026-07-27",
     )
     prompt = monitor._build_prompt([item])  # must not raise
-    assert "Standing file directives" not in prompt
+    assert "Standing bracketed lines" not in prompt
     assert "### Content:" in prompt
 
 
@@ -707,7 +707,7 @@ async def test_build_prompt_directives_are_sanitized(monitor, inbox_dir):
         content_hash="h", detected_at="2026-07-27",
     )
     prompt = monitor._build_prompt([item])
-    assert "Standing file directives" in prompt
+    assert "Standing bracketed lines" in prompt
     assert '<external-content source="inbox"' in prompt
 
 

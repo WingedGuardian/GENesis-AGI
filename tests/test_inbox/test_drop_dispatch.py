@@ -640,7 +640,7 @@ async def test_resume_dispatch_reads_current_file_directives(
     assert "https://example.com/a0" not in prompt  # still not a full re-read
     # The fix: standing directive surfaced on the resume path too.
     assert "build everything here by default" in prompt
-    assert "Standing file directives" in prompt
+    assert "Standing bracketed lines" in prompt
 
 # ── Follow-up dedup wiring ───────────────────────────────────────────────
 

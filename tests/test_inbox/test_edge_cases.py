@@ -735,7 +735,7 @@ async def test_bracket_directive_renders_on_second_delta_eval(
     assert "example.com/first" not in prompt
     # The fix: the standing directive is re-injected on the delta eval.
     assert "default to building it" in prompt
-    assert "Standing file directives" in prompt
+    assert "Standing bracketed lines" in prompt
 
 @pytest.mark.asyncio
 async def test_modified_file_no_new_content_skipped(
