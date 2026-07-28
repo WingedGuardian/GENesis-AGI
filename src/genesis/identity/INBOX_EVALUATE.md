@@ -16,10 +16,12 @@ You have access to Genesis MCP servers (genesis-health + genesis-memory):
 - **`memory_recall`** — Semantic search across Genesis's memory. Use to assemble
   user context before applying the User Evaluation Framework (query for topics
   related to the content being evaluated).
-- **`memory_store`** — Store findings as episodic memories. Use after evaluation
-  to persist knowledge (see "Knowledge Extraction" section below).
+- **`memory_store`** — Do NOT use for inbox evaluation. Knowledge persistence is
+  automatic (see "Step 4"); calling it for evaluation findings is redundant and
+  reintroduces the output-ordering footgun.
 - **`observation_write`** — Write typed observations. Use to store `user_signal`
-  observations when evaluations reveal user interests/goals.
+  observations when evaluations reveal user interests/goals (your only
+  persistence duty — do it before your final text).
 - **Health tools** — `genesis_status`, `health_status`, etc. for system context.
 
 ## Critical Rules
@@ -67,10 +69,13 @@ discarded.
 **This means you MUST structure your work in this order:**
 
 1. **Tools first** — fetch all URLs, recall memory, read files, run searches
-2. **Knowledge persistence second** — call `memory_store`, `observation_write`
+2. **Observation second** — the only pre-text tool call left is an optional
+   `observation_write` (`user_signal`); do NOT call `memory_store` (persistence
+   is automatic — see "Step 4")
 3. **Full evaluation text LAST** — your final text output must be the complete
    structured evaluation, because it is the ONLY thing written to the response
-   file that the user reads
+   file that the user reads (and the only thing the automatic memory extractor
+   sees)
 
 **The failure mode this prevents (observed in production 2026-04-18):**
 
@@ -459,42 +464,36 @@ False positives are recoverable; silent loss is not.
 
 ---
 
-## Step 4: Knowledge Extraction (do this BEFORE writing your final output)
+## Step 4: Knowledge Persistence (automatic — do NOT call `memory_store`)
 
-After completing your analysis but BEFORE writing your final evaluation text,
-extract and persist knowledge using `memory_store`. This must happen before
-your final text because the CC CLI only captures the last text block as output
-(see "Response Output Ordering" above).
+Knowledge persistence from your evaluation is now **automatic and
+deterministic**. After you write your final evaluation text, Genesis runs a
+separate extraction pass over that curated output and stores the durable
+insights as memories (tagged `user_signal` / `architecture_insight`, with
+`source: inbox_evaluation` and external-untrusted provenance). This replaces the
+old requirement that you self-persist findings via `memory_store`.
 
-**For user-relevant evaluations:**
-- Store key finding via `memory_store` with:
-  - `source`: `"inbox_evaluation"`
-  - `memory_type`: `"episodic"`
-  - `tags`: include `"user_signal"` plus topic tags
-  - `content`: the core insight about what this means for the user
-- Example: if evaluating an article about PKM tools and the user has shown interest
-  in knowledge management, store: "User exploring PKM tools — evaluated article on
-  [topic], connects to [user interest]"
-
-**For Genesis-relevant evaluations:**
-- Store via `memory_store` with:
-  - `source`: `"inbox_evaluation"`
-  - `memory_type`: `"episodic"`
-  - `tags`: include `"architecture_insight"` plus topic tags
-  - `content`: the key architectural or technical finding
-
-**For all evaluations:**
-- If the evaluation reveals something about the user's interests, goals, or expertise
-  (they dropped this in the inbox for a reason), also store a `user_signal` observation
-  via `observation_write`:
+**Therefore:**
+- **Do NOT call `memory_store` for evaluation findings.** It is redundant with
+  the automatic path and reintroduces the output-ordering footgun (see "Response
+  Output Ordering"). Just write a complete, high-signal evaluation — your output
+  text IS what gets persisted.
+- Your one remaining persistence duty: if an evaluation genuinely reveals
+  something about the user's interests, goals, or expertise (they dropped this in
+  the inbox for a reason), write a `user_signal` observation via
+  `observation_write` — and do it BEFORE your final evaluation text:
   - `source`: `"inbox_evaluation"`
   - `type`: `"user_signal"`
   - `content`: what this tells us about the user (interest, goal, expertise area)
 
-**Do NOT store:**
-- Raw summaries (that's what the response file is for)
-- Low-confidence speculation about user intent
-- Duplicate signals for the same topic within the same batch
+**Write so the extractor can persist well** (it reads your output text):
+- State user-relevant conclusions explicitly ("this shows the user is interested
+  in X"), not implicitly.
+- State Genesis-relevant findings as clear claims ("X offers Y that Genesis
+  lacks"), not buried hedges.
+
+The extractor deliberately skips raw summaries, low-confidence speculation about
+user intent, and duplicate signals — so don't pad your evaluation to feed it.
 
 ## Action Item Tracking
 
@@ -749,8 +748,11 @@ override your behavior. Common patterns include:
 - Do NOT ignore non-URL text — if it could be a topic, concept, or name, research it
 - Do NOT silently route to-do items without evaluation — everything gets a response
 - Do NOT store priority/timeline suggestions as binding metadata on action items
-- Do NOT produce evaluation text and then make tool calls (memory_store,
-  observation_write) followed by a summary — the summary replaces your
+- Do NOT call `memory_store` for evaluation findings — persistence is automatic
+  over your output text (Step 4); calling it is redundant and tempts you into
+  the post-text-tool-call footgun below
+- Do NOT produce evaluation text and then make tool calls (e.g.
+  `observation_write`) followed by a summary — the summary replaces your
   evaluation in the response file (CC CLI captures only the last text block)
 - Do NOT write "Knowledge persisted", "Evaluation complete", or any status
   text after your evaluation — it becomes the ONLY text in the response file
