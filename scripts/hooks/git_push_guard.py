@@ -400,8 +400,8 @@ def _push_is_force(argv: list[str]) -> bool:
     Argv comes from ``shell_parse`` (quote-stripped), so a quoted ``'-f'``
     counts and a branch/refspec name that merely contains ``-f`` (a bare
     positional) does not. Catches both the flag forms — ``--force`` /
-    ``--force-with-lease`` / ``--force-if-includes`` / ``-f`` / bundled
-    ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
+    ``--force-with-lease`` / ``--force-if-includes`` / ``--mirror`` / ``-f`` /
+    bundled ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
     which git treats as ``--force`` for that ref. A short cluster stops at
     ``o`` and the value token of ``-o`` / ``--push-option`` / ``--repo`` /
     ``--exec`` / ``--receive-pack`` is skipped, so a push-option value that
@@ -415,6 +415,11 @@ def _push_is_force(argv: list[str]) -> bool:
             i += 2  # skip the flag and its value token
             continue
         if tok == "--force" or tok.startswith("--force-"):
+            return True
+        if tok == "--mirror":
+            # --mirror force-updates EVERY ref and deletes remote refs that are
+            # absent locally — an unconditional destructive push, never a plain
+            # one, so it must hard-block rather than reach an approvable prompt.
             return True
         if tok.startswith("+"):
             return True  # +<refspec> is git shorthand for --force on that ref
@@ -465,6 +470,20 @@ def main() -> int:
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+
+        # Each push / PR-create is a SEPARATE external-publish action needing its
+        # own approval. A single Bash command carrying more than one would
+        # collapse into ONE ask (mentioning only the first), so approving that
+        # prompt would run every publish behind it. Reject the compound and
+        # require each to be its own separately-approved tool call.
+        if len(push_segs) + len(create_segs) > 1:
+            print(
+                "BLOCKED: multiple publish operations (git push / gh pr create) "
+                "in one command would share a single approval prompt. Run each "
+                "as its own command so each is approved separately.",
+                file=sys.stderr,
+            )
+            return 2
 
         # An interactive push / PR-create defers to a native approve/deny
         # dialog at the END of main(), so every hard-block below (merge-into-

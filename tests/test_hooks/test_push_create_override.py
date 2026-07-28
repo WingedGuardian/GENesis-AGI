@@ -196,6 +196,49 @@ def test_push_option_value_with_plus_not_mistaken_for_force():
     assert _decision(res) == "ask"
 
 
+def test_force_push_mirror_blocked():
+    """--mirror force-updates all refs and deletes remote refs → hard-block."""
+    res = _run("git push --mirror origin")
+    assert res.returncode == 2
+    assert _decision(res) is None
+
+
+def test_force_push_mirror_blocked_even_dispatched():
+    res = _run("git push --mirror origin", dispatched=True)
+    assert res.returncode == 2
+
+
+# ── compound with >1 gated publish op → hard-block (each needs its own approval) ──
+
+
+def test_push_and_pr_create_compound_blocked():
+    """push && gh pr create must not share ONE approval prompt — approving the
+    push's ask would also create the PR (Codex P1) → hard-block, require split."""
+    res = _run("git push origin feat && gh pr create --title x --body y")
+    assert res.returncode == 2
+    assert _decision(res) is None
+    assert "separate" in res.stderr
+
+
+def test_two_pushes_compound_blocked():
+    res = _run("git push origin a && git push origin b")
+    assert res.returncode == 2
+    assert _decision(res) is None
+
+
+def test_two_pr_creates_compound_blocked():
+    res = _run("gh pr create --title a --body b && gh pr create --title c --body d")
+    assert res.returncode == 2
+    assert _decision(res) is None
+
+
+def test_single_push_with_nongated_op_still_asks():
+    """A single push next to a non-publish command still just asks (gated == 1)."""
+    res = _run("git push origin feat && ls -la")
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
 # ── the retired `# review-override` token cannot self-approve push/create ──
 
 
