@@ -1523,14 +1523,41 @@ class EgoSession:
         if not proposals:
             return proposals
 
-        # Fetch recent history for zombie/duplicate detection
+        # Fetch recent history for zombie/duplicate detection.
+        #
+        # When blind drafting is active (reconcile mode != "off") the ego no
+        # longer sees the pending board while drafting, so the realist becomes
+        # the SOLE enforcing deduplicator. The legacy 2-day/LIMIT-20 GLOBAL
+        # window would let a pending item older than two days (or displaced by
+        # newer rows) slip past Rule #2 and be re-inserted (Codex P1). In that
+        # mode widen to the FULL ego-scoped board — all pending + approved, any
+        # age (the dedup targets that matter) — plus this ego's recently-resolved
+        # rows (7d, the zombie signal), board-first and bounded. In "off" mode
+        # keep the exact legacy query (pre-PR-5 behavior).
+        from genesis.ego import reconcile_config
+
+        blind = reconcile_config.effective_mode() != "off"
         try:
-            cursor = await self._db.execute(
-                "SELECT action_type, content, status, created_at "
-                "FROM ego_proposals "
-                "WHERE created_at >= datetime('now', '-2 days') "
-                "ORDER BY created_at DESC LIMIT 20",
-            )
+            if blind:
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, created_at "
+                    "FROM ego_proposals "
+                    "WHERE (ego_source = ? OR ego_source IS NULL) "
+                    "AND (status IN ('pending', 'approved') "
+                    "     OR created_at >= datetime('now', '-7 days')) "
+                    "ORDER BY "
+                    "  CASE WHEN status IN ('pending', 'approved') THEN 0 ELSE 1 END, "
+                    "  created_at DESC "
+                    "LIMIT 35",
+                    (self._source_tag,),
+                )
+            else:
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, created_at "
+                    "FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-2 days') "
+                    "ORDER BY created_at DESC LIMIT 20",
+                )
             recent = [dict(r) for r in await cursor.fetchall()]
         except Exception:
             logger.warning("Realist: failed to fetch history, passing through")
@@ -1564,6 +1591,7 @@ class EgoSession:
             recent,
             ego_source=self._source_tag,
             active_directives=active_directives,
+            widened=blind,
         )
 
         try:
@@ -2845,6 +2873,7 @@ def _build_realist_prompt(
     *,
     ego_source: str = "",
     active_directives: list[dict] | None = None,
+    widened: bool = False,
 ) -> str:
     """Build the realist evaluation prompt.
 
@@ -2977,6 +3006,16 @@ monitoring, or internal maintenance.
             "apply.\n"
         )
 
+    # Header describes the ACTUAL contents of the history table above, which
+    # widens to the full board when blind drafting is active (see
+    # _filter_proposals). Keeping it honest matters — the realist is told it
+    # "only knows what is in the history table" (Rule #6).
+    history_header = (
+        "## Full Pending Board + Recently Resolved (7d)"
+        if widened
+        else "## Recent Proposal History (48h)"
+    )
+
     return f"""You are the Realist — a quality gate for ego proposals. Evaluate each
 proposal and return a JSON array of verdicts.
 {ego_section}{directive_section}
@@ -3011,7 +3050,7 @@ proposal and return a JSON array of verdicts.
    now — circumstances change. Judge the proposal on its own merits,
    not on inferred system state.
 {domain_rule}{operate_rule}
-## Recent Proposal History (48h)
+{history_header}
 {chr(10).join(history_lines)}
 
 ## New Proposals to Evaluate
