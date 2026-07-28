@@ -376,6 +376,80 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
     return False, ""
 
 
+def _is_dispatched() -> bool:
+    """True in a Genesis-dispatched (autonomous/headless) CC session.
+
+    ``cc/invoker.py`` stamps ``GENESIS_CC_SESSION=1`` on every dispatched
+    session; a user-launched foreground session does not carry it. Dispatched
+    sessions have no human to answer an ``ask`` prompt and never push via the CC
+    Bash tool in normal operation — the executor pushes from the server
+    subprocess, scope-gated (``autonomy/executor``) — so they are hard-denied
+    rather than prompted.
+    """
+    return os.environ.get("GENESIS_CC_SESSION") == "1"
+
+
+# git push flags that consume the NEXT token as their value — so a value that
+# happens to start with '+' or contain 'f' is not misread as a force.
+_PUSH_VALUE_FLAGS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
+
+
+def _push_is_force(argv: list[str]) -> bool:
+    """Whether a parsed ``git push`` argv performs a force push.
+
+    Argv comes from ``shell_parse`` (quote-stripped), so a quoted ``'-f'``
+    counts and a branch/refspec name that merely contains ``-f`` (a bare
+    positional) does not. Catches both the flag forms — ``--force`` /
+    ``--force-with-lease`` / ``--force-if-includes`` / ``-f`` / bundled
+    ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
+    which git treats as ``--force`` for that ref. A short cluster stops at
+    ``o`` and the value token of ``-o`` / ``--push-option`` / ``--repo`` /
+    ``--exec`` / ``--receive-pack`` is skipped, so a push-option value that
+    starts with ``+`` or contains ``f`` (e.g. ``-oci.skip``) is not mistaken
+    for a force.
+    """
+    i = 1  # skip argv[0] == "git"
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _PUSH_VALUE_FLAGS:
+            i += 2  # skip the flag and its value token
+            continue
+        if tok == "--force" or tok.startswith("--force-"):
+            return True
+        if tok.startswith("+"):
+            return True  # +<refspec> is git shorthand for --force on that ref
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+            for ch in tok[1:]:
+                if ch == "o":  # -oVALUE glued push-option — rest is its value
+                    break
+                if ch == "f":
+                    return True
+        i += 1
+    return False
+
+
+def _ask(reason: str) -> int:
+    """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
+
+    Prints the hook JSON to stdout and returns 0; Claude Code shows the user a
+    permission prompt and runs the tool only on explicit approval — a gate the
+    agent cannot self-satisfy. Verified to render in a wrapped child session
+    2026-07-27.
+    """
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    return 0
+
+
 def main() -> int:
     try:
         cmd = field(read_payload(), "command")
@@ -392,26 +466,45 @@ def main() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
+        # An interactive push / PR-create defers to a native approve/deny
+        # dialog at the END of main(), so every hard-block below (merge-into-
+        # main, the pr-merge gates, sqlite, --no-verify) still takes precedence
+        # — a compound `git push && git commit --no-verify` blocks, never asks.
+        ask_reason: str | None = None
+
         # ── git push (any branch) ──────────────────────────────────
+        # Interactive → the user approves in a dialog only they can satisfy.
+        # Dispatched/autonomous → hard-denied (no human to ask; real autonomous
+        # delivery goes through the scope-gated server path, not the CC Bash
+        # tool). The old `# review-override` token is dropped for push: the
+        # dialog replaces it, so the agent can no longer self-approve.
         if push_segs:
-            if all(s.override for s in push_segs):
+            # Force push is destructive — hard-block in EVERY session (never a
+            # mere ask). argv-based (via shell_parse) so a quoted `'-f'` or a
+            # `--force-with-lease` cannot evade it into a generic approval prompt.
+            if any(_push_is_force(s.argv) for s in push_segs):
                 print(
-                    "NOTE: git push override honored — user approved in-session.",
+                    "BLOCKED: Force push is not allowed — open a PR instead.",
                     file=sys.stderr,
                 )
-            else:
-                _remote, branch = _get_push_remote_and_branch(cmd)
+                return 2
+            _remote, branch = _get_push_remote_and_branch(cmd)
+            if _is_dispatched():
                 print(
                     f"BLOCKED: git push requires user approval before "
                     f"publishing code externally (target: {branch or 'default'}).",
                     file=sys.stderr,
                 )
                 print(
-                    "Ask the user 'Ready to push?'; once approved, append a "
-                    "trailing '  # review-override' comment to proceed.",
+                    "Autonomous/dispatched sessions cannot push directly — "
+                    "delivery goes through the scope-gated server path.",
                     file=sys.stderr,
                 )
                 return 2
+            ask_reason = (
+                f"git push needs your approval before publishing externally "
+                f"(target: {branch or 'default'})."
+            )
 
         # ── git merge into main ─────────────────────────────────────
         if merge_git_segs:
@@ -429,22 +522,18 @@ def main() -> int:
 
         # ── gh pr create ───────────────────────────────────────────
         if create_segs:
-            if all(s.override for s in create_segs):
-                print(
-                    "NOTE: gh pr create override honored — user approved in-session.",
-                    file=sys.stderr,
-                )
-            else:
+            if _is_dispatched():
                 print(
                     "BLOCKED: Creating a PR requires user approval before publishing externally.",
                     file=sys.stderr,
                 )
                 print(
-                    "Ask the user 'Ready to create the PR?'; once approved, "
-                    "append a trailing '  # review-override' comment to proceed.",
+                    "Autonomous/dispatched sessions cannot open PRs directly.",
                     file=sys.stderr,
                 )
                 return 2
+            if ask_reason is None:
+                ask_reason = "gh pr create needs your approval before publishing externally."
 
         # ── gh pr merge ────────────────────────────────────────────
         if merge_pr_segs:
@@ -565,6 +654,13 @@ def main() -> int:
                 "Have you received explicit user approval?",
                 file=sys.stderr,
             )
+
+        # ── Interactive push / PR-create approval prompt (deferred) ──
+        # Reached only if no hard-block above returned. Dispatched sessions
+        # were already denied inline; here, an interactive human session gets a
+        # native approve/deny dialog for its push / PR-create.
+        if ask_reason is not None:
+            return _ask(ask_reason)
 
     except Exception:
         pass  # Fail-open on any error — never block legitimate work

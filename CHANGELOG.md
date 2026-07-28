@@ -72,6 +72,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **`git push` and `gh pr create` in an interactive Claude Code session now ask
+  for your approval instead of hard-stopping.** These safety hooks used to block
+  the command outright with no in-session way through; now Claude Code shows you
+  a native approve/deny prompt you confirm with one keystroke — a gate the agent
+  cannot self-satisfy. Autonomous/background Genesis sessions stay blocked from
+  pushing directly (their real delivery path is separately gated). Branch names
+  that merely contain `-f` (e.g. `fix/…-false-positives`) are no longer mistaken
+  for a force-push and blocked.
 - **Genesis now keeps its own internal event log from growing without bound.**
   The observability event stream — the record of everything Genesis notices and
   does — was the last high-volume table with no cleanup, growing steadily on

@@ -579,6 +579,27 @@ class TestBashHookGitPushForce:
         )
         assert result.returncode == 0
 
+    def test_git_push_branch_name_with_dash_f_allowed(self, bash_hook_command: str) -> None:
+        """A branch name containing '-f' is NOT a force flag -> allowed.
+
+        Regression: the old pattern *"-f"* matched the '-f' inside a branch
+        name like 'fix/...-false-positives'; requiring a space before the flag
+        (*" -f"*) fixes the false-positive without letting a real -f through.
+        """
+        result = run_hook(
+            bash_hook_command,
+            {"command": "git push origin fix/guard-false-positives"},
+        )
+        assert result.returncode == 0
+
+    def test_git_push_branch_add_foo_allowed(self, bash_hook_command: str) -> None:
+        """'-f' inside 'add-foo' must not trip the force gate -> allowed."""
+        result = run_hook(
+            bash_hook_command,
+            {"command": "git push origin feature/add-foo"},
+        )
+        assert result.returncode == 0
+
     def test_git_push_u_allowed(self, bash_hook_command: str) -> None:
         """git push -u origin feature -> allowed (-u is not -f)."""
         result = run_hook(
