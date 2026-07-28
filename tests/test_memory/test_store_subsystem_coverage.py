@@ -64,6 +64,7 @@ USER_CONTEXT_ALLOWLIST: dict[str, str] = {
     # NOTE: s2s_session.py::close no longer writes memory — voice conversations
     # now land as extractable transcripts (W0.5), so there is no .store() call
     # here to classify.
+    "channels/voice/genesis_bridge.py::_remember": "user-spoken fact via the voice remember tool (first-party user content; must stay in recall)",
     "eval/longmemeval/ingest.py::ingest_haystack": "LongMemEval benchmark haystack ingest into an EPHEMERAL throwaway store "
     "(first_party user-history content; never touches prod; not a subsystem)",
     "knowledge/ingest_upload.py::_store_as_is": "user-uploaded knowledge_base content (external-world, recallable)",

@@ -34,8 +34,8 @@ except ImportError:
 
 from genesis.channels.voice import config as voice_config
 from genesis.channels.voice.genesis_bridge import (
-    TOOL_DECLARATIONS,
     GenesisBridge,
+    get_tool_declarations,
 )
 
 if TYPE_CHECKING:
@@ -156,7 +156,7 @@ class S2SSessionManager:
         await conn.session.update(session={
             "type": "realtime",
             "instructions": system_prompt,
-            "tools": TOOL_DECLARATIONS,
+            "tools": get_tool_declarations(),
         })
 
         # Wait for session.updated confirmation (timeout: 10s)

@@ -366,6 +366,59 @@ async def test_drain_ages_out_perpetually_stuck_row(config, db):
 
 
 @pytest.mark.asyncio
+async def test_drain_preserves_future_scheduled_reminder_at_due_time(config, db):
+    """A reminder scheduled far ahead (enqueued 30h ago, deliver_after just now)
+    must NOT be aged out when it finally becomes due — the retry cap ages from
+    deliver_after, not created_at. Before the fix, "remind me next week" was
+    silently dropped at delivery time. (Voice remind, PR #1236.)"""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    created = (now - timedelta(hours=30)).isoformat()  # enqueued 30h ago
+    due = (now - timedelta(minutes=1)).isoformat()  # became due a minute ago
+    await db.execute(
+        "INSERT INTO pending_outreach (id, message, category, channel, urgency, "
+        "created_at, deliver_after, delivered) VALUES ('sched1', 'Reminder: call', "
+        "'notification', 'telegram', 'high', ?, ?, 0)",
+        (created, due),
+    )
+    await db.commit()
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit_urgent.assert_called_once()  # delivered, NOT aged out
+    assert await _remaining(db) == []  # cleared as delivered (sent)
+
+
+@pytest.mark.asyncio
+async def test_drain_ages_out_row_stuck_past_its_deliver_after(config, db):
+    """The retry cap still fires for a genuinely stuck row: due 26h ago and
+    never delivered → dropped. Confirms the deliver_after age basis did not
+    disable the cap for overdue rows."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    created = (now - timedelta(hours=30)).isoformat()
+    due = (now - timedelta(hours=26)).isoformat()  # overdue 26h, still stuck
+    await db.execute(
+        "INSERT INTO pending_outreach (id, message, category, channel, urgency, "
+        "created_at, deliver_after, delivered) VALUES ('sched2', 'x', "
+        "'notification', 'telegram', 'low', ?, ?, 0)",
+        (created, due),
+    )
+    await db.commit()
+    pipeline = _drain_pipeline(OutreachStatus.REJECTED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    pipeline.submit.assert_not_called()  # aged out
+    assert await _remaining(db) == []  # dropped
+
+
+@pytest.mark.asyncio
 async def test_drain_null_id_row_is_cleared_not_looped(config, db):
     """A legacy NULL-id row must be cleared via the rowid fallback, not
     re-drained forever. Before the fix, mark_delivered(WHERE id=NULL) matched

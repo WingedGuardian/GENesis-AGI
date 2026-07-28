@@ -1,0 +1,21 @@
+# Voice ACT — the s2s voice model's remember/remind tools. Read live per voice
+# tool call (get_tool_declarations + the handlers), so settings_update(
+# "voice_act", {...}) or a hand edit here takes effect on the next voice tool
+# call — no restart.
+#
+# Master switch: false forces off (tools hidden from the model + handlers refuse).
+enabled: true
+
+# Mode: off | live
+#   off  — remember/remind are NOT offered to the s2s model and their handlers
+#          refuse; ask_genesis recall is unaffected. This is the default: a fresh
+#          autonomous memory-write + owner-reminder surface ships dark and is
+#          armed to live only after live E2E (shadow-first, like
+#          session_ledger_shadow / skill_evolution_gate). An invalid value here
+#          also degrades to off (a write surface never acts on bad config).
+#   live — the s2s model may call remember(fact) -> episodic memory and
+#          remind(text, when) -> a scheduled reminder delivered to the owner.
+#
+# Env kill switch (separate lever): GENESIS_VOICE_ACT_DISABLED=1 forces off.
+# ("off" is quoted so YAML does not parse it as the boolean false.)
+mode: "off"
