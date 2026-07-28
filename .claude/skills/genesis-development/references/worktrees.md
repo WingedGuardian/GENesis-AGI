@@ -102,10 +102,12 @@ over.
   tool). Force push (`--force` / `--force-with-lease` / `-f` / `+refspec` /
   `--mirror`) is **hard-blocked** in every session. Multiple pushes in one
   command are blocked — each push needs its own approval.
-- `gh pr create` — **NOT gated**. Opening a PR is a review request on
-  already-pushed code, not a code-publish (the push is what's gated), so it
-  needs no separate prompt; a `git push && gh pr create` prompts once — for the
-  push — and the PR-create rides along.
+- `gh pr create` — **un-gated when its branch is already on the remote** (then
+  it's just a review request on pushed code), so a `git push && gh pr create`
+  prompts once — for the push — and the PR-create rides along. The exception:
+  gh will *push* (and can fork) a branch whose HEAD is not yet on the remote, so
+  a create from an **unpushed branch** is gated like a push (interactive → ask,
+  dispatched → deny). Verified via local remote-tracking refs, fail-safe.
 - `git merge` into main/master — **hard-blocked** (use the PR workflow).
 - `gh pr merge` without `--admin`, or with unresolved review findings —
   **hard-blocked** (a `# review-override` trailing comment acknowledges

@@ -83,9 +83,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   instead of hard-stopping.** This safety hook used to block the command outright
   with no in-session way through; now Claude Code shows you a native approve/deny
   prompt you confirm with one keystroke — a gate the agent cannot self-satisfy.
-  `gh pr create` is no longer prompted separately (opening a PR is a review
-  request on already-pushed code, not a code-publish — so `git push && gh pr
-  create` asks once, for the push). Autonomous/background Genesis sessions stay
+  `gh pr create` is not prompted separately when its branch is already pushed
+  (opening a PR is then just a review request — so `git push && gh pr create`
+  asks once, for the push); a create from an unpushed branch, which gh would
+  push itself, is still gated. Autonomous/background Genesis sessions stay
   blocked from pushing directly (their real delivery path is separately gated).
   Force pushes stay hard-blocked; branch names that merely contain `-f` (e.g.
   `fix/…-false-positives`) are no longer mistaken for a force-push.

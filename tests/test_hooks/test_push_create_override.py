@@ -59,31 +59,36 @@ def _decision(res: subprocess.CompletedProcess) -> str | None:
 # ── gh pr create ────────────────────────────────────────────────────
 
 
-def test_pr_create_not_gated_interactive():
-    """gh pr create is NOT gated — opening a PR on already-pushed code is a
-    review request, not a code-publish (the push is what's gated). No prompt."""
-    res = _run("gh pr create --title x --body y")
+# gh pr create is UN-gated when its head branch is already on the remote (then
+# it's just a review request on pushed code). That un-gated path is git-state
+# dependent, so it is covered deterministically by the _pr_create_would_publish
+# unit tests in test_merge_review_gate.py. Here we test the GATED path: an
+# --head not on the remote (origin/<nonexistent> never exists) which gh would
+# push — that must be gated like a push.
+_UNPUSHED = "zzz-unpushed-branch-xyz"
+
+
+def test_pr_create_unpushed_branch_asks_interactive():
+    res = _run(f"gh pr create --head {_UNPUSHED} --title x --body y")
     assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_pr_create_unpushed_branch_denied_dispatched():
+    res = _run(f"gh pr create --head {_UNPUSHED} --title x --body y", dispatched=True)
+    assert res.returncode == 2
     assert _decision(res) is None
 
 
-def test_pr_create_not_gated_dispatched():
-    """Un-gated in every session: a dispatched session cannot push code (that is
-    denied), so a PR-create on already-pushed code needs no separate gate."""
-    res = _run("gh pr create --title x --body y", dispatched=True)
-    assert res.returncode == 0, res.stderr
-    assert _decision(res) is None
+def test_pr_create_unpushed_global_flag_still_detected():
+    """A gh global flag before `pr` must not evade detection of the create."""
+    res = _run(f"gh --repo o/r pr create --head {_UNPUSHED} --title x --body y", dispatched=True)
+    assert res.returncode == 2
 
 
 def test_pr_create_mention_in_string_not_tripped():
     res = _run('echo "run gh pr create later"')
     assert res.returncode == 0
-    assert _decision(res) is None
-
-
-def test_pr_create_with_global_flag_not_gated():
-    res = _run("gh --repo o/r pr create --title x --body y")
-    assert res.returncode == 0, res.stderr
     assert _decision(res) is None
 
 
@@ -232,12 +237,6 @@ def test_two_pushes_compound_blocked():
     assert "separate" in res.stderr
 
 
-def test_two_pr_creates_not_gated():
-    res = _run("gh pr create --title a --body b && gh pr create --title c --body d")
-    assert res.returncode == 0, res.stderr
-    assert _decision(res) is None
-
-
 def test_single_push_with_nongated_op_still_asks():
     """A single push next to a non-publish command still just asks (gated == 1)."""
     res = _run("git push origin feat && ls -la")
@@ -263,11 +262,14 @@ def test_push_override_token_cannot_self_approve_dispatched():
     assert _decision(res) is None
 
 
-def test_pr_create_not_gated_with_token():
-    """gh pr create is un-gated regardless of any trailing token — no prompt."""
-    res = _run("gh pr create --title x --body-file /tmp/b.md  # review-override")
+def test_pr_create_token_does_not_ungate_unpushed():
+    """The retired token cannot un-gate an unpushed create either — it still
+    gates (gh would push) and asks, regardless of any trailing token."""
+    res = _run(
+        f"gh pr create --head {_UNPUSHED} --title x --body-file /tmp/b.md  # review-override"
+    )
     assert res.returncode == 0, res.stderr
-    assert _decision(res) is None
+    assert _decision(res) == "ask"
 
 
 # ── shell-parse bypass-hardening preserved (dispatched → still hard-denied) ──
