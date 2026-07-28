@@ -369,15 +369,33 @@ is more valuable than a thorough whitepaper on an irrelevant domain.
 
 Additionally, for Genesis-relevant items, assess Architecture Impact:
 - **validates** — confirms existing design (no action needed)
-- **extends** — compatible addition (queue for appropriate phase)
+- **extends** — compatible addition; still defaults to V4 (do now) unless
+  deliberately sequenced behind named work (do NOT read "extends" as license to
+  soft-defer)
 - **challenges** — rethink needed (flag for discussion)
 - **irrelevant** — note and move on
 
 And assign Scope Tags:
-- **V4** — current active scope (do it now)
-- **V5** — next version scope (defer)
-- **Future** — beyond V5
-- **Never** — doesn't fit Genesis philosophy, explicitly reject with reason
+- **V4** — do it now. This is the DEFAULT whenever the item is usable at all.
+- **V5** — deliberately sequenced behind specific, NAMED current work (say which).
+  Not a synonym for "later" or "defer" — if you can't name what it's sequenced
+  behind, it's V4.
+- **Future** — blocked on a NAMED missing prerequisite (state the prerequisite).
+- **Never** — conflicts with Genesis's philosophy or is technically unsound, with
+  an articulable reason.
+
+**Disposition posture (read before you rate):** Genesis's scope is everything
+digital. Default toward adopt/adapt and V4 — an item that is usable at all should
+be acted on, not parked. The following are NOT valid grounds for WATCH / IGNORE /
+Never / V5:
+- "no current use case" / "we don't have that use case today"
+- "out of our wheelhouse" / "doesn't fit our current scope"
+- "interesting but not obviously valuable"
+"Genesis already has a weaker version of this" is a reason to UPGRADE, never to
+dismiss — do the upgrade comparison (Rigor-gap / Overlap table) and rate ADOPT or
+ADAPT accordingly. **WATCH requires a named trigger** — the specific condition or
+signal that would re-activate it. A WATCH with no trigger is a disguised IGNORE;
+write it as an honest IGNORE (with a reason) instead.
 
 **If the skill file cannot be read**, apply this fallback framework:
 Evaluate through four lenses: (1) How It Helps Genesis directly — applicability,
@@ -387,7 +405,9 @@ future version ideas, creative applications. (4) What to Learn — engineering p
 competitive positioning, design principles. Then classify architecture impact,
 assign a scope tag, and produce the Recommendation YAML block (see output format
 in Step 5). If Genesis has a comparable capability, also produce the Overlap
-Comparison table.
+Comparison table. The disposition posture above still applies: default toward
+adopt/adapt and V4; "no current use case" / "out of our wheelhouse" are not valid
+grounds to park an item; a weaker existing version means upgrade, not dismiss.
 
 ### Tool/Product Scoring Rubric (for concrete external tools, products, libraries, repos)
 
@@ -551,10 +571,10 @@ lens breakdown.}
 For **Genesis-relevant** items, use this YAML block:
 
 ```yaml
-action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE
+action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE (default toward ADOPT/ADAPT; WATCH needs a named trigger)
 next_step: "One concrete sentence — what specifically to do next"
 effort: Small              # Trivial | Small | Medium | Large
-scope: V4                  # V4 (current) | V5 (next) | Future | Never
+scope: V4                  # V4 (do now — DEFAULT) | V5 (sequenced behind named work) | Future (named blocker) | Never (philosophy conflict)
 confidence: high           # low | medium | high
 architecture_impact: extends  # validates | extends | challenges | irrelevant
 # Optional — ONLY for concrete external tools/products/repos (see Step 3 rubric):
@@ -571,7 +591,7 @@ verdict fields:
 action: BUILD              # capability-build items ONLY (never elsewhere)
 next_step: "One concrete sentence — what the build produces"
 effort: Small              # Trivial | Small | Medium | Large
-scope: V4                  # V4 | V5 | Future | Never
+scope: V4                  # V4 (do now — DEFAULT) | V5 (sequenced behind named work) | Future (named blocker) | Never (philosophy conflict)
 confidence: high           # low | medium | high
 architecture_impact: extends
 verdict: build             # build | dont_build | needs_discussion
