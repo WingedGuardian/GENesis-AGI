@@ -3,6 +3,8 @@ reaffirm_proposal, withdraw-with-evidence. Wall-clock-independent."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 import pytest
 
@@ -177,3 +179,34 @@ async def test_withdraw_coalesce_preserves_existing_note(db):
     await db.commit()
     await ego_crud.withdraw_proposal(db, "p1", user_response=None)
     assert (await _row(db))["user_response"] == "earlier note"
+
+
+# ── retention prune ──────────────────────────────────────────────────────
+
+
+async def test_prune_deletes_old_keeps_recent(db):
+    now = datetime.now(UTC)
+    old = (now - timedelta(days=60)).isoformat()
+    recent = (now - timedelta(days=10)).isoformat()
+    for rid, ts in (("r_old", old), ("r_recent", recent)):
+        await db.execute(
+            "INSERT INTO ego_proposal_revisions "
+            "(id, proposal_id, revision_num, revised_at) VALUES (?, ?, ?, ?)",
+            (rid, "p1", 1, ts),
+        )
+    await db.commit()
+    deleted = await ego_crud.prune_proposal_revisions(
+        db, older_than_days=45, now=now.isoformat()
+    )
+    assert deleted == 1
+    cur = await db.execute("SELECT id FROM ego_proposal_revisions")
+    assert [r["id"] for r in await cur.fetchall()] == ["r_recent"]
+
+
+async def test_prune_noop_when_table_absent():
+    async with aiosqlite.connect(":memory:") as conn:
+        conn.row_factory = aiosqlite.Row
+        deleted = await ego_crud.prune_proposal_revisions(
+            conn, older_than_days=45, now=datetime.now(UTC).isoformat()
+        )
+        assert deleted == 0

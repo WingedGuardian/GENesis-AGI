@@ -738,6 +738,33 @@ async def revise_proposal(
     return new_revision
 
 
+async def prune_proposal_revisions(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 45,
+    now: str,
+) -> int:
+    """Delete ego_proposal_revisions audit rows older than *older_than_days*
+    relative to ISO ``now``. Retention for the unbounded revision audit table
+    (the reconcile stage is its first writer, PR-5), wired into disk_hygiene.sh.
+    ``now`` is injected (never wall-clock here) so the cutover is deterministic
+    and testable. No-ops if the table is absent; never creates it. Returns rows
+    deleted.
+    """
+    cursor = await db.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='ego_proposal_revisions'"
+    )
+    if await cursor.fetchone() is None:
+        return 0
+    cutoff = (datetime.fromisoformat(now) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM ego_proposal_revisions WHERE revised_at < ?", (cutoff,)
+    )
+    await db.commit()
+    return cursor.rowcount or 0
+
+
 async def execute_proposal(
     db: aiosqlite.Connection,
     id: str,
