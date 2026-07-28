@@ -616,6 +616,54 @@ class TestS2SSessionManager:
         assert session.connection is None  # Not connected yet
         assert session.turn_count == 0
 
+    async def test_connect_uses_gated_tool_declarations(self, monkeypatch):
+        """The in-process S2S session must configure the model with the
+        mode-gated get_tool_declarations(), not the static base list — else
+        voice_act=live never reaches the native Wyoming/GPT-Realtime path.
+        (Codex P1, PR #1236.)"""
+        from genesis.channels.voice import s2s_session as s2s_mod
+
+        sentinel = [{"type": "function", "name": "remember"}]
+        monkeypatch.setattr(s2s_mod, "get_tool_declarations", lambda: sentinel)
+
+        update = AsyncMock()
+
+        class _Evt:
+            type = "session.updated"
+
+        class _Conn:
+            def __init__(self):
+                self.session = MagicMock(update=update)
+
+            def __aiter__(self):
+                async def _gen():
+                    yield _Evt()
+
+                return _gen()
+
+        conn = _Conn()
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        client = MagicMock()
+        client.realtime.connect = MagicMock(return_value=_CM())
+
+        bridge = MagicMock()
+        bridge.get_system_prompt = MagicMock(return_value="SYS")
+        mgr = s2s_mod.S2SSessionManager(bridge=bridge)
+        mgr._client = client
+        session = s2s_mod.S2SSession(session_id="s", satellite_id="sat")
+
+        await mgr.connect(session)
+
+        update.assert_awaited_once()
+        assert update.await_args.kwargs["session"]["tools"] is sentinel
+
     async def test_reuse_session(self):
         from genesis.channels.voice.s2s_session import S2SSessionManager
 
@@ -1225,6 +1273,12 @@ class TestVoiceActConfig:
 
     def test_enabled_false_forces_off(self, monkeypatch, tmp_path):
         cfg = self._pin(monkeypatch, tmp_path, "mode: live\nenabled: false\n")
+        assert cfg.effective_mode() == "off"
+
+    def test_non_boolean_enabled_fails_closed(self, monkeypatch, tmp_path):
+        # A hand-edited / overlay non-boolean enabled (e.g. the YAML string
+        # "false", which is truthy) must NOT leave a write surface on.
+        cfg = self._pin(monkeypatch, tmp_path, 'mode: live\nenabled: "false"\n')
         assert cfg.effective_mode() == "off"
 
     def test_shipped_default_config_is_off(self, monkeypatch):

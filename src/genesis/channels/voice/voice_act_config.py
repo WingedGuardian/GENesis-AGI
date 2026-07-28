@@ -87,7 +87,11 @@ def effective_mode() -> str:
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return "off"
     cfg = load_config()
-    if not cfg.get("enabled", True):
+    enabled = cfg.get("enabled", True)
+    if not isinstance(enabled, bool) or not enabled:
+        # Fail closed: a hand-edited / overlay non-boolean `enabled` (e.g. the
+        # YAML string "false", which is truthy) must never leave a write surface
+        # on. Only a real boolean True enables.
         return "off"
     mode = cfg.get("mode")
     if mode is False:
