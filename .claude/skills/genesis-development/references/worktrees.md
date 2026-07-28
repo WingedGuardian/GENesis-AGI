@@ -93,10 +93,20 @@ over.
 
 ## Push/Merge Enforcement
 
-`git_push_guard.py` (PreToolUse hook) blocks:
-- `git push` to main/master (any variation — bare, with remote, with refspec)
-- `git merge` when on main/master
+`git_push_guard.py` (PreToolUse hook) gates:
+- `git push` (any branch) — an **interactive** session gets a native
+  approve/deny dialog (`permissionDecision:ask`) that only *you* can satisfy;
+  a Genesis-**dispatched** session (`GENESIS_CC_SESSION=1`) is **hard-denied**
+  (no human to prompt; real autonomous delivery goes through the scope-gated
+  server path, not the CC Bash tool).
+- `gh pr create` — same interactive prompt / dispatched deny.
+- `git merge` into main/master — **hard-blocked** (use the PR workflow).
+- `gh pr merge` without `--admin`, or with unresolved review findings —
+  **hard-blocked** (a `# review-override` trailing comment acknowledges
+  intentionally-accepted findings on the *merge* command only).
 
-All code changes must go through PRs. The only merge path is
-`gh pr merge --squash --admin` after explicit user approval. Each step
-(commit → push branch → create PR → merge) needs separate user confirmation.
+The push/PR-create dialog replaced the old `# review-override` token for those
+two gates — the agent can no longer self-approve a push. All code changes go
+through PRs; the only merge path is `gh pr merge --squash --admin` after
+explicit user approval. Each step (commit → push branch → create PR → merge)
+needs your confirmation.
