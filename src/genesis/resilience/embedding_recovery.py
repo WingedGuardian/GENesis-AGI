@@ -109,17 +109,6 @@ class EmbeddingRecoveryWorker:
                     # (legacy row) → key omitted; gates fail closed on it.
                     if taxo.get("origin_class"):
                         payload["origin_class"] = taxo["origin_class"]
-                    # A memory superseded/deprecated WHILE its embed was still
-                    # pending keeps deprecated=1 in metadata: _mark_superseded only
-                    # updates Qdrant when a point already exists, so the pending
-                    # row is left deprecation-blind. Re-stamp the rebuilt payload as
-                    # excluded-from-recall (mirrors _mark_superseded's Qdrant
-                    # payload) instead of resurfacing the superseded memory as a
-                    # live vector on re-embed.
-                    if taxo.get("deprecated"):
-                        payload["deprecated"] = True
-                        if taxo.get("superseded_by"):
-                            payload["merged_into"] = taxo["superseded_by"]
                 if life_domain:
                     payload["life_domain"] = life_domain
                 if project_type:
@@ -157,6 +146,20 @@ class EmbeddingRecoveryWorker:
                     self._db, memory_id=item["memory_id"]
                 ):
                     continue
+
+                # Deprecation is re-read HERE, after the embed and immediately
+                # before the write — NOT from the pre-embed `taxo` snapshot. A
+                # _mark_superseded landing during the (slow) embed sets deprecated=1
+                # in SQLite but skips Qdrant (no point yet); stamping from the stale
+                # snapshot would resurface the superseded memory as a live vector.
+                # Mirrors _mark_superseded's Qdrant payload. (The residual read->
+                # upsert micro-window is the lock-free-dual-write class tracked for
+                # the cross-store mutation outbox; see the 2026-07-28 design doc.)
+                fresh_meta = await memory_crud.get_taxonomy(self._db, item["memory_id"])
+                if fresh_meta and fresh_meta.get("deprecated"):
+                    payload["deprecated"] = True
+                    if fresh_meta.get("superseded_by"):
+                        payload["merged_into"] = fresh_meta["superseded_by"]
 
                 upsert_point(
                     self._qdrant,

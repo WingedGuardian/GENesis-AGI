@@ -317,6 +317,40 @@ class TestDrainPending:
         assert payload["merged_into"] == "mem-new"
 
     @pytest.mark.asyncio
+    async def test_supersede_during_embed_still_restamped(self, db, worker):
+        """Codex R3/B: a _mark_superseded landing DURING the (slow) embed — after
+        the pre-embed taxonomy read, before the upsert — must still be caught. The
+        worker re-reads deprecation AFTER the embed, so the rebuilt payload is
+        stamped excluded-from-recall rather than resurrecting the superseded memory
+        from a stale snapshot."""
+        from genesis.db.crud import memory as memory_crud
+
+        w, embedder, qdrant = worker
+        await memory_crud.create_metadata(
+            db, memory_id="mem-sd", created_at="2026-03-11T12:00:00",
+            wing="memory", embedding_status="pending",
+        )
+        await crud.create(
+            db, id="pe-sd", memory_id="mem-sd", content="body",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+
+        # Supersede lands mid-embed (after the pre-embed taxo read at line ~74,
+        # before the post-embed deprecation re-read).
+        async def embed_then_supersede(_content):
+            await memory_crud.mark_superseded(
+                db, "mem-sd", "mem-succ", "2026-03-12T00:00:00"
+            )
+            return [0.1] * 1024
+
+        embedder.embed = AsyncMock(side_effect=embed_then_supersede)
+        assert await w.drain_pending() == 1
+        payload = qdrant.upsert.call_args.kwargs["points"][0].payload
+        assert payload["deprecated"] is True
+        assert payload["merged_into"] == "mem-succ"
+
+    @pytest.mark.asyncio
     async def test_zero_confidence_not_coerced_to_default(self, db, worker):
         """A legitimate 0.0 confidence must survive re-embed, not be coerced to the
         0.5 default (recall activation multiplies by payload confidence, so a 0.0
