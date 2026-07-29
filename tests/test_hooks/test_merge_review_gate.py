@@ -799,3 +799,49 @@ class TestCiGateEndToEnd:
             lambda: self._payload("gh pr merge 5 --squash --admin"),
         )
         assert guard_module.main() == 0
+
+
+class TestCiStatusUnfinishedStates:
+    """P1 fix: ANY non-terminal check status counts as pending (not just
+    QUEUED/IN_PROGRESS) — a new/renamed unfinished state can't read as green."""
+
+    @staticmethod
+    def _set(monkeypatch, checks):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
+
+    def test_pending_status_is_pending(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [
+            {"name": "test", "status": "PENDING"},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("pending", ["test"])
+
+    def test_waiting_requested_new_states_are_pending(self, guard_module, monkeypatch):
+        for st in ("WAITING", "REQUESTED", "SOME_NEW_STATE"):
+            self._set(monkeypatch, [{"name": "test", "status": st}])
+            assert guard_module._pr_ci_status("1")[0] == "pending", st
+
+    def test_completed_null_conclusion_not_pending(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [
+            {"name": "test", "status": "COMPLETED", "conclusion": None},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+
+class TestMultiMergeBlocked:
+    """P2 fix: multiple merge segments (or merge+push) in one command are blocked
+    — the CI/review gates only inspect the first, so a second could smuggle past."""
+
+    def test_two_merges_blocked(self):
+        res = _run_guard("gh pr merge 1 --squash --admin && gh pr merge 2 --squash --admin")
+        assert res.returncode == 2
+        assert "multiple publish/merge" in res.stderr
+
+    def test_merge_plus_push_blocked(self):
+        res = _run_guard("gh pr merge 1 --squash --admin && git push origin x")
+        assert res.returncode == 2
+
+    def test_single_merge_not_tripped_by_multi_guard(self):
+        res = _run_guard("gh pr merge 1 --squash --admin")
+        assert "multiple publish/merge" not in res.stderr

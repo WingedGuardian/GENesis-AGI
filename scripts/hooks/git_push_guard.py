@@ -173,6 +173,10 @@ _CI_RED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "
 _CI_RED_STATES = {"FAILURE", "ERROR"}  # legacy StatusContext state
 _CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL"}
 _CI_GREEN = {"SUCCESS"}
+# The only CheckRun.status that means "finished". Everything else
+# (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so
+# a new/renamed non-terminal state can never be silently mistaken for green.
+_CI_TERMINAL_STATUSES = {"COMPLETED"}
 
 
 def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
@@ -228,7 +232,7 @@ def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
             continue
         name = c.get("name") or c.get("context") or "check"
         conclusion = c.get("conclusion")  # CheckRun
-        status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED
+        status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
         state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
@@ -236,12 +240,20 @@ def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
-        elif status in ("QUEUED", "IN_PROGRESS") or state == "PENDING":
-            saw_recognized = True
-            pending.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
             saw_recognized = True
-        # else: unrecognized shape — ignore this entry
+        elif status in _CI_TERMINAL_STATUSES:
+            # COMPLETED with an unrecognized/None conclusion — treat as done,
+            # don't fabricate pending; ignore this entry.
+            saw_recognized = True
+        elif status is not None or state == "PENDING":
+            # ANY non-terminal CheckRun status (QUEUED/IN_PROGRESS/PENDING/
+            # WAITING/REQUESTED/…) or a PENDING StatusContext is unfinished →
+            # block. Enumerating "known pending" states would silently miss new
+            # ones (P1 review finding), so we invert: not-terminal ⇒ pending.
+            saw_recognized = True
+            pending.append(name)
+        # else: no status/state/conclusion at all — unrecognized shape, ignore
 
     if red:
         return "red", sorted(set(red))
@@ -563,16 +575,18 @@ def main() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
-        # Each push / PR-create is a SEPARATE external-publish action needing its
-        # own approval. A single Bash command carrying more than one would
-        # collapse into ONE ask (mentioning only the first), so approving that
-        # prompt would run every publish behind it. Reject the compound and
-        # require each to be its own separately-approved tool call.
-        if len(push_segs) + len(create_segs) > 1:
+        # Each push / PR-create / PR-merge is a SEPARATE gated action. A single
+        # Bash command carrying more than one would collapse into ONE ask/gate
+        # (evaluated only for the first), so approving it would run every publish
+        # — and every UNCHECKED merge — behind it. Reject the compound and require
+        # each to be its own separately-gated tool call. (Merges are included so
+        # `gh pr merge 1 --admin && gh pr merge 2 --admin` can't smuggle the
+        # second past the CI/review gates, which only inspect the first segment.)
+        if len(push_segs) + len(create_segs) + len(merge_pr_segs) > 1:
             print(
-                "BLOCKED: multiple publish operations (git push / gh pr create) "
-                "in one command would share a single approval prompt. Run each "
-                "as its own command so each is approved separately.",
+                "BLOCKED: multiple publish/merge operations (git push / gh pr "
+                "create / gh pr merge) in one command would share a single gate. "
+                "Run each as its own command so each is gated separately.",
                 file=sys.stderr,
             )
             return 2
