@@ -18,7 +18,7 @@ from genesis.cc.invoker import CCInvoker
 from genesis.cc.types import CCInvocation
 
 # A LAN CC peer (RFC1918 literal — no DNS) vs the native/WAN endpoints.
-_LAN_URL = "http://192.168.50.100:1234"
+_LAN_URL = "http://192.168.1.10:1234"
 _WAN_URL = "https://8.8.8.8:443"
 
 

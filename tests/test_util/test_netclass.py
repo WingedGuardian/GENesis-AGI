@@ -14,14 +14,14 @@ from genesis.util.netclass import LOCAL, WAN, NetClassifier
     "ip",
     [
         "127.0.0.1",  # loopback
-        "10.176.34.199",  # RFC1918 /8 (this install's Ollama)
+        "10.0.0.5",  # RFC1918 /8 (e.g. a LAN Ollama host)
         "172.16.5.4",  # RFC1918 /12
-        "192.168.50.100",  # RFC1918 /16 (this install's LM Studio)
-        "100.97.179.21",  # CGNAT / Tailscale
+        "192.168.1.10",  # RFC1918 /16 (e.g. a LAN LM Studio host)
+        "100.64.0.1",  # CGNAT / Tailscale mesh v4
         "169.254.1.1",  # link-local
         "::1",  # v6 loopback
         "fc00::1",  # v6 ULA
-        "fd7a:115c:a1e0::1",  # Tailscale mesh (under fc00::/7)
+        "fd00::1",  # v6 ULA (Tailscale-style fd.. mesh, under fc00::/7)
         "fe80::1",  # v6 link-local
         "[::1]",  # bracketed v6 (URL form)
     ],
@@ -56,7 +56,7 @@ def test_classify_url_empty_is_wan():
 
 
 def test_classify_url_lan_literal():
-    assert NetClassifier().classify_url("http://192.168.50.100:1234/v1") == LOCAL
+    assert NetClassifier().classify_url("http://192.168.1.10:1234/v1") == LOCAL
 
 
 def test_classify_url_wan_literal():
@@ -156,7 +156,7 @@ def test_unresolvable_no_cache_is_wan():
 async def test_async_literal_and_none():
     nc = NetClassifier()
     assert await nc.classify_url_async(None) == WAN
-    assert await nc.classify_url_async("http://192.168.50.100:1234") == LOCAL
+    assert await nc.classify_url_async("http://192.168.1.10:1234") == LOCAL
     assert await nc.classify_host_async("8.8.8.8") == WAN
 
 
