@@ -1,4 +1,4 @@
-"""Composite resilience state machine — 4 independent axes with flapping protection."""
+"""Composite resilience state machine — 6 independent axes with flapping protection."""
 
 from __future__ import annotations
 
@@ -61,6 +61,19 @@ class TmpPressureStatus(IntEnum):
     NORMAL = 3     # Green:  <50%
 
 
+class NetworkStatus(IntEnum):
+    """Internet connectivity as observed by the NetworkSentinel. Lower = worse.
+
+    Distinct from CloudStatus: cloud is a *symptom* (circuit-breaker-derived
+    from provider call outcomes), network is the *cause* (direct DNS+TCP probe
+    of the open internet). DEGRADED = reachable but impaired (slow/partial —
+    still working); OFFLINE = no connectivity confirmed across probe anchors.
+    """
+    OFFLINE = 0
+    DEGRADED = 1
+    NORMAL = 2
+
+
 # ── Transition record ────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -83,6 +96,7 @@ class ResilienceState:
     embedding: EmbeddingStatus = EmbeddingStatus.NORMAL
     cc: CCStatus = CCStatus.NORMAL
     tmp_pressure: TmpPressureStatus = TmpPressureStatus.NORMAL
+    network: NetworkStatus = NetworkStatus.NORMAL
     timestamp: str = ""
     # Bounded append-only observability log (never read by routing). Capped so a
     # long-lived server can't grow it without limit; flap detection uses a
@@ -117,6 +131,12 @@ class ResilienceState:
         elif self.tmp_pressure == TmpPressureStatus.MODERATE and level < DegradationLevel.FALLBACK:
             level = DegradationLevel.FALLBACK
 
+        # Network axis is DELIBERATELY excluded from the legacy level in PR-2.
+        # Feeding OFFLINE→ESSENTIAL here would activate ungated call-site
+        # shedding (via DegradationTracker, wired in PR-1) from a brand-new,
+        # unsoaked connectivity detector. Shedding is deferred to PR-3, gated
+        # by the parking_mode lever with LAN-aware classification. The network
+        # axis still drives watchdog forgiveness + is_any_degraded in PR-2.
         return level
 
 
@@ -149,6 +169,10 @@ class ResilienceStateMachine:
             "embedding": _AxisFlap(),
             "cc": _AxisFlap(),
             "tmp_pressure": _AxisFlap(),
+            # Registered even though update_network opts out of flap protection:
+            # _update() does `self._flap[axis]` unconditionally before the
+            # protection check, so a missing entry would KeyError.
+            "network": _AxisFlap(),
         }
 
     @property
@@ -167,6 +191,12 @@ class ResilienceStateMachine:
             or self._state.memory != MemoryStatus.NORMAL
             or self._state.embedding != EmbeddingStatus.NORMAL
             or self._state.cc != CCStatus.NORMAL
+            # Network counts ONLY at OFFLINE, never DEGRADED: a slow-but-working
+            # network must not pause queue draining (recovery.py re-dispatch),
+            # but a confirmed-dead network should — re-dispatching into it just
+            # burns retries. In the BASE expression (not the tmp_pressure
+            # branch) because the sole consumer passes include_tmp_pressure=False.
+            or self._state.network == NetworkStatus.OFFLINE
         )
         if include_tmp_pressure:
             degraded = degraded or self._state.tmp_pressure != TmpPressureStatus.NORMAL
@@ -194,6 +224,17 @@ class ResilienceStateMachine:
 
     def update_tmp_pressure(self, status: TmpPressureStatus) -> list[StateTransition]:
         return self._update("tmp_pressure", status)
+
+    def update_network(self, status: NetworkStatus) -> list[StateTransition]:
+        # The NetworkSentinel owns its OWN asymmetric hysteresis (fast to
+        # declare OFFLINE, slow to clear). The generic per-axis flap protection
+        # is symmetric and HOLDS THE WORSE STATE for 10min on 3 flips — applied
+        # here it would latch OFFLINE for 10min past a real recovery, fighting
+        # the sentinel's fast OFFLINE→DEGRADED path AND holding is_any_degraded
+        # true (pausing DLQ replay) + suppressing watchdog restarts long after
+        # the network is back. Opt out — the sentinel's hysteresis IS the flap
+        # damping. (Same rationale as update_cc above.)
+        return self._update("network", status, apply_flapping_protection=False)
 
     def _update(
         self,
