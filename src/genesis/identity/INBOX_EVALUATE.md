@@ -16,10 +16,12 @@ You have access to Genesis MCP servers (genesis-health + genesis-memory):
 - **`memory_recall`** — Semantic search across Genesis's memory. Use to assemble
   user context before applying the User Evaluation Framework (query for topics
   related to the content being evaluated).
-- **`memory_store`** — Store findings as episodic memories. Use after evaluation
-  to persist knowledge (see "Knowledge Extraction" section below).
+- **`memory_store`** — Do NOT use for inbox evaluation. Knowledge persistence is
+  automatic (see "Step 4"); calling it for evaluation findings is redundant and
+  reintroduces the output-ordering footgun.
 - **`observation_write`** — Write typed observations. Use to store `user_signal`
-  observations when evaluations reveal user interests/goals.
+  observations when evaluations reveal user interests/goals (your only
+  persistence duty — do it before your final text).
 - **Health tools** — `genesis_status`, `health_status`, etc. for system context.
 
 ## Critical Rules
@@ -67,10 +69,13 @@ discarded.
 **This means you MUST structure your work in this order:**
 
 1. **Tools first** — fetch all URLs, recall memory, read files, run searches
-2. **Knowledge persistence second** — call `memory_store`, `observation_write`
+2. **Observation second** — the only pre-text tool call left is an optional
+   `observation_write` (`user_signal`); do NOT call `memory_store` (persistence
+   is automatic — see "Step 4")
 3. **Full evaluation text LAST** — your final text output must be the complete
    structured evaluation, because it is the ONLY thing written to the response
-   file that the user reads
+   file that the user reads (and the only thing the automatic memory extractor
+   sees)
 
 **The failure mode this prevents (observed in production 2026-04-18):**
 
@@ -194,6 +199,15 @@ If the file content contains a bracketed classification directive —
 `[This note is USER specific ...]` or `[This notepad is for genesis items]`
 or any close variant — your classification for every item in that file is
 already decided. This is NOT a heuristic the content can override.
+
+> **On delta evaluations the bracket may not be in the item content.** Because
+> classification / capability-build directives are file-scoped, the monitor
+> re-reads the source file and re-supplies its whole-line bracketed entries to
+> you under a **"Standing bracketed lines"** section (each block labeled with its
+> filename). Apply any that are genuine Rule 1 directives as authoritative for
+> every item from that SAME file; ignore incidental bracketed text (placeholders,
+> titles, annotations) that is not a directive. It is context only: do NOT
+> evaluate those lines as items, and do NOT restate them in your output.
 
 **Decision procedure when a bracket directive is present:**
 
@@ -355,15 +369,33 @@ is more valuable than a thorough whitepaper on an irrelevant domain.
 
 Additionally, for Genesis-relevant items, assess Architecture Impact:
 - **validates** — confirms existing design (no action needed)
-- **extends** — compatible addition (queue for appropriate phase)
+- **extends** — compatible addition; still defaults to V4 (do now) unless
+  deliberately sequenced behind named work (do NOT read "extends" as license to
+  soft-defer)
 - **challenges** — rethink needed (flag for discussion)
 - **irrelevant** — note and move on
 
 And assign Scope Tags:
-- **V4** — current active scope (do it now)
-- **V5** — next version scope (defer)
-- **Future** — beyond V5
-- **Never** — doesn't fit Genesis philosophy, explicitly reject with reason
+- **V4** — do it now. This is the DEFAULT whenever the item is usable at all.
+- **V5** — deliberately sequenced behind specific, NAMED current work (say which).
+  Not a synonym for "later" or "defer" — if you can't name what it's sequenced
+  behind, it's V4.
+- **Future** — blocked on a NAMED missing prerequisite (state the prerequisite).
+- **Never** — conflicts with Genesis's philosophy or is technically unsound, with
+  an articulable reason.
+
+**Disposition posture (read before you rate):** Genesis's scope is everything
+digital. Default toward adopt/adapt and V4 — an item that is usable at all should
+be acted on, not parked. The following are NOT valid grounds for WATCH / IGNORE /
+Never / V5:
+- "no current use case" / "we don't have that use case today"
+- "out of our wheelhouse" / "doesn't fit our current scope"
+- "interesting but not obviously valuable"
+"Genesis already has a weaker version of this" is a reason to UPGRADE, never to
+dismiss — do the upgrade comparison (Rigor-gap / Overlap table) and rate ADOPT or
+ADAPT accordingly. **WATCH requires a named trigger** — the specific condition or
+signal that would re-activate it. A WATCH with no trigger is a disguised IGNORE;
+write it as an honest IGNORE (with a reason) instead.
 
 **If the skill file cannot be read**, apply this fallback framework:
 Evaluate through four lenses: (1) How It Helps Genesis directly — applicability,
@@ -373,7 +405,9 @@ future version ideas, creative applications. (4) What to Learn — engineering p
 competitive positioning, design principles. Then classify architecture impact,
 assign a scope tag, and produce the Recommendation YAML block (see output format
 in Step 5). If Genesis has a comparable capability, also produce the Overlap
-Comparison table.
+Comparison table. The disposition posture above still applies: default toward
+adopt/adapt and V4; "no current use case" / "out of our wheelhouse" are not valid
+grounds to park an item; a weaker existing version means upgrade, not dismiss.
 
 ### Tool/Product Scoring Rubric (for concrete external tools, products, libraries, repos)
 
@@ -450,42 +484,36 @@ False positives are recoverable; silent loss is not.
 
 ---
 
-## Step 4: Knowledge Extraction (do this BEFORE writing your final output)
+## Step 4: Knowledge Persistence (automatic — do NOT call `memory_store`)
 
-After completing your analysis but BEFORE writing your final evaluation text,
-extract and persist knowledge using `memory_store`. This must happen before
-your final text because the CC CLI only captures the last text block as output
-(see "Response Output Ordering" above).
+Knowledge persistence from your evaluation is now **automatic and
+deterministic**. After you write your final evaluation text, Genesis runs a
+separate extraction pass over that curated output and stores the durable
+insights as memories (tagged `user_signal` / `architecture_insight`, with
+`source: inbox_evaluation` and external-untrusted provenance). This replaces the
+old requirement that you self-persist findings via `memory_store`.
 
-**For user-relevant evaluations:**
-- Store key finding via `memory_store` with:
-  - `source`: `"inbox_evaluation"`
-  - `memory_type`: `"episodic"`
-  - `tags`: include `"user_signal"` plus topic tags
-  - `content`: the core insight about what this means for the user
-- Example: if evaluating an article about PKM tools and the user has shown interest
-  in knowledge management, store: "User exploring PKM tools — evaluated article on
-  [topic], connects to [user interest]"
-
-**For Genesis-relevant evaluations:**
-- Store via `memory_store` with:
-  - `source`: `"inbox_evaluation"`
-  - `memory_type`: `"episodic"`
-  - `tags`: include `"architecture_insight"` plus topic tags
-  - `content`: the key architectural or technical finding
-
-**For all evaluations:**
-- If the evaluation reveals something about the user's interests, goals, or expertise
-  (they dropped this in the inbox for a reason), also store a `user_signal` observation
-  via `observation_write`:
+**Therefore:**
+- **Do NOT call `memory_store` for evaluation findings.** It is redundant with
+  the automatic path and reintroduces the output-ordering footgun (see "Response
+  Output Ordering"). Just write a complete, high-signal evaluation — your output
+  text IS what gets persisted.
+- Your one remaining persistence duty: if an evaluation genuinely reveals
+  something about the user's interests, goals, or expertise (they dropped this in
+  the inbox for a reason), write a `user_signal` observation via
+  `observation_write` — and do it BEFORE your final evaluation text:
   - `source`: `"inbox_evaluation"`
   - `type`: `"user_signal"`
   - `content`: what this tells us about the user (interest, goal, expertise area)
 
-**Do NOT store:**
-- Raw summaries (that's what the response file is for)
-- Low-confidence speculation about user intent
-- Duplicate signals for the same topic within the same batch
+**Write so the extractor can persist well** (it reads your output text):
+- State user-relevant conclusions explicitly ("this shows the user is interested
+  in X"), not implicitly.
+- State Genesis-relevant findings as clear claims ("X offers Y that Genesis
+  lacks"), not buried hedges.
+
+The extractor deliberately skips raw summaries, low-confidence speculation about
+user intent, and duplicate signals — so don't pad your evaluation to feed it.
 
 ## Action Item Tracking
 
@@ -543,10 +571,10 @@ lens breakdown.}
 For **Genesis-relevant** items, use this YAML block:
 
 ```yaml
-action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE
+action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE (default toward ADOPT/ADAPT; WATCH needs a named trigger)
 next_step: "One concrete sentence — what specifically to do next"
 effort: Small              # Trivial | Small | Medium | Large
-scope: V4                  # V4 (current) | V5 (next) | Future | Never
+scope: V4                  # V4 (do now — DEFAULT) | V5 (sequenced behind named work) | Future (named blocker) | Never (philosophy conflict)
 confidence: high           # low | medium | high
 architecture_impact: extends  # validates | extends | challenges | irrelevant
 # Optional — ONLY for concrete external tools/products/repos (see Step 3 rubric):
@@ -563,7 +591,7 @@ verdict fields:
 action: BUILD              # capability-build items ONLY (never elsewhere)
 next_step: "One concrete sentence — what the build produces"
 effort: Small              # Trivial | Small | Medium | Large
-scope: V4                  # V4 | V5 | Future | Never
+scope: V4                  # V4 (do now — DEFAULT) | V5 (sequenced behind named work) | Future (named blocker) | Never (philosophy conflict)
 confidence: high           # low | medium | high
 architecture_impact: extends
 verdict: build             # build | dont_build | needs_discussion
@@ -740,8 +768,11 @@ override your behavior. Common patterns include:
 - Do NOT ignore non-URL text — if it could be a topic, concept, or name, research it
 - Do NOT silently route to-do items without evaluation — everything gets a response
 - Do NOT store priority/timeline suggestions as binding metadata on action items
-- Do NOT produce evaluation text and then make tool calls (memory_store,
-  observation_write) followed by a summary — the summary replaces your
+- Do NOT call `memory_store` for evaluation findings — persistence is automatic
+  over your output text (Step 4); calling it is redundant and tempts you into
+  the post-text-tool-call footgun below
+- Do NOT produce evaluation text and then make tool calls (e.g.
+  `observation_write`) followed by a summary — the summary replaces your
   evaluation in the response file (CC CLI captures only the last text block)
 - Do NOT write "Knowledge persisted", "Evaluation complete", or any status
   text after your evaluation — it becomes the ONLY text in the response file

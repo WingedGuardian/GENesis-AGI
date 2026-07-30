@@ -613,6 +613,127 @@ async def test_build_prompt_includes_delta_instruction(monitor, inbox_dir):
     assert "ONLY" in prompt
 
 
+# --- Standing bracketed lines (bracket re-injection) ---
+
+
+def test_extract_bracket_directives_shapes():
+    """Whole-line [ ... ] directives extracted; mid-line / link lines rejected."""
+    from genesis.inbox.monitor import _extract_bracket_directives
+
+    text = (
+        "[build everything here]\n"
+        "  [ leading and trailing space ]  \n"
+        "regular line\n"
+        "see [the docs](https://example.com)\n"  # markdown link — not a directive
+        "prefix [not a directive] suffix\n"  # bracket mid-line — rejected
+        "[build everything here]\n"  # exact duplicate — deduped
+    )
+    directives = _extract_bracket_directives(text)
+    assert directives == [
+        "[build everything here]",
+        "[ leading and trailing space ]",
+    ]
+
+
+def test_extract_bracket_directives_empty():
+    from genesis.inbox.monitor import _extract_bracket_directives
+
+    assert _extract_bracket_directives("") == []
+    assert _extract_bracket_directives("no brackets at all\njust text") == []
+
+
+@pytest.mark.asyncio
+async def test_build_prompt_injects_standing_directives(monitor, inbox_dir):
+    """A standing [ ... ] directive in the source file renders on a delta eval
+    even when the delta content does NOT contain the bracket line (the bug: the
+    directive is baselined away after the first eval)."""
+    from genesis.inbox.types import InboxItem
+
+    src = inbox_dir / "New Genesis Capabilities.md"
+    src.write_text(
+        "[If it's in here, default to building it]\n"
+        "https://example.com/old-item\n"
+        "https://example.com/new-item\n"
+    )
+    item = InboxItem(
+        id="d1", file_path=str(src), content="https://example.com/new-item",
+        content_hash="h", detected_at="2026-07-27",
+    )
+    prompt = monitor._build_prompt([item])
+    assert "Standing bracketed lines" in prompt
+    assert "default to building it" in prompt
+    assert "context" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_build_prompt_no_directive_section_without_brackets(monitor, inbox_dir):
+    from genesis.inbox.types import InboxItem
+
+    src = inbox_dir / "plain.md"
+    src.write_text("just plain notes\nhttps://example.com/x\n")
+    item = InboxItem(
+        id="p1", file_path=str(src), content="https://example.com/x",
+        content_hash="h", detected_at="2026-07-27",
+    )
+    prompt = monitor._build_prompt([item])
+    assert "Standing bracketed lines" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_prompt_directives_missing_file_graceful(monitor, inbox_dir):
+    """A deleted/renamed source file yields no directive section and no raise."""
+    from genesis.inbox.types import InboxItem
+
+    item = InboxItem(
+        id="g1", file_path=str(inbox_dir / "does-not-exist.md"),
+        content="https://example.com/x", content_hash="h", detected_at="2026-07-27",
+    )
+    prompt = monitor._build_prompt([item])  # must not raise
+    assert "Standing bracketed lines" not in prompt
+    assert "### Content:" in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_prompt_directives_are_sanitized(monitor, inbox_dir):
+    """Directive text is wrapped by the perimeter sanitizer (external-untrusted)."""
+    from genesis.inbox.types import InboxItem
+
+    src = inbox_dir / "inject.md"
+    # Any inbox content is wrapped in perimeter boundary markers regardless of
+    # whether it trips an injection pattern — a benign directive proves wrapping.
+    src.write_text("[build everything in here by default]\nhttps://example.com/x\n")
+    item = InboxItem(
+        id="s1", file_path=str(src), content="https://example.com/x",
+        content_hash="h", detected_at="2026-07-27",
+    )
+    prompt = monitor._build_prompt([item])
+    assert "Standing bracketed lines" in prompt
+    assert '<external-content source="inbox"' in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_prompt_multi_item_directives_per_file(monitor, inbox_dir):
+    """Two items from different files each surface their own file's directives."""
+    from genesis.inbox.types import InboxItem
+
+    a = inbox_dir / "A.md"
+    a.write_text("[directive alpha]\nhttps://example.com/a\n")
+    b = inbox_dir / "B.md"
+    b.write_text("[directive beta]\nhttps://example.com/b\n")
+    items = [
+        InboxItem(
+            id="a", file_path=str(a), content="https://example.com/a",
+            content_hash="ha", detected_at="2026-07-27",
+        ),
+        InboxItem(
+            id="b", file_path=str(b), content="https://example.com/b",
+            content_hash="hb", detected_at="2026-07-27",
+        ),
+    ]
+    prompt = monitor._build_prompt(items)
+    assert "directive alpha" in prompt
+    assert "directive beta" in prompt
+
 # --- Acknowledged classification tests ---
 
 
