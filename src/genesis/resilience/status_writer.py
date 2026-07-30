@@ -72,6 +72,10 @@ class StatusFileWriter:
                 "memory": state.memory.name,
                 "embedding": state.embedding.name,
                 "cc": state.cc.name,
+                # tmp_pressure was historically omitted here despite being a real
+                # axis feeding to_legacy_degradation_level — added alongside network.
+                "tmp_pressure": state.tmp_pressure.name,
+                "network": state.network.name,
             },
             "queue_depths": {
                 "deferred_work": deferred_count,
@@ -132,6 +136,20 @@ class StatusFileWriter:
             stats = getattr(ingestor, "stats", None)
             if isinstance(stats, dict):
                 data["reflex"] = stats
+        except Exception:
+            pass
+
+        # Connectivity snapshot from the network sentinel. Carries the sentinel's
+        # OWN last_probe_at so the watchdog can staleness-check the PROBE (not the
+        # file): status.json's top-level timestamp refreshes from THIS 60s loop
+        # independently, so a dead sentinel + live status-writer would otherwise
+        # look fresh forever with a frozen network field. isinstance guard is
+        # load-bearing (absent sentinel / mock runtime → skip, never crash write).
+        try:
+            sentinel = getattr(self._runtime, "_network_sentinel", None)
+            snap = sentinel.snapshot() if sentinel is not None else None
+            if isinstance(snap, dict):
+                data["network"] = snap
         except Exception:
             pass
 
@@ -197,8 +215,11 @@ class StatusFileWriter:
             CloudStatus,
             EmbeddingStatus,
             MemoryStatus,
+            NetworkStatus,
         )
 
+        if state.network != NetworkStatus.NORMAL:
+            parts.append(f"Internet {state.network.name.lower()}")
         if state.cloud != CloudStatus.NORMAL:
             parts.append(f"Cloud {state.cloud.name.lower()}")
         if state.memory != MemoryStatus.NORMAL:

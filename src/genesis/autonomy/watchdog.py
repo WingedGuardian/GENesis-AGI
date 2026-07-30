@@ -190,6 +190,19 @@ class WatchdogChecker:
                     )
                     return WatchdogAction.SKIP
 
+                # Connectivity forgiveness (PR-2): a zombie scheduler during a
+                # network outage is surplus dispatch stalled on dead-network
+                # provider calls — a restart cannot fix an ISP outage (it just
+                # wipes in-memory circuit-breaker state and re-walks the dead
+                # chain slowly). Skip while the network is degraded/offline.
+                if self._network_suppresses_restart(status):
+                    logger.info(
+                        "Zombie detected (%s) but network degraded/offline "
+                        "(fresh probe) — restart can't fix connectivity, skipping",
+                        ", ".join(zombie),
+                    )
+                    return WatchdogAction.SKIP
+
                 logger.warning(
                     "Zombie scheduler detected: %s — triggering restart",
                     ", ".join(zombie),
@@ -207,6 +220,46 @@ class WatchdogChecker:
         # 3. Stale — attempt restart via shared logic
         state = self._load_state()
         return self._restart_if_allowed(state, reason="stale_status_restart")
+
+    def _network_suppresses_restart(self, status: dict) -> bool:
+        """True ONLY when a FRESH sentinel probe reports degraded/offline.
+
+        Fails safe (returns False → allow restart) on: absent network field,
+        missing/garbled timestamp, or a STALE probe (dead/stalled sentinel).
+        status.json's own top-level freshness is not sufficient — the 60s
+        status-writer loop refreshes the file timestamp independently of the
+        sentinel, so a dead sentinel + live writer would look fresh forever with
+        a frozen network field. We therefore staleness-check the sentinel's OWN
+        last_probe_at, so a genuinely wedged server with a healthy network is
+        never left unrestarted.
+        """
+        try:
+            from datetime import UTC, datetime
+
+            from genesis.resilience import network_config, network_state
+
+            net = status.get("network")
+            if not isinstance(net, dict):
+                return False
+            if net.get("state") not in ("DEGRADED", "OFFLINE"):
+                return False
+            age = network_state.probe_age_s(net, datetime.now(UTC))
+            # None (absent/garbled) OR negative (a future timestamp from clock
+            # skew / bad data) → not a trustworthy fresh probe; fail toward restart.
+            if age is None or age < 0:
+                return False
+            threshold = network_config.structural().staleness_threshold_s
+            if age > threshold:
+                logger.info(
+                    "Network field stale (%.0fs > %ds) — NOT suppressing restart",
+                    age, threshold,
+                )
+                return False
+            return True
+        except Exception:
+            # Any failure in the connectivity check must fail toward restart.
+            logger.debug("Network suppression check failed — allowing restart", exc_info=True)
+            return False
 
     def _restart_if_allowed(self, state: dict, *, reason: str) -> WatchdogAction:
         """Shared restart logic: backoff → validation → restart or skip."""
