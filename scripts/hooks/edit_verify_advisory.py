@@ -75,12 +75,14 @@ def _git_baseline(path: Path) -> tuple[str | None, bool]:
     """Committed (HEAD) contents of ``path``, as ``(baseline, git_ok)``.
 
     - ``(text, True)`` — the file has a committed blob.
-    - ``(None, True)`` — git RAN and the file has no committed baseline to
-      disturb: a new/untracked file, or a path outside any git repo (both exit
-      non-zero without erroring).
-    - ``(None, False)`` — git itself FAILED (timeout / missing binary). The
-      caller must NOT assume "no baseline" here — the file might be a dirty
-      tracked file — so it fails conservative.
+    - ``(None, True)`` — git RAN and there is genuinely no committed baseline to
+      disturb: a new/untracked file, a path outside any git repo, or a repo with
+      no commits yet. Recognised by git's benign "not in HEAD" / "not a git
+      repository" / "unknown revision" messages.
+    - ``(None, False)`` — git FAILED (timeout / missing binary) OR exited
+      non-zero for any OTHER reason (a corrupt/locked repo, permission error).
+      The caller must NOT assume "no baseline" — the file might be a dirty
+      tracked file we simply couldn't read — so it fails conservative.
 
     ``git show HEAD:./<name>`` resolves the blob relative to the file's own
     directory, so it works in worktrees and subdirectories alike."""
@@ -95,7 +97,19 @@ def _git_baseline(path: Path) -> tuple[str | None, bool]:
         return (None, False)
     if proc.returncode == 0:
         return (proc.stdout, True)
-    return (None, True)
+    # Non-zero: only treat as "no baseline (safe to format)" for the benign
+    # cases git reports explicitly. Any other fatal exit (corrupt/locked repo,
+    # permissions) is UNSAFE — a tracked file may exist but be unreadable.
+    stderr = (proc.stderr or "").lower()
+    benign = (
+        "does not exist in" in stderr  # new path, not in HEAD
+        or "exists on disk, but not in" in stderr  # untracked file
+        or "not a git repository" in stderr  # outside a repo
+        or "unknown revision" in stderr  # no commits yet
+        or "ambiguous argument" in stderr  # HEAD unborn
+        or "bad revision" in stderr
+    )
+    return (None, True) if benign else (None, False)
 
 
 def _baseline_status(ruff: Path, path: Path) -> tuple[bool, bool]:

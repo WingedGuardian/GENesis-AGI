@@ -10,6 +10,7 @@ on every malformed or out-of-scope input.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -193,7 +194,6 @@ def test_git_unavailable_fails_safe(tmp_path: Path):
     payload = {"tool_name": "Edit", "tool_input": {"file_path": str(f)}, "session_id": "t"}
     # A PATH with no `git` on it → subprocess FileNotFoundError inside the hook.
     # ruff is resolved via sys.executable's dir (absolute), so it still runs.
-    import os
 
     env = {**os.environ, "PATH": "/nonexistent-dir"}
     proc = subprocess.run(

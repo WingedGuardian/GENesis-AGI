@@ -178,3 +178,12 @@ class TestReviewFixes:
     def test_value_equal_to_label_not_mangled(self):
         # N1: span redaction, not first-occurrence substring replace.
         assert s.scrub("password: password") == "password: [REDACTED]"
+
+    def test_quoted_password_with_spaces_fully_redacted(self):
+        # Codex P1: a quoted password/passphrase containing whitespace must be
+        # redacted WHOLE, not just up to the first space.
+        out = s.scrub('password: "hunter 2 correct horse"')
+        assert "hunter" not in out and "horse" not in out and R in out
+        # value words chosen NOT to be substrings of the label ("passphrase").
+        out2 = s.scrub("passphrase = 'zebra quux mango token'")
+        assert "zebra" not in out2 and "mango" not in out2 and R in out2

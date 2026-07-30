@@ -66,16 +66,19 @@ _CREDENTIAL_TOKEN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# password/passphrase/pin values — keep the label, redact the value.
+# password/passphrase/pin values — keep the label, redact the value. A quoted
+# value is captured whole (quotes let a password contain spaces, e.g.
+# `password: "hunter 2 pw"`); an unquoted value stops at whitespace/separator.
 _SINGLE_CREDENTIAL_PATTERN = re.compile(
     r"\b(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
     r"\s*(?:is\s+|[:=]\s*)"
-    r"(?P<value>[^\s,;]{4,})",
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;]{4,})",
     re.IGNORECASE,
 )
 
-# Credentials embedded in a URL userinfo: scheme://user:PASSWORD@host.
-# Only fires when an ``@`` follows, so ``host:port/path`` URLs never match.
+# Credentials embedded in a URL's userinfo section (the user/password pair that
+# can precede an "@" host separator). Only fires when an "@" follows, so a plain
+# host-and-port URL never matches.
 _URL_CREDENTIAL_PATTERN = re.compile(
     r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@\s]+:)(?P<pw>[^@/\s]+)(?P<at>@)",
 )
