@@ -152,9 +152,10 @@ class EmbeddingRecoveryWorker:
                 # _mark_superseded landing during the (slow) embed sets deprecated=1
                 # in SQLite but skips Qdrant (no point yet); stamping from the stale
                 # snapshot would resurface the superseded memory as a live vector.
-                # Mirrors _mark_superseded's Qdrant payload. (The residual read->
-                # upsert micro-window is the lock-free-dual-write class tracked for
-                # the cross-store mutation outbox; see the 2026-07-28 design doc.)
+                # Mirrors _mark_superseded's Qdrant payload. (A residual read->
+                # upsert micro-window remains — SQLite and Qdrant share no
+                # transaction, so ordering alone cannot close it; drift from this
+                # class surfaces via the memory-integrity ghost/mirror checks.)
                 fresh_meta = await memory_crud.get_taxonomy(self._db, item["memory_id"])
                 if fresh_meta and fresh_meta.get("deprecated"):
                     payload["deprecated"] = True
