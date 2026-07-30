@@ -32,14 +32,35 @@ from shell_parse import (  # noqa: E402
     gh_pr_subcommand,
     git_subcommand,
     has_trailing_override,
+    split_segments,
+)
+
+# Sentinel: the effective cwd cannot be confidently resolved (a cd into a
+# variable/command-substitution, a subshell, or a target nested at depth>0).
+# Callers MUST fail closed on it — block the merge, do not soften a force push.
+_CWD_UNKNOWN = object()
+
+# git global options that consume the FOLLOWING token as their value — used to
+# skip past `git -C <dir>` / `git -c KEY=VAL` when locating a push's positionals.
+_GIT_GLOBAL_VALUE_FLAGS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
 )
 
 
-def _current_branch() -> str | None:
-    """Get current git branch name."""
+def _current_branch(cwd: str | None = None) -> str | None:
+    """Get current git branch name, optionally in a specific working dir.
+
+    When ``cwd`` is truthy, run ``git -C <cwd> branch --show-current`` so the
+    branch reflects the worktree the command actually targets — not the hook's
+    own cwd (always the main tree, on ``main``). Fail-safe: None on any error.
+    """
     try:
+        args = ["git"]
+        if cwd:
+            args += ["-C", cwd]
+        args += ["branch", "--show-current"]
         result = subprocess.run(
-            ["git", "branch", "--show-current"],
+            args,
             capture_output=True,
             text=True,
             timeout=5,
@@ -49,10 +70,131 @@ def _current_branch() -> str | None:
         return None
 
 
-def _get_push_remote_and_branch(cmd: str) -> tuple[str | None, str | None]:
+def _seg_dash_C(argv) -> str | None:
+    """The dir named by a ``git -C <dir>`` in a segment's argv, else None."""
+    argv = argv or []
+    for i, tok in enumerate(argv):
+        if tok == "-C" and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def _cd_target(raw: str):
+    """Classify a top-level command segment as a ``cd``.
+
+    Returns the literal target dir when ``raw`` is a plain ``cd <literal-path>``
+    segment; ``_CWD_UNKNOWN`` when it is a cd we cannot resolve (no arg, ``cd -``,
+    a variable/command-substitution/glob target, or a subshell/group that would
+    scope the cd); ``None`` when it is not a cd at all. Because ``split_segments``
+    already split on shell operators, a genuine cd segment is exactly ``cd <path>``.
+    """
+    s = raw.strip()
+    # A subshell/group ( … ) / { … } scopes its cd — we cannot track it.
+    if s.startswith("(") or s.startswith("{"):
+        return _CWD_UNKNOWN
+    m = re.match(r"^cd(?:\s+(?P<p>.*))?$", s)
+    if not m:
+        return None
+    p = (m.group("p") or "").strip()
+    if not p or p == "-":
+        return _CWD_UNKNOWN  # `cd` (home) / `cd -` (previous) — unresolvable here
+    # Quoted target.
+    if len(p) >= 2 and p[0] in "'\"" and p[-1] == p[0]:
+        inner = p[1:-1]
+        if p[0] == '"' and ("$" in inner or "`" in inner):
+            return _CWD_UNKNOWN  # double-quote expansion
+        return inner
+    if " " in p or "\t" in p:
+        return _CWD_UNKNOWN  # extra args / unexpected shape → don't guess
+    if p.startswith("~"):
+        p = os.path.expanduser(p)
+    if any(ch in p for ch in "$`*?"):
+        return _CWD_UNKNOWN  # expansion or glob → unresolvable
+    return p
+
+
+def _effective_cwd(cmd: str, payload: dict, seg=None):
+    """The directory where a SINGLE target segment actually runs.
+
+    Returns ``str`` (resolved), ``None`` (no cwd info → run in the hook's own
+    cwd), or ``_CWD_UNKNOWN`` (ambiguous → caller must fail closed). Resolution:
+      1. ``git -C <dir>`` on the target segment's argv (explicit).
+      2. If the target is nested (depth>0, inside bash -c/subshell/$()), UNKNOWN.
+      3. Else the LAST top-level ``cd`` that runs BEFORE the target segment —
+         bash applies cds sequentially, so the last one wins (an unresolvable cd
+         before the target ⇒ UNKNOWN). Falls back to the payload cwd as the base.
+    Used for single-target callers (push); the merge check uses the multi-target
+    walk in ``_walk_merge_into_main`` so every merge in a compound is covered.
+    """
+    if seg is not None:
+        dash_c = _seg_dash_C(getattr(seg, "argv", None))
+        if dash_c is not None:
+            return dash_c
+        if getattr(seg, "depth", 0) > 0:
+            return _CWD_UNKNOWN
+    base = payload.get("cwd") if isinstance(payload, dict) else None
+    cur = base if isinstance(base, str) and base else None
+    target_raw = getattr(seg, "raw", None)
+    if target_raw is not None:
+        for raw in split_segments(cmd):
+            if raw == target_raw:
+                return cur  # cwd in effect when the target segment runs
+            cd = _cd_target(raw)
+            if cd is _CWD_UNKNOWN:
+                cur = _CWD_UNKNOWN
+            elif cd is not None:
+                cur = cd
+    return cur
+
+
+def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool:
+    """True if ANY executed ``git merge`` would run on main/master (fail-closed).
+
+    Walks the top-level segments in bash order tracking cwd (last literal ``cd``
+    wins), and checks EACH ``git merge`` as it would actually run — so a compound
+    like ``git -C <feat-wt> merge a && git merge b`` cannot smuggle the second
+    (bare) merge into main behind the first. A per-segment
+    ``# merge-to-main-override`` acknowledges that segment. Fail closed: a merge
+    nested at depth>0 (bash -c / subshell / ``$()``) or reached under an
+    unresolvable cd is treated as targeting main and blocked (unless overridden).
+    """
+    # depth>0 merges cannot be associated with a top-level cwd → fail closed.
+    for s in merge_git_segs:
+        if getattr(s, "depth", 0) > 0 and not has_trailing_override(
+            s.raw, "merge-to-main-override"
+        ):
+            return True
+
+    base = payload.get("cwd") if isinstance(payload, dict) else None
+    cur = base if isinstance(base, str) and base else None
+    for raw in split_segments(cmd):
+        top = [s for s in analyze(raw) if getattr(s, "depth", 0) == 0]
+        merge_here = next(
+            (s for s in top if s.exe == "git" and git_subcommand(s.argv) == "merge"),
+            None,
+        )
+        if merge_here is not None and not has_trailing_override(raw, "merge-to-main-override"):
+            mcwd = _seg_dash_C(merge_here.argv)
+            if mcwd is None:
+                mcwd = cur
+            if mcwd is _CWD_UNKNOWN:
+                return True
+            branch = _current_branch(cwd=mcwd if isinstance(mcwd, str) else None)
+            if branch in ("main", "master"):
+                return True
+        cd = _cd_target(raw)
+        if cd is _CWD_UNKNOWN:
+            cur = _CWD_UNKNOWN
+        elif cd is not None:
+            cur = cd
+    return False
+
+
+def _get_push_remote_and_branch(cmd: str, cwd: str | None = None) -> tuple[str | None, str | None]:
     """Parse git push command to determine target remote and branch.
 
-    Returns (remote, branch) or (None, None) if can't determine.
+    Returns (remote, branch) or (None, None) if can't determine. ``cwd`` is the
+    effective worktree dir, used to resolve the current branch label correctly.
     """
     parts = cmd.split()
     # Find 'push' position
@@ -76,10 +218,10 @@ def _get_push_remote_and_branch(cmd: str) -> tuple[str | None, str | None]:
 
     if len(args) == 0:
         # Bare 'git push' — pushes current branch to its upstream
-        return "upstream", _current_branch()
+        return "upstream", _current_branch(cwd=cwd)
     if len(args) == 1:
         # 'git push origin' — pushes current branch to remote
-        return args[0], _current_branch()
+        return args[0], _current_branch(cwd=cwd)
     if len(args) >= 2:
         # 'git push origin main' or 'git push origin feature:main'
         remote = args[0]
@@ -537,6 +679,86 @@ def _push_is_force(argv: list[str]) -> bool:
     return False
 
 
+def _push_named_remote(argv: list[str]) -> str | None:
+    """The remote named on a ``git push <remote> …``, else None.
+
+    argv is quote-stripped from ``shell_parse``. Skips git global options (and
+    their values), the ``push`` token, and push flags/values; the first bare
+    positional after that is the remote. A ``+<refspec>`` positional is NOT a
+    remote (it is a force refspec) and is skipped.
+    """
+    i = 1  # skip argv[0] == "git"
+    # advance past git global options to the `push` token
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "push":
+        return None
+    i += 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _PUSH_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-") or t.startswith("+"):
+            i += 1
+            continue
+        return t  # first bare positional after `push` is the remote
+    return None
+
+
+def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
+    """The target remote for a ``git push`` segment, or None if UNKNOWN.
+
+    Resolution order: an explicitly named remote → that; else the current
+    branch's upstream remote (the part before ``/`` of ``@{upstream}``); else
+    None. Callers FAIL CLOSED on None — an undeterminable remote is treated as
+    origin/public and blocked.
+    """
+    remote = _push_named_remote(getattr(seg, "argv", None) or [])
+    if remote:
+        return remote
+    try:
+        args = ["git"]
+        if cwd:
+            args += ["-C", cwd]
+        args += ["rev-parse", "--abbrev-ref", "@{upstream}"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            upstream = result.stdout.strip()
+            if "/" in upstream:
+                return upstream.split("/", 1)[0]
+    except Exception:
+        pass
+    return None
+
+
+def _remote_url(name: str, cwd: str | None = None) -> str | None:
+    """The fetch/push URL configured for remote ``name``, or None if unresolvable.
+
+    Classifying a force-push target by NAME is spoofable — ``git remote add
+    mirror <origin-url>`` gives a non-"origin" name that still points at the
+    PUBLIC repo. Callers compare this URL against origin's to decide whether a
+    force actually rewrites public history; an unresolvable URL FAILS CLOSED.
+    """
+    try:
+        args = ["git"]
+        if cwd:
+            args += ["-C", cwd]
+        args += ["remote", "get-url", name]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        url = result.stdout.strip()
+        return url if result.returncode == 0 and url else None
+    except Exception:
+        return None
+
+
 def _ask(reason: str) -> int:
     """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
 
@@ -615,7 +837,8 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
 
 def main() -> int:
     try:
-        cmd = field(read_payload(), "command")
+        payload = read_payload()
+        cmd = field(payload, "command")
         if not cmd:
             return 0
 
@@ -662,46 +885,94 @@ def main() -> int:
         # tool). The old `# review-override` token is dropped for push: the
         # dialog replaces it, so the agent can no longer self-approve.
         if push_segs:
-            # Force push is destructive — hard-block in EVERY session (never a
-            # mere ask). argv-based (via shell_parse) so a quoted `'-f'` or a
-            # `--force-with-lease` cannot evade it into a generic approval prompt.
-            if any(_push_is_force(s.argv) for s in push_segs):
-                print(
-                    "BLOCKED: Force push is not allowed — open a PR instead.",
-                    file=sys.stderr,
+            _pcwd = _effective_cwd(cmd, payload, seg=push_segs[0])
+            pcwd_unknown = _pcwd is _CWD_UNKNOWN
+            pcwd = _pcwd if isinstance(_pcwd, str) else None
+            # Force push is destructive. argv-based force detection (via
+            # shell_parse) so a quoted `'-f'` / `--force-with-lease` / bundled
+            # `-uf` / `+refspec` all still count and cannot evade into a generic
+            # prompt.
+            #
+            # SECURITY INVARIANT: a force push is HARD-BLOCKED in ALL sessions
+            # whenever it targets the public repo. "Public" is decided by URL, not
+            # remote name — an explicit `origin`, an UNKNOWN/None remote, an
+            # ambiguous cwd, OR a differently-named remote whose URL EQUALS
+            # origin's (e.g. `git remote add mirror <origin-url>`) all count as
+            # public ⇒ blocked (fail closed). Only a remote whose URL is
+            # resolvable AND differs from origin's gets the softer cautious-ask
+            # path — interactive asks (rewrites remote history), dispatched denies.
+            force_segs = [s for s in push_segs if _push_is_force(s.argv)]
+            if force_segs:
+                remote = _resolve_push_remote(force_segs[0], cwd=pcwd)
+                if pcwd_unknown or remote is None or remote == "origin":
+                    print(
+                        "BLOCKED: Force push to origin/<public> is not allowed — open a PR.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                # Classify by URL — a non-"origin" name pointing at origin's repo
+                # is still a public force push. Unresolvable URL ⇒ fail closed.
+                remote_url = _remote_url(remote, cwd=pcwd)
+                origin_url = _remote_url("origin", cwd=pcwd)
+                if remote_url is None or origin_url is None or remote_url == origin_url:
+                    print(
+                        "BLOCKED: Force push to origin/<public> is not allowed — open a PR.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                # Definitely a different repo from origin → cautious, never silent.
+                if _is_dispatched():
+                    print(
+                        f"BLOCKED: force push rewrites remote history on "
+                        f"'{remote}'; autonomous/dispatched sessions cannot "
+                        f"force-push.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                ask_reason = (
+                    f"FORCE push detected — this REWRITES remote history on "
+                    f"'{remote}' (a non-origin remote). Approve only if you "
+                    f"intend to rewrite that remote's history."
                 )
-                return 2
-            _remote, branch = _get_push_remote_and_branch(cmd)
-            if _is_dispatched():
-                print(
-                    f"BLOCKED: git push requires user approval before "
-                    f"publishing code externally (target: {branch or 'default'}).",
-                    file=sys.stderr,
+                # Fall through: any hard-block below still takes precedence.
+            else:
+                # Non-force push: interactive asks, dispatched hard-denies.
+                _remote, branch = _get_push_remote_and_branch(cmd, cwd=pcwd)
+                if _is_dispatched():
+                    print(
+                        f"BLOCKED: git push requires user approval before "
+                        f"publishing code externally (target: {branch or 'default'}).",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "Autonomous/dispatched sessions cannot push directly — "
+                        "delivery goes through the scope-gated server path.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                ask_reason = (
+                    f"git push needs your approval before publishing externally "
+                    f"(target: {branch or 'default'})."
                 )
-                print(
-                    "Autonomous/dispatched sessions cannot push directly — "
-                    "delivery goes through the scope-gated server path.",
-                    file=sys.stderr,
-                )
-                return 2
-            ask_reason = (
-                f"git push needs your approval before publishing externally "
-                f"(target: {branch or 'default'})."
-            )
 
         # ── git merge into main ─────────────────────────────────────
-        if merge_git_segs:
-            current = _current_branch()
-            if current in ("main", "master"):
-                print(
-                    "BLOCKED: Merging into main directly is not allowed.",
-                    file=sys.stderr,
-                )
-                print(
-                    "Use the PR workflow instead.",
-                    file=sys.stderr,
-                )
-                return 2
+        # Worktree-aware AND compound-aware: EVERY git-merge in the command is
+        # checked in the dir it actually runs (git -C / the last cd before it /
+        # payload cwd), NOT just the first segment and NOT the hook's own cwd — so
+        # a feature-branch merge cannot chaperone a second bare `git merge` into
+        # main. A per-segment `# merge-to-main-override` acknowledges an intended
+        # on-main merge; an ambiguous cwd fails closed (blocked). See
+        # _walk_merge_into_main.
+        if merge_git_segs and _walk_merge_into_main(cmd, payload, merge_git_segs):
+            print(
+                "BLOCKED: Merging into main directly is not allowed.",
+                file=sys.stderr,
+            )
+            print(
+                "Use the PR workflow instead.",
+                file=sys.stderr,
+            )
+            return 2
 
         # ── gh pr create ────────────────────────────────────────────
         # Un-gated when its branch is already on the remote — opening a PR is then
