@@ -64,9 +64,26 @@ def _extract_working_dir(command: str) -> str | None:
     return path if os.path.isdir(path) else None
 
 
+def _payload_cwd(payload: dict) -> str | None:
+    """The Bash tool's actual working directory, from the PreToolUse payload.
+
+    CC reports ``cwd`` = the shell's current directory at hook time, and it
+    TRACKS the Bash tool's persisted ``cd`` across separate calls (verified live
+    2026-07-29). So a bare ``git commit`` with no leading ``cd`` still resolves
+    to the right worktree via this, where the command-string parse can't see it.
+    ``CLAUDE_PROJECT_DIR`` is NOT usable here — it is the static session root, so
+    it points at the wrong worktree when this session drives a secondary one.
+    """
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    if isinstance(cwd, str) and cwd and os.path.isabs(cwd) and os.path.isdir(cwd):
+        return cwd  # absolute (CC always supplies absolute) + real dir
+    return None
+
+
 def main() -> None:
     # Parse tool input
-    command = field(read_payload(), "command")
+    payload = read_payload()
+    command = field(payload, "command")
     if not _COMMIT_PATTERN.search(command):
         sys.exit(0)  # Not a commit, allow
 
@@ -95,8 +112,12 @@ def main() -> None:
         )
         return
 
-    # Detect worktree: extract working directory from 'cd /path && git commit'
-    cwd = _extract_working_dir(command)
+    # Detect worktree, in precedence order: an explicit 'cd /path && git commit'
+    # (the command targets THAT dir) → the Bash tool's actual cwd from the payload
+    # (a bare commit runs there; tracks cd-drift across calls) → None (the hook's
+    # own cwd / project root). This is what lets a bare `git commit` from a
+    # secondary worktree find its own review marker instead of false-blocking.
+    cwd = _extract_working_dir(command) or _payload_cwd(payload)
 
     # Import review_state from same directory
     script_dir = os.path.dirname(os.path.abspath(__file__))

@@ -310,14 +310,69 @@ def test_marker_not_clobbered_by_concurrent_worktree(
     assert res.returncode == 0, res.stderr
 
 
-def test_distinct_worktrees_get_distinct_markers(
-    repo: Path, home: Path, tmp_path: Path
-) -> None:
+def test_distinct_worktrees_get_distinct_markers(repo: Path, home: Path, tmp_path: Path) -> None:
     repo_b = _second_repo(tmp_path, "repo_b2")
     assert _mark(repo, home).returncode == 0
     assert _mark(repo_b, home).returncode == 0
     markers = list((home / ".genesis" / "review_markers").glob("*.json"))
     assert len(markers) == 2, [m.name for m in markers]
+
+
+# ── Worktree resolved from the payload cwd (bare commit, no `cd` prefix) ──
+
+
+def _run_hook_at(
+    command: str, *, run_from: Path, payload_cwd: Path, home: Path
+) -> subprocess.CompletedProcess:
+    """Run the hook with the process cwd and the payload `cwd` set independently.
+
+    Mirrors the real case where CC's hook process runs at the static project
+    root (run_from) while the Bash tool's actual dir — carried in the payload
+    `cwd` — is a different worktree the session cd'd into."""
+    payload = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "session_id": "test",
+            "cwd": str(payload_cwd),
+        }
+    )
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run(
+        [sys.executable, str(_HOOK)],
+        input=payload,
+        cwd=str(run_from),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_bare_commit_resolves_reviewed_worktree_via_payload_cwd(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """A bare `git commit` (no `cd` prefix) resolves its worktree from the
+    payload `cwd`, so a reviewed commit is allowed even when the hook's own
+    process cwd is a DIFFERENT worktree — the CLAUDE_PROJECT_DIR != actual
+    worktree case that used to false-block."""
+    repo_b = _second_repo(tmp_path, "repo_b_neutral")  # process cwd; unreviewed
+    assert _mark(repo, home).returncode == 0  # reviewed worktree = repo (payload cwd)
+    res = _run_hook_at('git commit -m "reviewed"', run_from=repo_b, payload_cwd=repo, home=home)
+    assert res.returncode == 0, res.stderr
+
+
+def test_payload_cwd_wins_over_process_cwd_and_still_enforces(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """The payload `cwd` (the real commit target) wins over the hook's process
+    cwd, and does NOT weaken the gate: marking the WRONG worktree (repo_b, where
+    the hook process runs) leaves the real target (repo) unreviewed → blocked."""
+    repo_b = _second_repo(tmp_path, "repo_b_marked")
+    assert _mark(repo_b, home).returncode == 0  # the WRONG worktree is reviewed
+    res = _run_hook_at('git commit -m "wip"', run_from=repo_b, payload_cwd=repo, home=home)
+    assert res.returncode == 2, res.stderr
 
 
 def _run_invalidate(command: str, repo: Path, home: Path) -> subprocess.CompletedProcess:
@@ -334,8 +389,12 @@ def _run_invalidate(command: str, repo: Path, home: Path) -> subprocess.Complete
     env = {**os.environ, "HOME": str(home)}
     return subprocess.run(
         [sys.executable, str(_INVALIDATE)],
-        input=payload, cwd=str(repo), env=env,
-        capture_output=True, text=True, timeout=30,
+        input=payload,
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
 
 
@@ -366,3 +425,57 @@ def test_invalidate_ignores_non_commit(repo: Path, home: Path) -> None:
     assert _mark(repo, home).returncode == 0
     _run_invalidate("echo not a commit", repo, home)
     assert len(_markers(home)) == 1  # marker survives
+
+
+def _run_invalidate_at(
+    command: str, *, run_from: Path, payload_cwd: Path, home: Path
+) -> subprocess.CompletedProcess:
+    """PostToolUse invalidation hook with process cwd and payload cwd set apart."""
+    payload = json.dumps(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {"stdout": "[feature/x abc1234] msg", "stderr": ""},
+            "session_id": "test",
+            "cwd": str(payload_cwd),
+        }
+    )
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run(
+        [sys.executable, str(_INVALIDATE)],
+        input=payload,
+        cwd=str(run_from),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_bare_commit_invalidates_via_payload_cwd_no_stale_bypass(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """End-to-end BLOCKER regression (both hooks together): a bare commit is
+    CHECKED against repo's marker via payload cwd (PreToolUse), so the PostToolUse
+    invalidator MUST clear that SAME marker via payload cwd. If it doesn't (the
+    asymmetry where only the checker learned payload-cwd), repo's marker survives
+    and a later add+commit chain in repo sails through the existence-only gate on
+    a stale review — the exact unreviewed-commit bypass this guards."""
+    repo_b = _second_repo(tmp_path, "repo_b_e2e")  # hook PROCESS cwd (wrong worktree)
+    assert _mark(repo, home).returncode == 0  # review recorded for repo (real target)
+    # PreToolUse allows the bare commit — resolves repo via payload cwd.
+    assert (
+        _run_hook_at(
+            'git commit -m "reviewed"', run_from=repo_b, payload_cwd=repo, home=home
+        ).returncode
+        == 0
+    )
+    # PostToolUse must clear repo's marker (same payload cwd), not the process-cwd key.
+    _run_invalidate_at('git commit -m "reviewed"', run_from=repo_b, payload_cwd=repo, home=home)
+    assert _markers(home) == [], "invalidator did not clear the payload-cwd-resolved marker"
+    # A NEW unreviewed add+commit chain in repo must now BLOCK (no stale marker).
+    res = _run_hook_at(
+        'git add -A && git commit -m "unreviewed"', run_from=repo_b, payload_cwd=repo, home=home
+    )
+    assert res.returncode == 2, res.stderr

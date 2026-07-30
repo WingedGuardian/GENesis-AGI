@@ -119,6 +119,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The commit review gate no longer false-blocks commits made from a second
+  worktree.** When one Claude Code session worked in a git worktree other than
+  the one it launched from, the hook that requires a code review before a commit
+  looked for the review record in the wrong worktree and blocked the commit even
+  though the review had been done. It now reads the Bash tool's actual working
+  directory from the hook payload, so a plain `git commit` resolves its own
+  worktree's review record — no `cd`-prefix workaround needed. The gate is not
+  weakened: an unreviewed commit still blocks, verified by a test that marks the
+  wrong worktree and confirms the real target is still gated.
 - **Genesis's safety guardrails work again.** The hooks that block dangerous
   actions in Claude Code sessions — force-pushing, `rm -rf` on your data
   directories or database, committing to `main` without a review, writing to

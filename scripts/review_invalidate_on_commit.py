@@ -14,6 +14,7 @@ Exit codes:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -33,13 +34,25 @@ _COMMIT_PATTERN = re.compile(r"\bgit\s+commit\b")
 def _extract_working_dir(command: str) -> str | None:
     """Extract the worktree cwd from a leading ``cd <path> && ...`` so the marker
     cleared matches the per-worktree marker that authorized this commit."""
-    import os
-
     m = re.match(r"^cd\s+([^\s&|;]+)", command)
     if not m:
         return None
     path = os.path.expanduser(m.group(1))
     return path if os.path.isdir(path) else None
+
+
+def _payload_cwd(payload: dict) -> str | None:
+    """The Bash tool's actual working directory, from the PostToolUse payload.
+
+    MUST mirror ``review_enforcement_commit._payload_cwd`` exactly: the PreToolUse
+    checker resolves a bare ``git commit`` (no leading ``cd``) via this payload
+    ``cwd``, so the PostToolUse invalidator has to clear the SAME per-worktree
+    marker — else the checked marker survives the commit and a later add+commit
+    chain in that worktree passes the existence-only gate on a stale review."""
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    if isinstance(cwd, str) and cwd and os.path.isabs(cwd) and os.path.isdir(cwd):
+        return cwd  # absolute (CC always supplies absolute) + real dir
+    return None
 
 
 def main() -> None:
@@ -64,8 +77,11 @@ def main() -> None:
         pass  # Can't parse result — be conservative, invalidate anyway
 
     # Clear the per-worktree review marker (matching the cwd that authorized
-    # this commit) so the next commit requires a fresh review.
-    clear_marker(cwd=_extract_working_dir(command))
+    # this commit) so the next commit requires a fresh review. Same precedence as
+    # the PreToolUse checker — explicit `cd X && …` → payload cwd → None — so the
+    # marker CLEARED is the same one that was CHECKED (a bare commit resolves via
+    # payload cwd on both sides; a mismatch would leave a stale marker valid).
+    clear_marker(cwd=_extract_working_dir(command) or _payload_cwd(payload))
 
     sys.exit(0)
 
