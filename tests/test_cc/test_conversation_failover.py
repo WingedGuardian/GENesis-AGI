@@ -14,10 +14,17 @@ import pytest
 
 from genesis.cc import fallback_state, roster
 from genesis.cc.conversation import ConversationLoop
-from genesis.cc.exceptions import CCError, CCRateLimitError
+from genesis.cc.exceptions import CCError, CCNetworkOfflineError, CCRateLimitError
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.system_prompt import SystemPromptAssembler
-from genesis.cc.types import CCInvocation, CCOutput, ChannelType, StreamEvent
+from genesis.cc.types import (
+    CCInvocation,
+    CCModel,
+    CCOutput,
+    ChannelType,
+    EffortLevel,
+    StreamEvent,
+)
 from genesis.db.crud import cc_sessions
 
 
@@ -229,3 +236,52 @@ async def test_run_failover_peer_rate_limit_propagates(loop, invoker):
     with pytest.raises(CCRateLimitError):
         await loop._run_failover_peer("glm-5.2", _PEER_INV, sticky=None, on_event=None)
     assert invoker.run.call_count == 1  # no fresh retry on rate-limit
+
+
+# ── CAVEAT A: network-offline on a RESUME turn must NOT fail the live session ──
+
+@pytest.mark.asyncio
+async def test_network_offline_on_resume_fast_reraises(loop, invoker):
+    # A CCNetworkOfflineError on a resume turn is the internet being down, NOT a
+    # stale resume. It must fast-re-raise WITHOUT _recover_stale_resume (which
+    # would mark the live CC session failed and retry fresh).
+    invoker.run = AsyncMock(side_effect=CCNetworkOfflineError("offline"))
+    loop._recover_stale_resume = AsyncMock()
+    inv = CCInvocation(prompt="x", resume_session_id="cc-live")
+    with pytest.raises(CCNetworkOfflineError):
+        await loop._try_invoke(
+            inv, session={"id": "cc-live"}, was_resume=True, prompt_text="x",
+            model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+            user_id="u1", channel=ChannelType.TERMINAL, thread_id=None,
+        )
+    loop._recover_stale_resume.assert_not_awaited()
+    assert invoker.run.await_count == 1  # no fresh retry
+
+
+@pytest.mark.asyncio
+async def test_network_offline_on_resume_streaming_fast_reraises(loop, invoker):
+    invoker.run_streaming = AsyncMock(side_effect=CCNetworkOfflineError("offline"))
+    loop._recover_stale_resume = AsyncMock()
+    inv = CCInvocation(prompt="x", resume_session_id="cc-live")
+    with pytest.raises(CCNetworkOfflineError):
+        await loop._try_invoke_streaming(
+            inv, session={"id": "cc-live"}, was_resume=True, prompt_text="x",
+            model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+            user_id="u1", channel=ChannelType.TERMINAL, thread_id=None, on_event=None,
+        )
+    loop._recover_stale_resume.assert_not_awaited()
+    assert invoker.run_streaming.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_failover_peer_offline_propagates_without_fresh_retry(loop, invoker):
+    # Same class on the peer path: an offline error on a sticky peer resume must
+    # propagate, NOT trigger the "retry fresh" recovery (which is for stale resumes).
+    invoker.run = AsyncMock(side_effect=CCNetworkOfflineError("offline"))
+    with pytest.raises(CCNetworkOfflineError):
+        await loop._run_failover_peer(
+            "glm-5.2", _PEER_INV,
+            sticky={"roster_model": "glm-5.2", "cc_session_id": "glm-prev"},
+            on_event=None,
+        )
+    assert invoker.run.call_count == 1  # no fresh retry

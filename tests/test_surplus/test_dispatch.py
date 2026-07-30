@@ -234,3 +234,76 @@ async def test_route_insights_ingests_bookmark_enrichment(monkeypatch):
     # In KB_ROUTING (enriched bookmarks are durable) though NOT judge-eligible.
     spy, _ = await _run_route(TaskType.BOOKMARK_ENRICHMENT, monkeypatch)
     spy.assert_awaited_once()
+
+
+# ── _filter_tiers_for_network — PR-3 outage awareness ──────────────────
+
+from genesis.resilience import network_config as _network_config  # noqa: E402
+from genesis.surplus.types import ComputeTier as _ComputeTier  # noqa: E402
+
+_CLOUD_AND_LOCAL = [_ComputeTier.FREE_API, _ComputeTier.LOCAL_30B]
+_CLOUD_ONLY = [_ComputeTier.FREE_API]
+_LOCAL_ONLY = [_ComputeTier.LOCAL_30B]
+
+
+def _patch_decision(monkeypatch, value):
+    monkeypatch.setattr(_network_config, "parking_decision", lambda now=None: value)
+
+
+def test_filter_off_unchanged(monkeypatch):
+    _patch_decision(monkeypatch, "off")
+    assert dispatch._filter_tiers_for_network(list(_CLOUD_AND_LOCAL)) == _CLOUD_AND_LOCAL
+
+
+def test_filter_normal_unchanged(monkeypatch):
+    _patch_decision(monkeypatch, "normal")
+    assert dispatch._filter_tiers_for_network(list(_CLOUD_AND_LOCAL)) == _CLOUD_AND_LOCAL
+
+
+def test_filter_shadow_unchanged(monkeypatch):
+    # Shadow observes only — tiers untouched (a "would filter" log fires).
+    _patch_decision(monkeypatch, "shadow")
+    assert dispatch._filter_tiers_for_network(list(_CLOUD_AND_LOCAL)) == _CLOUD_AND_LOCAL
+
+
+def test_filter_park_strips_cloud_keeps_local(monkeypatch):
+    _patch_decision(monkeypatch, "park")
+    assert dispatch._filter_tiers_for_network(list(_CLOUD_AND_LOCAL)) == _LOCAL_ONLY
+
+
+def test_filter_park_strips_all_when_no_local(monkeypatch):
+    # Cloud-only during an outage → empty list (surplus goes quiet-pending).
+    _patch_decision(monkeypatch, "park")
+    assert dispatch._filter_tiers_for_network(list(_CLOUD_ONLY)) == []
+
+
+def test_filter_park_noop_when_already_local(monkeypatch):
+    _patch_decision(monkeypatch, "park")
+    assert dispatch._filter_tiers_for_network(list(_LOCAL_ONLY)) == _LOCAL_ONLY
+
+
+def test_filter_failsafe_on_error(monkeypatch):
+    # Any error in the gate leaves tiers intact (never strips on uncertainty).
+    def _boom(now=None):
+        raise RuntimeError("gate broke")
+
+    monkeypatch.setattr(_network_config, "parking_decision", _boom)
+    assert dispatch._filter_tiers_for_network(list(_CLOUD_AND_LOCAL)) == _CLOUD_AND_LOCAL
+
+
+async def test_dispatch_once_offline_feeds_filtered_tiers_and_never_fails(monkeypatch):
+    # OFFLINE+live+cloud-only → next_task receives [], no task runs, nothing is
+    # marked failed (the task stays `pending` for the next cycle).
+    _patch_decision(monkeypatch, "park")
+    ctx = _make_ctx(idle=True)
+    ctx._compute = _types.SimpleNamespace(
+        get_available_tiers=AsyncMock(return_value=list(_CLOUD_ONLY)),
+    )
+    ctx._queue.next_task = AsyncMock(return_value=None)
+
+    processed = await dispatch.dispatch_once(ctx)
+
+    assert processed is False
+    ctx._queue.next_task.assert_awaited_once_with([])  # cloud stripped → empty
+    ctx._queue.mark_failed.assert_not_called()
+    ctx._queue.mark_running.assert_not_called()

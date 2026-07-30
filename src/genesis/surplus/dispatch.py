@@ -29,6 +29,7 @@ from genesis.observability.types import Severity, Subsystem
 from genesis.surplus.types import (
     INSIGHT_PRODUCING_TASK_TYPES,
     KB_ROUTING_TASK_TYPES,
+    ComputeTier,
     TaskType,
 )
 
@@ -342,6 +343,50 @@ async def _signal_autonomy_success() -> None:
         logger.debug("Autonomy success signal failed (non-fatal)", exc_info=True)
 
 
+def _filter_tiers_for_network(tiers: list[ComputeTier]) -> list[ComputeTier]:
+    """Strip cloud compute tiers when the network is hard-OFFLINE (PR-3).
+
+    Keeps surplus outage-aware: during a detected outage, tasks that need the
+    internet stay ``pending`` (``next_task`` simply selects nothing for the
+    stripped tiers, and re-selects them the instant connectivity returns)
+    instead of dispatching into a dead network and churning ``failed`` /
+    dead-letter rows every cycle. LAN-local compute (``LOCAL_30B``) still runs.
+
+    This is dispatch-side *compute-availability* gating — the same mechanism as
+    the existing LM-Studio reachability check in ``get_available_tiers`` — NOT
+    generator alert-awareness (surplus generators stay deliberately blind to
+    infrastructure alerts). Fail-safe: the parking lever off, a non-fresh/absent
+    OFFLINE signal, or any error leaves the tier list untouched.
+    """
+    try:
+        from genesis.resilience import network_config
+
+        decision = network_config.parking_decision()
+        if decision in ("off", "normal"):
+            return tiers
+        local_only = [t for t in tiers if t == ComputeTier.LOCAL_30B]
+        if local_only == tiers:
+            return tiers  # already LAN-only (or empty) — nothing cloud to strip
+        if decision == "shadow":
+            logger.info(
+                "network OFFLINE: WOULD restrict surplus to LAN compute "
+                "(shadow mode) — proceeding",
+            )
+            return tiers
+        logger.info(
+            "network OFFLINE: surplus restricted to LAN compute (%d→%d tiers)",
+            len(tiers),
+            len(local_only),
+        )
+        return local_only
+    except Exception:
+        logger.debug(
+            "surplus network tier filter errored — leaving tiers intact",
+            exc_info=True,
+        )
+        return tiers
+
+
 async def dispatch_once(sched: DispatchContext) -> bool:
     """Single dispatch cycle. Returns True if a task was processed."""
     # 0. Recover tasks stuck in 'running' state (crashed mid-execution)
@@ -360,6 +405,11 @@ async def dispatch_once(sched: DispatchContext) -> bool:
 
     # 3. Check compute availability
     available_tiers = await sched._compute.get_available_tiers()
+
+    # 3b. Outage awareness (PR-3): when the network is hard-OFFLINE, strip cloud
+    # tiers so internet-dependent tasks stay `pending` instead of churning into a
+    # dead network. LAN-local compute still runs; fail-safe leaves tiers intact.
+    available_tiers = _filter_tiers_for_network(available_tiers)
 
     # 4. Get next task
     task = await sched._queue.next_task(available_tiers)

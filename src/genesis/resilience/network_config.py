@@ -31,6 +31,7 @@ import copy
 import logging
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -167,6 +168,43 @@ def backup_push_retry_mode() -> str:
         logger.warning("network backup_push_retry invalid %r — degrading to off", mode)
         return "off"
     return mode
+
+
+def parking_decision(now: datetime | None = None) -> str:
+    """PR-3 consumer gate: should degraded-mode parking apply *right now*?
+
+    The single source of truth for "the network is actionably OFFLINE", shared
+    by every consumer (the CC-invoker preflight and the surplus tier filter) so
+    they cannot drift. Combines the :func:`effective_parking_mode` lever with the
+    live connectivity snapshot (``network_state.json``) and the same freshness
+    guard the watchdog/dashboard use.
+
+    Returns one of:
+      ``"off"``    — lever off; caller must no-op (behave as pre-sentinel).
+      ``"normal"`` — not actionably OFFLINE (snapshot absent, stale, or
+                     NORMAL/DEGRADED); caller proceeds exactly as today.
+      ``"shadow"`` — fresh OFFLINE + shadow mode; caller logs "would park" and
+                     proceeds (observe-only soak).
+      ``"park"``   — fresh OFFLINE + live mode; caller applies its parking action.
+
+    Fail-safe: shadow/off are the only non-``normal`` returns unless the snapshot
+    is a *fresh* OFFLINE — any missing/garbled/stale signal degrades to
+    ``"normal"`` (never invents a park). ``now`` is injectable for tests.
+    """
+    from genesis.resilience import network_state
+
+    mode = effective_parking_mode()
+    if mode == "off":
+        return "off"
+    snapshot = network_state.read_state()
+    if snapshot is None or snapshot.get("state") != "OFFLINE":
+        return "normal"
+    age = network_state.probe_age_s(snapshot, now or datetime.now(UTC))
+    if age is None or age > structural().staleness_threshold_s:
+        # Stalled/absent sentinel — don't act on a connectivity signal we can't
+        # trust (mirrors the watchdog's fail-toward-safe staleness rule).
+        return "normal"
+    return "park" if mode == "live" else "shadow"
 
 
 def _knob_int(cfg: dict[str, Any], key: str) -> int:
