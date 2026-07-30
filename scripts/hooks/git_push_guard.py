@@ -455,6 +455,60 @@ def _ask(reason: str) -> int:
     return 0
 
 
+def _pr_create_head_branch(argv: list[str]) -> str | None:
+    """The head branch named by a ``gh pr create`` (``--head``/``-H`` VALUE, or
+    ``--head=VALUE``), stripped of any ``owner:`` prefix. None → gh uses the
+    current branch."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--head", "-H") and i + 1 < len(argv):
+            v = argv[i + 1]
+            return v.split(":", 1)[1] if ":" in v else v
+        if tok.startswith("--head="):
+            v = tok.split("=", 1)[1]
+            return v.split(":", 1)[1] if ":" in v else v
+        i += 1
+    return None
+
+
+def _pr_create_would_publish(argv: list[str]) -> bool:
+    """Whether a ``gh pr create`` might PUSH its branch (bypassing the push gate).
+
+    gh pushes — and can even fork — a branch whose HEAD is not yet on the remote,
+    so a bare create from an unpushed branch publishes code around this hook.
+    Checks the LOCAL remote-tracking ref (no network): the branch's remote ref
+    must exist AND already contain HEAD. Fail-safe — any uncertainty → True (gate).
+    """
+    branch = _pr_create_head_branch(argv) or _current_branch()
+    if not branch:
+        return True  # can't determine the branch → gate
+    remote_ref = f"refs/remotes/origin/{branch}"
+    try:
+        exists = (
+            subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", remote_ref],
+                capture_output=True,
+                timeout=5,
+            ).returncode
+            == 0
+        )
+        if not exists:
+            return True  # branch not on the remote → gh would push it → gate
+        # HEAD already reachable from the remote branch → nothing to push.
+        contained = (
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", "HEAD", remote_ref],
+                capture_output=True,
+                timeout=5,
+            ).returncode
+            == 0
+        )
+        return not contained  # unpushed commits on HEAD → gh may push → gate
+    except Exception:
+        return True  # fail-safe → gate
+
+
 def main() -> int:
     try:
         cmd = field(read_payload(), "command")
@@ -471,24 +525,27 @@ def main() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
-        # Each push / PR-create is a SEPARATE external-publish action needing its
-        # own approval. A single Bash command carrying more than one would
+        # Each git push is a SEPARATE external-publish action needing its own
+        # approval. A single Bash command carrying more than one push would
         # collapse into ONE ask (mentioning only the first), so approving that
-        # prompt would run every publish behind it. Reject the compound and
-        # require each to be its own separately-approved tool call.
-        if len(push_segs) + len(create_segs) > 1:
+        # prompt would run every push behind it. Reject the compound and require
+        # each push to be its own separately-approved tool call. (gh pr create is
+        # normally un-gated — a review request on already-pushed code — and rides
+        # along on a push's approval; the exception, where gh itself would push an
+        # unpushed branch, is handled by the create arm below.)
+        if len(push_segs) > 1:
             print(
-                "BLOCKED: multiple publish operations (git push / gh pr create) "
-                "in one command would share a single approval prompt. Run each "
-                "as its own command so each is approved separately.",
+                "BLOCKED: multiple git push operations in one command would "
+                "share a single approval prompt. Run each push as its own "
+                "command so each is approved separately.",
                 file=sys.stderr,
             )
             return 2
 
-        # An interactive push / PR-create defers to a native approve/deny
-        # dialog at the END of main(), so every hard-block below (merge-into-
-        # main, the pr-merge gates, sqlite, --no-verify) still takes precedence
-        # — a compound `git push && git commit --no-verify` blocks, never asks.
+        # An interactive push defers to a native approve/deny dialog at the END
+        # of main(), so every hard-block below (merge-into-main, the pr-merge
+        # gates, sqlite, --no-verify) still takes precedence — a compound
+        # `git push && git commit --no-verify` blocks, never asks.
         ask_reason: str | None = None
 
         # ── git push (any branch) ──────────────────────────────────
@@ -539,20 +596,25 @@ def main() -> int:
                 )
                 return 2
 
-        # ── gh pr create ───────────────────────────────────────────
-        if create_segs:
+        # ── gh pr create ────────────────────────────────────────────
+        # Un-gated when its branch is already on the remote — opening a PR is then
+        # just a review request on already-pushed code, so `git push && gh pr
+        # create` prompts once (for the push) and the create rides along. BUT a
+        # bare create from an UNPUSHED branch makes gh push (and possibly fork) the
+        # branch itself — a code-publish that would bypass the push gate — so gate
+        # that form like a push: dispatched → deny, interactive → ask.
+        if create_segs and any(_pr_create_would_publish(s.argv) for s in create_segs):
             if _is_dispatched():
                 print(
-                    "BLOCKED: Creating a PR requires user approval before publishing externally.",
-                    file=sys.stderr,
-                )
-                print(
-                    "Autonomous/dispatched sessions cannot open PRs directly.",
+                    "BLOCKED: this gh pr create would push a not-yet-pushed branch; "
+                    "autonomous/dispatched sessions cannot publish code.",
                     file=sys.stderr,
                 )
                 return 2
             if ask_reason is None:
-                ask_reason = "gh pr create needs your approval before publishing externally."
+                ask_reason = (
+                    "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
+                )
 
         # ── gh pr merge ────────────────────────────────────────────
         if merge_pr_segs:
