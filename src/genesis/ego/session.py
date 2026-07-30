@@ -102,6 +102,12 @@ _EGO_CYCLE_DISALLOWED_TOOLS = (
     # class as the goal tools above). Capture happens in user-facing
     # sessions (conversation, resolution paths), never inside a cycle.
     "mcp__genesis-health__ego_decision",
+    # Directives and proposal resolution are USER authority — both stamp
+    # source="user" on what they create (a directive; a withdrawn -> re-validation
+    # directive). The ego cycle must never forge either. Belt to the per-tool
+    # is_dispatched_session_env() gate's suspenders.
+    "mcp__genesis-health__ego_directive",
+    "mcp__genesis-health__ego_proposal_resolve",
 )
 
 # Per-cycle cap on autonomous own-goal creations (genesis ego). One per cycle
