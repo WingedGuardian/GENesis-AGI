@@ -893,6 +893,28 @@ def test_git_dash_C_to_main_blocked(repo: Path, home: Path, tmp_path: Path) -> N
     assert "main" in res.stderr.lower()
 
 
+def test_commit_dash_C_reuse_message_is_not_a_worktree(repo: Path, home: Path) -> None:
+    """`git commit -C HEAD` reuses HEAD's message — the `-C` is the commit's own
+    flag, NOT a `git -C <dir>` redirect. It must resolve the SHELL's worktree
+    (here `repo`), so an unreviewed one still BLOCKS (Rule 2) and a reviewed one
+    passes — not resolve a bogus `<cwd>/HEAD` dir. Regression for the Codex P1."""
+    res = _run_hook("git commit -C HEAD", repo, home, payload_cwd=str(repo))
+    assert res.returncode == 2, res.stderr  # unreviewed → still gated in `repo`
+    assert "without review" in res.stderr
+    assert _mark(repo, home).returncode == 0
+    res_ok = _run_hook("git commit -C HEAD", repo, home, payload_cwd=str(repo))
+    assert res_ok.returncode == 0, res_ok.stderr  # reviewed `repo` → allowed
+
+
+def test_invalidate_commit_dash_C_reuse_clears_shell_worktree(repo: Path, home: Path) -> None:
+    """The invalidator must clear the SHELL's worktree marker for
+    `git commit -C HEAD`, not a bogus `<cwd>/HEAD` (which would leave the real
+    marker stale). Pairs with the checker regression above."""
+    assert _mark(repo, home).returncode == 0
+    _run_invalidate_at("git commit -C HEAD", run_from=repo, payload_cwd=repo, home=home)
+    assert _markers(home) == [], "`git commit -C HEAD` did not clear the real marker"
+
+
 def test_commit_pattern_matches_git_dash_c_and_dash_C() -> None:
     """Drift guard: BOTH hooks' `_COMMIT_PATTERN` must detect `git -C`/`git -c`
     commit forms (and not regress to the rigid `git commit` adjacency), and the

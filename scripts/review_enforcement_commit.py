@@ -97,11 +97,29 @@ def _is_docs_or_config(path: str) -> bool:
 
 
 def _seg_dash_C(argv) -> str | None:
-    """The dir named by a ``git -C <dir>`` in a segment's argv, else None."""
+    """The dir named by a GLOBAL ``git -C <dir>`` in a segment's argv, else None.
+
+    Only the ``-C`` that precedes the git SUBCOMMAND is the "run as if started in
+    <dir>" global option. A ``-C`` AFTER the subcommand is that subcommand's own
+    flag with a different meaning — for ``git commit -C <commit>`` it reuses that
+    commit's message/authorship and ``<commit>`` is a commit-ish (e.g. ``HEAD``),
+    NOT a directory. Scanning the whole argv (the old behavior) mistook
+    ``git commit -C HEAD`` for a ``-C HEAD`` worktree redirect and resolved a
+    bogus ``<cwd>/HEAD`` dir. So walk only the global-option prefix and stop at
+    the first non-option token (the subcommand)."""
     argv = argv or []
-    for i, tok in enumerate(argv):
+    i = 1  # argv[0] is the executable ("git")
+    while i < len(argv):
+        tok = argv[i]
         if tok == "-C" and i + 1 < len(argv):
             return argv[i + 1]
+        if tok in _GIT_GLOBAL_VALUE_FLAGS:  # another global value-flag: skip flag+value
+            i += 2
+            continue
+        if tok.startswith("-"):  # a global boolean flag (e.g. --no-pager)
+            i += 1
+            continue
+        break  # reached the subcommand — any later -C belongs to it, not to git
     return None
 
 
