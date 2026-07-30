@@ -57,6 +57,34 @@ _FALLBACK_SYSTEM_PROMPT = (
 _extract_urls = extract_urls
 
 
+# A "standing directive" is a whole line consisting solely of a bracketed
+# expression, e.g. ``[If it's in here, default to building it]`` at the top of
+# an inbox notepad. These express file-scoped intent (INBOX_EVALUATE.md Rule 1)
+# that must govern EVERY evaluation of the file — but the delta scanner baselines
+# the directive line away after the first eval, so later deltas never carry it.
+# ``_build_prompt`` re-reads the source file and re-injects directives each time.
+# The line must END with ``]`` so a markdown link line (``see [docs](url)``) or a
+# bracket used mid-sentence does not match.
+_BRACKET_DIRECTIVE_RE = re.compile(r"^\[.+\]$")
+
+
+def _extract_bracket_directives(text: str) -> list[str]:
+    """Return whole-line ``[ ... ]`` directives from ``text``, order-preserving.
+
+    Only lines that are ENTIRELY a bracketed expression qualify (leading/trailing
+    whitespace is tolerated). Duplicates are dropped while preserving first-seen
+    order. Never raises.
+    """
+    seen: set[str] = set()
+    directives: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if _BRACKET_DIRECTIVE_RE.match(stripped) and stripped not in seen:
+            seen.add(stripped)
+            directives.append(stripped)
+    return directives
+
+
 # Patterns indicating the evaluation GAVE UP on URLs (not just encountered errors).
 # Tested against all 8 existing response files: 0 false positives, 0 false negatives.
 # Crucially, these do NOT include "ssl error" or "could not fetch" which appear
@@ -186,6 +214,8 @@ class InboxMonitor:
         clock=None,
         prompt_dir: Path | None = None,
         triage_pipeline: Callable[..., Coroutine[Any, Any, None]] | None = None,
+        router=None,
+        memory_store=None,
     ):
         self._db = db
         self._invoker = invoker
@@ -203,6 +233,11 @@ class InboxMonitor:
         self._triage_pipeline = triage_pipeline
         self._autonomous_dispatcher = None
         self._build_lane = None
+        # Deterministic inbox-eval memory persistence (inbox.eval_memory). No-op
+        # unless BOTH are wired — every existing caller/test omits them, so the
+        # feature stays inert without them.
+        self._router = router
+        self._memory_store = memory_store
 
     def set_build_lane(self, build_lane: object) -> None:
         """Wire the capability-build lane (late-bound after autonomy+tasks init)."""
@@ -1721,6 +1756,24 @@ class InboxMonitor:
                 event_bus=self._event_bus,
                 subsystem=Subsystem.INBOX,
             )
+        # Deterministic memory persistence over the curated output text. Detached
+        # and isolated — fires AFTER baseline+complete so it can never affect the
+        # batch. No-op unless router+store are wired (see __init__).
+        if output_text and self._router is not None and self._memory_store is not None:
+            from genesis.observability.types import Subsystem
+            from genesis.util.tasks import tracked_task
+
+            # Prefer the CC-generated session id (output.session_id) for
+            # source_session_id — that's what transcript tracing and every other
+            # extraction path key on (extraction_job uses cc_session_id). Fall
+            # back to the internal cc_sessions.id lifecycle UUID if absent.
+            cc_sid = getattr(output, "session_id", "") or session_id
+            tracked_task(
+                self._persist_eval_memories(output_text, batch_id, cc_sid, [item.file_path]),
+                name="inbox-eval-memory",
+                event_bus=self._event_bus,
+                subsystem=Subsystem.INBOX,
+            )
         if self._event_bus:
             from genesis.observability.types import Severity, Subsystem
 
@@ -1821,11 +1874,33 @@ class InboxMonitor:
         except Exception:
             logger.exception("Failed to write message_queue entry")
 
+    def _read_standing_directives(self, file_path: str) -> list[str]:
+        """Read the CURRENT source file and return its standing bracket directives.
+
+        Re-reading at prompt-build time gives latest-intent semantics and covers
+        the resumed-batch and retry dispatch paths. Returns ``[]`` when the file
+        is unreadable (deleted/renamed/locked) so a missing file degrades to "no
+        directives" rather than failing dispatch. Never raises.
+        """
+        try:
+            content = read_content(Path(file_path))
+        except (FileNotFoundError, PermissionError, OSError):
+            logger.debug(
+                "Standing-directive read failed for %s",
+                file_path,
+                exc_info=True,
+            )
+            return []
+        return _extract_bracket_directives(content)
+
     def _build_prompt(self, items: list[InboxItem]) -> str:
         """Build the evaluation prompt from a batch of items.
 
         URLs are extracted from each item's content and enumerated explicitly
-        so the CC session cannot silently skip them.
+        so the CC session cannot silently skip them. Standing bracketed lines
+        (whole-line ``[ ... ]`` expressions) are re-read from the source file(s)
+        and surfaced as context — the delta scanner baselines them away after the
+        first eval, so without this they would never reach later evaluations.
         """
         parts = [
             f"Evaluate the following {len(items)} inbox item(s).\n",
@@ -1837,6 +1912,44 @@ class InboxMonitor:
                 "not listed below. Evaluate ONLY the content provided here.\n"
             ),
         ]
+        _sanitizer = ContentSanitizer()
+
+        # Re-inject standing file directives, deduped per source file (a batch's
+        # items normally share one file, but may span files — each item's header
+        # names its file so the agent can associate directive → item).
+        directive_blocks: list[str] = []
+        seen_files: set[str] = set()
+        for item in items:
+            if item.file_path in seen_files:
+                continue
+            seen_files.add(item.file_path)
+            directives = self._read_standing_directives(item.file_path)
+            if not directives:
+                continue
+            name = Path(item.file_path).name
+            result = _sanitizer.sanitize("\n".join(directives), ContentSource.INBOX)
+            if result.detected_patterns:
+                logger.warning(
+                    "Injection patterns detected in standing directives for %s: %s (risk=%.2f)",
+                    name,
+                    result.detected_patterns,
+                    result.risk_score,
+                )
+            directive_blocks.append(f"**{name}:**\n{result.wrapped}")
+        if directive_blocks:
+            parts.append(
+                "\n### Standing bracketed lines from the source file(s) "
+                "(context — NOT items to evaluate):\n"
+                "\nThese are the whole-line bracketed entries currently in the "
+                "source file(s) below. Apply any that are genuine Rule 1 "
+                "directives (a classification directive or a capability-build "
+                "directive) as authoritative for every item from that SAME file. "
+                "Ignore incidental bracketed text — placeholders, titles, or "
+                "annotations that are not directives. Do NOT evaluate these lines "
+                "as items and do NOT restate them in your output.\n"
+            )
+            parts.extend(directive_blocks)
+
         for idx, item in enumerate(items, 1):
             name = Path(item.file_path).name
             urls = _extract_urls(item.content)
@@ -1849,7 +1962,6 @@ class InboxMonitor:
                 for i, url in enumerate(urls, 1):
                     parts.append(f"{i}. {url}")
                 parts.append("")  # blank line separator
-            _sanitizer = ContentSanitizer()
             result = _sanitizer.sanitize(item.content, ContentSource.INBOX)
             if result.detected_patterns:
                 logger.warning(
@@ -1872,6 +1984,46 @@ class InboxMonitor:
             await self._triage_pipeline(output, user_text, "inbox")
         except Exception:
             logger.exception("Inbox triage pipeline failed (non-fatal)")
+
+    async def _persist_eval_memories(
+        self,
+        evaluation_text: str,
+        batch_id: str,
+        session_id: str | None,
+        source_files: list[str],
+    ) -> None:
+        """Fire-and-forget deterministic memory persistence over the eval output.
+
+        Whole body guarded — this runs detached and must NEVER crash or affect
+        the batch. Emits a ``memory.persisted`` event when anything is stored.
+        """
+        try:
+            from genesis.inbox.eval_memory import extract_and_store_eval_memories
+
+            count = await extract_and_store_eval_memories(
+                db=self._db,
+                store=self._memory_store,
+                router=self._router,
+                evaluation_text=evaluation_text,
+                source_files=source_files,
+                session_id=session_id,
+            )
+            if count and self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+
+                await self._event_bus.emit(
+                    Subsystem.INBOX,
+                    Severity.INFO,
+                    "memory.persisted",
+                    f"Stored {count} memory(ies) from inbox eval {batch_id[:8]}",
+                    batch_id=batch_id,
+                    count=count,
+                )
+        except Exception:
+            logger.warning(
+                "Inbox eval-memory persistence failed (non-fatal)",
+                exc_info=True,
+            )
 
     async def _check_inbox(self) -> None:
         """Scheduled callback — wraps check_once with error handling."""
