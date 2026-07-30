@@ -63,7 +63,18 @@ def main() -> int:
             "- Code: use CBM search_graph/trace_path, Serena find_symbol/find_referencing_symbols\n"
             "- These MCP tools are available to the agent. Prefer them over CC WebFetch/WebSearch and raw Grep."
         )
-        print(json.dumps({"additionalContext": nudge}))
+        # Reaches the model ONLY via hookSpecificOutput.additionalContext;
+        # a top-level additionalContext key is silently discarded.
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": nudge,
+                    }
+                }
+            )
+        )
 
     except (json.JSONDecodeError, KeyError):
         pass  # Fail-open

@@ -55,7 +55,19 @@ def main() -> int:
             "- web_search(query) — SearXNG (unlimited) with Brave/Tavily/Exa/Perplexity options\n"
             "CC WebFetch is best when you specifically need an AI-processed summary."
         )
-        print(json.dumps({"additionalContext": nudge}))
+        # PostToolUse/PreToolUse advisories reach the model ONLY via
+        # hookSpecificOutput.additionalContext; a top-level additionalContext
+        # key is silently discarded by Claude Code.
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": nudge,
+                    }
+                }
+            )
+        )
 
     except (json.JSONDecodeError, KeyError):
         pass  # Fail-open

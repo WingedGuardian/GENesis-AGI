@@ -47,9 +47,11 @@ if [[ -n "$FILE_PATH" ]]; then
     esac
 fi
 
-# Emit soft tip via additionalContext (never blocks)
+# Emit soft tip via hookSpecificOutput.additionalContext (never blocks).
+# A top-level additionalContext key is silently discarded by Claude Code — the
+# nudge only reaches the model nested under hookSpecificOutput (audit B7).
 cat << 'TIPJSON'
-{"additionalContext": "Tip: For code exploration, consider using code intelligence tools — Serena (Python symbols), codebase-memory-mcp (code graph, architecture), or GitNexus (impact analysis). See .claude/docs/code-intelligence.md for the full decision matrix."}
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "Tip: For code exploration, consider using code intelligence tools — Serena (Python symbols), codebase-memory-mcp (code graph, architecture), or GitNexus (impact analysis). See .claude/docs/code-intelligence.md for the full decision matrix."}}
 TIPJSON
 
 exit 0
