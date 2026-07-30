@@ -102,12 +102,20 @@ over.
   tool). Force push (`--force` / `--force-with-lease` / `-f` / `+refspec` /
   `--mirror`) is **hard-blocked** in every session. Multiple pushes in one
   command are blocked — each push needs its own approval.
-- `gh pr create` — **un-gated when its branch is already on the remote** (then
-  it's just a review request on pushed code), so a `git push && gh pr create`
-  prompts once — for the push — and the PR-create rides along. The exception:
-  gh will *push* (and can fork) a branch whose HEAD is not yet on the remote, so
-  a create from an **unpushed branch** is gated like a push (interactive → ask,
-  dispatched → deny). Verified via local remote-tracking refs, fail-safe.
+- `gh pr create` — a create only publishes code in the **implicit** form (no
+  `--head`), where gh may *push* (and can fork) the current branch when it isn't
+  fully on the remote. So an **explicit `--head`** (local, unpushed, or
+  `owner:fork`) is **un-gated** — `gh pr create --help`: "Use `--head` to
+  explicitly skip any forking or pushing behavior." The implicit form is un-gated
+  **only when the current branch is already on the remote** (then it's just a
+  review request on pushed code); if it isn't, it's gated like a push (interactive
+  → ask, dispatched → deny). The "already pushed?" check hits the **actual remote**
+  via `git ls-remote` (not the local tracking ref, which goes stale when a merged
+  branch is deleted), fail-safe — any network error / timeout / uncertainty gates.
+  On the un-gated path the hook emits an explicit **`allow`** so Claude Code's own
+  permission prompt doesn't re-fire for the (non-allow-listed) command — so a
+  `git push && gh pr create` prompts once (for the push) and the create rides
+  along, and a standalone create on pushed code doesn't prompt at all.
 - `git merge` into main/master — **hard-blocked** (use the PR workflow).
 - `gh pr merge` without `--admin`, or with unresolved review findings —
   **hard-blocked** (a `# review-override` trailing comment acknowledges
