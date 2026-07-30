@@ -62,6 +62,7 @@ from pathlib import Path
 
 from genesis.db.connection import open_ro_connection
 from genesis.db.crud import pending_embeddings as pending_crud
+from genesis.memory._locks import memory_id_lock
 from genesis.memory.integrity import _scroll_all_points
 from genesis.qdrant import collections as qdrant_ops
 
@@ -262,48 +263,52 @@ async def run_reconcile(
     mirrors_requeued = 0
     mirrors_skipped_no_content = 0
     for mid, coll in mirrors:
-        # Re-read the authoritative row through the LIVE connection: the memory
-        # may have been deleted (row gone) or re-queued/changed (status no
-        # longer 'embedded') since enumeration — both mean skip, never
-        # resurrect or double-queue.
-        cursor = await db.execute(
-            "SELECT created_at, confidence, embedding_status FROM memory_metadata "
-            "WHERE memory_id = ?",
-            (mid,),
-        )
-        mrow = await cursor.fetchone()
-        if mrow is None or mrow[2] != "embedded":
-            continue
-        meta_created_at, confidence = mrow[0], mrow[1]
-        cursor = await db.execute(
-            "SELECT content, tags FROM memory_fts WHERE memory_id = ?", (mid,)
-        )
-        frow = await cursor.fetchone()
-        content = frow[0] if frow else None
-        if not content:
-            # No recoverable content → cannot re-embed. Stop the mirror lying
-            # 'embedded' (honest vectorless state).
-            await db.execute(
-                "UPDATE memory_metadata SET embedding_status = 'failed' WHERE memory_id = ?",
+        # Hold the per-memory-id lock across the re-read → requeue so a
+        # concurrent MemoryStore.delete() of this memory cannot land between the
+        # status=='embedded' check and the requeue insert (which would resurrect
+        # a memory the user just deleted). The re-read is still authoritative:
+        # if the memory was deleted (row gone) or changed (status no longer
+        # 'embedded') BEFORE we take the lock, we skip — never resurrect or
+        # double-queue. Same lock the delete/re-embed paths take (memory/_locks).
+        async with memory_id_lock(mid):
+            cursor = await db.execute(
+                "SELECT created_at, confidence, embedding_status FROM memory_metadata "
+                "WHERE memory_id = ?",
                 (mid,),
             )
-            await db.commit()
-            mirrors_skipped_no_content += 1
-            continue
-        # memory_fts stores tags space-separated; the queue stores them
-        # comma-separated (the worker rebuilds facet payload keys from that).
-        tags = ",".join((frow[1] or "").split()) or None
-        await pending_crud.requeue_for_reembed(
-            db,
-            memory_id=mid,
-            content=content,
-            tags=tags,
-            memory_type="knowledge" if coll == "knowledge_base" else "episodic",
-            collection=coll,
-            created_at=str(meta_created_at) if meta_created_at else now_dt.isoformat(),
-            confidence=confidence,
-        )
-        mirrors_requeued += 1
+            mrow = await cursor.fetchone()
+            if mrow is None or mrow[2] != "embedded":
+                continue
+            meta_created_at, confidence = mrow[0], mrow[1]
+            cursor = await db.execute(
+                "SELECT content, tags FROM memory_fts WHERE memory_id = ?", (mid,)
+            )
+            frow = await cursor.fetchone()
+            content = frow[0] if frow else None
+            if not content:
+                # No recoverable content → cannot re-embed. Stop the mirror lying
+                # 'embedded' (honest vectorless state).
+                await db.execute(
+                    "UPDATE memory_metadata SET embedding_status = 'failed' WHERE memory_id = ?",
+                    (mid,),
+                )
+                await db.commit()
+                mirrors_skipped_no_content += 1
+                continue
+            # memory_fts stores tags space-separated; the queue stores them
+            # comma-separated (the worker rebuilds facet payload keys from that).
+            tags = ",".join((frow[1] or "").split()) or None
+            await pending_crud.requeue_for_reembed(
+                db,
+                memory_id=mid,
+                content=content,
+                tags=tags,
+                memory_type="knowledge" if coll == "knowledge_base" else "episodic",
+                collection=coll,
+                created_at=str(meta_created_at) if meta_created_at else now_dt.isoformat(),
+                confidence=confidence,
+            )
+            mirrors_requeued += 1
 
     status = "partial" if (ghost_delete_failed or capped or truncated) else "ok"
     result = ReconcileResult(

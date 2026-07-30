@@ -140,12 +140,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "a cross-backend consistency check (memory_metadata <-> Qdrant <-> "
             "memory_fts) and a recall-health probe over an install-local golden "
             "set, surfacing findings via a posture alert + dashboard tile. "
-            "Active adds the Phase-1 nightly reconcile job that repairs aged "
-            "drift (ghost vectors deleted with payload export; lying mirrors "
-            "re-queued for re-embed) — knobs repair_min_age_seconds / "
-            "max_repairs_per_run; opt-in now, becomes the default in the "
-            "follow-up PR. Read live per run — takes effect next scheduled "
-            "run. Kill switch: GENESIS_MEMORY_INTEGRITY_DISABLED=1."
+            "Active (default) adds the Phase-1 nightly reconcile job that "
+            "repairs aged drift (ghost vectors deleted with payload export; "
+            "lying mirrors re-queued for re-embed; a per-memory-id lock keeps "
+            "repair safe against concurrent deletes) — knobs "
+            "repair_min_age_seconds / max_repairs_per_run. Read live per run — "
+            "takes effect next scheduled run. Kill switch: "
+            "GENESIS_MEMORY_INTEGRITY_DISABLED=1."
         ),
         config_filename="memory_integrity.yaml",
         readonly=False,

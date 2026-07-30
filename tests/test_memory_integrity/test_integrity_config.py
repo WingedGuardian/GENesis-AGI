@@ -5,20 +5,26 @@ from __future__ import annotations
 from genesis.memory import integrity_config as ic
 
 
-def test_default_mode_is_passive(monkeypatch):
-    # PR-1 ships the repair lane but keeps the DEFAULT passive until the
-    # follow-up adds the per-id lock. Both DEFAULTS and the repo yaml agree.
+def test_default_mode_is_active(monkeypatch):
+    # Repair on by default: the per-memory-id lock closes the requeue-vs-delete
+    # race, so active is safe as the default. Both DEFAULTS and the repo yaml agree.
     monkeypatch.delenv(ic._ENV_KILL_SWITCH, raising=False)
-    assert ic.DEFAULTS["mode"] == "passive"
-    assert ic.effective_mode() == "passive"
+    assert ic.DEFAULTS["mode"] == "active"
+    assert ic.effective_mode() == "active"
 
 
 def test_active_mode_honored_not_coerced(monkeypatch):
-    # The KEY PR-1 capability: 'active' is fully implemented and must run as
-    # 'active' when explicitly set (pre-Phase-1 it was coerced to passive).
+    # 'active' is fully implemented and must run as 'active' when set
+    # (pre-Phase-1 it was coerced to passive).
     monkeypatch.delenv(ic._ENV_KILL_SWITCH, raising=False)
     monkeypatch.setattr(ic, "load_config", lambda: {**ic.DEFAULTS, "mode": "active"})
     assert ic.effective_mode() == "active"
+
+
+def test_passive_opt_out_honored(monkeypatch):
+    monkeypatch.delenv(ic._ENV_KILL_SWITCH, raising=False)
+    monkeypatch.setattr(ic, "load_config", lambda: {**ic.DEFAULTS, "mode": "passive"})
+    assert ic.effective_mode() == "passive"
 
 
 def test_invalid_mode_degrades_to_passive(monkeypatch):
@@ -77,11 +83,11 @@ def test_settings_validator_rejects_invalid():
 
 
 def test_defaults_are_fresh_install_safe():
-    # A fresh clone with no overlay resolves to passive (repair opt-in until the
-    # follow-up) + sane knobs. The repo yaml and DEFAULTS must agree.
+    # A fresh clone with no overlay resolves to active (repair on by default,
+    # race closed by the per-id lock) + sane knobs. Repo yaml + DEFAULTS agree.
     cfg = ic.load_config()
     assert cfg["enabled"] is True
-    assert cfg["mode"] == "passive"
+    assert cfg["mode"] == "active"
     assert cfg["sample_fraction"] == 1.0
     assert cfg["repair_min_age_seconds"] == 3600
     assert cfg["max_repairs_per_run"] == 500

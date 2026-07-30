@@ -29,6 +29,35 @@ def _store(db):
     )
 
 
+class TestDeleteHoldsPerIdLock:
+    """delete() runs its whole locate→delete→cascade under the memory's id-lock,
+    so a concurrent re-embed/reconcile-requeue of the same memory is serialized
+    and can't resurrect a vector. Assert the lock is HELD during the cascade."""
+
+    @pytest.mark.asyncio
+    async def test_delete_cascade_runs_under_lock(self, db, monkeypatch):
+        from genesis.memory._locks import memory_id_lock
+
+        await memory_crud.create(db, memory_id="mem-lk", content="x")
+        await memory_crud.create_metadata(
+            db,
+            memory_id="mem-lk",
+            created_at="2026-03-11T12:00:00",
+        )
+        held: dict[str, bool] = {}
+        real_delete_meta = memory_crud.delete_metadata
+
+        async def _spy(*args, **kwargs):
+            held["at_cascade"] = memory_id_lock("mem-lk").locked()
+            return await real_delete_meta(*args, **kwargs)
+
+        monkeypatch.setattr(store_mod.memory_crud, "delete_metadata", _spy)
+
+        await _store(db).delete("mem-lk")
+        assert held.get("at_cascade") is True
+        assert memory_id_lock("mem-lk").locked() is False  # released after
+
+
 class TestDeleteCascadesEntityMentions:
     """F4: delete() must cascade entity_mentions or leave dangling rows."""
 

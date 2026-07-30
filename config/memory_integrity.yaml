@@ -17,15 +17,15 @@ enabled: true
 
 # Mode: off | passive | active
 #   off     — jobs do not run.
-#   passive — (default) read-only checks + surfacing only (persist + posture
-#             alert + dashboard tile). NEVER repairs.
-#   active  — passive + the nightly reconcile repair job. Fully implemented and
-#             safe to opt into now (set `mode: active` here); it becomes the
-#             default in the follow-up PR that lands the per-memory-id lock
-#             closing the last mirror-requeue-vs-delete race.
+#   passive — read-only checks + surfacing only (persist + posture alert +
+#             dashboard tile). NEVER repairs.
+#   active  — (default) passive + the nightly reconcile repair job. Default
+#             because drift otherwise accumulates silently; the per-memory-id
+#             lock (memory/_locks.py) makes repair safe against concurrent
+#             deletes. Opt out with `mode: passive`.
 # An invalid value degrades to passive (still observing, never repairing) —
 # never a silent off.
-mode: passive
+mode: active
 
 # ── reconcile repair lane (mode=active only) ─────────────────────────────
 repair_min_age_seconds: 3600  # never touch an offender younger than this (in-flight writes)

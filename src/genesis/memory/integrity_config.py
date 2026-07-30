@@ -8,15 +8,15 @@ cache, so an operator edit takes effect on the next scheduled run.
 
 Modes (``off | passive | active``):
 
-- ``passive`` (DEFAULT) — run the read-only checks and surface findings
-  (persist + posture alert + dashboard). Never repairs. This was the whole of
-  Phase 0, and remains the default until the follow-up PR lands the
-  per-memory-id delete/re-embed lock that closes the last mirror-requeue race.
-- ``active`` — everything ``passive`` does, PLUS the Phase-1 periodic reconcile
-  job (``memory/integrity_repair.py``) that repairs aged ghost points and lying
-  mirrors nightly. Fully implemented and safe to opt into now
-  (``mode: active`` in the local overlay); it becomes the default in the
-  follow-up once the race-closing lock ships.
+- ``active`` (DEFAULT) — everything ``passive`` does, PLUS the Phase-1 periodic
+  reconcile job (``memory/integrity_repair.py``) that repairs aged ghost points
+  and lying mirrors nightly. Default because drift otherwise accumulates
+  silently — the same rationale as the d0008 one-time repair running
+  unconditionally at boot. The mirror-requeue-vs-delete race is closed by the
+  per-memory-id lock (``memory/_locks.py``), so repair never resurrects a
+  deleted memory. Opt out with ``mode: passive`` in the local overlay.
+- ``passive`` — run the read-only checks and surface findings (persist +
+  posture alert + dashboard). Never repairs. This was the whole of Phase 0.
 - ``off`` — do not run at all.
 
 Failure posture: an INVALID mode degrades to ``passive`` (still observing, no
@@ -52,10 +52,10 @@ _ENV_KILL_SWITCH = "GENESIS_MEMORY_INTEGRITY_DISABLED"
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
-    # Repair (mode=active) is fully implemented, but the DEFAULT stays passive
-    # until the follow-up PR adds the per-memory-id lock that closes the last
-    # mirror-requeue-vs-delete race. Flip to active in that PR.
-    "mode": "passive",
+    # Repair on by default: the per-memory-id lock (memory/_locks.py) closes the
+    # mirror-requeue-vs-delete race, so active repair never resurrects a deleted
+    # memory. Opt out with mode: passive in the local overlay.
+    "mode": "active",
     # ── consistency checker ──
     "sample_fraction": 1.0,  # 1.0 = exact full scan (cheap at single-user scale)
     "max_points": 500_000,  # Qdrant scroll budget; exceeding it sets truncated

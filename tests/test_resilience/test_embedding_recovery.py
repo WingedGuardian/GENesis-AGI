@@ -292,6 +292,36 @@ class TestDrainPending:
         qdrant.upsert.assert_not_called()  # no ghost point written
 
     @pytest.mark.asyncio
+    async def test_upsert_runs_under_per_id_lock(self, db, worker, monkeypatch):
+        """The existence-recheck→upsert→finalize window holds the memory's id-lock,
+        so a concurrent MemoryStore.delete() of the same memory is serialized and
+        can't slip in to strand a resurrected vector. We assert the lock is HELD at
+        upsert time (the embed above ran without it)."""
+        import genesis.qdrant.collections as qcoll
+        from genesis.memory._locks import memory_id_lock
+
+        w, _, _ = worker
+        await crud.create(
+            db, id="pe-lk", memory_id="mem-lk", content="lock me",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+
+        held: dict[str, bool] = {}
+
+        def _spy_upsert(*args, **kwargs):
+            held["at_upsert"] = memory_id_lock("mem-lk").locked()
+
+        # drain_pending does a LOCAL `from genesis.qdrant.collections import
+        # upsert_point`, so patch the source module attribute.
+        monkeypatch.setattr(qcoll, "upsert_point", _spy_upsert)
+
+        assert await w.drain_pending() == 1
+        assert held.get("at_upsert") is True  # upsert happened inside the lock
+        # lock released after the section
+        assert memory_id_lock("mem-lk").locked() is False
+
+    @pytest.mark.asyncio
     async def test_deprecated_memory_restamped_on_reembed(self, db, worker):
         """A memory superseded WHILE its embed was still pending keeps deprecated=1
         in metadata (MemoryStore._mark_superseded only touches Qdrant for an
