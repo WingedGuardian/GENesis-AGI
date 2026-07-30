@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from genesis.awareness.signal_format import format_signal_line, format_signals
 from genesis.awareness.types import Depth, SignalReading, TickResult
-from genesis.cc.types import CCModel
+from genesis.cc.reflection_bridge.reflection_models_config import model_for_depth
 
 if TYPE_CHECKING:
     from genesis.perception.context import ContextAssembler
@@ -540,12 +540,6 @@ async def build_light_prompt_enriched(
 # ── Prompt file loading ──────────────────────────────────────────────
 
 
-_DEPTH_MODEL = {
-    Depth.LIGHT: CCModel.HAIKU,
-    Depth.DEEP: CCModel.SONNET,
-    Depth.STRATEGIC: CCModel.OPUS,
-}
-
 _PROMPT_FILES = {
     Depth.LIGHT: "REFLECTION_LIGHT.md",
     Depth.DEEP: "REFLECTION_DEEP.md",
@@ -579,7 +573,7 @@ def _resolve_prompt_in_dir(depth: Depth, prompt_dir: Path) -> str | None:
     if not filename:
         return None
     try:
-        model = _DEPTH_MODEL.get(depth)
+        model = model_for_depth(depth)
         if model:
             stem = filename.rsplit(".", 1)[0]
             model_path = prompt_dir / f"{stem}_{model.value.upper()}.md"

@@ -1,0 +1,27 @@
+# Reflection depth → model/effort mapping.
+#
+# Read live per reflection (no restart) by
+# genesis.cc.reflection_bridge.reflection_models_config, which the reflection
+# bridge (_bridge.py) and prompt resolver (_prompts.py) both delegate to.
+#
+# Editable from the dashboard Config tab (settings domain: reflection_models).
+# Local overrides go to ~/.genesis/config/reflection_models.local.yaml and
+# survive git updates.
+#
+# model:  one of haiku | sonnet | opus | fable
+# effort: one of low | medium | high | xhigh | max
+#
+# NOTE: Haiku does not use an effort setting — the CC invoker OMITS --effort for
+# Haiku (model_supports_effort). So `light` intentionally carries no `effort`
+# key here; setting one would be ignored at dispatch.
+
+light:
+  model: haiku
+
+deep:
+  model: sonnet
+  effort: xhigh
+
+strategic:
+  model: opus
+  effort: xhigh

@@ -388,6 +388,18 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=True,
     ),
+    "reflection_models": SettingsDomain(
+        name="reflection_models",
+        description=(
+            "Reflection depth → model/effort (light/deep/strategic). Read live "
+            "per reflection by cc.reflection_bridge.reflection_models_config (no "
+            "restart). Haiku (light) ignores effort — the invoker omits --effort "
+            "for it, so light carries no effort key."
+        ),
+        config_filename="reflection_models.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per reflection by reflection_models_config
+    ),
     "contribution": SettingsDomain(
         name="contribution",
         description="Contribution offer pipeline (proactive upstream fix offers)",
@@ -807,6 +819,52 @@ def _validate_channels(changes: dict) -> list[str]:
             f"got '{tg['default_effort']}'"
         )
 
+    return errors
+
+
+def _validate_reflection_models(changes: dict) -> list[str]:
+    """Validate reflection depth → model/effort config changes.
+
+    Keys must be depths (light/deep/strategic); each a mapping with model and/or
+    effort. Effort is additionally rejected when it exceeds the model's ceiling
+    (via clamp_effort), so a nonsensical pairing can't be saved.
+    """
+    from genesis.cc.reflection_bridge.reflection_models_config import VALID_DEPTH_KEYS
+    from genesis.cc.types import CCModel, EffortLevel, clamp_effort, model_supports_effort
+
+    errors: list[str] = []
+    valid_models = VALID_MODEL_NAMES
+    valid_efforts = VALID_EFFORT_NAMES
+
+    for depth_key, spec in changes.items():
+        if depth_key not in VALID_DEPTH_KEYS:
+            errors.append(
+                f"Unknown depth '{depth_key}'. Valid: {', '.join(sorted(VALID_DEPTH_KEYS))}"
+            )
+            continue
+        if not isinstance(spec, dict):
+            errors.append(f"{depth_key} must be a mapping")
+            continue
+        for key in spec:
+            if key not in ("model", "effort"):
+                errors.append(f"Unknown key '{depth_key}.{key}'. Valid: model, effort")
+        model = spec.get("model")
+        if model is not None and model not in valid_models:
+            errors.append(f"{depth_key}.model must be one of {sorted(valid_models)}, got '{model}'")
+        effort = spec.get("effort")
+        if effort is not None and effort not in valid_efforts:
+            errors.append(
+                f"{depth_key}.effort must be one of {sorted(valid_efforts)}, got '{effort}'"
+            )
+        # Ceiling check: reject an effort above the chosen model's supported max.
+        if model in valid_models and effort in valid_efforts:
+            m = CCModel(model)
+            if model_supports_effort(m):
+                clamped = clamp_effort(m, EffortLevel(effort))
+                if clamped != EffortLevel(effort):
+                    errors.append(
+                        f"{depth_key}.effort '{effort}' exceeds {model}'s max '{clamped.value}'"
+                    )
     return errors
 
 
@@ -1283,6 +1341,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "surplus": _validate_surplus,
     "ego": _validate_ego,
     "channels": _validate_channels,
+    "reflection_models": _validate_reflection_models,
     "contribution": _validate_contribution,
     "observability": _validate_observability,
 }
