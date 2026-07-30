@@ -73,6 +73,7 @@ USER_CONTEXT_ALLOWLIST: dict[str, str] = {
     "mcp/memory/core.py::memory_extract": "user-invoked MCP extraction",
     "mcp/memory/core.py::memory_synthesize": "user-invoked MCP synthesis",
     "memory/dream_cycle.py::_synthesize_and_deprecate": "consolidated memory meant FOR recall (tagging would break update_payload)",
+    "inbox/eval_memory.py::extract_and_store_eval_memories": "inbox-eval insights (user_signal / architecture_insight distilled from the curated .genesis.md output; user-context knowledge that must stay in default recall, not internal decisional output)",
     "memory/knowledge_ingest.py::ingest_knowledge_unit": "knowledge_base ingest (external-world, recallable)",
     "memory/session_observer.py::process_pending_observations": "conversation-derived observations (~48% of recall pool; must stay)",
     "recon/cc_update_analyzer.py::_ingest_to_knowledge": "external-world CC-update knowledge (recallable)",

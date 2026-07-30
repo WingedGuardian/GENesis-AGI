@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 import pytest
 
@@ -47,6 +49,17 @@ async def _alerts(db) -> list[dict]:
 
 def _open(alerts):
     return [a for a in alerts if a["resolved"] == 0]
+
+
+def _ago(*, days: int = 0, hours: int = 0, minutes: int = 0) -> str:
+    """A timestamp ``now - offset`` in the stored ``YYYY-MM-DD HH:MM:SS`` format
+    (space-separated, no tz) so it sorts lexically = chronologically against the
+    posture check's ``since_iso`` window. Relative to real ``now`` so these
+    tests never drift across the staleness threshold as the calendar advances
+    (no wall-clock-dependent tests)."""
+    return (
+        datetime.now(UTC) - timedelta(days=days, hours=hours, minutes=minutes)
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ── posture ──
@@ -154,7 +167,7 @@ async def test_stuck_unknown_streak_alerts(monkeypatch):
         sample_fraction=1.0,
         truncated=False,
         unknown_reason="qdrant_unavailable",
-        created_at="2026-07-15 03:50:00",
+        created_at=_ago(days=10),
     )
     await mi.insert_consistency_report(
         db,
@@ -165,7 +178,7 @@ async def test_stuck_unknown_streak_alerts(monkeypatch):
         sample_fraction=1.0,
         truncated=False,
         unknown_reason="qdrant_unavailable",
-        created_at="2026-07-25 03:50:00",
+        created_at=_ago(hours=1),
     )
     await loop._check_memory_integrity_posture(db)
     opn = _open(await _alerts(db))
@@ -188,7 +201,7 @@ async def test_unknown_after_degraded_holds_alert(monkeypatch):
         sampled_rows=100,
         sample_fraction=1.0,
         truncated=False,
-        created_at="2026-07-25 03:50:00",
+        created_at=_ago(hours=3),
     )
     await loop._check_memory_integrity_posture(db)
     assert len(_open(await _alerts(db))) == 1
@@ -202,7 +215,7 @@ async def test_unknown_after_degraded_holds_alert(monkeypatch):
         sample_fraction=1.0,
         truncated=False,
         unknown_reason="qdrant_unavailable",
-        created_at="2026-07-25 03:55:00",
+        created_at=_ago(hours=2),
     )
     await loop._check_memory_integrity_posture(db)
     assert len(_open(await _alerts(db))) == 1  # held, not resolved
@@ -215,7 +228,7 @@ async def test_unknown_after_degraded_holds_alert(monkeypatch):
         sampled_rows=100,
         sample_fraction=1.0,
         truncated=False,
-        created_at="2026-07-25 04:00:00",
+        created_at=_ago(hours=1),
     )
     await loop._check_memory_integrity_posture(db)
     assert _open(await _alerts(db)) == []
@@ -229,7 +242,7 @@ async def test_stuck_recall_probe_alerts_but_unseeded_does_not(monkeypatch):
 
     db = await _setup()
     # probe running 10d, all unknown due to a real retriever error → stale
-    for ts in ("2026-07-15 03:20:00", "2026-07-25 03:20:00"):
+    for ts in (_ago(days=10), _ago(hours=1)):
         await mi.insert_recall_probe_run(
             db,
             status="unknown",
@@ -247,7 +260,7 @@ async def test_stuck_recall_probe_alerts_but_unseeded_does_not(monkeypatch):
 
     # Contrast: an unseeded golden set (golden_set_too_small) must NOT alert.
     db2 = await _setup()
-    for ts in ("2026-07-15 03:20:00", "2026-07-25 03:20:00"):
+    for ts in (_ago(days=10), _ago(hours=1)):
         await mi.insert_recall_probe_run(
             db2,
             status="unknown",
