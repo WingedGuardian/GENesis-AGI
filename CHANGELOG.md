@@ -9,6 +9,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **The push-approval prompt now appears only on a branch's first push, not on
+  every push.** Publishing a branch to the public repo still asks for your
+  approval the first time — that's the moment code actually goes public — but
+  re-pushing fixes to a branch that's already on the remote (the normal
+  PR-iteration loop) no longer re-prompts. A genuinely new branch prompts again,
+  pushing to `main` still prompts, force-pushes are still hard-blocked, and
+  autonomous/dispatched sessions still can't push at all. The check reads the live
+  remote and fails safe: any uncertainty (unreachable remote, ambiguous target)
+  falls back to asking.
+
 ### Fixed
 
 - **Committing with `git -C` or `git -c` no longer skips the code-review gate.**

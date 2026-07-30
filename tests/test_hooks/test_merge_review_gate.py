@@ -24,8 +24,16 @@ sys.path.insert(0, str(_SCRIPTS))
 from shell_parse import (  # noqa: E402
     analyze,
     gh_pr_subcommand,
+    git_subcommand,
     has_trailing_override,
 )
+
+
+def _push_seg(command: str):
+    """The git-push Segment parsed from a command string (for argv-based helpers)."""
+    return next(
+        s for s in analyze(command) if s.exe == "git" and git_subcommand(s.argv) == "push"
+    )
 
 
 def _run_guard(
@@ -79,6 +87,20 @@ def _rc(code: int) -> subprocess.CompletedProcess:
 def _proc(code: int, out: str = "") -> subprocess.CompletedProcess:
     """A fake CompletedProcess carrying a returncode and stdout."""
     return subprocess.CompletedProcess(args=[], returncode=code, stdout=out)
+
+
+def _config_run(values: dict, default: tuple = (1, "")):
+    """A ``subprocess.run`` side_effect mapping a git-config KEY (the last argv
+    token) to ``(rc, stdout)``. Unlisted keys resolve to ``default`` = ``(1, "")``
+    (git's "unset" signal). Order/count-independent — robust to how many config
+    reads _push_config_is_simple performs."""
+
+    def run(argv, **kwargs):
+        key = argv[-1]
+        rc, out = values.get(key, default)
+        return _proc(rc, out)
+
+    return run
 
 
 class TestPrCreateHeadRaw:
@@ -285,6 +307,432 @@ class TestPrCreateWouldPublish:
             ),
         ):
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
+
+
+# ── _remote_branch_sha / _push_is_republish (first-push gate) ────────
+
+
+class TestRemoteBranchSha:
+    """_remote_branch_sha queries the LIVE remote (git ls-remote) and returns the
+    tip sha for EXACTLY refs/heads/<branch>, else None (fail-safe). Shared by the
+    pr-create gate and the first-push republish gate."""
+
+    def test_exact_ref_returns_sha(self, guard_module):
+        with patch.object(
+            guard_module.subprocess, "run", return_value=_proc(0, "abc123\trefs/heads/feat")
+        ):
+            assert guard_module._remote_branch_sha("origin", "feat") == "abc123"
+
+    def test_namespaced_ref_not_matched(self, guard_module):
+        # querying "feat" can tail-match refs/heads/ws8/feat — must NOT accept it.
+        with patch.object(
+            guard_module.subprocess, "run", return_value=_proc(0, "aaa111\trefs/heads/ws8/feat")
+        ):
+            assert guard_module._remote_branch_sha("origin", "feat") is None
+
+    def test_exact_line_among_many_used(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=_proc(0, "aaa\trefs/heads/ws8/feat\nbbb\trefs/heads/feat"),
+        ):
+            assert guard_module._remote_branch_sha("origin", "feat") == "bbb"
+
+    def test_absent_returns_none(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", return_value=_proc(0, "")):
+            assert guard_module._remote_branch_sha("origin", "feat") is None
+
+    def test_rc_nonzero_returns_none(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", return_value=_proc(2, "")):
+            assert guard_module._remote_branch_sha("origin", "feat") is None
+
+    def test_timeout_returns_none(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd="git", timeout=10),
+        ):
+            assert guard_module._remote_branch_sha("origin", "feat") is None
+
+    def test_oserror_returns_none(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", side_effect=OSError("boom")):
+            assert guard_module._remote_branch_sha("origin", "feat") is None
+
+    def test_cwd_passed_as_dash_C(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", return_value=_proc(0, "")) as run:
+            guard_module._remote_branch_sha("origin", "feat", cwd="/wt")
+        argv = run.call_args_list[0].args[0]
+        assert argv[:3] == ["git", "-C", "/wt"]
+        assert "ls-remote" in argv
+
+    def test_no_cwd_omits_dash_C(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", return_value=_proc(0, "")) as run:
+            guard_module._remote_branch_sha("origin", "feat")
+        argv = run.call_args_list[0].args[0]
+        assert argv[0] == "git" and argv[1] == "ls-remote"
+
+
+class TestPushIsRepublish:
+    """_push_is_republish: True iff the branch is already on the remote (published
+    and approved on its first push). Fail-safe to False (→ prompt) on any
+    uncertainty — an unresolved remote/branch never triggers a network call."""
+
+    def test_present_is_republish(self, guard_module):
+        with patch.object(guard_module, "_remote_branch_sha", return_value="abc123"):
+            assert guard_module._push_is_republish("origin", "feat") is True
+
+    def test_absent_is_not_republish(self, guard_module):
+        with patch.object(guard_module, "_remote_branch_sha", return_value=None):
+            assert guard_module._push_is_republish("origin", "feat") is False
+
+    def test_none_remote_short_circuits(self, guard_module):
+        # unresolved remote → never republish; must NOT touch the remote.
+        with patch.object(guard_module, "_remote_branch_sha", side_effect=AssertionError):
+            assert guard_module._push_is_republish(None, "feat") is False
+
+    def test_none_branch_short_circuits(self, guard_module):
+        with patch.object(guard_module, "_remote_branch_sha", side_effect=AssertionError):
+            assert guard_module._push_is_republish("origin", None) is False
+
+    def test_cwd_forwarded(self, guard_module):
+        with patch.object(guard_module, "_remote_branch_sha", return_value="x") as srch:
+            guard_module._push_is_republish("origin", "feat", cwd="/wt")
+        assert srch.call_args_list[0].kwargs.get("cwd") == "/wt"
+
+
+class TestPushPositionals:
+    """_push_positionals extracts [remote, refspec, ...] from a quote-stripped push
+    argv, correctly skipping no-value flags (-u/--set-upstream — which do NOT eat
+    the next token) and value flags (-o <v>). Empty for a non-push / bare push."""
+
+    def test_bare_push(self, guard_module):
+        assert guard_module._push_positionals(["git", "push"]) == []
+
+    def test_remote_only(self, guard_module):
+        assert guard_module._push_positionals(["git", "push", "origin"]) == ["origin"]
+
+    def test_remote_and_branch(self, guard_module):
+        assert guard_module._push_positionals(["git", "push", "origin", "feat"]) == ["origin", "feat"]
+
+    def test_set_upstream_does_not_eat_remote(self, guard_module):
+        # Regression for the naive-split bug: -u / --set-upstream take NO separate
+        # token, so 'origin' must remain a positional (not be consumed as a value).
+        assert guard_module._push_positionals(["git", "push", "-u", "origin", "feat"]) == [
+            "origin",
+            "feat",
+        ]
+        assert guard_module._push_positionals(
+            ["git", "push", "--set-upstream", "origin", "feat"]
+        ) == ["origin", "feat"]
+
+    def test_value_flag_skips_its_value(self, guard_module):
+        assert guard_module._push_positionals(
+            ["git", "push", "-o", "ci.skip", "origin", "feat"]
+        ) == ["origin", "feat"]
+
+    def test_global_dash_c_skipped(self, guard_module):
+        assert guard_module._push_positionals(
+            ["git", "-C", "/wt", "push", "origin", "feat"]
+        ) == ["origin", "feat"]
+
+    def test_plus_refspec_excluded(self, guard_module):
+        # +feat is force shorthand → skipped (force is handled in a separate arm).
+        assert guard_module._push_positionals(["git", "push", "origin", "+feat"]) == ["origin"]
+
+    def test_not_a_push(self, guard_module):
+        assert guard_module._push_positionals(["git", "commit", "-m", "x"]) == []
+
+
+class TestPushConfigIsSimple:
+    """_push_config_is_simple: True only when NO config broadens a bare/remote-only
+    push — no `remote.<remote>.push` refspec, push.default in {unset, simple,
+    current}, and no submodule push-recursion. Fail-CLOSED on any config-read
+    error / unresolved remote."""
+
+    def test_all_unset_is_simple(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", side_effect=_config_run({})):
+            assert guard_module._push_config_is_simple("origin") is True
+
+    def test_custom_push_refspec_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"remote.origin.push": (0, "HEAD:main")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_push_default_simple_ok(self, guard_module):
+        with patch.object(
+            guard_module.subprocess, "run", side_effect=_config_run({"push.default": (0, "simple")})
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+
+    def test_push_default_current_ok(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.default": (0, "current")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+
+    def test_push_default_matching_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.default": (0, "matching")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_push_default_upstream_not_simple(self, guard_module):
+        # Regression (round-3 BLOCKER): upstream pushes cur to a possibly
+        # differently-named upstream branch (e.g. feat → origin/main).
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.default": (0, "upstream")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_push_default_tracking_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.default": (0, "tracking")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_recurse_submodules_on_demand_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.recurseSubmodules": (0, "on-demand")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_recurse_submodules_check_ok(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.recurseSubmodules": (0, "check")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+
+    def test_recurse_submodules_false_ok(self, guard_module):
+        # `false` is git-equivalent to `no` → safe (was wrongly rejected before).
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.recurseSubmodules": (0, "false")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+
+    def test_push_default_case_insensitive(self, guard_module):
+        # git enum values are case-insensitive — Matching must still be rejected.
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.default": (0, "Matching")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_submodule_recurse_true_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"submodule.recurse": (0, "true")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_config_read_error_fails_closed(self, guard_module):
+        # rc 128 (bad config) with empty stdout must NOT be read as "unset".
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"remote.origin.push": (128, "")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_none_remote_not_simple(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", side_effect=AssertionError):
+            assert guard_module._push_config_is_simple(None) is False
+
+    def test_exception_fails_closed(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", side_effect=OSError("boom")):
+            assert guard_module._push_config_is_simple("origin") is False
+
+
+class TestPushTargetsCurrentBranch:
+    """_push_targets_current_branch(seg, cur, remote) (ALLOWLIST posture) is True
+    ONLY for a plain current-branch update: bare / `<remote>` (with simple config)
+    or explicit `<remote> <cur>`, carrying only ref-neutral flags. `remote` is the
+    caller-resolved effective push remote. Every cross-name / delete / broadening /
+    unknown-flag / bundled-delete form is False."""
+
+    def _t(self, guard_module, cmd, cur):
+        return guard_module._push_targets_current_branch(_push_seg(cmd), cur, "origin")
+
+    # ── explicit `<remote> <cur>` → no config subprocess ──
+
+    def test_explicit_current_branch(self, guard_module):
+        assert self._t(guard_module, "git push origin feat", "feat") is True
+
+    def test_set_upstream_current_branch(self, guard_module):
+        assert self._t(guard_module, "git push -u origin feat", "feat") is True
+
+    def test_safe_short_bundle_ok(self, guard_module):
+        # -uv = --set-upstream --verbose (ref-neutral) with explicit current branch.
+        assert self._t(guard_module, "git push -uv origin feat", "feat") is True
+
+    def test_push_option_value_flag_ok(self, guard_module):
+        assert self._t(guard_module, "git push -o ci.skip origin feat", "feat") is True
+
+    def test_push_option_glued_ok(self, guard_module):
+        assert self._t(guard_module, "git push -oci.skip origin feat", "feat") is True
+
+    def test_different_named_branch_false(self, guard_module):
+        # `git push -u origin other` while on feat → NOT a current-branch update.
+        assert self._t(guard_module, "git push -u origin other", "feat") is False
+
+    def test_colon_refspec_false(self, guard_module):
+        assert self._t(guard_module, "git push origin feat:main", "feat") is False
+
+    def test_delete_refspec_false(self, guard_module):
+        assert self._t(guard_module, "git push origin :feat", "feat") is False
+
+    # ── broadening / unknown / bundled-delete flags → False (allowlist rejects) ──
+
+    def test_broadening_all_false(self, guard_module):
+        assert self._t(guard_module, "git push --all origin", "feat") is False
+
+    def test_broadening_tags_false(self, guard_module):
+        assert self._t(guard_module, "git push --tags origin", "feat") is False
+
+    def test_broadening_delete_flag_false(self, guard_module):
+        assert self._t(guard_module, "git push --delete origin feat", "feat") is False
+
+    def test_broadening_repo_flag_false(self, guard_module):
+        assert self._t(guard_module, "git push --repo origin feat", "feat") is False
+
+    def test_stdin_flag_false(self, guard_module):
+        assert self._t(guard_module, "git push --stdin origin", "feat") is False
+
+    def test_follow_tags_false(self, guard_module):
+        assert self._t(guard_module, "git push --follow-tags origin", "feat") is False
+
+    def test_bundled_delete_false(self, guard_module):
+        # -ud / -du / -qd all carry `d` (delete) → rejected by the short-letter scan.
+        for cmd in ("git push -ud origin feat", "git push -du origin feat", "git push -qd origin feat"):
+            assert self._t(guard_module, cmd, "feat") is False, cmd
+
+    # ── bare / remote-only → gated on _push_config_is_simple (mocked) ──
+
+    def test_bare_push_simple_config_true(self, guard_module):
+        with patch.object(guard_module, "_push_config_is_simple", return_value=True):
+            assert self._t(guard_module, "git push", "feat") is True
+
+    def test_bare_push_nonsimple_config_false(self, guard_module):
+        with patch.object(guard_module, "_push_config_is_simple", return_value=False):
+            assert self._t(guard_module, "git push", "feat") is False
+
+    def test_remote_only_uses_effective_remote(self, guard_module):
+        # The config check keys on the caller-resolved `remote`, not positionals[0].
+        with patch.object(guard_module, "_push_config_is_simple", return_value=True) as cfg:
+            assert self._t(guard_module, "git push origin", "feat") is True
+        assert cfg.call_args_list[0].args[0] == "origin"
+
+    def test_detached_or_empty_false(self, guard_module):
+        assert self._t(guard_module, "git push", "") is False
+        assert self._t(guard_module, "git push", None) is False
+
+
+class TestGetPushRemoteAndBranch:
+    """_get_push_remote_and_branch resolves (remote, dst-branch) from the argv —
+    fixing the naive-split bug where -u/--set-upstream ate the remote token."""
+
+    def test_set_upstream_does_not_eat_remote(self, guard_module):
+        # Regression: `git push -u origin feat` → remote=origin, branch=feat (NOT
+        # the current branch via the eaten-remote bug).
+        assert guard_module._get_push_remote_and_branch(_push_seg("git push -u origin feat")) == (
+            "origin",
+            "feat",
+        )
+
+    def test_refspec_dst(self, guard_module):
+        assert guard_module._get_push_remote_and_branch(
+            _push_seg("git push origin feat:main")
+        ) == ("origin", "main")
+
+    def test_bare_push_uses_current_branch(self, guard_module):
+        with patch.object(guard_module, "_current_branch", return_value="feat"):
+            assert guard_module._get_push_remote_and_branch(_push_seg("git push")) == (
+                "upstream",
+                "feat",
+            )
+
+    def test_remote_only_uses_current_branch(self, guard_module):
+        with patch.object(guard_module, "_current_branch", return_value="feat"):
+            assert guard_module._get_push_remote_and_branch(_push_seg("git push origin")) == (
+                "origin",
+                "feat",
+            )
+
+    def test_value_flag_not_mistaken_for_remote(self, guard_module):
+        assert guard_module._get_push_remote_and_branch(
+            _push_seg("git push -o ci.skip origin feat")
+        ) == ("origin", "feat")
+
+    def test_not_a_push_returns_none(self, guard_module):
+        seg = next(iter(analyze("git commit -m x")))
+        assert guard_module._get_push_remote_and_branch(seg) == (None, None)
+
+
+class TestEffectivePushRemote:
+    """_effective_push_remote follows git's real bare-push remote precedence:
+    explicit --repo/positional > branch.<cur>.pushRemote > remote.pushDefault >
+    @{upstream} remote > origin."""
+
+    def test_explicit_positional_remote(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", side_effect=AssertionError):
+            assert (
+                guard_module._effective_push_remote(_push_seg("git push origin"), "feat") == "origin"
+            )
+
+    def test_explicit_repo_flag(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", side_effect=AssertionError):
+            assert (
+                guard_module._effective_push_remote(_push_seg("git push --repo fork feat"), "feat")
+                == "fork"
+            )
+
+    def test_bare_uses_push_remote(self, guard_module):
+        # Regression (round-4 BLOCKER): triangular fork workflow — bare push goes to
+        # branch.<cur>.pushRemote, NOT the @{upstream} remote.
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"branch.feat.pushRemote": (0, "fork")}),
+        ):
+            assert guard_module._effective_push_remote(_push_seg("git push"), "feat") == "fork"
+
+    def test_bare_uses_push_default(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"remote.pushDefault": (0, "fork")}),
+        ):
+            assert guard_module._effective_push_remote(_push_seg("git push"), "feat") == "fork"
+
+    def test_bare_falls_back_to_upstream(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"@{upstream}": (0, "up/feat")}),
+        ):
+            assert guard_module._effective_push_remote(_push_seg("git push"), "feat") == "up"
+
+    def test_bare_defaults_to_origin(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", side_effect=_config_run({})):
+            assert guard_module._effective_push_remote(_push_seg("git push"), "feat") == "origin"
 
 
 # ── _check_pr_review_findings tests ─────────────────────────────────
