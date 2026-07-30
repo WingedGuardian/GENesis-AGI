@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: surface credentials for auth-related Bash commands.
+"""PreToolUse hook: surface stored credentials for auth-related Bash commands.
 
-When a Bash command involves SSH, SCP, Incus, or other auth-related
-operations, check the reference store and network topology for matching
-credentials and inject them so the model doesn't guess.
+When a Bash command involves SSH, SCP, Incus, or other auth-related operations,
+check the reference store and network topology for matching entries and point
+the model at them so it doesn't guess.
 
-Reads hook input from stdin as JSON:
-  {"tool_name": "Bash", "tool_input": {"command": "..."}, ...}
-
-Output (stdout): credential hints injected into conversation.
-Exit 0 always — this is advisory, never blocks.
+Privacy contract: this hook POINTS at credentials, it does not reveal them. It
+surfaces reference-store matches by their CONCEPT (label) name only — never the
+body, which holds the raw ``Value:`` secret — and tells the model to retrieve
+them via the ``reference_lookup`` MCP tool (masked, audited). Network-topology
+hints are scrubbed of any inline secret shapes. Output travels on the documented
+PreToolUse ``hookSpecificOutput.additionalContext`` JSON channel (plain stdout
+does not reach the model on PreToolUse). Exit 0 always — advisory, never blocks.
 """
 
 from __future__ import annotations
@@ -45,9 +47,15 @@ SRC_DIR = REPO_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+# Self-locate the hooks dir so the shared helpers resolve as a script.
+_HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOKS_DIR not in sys.path:
+    sys.path.insert(0, _HOOKS_DIR)
+from hook_input import field, read_payload  # noqa: E402
+from secret_scrub import scrub  # noqa: E402
+
 _NETWORK_TOPOLOGY = (
-    Path.home()
-    / ".claude/projects/-home-ubuntu-genesis/memory/reference_network_topology.md"
+    Path.home() / ".claude/projects/-home-ubuntu-genesis/memory/reference_network_topology.md"
 )
 
 
@@ -55,6 +63,7 @@ def _genesis_db_path() -> Path:
     """Resolve DB path via genesis.env (works in worktrees)."""
     try:
         import importlib
+
         return importlib.import_module("genesis.env").genesis_db_path()
     except Exception:
         return REPO_DIR / "data" / "genesis.db"  # fallback
@@ -73,45 +82,46 @@ def _extract_targets(command: str) -> list[str]:
     return targets
 
 
-def _search_reference_store(targets: list[str]) -> list[str]:
-    """Query knowledge_units for reference entries matching targets."""
+def _reference_concept_hits(targets: list[str]) -> list[str]:
+    """CONCEPT (label) names of reference entries matching any target.
+
+    Never returns bodies — a reference body holds the raw ``Value:`` secret.
+    The model is pointed at the ``reference_lookup`` MCP tool (masked, audited)
+    instead of having the secret injected into the transcript.
+    """
     db_path = _genesis_db_path()
     if not db_path.exists():
         return []
 
-    hints = []
+    concepts: list[str] = []
     try:
-        conn = sqlite3.connect(str(db_path), timeout=2)
-        conn.execute("PRAGMA query_only = ON")
-        conn.row_factory = sqlite3.Row
+        # mode=ro is WAL-aware read-only (immutable=1 would miss un-checkpointed
+        # writes); query_only is belt-and-suspenders against any write.
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
         try:
+            conn.execute("PRAGMA query_only = ON")
+            conn.row_factory = sqlite3.Row
             for target in targets:
                 rows = conn.execute(
-                    "SELECT concept, body FROM knowledge_units "
+                    "SELECT DISTINCT concept FROM knowledge_units "
                     "WHERE project_type = 'reference' "
                     "AND (body LIKE ? OR concept LIKE ?) "
                     "LIMIT 3",
                     (f"%{target}%", f"%{target}%"),
                 ).fetchall()
                 for row in rows:
-                    body = row["body"] or ""
-                    # Extract the most useful line (the one with the target)
-                    for line in body.split("\n"):
-                        if target in line and len(line.strip()) > 10:
-                            hints.append(line.strip()[:200])
-                            break
-                    else:
-                        if body:
-                            hints.append(body[:200])
+                    concept = (row["concept"] or "").strip()
+                    if concept:
+                        concepts.append(concept)
         finally:
             conn.close()
     except Exception:
         pass
-    return hints
+    return concepts
 
 
 def _search_network_topology(targets: list[str]) -> list[str]:
-    """Search the network topology reference for target info."""
+    """Search the network topology reference for target info (secret-scrubbed)."""
     if not _NETWORK_TOPOLOGY.exists():
         return []
 
@@ -121,10 +131,21 @@ def _search_network_topology(targets: list[str]) -> list[str]:
         for target in targets:
             for line in content.split("\n"):
                 if target in line and len(line.strip()) > 5:
-                    hints.append(line.strip()[:200])
+                    hints.append(scrub(line.strip()[:200]))
     except Exception:
         pass
     return hints
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        norm = item.strip()
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
 
 
 def main() -> None:
@@ -132,14 +153,8 @@ def main() -> None:
     if os.environ.get("GENESIS_CC_SESSION") == "1":
         return
 
-    try:
-        raw = sys.stdin.read()
-        hook_input = json.loads(raw) if raw.strip() else {}
-    except (json.JSONDecodeError, OSError):
-        return
-
-    tool_input = hook_input.get("tool_input", {})
-    command = tool_input.get("command", "")
+    payload = read_payload()
+    command = field(payload, "command")
 
     if not command or not _is_auth_command(command):
         return
@@ -148,23 +163,34 @@ def main() -> None:
     if not targets:
         return
 
-    # Check both sources
-    ref_hints = _search_reference_store(targets)
-    topo_hints = _search_network_topology(targets)
+    concept_hits = _dedupe(_reference_concept_hits(targets))
+    topo_hints = _dedupe(_search_network_topology(targets))
 
-    all_hints = []
-    seen = set()
-    for hint in ref_hints + topo_hints:
-        normalized = hint.strip()
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            all_hints.append(normalized)
+    lines: list[str] = []
+    if concept_hits:
+        lines.append(
+            "Stored credentials/access info exist in the reference store for: "
+            + ", ".join(concept_hits[:5])
+            + ". Retrieve them with the reference_lookup MCP tool — do NOT guess "
+            "or reuse values from history."
+        )
+    if topo_hints:
+        lines.append("Network topology notes for the target(s):")
+        lines.extend(f"  {hint}" for hint in topo_hints[:5])
 
-    if all_hints:
-        print("[Credential] Found stored access info for target:")
-        for hint in all_hints[:5]:
-            print(f"  {hint}")
-        sys.stdout.flush()
+    if not lines:
+        return
+
+    context = "[Credential surface] " + "\n".join(lines)
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": context,
+            }
+        },
+        sys.stdout,
+    )
 
 
 if __name__ == "__main__":
