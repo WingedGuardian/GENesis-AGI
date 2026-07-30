@@ -1004,6 +1004,18 @@ verified: b662f3e3 2026-07-17
   probes before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
+  `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
+  public anchors) on a cadence and publishes a 3-state `network` axis
+  (NORMAL/DEGRADED/OFFLINE) with asymmetric hysteresis — it OWNS its hysteresis
+  and opts out of the state machine's symmetric flap protection. The axis drives
+  watchdog zombie-restart suppression (a restart can't fix an ISP outage), the
+  `is_any_degraded` recovery gate (at OFFLINE only — don't re-dispatch into a
+  dead network), and the dashboard "Internet" light; it is DELIBERATELY excluded
+  from `to_legacy_degradation_level` (call-site shedding is deferred to PR-3
+  under `network.parking_mode`). Lever/kill-switch in `network_config.py`
+  (`GENESIS_NETWORK_SENTINEL_DISABLED`); window store `~/.genesis/network_state.json`
+  (`network_state.py`, stdlib-only, self-bounding). Consumers staleness-check the
+  sentinel's own `last_probe_at` and fail toward their safe default.
 - **observability/**: event bus dispatches inline AND logs every event;
   persist-queue overflow drops events but emits a rate-limited "dropped"
   meta-event (WS-17). Two health layers (async probes vs systemd shell-out);

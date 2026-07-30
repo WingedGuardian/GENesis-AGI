@@ -3756,7 +3756,7 @@
           // cc_slots renders in its own dedicated "Claude Code Sessions" section
           // (it's an array, not a probe) and is excluded from the probe grid; the
           // label here is defensive in case infraLabel is ever called for it.
-          const labels = { ambient: "Voice Bridge", cc_slots: "Claude Code Sessions" };
+          const labels = { ambient: "Voice Bridge", cc_slots: "Claude Code Sessions", internet: "Internet" };
           return labels[name] || name;
         },
 
