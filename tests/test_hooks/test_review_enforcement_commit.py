@@ -41,11 +41,14 @@ def repo(tmp_path: Path) -> Path:
     _git(r, "-c", "init.defaultBranch=main", "init", "-q")
     _git(r, "config", "user.email", "t@e.st")
     _git(r, "config", "user.name", "tester")
-    (r / "f.txt").write_text("base\n")
+    (r / "f.py").write_text("base = 1\n")
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "base")
     _git(r, "checkout", "-q", "-b", "feature/x")
-    (r / "f.txt").write_text("changed\n")  # staged below → has_code_changes
+    # A .py change: real code that Rule 2 must gate (a docs/config extension like
+    # .txt is now legitimately exempt by the Change-4 skip, so it cannot stand in
+    # for "unreviewed code" here).
+    (r / "f.py").write_text("base = 2\n")  # staged below → has_code_changes
     _git(r, "add", "-A")
     return r
 
@@ -57,15 +60,18 @@ def home(tmp_path: Path) -> Path:
     return h
 
 
-def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProcess:
-    payload = json.dumps(
-        {
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": command},
-            "session_id": "test",
-        }
-    )
+def _run_hook(
+    command: str, repo: Path, home: Path, payload_cwd: str | None = None
+) -> subprocess.CompletedProcess:
+    body = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "session_id": "test",
+    }
+    if payload_cwd is not None:
+        body["cwd"] = payload_cwd
+    payload = json.dumps(body)
     env = {**os.environ, "HOME": str(home)}
     return subprocess.run(
         [sys.executable, str(_HOOK)],
@@ -221,7 +227,7 @@ def test_override_on_other_segment_does_not_authorize(repo: Path, home: Path) ->
 
 def test_main_branch_not_overridable(repo: Path, home: Path) -> None:
     _git(repo, "checkout", "-q", "main")
-    (repo / "f.txt").write_text("main-change\n")
+    (repo / "f.py").write_text("main_change = 1\n")
     _git(repo, "add", "-A")
     res = _run_hook('git commit -m "wip"  # review-override', repo, home)
     assert res.returncode == 2
@@ -281,11 +287,11 @@ def _second_repo(tmp_path: Path, name: str) -> Path:
     _git(r, "-c", "init.defaultBranch=main", "init", "-q")
     _git(r, "config", "user.email", "t@e.st")
     _git(r, "config", "user.name", "tester")
-    (r / "g.txt").write_text("base\n")
+    (r / "g.py").write_text("base = 1\n")
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "base")
     _git(r, "checkout", "-q", "-b", "feature/y")
-    (r / "g.txt").write_text("changed\n")
+    (r / "g.py").write_text("base = 2\n")
     _git(r, "add", "-A")
     return r
 
@@ -310,9 +316,7 @@ def test_marker_not_clobbered_by_concurrent_worktree(
     assert res.returncode == 0, res.stderr
 
 
-def test_distinct_worktrees_get_distinct_markers(
-    repo: Path, home: Path, tmp_path: Path
-) -> None:
+def test_distinct_worktrees_get_distinct_markers(repo: Path, home: Path, tmp_path: Path) -> None:
     repo_b = _second_repo(tmp_path, "repo_b2")
     assert _mark(repo, home).returncode == 0
     assert _mark(repo_b, home).returncode == 0
@@ -334,8 +338,12 @@ def _run_invalidate(command: str, repo: Path, home: Path) -> subprocess.Complete
     env = {**os.environ, "HOME": str(home)}
     return subprocess.run(
         [sys.executable, str(_INVALIDATE)],
-        input=payload, cwd=str(repo), env=env,
-        capture_output=True, text=True, timeout=30,
+        input=payload,
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
 
 
@@ -366,3 +374,248 @@ def test_invalidate_ignores_non_commit(repo: Path, home: Path) -> None:
     assert _mark(repo, home).returncode == 0
     _run_invalidate("echo not a commit", repo, home)
     assert len(_markers(home)) == 1  # marker survives
+
+
+# ── Docs/config-only skip (Change 4) ─────────────────────────────────────
+# A commit whose ENTIRE staged set is docs/config carries no code to review
+# (adaptive-review "review level: None") → Rule 2 is skipped. Conservative
+# fail-toward-review default: any code/unknown extension, an empty staged set, or
+# an unreadable diff falls through to normal enforcement (never skipped). Rule 0
+# (--no-verify) and Rule 1 (main) are checked BEFORE the skip and stay hard.
+
+
+def _restage(repo: Path, paths_contents: dict[str, str]) -> None:
+    """Clean the tree, then write the given files and stage EXACTLY them.
+
+    A hard reset drops the fixture's staged (code) change so the staged set is
+    only the files under test — a soft reset would leave that change in the
+    working tree, and `git add -A` would re-stage it, polluting the set.
+    """
+    _git(repo, "reset", "--hard", "HEAD", "-q")
+    for rel, content in paths_contents.items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    _git(repo, "add", "-A")
+
+
+def test_docs_only_commit_skips_enforcement(repo: Path, home: Path) -> None:
+    """README.md + config/x.yaml with NO review marker → skipped (exit 0)."""
+    _restage(repo, {"README.md": "# docs\n", "config/x.yaml": "a: 1\n"})
+    res = _run_hook('git commit -m "docs"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+def test_single_readme_skips(repo: Path, home: Path) -> None:
+    _restage(repo, {"README.md": "# docs\n"})
+    res = _run_hook('git commit -m "docs"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+def test_extensionless_docs_basenames_skip(repo: Path, home: Path) -> None:
+    """CHANGELOG / LICENSE / .gitignore basenames are on the allowlist."""
+    _restage(repo, {"CHANGELOG": "v1\n", "LICENSE": "MIT\n", ".gitignore": "*.pyc\n"})
+    res = _run_hook('git commit -m "chores"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+def test_code_file_still_enforced(repo: Path, home: Path) -> None:
+    """A .py in the staged set → NOT docs-only → Rule 2 still blocks."""
+    _restage(repo, {"foo.py": "print(1)\n"})
+    res = _run_hook('git commit -m "code"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_mixed_docs_and_code_enforced(repo: Path, home: Path) -> None:
+    """One code file among docs → the whole set is NOT docs-only → enforced."""
+    _restage(repo, {"README.md": "# docs\n", "foo.py": "print(1)\n"})
+    res = _run_hook('git commit -m "mixed"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_unknown_extension_enforced(repo: Path, home: Path) -> None:
+    """An unrecognized extension is treated as code (fail toward review)."""
+    _restage(repo, {"data.json": "{}\n"})
+    res = _run_hook('git commit -m "json"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_empty_staged_set_falls_back_to_enforcement(repo: Path, home: Path) -> None:
+    """A git-add-&&-commit chain stages nothing at hook time → NOT skipped →
+    marker-based Rule 2 blocks when unreviewed (fallback, not a docs skip)."""
+    _git(repo, "reset", "-q")  # nothing staged now
+    (repo / "g.txt").write_text("new\n")  # a docs-ext file, but not yet staged
+    res = _run_hook('git add -A && git commit -m "wip"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_docs_only_no_verify_still_blocked(repo: Path, home: Path) -> None:
+    """Rule 0 precedes the docs skip — --no-verify on a docs-only commit blocks."""
+    _restage(repo, {"README.md": "# docs\n"})
+    res = _run_hook('git commit --no-verify -m "docs"', repo, home)
+    assert res.returncode == 2
+    assert "no-verify" in res.stderr
+
+
+def test_docs_only_on_main_still_blocked(repo: Path, home: Path) -> None:
+    """Rule 1 precedes the docs skip — a docs-only commit on main still blocks."""
+    _git(repo, "checkout", "-q", "main")
+    _restage(repo, {"README.md": "# docs\n"})
+    res = _run_hook('git commit -m "docs"', repo, home)
+    assert res.returncode == 2
+    assert "main" in res.stderr.lower()
+
+
+# ── SHOULD-FIX 4: .github/workflows/*.yml is executable CI config ─────────
+
+
+def test_github_workflow_yaml_still_enforced(repo: Path, home: Path) -> None:
+    """A workflow-only commit is NOT docs/config (arbitrary `run:` with repo
+    secrets) → Rule 2 still fires even though the file is .yml."""
+    _restage(repo, {".github/workflows/ci.yml": "on: push\njobs: {}\n"})
+    res = _run_hook('git commit -m "ci"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_workflow_plus_docs_still_enforced(repo: Path, home: Path) -> None:
+    """One workflow file among docs → the set is not all-docs → enforced."""
+    _restage(repo, {"README.md": "# d\n", ".github/workflows/ci.yml": "on: push\n"})
+    res = _run_hook('git commit -m "mix"', repo, home)
+    assert res.returncode == 2
+
+
+def test_nonworkflow_yaml_still_skips(repo: Path, home: Path) -> None:
+    """A legit config .yaml (not under .github/) still skips review."""
+    _restage(repo, {"config/recon_watchlist.yaml": "watch: []\n"})
+    res = _run_hook('git commit -m "cfg"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+# ── BLOCKER 2: decoy-cd cannot point the docs skip at the wrong repo ───────
+
+
+def _docs_only_repo(tmp_path: Path, name: str) -> Path:
+    """A throwaway repo on a feature branch whose ENTIRE staged set is docs."""
+    r = tmp_path / name
+    r.mkdir()
+    _git(r, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(r, "config", "user.email", "t@e.st")
+    _git(r, "config", "user.name", "tester")
+    (r / "seed.py").write_text("x = 1\n")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "base")
+    _git(r, "checkout", "-q", "-b", "feature/docs")
+    (r / "README.md").write_text("# only docs staged\n")
+    _git(r, "add", "-A")
+    return r
+
+
+def test_decoy_cd_docs_skip_uses_real_wt(repo: Path, home: Path, tmp_path: Path) -> None:
+    """`cd <docs-repo> && true; cd <real-wt> && git commit` must inspect the REAL
+    wt (code staged, no marker) → enforced. The old first-cd resolver would have
+    read the decoy docs repo's staged set and skipped review for real code."""
+    decoy = _docs_only_repo(tmp_path, "decoy_docs")
+    cmd = f"cd {decoy} && true; cd {repo} && git commit -m x"
+    res = _run_hook(cmd, repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_ambiguous_cd_before_commit_enforced(repo: Path, home: Path) -> None:
+    """A cd into a variable before the commit ⇒ UNKNOWN cwd ⇒ fail closed (Rule 1
+    blocks; the docs skip is never reached)."""
+    res = _run_hook("cd $WT && git commit -m x", repo, home)
+    assert res.returncode == 2
+
+
+# ── P1-D: staged index at hook time ≠ what the command commits ────────────
+
+
+def test_commit_dash_a_with_docs_staged_enforced(repo: Path, home: Path) -> None:
+    """`git commit -a` stages tracked code the --cached snapshot doesn't show yet
+    → NOT a pure commit → the docs-only skip must NOT fire."""
+    _restage(repo, {"README.md": "# docs\n"})
+    (repo / "f.py").write_text("changed = 3\n")  # tracked, unstaged code change
+    res = _run_hook('git commit -a -m "x"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_commit_pathspec_with_docs_staged_enforced(repo: Path, home: Path) -> None:
+    """`git commit -m x app.py` selects a pathspec → not pure → not skipped."""
+    _restage(repo, {"README.md": "# docs\n"})
+    res = _run_hook('git commit -m "x" app.py', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_add_then_commit_chain_with_docs_staged_enforced(repo: Path, home: Path) -> None:
+    """`git add app.py && git commit` stages code in a prior segment → not pure."""
+    _restage(repo, {"README.md": "# docs\n"})
+    (repo / "app.py").write_text("y = 2\n")
+    res = _run_hook('git add app.py && git commit -m "x"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_bare_docs_commit_still_skips_after_p1d(repo: Path, home: Path) -> None:
+    """Control: a genuinely pure bare docs commit still skips."""
+    _restage(repo, {"README.md": "# docs\n"})
+    res = _run_hook('git commit -m "docs"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+# ── P2-E: renames surface both source and destination ────────────────────
+
+
+def test_rename_from_code_to_docs_enforced(repo: Path, home: Path) -> None:
+    """A staged rename `foo.py → README.md` shows only README under --name-only,
+    but the SOURCE is code → must enforce (uses --name-status -M, both sides)."""
+    _git(repo, "reset", "--hard", "HEAD", "-q")
+    (repo / "foo.py").write_text("x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add foo")
+    _git(repo, "mv", "foo.py", "README.md")  # staged rename foo.py → README.md
+    res = _run_hook('git commit -m "rename"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_rename_docs_to_docs_still_skips(repo: Path, home: Path) -> None:
+    """A docs→docs rename (both sides docs) still skips."""
+    _git(repo, "reset", "--hard", "HEAD", "-q")
+    (repo / "NOTES.md").write_text("# notes\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add notes")
+    _git(repo, "mv", "NOTES.md", "README.md")
+    res = _run_hook('git commit -m "rename docs"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+# ── P1-A: relative cd resolved against the payload cwd (commit) ────────────
+
+
+def test_relative_cd_commit_to_sibling_main_blocked(repo: Path, home: Path, tmp_path: Path) -> None:
+    """`cd ../main && git commit` from a feature-wt payload cwd resolves to the
+    sibling main tree → Rule 1 blocks (relative path resolved against the cwd)."""
+    trees = tmp_path / "trees"
+    feature = trees / "feature"
+    main = trees / "main"
+    for d, br in ((feature, "feature/x"), (main, "main")):
+        d.mkdir(parents=True)
+        _git(d, "-c", "init.defaultBranch=main", "init", "-q")
+        _git(d, "config", "user.email", "t@e.st")
+        _git(d, "config", "user.name", "tester")
+        (d / "seed.py").write_text("x = 1\n")
+        _git(d, "add", "-A")
+        _git(d, "commit", "-qm", "base")
+        if br != "main":
+            _git(d, "checkout", "-q", "-b", br)
+    res = _run_hook("cd ../main && git commit -m x", feature, home, payload_cwd=str(feature))
+    assert res.returncode == 2
+    assert "main" in res.stderr.lower()
