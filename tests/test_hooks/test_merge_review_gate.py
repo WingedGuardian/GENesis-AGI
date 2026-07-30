@@ -20,6 +20,13 @@ import pytest
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
 _GUARD = _SCRIPTS / "git_push_guard.py"
 
+sys.path.insert(0, str(_SCRIPTS))
+from shell_parse import (  # noqa: E402
+    analyze,
+    gh_pr_subcommand,
+    has_trailing_override,
+)
+
 
 def _run_guard(
     command: str, *, mock_gh_output: str = "", mock_gh_rc: int = 0
@@ -680,3 +687,240 @@ class TestResolvePrNumber:
             ),
         ):
             assert guard_module._resolve_pr_number("gh pr merge --squash") is None
+
+
+# ── CI-status merge gate (_pr_ci_status / _has_ci_override) ───────────────
+
+
+class TestPrCiStatus:
+    """The CI classifier that blocks red/pending merges (env-injected, no net)."""
+
+    @staticmethod
+    def _set(monkeypatch, checks):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
+
+    def test_all_success_is_green(self, guard_module, monkeypatch):
+        self._set(
+            monkeypatch,
+            [
+                {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ],
+        )
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_failure_is_red(self, guard_module, monkeypatch):
+        self._set(
+            monkeypatch,
+            [
+                {"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ],
+        )
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_in_progress_is_pending(self, guard_module, monkeypatch):
+        self._set(
+            monkeypatch,
+            [
+                {"name": "test", "status": "IN_PROGRESS", "conclusion": None},
+                {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ],
+        )
+        assert guard_module._pr_ci_status("1") == ("pending", ["test"])
+
+    def test_red_beats_pending(self, guard_module, monkeypatch):
+        self._set(
+            monkeypatch,
+            [
+                {"name": "test", "conclusion": "FAILURE"},
+                {"name": "build", "status": "IN_PROGRESS"},
+            ],
+        )
+        assert guard_module._pr_ci_status("1")[0] == "red"
+
+    def test_skipped_and_neutral_ignored(self, guard_module, monkeypatch):
+        self._set(
+            monkeypatch,
+            [
+                {"name": "test", "conclusion": "SUCCESS"},
+                {"name": "opt", "conclusion": "SKIPPED"},
+                {"name": "info", "conclusion": "NEUTRAL"},
+            ],
+        )
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_legacy_statuscontext_failure_is_red(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [{"context": "legacy-ci", "state": "FAILURE"}])
+        assert guard_module._pr_ci_status("1") == ("red", ["legacy-ci"])
+
+    def test_empty_is_unknown(self, guard_module, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", "[]")
+        assert guard_module._pr_ci_status("1") == ("unknown", [])
+
+    def test_garbage_is_unknown(self, guard_module, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", "not-json")
+        assert guard_module._pr_ci_status("1") == ("unknown", [])
+
+    def test_non_ci_payload_is_unknown_fail_open(self, guard_module, monkeypatch):
+        # e.g. a review-comment mock other tests inject — must not be read as red.
+        self._set(monkeypatch, [{"login": "codex", "body": "FAILURE somewhere"}])
+        assert guard_module._pr_ci_status("1") == ("unknown", [])
+
+
+class TestCiOverrideSigil:
+    """The `# ci-override` sigil is quote-aware and (at the call site) bound to
+    the merge segment — it cannot be spoofed from a quoted --body or a chained
+    command. This is the BLOCKER the reviewer caught in the first draft."""
+
+    def test_trailing_comment_accepted(self, guard_module):
+        assert has_trailing_override("gh pr merge 5 --squash --admin  # ci-override", "ci-override")
+
+    def test_absent(self, guard_module):
+        assert not has_trailing_override("gh pr merge 5 --squash --admin", "ci-override")
+
+    def test_review_override_is_not_ci_override(self, guard_module):
+        assert not has_trailing_override(
+            "gh pr merge 5 --squash --admin  # review-override", "ci-override"
+        )
+
+    def test_sigil_in_quoted_body_rejected(self, guard_module):
+        # No real '#' comment — sigil is just text inside --body.
+        assert not has_trailing_override(
+            'gh pr merge 5 --admin --body "flaky, see ci-override note"', "ci-override"
+        )
+
+    def test_hash_sigil_inside_quotes_rejected(self, guard_module):
+        # A literal '# ci-override' buried INSIDE quotes must not count.
+        assert not has_trailing_override(
+            'gh pr merge 5 --admin --body "x # ci-override"', "ci-override"
+        )
+
+    def test_not_bound_to_other_segment(self, guard_module):
+        # Sigil on a chained commit segment must not waive the merge segment.
+        segs = analyze("git commit -m wip  # ci-override && gh pr merge 5 --squash --admin")
+        merge = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"][0]
+        assert not has_trailing_override(merge.raw, "ci-override")
+
+    def test_default_sigil_review_override_unchanged(self, guard_module):
+        assert has_trailing_override("gh pr merge 5 --admin  # review-override")
+
+
+class TestCiGateEndToEnd:
+    """The gate actually returns exit 2 through main() on red CI — closes the
+    'mechanism present but not reached' gap the reviewer flagged."""
+
+    def _payload(self, cmd):
+        return {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+        }
+
+    def _patch_merge_ok(self, guard_module, monkeypatch):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n: "MERGEABLE")
+        monkeypatch.setattr(
+            guard_module, "_check_pr_review_findings", lambda n, force=False: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, force=False: (False, ""),
+        )
+
+    def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "FAILURE"}])
+        )
+        self._patch_merge_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin"),
+        )
+        rc = guard_module.main()
+        assert rc == 2
+        assert "CI is RED" in capsys.readouterr().err
+
+    def test_red_ci_with_override_allowed(self, guard_module, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "FAILURE"}])
+        )
+        self._patch_merge_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin  # ci-override"),
+        )
+        assert guard_module.main() == 0
+
+    def test_pending_ci_blocks(self, guard_module, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "test", "status": "IN_PROGRESS"}]),
+        )
+        self._patch_merge_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin"),
+        )
+        assert guard_module.main() == 2
+
+    def test_green_ci_allowed(self, guard_module, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+        )
+        self._patch_merge_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin"),
+        )
+        assert guard_module.main() == 0
+
+
+class TestCiStatusUnfinishedStates:
+    """P1 fix: ANY non-terminal check status counts as pending (not just
+    QUEUED/IN_PROGRESS) — a new/renamed unfinished state can't read as green."""
+
+    @staticmethod
+    def _set(monkeypatch, checks):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
+
+    def test_pending_status_is_pending(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [
+            {"name": "test", "status": "PENDING"},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("pending", ["test"])
+
+    def test_waiting_requested_new_states_are_pending(self, guard_module, monkeypatch):
+        for st in ("WAITING", "REQUESTED", "SOME_NEW_STATE"):
+            self._set(monkeypatch, [{"name": "test", "status": st}])
+            assert guard_module._pr_ci_status("1")[0] == "pending", st
+
+    def test_completed_null_conclusion_not_pending(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [
+            {"name": "test", "status": "COMPLETED", "conclusion": None},
+            {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+
+class TestMultiMergeBlocked:
+    """P2 fix: multiple merge segments (or merge+push) in one command are blocked
+    — the CI/review gates only inspect the first, so a second could smuggle past."""
+
+    def test_two_merges_blocked(self):
+        res = _run_guard("gh pr merge 1 --squash --admin && gh pr merge 2 --squash --admin")
+        assert res.returncode == 2
+        assert "multiple publish/merge" in res.stderr
+
+    def test_merge_plus_push_blocked(self):
+        res = _run_guard("gh pr merge 1 --squash --admin && git push origin x")
+        assert res.returncode == 2
+
+    def test_single_merge_not_tripped_by_multi_guard(self):
+        res = _run_guard("gh pr merge 1 --squash --admin")
+        assert "multiple publish/merge" not in res.stderr

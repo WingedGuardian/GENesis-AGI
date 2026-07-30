@@ -31,6 +31,7 @@ from shell_parse import (  # noqa: E402
     commit_skips_hooks,
     gh_pr_subcommand,
     git_subcommand,
+    has_trailing_override,
 )
 
 
@@ -165,6 +166,109 @@ def _check_mergeable(pr_num: str) -> str | None:
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
         return None  # Fail-open
+
+
+# Check-run conclusions / statuses that mean the CI is NOT green.
+_CI_RED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+_CI_RED_STATES = {"FAILURE", "ERROR"}  # legacy StatusContext state
+_CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL"}
+_CI_GREEN = {"SUCCESS"}
+# The only CheckRun.status that means "finished". Everything else
+# (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so
+# a new/renamed non-terminal state can never be silently mistaken for green.
+_CI_TERMINAL_STATUSES = {"COMPLETED"}
+
+
+def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
+    """Classify a PR's CI check-runs.
+
+    Returns ``(state, problem_checks)`` where state is one of:
+      * ``"green"``   — every non-skipped check concluded SUCCESS
+      * ``"red"``     — at least one check failed/cancelled/timed-out
+      * ``"pending"`` — a check is still queued/running (and none are red)
+      * ``"unknown"`` — could not determine (API error, no checks, or an
+                        unrecognized payload shape) → callers FAIL OPEN, because
+                        blocking a merge on our own inability to read CI would be
+                        worse than the gap this gate closes.
+
+    Tests inject via the ``_TEST_GH_CI_ROLLUP`` env var (a JSON array like
+    ``gh pr view --json statusCheckRollup``) so no network is needed.
+    """
+    raw = os.environ.get("_TEST_GH_CI_ROLLUP")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_num,
+                    "--json",
+                    "statusCheckRollup",
+                    "--jq",
+                    ".statusCheckRollup",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                return "unknown", []
+            raw = result.stdout.strip()
+        except Exception:
+            return "unknown", []
+    try:
+        checks = json.loads(raw) if raw else []
+    except Exception:
+        return "unknown", []
+    if not isinstance(checks, list) or not checks:
+        return "unknown", []
+
+    red: list[str] = []
+    pending: list[str] = []
+    saw_recognized = False
+    for c in checks:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name") or c.get("context") or "check"
+        conclusion = c.get("conclusion")  # CheckRun
+        status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
+        state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+        if conclusion in _CI_SKIP_CONCLUSIONS:
+            saw_recognized = True
+            continue
+        if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
+            saw_recognized = True
+            red.append(name)
+        elif conclusion in _CI_GREEN or state in _CI_GREEN:
+            saw_recognized = True
+        elif status in _CI_TERMINAL_STATUSES:
+            # COMPLETED with an unrecognized/None conclusion — treat as done,
+            # don't fabricate pending; ignore this entry.
+            saw_recognized = True
+        elif status is not None or state == "PENDING":
+            # ANY non-terminal CheckRun status (QUEUED/IN_PROGRESS/PENDING/
+            # WAITING/REQUESTED/…) or a PENDING StatusContext is unfinished →
+            # block. Enumerating "known pending" states would silently miss new
+            # ones (P1 review finding), so we invert: not-terminal ⇒ pending.
+            saw_recognized = True
+            pending.append(name)
+        # else: no status/state/conclusion at all — unrecognized shape, ignore
+
+    if red:
+        return "red", sorted(set(red))
+    if pending:
+        return "pending", sorted(set(pending))
+    if not saw_recognized:
+        return "unknown", []  # payload had no CI-shaped entries
+    return "green", []
+
+
+# The CI-status gate is waived only by a genuine ``# ci-override`` trailing
+# comment on the merge segment itself — detected with the same quote-aware,
+# segment-bound parser as ``# review-override`` (shell_parse.has_trailing_override)
+# so it cannot be spoofed from inside a quoted --body or a different chained
+# command. Distinct from --admin and # review-override; waives ONLY this gate.
 
 
 # ── Review findings detection ──────────────────────────────────────────
@@ -525,19 +629,22 @@ def main() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
-        # Each git push is a SEPARATE external-publish action needing its own
-        # approval. A single Bash command carrying more than one push would
-        # collapse into ONE ask (mentioning only the first), so approving that
-        # prompt would run every push behind it. Reject the compound and require
-        # each push to be its own separately-approved tool call. (gh pr create is
-        # normally un-gated — a review request on already-pushed code — and rides
-        # along on a push's approval; the exception, where gh itself would push an
-        # unpushed branch, is handled by the create arm below.)
-        if len(push_segs) > 1:
+        # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
+        # command carrying more than one would collapse into ONE ask/gate
+        # (evaluated only for the first), so approving it would run every push —
+        # and every UNCHECKED merge — behind it. Reject the compound and require
+        # each to be its own separately-gated tool call. (Merges are included so
+        # `gh pr merge 1 --admin && gh pr merge 2 --admin` can't smuggle the
+        # second past the CI/review gates, which only inspect the first segment.
+        # gh pr create is un-gated (#1241) — a review request on already-pushed
+        # code, riding a push's approval — so it is NOT counted here; the
+        # exception where gh itself would push an unpushed branch is handled by
+        # the create arm below.)
+        if len(push_segs) + len(merge_pr_segs) > 1:
             print(
-                "BLOCKED: multiple git push operations in one command would "
-                "share a single approval prompt. Run each push as its own "
-                "command so each is approved separately.",
+                "BLOCKED: multiple publish/merge operations (git push / gh pr "
+                "merge) in one command would share a single gate. Run each as "
+                "its own command so each is gated separately.",
                 file=sys.stderr,
             )
             return 2
@@ -664,6 +771,40 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     return 2
+
+                # CI-status gate. On an unprotected default branch,
+                # mergeStateStatus=CLEAN is NOT a CI verdict (it only means "no
+                # conflict / no REQUIRED check blocking", and nothing is required
+                # when the branch is unprotected). So --admin merges would sail
+                # past a red `test` job — exactly how main was broken on
+                # 2026-07-28. Block red/pending CI unless a conscious, separate
+                # `# ci-override` is appended (never waived by --admin or
+                # # review-override). Fail-OPEN on "unknown" so a transient API
+                # hiccup can't wedge merges.
+                ci_state, ci_bad = _pr_ci_status(pr_num)
+                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                if ci_state in ("red", "pending") and not ci_override:
+                    print(
+                        f"BLOCKED: PR #{pr_num} CI is {ci_state.upper()} "
+                        f"({', '.join(ci_bad[:6])}).",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"Do NOT merge red/pending CI. Wait for green "
+                        f"(gh pr checks {pr_num}). If these checks are a known, "
+                        "documented pre-existing flake you are consciously "
+                        "accepting, append a trailing '# ci-override' to merge "
+                        "anyway (logged).",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if ci_state in ("red", "pending"):
+                    print(
+                        f"NOTE: CI {ci_state.upper()} on #{pr_num} "
+                        f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
 
                 # Check for unresolved review findings
                 force_override = merge_seg.override
