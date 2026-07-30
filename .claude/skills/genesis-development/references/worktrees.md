@@ -107,7 +107,9 @@ over.
   prompts once — for the push — and the PR-create rides along. The exception:
   gh will *push* (and can fork) a branch whose HEAD is not yet on the remote, so
   a create from an **unpushed branch** is gated like a push (interactive → ask,
-  dispatched → deny). Verified via local remote-tracking refs, fail-safe.
+  dispatched → deny). Verified against the **actual remote** via `git ls-remote`
+  (not the local tracking ref, which goes stale when a merged branch is deleted),
+  fail-safe — any network error / timeout / uncertainty gates.
 - `git merge` into main/master — **hard-blocked** (use the PR workflow).
 - `gh pr merge` without `--admin`, or with unresolved review findings —
   **hard-blocked** (a `# review-override` trailing comment acknowledges

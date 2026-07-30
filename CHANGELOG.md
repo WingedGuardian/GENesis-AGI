@@ -86,8 +86,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `gh pr create` is not prompted separately when its branch is already pushed
   (opening a PR is then just a review request — so `git push && gh pr create`
   asks once, for the push); a create from an unpushed branch, which gh would
-  push itself, is still gated. Autonomous/background Genesis sessions stay
-  blocked from pushing directly (their real delivery path is separately gated).
+  push itself, is still gated. That "already pushed?" check queries the live
+  remote, so it isn't fooled by a stale local reference to a since-deleted
+  branch, and any network error just gates. Autonomous/background Genesis
+  sessions stay blocked from pushing directly (their real delivery path is
+  separately gated).
   Force pushes stay hard-blocked; branch names that merely contain `-f` (e.g.
   `fix/…-false-positives`) are no longer mistaken for a force-push.
 - **Genesis now keeps its own internal event log from growing without bound.**

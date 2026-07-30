@@ -455,21 +455,28 @@ def _ask(reason: str) -> int:
     return 0
 
 
-def _pr_create_head_branch(argv: list[str]) -> str | None:
-    """The head branch named by a ``gh pr create`` (``--head``/``-H`` VALUE, or
-    ``--head=VALUE``), stripped of any ``owner:`` prefix. None → gh uses the
-    current branch."""
+def _pr_create_head_raw(argv: list[str]) -> str | None:
+    """The RAW ``--head``/``-H`` value (``owner:`` prefix intact), or None. An
+    ``owner:branch`` head means gh publishes to a FORK, not origin."""
     i = 0
     while i < len(argv):
         tok = argv[i]
         if tok in ("--head", "-H") and i + 1 < len(argv):
-            v = argv[i + 1]
-            return v.split(":", 1)[1] if ":" in v else v
+            return argv[i + 1]
         if tok.startswith("--head="):
-            v = tok.split("=", 1)[1]
-            return v.split(":", 1)[1] if ":" in v else v
+            return tok.split("=", 1)[1]
         i += 1
     return None
+
+
+def _pr_create_head_branch(argv: list[str]) -> str | None:
+    """The head branch named by a ``gh pr create`` (``--head``/``-H`` VALUE, or
+    ``--head=VALUE``), stripped of any ``owner:`` prefix. None → gh uses the
+    current branch."""
+    v = _pr_create_head_raw(argv)
+    if v is None:
+        return None
+    return v.split(":", 1)[1] if ":" in v else v
 
 
 def _pr_create_would_publish(argv: list[str]) -> bool:
@@ -477,34 +484,73 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
 
     gh pushes — and can even fork — a branch whose HEAD is not yet on the remote,
     so a bare create from an unpushed branch publishes code around this hook.
-    Checks the LOCAL remote-tracking ref (no network): the branch's remote ref
-    must exist AND already contain HEAD. Fail-safe — any uncertainty → True (gate).
+
+    Compares the LOCAL tip of the branch gh would publish — the ``--head`` branch
+    if given, else the current branch (NOT necessarily ``HEAD``: ``--head`` can
+    name a branch other than the checkout) — against the ACTUAL remote, queried
+    with ``git ls-remote`` rather than the LOCAL remote-tracking ref (which goes
+    stale the moment the remote branch is deleted — a squash-merge auto-delete
+    leaves ``refs/remotes/origin/<branch>`` pointing at a now-gone branch, so a
+    local-ref check would wrongly report "already pushed"). The branch must exist
+    on the remote AND already contain that local tip. Assumes origin's push and
+    fetch destinations coincide (the standard single-remote setup); an
+    ``owner:branch`` cross-fork head is gated outright since it publishes to a
+    fork this check can't see. Fail-safe — any uncertainty (network error,
+    timeout, missing branch, unpushed commits) → True (gate). Bounded by a 10s
+    ls-remote timeout that fits inside the hook's 60s budget; a hung/slow remote
+    fails closed, never open.
     """
+    raw_head = _pr_create_head_raw(argv)
+    if raw_head and ":" in raw_head:
+        return True  # owner:branch → gh publishes to a fork, not origin → gate
     branch = _pr_create_head_branch(argv) or _current_branch()
     if not branch:
         return True  # can't determine the branch → gate
-    remote_ref = f"refs/remotes/origin/{branch}"
     try:
-        exists = (
-            subprocess.run(
-                ["git", "show-ref", "--verify", "--quiet", remote_ref],
-                capture_output=True,
-                timeout=5,
-            ).returncode
-            == 0
+        # The tip gh would publish is the head BRANCH's local ref, not HEAD —
+        # `--head other` publishes `other` even while another branch is checked out.
+        local_sha = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        if not local_sha:
+            return True  # not a local branch → can't tell what gh would push → gate
+        remote = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin", branch],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-        if not exists:
+        if remote.returncode != 0:
+            return True  # cannot reach/read the remote → gate (fail-safe)
+        # ls-remote's <pattern> is NOT an exact filter — a bare name tail-matches
+        # namespaced refs (pattern `matrix` also matches `refs/heads/ws8/matrix`),
+        # so a differently-namespaced remote branch could hand back the WRONG sha
+        # and under-gate. Accept only a line whose ref path is EXACTLY this branch.
+        target_ref = f"refs/heads/{branch}"
+        remote_sha = ""
+        for ln in remote.stdout.splitlines():
+            parts = ln.split()
+            if len(parts) >= 2 and parts[1] == target_ref:
+                remote_sha = parts[0]
+                break
+        if not remote_sha:
             return True  # branch not on the remote → gh would push it → gate
-        # HEAD already reachable from the remote branch → nothing to push.
+        if local_sha == remote_sha:
+            return False  # branch tip is exactly the remote tip → nothing to push
+        # Not the tip: un-gate only if the local tip is already contained in the
+        # remote branch (needs the object locally; if absent, is-ancestor → gate).
         contained = (
             subprocess.run(
-                ["git", "merge-base", "--is-ancestor", "HEAD", remote_ref],
+                ["git", "merge-base", "--is-ancestor", local_sha, remote_sha],
                 capture_output=True,
                 timeout=5,
             ).returncode
             == 0
         )
-        return not contained  # unpushed commits on HEAD → gh may push → gate
+        return not contained  # unpushed commits on the branch → gh may push → gate
     except Exception:
         return True  # fail-safe → gate
 

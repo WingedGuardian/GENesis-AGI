@@ -14,7 +14,10 @@ it still governs the pr-merge review-findings gate (see test_merge_review_gate.p
 All shell-parse bypass-hardening from #1232 is preserved — a push detected through
 a wrapper is still caught, now denied in the dispatched context.
 
-Pure string-parsing paths (no gh/git network), so no mocking needed.
+Mostly pure string-parsing paths, so no mocking needed. The gated pr-create cases
+resolve their branch against the real remote via ``git ls-remote``; they use a
+bogus branch (or tolerate a network failure) so the decision is "gate" either way,
+keeping the assertions deterministic regardless of connectivity.
 """
 
 from __future__ import annotations
@@ -63,8 +66,10 @@ def _decision(res: subprocess.CompletedProcess) -> str | None:
 # it's just a review request on pushed code). That un-gated path is git-state
 # dependent, so it is covered deterministically by the _pr_create_would_publish
 # unit tests in test_merge_review_gate.py. Here we test the GATED path: an
-# --head not on the remote (origin/<nonexistent> never exists) which gh would
-# push — that must be gated like a push.
+# --head that ls-remote cannot find on origin (this bogus branch never exists,
+# so ls-remote returns empty; if the network is down it fails closed) which gh
+# would push — either way it must be gated like a push, keeping this test
+# deterministic regardless of connectivity.
 _UNPUSHED = "zzz-unpushed-branch-xyz"
 
 
