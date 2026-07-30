@@ -59,30 +59,37 @@ def _decision(res: subprocess.CompletedProcess) -> str | None:
 # ── gh pr create ────────────────────────────────────────────────────
 
 
-def test_pr_create_interactive_asks():
-    res = _run("gh pr create --title x --body y")
+# gh pr create is UN-gated when its head branch is already on the remote (then
+# it's just a review request on pushed code). That un-gated path is git-state
+# dependent, so it is covered deterministically by the _pr_create_would_publish
+# unit tests in test_merge_review_gate.py. Here we test the GATED path: an
+# --head not on the remote (origin/<nonexistent> never exists) which gh would
+# push — that must be gated like a push.
+_UNPUSHED = "zzz-unpushed-branch-xyz"
+
+
+def test_pr_create_unpushed_branch_asks_interactive():
+    res = _run(f"gh pr create --head {_UNPUSHED} --title x --body y")
     assert res.returncode == 0, res.stderr
     assert _decision(res) == "ask"
 
 
-def test_pr_create_dispatched_denied():
-    res = _run("gh pr create --title x --body y", dispatched=True)
+def test_pr_create_unpushed_branch_denied_dispatched():
+    res = _run(f"gh pr create --head {_UNPUSHED} --title x --body y", dispatched=True)
     assert res.returncode == 2
     assert _decision(res) is None
-    assert "Creating a PR requires user approval" in res.stderr
+
+
+def test_pr_create_unpushed_global_flag_still_detected():
+    """A gh global flag before `pr` must not evade detection of the create."""
+    res = _run(f"gh --repo o/r pr create --head {_UNPUSHED} --title x --body y", dispatched=True)
+    assert res.returncode == 2
 
 
 def test_pr_create_mention_in_string_not_tripped():
     res = _run('echo "run gh pr create later"')
     assert res.returncode == 0
     assert _decision(res) is None
-
-
-def test_pr_create_with_global_flag_before_pr_detected():
-    """A gh global flag before `pr` must not evade the create gate."""
-    res = _run("gh --repo o/r pr create --title x --body y", dispatched=True)
-    assert res.returncode == 2
-    assert "Creating a PR requires user approval" in res.stderr
 
 
 # ── git push ────────────────────────────────────────────────────────
@@ -208,28 +215,26 @@ def test_force_push_mirror_blocked_even_dispatched():
     assert res.returncode == 2
 
 
-# ── compound with >1 gated publish op → hard-block (each needs its own approval) ──
+# ── compound: multiple PUSHES block (each needs own approval); a push + an
+#    un-gated pr-create asks ONCE (for the push), and the pr-create rides along ──
 
 
-def test_push_and_pr_create_compound_blocked():
-    """push && gh pr create must not share ONE approval prompt — approving the
-    push's ask would also create the PR (Codex P1) → hard-block, require split."""
+def test_push_and_pr_create_compound_asks_once():
+    """push && gh pr create is ONE prompt — for the push. gh pr create is not a
+    code-publish (it opens a review request on already-pushed code), so it rides
+    on the push's approval instead of demanding its own (user direction)."""
     res = _run("git push origin feat && gh pr create --title x --body y")
-    assert res.returncode == 2
-    assert _decision(res) is None
-    assert "separate" in res.stderr
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
 
 
 def test_two_pushes_compound_blocked():
+    """Two real pushes still block — each publishes code and needs its own
+    approval, so they cannot share a single prompt."""
     res = _run("git push origin a && git push origin b")
     assert res.returncode == 2
     assert _decision(res) is None
-
-
-def test_two_pr_creates_compound_blocked():
-    res = _run("gh pr create --title a --body b && gh pr create --title c --body d")
-    assert res.returncode == 2
-    assert _decision(res) is None
+    assert "separate" in res.stderr
 
 
 def test_single_push_with_nongated_op_still_asks():
@@ -257,8 +262,12 @@ def test_push_override_token_cannot_self_approve_dispatched():
     assert _decision(res) is None
 
 
-def test_pr_create_override_token_is_inert_interactive():
-    res = _run("gh pr create --title x --body-file /tmp/b.md  # review-override")
+def test_pr_create_token_does_not_ungate_unpushed():
+    """The retired token cannot un-gate an unpushed create either — it still
+    gates (gh would push) and asks, regardless of any trailing token."""
+    res = _run(
+        f"gh pr create --head {_UNPUSHED} --title x --body-file /tmp/b.md  # review-override"
+    )
     assert res.returncode == 0, res.stderr
     assert _decision(res) == "ask"
 

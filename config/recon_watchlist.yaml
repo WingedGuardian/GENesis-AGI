@@ -70,3 +70,22 @@ projects:
     urls:
       - https://docs.nvidia.com/nemo-framework/
       - https://github.com/NVIDIA/NeMo/releases
+
+  - name: Rustwright
+    repo: Skyvern-AI/rustwright
+    track: [releases, commits]
+    priority: low
+    notes: >
+      Rust in-process, Playwright-API-COMPATIBLE driver — a genuine drop-in for
+      the Playwright layer Genesis already runs (mcp/health/browser.py). Claims
+      ~2.5x faster, ~70% less RAM, and no Node.js driver subprocess — which
+      directly attacks our real Playwright process-sprawl pain (a single session
+      spawns 7-9 child procs; see autonomy/remediation.py) plus sheds Playwright
+      driver fingerprints. Chromium-only (never touches Firefox). Stealth
+      hypothesis worth testing: run ON-BOX in-process (NOT over CDP — a remote
+      debug port is itself a detection surface), a real local Chrome with no
+      Node-driver signature and no CDP-attach tells could beat Camoufox on the
+      automation-detection axis (real Chrome fingerprint blends better than
+      minority Firefox); engine-level fingerprint spoofing (canvas/WebGL) is a
+      separate axis it doesn't cover. Alpha. Pilot once it stabilizes: benchmark
+      RAM/speed/proc-count AND on-box stealth vs Camoufox. Watch for beta.

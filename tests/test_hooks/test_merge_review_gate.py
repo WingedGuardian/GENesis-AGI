@@ -71,6 +71,85 @@ def guard_module():
     return mod
 
 
+def _rc(code: int) -> subprocess.CompletedProcess:
+    """A fake CompletedProcess carrying just a returncode."""
+    return subprocess.CompletedProcess(args=[], returncode=code)
+
+
+class TestPrCreateHeadBranch:
+    """_pr_create_head_branch parses --head / -H / --head= (owner: stripped)."""
+
+    def test_none_when_no_head(self, guard_module):
+        assert guard_module._pr_create_head_branch(["gh", "pr", "create", "--title", "x"]) is None
+
+    def test_head_space_value(self, guard_module):
+        assert (
+            guard_module._pr_create_head_branch(["gh", "pr", "create", "--head", "feat"]) == "feat"
+        )
+
+    def test_head_short_flag(self, guard_module):
+        assert guard_module._pr_create_head_branch(["gh", "pr", "create", "-H", "feat"]) == "feat"
+
+    def test_head_equals(self, guard_module):
+        assert guard_module._pr_create_head_branch(["gh", "pr", "create", "--head=feat"]) == "feat"
+
+    def test_head_owner_stripped(self, guard_module):
+        got = guard_module._pr_create_head_branch(["gh", "pr", "create", "--head", "someone:feat"])
+        assert got == "feat"
+
+
+class TestPrCreateWouldPublish:
+    """_pr_create_would_publish gates iff the head branch's HEAD is not yet on the
+    remote (gh would push it). Verified via local git refs — mocked here so the
+    test is deterministic and network/git-state independent."""
+
+    def test_no_branch_gates(self, guard_module):
+        with patch.object(guard_module, "_current_branch", return_value=None):
+            assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
+
+    def test_remote_ref_absent_gates(self, guard_module):
+        # show-ref --verify fails (rc=1) → branch not on remote → gh would push.
+        with (
+            patch.object(guard_module, "_current_branch", return_value="feat"),
+            patch.object(guard_module.subprocess, "run", return_value=_rc(1)),
+        ):
+            assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
+
+    def test_head_on_remote_and_contained_ungated(self, guard_module):
+        # ref exists (rc=0), then HEAD is an ancestor (rc=0) → nothing to push.
+        with (
+            patch.object(guard_module, "_current_branch", return_value="feat"),
+            patch.object(guard_module.subprocess, "run", side_effect=[_rc(0), _rc(0)]),
+        ):
+            assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is False
+
+    def test_head_on_remote_but_ahead_gates(self, guard_module):
+        # ref exists (rc=0) but HEAD not an ancestor (rc=1) → unpushed commits → gate.
+        with (
+            patch.object(guard_module, "_current_branch", return_value="feat"),
+            patch.object(guard_module.subprocess, "run", side_effect=[_rc(0), _rc(1)]),
+        ):
+            assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
+
+    def test_explicit_head_checked_not_current(self, guard_module):
+        with (
+            patch.object(guard_module, "_current_branch", return_value="main"),
+            patch.object(guard_module.subprocess, "run", return_value=_rc(1)) as run,
+        ):
+            assert (
+                guard_module._pr_create_would_publish(["gh", "pr", "create", "--head", "other"])
+                is True
+            )
+        assert any("refs/remotes/origin/other" in " ".join(c.args[0]) for c in run.call_args_list)
+
+    def test_subprocess_error_fails_safe(self, guard_module):
+        with (
+            patch.object(guard_module, "_current_branch", return_value="feat"),
+            patch.object(guard_module.subprocess, "run", side_effect=OSError("boom")),
+        ):
+            assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
+
+
 # ── _check_pr_review_findings tests ─────────────────────────────────
 
 
