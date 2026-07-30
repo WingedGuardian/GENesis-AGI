@@ -388,7 +388,7 @@
                 ]
             },
             {
-                "matcher": "WebFetch|browser_navigate|browser_snapshot|browser_click|browser_evaluate|browser_run_code",
+                "matcher": "WebFetch|mcp__genesis-health__browser_.*",
                 "hooks": [
                     {
                         "type": "command",
@@ -398,7 +398,7 @@
                 ]
             },
             {
-                "matcher": "browser_navigate",
+                "matcher": "mcp__genesis-health__browser_navigate",
                 "hooks": [
                     {
                         "type": "command",
