@@ -6,8 +6,18 @@ via the surplus scheduler.
 
 Extraction scope:
 - Foreground sessions (user conversations)
-- Inbox evaluation sessions (background CC that evaluates URLs)
-- Excluded: reflection, surplus, bridge sessions (have their own pipelines)
+- Voice sessions (transcripts written by the voice pipeline)
+- Excluded (deliberately — see ``_EXCLUDED_SOURCE_TAGS``): inbox_evaluation
+  (external-untrusted fetched-web transcripts — the curated ``.genesis.md``
+  output path handles inbox→memory instead), ego/reflection/campaign/etc.
+  (their own pipelines).
+
+Every production ``source_tag`` family must be classified as either extractable
+or explicitly excluded — the coverage-guard test
+(``tests/test_memory/test_extraction_job.py::test_source_tag_coverage_guard``)
+enforces this so a new session type can never silently fall out of extraction
+(as inbox_evaluation did: the set said "inbox" but the monitor tags
+"inbox_evaluation", so 320 sessions matched nothing for months).
 """
 
 from __future__ import annotations
@@ -48,7 +58,41 @@ logger = logging.getLogger(__name__)
 # Session types eligible for extraction. 'voice' rows are written by the
 # voice transcript writer (channels/voice/transcript_writer.py) — their
 # transcripts live in voice_transcript_dir(), not the CC projects dir.
-_EXTRACTABLE_SOURCE_TAGS = {"foreground", "inbox", "voice"}
+# NOTE: "inbox" was a phantom tag here for months — the inbox monitor tags its
+# sessions "inbox_evaluation" (never "inbox"), so this set matched ZERO inbox
+# rows. inbox_evaluation is now a DELIBERATE exclusion (see below), not a bug.
+_EXTRACTABLE_SOURCE_TAGS = {"foreground", "voice"}
+
+# Session types deliberately NOT transcript-extracted, each with its reason.
+# Documentation + the coverage-guard's source of truth; NOT consumed by the
+# extraction logic (which reads only _EXTRACTABLE_SOURCE_TAGS). Keeping the full
+# taxonomy here makes "should this new tag be extracted?" a conscious decision
+# instead of a silent hole.
+_EXCLUDED_SOURCE_TAGS = frozenset({
+    "inbox_evaluation",  # external-untrusted fetched-web transcript; the curated
+                         # .genesis.md output path handles inbox→memory instead
+    "genesis_ego_cycle",  # ego has its own persistence
+    "user_ego_cycle",  # ego has its own persistence
+    "ego_cycle",  # legacy ego tag
+    "ego_dispatch",  # ego-dispatched work; own pipeline
+    "ego_proposal_executor",  # ego proposal execution; own pipeline
+    "campaign",  # campaign sessions; own artifacts
+    "sentinel",  # health/incident monitor; not user knowledge
+    "weekly_assessment",  # internal assessment; own outputs
+    "quality_calibration",  # eval/calibration; not user knowledge
+    "direct_session",  # direct MCP session runner; own handling
+    "mail_follow_up",  # mail pipeline; own handling
+    "mail_reply",  # mail pipeline; own handling
+    "models_md_synthesis",  # models.md synthesis job; own output
+})
+
+# Prefix families whose per-run tags are all excluded (e.g. "reflection_deep",
+# "reflection_light", "reflection_strategic"; "user_job:<uuid>"). NOTE: a
+# source_tag written via raw parameterized SQL (positional bind) rather than a
+# `source_tag="..."` keyword literal is invisible to the coverage-guard's regex
+# scan, so it MUST be registered here by hand — e.g. "priority_<n>" from
+# resilience/cc_budget.py's INSERT (budget-counter rows, not transcripts).
+_EXCLUDED_SOURCE_TAG_PREFIXES = ("reflection", "user_job", "priority")
 
 # Transcript directory
 _TRANSCRIPT_DIR = Path.home() / ".claude" / "projects" / cc_project_dir()
@@ -105,6 +149,11 @@ async def _check_claim_duplicate(
             return True
 
     return False
+
+
+# Public alias for reuse by sibling extractors (e.g. inbox.eval_memory) so
+# they don't import the private _check_claim_duplicate across modules.
+check_claim_duplicate = _check_claim_duplicate
 
 
 async def run_extraction_cycle(
