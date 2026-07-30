@@ -376,6 +376,205 @@ def test_invalidate_ignores_non_commit(repo: Path, home: Path) -> None:
     assert len(_markers(home)) == 1  # marker survives
 
 
+# ── Invalidator/checker cwd symmetry (the #1254 follow-up, ab42b04f) ──────
+# #1254 made the PreToolUse checker resolve the commit's real worktree via
+# `git -C` / the last `cd` / the payload cwd. The PostToolUse invalidator was
+# left on the leading-`cd` regex (→ process cwd), so for a `git -C W commit` or
+# a decoy multi-`cd` the CHECKED marker (W) and the CLEARED marker (the shell's
+# worktree) diverged: W's marker survived its TTL and a later unreviewed
+# `git add && git commit` chain sailed through the existence-only gate. These
+# tests pin the invalidator to the same worktree the checker validates.
+#
+# Live-faithful setup: a 2026-07-30 probe confirmed CC spawns the hook with
+# process_cwd == payload `cwd`, and the PostToolUse `cwd` is POST-execution (it
+# already reflects the command's `cd`s). So `run_from` and `payload_cwd` are set
+# EQUAL here (matching reality), and divergence is produced the real way — via
+# `git -C` or a decoy `cd` in the command — not by forcing process≠payload.
+
+
+def _run_invalidate_at(
+    command: str, *, run_from: Path, payload_cwd: Path, home: Path
+) -> subprocess.CompletedProcess:
+    """PostToolUse invalidator with the process cwd and payload `cwd` set apart.
+
+    Real CC keeps them equal; callers pass them equal for live-faithful cases and
+    unequal only for the defensive mechanism test that pins which field is read.
+    """
+    payload = json.dumps(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {"stdout": "[feature/x abc1234] msg", "stderr": ""},
+            "session_id": "test",
+            "cwd": str(payload_cwd),
+        }
+    )
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run(
+        [sys.executable, str(_INVALIDATE)],
+        input=payload,
+        cwd=str(run_from),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_git_dash_C_commit_clears_target_worktree_not_shell(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """`git -C W commit` from a shell sitting in a DIFFERENT worktree: the
+    checker validates W's marker via `-C`, so the invalidator MUST clear W's
+    marker. The old invalidator (leading-`cd` regex → None → process cwd) cleared
+    the shell's worktree and left W's marker alive — the stale-review bypass.
+    Live-faithful: process cwd == payload cwd == the shell worktree (repo_b)."""
+    repo_b = _second_repo(tmp_path, "repo_b_gitC")  # the shell's worktree
+    assert _mark(repo, home).returncode == 0  # review recorded for repo (= W)
+    assert len(_markers(home)) == 1
+    _run_invalidate_at(
+        f"git -C {repo} commit -m done", run_from=repo_b, payload_cwd=repo_b, home=home
+    )
+    assert _markers(home) == [], "`git -C W commit` did not clear W's marker"
+
+
+def test_git_dash_C_no_stale_bypass_e2e(repo: Path, home: Path, tmp_path: Path) -> None:
+    """End-to-end (both hooks): a reviewed `git -C W commit` is ALLOWED by the
+    checker (resolves W via `-C`), the invalidator clears W's marker, and a NEW
+    unreviewed `git -C W add && git -C W commit` chain must then BLOCK. Guards the
+    exact bypass the invalidator asymmetry opened."""
+    repo_b = _second_repo(tmp_path, "repo_b_e2e_gitC")  # shell worktree
+    assert _mark(repo, home).returncode == 0
+    # Checker allows the reviewed commit (resolves repo via -C).
+    assert (
+        _run_hook(
+            f"git -C {repo} commit -m reviewed", repo_b, home, payload_cwd=str(repo_b)
+        ).returncode
+        == 0
+    )
+    # Invalidator clears repo's marker (same -C target).
+    _run_invalidate_at(
+        f"git -C {repo} commit -m reviewed", run_from=repo_b, payload_cwd=repo_b, home=home
+    )
+    assert _markers(home) == []
+    # A new UNREVIEWED add+commit chain targeting repo must now BLOCK.
+    res = _run_hook(
+        f"git -C {repo} add -A && git -C {repo} commit -m unreviewed",
+        repo_b,
+        home,
+        payload_cwd=str(repo_b),
+    )
+    assert res.returncode == 2, res.stderr
+
+
+def test_decoy_multi_cd_clears_last_cd_worktree(repo: Path, home: Path, tmp_path: Path) -> None:
+    """A decoy `cd A && … ; cd W && git commit` runs in W (bash applies cds in
+    order; the shell ends in W, so the POST-execution payload cwd is W). The
+    invalidator must clear W's marker — not A's (which the old leading-`cd` regex
+    picked). Live-faithful: payload cwd == the post-execution dir (repo = W)."""
+    repo_b = _second_repo(tmp_path, "repo_b_decoy")  # the decoy A
+    assert _mark(repo, home).returncode == 0  # review for repo (= W)
+    _run_invalidate_at(
+        f"cd {repo_b} && true ; cd {repo} && git commit -m done",
+        run_from=repo,
+        payload_cwd=repo,
+        home=home,
+    )
+    assert _markers(home) == [], "decoy multi-cd cleared the wrong (first-cd) worktree"
+
+
+def test_cd_after_commit_over_clears_real_worktree(repo: Path, home: Path, tmp_path: Path) -> None:
+    """`cd W && git commit && cd Z`: the commit ran in W but the POST-execution
+    payload cwd is Z. The invalidator detects the `cd` AFTER the commit segment,
+    treats the cwd as ambiguous, and over-clears the candidate set — so W's
+    marker (recovered from the leading `cd W`) is still cleared."""
+    repo_z = _second_repo(tmp_path, "repo_z_after")  # Z, where the shell ends
+    assert _mark(repo, home).returncode == 0  # review for repo (= W)
+    _run_invalidate_at(
+        f"cd {repo} && git commit -m done && cd {repo_z}",
+        run_from=repo_z,
+        payload_cwd=repo_z,
+        home=home,
+    )
+    assert _markers(home) == [], "cd-after-commit did not over-clear W's marker"
+
+
+def test_decoy_plus_trailing_cd_over_clears_real_worktree(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """`cd A && … ; cd W && git commit && cd Z`: the trailing `cd Z` makes the
+    post cwd (Z) miss the real commit dir W, AND the leading-`cd` regex picks A
+    (also not W). The over-clear set must still reach W via the checker's own
+    walk-based resolution — else W's marker survives and a later unreviewed
+    add+commit chain there reuses the stale review (a bypass Codex flagged)."""
+    repo_a = _second_repo(tmp_path, "repo_a_decoytrail")  # decoy A (leading cd)
+    repo_z = _second_repo(tmp_path, "repo_z_decoytrail")  # Z (post cwd)
+    assert _mark(repo, home).returncode == 0  # review for repo (= W, the real dir)
+    _run_invalidate_at(
+        f"cd {repo_a} && true ; cd {repo} && git commit -m done && cd {repo_z}",
+        run_from=repo_z,
+        payload_cwd=repo_z,
+        home=home,
+    )
+    assert _markers(home) == [], "decoy+trailing-cd left W's marker uncleared (bypass)"
+
+
+def test_leading_space_cd_plus_trailing_cd_over_clears(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """A LEADING SPACE before `cd W` defeats `_extract_working_dir`'s `^cd` anchor,
+    and the trailing `cd Z` moves the post cwd off W — so only the checker's own
+    walk (which strips segments) still lands on W. Regression for the reviewer's
+    Blocker 3 leading-whitespace variant."""
+    repo_z = _second_repo(tmp_path, "repo_z_lead")
+    assert _mark(repo, home).returncode == 0  # review for repo (= W)
+    _run_invalidate_at(
+        f" cd {repo} && git commit -m done && cd {repo_z}",  # note leading space
+        run_from=repo_z,
+        payload_cwd=repo_z,
+        home=home,
+    )
+    assert _markers(home) == [], "leading-space cd + trailing cd left W uncleared"
+
+
+def test_compound_decoy_no_stale_bypass_e2e(repo: Path, home: Path, tmp_path: Path) -> None:
+    """Full Blocker-3 E2E: a reviewed compound-decoy commit is ALLOWED by the
+    checker against W, the invalidator clears W (via the walk candidate), and a
+    later UNREVIEWED add+commit chain in W must then BLOCK — proving the stale
+    marker no longer survives to authorize it."""
+    repo_a = _second_repo(tmp_path, "repo_a_e2e")
+    repo_z = _second_repo(tmp_path, "repo_z_e2e")
+    assert _mark(repo, home).returncode == 0
+    reviewed = f"cd {repo_a} && true ; cd {repo} && git commit -m ok && cd {repo_z}"
+    # Checker (Pre) resolves W and allows the reviewed commit.
+    assert _run_hook(reviewed, repo_a, home, payload_cwd=str(repo_a)).returncode == 0
+    # Invalidator (Post, shell ended in Z) must still clear W.
+    _run_invalidate_at(reviewed, run_from=repo_z, payload_cwd=repo_z, home=home)
+    assert _markers(home) == []
+    # A new unreviewed add+commit chain in W must BLOCK (no stale marker).
+    res = _run_hook(
+        f"cd {repo} && git add -A && git commit -m sneaky",
+        repo_z,
+        home,
+        payload_cwd=str(repo_z),
+    )
+    assert res.returncode == 2, res.stderr
+
+
+def test_invalidator_reads_payload_cwd_field_not_process_cwd(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """DEFENSIVE (not live-faithful): with process cwd and payload `cwd` forced
+    apart, a bare `git commit` clears the PAYLOAD-cwd worktree. Pins the resolver
+    to the documented payload field so a future refactor to process cwd (or a CC
+    release that breaks the process==payload equality) is caught."""
+    repo_b = _second_repo(tmp_path, "repo_b_field")  # process cwd (wrong worktree)
+    assert _mark(repo, home).returncode == 0  # review for repo (payload cwd)
+    _run_invalidate_at("git commit -m done", run_from=repo_b, payload_cwd=repo, home=home)
+    assert _markers(home) == [], "invalidator keyed on process cwd, not payload cwd"
+
+
 # ── Docs/config-only skip (Change 4) ─────────────────────────────────────
 # A commit whose ENTIRE staged set is docs/config carries no code to review
 # (adaptive-review "review level: None") → Rule 2 is skipped. Conservative
@@ -619,3 +818,129 @@ def test_relative_cd_commit_to_sibling_main_blocked(repo: Path, home: Path, tmp_
     res = _run_hook("cd ../main && git commit -m x", feature, home, payload_cwd=str(feature))
     assert res.returncode == 2
     assert "main" in res.stderr.lower()
+
+
+# ── `git -C` / `git -c` commit forms reach the gate (d21db5ea, honest-use half) ──
+# The cheap early-out used to key on a rigid `\bgit\s+commit\b`, which does NOT
+# match `git -C <dir> commit` or `git -c k=v commit` (global options sit between
+# "git" and "commit"), so BOTH hooks exited early and those commit forms skipped
+# the ENTIRE gate — review (Rule 2), --no-verify (Rule 0), and direct-to-main
+# (Rule 1). Broadened to the "commit" token; `analyze()` remains the precise
+# filter. These pin every rule for the `git -C`/`git -c` forms.
+
+
+def _main_repo(tmp_path: Path, name: str) -> Path:
+    """A git repo left ON `main` with a staged change (for Rule 1 via `-C`)."""
+    r = tmp_path / name
+    r.mkdir()
+    _git(r, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(r, "config", "user.email", "t@e.st")
+    _git(r, "config", "user.name", "tester")
+    (r / "h.py").write_text("base = 1\n")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "base")
+    (r / "h.py").write_text("base = 2\n")
+    _git(r, "add", "-A")
+    return r
+
+
+def test_git_dash_C_commit_blocked_without_review(repo: Path, home: Path) -> None:
+    """`git -C W commit` on unreviewed code is BLOCKED (Rule 2) — previously it
+    slipped past the early-out and was allowed unconditionally."""
+    res = _run_hook(f"git -C {repo} commit -m x", repo, home, payload_cwd=str(repo))
+    assert res.returncode == 2, res.stderr
+    assert "without review" in res.stderr
+
+
+def test_git_dash_c_config_commit_blocked_without_review(repo: Path, home: Path) -> None:
+    """`git -c k=v commit` on unreviewed code is BLOCKED (Rule 2)."""
+    res = _run_hook("git -c commit.gpgsign=false commit -m x", repo, home, payload_cwd=str(repo))
+    assert res.returncode == 2, res.stderr
+    assert "without review" in res.stderr
+
+
+def test_git_dash_C_commit_allowed_after_marking(repo: Path, home: Path) -> None:
+    """A reviewed `git -C W commit` passes the gate."""
+    assert _mark(repo, home).returncode == 0
+    res = _run_hook(f"git -C {repo} commit -m ok", repo, home, payload_cwd=str(repo))
+    assert res.returncode == 0, res.stderr
+
+
+def test_git_dash_C_override_allows(repo: Path, home: Path) -> None:
+    """A trailing `# review-override` bypasses Rule 2 on a `git -C` commit."""
+    res = _run_hook(
+        f"git -C {repo} commit -m x  # review-override", repo, home, payload_cwd=str(repo)
+    )
+    assert res.returncode == 0, res.stderr
+
+
+def test_git_dash_C_no_verify_still_blocked(repo: Path, home: Path) -> None:
+    """`git -C W commit --no-verify` is BLOCKED by Rule 0 (which previously the
+    early-out let slip). Reviewed or not, --no-verify is never allowed."""
+    assert _mark(repo, home).returncode == 0  # even reviewed, --no-verify is denied
+    res = _run_hook(f"git -C {repo} commit -m x --no-verify", repo, home, payload_cwd=str(repo))
+    assert res.returncode == 2, res.stderr
+    assert "no-verify" in res.stderr.lower()
+
+
+def test_git_dash_C_to_main_blocked(repo: Path, home: Path, tmp_path: Path) -> None:
+    """`git -C <main-tree> commit` is BLOCKED by Rule 1 even when the shell sits
+    in a feature worktree — the `-C` target's branch decides."""
+    main = _main_repo(tmp_path, "maintree")
+    assert _mark(main, home).returncode == 0  # reviewed, to isolate Rule 1 from Rule 2
+    res = _run_hook(f"git -C {main} commit -m x", repo, home, payload_cwd=str(repo))
+    assert res.returncode == 2, res.stderr
+    assert "main" in res.stderr.lower()
+
+
+def test_commit_dash_C_reuse_message_is_not_a_worktree(repo: Path, home: Path) -> None:
+    """`git commit -C HEAD` reuses HEAD's message — the `-C` is the commit's own
+    flag, NOT a `git -C <dir>` redirect. It must resolve the SHELL's worktree
+    (here `repo`), so an unreviewed one still BLOCKS (Rule 2) and a reviewed one
+    passes — not resolve a bogus `<cwd>/HEAD` dir. Regression for the Codex P1."""
+    res = _run_hook("git commit -C HEAD", repo, home, payload_cwd=str(repo))
+    assert res.returncode == 2, res.stderr  # unreviewed → still gated in `repo`
+    assert "without review" in res.stderr
+    assert _mark(repo, home).returncode == 0
+    res_ok = _run_hook("git commit -C HEAD", repo, home, payload_cwd=str(repo))
+    assert res_ok.returncode == 0, res_ok.stderr  # reviewed `repo` → allowed
+
+
+def test_invalidate_commit_dash_C_reuse_clears_shell_worktree(repo: Path, home: Path) -> None:
+    """The invalidator must clear the SHELL's worktree marker for
+    `git commit -C HEAD`, not a bogus `<cwd>/HEAD` (which would leave the real
+    marker stale). Pairs with the checker regression above."""
+    assert _mark(repo, home).returncode == 0
+    _run_invalidate_at("git commit -C HEAD", run_from=repo, payload_cwd=repo, home=home)
+    assert _markers(home) == [], "`git commit -C HEAD` did not clear the real marker"
+
+
+def test_commit_pattern_matches_git_dash_c_and_dash_C() -> None:
+    """Drift guard: BOTH hooks' `_COMMIT_PATTERN` must detect `git -C`/`git -c`
+    commit forms (and not regress to the rigid `git commit` adjacency), and the
+    two patterns must stay identical so the pair detects the same commit set."""
+    import importlib.util
+
+    def _pattern(mod_name: str):
+        spec = importlib.util.spec_from_file_location(
+            mod_name, str(_REPO_ROOT / "scripts" / f"{mod_name}.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        # scripts/ and scripts/hooks/ on path for the modules' own imports
+        sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+        sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
+        spec.loader.exec_module(mod)
+        return mod._COMMIT_PATTERN
+
+    checker_pat = _pattern("review_enforcement_commit")
+    invalidate_pat = _pattern("review_invalidate_on_commit")
+    forms = [
+        "git commit -m x",
+        "git -C /some/wt commit -m x",
+        "git -c commit.gpgsign=false commit -m x",
+        "cd /wt && git commit -m x",
+    ]
+    for f in forms:
+        assert checker_pat.search(f), f"checker pattern missed: {f}"
+        assert invalidate_pat.search(f), f"invalidator pattern missed: {f}"
+    assert checker_pat.pattern == invalidate_pat.pattern, "hook patterns drifted apart"

@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Committing with `git -C` or `git -c` no longer skips the code-review gate.**
+  The safety hook that blocks commits until a review is recorded (and blocks
+  `--no-verify` and direct commits to `main`) recognized only the plain
+  `git commit` form. Commits written as `git -C <dir> commit` or
+  `git -c key=val commit` — a form these sessions use routinely for worktrees —
+  slipped past it entirely and committed with no review check at all. The gate
+  now recognizes those forms, so every commit is held to the same review rule,
+  and the matching post-commit cleanup clears the review for the exact worktree
+  the commit landed in (not the shell's directory), so one review can't silently
+  authorize a later unrelated commit.
 - **Deleting a memory no longer risks leaving an orphaned vector behind.** A
   memory lives across SQLite and a vector store; if the vector store hiccupped
   mid-delete, Genesis used to remove the memory's records but leave its vector
