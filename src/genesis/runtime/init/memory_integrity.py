@@ -1,18 +1,22 @@
-"""Scheduled memory-integrity jobs — Phase 0 "make silence loud".
+"""Scheduled memory-integrity jobs — Phase 0 detection + Phase 1 repair.
 
-Two restart-safe off-peak jobs, registered on the learning scheduler via a
+Restart-safe off-peak jobs, registered on the learning scheduler via a
 testable seam (the ``_wire_drip_retention_jobs`` precedent):
 
-- ``memory_consistency_check`` (03:50 local) — the read-only cross-backend
-  consistency scan (memory_metadata <-> Qdrant <-> memory_fts).
 - ``recall_health_probe`` (03:20 local) — the golden-set recall-health probe
   through the real retriever.
+- ``memory_consistency_check`` (03:50 local) — the read-only cross-backend
+  consistency scan (memory_metadata <-> Qdrant <-> memory_fts).
+- ``memory_reconcile`` (04:40 local, ``mode=active`` only) — the Phase-1
+  repair lane (``memory/integrity_repair.py``): deletes aged ghost points
+  (payloads exported first) and re-queues aged lying mirrors for re-embed.
+- ``memory_integrity_prune`` (04:15 local) — retention for the run tables.
 
-Both no-op when ``effective_mode() == 'off'`` (recording success so the job
-looks healthy, not stuck), read all knobs live from the config, and persist one
-row per run. The persisted rows are the fact store the awareness posture check
-and the dashboard tile read — the jobs never raise alerts themselves (decoupled
-surfacing).
+All no-op outside their required mode (recording success so a deliberately
+idle job looks healthy, not stuck), read all knobs live from the config, and
+persist one row per run. The persisted rows are the fact store the awareness
+posture check and the dashboard tile read — the jobs never raise alerts
+themselves (decoupled surfacing).
 """
 
 from __future__ import annotations
@@ -131,6 +135,73 @@ def _wire_memory_integrity_jobs(scheduler, rt) -> None:
         _run_consistency_check,
         CronTrigger(hour=3, minute=50, timezone=user_timezone()),
         id="memory_consistency_check",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    async def _run_memory_reconcile() -> None:
+        if rt._db is None:
+            return
+        # Phase-1 repair runs ONLY under 'active'. 'passive' and 'off' are both
+        # healthy no-ops here — the mode says don't repair, and a deliberately
+        # idle job must not read as stuck.
+        if integrity_config.effective_mode() != "active":
+            rt.record_job_success("memory_reconcile")
+            return
+        try:
+            from genesis.db.crud import memory_integrity as mi_crud
+            from genesis.memory.integrity_repair import run_reconcile
+            from genesis.qdrant.collections import get_client
+
+            cfg = integrity_config.load_config()
+            result = await run_reconcile(
+                db=rt._db,
+                qdrant_client=get_client(),
+                min_age_seconds=integrity_config.knob_int(cfg, "repair_min_age_seconds"),
+                max_repairs_per_run=integrity_config.knob_int(cfg, "max_repairs_per_run"),
+                max_points=integrity_config.knob_int(cfg, "max_points"),
+            )
+            await mi_crud.insert_reconcile_run(
+                rt._db,
+                status=result.status,
+                ghosts_deleted=result.ghosts_deleted,
+                ghost_delete_failed=result.ghost_delete_failed,
+                mirrors_requeued=result.mirrors_requeued,
+                mirrors_skipped_no_content=result.mirrors_skipped_no_content,
+                tombstones_drained=result.tombstones_drained,
+                truncated=result.truncated,
+                capped=result.capped,
+                duration_ms=result.duration_ms,
+                details=result.details,
+                unknown_reason=result.unknown_reason,
+            )
+            rt.record_job_success("memory_reconcile")
+            logger.info(
+                "memory reconcile: status=%s ghosts_deleted=%d mirrors_requeued=%d",
+                result.status,
+                result.ghosts_deleted,
+                result.mirrors_requeued,
+            )
+        except Exception as exc:
+            rt.record_job_failure("memory_reconcile", exc=exc)
+            logger.exception("memory reconcile failed")
+            # Best-effort audit row so a mid-run crash is visible in the run
+            # history, not only in job-health.
+            try:
+                from genesis.db.crud import memory_integrity as mi_crud
+
+                await mi_crud.insert_reconcile_run(
+                    rt._db,
+                    status="failed",
+                    unknown_reason=f"exception: {type(exc).__name__}",
+                )
+            except Exception:
+                logger.warning("memory reconcile: failed-run audit row not written", exc_info=True)
+
+    scheduler.add_job(
+        _run_memory_reconcile,
+        CronTrigger(hour=4, minute=40, timezone=user_timezone()),
+        id="memory_reconcile",
         max_instances=1,
         misfire_grace_time=3600,
     )

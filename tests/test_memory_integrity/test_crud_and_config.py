@@ -225,3 +225,60 @@ async def test_crud_noop_before_migration(tmp_path):
     assert await mi.has_recent_non_unknown_report(conn, since_iso="2000-01-01") is True
     assert await mi.prune_memory_integrity(conn, older_than_days=90, now="2030-01-01") == 0
     await conn.close()
+
+# ── memory_reconcile_runs (Phase 1) ──────────────────────────────────────
+
+
+async def test_reconcile_run_round_trip(tmp_path):
+    conn = await _conn(tmp_path)
+    rid = await mi.insert_reconcile_run(
+        conn,
+        status="partial",
+        ghosts_deleted=3,
+        ghost_delete_failed=1,
+        mirrors_requeued=2,
+        mirrors_skipped_no_content=1,
+        truncated=True,
+        capped=True,
+        duration_ms=99,
+        details={"mirrors_skipped_truncated": True},
+    )
+    assert rid
+    latest = await mi.latest_reconcile_run(conn)
+    assert latest["status"] == "partial"
+    assert latest["ghosts_deleted"] == 3
+    assert latest["truncated"] == 1 and latest["capped"] == 1
+    assert "mirrors_skipped_truncated" in latest["details_json"]
+
+
+async def test_reconcile_guard_is_independent_of_phase0(tmp_path):
+    """Dropping memory_reconcile_runs (pre-0074 install) must no-op ONLY the
+    reconcile writer — Phase-0 report inserts keep working, and vice versa the
+    availability guards never cross-contaminate."""
+    conn = await _conn(tmp_path)
+    await conn.execute("DROP TABLE memory_reconcile_runs")
+    await conn.commit()
+    assert await mi.insert_reconcile_run(conn, status="ok") is None  # no-op, no raise
+    assert await mi.latest_reconcile_run(conn) is None
+    # Phase-0 writer unaffected:
+    rid = await mi.insert_consistency_report(
+        conn, status="healthy", counts={}, total_rows=0, sampled_rows=0,
+        sample_fraction=1.0, truncated=False,
+    )
+    assert rid is not None
+    # prune still works with the reconcile table missing (its guard skips it)
+    assert await mi.prune_memory_integrity(conn, older_than_days=1, now="2026-07-30 00:00:00") == 0
+    await conn.close()
+
+
+async def test_reconcile_prune(tmp_path):
+    conn = await _conn(tmp_path)
+    await mi.insert_reconcile_run(conn, status="ok", created_at="2026-01-01 00:00:00")
+    await mi.insert_reconcile_run(conn, status="ok", created_at="2026-07-29 00:00:00")
+    removed = await mi.prune_memory_integrity(
+        conn, older_than_days=90, now="2026-07-30 00:00:00"
+    )
+    assert removed == 1
+    latest = await mi.latest_reconcile_run(conn)
+    assert latest["created_at"] == "2026-07-29 00:00:00"
+    await conn.close()
