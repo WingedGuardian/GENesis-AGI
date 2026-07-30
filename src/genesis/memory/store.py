@@ -496,35 +496,59 @@ class MemoryStore:
     async def delete(self, memory_id: str) -> dict:
         """Delete a memory from all layers. Returns per-layer status.
 
-        Tries all layers independently — partial failure is acceptable.
-        Qdrant deletes try both collections since the FTS5 collection column
-        is unreliable (documented in memory.py:72-73).
+        **Point-first, fail-closed, atomic on the point's real collection.** The
+        metadata ``collection`` column is unreliable (memory.py:72-73), so the
+        point is first LOCATED by a by-id retrieve against both collections, then
+        deleted only from the collection(s) that actually hold it — never a blind
+        delete against both (a transient failure on the collection that did NOT
+        hold the point would otherwise strand the one that did). A ``retrieve`` or
+        ``delete`` that raises means Qdrant is unreachable → **defer**: touch no
+        SQLite layer and return ``deferred=True`` so the memory stays coherent and
+        retryable rather than leaving an orphaned "ghost" point. A memory that
+        never had a vector (``fts5_only``/``pending``/``failed``) locates to
+        nothing and deletes cleanly.
         """
         results: dict[str, bool | int] = {}
 
-        # 1. memory_metadata companion table
+        # 1. Locate the point (unreliable collection column → check both) and
+        # delete only where it lives. retrieve/delete raise on a real Qdrant error
+        # → defer; an empty locate means the point is absent (nothing to delete).
+        try:
+            present: list[str] = []
+            for coll in ("episodic_memory", "knowledge_base"):
+                got = await asyncio.to_thread(
+                    self._qdrant.retrieve,
+                    collection_name=coll,
+                    ids=[memory_id],
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                if got:
+                    present.append(coll)
+            for coll in present:  # atomic on the point's real collection
+                await asyncio.to_thread(
+                    delete_point, self._qdrant, collection=coll, point_id=memory_id,
+                )
+        except Exception:
+            logger.error(
+                "Qdrant unavailable during delete of %s — deferring to keep stores "
+                "consistent (no orphan)", memory_id, exc_info=True,
+            )
+            results["deferred"] = True
+            results["metadata"] = False
+            results["fts5"] = False
+            return results
+        results["qdrant_deleted"] = len(present)
+
+        # 2. memory_metadata companion table (point confirmed gone → safe)
         results["metadata"] = await memory_crud.delete_metadata(
             self._db, memory_id=memory_id,
         )
 
-        # 2. FTS5 text index
+        # 3. FTS5 text index
         results["fts5"] = await memory_crud.delete(
             self._db, memory_id=memory_id,
         )
-
-        # 3. Qdrant — try both collections (collection column unreliable)
-        for coll in ("episodic_memory", "knowledge_base"):
-            try:
-                await asyncio.to_thread(
-                    delete_point, self._qdrant, collection=coll, point_id=memory_id,
-                )
-                results[f"qdrant_{coll}"] = True
-            except Exception:
-                logger.error(
-                    "Qdrant delete failed for %s in %s", memory_id, coll,
-                    exc_info=True,
-                )
-                results[f"qdrant_{coll}"] = False
 
         # 4. Cascade: memory_links
         results["links_deleted"] = await memory_links_crud.delete_by_memory(

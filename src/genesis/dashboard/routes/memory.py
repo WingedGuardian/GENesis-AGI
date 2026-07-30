@@ -145,14 +145,42 @@ async def memory_delete(memory_id: str):
 
     try:
         if rt.memory_store is None:
-            # Fallback: FTS5-only delete if MemoryStore not available
+            # Degraded boot (no MemoryStore/Qdrant client): SQLite is all we can
+            # touch. Refuse to delete an EMBEDDED memory — we can't remove its
+            # point, and dropping only FTS+metadata would orphan it as a ghost.
+            # fts5_only/pending/failed rows have no durable point, so FTS +
+            # metadata is a complete, safe delete.
             from genesis.db.crud import memory as memory_crud
 
+            meta = await memory_crud.get_metadata(rt.db, memory_id)
+            if meta and meta["embedding_status"] == "embedded":
+                return (
+                    jsonify(
+                        {
+                            "status": "unavailable",
+                            "detail": "vector store unavailable; cannot safely delete an embedded memory",
+                        }
+                    ),
+                    503,
+                )
             deleted = await memory_crud.delete(rt.db, memory_id=memory_id)
             await memory_crud.delete_metadata(rt.db, memory_id=memory_id)
             return jsonify({"status": "partial", "fts5": deleted})
 
         results = await rt.memory_store.delete(memory_id)
+        if results.get("deferred"):
+            # Vector store unavailable → delete not applied (memory retained).
+            # Report honestly rather than a misleading "ok".
+            return (
+                jsonify(
+                    {
+                        "status": "deferred",
+                        "detail": "vector store unavailable; delete not applied, retry later",
+                        "details": results,
+                    }
+                ),
+                503,
+            )
         return jsonify({"status": "ok", "details": results})
     except Exception:
         logger.error("Memory delete failed for %s", memory_id, exc_info=True)

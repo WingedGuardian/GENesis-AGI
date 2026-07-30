@@ -352,6 +352,16 @@ def test_every_recall_site_is_classified():
 _QDRANT_READ_VALID = {"prompt-gated", "infra", "library", "deferred-with-reason"}
 
 KNOWN_QDRANT_READ_SITES: dict[str, tuple[str, str]] = {
+    "db/data_migrations/d0008_reconcile_memory_cross_store.py::_scroll_points": (
+        "infra",
+        "one-time reconcile migration; scrolls point ids (with_payload=[created_at]) "
+        "to set-diff against memory_metadata — never prompted",
+    ),
+    "db/data_migrations/d0008_reconcile_memory_cross_store.py::_export_ghosts": (
+        "infra",
+        "one-time reconcile migration; retrieves orphaned ghost payloads to export "
+        "before deletion — never prompted",
+    ),
     "eval/bench/isolation.py::_scroll_usage": (
         "infra",
         "bench snapshot usage-payload copy between collections",

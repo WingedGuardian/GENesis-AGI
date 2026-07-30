@@ -14,7 +14,10 @@ it still governs the pr-merge review-findings gate (see test_merge_review_gate.p
 All shell-parse bypass-hardening from #1232 is preserved — a push detected through
 a wrapper is still caught, now denied in the dispatched context.
 
-Pure string-parsing paths (no gh/git network), so no mocking needed.
+Mostly pure string-parsing paths, so no mocking needed. The gated pr-create cases
+resolve their branch against the real remote via ``git ls-remote``; they use a
+bogus branch (or tolerate a network failure) so the decision is "gate" either way,
+keeping the assertions deterministic regardless of connectivity.
 """
 
 from __future__ import annotations
@@ -59,31 +62,36 @@ def _decision(res: subprocess.CompletedProcess) -> str | None:
 # ── gh pr create ────────────────────────────────────────────────────
 
 
-# gh pr create is UN-gated when its head branch is already on the remote (then
-# it's just a review request on pushed code). That un-gated path is git-state
-# dependent, so it is covered deterministically by the _pr_create_would_publish
-# unit tests in test_merge_review_gate.py. Here we test the GATED path: an
-# --head not on the remote (origin/<nonexistent> never exists) which gh would
-# push — that must be gated like a push.
-_UNPUSHED = "zzz-unpushed-branch-xyz"
+# gh pr create publishes code ONLY in the implicit form (no --head), where gh may
+# push the current branch if it isn't fully on the remote. Per `gh pr create
+# --help`, "Use --head to explicitly skip any forking or pushing behavior" — so
+# ANY explicit --head cannot publish and is un-gated. The un-gated path emits an
+# explicit `allow` so CC's own permission prompt for this non-allow-listed command
+# does not fire (a bare exit-0 would leave it to prompt). The implicit
+# push-or-not decision is git-state dependent, so it's covered deterministically
+# by the _pr_create_would_publish unit tests in test_merge_review_gate.py; here we
+# assert the deterministic explicit-head behavior (allow, no network).
+_HEAD = "zzz-some-branch-xyz"
 
 
-def test_pr_create_unpushed_branch_asks_interactive():
-    res = _run(f"gh pr create --head {_UNPUSHED} --title x --body y")
+def test_pr_create_explicit_head_allowed_interactive():
+    res = _run(f"gh pr create --head {_HEAD} --title x --body y")
     assert res.returncode == 0, res.stderr
-    assert _decision(res) == "ask"
+    assert _decision(res) == "allow"  # gh skips push with --head → no prompt
 
 
-def test_pr_create_unpushed_branch_denied_dispatched():
-    res = _run(f"gh pr create --head {_UNPUSHED} --title x --body y", dispatched=True)
-    assert res.returncode == 2
-    assert _decision(res) is None
+def test_pr_create_explicit_head_allowed_dispatched():
+    res = _run(f"gh pr create --head {_HEAD} --title x --body y", dispatched=True)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "allow"
 
 
-def test_pr_create_unpushed_global_flag_still_detected():
-    """A gh global flag before `pr` must not evade detection of the create."""
-    res = _run(f"gh --repo o/r pr create --head {_UNPUSHED} --title x --body y", dispatched=True)
-    assert res.returncode == 2
+def test_pr_create_cross_fork_head_allowed():
+    """An owner:branch cross-fork head also can't push around the gate (gh can't
+    push to a fork we don't control), so it is un-gated too."""
+    res = _run("gh pr create --head someone:feature --title x --body y")
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "allow"
 
 
 def test_pr_create_mention_in_string_not_tripped():
@@ -262,14 +270,13 @@ def test_push_override_token_cannot_self_approve_dispatched():
     assert _decision(res) is None
 
 
-def test_pr_create_token_does_not_ungate_unpushed():
-    """The retired token cannot un-gate an unpushed create either — it still
-    gates (gh would push) and asks, regardless of any trailing token."""
-    res = _run(
-        f"gh pr create --head {_UNPUSHED} --title x --body-file /tmp/b.md  # review-override"
-    )
+def test_pr_create_token_irrelevant_to_gate():
+    """The retired `# review-override` token never factored into pr-create gating
+    (it governs the pr-merge findings gate only). An explicit-head create is
+    allowed on its own merits — the trailing token neither helps nor changes it."""
+    res = _run(f"gh pr create --head {_HEAD} --title x --body-file /tmp/b.md  # review-override")
     assert res.returncode == 0, res.stderr
-    assert _decision(res) == "ask"
+    assert _decision(res) == "allow"
 
 
 # ── shell-parse bypass-hardening preserved (dispatched → still hard-denied) ──

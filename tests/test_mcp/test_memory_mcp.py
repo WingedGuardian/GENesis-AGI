@@ -182,7 +182,7 @@ async def test_knowledge_ingest_stores_with_correct_qdrant_id():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="qdrant-uuid-123")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "test-embed-model"
 
@@ -267,7 +267,7 @@ async def test_knowledge_ingest_memory_class_override():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="qdrant-xyz")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -372,7 +372,7 @@ async def test_reference_store_full_roundtrip():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="qdrant-cred-1")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "test-embed"
 
@@ -437,7 +437,7 @@ async def test_reference_store_upsert_preserves_id():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="qdrant-a")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -507,7 +507,7 @@ async def test_reference_store_different_kinds_no_body_collision():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(side_effect=fake_store)
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -549,7 +549,7 @@ async def test_reference_lookup_logs_credential_access():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q1")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -605,7 +605,7 @@ async def test_reference_lookup_non_credentials_no_audit():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q1")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -656,7 +656,7 @@ async def test_reference_lookup_hybrid_vector_path():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q-vector-1")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -718,7 +718,7 @@ async def test_reference_lookup_hybrid_merges_both_paths():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q-both")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -766,7 +766,7 @@ async def test_reference_delete_roundtrip():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q-delete-me")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -814,7 +814,7 @@ async def test_reference_delete_survives_audit_rows_with_fk_on():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(return_value="q-fk-test")
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 
@@ -879,7 +879,7 @@ async def test_reference_delete_refuses_non_reference_unit():
         )
 
         mock_store = AsyncMock()
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
 
         old = (mod._store, mod._db, mod._retriever, mod._qdrant)
         try:
@@ -907,7 +907,7 @@ async def test_reference_export_returns_stats():
 
         mock_store = AsyncMock()
         mock_store.store = AsyncMock(side_effect=["q1", "q2", "q3"])
-        mock_store.delete = AsyncMock()
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
         mock_store._embeddings = MagicMock()
         mock_store._embeddings.model_name = "m"
 

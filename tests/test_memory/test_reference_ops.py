@@ -24,6 +24,7 @@ from genesis.memory.reference_extraction import (
 )
 from genesis.memory.reference_ops import (
     REFERENCE_PROJECT,
+    ReferenceStoreUnavailable,
     delete_reference_entry,
     parse_reference_body,
 )
@@ -131,7 +132,9 @@ async def _insert_ref(db, *, qdrant_id="qid-123", project_type=REFERENCE_PROJECT
 async def test_delete_removes_row_and_qdrant(_db):
     unit_id = await _insert_ref(_db)
     store = AsyncMock()
-    store.delete = AsyncMock()
+    # MemoryStore.delete returns a per-layer status dict; a successful delete has
+    # no "deferred" key (that appears only when Qdrant was unavailable).
+    store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
 
     deleted = await delete_reference_entry(_db, store, unit_id)
 
@@ -143,6 +146,20 @@ async def test_delete_removes_row_and_qdrant(_db):
         "SELECT COUNT(*) FROM knowledge_fts WHERE unit_id = ?", (unit_id,),
     )
     assert rows[0][0] == 0
+
+
+async def test_delete_deferred_raises_and_keeps_unit(_db):
+    # When store.delete DEFERS (Qdrant down → point + metadata retained), the
+    # helper must RAISE a retryable error (distinct from "not found") and leave
+    # the knowledge_units row intact for retry.
+    unit_id = await _insert_ref(_db)
+    store = AsyncMock()
+    store.delete = AsyncMock(return_value={"deferred": True, "metadata": False, "fts5": False})
+
+    with pytest.raises(ReferenceStoreUnavailable):
+        await delete_reference_entry(_db, store, unit_id)
+
+    assert await kc.get(_db, unit_id) is not None  # unit row survives for retry
 
 
 async def test_delete_missing_returns_false(_db):

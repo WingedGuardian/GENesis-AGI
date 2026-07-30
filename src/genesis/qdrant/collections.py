@@ -261,12 +261,19 @@ def search(
 def delete_point(
     client: QdrantClient, *, collection: str, point_id: str
 ) -> None:
-    """Delete a point by ID."""
+    """Delete a point by ID.
+
+    ``wait=True`` is explicit (it is also the client default) so a returned
+    call means the delete is durably applied, not merely acknowledged — callers
+    that gate cross-store consistency on "delete_point did not raise" (e.g.
+    ``MemoryStore.delete`` point-first ordering) depend on that guarantee.
+    """
     from qdrant_client.models import PointIdsList
 
     client.delete(
         collection_name=collection,
         points_selector=PointIdsList(points=[point_id]),
+        wait=True,
     )
 
 

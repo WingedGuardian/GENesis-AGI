@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth — the MCP tool module imports these back.
 REFERENCE_PROJECT = "reference"
+
+
+class ReferenceStoreUnavailable(RuntimeError):
+    """The vector store was unavailable so the reference delete was DEFERRED and
+    must be retried — distinct from "no such reference" (which returns ``False``).
+    Callers should surface a retryable failure, not a 404/absent result."""
 REFERENCE_KINDS = frozenset({
     "credentials",
     "url",
@@ -127,11 +133,26 @@ async def delete_reference_entry(
     qdrant_id = row.get("qdrant_id")
     if qdrant_id and store is not None:
         try:
-            await store.delete(qdrant_id)
-        except Exception:
+            res = await store.delete(qdrant_id)
+        except ReferenceStoreUnavailable:
+            raise
+        except Exception as exc:
             logger.error(
                 "delete_reference_entry: Qdrant cleanup failed for unit %s "
-                "(qdrant_id=%s)", unit_id, qdrant_id, exc_info=True,
+                "(qdrant_id=%s) — deferring, leaving unit for retry",
+                unit_id, qdrant_id, exc_info=True,
+            )
+            raise ReferenceStoreUnavailable(
+                f"reference delete failed for unit {unit_id} (qdrant_id={qdrant_id})"
+            ) from exc
+        if res.get("deferred"):
+            # Vector store unavailable → store.delete kept the point + metadata
+            # intact. Do NOT drop the knowledge_units row, or we would orphan it
+            # from its record. Signal a RETRYABLE failure (not "not found") so the
+            # caller can report it correctly and retry the whole delete later.
+            raise ReferenceStoreUnavailable(
+                f"reference delete deferred for unit {unit_id} "
+                f"(qdrant_id={qdrant_id}): vector store unavailable"
             )
 
     deleted = await knowledge_crud.delete(db, unit_id)

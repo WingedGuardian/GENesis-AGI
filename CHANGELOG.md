@@ -9,6 +9,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deleting a memory no longer risks leaving an orphaned vector behind.** A
+  memory lives across SQLite and a vector store; if the vector store hiccupped
+  mid-delete, Genesis used to remove the memory's records but leave its vector
+  stranded — invisible bloat that could subtly pollute search, and it never
+  cleaned itself up. Deletes are now ordered vector-first and fail closed: if the
+  vector store is unavailable the whole delete is deferred and retried, so a
+  memory is never left half-removed. A one-time startup cleanup removes any
+  existing orphaned vectors (their contents are exported to `~/.genesis/output`
+  first) and restores memories that had lost their vector back to full search —
+  healing the drift the new Memory Integrity checks surface.
+- **Rebuilding a memory's vector no longer resurrects a superseded one.** When a
+  missing vector is rebuilt, Genesis re-stamps it with the memory's current
+  state — so a memory that was retired or superseded while its vector was still
+  pending stays excluded from recall instead of quietly reappearing, and its real
+  confidence is preserved rather than reset to a default.
+
 ### Added
 
 - **Talk to Genesis by voice to remember things and set reminders.** When
@@ -83,11 +101,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   instead of hard-stopping.** This safety hook used to block the command outright
   with no in-session way through; now Claude Code shows you a native approve/deny
   prompt you confirm with one keystroke — a gate the agent cannot self-satisfy.
-  `gh pr create` is not prompted separately when its branch is already pushed
-  (opening a PR is then just a review request — so `git push && gh pr create`
-  asks once, for the push); a create from an unpushed branch, which gh would
-  push itself, is still gated. Autonomous/background Genesis sessions stay
-  blocked from pushing directly (their real delivery path is separately gated).
+  `gh pr create` no longer prompts on its own when it can't publish code —
+  opening a PR is then just a review request, so `git push && gh pr create` asks
+  once (for the push) and a standalone create on already-pushed code doesn't
+  prompt at all. Only the one form that can publish — a create with no `--head`
+  from a branch that isn't fully pushed, where gh pushes the branch itself — is
+  gated like a push; any explicit `--head` (which tells gh to skip pushing) is
+  never gated. The "already pushed?" check queries the live remote, so it isn't
+  fooled by a stale local reference to a since-deleted branch, and any network
+  error just gates. Autonomous/background Genesis sessions stay blocked from
+  pushing directly (their real delivery path is separately gated).
   Force pushes stay hard-blocked; branch names that merely contain `-f` (e.g.
   `fix/…-false-positives`) are no longer mistaken for a force-push.
 - **Genesis now keeps its own internal event log from growing without bound.**

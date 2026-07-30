@@ -141,7 +141,20 @@ async def ingest_knowledge_unit(
     # handles metadata, FTS5, Qdrant, links, and pending_embeddings cascade.
     if old_qdrant_id and old_qdrant_id != qdrant_memory_id:
         try:
-            await store.delete(old_qdrant_id)
+            res = await store.delete(old_qdrant_id)
+            if res.get("deferred"):
+                # Vector store unavailable → store.delete() touched nothing, so
+                # the replaced memory is still fully alive (point + metadata +
+                # FTS) alongside its successor — and unlike a ghost, no cleanup
+                # can classify it as an offender (it has a metadata row). No
+                # sweep retries this delete either, so log LOUDLY: this is the
+                # knowledge-unit stale-pair case for a cross-store reconcile.
+                logger.error(
+                    "Stale-point cleanup deferred for %s while upserting "
+                    "knowledge unit %s: vector store unavailable — the replaced "
+                    "memory remains recallable alongside its successor until "
+                    "reconciled", old_qdrant_id, unit_id,
+                )
         except Exception:
             logger.error(
                 "Failed to clean up stale Qdrant point %s while upserting "
