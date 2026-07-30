@@ -88,6 +88,7 @@ def init(rt: GenesisRuntime) -> None:
             rt._awareness_loop.set_resilience_state_machine(rt._resilience_state_machine)
             if rt._circuit_breakers is not None:
                 rt._awareness_loop.set_circuit_breakers(rt._circuit_breakers)
+            rt._awareness_loop.set_degradation_tracker(degradation)
             logger.info("Deferred queue + resilience state machine + circuit breakers injected into awareness loop")
 
     except ImportError:
