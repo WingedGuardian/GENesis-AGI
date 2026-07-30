@@ -95,15 +95,21 @@ def _export_path(export_dir: Path, now: datetime) -> Path:
     return export_dir / f"memory_reconcile_ghost_export-{now.strftime('%Y%m%d')}.jsonl"
 
 
-def _export_ghosts(qdrant_client, ghosts: list[tuple[str, str]], path: Path, now_iso: str) -> None:
+def _export_ghosts(
+    qdrant_client, ghosts: list[tuple[str, str]], path: Path, now_iso: str
+) -> set[str]:
     """Append each ghost's full payload to the export JSONL before deletion.
 
-    Sync (runs via to_thread). Best-effort per point — a retrieve failure must
-    not block the reconcile; the file is the recovery net for the otherwise-
-    irreversible point delete.
+    Sync (runs via to_thread). Returns the set of point ids whose payload was
+    SUCCESSFULLY captured — the export is the recovery net for an irreversible
+    point delete, so a ghost whose ``retrieve`` raised (or returned nothing) is
+    NOT in the returned set and the caller must NOT delete it: deleting content
+    we failed to preserve would silently destroy the only copy. A skipped ghost
+    is simply retried on the next run.
     """
+    exported_ok: set[str] = set()
     if not ghosts:
-        return
+        return exported_ok
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         for pid, coll in ghosts:
@@ -111,10 +117,10 @@ def _export_ghosts(qdrant_client, ghosts: list[tuple[str, str]], path: Path, now
                 got = qdrant_client.retrieve(
                     collection_name=coll, ids=[pid], with_payload=True, with_vectors=False
                 )
-                payload = got[0].payload if got else None
             except Exception:
                 logger.warning("reconcile: ghost export retrieve failed for %s", pid, exc_info=True)
-                payload = None
+                continue  # not exported → caller leaves it for next run
+            payload = got[0].payload if got else None
             fh.write(
                 json.dumps(
                     {
@@ -126,6 +132,8 @@ def _export_ghosts(qdrant_client, ghosts: list[tuple[str, str]], path: Path, now
                 )
                 + "\n"
             )
+            exported_ok.add(pid)
+    return exported_ok
 
 
 async def run_reconcile(
@@ -223,38 +231,49 @@ async def run_reconcile(
     if truncated:
         details["mirrors_skipped_truncated"] = True
 
-    # ── Repair: ghosts (export → point delete → stray-row sweep) ──
+    # ── Repair: ghosts (export → point delete + stray-row sweep, per id) ──
     ghost_delete_failed = 0
+    ghost_export_skipped = 0
     deleted: list[str] = []
     if ghosts:
         now_iso = now_dt.isoformat()
-        await asyncio.to_thread(
+        # Export is a PRECONDITION for deletion: only ghosts whose payload we
+        # actually captured are eligible. A ghost whose export failed keeps its
+        # point (the only copy of its content) and is retried next run — never
+        # delete content the recovery net didn't preserve.
+        exported_ok = await asyncio.to_thread(
             _export_ghosts, qdrant_client, ghosts, _export_path(export_dir, now_dt), now_iso
         )
-        for pid, coll in ghosts:
-            try:
-                await asyncio.to_thread(
-                    qdrant_ops.delete_point, qdrant_client, collection=coll, point_id=pid
+        deletable = [(pid, coll) for pid, coll in ghosts if pid in exported_ok]
+        ghost_export_skipped = len(ghosts) - len(deletable)
+
+        # Each ghost's point delete + stray-row sweep runs UNDER the per-id lock,
+        # so the recovery worker (which may hold a 'pending' queue row for this id
+        # and takes the same lock) cannot upsert the point back between our delete
+        # and our sweep — which would strand a vector-only ghost. A ghost has no
+        # metadata row by definition, so the sweep is a completeness no-op in the
+        # normal case. Shared serialized connection, periodic commit, never rollback.
+        for i, (pid, coll) in enumerate(deletable, 1):
+            async with memory_id_lock(pid):
+                try:
+                    await asyncio.to_thread(
+                        qdrant_ops.delete_point, qdrant_client, collection=coll, point_id=pid
+                    )
+                except Exception:
+                    logger.warning(
+                        "reconcile: ghost point delete failed for %s — left for next run",
+                        pid,
+                        exc_info=True,
+                    )
+                    ghost_delete_failed += 1
+                    continue
+                await db.execute("DELETE FROM memory_fts WHERE memory_id = ?", (pid,))
+                await db.execute(
+                    "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?", (pid, pid)
                 )
+                await db.execute("DELETE FROM pending_embeddings WHERE memory_id = ?", (pid,))
+                await db.execute("DELETE FROM entity_mentions WHERE memory_id = ?", (pid,))
                 deleted.append(pid)
-            except Exception:
-                logger.warning(
-                    "reconcile: ghost point delete failed for %s — left for next run",
-                    pid,
-                    exc_info=True,
-                )
-                ghost_delete_failed += 1
-        # Stray-row sweep for confirmed-deleted ghosts. A ghost has no metadata
-        # row by definition; these are completeness no-ops in the normal case.
-        # Small per-statement writes on the shared serialized connection with a
-        # periodic commit — cooperative with live writers, never rollback.
-        for i, pid in enumerate(deleted, 1):
-            await db.execute("DELETE FROM memory_fts WHERE memory_id = ?", (pid,))
-            await db.execute(
-                "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?", (pid, pid)
-            )
-            await db.execute("DELETE FROM pending_embeddings WHERE memory_id = ?", (pid,))
-            await db.execute("DELETE FROM entity_mentions WHERE memory_id = ?", (pid,))
             if i % _SWEEP_COMMIT_EVERY == 0:
                 await db.commit()
         await db.commit()
@@ -310,7 +329,13 @@ async def run_reconcile(
             )
             mirrors_requeued += 1
 
-    status = "partial" if (ghost_delete_failed or capped or truncated) else "ok"
+    if ghost_export_skipped:
+        # Ghosts whose export failed were left undeleted (retried next run) —
+        # surface it so a persistent export failure is visible, not silent.
+        details["ghost_export_skipped"] = ghost_export_skipped
+    status = (
+        "partial" if (ghost_delete_failed or ghost_export_skipped or capped or truncated) else "ok"
+    )
     result = ReconcileResult(
         status=status,
         ghosts_deleted=len(deleted),

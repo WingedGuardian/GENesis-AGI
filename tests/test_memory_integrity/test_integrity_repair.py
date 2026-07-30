@@ -262,6 +262,70 @@ async def test_ghost_delete_failure_left_for_retry(tmp_path, monkeypatch):
     assert "ghost_bad" in client.points["episodic_memory"]  # still there → next run
 
 
+async def test_ghost_export_failure_skips_deletion(tmp_path, monkeypatch):
+    """The export is a PRECONDITION for deletion: if retrieve() fails so the
+    payload can't be captured, the ghost's point must NOT be deleted (its content
+    would be lost with no recovery net) — it is left for the next run. A ghost
+    whose export succeeds is deleted normally."""
+    path = await _db(tmp_path)
+    client = _points(
+        {"episodic_memory": {"g_ok": {"created_at": _OLD}, "g_bad": {"created_at": _OLD}}}
+    )
+    real_retrieve = client.retrieve
+
+    def _flaky_retrieve(*, collection_name, ids, **kw):
+        if "g_bad" in ids:
+            raise ConnectionError("retrieve boom")
+        return real_retrieve(collection_name=collection_name, ids=ids, **kw)
+
+    client.retrieve = _flaky_retrieve
+
+    result = await _run(path, client, monkeypatch, tmp_path)
+
+    assert result.ghosts_deleted == 1  # only g_ok
+    assert result.status == "partial"
+    assert result.details.get("ghost_export_skipped") == 1
+    assert "g_bad" in client.points["episodic_memory"]  # NOT deleted → retried
+    assert "g_ok" not in client.points["episodic_memory"]
+    # export file contains only the successfully-captured ghost
+    exports = list((tmp_path / "export").glob("*.jsonl"))
+    lines = [json.loads(ln) for ln in exports[0].read_text().splitlines()]
+    assert [e["point_id"] for e in lines] == ["g_ok"]
+
+
+async def test_ghost_delete_and_sweep_run_under_per_id_lock(tmp_path, monkeypatch):
+    """The ghost point-delete + stray-row sweep hold memory_id_lock(pid), so the
+    recovery worker (which may hold a 'pending' queue row for this id and takes
+    the same lock) can't re-upsert the point between the delete and the sweep."""
+    from genesis.memory._locks import memory_id_lock
+
+    path = await _db(tmp_path)
+    client = _points({"episodic_memory": {"g_lk": {"created_at": _OLD}}})
+    held: dict[str, bool] = {}
+
+    def _spy_delete(c, *, collection, point_id):
+        held["at_delete"] = memory_id_lock(point_id).locked()
+        client.points.get(collection, {}).pop(point_id, None)
+
+    monkeypatch.setattr(qdrant_ops, "delete_point", _spy_delete)
+    conn = await aiosqlite.connect(path)
+    conn.row_factory = None
+    try:
+        result = await integrity_repair.run_reconcile(
+            db=conn,
+            qdrant_client=client,
+            db_path=path,
+            export_dir=tmp_path / "export",
+            now=_NOW,
+        )
+    finally:
+        await conn.close()
+
+    assert result.ghosts_deleted == 1
+    assert held.get("at_delete") is True  # delete ran inside the id-lock
+    assert memory_id_lock("g_lk").locked() is False  # released after
+
+
 async def test_qdrant_down_skips_run_touching_nothing(tmp_path, monkeypatch):
     path = await _db(tmp_path)
     await _seed(path, "mir_old", created_at=_OLD)
