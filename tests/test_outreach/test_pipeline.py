@@ -362,7 +362,9 @@ async def test_delivery_failure_suppressed_when_open_duplicate(
     )
     result = await pipeline.submit(req)
     assert result.status == OutreachStatus.FAILED
-    mock_deferred.has_open.assert_awaited_once_with("outreach_delivery", "Defer test")
+    mock_deferred.has_open.assert_awaited_once_with(
+        "outreach_delivery", "Defer test", "surplus", "surplus_insight"
+    )
     mock_deferred.enqueue.assert_not_called()
 
 

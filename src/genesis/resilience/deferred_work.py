@@ -197,14 +197,20 @@ class DeferredWorkQueue:
         """Count pending items, optionally filtered by work_type."""
         return await crud.count_pending(self._db, work_type=work_type)
 
-    async def has_open(self, work_type: str, topic: str) -> bool:
-        """True if an OPEN (pending/processing) item already exists for this
-        (work_type, topic). Dedup-at-defer guard — see
-        ``crud.count_open_by_topic``.
+    async def has_open(
+        self, work_type: str, topic: str, category: str, signal_type: str | None
+    ) -> bool:
+        """True if an OPEN (pending/processing) item already exists for this FULL
+        outreach identity (work_type, topic, category, signal_type). Dedup-at-defer
+        guard — see ``crud.count_open_by_identity``.
         """
         return (
-            await crud.count_open_by_topic(
-                self._db, work_type=work_type, topic=topic
+            await crud.count_open_by_identity(
+                self._db,
+                work_type=work_type,
+                topic=topic,
+                category=category,
+                signal_type=signal_type,
             )
             > 0
         )

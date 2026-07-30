@@ -153,34 +153,57 @@ async def count_pending_in(
     return int(row[0])
 
 
-async def count_open_by_topic(
+async def count_open_by_identity(
     db: aiosqlite.Connection,
     *,
     work_type: str,
     topic: str,
+    category: str,
+    signal_type: str | None,
 ) -> int:
-    """Count OPEN (pending or processing) rows for a work_type whose payload
-    ``topic`` matches.
+    """Count OPEN (pending or processing) rows for a work_type matching the FULL
+    outreach dedup identity ``(topic, category, signal_type)`` stored in
+    ``payload_json``.
 
-    Dedup-at-defer: repeated delivery failures of the same alert must not each
+    Dedup-at-defer: repeated delivery failures of the SAME message must not each
     enqueue a fresh row. Both the recovery worker's retry (which moves the
     original to 'processing' before re-attempting, then re-defers on failure)
     and the alert-drain re-submit loop go through ``_defer`` — counting
     'processing' as well as 'pending' closes both amplification paths (2026-07
     outage: 690 duplicate rows for one backup-alert topic).
 
-    ``topic`` lives in ``payload_json`` (no dedicated column) — read it with the
-    JSON1 ``json_extract``. A single-writer queue makes the read-then-insert
-    race-free enough here; the ``idx_rlp_open_dedup`` partial-unique-index
-    pattern (``cc_rate_limit_parks``) is the upgrade path if a concurrent
-    producer ever appears.
+    Keys on the SAME ``(signal_type, topic, category)`` identity governance uses
+    (``outreach/governance.py``), NOT topic alone. A topic is reused across
+    message TYPES (e.g. ``autonomy/executor/engine.py`` emits progress, success,
+    alert, and blocker under one ``Task <id>`` topic); a topic-only guard would
+    suppress a later blocker behind an open progress row and permanently drop it.
+    (The alert-drain dupes share one identity so they still collapse to a single
+    row; the recovery worker rewrites signal_type to ``deferred_retry`` on its
+    retries, so that path stabilises at ~2 rows/message — still vs 690 — while
+    distinct message types stay independently deliverable.)
+
+    ``json_valid`` + ``CASE`` guard each extraction so a corrupt ``payload_json``
+    row (external corruption — ``_defer`` always writes valid JSON) is skipped
+    rather than raising ``OperationalError``, which would propagate through
+    ``has_open`` into ``_defer``'s broad handler and silently drop EVERY new
+    delivery until the bad row is cleared. ``COALESCE(..., '')`` makes a
+    missing/NULL signal_type or category match cleanly (SQL ``NULL = ?`` is never
+    true). Single-writer queue → the read-then-insert is race-free enough; the
+    ``idx_rlp_open_dedup`` partial-unique-index pattern (``cc_rate_limit_parks``)
+    is the upgrade path if a concurrent producer ever appears.
     """
     cursor = await db.execute(
         """SELECT COUNT(*) FROM deferred_work_queue
            WHERE work_type = ?
              AND status IN ('pending', 'processing')
-             AND json_extract(payload_json, '$.topic') = ?""",
-        (work_type, topic),
+             AND (CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.topic') END) = ?
+             AND COALESCE(CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.category') END, '') = ?
+             AND COALESCE(CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.signal_type') END, '')
+                 = COALESCE(?, '')""",
+        (work_type, topic, category, signal_type),
     )
     row = await cursor.fetchone()
     return int(row[0])

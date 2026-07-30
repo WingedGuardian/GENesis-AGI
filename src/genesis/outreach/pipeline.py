@@ -887,7 +887,10 @@ class OutreachPipeline:
             # (pending/processing) row for this topic already exists. Empty topic
             # → never suppress (can't distinguish distinct sends).
             if request.topic and await self._deferred_queue.has_open(
-                "outreach_delivery", request.topic
+                "outreach_delivery",
+                request.topic,
+                request.category.value,
+                request.signal_type,
             ):
                 logger.info(
                     "Defer suppressed for %s — open deferred outreach for "
@@ -906,6 +909,7 @@ class OutreachPipeline:
                     "channel": channel,
                     "content": content,
                     "category": request.category.value,
+                    "signal_type": request.signal_type,
                     "topic": request.topic,
                     # Origin-targeted delivery must survive a transient-failure
                     # retry, or a result that failed once lands in the default

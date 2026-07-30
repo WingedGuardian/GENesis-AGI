@@ -104,66 +104,115 @@ class TestMarkStatus:
 
 
 class TestHasOpen:
-    """Dedup-at-defer guard — count_open_by_topic / has_open."""
+    """Dedup-at-defer guard — count_open_by_identity / has_open. Identity is the
+    full (topic, category, signal_type) governance uses, NOT topic alone."""
+
+    @staticmethod
+    def _payload(topic="alert:x", category="alert", signal_type="sig"):
+        import json as _json
+
+        return _json.dumps(
+            {"topic": topic, "category": category, "signal_type": signal_type}
+        )
+
+    async def _enqueue(self, queue, **ident):
+        return await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, self._payload(**ident), "r"
+        )
 
     @pytest.mark.asyncio
     async def test_pending_row_is_open(self, queue):
-        await queue.enqueue(
-            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
-        )
-        assert await queue.has_open("outreach_delivery", "alert:x")
+        await self._enqueue(queue)
+        assert await queue.has_open("outreach_delivery", "alert:x", "alert", "sig")
 
     @pytest.mark.asyncio
     async def test_processing_row_is_open(self, queue):
         # The recovery worker marks the original 'processing' before re-attempting;
         # a re-defer during that window must still see it as open.
-        item_id = await queue.enqueue(
-            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
-        )
+        item_id = await self._enqueue(queue)
         await queue.mark_processing(item_id)
-        assert await queue.has_open("outreach_delivery", "alert:x")
+        assert await queue.has_open("outreach_delivery", "alert:x", "alert", "sig")
 
     @pytest.mark.asyncio
     async def test_terminal_rows_are_not_open(self, queue):
-        completed_id = await queue.enqueue(
-            "outreach_delivery", None, REFLECTION, '{"topic": "alert:c"}', "r"
-        )
+        completed_id = await self._enqueue(queue, topic="alert:c")
         await queue.mark_completed(completed_id)
-        assert not await queue.has_open("outreach_delivery", "alert:c")
+        assert not await queue.has_open("outreach_delivery", "alert:c", "alert", "sig")
 
-        discarded_id = await queue.enqueue(
-            "outreach_delivery", None, REFLECTION, '{"topic": "alert:d"}', "r"
-        )
+        discarded_id = await self._enqueue(queue, topic="alert:d")
         await queue.mark_discarded(discarded_id, "gone")
-        assert not await queue.has_open("outreach_delivery", "alert:d")
+        assert not await queue.has_open("outreach_delivery", "alert:d", "alert", "sig")
 
     @pytest.mark.asyncio
     async def test_distinguishes_topics(self, queue):
-        await queue.enqueue(
-            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
-        )
-        assert not await queue.has_open("outreach_delivery", "alert:y")
+        await self._enqueue(queue)
+        assert not await queue.has_open("outreach_delivery", "alert:y", "alert", "sig")
 
     @pytest.mark.asyncio
     async def test_distinguishes_work_types(self, queue):
-        await queue.enqueue(
-            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
+        await self._enqueue(queue)
+        assert not await queue.has_open("reflection", "alert:x", "alert", "sig")
+
+    @pytest.mark.asyncio
+    async def test_same_topic_different_category_not_open(self, queue):
+        # Codex P1: a topic is reused across message types (executor emits
+        # progress/success/alert/blocker under one 'Task <id>' topic). Keying on
+        # category (and signal_type) keeps a later blocker independently
+        # deliverable instead of being dropped behind an open progress row.
+        await self._enqueue(queue, category="notification")
+        assert not await queue.has_open(
+            "outreach_delivery", "alert:x", "blocker", "sig"
         )
-        assert not await queue.has_open("reflection", "alert:x")
+        # ...but the exact same identity IS a dup.
+        assert await queue.has_open(
+            "outreach_delivery", "alert:x", "notification", "sig"
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_topic_different_signal_type_not_open(self, queue):
+        await self._enqueue(queue, signal_type="progress")
+        assert not await queue.has_open(
+            "outreach_delivery", "alert:x", "alert", "blocker_signal"
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_payload_row_does_not_raise(self, queue):
+        # Codex P2: a corrupt payload_json must be skipped, not raise
+        # OperationalError (which _defer's broad handler would swallow, silently
+        # dropping EVERY new delivery until the bad row is cleared).
+        await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, "not valid json{", "r"
+        )
+        await self._enqueue(queue)  # a valid dup alongside the corrupt row
+        assert await queue.has_open("outreach_delivery", "alert:x", "alert", "sig")
+        assert not await queue.has_open("outreach_delivery", "nope", "alert", "sig")
+
+    @pytest.mark.asyncio
+    async def test_null_signal_type_matches_cleanly(self, queue):
+        import json as _json
+
+        await queue.enqueue(
+            "outreach_delivery",
+            None,
+            REFLECTION,
+            _json.dumps({"topic": "alert:x", "category": "alert"}),  # no signal_type
+            "r",
+        )
+        assert await queue.has_open("outreach_delivery", "alert:x", "alert", None)
 
     @pytest.mark.asyncio
     async def test_counts_multiple_open(self, queue):
         from genesis.db.crud import deferred_work as crud
 
-        await queue.enqueue(
-            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
-        )
-        await queue.enqueue(
-            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
-        )
+        await self._enqueue(queue)
+        await self._enqueue(queue)
         assert (
-            await crud.count_open_by_topic(
-                queue._db, work_type="outreach_delivery", topic="alert:x"
+            await crud.count_open_by_identity(
+                queue._db,
+                work_type="outreach_delivery",
+                topic="alert:x",
+                category="alert",
+                signal_type="sig",
             )
             == 2
         )
