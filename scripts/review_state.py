@@ -33,9 +33,41 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
+_MARKER_DIR = Path.home() / ".genesis" / "review_markers"
+# Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
+# so an in-flight review from before an upgrade isn't lost mid-session.
+_LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
 _MAX_EVIDENCE_AGE_SECONDS = 1800  # 30 minutes
 _GSTACK_ANALYTICS = Path.home() / ".gstack" / "analytics" / "skill-usage.jsonl"
+
+
+def _worktree_key(cwd: str | None = None) -> str:
+    """Stable per-worktree key from the git worktree root.
+
+    Concurrent CC sessions each work in their own git worktree; a single global
+    marker file let them clobber each other's review state (session B's commit
+    reset session A's marker mid-workflow). Keying the marker by worktree root
+    isolates them. Falls back to "default" outside a git repo.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=cwd,
+        )
+        root = result.stdout.strip()
+        if root:
+            return hashlib.sha256(root.encode()).hexdigest()[:12]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return "default"
+
+
+def _state_file(cwd: str | None = None) -> Path:
+    """Per-worktree marker path (see ``_worktree_key``)."""
+    return _MARKER_DIR / f"{_worktree_key(cwd)}.json"
 
 
 def get_current_diff_hash(cwd: str | None = None) -> str:
@@ -70,38 +102,44 @@ def has_code_changes(cwd: str | None = None) -> bool:
     return get_current_diff_hash(cwd=cwd) not in ("clean", "unknown")
 
 
-def is_review_current() -> bool:
-    """Check if the stored review marker matches current diff state."""
-    current = get_current_diff_hash()
+def _load_marker(cwd: str | None = None) -> dict | None:
+    """Read the per-worktree marker, falling back to the legacy global file."""
+    for path in (_state_file(cwd), _LEGACY_STATE_FILE):
+        try:
+            if path.exists():
+                return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
+
+
+def is_review_current(cwd: str | None = None) -> bool:
+    """Check if the stored (per-worktree) marker matches current diff state."""
+    current = get_current_diff_hash(cwd=cwd)
     if current in ("clean", "unknown"):
         return True  # No changes = no review needed
-    if not _STATE_FILE.exists():
-        return False
-    try:
-        state = json.loads(_STATE_FILE.read_text())
-        return state.get("diff_hash") == current
-    except (json.JSONDecodeError, OSError):
-        return False
+    state = _load_marker(cwd)
+    return bool(state) and state.get("diff_hash") == current
 
 
-def has_valid_review_marker() -> bool:
-    """Check if a review marker file exists and is not expired.
+def has_valid_review_marker(cwd: str | None = None) -> bool:
+    """Check if a (per-worktree) review marker exists and is not expired.
 
     Unlike is_review_current(), this does NOT short-circuit on clean staged
     area. Used when the caller knows changes are about to be staged (e.g.
     git add && git commit in the same command).
     """
-    if not _STATE_FILE.exists():
+    state = _load_marker(cwd)
+    if not state:
         return False
     try:
-        state = json.loads(_STATE_FILE.read_text())
         reviewed_at = state.get("reviewed_at", "")
         if not reviewed_at:
             return False
         ts = datetime.fromisoformat(reviewed_at)
         age = (datetime.now(UTC) - ts).total_seconds()
         return age <= _MAX_EVIDENCE_AGE_SECONDS
-    except (json.JSONDecodeError, OSError, ValueError):
+    except (ValueError, TypeError):
         return False
 
 
@@ -149,8 +187,8 @@ def _verify_agent_output(path: str) -> tuple[bool, str]:
     return True, f"Agent output valid ({int(age)}s old, {p.stat().st_size} bytes)"
 
 
-def mark_reviewed(agent_output_path: str | None = None) -> bool:
-    """Write review marker after verifying evidence.
+def mark_reviewed(agent_output_path: str | None = None, cwd: str | None = None) -> bool:
+    """Write the per-worktree review marker after verifying evidence.
 
     The authoritative gate is Check 2 (code-reviewer agent output). Check 1
     (gstack telemetry) is advisory — it annotates the marker but never refuses,
@@ -170,17 +208,33 @@ def mark_reviewed(agent_output_path: str | None = None) -> bool:
         print("Dispatch the superpowers:code-reviewer agent first.", file=sys.stderr)
         return False
 
-    # Authoritative evidence present — write marker.
-    _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Authoritative evidence present — write the per-worktree marker.
+    state_file = _state_file(cwd)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
     state = {
-        "diff_hash": get_current_diff_hash(),
+        "diff_hash": get_current_diff_hash(cwd=cwd),
         "reviewed_at": datetime.now(UTC).isoformat(),
         "review_evidence": review_msg,  # advisory annotation (gstack corroboration)
         "agent_evidence": agent_msg,
     }
-    _STATE_FILE.write_text(json.dumps(state, indent=2))
+    state_file.write_text(json.dumps(state, indent=2))
     print(f"Review marker written: {state['diff_hash']}")
     return True
+
+
+def clear_marker(cwd: str | None = None) -> None:
+    """Delete the per-worktree review marker (and the legacy global file).
+
+    Called by the post-commit invalidation hook so the next commit requires a
+    fresh review. MUST target the same per-worktree path ``mark_reviewed`` wrote
+    — deleting only the legacy file would leave the real marker in place and
+    silently authorize every subsequent commit for the marker's TTL. Never raises.
+    """
+    import contextlib
+
+    for path in (_state_file(cwd), _LEGACY_STATE_FILE):
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
 
 
 def get_current_branch(cwd: str | None = None) -> str:
@@ -212,8 +266,8 @@ def main() -> None:
         print(f"diff_hash: {diff_hash}")
         print(f"has_changes: {changes}")
         print(f"review_current: {current}")
-        if _STATE_FILE.exists():
-            state = json.loads(_STATE_FILE.read_text())
+        state = _load_marker()
+        if state:
             print(f"last_reviewed: {state.get('reviewed_at', 'unknown')}")
             print(f"stored_hash: {state.get('diff_hash', 'none')}")
 
