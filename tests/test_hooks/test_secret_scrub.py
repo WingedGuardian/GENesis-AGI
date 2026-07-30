@@ -187,3 +187,29 @@ class TestReviewFixes:
         # value words chosen NOT to be substrings of the label ("passphrase").
         out2 = s.scrub("passphrase = 'zebra quux mango token'")
         assert "zebra" not in out2 and "mango" not in out2 and R in out2
+
+    def test_env_quoted_multiword_secret_fully_redacted(self):
+        # Codex P1 (round 2): the env-assignment path must ALSO redact a quoted
+        # multi-word value whole — for secret-hinted keys the password-label
+        # pattern does NOT catch, the env pattern is the only line of defence,
+        # and its value group used to stop at the first space (tail leaked).
+        for line in (
+            "MY_SECRET='correct horse battery'",
+            "AWS_SECRET_ACCESS_KEY='correct horse battery'",
+            "DB_PASSWORD='correct horse battery'",  # no \b between '_' and 'P'
+            'API_TOKEN="alpha bravo charlie"',
+        ):
+            out = s.scrub(line)
+            assert R in out, line
+            assert "horse" not in out and "battery" not in out and "charlie" not in out, line
+
+    def test_underscore_prefixed_password_label_caught(self):
+        # (?<![A-Za-z]) anchor: DB_PASSWORD: <value> free-text form is redacted
+        # even though \b would not match inside the underscore-joined label.
+        out = s.scrub("DB_PASSWORD: hunter2secretvalue")
+        assert R in out and "hunter2secretvalue" not in out
+
+    def test_env_quoted_value_without_secret_hint_preserved(self):
+        # The secret-key-name gate still applies: a quoted value under a benign
+        # key (no KEY/SECRET/TOKEN/… in the name) must NOT be redacted.
+        assert s.scrub("MESSAGE='hello world foo'") == "MESSAGE='hello world foo'"

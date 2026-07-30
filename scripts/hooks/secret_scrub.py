@@ -67,10 +67,12 @@ _CREDENTIAL_TOKEN_PATTERN = re.compile(
 )
 
 # password/passphrase/pin values — keep the label, redact the value. A quoted
-# value is captured whole (quotes let a password contain spaces, e.g.
-# `password: "hunter 2 pw"`); an unquoted value stops at whitespace/separator.
+# value is captured whole (the quote alternatives let the value contain spaces);
+# an unquoted value stops at whitespace/separator. The left anchor is
+# ``(?<![A-Za-z])`` (not ``\b``) so an underscore-joined label still matches —
+# e.g. the ``DB_PASSWORD`` form has no word boundary between ``_`` and ``P``.
 _SINGLE_CREDENTIAL_PATTERN = re.compile(
-    r"\b(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
+    r"(?<![A-Za-z])(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
     r"\s*(?:is\s+|[:=]\s*)"
     r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;]{4,})",
     re.IGNORECASE,
@@ -84,11 +86,14 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 )
 
 # .env-style UPPER_SNAKE=value. The bare pattern over-redacts (PYTHONPATH=…,
-# EDITOR=…), so it is gated to keys whose NAME signals a secret.
+# EDITOR=…), so it is gated to keys whose NAME signals a secret. A quoted value
+# is captured whole (so a multi-word secret like KEY='a b c' is not left with
+# its tail exposed after the first space); an unquoted value is a 6+ run of
+# non-space so short non-secret values aren't touched.
 _ENV_ASSIGNMENT_PATTERN = re.compile(
     r"(?P<key>[A-Z][A-Z0-9_]{2,})"
     r"(?P<sep>\s*=\s*)"
-    r"(?P<val>[^\s]{6,})",
+    r"(?P<val>\"[^\"]*\"|'[^']*'|[^\s]{6,})",
 )
 _SECRET_KEY_HINT = re.compile(
     r"KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|API|CRED|PRIVATE", re.IGNORECASE
