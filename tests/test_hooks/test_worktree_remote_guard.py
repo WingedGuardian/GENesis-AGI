@@ -141,6 +141,37 @@ def remotes_repo(tmp_path):
     return r
 
 
+@pytest.fixture
+def push_url_repo(tmp_path):
+    """A working repo whose ``sneaky`` remote has a PRIVATE fetch url but a PUSH
+    url set to origin's url (P1-B) — git pushes to origin's repo even though the
+    fetch url differs. ``backups`` stays a genuinely-separate repo."""
+    origin_url = str(tmp_path / "origin.git")
+    fork_url = str(tmp_path / "fork.git")
+    subprocess.run(["git", "init", "--bare", "-q", origin_url], check=True, capture_output=True)
+    subprocess.run(["git", "init", "--bare", "-q", fork_url], check=True, capture_output=True)
+    r = tmp_path / "wt"
+    _init_repo(r, "feature/x")
+    _git(r, "remote", "add", "origin", origin_url)
+    _git(r, "remote", "add", "sneaky", fork_url)  # private FETCH url…
+    _git(r, "remote", "set-url", "--push", "sneaky", origin_url)  # …but PUSH → origin
+    _git(r, "remote", "add", "backups", fork_url)  # fetch AND push → fork (disjoint)
+    return r
+
+
+@pytest.fixture
+def sibling_trees(tmp_path):
+    """Two sibling repos so a RELATIVE `cd ../main` / `git -C ../main` resolves:
+
+    ``trees/feature`` (feature branch) and ``trees/main`` (main branch)."""
+    trees = tmp_path / "trees"
+    feature = trees / "feature"
+    main = trees / "main"
+    _init_repo(feature, "feature/x")
+    _init_repo(main, "main")
+    return feature, main
+
+
 # ── Change 1 + 3: worktree-aware merge-into-main ─────────────────────────
 
 
@@ -333,8 +364,8 @@ class TestForcePushRemoteAware:
         monkeypatch.setattr(guard_module, "_resolve_push_remote", lambda seg, cwd=None: "myfork")
         monkeypatch.setattr(
             guard_module,
-            "_remote_url",
-            lambda name, cwd=None: "url://fork" if name == "myfork" else "url://origin",
+            "_remote_push_urls",
+            lambda name, cwd=None: {"url://fork"} if name == "myfork" else {"url://origin"},
         )
         monkeypatch.setattr(guard_module, "read_payload", lambda: _payload("git push -f"))
         rc = guard_module.main()
@@ -403,3 +434,96 @@ def test_bare_push_label_uses_worktree_branch(guard_module, monkeypatch, capsys)
     out = json.loads(capsys.readouterr().out)
     assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert "feature/label" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# ── P1-A: relative cd / git -C resolved against the effective (absolute) cwd ──
+
+
+class TestRelativeCwdResolution:
+    def test_relative_cd_merge_into_main_blocked(self, sibling_trees):
+        """`cd ../main && git merge x` from a feature-wt payload cwd resolves to
+        the sibling main tree → main branch → blocked (was kept verbatim before,
+        so `git -C ../main` ran from the hook cwd and mis-resolved / fell open)."""
+        feature, main = sibling_trees
+        res = _run_cwd("cd ../main && git merge x", str(feature))
+        assert res.returncode == 2
+        assert "Merging into main" in res.stderr
+
+    def test_relative_dash_C_merge_into_main_blocked(self, sibling_trees):
+        feature, main = sibling_trees
+        res = _run_cwd("git -C ../main merge x", str(feature))
+        assert res.returncode == 2
+        assert "Merging into main" in res.stderr
+
+    def test_relative_cd_to_feature_not_blocked(self, sibling_trees):
+        """Control: relative cd landing on a feature branch → not blocked."""
+        feature, main = sibling_trees
+        res = _run_cwd("cd ../feature && git merge x", str(main))
+        assert res.returncode == 0, res.stderr
+
+    def test_none_branch_fails_closed(self, guard_module, monkeypatch):
+        """A merge whose branch cannot be read (None) → fail closed → block."""
+        monkeypatch.setattr(guard_module, "_is_dispatched", lambda: False)
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: None)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: _payload("git merge x", cwd="/wt")
+        )
+        assert guard_module.main() == 2
+
+    def test_detached_head_empty_branch_allowed(self, guard_module, monkeypatch):
+        """A detached HEAD ("") is not main and not None → allowed."""
+        monkeypatch.setattr(guard_module, "_is_dispatched", lambda: False)
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "")
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: _payload("git merge x", cwd="/wt")
+        )
+        assert guard_module.main() == 0
+
+
+# ── P1-B: force-push classified by PUSH url set, not fetch url ────────────
+
+
+class TestForcePushUrlClassification:
+    def test_force_to_remote_with_origin_pushurl_blocked(self, push_url_repo):
+        """`sneaky` has a private FETCH url but its PUSH url == origin's → git
+        would force the PUBLIC repo → hard-block (fetch-url classification missed
+        this)."""
+        res = _run_cwd(f"git push {_FORCE} sneaky main", str(push_url_repo))
+        assert res.returncode == 2
+        assert "Force push to origin" in res.stderr
+        assert _decision(res) is None
+
+    def test_force_to_disjoint_pushurl_asks(self, push_url_repo):
+        """`backups` push url is disjoint from origin's → cautious ask."""
+        res = _run_cwd(f"git push {_FORCE} backups main", str(push_url_repo))
+        assert res.returncode == 0, res.stderr
+        assert _decision(res) == "ask"
+
+    def test_force_to_disjoint_pushurl_denied_dispatched(self, push_url_repo):
+        res = _run_cwd(f"git push {_FORCE} backups main", str(push_url_repo), dispatched=True)
+        assert res.returncode == 2
+
+
+# ── P1-C: --repo <dest> honored as the push destination ──────────────────
+
+
+class TestForcePushRepoFlag:
+    def test_force_repo_flag_origin_blocked(self, remotes_repo):
+        """`git push --force --repo origin` targets origin regardless of upstream
+        → hard-block (was skipped, falling back to a private upstream → soft ask)."""
+        res = _run_cwd(f"git push {_FORCE} --repo origin", str(remotes_repo))
+        assert res.returncode == 2
+        assert "Force push to origin" in res.stderr
+
+    def test_force_repo_equals_origin_blocked(self, remotes_repo):
+        res = _run_cwd(f"git push {_FORCE} --repo=origin", str(remotes_repo))
+        assert res.returncode == 2
+
+    def test_force_repo_flag_precedence_over_positional(self, guard_module):
+        seg = [
+            s
+            for s in analyze(f"git push {_FORCE} --repo origin backups main")
+            if git_subcommand(s.argv) == "push"
+        ][0]
+        # --repo wins over the positional `backups`.
+        assert guard_module._resolve_push_remote(seg) == "origin"

@@ -60,15 +60,18 @@ def home(tmp_path: Path) -> Path:
     return h
 
 
-def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProcess:
-    payload = json.dumps(
-        {
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": command},
-            "session_id": "test",
-        }
-    )
+def _run_hook(
+    command: str, repo: Path, home: Path, payload_cwd: str | None = None
+) -> subprocess.CompletedProcess:
+    body = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "session_id": "test",
+    }
+    if payload_cwd is not None:
+        body["cwd"] = payload_cwd
+    payload = json.dumps(body)
     env = {**os.environ, "HOME": str(home)}
     return subprocess.run(
         [sys.executable, str(_HOOK)],
@@ -528,3 +531,91 @@ def test_ambiguous_cd_before_commit_enforced(repo: Path, home: Path) -> None:
     blocks; the docs skip is never reached)."""
     res = _run_hook("cd $WT && git commit -m x", repo, home)
     assert res.returncode == 2
+
+
+# ── P1-D: staged index at hook time ≠ what the command commits ────────────
+
+
+def test_commit_dash_a_with_docs_staged_enforced(repo: Path, home: Path) -> None:
+    """`git commit -a` stages tracked code the --cached snapshot doesn't show yet
+    → NOT a pure commit → the docs-only skip must NOT fire."""
+    _restage(repo, {"README.md": "# docs\n"})
+    (repo / "f.py").write_text("changed = 3\n")  # tracked, unstaged code change
+    res = _run_hook('git commit -a -m "x"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_commit_pathspec_with_docs_staged_enforced(repo: Path, home: Path) -> None:
+    """`git commit -m x app.py` selects a pathspec → not pure → not skipped."""
+    _restage(repo, {"README.md": "# docs\n"})
+    res = _run_hook('git commit -m "x" app.py', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_add_then_commit_chain_with_docs_staged_enforced(repo: Path, home: Path) -> None:
+    """`git add app.py && git commit` stages code in a prior segment → not pure."""
+    _restage(repo, {"README.md": "# docs\n"})
+    (repo / "app.py").write_text("y = 2\n")
+    res = _run_hook('git add app.py && git commit -m "x"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_bare_docs_commit_still_skips_after_p1d(repo: Path, home: Path) -> None:
+    """Control: a genuinely pure bare docs commit still skips."""
+    _restage(repo, {"README.md": "# docs\n"})
+    res = _run_hook('git commit -m "docs"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+# ── P2-E: renames surface both source and destination ────────────────────
+
+
+def test_rename_from_code_to_docs_enforced(repo: Path, home: Path) -> None:
+    """A staged rename `foo.py → README.md` shows only README under --name-only,
+    but the SOURCE is code → must enforce (uses --name-status -M, both sides)."""
+    _git(repo, "reset", "--hard", "HEAD", "-q")
+    (repo / "foo.py").write_text("x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add foo")
+    _git(repo, "mv", "foo.py", "README.md")  # staged rename foo.py → README.md
+    res = _run_hook('git commit -m "rename"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_rename_docs_to_docs_still_skips(repo: Path, home: Path) -> None:
+    """A docs→docs rename (both sides docs) still skips."""
+    _git(repo, "reset", "--hard", "HEAD", "-q")
+    (repo / "NOTES.md").write_text("# notes\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add notes")
+    _git(repo, "mv", "NOTES.md", "README.md")
+    res = _run_hook('git commit -m "rename docs"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+# ── P1-A: relative cd resolved against the payload cwd (commit) ────────────
+
+
+def test_relative_cd_commit_to_sibling_main_blocked(repo: Path, home: Path, tmp_path: Path) -> None:
+    """`cd ../main && git commit` from a feature-wt payload cwd resolves to the
+    sibling main tree → Rule 1 blocks (relative path resolved against the cwd)."""
+    trees = tmp_path / "trees"
+    feature = trees / "feature"
+    main = trees / "main"
+    for d, br in ((feature, "feature/x"), (main, "main")):
+        d.mkdir(parents=True)
+        _git(d, "-c", "init.defaultBranch=main", "init", "-q")
+        _git(d, "config", "user.email", "t@e.st")
+        _git(d, "config", "user.name", "tester")
+        (d / "seed.py").write_text("x = 1\n")
+        _git(d, "add", "-A")
+        _git(d, "commit", "-qm", "base")
+        if br != "main":
+            _git(d, "checkout", "-q", "-b", br)
+    res = _run_hook("cd ../main && git commit -m x", feature, home, payload_cwd=str(feature))
+    assert res.returncode == 2
+    assert "main" in res.stderr.lower()

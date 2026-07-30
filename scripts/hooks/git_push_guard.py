@@ -113,50 +113,69 @@ def _cd_target(raw: str):
     return p
 
 
+def _resolve_against(current, target: str):
+    """Resolve a possibly-relative ``cd``/``-C`` target to an ABSOLUTE path.
+
+    An absolute target is normalized and returned (it recovers even from a prior
+    ``_CWD_UNKNOWN``). A relative target is joined onto ``current``; if
+    ``current`` is unknown/None the result is ``_CWD_UNKNOWN`` (fail closed) —
+    a relative path with no known base cannot be resolved, and running
+    ``git -C <relative>`` from the hook's own cwd would silently target the wrong
+    tree (P1-A).
+    """
+    if os.path.isabs(target):
+        return os.path.normpath(target)
+    if not isinstance(current, str) or not current:
+        return _CWD_UNKNOWN
+    return os.path.normpath(os.path.join(current, target))
+
+
 def _effective_cwd(cmd: str, payload: dict, seg=None):
-    """The directory where a SINGLE target segment actually runs.
+    """The ABSOLUTE directory where a SINGLE target segment actually runs.
 
     Returns ``str`` (resolved), ``None`` (no cwd info → run in the hook's own
     cwd), or ``_CWD_UNKNOWN`` (ambiguous → caller must fail closed). Resolution:
-      1. ``git -C <dir>`` on the target segment's argv (explicit).
-      2. If the target is nested (depth>0, inside bash -c/subshell/$()), UNKNOWN.
-      3. Else the LAST top-level ``cd`` that runs BEFORE the target segment —
-         bash applies cds sequentially, so the last one wins (an unresolvable cd
-         before the target ⇒ UNKNOWN). Falls back to the payload cwd as the base.
+      1. If the target is nested (depth>0, inside bash -c/subshell/$()), UNKNOWN.
+      2. The LAST top-level ``cd`` that runs BEFORE the target segment — bash
+         applies cds sequentially, so the last one wins; relative cds/-C are
+         resolved against the running cwd, and an unresolvable one ⇒ UNKNOWN.
+      3. ``git -C <dir>`` on the target segment's argv overrides, resolved
+         against the cwd in effect at the target.
     Used for single-target callers (push); the merge check uses the multi-target
     walk in ``_walk_merge_into_main`` so every merge in a compound is covered.
     """
-    if seg is not None:
-        dash_c = _seg_dash_C(getattr(seg, "argv", None))
-        if dash_c is not None:
-            return dash_c
-        if getattr(seg, "depth", 0) > 0:
-            return _CWD_UNKNOWN
+    if seg is not None and getattr(seg, "depth", 0) > 0:
+        return _CWD_UNKNOWN
     base = payload.get("cwd") if isinstance(payload, dict) else None
-    cur = base if isinstance(base, str) and base else None
+    cur = os.path.normpath(base) if isinstance(base, str) and base else None
     target_raw = getattr(seg, "raw", None)
     if target_raw is not None:
         for raw in split_segments(cmd):
             if raw == target_raw:
-                return cur  # cwd in effect when the target segment runs
+                break
             cd = _cd_target(raw)
             if cd is _CWD_UNKNOWN:
                 cur = _CWD_UNKNOWN
             elif cd is not None:
-                cur = cd
+                cur = _resolve_against(cur, cd)
+    if seg is not None:
+        dash_c = _seg_dash_C(getattr(seg, "argv", None))
+        if dash_c is not None:
+            return _resolve_against(cur, dash_c)
     return cur
 
 
 def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool:
     """True if ANY executed ``git merge`` would run on main/master (fail-closed).
 
-    Walks the top-level segments in bash order tracking cwd (last literal ``cd``
-    wins), and checks EACH ``git merge`` as it would actually run — so a compound
-    like ``git -C <feat-wt> merge a && git merge b`` cannot smuggle the second
-    (bare) merge into main behind the first. A per-segment
-    ``# merge-to-main-override`` acknowledges that segment. Fail closed: a merge
-    nested at depth>0 (bash -c / subshell / ``$()``) or reached under an
-    unresolvable cd is treated as targeting main and blocked (unless overridden).
+    Walks the top-level segments in bash order tracking the ABSOLUTE cwd (last
+    ``cd`` wins; relative cds/-C resolved against it), and checks EACH ``git
+    merge`` as it would actually run — so a compound like ``git -C <feat-wt>
+    merge a && git merge b`` cannot smuggle the second (bare) merge into main
+    behind the first. A per-segment ``# merge-to-main-override`` acknowledges that
+    segment. Fail closed: a merge nested at depth>0, reached under an unresolvable
+    cwd, OR whose branch cannot be read (None) is treated as targeting main and
+    blocked (unless overridden). A detached HEAD ("") is left allowed.
     """
     # depth>0 merges cannot be associated with a top-level cwd → fail closed.
     for s in merge_git_segs:
@@ -166,7 +185,7 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             return True
 
     base = payload.get("cwd") if isinstance(payload, dict) else None
-    cur = base if isinstance(base, str) and base else None
+    cur = os.path.normpath(base) if isinstance(base, str) and base else None
     for raw in split_segments(cmd):
         top = [s for s in analyze(raw) if getattr(s, "depth", 0) == 0]
         merge_here = next(
@@ -174,19 +193,18 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             None,
         )
         if merge_here is not None and not has_trailing_override(raw, "merge-to-main-override"):
-            mcwd = _seg_dash_C(merge_here.argv)
-            if mcwd is None:
-                mcwd = cur
+            dash_c = _seg_dash_C(merge_here.argv)
+            mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
             if mcwd is _CWD_UNKNOWN:
                 return True
             branch = _current_branch(cwd=mcwd if isinstance(mcwd, str) else None)
-            if branch in ("main", "master"):
-                return True
+            if branch is None or branch in ("main", "master"):
+                return True  # None branch (error/unresolved) fails closed
         cd = _cd_target(raw)
         if cd is _CWD_UNKNOWN:
             cur = _CWD_UNKNOWN
         elif cd is not None:
-            cur = cd
+            cur = _resolve_against(cur, cd)
     return False
 
 
@@ -713,15 +731,37 @@ def _push_named_remote(argv: list[str]) -> str | None:
     return None
 
 
-def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
-    """The target remote for a ``git push`` segment, or None if UNKNOWN.
+def _push_repo_flag(argv: list[str]) -> str | None:
+    """The value of a ``--repo <value>`` / ``--repo=value`` on a git push, else None.
 
-    Resolution order: an explicitly named remote → that; else the current
-    branch's upstream remote (the part before ``/`` of ``@{upstream}``); else
-    None. Callers FAIL CLOSED on None — an undeterminable remote is treated as
-    origin/public and blocked.
+    ``git push --repo <dest>`` overrides both the positional remote and the
+    branch upstream as the push DESTINATION (P1-C), so it must win when deciding
+    what a force push actually targets. The value may be a remote name OR a URL.
     """
-    remote = _push_named_remote(getattr(seg, "argv", None) or [])
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if t == "--repo" and i + 1 < len(argv):
+            return argv[i + 1]
+        if t.startswith("--repo="):
+            return t.split("=", 1)[1]
+        i += 1
+    return None
+
+
+def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
+    """The push DESTINATION (remote name or URL) for a segment, or None if UNKNOWN.
+
+    Resolution order: an explicit ``--repo <dest>`` (P1-C) → an explicitly named
+    positional remote → else the current branch's upstream remote (the part
+    before ``/`` of ``@{upstream}``); else None. Callers FAIL CLOSED on None — an
+    undeterminable destination is treated as origin/public and blocked.
+    """
+    argv = getattr(seg, "argv", None) or []
+    repo = _push_repo_flag(argv)
+    if repo:
+        return repo
+    remote = _push_named_remote(argv)
     if remote:
         return remote
     try:
@@ -739,24 +779,51 @@ def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
     return None
 
 
-def _remote_url(name: str, cwd: str | None = None) -> str | None:
-    """The fetch/push URL configured for remote ``name``, or None if unresolvable.
+def _looks_like_url(dest: str) -> bool:
+    """Whether a push destination is a URL/path rather than a remote NAME."""
+    return (
+        "://" in dest
+        or "@" in dest
+        or ":" in dest  # scp-like git@host:path or host:path
+        or dest.startswith(("/", "./", "../", "~"))
+    )
 
-    Classifying a force-push target by NAME is spoofable — ``git remote add
-    mirror <origin-url>`` gives a non-"origin" name that still points at the
-    PUBLIC repo. Callers compare this URL against origin's to decide whether a
-    force actually rewrites public history; an unresolvable URL FAILS CLOSED.
+
+def _remote_push_urls(name: str, cwd: str | None = None) -> set[str]:
+    """The set of PUSH urls configured for a remote NAME (empty if unresolvable).
+
+    git pushes to the PUSH url, which can differ from the fetch url
+    (``git remote set-url --push``), so classifying by the fetch url misses a
+    public push target (P1-B). ``--push --all`` returns every push url (one per
+    line). An empty set means the name is not a resolvable remote → callers FAIL
+    CLOSED.
     """
     try:
         args = ["git"]
         if cwd:
             args += ["-C", cwd]
-        args += ["remote", "get-url", name]
+        args += ["remote", "get-url", "--push", "--all", name]
         result = subprocess.run(args, capture_output=True, text=True, timeout=5)
-        url = result.stdout.strip()
-        return url if result.returncode == 0 and url else None
+        if result.returncode == 0:
+            return {ln.strip() for ln in result.stdout.splitlines() if ln.strip()}
     except Exception:
-        return None
+        pass
+    return set()
+
+
+def _push_dest_urls(dest: str, cwd: str | None = None) -> set[str]:
+    """Push-url set for a destination that may be a remote NAME or a raw URL/path.
+
+    A known remote name resolves to its ``--push`` urls; otherwise, if the
+    destination looks like a URL/path (e.g. a ``--repo https://…`` value), it IS
+    the target url. An unresolvable name yields an empty set (fail closed).
+    """
+    urls = _remote_push_urls(dest, cwd)
+    if urls:
+        return urls
+    if _looks_like_url(dest):
+        return {dest}
+    return set()
 
 
 def _ask(reason: str) -> int:
@@ -894,13 +961,14 @@ def main() -> int:
             # prompt.
             #
             # SECURITY INVARIANT: a force push is HARD-BLOCKED in ALL sessions
-            # whenever it targets the public repo. "Public" is decided by URL, not
-            # remote name — an explicit `origin`, an UNKNOWN/None remote, an
-            # ambiguous cwd, OR a differently-named remote whose URL EQUALS
-            # origin's (e.g. `git remote add mirror <origin-url>`) all count as
-            # public ⇒ blocked (fail closed). Only a remote whose URL is
-            # resolvable AND differs from origin's gets the softer cautious-ask
-            # path — interactive asks (rewrites remote history), dispatched denies.
+            # whenever it targets the public repo. "Public" is decided by PUSH URL,
+            # not remote name — an explicit `origin`, an UNKNOWN/None destination,
+            # an ambiguous cwd, a `--repo origin` (P1-C), OR a differently-named
+            # remote whose PUSH url set INTERSECTS origin's (e.g. `git remote add
+            # mirror <origin-url>`, or a `set-url --push` to origin's url, P1-B)
+            # all count as public ⇒ blocked (fail closed). Only a destination
+            # whose push urls resolve AND are DISJOINT from origin's gets the
+            # softer cautious-ask path — interactive asks, dispatched denies.
             force_segs = [s for s in push_segs if _push_is_force(s.argv)]
             if force_segs:
                 remote = _resolve_push_remote(force_segs[0], cwd=pcwd)
@@ -910,11 +978,11 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     return 2
-                # Classify by URL — a non-"origin" name pointing at origin's repo
-                # is still a public force push. Unresolvable URL ⇒ fail closed.
-                remote_url = _remote_url(remote, cwd=pcwd)
-                origin_url = _remote_url("origin", cwd=pcwd)
-                if remote_url is None or origin_url is None or remote_url == origin_url:
+                # Classify by PUSH-url set — a non-"origin" name/url that shares any
+                # push url with origin is still a public force. Unresolvable ⇒ block.
+                dest_urls = _push_dest_urls(remote, cwd=pcwd)
+                origin_urls = _remote_push_urls("origin", cwd=pcwd)
+                if not dest_urls or not origin_urls or (dest_urls & origin_urls):
                     print(
                         "BLOCKED: Force push to origin/<public> is not allowed — open a PR.",
                         file=sys.stderr,

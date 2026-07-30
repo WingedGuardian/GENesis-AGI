@@ -128,57 +128,191 @@ def _cd_target(raw: str):
     return p
 
 
+def _resolve_against(current, target: str):
+    """Resolve a possibly-relative ``cd``/``-C`` target to an ABSOLUTE path.
+
+    Absolute → normalized (recovers even from a prior UNKNOWN). Relative → joined
+    onto ``current``; if ``current`` is unknown/None → ``_CWD_UNKNOWN`` (fail
+    closed), since ``git -C <relative>`` from the hook's own cwd would silently
+    inspect the wrong tree (P1-A).
+    """
+    if os.path.isabs(target):
+        return os.path.normpath(target)
+    if not isinstance(current, str) or not current:
+        return _CWD_UNKNOWN
+    return os.path.normpath(os.path.join(current, target))
+
+
 def _effective_diff_cwd(command: str, payload: dict, segs: list):
-    """The dir whose index the commit inspects — ``str``, ``None``, or ``_CWD_UNKNOWN``.
+    """The ABSOLUTE dir whose index the commit inspects — ``str``/``None``/UNKNOWN.
 
     Resolution mirrors git_push_guard (self-contained; no import):
-      1. ``git -C <dir>`` on a commit segment's argv.
-      2. If the commit is nested (depth>0), UNKNOWN → fail closed.
-      3. Else the LAST top-level ``cd`` before the commit segment (bash applies
-         cds sequentially, so the last one wins — a decoy ``cd A && …; cd B &&
-         git commit`` runs in B, not A). An unresolvable cd before the commit ⇒
-         UNKNOWN. Falls back to the payload cwd as the base.
+      1. If the commit is nested (depth>0), UNKNOWN → fail closed.
+      2. The LAST top-level ``cd`` before the commit segment (bash applies cds
+         sequentially, so the last wins — a decoy ``cd A && …; cd B && git
+         commit`` runs in B). Relative cds/-C resolve against the running cwd; an
+         unresolvable one ⇒ UNKNOWN. Falls back to the payload cwd as the base.
+      3. ``git -C <dir>`` on the commit segment overrides, resolved against that.
     """
     commit_seg = next((s for s in segs if git_subcommand(s.argv) == "commit"), None)
-    if commit_seg is not None:
-        dash_c = _seg_dash_C(getattr(commit_seg, "argv", None))
-        if dash_c is not None:
-            return dash_c
-        if getattr(commit_seg, "depth", 0) > 0:
-            return _CWD_UNKNOWN
+    if commit_seg is not None and getattr(commit_seg, "depth", 0) > 0:
+        return _CWD_UNKNOWN
 
     base = payload.get("cwd") if isinstance(payload, dict) else None
-    cur = base if isinstance(base, str) and base else None
+    cur = os.path.normpath(base) if isinstance(base, str) and base else None
     target_raw = getattr(commit_seg, "raw", None) if commit_seg is not None else None
     if target_raw is not None:
         for raw in split_segments(command):
             if raw == target_raw:
-                return cur
+                break
             cd = _cd_target(raw)
             if cd is _CWD_UNKNOWN:
                 cur = _CWD_UNKNOWN
             elif cd is not None:
-                cur = cd
+                cur = _resolve_against(cur, cd)
+    if commit_seg is not None:
+        dash_c = _seg_dash_C(getattr(commit_seg, "argv", None))
+        if dash_c is not None:
+            return _resolve_against(cur, dash_c)
     return cur
 
 
 def _staged_files(cwd: str | None) -> list[str] | None:
     """Staged paths for the pending commit, or None if the diff cannot be read.
 
-    None (command failed / error) is the caller's signal to fall back to normal
-    enforcement rather than skip.
+    Uses ``--name-status -M`` so renames/copies surface BOTH sides (P2-E): a
+    ``foo.py → README.md`` rename shows only ``README.md`` under ``--name-only``,
+    which would wrongly read as docs-only. Both the source and the destination
+    are returned, so a code source still forces review. None (command error) is
+    the caller's signal to fall back to normal enforcement rather than skip.
     """
     args = ["git"]
     if cwd:
         args += ["-C", cwd]
-    args += ["diff", "--cached", "--name-only"]
+    args += ["diff", "--cached", "--name-status", "-M"]
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             return None
-        return [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+        paths: list[str] = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            status = parts[0]
+            # Rename/Copy: `R100<TAB>old<TAB>new` / `C075<TAB>old<TAB>new` — both
+            # the source and the destination path are relevant.
+            if status[:1] in ("R", "C") and len(parts) >= 3:
+                paths.append(parts[1])
+                paths.append(parts[2])
+            elif len(parts) >= 2:
+                paths.append(parts[-1])
+        return paths
     except Exception:
         return None
+
+
+# ── Pure-commit gate for the docs/config skip (P1-D) ─────────────────────
+# The staged index at hook time is NOT what a commit necessarily records:
+# `git commit -a` stages tracked changes, `git commit -m x app.py` selects a
+# pathspec, and `git add app.py && git commit` stages code in a prior segment.
+# The docs-only skip may fire ONLY for a "pure" bare commit that provably cannot
+# add or select content beyond the current --cached snapshot.
+_GIT_GLOBAL_VALUE_FLAGS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"}
+)
+# git commit long flags that CONSUME a following value token (so the value is not
+# misread as a pathspec).
+_COMMIT_VALUE_LONG = frozenset(
+    {
+        "--message",
+        "--file",
+        "--author",
+        "--date",
+        "--template",
+        "--reuse-message",
+        "--reedit-message",
+        "--fixup",
+        "--squash",
+        "--gpg-sign",
+        "--cleanup",
+    }
+)
+# Long flags that select/stage content beyond the index → not a pure commit.
+_COMMIT_SELECT_LONG = frozenset(
+    {"--all", "--include", "--only", "--patch", "--interactive", "--pathspec-from-file"}
+)
+_COMMIT_ARG_SHORT = "mFCct"  # short flags consuming a value (t = --template)
+_COMMIT_SELECT_SHORT = "aiop"  # -a --all, -i --include, -o --only, -p --patch
+
+
+def _commit_can_select_content(argv: list[str]) -> bool:
+    """Whether a ``git commit`` argv could stage/select content (pathspec or
+    -a/-i/-o/-p/--all/…): True ⇒ NOT a pure commit ⇒ do not take the docs skip."""
+    # advance to the "commit" token, past git global options
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "commit":
+        return True  # can't confirm shape → fail toward enforcement
+    i += 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return (i + 1) < len(argv)  # any pathspec after `--`
+        if tok.startswith("--"):
+            name = tok.split("=", 1)[0]
+            if name in _COMMIT_SELECT_LONG:
+                return True
+            if name in _COMMIT_VALUE_LONG and "=" not in tok:
+                i += 2
+                continue
+            i += 1
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            consumes_next = False
+            for j, ch in enumerate(tok[1:], 1):
+                if ch in _COMMIT_SELECT_SHORT:
+                    return True
+                if ch == "S":
+                    break  # -S[keyid]: rest of token is an optional value
+                if ch in _COMMIT_ARG_SHORT:
+                    consumes_next = j == len(tok) - 1  # value is next token if last
+                    break
+                # else a boolean short flag (n/e/s/q/v/u/z/…) — keep scanning
+            i += 2 if consumes_next else 1
+            continue
+        return True  # a bare positional = pathspec
+    return False
+
+
+def _commit_may_add_content(segs: list) -> bool:
+    """True if the command could commit content the --cached snapshot doesn't show.
+
+    Covers the commit segment's own pathspec/select flags AND any staging command
+    (git add/rm/mv/reset, or restore --staged) elsewhere in the chain (P1-D).
+    """
+    commit_seg = next((s for s in segs if git_subcommand(s.argv) == "commit"), None)
+    if commit_seg is None:
+        return True
+    if _commit_can_select_content(commit_seg.argv):
+        return True
+    for s in segs:
+        if s is commit_seg:
+            continue
+        sub = git_subcommand(s.argv)
+        if sub in ("add", "rm", "mv", "reset"):
+            return True
+        if sub == "restore" and "--staged" in s.argv:
+            return True
+    return False
 
 
 def main() -> None:
@@ -250,15 +384,17 @@ def main() -> None:
     # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
     # or config carries no code to review (adaptive-review "review level: None"),
     # so skip Rule 2 for it. Conservative fail-toward-review default: we skip ONLY
-    # when the staged set is non-empty AND every path is on the docs/config
-    # allowlist. An empty staged set (e.g. a "git add && git commit" chain that
-    # stages in-command), a diff we cannot read, or an ambiguous cwd (already
-    # blocked by Rule 1 above) falls through to normal enforcement — never
-    # skipped. Placed AFTER Rule 0 (--no-verify) and Rule 1 (main-branch) so it
-    # can never weaken those hard blocks.
-    staged = _staged_files(cwd)
-    if staged and all(_is_docs_or_config(p) for p in staged):
-        sys.exit(0)
+    # when (a) the commit is PURE — it cannot add/select content beyond the
+    # current index (no pathspec, no -a/-i/-o/-p, and no git add/rm/mv/reset in
+    # the chain, P1-D) — AND (b) the staged set is non-empty and every path is on
+    # the docs/config allowlist. An impure commit, an empty staged set, a diff we
+    # cannot read, or an ambiguous cwd (already blocked by Rule 1) falls through
+    # to normal enforcement — never skipped. Placed AFTER Rule 0 (--no-verify) and
+    # Rule 1 (main-branch) so it can never weaken those hard blocks.
+    if not _commit_may_add_content(segs):
+        staged = _staged_files(cwd)
+        if staged and all(_is_docs_or_config(p) for p in staged):
+            sys.exit(0)
 
     # Rule 2: Block commits without review (on branches)
     # Race condition: when command is "git add X && git commit", nothing is
