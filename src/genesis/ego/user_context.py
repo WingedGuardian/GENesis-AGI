@@ -109,6 +109,11 @@ class UserEgoContextBuilder:
         from genesis.ego.focus import _ALWAYS_SECTIONS
 
         self._current_focus_id = focus_id
+        # Blind drafting (see genesis_context.build): withhold the pending board
+        # from drafting context when the reconcile stage is active (shadow/live).
+        from genesis.ego import reconcile_config
+
+        self._blind_drafting = reconcile_config.effective_mode() != "off"
         weights = dict(context_weights) if context_weights else {}
         # Primary enforcement is in compaction.assemble_context(). This
         # is a defense-in-depth guard for direct build() callers.
@@ -150,6 +155,9 @@ class UserEgoContextBuilder:
             ("recurring_patterns", self._recurring_patterns_section),
             ("output_contract", self._output_contract_section),
         ]
+
+        if self._blind_drafting:
+            section_map = [(k, m) for k, m in section_map if k != "proposal_board"]
 
         import asyncio
 
@@ -943,15 +951,18 @@ class UserEgoContextBuilder:
         when available. No aggregate scores, no user_response text —
         those trigger deference bias.
         """
+        blind = getattr(self, "_blind_drafting", False)
         if depth == "light":
             try:
-                cursor = await self._db.execute(
-                    "SELECT COUNT(*) FROM ego_proposals "
-                    "WHERE created_at >= datetime('now', '-7 days') "
-                    "AND status IN ('pending', 'approved', 'executed') "
-                    "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
-                )
-                active = (await cursor.fetchone())[0]
+                active = 0
+                if not blind:
+                    cursor = await self._db.execute(
+                        "SELECT COUNT(*) FROM ego_proposals "
+                        "WHERE created_at >= datetime('now', '-7 days') "
+                        "AND status IN ('pending', 'approved', 'executed') "
+                        "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
+                    )
+                    active = (await cursor.fetchone())[0]
                 cursor2 = await self._db.execute(
                     "SELECT COUNT(*) FROM ego_proposals "
                     "WHERE created_at >= datetime('now', '-7 days') "
@@ -960,11 +971,13 @@ class UserEgoContextBuilder:
                     "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
                 )
                 tried = (await cursor2.fetchone())[0]
+                if blind:
+                    return f"## Proposals\nRecently tried: {tried}\n"
                 return f"## Proposals\nActive: {active} | Recently tried: {tried}\n"
             except Exception:
                 return "## Proposals\n*Not available.*\n"
 
-        lines = ["## Active Proposals\n"]
+        lines: list[str] = []
         table_header = (
             "| Action | Topic | Outcome | Realist |\n|--------|-------|---------|---------|"
         )
@@ -985,26 +998,28 @@ class UserEgoContextBuilder:
             return f"| {action_type} | {short} | {status} | {realist} |"
 
         try:
-            # Section 1: Active proposals (user ego only)
-            cursor = await self._db.execute(
-                "SELECT action_type, content, status, realist_verdict, "
-                "realist_reasoning, created_at "
-                "FROM ego_proposals "
-                "WHERE created_at >= datetime('now', '-7 days') "
-                "AND status IN ('pending', 'approved', 'executed') "
-                "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL) "
-                "ORDER BY created_at DESC "
-                "LIMIT 15",
-            )
-            active_rows = await cursor.fetchall()
+            # Section 1: Active (pending) proposals — WITHHELD under blind drafting.
+            if not blind:
+                lines.append("## Active Proposals\n")
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, realist_verdict, "
+                    "realist_reasoning, created_at "
+                    "FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-7 days') "
+                    "AND status IN ('pending', 'approved', 'executed') "
+                    "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL) "
+                    "ORDER BY created_at DESC "
+                    "LIMIT 15",
+                )
+                active_rows = await cursor.fetchall()
 
-            if not active_rows:
-                lines.append("*No active proposals.*\n")
-            else:
-                lines.append(table_header)
-                for row in active_rows:
-                    lines.append(_format_row(row))
-                lines.append("")
+                if not active_rows:
+                    lines.append("*No active proposals.*\n")
+                else:
+                    lines.append(table_header)
+                    for row in active_rows:
+                        lines.append(_format_row(row))
+                    lines.append("")
 
             # Section 2: Recently tried (user ego only)
             lines.append("## Recently Tried (do not re-propose)\n")

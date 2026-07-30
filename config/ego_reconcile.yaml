@@ -1,0 +1,23 @@
+# Ego reconcile stage (PR-5).
+# See src/genesis/ego/reconcile_config.py for the full contract.
+#
+# After the ego drafts proposals each cycle, the reconcile stage matches those
+# drafts against the existing pending board (ego-scoped) plus a deterministic
+# covered-work snapshot (active user_jobs, job health, recently-merged PRs), and
+# emits per-draft verdicts: new / reaffirm / revise (versioned) / withdraw-with-
+# evidence. Ships in shadow — it observes and logs, applies nothing.
+
+enabled: true
+
+# off | shadow | live
+#   off    — reconcile does not run; drafting keeps the board in context (pre-PR-5)
+#   shadow — reconcile runs + logs verdicts, applies nothing; drafting goes blind,
+#            the existing realist stays as the dedup backstop (default)
+#   live   — shadow + APPLY verdicts + widen the realist history to the full board.
+#            Only flip to live once PR-6's resolve-side revision guards are wired
+#            (else a live revise reopens the approve-time TOCTOU).
+mode: shadow
+
+# Retention for the ego_proposal_revisions audit table (reconcile is its first
+# writer). Prune runs via the disk-hygiene tick.
+revision_retention_days: 45

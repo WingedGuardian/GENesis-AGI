@@ -9,6 +9,14 @@ import pytest
 from genesis.ego.genesis_context import GenesisEgoContextBuilder
 
 
+@pytest.fixture(autouse=True)
+def _force_reconcile_off(monkeypatch):
+    """These tests predate the PR-5 reconcile lever and assert the board-visible
+    (mode=off) rendering of the proposal sections. The blind-drafting default
+    (shadow) is covered separately in test_blind_drafting.py."""
+    monkeypatch.setattr("genesis.ego.reconcile_config.effective_mode", lambda: "off")
+
+
 @pytest.fixture
 async def db():
     """In-memory DB with tables needed by GenesisEgoContextBuilder."""

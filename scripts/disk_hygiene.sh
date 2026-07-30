@@ -19,6 +19,8 @@
 #      (session-manager PR-3 ambient extractor shadow store; runs + events)
 #   9. Retention prune of ~/.genesis/output/retrieval_efficacy/*.md (>45d)
 #      (WS2-0 retrieval-efficacy report; dated md per run — file-age prune)
+#  10. Retention prune of ego_proposal_revisions (ego_reconcile config window)
+#      → scripts/prune_proposal_revisions.py (PR-5 reconcile revision audit)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -98,6 +100,10 @@ main() {
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
         || echo "prune_repo_pulse exited $?"
+
+    echo "--- ego proposal-revision audit retention prune (ego_reconcile config) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_proposal_revisions.py" \
+        || echo "prune_proposal_revisions exited $?"
 
     echo "--- retrieval-efficacy report retention prune (>45d) ---"
     # WS2-0: retrieval_efficacy_report.py writes a dated md per run; bound the

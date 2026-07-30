@@ -183,6 +183,7 @@ class EgoSession:
         self._focus_selector = None  # Lazy-init in _perceive
         self._sweep_lock = asyncio.Lock()
         self._last_realist_cost_usd = 0.0  # accumulated by _filter_proposals
+        self._last_reconcile_cost_usd = 0.0  # accumulated by _reconcile_drafts
         # Cache the static system prompt (read once, not every cycle).
         # Fail loud: a missing per-ego prompt must never silently degrade
         # to a placeholder identity (the legacy identity/EGO_SESSION.md
@@ -1000,6 +1001,18 @@ class EgoSession:
         # 9. Process proposals
         if parsed:
             proposals = parsed.get("proposals", [])
+            # PR-5 reconcile stage (observe-only): match drafts against the
+            # pending board + covered-work and LOG verdicts. Applies nothing
+            # (verdict application lands in PR-6); returns drafts unchanged.
+            proposals = await self._reconcile_drafts(proposals)
+            # Cost observability for the reconcile CC call (mirrors the
+            # realist cost line); tracked via logging since EgoCycle is frozen.
+            if self._last_reconcile_cost_usd > 0:
+                logger.info(
+                    "Reconcile cost: $%.4f (ego cycle: $%.4f)",
+                    self._last_reconcile_cost_usd,
+                    cycle.cost_usd,
+                )
             # communication_decision is intentionally per-cycle and NOT
             # persisted to ego_state. It controls THIS cycle's delivery only.
             comm_decision = parsed.get("communication_decision", "send_digest")
@@ -1352,6 +1365,149 @@ class EgoSession:
 
     # -- Helpers -----------------------------------------------------------
 
+    async def _run_gate_cc(self, prompt: str, *, label: str):
+        """Run a lightweight in-cycle gate CC call (reconcile/realist), returning
+        the CC output or None on error. Mirrors the realist's fail-open envelope
+        (OPUS/MEDIUM, expect_output for silent-cap detection). PR-6 migrates the
+        realist call site onto this shared helper when it touches the realist for
+        the history widen.
+        """
+        try:
+            invocation = CCInvocation(
+                prompt=prompt,
+                expect_output=True,
+                model=CCModel.OPUS,
+                effort=EffortLevel.MEDIUM,
+                skip_permissions=True,
+                working_dir=background_session_dir(),
+            )
+            output = await self._invoker.run(invocation)
+            if output.is_error:
+                logger.warning("%s CC call failed: %s", label, output.error_message)
+                return None
+            return output
+        except Exception:
+            logger.warning("%s CC call raised, treating as unavailable", label, exc_info=True)
+            return None
+
+    async def _gather_covered_work(self) -> dict:
+        """Deterministic covered-work snapshot (NOT memory) for the reconcile
+        stage: active user_jobs, jobs running-but-not-succeeding, and recently
+        merged-PR coverage annotations. Each source is fail-soft to empty so a
+        missing table on a fresh install degrades cleanly to an empty snapshot.
+        """
+        from genesis.db.crud import job_health as job_health_crud
+        from genesis.db.crud import repo_pulse as repo_pulse_crud
+        from genesis.db.crud import user_jobs as user_jobs_crud
+
+        snapshot: dict = {"jobs": [], "stale_jobs": [], "merged_prs": []}
+        with contextlib.suppress(Exception):
+            jobs = await user_jobs_crud.list_jobs(self._db, status="active")
+            snapshot["jobs"] = [
+                {
+                    "title": j.get("title"),
+                    "status": j.get("last_status") or j.get("status"),
+                    "last_run": j.get("last_run_at"),
+                }
+                for j in jobs
+            ]
+        with contextlib.suppress(Exception):
+            snapshot["stale_jobs"] = await job_health_crud.get_stale_jobs(
+                self._db, threshold_days=3
+            )
+        with contextlib.suppress(Exception):
+            anns = await repo_pulse_crud.list_annotations(
+                self._db, status="confirmed", limit=50
+            )
+            snapshot["merged_prs"] = [
+                {
+                    "pr_number": a.get("pr_number"),
+                    "pr_title": a.get("pr_title"),
+                    "item_text": a.get("item_text"),
+                }
+                for a in anns
+            ]
+        return snapshot
+
+    async def _reconcile_drafts(self, proposals: list[dict]) -> list[dict]:
+        """PR-5 reconcile stage — OBSERVE-ONLY. Match this cycle's drafts against
+        the ego-scoped pending board + a deterministic covered-work snapshot and
+        LOG the per-draft verdicts (new/reaffirm/revise/withdraw). Applies
+        NOTHING — verdict application lands in PR-6. Returns drafts unchanged and
+        is fully fail-open: any error passes the drafts through untouched.
+
+        Gated by the ego_reconcile settings lever: off = the stage does not run
+        (no extra CC call); shadow/live both observe-only in PR-5 (live's apply
+        is PR-6).
+        """
+        self._last_reconcile_cost_usd = 0.0
+        if not proposals:
+            return proposals
+        from genesis.ego import reconcile_config
+
+        mode = reconcile_config.effective_mode()
+        if mode == "off":
+            return proposals
+        try:
+            board = await ego_crud.list_pending_proposals(
+                self._db, ego_source=self._source_tag
+            )
+            covered = await self._gather_covered_work()
+            prompt = _build_reconcile_prompt(
+                proposals, board, covered, ego_source=self._source_tag
+            )
+            output = await self._run_gate_cc(prompt, label="Reconcile")
+            if output is None:
+                return proposals
+            self._last_reconcile_cost_usd = output.cost_usd
+            verdicts = _parse_reconcile_response(output.text, len(proposals))
+            self._log_reconcile_verdicts(mode, verdicts, proposals, board, covered)
+        except Exception:
+            logger.warning(
+                "Reconcile stage failed, passing drafts through", exc_info=True
+            )
+        return proposals
+
+    def _log_reconcile_verdicts(
+        self,
+        mode: str,
+        verdicts: dict[int, dict],
+        proposals: list[dict],
+        board: list[dict],
+        covered: dict,
+    ) -> None:
+        """Structured observation log of reconcile verdicts — the PR-5 shadow
+        signal the replay gate reviews. Never mutates anything."""
+        counts: dict[str, int] = {}
+        for i in range(len(proposals)):
+            v = verdicts.get(i, {"verdict": "new"})
+            counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+        logger.info(
+            "Reconcile[%s] %s: %d drafts vs %d board items, "
+            "%d active jobs / %d stale / %d merged-PRs — verdicts=%s",
+            mode,
+            self._source_tag,
+            len(proposals),
+            len(board),
+            len(covered.get("jobs", [])),
+            len(covered.get("stale_jobs", [])),
+            len(covered.get("merged_prs", [])),
+            counts,
+        )
+        for i, prop in enumerate(proposals):
+            v = verdicts.get(i)
+            if not v or v["verdict"] == "new":
+                continue
+            logger.info(
+                "Reconcile[%s] draft[%d] -> %s target=%s :: %s | %s",
+                mode,
+                i,
+                v["verdict"],
+                (v.get("target_id") or "")[:12],
+                str(prop.get("content", ""))[:80].replace("\n", " "),
+                str(v.get("reason", ""))[:120],
+            )
+
     async def _filter_proposals(
         self,
         proposals: list[dict],
@@ -1373,14 +1529,41 @@ class EgoSession:
         if not proposals:
             return proposals
 
-        # Fetch recent history for zombie/duplicate detection
+        # Fetch recent history for zombie/duplicate detection.
+        #
+        # When blind drafting is active (reconcile mode != "off") the ego no
+        # longer sees the pending board while drafting, so the realist becomes
+        # the SOLE enforcing deduplicator. The legacy 2-day/LIMIT-20 GLOBAL
+        # window would let a pending item older than two days (or displaced by
+        # newer rows) slip past Rule #2 and be re-inserted (Codex P1). In that
+        # mode widen to the FULL ego-scoped board — all pending + approved, any
+        # age (the dedup targets that matter) — plus this ego's recently-resolved
+        # rows (7d, the zombie signal), board-first and bounded. In "off" mode
+        # keep the exact legacy query (pre-PR-5 behavior).
+        from genesis.ego import reconcile_config
+
+        blind = reconcile_config.effective_mode() != "off"
         try:
-            cursor = await self._db.execute(
-                "SELECT action_type, content, status, created_at "
-                "FROM ego_proposals "
-                "WHERE created_at >= datetime('now', '-2 days') "
-                "ORDER BY created_at DESC LIMIT 20",
-            )
+            if blind:
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, created_at "
+                    "FROM ego_proposals "
+                    "WHERE (ego_source = ? OR ego_source IS NULL) "
+                    "AND (status IN ('pending', 'approved') "
+                    "     OR created_at >= datetime('now', '-7 days')) "
+                    "ORDER BY "
+                    "  CASE WHEN status IN ('pending', 'approved') THEN 0 ELSE 1 END, "
+                    "  created_at DESC "
+                    "LIMIT 35",
+                    (self._source_tag,),
+                )
+            else:
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, created_at "
+                    "FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-2 days') "
+                    "ORDER BY created_at DESC LIMIT 20",
+                )
             recent = [dict(r) for r in await cursor.fetchall()]
         except Exception:
             logger.warning("Realist: failed to fetch history, passing through")
@@ -1414,6 +1597,7 @@ class EgoSession:
             recent,
             ego_source=self._source_tag,
             active_directives=active_directives,
+            widened=blind,
         )
 
         try:
@@ -2547,12 +2731,155 @@ Principle: release no more information than the task requires.
 _NEUTRAL_STATUS = NEUTRAL_STATUS  # re-export for backwards compat
 
 
+def _build_reconcile_prompt(
+    drafts: list[dict],
+    board: list[dict],
+    covered_work: dict,
+    *,
+    ego_source: str = "",
+) -> str:
+    """Prompt for the reconcile stage: classify each freshly-drafted proposal
+    against the existing pending board and a deterministic covered-work snapshot.
+
+    Verdicts (one per draft, index-aligned):
+      - new       — genuinely novel; nothing on the board or covered-work matches.
+      - reaffirm  — a board item already covers it; re-validate, do not duplicate.
+      - revise    — a board item covers it but this draft sharpens/updates it.
+      - withdraw  — a board item is INVALIDATED by covered-work evidence (a job
+                    already does it, or a merged PR closed it) and should retire.
+
+    PR-5 only LOGS these (applies nothing); PR-6 acts on them.
+    """
+
+    def _clip(text: object, n: int = 200) -> str:
+        return str(text or "")[:n].replace("\n", " ").replace("|", "/")
+
+    draft_lines = [
+        f'[{i}] action={d.get("action_type", "")} :: {_clip(d.get("content", ""))}'
+        for i, d in enumerate(drafts)
+    ]
+    board_lines = [
+        f'- id={str(b.get("id", ""))[:12]} rev={b.get("revision_num", 1)} '
+        f'action={b.get("action_type", "")} :: {_clip(b.get("content", ""))}'
+        for b in board
+    ] or ["(board is empty)"]
+    job_lines = [
+        f'- {_clip(j.get("title"), 80)} [status={j.get("status")}] last_run={j.get("last_run")}'
+        for j in covered_work.get("jobs", [])
+    ] or ["(no active jobs)"]
+    stale_lines = [
+        f'- {s.get("job_name")}: running but not succeeded in '
+        f'{round(float(s.get("gap_days") or 0), 1)}d'
+        for s in covered_work.get("stale_jobs", [])
+    ]
+    pr_lines = [
+        f'- PR#{p.get("pr_number")} {_clip(p.get("pr_title"), 60)} — '
+        f'closed: {_clip(p.get("item_text"), 80)}'
+        for p in covered_work.get("merged_prs", [])
+    ] or ["(no recent merged-PR coverage)"]
+
+    ego_label = (
+        "operations (COO)" if ego_source == "genesis_ego_cycle" else "user-facing (CEO)"
+    )
+    nl = "\n"
+
+    return f"""You are the RECONCILE stage of Genesis's {ego_label} ego cycle.
+
+The ego just drafted the proposals below WITHOUT seeing its pending board (blind
+drafting). Match each draft against the existing pending board and the
+deterministic covered-work snapshot, and decide whether it is genuinely new or
+already handled.
+
+## Freshly drafted proposals (index-aligned)
+{nl.join(draft_lines) if draft_lines else "(none)"}
+
+## Pending board (already awaiting user decision)
+{nl.join(board_lines)}
+
+## Covered work — deterministic ground truth (NOT memory)
+Active scheduled jobs:
+{nl.join(job_lines)}
+Jobs running but not succeeding:
+{nl.join(stale_lines) if stale_lines else "(none)"}
+Recently merged PRs (work already shipped):
+{nl.join(pr_lines)}
+
+## Your task
+For EACH draft (by index) output exactly one verdict:
+- "new": nothing above covers it — genuinely novel work.
+- "reaffirm": a pending board item ALREADY covers it — put the board id in target_id.
+- "revise": a board item covers it but this draft sharpens/updates it — target_id = board id.
+- "withdraw": a board item is INVALIDATED by covered-work (an active job already does it,
+  or a merged PR closed it) — target_id = the board id to retire, reason = the evidence.
+
+Judge the SEMANTIC match yourself; do not require identical wording. When unsure, prefer "new".
+
+Output STRICT JSON only — an array with one object per draft:
+[{{"index": 0, "verdict": "new|reaffirm|revise|withdraw", "target_id": "<board id or null>", "reason": "<one line>"}}]
+"""
+
+
+def _parse_reconcile_response(
+    raw_text: str,
+    num_drafts: int,
+) -> dict[int, dict]:
+    """Parse the reconcile stage's JSON response into per-draft verdicts.
+
+    Returns {index: {"verdict": str, "target_id": str|None, "reason": str}}.
+    On parse failure returns empty dict (every draft treated as "new").
+    """
+    if not raw_text or not raw_text.strip():
+        return {}
+    text = raw_text.strip()
+
+    parsed = None
+    with contextlib.suppress(json.JSONDecodeError):
+        parsed = json.loads(text)
+    if parsed is None:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if match:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(match.group(1).strip())
+    if parsed is None:
+        first = text.find("[")
+        last = text.rfind("]")
+        if first != -1 and last > first:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(text[first : last + 1])
+
+    if not isinstance(parsed, list):
+        logger.warning("Reconcile response is not a JSON array: %.200s", text)
+        return {}
+
+    verdicts: dict[int, dict] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            idx = int(entry.get("index", -1))
+        except (ValueError, TypeError):
+            continue
+        if idx < 0 or idx >= num_drafts:
+            continue
+        verdict = entry.get("verdict", "new")
+        if verdict not in ("new", "reaffirm", "revise", "withdraw"):
+            verdict = "new"
+        target = entry.get("target_id")
+        verdicts[idx] = {
+            "verdict": verdict,
+            "target_id": str(target) if target else None,
+            "reason": str(entry.get("reason", ""))[:500],
+        }
+    return verdicts
+
+
 def _build_realist_prompt(
     proposals: list[dict],
     recent_history: list[dict],
     *,
     ego_source: str = "",
     active_directives: list[dict] | None = None,
+    widened: bool = False,
 ) -> str:
     """Build the realist evaluation prompt.
 
@@ -2685,6 +3012,16 @@ monitoring, or internal maintenance.
             "apply.\n"
         )
 
+    # Header describes the ACTUAL contents of the history table above, which
+    # widens to the full board when blind drafting is active (see
+    # _filter_proposals). Keeping it honest matters — the realist is told it
+    # "only knows what is in the history table" (Rule #6).
+    history_header = (
+        "## Full Pending Board + Recently Resolved (7d)"
+        if widened
+        else "## Recent Proposal History (48h)"
+    )
+
     return f"""You are the Realist — a quality gate for ego proposals. Evaluate each
 proposal and return a JSON array of verdicts.
 {ego_section}{directive_section}
@@ -2719,7 +3056,7 @@ proposal and return a JSON array of verdicts.
    now — circumstances change. Judge the proposal on its own merits,
    not on inferred system state.
 {domain_rule}{operate_rule}
-## Recent Proposal History (48h)
+{history_header}
 {chr(10).join(history_lines)}
 
 ## New Proposals to Evaluate
