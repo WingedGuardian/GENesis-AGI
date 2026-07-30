@@ -165,6 +165,10 @@ class NetworkSentinel:
         self._closed_windows: list[dict] = []
         self._task: asyncio.Task | None = None
 
+        # Restore persisted outage-window state so a restart doesn't erase history
+        # or reset an in-progress outage's start (Codex P2).
+        self._hydrate()
+
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -405,4 +409,59 @@ class NetworkSentinel:
     def _publish(self, tuning: NetworkTuning) -> None:
         data = self.snapshot()
         data["closed_windows"] = [dict(w) for w in self._closed_windows]
+        # Persist the OPEN window too (start + cause), so a restart mid-outage
+        # can restore the original outage start rather than losing it.
+        data["open_window"] = dict(self._open_window) if self._open_window else None
         network_state.write_state(data, self._state_path)
+
+    def _hydrate(self) -> None:
+        """Restore persisted outage-window state on construction.
+
+        The store is a PERSISTENT outage-window store: without this, the first
+        probe after ANY restart would publish empty collections over
+        network_state.json, erasing closed-window history and — mid-outage —
+        losing the original outage start (the motivating 22.5h outage spanned 25
+        restarts). Fully fail-safe: a missing/corrupt/partial file leaves the
+        fresh empty state. The OPEN window and the OFFLINE axis are restored
+        together (coupled — a window is only ever open while OFFLINE) so a
+        restored window can never be orphaned; DEGRADED/NORMAL simply re-detect
+        on the first probe."""
+        data = network_state.read_state(self._state_path)
+        if not isinstance(data, dict):
+            return
+        cw = data.get("closed_windows")
+        if isinstance(cw, list):
+            valid = [
+                dict(w)
+                for w in cw
+                if isinstance(w, dict)
+                and isinstance(w.get("start"), str)
+                and isinstance(w.get("end"), str)
+            ]
+            self._closed_windows = valid[-network_state.MAX_CLOSED_WINDOWS :]
+
+        state_name = data.get("state")
+        ow = data.get("open_window")
+        # Only restore an open outage (and its OFFLINE axis) when the persisted
+        # state agrees it was OFFLINE — keeps window/axis coherent.
+        if (
+            state_name == NetworkStatus.OFFLINE.name
+            and isinstance(ow, dict)
+            and isinstance(ow.get("start"), str)
+        ):
+            self._open_window = dict(ow)
+            self._state = NetworkStatus.OFFLINE
+            since = data.get("since")
+            if isinstance(since, str):
+                try:
+                    parsed = datetime.fromisoformat(since)
+                    self._state_since = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+                except ValueError:
+                    pass
+            cause = data.get("cause")
+            if isinstance(cause, str):
+                self._last_cause = cause
+            self._recovery_hook_fired = False  # mid-outage → recovery must fire on return
+            # Reflect the restored axis on the shared state machine immediately so
+            # is_any_degraded / status.json are correct before the first probe.
+            self._state_machine.update_network(NetworkStatus.OFFLINE)

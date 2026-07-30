@@ -437,3 +437,109 @@ async def test_no_anchors_round_resets_clean_streak(tmp_path):
     assert sen._state == NetworkStatus.DEGRADED  # would be NORMAL without the reset
     await sen._probe_round()  # r5 clean → streak 2 → NORMAL
     assert sen._state == NetworkStatus.NORMAL
+
+
+# ── restart persistence / hydration (cloud Codex P2) ─────────────────────────
+
+
+def _write_state_file(path, **fields):
+    import json
+
+    path.write_text(json.dumps(fields))
+
+
+def _new_sentinel(tmp_path, *, clock=None):
+    clock = clock or FakeClock(datetime(2026, 7, 30, 13, 0, 0, tzinfo=UTC))
+    sm = ResilienceStateMachine(clock=clock)
+
+    async def prober(_t):  # unused for pure-hydration assertions
+        return CLEAN
+
+    sen = NetworkSentinel(
+        state_machine=sm,
+        prober=prober,
+        clock=clock,
+        tuning_provider=lambda: make_tuning(),
+        state_path=tmp_path / "network_state.json",
+    )
+    return sen, sm, clock
+
+
+def test_hydrate_restores_closed_windows(tmp_path):
+    _write_state_file(
+        tmp_path / "network_state.json",
+        state="NORMAL",
+        closed_windows=[
+            {
+                "start": "2026-07-30T12:00:00+00:00",
+                "end": "2026-07-30T12:05:00+00:00",
+                "cause": "all_fail",
+            },
+        ],
+    )
+    sen, sm, _ = _new_sentinel(tmp_path)
+    assert len(sen._closed_windows) == 1
+    assert sen._state == NetworkStatus.NORMAL  # post-outage → axis re-detects
+    assert sen._open_window is None
+
+
+def test_hydrate_restores_open_outage_and_axis(tmp_path):
+    _write_state_file(
+        tmp_path / "network_state.json",
+        state="OFFLINE",
+        since="2026-07-30T12:00:00+00:00",
+        cause="all_fail",
+        window_open=True,
+        open_window={"start": "2026-07-30T12:00:00+00:00", "cause": "all_fail"},
+        closed_windows=[],
+    )
+    sen, sm, _ = _new_sentinel(tmp_path)
+    assert sen._state == NetworkStatus.OFFLINE
+    assert sm.current.network == NetworkStatus.OFFLINE  # axis reflected immediately
+    assert sen._open_window is not None
+    assert sen._open_window["start"] == "2026-07-30T12:00:00+00:00"  # original start preserved
+    assert sen._recovery_hook_fired is False  # armed to fire on recovery
+
+
+def test_hydrate_ignores_corrupt_file(tmp_path):
+    (tmp_path / "network_state.json").write_text("{not json")
+    sen, sm, _ = _new_sentinel(tmp_path)
+    assert sen._closed_windows == []
+    assert sen._open_window is None
+    assert sen._state == NetworkStatus.NORMAL
+
+
+@pytest.mark.asyncio
+async def test_hydrated_outage_continues_then_closes_with_original_start(tmp_path):
+    # Restore an open outage; still-down keeps it open (same start); recovery
+    # closes it with the ORIGINAL start (span not reset by the restart).
+    clock = FakeClock(datetime(2026, 7, 30, 13, 0, 0, tzinfo=UTC))
+    _write_state_file(
+        tmp_path / "network_state.json",
+        state="OFFLINE",
+        since="2026-07-30T12:00:00+00:00",
+        cause="all_fail",
+        window_open=True,
+        open_window={"start": "2026-07-30T12:00:00+00:00", "cause": "all_fail"},
+        closed_windows=[],
+    )
+    sm = ResilienceStateMachine(clock=clock)
+    probes = iter([ALL_FAIL, CLEAN])
+
+    async def prober(_t):
+        return next(probes)
+
+    sen = NetworkSentinel(
+        state_machine=sm,
+        prober=prober,
+        clock=clock,
+        tuning_provider=lambda: make_tuning(),
+        state_path=tmp_path / "network_state.json",
+    )
+    await sen._probe_round()  # still all_fail → stays OFFLINE, window preserved
+    assert sen._state == NetworkStatus.OFFLINE
+    assert sen._open_window["start"] == "2026-07-30T12:00:00+00:00"
+    await sen._probe_round()  # clean → OFFLINE→DEGRADED, closes the window
+    assert sen._state == NetworkStatus.DEGRADED
+    assert len(sen._closed_windows) == 1
+    assert sen._closed_windows[0]["start"] == "2026-07-30T12:00:00+00:00"  # span preserved
