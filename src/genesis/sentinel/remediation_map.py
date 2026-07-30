@@ -202,6 +202,14 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "Ollama is optional and typically runs on a separate machine — "
         "model pulls there are not the container's to make."
     ),
+    "infra:internet_down": (
+        "A confirmed internet outage (network sentinel, WARNING-level) is not "
+        "something the container firefighter can remediate — it's an ISP/link "
+        "failure outside the container's control. The network axis already "
+        "drives the actionable in-container responses (watchdog restart "
+        "suppression, recovery-replay pause); this alert is a dashboard/reflex "
+        "awareness signal for the user, not a Sentinel job."
+    ),
     "backup:tier2_unconfigured": (
         "Backup configuration guidance, not an emergency (WARNING-level; "
         "also covered by the backup: prefix rule above)."
