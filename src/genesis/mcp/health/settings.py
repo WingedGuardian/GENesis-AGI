@@ -237,6 +237,19 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every ego cycle
     ),
+    "voice_act": SettingsDomain(
+        name="voice_act",
+        description=(
+            "Voice ACT — the s2s model's remember/remind tools. master `enabled` "
+            "+ `mode` off/live. live offers remember(fact) → episodic memory and "
+            "remind(text, when) → scheduled owner reminder; off (default) hides "
+            "the tools and refuses their handlers (ask_genesis recall unaffected). "
+            "Ship dark, arm after live E2E. Read live per tool call — no restart."
+        ),
+        config_filename="voice_act.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every tool call
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -1173,6 +1186,25 @@ def _validate_ego_reconcile(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_voice_act(changes: dict) -> list[str]:
+    """Validate voice-ACT lever changes (see
+    genesis.channels.voice.voice_act_config). Rejects bad WRITES so
+    settings_update reports the error instead of silently persisting e.g.
+    `enabled: "false"` (truthy) or an unknown `mode`."""
+    from genesis.channels.voice.voice_act_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode" and value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_memory_integrity(changes: dict) -> list[str]:
     """Validate memory-integrity lever changes (see
     genesis.memory.integrity_config). Runtime already fail-safe-coerces at read
@@ -1212,6 +1244,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "cc_foreground_reaper": _validate_cc_foreground_reaper,
+    "voice_act": _validate_voice_act,
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,

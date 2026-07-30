@@ -135,7 +135,7 @@ class TestFindExtractableSessions:
         mock_sessions = [
             {"id": "s1", "cc_session_id": "cc1", "source_tag": "foreground",
              "last_extracted_at": None, "last_extracted_line": 0, "started_at": "2026-03-23"},
-            {"id": "s2", "cc_session_id": "cc2", "source_tag": "inbox",
+            {"id": "s2", "cc_session_id": "cc2", "source_tag": "voice",
              "last_extracted_at": None, "last_extracted_line": 0, "started_at": "2026-03-23"},
         ]
         with patch("genesis.db.crud.cc_sessions.get_extractable",
@@ -143,9 +143,93 @@ class TestFindExtractableSessions:
             sessions = await _find_extractable_sessions(db)
             assert len(sessions) == 2
             assert sessions[0]["source_tag"] == "foreground"
-            assert sessions[1]["source_tag"] == "inbox"
+            assert sessions[1]["source_tag"] == "voice"
             mock_get.assert_called_once()
 
+
+class TestSourceTagCoverage:
+    """The tag taxonomy must classify every production source_tag family —
+    the guard that would have caught the inbox_evaluation phantom-tag bug."""
+
+    def test_extractable_and_excluded_disjoint(self):
+        from genesis.memory.extraction_job import (
+            _EXCLUDED_SOURCE_TAGS,
+            _EXTRACTABLE_SOURCE_TAGS,
+        )
+
+        assert not (_EXTRACTABLE_SOURCE_TAGS & _EXCLUDED_SOURCE_TAGS)
+
+    def test_inbox_evaluation_is_deliberately_excluded(self):
+        """The real inbox tag is inbox_evaluation (not 'inbox'), and it is an
+        intentional exclusion — extracted via the curated-output path instead."""
+        from genesis.memory.extraction_job import (
+            _EXCLUDED_SOURCE_TAGS,
+            _EXTRACTABLE_SOURCE_TAGS,
+        )
+
+        assert "inbox_evaluation" in _EXCLUDED_SOURCE_TAGS
+        assert "inbox_evaluation" not in _EXTRACTABLE_SOURCE_TAGS
+        assert "inbox" not in _EXTRACTABLE_SOURCE_TAGS  # the phantom is gone
+
+    def test_source_tag_coverage_guard(self):
+        """Every ``source_tag=`` keyword literal in src/ is consciously
+        classified as extractable or excluded — no silent holes. Derives its
+        known set by scanning src/ (not a hand-maintained snapshot, which is
+        exactly how inbox_evaluation and mail_reply slipped).
+
+        Scope/limit: the regex sees the ``source_tag="..."`` keyword-argument
+        idiom — the shape EVERY live dispatch uses (session_manager /
+        DirectSessionRequest). A source_tag written via raw parameterized SQL
+        (positional bind, e.g. resilience/cc_budget.py) is invisible to the
+        scan and must be classified by hand in _EXCLUDED_SOURCE_TAG_PREFIXES;
+        the known indirect writers are asserted explicitly below."""
+        import re
+
+        from genesis.env import repo_root
+        from genesis.memory.extraction_job import (
+            _EXCLUDED_SOURCE_TAG_PREFIXES,
+            _EXCLUDED_SOURCE_TAGS,
+            _EXTRACTABLE_SOURCE_TAGS,
+        )
+
+        # Captures the static part of a source_tag string literal; group 2 marks
+        # an f-string interpolation (e.g. "reflection_{...}", "user_job:{...}"),
+        # which is treated as a PREFIX family. Only matches assignment (a quote
+        # after =), never == comparisons.
+        pat = re.compile(r"""source_tag\s*=\s*f?["']([^"'{]*)(\{)?""")
+        literals: set[tuple[str, bool]] = set()
+        for py in (repo_root() / "src").rglob("*.py"):
+            for line in py.read_text(encoding="utf-8", errors="ignore").splitlines():
+                # Drop comments so prose mentioning source_tag="..." (e.g. this
+                # module's own docstrings) can't inject phantom literals.
+                code = line.split("#", 1)[0]
+                for m in pat.finditer(code):
+                    static, is_prefix = m.group(1), bool(m.group(2))
+                    if static:
+                        literals.add((static, is_prefix))
+
+        prefixes = set(_EXCLUDED_SOURCE_TAG_PREFIXES)
+
+        def classified(static: str, is_prefix: bool) -> bool:
+            if is_prefix:  # f-string stem — must be a registered excluded prefix
+                return static.rstrip("_:-") in prefixes
+            return (
+                static in _EXTRACTABLE_SOURCE_TAGS
+                or static in _EXCLUDED_SOURCE_TAGS
+                or static.startswith(_EXCLUDED_SOURCE_TAG_PREFIXES)
+            )
+
+        assert literals, "no source_tag literals found — regex or repo_root broken"
+        unclassified = sorted(
+            s for s, is_prefix in literals if not classified(s, is_prefix)
+        )
+        assert not unclassified, f"unclassified source_tag literals: {unclassified}"
+
+        # Indirect writers the regex cannot see (raw parameterized SQL) must be
+        # classified by hand — assert the known ones so they can't silently drop.
+        known_indirect = ["priority_0"]  # cc_budget.py f"priority_{n}" INSERT
+        missing = [t for t in known_indirect if not classified(t, False)]
+        assert not missing, f"unclassified indirect source_tags: {missing}"
 
 class TestUpdateWatermark:
     """Tests for _update_watermark."""

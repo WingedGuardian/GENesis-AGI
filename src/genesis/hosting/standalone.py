@@ -334,6 +334,7 @@ class StandaloneAdapter:
             bridge = GenesisBridge(
                 voice_handler=voice_handler,
                 approval_gate=approval_gate,
+                runtime=self._runtime,
             )
 
             # S2S session manager — conversations land as per-turn transcript

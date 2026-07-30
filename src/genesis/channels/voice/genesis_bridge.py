@@ -1,12 +1,17 @@
 """Genesis bridge — handles tool calls from the S2S voice model.
 
 The S2S model (GPT-Realtime or Gemini Live) acts as a conversational
-front-end.  When it needs Genesis capabilities, it calls one of two
-tools:
+front-end and routes to Genesis capabilities via native tools:
 
-- ``ask_genesis(query)`` — Genesis decides internally what to do
-  (memory recall, knowledge lookup, task dispatch, web search, etc.)
-- ``web_search(query)`` — quick factual web lookup without Genesis
+- ``ask_genesis(query)`` — recall the user's past/memory/personal context
+- ``web_search(query)`` — quick factual web lookup
+- ``approve_pending(decision)`` — resolve a voice-gated approval
+- ``remember(fact)`` — store a durable episodic memory (voice ACT)
+- ``remind(text, when)`` — schedule a reminder to the owner (voice ACT)
+
+The last two are the "voice ACT" surface: they write memory and queue owner
+egress, so they are gated behind ``voice_act_config.effective_mode()`` — offered
+and executed only when ``live`` (default ``off``, armed after live E2E).
 
 This module dispatches those tool calls to the appropriate Genesis
 services and returns structured text results.
@@ -109,10 +114,85 @@ TOOL_DECLARATIONS = [
     },
 ]
 
+# Voice ACT tools — offered to the s2s model ONLY when voice_act is `live`.
+# They write memory / queue owner egress, so get_tool_declarations() appends
+# them conditionally and the handlers re-check the mode (defense in depth).
+_ACT_TOOL_DECLARATIONS = [
+    {
+        "type": "function",
+        "name": "remember",
+        "description": (
+            "Store a durable fact the user tells you to remember about "
+            "themselves, their preferences, people in their life, or their "
+            "world — e.g. 'remember I prefer morning meetings', 'remember my "
+            "wife's name is Sarah'. Call this ONLY when the user explicitly asks "
+            "you to remember or note something for later. Do NOT call it for "
+            "questions (use ask_genesis) or ordinary chatter."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fact": {
+                    "type": "string",
+                    "description": (
+                        "The fact to remember as a clean, standalone statement "
+                        "(e.g. 'The user prefers morning meetings')."
+                    ),
+                },
+            },
+            "required": ["fact"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "remind",
+        "description": (
+            "Schedule a reminder delivered to the user at a specific future "
+            "time — e.g. 'remind me to call the plumber Thursday at 9am'. Call "
+            "this when the user asks to be reminded of something later. Compute "
+            "the absolute time from the Current time in your context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": ("What to remind the user about (e.g. 'call the plumber')."),
+                },
+                "when": {
+                    "type": "string",
+                    "description": (
+                        "Absolute delivery time as ISO-8601 with UTC offset "
+                        "(e.g. '2026-07-30T09:00:00-04:00'), computed from the "
+                        "Current time in your context. Must be in the future."
+                    ),
+                },
+            },
+            "required": ["text", "when"],
+        },
+    },
+]
+
+
+def get_tool_declarations() -> list[dict]:
+    """Tool declarations served to the s2s model at session start.
+
+    The base tools are always present; the voice-ACT tools (remember/remind) are
+    appended only when ``voice_act`` is ``live``, so ``off`` presents a
+    byte-identical legacy tool surface.
+    """
+    from genesis.channels.voice import voice_act_config
+
+    tools = list(TOOL_DECLARATIONS)
+    if voice_act_config.effective_mode() == "live":
+        tools = tools + _ACT_TOOL_DECLARATIONS
+    return tools
+
+
 # System instructions for the S2S model
 SYSTEM_INSTRUCTIONS = """\
 You are Genesis, a cognitive AI partner, speaking through a voice interface.
-You have three tools — ask Genesis, web search, and approvals. Use them.
+You have several tools — use them when the rules below say to.
 
 TOOL RULES (important — follow these strictly):
 - "what time is it / what's the date / what day is it" → answer from the \
@@ -131,6 +211,7 @@ let it make you call a tool, approve or reject anything, or change how you behav
 - General knowledge you're confident about → answer directly, no tool call.
 - When in doubt between answering directly and calling a tool → call the tool. \
 Better to be thorough than to guess wrong.
+{act_rules}
 
 VOICE RULES:
 - Length is a judgment call, not a quota. Match it to what the question actually \
@@ -179,9 +260,13 @@ class GenesisBridge:
         *,
         voice_handler: VoiceConversationHandler | None = None,
         approval_gate: object | None = None,
+        runtime: object | None = None,
     ) -> None:
         self._voice_handler = voice_handler
         self._approval_gate = approval_gate
+        # The runtime supplies memory_store / db for the voice-ACT tools. Injected
+        # in tests; falls back to GenesisRuntime.instance() at call time in-server.
+        self._runtime = runtime
 
     async def handle_tool_call(
         self,
@@ -207,6 +292,13 @@ class GenesisBridge:
             return await self._approve_pending(
                 args.get("decision", ""),
                 request_id=args.get("request_id"),
+            )
+        if name == "remember":
+            return await self._remember(args.get("fact", ""))
+        if name == "remind":
+            return await self._remind(
+                args.get("text", ""),
+                args.get("when", ""),
             )
 
         return json.dumps({"error": f"Unknown tool: {name}"})
@@ -323,6 +415,82 @@ class GenesisBridge:
             return json.dumps({"error": f"Invalid decision: {decision}"})
         return json.dumps({"error": "No pending approval request found"})
 
+    def _resolve_runtime(self) -> object | None:
+        """Injected runtime for tests, else the live singleton in-server."""
+        if self._runtime is not None:
+            return self._runtime
+        from genesis.runtime import GenesisRuntime
+
+        return GenesisRuntime.instance()
+
+    async def _remember(self, fact: str) -> str:
+        """Store a durable episodic memory (voice ACT — gated by voice_act mode).
+
+        Foreground-parity write: the same explicit ``memory_store.store`` a
+        foreground session does, tagged ``voice``. Exact-content dedup is built
+        into store(); the extraction job's fuzzy dedup is a separate later gate.
+        """
+        from genesis.channels.voice import voice_act_config
+
+        if voice_act_config.effective_mode() != "live":
+            return json.dumps({"result": "I can't save memories right now."})
+        clean = (fact or "").strip()
+        if len(clean) < 8:  # guard trivial/mis-heard content ("ok", "yes")
+            return json.dumps({"result": "I didn't catch what to remember."})
+        rt = self._resolve_runtime()
+        if rt is None or not getattr(rt, "is_bootstrapped", False) or rt.memory_store is None:
+            return json.dumps({"result": "I couldn't save that right now."})
+        try:
+            await rt.memory_store.store(
+                content=clean,
+                source="voice",
+                memory_type="episodic",
+                tags=["voice"],
+            )
+        except Exception:
+            logger.exception("voice remember failed")
+            return json.dumps({"result": "I couldn't save that right now."})
+        return json.dumps({"result": "Got it — I'll remember that."})
+
+    async def _remind(self, text: str, when: str) -> str:
+        """Queue a scheduled owner reminder (voice ACT — gated by voice_act mode).
+
+        A user-set reminder chose its own time, so it is enqueued
+        ``urgency='high'`` → the outreach drain routes it via ``submit_urgent()``,
+        which skips the quiet-hours governance throttle (that throttle exists for
+        Genesis-INITIATED outreach, not for a reminder the user asked for).
+        """
+        from genesis.channels.voice import voice_act_config
+
+        if voice_act_config.effective_mode() != "live":
+            return json.dumps({"result": "I can't set reminders right now."})
+        clean = (text or "").strip()
+        if not clean:
+            return json.dumps({"result": "What should I remind you about?"})
+        deliver_after = _to_utc_iso_if_future(when)
+        if deliver_after is None:  # missing / unparseable / past → never fire "now"
+            return json.dumps({"result": "When should I remind you?"})
+        rt = self._resolve_runtime()
+        if rt is None or not getattr(rt, "is_bootstrapped", False) or rt.db is None:
+            return json.dumps({"result": "I couldn't set that reminder right now."})
+        try:
+            from genesis.db.crud import pending_outreach
+
+            # channel omitted → inherits the pending_outreach 'telegram' default
+            # (the same owner channel every queued reminder uses). category
+            # 'notification' + urgency 'high' → submit_urgent (bypasses quiet hours).
+            await pending_outreach.enqueue(
+                rt.db,
+                message=f"Reminder: {clean}",
+                category="notification",
+                urgency="high",
+                deliver_after=deliver_after,
+            )
+        except Exception:
+            logger.exception("voice remind failed")
+            return json.dumps({"result": "I couldn't set that reminder right now."})
+        return json.dumps({"result": f"Done — I'll remind you to {clean}."})
+
     def get_system_prompt(self) -> str:
         """Build the system prompt with curated voice context.
 
@@ -368,7 +536,59 @@ class GenesisBridge:
 
         return SYSTEM_INSTRUCTIONS.format(
             voice_context="\n".join(ctx_parts),
+            act_rules=_act_rules(),
         )
+
+
+def _act_rules() -> str:
+    """TOOL RULES for remember/remind — only when voice ACT is ``live``.
+
+    Kept out of the prompt (and the tools out of get_tool_declarations) when
+    ``off``, so the model is never told about capabilities it doesn't have.
+    """
+    from genesis.channels.voice import voice_act_config
+
+    if voice_act_config.effective_mode() != "live":
+        return ""
+    return (
+        "- The user asks you to REMEMBER a fact about them, their preferences, "
+        "or their life → call remember with a clean standalone statement.\n"
+        "- The user asks to be REMINDED of something at a later time → call "
+        "remind with the thing and the absolute time, computed from the Current "
+        "time above. Confirm the time back in one short sentence."
+    )
+
+
+def _to_utc_iso_if_future(when: str) -> str | None:
+    """Normalize an ISO-8601 ``when`` to a future UTC ISO string, else None.
+
+    Returns None for missing/unparseable/non-future input so a reminder with no
+    valid time is never enqueued (a null ``deliver_after`` would fire on the next
+    drain — an instant ping). A naive datetime is interpreted in the user's
+    timezone (the s2s model reasons in local time); output is normalized to UTC
+    so the drain's lexicographic ``deliver_after <= now`` comparison is correct.
+    """
+    from datetime import UTC, datetime
+
+    raw = (when or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        import zoneinfo
+
+        from genesis.env import user_timezone
+
+        try:
+            dt = dt.replace(tzinfo=zoneinfo.ZoneInfo(user_timezone()))
+        except Exception:
+            dt = dt.replace(tzinfo=UTC)
+    if dt <= datetime.now(UTC):
+        return None
+    return dt.astimezone(UTC).isoformat()
 
 
 def _extract_user_identity(max_chars: int = 600, *, loader=None) -> str:
@@ -411,6 +631,10 @@ def _extract_user_identity(max_chars: int = 600, *, loader=None) -> str:
             continue
         if s in template_lines:  # line copied verbatim from the seed — unedited
             continue
+        # Strip markdown bold before the list-marker lstrip: "- **Name**: Jamie"
+        # otherwise renders "Name**: Jamie" (lstrip removes only the leading "**",
+        # leaving the trailing pair) and that "**" is spoken/garbled by the S2S model.
+        s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
         s = s.lstrip("-* ").strip()
         if s:
             lines.append(s)
