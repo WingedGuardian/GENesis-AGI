@@ -26,6 +26,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   state — so a memory that was retired or superseded while its vector was still
   pending stays excluded from recall instead of quietly reappearing, and its real
   confidence is preserved rather than reset to a default.
+- **Internet outages no longer leave a mess behind.** A long connectivity loss
+  used to pile up hundreds of duplicate queued alerts, spam the health view with
+  false "delivery exhausted" warnings, and — worst — put Genesis in an endless
+  restart loop (it announced "going offline" over and over because restarting
+  can't fix a dead network). Now: a repeated delivery failure for the same alert
+  is de-duplicated instead of re-queued; a duplicate that was already delivered,
+  or an email held for your approval, is treated as done rather than retried into
+  a false failure; deferred messages actually expire on their 4-hour deadline
+  instead of lingering forever; and the watchdog, after restarting a few times
+  for the same reason, backs off and sends you one warning instead of restarting
+  on a loop.
+- **Genesis now sheds low-priority background work when its providers are
+  struggling.** The degradation system that's meant to skip non-essential work
+  (surplus brainstorms, the morning report) during a provider brownout was wired
+  up but never actually triggered on provider failures — it does now, so a rough
+  patch for the model providers no longer drags every background task down with it.
 
 ### Added
 

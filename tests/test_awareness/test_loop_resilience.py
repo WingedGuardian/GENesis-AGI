@@ -63,11 +63,51 @@ async def test_late_binding_setters(db):
     sm = MagicMock()
     dq = AsyncMock()
 
+    tracker = MagicMock()
     loop.set_resilience_state_machine(sm)
     loop.set_deferred_queue(dq)
+    loop.set_degradation_tracker(tracker)
 
     assert loop._resilience_state_machine is sm
     assert loop._deferred_queue is dq
+    assert loop._degradation_tracker is tracker
+
+
+async def test_on_tick_latches_degradation_into_tracker(db, monkeypatch):
+    """Fix E wiring: _on_tick must call update_from_resilience() on the injected
+    DegradationTracker so cloud degradation actually sheds background call sites.
+    With cloud REDUCED and NO circuit breakers (so the tick's cloud-axis update is
+    skipped and the pre-set state stands), the tracker level moves NORMAL -> REDUCED,
+    which only update_from_resilience() does. Guards against the wiring being
+    dropped or moved to a path _on_tick never calls."""
+    from genesis.resilience.state import CloudStatus, ResilienceStateMachine
+    from genesis.routing.degradation import DegradationTracker
+    from genesis.routing.types import DegradationLevel
+
+    def _fake_tracked_task(coro, *, name="", **kw):
+        coro.close()
+        return None
+
+    monkeypatch.setattr("genesis.util.tasks.tracked_task", _fake_tracked_task)
+    # Hermetic: pin tmp pressure to NORMAL so the composite level reflects only
+    # the cloud axis regardless of the host's live watchgod state (a host under
+    # CRITICAL tmp pressure would otherwise push the legacy level to ESSENTIAL).
+    monkeypatch.setattr(
+        "genesis.observability.service_status.collect_cc_tmp_usage",
+        lambda: {"cc_tier": "green"},
+    )
+
+    sm = ResilienceStateMachine()
+    sm.update_cloud(CloudStatus.REDUCED)
+    tracker = DegradationTracker(resilience_state=sm)
+    assert tracker.current_level == DegradationLevel.NORMAL  # not latched yet
+
+    loop = AwarenessLoop(db=db, collectors=[])
+    loop.set_resilience_state_machine(sm)
+    loop.set_degradation_tracker(tracker)
+    await loop._on_tick()
+
+    assert tracker.current_level == DegradationLevel.REDUCED
 
 
 # ── LIGHT → CC Haiku (primary) ───────────────────────────────────────────

@@ -60,6 +60,23 @@ def test_update_from_resilience_embedding_down():
     assert tracker.current_level == DegradationLevel.LOCAL_COMPUTE_DOWN
 
 
+def test_reduced_cloud_sheds_l2_call_sites():
+    """The bug fixed by wiring update_from_resilience into the awareness tick
+    (ego goal af5c59b8): cloud REDUCED must actually SHED the _L2_SKIP call sites
+    once the composite state is latched. Before the wiring the tracker's cloud
+    level stayed frozen at NORMAL and nothing was ever shed on provider
+    degradation."""
+    rsm = ResilienceStateMachine()
+    rsm.update_cloud(CloudStatus.REDUCED)
+    tracker = DegradationTracker(resilience_state=rsm)
+    tracker.update_from_resilience()
+    assert tracker.current_level == DegradationLevel.REDUCED
+    assert tracker.should_skip("12_surplus_brainstorm") is True
+    assert tracker.should_skip("13_morning_report") is True
+    # A site outside _L2_SKIP keeps running at REDUCED.
+    assert tracker.should_skip("5_deep_reflection") is False
+
+
 def test_update_from_resilience_no_state():
     """update_from_resilience with no resilience_state is a no-op."""
     tracker = DegradationTracker()

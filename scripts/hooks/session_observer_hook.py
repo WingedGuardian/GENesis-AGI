@@ -22,6 +22,15 @@ from pathlib import Path
 if os.environ.get("GENESIS_CC_SESSION") == "1":
     sys.exit(0)
 
+# Self-locate so secret_scrub resolves whether run as a script or imported.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from secret_scrub import (  # noqa: E402
+    command_touches_secret,
+    is_secret_path,
+    scrub,
+    scrub_info,
+)
+
 # Tools that produce low-signal observations — not worth capturing
 _SKIP_TOOLS = frozenset(
     {
@@ -56,17 +65,26 @@ _MAX_FILE_BYTES = 500_000  # ~500KB, roughly 200-300 observations
 def _extract_key_info(tool_name: str, tool_input: dict) -> dict:
     """Extract the most useful information from tool input by tool type."""
     info: dict = {}
+    if _is_credential_tool(tool_name):
+        # reference_store args ARE the credential — never capture them.
+        return {"note": "[redacted: credential-store tool]"}
     if tool_name in ("Read", "Write"):
         info["file_path"] = tool_input.get("file_path", "")
     elif tool_name == "Edit":
-        info["file_path"] = tool_input.get("file_path", "")
-        # Capture what changed for richer LLM context
+        fp = tool_input.get("file_path", "")
+        info["file_path"] = fp
+        # Capture what changed for richer LLM context — but the before/after
+        # bodies of a secret-bearing file ARE secrets, so never persist them.
         old = tool_input.get("old_string", "")
         new = tool_input.get("new_string", "")
-        if old:
-            info["old_string"] = old[:150]
-        if new:
-            info["new_string"] = new[:150]
+        if is_secret_path(fp):
+            if old or new:
+                info["edit"] = "[redacted: secret-bearing file]"
+        else:
+            if old:
+                info["old_string"] = old[:150]
+            if new:
+                info["new_string"] = new[:150]
     elif tool_name == "Bash":
         cmd = tool_input.get("command", "")
         info["command"] = cmd[:500] if cmd else ""
@@ -88,7 +106,8 @@ def _extract_key_info(tool_name: str, tool_input: dict) -> dict:
                 info[key] = val[:200]
             elif isinstance(val, (int, float, bool)):
                 info[key] = val
-    return info
+    # Redact inline secret shapes from every captured string value.
+    return scrub_info(info)
 
 
 def _truncate_output(output_raw: str) -> str:
@@ -96,6 +115,34 @@ def _truncate_output(output_raw: str) -> str:
     if not output_raw or len(output_raw) <= _OUTPUT_CAP:
         return output_raw or ""
     return output_raw[:_OUTPUT_CAP] + f"\n... [truncated, {len(output_raw)} total chars]"
+
+
+def _is_credential_tool(tool_name: str) -> bool:
+    """Reference-store MCP tools carry credentials by design — their args and
+    results should not be captured into telemetry at all."""
+    return tool_name.lower().endswith(("reference_store", "reference_lookup", "reference_export"))
+
+
+def _summarize_output(tool_name: str, tool_input: dict, output_raw: str) -> str:
+    """Capture tool output for note-taking without persisting secret bodies.
+
+    Reading/editing/searching a secret-bearing path, a Bash command that reads
+    one, or a reference-store tool puts raw secrets in the result — skip
+    capturing it. Whatever IS captured is still scrubbed for inline secret
+    shapes (a token echoed in output, an ``export API_KEY=…``), since this text
+    flows on into memory extraction and proactive recall."""
+    if not output_raw:
+        return ""
+    ti = tool_input if isinstance(tool_input, dict) else {}
+    path = ti.get("file_path", "") or ti.get("path", "")
+    cmd = ti.get("command", "")
+    if tool_name in ("Read", "Edit", "Write", "Grep", "Glob") and is_secret_path(path):
+        return "[skipped: secret-bearing path]"
+    if tool_name == "Bash" and command_touches_secret(cmd):
+        return "[skipped: command reads a secret-bearing file]"
+    if _is_credential_tool(tool_name):
+        return "[skipped: credential-store tool]"
+    return scrub(_truncate_output(output_raw))
 
 
 def main() -> None:
@@ -139,7 +186,7 @@ def _process(data: dict) -> None:
         "session_id": session_id,
         "tool_name": tool_name,
         "key_info": _extract_key_info(tool_name, tool_input),
-        "output_summary": _truncate_output(output_raw),
+        "output_summary": _summarize_output(tool_name, tool_input, output_raw),
     }
 
     # Append to per-session JSONL file
