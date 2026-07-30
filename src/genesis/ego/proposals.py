@@ -152,6 +152,16 @@ def _format_digest(
         confidence = p.get("confidence", 0.0)
         lines.append(f"\n[{confidence:.2f} confidence]")
 
+        # PR-6a: revision + revalidation surfacing. Dark until reconcile
+        # revise/reaffirm ships — revision_num stays 1 and last_validated_at
+        # equals created_at today, so neither line renders yet.
+        revision = p.get("revision_num", 1)
+        if revision and revision > 1:
+            lines.append(f"[rev {revision}]")
+        last_validated = p.get("last_validated_at")
+        if last_validated and last_validated != p.get("created_at"):
+            lines.append(f"<i>verified as of {_ESC(str(last_validated)[:16])}</i>")
+
         # WS-2 P4 arbitration annotations (annotate-only; never suppresses).
         badge = p.get("_calibration_badge")
         if badge:
@@ -615,6 +625,25 @@ class ProposalWorkflow:
             value=delivery_id,
         )
 
+        # PR-6a resolve-side guard: snapshot the revision each proposal was
+        # RENDERED at, so a reply resolving this digest pins the revision the
+        # user actually saw. A concurrent revise (PR-6b) bumps revision_num;
+        # resolve_proposals passes this as expected_revision so a stale resolve
+        # refuses instead of clobbering the newer version. Keyed by batch_id
+        # (all resolve_proposals receives). Written only after a successful
+        # delivery. Every row is revision_num=1 until PR-6b introduces revise,
+        # so today this is a no-op match.
+        try:
+            await ego_crud.set_state(
+                self._db,
+                key=f"revision_snapshot:{batch_id}",
+                value=json.dumps({p["id"]: p.get("revision_num", 1) for p in proposals}),
+            )
+        except Exception:
+            logger.debug(
+                "Failed to write revision snapshot for %s", batch_id, exc_info=True
+            )
+
         # GROUNDWORK(digest-rate-limit): record delivery timestamp for
         # rate limiting. Written even when gate is disabled so the
         # timestamp is ready when the gate is flipped on.
@@ -656,6 +685,20 @@ class ProposalWorkflow:
         proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
         results: dict[str, str] = {}
 
+        # PR-6a resolve-side guard: pin each resolve to the revision the user saw
+        # in the digest (snapshotted at send_digest). Missing snapshot → None →
+        # unguarded (behaves as today); NEVER default to 1, or pre-existing
+        # digests and bulk "approve all pending" would refuse legitimate resolves.
+        rev_snapshot: dict[str, int] = {}
+        try:
+            snap_raw = await ego_crud.get_state(self._db, f"revision_snapshot:{batch_id}")
+            if snap_raw:
+                rev_snapshot = json.loads(snap_raw)
+        except Exception:
+            logger.debug(
+                "Failed to load revision snapshot for %s", batch_id, exc_info=True
+            )
+
         for idx, (status, reason) in decisions.items():
             if idx < 1 or idx > len(proposals):
                 continue
@@ -665,6 +708,7 @@ class ProposalWorkflow:
                 prop["id"],
                 status=status,
                 user_response=reason,
+                expected_revision=rev_snapshot.get(prop["id"]),
             )
             if updated:
                 results[prop["id"]] = status

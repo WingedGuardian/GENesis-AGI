@@ -524,23 +524,37 @@ async def _resolve_one_proposal(
     if prop.get("status") != "pending":
         return f"already {prop.get('status')}"
 
-    # GROUNDWORK(ego-pr6-revalidation): this resolves over a SEPARATE
-    # non-serialized get_raw_db connection after reading `prop`, so a concurrent
-    # revise (PR-5 reconcile) could move the proposal's revision between the read
-    # and this write and resolve a stale revision. resolve_proposal already
-    # accepts expected_revision (PR-4 unit B, inert until wired); PR-6 passes
-    # prop["revision_num"] here to make the update atomic. Not passed yet (dark).
-    # NOTE for PR-6: with expected_revision set, a False return conflates
-    # stale-revision, already-resolved, and missing-id. PR-6 must re-read the row
-    # to distinguish a race refusal (re-surface the fresh revision) from a benign
-    # already-resolved before reporting to the user.
+    # PR-6a resolve-side guard: this resolves over a SEPARATE non-serialized
+    # get_raw_db connection after reading `prop`, so a concurrent revise
+    # (PR-6b reconcile) could move the proposal's revision between that read and
+    # this write. Passing expected_revision=prop["revision_num"] makes the UPDATE
+    # atomic (resolve_proposal appends `AND revision_num = ?`), so a stale resolve
+    # refuses instead of clobbering a newer revision. A no-op match today — every
+    # row is revision_num=1 until PR-6b introduces revise. With the guard set, a
+    # False return conflates stale-revision, already-resolved and missing-id, so
+    # we re-read the row below to distinguish a genuine race refusal (re-surface
+    # the fresh revision) from a benign already-resolved / missing row.
     updated = await ego_crud.resolve_proposal(
         db,
         prop["id"],
         status=status,
         user_response=reason or None,
+        expected_revision=prop.get("revision_num"),
     )
     if not updated:
+        # expected_revision set → a False return conflates three cases. Re-read the
+        # row to distinguish a stale-revision race (proposal revised between our
+        # read and this write) from a benign already-resolved / missing-id.
+        fresh = await ego_crud.get_proposal(db, prop["id"])
+        if fresh is None:
+            return "not updated (proposal no longer exists)"
+        if fresh.get("status") != "pending":
+            return f"already {fresh.get('status')}"
+        if fresh.get("revision_num") != prop.get("revision_num"):
+            return (
+                f"stale revision (you saw rev {prop.get('revision_num')}, "
+                f"now rev {fresh.get('revision_num')}) — re-review before resolving"
+            )
         return "not updated"
 
     # Shared post-resolution hook: J-9, journal, decision capture,
