@@ -35,9 +35,17 @@ from shell_parse import (  # noqa: E402
 # Fail closed on it — treat as main (block Rule 1) and do NOT take the docs skip.
 _CWD_UNKNOWN = object()
 
-# Cheap early-out: a raw command that never mentions "git commit" is not a
-# commit. Actual detection (through wrappers, bash -c, etc.) uses shell_parse.
-_COMMIT_PATTERN = re.compile(r"\bgit\s+commit\b")
+# Cheap early-out: a command with no "commit" TOKEN cannot be a git commit, so
+# skip the shell_parse pass. It must gate on the token alone, NOT on a rigid
+# "git commit" adjacency — `git -C <dir> commit` and `git -c k=v commit` put
+# global options between "git" and "commit", so `\bgit\s+commit\b` MISSED them
+# and let those commit forms skip the ENTIRE gate (review, --no-verify, and the
+# direct-to-main block). Precise detection is still shell_parse's `analyze()` +
+# `git_subcommand` below; this only decides whether to run it. Kept identical in
+# review_invalidate_on_commit.py (the PostToolUse invalidator) — the pair must
+# detect the same set of commits or the marker cleared drifts from the one
+# checked. Guarded by test_commit_pattern_matches_git_dash_c_and_dash_C.
+_COMMIT_PATTERN = re.compile(r"\bcommit\b")
 
 
 def _commit_override(command: str, segs: list) -> str:
