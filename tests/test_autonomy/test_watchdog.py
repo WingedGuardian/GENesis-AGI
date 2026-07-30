@@ -85,6 +85,9 @@ def _make_checker(
         secrets_path=str(secrets_path or tmp_path / "secrets.env"),
         state_file=str(tmp_path / "watchdog_state.json"),
         stabilization_s=kwargs.get("stabilization_s", 600),
+        flap_window_s=kwargs.get("flap_window_s", 21600),
+        flap_threshold=kwargs.get("flap_threshold", 3),
+        flap_backoff_max_s=kwargs.get("flap_backoff_max_s", 7200),
     )
 
 
@@ -126,6 +129,109 @@ class TestDeployInProgress:
         # guard adds zero behavior change outside a deploy window.
         checker = _make_checker(tmp_path, stale_status)
         assert checker.check() is WatchdogAction.RESTART
+
+
+class TestFlapDamping:
+    """Slow recurring same-reason restarts (spaced beyond the stabilization
+    window, so consecutive_failures keeps resetting) must eventually back off and
+    surface a warning, instead of restarting forever (2026-07 outage: 25x/12h)."""
+
+    def _seed(self, count, reason="zombie_scheduler", age_s=5):
+        now = time.time()
+        return {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [{"ts": now - age_s, "reason": reason} for _ in range(count)],
+        }
+
+    def test_backs_off_after_threshold(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        assert (
+            checker._restart_if_allowed(self._seed(3), reason="zombie_scheduler")
+            is WatchdogAction.BACKOFF
+        )
+
+    def test_below_threshold_still_restarts(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        assert (
+            checker._restart_if_allowed(self._seed(2), reason="zombie_scheduler")
+            is WatchdogAction.RESTART
+        )
+
+    def test_different_reasons_dont_cross_count(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        now = time.time()
+        state = {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [
+                {"ts": now - 5, "reason": "zombie_scheduler"},
+                {"ts": now - 5, "reason": "zombie_scheduler"},
+                {"ts": now - 5, "reason": "stale_status_restart"},
+            ],
+        }
+        assert (
+            checker._restart_if_allowed(state, reason="zombie_scheduler")
+            is WatchdogAction.RESTART
+        )
+
+    def test_history_pruned_past_window(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(
+            tmp_path, stale_status, flap_threshold=3, flap_window_s=100, backoff_max_s=10
+        )
+        now = time.time()
+        state = {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [
+                {"ts": now - 500, "reason": "zombie_scheduler"},  # outside 100s window
+                {"ts": now - 5, "reason": "zombie_scheduler"},
+                {"ts": now - 5, "reason": "zombie_scheduler"},
+            ],
+        }
+        assert (
+            checker._restart_if_allowed(state, reason="zombie_scheduler")
+            is WatchdogAction.RESTART
+        )
+
+    def test_alert_enqueued_once_on_flap(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        with patch("genesis.guardian.alert.queue.enqueue_alert") as mock_alert:
+            checker._restart_if_allowed(self._seed(3), reason="zombie_scheduler")
+        mock_alert.assert_called_once()
+        assert mock_alert.call_args.kwargs["dedupe_key"] == "watchdog:flap:zombie_scheduler"
+        assert mock_alert.call_args.kwargs["severity"] == "warning"
+
+    def test_record_failure_appends_history(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status)
+        state = {"consecutive_failures": 0, "restart_history": []}
+        checker._record_failure(state, reason="zombie_scheduler")
+        assert len(state["restart_history"]) == 1
+        assert state["restart_history"][0]["reason"] == "zombie_scheduler"
+
+    def test_reset_state_preserves_history(self, tmp_path: Path, fresh_status: Path):
+        checker = _make_checker(tmp_path, fresh_status, stabilization_s=0)
+        state_file = tmp_path / "watchdog_state.json"
+        now = time.time()
+        state_file.write_text(
+            json.dumps({
+                "consecutive_failures": 3,
+                "last_restart_at": now - 1000,
+                "restart_history": [{"ts": now - 10, "reason": "zombie_scheduler"}],
+            })
+        )
+        checker.check()
+        state = json.loads(state_file.read_text())
+        assert state["consecutive_failures"] == 0  # healthy reset
+        assert len(state["restart_history"]) == 1  # but history preserved
+
+    def test_legacy_state_without_history_ok(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3)
+        action = checker._restart_if_allowed(
+            {"consecutive_failures": 0, "next_attempt_after": None},
+            reason="zombie_scheduler",
+        )
+        assert action is WatchdogAction.RESTART  # no restart_history key → no crash
 
 
 class TestHealthy:

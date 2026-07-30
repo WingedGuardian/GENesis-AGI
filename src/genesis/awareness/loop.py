@@ -1933,6 +1933,7 @@ class AwarenessLoop:
         self._resilience_state_machine = resilience_state_machine
         self._deferred_queue = deferred_queue
         self._circuit_breakers: CircuitBreakerRegistry | None = None
+        self._degradation_tracker = None
         self._tick_event_loop: asyncio.AbstractEventLoop | None = None
         self._topic_manager = None
         self._guardian_watchdog = None
@@ -1973,6 +1974,12 @@ class AwarenessLoop:
     def set_circuit_breakers(self, breakers: CircuitBreakerRegistry) -> None:
         """Inject circuit breaker registry for resilience state updates."""
         self._circuit_breakers = breakers
+
+    def set_degradation_tracker(self, tracker) -> None:
+        """Inject the routing DegradationTracker so the awareness tick can latch
+        composite resilience state into it (see _on_tick). Without this the
+        tracker's cloud degradation level never leaves NORMAL."""
+        self._degradation_tracker = tracker
 
     async def _update_resilience_cognitive_state(self, level: DegradationLevel) -> None:
         """Write or clear cognitive state when resilience level changes."""
@@ -2225,6 +2232,20 @@ class AwarenessLoop:
                         self._resilience_state_machine.update_tmp_pressure(tmp_status)
                 except Exception:
                     logger.debug("tmp_pressure axis update failed", exc_info=True)
+
+            # Latch the composite resilience state into the routing degradation
+            # tracker so cloud/provider degradation actually sheds background
+            # call sites (_L2_SKIP at REDUCED, _L3_KEEP at ESSENTIAL). Without
+            # this per-tick refresh the tracker's cloud level is frozen at
+            # NORMAL and shedding never fires on provider degradation (the
+            # tmp_pressure axis reads live state and was unaffected). Runs after
+            # all axis updates so the freshest composite state is latched.
+            # (ego goal af5c59b8: surplus L0-skip)
+            if self._degradation_tracker is not None:
+                try:
+                    self._degradation_tracker.update_from_resilience()
+                except Exception:
+                    logger.debug("degradation tracker update failed", exc_info=True)
 
             # Per-CC-slot RSS leak check — reads /proc (no DB dependency, so it
             # still runs during a DB hiccup); the observation write is guarded on

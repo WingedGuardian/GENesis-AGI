@@ -197,6 +197,18 @@ class DeferredWorkQueue:
         """Count pending items, optionally filtered by work_type."""
         return await crud.count_pending(self._db, work_type=work_type)
 
+    async def has_open(self, work_type: str, topic: str) -> bool:
+        """True if an OPEN (pending/processing) item already exists for this
+        (work_type, topic). Dedup-at-defer guard — see
+        ``crud.count_open_by_topic``.
+        """
+        return (
+            await crud.count_open_by_topic(
+                self._db, work_type=work_type, topic=topic
+            )
+            > 0
+        )
+
     async def count_worklist_pending(self) -> int:
         """Count pending batch-worklist items (dream synthesis etc.).
 

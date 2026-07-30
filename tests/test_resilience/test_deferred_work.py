@@ -103,6 +103,72 @@ class TestMarkStatus:
         assert await queue.count_pending() == 0
 
 
+class TestHasOpen:
+    """Dedup-at-defer guard — count_open_by_topic / has_open."""
+
+    @pytest.mark.asyncio
+    async def test_pending_row_is_open(self, queue):
+        await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
+        )
+        assert await queue.has_open("outreach_delivery", "alert:x")
+
+    @pytest.mark.asyncio
+    async def test_processing_row_is_open(self, queue):
+        # The recovery worker marks the original 'processing' before re-attempting;
+        # a re-defer during that window must still see it as open.
+        item_id = await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
+        )
+        await queue.mark_processing(item_id)
+        assert await queue.has_open("outreach_delivery", "alert:x")
+
+    @pytest.mark.asyncio
+    async def test_terminal_rows_are_not_open(self, queue):
+        completed_id = await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, '{"topic": "alert:c"}', "r"
+        )
+        await queue.mark_completed(completed_id)
+        assert not await queue.has_open("outreach_delivery", "alert:c")
+
+        discarded_id = await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, '{"topic": "alert:d"}', "r"
+        )
+        await queue.mark_discarded(discarded_id, "gone")
+        assert not await queue.has_open("outreach_delivery", "alert:d")
+
+    @pytest.mark.asyncio
+    async def test_distinguishes_topics(self, queue):
+        await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
+        )
+        assert not await queue.has_open("outreach_delivery", "alert:y")
+
+    @pytest.mark.asyncio
+    async def test_distinguishes_work_types(self, queue):
+        await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
+        )
+        assert not await queue.has_open("reflection", "alert:x")
+
+    @pytest.mark.asyncio
+    async def test_counts_multiple_open(self, queue):
+        from genesis.db.crud import deferred_work as crud
+
+        await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
+        )
+        await queue.enqueue(
+            "outreach_delivery", None, REFLECTION, '{"topic": "alert:x"}', "r"
+        )
+        assert (
+            await crud.count_open_by_topic(
+                queue._db, work_type="outreach_delivery", topic="alert:x"
+            )
+            == 2
+        )
+
+
 class TestStalenessExpiry:
     @pytest.mark.asyncio
     async def test_drain_never_expires(self, queue):

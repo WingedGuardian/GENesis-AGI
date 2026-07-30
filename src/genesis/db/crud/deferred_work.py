@@ -153,6 +153,39 @@ async def count_pending_in(
     return int(row[0])
 
 
+async def count_open_by_topic(
+    db: aiosqlite.Connection,
+    *,
+    work_type: str,
+    topic: str,
+) -> int:
+    """Count OPEN (pending or processing) rows for a work_type whose payload
+    ``topic`` matches.
+
+    Dedup-at-defer: repeated delivery failures of the same alert must not each
+    enqueue a fresh row. Both the recovery worker's retry (which moves the
+    original to 'processing' before re-attempting, then re-defers on failure)
+    and the alert-drain re-submit loop go through ``_defer`` — counting
+    'processing' as well as 'pending' closes both amplification paths (2026-07
+    outage: 690 duplicate rows for one backup-alert topic).
+
+    ``topic`` lives in ``payload_json`` (no dedicated column) — read it with the
+    JSON1 ``json_extract``. A single-writer queue makes the read-then-insert
+    race-free enough here; the ``idx_rlp_open_dedup`` partial-unique-index
+    pattern (``cc_rate_limit_parks``) is the upgrade path if a concurrent
+    producer ever appears.
+    """
+    cursor = await db.execute(
+        """SELECT COUNT(*) FROM deferred_work_queue
+           WHERE work_type = ?
+             AND status IN ('pending', 'processing')
+             AND json_extract(payload_json, '$.topic') = ?""",
+        (work_type, topic),
+    )
+    row = await cursor.fetchone()
+    return int(row[0])
+
+
 async def count_recovery_pending(
     db: aiosqlite.Connection,
     *,
