@@ -72,7 +72,11 @@ _HOME = str(Path.home())
 
 # (script, tool_name, tool_input, must_block) — the safety-critical exit-2 guards.
 _BLOCKING_CASES = [
-    ("hooks/git_push_guard.py", "Bash", {"command": "git push origin main"}, True),
+    # A force push is hard-blocked in EVERY session, so it proves the guard read
+    # stdin and acted (a plain `git push` now emits an interactive ask, not an
+    # exit-2 block — that session-aware behavior is covered in
+    # tests/test_hooks/test_push_create_override.py).
+    ("hooks/git_push_guard.py", "Bash", {"command": "git push --force origin main"}, True),
     ("hooks/git_push_guard.py", "Bash", {"command": "ls -la"}, False),
     ("hooks/destructive_command_guard.py", "Bash", {"command": f"rm -rf {_HOME}"}, True),
     ("hooks/destructive_command_guard.py", "Bash", {"command": "rm file.txt"}, False),
@@ -111,11 +115,15 @@ def test_guard_acts_on_real_stdin_payload(script, tool, ti, must_block):
 
 
 def test_legacy_env_var_still_honored():
-    """Backward-compat: a legacy CLAUDE_TOOL_INPUT (tool-input dict only) still blocks."""
+    """Backward-compat: a legacy CLAUDE_TOOL_INPUT (tool-input dict only) still blocks.
+
+    Uses a force push — hard-blocked in every session — so the assertion targets
+    the input-contract (legacy env path is read), not the session-aware ask.
+    """
     proc = _run(
         "hooks/git_push_guard.py",
         stdin="",
-        env_var=json.dumps({"command": "git push origin main"}),
+        env_var=json.dumps({"command": "git push --force origin main"}),
     )
     assert proc.returncode == 2, f"legacy env path regressed: stderr={proc.stderr[:200]!r}"
 

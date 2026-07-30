@@ -294,8 +294,8 @@ def voice_tool_declarations():
         msg, status = auth
         return jsonify({"error": msg}), status
 
-    from genesis.channels.voice.genesis_bridge import TOOL_DECLARATIONS
-    return jsonify({"tools": TOOL_DECLARATIONS})
+    from genesis.channels.voice.genesis_bridge import get_tool_declarations
+    return jsonify({"tools": get_tool_declarations()})
 
 
 # ── Graduation landing (W0 — DARK: quarantine insert only, no consumer) ──

@@ -602,6 +602,46 @@ async def test_resume_uses_persisted_batch_delta_not_full_file(
     assert "https://example.com/a0" not in prompt  # NOT a full-file re-read
 
 
+@pytest.mark.asyncio
+async def test_resume_dispatch_reads_current_file_directives(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """A resumed/approved batch re-reads the CURRENT file's standing directives
+    at dispatch time — so file-scoped build intent reaches the eval even on the
+    resume path, without expanding the persisted delta itself."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("[build everything here by default]\n" + _urls(20))
+    import hashlib
+
+    h = hashlib.sha256(
+        "\n".join(line.rstrip() for line in f.read_text().split("\n")).encode()
+    ).hexdigest()
+    await inbox_items.create(
+        db, id="row-1", file_path=str(f), content_hash=h, status="processing",
+        created_at="2026-06-30T11:00:00+00:00", drop_id="D1",
+        batch_items="https://example.com/a18\nhttps://example.com/a19",
+    )
+    await inbox_items.update_status(
+        db, "row-1", status="processing",
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-9",
+    )
+    mon._autonomous_dispatcher = _wired(
+        decision=AutonomousDispatchDecision(
+            mode="blocked", reason="pending", approval_request_id="req-9",
+        ),
+        approval_by_id={"req-9": {"status": "approved"}},
+    )
+
+    await mon.check_once()
+
+    prompt = mock_invoker.run.call_args.args[0].prompt
+    assert "https://example.com/a18" in prompt  # persisted delta, unchanged
+    assert "https://example.com/a0" not in prompt  # still not a full re-read
+    # The fix: standing directive surfaced on the resume path too.
+    assert "build everything here by default" in prompt
+    assert "Standing bracketed lines" in prompt
+
 # ── Follow-up dedup wiring ───────────────────────────────────────────────
 
 

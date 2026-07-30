@@ -188,12 +188,15 @@ def _strip_trailing_comment(seg: str) -> str:
     return "".join(out)
 
 
-def _has_trailing_override(seg: str) -> bool:
-    """Whether the segment carries a genuine ``# review-override`` comment.
+def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
+    """Whether the segment carries a genuine ``# <sigil>`` comment.
 
     The ``#`` must open a real comment (outside quotes, preceded by whitespace),
-    so a token buried in a quoted message word does not count.
+    so a token buried in a quoted message word does not count. ``sigil`` selects
+    which override token to detect (``review-override`` by default; the CI-status
+    merge gate passes ``ci-override``).
     """
+    token = re.compile(re.escape(sigil) + r"(?![-\w])")
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -218,10 +221,15 @@ def _has_trailing_override(seg: str) -> bool:
             # The sigil must be the token, optionally followed by punctuation /
             # comment text (`# review-override: accepted P2s`), but NOT be a
             # prefix of a longer token (`review-override-x`, `review-overridexyz`).
-            return bool(re.match(r"review-override(?![-\w])", rest))
+            return bool(token.match(rest))
         prev_ws = c.isspace()
         i += 1
     return False
+
+
+def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
+    """Public alias of :func:`_has_trailing_override` for sibling hooks."""
+    return _has_trailing_override(seg, sigil)
 
 
 def _argv(seg: str) -> list[str]:

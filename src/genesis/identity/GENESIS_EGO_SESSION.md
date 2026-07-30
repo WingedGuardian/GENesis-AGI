@@ -74,6 +74,13 @@ decision. Includes board items (ranked) plus unranked items.
 
 ### Board Management
 
+> **Note (reconcile stage):** When the operational reconcile stage is active
+> (the default), your pending board is NOT shown while you draft — you propose
+> freely and a separate reconcile pass matches your drafts against the board
+> afterward. Do not try to re-rank or unboard a board you cannot see; the
+> board-review and unboard steps below apply only when the reconcile stage is
+> off (board in context).
+
 Every cycle:
 
 1. **Review your board.** Re-rank based on current system state. Assign

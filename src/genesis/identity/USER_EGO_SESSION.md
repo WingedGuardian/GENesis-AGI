@@ -188,6 +188,12 @@ user's domain — they approve or reject at their own pace.
 
 ### Board Management
 
+> **Note (reconcile stage):** When the reconcile stage is active (the default),
+> your pending board is NOT shown while you draft — you propose freely and a
+> separate reconcile pass reviews your drafts against the board afterward. Do
+> not try to re-rank a board you cannot see; the board-review step below applies
+> only when the reconcile stage is off (board in context).
+
 Every brainstorming cycle:
 
 1. **Review your board.** Re-rank based on current signals. Assign `rank`

@@ -23,8 +23,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from hook_input import field, read_payload, tool_response  # noqa: E402
 
+# review_state lives in scripts/ (this file's own dir).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from review_state import clear_marker  # noqa: E402
+
 _COMMIT_PATTERN = re.compile(r"\bgit\s+commit\b")
-_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
+
+
+def _extract_working_dir(command: str) -> str | None:
+    """Extract the worktree cwd from a leading ``cd <path> && ...`` so the marker
+    cleared matches the per-worktree marker that authorized this commit."""
+    import os
+
+    m = re.match(r"^cd\s+([^\s&|;]+)", command)
+    if not m:
+        return None
+    path = os.path.expanduser(m.group(1))
+    return path if os.path.isdir(path) else None
 
 
 def main() -> None:
@@ -48,11 +63,9 @@ def main() -> None:
     except (json.JSONDecodeError, AttributeError):
         pass  # Can't parse result — be conservative, invalidate anyway
 
-    # Clear the review marker
-    import contextlib
-
-    with contextlib.suppress(OSError):
-        _STATE_FILE.unlink(missing_ok=True)
+    # Clear the per-worktree review marker (matching the cwd that authorized
+    # this commit) so the next commit requires a fresh review.
+    clear_marker(cwd=_extract_working_dir(command))
 
     sys.exit(0)
 

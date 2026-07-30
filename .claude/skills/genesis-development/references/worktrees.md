@@ -93,10 +93,27 @@ over.
 
 ## Push/Merge Enforcement
 
-`git_push_guard.py` (PreToolUse hook) blocks:
-- `git push` to main/master (any variation — bare, with remote, with refspec)
-- `git merge` when on main/master
+`git_push_guard.py` (PreToolUse hook) gates:
+- `git push` (any branch) — the one action that publishes code externally. An
+  **interactive** session gets a native approve/deny dialog
+  (`permissionDecision:ask`) that only *you* can satisfy; a Genesis-**dispatched**
+  session (`GENESIS_CC_SESSION=1`) is **hard-denied** (no human to prompt; real
+  autonomous delivery goes through the scope-gated server path, not the CC Bash
+  tool). Force push (`--force` / `--force-with-lease` / `-f` / `+refspec` /
+  `--mirror`) is **hard-blocked** in every session. Multiple pushes in one
+  command are blocked — each push needs its own approval.
+- `gh pr create` — **un-gated when its branch is already on the remote** (then
+  it's just a review request on pushed code), so a `git push && gh pr create`
+  prompts once — for the push — and the PR-create rides along. The exception:
+  gh will *push* (and can fork) a branch whose HEAD is not yet on the remote, so
+  a create from an **unpushed branch** is gated like a push (interactive → ask,
+  dispatched → deny). Verified via local remote-tracking refs, fail-safe.
+- `git merge` into main/master — **hard-blocked** (use the PR workflow).
+- `gh pr merge` without `--admin`, or with unresolved review findings —
+  **hard-blocked** (a `# review-override` trailing comment acknowledges
+  intentionally-accepted findings on the *merge* command only).
 
-All code changes must go through PRs. The only merge path is
-`gh pr merge --squash --admin` after explicit user approval. Each step
-(commit → push branch → create PR → merge) needs separate user confirmation.
+The push dialog replaced the old `# review-override` token for the push gate —
+the agent can no longer self-approve a push. All code changes go through PRs;
+the only merge path is `gh pr merge --squash --admin` after explicit user
+approval.

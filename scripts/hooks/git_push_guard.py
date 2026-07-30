@@ -31,6 +31,7 @@ from shell_parse import (  # noqa: E402
     commit_skips_hooks,
     gh_pr_subcommand,
     git_subcommand,
+    has_trailing_override,
 )
 
 
@@ -165,6 +166,109 @@ def _check_mergeable(pr_num: str) -> str | None:
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
         return None  # Fail-open
+
+
+# Check-run conclusions / statuses that mean the CI is NOT green.
+_CI_RED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+_CI_RED_STATES = {"FAILURE", "ERROR"}  # legacy StatusContext state
+_CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL"}
+_CI_GREEN = {"SUCCESS"}
+# The only CheckRun.status that means "finished". Everything else
+# (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so
+# a new/renamed non-terminal state can never be silently mistaken for green.
+_CI_TERMINAL_STATUSES = {"COMPLETED"}
+
+
+def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
+    """Classify a PR's CI check-runs.
+
+    Returns ``(state, problem_checks)`` where state is one of:
+      * ``"green"``   — every non-skipped check concluded SUCCESS
+      * ``"red"``     — at least one check failed/cancelled/timed-out
+      * ``"pending"`` — a check is still queued/running (and none are red)
+      * ``"unknown"`` — could not determine (API error, no checks, or an
+                        unrecognized payload shape) → callers FAIL OPEN, because
+                        blocking a merge on our own inability to read CI would be
+                        worse than the gap this gate closes.
+
+    Tests inject via the ``_TEST_GH_CI_ROLLUP`` env var (a JSON array like
+    ``gh pr view --json statusCheckRollup``) so no network is needed.
+    """
+    raw = os.environ.get("_TEST_GH_CI_ROLLUP")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_num,
+                    "--json",
+                    "statusCheckRollup",
+                    "--jq",
+                    ".statusCheckRollup",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                return "unknown", []
+            raw = result.stdout.strip()
+        except Exception:
+            return "unknown", []
+    try:
+        checks = json.loads(raw) if raw else []
+    except Exception:
+        return "unknown", []
+    if not isinstance(checks, list) or not checks:
+        return "unknown", []
+
+    red: list[str] = []
+    pending: list[str] = []
+    saw_recognized = False
+    for c in checks:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name") or c.get("context") or "check"
+        conclusion = c.get("conclusion")  # CheckRun
+        status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
+        state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+        if conclusion in _CI_SKIP_CONCLUSIONS:
+            saw_recognized = True
+            continue
+        if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
+            saw_recognized = True
+            red.append(name)
+        elif conclusion in _CI_GREEN or state in _CI_GREEN:
+            saw_recognized = True
+        elif status in _CI_TERMINAL_STATUSES:
+            # COMPLETED with an unrecognized/None conclusion — treat as done,
+            # don't fabricate pending; ignore this entry.
+            saw_recognized = True
+        elif status is not None or state == "PENDING":
+            # ANY non-terminal CheckRun status (QUEUED/IN_PROGRESS/PENDING/
+            # WAITING/REQUESTED/…) or a PENDING StatusContext is unfinished →
+            # block. Enumerating "known pending" states would silently miss new
+            # ones (P1 review finding), so we invert: not-terminal ⇒ pending.
+            saw_recognized = True
+            pending.append(name)
+        # else: no status/state/conclusion at all — unrecognized shape, ignore
+
+    if red:
+        return "red", sorted(set(red))
+    if pending:
+        return "pending", sorted(set(pending))
+    if not saw_recognized:
+        return "unknown", []  # payload had no CI-shaped entries
+    return "green", []
+
+
+# The CI-status gate is waived only by a genuine ``# ci-override`` trailing
+# comment on the merge segment itself — detected with the same quote-aware,
+# segment-bound parser as ``# review-override`` (shell_parse.has_trailing_override)
+# so it cannot be spoofed from inside a quoted --body or a different chained
+# command. Distinct from --admin and # review-override; waives ONLY this gate.
 
 
 # ── Review findings detection ──────────────────────────────────────────
@@ -376,6 +480,139 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
     return False, ""
 
 
+def _is_dispatched() -> bool:
+    """True in a Genesis-dispatched (autonomous/headless) CC session.
+
+    ``cc/invoker.py`` stamps ``GENESIS_CC_SESSION=1`` on every dispatched
+    session; a user-launched foreground session does not carry it. Dispatched
+    sessions have no human to answer an ``ask`` prompt and never push via the CC
+    Bash tool in normal operation — the executor pushes from the server
+    subprocess, scope-gated (``autonomy/executor``) — so they are hard-denied
+    rather than prompted.
+    """
+    return os.environ.get("GENESIS_CC_SESSION") == "1"
+
+
+# git push flags that consume the NEXT token as their value — so a value that
+# happens to start with '+' or contain 'f' is not misread as a force.
+_PUSH_VALUE_FLAGS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
+
+
+def _push_is_force(argv: list[str]) -> bool:
+    """Whether a parsed ``git push`` argv performs a force push.
+
+    Argv comes from ``shell_parse`` (quote-stripped), so a quoted ``'-f'``
+    counts and a branch/refspec name that merely contains ``-f`` (a bare
+    positional) does not. Catches both the flag forms — ``--force`` /
+    ``--force-with-lease`` / ``--force-if-includes`` / ``--mirror`` / ``-f`` /
+    bundled ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
+    which git treats as ``--force`` for that ref. A short cluster stops at
+    ``o`` and the value token of ``-o`` / ``--push-option`` / ``--repo`` /
+    ``--exec`` / ``--receive-pack`` is skipped, so a push-option value that
+    starts with ``+`` or contains ``f`` (e.g. ``-oci.skip``) is not mistaken
+    for a force.
+    """
+    i = 1  # skip argv[0] == "git"
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _PUSH_VALUE_FLAGS:
+            i += 2  # skip the flag and its value token
+            continue
+        if tok == "--force" or tok.startswith("--force-"):
+            return True
+        if tok == "--mirror":
+            # --mirror force-updates EVERY ref and deletes remote refs that are
+            # absent locally — an unconditional destructive push, never a plain
+            # one, so it must hard-block rather than reach an approvable prompt.
+            return True
+        if tok.startswith("+"):
+            return True  # +<refspec> is git shorthand for --force on that ref
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+            for ch in tok[1:]:
+                if ch == "o":  # -oVALUE glued push-option — rest is its value
+                    break
+                if ch == "f":
+                    return True
+        i += 1
+    return False
+
+
+def _ask(reason: str) -> int:
+    """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
+
+    Prints the hook JSON to stdout and returns 0; Claude Code shows the user a
+    permission prompt and runs the tool only on explicit approval — a gate the
+    agent cannot self-satisfy. Verified to render in a wrapped child session
+    2026-07-27.
+    """
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    return 0
+
+
+def _pr_create_head_branch(argv: list[str]) -> str | None:
+    """The head branch named by a ``gh pr create`` (``--head``/``-H`` VALUE, or
+    ``--head=VALUE``), stripped of any ``owner:`` prefix. None → gh uses the
+    current branch."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--head", "-H") and i + 1 < len(argv):
+            v = argv[i + 1]
+            return v.split(":", 1)[1] if ":" in v else v
+        if tok.startswith("--head="):
+            v = tok.split("=", 1)[1]
+            return v.split(":", 1)[1] if ":" in v else v
+        i += 1
+    return None
+
+
+def _pr_create_would_publish(argv: list[str]) -> bool:
+    """Whether a ``gh pr create`` might PUSH its branch (bypassing the push gate).
+
+    gh pushes — and can even fork — a branch whose HEAD is not yet on the remote,
+    so a bare create from an unpushed branch publishes code around this hook.
+    Checks the LOCAL remote-tracking ref (no network): the branch's remote ref
+    must exist AND already contain HEAD. Fail-safe — any uncertainty → True (gate).
+    """
+    branch = _pr_create_head_branch(argv) or _current_branch()
+    if not branch:
+        return True  # can't determine the branch → gate
+    remote_ref = f"refs/remotes/origin/{branch}"
+    try:
+        exists = (
+            subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", remote_ref],
+                capture_output=True,
+                timeout=5,
+            ).returncode
+            == 0
+        )
+        if not exists:
+            return True  # branch not on the remote → gh would push it → gate
+        # HEAD already reachable from the remote branch → nothing to push.
+        contained = (
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", "HEAD", remote_ref],
+                capture_output=True,
+                timeout=5,
+            ).returncode
+            == 0
+        )
+        return not contained  # unpushed commits on HEAD → gh may push → gate
+    except Exception:
+        return True  # fail-safe → gate
+
+
 def main() -> int:
     try:
         cmd = field(read_payload(), "command")
@@ -392,26 +629,65 @@ def main() -> int:
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
         merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
 
+        # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
+        # command carrying more than one would collapse into ONE ask/gate
+        # (evaluated only for the first), so approving it would run every push —
+        # and every UNCHECKED merge — behind it. Reject the compound and require
+        # each to be its own separately-gated tool call. (Merges are included so
+        # `gh pr merge 1 --admin && gh pr merge 2 --admin` can't smuggle the
+        # second past the CI/review gates, which only inspect the first segment.
+        # gh pr create is un-gated (#1241) — a review request on already-pushed
+        # code, riding a push's approval — so it is NOT counted here; the
+        # exception where gh itself would push an unpushed branch is handled by
+        # the create arm below.)
+        if len(push_segs) + len(merge_pr_segs) > 1:
+            print(
+                "BLOCKED: multiple publish/merge operations (git push / gh pr "
+                "merge) in one command would share a single gate. Run each as "
+                "its own command so each is gated separately.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # An interactive push defers to a native approve/deny dialog at the END
+        # of main(), so every hard-block below (merge-into-main, the pr-merge
+        # gates, sqlite, --no-verify) still takes precedence — a compound
+        # `git push && git commit --no-verify` blocks, never asks.
+        ask_reason: str | None = None
+
         # ── git push (any branch) ──────────────────────────────────
+        # Interactive → the user approves in a dialog only they can satisfy.
+        # Dispatched/autonomous → hard-denied (no human to ask; real autonomous
+        # delivery goes through the scope-gated server path, not the CC Bash
+        # tool). The old `# review-override` token is dropped for push: the
+        # dialog replaces it, so the agent can no longer self-approve.
         if push_segs:
-            if all(s.override for s in push_segs):
+            # Force push is destructive — hard-block in EVERY session (never a
+            # mere ask). argv-based (via shell_parse) so a quoted `'-f'` or a
+            # `--force-with-lease` cannot evade it into a generic approval prompt.
+            if any(_push_is_force(s.argv) for s in push_segs):
                 print(
-                    "NOTE: git push override honored — user approved in-session.",
+                    "BLOCKED: Force push is not allowed — open a PR instead.",
                     file=sys.stderr,
                 )
-            else:
-                _remote, branch = _get_push_remote_and_branch(cmd)
+                return 2
+            _remote, branch = _get_push_remote_and_branch(cmd)
+            if _is_dispatched():
                 print(
                     f"BLOCKED: git push requires user approval before "
                     f"publishing code externally (target: {branch or 'default'}).",
                     file=sys.stderr,
                 )
                 print(
-                    "Ask the user 'Ready to push?'; once approved, append a "
-                    "trailing '  # review-override' comment to proceed.",
+                    "Autonomous/dispatched sessions cannot push directly — "
+                    "delivery goes through the scope-gated server path.",
                     file=sys.stderr,
                 )
                 return 2
+            ask_reason = (
+                f"git push needs your approval before publishing externally "
+                f"(target: {branch or 'default'})."
+            )
 
         # ── git merge into main ─────────────────────────────────────
         if merge_git_segs:
@@ -427,24 +703,25 @@ def main() -> int:
                 )
                 return 2
 
-        # ── gh pr create ───────────────────────────────────────────
-        if create_segs:
-            if all(s.override for s in create_segs):
+        # ── gh pr create ────────────────────────────────────────────
+        # Un-gated when its branch is already on the remote — opening a PR is then
+        # just a review request on already-pushed code, so `git push && gh pr
+        # create` prompts once (for the push) and the create rides along. BUT a
+        # bare create from an UNPUSHED branch makes gh push (and possibly fork) the
+        # branch itself — a code-publish that would bypass the push gate — so gate
+        # that form like a push: dispatched → deny, interactive → ask.
+        if create_segs and any(_pr_create_would_publish(s.argv) for s in create_segs):
+            if _is_dispatched():
                 print(
-                    "NOTE: gh pr create override honored — user approved in-session.",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    "BLOCKED: Creating a PR requires user approval before publishing externally.",
-                    file=sys.stderr,
-                )
-                print(
-                    "Ask the user 'Ready to create the PR?'; once approved, "
-                    "append a trailing '  # review-override' comment to proceed.",
+                    "BLOCKED: this gh pr create would push a not-yet-pushed branch; "
+                    "autonomous/dispatched sessions cannot publish code.",
                     file=sys.stderr,
                 )
                 return 2
+            if ask_reason is None:
+                ask_reason = (
+                    "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
+                )
 
         # ── gh pr merge ────────────────────────────────────────────
         if merge_pr_segs:
@@ -494,6 +771,40 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     return 2
+
+                # CI-status gate. On an unprotected default branch,
+                # mergeStateStatus=CLEAN is NOT a CI verdict (it only means "no
+                # conflict / no REQUIRED check blocking", and nothing is required
+                # when the branch is unprotected). So --admin merges would sail
+                # past a red `test` job — exactly how main was broken on
+                # 2026-07-28. Block red/pending CI unless a conscious, separate
+                # `# ci-override` is appended (never waived by --admin or
+                # # review-override). Fail-OPEN on "unknown" so a transient API
+                # hiccup can't wedge merges.
+                ci_state, ci_bad = _pr_ci_status(pr_num)
+                ci_override = has_trailing_override(merge_seg.raw, "ci-override")
+                if ci_state in ("red", "pending") and not ci_override:
+                    print(
+                        f"BLOCKED: PR #{pr_num} CI is {ci_state.upper()} "
+                        f"({', '.join(ci_bad[:6])}).",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"Do NOT merge red/pending CI. Wait for green "
+                        f"(gh pr checks {pr_num}). If these checks are a known, "
+                        "documented pre-existing flake you are consciously "
+                        "accepting, append a trailing '# ci-override' to merge "
+                        "anyway (logged).",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if ci_state in ("red", "pending"):
+                    print(
+                        f"NOTE: CI {ci_state.upper()} on #{pr_num} "
+                        f"({', '.join(ci_bad[:6])}) — merging via # ci-override "
+                        "(consciously accepted).",
+                        file=sys.stderr,
+                    )
 
                 # Check for unresolved review findings
                 force_override = merge_seg.override
@@ -565,6 +876,13 @@ def main() -> int:
                 "Have you received explicit user approval?",
                 file=sys.stderr,
             )
+
+        # ── Interactive push / PR-create approval prompt (deferred) ──
+        # Reached only if no hard-block above returned. Dispatched sessions
+        # were already denied inline; here, an interactive human session gets a
+        # native approve/deny dialog for its push / PR-create.
+        if ask_reason is not None:
+            return _ask(ask_reason)
 
     except Exception:
         pass  # Fail-open on any error — never block legitimate work

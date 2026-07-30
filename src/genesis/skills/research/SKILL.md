@@ -51,4 +51,6 @@ open_questions:
 ## References
 
 - `docs/architecture/genesis-v3-vision.md` — For relevance filtering
-- `docs/architecture/genesis-v3-gap-assessment.md` — Known gaps
+- `docs/architecture/CURRENT.md` — the live subsystem map (what Genesis has
+  today, with freshness stamps); consult before claiming a gap. Enumerate,
+  don't spot-check.

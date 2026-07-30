@@ -9,7 +9,7 @@ Focus (post-#1227 hardening):
   when buried in the commit message (where it would leak into public history).
 
 Install-agnostic: builds a throwaway git repo under ``tmp_path`` and points
-``HOME`` at another temp dir, so the real ``~/.genesis/review_state.json`` and
+``HOME`` at another temp dir, so the real per-worktree markers under ``~/.genesis/review_markers/`` and
 any concurrent session's markers are never touched. No network, no live server.
 """
 
@@ -26,6 +26,7 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOOK = _REPO_ROOT / "scripts" / "review_enforcement_commit.py"
 _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
+_INVALIDATE = _REPO_ROOT / "scripts" / "review_invalidate_on_commit.py"
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -235,7 +236,10 @@ def test_mark_succeeds_without_gstack(repo: Path, home: Path) -> None:
     res = _mark(repo, home)
     assert res.returncode == 0, res.stderr
     assert "Review marker written" in res.stdout
-    marker = json.loads((home / ".genesis" / "review_state.json").read_text())
+    # Marker is per-worktree under review_markers/<key>.json (exactly one here).
+    markers = list((home / ".genesis" / "review_markers").glob("*.json"))
+    assert len(markers) == 1
+    marker = json.loads(markers[0].read_text())
     assert "authoritative" in marker["review_evidence"]  # advisory annotation
 
 
@@ -265,3 +269,100 @@ def test_commit_allowed_after_marking(repo: Path, home: Path) -> None:
     assert _mark(repo, home).returncode == 0
     res = _run_hook('git commit -m "wip"', repo, home)
     assert res.returncode == 0, res.stderr
+
+
+# ── Per-worktree marker isolation (concurrent-session clobber fix) ────────
+
+
+def _second_repo(tmp_path: Path, name: str) -> Path:
+    """A distinct git worktree root on its own feature branch, staged."""
+    r = tmp_path / name
+    r.mkdir()
+    _git(r, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(r, "config", "user.email", "t@e.st")
+    _git(r, "config", "user.name", "tester")
+    (r / "g.txt").write_text("base\n")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "base")
+    _git(r, "checkout", "-q", "-b", "feature/y")
+    (r / "g.txt").write_text("changed\n")
+    _git(r, "add", "-A")
+    return r
+
+
+def test_reviewed_commit_allowed(repo: Path, home: Path) -> None:
+    """Baseline: after marking, the commit passes the gate (no override)."""
+    assert _mark(repo, home).returncode == 0
+    res = _run_hook('git commit -m "reviewed"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+def test_marker_not_clobbered_by_concurrent_worktree(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    """A concurrent session marking a DIFFERENT worktree (same shared HOME)
+    must not reset this worktree's marker — the global-file clobber bug."""
+    repo_b = _second_repo(tmp_path, "repo_b")
+    assert _mark(repo, home).returncode == 0  # our worktree reviewed
+    assert _mark(repo_b, home).returncode == 0  # concurrent session marks its own
+    # Our commit must STILL be allowed — B's mark did not touch A's marker.
+    res = _run_hook('git commit -m "reviewed"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+def test_distinct_worktrees_get_distinct_markers(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    repo_b = _second_repo(tmp_path, "repo_b2")
+    assert _mark(repo, home).returncode == 0
+    assert _mark(repo_b, home).returncode == 0
+    markers = list((home / ".genesis" / "review_markers").glob("*.json"))
+    assert len(markers) == 2, [m.name for m in markers]
+
+
+def _run_invalidate(command: str, repo: Path, home: Path) -> subprocess.CompletedProcess:
+    """Run the PostToolUse invalidation hook for a successful commit."""
+    payload = json.dumps(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {"stdout": "[feature/x abc1234] msg", "stderr": ""},
+            "session_id": "test",
+        }
+    )
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run(
+        [sys.executable, str(_INVALIDATE)],
+        input=payload, cwd=str(repo), env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def _markers(home: Path) -> list[Path]:
+    return list((home / ".genesis" / "review_markers").glob("*.json"))
+
+
+def test_commit_invalidates_per_worktree_marker(repo: Path, home: Path) -> None:
+    """After a commit, the per-worktree marker is cleared so the NEXT commit
+    needs a fresh review. Regression for the BLOCKER: the invalidation hook must
+    delete the per-worktree marker, not the retired global file (else one review
+    silently authorizes every subsequent git-add+commit for the marker's TTL)."""
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1  # marker written
+
+    # Simulate CC firing the PostToolUse invalidation hook after the commit.
+    _run_invalidate("git commit -m done", repo, home)
+    assert _markers(home) == [], "per-worktree marker was not cleared after commit"
+
+    # The next commit must be blocked again (no valid marker).
+    res = _run_hook('git commit -m "again"', repo, home)
+    assert res.returncode == 2
+    assert "without review" in res.stderr
+
+
+def test_invalidate_ignores_non_commit(repo: Path, home: Path) -> None:
+    """A non-commit command must NOT clear the marker."""
+    assert _mark(repo, home).returncode == 0
+    _run_invalidate("echo not a commit", repo, home)
+    assert len(_markers(home)) == 1  # marker survives

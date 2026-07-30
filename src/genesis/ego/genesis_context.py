@@ -77,6 +77,15 @@ class GenesisEgoContextBuilder:
         # later cycle's context.
         self._focus_id = focus_id
 
+        # Blind drafting: when the reconcile stage is active (shadow/live) the
+        # pending board is withheld from drafting context so the cycle no longer
+        # anchors on (and riffs variations of) already-pending proposals — the
+        # reconcile stage matches drafts to the board afterward instead. off =
+        # today's behavior (board stays in context).
+        from genesis.ego import reconcile_config
+
+        self._blind_drafting = reconcile_config.effective_mode() != "off"
+
         sections: list[str] = []
         sections.append("# GENESIS_EGO_CONTEXT — Operations Briefing\n")
         sections.append(
@@ -108,6 +117,9 @@ class GenesisEgoContextBuilder:
             ("confidence_calibration", self._confidence_calibration_section),
             ("output_contract", self._output_contract_section),
         ]
+
+        if self._blind_drafting:
+            section_map = [(k, m) for k, m in section_map if k != "proposal_board"]
 
         for key, method in section_map:
             depth = weights.get(key, "deep")
@@ -475,38 +487,43 @@ class GenesisEgoContextBuilder:
         (withdrawn/tabled/rejected/failed/expired) so active proposals
         are always visible regardless of withdrawn noise volume.
         """
-        lines = ["## Active Proposals\n"]
+        blind = getattr(self, "_blind_drafting", False)
+        lines: list[str] = []
         table_header = (
             "| Action | Content | Status | Response |\n"
             "|--------|---------|--------|----------|"
         )
 
         try:
-            # Section 1: Active proposals (genesis ego only)
-            cursor = await self._db.execute(
-                "SELECT action_type, content, status, "
-                "user_response, created_at "
-                "FROM ego_proposals "
-                "WHERE created_at >= datetime('now', '-7 days') "
-                "AND status IN ('pending', 'approved', 'executed') "
-                "AND (ego_source = 'genesis_ego_cycle' OR ego_source IS NULL) "
-                "ORDER BY created_at DESC "
-                "LIMIT 15"
-            )
-            active_rows = await cursor.fetchall()
+            # Section 1: Active (pending) proposals — WITHHELD under blind drafting
+            # so the drafting cycle no longer anchors on the pending board. The
+            # Recently Tried learning signal (Section 2) always stays.
+            if not blind:
+                lines.append("## Active Proposals\n")
+                cursor = await self._db.execute(
+                    "SELECT action_type, content, status, "
+                    "user_response, created_at "
+                    "FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-7 days') "
+                    "AND status IN ('pending', 'approved', 'executed') "
+                    "AND (ego_source = 'genesis_ego_cycle' OR ego_source IS NULL) "
+                    "ORDER BY created_at DESC "
+                    "LIMIT 15"
+                )
+                active_rows = await cursor.fetchall()
 
-            if not active_rows:
-                lines.append("*No active proposals.*\n")
-            else:
-                lines.append(table_header)
-                for action_type, content, status, response, _created in active_rows:
-                    short = content[:80] + "..." if len(content) > 80 else content
-                    short = short.replace("\n", " ").replace("|", "/")
-                    resp = (response or "\u2014")[:50]
-                    lines.append(
-                        f"| {action_type} | {short} | {status} | {resp} |"
-                    )
-                lines.append("")
+                if not active_rows:
+                    lines.append("*No active proposals.*\n")
+                else:
+                    lines.append(table_header)
+                    for action_type, content, status, response, _created in active_rows:
+                        short = content[:80] + "..." if len(content) > 80 else content
+                        short = short.replace("\n", " ").replace("|", "/")
+                        resp = (response or "\u2014")[:50]
+                        lines.append(
+                            f"| {action_type} | {short} | {status} | {resp} |"
+                        )
+                    lines.append("")
 
             # Section 2: Recently tried (genesis ego only)
             lines.append("## Recently Tried (do not re-propose)\n")

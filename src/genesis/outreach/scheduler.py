@@ -713,6 +713,21 @@ class OutreachScheduler:
                                 # cap (subtracting naive from aware raises) — treat
                                 # it as UTC, which is how created_at is written.
                                 parsed = parsed.replace(tzinfo=UTC)
+                            # Age the retry cap from when the row became DUE, not
+                            # when it was created — a reminder scheduled far ahead
+                            # (deliver_after) is not "stuck" until its delivery
+                            # time passes, so the cap must not drop it before it
+                            # is ever attempted.
+                            deliver_after_ts = row.get("deliver_after")
+                            if deliver_after_ts:
+                                try:
+                                    _da = datetime.fromisoformat(deliver_after_ts)
+                                    if _da.tzinfo is None:
+                                        _da = _da.replace(tzinfo=UTC)
+                                    if _da > parsed:
+                                        parsed = _da
+                                except (ValueError, TypeError):
+                                    pass
                             age = datetime.now(UTC) - parsed
                         except (ValueError, TypeError):
                             age = None

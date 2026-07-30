@@ -13,7 +13,11 @@ from genesis.cc.types import CCOutput
 from genesis.db.crud import ego as ego_crud
 from genesis.db.schema import TABLES
 from genesis.ego.dispatch import EgoDispatcher
-from genesis.ego.session import EgoSession
+from genesis.ego.session import (
+    EgoSession,
+    _build_reconcile_prompt,
+    _parse_reconcile_response,
+)
 from genesis.ego.signals import EgoSignal
 from genesis.ego.types import EgoConfig
 
@@ -1356,3 +1360,136 @@ class TestOwnGoalReviews:
 
         assert await self._status(goals_db, "og3") == "active"
         ego_session._proposals.create_batch.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# PR-5 reconcile stage (observe-only)
+# ---------------------------------------------------------------------------
+
+
+def _draft(content="investigate the backlog", action_type="investigate") -> dict:
+    return {"action_type": action_type, "content": content}
+
+
+_RECONCILE_JSON = (
+    '[{"index": 0, "verdict": "reaffirm", "target_id": "board123", '
+    '"reason": "already pending on the board"}]'
+)
+
+
+class TestReconcileStageObserve:
+    """PR-5: the reconcile stage runs when mode != off, LOGS verdicts, and
+    applies NOTHING (returns drafts unchanged, board untouched)."""
+
+    async def test_off_mode_skips_cc_call(self, ego_session, mock_invoker, monkeypatch):
+        monkeypatch.setattr("genesis.ego.reconcile_config.effective_mode", lambda: "off")
+        ego_session._source_tag = "genesis_ego_cycle"
+        drafts = [_draft()]
+        out = await ego_session._reconcile_drafts(drafts)
+        assert out == drafts
+        mock_invoker.run.assert_not_called()
+
+    async def test_empty_drafts_noop(self, ego_session, mock_invoker, monkeypatch):
+        monkeypatch.setattr("genesis.ego.reconcile_config.effective_mode", lambda: "shadow")
+        out = await ego_session._reconcile_drafts([])
+        assert out == []
+        mock_invoker.run.assert_not_called()
+
+    async def test_shadow_runs_and_returns_unchanged(
+        self, ego_session, mock_invoker, db, monkeypatch
+    ):
+        monkeypatch.setattr("genesis.ego.reconcile_config.effective_mode", lambda: "shadow")
+        mock_invoker.run.return_value = _cc_output(text=_RECONCILE_JSON)
+        ego_session._source_tag = "genesis_ego_cycle"
+        # A real pending proposal on the board — must be untouched by observe-only.
+        await ego_crud.create_proposal(
+            db, id="board123", action_type="investigate", content="existing",
+            status="pending", ego_source="genesis_ego_cycle",
+        )
+        drafts = [_draft()]
+        out = await ego_session._reconcile_drafts(drafts)
+        assert out == drafts  # applies nothing
+        assert mock_invoker.run.call_count == 1
+        row = await ego_crud.get_proposal(db, "board123")
+        assert row["status"] == "pending"  # not withdrawn/revised
+        assert row["revision_num"] == 1
+        assert ego_session._last_reconcile_cost_usd > 0
+
+    async def test_fail_open_on_cc_error(self, ego_session, mock_invoker, monkeypatch):
+        monkeypatch.setattr("genesis.ego.reconcile_config.effective_mode", lambda: "shadow")
+        mock_invoker.run.return_value = _cc_output(is_error=True)
+        ego_session._source_tag = "genesis_ego_cycle"
+        drafts = [_draft()]
+        out = await ego_session._reconcile_drafts(drafts)
+        assert out == drafts
+
+    async def test_fail_open_on_cc_raise(self, ego_session, mock_invoker, monkeypatch):
+        monkeypatch.setattr("genesis.ego.reconcile_config.effective_mode", lambda: "shadow")
+        mock_invoker.run.side_effect = TimeoutError("CC timed out")
+        ego_session._source_tag = "genesis_ego_cycle"
+        drafts = [_draft()]
+        out = await ego_session._reconcile_drafts(drafts)
+        assert out == drafts
+
+    async def test_covered_work_fail_soft_when_tables_absent(self, ego_session):
+        # The test db has no user_jobs/job_health/repo_pulse_annotations tables.
+        snap = await ego_session._gather_covered_work()
+        assert snap == {"jobs": [], "stale_jobs": [], "merged_prs": []}
+
+
+class TestReconcileParsing:
+    def test_valid_array(self):
+        r = _parse_reconcile_response(_RECONCILE_JSON, 1)
+        assert r[0]["verdict"] == "reaffirm"
+        assert r[0]["target_id"] == "board123"
+
+    def test_code_fence(self):
+        text = "```json\n" + _RECONCILE_JSON + "\n```"
+        assert _parse_reconcile_response(text, 1)[0]["verdict"] == "reaffirm"
+
+    def test_bracket_extraction(self):
+        text = "Here you go:\n" + _RECONCILE_JSON + "\nDone."
+        assert _parse_reconcile_response(text, 1)[0]["verdict"] == "reaffirm"
+
+    def test_empty_and_garbage(self):
+        assert _parse_reconcile_response("", 1) == {}
+        assert _parse_reconcile_response("   ", 1) == {}
+        assert _parse_reconcile_response("not json", 1) == {}
+
+    def test_out_of_range_index_dropped(self):
+        assert _parse_reconcile_response('[{"index": 5, "verdict": "new"}]', 1) == {}
+
+    def test_invalid_verdict_coerced_to_new(self):
+        r = _parse_reconcile_response('[{"index": 0, "verdict": "explode"}]', 1)
+        assert r[0]["verdict"] == "new"
+
+    def test_null_target_id(self):
+        r = _parse_reconcile_response('[{"index": 0, "verdict": "new", "target_id": null}]', 1)
+        assert r[0]["target_id"] is None
+
+
+class TestReconcilePrompt:
+    def test_renders_drafts_board_and_covered_work(self):
+        drafts = [_draft(content="UNIQUE_DRAFT_TEXT")]
+        board = [{"id": "b1abcdef", "action_type": "outreach", "content": "BOARD_ITEM", "revision_num": 1}]
+        covered = {
+            "jobs": [{"title": "WEEKLY_JOB", "status": "ok", "last_run": "2026-07-20"}],
+            "stale_jobs": [{"job_name": "STALE_JOB", "gap_days": 4.2}],
+            "merged_prs": [{"pr_number": 42, "pr_title": "MERGED_PR", "item_text": "closed thing"}],
+        }
+        p = _build_reconcile_prompt(drafts, board, covered, ego_source="genesis_ego_cycle")
+        assert "UNIQUE_DRAFT_TEXT" in p
+        assert "BOARD_ITEM" in p
+        assert "WEEKLY_JOB" in p
+        assert "STALE_JOB" in p
+        assert "MERGED_PR" in p
+        assert "operations (COO)" in p
+        # verdict vocabulary present
+        for v in ("new", "reaffirm", "revise", "withdraw"):
+            assert v in p
+
+    def test_empty_board_and_covered_render_placeholders(self):
+        p = _build_reconcile_prompt([_draft()], [], {}, ego_source="user_ego_cycle")
+        assert "(board is empty)" in p
+        assert "(no active jobs)" in p
+        assert "user-facing (CEO)" in p

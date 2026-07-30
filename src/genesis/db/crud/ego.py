@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import aiosqlite
 
@@ -594,6 +595,176 @@ async def resolve_proposal(
     return cursor.rowcount > 0
 
 
+async def reaffirm_proposal(db: aiosqlite.Connection, id: str) -> bool:
+    """Mark a pending proposal validated-as-of-now (reconcile reaffirm verdict).
+
+    Touches only ``last_validated_at``; status/rank/content are unchanged.
+    Returns True if a pending row was updated.
+    """
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET last_validated_at = ? WHERE id = ? AND status = 'pending'",
+        (datetime.now(UTC).isoformat(), id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def insert_proposal_revision(
+    db: aiosqlite.Connection,
+    *,
+    proposal_id: str,
+    revision_num: int,
+    content: str | None,
+    rationale: str | None,
+    confidence: float | None,
+    execution_plan: str | None,
+    expected_outputs: str | None,
+    revised_by: str | None,
+    reason: str | None,
+) -> None:
+    """Append a prior-values snapshot to ego_proposal_revisions.
+
+    Does NOT commit — ``revise_proposal`` commits the audit row and the proposal
+    UPDATE in a single transaction so the guard's rowcount decision and the audit
+    write land together.
+    """
+    await db.execute(
+        """INSERT INTO ego_proposal_revisions
+           (id, proposal_id, revision_num, content, rationale, confidence,
+            execution_plan, expected_outputs, revised_at, revised_by, reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            uuid4().hex,
+            proposal_id,
+            revision_num,
+            content,
+            rationale,
+            confidence,
+            execution_plan,
+            expected_outputs,
+            datetime.now(UTC).isoformat(),
+            revised_by,
+            reason,
+        ),
+    )
+
+
+async def revise_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    expected_revision: int,
+    content: str,
+    rationale: str | None = None,
+    confidence: float | None = None,
+    execution_plan: str | None = None,
+    expected_outputs: str | None = None,
+    revised_by: str | None = None,
+    reason: str | None = None,
+) -> int | None:
+    """Version-revise a PENDING proposal in place (reconcile revise verdict).
+
+    Guard-first, single transaction. The shared SerializedConnection cannot be
+    rolled back, so we never write the audit row before the guard decides:
+
+      1. SELECT the current row (prior values, live revision_num/status).
+      2. Guarded UPDATE ... WHERE id=? AND status='pending' AND revision_num=?
+         — the rowcount is the atomic decision. Bumps revision_num, rewrites the
+         mutable fields, and recomputes content_hash/content_size so the dispatch
+         integrity check stays truthful on the new content.
+      3. Only if rowcount == 1, append the PRIOR values to ego_proposal_revisions
+         (recorded under the superseded revision_num).
+      4. One commit.
+
+    ``action_type`` is immutable (calibration cells + decision_prefix key on it),
+    so it is never in the update set. Returns the new revision_num on success, or
+    None if the guard failed (row concurrently revised/resolved, no longer
+    pending, or absent).
+    """
+    from genesis.ego.integrity import content_hash as _content_hash
+    from genesis.ego.integrity import content_size as _content_size
+
+    cursor = await db.execute(
+        "SELECT content, rationale, confidence, execution_plan, expected_outputs, "
+        "revision_num, status FROM ego_proposals WHERE id = ?",
+        (id,),
+    )
+    prior = await cursor.fetchone()
+    if prior is None:
+        return None
+
+    new_hash = _content_hash(content) if content else None
+    new_size = _content_size(content) if content else 0
+    new_revision = expected_revision + 1
+
+    update = await db.execute(
+        "UPDATE ego_proposals SET content = ?, "
+        "rationale = COALESCE(?, rationale), confidence = COALESCE(?, confidence), "
+        "execution_plan = COALESCE(?, execution_plan), "
+        "expected_outputs = COALESCE(?, expected_outputs), revision_num = ?, "
+        "content_hash = ?, content_size = ?, last_validated_at = ? "
+        "WHERE id = ? AND status = 'pending' AND revision_num = ?",
+        (
+            content,
+            rationale,
+            confidence,
+            execution_plan,
+            expected_outputs,
+            new_revision,
+            new_hash,
+            new_size,
+            datetime.now(UTC).isoformat(),
+            id,
+            expected_revision,
+        ),
+    )
+    if update.rowcount != 1:
+        await db.commit()
+        return None
+
+    await insert_proposal_revision(
+        db,
+        proposal_id=id,
+        revision_num=expected_revision,
+        content=prior["content"],
+        rationale=prior["rationale"],
+        confidence=prior["confidence"],
+        execution_plan=prior["execution_plan"],
+        expected_outputs=prior["expected_outputs"],
+        revised_by=revised_by,
+        reason=reason,
+    )
+    await db.commit()
+    return new_revision
+
+
+async def prune_proposal_revisions(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 45,
+    now: str,
+) -> int:
+    """Delete ego_proposal_revisions audit rows older than *older_than_days*
+    relative to ISO ``now``. Retention for the unbounded revision audit table
+    (the reconcile stage is its first writer, PR-5), wired into disk_hygiene.sh.
+    ``now`` is injected (never wall-clock here) so the cutover is deterministic
+    and testable. No-ops if the table is absent; never creates it. Returns rows
+    deleted.
+    """
+    cursor = await db.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='ego_proposal_revisions'"
+    )
+    if await cursor.fetchone() is None:
+        return 0
+    cutoff = (datetime.fromisoformat(now) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM ego_proposal_revisions WHERE revised_at < ?", (cutoff,)
+    )
+    await db.commit()
+    return cursor.rowcount or 0
+
+
 async def execute_proposal(
     db: aiosqlite.Connection,
     id: str,
@@ -741,12 +912,22 @@ async def table_proposal(
 async def withdraw_proposal(
     db: aiosqlite.Connection,
     id: str,
+    *,
+    user_response: str | None = None,
 ) -> bool:
-    """Move a pending proposal to 'withdrawn' status. Returns True if updated."""
+    """Move a pending proposal to 'withdrawn' status. Returns True if updated.
+
+    ``user_response`` carries withdrawal evidence (e.g. the reconcile stage's
+    premise-invalidation note) and is stored alongside the status change so the
+    board and intervention journal record WHY the proposal was retired. It is
+    applied via COALESCE so an omitted note never clobbers an existing one;
+    existing callers that omit it are unchanged.
+    """
     cursor = await db.execute(
         "UPDATE ego_proposals SET status = 'withdrawn', rank = NULL, "
-        "resolved_at = ? WHERE id = ? AND status = 'pending'",
-        (datetime.now(UTC).isoformat(), id),
+        "resolved_at = ?, user_response = COALESCE(?, user_response) "
+        "WHERE id = ? AND status = 'pending'",
+        (datetime.now(UTC).isoformat(), user_response, id),
     )
     await db.commit()
     return cursor.rowcount > 0

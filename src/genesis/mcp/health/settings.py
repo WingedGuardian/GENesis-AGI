@@ -221,6 +221,35 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every reaper pass
     ),
+    "ego_reconcile": SettingsDomain(
+        name="ego_reconcile",
+        description=(
+            "Ego reconcile stage (PR-5) — master `enabled` + `mode` off/shadow/live, "
+            "plus revision_retention_days. After the ego drafts proposals it matches "
+            "them against the pending board (ego-scoped) + a deterministic covered-work "
+            "snapshot and emits verdicts (new/reaffirm/revise/withdraw). shadow "
+            "(default) logs verdicts and applies nothing (drafting goes blind, the "
+            "realist backstops); live applies verdicts + widens the realist history; "
+            "off disables the stage. Only flip to live once PR-6's resolve-side revision "
+            "guards are wired. Read live each cycle — takes effect next cycle, no restart."
+        ),
+        config_filename="ego_reconcile.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every ego cycle
+    ),
+    "voice_act": SettingsDomain(
+        name="voice_act",
+        description=(
+            "Voice ACT — the s2s model's remember/remind tools. master `enabled` "
+            "+ `mode` off/live. live offers remember(fact) → episodic memory and "
+            "remind(text, when) → scheduled owner reminder; off (default) hides "
+            "the tools and refuses their handlers (ask_genesis recall unaffected). "
+            "Ship dark, arm after live E2E. Read live per tool call — no restart."
+        ),
+        config_filename="voice_act.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every tool call
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -1134,6 +1163,48 @@ def _validate_cc_foreground_reaper(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_ego_reconcile(changes: dict) -> list[str]:
+    """Validate ego reconcile-stage lever changes (see
+    genesis.ego.reconcile_config). Runtime already degrades to shadow on a bad
+    read; this rejects bad WRITES so settings_update reports the error instead of
+    silently persisting e.g. `enabled: "false"` (truthy) or an unknown mode."""
+    from genesis.ego.reconcile_config import INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_voice_act(changes: dict) -> list[str]:
+    """Validate voice-ACT lever changes (see
+    genesis.channels.voice.voice_act_config). Rejects bad WRITES so
+    settings_update reports the error instead of silently persisting e.g.
+    `enabled: "false"` (truthy) or an unknown `mode`."""
+    from genesis.channels.voice.voice_act_config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode" and value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_memory_integrity(changes: dict) -> list[str]:
     """Validate memory-integrity lever changes (see
     genesis.memory.integrity_config). Runtime already fail-safe-coerces at read
@@ -1168,10 +1239,12 @@ def _validate_memory_integrity(changes: dict) -> list[str]:
 
 
 _DOMAIN_VALIDATORS: dict[str, Any] = {
+    "ego_reconcile": _validate_ego_reconcile,
     "memory_integrity": _validate_memory_integrity,
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "cc_foreground_reaper": _validate_cc_foreground_reaper,
+    "voice_act": _validate_voice_act,
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,

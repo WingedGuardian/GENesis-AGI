@@ -132,9 +132,9 @@ def main() -> None:
     if stages_in_same_command:
         # Can't check diff hash (staging hasn't happened yet) — require the
         # marker file to exist and not be expired.
-        rule2_blocks = not has_valid_review_marker()
+        rule2_blocks = not has_valid_review_marker(cwd=cwd)
     else:
-        rule2_blocks = has_code_changes(cwd=cwd) and not is_review_current()
+        rule2_blocks = has_code_changes(cwd=cwd) and not is_review_current(cwd=cwd)
 
     if rule2_blocks:
         # A trailing '# review-override' comment (outside quotes) acknowledges
