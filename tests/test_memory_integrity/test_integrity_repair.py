@@ -293,6 +293,31 @@ async def test_ghost_export_failure_skips_deletion(tmp_path, monkeypatch):
     assert [e["point_id"] for e in lines] == ["g_ok"]
 
 
+async def test_ghost_absent_at_export_time_is_deferred(tmp_path, monkeypatch):
+    """Codex R3: the EMPTY-retrieve path (point vanished between enumeration and
+    export) must ALSO be treated as export-failure — export captures only a null,
+    so deleting/sweeping could still destroy stray content that IS present. Leave
+    it for the next run rather than authorizing the delete."""
+    path = await _db(tmp_path)
+    client = _points({"episodic_memory": {"g_gone": {"created_at": _OLD}}})
+
+    def _empty_retrieve(*, collection_name, ids, **kw):
+        return []  # vanished between scroll and export
+
+    client.retrieve = _empty_retrieve
+
+    result = await _run(path, client, monkeypatch, tmp_path)
+
+    assert result.ghosts_deleted == 0
+    assert result.status == "partial"
+    assert result.details.get("ghost_export_skipped") == 1
+    # export file, if written at all, contains no record for the vanished ghost
+    exports = list((tmp_path / "export").glob("*.jsonl"))
+    if exports:
+        lines = [json.loads(ln) for ln in exports[0].read_text().splitlines()]
+        assert all(e["point_id"] != "g_gone" for e in lines)
+
+
 async def test_ghost_delete_and_sweep_run_under_per_id_lock(tmp_path, monkeypatch):
     """The ghost point-delete + stray-row sweep hold memory_id_lock(pid), so the
     recovery worker (which may hold a 'pending' queue row for this id and takes

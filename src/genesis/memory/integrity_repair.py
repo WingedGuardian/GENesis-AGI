@@ -120,7 +120,14 @@ def _export_ghosts(
             except Exception:
                 logger.warning("reconcile: ghost export retrieve failed for %s", pid, exc_info=True)
                 continue  # not exported → caller leaves it for next run
-            payload = got[0].payload if got else None
+            if not got:
+                # Point vanished between enumeration and export — the export would
+                # capture only a null. Treat as an export failure: do NOT authorize
+                # the delete+sweep (which could still destroy stray FTS/pending
+                # content that IS present). Leave it for the next run.
+                logger.warning("reconcile: ghost %s absent at export time — deferring", pid)
+                continue
+            payload = got[0].payload
             fh.write(
                 json.dumps(
                     {
