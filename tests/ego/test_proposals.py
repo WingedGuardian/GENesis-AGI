@@ -448,6 +448,47 @@ class TestProposalWorkflow:
         row = await ego_crud.get_proposal(db, ids[0])
         assert row["status"] == "rejected"
 
+    async def test_create_batch_stamps_revalidation(self, workflow, db):
+        """create_batch stamps revalidate_at per urgency; last_validated_at=created_at."""
+        from datetime import datetime
+
+        props = [
+            {"action_type": "investigate", "content": "high one", "urgency": "high"},
+            {"action_type": "investigate", "content": "low one", "urgency": "low"},
+            {"action_type": "investigate", "content": "default normal one"},
+        ]
+        batch_id, ids, _ = await workflow.create_batch(props)
+        rows = {
+            r["content"]: r
+            for r in await ego_crud.list_proposals_by_batch(db, batch_id)
+        }
+
+        def _delta_h(row):
+            c = datetime.fromisoformat(row["created_at"])
+            rv = datetime.fromisoformat(row["revalidate_at"])
+            return round((rv - c).total_seconds() / 3600)
+
+        for r in rows.values():
+            assert r["last_validated_at"] == r["created_at"]
+            assert r["revalidate_at"] > r["created_at"]
+
+        # EgoConfig defaults: high=48h, low=168h, normal=72h
+        assert _delta_h(rows["high one"]) == 48
+        assert _delta_h(rows["low one"]) == 168
+        assert _delta_h(rows["default normal one"]) == 72
+
+    async def test_create_proposal_direct_no_revalidation_stays_null(self, db):
+        """Informational path (direct create_proposal) leaves revalidation NULL."""
+        await ego_crud.create_proposal(
+            db,
+            id="info1",
+            action_type="j9_regression",
+            content="eval regression alert",
+        )
+        row = await ego_crud.get_proposal(db, "info1")
+        assert row["revalidate_at"] is None
+        assert row["last_validated_at"] is None
+
 
 class TestValidateBatch:
     """Tests for structural proposal validation."""

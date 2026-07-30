@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
@@ -312,6 +312,16 @@ class ProposalWorkflow:
         batch_id = uuid.uuid4().hex[:16]
         created_at = datetime.now(UTC).isoformat()
 
+        # Revalidation cadence (PR-6a): stamp revalidate_at per urgency so the
+        # reconcile stage can flag proposals whose premises are due for a
+        # re-check. NEVER a kill path — overdue only queues verification
+        # (locked decision #2). Config-derived; degrades to EgoConfig defaults.
+
+        from genesis.ego.config import load_ego_config
+
+        _reval_intervals = load_ego_config().revalidation_interval_hours
+        _created_dt = datetime.fromisoformat(created_at)
+
         # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
         # hallucinated goal_ids from persisting).
         valid_goal_ids: set[str] | None = None
@@ -383,6 +393,10 @@ class ProposalWorkflow:
                 except Exception:
                     logger.warning("Proposal dedup check failed, proceeding", exc_info=True)
 
+            _urg = p.get("urgency", "normal")
+            _reval_hours = _reval_intervals.get(_urg, _reval_intervals.get("normal", 72))
+            _revalidate_at = (_created_dt + timedelta(hours=_reval_hours)).isoformat()
+
             await ego_crud.create_proposal(
                 self._db,
                 id=pid,
@@ -410,6 +424,8 @@ class ProposalWorkflow:
                 expected_outputs=_serialize_expected_outputs(
                     p.get("expected_outputs"),
                 ),
+                revalidate_at=_revalidate_at,
+                last_validated_at=created_at,
             )
             ids.append(pid)
             created_proposals.append(p)

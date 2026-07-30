@@ -441,6 +441,8 @@ async def create_proposal(
     content_size: int | None = None,
     original_content: str | None = None,
     expected_outputs: str | None = None,
+    revalidate_at: str | None = None,
+    last_validated_at: str | None = None,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -452,9 +454,9 @@ async def create_proposal(
             batch_id, created_at, expires_at, rank, execution_plan,
             recurring, memory_basis, realist_verdict, realist_reasoning,
             ego_source, goal_id, content_hash, content_size,
-            original_content, expected_outputs)
+            original_content, expected_outputs, revalidate_at, last_validated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?)""",
+                   ?, ?, ?, ?)""",
         (
             id,
             action_type,
@@ -481,6 +483,8 @@ async def create_proposal(
             content_size,
             original_content,
             expected_outputs,
+            revalidate_at,
+            last_validated_at,
         ),
     )
     await db.commit()
