@@ -452,12 +452,12 @@ def published_feat(tmp_path):
     _git(clone, "config", "user.name", "probe")
     _git(clone, "checkout", "-b", "main")
     (clone / "r.txt").write_text("root\n")
-    _git(clone, "add", "-A")
+    _git(clone, "add", "r.txt")
     _git(clone, "commit", "-m", "root")
     _git(clone, "push", "-u", "origin", "main")
     _git(clone, "checkout", "-b", "feat/x")
     (clone / "a.txt").write_text("hi\n")
-    _git(clone, "add", "-A")
+    _git(clone, "add", "a.txt")
     _git(clone, "commit", "-m", "feat")
     _git(clone, "push", "-u", "origin", "feat/x")
     return str(clone)
@@ -481,7 +481,7 @@ def test_first_push_new_branch_asks(published_feat):
     """A genuinely-first push of a NOT-yet-published branch still asks."""
     _git(published_feat, "checkout", "-b", "feat/y")
     (Path(published_feat) / "b.txt").write_text("y\n")
-    _git(published_feat, "add", "-A")
+    _git(published_feat, "add", "b.txt")
     _git(published_feat, "commit", "-m", "y")
     res = _run_at("git push -u origin feat/y", published_feat)
     assert res.returncode == 0, res.stderr
