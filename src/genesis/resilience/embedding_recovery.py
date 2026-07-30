@@ -89,7 +89,11 @@ class EmbeddingRecoveryWorker:
                     "source": item.get("source") or "embedding_recovery",
                     "source_type": "memory",
                     "tags": tag_list,
-                    "confidence": item.get("confidence") or 0.5,
+                    "confidence": (
+                        item.get("confidence")
+                        if item.get("confidence") is not None
+                        else 0.5
+                    ),
                     "created_at": item.get("created_at", datetime.now(UTC).isoformat()),
                     "retrieved_count": 0,
                     "scope": "external" if collection == "knowledge_base" else "user",
@@ -129,6 +133,34 @@ class EmbeddingRecoveryWorker:
                     source=payload.get("source", ""),
                     source_pipeline=payload.get("source_pipeline", ""),
                 )
+
+                # Fail-closed against a concurrent delete. We pulled `item` from
+                # query_pending BEFORE the (slow, network) embed above; MemoryStore
+                # .delete() cascades removal of this memory's pending_embeddings row
+                # (with metadata + FTS). If that row is gone now, the memory was
+                # deleted mid-embed and upserting would strand a Qdrant-only ghost.
+                # store() writes the pending row and delete() removes it, so a
+                # legitimately in-flight store keeps the row present — this only
+                # fires on a real concurrent delete, right before the write.
+                if not await crud.exists_for_memory(
+                    self._db, memory_id=item["memory_id"]
+                ):
+                    continue
+
+                # Deprecation is re-read HERE, after the embed and immediately
+                # before the write — NOT from the pre-embed `taxo` snapshot. A
+                # _mark_superseded landing during the (slow) embed sets deprecated=1
+                # in SQLite but skips Qdrant (no point yet); stamping from the stale
+                # snapshot would resurface the superseded memory as a live vector.
+                # Mirrors _mark_superseded's Qdrant payload. (A residual read->
+                # upsert micro-window remains — SQLite and Qdrant share no
+                # transaction, so ordering alone cannot close it; drift from this
+                # class surfaces via the memory-integrity ghost/mirror checks.)
+                fresh_meta = await memory_crud.get_taxonomy(self._db, item["memory_id"])
+                if fresh_meta and fresh_meta.get("deprecated"):
+                    payload["deprecated"] = True
+                    if fresh_meta.get("superseded_by"):
+                        payload["merged_into"] = fresh_meta["superseded_by"]
 
                 upsert_point(
                     self._qdrant,

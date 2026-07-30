@@ -78,7 +78,7 @@ async def test_get_taxonomy(db):
     )
     assert await memory.get_taxonomy(db, "tx1") == {
         "wing": "infrastructure", "room": "watchdog",
-        "origin_class": "first_party",
+        "origin_class": "first_party", "deprecated": 0, "superseded_by": None,
     }
     # room/origin_class optional — a wing-only row still resolves
     await memory.create_metadata(
@@ -86,6 +86,7 @@ async def test_get_taxonomy(db):
     )
     assert await memory.get_taxonomy(db, "tx2") == {
         "wing": "memory", "room": None, "origin_class": None,
+        "deprecated": 0, "superseded_by": None,
     }
     assert await memory.get_taxonomy(db, "missing") is None
 

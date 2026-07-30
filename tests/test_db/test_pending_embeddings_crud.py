@@ -288,3 +288,22 @@ class TestResetFailedMirror:
         assert reset == 0
         meta = await memory_crud.get_metadata(db, "orphan-f")
         assert meta["embedding_status"] == "failed"
+
+
+class TestExistsForMemory:
+    @pytest.mark.asyncio
+    async def test_true_then_false_after_delete(self, db):
+        # The recovery worker's fail-closed pre-upsert guard relies on this:
+        # present while queued, absent once delete()'s cascade removes the row.
+        await crud.create(
+            db, id="pe-e", memory_id="mem-e", content="x",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+        assert await crud.exists_for_memory(db, memory_id="mem-e") is True
+        await crud.delete_by_memory(db, memory_id="mem-e")
+        assert await crud.exists_for_memory(db, memory_id="mem-e") is False
+
+    @pytest.mark.asyncio
+    async def test_false_for_unknown(self, db):
+        assert await crud.exists_for_memory(db, memory_id="nope") is False
