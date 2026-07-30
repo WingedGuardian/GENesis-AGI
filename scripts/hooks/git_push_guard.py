@@ -455,68 +455,102 @@ def _ask(reason: str) -> int:
     return 0
 
 
+def _allow(reason: str) -> int:
+    """Emit a PreToolUse ``allow`` decision — auto-approve, no prompt.
+
+    Prints the hook JSON to stdout and returns 0. An ``allow`` decision bypasses
+    Claude Code's own permission prompt, unlike a bare exit-0 (which leaves the
+    command to the normal permission flow — and a non-allow-listed ``gh pr create``
+    would then still prompt). Used ONLY on the verified-safe pr-create path (the
+    branch is already on the remote, or an explicit ``--head`` means gh cannot
+    push), so opening the PR rides on the push's approval instead of demanding its
+    own.
+    """
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    return 0
+
+
 def _pr_create_head_raw(argv: list[str]) -> str | None:
-    """The RAW ``--head``/``-H`` value (``owner:`` prefix intact), or None. An
-    ``owner:branch`` head means gh publishes to a FORK, not origin."""
+    """The RAW ``--head``/``-H`` value (``owner:`` prefix intact), or None.
+
+    Returns the LAST occurrence, mirroring gh's pflag last-value-wins semantics
+    for a repeated string flag — ``--head real --head=`` resolves to ``""`` in gh,
+    so this must too, else a stale earlier value could wrongly look like a real
+    head. ``None`` = no ``--head`` given at all (distinct from an empty value)."""
+    result: str | None = None
     i = 0
     while i < len(argv):
         tok = argv[i]
         if tok in ("--head", "-H") and i + 1 < len(argv):
-            return argv[i + 1]
-        if tok.startswith("--head="):
-            return tok.split("=", 1)[1]
+            result = argv[i + 1]
+        elif tok.startswith("--head="):
+            result = tok.split("=", 1)[1]
         i += 1
-    return None
-
-
-def _pr_create_head_branch(argv: list[str]) -> str | None:
-    """The head branch named by a ``gh pr create`` (``--head``/``-H`` VALUE, or
-    ``--head=VALUE``), stripped of any ``owner:`` prefix. None → gh uses the
-    current branch."""
-    v = _pr_create_head_raw(argv)
-    if v is None:
-        return None
-    return v.split(":", 1)[1] if ":" in v else v
+    return result
 
 
 def _pr_create_would_publish(argv: list[str]) -> bool:
-    """Whether a ``gh pr create`` might PUSH its branch (bypassing the push gate).
+    """Whether a ``gh pr create`` might PUSH/fork its branch (bypassing the push gate).
 
-    gh pushes — and can even fork — a branch whose HEAD is not yet on the remote,
-    so a bare create from an unpushed branch publishes code around this hook.
+    Per the gh manual (``gh pr create --help``): only a create with NO ``--head``
+    can publish — "when the current branch isn't fully pushed to a git remote, a
+    prompt will ask where to push the branch and offer an option to fork ... Use
+    ``--head`` to explicitly skip any forking or pushing behavior." So:
 
-    Compares the LOCAL tip of the branch gh would publish — the ``--head`` branch
-    if given, else the current branch (NOT necessarily ``HEAD``: ``--head`` can
-    name a branch other than the checkout) — against the ACTUAL remote, queried
-    with ``git ls-remote`` rather than the LOCAL remote-tracking ref (which goes
-    stale the moment the remote branch is deleted — a squash-merge auto-delete
-    leaves ``refs/remotes/origin/<branch>`` pointing at a now-gone branch, so a
-    local-ref check would wrongly report "already pushed"). The branch must exist
-    on the remote AND already contain that local tip. Assumes origin's push and
-    fetch destinations coincide (the standard single-remote setup); an
-    ``owner:branch`` cross-fork head is gated outright since it publishes to a
-    fork this check can't see. Fail-safe — any uncertainty (network error,
-    timeout, missing branch, unpushed commits) → True (gate). Bounded by a 10s
-    ls-remote timeout that fits inside the hook's 60s budget; a hung/slow remote
-    fails closed, never open.
+    * A NON-EMPTY, plausibly-LITERAL explicit ``--head`` (local, unpushed, or
+      ``owner:fork``) → gh does NOT push/fork; it references the head ref as-is
+      (erroring if absent) → cannot publish code around this hook → **un-gate**.
+      (gh only takes this skip-push path when its resolved ``HeadBranch != ""``.
+      An EMPTY head — ``--head=`` / ``--head ""``, or a repeated flag whose LAST
+      value is empty — is gh's implicit path, and a value carrying shell-expansion
+      metacharacters (``$VAR`` / ``$(...)`` / backticks) could resolve to empty at
+      runtime and we can't see through it; both are NOT trusted as a real head and
+      fall through to the implicit verification below.)
+    * No ``--head`` (or an empty one) → gh may push the CURRENT branch when it
+      isn't fully on the remote. Verified against the ACTUAL remote with ``git
+      ls-remote`` — not the LOCAL remote-tracking ref, which goes stale the moment
+      a merged branch is deleted (a squash-merge auto-delete leaves
+      refs/remotes/origin/<branch> pointing at a gone branch, so a local-ref check
+      would wrongly report "already pushed"). Accept only the ls-remote line whose
+      ref path is EXACTLY ``refs/heads/<branch>`` (a bare pattern tail-matches
+      namespaced refs).
+
+    Assumes origin's push and fetch destinations coincide (standard single-remote
+    setup). Fail-safe — any uncertainty (network error, timeout, current branch
+    not on the remote, unpushed commits, detached HEAD) → True (gate). The
+    ls-remote call is bounded by a 10s timeout inside the hook's 60s budget; a
+    hung/slow remote fails closed, never open.
     """
     raw_head = _pr_create_head_raw(argv)
-    if raw_head and ":" in raw_head:
-        return True  # owner:branch → gh publishes to a fork, not origin → gate
-    branch = _pr_create_head_branch(argv) or _current_branch()
+    if raw_head and "$" not in raw_head and "`" not in raw_head:
+        # A NON-EMPTY, plausibly-LITERAL --head → gh skips push/fork → un-gate.
+        # An empty head (--head= / --head "") is gh's implicit path; a value with
+        # shell-expansion metacharacters ($VAR / $(...) / `...`) could resolve to
+        # empty (→ implicit push) at runtime and we can't see through it — both
+        # fall through to the live current-branch verification below (fail-safe).
+        return False
+    branch = _current_branch()
     if not branch:
-        return True  # can't determine the branch → gate
+        return True  # detached / unknown current branch → can't verify → gate
     try:
-        # The tip gh would publish is the head BRANCH's local ref, not HEAD —
-        # `--head other` publishes `other` even while another branch is checked out.
-        local_sha = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
         ).stdout.strip()
-        if not local_sha:
-            return True  # not a local branch → can't tell what gh would push → gate
+        if not head_sha:
+            return True  # can't resolve HEAD → gate
         remote = subprocess.run(
             ["git", "ls-remote", "--heads", "origin", branch],
             capture_output=True,
@@ -525,10 +559,6 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
         )
         if remote.returncode != 0:
             return True  # cannot reach/read the remote → gate (fail-safe)
-        # ls-remote's <pattern> is NOT an exact filter — a bare name tail-matches
-        # namespaced refs (pattern `matrix` also matches `refs/heads/ws8/matrix`),
-        # so a differently-namespaced remote branch could hand back the WRONG sha
-        # and under-gate. Accept only a line whose ref path is EXACTLY this branch.
         target_ref = f"refs/heads/{branch}"
         remote_sha = ""
         for ln in remote.stdout.splitlines():
@@ -537,20 +567,21 @@ def _pr_create_would_publish(argv: list[str]) -> bool:
                 remote_sha = parts[0]
                 break
         if not remote_sha:
-            return True  # branch not on the remote → gh would push it → gate
-        if local_sha == remote_sha:
-            return False  # branch tip is exactly the remote tip → nothing to push
-        # Not the tip: un-gate only if the local tip is already contained in the
-        # remote branch (needs the object locally; if absent, is-ancestor → gate).
+            return True  # current branch not on the remote → gh would push it → gate
+        if head_sha == remote_sha:
+            return False  # current branch tip is on the remote → nothing to push
+        # HEAD differs from the remote tip: un-gate only if HEAD is already
+        # contained in the remote branch (needs the object locally; if absent,
+        # is-ancestor fails → gate).
         contained = (
             subprocess.run(
-                ["git", "merge-base", "--is-ancestor", local_sha, remote_sha],
+                ["git", "merge-base", "--is-ancestor", "HEAD", remote_sha],
                 capture_output=True,
                 timeout=5,
             ).returncode
             == 0
         )
-        return not contained  # unpushed commits on the branch → gh may push → gate
+        return not contained  # unpushed commits on HEAD → gh may push → gate
     except Exception:
         return True  # fail-safe → gate
 
@@ -788,6 +819,18 @@ def main() -> int:
         # native approve/deny dialog for its push / PR-create.
         if ask_reason is not None:
             return _ask(ask_reason)
+
+        # A standalone, un-gated `gh pr create` (branch already on the remote, or
+        # an explicit --head that gh won't push): reaching here means nothing
+        # needed approval. Emit an explicit `allow` so CC's OWN permission prompt
+        # doesn't fire for this non-allow-listed command — the un-gate is only
+        # meaningful if it actually suppresses the prompt. (A push in the same
+        # command would have set ask_reason above, so this never overrides a push.)
+        if create_segs:
+            return _allow(
+                "gh pr create cannot publish code here (explicit --head, or current "
+                "branch already on the remote) — no push, so no separate approval"
+            )
 
     except Exception:
         pass  # Fail-open on any error — never block legitimate work

@@ -83,14 +83,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   instead of hard-stopping.** This safety hook used to block the command outright
   with no in-session way through; now Claude Code shows you a native approve/deny
   prompt you confirm with one keystroke — a gate the agent cannot self-satisfy.
-  `gh pr create` is not prompted separately when its branch is already pushed
-  (opening a PR is then just a review request — so `git push && gh pr create`
-  asks once, for the push); a create from an unpushed branch, which gh would
-  push itself, is still gated. That "already pushed?" check queries the live
-  remote, so it isn't fooled by a stale local reference to a since-deleted
-  branch, and any network error just gates. Autonomous/background Genesis
-  sessions stay blocked from pushing directly (their real delivery path is
-  separately gated).
+  `gh pr create` no longer prompts on its own when it can't publish code —
+  opening a PR is then just a review request, so `git push && gh pr create` asks
+  once (for the push) and a standalone create on already-pushed code doesn't
+  prompt at all. Only the one form that can publish — a create with no `--head`
+  from a branch that isn't fully pushed, where gh pushes the branch itself — is
+  gated like a push; any explicit `--head` (which tells gh to skip pushing) is
+  never gated. The "already pushed?" check queries the live remote, so it isn't
+  fooled by a stale local reference to a since-deleted branch, and any network
+  error just gates. Autonomous/background Genesis sessions stay blocked from
+  pushing directly (their real delivery path is separately gated).
   Force pushes stay hard-blocked; branch names that merely contain `-f` (e.g.
   `fix/…-false-positives`) are no longer mistaken for a force-push.
 - **Genesis now keeps its own internal event log from growing without bound.**

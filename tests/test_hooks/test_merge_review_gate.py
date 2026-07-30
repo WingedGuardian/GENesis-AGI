@@ -74,64 +74,95 @@ def _proc(code: int, out: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=code, stdout=out)
 
 
-class TestPrCreateHeadBranch:
-    """_pr_create_head_branch parses --head / -H / --head= (owner: stripped)."""
+class TestPrCreateHeadRaw:
+    """_pr_create_head_raw returns the RAW --head / -H / --head= value (owner:
+    prefix intact), or None. Presence of ANY --head means gh skips push/fork."""
 
     def test_none_when_no_head(self, guard_module):
-        assert guard_module._pr_create_head_branch(["gh", "pr", "create", "--title", "x"]) is None
+        assert guard_module._pr_create_head_raw(["gh", "pr", "create", "--title", "x"]) is None
 
     def test_head_space_value(self, guard_module):
-        assert (
-            guard_module._pr_create_head_branch(["gh", "pr", "create", "--head", "feat"]) == "feat"
-        )
+        assert guard_module._pr_create_head_raw(["gh", "pr", "create", "--head", "feat"]) == "feat"
 
     def test_head_short_flag(self, guard_module):
-        assert guard_module._pr_create_head_branch(["gh", "pr", "create", "-H", "feat"]) == "feat"
+        assert guard_module._pr_create_head_raw(["gh", "pr", "create", "-H", "feat"]) == "feat"
 
     def test_head_equals(self, guard_module):
-        assert guard_module._pr_create_head_branch(["gh", "pr", "create", "--head=feat"]) == "feat"
+        assert guard_module._pr_create_head_raw(["gh", "pr", "create", "--head=feat"]) == "feat"
 
-    def test_head_owner_stripped(self, guard_module):
-        got = guard_module._pr_create_head_branch(["gh", "pr", "create", "--head", "someone:feat"])
-        assert got == "feat"
+    def test_head_owner_kept_raw(self, guard_module):
+        got = guard_module._pr_create_head_raw(["gh", "pr", "create", "--head", "someone:feat"])
+        assert got == "someone:feat"
+
+    def test_last_value_wins(self, guard_module):
+        # gh's pflag applies last-value-wins for a repeated string flag, so the
+        # parser must return the LAST occurrence — not the first.
+        assert (
+            guard_module._pr_create_head_raw(["gh", "pr", "create", "--head", "a", "--head=b"])
+            == "b"
+        )
+        assert (
+            guard_module._pr_create_head_raw(["gh", "pr", "create", "--head", "real", "--head="])
+            == ""
+        )
 
 
 class TestPrCreateWouldPublish:
-    """_pr_create_would_publish gates iff the branch gh would publish is not yet on
-    the remote (gh would push it). It compares the LOCAL tip of that branch — the
-    --head branch, else the current branch (NOT necessarily HEAD) — against the
+    """Only a create with NO --head can publish (gh may push the current branch
+    when it isn't fully on the remote). Any explicit --head makes gh skip
+    push/fork → un-gate, no git touched. The implicit case is verified against the
     ACTUAL remote via git ls-remote (not the stale-prone local tracking ref).
-    subprocess mocked here for determinism. Call order per branch: rev-parse
-    --verify refs/heads/<branch>, ls-remote --heads origin <branch>, then
-    merge-base --is-ancestor <local_sha> <remote_sha>."""
+    subprocess mocked for determinism. Implicit call order: rev-parse HEAD,
+    ls-remote --heads origin <current>, merge-base --is-ancestor HEAD <remote_sha>."""
+
+    def test_explicit_head_never_publishes(self, guard_module):
+        # gh --help: "Use --head to explicitly skip any forking or pushing
+        # behavior." So ANY explicit head un-gates WITHOUT touching git — incl. a
+        # cross-fork owner:branch head (gh can't push to a fork we don't control).
+        for argv in (
+            ["gh", "pr", "create", "--head", "feat"],
+            ["gh", "pr", "create", "-H", "feat"],
+            ["gh", "pr", "create", "--head=feat"],
+            ["gh", "pr", "create", "--head", "alice:feat"],
+        ):
+            with patch.object(guard_module.subprocess, "run", side_effect=AssertionError) as run:
+                assert guard_module._pr_create_would_publish(argv) is False
+            assert run.call_count == 0  # short-circuits before any git call
+
+    def test_untrusted_head_falls_through_to_gate(self, guard_module):
+        # Regression (both reviewers): a head that gh would treat as EMPTY, or one
+        # we can't verify statically, must NOT un-gate — it falls through to the
+        # implicit current-branch push path. Covered:
+        #   - literal empty (`--head=` / `--head ""`) → gh's HeadBranch == "";
+        #   - repeated flag, LAST value empty → gh's last-wins → "";
+        #   - shell-expansion value (`$BRANCH` / `$(...)` / backtick) → may resolve
+        #     empty at runtime, unseeable here.
+        # With the current branch unknown, each falls through and GATES (not un-gate).
+        for argv in (
+            ["gh", "pr", "create", "--head="],
+            ["gh", "pr", "create", "--head", ""],
+            ["gh", "pr", "create", "--head", "real", "--head="],  # last-value-wins
+            ["gh", "pr", "create", "--head", "$BRANCH"],  # shell variable
+            ["gh", "pr", "create", "--head", "$(git rev-parse --abbrev-ref HEAD)"],
+            ["gh", "pr", "create", "--head", "`echo x`"],  # backtick substitution
+        ):
+            with patch.object(guard_module, "_current_branch", return_value=None):
+                assert guard_module._pr_create_would_publish(argv) is True, argv
 
     def test_no_branch_gates(self, guard_module):
         with patch.object(guard_module, "_current_branch", return_value=None):
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
 
-    def test_cross_fork_owner_head_gates(self, guard_module):
-        # --head owner:branch → gh publishes to a FORK, not origin. We can't verify
-        # a fork's state here, so gate outright — BEFORE any git subprocess runs.
-        with patch.object(guard_module.subprocess, "run", side_effect=AssertionError) as run:
-            assert (
-                guard_module._pr_create_would_publish(
-                    ["gh", "pr", "create", "--head", "alice:feature"]
-                )
-                is True
-            )
-        assert run.call_count == 0  # short-circuits before touching git
-
-    def test_local_branch_missing_gates(self, guard_module):
-        # rev-parse of the head branch fails (not a local branch) → can't tell what
-        # gh would publish → gate.
+    def test_empty_head_sha_gates(self, guard_module):
+        # rev-parse HEAD empty (unborn / odd state) → can't resolve → gate.
         with (
             patch.object(guard_module, "_current_branch", return_value="feat"),
-            patch.object(guard_module.subprocess, "run", side_effect=[_proc(1, "")]),
+            patch.object(guard_module.subprocess, "run", side_effect=[_proc(0, "")]),
         ):
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
 
-    def test_remote_branch_absent_gates(self, guard_module):
-        # local branch exists; ls-remote returns NO ref line → branch not on remote → gate.
+    def test_current_branch_absent_on_remote_gates(self, guard_module):
+        # ls-remote returns NO matching ref → current branch not pushed → gate.
         with (
             patch.object(guard_module, "_current_branch", return_value="feat"),
             patch.object(
@@ -165,15 +196,15 @@ class TestPrCreateWouldPublish:
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
 
     def test_namespaced_ref_mismatch_gates(self, guard_module):
-        # ls-remote pattern-matches tail components: querying short name "matrix"
-        # can return `refs/heads/ws8/matrix` (a DIFFERENT branch). That line's ref
-        # path != refs/heads/matrix, so it must NOT be accepted → gate (no under-block).
+        # ls-remote pattern-matches tail components: querying short name "feat"
+        # can return `refs/heads/ws8/feat` (a DIFFERENT branch). That line's ref
+        # path != refs/heads/feat, so it must NOT be accepted → gate (no under-block).
         with (
-            patch.object(guard_module, "_current_branch", return_value="matrix"),
+            patch.object(guard_module, "_current_branch", return_value="feat"),
             patch.object(
                 guard_module.subprocess,
                 "run",
-                side_effect=[_proc(0, "L1"), _proc(0, "aaa111\trefs/heads/ws8/matrix")],
+                side_effect=[_proc(0, "H1"), _proc(0, "aaa111\trefs/heads/ws8/feat")],
             ),
         ):
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
@@ -181,21 +212,21 @@ class TestPrCreateWouldPublish:
     def test_exact_ref_among_multiple_lines_used(self, guard_module):
         # Several lines returned; only the exact refs/heads/<branch> line is used.
         with (
-            patch.object(guard_module, "_current_branch", return_value="matrix"),
+            patch.object(guard_module, "_current_branch", return_value="feat"),
             patch.object(
                 guard_module.subprocess,
                 "run",
                 side_effect=[
-                    _proc(0, "bbb222"),
-                    _proc(0, "aaa111\trefs/heads/ws8/matrix\nbbb222\trefs/heads/matrix"),
+                    _proc(0, "bbb222\n"),
+                    _proc(0, "aaa111\trefs/heads/ws8/feat\nbbb222\trefs/heads/feat"),
                 ],
             ),
         ):
-            # local tip == the EXACT branch's remote tip (bbb222), not aaa111 → ungate.
+            # HEAD == the EXACT branch's remote tip (bbb222), not aaa111 → ungate.
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is False
 
     def test_head_is_remote_tip_ungated(self, guard_module):
-        # local branch tip == remote tip → nothing to push.
+        # current branch tip (HEAD) == remote tip → nothing to push.
         with (
             patch.object(guard_module, "_current_branch", return_value="feat"),
             patch.object(
@@ -206,8 +237,8 @@ class TestPrCreateWouldPublish:
         ):
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is False
 
-    def test_local_tip_contained_but_not_remote_tip_ungated(self, guard_module):
-        # local tip differs from remote tip but is an ancestor of it (rc=0) → nothing to push.
+    def test_head_contained_but_not_tip_ungated(self, guard_module):
+        # HEAD differs from remote tip but is an ancestor of it (rc=0) → nothing to push.
         with (
             patch.object(guard_module, "_current_branch", return_value="feat"),
             patch.object(
@@ -218,8 +249,8 @@ class TestPrCreateWouldPublish:
         ):
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is False
 
-    def test_local_tip_ahead_of_remote_gates(self, guard_module):
-        # local tip differs and is NOT an ancestor (rc=1) → unpushed commits → gate.
+    def test_head_ahead_of_remote_gates(self, guard_module):
+        # HEAD differs and is NOT an ancestor (rc=1) → unpushed commits → gate.
         with (
             patch.object(guard_module, "_current_branch", return_value="feat"),
             patch.object(
@@ -229,36 +260,6 @@ class TestPrCreateWouldPublish:
             ),
         ):
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
-
-    def test_head_branch_resolved_not_checkout(self, guard_module):
-        # Regression (Codex F1): --head names `feature` while `main` is checked out.
-        # gh publishes `feature`, so we must resolve refs/heads/FEATURE's tip and
-        # compare THAT to the remote — never the current checkout's HEAD. Here the
-        # local `feature` tip (H1) is ahead of origin/feature (H0) → gate, even
-        # though a HEAD-based check on `main` might have matched and under-gated.
-        with (
-            patch.object(guard_module, "_current_branch", return_value="main"),
-            patch.object(
-                guard_module.subprocess,
-                "run",
-                side_effect=[_proc(0, "H1"), _proc(0, "H0\trefs/heads/feature"), _rc(1)],
-            ) as run,
-        ):
-            assert (
-                guard_module._pr_create_would_publish(["gh", "pr", "create", "--head", "feature"])
-                is True
-            )
-        # The LOCAL tip resolved is refs/heads/feature, not HEAD.
-        assert any(
-            c.args[0][:3] == ["git", "rev-parse", "--verify"]
-            and c.args[0][-1] == "refs/heads/feature"
-            for c in run.call_args_list
-        )
-        # ls-remote is queried for the EXPLICIT head branch, not the current one.
-        assert any(
-            "ls-remote" in " ".join(c.args[0]) and c.args[0][-1] == "feature"
-            for c in run.call_args_list
-        )
 
     def test_subprocess_error_fails_safe(self, guard_module):
         with (
