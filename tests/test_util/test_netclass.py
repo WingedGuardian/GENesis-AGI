@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from genesis.util import netclass
@@ -180,3 +182,35 @@ async def test_async_resolver_failure_falls_back_to_wan():
 
 def test_default_classifier_is_singleton():
     assert netclass.default_classifier() is netclass.default_classifier()
+
+
+# ── Bounded resolution (dead resolver must not stall the preflight) ─────
+
+
+@pytest.mark.asyncio
+async def test_async_resolution_bounded_by_timeout_no_cache_is_wan():
+    # A resolver that hangs (dead DNS during an outage) must NOT hang the
+    # preflight — it times out and falls to the conservative WAN verdict.
+    async def _hang(h):
+        await asyncio.sleep(30)
+        return ["192.168.1.10"]
+
+    nc = NetClassifier(async_resolver=_hang, resolve_timeout_s=0.05)
+    assert await nc.classify_host_async("cold.example") == WAN
+
+
+@pytest.mark.asyncio
+async def test_async_resolution_timeout_falls_back_to_last_known_good():
+    state = {"hang": False}
+
+    async def _res(h):
+        if state["hang"]:
+            await asyncio.sleep(30)
+            return []
+        return ["192.168.1.10"]
+
+    # cache_ttl_s=0 forces a re-resolve on the second call.
+    nc = NetClassifier(async_resolver=_res, resolve_timeout_s=0.05, cache_ttl_s=0)
+    assert await nc.classify_host_async("nas.local") == LOCAL  # warm the cache
+    state["hang"] = True
+    assert await nc.classify_host_async("nas.local") == LOCAL  # timeout → LKG

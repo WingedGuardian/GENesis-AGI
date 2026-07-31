@@ -62,6 +62,12 @@ _LOCAL_NETS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
 )
 
 _DEFAULT_CACHE_TTL_S = 300
+# Bound resolution so a hostname endpoint with a cold cache during a DNS outage
+# (the very condition that declares the network OFFLINE) can't stall the CC
+# preflight: a dead resolver's getaddrinfo can otherwise hang for the system
+# resolver's timeout (seconds), defeating the sub-second fail-fast. On timeout we
+# fall through to last-known-good, else the conservative WAN verdict.
+_DEFAULT_RESOLVE_TIMEOUT_S = 1.0
 
 
 def _classify_ip_obj(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
@@ -116,11 +122,13 @@ class NetClassifier:
         clock: Callable[[], float] | None = None,
         resolver: Callable[[str], list[str]] | None = None,
         async_resolver: Callable[[str], object] | None = None,
+        resolve_timeout_s: float = _DEFAULT_RESOLVE_TIMEOUT_S,
     ):
         self._ttl = cache_ttl_s
         self._clock = clock or time.monotonic
         self._resolver = resolver
         self._async_resolver = async_resolver
+        self._resolve_timeout_s = resolve_timeout_s
         # host -> (classification, resolved_at_monotonic)
         self._cache: dict[str, tuple[str, float]] = {}
 
@@ -190,8 +198,14 @@ class NetClassifier:
         if fresh is not None:
             return fresh
         try:
-            addrs = await self._resolve_async(host)
-        except OSError:
+            # Bounded: a dead resolver during an outage must not stall the
+            # preflight. TimeoutError subclasses OSError, so wait_for's timeout
+            # is caught by the same handler as a resolver error.
+            addrs = await asyncio.wait_for(
+                self._resolve_async(host),
+                self._resolve_timeout_s,
+            )
+        except (TimeoutError, OSError):
             lkg = self._last_known_good(host)
             if lkg is not None:
                 return lkg

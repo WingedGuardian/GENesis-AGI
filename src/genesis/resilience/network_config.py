@@ -145,10 +145,17 @@ def sentinel_enabled() -> bool:
 
 
 def effective_parking_mode() -> str:
-    """PR-3 degraded-mode parking lever. Invalid → ``shadow`` (observe only)."""
-    cfg = load_config()
-    if not cfg.get("enabled", True):
+    """PR-3 degraded-mode parking lever. Invalid → ``shadow`` (observe only).
+
+    Honors the sentinel kill switch: if the sentinel is disabled (env
+    ``GENESIS_NETWORK_SENTINEL_DISABLED=1`` OR ``enabled: false``), parking is
+    OFF regardless of a lingering on-disk OFFLINE snapshot — the hard-off switch
+    must immediately stop parking WAN dispatches / cloud surplus, not wait for
+    the stale snapshot to age out.
+    """
+    if not sentinel_enabled():
         return "off"
+    cfg = load_config()
     mode = cfg.get("parking_mode")
     if mode is False:  # YAML-1.1 `parking_mode: off` → boolean False; honor it
         return "off"

@@ -160,3 +160,13 @@ def test_parking_normal_when_timestamp_unparseable(cfg_env, patch_state):
     snap["last_probe_at"] = "not-a-timestamp"
     patch_state(snap)
     assert network_config.parking_decision(now=_NOW) == "normal"
+
+
+def test_kill_switch_forces_parking_off_despite_fresh_offline(cfg_env, patch_state, monkeypatch):
+    # The env kill switch must immediately disable parking even with a fresh
+    # OFFLINE snapshot + parking_mode=live on disk (don't wait for it to age out).
+    _write(cfg_env, "network:\n  enabled: true\n  parking_mode: live\n")
+    patch_state(_snap("OFFLINE", age_s=30))
+    monkeypatch.setenv(network_config._ENV_KILL_SWITCH, "1")
+    assert network_config.effective_parking_mode() == "off"
+    assert network_config.parking_decision(now=_NOW) == "off"

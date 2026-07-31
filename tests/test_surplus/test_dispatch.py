@@ -14,8 +14,9 @@ from unittest.mock import AsyncMock
 
 import genesis.db.crud.observations as observations_mod
 import genesis.db.crud.surplus_tasks as surplus_tasks_mod
+from genesis.resilience import network_config
 from genesis.surplus import dispatch
-from genesis.surplus.types import TaskType
+from genesis.surplus.types import ComputeTier, TaskType
 
 
 class _Task:
@@ -238,16 +239,13 @@ async def test_route_insights_ingests_bookmark_enrichment(monkeypatch):
 
 # ── _filter_tiers_for_network — PR-3 outage awareness ──────────────────
 
-from genesis.resilience import network_config as _network_config  # noqa: E402
-from genesis.surplus.types import ComputeTier as _ComputeTier  # noqa: E402
-
-_CLOUD_AND_LOCAL = [_ComputeTier.FREE_API, _ComputeTier.LOCAL_30B]
-_CLOUD_ONLY = [_ComputeTier.FREE_API]
-_LOCAL_ONLY = [_ComputeTier.LOCAL_30B]
+_CLOUD_AND_LOCAL = [ComputeTier.FREE_API, ComputeTier.LOCAL_30B]
+_CLOUD_ONLY = [ComputeTier.FREE_API]
+_LOCAL_ONLY = [ComputeTier.LOCAL_30B]
 
 
 def _patch_decision(monkeypatch, value):
-    monkeypatch.setattr(_network_config, "parking_decision", lambda now=None: value)
+    monkeypatch.setattr(network_config, "parking_decision", lambda now=None: value)
 
 
 def test_filter_off_unchanged(monkeypatch):
@@ -287,7 +285,7 @@ def test_filter_failsafe_on_error(monkeypatch):
     def _boom(now=None):
         raise RuntimeError("gate broke")
 
-    monkeypatch.setattr(_network_config, "parking_decision", _boom)
+    monkeypatch.setattr(network_config, "parking_decision", _boom)
     assert dispatch._filter_tiers_for_network(list(_CLOUD_AND_LOCAL)) == _CLOUD_AND_LOCAL
 
 
