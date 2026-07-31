@@ -337,6 +337,27 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   and the pre-emit quote gate (a finding must quote its motivating
   file:line or be confidence-capped).
 
+### Review-loop discipline
+
+- **One reviewer at a time — NEVER run two review agents simultaneously.** Run
+  one reviewer (e.g. Codex), apply/verify its findings, then run the next
+  reviewer (e.g. Claude) on the *fixed* code — sequential, never in parallel.
+  The second reviewer should see the improved code, not the same unfixed diff
+  both would otherwise review; parallel also doubles review spend per baseline.
+  (Standing user directive.)
+- **Escalation cap — stop and raise after 3 rounds that each find NEW defects.**
+  A *round* = one review→fix→re-review iteration (local reviewer rounds and
+  cloud-bot re-review rounds count together, per change). If a **4th round still
+  surfaces NEW findings** (3 prior rounds each already fixed *distinct* issues),
+  STOP and raise it to the user before continuing — summarize what each round
+  found and why the surface is wider than scoped, and let the user choose: keep
+  hardening, switch to a robust-by-construction redesign, narrow scope, or shelve.
+  Caveats: **multiple findings in a single pass = one round** (not an escalation);
+  the same defect reappearing (an incomplete prior fix) is a fix-it-properly
+  issue, not an escalation trigger. This complements the enumerate-class-then-lock
+  convergence discipline — the cap is the escalation trigger when the class won't
+  lock within ≤3 rounds.
+
 ## Pre-Commit Gate
 
 Verify before any commit:
