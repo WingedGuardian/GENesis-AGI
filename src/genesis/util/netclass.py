@@ -23,7 +23,7 @@ Design (encode the *principle*, not a hardcoded host list):
 LAN set (RFC-grounded, so it generalizes to any install):
 loopback (127/8, ::1), RFC1918 (10/8, 172.16/12, 192.168/16),
 CGNAT / Tailscale (100.64/10), link-local (169.254/16, fe80::/10),
-IPv6 ULA (fc00::/7 — covers Tailscale's fd7a:… mesh addresses).
+IPv6 ULA (fc00::/7 — covers Tailscale-style mesh addresses).
 
 Async note: in-loop callers MUST use the ``*_async`` variants — they resolve via
 ``loop.getaddrinfo`` so a slow/dead resolver never blocks the event loop (a bare
