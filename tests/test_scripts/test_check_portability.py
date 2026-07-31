@@ -41,8 +41,8 @@ def _run(repo: Path) -> subprocess.CompletedProcess:
         "172.31.255.1",  # RFC1918 class B upper bound
         "100.64.0.1",  # Tailscale CGNAT lower bound
         "100.127.9.9",  # Tailscale CGNAT upper bound
-        "fd42:abcd::1",  # IPv6 ULA (container prefix shape)
-        "fd7a:115c::1",  # IPv6 ULA (Tailscale prefix shape)
+        "fdcc:abcd::1",  # IPv6 ULA (generic fc00::/7 class)
+        "fddd:115c::1",  # IPv6 ULA (generic fc00::/7 class)
     ],
 )
 def test_flags_private_address_classes(tmp_path, leak):

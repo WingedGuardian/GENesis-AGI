@@ -234,8 +234,8 @@ class TestBroaderNormalization:
 
     def test_ip_addresses_preserved(self):
         from genesis.learning.observation_writer import _normalize_for_dedup
-        a = _normalize_for_dedup("host 10.176.34.199")
-        b = _normalize_for_dedup("host 10.176.34.200")
+        a = _normalize_for_dedup("host 10.0.0.1")
+        b = _normalize_for_dedup("host 10.0.0.2")
         assert a != b
 
     def test_iso_timestamps_preserved(self):

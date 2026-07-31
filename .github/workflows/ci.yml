@@ -186,6 +186,53 @@ jobs:
           bash scripts/check_portability.sh
           echo "Portability scan (address classes): CLEAN"
 
+      - name: Install-IP scan (tests included)
+        # The gitleaks + portability scans above allowlist/exclude tests/, so a
+        # real install IP in a TEST fixture (network-topology disclosure) ships
+        # green. This step closes that blind spot: it scans the WHOLE tree —
+        # tests included — for THIS install's real network identifiers, with a
+        # small STABLE exclude for SCANNER-DEFINITION files that embed these
+        # patterns as data (sanitize.py, .gitleaks.toml, commit-msg,
+        # check_portability.sh, netclass.py, this file's PR-desc scan).
+        # Pattern set is deliberately the SAME install identifiers already
+        # public in this file's PR-description scan (below) — this step adds NO
+        # new real identifier to public content. The install's more-specific
+        # container / host / Tailscale-v4 prefixes are intentionally NOT scanned
+        # here: naming them would be a NEW public disclosure, they fall in the
+        # same class as the IPv6 prefix already covered, and the deferred
+        # sanitizer-genericization follow-up closes the whole class via generic
+        # patterns + a local overlay. The values this PR actually remediates are
+        # covered below.
+        run: |
+          set -euo pipefail
+          raw=$(
+            rg -n --hidden \
+              --glob '!**/.git/**' \
+              --glob '!**/src/genesis/contribution/sanitize.py' \
+              --glob '!**/src/genesis/util/netclass.py' \
+              --glob '!**/scripts/check_portability.sh' \
+              --glob '!**/scripts/hooks/commit-msg' \
+              --glob '!**/.gitleaks.toml' \
+              --glob '!**/.github/workflows/ci.yml' \
+              -e '10\.176\.[0-9]' \
+              -e '192\.168\.50\.[0-9]' \
+              -e '\bfd7a:[0-9a-f:]' \
+              -e '\b(zorror|assistant1)\b' \
+              . 2>/dev/null || true
+          )
+          # The sanitizer's own test MUST embed install-shaped inputs to verify
+          # redaction, so it is NOT excluded wholesale (a real host reintroduced
+          # there would then be invisible — Codex P1 on #1267). Instead allowlist
+          # only its KNOWN generic placeholder VALUES; a newly-added real host is
+          # not in this list and is still flagged.
+          hits=$(printf '%s' "$raw" | grep -vE 'tests/test_contribution/test_sanitize\.py:[0-9]+:.*(10\.176\.0\.[01]|fd7a::1)' || true)
+          if [[ -n "$hits" ]]; then
+            echo "::error::Install-specific network identifiers found (tests/ included):"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "Install-IP scan (tests included): CLEAN"
+
       - name: Email scan
         run: |
           set -euo pipefail
