@@ -660,3 +660,41 @@ def test_push_default_remote_triangular_asks(published_feat, tmp_path):
     res = _run_at("git push", published_feat)
     assert res.returncode == 0, res.stderr
     assert _decision(res) == "ask"
+
+
+# ── REGRESSION (cloud Codex P1s): the re-push auto-allow must be DEFERRED past all
+# hard-blocks; mirror config and receive-pack/exec must not be auto-allowed. ──
+
+
+def test_republish_then_no_verify_hard_blocks(published_feat):
+    """P1: a compound `git push <republish> && git commit --no-verify` must still
+    HARD-BLOCK (exit 2). The re-push auto-allow is deferred to the tail, so the
+    --no-verify hard-block takes precedence — the allow must NOT short-circuit it."""
+    res = _run_at("git push origin feat/x && git commit --no-verify -m x", published_feat)
+    assert res.returncode == 2
+    assert _decision(res) is None
+    assert "no-verify" in res.stderr
+
+
+def test_mirror_config_asks(published_feat):
+    """P1: `remote.origin.mirror=true` makes a bare push mirror ALL refs
+    (force-update/delete) — must ASK, never auto-allow as a re-push."""
+    _git(published_feat, "config", "remote.origin.mirror", "true")
+    res = _run_at("git push origin", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_receive_pack_flag_asks(published_feat):
+    """P1: `--receive-pack=<program>` selects an executed receive-pack program (an
+    arbitrary-code vector on local/SSH) — must ASK, not auto-allow."""
+    res = _run_at("git push --receive-pack=/tmp/helper origin feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_exec_flag_asks(published_feat):
+    """`--exec=<program>` is the alias of --receive-pack → same arbitrary-code vector → ASK."""
+    res = _run_at("git push --exec=/tmp/helper origin feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"

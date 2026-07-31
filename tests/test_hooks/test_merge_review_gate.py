@@ -535,6 +535,15 @@ class TestPushConfigIsSimple:
         ):
             assert guard_module._push_config_is_simple("origin") is False
 
+    def test_mirror_true_not_simple(self, guard_module):
+        # P1: remote.<remote>.mirror=true → a bare push mirrors ALL refs → not simple.
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"remote.origin.mirror": (0, "true")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
     def test_submodule_recurse_true_not_simple(self, guard_module):
         with patch.object(
             guard_module.subprocess,
@@ -618,6 +627,14 @@ class TestPushTargetsCurrentBranch:
 
     def test_follow_tags_false(self, guard_module):
         assert self._t(guard_module, "git push --follow-tags origin", "feat") is False
+
+    def test_receive_pack_flag_false(self, guard_module):
+        # P1: --receive-pack/--exec select an EXECUTED program → not a plain re-push.
+        assert self._t(guard_module, "git push --receive-pack=/x origin feat", "feat") is False
+        assert self._t(guard_module, "git push --receive-pack /x origin feat", "feat") is False
+
+    def test_exec_flag_false(self, guard_module):
+        assert self._t(guard_module, "git push --exec=/x origin feat", "feat") is False
 
     def test_bundled_delete_false(self, guard_module):
         # -ud / -du / -qd all carry `d` (delete) → rejected by the short-letter scan.

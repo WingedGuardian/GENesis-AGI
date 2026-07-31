@@ -669,9 +669,11 @@ _PUSH_SAFE_LONG_FLAGS = frozenset(
         "--no-thin",
     }
 )
-# Ref-neutral value flags (skip the flag AND its value token). ``--repo`` is a
-# value flag but broadens/redirects the push, so it is deliberately EXCLUDED.
-_PUSH_SAFE_VALUE_FLAGS = frozenset({"-o", "--push-option", "--receive-pack", "--exec"})
+# Ref-neutral value flags (skip the flag AND its value token). ``--repo`` (redirects
+# the push) and ``--receive-pack``/``--exec`` (select a receive-pack PROGRAM that git
+# EXECUTES on local/SSH transports — an arbitrary-code vector) are deliberately
+# EXCLUDED, so a push carrying any of them falls through to the approval prompt.
+_PUSH_SAFE_VALUE_FLAGS = frozenset({"-o", "--push-option"})
 # Ref-neutral short-flag letters (for bundles like ``-uq``). ``o`` is handled
 # separately (glued push-option value). ``f`` (force) and ``d`` (delete) are absent
 # by design — a bundle containing either is not a plain current-branch update.
@@ -854,6 +856,8 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
 
     Broadening/redirecting knobs checked (each case-insensitive):
       • ``remote.<remote>.push`` refspec (``push = HEAD:main`` → sends HEAD to main);
+      • ``remote.<remote>.mirror`` (a bare push mirrors ALL refs — force-updates /
+        deletes unrelated remote refs);
       • ``push.default`` other than ``simple``/``current`` (``upstream``/``tracking``
         push cur to a differently-named upstream; ``matching`` pushes every
         same-named branch);
@@ -878,6 +882,13 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
         return False
     rc, out = got
     if rc == 0 and out:
+        return False
+    # 1b. remote.<remote>.mirror makes a bare push mirror EVERY ref (force/delete).
+    got = _git_config_get(base, f"remote.{remote}.mirror", as_bool=True)
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out == "true":
         return False
     # 2. push.default must be a same-name mode (unset → simple → safe).
     got = _git_config_get(base, "push.default")
@@ -1313,6 +1324,11 @@ def main() -> int:
         # gates, sqlite, --no-verify) still takes precedence — a compound
         # `git push && git commit --no-verify` blocks, never asks.
         ask_reason: str | None = None
+        # A first-push-only re-push AUTO-ALLOW is ALSO deferred to the END (same
+        # reason): emitting `_allow` inline would short-circuit the whole Bash
+        # invocation before the hard-blocks run, so `git push <republish> && git
+        # commit --no-verify` would sail through. Set the reason here; emit at the tail.
+        push_allow_reason: str | None = None
 
         # ── git push (any branch) ──────────────────────────────────
         # Interactive → the user approves in a dialog only they can satisfy.
@@ -1417,14 +1433,17 @@ def main() -> int:
                     and _push_targets_current_branch(push_segs[0], cur, push_remote, cwd=pcwd)
                     and _push_is_republish(push_remote, cur, pcwd)
                 ):
-                    return _allow(
+                    # Deferred (NOT an inline return) so any hard-block in a compound
+                    # command still takes precedence — see push_allow_reason above.
+                    push_allow_reason = (
                         f"re-push to '{cur}' (already on the remote — approved on "
                         f"its first push); only the first push of a branch/PR prompts."
                     )
-                ask_reason = (
-                    f"git push needs your approval before publishing externally "
-                    f"(target: {branch or 'default'})."
-                )
+                else:
+                    ask_reason = (
+                        f"git push needs your approval before publishing externally "
+                        f"(target: {branch or 'default'})."
+                    )
 
         # ── git merge into main ─────────────────────────────────────
         # Worktree-aware AND compound-aware: EVERY git-merge in the command is
@@ -1625,6 +1644,12 @@ def main() -> int:
         # native approve/deny dialog for its push / PR-create.
         if ask_reason is not None:
             return _ask(ask_reason)
+
+        # A first-push-only re-push auto-allow — emitted ONLY here, after every
+        # hard-block has had its chance to return 2, so a compound
+        # `git push <republish> && git commit --no-verify` still hard-blocks.
+        if push_allow_reason is not None:
+            return _allow(push_allow_reason)
 
         # A standalone, un-gated `gh pr create` (branch already on the remote, or
         # an explicit --head that gh won't push): reaching here means nothing
