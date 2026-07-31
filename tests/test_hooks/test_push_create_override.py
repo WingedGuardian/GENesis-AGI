@@ -28,6 +28,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest  # noqa: F401  (used by fixtures/tests appended below)
+
 _GUARD = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "git_push_guard.py"
 
 
@@ -394,3 +396,305 @@ def test_push_then_no_verify_hard_blocks_not_asks():
     assert res.returncode == 2
     assert _decision(res) is None
     assert "no-verify" in res.stderr
+
+
+# ── First-push-only gate (re-push to an already-published branch is un-gated) ──
+# The load-bearing new behavior gets a REAL local bare remote so the ALLOW path is
+# deterministic in CI (not dependent on the network / real origin). Mirrors
+# git_push_guard.py::_push_is_republish: a branch already on the remote was
+# approved on its first push, so a re-push must not re-prompt; a genuinely-first
+# push (branch absent) still asks; dispatched still hard-denies; force still blocks;
+# push-to-main / cross-name refspec still ask.
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _run_at(command: str, cwd: str, *, dispatched: bool = False) -> subprocess.CompletedProcess:
+    """Run the hook with an explicit payload cwd + matching process cwd (a real repo)."""
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("CLAUDE_TOOL_INPUT", "GENESIS_CC_SESSION")
+    }
+    if dispatched:
+        env["GENESIS_CC_SESSION"] = "1"
+    payload = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": cwd,
+        }
+    )
+    return subprocess.run(
+        [sys.executable, str(_GUARD)],
+        input=payload,
+        env=env,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+
+
+@pytest.fixture()
+def published_feat(tmp_path):
+    """A clone whose branch ``feat/x`` is ALREADY pushed to a local bare remote.
+
+    Returns the clone dir; the checked-out branch is ``feat/x`` (published) with
+    ``main`` also on the remote. No network — purely local git.
+    """
+    remote = tmp_path / "remote.git"
+    clone = tmp_path / "clone"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(tmp_path, "clone", str(remote), str(clone))
+    _git(clone, "config", "user.email", "t@t.local")
+    _git(clone, "config", "user.name", "probe")
+    _git(clone, "checkout", "-b", "main")
+    (clone / "r.txt").write_text("root\n")
+    _git(clone, "add", "r.txt")
+    _git(clone, "commit", "-m", "root")
+    _git(clone, "push", "-u", "origin", "main")
+    _git(clone, "checkout", "-b", "feat/x")
+    (clone / "a.txt").write_text("hi\n")
+    _git(clone, "add", "a.txt")
+    _git(clone, "commit", "-m", "feat")
+    _git(clone, "push", "-u", "origin", "feat/x")
+    return str(clone)
+
+
+def test_republish_bare_push_allows(published_feat):
+    """On feat/x (already on the remote), a bare `git push` re-push → allow, no prompt."""
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "allow"
+
+
+def test_republish_explicit_push_allows(published_feat):
+    """`git push origin feat/x` for an already-published branch → allow."""
+    res = _run_at("git push origin feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "allow"
+
+
+def test_first_push_new_branch_asks(published_feat):
+    """A genuinely-first push of a NOT-yet-published branch still asks."""
+    _git(published_feat, "checkout", "-b", "feat/y")
+    (Path(published_feat) / "b.txt").write_text("y\n")
+    _git(published_feat, "add", "b.txt")
+    _git(published_feat, "commit", "-m", "y")
+    res = _run_at("git push -u origin feat/y", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_dispatched_republish_still_denied(published_feat):
+    """The human-not-agent boundary holds: a dispatched re-push is hard-denied,
+    never silently allowed."""
+    res = _run_at("git push", published_feat, dispatched=True)
+    assert res.returncode == 2
+    assert _decision(res) is None
+
+
+def test_republish_to_main_refspec_asks(published_feat):
+    """`git push origin feat/x:main` (dst=main) must still ask — a push to the
+    default branch never goes silent even though main is on the remote."""
+    res = _run_at("git push origin feat/x:main", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_cross_name_refspec_asks(published_feat):
+    """`git push origin feat/x:other` (dst != current branch) falls through to ask,
+    even if `other` exists on the remote."""
+    _git(published_feat, "branch", "other")
+    _git(published_feat, "push", "origin", "other")
+    res = _run_at("git push origin feat/x:other", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_force_republish_still_blocks(published_feat):
+    """A force re-push of an already-published branch is still HARD-blocked (the
+    force arm runs before the republish check)."""
+    res = _run_at("git push --force origin feat/x", published_feat)
+    assert res.returncode == 2
+    assert _decision(res) is None
+
+
+# ── REGRESSION (reviewer BLOCKER): the -u/--set-upstream parser must not collapse
+# the target branch to the current one and silently allow a genuine first push,
+# a push to main, a remote-branch delete, or a branch-broadening push. ──
+
+
+def test_set_upstream_new_branch_still_asks(published_feat):
+    """On the published `feat/x`, `git push -u origin feat/z` (a NOT-yet-pushed
+    branch) must ASK. The old naive parser ate the `origin` token and made
+    `branch == cur` a tautology, silently allowing this genuine first push."""
+    _git(published_feat, "branch", "feat/z")  # new local branch, unpublished; stay on feat/x
+    res = _run_at("git push -u origin feat/z", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_set_upstream_main_still_asks(published_feat):
+    """`git push -u origin main` while on a published feature branch must ASK — a
+    push to the default branch must never go silent."""
+    res = _run_at("git push -u origin main", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_delete_remote_branch_asks(published_feat):
+    """Deleting the current branch on the remote (`git push origin :feat/x`) is a
+    remote mutation, not a re-push → must ASK."""
+    res = _run_at("git push origin :feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_push_all_branches_asks(published_feat):
+    """`git push --all origin` publishes EVERY local branch — never a plain
+    current-branch re-push → must ASK."""
+    res = _run_at("git push --all origin", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_push_delete_flag_asks(published_feat):
+    """`git push --delete origin feat/x` deletes a remote branch → must ASK."""
+    res = _run_at("git push --delete origin feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+# ── REGRESSION (round-2 review): the allowlist predicate must reject bundled short
+# delete flags, --stdin, and config-broadened bare pushes — each a silent-allow
+# evasion of the first-push-only skip. ──
+
+
+def test_bundled_short_delete_asks(published_feat):
+    """`git push -ud origin feat/x` (= --set-upstream --delete) DELETES the remote
+    branch. A bundled short `d` must be caught by the allowlist's letter scan (like
+    `-uf` is caught as force) → ASK, not a silent destructive delete."""
+    res = _run_at("git push -ud origin feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_stdin_flag_asks(published_feat):
+    """`git push --stdin origin` reads refspecs from stdin (can target main / delete
+    / multiple refs) — not a plain current-branch update → ASK."""
+    res = _run_at("git push --stdin origin", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_config_push_refspec_asks(published_feat):
+    """A configured `remote.origin.push = HEAD:main` redirects a bare `git push
+    origin` to `main`. The effective-config check must catch it → ASK (a push to
+    the default branch must never go silent)."""
+    _git(published_feat, "config", "remote.origin.push", "HEAD:main")
+    res = _run_at("git push origin", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_push_default_matching_asks(published_feat):
+    """`push.default=matching` broadens a bare push to every same-named branch →
+    not a plain current-branch update → ASK."""
+    _git(published_feat, "config", "push.default", "matching")
+    res = _run_at("git push origin", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_safe_flags_still_allow(published_feat):
+    """Ref-neutral flags on an explicit current-branch re-push still ALLOW — the
+    allowlist must not over-prompt the normal `-o ci.skip` / `-uv` forms."""
+    res = _run_at("git push -uv -o ci.skip origin feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "allow"
+
+
+def test_push_default_upstream_asks(published_feat):
+    """REGRESSION (round-3 BLOCKER): with `push.default=upstream` and feat/x tracking
+    origin/main, a bare `git push` publishes feat/x's HEAD to `main`. The config
+    check must catch it → ASK (never a silent push to main)."""
+    _git(published_feat, "branch", "--set-upstream-to=origin/main", "feat/x")
+    _git(published_feat, "config", "push.default", "upstream")
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_push_default_tracking_asks(published_feat):
+    """`push.default=tracking` (deprecated alias of upstream) → same redirect risk → ASK."""
+    _git(published_feat, "branch", "--set-upstream-to=origin/main", "feat/x")
+    _git(published_feat, "config", "push.default", "tracking")
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_push_remote_triangular_asks(published_feat, tmp_path):
+    """REGRESSION (round-4 BLOCKER): a triangular fork workflow — pull from origin,
+    push to a `fork` remote via `branch.<cur>.pushRemote`. feat/x is on origin but
+    NOT on fork, so a bare `git push` is a genuine FIRST push to fork → must ASK.
+    The republish check must target the ACTUAL push remote (fork), not origin."""
+    fork = tmp_path / "fork.git"
+    _git(str(tmp_path), "init", "--bare", str(fork))
+    _git(published_feat, "remote", "add", "fork", str(fork))
+    _git(published_feat, "config", "branch.feat/x.pushRemote", "fork")
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_push_default_remote_triangular_asks(published_feat, tmp_path):
+    """Same via `remote.pushDefault=fork` — bare push goes to fork (unpublished) → ASK."""
+    fork = tmp_path / "fork2.git"
+    _git(str(tmp_path), "init", "--bare", str(fork))
+    _git(published_feat, "remote", "add", "fork2", str(fork))
+    _git(published_feat, "config", "remote.pushDefault", "fork2")
+    res = _run_at("git push", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+# ── REGRESSION (cloud Codex P1s): the re-push auto-allow must be DEFERRED past all
+# hard-blocks; mirror config and receive-pack/exec must not be auto-allowed. ──
+
+
+def test_republish_then_no_verify_hard_blocks(published_feat):
+    """P1: a compound `git push <republish> && git commit --no-verify` must still
+    HARD-BLOCK (exit 2). The re-push auto-allow is deferred to the tail, so the
+    --no-verify hard-block takes precedence — the allow must NOT short-circuit it."""
+    res = _run_at("git push origin feat/x && git commit --no-verify -m x", published_feat)
+    assert res.returncode == 2
+    assert _decision(res) is None
+    assert "no-verify" in res.stderr
+
+
+def test_mirror_config_asks(published_feat):
+    """P1: `remote.origin.mirror=true` makes a bare push mirror ALL refs
+    (force-update/delete) — must ASK, never auto-allow as a re-push."""
+    _git(published_feat, "config", "remote.origin.mirror", "true")
+    res = _run_at("git push origin", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_receive_pack_flag_asks(published_feat):
+    """P1: `--receive-pack=<program>` selects an executed receive-pack program (an
+    arbitrary-code vector on local/SSH) — must ASK, not auto-allow."""
+    res = _run_at("git push --receive-pack=/tmp/helper origin feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"
+
+
+def test_exec_flag_asks(published_feat):
+    """`--exec=<program>` is the alias of --receive-pack → same arbitrary-code vector → ASK."""
+    res = _run_at("git push --exec=/tmp/helper origin feat/x", published_feat)
+    assert res.returncode == 0, res.stderr
+    assert _decision(res) == "ask"

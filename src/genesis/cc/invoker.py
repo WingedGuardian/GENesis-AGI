@@ -18,6 +18,7 @@ from genesis.cc import roster
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
+    CCNetworkOfflineError,
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
@@ -609,6 +610,55 @@ class CCInvoker:
             except Exception:
                 logger.warning("CC status callback failed for %s", status, exc_info=True)
 
+    async def _network_preflight(self, invocation: CCInvocation) -> None:
+        """Fail fast pre-spawn when the network is hard-OFFLINE and WAN-bound.
+
+        PR-3 outage resilience. When the connectivity sentinel reports a fresh
+        OFFLINE state and the parking lever is ``live``, a CC dispatch whose
+        endpoint needs the internet raises :class:`CCNetworkOfflineError` here —
+        *before* the subprocess is spawned — so it fails in well under a second
+        instead of hanging up to ``timeout_s`` (7200s default; 45-55min hangs
+        were observed in the 2026-07-28 outage).
+
+        Fail-safe by construction: the lever off, an absent/stale/NORMAL/DEGRADED
+        snapshot, a LAN endpoint, or any error in the check itself all fall
+        through to a normal dispatch — identical to pre-sentinel behavior. Only
+        the precise (fresh-OFFLINE + live + WAN endpoint) case parks.
+        """
+        # Function-scope imports: cc.invoker is imported very early in runtime
+        # bootstrap; keep the resilience/util deps out of its module-load graph
+        # (cycle-proof, same rationale as surplus/dispatch.py's scoped imports).
+        try:
+            from genesis.resilience import network_config
+            from genesis.util import netclass
+
+            decision = network_config.parking_decision()
+            if decision in ("off", "normal"):
+                return
+            # Fresh OFFLINE (shadow or park). Only WAN endpoints are affected — a
+            # LAN CC peer (native mesh) stays reachable through a WAN outage. The
+            # native ``claude`` endpoint carries no base URL → WAN by rule, so a
+            # true outage correctly parks all CC here (api.anthropic.com is down).
+            endpoint_class = await netclass.default_classifier().classify_url_async(
+                invocation.anthropic_base_url
+            )
+            if endpoint_class != netclass.WAN:
+                return
+            if decision == "shadow":
+                logger.info(
+                    "network preflight: WOULD park WAN CC dispatch "
+                    "(network OFFLINE, shadow mode) — proceeding",
+                )
+                return
+            # decision == "park" (live mode)
+            raise CCNetworkOfflineError(
+                "network is OFFLINE — skipping WAN CC dispatch before subprocess spawn",
+            )
+        except CCNetworkOfflineError:
+            raise
+        except Exception:
+            logger.debug("network preflight check errored — proceeding", exc_info=True)
+
     async def run(self, invocation: CCInvocation) -> CCOutput:
         """Run a dispatched CC session (traced).
 
@@ -619,6 +669,7 @@ class CCInvoker:
         when capture is disabled.
         """
         invocation, roster_model = roster.apply_active(invocation)
+        await self._network_preflight(invocation)
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
@@ -793,6 +844,7 @@ class CCInvoker:
     ) -> CCOutput:
         """Run CC with stream-json output (traced — see run() for span rationale)."""
         invocation, roster_model = roster.apply_active(invocation)
+        await self._network_preflight(invocation)
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,

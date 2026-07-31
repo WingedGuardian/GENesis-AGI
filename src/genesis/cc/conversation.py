@@ -15,6 +15,7 @@ from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
+    CCNetworkOfflineError,
     CCQuotaExhaustedError,
     CCRateLimitError,
     CCTimeoutError,
@@ -750,10 +751,18 @@ class ConversationLoop:
         try:
             output = await self._invoker.run(invocation)
             return output, session
-        except (CCRateLimitError, CCQuotaExhaustedError, CCTimeoutError):
+        except (
+            CCRateLimitError,
+            CCQuotaExhaustedError,
+            CCTimeoutError,
+            CCNetworkOfflineError,
+        ):
             # Rate limits are account-wide, and a timeout is NOT a stale-resume
             # failure — retrying fresh won't help. A timeout retry just burns a
-            # second full window (the 2026-06-30 DM double-timeout). Let the
+            # second full window (the 2026-06-30 DM double-timeout). Likewise a
+            # network-offline preflight (PR-3): the resume session is fine, the
+            # internet is down — DON'T fail the live session as stale-resume and
+            # retry fresh (which would also just re-raise offline). Let the
             # caller's terminal handler deal with it.
             raise
         except CCError:
@@ -791,9 +800,16 @@ class ConversationLoop:
         try:
             output = await self._invoker.run_streaming(invocation, on_event=on_event)
             return output, session
-        except (CCRateLimitError, CCQuotaExhaustedError, CCTimeoutError):
+        except (
+            CCRateLimitError,
+            CCQuotaExhaustedError,
+            CCTimeoutError,
+            CCNetworkOfflineError,
+        ):
             # Account-wide (rate/quota) or a timeout — retrying fresh won't help;
-            # a timeout retry just burns a second full window (2026-06-30 DM).
+            # a timeout retry just burns a second full window (2026-06-30 DM). A
+            # network-offline preflight (PR-3) likewise must NOT fail the live
+            # session as a stale resume — the internet is down, not the session.
             raise
         except CCError:
             if not was_resume:
@@ -947,7 +963,10 @@ class ConversationLoop:
             inv = replace(peer_inv, resume_session_id=sticky["cc_session_id"])
         try:
             return await self._invoke_peer(inv, on_event)
-        except (CCRateLimitError, CCQuotaExhaustedError):
+        except (CCRateLimitError, CCQuotaExhaustedError, CCNetworkOfflineError):
+            # Offline joins the fast-re-raise (same class as CAVEAT A): a dead
+            # network is not a stale peer resume — retrying fresh won't help and
+            # must not mark the sticky peer session stale.
             raise
         except CCError:
             # Don't re-stream: nothing to recover if already fresh, and never retry
