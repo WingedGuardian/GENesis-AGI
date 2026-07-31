@@ -191,8 +191,9 @@ jobs:
         # real install IP in a TEST fixture (network-topology disclosure) ships
         # green. This step closes that blind spot: it scans the WHOLE tree —
         # tests included — for THIS install's real network identifiers, with a
-        # small STABLE exclude for files that legitimately embed these patterns
-        # as data (scanner definitions + the sanitizer's own test fixtures).
+        # small STABLE exclude for SCANNER-DEFINITION files that embed these
+        # patterns as data (sanitize.py, .gitleaks.toml, commit-msg,
+        # check_portability.sh, netclass.py, this file's PR-desc scan).
         # Pattern set is deliberately the SAME install identifiers already
         # public in this file's PR-description scan (below) — this step adds NO
         # new real identifier to public content. The install's more-specific
@@ -204,11 +205,10 @@ jobs:
         # covered below.
         run: |
           set -euo pipefail
-          hits=$(
+          raw=$(
             rg -n --hidden \
               --glob '!**/.git/**' \
               --glob '!**/src/genesis/contribution/sanitize.py' \
-              --glob '!**/tests/test_contribution/test_sanitize.py' \
               --glob '!**/src/genesis/util/netclass.py' \
               --glob '!**/scripts/check_portability.sh' \
               --glob '!**/scripts/hooks/commit-msg' \
@@ -216,10 +216,16 @@ jobs:
               --glob '!**/.github/workflows/ci.yml' \
               -e '10\.176\.[0-9]' \
               -e '192\.168\.50\.[0-9]' \
-              -e '\bfd7a:' \
+              -e '\bfd7a:[0-9a-f:]' \
               -e '\b(zorror|assistant1)\b' \
               . 2>/dev/null || true
           )
+          # The sanitizer's own test MUST embed install-shaped inputs to verify
+          # redaction, so it is NOT excluded wholesale (a real host reintroduced
+          # there would then be invisible — Codex P1 on #1267). Instead allowlist
+          # only its KNOWN generic placeholder VALUES; a newly-added real host is
+          # not in this list and is still flagged.
+          hits=$(printf '%s' "$raw" | grep -vE 'tests/test_contribution/test_sanitize\.py:[0-9]+:.*(10\.176\.0\.[01]|fd7a::1)' || true)
           if [[ -n "$hits" ]]; then
             echo "::error::Install-specific network identifiers found (tests/ included):"
             printf '%s\n' "$hits"

@@ -143,6 +143,56 @@ def _push_remote(cmd: str) -> str | None:
     return None
 
 
+def _effective_cwd(cmd: str, payload_cwd: str | None) -> str | None:
+    """The directory the ``git push`` actually runs in.
+
+    Honors a preceding ``cd <dir>`` segment and a ``git -C <dir>`` on the push
+    itself (either overrides the payload cwd) — so a ``git -C <worktree> push``
+    or ``cd <worktree> && git push`` is scanned against the repo actually being
+    pushed, not the hook's payload cwd. Falls back to ``payload_cwd``.
+    """
+    cwd = payload_cwd
+
+    def _resolve(base: str | None, path: str) -> str:
+        return path if os.path.isabs(path) else (os.path.join(base, path) if base else path)
+
+    for seg in re.split(r"\|\||&&|[;|&]", cmd):
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            continue
+        if not toks:
+            continue
+        # A bare `cd <dir>` changes cwd for the following segments.
+        if toks[0] == "cd" and len(toks) >= 2 and not toks[1].startswith("-"):
+            cwd = _resolve(cwd, toks[1])
+            continue
+        k = 0
+        while k < len(toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[k]):
+            k += 1
+        if k >= len(toks) or toks[k] != "git":
+            continue
+        # Scan the git args for `-C <dir>` and whether the subcommand is push.
+        c_dir: str | None = None
+        m = k + 1
+        while m < len(toks):
+            tok = toks[m]
+            if tok == "-C" and m + 1 < len(toks):
+                c_dir = toks[m + 1]
+                m += 2
+                continue
+            if tok.startswith("-"):
+                if tok in _GIT_GLOBAL_VALUE_OPTS and m + 1 < len(toks):
+                    m += 2
+                    continue
+                m += 1
+                continue
+            if tok == "push":
+                return _resolve(cwd, c_dir) if c_dir else cwd
+            break
+    return cwd
+
+
 def _targets_public_repo(remote: str, cwd: str | None) -> bool:
     """True if the push destination is origin (public), or is unresolvable.
 
@@ -208,7 +258,11 @@ def main() -> None:
         # the chain can never approach the hook's CC timeout (a timeout = block).
         global _deadline
         _deadline = time.monotonic() + _GIT_BUDGET_S
-        cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        payload_cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        # Resolve the repo the push ACTUALLY runs in — honoring `git -C <dir>`
+        # and a preceding `cd <dir>` — so we scan the branch being pushed, not
+        # the payload cwd (Codex P2 on #1267).
+        cwd = _effective_cwd(cmd, payload_cwd)
         if not _targets_public_repo(remote, cwd):
             return  # private-fork / non-origin push — real IPs allowed there
         diff_text = _outgoing_diff(cwd)

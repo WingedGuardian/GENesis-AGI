@@ -155,6 +155,29 @@ def test_git_bails_when_budget_exhausted(monkeypatch):
     assert hook._git(["rev-parse", "HEAD"], None) is None
 
 
+def test_effective_cwd_git_dash_c():
+    # `git -C <dir> push` runs in <dir>, overriding the payload cwd.
+    assert hook._effective_cwd("git -C /wt push -u origin br", "/main") == "/wt"
+
+
+def test_effective_cwd_leading_cd():
+    # `cd <dir> && git push` runs in <dir>.
+    assert hook._effective_cwd("cd /wt && git push origin br", "/main") == "/wt"
+
+
+def test_effective_cwd_git_c_overrides_cd():
+    # `-C` on the push wins over a preceding `cd`.
+    assert hook._effective_cwd("cd /a && git -C /b push", "/main") == "/b"
+
+
+def test_effective_cwd_relative_cd_resolves_against_payload():
+    assert hook._effective_cwd("cd sub && git push", "/base") == "/base/sub"
+
+
+def test_effective_cwd_bare_push_uses_payload():
+    assert hook._effective_cwd("git push origin br", "/main") == "/main"
+
+
 def test_targets_public_repo_normalizes_url(monkeypatch):
     """An explicit-URL push to the same repo as origin but spelled differently
     (``.git`` suffix / trailing slash) still counts as the public repo."""
