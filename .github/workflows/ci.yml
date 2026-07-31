@@ -186,6 +186,47 @@ jobs:
           bash scripts/check_portability.sh
           echo "Portability scan (address classes): CLEAN"
 
+      - name: Install-IP scan (tests included)
+        # The gitleaks + portability scans above allowlist/exclude tests/, so a
+        # real install IP in a TEST fixture (network-topology disclosure) ships
+        # green. This step closes that blind spot: it scans the WHOLE tree —
+        # tests included — for THIS install's real network identifiers, with a
+        # small STABLE exclude for files that legitimately embed these patterns
+        # as data (scanner definitions + the sanitizer's own test fixtures).
+        # Pattern set is deliberately the SAME install identifiers already
+        # public in this file's PR-description scan (below) — this step adds NO
+        # new real identifier to public content. The install's more-specific
+        # container / host / Tailscale-v4 prefixes are intentionally NOT scanned
+        # here: naming them would be a NEW public disclosure, they fall in the
+        # same class as the IPv6 prefix already covered, and the deferred
+        # sanitizer-genericization follow-up closes the whole class via generic
+        # patterns + a local overlay. The values this PR actually remediates are
+        # covered below.
+        run: |
+          set -euo pipefail
+          hits=$(
+            rg -n --hidden \
+              --glob '!**/.git/**' \
+              --glob '!**/src/genesis/contribution/sanitize.py' \
+              --glob '!**/tests/test_contribution/test_sanitize.py' \
+              --glob '!**/src/genesis/util/netclass.py' \
+              --glob '!**/scripts/check_portability.sh' \
+              --glob '!**/scripts/hooks/commit-msg' \
+              --glob '!**/.gitleaks.toml' \
+              --glob '!**/.github/workflows/ci.yml' \
+              -e '10\.176\.[0-9]' \
+              -e '192\.168\.50\.[0-9]' \
+              -e '\bfd7a:' \
+              -e '\b(zorror|assistant1)\b' \
+              . 2>/dev/null || true
+          )
+          if [[ -n "$hits" ]]; then
+            echo "::error::Install-specific network identifiers found (tests/ included):"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "Install-IP scan (tests included): CLEAN"
+
       - name: Email scan
         run: |
           set -euo pipefail
