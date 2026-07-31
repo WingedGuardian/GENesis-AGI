@@ -129,26 +129,36 @@ def _save_session_nudge(session_id: str, skill_name: str) -> None:
 def _score_skill(skill: dict, keywords: list[str]) -> float:
     """Score a skill against prompt keywords. Returns raw match points.
 
-    Name and explicit-keyword hits score 2 points each, description hits 1.
-    Deliberately NOT normalized by prompt keyword count — a long prompt
-    must not dilute a genuine hit below the firing threshold.
+    Scores the CURATED signals only: a whole-word skill-NAME token hit or an
+    explicit frontmatter-KEYWORD hit is worth 2 points each. DESCRIPTION prose
+    is deliberately NOT scored. Free-text descriptions name many tools in
+    passing (an AWS skill's prose mentions "SageMaker", "usage plan",
+    "timeout"), so the old substring match over descriptions surfaced skills
+    on generic words — "plan" inside "usage plan", "out" inside "timeout" —
+    summing two incidental hits to the firing threshold. A term distinctive
+    enough to nudge a skill belongs in that skill's `keywords:` frontmatter,
+    not mined from prose. Matching is whole-word (token membership), so "aws"
+    matches the name "aws-lambda" but not "awesome". Deliberately NOT
+    normalized by prompt length — a long prompt must not dilute a genuine hit
+    below the firing threshold.
     """
     if not keywords:
         return 0.0
 
-    name_lower = skill.get("name", "").lower().replace("-", " ").replace("_", " ")
-    desc_lower = skill.get("description", "").lower()
+    # Whole-word name tokens (hyphens/underscores → spaces, then split).
+    name_tokens = set(
+        skill.get("name", "").lower().replace("-", " ").replace("_", " ").split()
+    )
     skill_kws = {kw.lower() for kw in skill.get("keywords", [])}
 
     matches = 0
     for kw in keywords:
         kw_lower = kw.lower()
-        if kw_lower in name_lower:
-            matches += 2  # Name match weighted 2x
+        if kw_lower in name_tokens:
+            matches += 2  # Whole-word name-token match
         elif kw_lower in skill_kws:
-            matches += 2  # Explicit keyword match weighted 2x
-        elif kw_lower in desc_lower:
-            matches += 1
+            matches += 2  # Explicit frontmatter-keyword match
+        # Description prose intentionally not scored (see docstring).
 
     return float(matches)
 
@@ -160,8 +170,8 @@ def _extract_keywords(prompt: str) -> list[str]:
     stop = {
         "the", "is", "are", "was", "and", "or", "but", "for", "with",
         "this", "that", "can", "you", "how", "what", "when", "where",
-        "why", "not", "let", "use", "need", "want", "please", "just",
-        "some", "make", "get", "also", "then", "into",
+        "why", "not", "let", "lets", "use", "need", "want", "please", "just",
+        "some", "make", "get", "also", "then", "into", "them", "out",
     }
     return [w for w in words if len(w) >= 3 and w not in stop][:12]
 
