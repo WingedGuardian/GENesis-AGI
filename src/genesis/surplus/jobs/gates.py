@@ -155,6 +155,14 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.warning("GC: surplus insights purge failed", exc_info=True)
 
+    # Hard-delete long-discarded surplus insights (bound inert-row accumulation)
+    try:
+        deleted = await surplus_crud.purge_discarded(db, older_than_days=30)
+        if deleted:
+            logger.info("Deleted %d long-discarded surplus insights", deleted)
+    except Exception:
+        logger.warning("GC: surplus discarded purge failed", exc_info=True)
+
     # GC: remove completed/failed pending_embeddings older than 30 days
     try:
         from genesis.db.crud import pending_embeddings as pe_crud

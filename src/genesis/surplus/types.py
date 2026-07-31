@@ -63,8 +63,9 @@ class TaskType(StrEnum):
 #     success = the action ran; they don't target the KB, so all-discard is normal.
 #   - Pipeline intermediates (RESEARCH_QUERY_GEN, PROMPT_REVIEW_CATALOG,
 #     PROMPT_REVIEW_SAMPLE): their output feeds the *next* pipeline step, not the
-#     KB, so intake legitimately discards it. Only the pipeline *terminals*
-#     (ANTICIPATORY_RESEARCH, PROMPT_EFFECTIVENESS_REVIEW) produce KB-bound insight.
+#     KB, so intake legitimately discards it. Of the pipeline *terminals*, only
+#     ANTICIPATORY_RESEARCH is KB-bound; PROMPT_EFFECTIVENESS_REVIEW is first-party
+#     ideation, STAGED not KB-routed (see EPHEMERAL_IDEATION_TASK_TYPES below).
 #   - Monitoring/probe types (INFRASTRUCTURE_MONITOR, CC_MEMORY_STALENESS): a
 #     "nothing noteworthy / all healthy" pass is the EXPECTED good outcome, and
 #     their status content isn't durable knowledge — all-discard isn't a failure.
@@ -107,6 +108,41 @@ INSIGHT_PRODUCING_TASK_TYPES: frozenset[TaskType] = frozenset({
 KB_ROUTING_TASK_TYPES: frozenset[TaskType] = INSIGHT_PRODUCING_TASK_TYPES | {
     TaskType.BOOKMARK_ENRICHMENT,
 }
+
+
+# Task types that produce EPHEMERAL first-party ideation — self-directed
+# brainstorm / unblock / audit output. These are Genesis-authored work-items and
+# system flags, NOT durable external knowledge, so the intake pipeline STAGES
+# them in surplus_insights (ideas-review lifecycle with TTL decay) instead of
+# immortalizing them as knowledge_units. They stay in KB_ROUTING_TASK_TYPES (so
+# dispatch still calls run_intake); run_intake reroutes them to staging by
+# checking is_ephemeral_ideation() on the TRUE task type. EXCLUDES
+# ANTICIPATORY_RESEARCH (genuine web-cited knowledge) and CODE_AUDIT (its own
+# curated FindingsBridge ingestion path — see dispatch.py::_route_insights).
+EPHEMERAL_IDEATION_TASK_TYPES: frozenset[TaskType] = frozenset({
+    TaskType.SELF_UNBLOCK,
+    TaskType.BRAINSTORM_SELF,
+    TaskType.BRAINSTORM_USER,
+    TaskType.META_BRAINSTORM,
+    TaskType.MEMORY_AUDIT,
+    TaskType.PROCEDURE_AUDIT,
+    TaskType.GAP_CLUSTERING,
+    TaskType.WING_AUDIT,
+    TaskType.PROMPT_EFFECTIVENESS_REVIEW,
+})
+
+
+def is_ephemeral_ideation(task_type: str) -> bool:
+    """True if a surplus task-type string is ephemeral first-party ideation.
+
+    Accepts the raw task-type string (e.g. ``"self_unblock"``) as carried on
+    ``ScoredFinding.source_task_type``; unknown/empty strings → False (default
+    to durable routing — never over-shelve on an unrecognised type).
+    """
+    try:
+        return TaskType(task_type) in EPHEMERAL_IDEATION_TASK_TYPES
+    except ValueError:
+        return False
 
 
 class ComputeTier(StrEnum):
