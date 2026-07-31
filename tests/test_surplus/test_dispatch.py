@@ -199,7 +199,8 @@ def _intake_ctx():
 async def _run_route(task_type, monkeypatch):
     run_intake_spy = AsyncMock(
         return_value=_types.SimpleNamespace(
-            findings_count=1, routed_knowledge=1, routed_observation=0, routed_discard=0
+            findings_count=1, routed_knowledge=1, routed_observation=0,
+            routed_discard=0, routed_staging=0, staged_ids=[],
         )
     )
     monkeypatch.setattr(_intake_mod, "run_intake", run_intake_spy)

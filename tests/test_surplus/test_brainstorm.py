@@ -96,12 +96,17 @@ async def test_execute_brainstorm_real_executor_writes_staging(db, queue):
     runner = BrainstormRunner(db, queue, clock=_fixed_clock(), executor=FakeExecutor())
     staging_id = await runner.execute_brainstorm(TaskType.BRAINSTORM_USER, "cooperation")
 
+    # brainstorm_user is ephemeral ideation → run_intake STAGES it in
+    # surplus_insights (content-hashed id), rather than immortalizing it as a
+    # knowledge_unit. The staged row is keyed by content hash, not the returned
+    # tracking id, so verify by content/type rather than get_by_id(staging_id).
     assert staging_id is not None
-    row = await surplus_crud.get_by_id(db, staging_id)
-    assert row is not None
-    assert row["promotion_status"] == "pending"
-    assert row["source_task_type"] == "brainstorm_user"
-    assert row["drive_alignment"] == "cooperation"
+    rows = await surplus_crud.list_pending(db, limit=50)
+    staged = [r for r in rows if "Real insight" in r["content"]]
+    assert staged, "brainstorm output should be staged in surplus_insights"
+    assert staged[0]["promotion_status"] == "pending"
+    assert staged[0]["source_task_type"] == "brainstorm_user"
+    assert staged[0]["drive_alignment"] == "cooperation"
 
 
 async def test_execute_brainstorm_stub_writes_no_log(db, queue):
