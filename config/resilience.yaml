@@ -34,6 +34,11 @@ network:
   enabled: true
   # Degraded-mode parking lever (PR-3): off | shadow | live. Default shadow —
   # observe one real outage before granting parking authority. Invalid → shadow.
+  # PREREQUISITE before flipping to `live`: harden the periodic CC-invoker
+  # consumers (inbox retry budget, autonomy/ego outcome signals, direct_session)
+  # to treat CCNetworkOfflineError as "not attempted" rather than a failure —
+  # otherwise an outage pollutes calibration/retry state. In `shadow` the preflight
+  # never raises, so that class is dormant. See the PR-3b follow-up.
   parking_mode: shadow
   # Restore push-retry lever (PR-4): off | live. Invalid → off.
   backup_push_retry: live
