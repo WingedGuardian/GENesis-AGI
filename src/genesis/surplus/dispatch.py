@@ -171,6 +171,7 @@ async def _route_insights(
             else:
                 try:
                     from genesis.surplus.intake import (
+                        _valid_drive,
                         run_intake,
                         source_for_task_type,
                     )
@@ -180,19 +181,27 @@ async def _route_insights(
                         source=source,
                         source_task_type=str(task.task_type),
                         generating_model=insight.get("generating_model", "unknown"),
+                        drive_alignment=task.drive_alignment,
                         db=sched._db,
                     )
                     logger.info(
-                        "Intake routed %d findings (k=%d, o=%d, d=%d) for task %s",
+                        "Intake routed %d findings (k=%d, o=%d, d=%d, staged=%d) "
+                        "for task %s",
                         intake_stats.findings_count,
                         intake_stats.routed_knowledge,
                         intake_stats.routed_observation,
                         intake_stats.routed_discard,
+                        intake_stats.routed_staging,
                         task.id[:8],
                     )
-                    # Use a synthetic staging_id for tracking
-                    content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
-                    staging_id = f"{task.task_type.value}-{content_hash}"
+                    # Prefer the real staged row id (ideation → surplus_insights)
+                    # so a linked follow-up's result_staging_id resolves; else a
+                    # synthetic tracking id (KB-routed tasks stage no surplus row).
+                    if intake_stats.staged_ids:
+                        staging_id = intake_stats.staged_ids[0]
+                    else:
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                        staging_id = f"{task.task_type.value}-{content_hash}"
                 except Exception:
                     # Fallback: write to surplus_insights staging (old behavior)
                     logger.warning(
@@ -210,7 +219,7 @@ async def _route_insights(
                         content=content,
                         source_task_type=str(task.task_type),
                         generating_model=insight.get("generating_model", "unknown"),
-                        drive_alignment=task.drive_alignment,
+                        drive_alignment=_valid_drive(task.drive_alignment),
                         confidence=insight.get("confidence", 0.0),
                         created_at=now_iso,
                         ttl=ttl,

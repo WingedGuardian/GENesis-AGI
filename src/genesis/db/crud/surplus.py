@@ -168,3 +168,22 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def purge_discarded(db: aiosqlite.Connection, *, older_than_days: int = 30) -> int:
+    """Hard-delete discarded insights older than a cutoff. Returns count deleted.
+
+    Bounds accumulation of inert discarded rows (purge_expired only flips
+    pending→discarded; nothing removed them). Gated on created_at (no discarded_at
+    column) — conservative: a row discarded at its 7d TTL survives ~older_than_days
+    past creation, i.e. slightly longer than the nominal window. Promoted/pending
+    rows are never touched.
+    """
+    cursor = await db.execute(
+        "DELETE FROM surplus_insights WHERE promotion_status = 'discarded' "
+        "AND created_at != '' "
+        "AND datetime(REPLACE(created_at, 'T', ' ')) < datetime('now', ?)",
+        (f"-{older_than_days} days",),
+    )
+    await db.commit()
+    return cursor.rowcount
