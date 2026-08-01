@@ -11,6 +11,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Memory self-healing is now on by default, and deletes survive outages.**
+  Two upgrades complete the memory-repair story: (1) when a memory delete
+  can't finish because the vector store is unreachable, the intent is now
+  recorded as a durable "tombstone" — the nightly repair job re-attempts the
+  delete until it completes, and nothing will rebuild that memory's vector in
+  the meantime; (2) repair is now safe against deletes from every Genesis
+  process (not just the main server), so the nightly reconcile job runs by
+  default (`memory_integrity` mode `active`). Set `mode: passive` in your
+  local overlay for detection-only. Recall also stops surfacing "ghost"
+  leftovers: results whose backing record was deleted are filtered out of
+  vector search and ambient core-facts instead of reappearing until the
+  nightly sweep. (This treats any vector without a metadata record as a
+  ghost — including pre-metadata-era legacy vectors on long-lived installs;
+  those become invisible to semantic recall and are removed by the nightly
+  repair with their contents exported first.)
+
 - **Genesis can now repair memory drift automatically (opt-in).** Building on
   the Memory Integrity checks (which detect drift between the memory database
   and the vector store) and the one-time startup cleanup, a nightly repair job

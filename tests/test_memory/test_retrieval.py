@@ -1245,3 +1245,57 @@ async def test_recall_fires_entity_lane_shadow_on_zero_hits(mock_qdrant, mock_cr
     kw = spy.await_args.kwargs
     assert kw["ranked_lists"] == []
     assert kw["all_ids"] == set()
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_drops_vector_only_ghosts(mock_qdrant, mock_crud, mock_links, _mock_expand):
+    """A vector-only candidate with no memory_metadata row is a deleted
+    memory's leftover point — dropped before assembly. A candidate that also
+    has an FTS hit is never even checked (legacy fail-open preserved)."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit("mem-live", 0.95),
+        _make_qdrant_hit("mem-ghost", 0.90),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[_make_fts_row("mem-live", -5.0)])
+    _setup_link_mocks(mock_links)
+
+    with patch(
+        "genesis.memory.retrieval.metadata_missing_ids",
+        new_callable=AsyncMock,
+        return_value={"mem-ghost"},
+    ) as mock_missing:
+        results = await retriever.recall("test query", limit=5)
+
+    # Only the vector-only candidate was checked (mem-live has an FTS hit).
+    checked = mock_missing.call_args.args[-1]
+    assert checked == {"mem-ghost"}
+    assert [r.memory_id for r in results] == ["mem-live"]
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_ghost_filter_failure_degrades_open(
+    mock_qdrant, mock_crud, mock_links, _mock_expand,
+):
+    """A raising ghost lookup degrades to 'no ghost filter applied'."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.95)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    _setup_link_mocks(mock_links)
+
+    with patch(
+        "genesis.memory.retrieval.metadata_missing_ids",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("db locked"),
+    ):
+        results = await retriever.recall("test query", limit=5)
+
+    assert [r.memory_id for r in results] == ["mem-1"]

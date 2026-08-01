@@ -154,6 +154,24 @@ class EmbeddingRecoveryWorker:
                     ):
                         continue
 
+                    # A DEFERRED delete (Qdrant was down) leaves metadata + this
+                    # queue row intact but records a delete-intent tombstone —
+                    # visible cross-process, unlike the id lock. Re-embedding a
+                    # memory that is awaiting deletion would rebuild a vector
+                    # the reconcile drain is about to remove; skip until the
+                    # tombstone resolves (drain deletes it, or a successful
+                    # retry closes the tombstone and the row drains normally).
+                    from genesis.memory.delete_tombstones import has_open_tombstone
+
+                    if await has_open_tombstone(
+                        self._db, memory_id=item["memory_id"]
+                    ):
+                        logger.info(
+                            "skipping re-embed of %s — open delete tombstone",
+                            item["memory_id"],
+                        )
+                        continue
+
                     # Deprecation is re-read HERE, after the embed and under the
                     # lock — NOT from the pre-embed `taxo` snapshot. A
                     # _mark_superseded landing during the embed sets deprecated=1

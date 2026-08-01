@@ -61,7 +61,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from genesis.db.connection import open_ro_connection
+from genesis.db.crud import deferred_work as deferred_crud
 from genesis.db.crud import pending_embeddings as pending_crud
+from genesis.memory import delete_tombstones
 from genesis.memory._locks import memory_id_lock
 from genesis.memory.integrity import _scroll_all_points
 from genesis.qdrant import collections as qdrant_ops
@@ -153,17 +155,104 @@ async def run_reconcile(
     max_points: int = 500_000,
     export_dir: Path | None = None,
     now: datetime | None = None,
+    delete_memory=None,
 ) -> ReconcileResult:
     """Enumerate and repair aged cross-store offenders. Returns the run outcome.
 
     ``db`` is the runtime's shared serialized aiosqlite connection (all writes);
     enumeration reads go through a WAL-aware read-only connection so the write
     lock is never held across the scan. ``now`` is injectable for tests.
+
+    ``delete_memory`` is an async callable ``(memory_id) -> dict`` — in
+    production ``rt.memory_store.delete`` — used to DRAIN open delete-intent
+    tombstones (``memory/delete_tombstones.py``) before classification: each
+    open tombstone's delete is re-attempted through the full store cascade
+    (which takes the per-id lock itself). Ids attempted this run are EXCLUDED
+    from the ghost/mirror sets — a memory whose delete is in flight must never
+    be re-embedded, and its just-deleted point must not be double-processed.
+    None (store unavailable on a degraded boot) skips the drain loudly.
     """
     start = time.monotonic()
     now_dt = now or datetime.now(UTC)
     cutoff = (now_dt - timedelta(seconds=min_age_seconds)).isoformat()
     export_dir = export_dir or (Path.home() / ".genesis" / "output")
+
+    # ── Drain delete-intent tombstones FIRST (before any classification) ──
+    tombstones_drained = 0
+    tombstones_failed = 0
+    tombstones_skipped_no_deleter = 0
+    tombstone_attempted: set[str] = set()
+    try:
+        tombstone_rows = await deferred_crud.query_pending(
+            db, work_type=delete_tombstones.WORK_TYPE, limit=max(1, int(max_repairs_per_run))
+        )
+    except Exception:
+        logger.warning("reconcile: tombstone query failed — skipping drain", exc_info=True)
+        tombstone_rows = []
+    now_iso_drain = now_dt.isoformat()
+    for row in tombstone_rows:
+        mid = delete_tombstones.memory_id_from_row(row)
+        if not mid:
+            # completed_at makes the terminal row prunable (prune_terminal
+            # skips NULL-completed_at rows — they'd accumulate forever).
+            await deferred_crud.update_status(
+                db,
+                row["id"],
+                status="discarded",
+                error_message="corrupt payload_json",
+                completed_at=now_iso_drain,
+            )
+            continue
+        if mid in tombstone_attempted:
+            # Duplicate open row for an id already handled THIS run (the
+            # multi-process enqueue dedup is best-effort, so dups can exist).
+            # If the attempt succeeded, complete_open_tombstones below already
+            # closed this row — re-processing would re-open a completed row
+            # and double-count the drain; if it failed, retrying now would
+            # fail identically. Skip either way.
+            continue
+        if delete_memory is None:
+            tombstones_skipped_no_deleter += 1
+            tombstone_attempted.add(mid)  # still never classify an intent-marked id
+            continue
+        tombstone_attempted.add(mid)
+        await deferred_crud.update_status(
+            db, row["id"], status="processing", last_attempt_at=now_iso_drain
+        )
+        outcome: dict | None = None
+        try:
+            outcome = await delete_memory(mid)
+        except Exception:
+            logger.warning("reconcile: tombstone delete raised for %s", mid, exc_info=True)
+        if outcome is not None and not outcome.get("deferred"):
+            # Full cascade completed — close EVERY open row for this id (this
+            # one is 'processing', duplicates are 'pending'; both close here).
+            # In production store.delete's own close-out (step 7) already did
+            # this; repeating it covers test doubles and mid-loop races, and
+            # is idempotent.
+            await delete_tombstones.complete_open_tombstones(db, memory_id=mid)
+            tombstones_drained += 1
+        else:
+            # Qdrant still unreachable (deferred again) or the delete raised —
+            # back to pending so the next run retries; attempts was already
+            # bumped by the processing transition. DELIBERATELY no attempts
+            # cap: a delete intent must never be silently dropped (the memory
+            # would survive its own deletion). A poisoned intent stays visible
+            # as status=partial + tombstones_failed with a growing attempts
+            # count — that is the operator signal to intervene.
+            await deferred_crud.update_status(
+                db,
+                row["id"],
+                status="pending",
+                error_message="drain re-attempt did not complete",
+            )
+            tombstones_failed += 1
+    if tombstones_skipped_no_deleter:
+        logger.warning(
+            "reconcile: %d open tombstone(s) but no delete callable (degraded boot?) — "
+            "drain deferred to next run",
+            tombstones_skipped_no_deleter,
+        )
 
     # ── Enumerate: Qdrant point set (with ages) across both collections ──
     points: dict[str, tuple[str, str]] = {}  # pid -> (created_at, collection)
@@ -198,10 +287,13 @@ async def run_reconcile(
         await ro.close()
     meta_ids = {str(r[0]) for r in meta_rows}
 
+    # tombstone_attempted ids are excluded from BOTH sets: their delete was
+    # (re-)attempted this run, so a lingering point is mid-cascade (not a
+    # ghost verdict) and a lingering metadata row must never be re-embedded.
     ghosts = [
         (pid, coll)
         for pid, (created, coll) in points.items()
-        if pid not in meta_ids and created and created < cutoff
+        if pid not in meta_ids and pid not in tombstone_attempted and created and created < cutoff
     ]
     if truncated:
         # Vector ABSENCE cannot be proven from a partial point set — a mirror
@@ -211,7 +303,11 @@ async def run_reconcile(
         mirrors = [
             (str(mid), str(coll) if coll else "episodic_memory")
             for mid, created, status, coll in meta_rows
-            if status == "embedded" and str(mid) not in points and created and str(created) < cutoff
+            if status == "embedded"
+            and str(mid) not in points
+            and str(mid) not in tombstone_attempted
+            and created
+            and str(created) < cutoff
         ]
 
     # ── Per-run cap (ghosts first — pure cleanup; mirrors restore recall) ──
@@ -324,7 +420,7 @@ async def run_reconcile(
             # memory_fts stores tags space-separated; the queue stores them
             # comma-separated (the worker rebuilds facet payload keys from that).
             tags = ",".join((frow[1] or "").split()) or None
-            await pending_crud.requeue_for_reembed(
+            requeued = await pending_crud.requeue_for_reembed(
                 db,
                 memory_id=mid,
                 content=content,
@@ -334,14 +430,31 @@ async def run_reconcile(
                 created_at=str(meta_created_at) if meta_created_at else now_dt.isoformat(),
                 confidence=confidence,
             )
-            mirrors_requeued += 1
+            # False = the statement's own metadata/tombstone guard refused (a
+            # cross-process delete won the race after our re-read) — correctly
+            # not requeued, don't count it as repaired.
+            if requeued:
+                mirrors_requeued += 1
 
     if ghost_export_skipped:
         # Ghosts whose export failed were left undeleted (retried next run) —
         # surface it so a persistent export failure is visible, not silent.
         details["ghost_export_skipped"] = ghost_export_skipped
+    if tombstones_failed:
+        details["tombstones_failed"] = tombstones_failed
+    if tombstones_skipped_no_deleter:
+        details["tombstones_skipped_no_deleter"] = tombstones_skipped_no_deleter
     status = (
-        "partial" if (ghost_delete_failed or ghost_export_skipped or capped or truncated) else "ok"
+        "partial"
+        if (
+            ghost_delete_failed
+            or ghost_export_skipped
+            or capped
+            or truncated
+            or tombstones_failed
+            or tombstones_skipped_no_deleter
+        )
+        else "ok"
     )
     result = ReconcileResult(
         status=status,
@@ -349,6 +462,7 @@ async def run_reconcile(
         ghost_delete_failed=ghost_delete_failed,
         mirrors_requeued=mirrors_requeued,
         mirrors_skipped_no_content=mirrors_skipped_no_content,
+        tombstones_drained=tombstones_drained,
         truncated=truncated,
         capped=capped,
         duration_ms=int((time.monotonic() - start) * 1000),

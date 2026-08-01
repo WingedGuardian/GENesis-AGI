@@ -486,3 +486,187 @@ async def test_knowledge_collection_mirror_requeues_as_knowledge(tmp_path, monke
         "SELECT memory_type, collection FROM pending_embeddings WHERE memory_id = 'kb_mir'",
     )
     assert rows == [("knowledge", "knowledge_base")]
+
+
+# ── Tombstone drain (PR-2: cross-process deferred deletes) ──────────────────
+
+
+async def _run_rowfactory(path, client, monkeypatch, tmp_path, **kw):
+    """Like _run, but with the production Row factory — the tombstone drain
+    reads deferred_work_queue rows as dicts (crud.query_pending), which needs
+    aiosqlite.Row exactly as the runtime's shared connection provides."""
+    monkeypatch.setattr(
+        qdrant_ops,
+        "delete_point",
+        _fake_delete(client, **{k: kw.pop(k) for k in ("fail_ids",) if k in kw}),
+    )
+    conn = await aiosqlite.connect(path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        return await integrity_repair.run_reconcile(
+            db=conn,
+            qdrant_client=client,
+            db_path=path,
+            export_dir=tmp_path / "export",
+            now=_NOW,
+            **kw,
+        )
+    finally:
+        await conn.close()
+
+
+async def _seed_tombstone(path: str, memory_id: str) -> None:
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        "INSERT INTO deferred_work_queue (id, work_type, priority, payload_json, "
+        "deferred_at, deferred_reason, staleness_policy, status, created_at) "
+        "VALUES (?, 'memory_deferred_delete', 50, ?, ?, 'test', 'drain', 'pending', ?)",
+        (
+            f"tomb-{memory_id}",
+            json.dumps({"topic": memory_id, "category": "memory_delete",
+                        "signal_type": None, "memory_id": memory_id}),
+            _OLD,
+            _OLD,
+        ),
+    )
+    await conn.commit()
+    await conn.close()
+
+
+async def test_tombstone_drain_deletes_and_completes(tmp_path, monkeypatch):
+    """An open tombstone's delete is re-attempted via delete_memory; success
+    marks the row completed and counts tombstones_drained — and the id is
+    EXCLUDED from ghost classification even though its point is still
+    enumerable this run."""
+    path = await _db(tmp_path)
+    await _seed_tombstone(path, "m_tomb")
+    client = _points({"episodic_memory": {"m_tomb": {"created_at": _OLD, "content": "x"}}})
+
+    deleted_ids: list[str] = []
+
+    async def fake_delete_memory(mid: str) -> dict:
+        deleted_ids.append(mid)
+        client.points["episodic_memory"].pop(mid, None)
+        return {"qdrant_deleted": 1, "metadata": True}
+
+    result = await _run_rowfactory(
+        path, client, monkeypatch, tmp_path, delete_memory=fake_delete_memory
+    )
+    assert deleted_ids == ["m_tomb"]
+    assert result.tombstones_drained == 1
+    assert result.status == "ok"
+    assert result.ghosts_deleted == 0  # excluded from ghost set, not double-processed
+    rows = await _fetch(
+        path, "SELECT status FROM deferred_work_queue WHERE id = 'tomb-m_tomb'"
+    )
+    assert rows == [("completed",)]
+
+
+async def test_tombstone_drain_failure_stays_pending(tmp_path, monkeypatch):
+    """A drain attempt that defers again (Qdrant still down) goes back to
+    pending for the next run; the run reports partial with the count."""
+    path = await _db(tmp_path)
+    await _seed_tombstone(path, "m_still")
+
+    async def fake_delete_memory(mid: str) -> dict:
+        return {"deferred": True}
+
+    result = await _run_rowfactory(
+        path, _points({}), monkeypatch, tmp_path, delete_memory=fake_delete_memory
+    )
+    assert result.tombstones_drained == 0
+    assert result.status == "partial"
+    assert result.details.get("tombstones_failed") == 1
+    rows = await _fetch(
+        path, "SELECT status, attempts FROM deferred_work_queue WHERE id = 'tomb-m_still'"
+    )
+    assert rows == [("pending", 1)]
+
+
+async def test_tombstone_without_deleter_skipped_and_excluded(tmp_path, monkeypatch):
+    """No delete callable (degraded boot): the drain is skipped loudly, the run
+    is partial, and the tombstoned id is still excluded from mirror requeue —
+    an intent-marked memory must never be re-embedded."""
+    path = await _db(tmp_path)
+    await _seed(path, "m_nodel", created_at=_OLD)  # would otherwise be a mirror
+    await _seed_tombstone(path, "m_nodel")
+
+    result = await _run_rowfactory(path, _points({}), monkeypatch, tmp_path)
+    assert result.status == "partial"
+    assert result.details.get("tombstones_skipped_no_deleter") == 1
+    assert result.mirrors_requeued == 0
+    rows = await _fetch(
+        path, "SELECT COUNT(*) FROM pending_embeddings WHERE memory_id = 'm_nodel'"
+    )
+    assert rows[0][0] == 0
+
+
+async def test_corrupt_tombstone_discarded(tmp_path, monkeypatch):
+    path = await _db(tmp_path)
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        "INSERT INTO deferred_work_queue (id, work_type, priority, payload_json, "
+        "deferred_at, deferred_reason, staleness_policy, status, created_at) "
+        "VALUES ('tomb-bad', 'memory_deferred_delete', 50, 'not json', ?, 'test', "
+        "'drain', 'pending', ?)",
+        (_OLD, _OLD),
+    )
+    await conn.commit()
+    await conn.close()
+
+    async def fake_delete_memory(mid: str) -> dict:  # pragma: no cover - not reached
+        raise AssertionError("must not be called for a corrupt row")
+
+    result = await _run_rowfactory(
+        path, _points({}), monkeypatch, tmp_path, delete_memory=fake_delete_memory
+    )
+    assert result.tombstones_drained == 0
+    rows = await _fetch(
+        path, "SELECT status FROM deferred_work_queue WHERE id = 'tomb-bad'"
+    )
+    assert rows == [("discarded",)]
+
+
+async def test_duplicate_tombstones_for_one_id_drain_once(tmp_path, monkeypatch):
+    """Two open tombstone rows for the SAME memory_id (best-effort multi-process
+    dedup can produce dups): the drain attempts the delete exactly once, closes
+    BOTH rows, counts one drain — and never re-opens a completed row."""
+    path = await _db(tmp_path)
+    await _seed_tombstone(path, "m_dup")
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        "INSERT INTO deferred_work_queue (id, work_type, priority, payload_json, "
+        "deferred_at, deferred_reason, staleness_policy, status, created_at) "
+        "VALUES ('tomb-m_dup-2', 'memory_deferred_delete', 50, ?, ?, 'test', "
+        "'drain', 'pending', ?)",
+        (
+            json.dumps({"topic": "m_dup", "category": "memory_delete",
+                        "signal_type": None, "memory_id": "m_dup"}),
+            _OLD,
+            _OLD,
+        ),
+    )
+    await conn.commit()
+    await conn.close()
+
+    calls: list[str] = []
+
+    async def fake_delete_memory(mid: str) -> dict:
+        calls.append(mid)
+        return {"qdrant_deleted": 1, "metadata": True}
+
+    result = await _run_rowfactory(
+        path, _points({}), monkeypatch, tmp_path, delete_memory=fake_delete_memory
+    )
+    assert calls == ["m_dup"]  # exactly one attempt
+    assert result.tombstones_drained == 1
+    assert result.details.get("tombstones_failed") is None
+    rows = await _fetch(
+        path,
+        "SELECT id, status FROM deferred_work_queue WHERE work_type = 'memory_deferred_delete' "
+        "ORDER BY id",
+    )
+    assert [(r[0], r[1]) for r in rows] == [
+        ("tomb-m_dup", "completed"),
+        ("tomb-m_dup-2", "completed"),
+    ]

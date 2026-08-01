@@ -545,7 +545,18 @@ class MemoryStore:
                 "Qdrant unavailable during delete of %s — deferring to keep stores "
                 "consistent (no orphan)", memory_id, exc_info=True,
             )
+            # Record the delete INTENT as a DB-backed tombstone so it survives
+            # the defer: visible to every process (unlike the in-process id
+            # lock), it blocks requeue/re-embed of this memory and is drained
+            # (delete re-attempted) by the nightly reconcile lane. Best-effort —
+            # enqueue_tombstone never raises.
+            from genesis.memory.delete_tombstones import enqueue_tombstone
+
             results["deferred"] = True
+            # True = intent durably recorded (new row OR an existing open one).
+            results["tombstoned"] = await enqueue_tombstone(
+                self._db, memory_id=memory_id, reason="qdrant_unreachable_on_delete"
+            )
             results["metadata"] = False
             results["fts5"] = False
             return results
@@ -586,5 +597,18 @@ class MemoryStore:
                 "entity_mentions delete failed for %s", memory_id, exc_info=True,
             )
             results["mentions_deleted"] = False
+
+        # 7. Close any open delete-intent tombstone: the delete just succeeded
+        # (possibly a retry of an earlier deferred attempt), so the recorded
+        # intent is satisfied — leaving it open would only make the reconcile
+        # lane re-attempt a no-op delete. Best-effort.
+        try:
+            from genesis.memory.delete_tombstones import complete_open_tombstones
+
+            await complete_open_tombstones(self._db, memory_id=memory_id)
+        except Exception:
+            logger.warning(
+                "tombstone close-out failed for %s", memory_id, exc_info=True,
+            )
 
         return results
