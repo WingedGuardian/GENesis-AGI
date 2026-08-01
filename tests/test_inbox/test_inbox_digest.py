@@ -39,7 +39,8 @@ async def db():
         kind TEXT NOT NULL DEFAULT 'follow_up',
         domain TEXT,
         goal_id TEXT,
-        dedup_key TEXT
+        dedup_key TEXT,
+        revisit_condition TEXT
     )""")
     await conn.execute("""CREATE TABLE inbox_items (
         id TEXT PRIMARY KEY,

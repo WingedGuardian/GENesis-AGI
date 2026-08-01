@@ -1293,7 +1293,10 @@ TABLES = {
                 domain IN ('internal', 'user_world')
             ),
             goal_id          TEXT,
-            dedup_key        TEXT
+            dedup_key        TEXT,
+            -- Declared LAST so a fresh CREATE matches the migration 0075
+            -- ALTER ... ADD COLUMN (which appends) — fresh/migrated column-order parity.
+            revisit_condition TEXT
         )
     """,
     "file_modifications": """
