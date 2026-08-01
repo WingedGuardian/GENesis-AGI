@@ -69,7 +69,7 @@ END_MARKER = "# --- END GENESIS AUTO-GENERATED ---"
 _HANDEDIT_HEADER = "# Hand-edited install-specific patterns below (preserved across regeneration)."
 
 #: The Actions secret name the CI private-pattern scan reads (PR 2 consumer).
-SECRET_NAME = "GENESIS_PRIVATE_PATTERNS"  # noqa: S105 — a secret NAME, not a value
+SECRET_NAME = "GENESIS_PRIVATE_PATTERNS"  # pragma: allowlist secret  # noqa: S105 — the secret's NAME, not a value
 
 #: Tokens too generic to fingerprint — matching them would block huge amounts of
 #: legitimate content. The container hostname is literally ``genesis`` and the
