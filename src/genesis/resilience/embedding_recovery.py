@@ -128,8 +128,16 @@ class EmbeddingRecoveryWorker:
                 if slr and "," in slr:
                     parts = slr.split(",", 1)
                     payload["source_line_range"] = [int(parts[0]), int(parts[1])]
-                # Classify for memory_class (consistent with store.py)
-                payload["memory_class"] = classify_memory(
+                # Preserve the authoritative store-time memory_class from
+                # metadata (honors explicit overrides — e.g. reference-extraction
+                # stores URL content as 'fact' to dodge the 0.7x reference
+                # activation penalty). classify_memory is a heuristic on content
+                # alone and cannot reconstruct an override; recomputing it here
+                # silently downgrades an explicitly-set class in the Qdrant
+                # payload recall actually reads. Fall back to the heuristic only
+                # when there is no metadata row (legacy / no-metadata path).
+                stored_class = taxo.get("memory_class") if taxo else None
+                payload["memory_class"] = stored_class or classify_memory(
                     item["content"],
                     source=payload.get("source", ""),
                     source_pipeline=payload.get("source_pipeline", ""),

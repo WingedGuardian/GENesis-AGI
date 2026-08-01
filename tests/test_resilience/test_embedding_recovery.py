@@ -131,6 +131,56 @@ class TestDrainPending:
         assert "life_domain" not in payload
 
     @pytest.mark.asyncio
+    async def test_reembed_preserves_stored_memory_class_override(self, db, worker):
+        """The authoritative store-time memory_class (honoring explicit
+        overrides) survives re-embed — it is NOT recomputed from content.
+
+        Scenario: reference-extraction stored reference-flavored content as
+        'fact' to dodge the 0.7x reference penalty. classify_memory() on that
+        same content would return 'reference'; the worker must keep 'fact'.
+        """
+        from genesis.db.crud import memory as memory_crud
+        from genesis.memory.classification import classify_memory
+
+        w, _, qdrant = worker
+        content = "refer to the deployment runbook tracked in the shared docs"
+        # sanity: the heuristic WOULD downgrade this to reference
+        assert classify_memory(content) == "reference"
+
+        await memory_crud.create_metadata(
+            db, memory_id="mem-cls", created_at="2026-03-11T12:00:00",
+            memory_class="fact",
+        )
+        await crud.create(
+            db, id="pe-cls", memory_id="mem-cls", content=content,
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+
+        assert await w.drain_pending() == 1
+        payload = qdrant.upsert.call_args.kwargs["points"][0].payload
+        assert payload["memory_class"] == "fact"  # preserved, not recomputed
+
+    @pytest.mark.asyncio
+    async def test_reembed_recomputes_class_when_no_metadata(self, db, worker):
+        """Legacy / no-metadata path: with no authoritative class to restore,
+        the worker falls back to the content heuristic (fail-open)."""
+        from genesis.memory.classification import classify_memory
+
+        w, _, qdrant = worker
+        content = "refer to the deployment runbook tracked in the shared docs"
+        assert classify_memory(content) == "reference"
+
+        await crud.create(
+            db, id="pe-nocls", memory_id="mem-nocls", content=content,
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+        assert await w.drain_pending() == 1
+        payload = qdrant.upsert.call_args.kwargs["points"][0].payload
+        assert payload["memory_class"] == "reference"  # heuristic fallback
+
+    @pytest.mark.asyncio
     async def test_count_pending(self, db, worker):
         w, _, _ = worker
         await crud.create(
