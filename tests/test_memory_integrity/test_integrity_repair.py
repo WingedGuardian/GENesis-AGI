@@ -670,3 +670,67 @@ async def test_duplicate_tombstones_for_one_id_drain_once(tmp_path, monkeypatch)
         ("tomb-m_dup", "completed"),
         ("tomb-m_dup-2", "completed"),
     ]
+
+
+async def test_tombstone_query_failure_reports_partial(tmp_path, monkeypatch):
+    """A failed tombstone-queue query must NOT read as a healthy run: the drain
+    was skipped, so requested deletions may still be pending (Codex #1270 P2)."""
+    path = await _db(tmp_path)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("queue table unavailable")
+
+    monkeypatch.setattr(integrity_repair.deferred_crud, "query_pending", _boom)
+    result = await _run_rowfactory(path, _points({}), monkeypatch, tmp_path)
+    assert result.status == "partial"
+    assert result.details.get("tombstone_query_failed") is True
+    assert result.tombstones_drained == 0
+
+
+async def test_drain_with_real_store_delete_end_to_end(tmp_path, monkeypatch):
+    """Integration: the drain's pending→processing transition + the REAL
+    MemoryStore.delete (write-ahead dedup against the processing row, full
+    cascade, step-7 close-out) — the combined path the unit tests fake."""
+    from unittest.mock import MagicMock
+
+    import genesis.memory.store as store_mod
+    from genesis.memory.store import MemoryStore
+
+    path = await _db(tmp_path)
+    await _seed(path, "m_real", created_at=_OLD)  # metadata + fts row
+    await _seed_tombstone(path, "m_real")
+    client = _points({"episodic_memory": {"m_real": {"created_at": _OLD, "content": "x"}}})
+    monkeypatch.setattr(store_mod, "delete_point", _fake_delete(client))
+
+    conn = await aiosqlite.connect(path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        store = MemoryStore(
+            embedding_provider=MagicMock(),
+            qdrant_client=client,
+            db=conn,
+            linker=None,
+        )
+        result = await integrity_repair.run_reconcile(
+            db=conn,
+            qdrant_client=client,
+            db_path=path,
+            export_dir=tmp_path / "export",
+            now=_NOW,
+            delete_memory=store.delete,
+        )
+    finally:
+        await conn.close()
+
+    assert result.tombstones_drained == 1
+    assert result.status == "ok"
+    # Memory fully gone across all stores; no duplicate tombstone row created
+    # by the write-ahead enqueue (it deduped against the drain's processing row).
+    assert await _fetch(path, "SELECT COUNT(*) FROM memory_metadata WHERE memory_id='m_real'") == [(0,)]
+    assert await _fetch(path, "SELECT COUNT(*) FROM memory_fts WHERE memory_id='m_real'") == [(0,)]
+    assert "m_real" not in client.points["episodic_memory"]
+    rows = await _fetch(
+        path,
+        "SELECT status FROM deferred_work_queue WHERE work_type='memory_deferred_delete'",
+    )
+    assert [r[0] for r in rows] == ["completed"]

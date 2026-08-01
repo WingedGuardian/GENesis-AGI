@@ -182,3 +182,51 @@ class TestMetadataMissingIds:
         missing = await metadata_missing_ids(db, {"mm-present", "mm-ghost-a", "mm-ghost-b"})
         assert missing == {"mm-ghost-a", "mm-ghost-b"}
         assert await metadata_missing_ids(db, set()) == set()
+
+
+class TestWriteAheadIntent:
+    """Codex #1270 P1: the tombstone is written BEFORE the cascade on EVERY
+    delete (not just the defer path), and closed after success — so the intent
+    is open, cross-process-visible, for the whole point-delete→cascade span."""
+
+    @pytest.mark.asyncio
+    async def test_successful_delete_writes_then_closes_intent(self, db):
+        store = _store(db)
+        store._qdrant.retrieve = MagicMock(return_value=[])
+        result = await store.delete("mem-wa")
+        assert not result.get("deferred")
+        # Intent was recorded and closed: a terminal completed row remains.
+        rows = await db.execute_fetchall(
+            "SELECT status, completed_at FROM deferred_work_queue "
+            "WHERE work_type = ? AND json_extract(payload_json, '$.memory_id') = 'mem-wa'",
+            (dt.WORK_TYPE,),
+        )
+        assert [r[0] for r in rows] == ["completed"]
+        assert rows[0][1] is not None  # prunable
+        assert await dt.has_open_tombstone(db, memory_id="mem-wa") is False
+
+    @pytest.mark.asyncio
+    async def test_intent_open_during_cascade(self, db):
+        """The tombstone must be OPEN at the moment the point delete runs —
+        that is the cross-process protection window."""
+        store = _store(db)
+        store._qdrant.retrieve = MagicMock(return_value=[])
+        open_during: dict[str, bool] = {}
+
+        # Sample tombstone state from inside the cascade via the metadata hook.
+        import genesis.memory.store as store_mod
+
+        real_delete_meta = store_mod.memory_crud.delete_metadata
+
+        async def _meta_spy(*args, **kwargs):
+            open_during["at_cascade"] = await dt.has_open_tombstone(db, memory_id="mem-wa2")
+            return await real_delete_meta(*args, **kwargs)
+
+        store_mod.memory_crud.delete_metadata = _meta_spy
+        try:
+            await store.delete("mem-wa2")
+        finally:
+            store_mod.memory_crud.delete_metadata = real_delete_meta
+
+        assert open_during.get("at_cascade") is True
+        assert await dt.has_open_tombstone(db, memory_id="mem-wa2") is False

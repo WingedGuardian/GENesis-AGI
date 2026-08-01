@@ -182,12 +182,18 @@ async def run_reconcile(
     tombstones_failed = 0
     tombstones_skipped_no_deleter = 0
     tombstone_attempted: set[str] = set()
+    tombstone_query_failed = False
     try:
         tombstone_rows = await deferred_crud.query_pending(
             db, work_type=delete_tombstones.WORK_TYPE, limit=max(1, int(max_repairs_per_run))
         )
     except Exception:
+        # Must NOT read as a healthy run (Codex #1270 P2): with an empty
+        # worklist substituted silently, a persistent queue/schema problem
+        # would leave requested deletions pending forever while every audit
+        # row says ok. Flag it → status becomes partial.
         logger.warning("reconcile: tombstone query failed — skipping drain", exc_info=True)
+        tombstone_query_failed = True
         tombstone_rows = []
     now_iso_drain = now_dt.isoformat()
     for row in tombstone_rows:
@@ -444,6 +450,8 @@ async def run_reconcile(
         details["tombstones_failed"] = tombstones_failed
     if tombstones_skipped_no_deleter:
         details["tombstones_skipped_no_deleter"] = tombstones_skipped_no_deleter
+    if tombstone_query_failed:
+        details["tombstone_query_failed"] = True
     status = (
         "partial"
         if (
@@ -453,6 +461,7 @@ async def run_reconcile(
             or truncated
             or tombstones_failed
             or tombstones_skipped_no_deleter
+            or tombstone_query_failed
         )
         else "ok"
     )
