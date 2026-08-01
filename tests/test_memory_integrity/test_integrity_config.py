@@ -6,13 +6,27 @@ from genesis.memory import integrity_config as ic
 
 
 def test_default_mode_is_passive(monkeypatch):
+    # PR-1 ships the repair lane + per-id lock but keeps the DEFAULT passive:
+    # the lock serializes delete-vs-requeue only within one process, and
+    # MemoryStore.delete() also runs in the genesis-memory MCP process. Active
+    # becomes the default with the cross-process tombstones (PR-2). Both
+    # DEFAULTS and the repo yaml agree.
     monkeypatch.delenv(ic._ENV_KILL_SWITCH, raising=False)
+    assert ic.DEFAULTS["mode"] == "passive"
     assert ic.effective_mode() == "passive"
 
 
-def test_active_coerced_to_passive(monkeypatch):
+def test_active_mode_honored_not_coerced(monkeypatch):
+    # 'active' is fully implemented and must run as 'active' when set
+    # (pre-Phase-1 it was coerced to passive).
     monkeypatch.delenv(ic._ENV_KILL_SWITCH, raising=False)
     monkeypatch.setattr(ic, "load_config", lambda: {**ic.DEFAULTS, "mode": "active"})
+    assert ic.effective_mode() == "active"
+
+
+def test_passive_opt_out_honored(monkeypatch):
+    monkeypatch.delenv(ic._ENV_KILL_SWITCH, raising=False)
+    monkeypatch.setattr(ic, "load_config", lambda: {**ic.DEFAULTS, "mode": "passive"})
     assert ic.effective_mode() == "passive"
 
 
@@ -72,8 +86,11 @@ def test_settings_validator_rejects_invalid():
 
 
 def test_defaults_are_fresh_install_safe():
-    # A fresh clone with no overlay must resolve to passive + sane knobs.
+    # A fresh clone with no overlay resolves to passive (repair opt-in until
+    # the cross-process tombstones land) + sane knobs. Repo yaml + DEFAULTS agree.
     cfg = ic.load_config()
     assert cfg["enabled"] is True
     assert cfg["mode"] == "passive"
     assert cfg["sample_fraction"] == 1.0
+    assert cfg["repair_min_age_seconds"] == 3600
+    assert cfg["max_repairs_per_run"] == 500

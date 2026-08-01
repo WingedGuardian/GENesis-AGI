@@ -9,11 +9,16 @@ cache, so an operator edit takes effect on the next scheduled run.
 Modes (``off | passive | active``):
 
 - ``passive`` (DEFAULT) — run the read-only checks and surface findings
-  (persist + posture alert + dashboard). Never repairs. This is the whole of
+  (persist + posture alert + dashboard). Never repairs. This was the whole of
   Phase 0.
-- ``active`` — RESERVED for Phase 1 (write-path/reconcile repair). Not yet
-  implemented, so it is coerced to ``passive`` with a warning: the system
-  should not silently believe repair is on when it is not.
+- ``active`` — everything ``passive`` does, PLUS the Phase-1 periodic
+  reconcile job (``memory/integrity_repair.py``) that repairs aged ghost points
+  and lying mirrors nightly. Opt in with ``mode: active`` in the local overlay.
+  Not the default yet: the per-memory-id lock (``memory/_locks.py``) closes the
+  mirror-requeue-vs-delete race only WITHIN a process, and
+  ``MemoryStore.delete()`` also runs in the separate genesis-memory MCP
+  process — active becomes the default once the cross-process delete-intent
+  tombstones land (PR-2).
 - ``off`` — do not run at all.
 
 Failure posture: an INVALID mode degrades to ``passive`` (still observing, no
@@ -49,6 +54,10 @@ _ENV_KILL_SWITCH = "GENESIS_MEMORY_INTEGRITY_DISABLED"
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
+    # Repair stays opt-in until the cross-process delete-intent tombstones land
+    # (PR-2): the per-memory-id lock (memory/_locks.py) serializes
+    # delete-vs-requeue only within one process, and MemoryStore.delete() also
+    # runs in the genesis-memory MCP process. Opt in with mode: active.
     "mode": "passive",
     # ── consistency checker ──
     "sample_fraction": 1.0,  # 1.0 = exact full scan (cheap at single-user scale)
@@ -66,9 +75,12 @@ DEFAULTS: dict[str, Any] = {
     "baseline_window_runs": 7,  # trailing runs averaged for the drift baseline
     "baseline_min_runs": 3,  # below this: observation period, no drift verdict
     "drift_band": 0.2,  # degraded if baseline_hit_rate - hit_rate > this
+    # ── reconcile repair lane (Phase 1, mode=active only) ──
+    "repair_min_age_seconds": 3600,  # never touch an offender younger than this
+    "max_repairs_per_run": 500,  # per-run work cap; hitting it sets capped=1
     # ── shared ──
     "stale_report_days": 3,  # no non-unknown report within → staleness alert
-    "retention_days": 90,  # prune reports/probe runs older than this
+    "retention_days": 90,  # prune reports/probe/reconcile runs older than this
 }
 
 _INT_KNOBS = (
@@ -81,6 +93,8 @@ _INT_KNOBS = (
     "min_golden_for_status",
     "baseline_window_runs",
     "baseline_min_runs",
+    "repair_min_age_seconds",
+    "max_repairs_per_run",
     "stale_report_days",
     "retention_days",
 )
@@ -125,9 +139,9 @@ def env_disabled() -> bool:
 def effective_mode() -> str:
     """The mode the jobs must run under — read live.
 
-    Env kill switch or master ``enabled: false`` → ``off``. ``active`` is
-    coerced to ``passive`` in Phase 0 (repair not yet implemented). An invalid
-    value degrades to ``passive`` — still observing, never a silent ``off``.
+    Env kill switch or master ``enabled: false`` → ``off``. An invalid value
+    degrades to ``passive`` — still observing but never repairing (toward less
+    write authority), and never a silent ``off``.
     """
     if env_disabled():
         return "off"
@@ -138,12 +152,6 @@ def effective_mode() -> str:
     if mode is False:
         # YAML-1.1 unquoted `mode: off` → boolean False. Honor the intent.
         return "off"
-    if mode == "active":
-        logger.warning(
-            "memory_integrity mode 'active' is reserved for Phase 1 (repair not "
-            "implemented) — running 'passive'"
-        )
-        return "passive"
     if mode not in MODES:
         logger.warning("memory_integrity has invalid mode %r — degrading to passive", mode)
         return "passive"

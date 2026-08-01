@@ -34,10 +34,24 @@ async def create(
             source_line_range, extraction_timestamp, source_pipeline,
             source_subsystem)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, memory_id, content, memory_type, tags, collection, created_at, status,
-         source, confidence, source_session_id, transcript_path,
-         source_line_range, extraction_timestamp, source_pipeline,
-         source_subsystem),
+        (
+            id,
+            memory_id,
+            content,
+            memory_type,
+            tags,
+            collection,
+            created_at,
+            status,
+            source,
+            confidence,
+            source_session_id,
+            transcript_path,
+            source_line_range,
+            extraction_timestamp,
+            source_pipeline,
+            source_subsystem,
+        ),
     )
     await db.commit()
     return id
@@ -88,6 +102,79 @@ async def mark_failed(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def requeue_for_reembed(
+    db: aiosqlite.Connection,
+    *,
+    memory_id: str,
+    content: str,
+    tags: str | None,
+    memory_type: str,
+    collection: str,
+    created_at: str,
+    confidence: float | None,
+    source: str = "memory_reconcile",
+) -> None:
+    """Re-queue one memory for re-embedding, regardless of prior queue state.
+
+    The lying-mirror repair primitive (d0008 semantics, shared by the periodic
+    reconcile lane): a metadata row claims ``embedded`` but its Qdrant point is
+    gone, so the vector must be rebuilt by the recovery worker. In ONE commit:
+
+    - a retained queue row (any status — a reaped 'failed' or stale 'embedded'
+      item) is RESET to a drainable ``status='pending'`` with content/tags/
+      confidence refreshed — the worker only drains 'pending', so merely
+      flipping the metadata mirror would never rebuild the vector;
+    - no queue row → INSERT one (tags comma-separated — the worker rebuilds the
+      ``life_domain:``/``project_type:`` facet payload keys from that list;
+      ``confidence`` carries the memory's real activation weight, never NULL
+      unless genuinely unknown);
+    - the ``memory_metadata.embedding_status`` mirror flips to ``'pending'`` so
+      the row stops lying 'embedded' and the pair reads consistent while queued.
+
+    Callers must pre-check content exists — a mirror with no recoverable FTS
+    content cannot be re-embedded (mark it 'failed' instead; see the reconcile
+    lane).
+    """
+    import uuid as _uuid
+
+    cursor = await db.execute(
+        "SELECT 1 FROM pending_embeddings WHERE memory_id = ? LIMIT 1",
+        (memory_id,),
+    )
+    exists = await cursor.fetchone()
+    if exists:
+        await db.execute(
+            """UPDATE pending_embeddings
+               SET status = 'pending', error_message = NULL, content = ?,
+                   tags = ?, memory_type = ?, collection = ?, confidence = ?
+               WHERE memory_id = ?""",
+            (content, tags, memory_type, collection, confidence, memory_id),
+        )
+    else:
+        await db.execute(
+            """INSERT INTO pending_embeddings
+               (id, memory_id, content, memory_type, tags, collection,
+                created_at, status, source, confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (
+                _uuid.uuid4().hex,
+                memory_id,
+                content,
+                memory_type,
+                tags,
+                collection,
+                created_at,
+                source,
+                confidence,
+            ),
+        )
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'pending' WHERE memory_id = ?",
+        (memory_id,),
+    )
+    await db.commit()
 
 
 async def reset_failed_to_pending(
@@ -178,8 +265,7 @@ async def purge_completed(
     """Delete embedded/failed rows older than *older_than_days*. Returns count deleted."""
     cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
     cursor = await db.execute(
-        "DELETE FROM pending_embeddings "
-        "WHERE status IN ('embedded', 'failed') AND created_at < ?",
+        "DELETE FROM pending_embeddings WHERE status IN ('embedded', 'failed') AND created_at < ?",
         (cutoff,),
     )
     await db.commit()
@@ -220,8 +306,6 @@ async def query_orphaned_metadata(
 async def count_pending(
     db: aiosqlite.Connection,
 ) -> int:
-    cursor = await db.execute(
-        "SELECT COUNT(*) FROM pending_embeddings WHERE status = 'pending'"
-    )
+    cursor = await db.execute("SELECT COUNT(*) FROM pending_embeddings WHERE status = 'pending'")
     row = await cursor.fetchone()
     return int(row[0])

@@ -167,6 +167,7 @@ async def test_no_unexpected_tables(db):
         "alert_events",  # WS-2 sensor fabric (M9/M10)
         "memory_consistency_reports",
         "recall_probe_runs",  # memory integrity Phase 0 ("make silence loud")
+        "memory_reconcile_runs",  # memory integrity Phase 1 (repair lane audit)
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"
