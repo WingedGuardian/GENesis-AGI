@@ -29,7 +29,7 @@ import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload  # noqa: E402
+from hook_input import field, read_payload, run_guard  # noqa: E402
 
 # Legacy single-token pattern — kept as the fallback when shlex cannot
 # tokenize the command (unmatched quotes etc.).
@@ -199,4 +199,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_guard(main, "destructive_command_guard")

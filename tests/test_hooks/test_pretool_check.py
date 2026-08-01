@@ -3,15 +3,27 @@
 Tests the hook both as a subprocess (how CC actually invokes it) and via
 direct function imports for finer-grained unit testing.
 
+Semantics (PR-Guards, 2026-08):
+  - The CRITICAL block applies to DISPATCHED sessions only (GENESIS_CC_SESSION=1
+    — every relay/chat channel reaches the filesystem through one). A direct
+    interactive CLI session is always allowed, matching the config's documented
+    intent ("only modifiable from direct CC CLI sessions").
+  - Matching is TAIL-based: repo-relative patterns match the path suffix under
+    any checkout root. CC sends ABSOLUTE paths — the old verbatim fnmatch left
+    every repo-relative pattern silently inert (found 2026-08-01).
+  - Blocking never depends on the genesis package (stdlib fallback message),
+    and an unexpected crash fails CLOSED via hook_input.run_guard.
+
 Exit codes:
-  0 — allow (path is not CRITICAL)
-  2 — block (path is CRITICAL, cannot be modified from relay channel)
+  0 — allow (interactive session, or path is not CRITICAL)
+  2 — block (dispatched session + CRITICAL path)
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -48,27 +60,50 @@ _FALLBACK_CRITICAL = _mod._FALLBACK_CRITICAL
 # ---------------------------------------------------------------------------
 
 
-def _run_subprocess(stdin_text: str) -> subprocess.CompletedProcess:
-    """Run pretool_check.py as a real subprocess, piping stdin_text."""
+def _subprocess_env(dispatched: bool) -> dict:
+    """Env for the hook subprocess with the session type made EXPLICIT.
+
+    The var is force-set or force-removed (never inherited) so the suite is
+    deterministic regardless of whether pytest itself runs inside a dispatched
+    session.
+    """
+    env = dict(os.environ)
+    if dispatched:
+        env["GENESIS_CC_SESSION"] = "1"
+    else:
+        env.pop("GENESIS_CC_SESSION", None)
+    return env
+
+
+def _run_subprocess(stdin_text: str, *, dispatched: bool = True) -> subprocess.CompletedProcess:
+    """Run pretool_check.py as a real subprocess, piping stdin_text.
+
+    Defaults to dispatched=True because the block behavior (the thing most
+    tests probe) only exists in dispatched sessions.
+    """
     return subprocess.run(
         [_PYTHON, str(_SCRIPT_PATH)],
         input=stdin_text,
         capture_output=True,
         text=True,
         timeout=10,
+        env=_subprocess_env(dispatched),
     )
 
 
-def _run_subprocess_json(file_path: str) -> subprocess.CompletedProcess:
+def _run_subprocess_json(file_path: str, *, dispatched: bool = True) -> subprocess.CompletedProcess:
     """Run pretool_check.py as a subprocess with a standard JSON payload."""
     payload = json.dumps({"file_path": file_path})
-    return _run_subprocess(payload)
+    return _run_subprocess(payload, dispatched=dispatched)
 
 
-def _run_main_mock(file_path: str) -> int:
+def _run_main_mock(file_path: str, *, dispatched: bool = True) -> int:
     """Run main() with mocked stdin containing the given file_path."""
     stdin_data = json.dumps({"file_path": file_path})
-    with patch("sys.stdin") as mock_stdin:
+    env_patch = {"GENESIS_CC_SESSION": "1"} if dispatched else {}
+    with patch("sys.stdin") as mock_stdin, patch.dict(os.environ, env_patch, clear=False):
+        if not dispatched:
+            os.environ.pop("GENESIS_CC_SESSION", None)
         mock_stdin.read.return_value = stdin_data
         old_stdin = _mod.sys.stdin
         _mod.sys.stdin = mock_stdin
@@ -84,7 +119,7 @@ def _run_main_mock(file_path: str) -> int:
 
 
 class TestSubprocessCriticalBlocked:
-    """CRITICAL paths must be blocked with exit code 2."""
+    """CRITICAL paths must be blocked with exit code 2 in DISPATCHED sessions."""
 
     def test_secrets_env(self):
         result = _run_subprocess_json("usr/secrets.env")
@@ -149,8 +184,71 @@ class TestSubprocessCriticalBlocked:
         assert result.returncode == 2
 
 
+class TestAbsolutePathMatching:
+    """REGRESSION (found inert 2026-08-01): CC sends ABSOLUTE paths, and the
+    old verbatim fnmatch never fired for repo-relative patterns — the guard was
+    silently a no-op for settings.json / protection.py / protected_paths.yaml.
+    Tail-matching must catch the absolute form under any checkout root."""
+
+    def test_absolute_settings_json(self):
+        result = _run_subprocess_json("/home/anyone/genesis/.claude/settings.json")
+        assert result.returncode == 2, "absolute settings.json path must block (was inert)"
+
+    def test_absolute_protection_module(self):
+        result = _run_subprocess_json("/srv/checkout/src/genesis/autonomy/protection.py")
+        assert result.returncode == 2
+
+    def test_absolute_protected_paths_yaml(self):
+        result = _run_subprocess_json("/home/anyone/genesis/config/protected_paths.yaml")
+        assert result.returncode == 2
+
+    def test_worktree_copy_blocks(self):
+        """A linked-worktree copy of a CRITICAL file is still CRITICAL."""
+        result = _run_subprocess_json(
+            "/home/anyone/genesis/.claude/worktrees/some-branch/src/genesis/autonomy/protection.py"
+        )
+        assert result.returncode == 2
+
+    def test_absolute_normal_path_allowed(self):
+        result = _run_subprocess_json("/home/anyone/genesis/src/genesis/router.py")
+        assert result.returncode == 0
+
+
+class TestInteractiveSessionAllowed:
+    """A direct interactive CLI session (no GENESIS_CC_SESSION) is allowed to
+    edit CRITICAL paths — per the config's documented intent. The block
+    targets relay/autonomous channels only."""
+
+    def test_secrets_env_allowed_interactive(self):
+        result = _run_subprocess_json("usr/secrets.env", dispatched=False)
+        assert result.returncode == 0
+        assert result.stderr == ""
+
+    def test_settings_json_allowed_interactive(self):
+        result = _run_subprocess_json(".claude/settings.json", dispatched=False)
+        assert result.returncode == 0
+
+    def test_protection_module_allowed_interactive(self):
+        result = _run_subprocess_json("src/genesis/autonomy/protection.py", dispatched=False)
+        assert result.returncode == 0
+
+    def test_env_var_zero_is_interactive(self):
+        """Only the exact stamp '1' marks a dispatched session."""
+        env = _subprocess_env(dispatched=False)
+        env["GENESIS_CC_SESSION"] = "0"
+        result = subprocess.run(
+            [_PYTHON, str(_SCRIPT_PATH)],
+            input=json.dumps({"file_path": "usr/secrets.env"}),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+        assert result.returncode == 0
+
+
 class TestSubprocessNormalAllowed:
-    """Normal paths must be allowed with exit code 0."""
+    """Normal paths must be allowed with exit code 0 (even when dispatched)."""
 
     def test_router_module(self):
         result = _run_subprocess_json("src/genesis/router.py")
@@ -219,11 +317,15 @@ class TestSubprocessEdgeCases:
         assert result.returncode == 0
 
     def test_stderr_contains_pattern_on_block(self):
-        """Blocked paths report the matching pattern in stderr."""
+        """Blocked paths report the matching pattern + honest remedy in stderr."""
         result = _run_subprocess_json("config/autonomy.yaml")
         assert result.returncode == 2
         assert "CRITICAL protected path" in result.stderr
-        assert "relay/chat channel" in result.stderr
+        # The remedy is honest about WHY (dispatched session) and the real fix
+        # (an interactive session) — the old "relay/chat channel" text claimed
+        # a channel distinction the hook could not make.
+        assert "autonomous/dispatched" in result.stderr
+        assert "interactive" in result.stderr
 
 
 # ===================================================================
@@ -269,9 +371,6 @@ class TestMatchesFunction:
     def test_glob_star_no_match_partial_prefix(self):
         """src/genesis/channels/** does NOT match src/genesis/channels_extra/foo.py."""
         patterns = ["src/genesis/channels/**"]
-        # This depends on prefix split behavior — "src/genesis/channels/"
-        # is the prefix, so "channels_extra" won't match because the prefix
-        # check uses startswith on the split before **
         assert _matches("src/genesis/channels_extra/foo.py", patterns) is None
 
     def test_recursive_glob_etc_netplan(self):
@@ -319,6 +418,35 @@ class TestMatchesFunction:
             is None
         )
 
+    # --- Tail-matching (the 2026-08-01 inertness fix) ---
+
+    def test_tail_match_absolute_repo_relative_pattern(self):
+        """A repo-relative pattern matches the ABSOLUTE path CC actually sends."""
+        patterns = [".claude/settings.json"]
+        assert _matches("/home/anyone/genesis/.claude/settings.json", patterns) is not None
+
+    def test_tail_match_worktree_root(self):
+        patterns = ["src/genesis/autonomy/protection.py"]
+        assert (
+            _matches(
+                "/home/anyone/genesis/.claude/worktrees/x/src/genesis/autonomy/protection.py",
+                patterns,
+            )
+            is not None
+        )
+
+    def test_tail_match_does_not_invent_partial_segment(self):
+        """Suffix candidates are '/'-boundary suffixes — 'foo.env' has no
+        '.env' suffix candidate, so the exact '.env' pattern must not match."""
+        assert _matches("foo.env", [".env"]) is None
+
+    def test_tail_match_recursive_glob_absolute(self):
+        patterns = ["src/genesis/channels/**"]
+        assert (
+            _matches("/home/anyone/genesis/src/genesis/channels/telegram/x.py", patterns)
+            is not None
+        )
+
 
 # ===================================================================
 # SECTION 3: Unit tests for _load_critical_patterns()
@@ -352,30 +480,30 @@ class TestLoadCriticalPatterns:
             patterns = _load_critical_patterns()
         assert patterns == list(_FALLBACK_CRITICAL)
 
-    def test_fallback_on_empty_config(self, tmp_path):
-        """When config is valid YAML but has no 'critical' key, returns empty."""
+    def test_fallback_on_config_without_critical_key(self, tmp_path):
+        """Valid YAML with no 'critical' key → fallback, never an EMPTY guard.
+
+        (Previously returned [] — a config-shape mistake silently disabled the
+        whole guard.)
+        """
         empty_yaml = tmp_path / "empty.yaml"
         empty_yaml.write_text("sensitive:\n  - pattern: foo\n    reason: bar\n")
         with patch.object(_mod, "_CONFIG_PATH", empty_yaml):
             patterns = _load_critical_patterns()
-        # No 'critical' key means data.get("critical", []) returns []
-        assert patterns == []
+        assert patterns == list(_FALLBACK_CRITICAL)
 
-    def test_empty_yaml_raises_attribute_error(self, tmp_path):
-        """Empty YAML file (safe_load returns None) → unhandled AttributeError.
+    def test_empty_yaml_falls_back(self, tmp_path):
+        """Empty YAML file (safe_load → None) → fallback, not a crash.
 
-        This is a known gap in the script: yaml.safe_load("") returns None,
-        and None.get("critical", []) raises AttributeError which is NOT caught
-        by the (OSError, yaml.YAMLError) handler. The script crashes rather
-        than falling back gracefully. We test the actual behavior here.
+        REGRESSION: the old handler caught only (OSError, YAMLError), so
+        None.get(...) raised AttributeError → exit 1 → CC treated the guard as
+        a non-blocking error and ran the Write (fail-open).
         """
         none_yaml = tmp_path / "none.yaml"
         none_yaml.write_text("")
-        with (
-            patch.object(_mod, "_CONFIG_PATH", none_yaml),
-            pytest.raises(AttributeError, match="'NoneType'.*'get'"),
-        ):
-            _load_critical_patterns()
+        with patch.object(_mod, "_CONFIG_PATH", none_yaml):
+            patterns = _load_critical_patterns()
+        assert patterns == list(_FALLBACK_CRITICAL)
 
     def test_custom_config(self, tmp_path):
         """Verify loading from a custom config with known patterns."""
@@ -420,6 +548,9 @@ class TestMainMocked:
     def test_critical_blocked(self):
         assert _run_main_mock("usr/secrets.env") == 2
 
+    def test_critical_allowed_interactive(self):
+        assert _run_main_mock("usr/secrets.env", dispatched=False) == 0
+
     def test_normal_allowed(self):
         assert _run_main_mock("src/genesis/router.py") == 0
 
@@ -451,15 +582,16 @@ class TestMainMocked:
 
 
 # ===================================================================
-# SECTION 5: Fallback integration (subprocess with missing config)
+# SECTION 5: Failure-hardening (subprocess wrappers)
 # ===================================================================
 
 
 class TestSubprocessFallback:
-    """Test that hardcoded fallback patterns work when config is missing.
+    """Hardcoded fallback patterns work when config is missing.
 
     We override _CONFIG_PATH by creating a wrapper script that patches the
-    module-level constant before running main().
+    module-level constant before running main(). Wrappers run DISPATCHED so
+    the block path is exercised.
     """
 
     @pytest.fixture
@@ -487,74 +619,134 @@ class TestSubprocessFallback:
         )
         return wrapper
 
-    def test_fallback_blocks_secrets_env(self, wrapper_script):
-        payload = json.dumps({"file_path": "usr/secrets.env"})
-        result = subprocess.run(
-            [_PYTHON, str(wrapper_script)],
-            input=payload,
+    def _run_wrapper(self, wrapper: Path, file_path: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [_PYTHON, str(wrapper)],
+            input=json.dumps({"file_path": file_path}),
             capture_output=True,
             text=True,
             timeout=10,
+            env=_subprocess_env(dispatched=True),
         )
+
+    def test_fallback_blocks_secrets_env(self, wrapper_script):
+        result = self._run_wrapper(wrapper_script, "usr/secrets.env")
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
     def test_fallback_blocks_settings_json(self, wrapper_script):
-        payload = json.dumps({"file_path": ".claude/settings.json"})
-        result = subprocess.run(
-            [_PYTHON, str(wrapper_script)],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        result = self._run_wrapper(wrapper_script, ".claude/settings.json")
         assert result.returncode == 2
 
     def test_fallback_blocks_protection_module(self, wrapper_script):
-        payload = json.dumps({"file_path": "src/genesis/autonomy/protection.py"})
-        result = subprocess.run(
-            [_PYTHON, str(wrapper_script)],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        result = self._run_wrapper(wrapper_script, "src/genesis/autonomy/protection.py")
         assert result.returncode == 2
 
     def test_fallback_blocks_protected_paths_yaml(self, wrapper_script):
-        payload = json.dumps({"file_path": "config/protected_paths.yaml"})
-        result = subprocess.run(
-            [_PYTHON, str(wrapper_script)],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        result = self._run_wrapper(wrapper_script, "config/protected_paths.yaml")
         assert result.returncode == 2
 
     def test_fallback_allows_normal_path(self, wrapper_script):
-        payload = json.dumps({"file_path": "src/genesis/router.py"})
-        result = subprocess.run(
-            [_PYTHON, str(wrapper_script)],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        result = self._run_wrapper(wrapper_script, "src/genesis/router.py")
         assert result.returncode == 0
 
     def test_fallback_emits_warning_on_stderr(self, wrapper_script):
         """When config is missing, stderr should contain a warning."""
-        payload = json.dumps({"file_path": "usr/secrets.env"})
+        result = self._run_wrapper(wrapper_script, "usr/secrets.env")
+        assert "WARNING" in result.stderr
+        assert "fallback" in result.stderr.lower()
+
+
+class TestBlockNeverDependsOnGenesis:
+    """REGRESSION (audit B4): the SteerMessage import lived on the BLOCK path,
+    so an install where the hook python cannot import genesis crashed (exit 1)
+    exactly and only when it should have blocked — CC treats exit 1 as a
+    non-blocking error, so the CRITICAL Write proceeded (fail-open)."""
+
+    @pytest.fixture
+    def broken_genesis_wrapper(self, tmp_path):
+        """Wrapper that poisons the genesis package so its import raises."""
+        wrapper = tmp_path / "wrapper.py"
+        wrapper.write_text(
+            textwrap.dedent(f"""\
+            import sys
+            # Poison the genesis package: any 'import genesis.*' raises.
+            sys.modules["genesis"] = None
+            sys.path.insert(0, "{_WORKTREE / "scripts"}")
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "pretool_check", "{_SCRIPT_PATH}"
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.exit(mod.main())
+        """)
+        )
+        return wrapper
+
+    def test_blocks_with_plain_text_when_genesis_unimportable(self, broken_genesis_wrapper):
         result = subprocess.run(
-            [_PYTHON, str(wrapper_script)],
-            input=payload,
+            [_PYTHON, str(broken_genesis_wrapper)],
+            input=json.dumps({"file_path": "usr/secrets.env"}),
             capture_output=True,
             text=True,
             timeout=10,
+            env=_subprocess_env(dispatched=True),
         )
-        assert "WARNING" in result.stderr
-        assert "fallback" in result.stderr.lower()
+        assert result.returncode == 2, (
+            f"must BLOCK even without genesis importable, got {result.returncode}: "
+            f"{result.stdout}{result.stderr}"
+        )
+        assert "BLOCKED" in result.stderr
+        assert "critical_protected_path" in result.stderr
+
+
+class TestCrashFailsClosed:
+    """An UNEXPECTED crash inside the guard fails CLOSED (exit 2 via
+    hook_input.run_guard) — never exit 1, which CC treats as non-blocking."""
+
+    @pytest.fixture
+    def crashing_wrapper(self, tmp_path):
+        """Wrapper that makes pattern loading raise an unexpected error."""
+        wrapper = tmp_path / "wrapper.py"
+        wrapper.write_text(
+            textwrap.dedent(f"""\
+            import sys
+            sys.path.insert(0, "{_WORKTREE / "scripts"}")
+            sys.path.insert(0, "{_WORKTREE / "scripts" / "hooks"}")
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "pretool_check", "{_SCRIPT_PATH}"
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            def boom():
+                raise RuntimeError("simulated guard bug")
+            mod._load_critical_patterns = boom
+
+            from hook_input import run_guard
+            run_guard(mod.main, "pretool_check")
+        """)
+        )
+        return wrapper
+
+    def test_unexpected_crash_exits_2(self, crashing_wrapper):
+        result = subprocess.run(
+            [_PYTHON, str(crashing_wrapper)],
+            input=json.dumps({"file_path": "usr/secrets.env"}),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_subprocess_env(dispatched=True),
+        )
+        assert result.returncode == 2, (
+            f"crash must fail CLOSED (2), got {result.returncode}: {result.stderr}"
+        )
+        assert "GUARD ERROR" in result.stderr
+        assert "simulated guard bug" in result.stderr
 
 
 # ===================================================================
@@ -640,8 +832,6 @@ class TestBoundaryRegressions:
         # "src/genesis/channels/". A bare "src/genesis/channels" does NOT
         # start with "src/genesis/channels/" so it should not match.
         patterns = ["src/genesis/channels/**"]
-        # fnmatch won't match because there's no ** expansion to match empty,
-        # and the startswith check looks for the prefix "src/genesis/channels/"
         assert _matches("src/genesis/channels", patterns) is None
 
     def test_service_extension_in_nested_path(self):
@@ -660,9 +850,10 @@ class TestBoundaryRegressions:
         assert _matches("foo.service", ["*.service"]) is not None
 
     def test_dotenv_only_exact(self):
-        """.env pattern should match exactly '.env', not 'something.env'."""
+        """.env pattern matches '.env' (at any '/' boundary), never 'foo.env'."""
         assert _matches(".env", [".env"]) is not None
-        # "foo.env" should NOT match ".env" (fnmatch is exact)
+        # "foo.env" must NOT match ".env" — tail candidates split on '/', so
+        # no candidate is ever a partial segment.
         assert _matches("foo.env", [".env"]) is None
 
     def test_secrets_env_wildcard(self):

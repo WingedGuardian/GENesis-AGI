@@ -25,7 +25,7 @@ import sys
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
 # (importlib does not add the file's dir to sys.path).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload  # noqa: E402
+from hook_input import field, read_payload, run_guard  # noqa: E402
 from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
@@ -1663,11 +1663,17 @@ def main() -> int:
                 "branch already on the remote) — no push, so no separate approval"
             )
 
-    except Exception:
-        pass  # Fail-open on any error — never block legitimate work
+    except (json.JSONDecodeError, KeyError):
+        # A malformed/partial payload is a parse-ambiguity fail-open (matches the
+        # sibling guards). Any OTHER exception is an orchestration BUG and must
+        # NOT silently allow a push/merge — it propagates to run_guard(), which
+        # fails CLOSED (exit 2). The per-check network/parse helpers keep their
+        # own intentional inner fail-opens; this only removes the blanket
+        # swallow-everything that turned real bugs into silent allows.
+        return 0
 
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_guard(main, "git_push_guard")

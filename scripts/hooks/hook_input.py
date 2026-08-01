@@ -128,6 +128,38 @@ def session_id(payload: dict, default: str = "unknown") -> str:
     return env_sid or default
 
 
+def run_guard(main_fn, name: str) -> None:
+    """Run a fail-closed guard's ``main()``, turning an UNEXPECTED crash into a
+    BLOCK (exit 2) instead of the exit 1 that CC treats as a *non-blocking* error.
+
+    Why: CC's PreToolUse contract is "exit 2 = block; ANY other code = non-blocking
+    error → the tool RUNS". So an uncaught exception in a guard (exit 1) is a silent
+    FAIL-OPEN — the destructive command it was meant to stop executes anyway. For the
+    handful of irreversible-action guards (recursive rm, protected-path delete,
+    worktree removal, push/merge, CRITICAL-path Write/Edit) that is the wrong
+    direction; they must fail CLOSED.
+
+    ``main_fn`` returns the intended exit code (0 allow / 2 block). Any ``Exception``
+    it raises is caught here, logged loudly (so a guard bug is visible, per "never
+    hide broken things"), and converted to exit 2. ``SystemExit``/``KeyboardInterrupt``
+    (``BaseException``, not ``Exception``) propagate untouched. This only catches what
+    the guard did NOT handle — a guard's OWN documented inner fail-opens (parse-
+    ambiguity paths that deliberately ``return 0``) are unaffected.
+
+    Only wire this for guards where fail-closed is correct — never for advisory or
+    convenience guards, which must stay fail-open so a bug never blocks legit work.
+    """
+    try:
+        code = main_fn()
+    except Exception as exc:  # noqa: BLE001 — fail CLOSED on ANY unexpected error
+        print(
+            f"GUARD ERROR ({name}): failing CLOSED (blocking) — {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    sys.exit(code if isinstance(code, int) else 0)
+
+
 def strip_quoted(command: str) -> str:
     """Return ``command`` with quoted regions removed.
 
