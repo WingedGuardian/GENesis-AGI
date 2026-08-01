@@ -645,7 +645,8 @@ if $_ENCRYPT_READY; then
         "$HOME/.claude/.credentials.json:claude_credentials.json" \
         "$HOME/.claude.json:claude.json" \
         "$HOME/.genesis/guardian_remote.yaml:guardian_remote.yaml" \
-        "$HOME/.genesis/config/genesis.yaml:genesis.yaml"; do
+        "$HOME/.genesis/config/genesis.yaml:genesis.yaml" \
+        "$HOME/.genesis/release-fingerprints.txt:release-fingerprints.txt"; do
         _srcf="${_spec%%:*}"; _dstn="${_spec##*:}"
         [ -f "$_srcf" ] || continue
         if encrypt_file "$_srcf" "creds/${_dstn}.gpg"; then
