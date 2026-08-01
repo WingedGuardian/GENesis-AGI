@@ -408,16 +408,21 @@ async def extract_procedure(
         )
         return None
 
-    # Skip if an explicit-teach procedure already covers this task_type
+    # Skip if an explicit-teach procedure already covers this task_type.
+    # A slug can now hold multiple distinct rows, so check ALL of them for an
+    # explicit-teach — `find_by_task_type` returns only the highest-confidence
+    # single row, which could non-deterministically be a draft row that masks an
+    # explicit-teach sibling.
     try:
-        from genesis.db.crud.procedural import find_by_task_type
+        from genesis.db.crud.procedural import list_by_task_type
 
-        existing = await find_by_task_type(db, data["task_type"])
-        if existing and existing.get("draft") == 0:
+        siblings = await list_by_task_type(db, data["task_type"])
+        explicit = next((r for r in siblings if r.get("draft") == 0), None)
+        if explicit is not None:
             logger.info(
                 "Skipped extraction for %s: explicit-teach %s exists",
                 data["task_type"],
-                existing["id"],
+                explicit["id"],
             )
             return None
     except Exception:

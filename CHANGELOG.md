@@ -9,6 +9,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Learned procedures no longer overwrite each other.** Genesis identified a
+  stored "how-to" procedure by its coarse topic label alone, so two genuinely
+  different lessons that happened to share a label would silently replace one
+  another — each new lesson destroying the previous one under the same row. On
+  one install a single `code_review` row had absorbed (and lost) ~30 distinct
+  lessons this way. Procedures are now matched by the similarity of the lesson
+  itself: a genuine refinement still updates in place, but a distinct lesson is
+  kept as its own procedure instead of overwriting an unrelated one.
+
 ### Added
 
 - **Memory self-healing is now on by default, and deletes survive outages.**

@@ -11,8 +11,22 @@ from datetime import UTC, datetime
 import aiosqlite
 
 from genesis.db.crud import procedural
+from genesis.learning.procedural.embedding import cosine_similarity, unpack_embedding
 
 logger = logging.getLogger(__name__)
+
+# Cosine threshold above which an incoming principle is treated as the SAME
+# procedure as an existing same-task_type row (→ refine-in-place) rather than a
+# distinct lesson (→ create a new row). Deliberately conservative: `task_type`
+# is a coarse free-text topic bucket, NOT an identity, so two genuinely distinct
+# lessons that happen to share a slug MUST NOT overwrite each other — sameness
+# requires positive embedding evidence. Reuses the production-validated value of
+# ``extractor.NOVELTY_THRESHOLD`` (kept in sync by intent, not import, to avoid
+# an operations→extractor layering cycle; that value is hand-calibrated, pending
+# a retune on accumulated data). Near-duplicates below this bar
+# accumulate as siblings (cleanable by an offline consolidation pass) instead of
+# destroying the prior lesson — the data-loss bug this guards against.
+SAME_PROCEDURE_THRESHOLD = 0.85
 
 # Reads-as-signal: a deliberate procedure_recall ("read") is a soft positive
 # signal. Every READ_CONFIDENCE_DISCOUNT reads count as one *effective* success.
@@ -43,6 +57,10 @@ class StoreResult:
     action: str  # "created" | "updated" | "skipped"
     warnings: list[str] = field(default_factory=list)
     conflicting_ids: list[str] = field(default_factory=list)
+    # Best same-task_type cosine similarity considered for the create-vs-update
+    # decision (None when no embedding was available to compare). Observability +
+    # test assertions; does not affect the stored row.
+    matched_similarity: float | None = None
 
 
 async def store_procedure(
@@ -106,6 +124,36 @@ async def store_procedure(
     return proc_id
 
 
+def _best_same_procedure_match(
+    candidates: list[dict], incoming_blob: bytes | None
+) -> tuple[dict | None, float]:
+    """Best same-task_type row whose principle embedding is ``>=
+    SAME_PROCEDURE_THRESHOLD`` similar to the incoming one.
+
+    Returns ``(row, similarity)`` when a same-procedure match is found, else
+    ``(None, best_sim)`` (best_sim = the highest score seen, for observability).
+    Sameness requires POSITIVE evidence — a missing incoming embedding, a
+    candidate with no usable embedding, or a best score below the threshold all
+    resolve to "not the same procedure", so the caller CREATES a distinct row
+    rather than overwriting (a duplicate is cleanable; an overwrite is not).
+    """
+    incoming_vec = unpack_embedding(incoming_blob)
+    if incoming_vec is None:
+        return None, 0.0
+    best_row: dict | None = None
+    best_sim = 0.0
+    for row in candidates:
+        cand_vec = unpack_embedding(row.get("principle_embedding"))
+        if cand_vec is None:
+            continue
+        sim = cosine_similarity(incoming_vec, cand_vec)
+        if sim > best_sim:
+            best_sim, best_row = sim, row
+    if best_row is not None and best_sim >= SAME_PROCEDURE_THRESHOLD:
+        return best_row, best_sim
+    return None, best_sim
+
+
 async def store_procedure_checked(
     db: aiosqlite.Connection,
     *,
@@ -127,34 +175,42 @@ async def store_procedure_checked(
 
     Defaults match the explicit-teach path (draft=0, success_count=1).
 
-    Conflict resolution:
-    - Exact task_type match, incoming is auto-extracted but existing is
-      explicit-teach → skip (don't overwrite human-taught).
-    - Exact task_type match, same source type → upsert (update content,
-      preserve operational history, bump version).
-    - High context_tag overlap with different task_type → warn but still create.
+    Conflict resolution — identity is the PRINCIPLE (by embedding), not the
+    ``task_type`` slug (a coarse free-text topic bucket):
+    - A same-slug row whose principle is ``>= SAME_PROCEDURE_THRESHOLD`` similar
+      → the SAME procedure → refine-in-place (bump version, preserve counts).
+      An auto-extraction (draft=1) never overwrites a matched explicit-teach
+      (draft=0) → skip. An explicit teach refining an auto row promotes it.
+    - No same-procedure match (or no embedding to compare) → a DISTINCT lesson →
+      CREATE a new row. This is the fix for the serial-overwrite data loss:
+      distinct lessons sharing a slug coexist instead of destroying each other.
+    - High context_tag overlap with a different task_type → warn but still create.
     """
-    existing = await procedural.find_by_task_type(db, task_type)
+    candidates = await procedural.list_by_task_type(db, task_type)
+    matched, best_sim = _best_same_procedure_match(candidates, principle_embedding)
 
-    if existing:
-        # Auto-extracted should never overwrite explicit-teach
-        if draft == 1 and existing.get("draft") == 0:
+    if matched is not None:
+        # Auto-extracted should never overwrite an explicit-teach of the SAME
+        # procedure (embedding-confirmed match, not just a shared slug).
+        if draft == 1 and matched.get("draft") == 0:
             logger.info(
-                "Skipped auto-extracted procedure for %s: explicit-teach %s exists",
-                task_type, existing["id"],
+                "Skipped auto-extracted procedure for %s: matches explicit-teach %s "
+                "(cosine=%.3f)",
+                task_type, matched["id"], best_sim,
             )
             return StoreResult(
-                procedure_id=existing["id"],
+                procedure_id=matched["id"],
                 action="skipped",
-                warnings=["Auto-extracted procedure skipped: explicit-teach already exists"],
-                conflicting_ids=[existing["id"]],
+                warnings=["Auto-extracted procedure skipped: matches explicit-teach"],
+                conflicting_ids=[matched["id"]],
+                matched_similarity=best_sim,
             )
 
-        # Upsert: update content, preserve operational history (counts, confidence)
-        new_version = existing.get("version", 1) + 1
-        await procedural.update(
-            db,
-            existing["id"],
+        # Refine in place: update content, preserve operational history
+        # (counts, confidence). Overwrite is CORRECT here — it is the same
+        # procedure, and `version` records the change.
+        new_version = matched.get("version", 1) + 1
+        update_fields: dict = dict(
             principle=principle,
             scenario=scenario,
             steps=steps,
@@ -162,15 +218,35 @@ async def store_procedure_checked(
             context_tags=context_tags,
             tool_trigger=tool_trigger,
             version=new_version,
-            source=json.dumps(source) if source else existing.get("source"),
+            source=json.dumps(source) if source else matched.get("source"),
         )
-        logger.info("Updated procedure %s (v%d): %s", existing["id"], new_version, task_type)
+        # An explicit teach (draft=0) refining a matched auto-extracted row
+        # (draft=1) promotes it. Recall gates on `confidence`/`success_count`,
+        # NOT `draft` (matcher.find_best_match returns None at score<=0;
+        # find_relevant filters confidence<min) — so flipping draft alone would
+        # leave the "promoted" row at its auto-lifecycle confidence (often 0.0)
+        # and thus unrecallable. Raise to the explicit-teach seed, never lowering
+        # a value the auto row already earned through successful use.
+        if draft == 0 and matched.get("draft") == 1:
+            update_fields["draft"] = 0
+            update_fields["confidence"] = max(matched.get("confidence") or 0.0, confidence)
+            update_fields["success_count"] = max(
+                matched.get("success_count") or 0, success_count
+            )
+        await procedural.update(db, matched["id"], **update_fields)
+        logger.info(
+            "Refined procedure %s (v%d, cosine=%.3f): %s",
+            matched["id"], new_version, best_sim, task_type,
+        )
         return StoreResult(
-            procedure_id=existing["id"],
+            procedure_id=matched["id"],
             action="updated",
+            matched_similarity=best_sim,
         )
 
-    # Check for high context_tag overlap with different task_types
+    # No same-procedure match → this is a DISTINCT lesson (or we had no embedding
+    # to prove sameness). Check for high context_tag overlap with different
+    # task_types (informational warning only).
     warnings: list[str] = []
     conflicting_ids: list[str] = []
     overlapping = await procedural.find_by_context_overlap(db, context_tags)
@@ -206,6 +282,7 @@ async def store_procedure_checked(
         action="created",
         warnings=warnings,
         conflicting_ids=conflicting_ids,
+        matched_similarity=best_sim or None,
     )
 
 
