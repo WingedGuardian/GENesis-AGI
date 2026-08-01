@@ -437,6 +437,19 @@ defaults, or tests. Resolve repo paths via `genesis.env.repo_root()` /
 real-but-wrong repo and return plausible stale data. Shipped config defaults
 must work on a fresh install with ZERO overlay.
 
+**Leak-detection patterns follow the same rule — never hardcode an install's
+private literals into a tracked scanner.** A public repo's CI grep / gitleaks
+rule / commit-msg hook / contribution sanitizer must ship only generic CLASS
+patterns (all RFC1918, IPv6 ULA per RFC 4193, `/home/<user>` shapes — see
+`scripts/check_portability.sh`). This install's SPECIFIC literals (its
+hostnames, subnets, ULA prefixes, private repo name, timezone) live only in the
+GENERATED `~/.genesis/release-fingerprints.txt` (built by
+`genesis.contribution.fingerprints` at bootstrap; hand-edited section preserved,
+backed up via `backup.sh`) and — opt-in — the public repo's
+`GENESIS_PRIVATE_PATTERNS` Actions secret. A scanner that must exclude its own
+definition files from scanning is self-allowlisting a leak. See procedure
+`public_repo_leak_detection_design`.
+
 **Tenant-neutral, not tenant-shaped.** Genesis is a single-user sovereign
 system. Build clean single-user code; do NOT pre-genericise for multi-tenancy —
 no `tenant_id` columns, ACL tables, or context objects that always resolve to

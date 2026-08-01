@@ -538,6 +538,29 @@ else
 fi
 echo
 
+# --- Release fingerprints (install-specific leak-detection patterns) ---
+# Generate ~/.genesis/release-fingerprints.txt from local config so the
+# contribution sanitizer + pre-push/commit-msg hooks match THIS install's
+# private strings — WITHOUT any private byte living in tracked source (the
+# public tree ships only generic CLASS patterns). Non-fatal: a fresh clone
+# with no local config produces a valid header-only file and never aborts
+# setup. Secret-sync (pushing the patterns to the public repo's
+# GENESIS_PRIVATE_PATTERNS Actions secret, which the CI private-scan reads) is
+# OPT-IN via GENESIS_SYNC_PRIVATE_PATTERNS=1 — pushing install-private data to
+# GitHub should be a deliberate choice, not an unconditional setup side effect.
+echo "--- Generating release fingerprints ---"
+if [[ "${GENESIS_SYNC_PRIVATE_PATTERNS:-0}" == "1" ]]; then
+    _fp_args="--sync-secret"
+else
+    _fp_args="--write"
+fi
+if "$VENV_DIR/bin/python" -m genesis.contribution.fingerprints "$_fp_args"; then
+    :
+else
+    echo "  WARNING: could not generate release fingerprints (non-fatal — generic class patterns still protect)"
+fi
+echo
+
 # --- Git hooks (worktree safety, push guards) ---
 echo "--- Installing git hooks ---"
 HOOKS_SRC="$GENESIS_ROOT/scripts/hooks"
