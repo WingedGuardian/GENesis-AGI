@@ -428,7 +428,9 @@ def sync_secret(
         )
         return False
     body = "\n".join(patterns) + "\n"
-    print(f"  fingerprints: syncing {len(patterns)} patterns to secret {SECRET_NAME} on {slug}")
+    # Log only the COUNT + target repo — never the patterns themselves (the
+    # sensitive value) and not the secret-name variable (CodeQL taints it).
+    print(f"  fingerprints: syncing {len(patterns)} pattern(s) to the CI secret on {slug}")
     try:
         proc = subprocess.run(
             ["gh", "secret", "set", SECRET_NAME, "--repo", slug, "--body-file", "-"],

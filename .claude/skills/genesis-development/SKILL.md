@@ -440,7 +440,7 @@ must work on a fresh install with ZERO overlay.
 **Leak-detection patterns follow the same rule — never hardcode an install's
 private literals into a tracked scanner.** A public repo's CI grep / gitleaks
 rule / commit-msg hook / contribution sanitizer must ship only generic CLASS
-patterns (all RFC1918, `fc00::/7` ULA, `/home/<user>` shapes — see
+patterns (all RFC1918, IPv6 ULA per RFC 4193, `/home/<user>` shapes — see
 `scripts/check_portability.sh`). This install's SPECIFIC literals (its
 hostnames, subnets, ULA prefixes, private repo name, timezone) live only in the
 GENERATED `~/.genesis/release-fingerprints.txt` (built by
