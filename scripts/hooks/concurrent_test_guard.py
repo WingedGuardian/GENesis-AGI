@@ -9,13 +9,19 @@ Catches all invocation patterns:
   - python3 -m pytest ...
   - Chained: ruff check . && pytest ...
   - Any command containing 'pytest' as a standalone word
+
+Running-process detection scans /proc cmdlines directly (2026-08 rewrite):
+the old `pgrep -f "pytest( |$)"` matched ANY process whose command line merely
+CONTAINED the word — `grep pytest x`, `tail -f pytest.log`, an editor on a
+pytest file — falsely blocking a legitimate first test run. A process counts
+only when it IS pytest: argv[0] basename == pytest, or a python interpreter
+invoked with `-m pytest`.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import subprocess
 import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
@@ -33,29 +39,56 @@ def _command_runs_pytest(cmd: str) -> bool:
     return bool(re.search(r"(?:^|&&|;|\|)\s*(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b", cmd))
 
 
-def _pytest_already_running() -> bool:
-    """Check if any pytest process is currently running (excluding this hook)."""
-    my_pid = os.getpid()
-    try:
-        # pgrep -f uses POSIX extended regex (NOT PCRE — no \b).
-        # Match "pytest" followed by space, end-of-string, or common flag chars.
-        result = subprocess.run(
-            ["pgrep", "-f", "pytest( |$)"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        if result.returncode != 0:
-            return False
-        for line in result.stdout.strip().splitlines():
-            try:
-                pid = int(line.strip())
-            except ValueError:
-                continue
-            if pid != my_pid:
+def _argv_is_pytest(argv: list[str]) -> bool:
+    """Whether a process argv IS a pytest run (not a mere textual mention).
+
+    True only for:
+      * argv[0] whose basename is exactly ``pytest`` (venv/system entrypoint);
+      * a python interpreter (basename starts with ``python``) whose args
+        contain the adjacent pair ``-m pytest``.
+    Everything else — ``grep pytest …``, ``tail -f pytest.log``, an editor on
+    ``pytest.ini`` — is NOT a pytest process. Pure function; hermetically
+    testable.
+    """
+    if not argv:
+        return False
+    base = os.path.basename(argv[0])
+    if base == "pytest":
+        return True
+    if base.startswith("python"):
+        for i, tok in enumerate(argv[1:-1], start=1):
+            if tok == "-m" and argv[i + 1] == "pytest":
                 return True
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    return False
+
+
+def _pytest_already_running() -> bool:
+    """Scan /proc for a live pytest process (excluding this hook's own chain).
+
+    Reads each /proc/<pid>/cmdline (NUL-separated argv — a single syscall per
+    process, same approach as worktree_cwd_guard's cwd scan). Processes that
+    vanish mid-scan are skipped. Fail-open on any scan error: this guard is a
+    resource-contention convenience, not an irreversible-action gate.
+    """
+    exclude = {os.getpid(), os.getppid()}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in exclude:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue  # process vanished or unreadable — skip
+        argv = [t.decode("utf-8", "replace") for t in raw.split(b"\x00") if t]
+        if _argv_is_pytest(argv):
+            return True
     return False
 
 
