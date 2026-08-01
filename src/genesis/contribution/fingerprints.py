@@ -4,8 +4,8 @@ leak-detection patterns, derived from local config/environment.
 Why this exists
 ---------------
 Leak-detection patterns are DATA with a privacy classification, not neutral
-code. A public repo must ship only GENERIC CLASS patterns (all RFC1918, fc00::/7
-ULA, ``/home/<user>`` shapes — see ``scripts/check_portability.sh``); an
+code. A public repo must ship only GENERIC CLASS patterns (all RFC1918, IPv6
+ULA per RFC 4193, ``/home/<user>`` shapes — see ``scripts/check_portability.sh``); an
 install's SPECIFIC private literals (its hostnames, subnets, ULA prefixes,
 private repo name, timezone) must live OUT of the tracked tree. This module
 generates those specific literals into the local fingerprint file that
@@ -218,7 +218,7 @@ def harvest(
         except Exception:
             pass
 
-    # 3. Live IPv6 ULA prefixes (fc00::/7 — container/host/mesh addresses).
+    # 3. Live IPv6 ULA prefixes (RFC 4193 — container/host/mesh addresses).
     if run_ip6:
         for prefix in _harvest_ula_prefixes():
             out.append((_escape(prefix), "IPv6 ULA prefix"))
@@ -254,7 +254,7 @@ def harvest(
 
 
 def _harvest_ula_prefixes() -> list[str]:
-    """First-two-hextet ULA prefixes (e.g. ``fd00:1234``) from ``ip -6 addr``.
+    """First-two-hextet IPv6 ULA prefixes (RFC 4193) from ``ip -6 addr``.
 
     Returns ``[]`` if ``ip`` is absent, errors, or times out — never raises.
     """
@@ -276,7 +276,7 @@ def _harvest_ula_prefixes() -> list[str]:
             continue
         addr = line.split()[1].split("/")[0].lower()
         if not addr.startswith(("fc", "fd")):
-            continue  # only fc00::/7 ULA
+            continue  # only IPv6 ULA (RFC 4193)
         hextets = addr.split(":")
         if len(hextets) < 2 or not hextets[0] or not hextets[1]:
             continue
