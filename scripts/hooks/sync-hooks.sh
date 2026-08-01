@@ -53,6 +53,26 @@ fi
 if [[ "$GIT_COMMON_DIR" != /* ]]; then
     GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR"
 fi
+
+# Skip in a LINKED worktree. In a worktree, --git-dir points at
+# $GIT_COMMON_DIR/worktrees/<name> while --git-common-dir is the shared main
+# .git; in the main worktree they resolve to the same dir. HOOKS_DST below is
+# ALWAYS the shared $GIT_COMMON_DIR/hooks, but HOOKS_SRC is this checkout's
+# scripts/hooks — so syncing from a linked worktree would overwrite the shared
+# hooks with the worktree branch's (possibly older or feature-modified) copies,
+# affecting EVERY session/tree. Only the main worktree owns the shared hooks.
+# Resolve both to absolute real paths before comparing (one may be relative).
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null || echo "")
+if [[ -n "$GIT_DIR" ]]; then
+    [[ "$GIT_DIR" != /* ]] && GIT_DIR="$REPO_ROOT/$GIT_DIR"
+    _gd_abs=$(cd "$GIT_DIR" 2>/dev/null && pwd)
+    _gc_abs=$(cd "$GIT_COMMON_DIR" 2>/dev/null && pwd)
+    if [[ -n "$_gd_abs" && -n "$_gc_abs" && "$_gd_abs" != "$_gc_abs" ]]; then
+        _log "in a linked worktree — skipping hook sync (shared hooks are owned by the main worktree)"
+        exit 0
+    fi
+fi
+
 HOOKS_DST="$GIT_COMMON_DIR/hooks"
 
 if [[ ! -d "$HOOKS_DST" ]]; then
@@ -82,6 +102,21 @@ _sha256_of() {
     sha256sum "$1" 2>/dev/null | awk '{print $1}'
 }
 
+# Atomically install $src → $dst: copy to a temp file in the SAME dir (so the
+# final mv is a same-filesystem rename, which is atomic), chmod, then rename over
+# $dst. A concurrent session — or git firing the hook mid-copy — never observes a
+# half-written, partially-executable hook. Returns non-zero on any failure; the
+# temp file is cleaned up so a failed install leaves no stray *.tmp.* behind.
+_atomic_install() {
+    local src="$1" dst="$2"
+    local tmp="$dst.tmp.$$"
+    if cp "$src" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$dst"; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
+
 _sync_one() {
     local name="$1"
     local src="$HOOKS_SRC/$name"
@@ -98,7 +133,7 @@ _sync_one() {
 
     if [[ ! -f "$dst" ]]; then
         # Fresh install — just copy.
-        cp "$src" "$dst" && chmod +x "$dst" || { _warn "cp failed for $name"; return 1; }
+        _atomic_install "$src" "$dst" || { _warn "cp failed for $name"; return 1; }
         _log "installed: $name"
         SYNCED=$((SYNCED + 1))
         return 0
@@ -127,7 +162,7 @@ _sync_one() {
     fi
 
     if [[ $is_known_prior -eq 1 ]]; then
-        cp "$src" "$dst" && chmod +x "$dst" || { _warn "cp failed for $name"; return 1; }
+        _atomic_install "$src" "$dst" || { _warn "cp failed for $name"; return 1; }
         _log "updated: $name (was stale prior version)"
         SYNCED=$((SYNCED + 1))
     else
@@ -154,7 +189,7 @@ _sync_helper() {
     src_hash=$(_sha256_of "$src")
 
     if [[ ! -f "$dst" ]]; then
-        cp "$src" "$dst" && chmod +x "$dst" || { _warn "cp failed for helper $name"; return 1; }
+        _atomic_install "$src" "$dst" || { _warn "cp failed for helper $name"; return 1; }
         _log "installed helper: $name"
         SYNCED=$((SYNCED + 1))
         return 0
@@ -166,7 +201,7 @@ _sync_helper() {
     fi
 
     # Helper drift — always overwrite.
-    cp "$src" "$dst" && chmod +x "$dst" || { _warn "cp failed for helper $name"; return 1; }
+    _atomic_install "$src" "$dst" || { _warn "cp failed for helper $name"; return 1; }
     _log "updated helper: $name"
     SYNCED=$((SYNCED + 1))
 }

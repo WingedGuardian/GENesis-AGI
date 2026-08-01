@@ -355,6 +355,21 @@ jobs:
       - name: Subsystem-map drift guard
         run: python scripts/check_subsystem_map.py
 
+  hook-versions-check:
+    # Completeness backstop for .genesis-hook-versions: every version of a
+    # tracked git hook that ever shipped on main must be recorded, or a
+    # community install still carrying it gets wedged (sync-hooks.sh treats an
+    # unrecorded hash as "user-modified" and never updates it). The checker
+    # walks FULL hook history, so this job checks out fetch-depth: 0; it skips
+    # gracefully on a shallow clone. See scripts/check_hook_versions_complete.sh.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Hook-version ledger completeness guard
+        run: bash scripts/check_hook_versions_complete.sh
+
   cc-node-lockstep:
     # Enforce the CC↔Node pin lockstep: NODE_MAJOR in scripts/lib/cc_version.sh
     # must satisfy the pinned Claude Code's engines.node floor. Prevents the
