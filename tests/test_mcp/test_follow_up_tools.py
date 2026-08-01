@@ -323,6 +323,96 @@ async def test_list_status_filter_excludes_tabled(db):
     assert sorted(f["kind"] for f in res_incl["follow_ups"]) == ["follow_up", "tabled"]
 
 
+# ─── Codex P1/P2: blocked_on_trigger dispatch semantics + ready clears trigger ─
+
+
+async def test_create_blocked_on_trigger_rejects_surplus_task(db):
+    """surplus_task dispatches immediately (dispatcher.py:63-70); pairing it with
+    blocked_on_trigger (wait for an event) would run before the trigger → rejected."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_create(
+            content="analyze after X",
+            reason="r",
+            strategy="surplus_task",
+            work_state="blocked_on_trigger",
+            revisit_condition="after event X",
+        )
+        recent = await follow_ups.get_recent(db, limit=50, include_tabled=True)
+    assert "error" in res
+    assert "surplus_task" in res["error"]
+    assert not any(r["content"] == "analyze after X" for r in recent)
+
+
+async def test_create_blocked_on_trigger_allows_scheduled_task(db):
+    """scheduled_task IS a valid trigger — the scheduler fires it at scheduled_at."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_create(
+            content="run at time T",
+            reason="r",
+            strategy="scheduled_task",
+            work_state="blocked_on_trigger",
+            revisit_condition="at 2026-08-01T00:00:00",
+            scheduled_at="2026-08-01T00:00:00",
+        )
+    assert res.get("kind") == "follow_up", res
+    assert res["revisit_condition"] == "at 2026-08-01T00:00:00"
+
+
+async def test_create_ready_ignores_supplied_revisit_condition(db):
+    """A 'ready' item has no trigger — any supplied revisit_condition is dropped."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_create(
+            content="just do it",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+            revisit_condition="spurious",
+        )
+    assert res["revisit_condition"] is None
+    row = await follow_ups.get_by_id(db, res["id"])
+    assert row["revisit_condition"] is None
+
+
+async def test_update_to_ready_clears_revisit_condition(db):
+    """Moving a blocked_on_trigger item to ready clears the now-obsolete trigger."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="was blocked",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="blocked_on_trigger",
+            revisit_condition="when Y",
+        )
+        fid = created["id"]
+        res = await follow_up_tools._impl_follow_up_update(fid, work_state="ready")
+    assert res["revisit_condition"] is None, res
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["revisit_condition"] is None
+
+
+async def test_update_to_blocked_on_trigger_rejects_surplus_task_row(db):
+    """A surplus_task row can't move to blocked_on_trigger (same dispatch conflict);
+    the gate fires before any write, so the row is unchanged."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="surplus item",
+            reason="r",
+            strategy="surplus_task",
+            work_state="ready",
+        )
+        fid = created["id"]
+        res = await follow_up_tools._impl_follow_up_update(
+            fid,
+            work_state="blocked_on_trigger",
+            revisit_condition="after Z",
+        )
+    assert "error" in res
+    assert "surplus_task" in res["error"]
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["kind"] == "follow_up"
+    assert row["revisit_condition"] is None
+
+
 # ─── d67c83c7 / #1198: notes-only preserves status; blocked_reason blocks ─────
 # These guard the lost-update contract and MUST stay untouched by the work_state
 # work — the update path still routes notes-only writes through update_notes.

@@ -90,6 +90,21 @@ async def _impl_follow_up_create(
                 "work_state='ready'."
             )
         }
+    if work_state == "blocked_on_trigger" and strategy == "surplus_task":
+        # surplus_task dispatches immediately on idle compute (dispatcher.py:63-70),
+        # which would run the work BEFORE the trigger fires. A prose trigger can't
+        # gate an immediate dispatch — steer to a strategy that honors waiting.
+        return {
+            "error": (
+                "work_state='blocked_on_trigger' cannot use strategy='surplus_task' — "
+                "surplus tasks dispatch immediately on idle compute and would run before "
+                "the trigger fires. Use strategy='scheduled_task' (with scheduled_at) for "
+                "a time trigger, or 'user_input_needed' / 'ego_judgment' for an event "
+                "trigger so it isn't auto-dispatched before the event."
+            )
+        }
+    if work_state == "ready":
+        revisit_condition = ""  # a 'ready' item has no trigger — never store one
 
     if strategy == "scheduled_task" and not scheduled_at:
         return {"error": "scheduled_at is required when strategy is 'scheduled_task'"}
@@ -263,6 +278,15 @@ async def _impl_follow_up_update(
                         "'deferred_cold' (tabled) / 'ready' instead."
                     )
                 }
+            if work_state == "blocked_on_trigger" and existing.get("strategy") == "surplus_task":
+                return {
+                    "error": (
+                        "work_state='blocked_on_trigger' can't apply to a surplus_task "
+                        "follow-up — surplus tasks dispatch immediately on idle compute, "
+                        "ignoring the trigger. Recreate it as scheduled_task (time trigger) "
+                        "or user_input_needed / ego_judgment (event trigger)."
+                    )
+                }
 
         if priority and priority != existing.get("priority"):
             await db.execute(
@@ -276,7 +300,10 @@ async def _impl_follow_up_update(
 
         if resolved_kind:
             await follow_ups.set_kind(db, follow_up_id, resolved_kind)
-        if revisit_condition is not None:
+        if work_state == "ready":
+            # a 'ready' item has no trigger — clear any stale revisit_condition
+            await follow_ups.set_revisit_condition(db, follow_up_id, None)
+        elif revisit_condition is not None:
             await follow_ups.set_revisit_condition(db, follow_up_id, revisit_condition)
 
         if status:
@@ -360,7 +387,9 @@ async def follow_up_create(
             still intend to do is 'ready', not 'deferred_cold'):
             - "ready": actionable now, just needs doing → HOT (follow_up).
             - "blocked_on_trigger": intended, waiting on a specific time/event/
-              precondition → HOT (follow_up). REQUIRES revisit_condition.
+              precondition → HOT (follow_up). REQUIRES revisit_condition. Not valid
+              with strategy="surplus_task" (that dispatches immediately, ignoring the
+              trigger) — use scheduled_task (time) or user_input_needed/ego_judgment (event).
             - "deferred_cold": consciously not pursuing near-term (vague/hard/
               someday) → COLD (tabled).
         strategy: How to EXECUTE it if/when acted on (orthogonal to work_state):
