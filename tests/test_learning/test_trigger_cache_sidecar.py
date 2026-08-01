@@ -27,8 +27,11 @@ def _fake_row(task_type: str) -> dict:
 def test_regenerate_writes_yaml_and_json(tmp_path, monkeypatch):
     yaml_p = tmp_path / "procedure_triggers.yaml"
     json_p = tmp_path / "procedure_triggers.json"
+    # Patch ONLY _CACHE_PATH — the sidecar path is derived from it at call time,
+    # so a single override keeps them consistent (the fix for Codex P2: patching
+    # _CACHE_PATH alone must not leave the sidecar pointing at the real config).
+    assert yaml_p.with_suffix(".json") == json_p
     monkeypatch.setattr(trigger_cache, "_CACHE_PATH", yaml_p)
-    monkeypatch.setattr(trigger_cache, "_JSON_CACHE_PATH", json_p)
 
     import genesis.db.crud.procedural as procedural
 
@@ -53,8 +56,11 @@ def test_regenerate_writes_yaml_and_json(tmp_path, monkeypatch):
 def test_regenerate_json_matches_yaml(tmp_path, monkeypatch):
     yaml_p = tmp_path / "procedure_triggers.yaml"
     json_p = tmp_path / "procedure_triggers.json"
+    # Patch ONLY _CACHE_PATH — the sidecar path is derived from it at call time,
+    # so a single override keeps them consistent (the fix for Codex P2: patching
+    # _CACHE_PATH alone must not leave the sidecar pointing at the real config).
+    assert yaml_p.with_suffix(".json") == json_p
     monkeypatch.setattr(trigger_cache, "_CACHE_PATH", yaml_p)
-    monkeypatch.setattr(trigger_cache, "_JSON_CACHE_PATH", json_p)
 
     import yaml as _yaml
 

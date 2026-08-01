@@ -34,9 +34,6 @@ _CACHE_PATH = Path(
     os.environ.get("GENESIS_PROCEDURE_TRIGGERS")
     or (Path(__file__).resolve().parents[4] / "config" / "procedure_triggers.yaml")
 )
-# Colocated stdlib-loadable sidecar of the same content, so the hook can read it
-# without importing yaml. Written after the YAML, so its mtime is >= the YAML's.
-_JSON_CACHE_PATH = _CACHE_PATH.with_suffix(".json")
 
 
 def get_cache_path() -> Path:
@@ -44,7 +41,14 @@ def get_cache_path() -> Path:
 
 
 def get_json_cache_path() -> Path:
-    return _JSON_CACHE_PATH
+    """Path to the colocated stdlib-loadable JSON sidecar of the trigger cache.
+
+    Derived from the ACTIVE ``_CACHE_PATH`` at call time (not a module-level
+    constant) so a caller/test that overrides only ``_CACHE_PATH`` keeps the two
+    in lockstep — otherwise a redirected YAML would leave the sidecar pointing at
+    the real install-local file and pollute it.
+    """
+    return _CACHE_PATH.with_suffix(".json")
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -105,7 +109,7 @@ async def regenerate(db: object) -> int:
     # is written last so its mtime is >= the YAML's — the hook only trusts the
     # sidecar when it is at least as fresh as the YAML.
     _atomic_write(_CACHE_PATH, yaml.dump(cache_data, default_flow_style=False, sort_keys=False))
-    _atomic_write(_JSON_CACHE_PATH, json.dumps(cache_data))
+    _atomic_write(get_json_cache_path(), json.dumps(cache_data))
 
     logger.info("Regenerated procedure trigger cache: %d triggers", len(triggers))
     return len(triggers)

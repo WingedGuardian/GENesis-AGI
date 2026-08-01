@@ -26,7 +26,7 @@ from pathlib import Path
 # production hooks rely on the default. Keep this script stdlib-only.
 _DB_PATH = Path(
     os.environ.get("GENESIS_DB_PATH", "") or Path.home() / "genesis" / "data" / "genesis.db"
-)
+).expanduser()  # honor ~/... overrides like genesis.env.genesis_db_path()
 
 # Cap the file read for the post-edit hash: a multi-MB Write/Edit target would
 # otherwise be slurped whole into memory on the PostToolUse path. Over the cap

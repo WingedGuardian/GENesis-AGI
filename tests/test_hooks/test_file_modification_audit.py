@@ -140,6 +140,28 @@ def test_missing_db_is_silent(tmp_path: Path):
     assert not db.exists()
 
 
+def test_tilde_in_db_path_is_expanded(tmp_path: Path):
+    """A ~/... GENESIS_DB_PATH is expanded (like genesis.env), so the row lands in
+    the real home-relative DB rather than a literal './~/...' that never exists."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "override.db"
+    _make_db(db)
+    target = tmp_path / "edited.py"
+    target.write_text("x = 1\n")
+    payload = {"session_id": "s", "tool_name": "Write", "tool_input": {"file_path": str(target)}}
+    proc = subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(home), "GENESIS_DB_PATH": "~/override.db"},
+        timeout=30,
+    )
+    assert proc.returncode == 0
+    assert len(_rows(db)) == 1  # ~ expanded to $HOME → row landed in the real db
+
+
 def test_non_write_edit_tool_ignored(tmp_path: Path):
     db = tmp_path / "override.db"
     _make_db(db)

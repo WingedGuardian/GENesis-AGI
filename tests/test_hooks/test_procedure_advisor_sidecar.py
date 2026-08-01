@@ -27,8 +27,11 @@ def _load_module():
 
 
 def _point(mod, monkeypatch, yaml_p: Path, json_p: Path) -> None:
+    # The hook derives the sidecar path from _CACHE_PATH at call time (so an
+    # override of _CACHE_PATH alone stays consistent) — the fixtures name files
+    # so that yaml_p.with_suffix(".json") == json_p.
+    assert yaml_p.with_suffix(".json") == json_p
     monkeypatch.setattr(mod, "_CACHE_PATH", yaml_p)
-    monkeypatch.setattr(mod, "_JSON_CACHE_PATH", json_p)
 
 
 def _yaml_triggers(task_type: str) -> str:
@@ -96,6 +99,22 @@ def test_falls_back_to_yaml_when_json_corrupt(tmp_path, monkeypatch):
 
     trig = mod._load_triggers()
     assert trig[0]["task_type"] == "from_yaml"
+
+
+def test_falls_back_when_json_wrong_shape(tmp_path, monkeypatch):
+    """A fresh sidecar that decodes but isn't {"triggers": [...]} must be treated
+    as a miss (never trusted, never a crash): {} suppressed advisories and [] used
+    to raise an uncaught AttributeError (Codex P2)."""
+    mod = _load_module()
+    yaml_p = tmp_path / "c.yaml"
+    json_p = tmp_path / "c.json"
+    yaml_p.write_text(_yaml_triggers("from_yaml"))
+    for bad in ("{}", "[]", '{"triggers": "notalist"}', '"a string"', "42"):
+        json_p.write_text(bad)
+        _set_order(older=yaml_p, newer=json_p)  # json newer but wrong shape
+        _point(mod, monkeypatch, yaml_p, json_p)
+        trig = mod._load_triggers()
+        assert len(trig) == 1 and trig[0]["task_type"] == "from_yaml", f"bad={bad!r}"
 
 
 def test_empty_when_neither_exists(tmp_path, monkeypatch):

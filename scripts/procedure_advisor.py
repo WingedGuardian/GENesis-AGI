@@ -35,8 +35,6 @@ _CACHE_PATH = Path(
     os.environ.get("GENESIS_PROCEDURE_TRIGGERS")
     or (Path(__file__).resolve().parent.parent / "config" / "procedure_triggers.yaml")
 )
-# Stdlib-loadable sidecar written alongside the YAML by trigger_cache.regenerate.
-_JSON_CACHE_PATH = _CACHE_PATH.with_suffix(".json")
 
 
 def _load_triggers() -> list[dict]:
@@ -48,17 +46,24 @@ def _load_triggers() -> list[dict]:
     source of truth; only fall back to parsing the YAML (lazy import) otherwise.
     The mtime guard (nanosecond, exact) ensures a YAML regenerated without a
     matching sidecar is never served stale from an older JSON.
+
+    The sidecar path is derived from ``_CACHE_PATH`` here (not a module constant)
+    so an override of ``_CACHE_PATH`` alone keeps the two consistent. A sidecar
+    that decodes but is not ``{"triggers": [...]}`` (e.g. ``{}`` or ``[]``) is
+    treated as a miss and falls through to the YAML — never trusted, never a crash.
     """
+    json_path = _CACHE_PATH.with_suffix(".json")
     try:
-        if _JSON_CACHE_PATH.stat().st_mtime_ns >= _CACHE_PATH.stat().st_mtime_ns:
-            data = json.loads(_JSON_CACHE_PATH.read_text())
-            return data.get("triggers", []) if data else []
+        if json_path.stat().st_mtime_ns >= _CACHE_PATH.stat().st_mtime_ns:
+            data = json.loads(json_path.read_text())
+            if isinstance(data, dict) and isinstance(data.get("triggers"), list):
+                return data["triggers"]
     except (OSError, ValueError):
         pass  # missing/corrupt/stale sidecar → fall back to the YAML
     try:
         import yaml
         data = yaml.safe_load(_CACHE_PATH.read_text())
-        return data.get("triggers", []) if data else []
+        return data.get("triggers", []) if isinstance(data, dict) else []
     except Exception:
         return []
 
