@@ -239,6 +239,50 @@ def _get_push_remote_and_branch(seg, cwd: str | None = None) -> tuple[str | None
     return remote, branch
 
 
+def _normalize_repo(value: str) -> str | None:
+    """Normalize a gh --repo value (OWNER/REPO, HOST/OWNER/REPO, or URL) to
+    the OWNER/REPO form usable in both `gh --repo` and `gh api repos/…` paths.
+    Returns None for a value we cannot see through (e.g. a shell variable) —
+    callers then fail closed on the gh calls it feeds."""
+    if not value or "$" in value or "`" in value:
+        return None
+    v = value.split("://", 1)[-1]  # strip scheme if a URL
+    parts = [p for p in v.split("/") if p]
+    if len(parts) < 2:
+        return None
+    return f"{parts[-2]}/{parts[-1]}"
+
+
+def _merge_target_repo(argv: list[str], cmd: str) -> str | None:
+    """The repo a `gh pr merge` explicitly targets, normalized, or None.
+
+    Sources, in order: an explicit `--repo <v>` / `--repo=<v>` / `-R <v>` /
+    `-R<v>` anywhere in the segment argv (gh pflag accepts any position), else
+    the owner/repo of a full PR URL in the command. None = no explicit target
+    → the gates use gh's cwd-repo resolution (current behavior).
+
+    Why this exists (2026-07-26 incident): every merge gate ran `gh pr view
+    <N>` / `gh api repos/:owner/:repo/…` against the CWD repo, so merging a
+    cross-repo PR checked the WRONG repo's PR #N — a permanent false block
+    when that PR is closed/UNKNOWN, or worse a wrong-PR gate PASS.
+    """
+    argv = argv or []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--repo", "-R") and i + 1 < len(argv):
+            return _normalize_repo(argv[i + 1])
+        if tok.startswith("--repo="):
+            return _normalize_repo(tok.split("=", 1)[1])
+        if tok.startswith("-R") and len(tok) > 2 and not tok.startswith("--"):
+            return _normalize_repo(tok[2:])  # glued short form -Rowner/repo
+        i += 1
+    url = re.search(r"(?:https?://)?([^/\s]+)/([^/\s]+)/([^/\s]+)/pull/\d+", cmd)
+    if url:
+        return _normalize_repo(f"{url.group(2)}/{url.group(3)}")
+    return None
+
+
 def _extract_pr_number(cmd: str) -> str | None:
     """PR number from a gh pr merge command (bare number, #N, or URL)."""
     match = re.search(r"\bgh pr merge\b(.*)$", cmd, re.DOTALL)
@@ -275,7 +319,12 @@ def _extract_pr_number(cmd: str) -> str | None:
     return None
 
 
-def _resolve_pr_number(cmd: str) -> str | None:
+def _repo_args(repo: str | None) -> list[str]:
+    """gh CLI args selecting an explicit target repo (empty = cwd repo)."""
+    return ["--repo", repo] if repo else []
+
+
+def _resolve_pr_number(cmd: str, repo: str | None = None) -> str | None:
     """Command PR number, else the current branch's open PR.
 
     No-arg `gh pr merge` from a PR branch is valid gh usage, but it
@@ -283,13 +332,18 @@ def _resolve_pr_number(cmd: str) -> str | None:
     `if pr_num:`) — the 2026-07-10 audit points at this as a mechanism
     behind findings-ignored merges. Resolution failure is the caller's
     signal to fail CLOSED for merge commands.
+
+    With an explicit ``repo`` and no number in the command, `gh pr view
+    --repo` errors (a selector is required) → None → the caller fails CLOSED.
+    That is deliberate: resolving the CWD branch's PR *number* and gating it
+    against a DIFFERENT repo would re-create the wrong-PR bug this fix kills.
     """
     pr_num = _extract_pr_number(cmd)
     if pr_num:
         return pr_num
     try:
         result = subprocess.run(
-            ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
+            ["gh", "pr", "view", *_repo_args(repo), "--json", "number", "--jq", ".number"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -302,11 +356,21 @@ def _resolve_pr_number(cmd: str) -> str | None:
     return None
 
 
-def _check_mergeable(pr_num: str) -> str | None:
+def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
     """Query GitHub for PR mergeable status. Returns MERGEABLE/UNKNOWN/CONFLICTING or None."""
     try:
         result = subprocess.run(
-            ["gh", "pr", "view", pr_num, "--json", "mergeable", "--jq", ".mergeable"],
+            [
+                "gh",
+                "pr",
+                "view",
+                pr_num,
+                *_repo_args(repo),
+                "--json",
+                "mergeable",
+                "--jq",
+                ".mergeable",
+            ],
             capture_output=True,
             text=True,
             timeout=10,
@@ -327,7 +391,7 @@ _CI_GREEN = {"SUCCESS"}
 _CI_TERMINAL_STATUSES = {"COMPLETED"}
 
 
-def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
+def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
     """Classify a PR's CI check-runs.
 
     Returns ``(state, problem_checks)`` where state is one of:
@@ -351,6 +415,7 @@ def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
                     "pr",
                     "view",
                     pr_num,
+                    *_repo_args(repo),
                     "--json",
                     "statusCheckRollup",
                     "--jq",
@@ -467,6 +532,7 @@ def _check_inline_review_findings(
     pr_num: str,
     *,
     force: bool = False,
+    repo: str | None = None,
 ) -> tuple[bool, str]:
     """Scan INLINE review comments for P1/P2 badge findings.
 
@@ -486,7 +552,7 @@ def _check_inline_review_findings(
             [
                 "gh",
                 "api",
-                f"repos/:owner/:repo/pulls/{pr_num}/comments",
+                f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/comments",
                 "--paginate",
                 "--jq",
                 ".[] | {id: .id, reply_to: .in_reply_to_id, "
@@ -537,7 +603,9 @@ def _check_inline_review_findings(
     return False, ""
 
 
-def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool, str]:
+def _check_pr_review_findings(
+    pr_num: str, *, force: bool = False, repo: str | None = None
+) -> tuple[bool, str]:
     """Check PR comments for unresolved automated review findings.
 
     Returns (should_block, message).
@@ -558,7 +626,7 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
             [
                 "gh",
                 "api",
-                f"repos/:owner/:repo/issues/{pr_num}/comments",
+                f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
                 "--jq",
                 "[.[] | {login: .user.login, type: .user.type, body: .body}]",
             ],
@@ -1501,7 +1569,11 @@ def main() -> int:
             # Check mergeable status before allowing merge. Merge is
             # the one command that fails CLOSED: if we can't tell which
             # PR this is, we can't run the gates, so we don't merge.
-            pr_num = _resolve_pr_number(cmd)
+            # An explicit --repo/-R (or PR URL) retargets EVERY gate below —
+            # without it, merging a cross-repo PR checked the CWD repo's
+            # same-numbered PR (wrong-repo gate; 2026-07-26 incident).
+            merge_repo = _merge_target_repo(merge_seg.argv, cmd)
+            pr_num = _resolve_pr_number(cmd, repo=merge_repo)
             if pr_num is None:
                 print(
                     "BLOCKED: cannot resolve which PR this merges "
@@ -1515,7 +1587,7 @@ def main() -> int:
                 )
                 return 2
             if pr_num:
-                mergeable = _check_mergeable(pr_num)
+                mergeable = _check_mergeable(pr_num, repo=merge_repo)
                 if mergeable == "UNKNOWN":
                     print(
                         f"BLOCKED: PR #{pr_num} mergeable status is UNKNOWN.",
@@ -1542,7 +1614,7 @@ def main() -> int:
                 # `# ci-override` is appended (never waived by --admin or
                 # # review-override). Fail-OPEN on "unknown" so a transient API
                 # hiccup can't wedge merges.
-                ci_state, ci_bad = _pr_ci_status(pr_num)
+                ci_state, ci_bad = _pr_ci_status(pr_num, repo=merge_repo)
                 ci_override = has_trailing_override(merge_seg.raw, "ci-override")
                 if ci_state in ("red", "pending") and not ci_override:
                     print(
@@ -1572,6 +1644,7 @@ def main() -> int:
                 should_block, review_msg = _check_pr_review_findings(
                     pr_num,
                     force=force_override,
+                    repo=merge_repo,
                 )
                 if should_block:
                     print(
@@ -1586,6 +1659,7 @@ def main() -> int:
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,
+                    repo=merge_repo,
                 )
                 if should_block:
                     print(
