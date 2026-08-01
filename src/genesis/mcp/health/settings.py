@@ -541,7 +541,7 @@ def _validate_tts(changes: dict) -> list[str]:
 def _validate_resilience(changes: dict) -> list[str]:
     """Validate resilience config changes."""
     errors: list[str] = []
-    valid_top_keys = {"flapping", "recovery", "cc", "status", "notifications"}
+    valid_top_keys = {"flapping", "recovery", "cc", "status", "notifications", "network"}
 
     for key in changes:
         if key not in valid_top_keys:
@@ -567,6 +567,28 @@ def _validate_resilience(changes: dict) -> list[str]:
     if isinstance(cc, dict):
         _validate_positive_int(cc, "max_sessions_per_hour", errors)
         _validate_float_range(cc, "throttle_threshold_pct", 0.0, 1.0, errors)
+
+    network = changes.get("network", {})
+    if isinstance(network, dict):
+        from genesis.resilience.network_config import BACKUP_RETRY_MODES, PARKING_MODES
+
+        pm = network.get("parking_mode")
+        if pm is not None and pm not in PARKING_MODES:
+            errors.append(f"network.parking_mode must be one of {PARKING_MODES}")
+        bpr = network.get("backup_push_retry")
+        if bpr is not None and bpr not in BACKUP_RETRY_MODES:
+            errors.append(f"network.backup_push_retry must be one of {BACKUP_RETRY_MODES}")
+        for field in (
+            "probe_port",
+            "probe_timeout_s",
+            "fast_cadence_s",
+            "steady_cadence_s",
+            "offline_all_fail_rounds",
+            "online_clean_rounds",
+            "stable_online_s",
+            "merge_gap_s",
+        ):
+            _validate_positive_int(network, field, errors)
 
     return errors
 

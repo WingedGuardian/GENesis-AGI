@@ -23,8 +23,30 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `GENESIS_MEMORY_INTEGRITY_DISABLED=1` turns the memory-integrity jobs off
   entirely. Every repair run is recorded, so what changed is always auditable.
 
+### Changed
+
+- **The push-approval prompt now appears only on a branch's first push, not on
+  every push.** Publishing a branch to the public repo still asks for your
+  approval the first time — that's the moment code actually goes public — but
+  re-pushing fixes to a branch that's already on the remote (the normal
+  PR-iteration loop) no longer re-prompts. A genuinely new branch prompts again,
+  pushing to `main` still prompts, force-pushes are still hard-blocked, and
+  autonomous/dispatched sessions still can't push at all. The check reads the live
+  remote and fails safe: any uncertainty (unreachable remote, ambiguous target)
+  falls back to asking.
+
 ### Fixed
 
+- **Committing with `git -C` or `git -c` no longer skips the code-review gate.**
+  The safety hook that blocks commits until a review is recorded (and blocks
+  `--no-verify` and direct commits to `main`) recognized only the plain
+  `git commit` form. Commits written as `git -C <dir> commit` or
+  `git -c key=val commit` — a form these sessions use routinely for worktrees —
+  slipped past it entirely and committed with no review check at all. The gate
+  now recognizes those forms, so every commit is held to the same review rule,
+  and the matching post-commit cleanup clears the review for the exact worktree
+  the commit landed in (not the shell's directory), so one review can't silently
+  authorize a later unrelated commit.
 - **Deleting a memory no longer risks leaving an orphaned vector behind.** A
   memory lives across SQLite and a vector store; if the vector store hiccupped
   mid-delete, Genesis used to remove the memory's records but leave its vector
@@ -40,6 +62,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   state — so a memory that was retired or superseded while its vector was still
   pending stays excluded from recall instead of quietly reappearing, and its real
   confidence is preserved rather than reset to a default.
+- **Internet outages no longer leave a mess behind.** A long connectivity loss
+  used to pile up hundreds of duplicate queued alerts, spam the health view with
+  false "delivery exhausted" warnings, and — worst — put Genesis in an endless
+  restart loop (it announced "going offline" over and over because restarting
+  can't fix a dead network). Now: a repeated delivery failure for the same alert
+  is de-duplicated instead of re-queued; a duplicate that was already delivered,
+  or an email held for your approval, is treated as done rather than retried into
+  a false failure; deferred messages actually expire on their 4-hour deadline
+  instead of lingering forever; and the watchdog, after restarting a few times
+  for the same reason, backs off and sends you one warning instead of restarting
+  on a loop.
+- **Genesis now sheds low-priority background work when its providers are
+  struggling.** The degradation system that's meant to skip non-essential work
+  (surplus brainstorms, the morning report) during a provider brownout was wired
+  up but never actually triggered on provider failures — it does now, so a rough
+  patch for the model providers no longer drags every background task down with it.
 
 ### Added
 

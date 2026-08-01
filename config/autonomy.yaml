@@ -56,6 +56,15 @@ watchdog:
   backoff_initial_seconds: 10
   backoff_max_seconds: 300               # Cap at 5 minutes
   config_validation: true                # Validate config before restart
+  # Flap damping — a SLOW recurring same-reason restart (spaced beyond the 120s
+  # stabilization window, so consecutive_failures resets each time) would restart
+  # forever; restart cannot fix a persistent external cause (2026-07 outage flapped
+  # zombie_scheduler ~25x/12h). Once >= flap_threshold same-reason restarts land
+  # within flap_window_seconds, escalate backoff (capped) and surface one warning
+  # alert. A BACKOFF, not a refusal — self-heals once the window prunes.
+  flap_window_seconds: 21600             # 6h rolling per-reason window
+  flap_threshold: 3                      # same-reason restarts before damping kicks in
+  flap_backoff_max_seconds: 7200         # cap escalating flap backoff at 2h
 
 # CC rate limit detection patterns
 # These are parsed from CC CLI stderr/stdout when rate limits are hit.

@@ -302,6 +302,7 @@ async def test_delivery_failure_defers(config, db, mock_drafter, mock_formatter)
     failing_channel = AsyncMock()
     failing_channel.send_message.side_effect = ConnectionError("Network down")
     mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)  # no open dup
 
     gate = GovernanceGate(config, db)
     pipeline = OutreachPipeline(
@@ -324,6 +325,47 @@ async def test_delivery_failure_defers(config, db, mock_drafter, mock_formatter)
     result = await pipeline.submit(req)
     assert result.status == OutreachStatus.FAILED
     mock_deferred.enqueue.assert_called_once()
+    # Fix B: deferred outreach must use the 'ttl' policy so expire_by_policy
+    # actually expires it (the old 'drain' policy never expired → pile-up).
+    assert mock_deferred.enqueue.call_args.kwargs["staleness_policy"] == "ttl"
+    assert mock_deferred.enqueue.call_args.kwargs["staleness_ttl_s"] == 14400
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_suppressed_when_open_duplicate(
+    config, db, mock_drafter, mock_formatter
+):
+    """Fix C: a repeated failure for a topic with an already-open deferred row
+    does NOT enqueue a second row (the 690-duplicate outage signature)."""
+    failing_channel = AsyncMock()
+    failing_channel.send_message.side_effect = ConnectionError("Network down")
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=True)  # dup already queued
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": failing_channel},
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="Defer test",
+        context="Will fail delivery",
+        salience_score=0.9,
+        signal_type="surplus_insight",
+    )
+    result = await pipeline.submit(req)
+    assert result.status == OutreachStatus.FAILED
+    mock_deferred.has_open.assert_awaited_once_with(
+        "outreach_delivery", "Defer test", "surplus", "surplus_insight"
+    )
+    mock_deferred.enqueue.assert_not_called()
 
 
 @pytest.mark.asyncio

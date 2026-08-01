@@ -22,7 +22,9 @@ _TIMEOUT = 10
 
 def _run_hook(payload: dict | str | None = None) -> subprocess.CompletedProcess:
     """Run the content_safety_hook.py script with optional JSON payload on stdin."""
-    stdin_text = payload if isinstance(payload, str) else json.dumps(payload) if payload is not None else ""
+    stdin_text = (
+        payload if isinstance(payload, str) else json.dumps(payload) if payload is not None else ""
+    )
     return subprocess.run(
         [_PYTHON, str(_SCRIPT)],
         input=stdin_text,
@@ -80,16 +82,40 @@ class TestWebContentToolsMatch:
         assert output is not None
         assert "CONTENT SAFETY" in output["hookSpecificOutput"]["additionalContext"]
 
-    def test_browser_evaluate(self) -> None:
-        payload = {"tool_name": "browser_evaluate", "tool_input": {"expression": "document.title"}}
+    def test_namespaced_mcp_browser_navigate(self) -> None:
+        """B2 regression: the REAL tool name is namespaced. The old exact
+        bare-name set membership silently no-op'd here — the advisory never
+        fired for MCP browser tools."""
+        payload = {
+            "tool_name": "mcp__genesis-health__browser_navigate",
+            "tool_input": {"url": "https://example.com"},
+        }
         result = _run_hook(payload)
         assert result.returncode == 0
         output = _parse_output(result)
         assert output is not None
         assert "CONTENT SAFETY" in output["hookSpecificOutput"]["additionalContext"]
 
-    def test_browser_run_code(self) -> None:
-        payload = {"tool_name": "browser_run_code", "tool_input": {"code": "console.log('hi')"}}
+    def test_namespaced_mcp_browser_run_js(self) -> None:
+        """The real tool is browser_run_js (not the phantom browser_run_code /
+        browser_evaluate the old matcher listed); it must fire."""
+        payload = {
+            "tool_name": "mcp__genesis-health__browser_run_js",
+            "tool_input": {"script": "document.title"},
+        }
+        result = _run_hook(payload)
+        assert result.returncode == 0
+        output = _parse_output(result)
+        assert output is not None
+        assert "CONTENT SAFETY" in output["hookSpecificOutput"]["additionalContext"]
+
+    def test_namespaced_mcp_browser_fill(self) -> None:
+        """A browser_* tool the OLD matcher didn't list at all must still fire
+        (prefix match, not an enumerated allowlist)."""
+        payload = {
+            "tool_name": "mcp__genesis-health__browser_fill",
+            "tool_input": {"selector": "#q", "value": "hi"},
+        }
         result = _run_hook(payload)
         assert result.returncode == 0
         output = _parse_output(result)
@@ -124,7 +150,10 @@ class TestNonWebToolsSilent:
         assert result.stdout.strip() == ""
 
     def test_edit_silent(self) -> None:
-        payload = {"tool_name": "Edit", "tool_input": {"file_path": "/tmp/f.py", "old_string": "a", "new_string": "b"}}
+        payload = {
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/tmp/f.py", "old_string": "a", "new_string": "b"},
+        }
         result = _run_hook(payload)
         assert result.returncode == 0
         assert result.stdout.strip() == ""
@@ -137,6 +166,14 @@ class TestNonWebToolsSilent:
 
     def test_agent_silent(self) -> None:
         payload = {"tool_name": "Agent", "tool_input": {"task": "do something"}}
+        result = _run_hook(payload)
+        assert result.returncode == 0
+        assert result.stdout.strip() == ""
+
+    def test_non_browser_mcp_tool_silent(self) -> None:
+        """A namespaced MCP tool that is NOT a browser tool must not fire —
+        the prefix match keys on the ``browser_`` suffix, not on ``mcp__``."""
+        payload = {"tool_name": "mcp__genesis-memory__reference_store", "tool_input": {}}
         result = _run_hook(payload)
         assert result.returncode == 0
         assert result.stdout.strip() == ""

@@ -29,6 +29,7 @@ from genesis.observability.types import Severity, Subsystem
 from genesis.surplus.types import (
     INSIGHT_PRODUCING_TASK_TYPES,
     KB_ROUTING_TASK_TYPES,
+    ComputeTier,
     TaskType,
 )
 
@@ -171,6 +172,7 @@ async def _route_insights(
             else:
                 try:
                     from genesis.surplus.intake import (
+                        _valid_drive,
                         run_intake,
                         source_for_task_type,
                     )
@@ -180,19 +182,27 @@ async def _route_insights(
                         source=source,
                         source_task_type=str(task.task_type),
                         generating_model=insight.get("generating_model", "unknown"),
+                        drive_alignment=task.drive_alignment,
                         db=sched._db,
                     )
                     logger.info(
-                        "Intake routed %d findings (k=%d, o=%d, d=%d) for task %s",
+                        "Intake routed %d findings (k=%d, o=%d, d=%d, staged=%d) "
+                        "for task %s",
                         intake_stats.findings_count,
                         intake_stats.routed_knowledge,
                         intake_stats.routed_observation,
                         intake_stats.routed_discard,
+                        intake_stats.routed_staging,
                         task.id[:8],
                     )
-                    # Use a synthetic staging_id for tracking
-                    content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
-                    staging_id = f"{task.task_type.value}-{content_hash}"
+                    # Prefer the real staged row id (ideation → surplus_insights)
+                    # so a linked follow-up's result_staging_id resolves; else a
+                    # synthetic tracking id (KB-routed tasks stage no surplus row).
+                    if intake_stats.staged_ids:
+                        staging_id = intake_stats.staged_ids[0]
+                    else:
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                        staging_id = f"{task.task_type.value}-{content_hash}"
                 except Exception:
                     # Fallback: write to surplus_insights staging (old behavior)
                     logger.warning(
@@ -210,7 +220,7 @@ async def _route_insights(
                         content=content,
                         source_task_type=str(task.task_type),
                         generating_model=insight.get("generating_model", "unknown"),
-                        drive_alignment=task.drive_alignment,
+                        drive_alignment=_valid_drive(task.drive_alignment),
                         confidence=insight.get("confidence", 0.0),
                         created_at=now_iso,
                         ttl=ttl,
@@ -342,6 +352,50 @@ async def _signal_autonomy_success() -> None:
         logger.debug("Autonomy success signal failed (non-fatal)", exc_info=True)
 
 
+def _filter_tiers_for_network(tiers: list[ComputeTier]) -> list[ComputeTier]:
+    """Strip cloud compute tiers when the network is hard-OFFLINE (PR-3).
+
+    Keeps surplus outage-aware: during a detected outage, tasks that need the
+    internet stay ``pending`` (``next_task`` simply selects nothing for the
+    stripped tiers, and re-selects them the instant connectivity returns)
+    instead of dispatching into a dead network and churning ``failed`` /
+    dead-letter rows every cycle. LAN-local compute (``LOCAL_30B``) still runs.
+
+    This is dispatch-side *compute-availability* gating — the same mechanism as
+    the existing LM-Studio reachability check in ``get_available_tiers`` — NOT
+    generator alert-awareness (surplus generators stay deliberately blind to
+    infrastructure alerts). Fail-safe: the parking lever off, a non-fresh/absent
+    OFFLINE signal, or any error leaves the tier list untouched.
+    """
+    try:
+        from genesis.resilience import network_config
+
+        decision = network_config.parking_decision()
+        if decision in ("off", "normal"):
+            return tiers
+        local_only = [t for t in tiers if t == ComputeTier.LOCAL_30B]
+        if local_only == tiers:
+            return tiers  # already LAN-only (or empty) — nothing cloud to strip
+        if decision == "shadow":
+            logger.info(
+                "network OFFLINE: WOULD restrict surplus to LAN compute "
+                "(shadow mode) — proceeding",
+            )
+            return tiers
+        logger.info(
+            "network OFFLINE: surplus restricted to LAN compute (%d→%d tiers)",
+            len(tiers),
+            len(local_only),
+        )
+        return local_only
+    except Exception:
+        logger.debug(
+            "surplus network tier filter errored — leaving tiers intact",
+            exc_info=True,
+        )
+        return tiers
+
+
 async def dispatch_once(sched: DispatchContext) -> bool:
     """Single dispatch cycle. Returns True if a task was processed."""
     # 0. Recover tasks stuck in 'running' state (crashed mid-execution)
@@ -360,6 +414,11 @@ async def dispatch_once(sched: DispatchContext) -> bool:
 
     # 3. Check compute availability
     available_tiers = await sched._compute.get_available_tiers()
+
+    # 3b. Outage awareness (PR-3): when the network is hard-OFFLINE, strip cloud
+    # tiers so internet-dependent tasks stay `pending` instead of churning into a
+    # dead network. LAN-local compute still runs; fail-safe leaves tiers intact.
+    available_tiers = _filter_tiers_for_network(available_tiers)
 
     # 4. Get next task
     task = await sched._queue.next_task(available_tiers)

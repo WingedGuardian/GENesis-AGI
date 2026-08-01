@@ -225,6 +225,32 @@ def test_load_full_yaml(monkeypatch):
     assert ml.model_id == "mistral-large-latest"
 
 
+def test_retry_profiles_under_watchdog_threshold():
+    """Every shipped retry profile must set max_total_s BELOW the watchdog's 900s
+    scheduler-heartbeat zombie threshold.
+
+    A background route_call that outlives 900s lets the surplus heartbeat go
+    stale and the watchdog restarts the whole server (2026-07 outage: background
+    was 1800s = 2x the threshold, so a single stalled dispatch kept re-killing
+    the server ~25x/day). An omitted key parses to None (uncapped) and fails the
+    ``is not None`` check too — an uncapped profile is exactly the footgun. Keep
+    in lockstep with autonomy/watchdog.py _check_scheduler_heartbeats (900s).
+    """
+    watchdog_zombie_threshold_s = 900
+    path = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
+    cfg = load_config(path, check_api_keys=False)
+    assert cfg.retry_profiles, "no retry profiles parsed"
+    for name, rp in cfg.retry_profiles.items():
+        assert rp.max_total_s is not None, (
+            f"retry profile {name!r} has no max_total_s — an uncapped background "
+            f"chain-walk can outlive the 900s watchdog zombie threshold"
+        )
+        assert rp.max_total_s < watchdog_zombie_threshold_s, (
+            f"retry profile {name!r} max_total_s={rp.max_total_s} must stay under "
+            f"the {watchdog_zombie_threshold_s}s watchdog zombie threshold"
+        )
+
+
 def test_provider_enabled_default():
     """Providers without explicit enabled field default to enabled."""
     cfg = load_config_from_string(MINIMAL_YAML)

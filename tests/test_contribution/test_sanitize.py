@@ -137,7 +137,7 @@ def test_portability_ip_blocks():
     diff = (
         "diff --git a/config.py b/config.py\n"
         "--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n"
-        "+OLLAMA_URL = 'http://10.176.34.199:11434'\n"
+        "+OLLAMA_URL = 'http://10.176.0.0:11434'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -240,7 +240,7 @@ def test_multi_file_diff_all_scanned():
     diff = (
         "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+ok_line\n"
         "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n"
-        "+IP = '10.176.34.199'\n"
+        "+IP = '10.176.0.0'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -300,7 +300,7 @@ def test_parse_diff_dev_null_target():
 def test_findings_include_severity():
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+ip=10.176.34.199\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+ip=10.176.0.0\n"
     )
     r = sanitize.scan_diff(diff)
     assert all(f.severity == Severity.BLOCK for f in r.blocking())
@@ -529,7 +529,7 @@ def test_portability_tailscale_ipv6_blocks():
     """Tailscale IPv6 (fd7a: ULA prefix) must be blocked pre-push."""
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST6 = 'fd7a:115c:a1e0::1'\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST6 = 'fd7a::1'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -540,7 +540,7 @@ def test_portability_10_176_range_blocks():
     """Any 10.176.x.x address (not just the two legacy literals) must block."""
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST = '10.176.99.42'\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST = '10.176.0.1'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False

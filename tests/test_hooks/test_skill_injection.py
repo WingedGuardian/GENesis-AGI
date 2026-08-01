@@ -115,14 +115,38 @@ def test_score_skill_raw_points_keyword_hit():
     assert _score_skill(skill, ["selenium"]) >= _MIN_SCORE
 
 
-def test_score_skill_raw_points_desc_hit_below_threshold():
-    """A lone description hit (1 point) stays below the firing threshold."""
-    from skill_injection_hook import _MIN_SCORE, _score_skill
+def test_score_skill_description_not_scored():
+    """Description prose is not scored at all — only name/keyword hits count.
+
+    A term appearing ONLY in the description scores 0 (the old scorer gave it
+    1 point; two such incidental hits could reach the threshold and fire a
+    spurious nudge — e.g. 'plan'→'usage plan' + 'out'→'timeout')."""
+    from skill_injection_hook import _score_skill
 
     skill = {"name": "forecasting", "description": "predict future trends", "keywords": []}
-    score = _score_skill(skill, ["trends"])
-    assert score == 1.0
-    assert score < _MIN_SCORE
+    assert _score_skill(skill, ["trends"]) == 0.0
+    # Two description-only hits still score 0 (the api-gateway FP class).
+    ag = {
+        "name": "api-gateway",
+        "description": "REST API, usage plan, throttling, CORS, timeout errors",
+        "keywords": [],
+    }
+    assert _score_skill(ag, ["plan", "out"]) == 0.0
+
+
+def test_score_skill_name_match_is_whole_word():
+    """Name matching is whole-word (token), not substring.
+
+    'aws' matches the name token in 'aws-lambda'; 'awe' / 'awesome' do not
+    (the old substring match let 'aws' hit 'awesome')."""
+    from skill_injection_hook import _MIN_SCORE, _score_skill
+
+    skill = {"name": "aws-lambda", "description": "serverless functions", "keywords": []}
+    assert _score_skill(skill, ["aws"]) == 2.0
+    assert _score_skill(skill, ["aws"]) >= _MIN_SCORE
+    assert _score_skill(skill, ["lambda"]) == 2.0
+    assert _score_skill(skill, ["awesome"]) == 0.0
+    assert _score_skill(skill, ["awe"]) == 0.0
 
 
 def test_score_skill_not_diluted_by_long_prompt():
@@ -200,6 +224,28 @@ def test_main_desc_only_hit_does_not_fire(tmp_path, monkeypatch, capsys):
         monkeypatch, capsys, catalog_file, "market trends overnight tonight"
     )
     assert "[Skill]" not in out
+
+
+def test_main_generic_words_do_not_fire_description_match(tmp_path, monkeypatch, capsys):
+    """Regression: generic words matching only a skill's DESCRIPTION prose must
+    not fire a nudge. 'ok lets plan them out' previously surfaced 'api-gateway'
+    via 'plan'→'usage plan' (+1) and 'out'→'timeout' (+1) = threshold 2."""
+    catalog_file = tmp_path / "skill_catalog.json"
+    api_gateway = {
+        "name": "api-gateway",
+        "description": (
+            "Build and operate APIs with Amazon API Gateway. Triggers on: "
+            "REST API, usage plan, throttling, CORS, timeout errors (4xx, 5xx)."
+        ),
+        "keywords": [],
+        "tier": 2,
+        "path": "skill-library/aws/aws-serverless/skills/api-gateway",
+    }
+    _write_catalog(catalog_file, tier2=[api_gateway])
+
+    out = _run_main(monkeypatch, capsys, catalog_file, "ok lets plan them out")
+    assert "[Skill]" not in out
+    assert "api-gateway" not in out
 
 
 def test_main_catalog_nudges_not_crowded_out_by_process_nudges(

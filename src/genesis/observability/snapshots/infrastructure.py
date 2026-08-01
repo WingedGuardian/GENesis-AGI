@@ -200,6 +200,62 @@ def _collect_cpu_usage() -> dict:
         return {"status": "unavailable", "used_pct": None, "count": count, "pressure": pressure}
 
 
+def _internet_since_duration(since_iso: str | None) -> str | None:
+    """Human 'for Nm' / 'for Nh Nm' since the given ISO timestamp, tz-safe."""
+    if not isinstance(since_iso, str):
+        return None
+    from datetime import UTC, datetime
+
+    try:
+        dt = datetime.fromisoformat(since_iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    secs = int((datetime.now(UTC) - dt).total_seconds())
+    if secs < 0:
+        return None
+    if secs < 3600:
+        return f"for {secs // 60}m"
+    return f"for {secs // 3600}h {(secs % 3600) // 60}m"
+
+
+def _internet_probe_entry() -> dict | None:
+    """Build the dashboard 'internet' probe from the sentinel window store.
+
+    Returns None when the sentinel is disabled / never ran (store absent) — the
+    key is then omitted entirely (an absent connectivity signal is not a fault,
+    mirroring the ambient absent-edge pattern). A stale probe (dead/stalled
+    sentinel) surfaces as 'unknown' so the light never asserts a false green.
+    """
+    from datetime import UTC, datetime
+
+    from genesis.resilience import network_config, network_state
+
+    net = network_state.read_state()
+    if net is None:
+        return None
+    # Misconfigured sentinel (enabled, zero anchors) — surface explicitly, never
+    # a false green: it publishes a fresh `no_anchors` marker for exactly this.
+    if net.get("cause") == "no_anchors":
+        return {"status": "unknown", "message": "not configured — no probe anchors"}
+    age = network_state.probe_age_s(net, datetime.now(UTC))
+    threshold = network_config.structural().staleness_threshold_s
+    # None (absent/garbled) / negative (future timestamp) / stale → don't assert
+    # a state we can't trust; show 'unknown' rather than a possibly-false green.
+    if age is None or age < 0 or age > threshold:
+        return {"status": "unknown", "message": "connectivity sentinel stale"}
+    state = net.get("state")
+    if state == "NORMAL":
+        return {"status": "healthy"}
+    if state in ("DEGRADED", "OFFLINE"):
+        label = "offline" if state == "OFFLINE" else "degraded"
+        dur = _internet_since_duration(net.get("since"))
+        msg = f"{label} {dur}" if dur else label
+        return {"status": "down" if state == "OFFLINE" else "degraded", "message": msg}
+    return {"status": "unknown", "message": f"state {state}"}
+
+
 async def infrastructure(
     db: aiosqlite.Connection | None,
     routing_config: RoutingConfig | None,
@@ -373,6 +429,15 @@ async def infrastructure(
                 infra["ambient"].update(result.details)
     except Exception as exc:
         infra["ambient"] = {"status": "error", "error": str(exc)}
+
+    # Internet connectivity — from the network sentinel's window store. Key is
+    # omitted when the sentinel is disabled / never ran (empty-state install).
+    try:
+        internet = _internet_probe_entry()
+        if internet is not None:
+            infra["internet"] = internet
+    except Exception as exc:
+        infra["internet"] = {"status": "error", "error": str(exc)}
 
     if ollama_enabled():
         try:

@@ -880,6 +880,24 @@ class OutreachPipeline:
         if not self._deferred_queue:
             return
         try:
+            # Dedup-at-defer: a repeated delivery failure of the SAME topic must
+            # not enqueue a fresh row each time (2026-07 outage: 690 duplicate
+            # rows for one backup-alert topic, from the recovery-worker retry
+            # loop AND the alert-drain re-submit loop). Suppress when an open
+            # (pending/processing) row for this topic already exists. Empty topic
+            # → never suppress (can't distinguish distinct sends).
+            if request.topic and await self._deferred_queue.has_open(
+                "outreach_delivery",
+                request.topic,
+                request.category.value,
+                request.signal_type,
+            ):
+                logger.info(
+                    "Defer suppressed for %s — open deferred outreach for "
+                    "topic %r already queued",
+                    outreach_id, request.topic,
+                )
+                return
             # "outreach_fallback" — deferred-queue work tag (not in model_routing.yaml).
             # No own routing chain; used for cost/event tracking only.
             await self._deferred_queue.enqueue(
@@ -891,6 +909,7 @@ class OutreachPipeline:
                     "channel": channel,
                     "content": content,
                     "category": request.category.value,
+                    "signal_type": request.signal_type,
                     "topic": request.topic,
                     # Origin-targeted delivery must survive a transient-failure
                     # retry, or a result that failed once lands in the default
@@ -899,8 +918,13 @@ class OutreachPipeline:
                     "target_thread_id": request.target_thread_id,
                 }),
                 reason=reason,
-                staleness_policy="drain",
-                staleness_ttl_s=14400,  # 4h — accommodates 5 retries with backoff
+                # "ttl" (not "drain"): expire_by_policy honors staleness_ttl_s
+                # only for the 'ttl' policy — under 'drain' the row NEVER expired,
+                # so failed-forever items accumulated (2026-07 outage). 4h covers
+                # 5 retries with backoff (sum ≈ 2.35h); RecoveryOrchestrator's
+                # 30-min expire_stale() sweep enforces it.
+                staleness_policy="ttl",
+                staleness_ttl_s=14400,
             )
         except Exception:
             logger.exception("Failed to defer outreach %s", outreach_id)

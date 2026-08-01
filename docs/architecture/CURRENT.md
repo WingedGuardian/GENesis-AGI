@@ -1025,6 +1025,27 @@ verified: b662f3e3 2026-07-17
   probes before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
+  `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
+  public anchors) on a cadence and publishes a 3-state `network` axis
+  (NORMAL/DEGRADED/OFFLINE) with asymmetric hysteresis — it OWNS its hysteresis
+  and opts out of the state machine's symmetric flap protection. The axis drives
+  watchdog zombie-restart suppression (a restart can't fix an ISP outage), the
+  `is_any_degraded` recovery gate (at OFFLINE only — don't re-dispatch into a
+  dead network), and the dashboard "Internet" light. Two OFFLINE-parking
+  consumers (PR-3) gate on `network.parking_mode` (off/shadow/live, default
+  shadow) through the shared `network_config.parking_decision()` gate: the
+  **CC-invoker network preflight** (`cc/invoker.py::_network_preflight` — raises
+  `CCNetworkOfflineError` BEFORE the subprocess spawns for a WAN endpoint,
+  turning a `timeout_s`-bounded hang (7200s default) into a sub-second fail; a
+  LAN CC peer, classified via `util/netclass.py`, still runs), and the
+  **surplus tier filter** (`surplus/dispatch.py::_filter_tiers_for_network` —
+  strips cloud compute tiers so internet-dependent tasks stay `pending` instead
+  of churning `failed`). The axis stays DELIBERATELY excluded from
+  `to_legacy_degradation_level` (broader legacy-level call-site shedding remains
+  deferred/tabled). Lever/kill-switch in `network_config.py`
+  (`GENESIS_NETWORK_SENTINEL_DISABLED`); window store `~/.genesis/network_state.json`
+  (`network_state.py`, stdlib-only, self-bounding). Consumers staleness-check the
+  sentinel's own `last_probe_at` and fail toward their safe default.
 - **observability/**: event bus dispatches inline AND logs every event;
   persist-queue overflow drops events but emits a rate-limited "dropped"
   meta-event (WS-17). Two health layers (async probes vs systemd shell-out);

@@ -51,6 +51,10 @@ excludes=(
   --glob '!**/scripts/hooks/commit-msg'
   --glob '!**/scripts/cc_cli_output/**'
   --glob '!**/scripts/spike_*'
+  # netclass.py is a LAN/WAN classifier — it defines the RFC-grounded private
+  # address ranges (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) as data,
+  # not install-specific addresses. Same rationale as excluding sanitize.py.
+  --glob '!**/src/genesis/util/netclass.py'
 )
 
 # Scan only targets that exist: a missing path makes rg exit 2 even when
