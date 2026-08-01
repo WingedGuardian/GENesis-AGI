@@ -21,8 +21,8 @@ set -o pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSIONS_FILE="$REPO_ROOT/.genesis-hook-versions"
 
-# Hooks we track. Keep in lockstep with check_hook_versions.sh and
-# sync-hooks.sh HOOKS_TO_SYNC.
+# Hooks we track. Keep in lockstep with check_hook_versions.sh,
+# check_hook_versions_complete.sh, and sync-hooks.sh HOOKS_TO_SYNC.
 TRACKED_HOOKS=(commit-msg post-commit pre-commit prepare-commit-msg pre-push)
 
 if [[ ! -f "$VERSIONS_FILE" ]]; then
