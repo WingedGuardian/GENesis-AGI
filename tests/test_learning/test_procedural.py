@@ -509,6 +509,32 @@ async def test_store_checked_explicit_refine_promotes_draft(db):
     # ...and now actually recallable: matcher.find_relevant filters confidence<0.3
     assert row["confidence"] == pytest.approx(2 / 3)
     assert row["success_count"] == 1
+    # ...and lifted off the DORMANT tier to the explicit-teach's requested tier
+    # (recall applies a stricter threshold to DORMANT rows).
+    assert row["activation_tier"] == "LIBRARY"
+
+
+@pytest.mark.asyncio
+async def test_store_checked_refine_updates_stored_embedding(db):
+    """Refining in place must also update principle_embedding — otherwise future
+    matching and proactive surfacing trust a BLOB describing the OLD text (the
+    refined row could even be re-classified as a distinct sibling later)."""
+    proc_id = await store_procedure(
+        db, task_type="t", principle="original", steps=["a"], tools_used=["Bash"],
+        context_tags=["x"], draft=0, success_count=1, confidence=0.7,
+        principle_embedding=_emb(0),
+    )
+    # cosine([1, 0.6, 0...], [1, 0, 0...]) ≈ 0.857 ≥ threshold → same procedure,
+    # but a DIFFERENT blob than the stored one.
+    near = pack_embedding([1.0, 0.6] + [0.0] * 1022)
+    result = await store_procedure_checked(
+        db, task_type="t", principle="original, reworded", steps=["b"],
+        tools_used=["Bash"], context_tags=["x"], principle_embedding=near,
+    )
+    assert result.action == "updated"
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, proc_id)
+    assert bytes(row["principle_embedding"]) == near  # embedding follows the new text
 
 
 @pytest.mark.asyncio

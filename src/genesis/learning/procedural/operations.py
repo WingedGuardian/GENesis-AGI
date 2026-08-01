@@ -220,6 +220,13 @@ async def store_procedure_checked(
             version=new_version,
             source=json.dumps(source) if source else matched.get("source"),
         )
+        # Keep the stored embedding in sync with the refined principle. A match
+        # implies the incoming embedding was usable (unpackable), so it is
+        # non-None here — but guard anyway so we never blank a good vector with a
+        # missing one. Leaving the old BLOB would make future matching and
+        # proactive surfacing trust a vector describing the PREVIOUS text.
+        if principle_embedding is not None:
+            update_fields["principle_embedding"] = principle_embedding
         # An explicit teach (draft=0) refining a matched auto-extracted row
         # (draft=1) promotes it. Recall gates on `confidence`/`success_count`,
         # NOT `draft` (matcher.find_best_match returns None at score<=0;
@@ -233,6 +240,11 @@ async def store_procedure_checked(
             update_fields["success_count"] = max(
                 matched.get("success_count") or 0, success_count
             )
+            # Promote the auto row's DORMANT tier to the explicit-teach's
+            # requested tier so recall stops applying the stricter dormant
+            # threshold; never demote a row the promoter already advanced.
+            if matched.get("activation_tier") == "DORMANT":
+                update_fields["activation_tier"] = activation_tier
         await procedural.update(db, matched["id"], **update_fields)
         logger.info(
             "Refined procedure %s (v%d, cosine=%.3f): %s",
