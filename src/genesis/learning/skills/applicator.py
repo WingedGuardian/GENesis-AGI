@@ -1,4 +1,16 @@
-"""Skill applicator — applies or stages skill improvement proposals."""
+"""Skill applicator — stages skill improvement proposals for human review.
+
+**Propose-only.** Autonomous skill-evolution NEVER writes a skill file. Every
+proposal — MINOR or larger — is *staged* for a human / CC session to review and
+apply through the normal worktree/PR flow. The structural validator result, the
+MODERATE+ apply-recommendation, and the shadow Critic verdict all ride the staged
+proposal (with the full proposed content) so a reviewer can decide.
+
+Gated auto-apply is deferred to the future WS1 ``enforce`` mode; the autonomy
+level, validator wiring, and provenance capture below are retained for that path.
+(Origin: 2026-08-01 — the auto-apply seam repeatedly landed principle-violating
+edits that the shadow Critic flagged but could not block.)
+"""
 
 from __future__ import annotations
 
@@ -8,7 +20,6 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from genesis.learning.cognitive_ledger import record_file_modification
 from genesis.learning.skills.types import ChangeSize, SkillProposal
 from genesis.learning.skills.validator import SkillValidator
 
@@ -17,12 +28,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# GROUNDWORK(skill-autonomy-graduation): autonomy_state category skill_evolution, starts L2
+# GROUNDWORK(skill-autonomy-graduation): autonomy_state category skill_evolution,
+# starts L2. Retained for the future WS1 `enforce` mode that re-enables gated
+# auto-apply; under propose-only every change size is staged for human review.
 _DEFAULT_AUTONOMY_LEVEL = 2
 
 
 class SkillApplicator:
-    """Applies or stages skill proposals based on change size and autonomy level."""
+    """Stages skill proposals for human review (propose-only)."""
 
     def __init__(self, *, autonomy_level: int = _DEFAULT_AUTONOMY_LEVEL):
         self._autonomy_level = autonomy_level
@@ -30,12 +43,9 @@ class SkillApplicator:
 
     @staticmethod
     def _build_modification_metadata(proposal: SkillProposal) -> dict:
-        """Metadata recorded with a skill mutation in the cognitive-mod ledger.
-
-        Captures *why* the skill changed — the triggering signals
-        (failure_patterns_addressed + the SkillReport-derived provenance trace) —
-        not just the diff, so a degrading edit can be understood and rolled back.
-        """
+        """Provenance recorded with a staged proposal — the triggering signals
+        (failure_patterns_addressed + the SkillReport-derived trace), so an
+        eventually-applied edit can be understood and rolled back."""
         return {
             "skill_name": proposal.skill_name,
             "change_size": proposal.change_size.value,
@@ -52,116 +62,99 @@ class SkillApplicator:
         router: object | None = None,
         current_content: str | None = None,
     ) -> dict:
-        """Apply or stage a skill proposal.
+        """Stage a skill proposal for human review — never writes a skill file.
 
-        At L2: MINOR auto-applies (if validation passes), MODERATE+ staged for review.
+        Propose-only: MINOR and larger alike are staged. Autonomous auto-apply is
+        retired here; it returns via the future WS1 ``enforce`` mode.
 
         Args:
-            proposal: The skill proposal to apply or stage.
+            proposal: The skill proposal to stage.
             db: Database connection.
-            router: LLM router for MODERATE+ validation (optional).
-            current_content: Current SKILL.md content for consistency checking.
+            router: LLM router for the MODERATE+ apply-recommendation + the Critic.
+            current_content: Current SKILL.md content (Critic baseline + validation).
         """
         now = datetime.now(UTC).isoformat()
 
-        if proposal.change_size == ChangeSize.MINOR and self._autonomy_level >= 2:  # noqa: PLR2004
-            # Validate before auto-applying
-            validation = self._validator.validate(proposal, current_content)
+        # Structural validation — informs the reviewer (and the future enforce gate).
+        validation = self._validator.validate(proposal, current_content)
+        # `validated` = passed the applicable gate: the structural validator for
+        # MINOR, the LLM apply-recommendation for MODERATE+ (False when there is no
+        # router to run it). Same semantics as before, now on the staging path.
+        if proposal.change_size == ChangeSize.MINOR:
+            validated = validation.passed
+        elif router is not None:
+            validated = await self._llm_validate(proposal, router=router)
+        else:
+            validated = False
 
-            if not validation.passed:
-                logger.info(
-                    "MINOR proposal for %s failed validation (%s), staging for review",
-                    proposal.skill_name,
-                    validation.blocking_failures,
-                )
-                # Fall through to staging path
-                return await self._stage(
-                    proposal,
-                    db,
-                    validated=False,
-                    now=now,
-                    validation_detail=validation.test_results,
-                )
+        # Shadow Critic (WS1): screens for self-modification pathologies. Under
+        # propose-only this is pure ENRICHMENT — it logs the WS1 shadow observation
+        # AND its verdict rides the staged proposal for the reviewer. It never
+        # gates anything (nothing auto-applies).
+        critic = await self._run_critic(
+            proposal, db, router=router, current_content=current_content, now=now
+        )
 
-            # Auto-apply MINOR changes that pass validation
-            from genesis.learning.skills.wiring import get_skill_path
+        return await self._stage(
+            proposal,
+            db,
+            validated=validated,
+            now=now,
+            validation_detail=None if validation.passed else validation.test_results,
+            validation_warnings=(validation.warnings or None),
+            critic=critic,
+        )
 
-            path = get_skill_path(proposal.skill_name)
-            if path is None:
-                return {"action": "failed", "reason": "skill not found"}
+    async def _run_critic(
+        self,
+        proposal: SkillProposal,
+        db: aiosqlite.Connection,
+        *,
+        router: object | None,
+        current_content: str | None,
+        now: str,
+    ) -> dict | None:
+        """Run the shadow Critic, log the WS1 observation, return the verdict.
 
-            # Route the overwrite through the cognitive self-mod ledger so the
-            # pre-image is captured and a degrading skill edit can be rolled back.
-            await record_file_modification(
-                db,
-                actor="skill_evolution",
-                path=path,
-                new_content=proposal.proposed_content,
-                summary=f"MINOR auto-apply: {proposal.rationale[:200]}",
-                metadata=self._build_modification_metadata(proposal),
+        Best-effort — a judge problem must never disturb staging. Returns the
+        verdict dict (to ride the proposal) or ``None`` (gate off / no router /
+        no baseline / judge unavailable).
+        """
+        from genesis.db.crud import observations
+
+        try:
+            from genesis.learning.skills.skill_edit_critic import run_critic
+
+            critic = await run_critic(
+                current_content=current_content, proposal=proposal, router=router
             )
-
-            # Log observation (include validation warnings if any)
-            from genesis.db.crud import observations
-
-            obs_content = {
-                "skill_name": proposal.skill_name,
-                "change_size": proposal.change_size.value,
-                "rationale": proposal.rationale,
-                "confidence": proposal.confidence,
-            }
-            if validation.warnings:
-                obs_content["validation_warnings"] = validation.warnings
-
+        except Exception:
+            logger.warning(
+                "skill-edit Critic failed for %s (staging unaffected)",
+                proposal.skill_name,
+                exc_info=True,
+            )
+            return None
+        if critic is None:
+            return None
+        try:
             await observations.create(
                 db,
                 id=str(uuid.uuid4()),
-                source="skill_evolution",
-                type="skill_evolution",
-                content=json.dumps(obs_content),
-                priority="medium",
+                source="skill_evolution_gate",
+                type="skill_edit_critic",
+                category=proposal.skill_name,  # indexed dampening/dedup key
+                content=json.dumps(critic),
+                priority=("high" if critic.get("verdict") == "flagged" else "low"),
                 created_at=now,
             )
-
-            # Shadow skill-edit Critic (WS1): screen the edit for self-modification
-            # pathologies AFTER it has been applied. Pure telemetry — a judge
-            # problem must never disturb the auto-apply, so the whole block is
-            # best-effort and the verdict NEVER gates the edit (shadow invariant).
-            try:
-                from genesis.learning.skills.skill_edit_critic import run_critic
-
-                critic = await run_critic(
-                    current_content=current_content,
-                    proposal=proposal,
-                    router=router,
-                )
-                if critic is not None:
-                    await observations.create(
-                        db,
-                        id=str(uuid.uuid4()),
-                        source="skill_evolution_gate",
-                        type="skill_edit_critic",
-                        content=json.dumps(critic),
-                        priority=("high" if critic.get("verdict") == "flagged" else "low"),
-                        created_at=now,
-                    )
-            except Exception:
-                logger.warning(
-                    "skill-edit Critic (shadow) failed for %s; edit already applied",
-                    proposal.skill_name,
-                    exc_info=True,
-                )
-
-            logger.info("Auto-applied MINOR skill change to %s", proposal.skill_name)
-            return {"action": "applied", "skill_name": proposal.skill_name}
-
-        else:
-            # Stage MODERATE+ for review (or any change if autonomy < 2)
-            validated = False
-            if proposal.change_size != ChangeSize.MINOR and router:
-                validated = await self._llm_validate(proposal, router=router)
-
-            return await self._stage(proposal, db, validated=validated, now=now)
+        except Exception:
+            logger.warning(
+                "failed to log skill_edit_critic observation for %s",
+                proposal.skill_name,
+                exc_info=True,
+            )
+        return critic
 
     async def _stage(
         self,
@@ -171,8 +164,15 @@ class SkillApplicator:
         validated: bool,
         now: str,
         validation_detail: dict[str, str] | None = None,
+        validation_warnings: list[str] | None = None,
+        critic: dict | None = None,
     ) -> dict:
-        """Stage a proposal for user review."""
+        """Stage a proposal for human review — persists the FULL proposed content.
+
+        The full ``proposed_content`` is stored so the proposal is applicable by a
+        reviewer / CC session; a short preview + the Critic verdict are what a
+        surfacing view should show.
+        """
         from genesis.db.crud import observations
 
         content = {
@@ -181,35 +181,54 @@ class SkillApplicator:
             "rationale": proposal.rationale,
             "confidence": proposal.confidence,
             "validated": validated,
+            # Full body — required so the staged proposal can actually be applied.
+            "proposed_content": proposal.proposed_content,
             "proposed_content_preview": proposal.proposed_content[:500],
+            "provenance": self._build_modification_metadata(proposal),
         }
         if validation_detail:
             content["validation_detail"] = validation_detail
+        if validation_warnings:
+            content["validation_warnings"] = validation_warnings
+        if critic is not None:
+            # The reviewer's key signal — the pathology screen verdict.
+            content["critic"] = {
+                "verdict": critic.get("verdict"),
+                "score": critic.get("score"),
+                "rationale": critic.get("rationale"),
+                "pathologies": critic.get("pathologies"),
+            }
+
+        flagged = bool(critic and critic.get("verdict") == "flagged")
+        priority = "high" if (proposal.change_size == ChangeSize.MAJOR or flagged) else "medium"
 
         await observations.create(
             db,
             id=str(uuid.uuid4()),
             source="skill_evolution",
             type="skill_proposal",
+            category=proposal.skill_name,  # indexed dampening/dedup key
             content=json.dumps(content),
-            priority="high" if proposal.change_size == ChangeSize.MAJOR else "medium",
+            priority=priority,
             created_at=now,
         )
 
         logger.info(
-            "Staged %s skill proposal for %s (validated=%s)",
+            "Staged %s skill proposal for %s (validated=%s, critic=%s)",
             proposal.change_size.value,
             proposal.skill_name,
             validated,
+            (critic or {}).get("verdict"),
         )
         return {
             "action": "staged",
             "skill_name": proposal.skill_name,
             "validated": validated,
+            "critic_verdict": (critic or {}).get("verdict"),
         }
 
     async def _llm_validate(self, proposal: SkillProposal, *, router: object) -> bool:
-        """Validate a MODERATE+ proposal with a second LLM call."""
+        """Validate a MODERATE+ proposal with a second LLM call (apply-recommendation)."""
         prompt = (
             f"Review this skill change proposal and determine if it should be applied.\n\n"
             f"Skill: {proposal.skill_name}\n"

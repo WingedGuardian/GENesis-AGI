@@ -262,7 +262,7 @@ async def _fetch_gate_obs(db):
     return await cur.fetchall()
 
 
-async def test_wiring_flagged_verdict_logs_and_still_applies(db, tmp_path, monkeypatch):
+async def test_wiring_flagged_verdict_logs_and_still_stages(db, tmp_path, monkeypatch):
     applicator, skill_md, proposal, restore = _minor_applicator_setup(tmp_path)
 
     async def fake_run_critic(**kwargs):
@@ -282,14 +282,17 @@ async def test_wiring_flagged_verdict_logs_and_still_applies(db, tmp_path, monke
     finally:
         restore()
 
-    # Shadow invariant: the edit applied unchanged.
-    assert result["action"] == "applied"
-    assert skill_md.read_text() == "new content"
-    # And a flagged verdict was logged at high priority (visible during bake).
+    # Propose-only invariant: the outcome is always STAGE — the Critic never
+    # changes it, and the applicator never writes a file.
+    assert result["action"] == "staged"
+    assert skill_md.read_text() == "old content\nguard: do NOT use when X"
+    # A flagged verdict is logged at high priority (visible during bake) and
+    # rides the staged proposal.
     rows = await _fetch_gate_obs(db)
     assert len(rows) == 1
     assert rows[0]["priority"] == "high"
     assert "constraint_stripping" in rows[0]["content"]
+    assert result["critic_verdict"] == "flagged"
 
 
 async def test_wiring_clean_verdict_logged_low_priority(db, tmp_path, monkeypatch):
@@ -306,15 +309,15 @@ async def test_wiring_clean_verdict_logged_low_priority(db, tmp_path, monkeypatc
     finally:
         restore()
 
-    assert result["action"] == "applied"
+    assert result["action"] == "staged"
     rows = await _fetch_gate_obs(db)
     assert len(rows) == 1
     assert rows[0]["priority"] == "low"
 
 
-async def test_wiring_critic_raise_does_not_block_edit(db, tmp_path, monkeypatch):
-    """B1 regression: a raise from the Critic block must NOT prevent the edit
-    (it runs after the file write) and must NOT propagate to abort the batch."""
+async def test_wiring_critic_raise_does_not_block_staging(db, tmp_path, monkeypatch):
+    """A raise from the Critic must NOT prevent staging or abort the batch — the
+    Critic is best-effort enrichment on the staging path (it never writes)."""
     applicator, skill_md, proposal, restore = _minor_applicator_setup(tmp_path)
 
     async def boom(**kwargs):
@@ -328,9 +331,9 @@ async def test_wiring_critic_raise_does_not_block_edit(db, tmp_path, monkeypatch
     finally:
         restore()
 
-    assert result["action"] == "applied"
-    assert skill_md.read_text() == "new content"
-    # Critic raised → no gate observation, but the edit still landed.
+    assert result["action"] == "staged"
+    assert skill_md.read_text() == "old content\nguard: do NOT use when X"
+    # Critic raised → no gate observation, but the proposal still staged.
     assert await _fetch_gate_obs(db) == []
 
 
@@ -349,5 +352,5 @@ async def test_wiring_none_verdict_logs_nothing(db, tmp_path, monkeypatch):
     finally:
         restore()
 
-    assert result["action"] == "applied"
+    assert result["action"] == "staged"
     assert await _fetch_gate_obs(db) == []
