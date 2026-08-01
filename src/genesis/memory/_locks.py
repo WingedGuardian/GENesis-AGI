@@ -8,15 +8,20 @@ interleave and leave the two stores disagreeing:
 - the reconcile lane re-reads a lying mirror then re-queues it for re-embed.
 
 A delete landing *between* another path's "is this memory still here?" check and
-its point write resurrects a vector the user deleted (invisible to recall — no
-metadata row — until the reconcile lane sweeps the resulting ghost). These
+its point write resurrects a vector the user deleted as a metadata-less ghost —
+and ghosts DO surface in recall (the retriever assembles raw Qdrant payloads
+without a metadata-existence join) until the reconcile lane sweeps them. These
 process-local per-id locks make each memory's delete atomic against its
-re-embed/requeue, closing that window at the source.
+re-embed/requeue, closing that window within one process.
 
 Scope is exactly one ``memory_id`` — different memories never contend, so this
-adds no cross-memory serialization. In-process only: all three call sites run in
-the genesis-server event loop. A crash *between* the point write and the SQLite
-commit is a separate (rare) window covered by the reconcile lane, not this lock.
+adds no cross-memory serialization. PROCESS-LOCAL ONLY: the recovery worker and
+reconcile lane run in genesis-server, but ``MemoryStore.delete()`` ALSO runs in
+the separate genesis-memory MCP process (``reference_delete``; ingest stale-point
+cleanup), which this lock cannot serialize against — that cross-process window
+is closed by the delete-intent tombstones (PR-2), not this lock. A crash
+*between* the point write and the SQLite commit is likewise a separate (rare)
+window covered by the reconcile lane.
 
 Covers the delete-vs-{re-embed, reconcile-requeue} triad — the paths that can
 RESURRECT a deleted vector. ``MemoryStore._mark_superseded`` also writes the same
