@@ -390,8 +390,14 @@ def test_sync_secret_success(tmp_path, monkeypatch):
     ok = fp.sync_secret(path=fpfile, repo_root=Path("/srv/genesis"), home=home)
     assert ok is True
     secret_call = next(c for c in calls if c[0][1] == "secret")
-    assert "Owner/PubRepo" in secret_call[0]  # --repo carries the resolved slug
-    assert "zorrik" in secret_call[1]  # body passed via stdin
+    cmd = secret_call[0]
+    assert "Owner/PubRepo" in cmd  # --repo carries the resolved slug
+    assert "zorrik" in secret_call[1]  # body passed via stdin (input=)
+    # Contract lock (real gh has no --body-file; value must go via stdin, never
+    # argv). Guards the mock-hid-the-flag bug that shipped in the first cut.
+    assert "--body-file" not in cmd
+    assert not any(str(a).startswith("--body") for a in cmd)
+    assert "zorrik" not in " ".join(cmd)  # value never on the command line
 
 
 def test_sync_secret_repo_mismatch_skips(tmp_path, monkeypatch):
