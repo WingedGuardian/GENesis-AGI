@@ -1,31 +1,53 @@
 #!/usr/bin/env python3
-"""PreToolUse hook (Bash): block rm/rmdir on protected data directories.
+"""PreToolUse hook (Bash): block rm/rmdir OPERANDS that target protected data.
 
 Complements destructive_command_guard.py (depth-based) with an explicit
 blocklist of named paths containing irreplaceable data: session transcripts,
 encrypted backups, Qdrant snapshots, browser profiles, and the production
 database.
 
-Files *inside* protected directories can still be written/modified — only
-deletion of the directories themselves (or commands that would remove them
-as a side-effect) is blocked.
+Operand-aware (2026-08 rewrite): the old check was `if path in cmd` — a raw
+substring test that blocked any command MENTIONING a protected path alongside
+any rm (`rm scratch.txt; cat ~/backups/notes`) and blocked deleting a file
+INSIDE a protected dir, contradicting this docstring. Now the rm/rmdir
+segments are parsed via shell_parse.analyze (the same quote-aware parser the
+push gate uses — no second divergent tokenizer) and only real deletion
+TARGETS block:
 
-Stdlib-only. Fail-open on parse errors.
+  * the protected dir itself (`rm -rf ~/genesis/data`)
+  * an ancestor of it (`rm -rf ~/genesis` — removes data/ as a side effect)
+  * a glob that could match the dir or an ancestor (`rm -rf ~/genesis/da*`)
+  * ANY glob under the dir (`rm -rf ~/genesis/data/*`, `…/data/*.db` — wipes
+    the contents while dodging "the dir itself")
+  * a protected FILE (the production DB + its WAL/SHM sidecars — deleting the
+    -wal of a live SQLite DB silently loses committed transactions)
+
+A specific non-glob file inside (`rm ~/genesis/data/old.log`) and non-rm
+mentions (`cat ~/backups/notes`) are ALLOWED.
+
+Relative operands resolve against the payload's `cwd`. Limitation (documented,
+not hidden): a `cd` INSIDE a compound command shifts the real cwd and is not
+tracked here — same posture as shell_parse: this is an approval/friction
+layer, not a sandbox. The old substring check missed that case too.
+
+Fail modes: an untokenizable command (shlex error) falls back to the legacy
+substring check — conservative, never weaker than the old guard. An unexpected
+crash fails CLOSED via hook_input.run_guard (exit 2).
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
+import shlex
 import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload, run_guard  # noqa: E402
+from hook_input import read_payload, run_guard, tool_input  # noqa: E402
+from shell_parse import analyze  # noqa: E402
 
 # Directories that must never be deleted.  Relative to $HOME.
-# Each entry is joined with os.path.expanduser("~") at runtime.
 _PROTECTED_RELATIVE = [
     ".claude/projects",  # CC session transcripts (JSONL)
     "backups",  # Encrypted Genesis backups
@@ -35,54 +57,164 @@ _PROTECTED_RELATIVE = [
     "genesis/data",  # Production database (genesis.db)
 ]
 
-# Matches rm or rmdir as a word boundary
+# Individual files that must never be deleted even though files inside their
+# parent dir are otherwise deletable. The WAL/SHM sidecars ride along: deleting
+# the -wal of a live SQLite database silently discards committed-but-
+# uncheckpointed transactions.
+_PROTECTED_FILES_RELATIVE = [
+    "genesis/data/genesis.db",
+    "genesis/data/genesis.db-wal",
+    "genesis/data/genesis.db-shm",
+]
+
+# Matches rm or rmdir as a word boundary (fast path + legacy fallback trigger)
 _RM_PATTERN = re.compile(r"\brm\b|\brmdir\b")
 
+# Glob metacharacters an rm operand may carry (bash expands these before rm
+# runs, so the guard must reason about what they COULD match).
+_GLOB_CHARS = ("*", "?", "[")
 
-def _build_protected_paths() -> list[str]:
-    """Expand relative paths to absolute, including common aliases."""
+# A redirection-shaped token to skip (mirrors destructive_command_guard's
+# _REDIR_TOKEN): optional fd digits then < or >, or &>. Never a real rm target
+# (no dangerous path starts with a redirection operator).
+_REDIR_TOKEN = re.compile(r"\d*[<>]|&>")
+
+
+def _expand(token: str, cwd: str | None) -> str | None:
+    """Absolute, normalized form of an rm operand, or None if unresolvable.
+
+    $HOME/… and ~/… forms expand; a relative operand resolves against the
+    payload cwd. shlex already stripped quotes, mirroring bash: a single-quoted
+    '$HOME' never reached us as a variable in bash either.
+    """
+    expanded = os.path.expanduser(os.path.expandvars(token))
+    if not os.path.isabs(expanded):
+        if not cwd or not isinstance(cwd, str):
+            return None  # relative target, unknown base — caller falls back
+        expanded = os.path.join(cwd, expanded)
+    return os.path.normpath(expanded)
+
+
+def _has_glob(token: str) -> bool:
+    return any(ch in token for ch in _GLOB_CHARS)
+
+
+def _operand_blocks(operand: str, cwd: str | None, dirs: list[str], files: list[str]) -> str | None:
+    """Reason string if deleting ``operand`` would destroy protected data."""
+    from fnmatch import fnmatch
+
+    expanded = _expand(operand, cwd)
+    if expanded is None:
+        return None  # unresolvable relative operand — handled by caller fallback
+    is_glob = _has_glob(operand)
+    for prot in dirs:
+        if expanded == prot:
+            return f"'{operand}' is the protected directory {prot}"
+        if prot.startswith(expanded + "/"):
+            return f"'{operand}' is an ancestor of the protected directory {prot}"
+        if is_glob and fnmatch(prot, expanded):
+            return f"glob '{operand}' can match the protected directory {prot}"
+        if is_glob and expanded.startswith(prot + "/"):
+            return f"glob '{operand}' deletes contents of the protected directory {prot}"
+    for prot in files:
+        if expanded == prot:
+            return f"'{operand}' is the protected file {prot}"
+        if is_glob and fnmatch(prot, expanded):
+            return f"glob '{operand}' can match the protected file {prot}"
+    return None
+
+
+def _rm_operands(argv: list[str]) -> list[str]:
+    """The operand (non-flag, non-redirect) tokens of an rm/rmdir argv."""
+    operands: list[str] = []
+    flags_done = False
+    for tok in argv[1:]:
+        if not flags_done and tok == "--":
+            flags_done = True
+            continue
+        if not flags_done and tok.startswith("-") and len(tok) > 1:
+            continue
+        if _REDIR_TOKEN.match(tok):
+            continue
+        operands.append(tok)
+    return operands
+
+
+def _legacy_substring_block(cmd: str, dirs: list[str]) -> str | None:
+    """The pre-2026-08 substring check — kept ONLY as the fallback for a
+    command shlex cannot tokenize (conservative: over-blocks, never under)."""
     home = os.path.expanduser("~")
-    paths: list[str] = []
-    for rel in _PROTECTED_RELATIVE:
-        # Absolute form: /home/ubuntu/.claude/projects
-        paths.append(os.path.join(home, rel))
-        # Tilde form: ~/.claude/projects
-        paths.append(os.path.join("~", rel))
-        # $HOME form: $HOME/.claude/projects
-        paths.append(os.path.join("$HOME", rel))
-    return paths
+    for prot in dirs:
+        for alias in (prot, prot.replace(home, "~", 1), prot.replace(home, "$HOME", 1)):
+            if alias in cmd:
+                return f"protected path {alias} appears in an untokenizable rm command"
+    return None
+
+
+def _protected_dirs() -> list[str]:
+    home = os.path.expanduser("~")
+    return [os.path.join(home, rel) for rel in _PROTECTED_RELATIVE]
+
+
+def _protected_files() -> list[str]:
+    home = os.path.expanduser("~")
+    return [os.path.join(home, rel) for rel in _PROTECTED_FILES_RELATIVE]
+
+
+def _block(reason: str) -> int:
+    print(f"BLOCKED: {reason}.", file=sys.stderr)
+    print(
+        "This target holds irreplaceable data (session transcripts, backups, "
+        "snapshots, browser profiles, or the production database).",
+        file=sys.stderr,
+    )
+    print(
+        "Specific files inside a protected directory can be removed by naming "
+        "them exactly (no globs).",
+        file=sys.stderr,
+    )
+    return 2
 
 
 def main() -> int:
+    payload = read_payload()
+    cmd = tool_input(payload).get("command", "")
+    if not cmd or not isinstance(cmd, str):
+        return 0
+
+    # Fast path: no rm/rmdir word anywhere in the command.
+    if not _RM_PATTERN.search(cmd):
+        return 0
+
+    dirs = _protected_dirs()
+    files = _protected_files()
+
+    # Explicit tokenizability probe: shell_parse._argv silently degrades to a
+    # naive split on shlex errors, so analyze() alone can never signal one.
     try:
-        cmd = field(read_payload(), "command")
-        if not cmd:
-            return 0
+        shlex.split(cmd.replace("\\\n", " "))
+    except ValueError:
+        reason = _legacy_substring_block(cmd, dirs)
+        return _block(reason) if reason else 0
 
-        # Fast path: no rm/rmdir in command
-        if not _RM_PATTERN.search(cmd):
-            return 0
-
-        protected = _build_protected_paths()
-        for path in protected:
-            if path in cmd:
-                print(
-                    f"BLOCKED: Cannot delete protected directory: {path}",
-                    file=sys.stderr,
-                )
-                print(
-                    "This directory contains irreplaceable data "
-                    "(session transcripts, backups, snapshots, or browser profiles).",
-                    file=sys.stderr,
-                )
-                print(
-                    "To remove specific files inside it, target them directly.",
-                    file=sys.stderr,
-                )
-                return 2
-
-    except (json.JSONDecodeError, KeyError):
-        pass  # Fail-open
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    for seg in analyze(cmd):
+        if seg.exe not in ("rm", "rmdir"):
+            continue
+        unresolved_here = False
+        for operand in _rm_operands(seg.argv):
+            reason = _operand_blocks(operand, cwd, dirs, files)
+            if reason:
+                return _block(reason)
+            if _expand(operand, cwd) is None:
+                unresolved_here = True
+        if unresolved_here:
+            # A relative rm target with no resolvable base: substring-check
+            # THIS SEGMENT's raw text (not the whole command — that would
+            # resurrect the mention-only false positive this rewrite kills).
+            reason = _legacy_substring_block(seg.raw, dirs)
+            if reason:
+                return _block(reason)
 
     return 0
 
