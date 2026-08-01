@@ -35,10 +35,26 @@ _CACHE_PATH = Path(
     os.environ.get("GENESIS_PROCEDURE_TRIGGERS")
     or (Path(__file__).resolve().parent.parent / "config" / "procedure_triggers.yaml")
 )
+# Stdlib-loadable sidecar written alongside the YAML by trigger_cache.regenerate.
+_JSON_CACHE_PATH = _CACHE_PATH.with_suffix(".json")
 
 
 def _load_triggers() -> list[dict]:
-    """Load YAML trigger cache. Returns empty list on any error."""
+    """Load the trigger cache. Returns an empty list on any error.
+
+    This is a PreToolUse hook — it runs in a fresh process on EVERY tool call,
+    so ``import yaml`` (~40ms) would be paid every time. Prefer the JSON sidecar
+    (stdlib ``json``, already imported) when it is at least as fresh as the YAML
+    source of truth; only fall back to parsing the YAML (lazy import) otherwise.
+    The mtime guard (nanosecond, exact) ensures a YAML regenerated without a
+    matching sidecar is never served stale from an older JSON.
+    """
+    try:
+        if _JSON_CACHE_PATH.stat().st_mtime_ns >= _CACHE_PATH.stat().st_mtime_ns:
+            data = json.loads(_JSON_CACHE_PATH.read_text())
+            return data.get("triggers", []) if data else []
+    except (OSError, ValueError):
+        pass  # missing/corrupt/stale sidecar → fall back to the YAML
     try:
         import yaml
         data = yaml.safe_load(_CACHE_PATH.read_text())
