@@ -459,7 +459,9 @@ def sync_secret(
     print(f"  fingerprints: syncing {len(patterns)} pattern(s) to the CI secret on {slug}")
     try:
         proc = subprocess.run(
-            ["gh", "secret", "set", SECRET_NAME, "--repo", slug, "--body-file", "-"],
+            # gh reads the secret VALUE from stdin when --body is omitted (there
+            # is no --body-file flag); pass it via input= so it never hits argv.
+            ["gh", "secret", "set", SECRET_NAME, "--repo", slug],
             input=body,
             capture_output=True,
             text=True,
