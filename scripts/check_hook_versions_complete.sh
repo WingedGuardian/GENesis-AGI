@@ -52,16 +52,38 @@ fi
 # across commits is reported ONCE (keyed on the hash, not per-commit).
 declare -A MISSING
 _EMPTY_SHA=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+_fail_closed() {
+    # A read failure means we did NOT examine the full history — for a
+    # completeness guard, that must ERROR (fail closed), never pass silently.
+    echo "ERROR: $1" >&2
+    echo "Cannot verify ledger completeness — run in a FULL clone (fetch-depth: 0," >&2
+    echo "not a shallow or blobless/partial clone)." >&2
+    exit 1
+}
+
 for h in "${TRACKED_HOOKS[@]}"; do
     path="scripts/hooks/$h"
     # Every commit on this branch that touched the hook = every version shipped.
     # git log is newest-first; the -z guard below keeps the newest occurrence.
-    for c in $(git log --format='%H' -- "$path" 2>/dev/null); do
+    # Capture first so a `git log` failure fails closed instead of looking like
+    # "no history" (empty output) and passing.
+    commits=$(git log --format='%H' -- "$path" 2>/dev/null) \
+        || _fail_closed "git log failed for $path"
+    for c in $commits; do
+        # Distinguish a genuinely-absent path (e.g. a delete-side commit — a
+        # legitimate skip) from an UNREADABLE object (a partial/blobless clone or
+        # object corruption — a read failure we must not paper over). ls-tree
+        # reports the path only when it exists in that commit's tree.
+        if [[ -z "$(git ls-tree -r --name-only "$c" -- "$path" 2>/dev/null)" ]]; then
+            continue  # path did not exist at this commit → not a shipped version
+        fi
+        # Path exists here, so we MUST be able to hash it. Pipe git show straight
+        # into sha256sum (capturing to a var would strip trailing newlines and
+        # change the digest). Under pipefail a git-show failure yields empty input
+        # → _EMPTY_SHA; combined with "path exists in tree" that is a read failure.
         hash=$(git show "$c:$path" 2>/dev/null | sha256sum | awk '{print $1}')
-        # git show prints nothing for a commit where the path was absent (e.g.
-        # the delete side of a rename); sha256sum of empty input is the fixed
-        # _EMPTY_SHA — skip it so it can't masquerade as a real missing version.
-        [[ -z "$hash" || "$hash" == "$_EMPTY_SHA" ]] && continue
+        [[ -z "$hash" || "$hash" == "$_EMPTY_SHA" ]] \
+            && _fail_closed "could not read $path at ${c:0:12} (unreadable object?)"
         key="$h:$hash"
         if ! grep -qxF "$key" "$VERSIONS_FILE"; then
             [[ -z "${MISSING[$key]:-}" ]] && MISSING[$key]="${c:0:12}"

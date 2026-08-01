@@ -39,7 +39,7 @@ def _write_hook(path: Path, name: str, body: str) -> str:
     """Write a hook version, commit it, return its sha256."""
     f = path / "scripts" / "hooks" / name
     f.write_text(body)
-    _git(path, "add", "-A")
+    _git(path, "add", f"scripts/hooks/{name}")
     _git(path, "commit", "-q", "-m", f"hook {name}: {body[:8]}", "--no-verify")
     return hashlib.sha256(body.encode()).hexdigest()
 
@@ -88,7 +88,9 @@ def test_skips_on_shallow_clone(tmp_path: Path) -> None:
     _write_hook(origin, "pre-commit", "#v2\n")
     # Record NOTHING — on a full clone this would fail; a shallow clone must skip.
     (origin / ".genesis-hook-versions").write_text("# empty\n")
-    _git(origin, "add", "-A")
+    # Stage the ledger and the (copied-but-uncommitted) checker script explicitly,
+    # so the depth-1 clone's tip carries both.
+    _git(origin, "add", ".genesis-hook-versions", "scripts/check_hook_versions_complete.sh")
     _git(origin, "commit", "-q", "-m", "ledger", "--no-verify")
 
     shallow = tmp_path / "shallow"
@@ -104,6 +106,50 @@ def test_skips_on_shallow_clone(tmp_path: Path) -> None:
     result = _run(shallow)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "shallow" in result.stdout.lower()
+
+
+def test_fails_closed_on_unreadable_history(tmp_path: Path) -> None:
+    """A version whose blob object is UNREADABLE (partial clone / corruption) must
+    ERROR, not be silently skipped as 'path absent' → the backstop would false-pass.
+
+    Deterministic: commit two versions, record BOTH (so a healthy repo PASSES),
+    then delete the loose object for the historical v1 blob. The tree still names
+    the path (ls-tree succeeds) but `git show` on the blob fails → fail closed.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    h1 = _write_hook(repo, "pre-commit", "#v1\n")
+    h2 = _write_hook(repo, "pre-commit", "#v2\n")
+    # Record BOTH versions: on a healthy repo this PASSES. The only way it can exit
+    # non-zero is the fail-closed read-failure path (not a real ledger gap).
+    (repo / ".genesis-hook-versions").write_text(f"pre-commit:{h1}\npre-commit:{h2}\n")
+
+    # Locate v1's blob object and delete it (loose in a fresh repo — no repack yet).
+    blob = subprocess.run(
+        ["git", "rev-parse", "HEAD~1:scripts/hooks/pre-commit"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    obj = repo / ".git" / "objects" / blob[:2] / blob[2:]
+    if not obj.is_file():
+        pytest.skip("v1 blob is packed, not loose — cannot deterministically remove it")
+    obj.unlink()
+
+    # Sanity: the tree still names the path, but the blob is now unreadable.
+    assert (
+        subprocess.run(
+            ["git", "show", "HEAD~1:scripts/hooks/pre-commit"], cwd=repo, capture_output=True
+        ).returncode
+        != 0
+    )
+
+    result = _run(repo)
+    assert result.returncode == 1, (
+        f"expected fail-closed, got {result.returncode}: {result.stdout}{result.stderr}"
+    )
+    assert "verify" in result.stderr.lower() or "unreadable" in result.stderr.lower()
 
 
 def test_real_tree_is_complete() -> None:
