@@ -394,3 +394,28 @@ class TestDrainPending:
         assert await w.drain_pending() == 1
         payload = qdrant.upsert.call_args.kwargs["points"][0].payload
         assert payload["confidence"] == 0.0
+
+
+class TestTombstoneSkip:
+    """A memory with an open delete-intent tombstone (deferred delete: metadata
+    and queue row still intact) must NOT be re-embedded — the reconcile drain
+    is about to delete it. The queue row stays pending until the tombstone
+    resolves."""
+
+    @pytest.mark.asyncio
+    async def test_open_tombstone_skips_upsert(self, db, worker):
+        from genesis.memory.delete_tombstones import enqueue_tombstone
+
+        w, embedder, qdrant = worker
+        await crud.create(
+            db, id="pe-ts", memory_id="mem-ts", content="awaiting delete",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2026-03-11T12:00:00",
+        )
+        await enqueue_tombstone(db, memory_id="mem-ts", reason="deferred delete")
+
+        processed = await w.drain_pending()
+        assert processed == 0
+        assert qdrant.upsert.call_count == 0
+        # Still pending — drains normally once the tombstone resolves.
+        assert await crud.count_pending(db) == 1

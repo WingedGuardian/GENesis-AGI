@@ -1090,11 +1090,36 @@ async def memory_core_facts(
         logger.warning("Qdrant scroll for core_facts failed", exc_info=True)
         return []
 
+    # Ghost filter: core_facts scrolls Qdrant payloads directly (bypasses
+    # HybridRetriever and its stage-4b filter), so a deleted memory's leftover
+    # point would inject deleted content into this ambient surface until the
+    # nightly reconcile sweep. Metadata is the authority: a scrolled point with
+    # no memory_metadata row is a ghost — drop it. Fail-open on DB error (same
+    # posture as the origin enrichment below).
+    _ghost_ids: set[str] = set()
+    try:
+        _pids = {str(p.id) for p in points}
+        if _pids:
+            from genesis.memory.retrieval import metadata_missing_ids
+
+            _ghost_ids = await metadata_missing_ids(memory_mod._db, _pids)
+            if _ghost_ids:
+                logger.info(
+                    "core_facts: dropped %d ghost point(s) (vector without metadata row)",
+                    len(_ghost_ids),
+                )
+    except Exception:
+        # Fail-open is right; INVISIBLE fail-open is not — this is the ambient
+        # always-injected surface, so a persistently broken filter must be loud.
+        logger.warning("core_facts ghost filter failed — returning unfiltered", exc_info=True)
+
     now_str = datetime.now(UTC).isoformat()
     scored: list[tuple[dict, float]] = []
     for point in points:
         payload = point.payload or {}
         mid = str(point.id)
+        if mid in _ghost_ids:
+            continue
         link_count = await memory_mod.memory_links.count_links(memory_mod._db, mid)
         act = compute_activation(
             confidence=payload.get("confidence", 0.7),

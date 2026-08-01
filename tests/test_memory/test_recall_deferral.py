@@ -17,6 +17,20 @@ import pytest
 from genesis.memory.retrieval import HybridRetriever
 
 
+@pytest.fixture(autouse=True)
+def _no_ghost_filter(monkeypatch):
+    """These tests fabricate Qdrant hits over a MagicMock db whose empty query
+    answers make every candidate look like a metadata-less ghost — the recall
+    ghost filter would (correctly, per its contract) drop them all. Neutralize
+    it here; its behavior is pinned in test_retrieval.py and
+    test_delete_tombstones.py."""
+
+    async def _none(db, ids):
+        return set()
+
+    monkeypatch.setattr("genesis.memory.retrieval.metadata_missing_ids", _none)
+
+
 def _qdrant_hit(mid: str, score: float) -> dict:
     now = datetime.now(UTC).isoformat()
     return {
