@@ -280,23 +280,37 @@ jobs:
 
           # Collect ADDED lines for this PR/push (+ PR body). Diff, not whole
           # tree — pre-existing legit content is out of scope by construction.
+          # Keep all '^+' lines INCLUDING the '+++ b/path' file headers: those
+          # carry only repo-relative paths (which never match an exact install
+          # value), and a '^+++' filter would ALSO drop added CONTENT beginning
+          # with '++' (it renders as '+++...' in the diff) — a leak-gate false
+          # negative.
           added=""
           body=""
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            added="$(git diff "${PR_BASE_SHA}...HEAD" 2>/dev/null | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
+            added="$(git diff "${PR_BASE_SHA}...HEAD" 2>/dev/null | grep -E '^\+' || true)"
             body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
           elif git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
-            added="$(git diff "${PUSH_BEFORE}" "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
+            added="$(git diff "${PUSH_BEFORE}" "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
           else
             # New branch / unknown base — scan just the tip commit's additions.
-            added="$(git show "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
+            added="$(git show "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
           fi
 
           scan="$(printf '%s\n%s\n' "$added" "$body")"
-          if printf '%s' "$scan" | grep -qE -f "$pf"; then
+          # Capture grep's exit code explicitly: 0 = match (leak), 1 = clean,
+          # >=2 = grep error (e.g. a malformed ERE in the secret). An `if grep`
+          # would read rc 2 as "no match" and PASS the gate silently — fail loud
+          # on error so a bad provisioned pattern can never disable the gate green.
+          rc=0
+          printf '%s' "$scan" | grep -qE -f "$pf" || rc=$?
+          if [[ "$rc" -eq 0 ]]; then
             echo "::error::private install identifier present in PR/push additions or PR body — content withheld"
             cnt="$(printf '%s' "$scan" | grep -cE -f "$pf" || true)"
             echo "match count: $cnt"
+            exit 1
+          elif [[ "$rc" -ge 2 ]]; then
+            echo "::error::private-pattern scan errored (grep rc=$rc) — GENESIS_PRIVATE_PATTERNS may contain a malformed ERE; regenerate with GENESIS_SYNC_PRIVATE_PATTERNS=1"
             exit 1
           fi
           echo "Private-pattern exact scan: CLEAN"
