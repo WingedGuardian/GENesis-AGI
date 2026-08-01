@@ -1,4 +1,4 @@
-"""d0009 — align pre-existing skill_proposal observations to propose-only.
+"""d0010 — align pre-existing skill_proposal observations to propose-only.
 
 Two upgrade-path gaps for ``skill_proposal`` observations created by the OLD
 skill-evolution applicator (before propose-only shipped), both flagged in review:
@@ -70,7 +70,7 @@ def migrate() -> dict:
     finally:
         db.close()
     logger.info(
-        "d0009: skill_proposal category_filled=%d, expires_at_bumped=%d",
+        "d0010: skill_proposal category_filled=%d, expires_at_bumped=%d",
         category_filled,
         expires_bumped,
     )

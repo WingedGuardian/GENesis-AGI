@@ -220,6 +220,42 @@ async def test_runner_rejects_duplicate_prefix(db, monkeypatch):
     assert await runner_mod.run_data_migrations(db) == []
 
 
+def test_no_duplicate_migration_prefixes_in_tree():
+    """Static guard: the REAL migration directories carry no duplicate prefixes.
+
+    Two concurrently-merged PRs each took `d0009` (2026-08-01: #1274 + #1276) —
+    the runner's runtime guard then made run_data_migrations a boot-time no-op
+    on EVERY install (error swallowed, all data migrations skipped) until one
+    was renamed. The runtime guard fires at deploy time on every install; this
+    test fires at CI time on the offending PR's merge ref, where the collision
+    is cheap to fix.
+    """
+    import re
+    from collections import Counter
+
+    from genesis.db._migration_discovery import discover_numbered_modules
+
+    surfaces = [
+        (
+            runner_mod._DATA_MIGRATIONS_DIR,
+            runner_mod._DATA_MIGRATION_PATTERN,
+            "data migration",
+        ),
+        (
+            runner_mod._DATA_MIGRATIONS_DIR.parent / "migrations",
+            re.compile(r"^(\d{4})_\w+\.py$"),
+            "schema migration",
+        ),
+    ]
+    for directory, pattern, label in surfaces:
+        ids = [mid for mid, _, _ in discover_numbered_modules(directory, pattern)]
+        dupes = {mid: n for mid, n in Counter(ids).items() if n > 1}
+        assert not dupes, (
+            f"duplicate {label} prefix(es) {dupes} in {directory} — "
+            "rename the newer file to the next free prefix"
+        )
+
+
 async def test_runner_redispatches_orphaned_running(db, monkeypatch):
     # A row left 'running' by a crashed prior boot must re-run.
     await crud.ensure_row(db, id="d0001", name="d0001_x", requires_operator=False)
