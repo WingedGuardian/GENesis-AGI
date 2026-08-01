@@ -261,30 +261,20 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ -z "${PRIV:-}" ]]; then
-            echo "::error::private pattern layer not provisioned (GENESIS_PRIVATE_PATTERNS empty) — run bootstrap with GENESIS_SYNC_PRIVATE_PATTERNS=1"
-            exit 1
-          fi
+          # Write the raw secret; scripts/ci/private_pattern_scan.py does ALL
+          # filtering + validation (blank/comment lines, empty set, malformed
+          # ERE) in tested Python — the fragile parts that repeatedly bit the
+          # former inline-shell gate. It exits 0=clean, 1=leak (counts only,
+          # never content), 3=fail-loud (unprovisioned/corrupt secret); set -e
+          # propagates a nonzero exit as the gate's failure.
           pf="$(mktemp)"
-          # Strip blank/comment lines BEFORE using as a grep -E -f pattern file —
-          # the secret ends in a trailing newline (sync_secret joins with "\n"),
-          # and a blank line is an EMPTY regex that matches EVERY line, which
-          # would turn this hard gate into an unconditional fail on every PR.
-          # (Mirrors _check_fingerprints and the commit-msg hook, which both
-          # filter before consuming the same pattern-file format.)
-          printf '%s\n' "$PRIV" | grep -vE '^[[:space:]]*(#|$)' > "$pf" || true
-          if [[ ! -s "$pf" ]]; then
-            echo "::error::GENESIS_PRIVATE_PATTERNS contained no usable patterns (all blank/comment) — regenerate with GENESIS_SYNC_PRIVATE_PATTERNS=1"
-            exit 1
-          fi
+          printf '%s' "$PRIV" > "$pf"
 
           # Collect ADDED lines for this PR/push (+ PR body). Diff, not whole
           # tree — pre-existing legit content is out of scope by construction.
-          # Keep all '^+' lines INCLUDING the '+++ b/path' file headers: those
-          # carry only repo-relative paths (which never match an exact install
-          # value), and a '^+++' filter would ALSO drop added CONTENT beginning
-          # with '++' (it renders as '+++...' in the diff) — a leak-gate false
-          # negative.
+          # Keep all '^+' lines INCLUDING the '+++ b/path' headers: those carry
+          # only repo-relative paths (which never match an exact install value),
+          # and a '^+++' filter would drop added content beginning with '++'.
           added=""
           body=""
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
@@ -297,23 +287,7 @@ jobs:
             added="$(git show "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
           fi
 
-          scan="$(printf '%s\n%s\n' "$added" "$body")"
-          # Capture grep's exit code explicitly: 0 = match (leak), 1 = clean,
-          # >=2 = grep error (e.g. a malformed ERE in the secret). An `if grep`
-          # would read rc 2 as "no match" and PASS the gate silently — fail loud
-          # on error so a bad provisioned pattern can never disable the gate green.
-          rc=0
-          printf '%s' "$scan" | grep -qE -f "$pf" || rc=$?
-          if [[ "$rc" -eq 0 ]]; then
-            echo "::error::private install identifier present in PR/push additions or PR body — content withheld"
-            cnt="$(printf '%s' "$scan" | grep -cE -f "$pf" || true)"
-            echo "match count: $cnt"
-            exit 1
-          elif [[ "$rc" -ge 2 ]]; then
-            echo "::error::private-pattern scan errored (grep rc=$rc) — GENESIS_PRIVATE_PATTERNS may contain a malformed ERE; regenerate with GENESIS_SYNC_PRIVATE_PATTERNS=1"
-            exit 1
-          fi
-          echo "Private-pattern exact scan: CLEAN"
+          printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
 
   migration-check:
     # Catch duplicate migration prefixes before merge — two PRs creating
