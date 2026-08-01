@@ -517,8 +517,8 @@ async def get_taxonomy(
     db: aiosqlite.Connection,
     memory_id: str,
 ) -> dict[str, str | None] | None:
-    """Return ``{"wing", "room", "origin_class", "deprecated", "superseded_by"}``
-    for a memory_id, or None.
+    """Return ``{"wing", "room", "origin_class", "memory_class",
+    "deprecated", "superseded_by"}`` for a memory_id, or None.
 
     The embedding-recovery worker uses this to restore metadata fields onto
     the reconstructed Qdrant payload (see ``resilience/embedding_recovery``)
@@ -528,9 +528,12 @@ async def get_taxonomy(
     store time, even on the FTS5-only/pending path) rather than the pending
     row, keeping ONE source of truth. ``life_domain`` is recovered from the
     ``life_domain:`` tag and ``project_type`` is not persisted on this path.
+    ``memory_class`` is likewise the authoritative store-time value (honoring
+    any explicit override); the worker restores it instead of recomputing
+    heuristically, which would silently downgrade an explicitly-set class.
     """
     rows = await db.execute_fetchall(
-        "SELECT wing, room, origin_class, deprecated, superseded_by "
+        "SELECT wing, room, origin_class, memory_class, deprecated, superseded_by "
         "FROM memory_metadata WHERE memory_id = ?",
         (memory_id,),
     )
@@ -541,13 +544,14 @@ async def get_taxonomy(
         "wing": row[0],
         "room": row[1],
         "origin_class": row[2],
+        "memory_class": row[3],
         # deprecated/superseded_by let the recovery worker re-stamp a
         # re-embedded point as excluded-from-recall (deprecated=True,
         # merged_into=<successor>), matching MemoryStore._mark_superseded — so a
         # memory superseded WHILE its embed was pending is not resurrected as a
         # live vector on re-embed (the worker path is otherwise deprecation-blind).
-        "deprecated": row[3],
-        "superseded_by": row[4],
+        "deprecated": row[4],
+        "superseded_by": row[5],
     }
 
 

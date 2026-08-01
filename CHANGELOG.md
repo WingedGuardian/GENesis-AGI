@@ -11,6 +11,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Re-embedding a memory no longer downgrades its recall ranking.** When a
+  memory's vector was rebuilt (after a vector-store outage, or by the nightly
+  repair job), its priority class was silently recomputed from the text alone —
+  discarding any deliberate classification and, for reference-style entries,
+  re-applying a ranking penalty that lowered how often they surfaced. Rebuilds
+  now preserve the stored class. Installs that already drifted are healed
+  automatically on update: a one-time pass re-syncs each memory's stored class
+  onto its vector (a clean no-op if nothing drifted).
+
 - **Learned procedures no longer overwrite each other.** Genesis identified a
   stored "how-to" procedure by its coarse topic label alone, so two genuinely
   different lessons that happened to share a label would silently replace one
