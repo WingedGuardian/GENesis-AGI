@@ -44,7 +44,10 @@ verified: 51bfbb35 2026-07-30
 points; "lying mirror" rows claiming a vector that's gone) is structurally
 possible. `memory/integrity.py` (Phase 0) detects nightly via set algebra and
 persists reports; `memory/integrity_repair.py` (Phase 1, `memory_reconcile`
-job 04:40, `integrity_config` mode `active` — the default) repairs aged
+job 04:40, `integrity_config` mode `active` — opt-in now, default once the
+cross-process delete-intent tombstones land: the per-memory-id lock
+serializes delete-vs-requeue only within one process, and
+`MemoryStore.delete()` also runs in the genesis-memory MCP process) repairs aged
 offenders nightly: ghosts deleted (payload exported to a date-stamped JSONL
 under `~/.genesis/output/` first), mirrors re-queued through
 `pending_embeddings.requeue_for_reembed` so `EmbeddingRecoveryWorker` rebuilds

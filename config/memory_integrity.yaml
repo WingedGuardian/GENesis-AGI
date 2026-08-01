@@ -17,15 +17,16 @@ enabled: true
 
 # Mode: off | passive | active
 #   off     — jobs do not run.
-#   passive — read-only checks + surfacing only (persist + posture alert +
-#             dashboard tile). NEVER repairs.
-#   active  — (default) passive + the nightly reconcile repair job. Default
-#             because drift otherwise accumulates silently; the per-memory-id
-#             lock (memory/_locks.py) makes repair safe against concurrent
-#             deletes. Opt out with `mode: passive`.
+#   passive — (default) read-only checks + surfacing only (persist + posture
+#             alert + dashboard tile). NEVER repairs.
+#   active  — passive + the nightly reconcile repair job. Opt-in until the
+#             cross-process delete-intent tombstones land (PR-2): the
+#             per-memory-id lock (memory/_locks.py) serializes
+#             delete-vs-requeue only within one process, and deletes also run
+#             in the genesis-memory MCP process. Opt in with `mode: active`.
 # An invalid value degrades to passive (still observing, never repairing) —
 # never a silent off.
-mode: active
+mode: passive
 
 # ── reconcile repair lane (mode=active only) ─────────────────────────────
 repair_min_age_seconds: 3600  # never touch an offender younger than this (in-flight writes)

@@ -11,16 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
-- **Genesis's memory now heals itself nightly.** Building on the Memory
-  Integrity checks (which detect drift between the memory database and the
-  vector store) and the one-time startup cleanup, a nightly repair job now
+- **Genesis can now repair memory drift automatically (opt-in).** Building on
+  the Memory Integrity checks (which detect drift between the memory database
+  and the vector store) and the one-time startup cleanup, a nightly repair job
   fixes any drift that reappears: orphaned "ghost" vectors are removed (their
   contents exported to `~/.genesis/output/` first as a safety net), and
   memories that silently lost their vector are re-queued so full semantic
-  search is restored. On by default (`memory_integrity` mode `active`); set
-  `mode: passive` in your local overlay for detection-only, or
-  `GENESIS_MEMORY_INTEGRITY_DISABLED=1` to turn the jobs off entirely. Every
-  repair run is recorded, so what changed is always auditable.
+  search is restored. Enable it by setting `memory_integrity` mode to `active`
+  (it becomes the default in an upcoming release, once repairs are fully
+  serialized against deletes from every Genesis process);
+  `GENESIS_MEMORY_INTEGRITY_DISABLED=1` turns the memory-integrity jobs off
+  entirely. Every repair run is recorded, so what changed is always auditable.
 
 ### Fixed
 

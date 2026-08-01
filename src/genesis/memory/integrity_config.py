@@ -8,15 +8,17 @@ cache, so an operator edit takes effect on the next scheduled run.
 
 Modes (``off | passive | active``):
 
-- ``active`` (DEFAULT) — everything ``passive`` does, PLUS the Phase-1 periodic
+- ``passive`` (DEFAULT) — run the read-only checks and surface findings
+  (persist + posture alert + dashboard). Never repairs. This was the whole of
+  Phase 0.
+- ``active`` — everything ``passive`` does, PLUS the Phase-1 periodic
   reconcile job (``memory/integrity_repair.py``) that repairs aged ghost points
-  and lying mirrors nightly. Default because drift otherwise accumulates
-  silently — the same rationale as the d0008 one-time repair running
-  unconditionally at boot. The mirror-requeue-vs-delete race is closed by the
-  per-memory-id lock (``memory/_locks.py``), so repair never resurrects a
-  deleted memory. Opt out with ``mode: passive`` in the local overlay.
-- ``passive`` — run the read-only checks and surface findings (persist +
-  posture alert + dashboard). Never repairs. This was the whole of Phase 0.
+  and lying mirrors nightly. Opt in with ``mode: active`` in the local overlay.
+  Not the default yet: the per-memory-id lock (``memory/_locks.py``) closes the
+  mirror-requeue-vs-delete race only WITHIN a process, and
+  ``MemoryStore.delete()`` also runs in the separate genesis-memory MCP
+  process — active becomes the default once the cross-process delete-intent
+  tombstones land (PR-2).
 - ``off`` — do not run at all.
 
 Failure posture: an INVALID mode degrades to ``passive`` (still observing, no
@@ -52,10 +54,11 @@ _ENV_KILL_SWITCH = "GENESIS_MEMORY_INTEGRITY_DISABLED"
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
-    # Repair on by default: the per-memory-id lock (memory/_locks.py) closes the
-    # mirror-requeue-vs-delete race, so active repair never resurrects a deleted
-    # memory. Opt out with mode: passive in the local overlay.
-    "mode": "active",
+    # Repair stays opt-in until the cross-process delete-intent tombstones land
+    # (PR-2): the per-memory-id lock (memory/_locks.py) serializes
+    # delete-vs-requeue only within one process, and MemoryStore.delete() also
+    # runs in the genesis-memory MCP process. Opt in with mode: active.
+    "mode": "passive",
     # ── consistency checker ──
     "sample_fraction": 1.0,  # 1.0 = exact full scan (cheap at single-user scale)
     "max_points": 500_000,  # Qdrant scroll budget; exceeding it sets truncated
