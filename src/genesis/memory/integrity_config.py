@@ -8,17 +8,16 @@ cache, so an operator edit takes effect on the next scheduled run.
 
 Modes (``off | passive | active``):
 
-- ``passive`` (DEFAULT) — run the read-only checks and surface findings
-  (persist + posture alert + dashboard). Never repairs. This was the whole of
-  Phase 0.
-- ``active`` — everything ``passive`` does, PLUS the Phase-1 periodic
-  reconcile job (``memory/integrity_repair.py``) that repairs aged ghost points
-  and lying mirrors nightly. Opt in with ``mode: active`` in the local overlay.
-  Not the default yet: the per-memory-id lock (``memory/_locks.py``) closes the
-  mirror-requeue-vs-delete race only WITHIN a process, and
-  ``MemoryStore.delete()`` also runs in the separate genesis-memory MCP
-  process — active becomes the default once the cross-process delete-intent
-  tombstones land (PR-2).
+- ``active`` (DEFAULT) — everything ``passive`` does, PLUS the Phase-1 periodic
+  reconcile job (``memory/integrity_repair.py``) that drains delete-intent
+  tombstones and repairs aged ghost points and lying mirrors nightly. Safe as
+  the default because repair is serialized against deletes from EVERY process:
+  in-process via the per-memory-id lock (``memory/_locks.py``), cross-process
+  via DB-backed tombstones (``memory/delete_tombstones.py``) plus the atomic
+  metadata/tombstone guard inside ``requeue_for_reembed``. Opt out with
+  ``mode: passive`` in the local overlay.
+- ``passive`` — run the read-only checks and surface findings (persist +
+  posture alert + dashboard). Never repairs. This was the whole of Phase 0.
 - ``off`` — do not run at all.
 
 Failure posture: an INVALID mode degrades to ``passive`` (still observing, no
@@ -54,11 +53,11 @@ _ENV_KILL_SWITCH = "GENESIS_MEMORY_INTEGRITY_DISABLED"
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
-    # Repair stays opt-in until the cross-process delete-intent tombstones land
-    # (PR-2): the per-memory-id lock (memory/_locks.py) serializes
-    # delete-vs-requeue only within one process, and MemoryStore.delete() also
-    # runs in the genesis-memory MCP process. Opt in with mode: active.
-    "mode": "passive",
+    # Repair on by default: delete-vs-repair is serialized in-process by the
+    # per-memory-id lock (memory/_locks.py) and cross-process by delete-intent
+    # tombstones (memory/delete_tombstones.py) + the atomic requeue guard
+    # (crud/pending_embeddings.py). Opt out with mode: passive in the overlay.
+    "mode": "active",
     # ── consistency checker ──
     "sample_fraction": 1.0,  # 1.0 = exact full scan (cheap at single-user scale)
     "max_points": 500_000,  # Qdrant scroll budget; exceeding it sets truncated

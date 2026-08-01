@@ -44,21 +44,30 @@ verified: 51bfbb35 2026-07-30
 points; "lying mirror" rows claiming a vector that's gone) is structurally
 possible. `memory/integrity.py` (Phase 0) detects nightly via set algebra and
 persists reports; `memory/integrity_repair.py` (Phase 1, `memory_reconcile`
-job 04:40, `integrity_config` mode `active` — opt-in now, default once the
-cross-process delete-intent tombstones land: the per-memory-id lock
-serializes delete-vs-requeue only within one process, and
-`MemoryStore.delete()` also runs in the genesis-memory MCP process) repairs aged
-offenders nightly: ghosts deleted (payload exported to a date-stamped JSONL
-under `~/.genesis/output/` first), mirrors re-queued through
-`pending_embeddings.requeue_for_reembed` so `EmbeddingRecoveryWorker` rebuilds
-the real vector. Truncation asymmetry is load-bearing: a truncated point
-scroll keeps ghost classification sound (metadata read is complete) but makes
-mirror classification unsound (can't prove absence) — mirrors are skipped
-under truncation. Repair never consumes Phase 0's (possibly sampled) report —
-it re-enumerates exactly. Audit rows: `memory_reconcile_runs` (migration
-0074). One-time historical cleanup was d0008; `MemoryStore.delete()` is
-point-first + fail-closed (defers, returning `{"deferred": True}`, when Qdrant
-is unavailable — callers must honor it).
+job 04:40, `integrity_config` mode `active` — the default) repairs aged
+offenders nightly: open delete-intent tombstones drained first (deferred
+deletes re-attempted through the full store cascade; attempted ids excluded
+from that run's ghost/mirror sets), ghosts deleted (payload exported to a
+date-stamped JSONL under `~/.genesis/output/` first), mirrors re-queued
+through `pending_embeddings.requeue_for_reembed` so `EmbeddingRecoveryWorker`
+rebuilds the real vector. Repair is serialized against deletes from EVERY
+process: in-process via the per-memory-id lock (`memory/_locks.py`);
+cross-process via DB-backed tombstones (`memory/delete_tombstones.py`, rows on
+`deferred_work_queue`, written by `MemoryStore.delete()` when Qdrant is down)
+plus an atomic metadata/tombstone guard inside `requeue_for_reembed` (single
+SQL statement — SQLite's cross-process write lock makes it atomic vs a delete
+in any process, e.g. the genesis-memory MCP server's `reference_delete`). The
+irreducible floor (documented, self-healing): the recovery worker's
+SQLite-check→Qdrant-upsert micro-window vs a concurrent full delete can still
+strand a ghost until the next nightly sweep. Truncation asymmetry is
+load-bearing: a truncated point scroll keeps ghost classification sound
+(metadata read is complete) but makes mirror classification unsound (can't
+prove absence) — mirrors are skipped under truncation. Repair never consumes
+Phase 0's (possibly sampled) report — it re-enumerates exactly. Audit rows:
+`memory_reconcile_runs` (migration 0074). One-time historical cleanup was
+d0008; `MemoryStore.delete()` is point-first + fail-closed (defers, returning
+`{"deferred": True}` and recording a tombstone, when Qdrant is unavailable —
+callers must honor it).
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
 stack.** Deep path: `memory/retrieval.py` `HybridRetriever.recall` (bitemporal

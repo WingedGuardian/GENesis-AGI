@@ -1699,6 +1699,13 @@ async def test_memory_core_facts_wraps_external_and_emits(monkeypatch):
         real_db.row_factory = aiosqlite.Row
         from genesis.db.schema import create_all_tables
         await create_all_tables(real_db)
+        # Scrolled points must have metadata rows — a point without one is a
+        # deleted memory's ghost and the core_facts ghost filter drops it.
+        for _mid in ("ext-1", "fp-1", "old-1"):
+            await real_db.execute(
+                "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+                (_mid, "2026-01-01T00:00:00+00:00"),
+            )
         await real_db.commit()
 
         qdrant = MagicMock()

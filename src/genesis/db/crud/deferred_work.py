@@ -188,9 +188,13 @@ async def count_open_by_identity(
     ``has_open`` into ``_defer``'s broad handler and silently drop EVERY new
     delivery until the bad row is cleared. ``COALESCE(..., '')`` makes a
     missing/NULL signal_type or category match cleanly (SQL ``NULL = ?`` is never
-    true). Single-writer queue → the read-then-insert is race-free enough; the
-    ``idx_rlp_open_dedup`` partial-unique-index pattern (``cc_rate_limit_parks``)
-    is the upgrade path if a concurrent producer ever appears.
+    true). The read-then-insert dedup was designed single-writer; one
+    work_type is now multi-process (``memory_deferred_delete`` — both
+    genesis-server and the genesis-memory MCP process enqueue) but explicitly
+    DUP-TOLERANT: duplicate open tombstones are all closed together and a
+    double-drained delete is idempotent (memory/delete_tombstones.py). For any
+    future work_type that is NOT dup-tolerant, the ``idx_rlp_open_dedup``
+    partial-unique-index pattern (``cc_rate_limit_parks``) is the upgrade path.
     """
     cursor = await db.execute(
         """SELECT COUNT(*) FROM deferred_work_queue
@@ -207,6 +211,41 @@ async def count_open_by_identity(
     )
     row = await cursor.fetchone()
     return int(row[0])
+
+
+async def complete_open_by_identity(
+    db: aiosqlite.Connection,
+    *,
+    work_type: str,
+    topic: str,
+    category: str,
+    signal_type: str | None,
+    completed_at: str,
+) -> int:
+    """Mark every OPEN (pending/processing) row matching the payload dedup
+    identity ``(topic, category, signal_type)`` as completed. Returns the count.
+
+    The inverse of :func:`count_open_by_identity` — used when the deferred
+    work's outcome was achieved out-of-band (e.g. a memory delete succeeded on
+    retry through the normal path, so its delete-intent tombstone is obsolete).
+    Same ``json_valid`` guards: a corrupt row is skipped, never raises.
+    """
+    cursor = await db.execute(
+        """UPDATE deferred_work_queue
+           SET status = 'completed', completed_at = ?
+           WHERE work_type = ?
+             AND status IN ('pending', 'processing')
+             AND (CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.topic') END) = ?
+             AND COALESCE(CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.category') END, '') = ?
+             AND COALESCE(CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.signal_type') END, '')
+                 = COALESCE(?, '')""",
+        (completed_at, work_type, topic, category, signal_type),
+    )
+    await db.commit()
+    return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
 
 async def count_recovery_pending(

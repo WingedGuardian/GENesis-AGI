@@ -154,12 +154,17 @@ def _wire_memory_integrity_jobs(scheduler, rt) -> None:
             from genesis.qdrant.collections import get_client
 
             cfg = integrity_config.load_config()
+            store = getattr(rt, "memory_store", None)
             result = await run_reconcile(
                 db=rt._db,
                 qdrant_client=get_client(),
                 min_age_seconds=integrity_config.knob_int(cfg, "repair_min_age_seconds"),
                 max_repairs_per_run=integrity_config.knob_int(cfg, "max_repairs_per_run"),
                 max_points=integrity_config.knob_int(cfg, "max_points"),
+                # Tombstone drain re-attempts deferred deletes through the full
+                # store cascade; on a degraded boot (no store) the drain is
+                # skipped loudly and the run reports partial.
+                delete_memory=store.delete if store is not None else None,
             )
             await mi_crud.insert_reconcile_run(
                 rt._db,
