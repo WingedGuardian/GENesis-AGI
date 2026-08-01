@@ -173,6 +173,11 @@
                       <strong>Reason:</strong> <span x-text="item.reason"></span>
                     </div>
                   </template>
+                  <template x-if="item.revisit_condition">
+                    <div style="margin-bottom:0.3rem; color:var(--color-text-secondary); font-size:0.68rem;">
+                      <strong>Revisit when:</strong> <span x-text="item.revisit_condition"></span>
+                    </div>
+                  </template>
                   <div style="display:flex; gap:0.5rem; font-size:0.62rem; color:var(--color-text-secondary); flex-wrap:wrap; margin-bottom:0.4rem;">
                     <span x-text="'Strategy: ' + (item.strategy || 'unknown')"></span>
                     <span x-text="'Source: ' + (item.source || 'unknown')"></span>
