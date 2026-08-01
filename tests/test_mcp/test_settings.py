@@ -207,7 +207,7 @@ async def test_settings_update_inbox_monitor(config_dir: Path):
                 "enabled": True,
                 "batch_size": 1,
                 "model": "sonnet",
-                "timezone": "America/New_York",
+                "timezone": "Europe/Berlin",
             },
         },
     )
@@ -225,7 +225,7 @@ async def test_settings_update_inbox_monitor(config_dir: Path):
     merged = _load_yaml_merged("inbox_monitor.yaml")
     assert merged["inbox_monitor"]["batch_size"] == 3
     assert merged["inbox_monitor"]["model"] == "opus"
-    assert merged["inbox_monitor"]["timezone"] == "America/New_York"  # Preserved from base
+    assert merged["inbox_monitor"]["timezone"] == "Europe/Berlin"  # Preserved from base
 
 
 async def test_settings_update_inbox_timezone_ignored(config_dir: Path):

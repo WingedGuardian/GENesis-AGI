@@ -137,7 +137,7 @@ def test_portability_ip_blocks():
     diff = (
         "diff --git a/config.py b/config.py\n"
         "--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n"
-        "+OLLAMA_URL = 'http://10.176.0.0:11434'\n"
+        "+OLLAMA_URL = 'http://10.0.0.1:11434'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -148,19 +148,24 @@ def test_portability_home_path_blocks():
     diff = (
         "diff --git a/x.py b/x.py\n"
         "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
-        "+path = '/home/ubuntu/genesis/data/genesis.db'\n"
+        "+path = '/home/alice/genesis/data/genesis.db'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
 
 
-def test_portability_timezone_blocks():
+def test_bare_timezone_not_a_portability_class():
+    """A timezone is NOT a generic portability class — it is an install-specific
+    EXACT value handled by the fingerprint layer, not hardcoded here (a public
+    scanner must not name this install's timezone). A bare IANA zone must pass
+    portability so contributions using ordinary timezones are not over-blocked."""
     diff = (
         "diff --git a/t.py b/t.py\n"
-        "--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n+TZ = 'America/New_York'\n"
+        "--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n+TZ = 'Europe/Berlin'\n"
     )
-    r = sanitize.scan_diff(diff)
-    assert r.ok is False
+    r = sanitize.scan_diff(diff, fingerprint_file=None)
+    # No fingerprint file present in the test env → no BLOCK from a bare zone.
+    assert not any(f.kind == FindingKind.PORTABILITY for f in r.findings)
 
 
 def test_portability_only_scans_added_lines():
@@ -168,8 +173,8 @@ def test_portability_only_scans_added_lines():
     diff = (
         "diff --git a/x.py b/x.py\n"
         "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
-        "-TZ = 'America/New_York'\n"
-        "+TZ = 'UTC'\n"
+        "-HOST = '10.0.0.1'\n"
+        "+HOST = 'localhost'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is True
@@ -240,7 +245,7 @@ def test_multi_file_diff_all_scanned():
     diff = (
         "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+ok_line\n"
         "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n"
-        "+IP = '10.176.0.0'\n"
+        "+IP = '10.0.0.1'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -248,24 +253,26 @@ def test_multi_file_diff_all_scanned():
     assert any(f.file == "b.py" for f in blocking)
 
 
-def test_wingedguardian_blocks():
+def test_repo_name_caught_via_fingerprint_not_portability(tmp_path):
+    """Private repo names are EXACT install values handled by the fingerprint
+    layer, NOT a generic portability class. (A bounded pattern for a private
+    repo whose name is a prefix of the public repo would mass-false-positive on
+    the public one — so it must never be hardcoded here.) Without a fingerprint
+    the repo-name string passes portability; with one it blocks via fingerprint."""
     diff = (
         "diff --git a/x.md b/x.md\n"
-        "--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n+see WingedGuardian/Genesis for more\n"
+        "--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n+see ExampleOrg/PrivateThing for more\n"
     )
-    r = sanitize.scan_diff(diff)
-    assert r.ok is False
+    # No fingerprint → a repo-name string is not a portability class → allowed.
+    r = sanitize.scan_diff(diff, fingerprint_file=tmp_path / "none.txt")
+    assert not any(f.kind == FindingKind.PORTABILITY for f in r.findings)
 
-
-def test_wingedguardian_public_allowed():
-    # The public repo name (GENesis-AGI) shouldn't match the private regex
-    diff = (
-        "diff --git a/x.md b/x.md\n"
-        "--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n+see WingedGuardian/GENesis-AGI\n"
-    )
-    r = sanitize.scan_diff(diff)
-    # The portability regex specifically matches private repo names
-    assert r.ok is True
+    # With a fingerprint listing the private repo → blocked via the fingerprint.
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text(r"\bExampleOrg/PrivateThing\b" + "\n")
+    r2 = sanitize.scan_diff(diff, fingerprint_file=fp)
+    assert r2.ok is False
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r2.blocking())
 
 
 def test_protected_paths_yaml_loaded(tmp_path, clean_diff):
@@ -300,7 +307,7 @@ def test_parse_diff_dev_null_target():
 def test_findings_include_severity():
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+ip=10.176.0.0\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+ip=10.0.0.1\n"
     )
     r = sanitize.scan_diff(diff)
     assert all(f.severity == Severity.BLOCK for f in r.blocking())
@@ -525,35 +532,88 @@ def test_portability_non_cgnat_100_allowed():
     assert r.ok is True
 
 
-def test_portability_tailscale_ipv6_blocks():
-    """Tailscale IPv6 (fd7a: ULA prefix) must be blocked pre-push."""
+def test_portability_ipv6_ula_blocks():
+    """Any IPv6 ULA (fc00::/7) prefix must be blocked pre-push — generic class,
+    not this install's specific fdXX: prefixes."""
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST6 = 'fd7a::1'\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST6 = 'fd00::1'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
     assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
 
 
-def test_portability_10_176_range_blocks():
-    """Any 10.176.x.x address (not just the two legacy literals) must block."""
+def test_portability_10_8_range_blocks():
+    """Any 10.0.0.0/8 address must block — the generic class, a strict superset
+    of the former install-specific 10.x literals."""
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST = '10.176.0.1'\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HOST = '10.0.0.1'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
     assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
 
 
-def test_portability_fd7a_requires_colon_no_false_positive():
-    r"""`\bfd7a:` should match Tailscale IPv6 (fd7a:...) but NOT an unrelated
-    hex token that merely contains 'fd7a' without the trailing colon (e.g. a
-    commit hash), so the floor doesn't over-block legitimate content."""
+def test_portability_ula_requires_colon_no_false_positive():
+    r"""The ULA class `[fF][cdCD][0-9a-fA-F]{2}:` should match an IPv6 ULA
+    (fd00:...) but NOT an unrelated hex token that merely starts with fdXX
+    without the trailing colon (e.g. a commit hash), so the floor doesn't
+    over-block legitimate content."""
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HASH = 'fd7abeefcafe0123'\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+HASH = 'fdcafe0123beef45'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is True
+
+
+# --- PR 2: generic-class parity + false-positive guards ---------------------
+
+def _portability_blocks(value: str, tmp_path) -> bool:
+    """True iff `value` triggers a PORTABILITY finding, with the fingerprint
+    layer disabled (nonexistent file) so ONLY the generic classes are exercised."""
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        f"--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+V = '{value}'\n"
+    )
+    r = sanitize.scan_diff(diff, fingerprint_file=tmp_path / "no-fp.txt")
+    return any(f.kind == FindingKind.PORTABILITY for f in r.findings)
+
+
+def test_class_sweep_rfc1918_and_ula_fully_covered(tmp_path):
+    """Every former install-specific literal is a member of its class — proven
+    by sweeping representative octets across the FULL range of each class
+    (endpoints + interior), so any specific subnet is trivially inside. Values
+    are generic sweep points, not this install's literals."""
+    for b in (0, 1, 128, 255):            # full 10.0.0.0/8 second-octet spread
+        assert _portability_blocks(f"10.{b}.3.4", tmp_path)
+    for b in (0, 128, 255):               # full 192.168.0.0/16 third-octet spread
+        assert _portability_blocks(f"192.168.{b}.9", tmp_path)
+    for b in (16, 24, 31):                # 172.16.0.0/12 valid second octet
+        assert _portability_blocks(f"172.{b}.0.1", tmp_path)
+    for pfx in ("fc00", "fcff", "fd00", "fdff"):   # fc00::/7 ULA endpoints
+        assert _portability_blocks(f"{pfx}::1", tmp_path)
+
+
+def test_class_false_positive_guards(tmp_path):
+    """Generic classes must NOT flag RFC 5737 doc ranges, public 172 outside
+    16..31, non-CGNAT 100.x, or a bare fdXX hex token without a colon."""
+    for v in ("192.0.2.1", "198.51.100.7", "203.0.113.9"):   # RFC 5737
+        assert not _portability_blocks(v, tmp_path)
+    for v in ("172.15.0.1", "172.32.0.1", "172.1.2.3"):      # public 172
+        assert not _portability_blocks(v, tmp_path)
+    assert not _portability_blocks("100.200.5.5", tmp_path)   # non-CGNAT 100.x
+    assert not _portability_blocks("fdcafe0123beef45", tmp_path)  # no colon
+
+
+def test_fingerprint_missing_file_warns(tmp_path, clean_diff):
+    """A missing fingerprint file surfaces a non-blocking WARN (provisioning
+    gap) rather than silently skipping — but never BLOCKs on that alone."""
+    r = sanitize.scan_diff(clean_diff, fingerprint_file=tmp_path / "absent.txt")
+    assert r.ok is True
+    assert any(
+        f.kind == FindingKind.FINGERPRINT and f.severity == Severity.WARN
+        for f in r.findings
+    )
