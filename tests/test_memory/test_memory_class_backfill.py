@@ -116,6 +116,25 @@ def test_resync_paginates(sqlite_db, monkeypatch):
     assert got == {"p_override", "p_rule"}  # both pages processed
 
 
+def test_d0009_migrate_and_verify_wrapper(tmp_path, monkeypatch):
+    """The d0009 entry points: migrate() returns the resync summary and closes
+    its connection (try/finally); verify() reflects the divergence count. The
+    core logic is covered above — this pins the thin runner-facing wrapper."""
+    import genesis.db.data_migrations.d0009_resync_memory_class_qdrant as d0009
+
+    dbfile = tmp_path / "genesis.db"
+    sqlite3.connect(str(dbfile)).close()  # real file so the ro connection opens
+    monkeypatch.setattr(d0009, "genesis_db_path", lambda: str(dbfile))
+    monkeypatch.setattr(d0009, "get_client", lambda: object())
+    monkeypatch.setattr(d0009, "resync_memory_class", lambda db, client, dry_run=False: {"fact": 3})
+    counts = iter([2, 0])
+    monkeypatch.setattr(d0009, "count_diverged_memory_class", lambda db, client: next(counts))
+
+    assert d0009.migrate() == {"fact": 3}
+    assert d0009.verify() is False  # 2 still diverged
+    assert d0009.verify() is True  # 0 diverged → complete
+
+
 def test_count_diverged_memory_class(sqlite_db, monkeypatch):
     pages = {
         "episodic_memory": [

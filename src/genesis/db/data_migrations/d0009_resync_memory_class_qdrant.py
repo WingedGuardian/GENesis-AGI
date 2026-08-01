@@ -32,6 +32,10 @@ requires_operator = False
 
 
 def migrate() -> dict:
+    """Re-sync memory_class onto diverged Qdrant payloads (see module docstring).
+
+    Returns per-target-class repair counts; a clean no-op ``{}`` where nothing
+    drifted."""
     db = sqlite3.connect(f"file:{genesis_db_path()}?mode=ro", uri=True)
     try:
         return resync_memory_class(db, get_client(), dry_run=False)
