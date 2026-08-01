@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import socket
 import subprocess
 import sys
@@ -102,8 +103,6 @@ _MIN_TOKEN_LEN = 5
 
 def _default_path() -> Path:
     """Resolve the fingerprint-file path (mirrors ``sanitize.scan_diff``)."""
-    import os
-
     env_path = os.environ.get("GENESIS_RELEASE_FINGERPRINTS")
     if env_path:
         return Path(env_path)
@@ -134,6 +133,21 @@ def _escape(literal: str) -> str:
     import re
 
     return re.escape(literal)
+
+
+def _bounded(literal: str) -> str:
+    """Escape ``literal`` and add ``\\b`` ONLY at edges that are word characters.
+
+    A trailing ``\\b`` after a non-word char (e.g. a repo name ending in ``-``)
+    can never match — both the punctuation and end-of-string are non-word
+    positions — so the pattern would silently fail to block its value. Anchor
+    conditionally instead.
+    """
+    esc = _escape(literal)
+    wordish = lambda c: c.isalnum() or c == "_"  # noqa: E731
+    left = r"\b" if literal[:1] and wordish(literal[0]) else ""
+    right = r"\b" if literal[-1:] and wordish(literal[-1]) else ""
+    return left + esc + right
 
 
 def _specific_token(tok: str) -> bool:
@@ -184,24 +198,36 @@ def harvest(
 
     out: list[tuple[str, str]] = []
 
-    # 1. genesis.yaml — service subnets, timezone, private repo name.
+    # 1. Effective service subnets + timezone + private repo name.
+    #    Precedence mirrors genesis.env: env override > genesis.yaml > default.
+    #    We read os.environ directly (rather than importing genesis.env) so
+    #    harvest stays home-injectable for tests and free of env.py's config
+    #    cache/defaults — but MUST honor the same overrides, else an install
+    #    using OLLAMA_URL/LM_STUDIO_URL/USER_TIMEZONE gets stale fingerprints
+    #    that fail to block its ACTUAL subnet/timezone. (secrets.env-sourced
+    #    overrides are only seen if bootstrap exported them into the process.)
     cfg = _load_yaml(home / ".genesis" / "config" / "genesis.yaml")
     try:
         net = cfg.get("network", {}) if isinstance(cfg, dict) else {}
-        for key in ("ollama_url", "lm_studio_url"):
-            pat = _ip_prefix_pattern(_host_from_url(str(net.get(key, "") or "")))
+        effective = {
+            "ollama_url": os.environ.get("OLLAMA_URL") or str(net.get("ollama_url", "") or ""),
+            "lm_studio_url": os.environ.get("LM_STUDIO_URL")
+            or str(net.get("lm_studio_url", "") or ""),
+        }
+        for key, url in effective.items():
+            pat = _ip_prefix_pattern(_host_from_url(url))
             if pat:
                 out.append((pat, f"private subnet ({key})"))
-        tz = str(cfg.get("timezone", "") or "").strip()
+        tz = (os.environ.get("USER_TIMEZONE") or str(cfg.get("timezone", "") or "")).strip()
         if tz and tz.upper() != "UTC":
-            out.append((r"\b" + _escape(tz) + r"\b", "install timezone"))
+            out.append((_bounded(tz), "install timezone"))
         gh = cfg.get("github", {}) if isinstance(cfg, dict) else {}
         user = str(gh.get("user", "") or "").strip()
         priv = str(gh.get("private_repo", "") or "").strip()
         # Only the user/repo COMBINATION — never the bare user (it appears in
         # the public org name and would mass-false-positive).
         if user and priv:
-            out.append((r"\b" + _escape(f"{user}/{priv}") + r"\b", "private repo name"))
+            out.append((_bounded(f"{user}/{priv}"), "private repo name"))
     except Exception:
         pass
 
@@ -211,7 +237,7 @@ def harvest(
         try:
             hu = str(remote.get("host_user", "") or "").strip()
             if hu and _specific_token(hu):
-                out.append((r"\b" + _escape(hu) + r"\b", f"host user ({name})"))
+                out.append((_bounded(hu), f"host user ({name})"))
             pat = _ip_prefix_pattern(str(remote.get("host_ip", "") or ""))
             if pat:
                 out.append((pat, f"host subnet ({name})"))
@@ -239,7 +265,7 @@ def harvest(
     try:
         hn = socket.gethostname().strip()
         if hn and _specific_token(hn):
-            out.append((r"\b" + _escape(hn) + r"\b", "hostname"))
+            out.append((_bounded(hn), "hostname"))
     except Exception:
         pass
 

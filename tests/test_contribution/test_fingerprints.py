@@ -44,6 +44,10 @@ def _stable_hostname(monkeypatch):
     # Force a stopword hostname so harvest() is deterministic regardless of the
     # runner's real hostname (which could otherwise add a pattern on CI).
     monkeypatch.setattr(fp.socket, "gethostname", lambda: "localhost")
+    # Clear the effective-config overrides so config tests read the fake yaml,
+    # not whatever the runner's shell exports (install-agnostic determinism).
+    for var in ("OLLAMA_URL", "LM_STUDIO_URL", "USER_TIMEZONE"):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +107,44 @@ def test_harvest_config_patterns(tmp_path):
     # CC project-dir slug is emitted (re.escape'd, so '-' becomes '\-').
     assert re.escape("-srv-proj") in pats
     assert any(c == "CC project-dir slug" for _, c in _harvest(home))
+
+
+def test_harvest_env_override_precedence(tmp_path, monkeypatch):
+    # Codex P1: an install using env/secrets overrides must be fingerprinted on
+    # its EFFECTIVE values, not the stale yaml leaves.
+    home = _fake_home(
+        tmp_path,
+        genesis_cfg={
+            "network": {"ollama_url": "http://10.5.6.7:11434"},
+            "timezone": "Europe/Berlin",
+        },
+    )
+    monkeypatch.setenv("OLLAMA_URL", "http://198.51.100.9:11434")  # RFC 5737 doc IP
+    monkeypatch.setenv("USER_TIMEZONE", "Asia/Tokyo")
+    pats = {p for p, _ in _harvest(home)}
+    assert r"\b198\.51\.100\." in pats  # env override wins
+    assert r"\b10\.5\.6\." not in pats  # stale yaml value not used
+    assert r"\bAsia/Tokyo\b" in pats
+    assert r"\bEurope/Berlin\b" not in pats
+
+
+def test_bounded_helper_edges():
+    # Codex P2: \b only where the edge char is a word char.
+    assert fp._bounded("abc") == r"\babc\b"
+    assert fp._bounded("Priv-") == r"\bPriv\-"  # no trailing \b after '-'
+    assert fp._bounded("/path") == r"/path\b"  # no leading \b before '/'
+
+
+def test_bounded_trailing_punctuation_round_trip(tmp_path):
+    # A private repo name ending in a non-word char must still block its value.
+    home = _fake_home(
+        tmp_path, genesis_cfg={"github": {"user": "AcmeOrg", "private_repo": "Priv-"}}
+    )
+    dest = tmp_path / "fp.txt"
+    fp.generate(path=dest, home=home, repo_root=Path("/srv/proj"), run_ip6=False)
+    r = sanitize.scan_diff(_make_diff("pushed to AcmeOrg/Priv- today"), fingerprint_file=dest)
+    assert r.ok is False
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r.blocking())
 
 
 def test_harvest_skips_localhost_and_utc(tmp_path):
