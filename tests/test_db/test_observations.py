@@ -335,6 +335,16 @@ def test_process_reaper_would_kill_ttl_registered(caplog):
     )
 
 
+def test_skill_proposal_ttl_is_60d_not_the_14d_default():
+    """The propose-only human-review queue (`skill_proposal`) must NOT sit at the
+    14-day default: `resolve_expired` runs live and would auto-resolve unreviewed
+    proposals, silently emptying the only human-safety queue. 60d gives real
+    review headroom."""
+    from datetime import timedelta
+
+    assert observations._compute_ttl("skill_proposal") == timedelta(days=60)
+
+
 _GIT_ALERT = dict(
     source="git_health_monitor",
     type="infrastructure_alert",
