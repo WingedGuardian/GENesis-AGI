@@ -20,9 +20,18 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 _BLOCK_STATUS = "rendered_unverified"
+
+# A marker stuck at rendered_unverified past this age is an ABANDONED artifact,
+# not an in-flight one: in a correct run Render -> Gate 2 is minutes. Beyond
+# this, the block's purpose (don't END a session that just rendered) is moot,
+# and holding it hostage would wedge every future Stop of that session. Allow
+# with a loud stale-marker warning instead. (Not a work timeout — an escape
+# hatch on an abandoned state.)
+_STALE_SECONDS = 24 * 60 * 60
 
 _BLOCK_MSG = (
     "BLOCKED: this session rendered a deliverable that has not passed Gate 2 verification.\n"
@@ -53,6 +62,20 @@ def _decide(data: dict, sessions_root: Path) -> int:
         if spec.get("session_id") != sid:
             return 0
         if spec.get("status") == _BLOCK_STATUS:
+            # Staleness escape: an abandoned marker must not wedge Stop forever.
+            try:
+                age = time.time() - marker.stat().st_mtime
+            except OSError:
+                age = 0.0
+            if age > _STALE_SECONDS:
+                print(
+                    "NOTE: a deliverable marker has been stuck at "
+                    f"'{_BLOCK_STATUS}' for {age / 3600:.1f}h (> "
+                    f"{_STALE_SECONDS // 3600}h) — treating it as abandoned and "
+                    f"allowing session end. Marker: {marker}",
+                    file=sys.stderr,
+                )
+                return 0
             return 2
         return 0
     except Exception:
