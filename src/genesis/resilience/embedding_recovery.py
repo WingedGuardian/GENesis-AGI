@@ -9,6 +9,7 @@ import aiosqlite
 
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import pending_embeddings as crud
+from genesis.memory._locks import memory_id_lock
 
 logger = logging.getLogger(__name__)
 
@@ -134,76 +135,80 @@ class EmbeddingRecoveryWorker:
                     source_pipeline=payload.get("source_pipeline", ""),
                 )
 
-                # Fail-closed against a concurrent delete. We pulled `item` from
-                # query_pending BEFORE the (slow, network) embed above; MemoryStore
-                # .delete() cascades removal of this memory's pending_embeddings row
-                # (with metadata + FTS). If that row is gone now, the memory was
-                # deleted mid-embed and upserting would strand a Qdrant-only ghost.
-                # store() writes the pending row and delete() removes it, so a
-                # legitimately in-flight store keeps the row present — this only
-                # fires on a real concurrent delete, right before the write.
-                if not await crud.exists_for_memory(
-                    self._db, memory_id=item["memory_id"]
-                ):
-                    continue
+                # Serialize the existence-recheck → upsert → finalize window
+                # against a concurrent MemoryStore.delete() of the SAME memory
+                # (memory/_locks.py). The slow embed above ran WITHOUT the lock;
+                # we take it now so the "is it still here?" check and the point
+                # write are atomic vs the delete cascade — a delete can no longer
+                # slip between them and leave a resurrected Qdrant-only ghost.
+                async with memory_id_lock(item["memory_id"]):
+                    # Fail-closed against a concurrent delete. We pulled `item`
+                    # from query_pending BEFORE the (slow) embed; MemoryStore
+                    # .delete() cascades removal of this memory's pending row
+                    # (with metadata + FTS). If it is gone now, the memory was
+                    # deleted and upserting would strand a Qdrant-only ghost.
+                    # store() writes the pending row and delete() removes it, so a
+                    # legitimately in-flight store keeps the row present.
+                    if not await crud.exists_for_memory(
+                        self._db, memory_id=item["memory_id"]
+                    ):
+                        continue
 
-                # Deprecation is re-read HERE, after the embed and immediately
-                # before the write — NOT from the pre-embed `taxo` snapshot. A
-                # _mark_superseded landing during the (slow) embed sets deprecated=1
-                # in SQLite but skips Qdrant (no point yet); stamping from the stale
-                # snapshot would resurface the superseded memory as a live vector.
-                # Mirrors _mark_superseded's Qdrant payload. (A residual read->
-                # upsert micro-window remains — SQLite and Qdrant share no
-                # transaction, so ordering alone cannot close it; drift from this
-                # class surfaces via the memory-integrity ghost/mirror checks.)
-                fresh_meta = await memory_crud.get_taxonomy(self._db, item["memory_id"])
-                if fresh_meta and fresh_meta.get("deprecated"):
-                    payload["deprecated"] = True
-                    if fresh_meta.get("superseded_by"):
-                        payload["merged_into"] = fresh_meta["superseded_by"]
+                    # Deprecation is re-read HERE, after the embed and under the
+                    # lock — NOT from the pre-embed `taxo` snapshot. A
+                    # _mark_superseded landing during the embed sets deprecated=1
+                    # in SQLite but skips Qdrant (no point yet); stamping from the
+                    # stale snapshot would resurface the superseded memory as a
+                    # live vector. Mirrors _mark_superseded's Qdrant payload.
+                    fresh_meta = await memory_crud.get_taxonomy(self._db, item["memory_id"])
+                    if fresh_meta and fresh_meta.get("deprecated"):
+                        payload["deprecated"] = True
+                        if fresh_meta.get("superseded_by"):
+                            payload["merged_into"] = fresh_meta["superseded_by"]
 
-                upsert_point(
-                    self._qdrant,
-                    collection=item["collection"],
-                    point_id=item["memory_id"],
-                    vector=vector,
-                    payload=payload,
-                )
+                    upsert_point(
+                        self._qdrant,
+                        collection=item["collection"],
+                        point_id=item["memory_id"],
+                        vector=vector,
+                        payload=payload,
+                    )
 
-                # Auto-link if linker available
-                if self._linker is not None:
+                    # Auto-link if linker available
+                    if self._linker is not None:
+                        try:
+                            await self._linker.auto_link(
+                                item["memory_id"],
+                                vector,
+                                collection=item["collection"],
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Auto-link failed for %s, continuing", item["memory_id"],
+                            )
+
+                    # Record the embed in memory_metadata first, then flip the
+                    # queue row (mark_embedded commits, flushing both). The vector
+                    # already landed in Qdrant above. Metadata-first is
+                    # self-healing: if only the metadata write lands, the queue
+                    # row stays 'pending' and the item is simply re-drained (the
+                    # upsert is idempotent), while metadata already reflects the
+                    # real vector — so it is never mislabelled 'failed' by the
+                    # orphan reconciler. No rollback: self._db is the shared
+                    # SerializedConnection and a rollback discards EVERY
+                    # coroutine's pending write (connection.py).
+                    now = datetime.now(UTC).isoformat()
                     try:
-                        await self._linker.auto_link(
-                            item["memory_id"],
-                            vector,
-                            collection=item["collection"],
+                        await memory_crud.set_embedding_status(
+                            self._db, item["memory_id"], "embedded"
                         )
+                        await crud.mark_embedded(self._db, item["id"], embedded_at=now)
+                        processed += 1
                     except Exception:
                         logger.warning(
-                            "Auto-link failed for %s, continuing", item["memory_id"],
+                            "Failed to finalize embedding status for %s — will re-drain",
+                            item["memory_id"], exc_info=True,
                         )
-
-                # Record the embed in memory_metadata first, then flip the
-                # queue row (mark_embedded commits, flushing both). The vector
-                # already landed in Qdrant above. Metadata-first is self-healing:
-                # if only the metadata write lands, the queue row stays 'pending'
-                # and the item is simply re-drained (the upsert is idempotent),
-                # while metadata already reflects the real vector — so it is
-                # never mislabelled 'failed' by the orphan reconciler. No
-                # rollback: self._db is the shared SerializedConnection and a
-                # rollback discards EVERY coroutine's pending write (connection.py).
-                now = datetime.now(UTC).isoformat()
-                try:
-                    await memory_crud.set_embedding_status(
-                        self._db, item["memory_id"], "embedded"
-                    )
-                    await crud.mark_embedded(self._db, item["id"], embedded_at=now)
-                    processed += 1
-                except Exception:
-                    logger.warning(
-                        "Failed to finalize embedding status for %s — will re-drain",
-                        item["memory_id"], exc_info=True,
-                    )
 
             except Exception as exc:
                 logger.error(

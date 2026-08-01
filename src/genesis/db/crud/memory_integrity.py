@@ -1,4 +1,4 @@
-"""CRUD for memory_consistency_reports + recall_probe_runs — Phase 0 integrity.
+"""CRUD for memory_consistency_reports + recall_probe_runs + memory_reconcile_runs.
 
 Persistence for the "make silence loud" observability spine (migration 0073).
 The consistency checker and recall-health probe write one row per run here; the
@@ -6,8 +6,9 @@ awareness posture check and the dashboard tile read the latest row per table;
 ``trailing_hit_rate`` supplies the recall-drift baseline.
 
 Writers guard on table existence and no-op pre-migration (the repo_pulse
-pattern) so a job scheduled before its migration lands never raises. Migration
-0073 is the sole schema authority; nothing here creates tables. Timestamps are
+pattern) so a job scheduled before its migration lands never raises. Migrations
+0073 (Phase-0 report/probe tables) and 0074 (Phase-1 reconcile-run table) are
+the sole schema authorities; nothing here creates tables. Timestamps are
 injected (``now``) for deterministic, testable retention.
 """
 
@@ -302,22 +303,125 @@ async def prune_memory_integrity(
     older_than_days: int = 90,
     now: str,
 ) -> int:
-    """Delete report/probe rows older than *older_than_days* relative to ISO ``now``.
+    """Delete report/probe/reconcile rows older than *older_than_days* vs ISO ``now``.
 
-    Retention for the two unbounded integrity stores (wired into the
+    Retention for the unbounded integrity stores (wired into the
     _wire_drip_retention_jobs family). ``now`` is injected (never wall-clock
     here) so the cutover is deterministic and testable. No-ops before migration
     0073; never creates tables. Returns total rows deleted.
+
+    ``memory_reconcile_runs`` (migration 0074) prunes under its OWN guard —
+    the Phase-0 tables must keep pruning on an install where 0074 hasn't
+    applied yet, and vice versa.
     """
-    if not await _tables_available(db):
-        return 0
     cutoff = f"datetime(?, '-{int(older_than_days)} days')"
     deleted = 0
-    for table in ("memory_consistency_reports", "recall_probe_runs"):
+    if await _tables_available(db):
+        for table in ("memory_consistency_reports", "recall_probe_runs"):
+            cursor = await db.execute(
+                f"DELETE FROM {table} WHERE created_at < {cutoff}",  # noqa: S608 - table names are literals; now bound
+                (now,),
+            )
+            deleted += cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+    if await _reconcile_table_available(db):
         cursor = await db.execute(
-            f"DELETE FROM {table} WHERE created_at < {cutoff}",  # noqa: S608 - table names are literals; now bound
+            f"DELETE FROM memory_reconcile_runs WHERE created_at < {cutoff}",  # noqa: S608 - now bound
             (now,),
         )
         deleted += cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
     await db.commit()
     return deleted
+
+
+# ── memory_reconcile_runs (Phase 1 repair lane, migration 0074) ──────────
+
+# Separate guard from _tables_available on purpose: extending that COUNT(*)==2
+# check to 3 would silently no-op the Phase-0 report writers on any install
+# where 0074 hasn't applied yet. Same caching contract: only TRUE is cached.
+_reconcile_table_verified = False
+
+
+async def _reconcile_table_available(db: aiosqlite.Connection) -> bool:
+    global _reconcile_table_verified
+    if _reconcile_table_verified:
+        return True
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'memory_reconcile_runs'"
+    )
+    row = await cursor.fetchone()
+    exists = bool(row and row[0] == 1)
+    if exists:
+        _reconcile_table_verified = True
+    return exists
+
+
+async def insert_reconcile_run(
+    db: aiosqlite.Connection,
+    *,
+    status: str,
+    ghosts_deleted: int = 0,
+    ghost_delete_failed: int = 0,
+    mirrors_requeued: int = 0,
+    mirrors_skipped_no_content: int = 0,
+    tombstones_drained: int = 0,
+    truncated: bool = False,
+    capped: bool = False,
+    duration_ms: int | None = None,
+    details: dict | None = None,
+    unknown_reason: str | None = None,
+    created_at: str | None = None,
+) -> str | None:
+    """Insert one reconcile-run row. Returns the row id, or None pre-migration."""
+    if not await _reconcile_table_available(db):
+        return None
+    run_id = uuid.uuid4().hex
+    cols = [
+        "id",
+        "status",
+        "ghosts_deleted",
+        "ghost_delete_failed",
+        "mirrors_requeued",
+        "mirrors_skipped_no_content",
+        "tombstones_drained",
+        "truncated",
+        "capped",
+        "duration_ms",
+        "details_json",
+        "unknown_reason",
+    ]
+    vals = [
+        run_id,
+        status,
+        int(ghosts_deleted),
+        int(ghost_delete_failed),
+        int(mirrors_requeued),
+        int(mirrors_skipped_no_content),
+        int(tombstones_drained),
+        1 if truncated else 0,
+        1 if capped else 0,
+        duration_ms,
+        json.dumps(details or {}, sort_keys=True),
+        unknown_reason,
+    ]
+    if created_at is not None:
+        cols.append("created_at")
+        vals.append(created_at)
+    placeholders = ", ".join("?" for _ in cols)
+    await db.execute(
+        f"INSERT INTO memory_reconcile_runs ({', '.join(cols)}) VALUES ({placeholders})",  # noqa: S608 - column names are literals above, values bound
+        vals,
+    )
+    await db.commit()
+    return run_id
+
+
+async def latest_reconcile_run(db: aiosqlite.Connection) -> dict | None:
+    """Return the most recent reconcile-run row as a dict, or None."""
+    if not await _reconcile_table_available(db):
+        return None
+    # rowid tiebreak — same rationale as latest_consistency_report.
+    cursor = await db.execute(
+        "SELECT * FROM memory_reconcile_runs ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    return _row_to_dict(cursor, row) if row else None

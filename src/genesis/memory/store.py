@@ -12,6 +12,7 @@ from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links as memory_links_crud
 from genesis.db.crud import pending_embeddings
+from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.linker import MemoryLinker
@@ -507,7 +508,17 @@ class MemoryStore:
         retryable rather than leaving an orphaned "ghost" point. A memory that
         never had a vector (``fts5_only``/``pending``/``failed``) locates to
         nothing and deletes cleanly.
+
+        Serialized per ``memory_id`` against the re-embed/reconcile-requeue paths
+        (``memory/_locks.py``): the whole locate→delete→cascade sequence holds the
+        id-lock, so a concurrent ``EmbeddingRecoveryWorker`` upsert or reconcile
+        requeue of the same memory cannot interleave and resurrect a vector the
+        user just deleted.
         """
+        async with memory_id_lock(memory_id):
+            return await self._delete_locked(memory_id)
+
+    async def _delete_locked(self, memory_id: str) -> dict:
         results: dict[str, bool | int] = {}
 
         # 1. Locate the point (unreliable collection column → check both) and

@@ -83,14 +83,21 @@ async def _scroll_all_points(
     *,
     collection: str,
     max_points: int,
-) -> tuple[set[str], set[str], bool]:
+    collect_created_at: bool = False,
+) -> tuple[set[str], set[str], bool, dict[str, str]]:
     """Enumerate a collection's point ids (sync client → to_thread).
 
-    Returns ``(present_ids, deprecated_payload_ids, truncated)``. ``truncated``
-    is True if the *max_points* budget was hit before exhausting the collection.
+    Returns ``(present_ids, deprecated_payload_ids, truncated, created_at_map)``.
+    ``truncated`` is True if the *max_points* budget was hit before exhausting
+    the collection. ``created_at_map`` (``{point_id: payload created_at}``) is
+    populated only when *collect_created_at* is set — the Phase-1 reconcile lane
+    needs point ages for its min-age floor; the Phase-0 checker does not, so it
+    skips the extra dict. A point missing ``created_at`` maps to ``""`` (the
+    repair lane fails safe and never touches an un-ageable point).
     """
     present: set[str] = set()
     deprecated_ids: set[str] = set()
+    created_at_map: dict[str, str] = {}
     offset: str | None = None
     truncated = False
     page_limit = max(1, min(1000, max_points))
@@ -108,12 +115,14 @@ async def _scroll_all_points(
             payload = p.get("payload") or {}
             if payload.get("deprecated"):
                 deprecated_ids.add(pid)
+            if collect_created_at:
+                created_at_map[pid] = str(payload.get("created_at") or "")
         if offset is None:
             break  # collection exhausted — results are COMPLETE
         if len(present) >= max_points:
             truncated = True  # budget hit with more points remaining
             break
-    return present, deprecated_ids, truncated
+    return present, deprecated_ids, truncated, created_at_map
 
 
 # Severe classes are search-path ABSENCES: a memory that exists but cannot be
@@ -207,7 +216,7 @@ async def run_consistency_check(
         truncated = False
         try:
             for collection in qdrant_ops.COLLECTIONS:
-                p, dep, trunc = await _scroll_all_points(
+                p, dep, trunc, _ = await _scroll_all_points(
                     qdrant_client, collection=collection, max_points=max_points
                 )
                 present_ids |= p

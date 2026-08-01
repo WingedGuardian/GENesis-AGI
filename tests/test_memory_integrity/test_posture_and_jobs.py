@@ -57,9 +57,9 @@ def _ago(*, days: int = 0, hours: int = 0, minutes: int = 0) -> str:
     posture check's ``since_iso`` window. Relative to real ``now`` so these
     tests never drift across the staleness threshold as the calendar advances
     (no wall-clock-dependent tests)."""
-    return (
-        datetime.now(UTC) - timedelta(days=days, hours=hours, minutes=minutes)
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    return (datetime.now(UTC) - timedelta(days=days, hours=hours, minutes=minutes)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 # ── posture ──
@@ -291,6 +291,136 @@ async def test_jobs_registered_on_scheduler():
     sched = AsyncIOScheduler()
     _wire_memory_integrity_jobs(sched, _RT())
     ids = {j.id for j in sched.get_jobs()}
-    assert {"recall_health_probe", "memory_consistency_check", "memory_integrity_prune"} <= ids
+    assert {
+        "recall_health_probe",
+        "memory_consistency_check",
+        "memory_reconcile",
+        "memory_integrity_prune",
+    } <= ids
     for j in sched.get_jobs():
         assert j.max_instances == 1
+
+
+async def test_reconcile_job_noops_outside_active(monkeypatch):
+    """mode=passive/off must be a healthy no-op: success recorded, no repair
+    attempted (the job body imports the repair module only on the active path)."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from genesis.memory import integrity_config as ic
+    from genesis.runtime.init.memory_integrity import _wire_memory_integrity_jobs
+
+    class _RT:
+        _db = object()
+        _hybrid_retriever = None
+
+        def __init__(self):
+            self.successes = []
+            self.failures = []
+
+        def record_job_success(self, name):
+            self.successes.append(name)
+
+        def record_job_failure(self, name, exc=None):
+            self.failures.append(name)
+
+    for mode in ("passive", "off"):
+        rt = _RT()
+        sched = AsyncIOScheduler()
+        _wire_memory_integrity_jobs(sched, rt)
+        monkeypatch.setattr(ic, "effective_mode", lambda m=mode: m)
+        await sched.get_job("memory_reconcile").func()
+        assert rt.successes == ["memory_reconcile"]
+        assert rt.failures == []
+
+
+async def _reconcile_rt(tmp_path):
+    """An RT with a real full-schema DB (so insert_reconcile_run persists) and
+    job-health recorders."""
+    from genesis.db.schema import create_all_tables
+
+    db = await aiosqlite.connect(str(tmp_path / "recon.db"))
+    db.row_factory = aiosqlite.Row
+    await create_all_tables(db)
+    await db.commit()
+
+    class _RT:
+        _hybrid_retriever = None
+
+        def __init__(self, conn):
+            self._db = conn
+            self.successes = []
+            self.failures = []
+
+        def record_job_success(self, name):
+            self.successes.append(name)
+
+        def record_job_failure(self, name, exc=None):
+            self.failures.append(name)
+
+    return _RT(db), db
+
+
+async def test_reconcile_job_active_persists_run_and_records_success(tmp_path, monkeypatch):
+    """mode=active: the job runs the real repair entry, persists a
+    memory_reconcile_runs row from the result, and records job success."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from genesis.memory import integrity_config as ic
+    from genesis.memory import integrity_repair
+    from genesis.qdrant import collections as qcoll
+    from genesis.runtime.init.memory_integrity import _wire_memory_integrity_jobs
+
+    rt, db = await _reconcile_rt(tmp_path)
+    try:
+        monkeypatch.setattr(ic, "effective_mode", lambda: "active")
+        monkeypatch.setattr(qcoll, "get_client", lambda: object())
+
+        async def _fake_reconcile(**kwargs):
+            return integrity_repair.ReconcileResult(
+                status="ok", ghosts_deleted=2, mirrors_requeued=1, duration_ms=5
+            )
+
+        monkeypatch.setattr(integrity_repair, "run_reconcile", _fake_reconcile)
+
+        sched = AsyncIOScheduler()
+        _wire_memory_integrity_jobs(sched, rt)
+        await sched.get_job("memory_reconcile").func()
+
+        assert rt.successes == ["memory_reconcile"] and rt.failures == []
+        row = await mi.latest_reconcile_run(db)
+        assert row["status"] == "ok"
+        assert row["ghosts_deleted"] == 2 and row["mirrors_requeued"] == 1
+    finally:
+        await db.close()
+
+
+async def test_reconcile_job_failure_writes_failed_audit_row(tmp_path, monkeypatch):
+    """A crash inside run_reconcile records job failure AND lands a best-effort
+    status='failed' audit row so the miss is visible in run history."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from genesis.memory import integrity_config as ic
+    from genesis.memory import integrity_repair
+    from genesis.qdrant import collections as qcoll
+    from genesis.runtime.init.memory_integrity import _wire_memory_integrity_jobs
+
+    rt, db = await _reconcile_rt(tmp_path)
+    try:
+        monkeypatch.setattr(ic, "effective_mode", lambda: "active")
+        monkeypatch.setattr(qcoll, "get_client", lambda: object())
+
+        async def _boom(**kwargs):
+            raise RuntimeError("reconcile exploded")
+
+        monkeypatch.setattr(integrity_repair, "run_reconcile", _boom)
+
+        sched = AsyncIOScheduler()
+        _wire_memory_integrity_jobs(sched, rt)
+        await sched.get_job("memory_reconcile").func()
+
+        assert rt.failures == ["memory_reconcile"] and rt.successes == []
+        row = await mi.latest_reconcile_run(db)
+        assert row is not None and row["status"] == "failed"
+        assert "RuntimeError" in (row["unknown_reason"] or "")
+    finally:
+        await db.close()
