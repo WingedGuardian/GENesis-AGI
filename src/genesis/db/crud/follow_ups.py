@@ -51,6 +51,7 @@ async def create(
     priority: str = "medium",
     pinned: bool = False,
     kind: str = "follow_up",
+    revisit_condition: str | None = None,
     domain: str | None = None,
     goal_id: str | None = None,
     dedup_key: str | None = None,
@@ -69,9 +70,9 @@ async def create(
     await db.execute(
         """INSERT INTO follow_ups
            (id, source, source_session, content, reason, strategy,
-            scheduled_at, status, priority, pinned, kind, domain, goal_id,
-            dedup_key, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+            scheduled_at, status, priority, pinned, kind, revisit_condition,
+            domain, goal_id, dedup_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             fid,
             source,
@@ -83,6 +84,7 @@ async def create(
             priority,
             int(pinned),
             kind,
+            revisit_condition.strip() if revisit_condition and revisit_condition.strip() else None,
             domain,
             goal_id,
             dedup_key,
@@ -612,6 +614,19 @@ _VALID_STATUS = {
     "blocked",
 }
 
+# Work-state → lane derivation. The MCP follow_up_create/update handlers take a
+# `work_state` (the item's actual state) and DERIVE `kind`, so priority can't leak
+# into the hot(follow_up)/cold(tabled) lane choice. `blocked_on_trigger` additionally
+# requires a `revisit_condition` (the trigger being waited on). See CC memory
+# followup_kind_conflation. Enforced at the MCP handler (judgment callers); rule-based
+# programmatic callers (e.g. inbox WATCH/BOOKMARK markers) set `kind` directly.
+WORK_STATE_TO_KIND = {
+    "ready": "follow_up",
+    "blocked_on_trigger": "follow_up",
+    "deferred_cold": "tabled",
+}
+VALID_WORK_STATE = frozenset(WORK_STATE_TO_KIND)
+
 # Allowlisted sort keys → ORDER BY fragment (never interpolate caller input).
 # Every fragment floats pinned rows to the top (pinned is a "keep visible"
 # flag, honored regardless of the chosen sort). The status sort ranks by
@@ -650,6 +665,24 @@ async def set_kind(db: aiosqlite.Connection, id: str, kind: str) -> bool:
     cursor = await db.execute(
         "UPDATE follow_ups SET kind = ? WHERE id = ?",
         (kind, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def set_revisit_condition(
+    db: aiosqlite.Connection, id: str, revisit_condition: str | None
+) -> bool:
+    """Set/clear a follow-up's revisit_condition — the trigger that resurfaces a
+    tabled item or the event a blocked follow_up waits on. None/whitespace clears it.
+
+    Targeted single-column write (mirrors set_kind/set_pinned): never a
+    read-modify-write of the row, so it can't reopen the #1198 lost-update race.
+    """
+    value = revisit_condition.strip() if revisit_condition and revisit_condition.strip() else None
+    cursor = await db.execute(
+        "UPDATE follow_ups SET revisit_condition = ? WHERE id = ?",
+        (value, id),
     )
     await db.commit()
     return cursor.rowcount > 0

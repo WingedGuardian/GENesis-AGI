@@ -14,7 +14,8 @@ Modes (``GENESIS_PROACTIVE_HOOK_MODE``, default ``server``):
   off    — session-local awareness only, no memory recall
 Endpoint base URL: ``GENESIS_PROACTIVE_HOOK_URL`` (default http://127.0.0.1:5000).
 
-Budget: <2.2s client (server times out first at 2.0s → clean fallback).
+Budget: <4.75s client (``_SERVER_TIMEOUT_S``) — the server's ~4.5s recall
+timeout fires first, so the client gets a clean 503 → FTS5 fallback.
 
 Reads hook input from stdin as JSON:
   {"session_id": "...", "prompt": "...", ...}

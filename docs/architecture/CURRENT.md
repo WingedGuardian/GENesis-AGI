@@ -338,7 +338,11 @@ verified: 0e65071c 2026-07-21
   cron jobs (via MCP) that dispatch background DirectSessions. Distinct from
   `surplus/scheduler.py`.
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
-  follow-ups into surplus tasks; retention sweep on the learning scheduler.
+  follow-ups into surplus tasks; retention sweep on the learning scheduler. The
+  `follow_up_create`/`update` MCP tools take a `work_state`
+  (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
+  cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
+  requires a `revisit_condition` (nullable column on `follow_ups`).
 - GROUNDWORK: v4-parallel-dispatch, v4-surplus-tasks, v4-rate-tracking.
 
 ## 5. Information intake & research

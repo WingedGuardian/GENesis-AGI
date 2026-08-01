@@ -8,8 +8,9 @@ Runs on every user prompt via .claude/settings.json. Hot path:
    system-reminder to stdout, unlink the marker.
 3. Exit 0. Fail-open on all errors.
 
-Budget: 500ms hook timeout configured in .claude/settings.json. Real cost
-should be <5ms even when pending offers exist. No network, no heavy I/O.
+Budget: 10s hook timeout configured in .claude/settings.json (CC hook timeouts
+are in seconds). Real cost should be <5ms even when pending offers exist. No
+network, no heavy I/O.
 
 Stdlib only — no Genesis imports, no venv required.
 """
