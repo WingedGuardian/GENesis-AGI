@@ -448,6 +448,29 @@ def build_lane_enabled() -> bool:
     return False
 
 
+def models_md_synthesis_enabled() -> bool:
+    """Whether the weekly models.md synthesis job may run. Default ON.
+
+    The job dispatches a CC session that refreshes the LOCAL models.md overlay
+    (``~/.genesis/output/models.md``) from recent model-intelligence findings —
+    it no longer commits to the tracked reference doc. This is the operator
+    off-switch for that autonomous behavior (a CC-cost or catalog-noise
+    concern), distinct from the global ``runtime.paused`` gate. Set
+    ``GENESIS_MODELS_MD_SYNTHESIS_OFF=1`` in secrets.env or
+    ``models_md_synthesis.enabled: false`` in ``~/.genesis/config/genesis.yaml``.
+    The check is per-run, so a flip takes effect on the next weekly tick with no
+    restart. Fails toward ON (env read can't raise, local config swallows).
+    """
+    env_val = os.environ.get("GENESIS_MODELS_MD_SYNTHESIS_OFF")
+    if env_val is not None:
+        # The env var names the OFF state: a truthy value DISABLES the job.
+        return env_val.strip().lower() not in {"1", "true", "yes", "on"}
+    local_val = _local_config().get("models_md_synthesis", {}).get("enabled")
+    if local_val is not None:
+        return bool(local_val)
+    return True
+
+
 def user_timezone() -> str:
     """User's local timezone (IANA format).
 
