@@ -14,6 +14,16 @@ Genesis-DISPATCHED CC session, which cc/invoker.py stamps with
 direct interactive CLI session (no stamp — the user is present and sovereign)
 is allowed through.
 
+LOAD-CONTEXT CAVEAT (verified 2026-08-01): this is a PROJECT hook, and CC
+discovers project settings by git-root detection. A default dispatched session
+runs with cwd ``~/.genesis/background-sessions`` (outside any git repo), so CC
+does NOT load project hooks there — this guard only *loads* for an in-repo /
+worktree cwd. Its practical reach is therefore an in-repo dispatched session
+(loads AND stamped → blocks). Autonomous file ops that never enter the repo cwd
+are governed by the autonomy/protection layer, not this bridge. The gate is
+still correct where it loads; it is not a claim of universal dispatched-session
+coverage.
+
 Path matching is TAIL-based: a repo-relative pattern like
 ``src/genesis/autonomy/protection.py`` matches that suffix under ANY checkout
 root (main repo, a linked worktree, a fresh clone) — CC sends ABSOLUTE paths,
