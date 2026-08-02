@@ -102,6 +102,32 @@ def genesis_home() -> Path:
     return Path(value).expanduser() if value else Path.home() / ".genesis"
 
 
+def internal_api_token_path() -> Path:
+    """Path to the persistent internal API token (generated once at server boot).
+
+    Trusted loopback/host callers read this to authenticate to ``/api`` mutation
+    endpoints when a dashboard password is set (see the dashboard auth gate).
+    Distinct from the optional ``GENESIS_MCP_HTTP_TOKEN`` (voice API) — this one
+    always exists once the server has booted, so callers need no configuration.
+    Written by the dashboard auth layer with mode 0600.
+    """
+    return genesis_home() / "internal_api_token"
+
+
+def read_internal_api_token() -> str | None:
+    """Return the internal API token, or ``None`` if absent / unreadable.
+
+    Pure read — never generates (only the server does, at boot). A ``None`` here
+    is correct on a fresh box where no dashboard password is set and the ``/api``
+    mutation gate is inactive: callers simply send no bearer.
+    """
+    try:
+        tok = internal_api_token_path().read_text().strip()
+        return tok or None
+    except OSError:
+        return None
+
+
 def memory_writebacks_off() -> bool:
     """True when retrieval write-backs (retrieved_count / last_retrieved_at
     bumps on recall) must be suppressed.

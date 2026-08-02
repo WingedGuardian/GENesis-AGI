@@ -420,6 +420,19 @@ class StandaloneAdapter:
         app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
         app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB (knowledge uploads)
 
+        # Internal API token + /api mutation gate. Mint the token once at boot
+        # (mode 0600) so trusted loopback/host callers can authenticate to /api
+        # mutations when a dashboard password is set. The gate is registered
+        # APP-LEVEL (not blueprint-level) so it covers every blueprint uniformly —
+        # the dashboard blueprint AND the separate outreach_api blueprint.
+        from genesis.dashboard.auth import (
+            check_api_mutation_auth,
+            get_or_create_internal_api_token,
+        )
+
+        get_or_create_internal_api_token()
+        app.before_request(check_api_mutation_auth)
+
         # Login page (on app, not blueprint — must be reachable before auth)
         @app.route("/genesis/login")
         def genesis_login_page():

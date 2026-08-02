@@ -1,9 +1,12 @@
 /**
  * Genesis standalone API client.
  *
- * Simplified version of Agent Zero's api.js.
- * No CSRF token exchange — Genesis standalone runs on localhost
- * without authentication.  Plain fetch passthrough.
+ * Simplified version of Agent Zero's api.js. Requests are same-origin, so the
+ * Flask session cookie rides along automatically; when a dashboard password is
+ * set, that cookie authenticates /api mutations (the server gates POST/PUT/
+ * DELETE/PATCH). CSRF is covered by the SameSite=Lax session cookie (a cross-site
+ * mutation carries no cookie), so no CSRF token exchange is needed here. On a 401
+ * (expired/missing session) fetchApi redirects to the login page.
  */
 
 // Exponential backoff state for server error recovery.

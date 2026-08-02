@@ -31,6 +31,22 @@ REPO = Path(__file__).resolve().parents[2]
 HOOK = REPO / "scripts" / "proactive_memory_hook.py"
 ENDPOINT = "/api/genesis/hook/recall"
 
+
+def _headers() -> dict[str, str]:
+    """Content-Type + internal bearer, so the POST passes the server's /api
+    mutation gate when a dashboard password is set (absent token → no bearer)."""
+    headers = {"Content-Type": "application/json"}
+    gh = os.environ.get("GENESIS_HOME")
+    token_path = (Path(gh).expanduser() if gh else Path.home() / ".genesis") / "internal_api_token"
+    try:
+        tok = token_path.read_text().strip()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+    except OSError:
+        pass
+    return headers
+
+
 # Representative taxonomy — command / decision-question / general / chatter /
 # file-context. Synthetic + generic (no install-specific content).
 _DEFAULT_PROMPTS = [
@@ -81,7 +97,7 @@ def _time_endpoint(prompt: str, session_id: str) -> float | None:
     req = urllib.request.Request(  # noqa: S310 - loopback dev tool, fixed http scheme
         _server_base() + ENDPOINT,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=_headers(),
         method="POST",
     )
     t0 = time.monotonic()

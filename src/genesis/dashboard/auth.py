@@ -75,6 +75,43 @@ def get_or_create_secret_key() -> str:
     return key
 
 
+_internal_token_cache: str | None = None
+
+
+def get_or_create_internal_api_token() -> str:
+    """Return the persistent internal API token, generating it once if absent.
+
+    Trusted loopback/host callers send this as a bearer to authenticate to
+    ``/api`` mutation endpoints when a dashboard password is set. Generated at
+    server boot (mode 0600), cached in-process. INDEPENDENT of the optional
+    ``GENESIS_MCP_HTTP_TOKEN`` (unset on typical installs), so the gate always has
+    a working token. Mirrors :func:`get_or_create_secret_key`.
+    """
+    global _internal_token_cache
+    if _internal_token_cache:
+        return _internal_token_cache
+    from genesis.env import internal_api_token_path
+
+    token_file = internal_api_token_path()
+    if token_file.exists():
+        try:
+            tok = token_file.read_text().strip()
+            if tok:
+                _internal_token_cache = tok
+                return tok
+        except OSError:
+            logger.warning("Could not read internal API token", exc_info=True)
+    tok = secrets.token_hex(32)
+    try:
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(tok)
+        token_file.chmod(0o600)
+    except OSError:
+        logger.warning("Could not persist internal API token", exc_info=True)
+    _internal_token_cache = tok
+    return tok
+
+
 def is_authenticated() -> bool:
     """Check if current request has a valid session."""
     if not get_dashboard_password():
@@ -138,6 +175,56 @@ def _check_auth():
 
     # Unauthenticated page request → redirect to login
     return redirect("/genesis/login")
+
+
+# ── App-level /api mutation gate (registered in standalone.py) ────────
+
+# Env kill switch: an operator can disable the /api mutation gate WITHOUT
+# unsetting the dashboard password, if an unforeseen machine caller breaks.
+_API_AUTH_OFF = ("off", "0", "false", "no")
+
+
+def check_api_mutation_auth():
+    """App-level gate: require auth for ``/api/**`` STATE-CHANGING requests when a
+    dashboard password is set.
+
+    Registered as an app-level ``before_request`` (NOT blueprint-level) so it
+    covers every blueprint uniformly — the main dashboard blueprint AND the
+    separate ``outreach_api`` blueprint, whose mutation routes a blueprint-scoped
+    hook would miss.
+
+    Open (returns None): everything when no password is set; when the kill switch
+    ``GENESIS_DASHBOARD_API_AUTH=off`` is set; any non-``/api`` path (HTML is
+    handled by the blueprint gate; ``/v1/*`` enforces its own bearer);
+    GET/HEAD/OPTIONS (non-mutating — guardian/health probes and dashboard polling
+    stay open); and the ``/api/genesis/auth/*`` login/logout endpoints. A mutation
+    passes with a valid session cookie OR a valid internal bearer token; otherwise
+    the request is rejected with 401.
+    """
+    if not get_dashboard_password():
+        return None
+    if os.environ.get("GENESIS_DASHBOARD_API_AUTH", "on").strip().lower() in _API_AUTH_OFF:
+        return None
+
+    path = request.path
+    if not path.startswith("/api/"):
+        return None
+    if path.startswith("/api/genesis/auth/"):
+        return None
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+
+    # Trusted browser session (same-origin cookie)?
+    if is_authenticated():
+        return None
+    # Trusted machine caller (internal bearer token)?
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        expected = get_or_create_internal_api_token()
+        if expected and hmac.compare_digest(auth_header[7:], expected):
+            return None
+
+    return jsonify({"error": "authentication required"}), 401
 
 
 # ── Routes ────────────────────────────────────────────────────────────
