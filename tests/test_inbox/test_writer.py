@@ -11,7 +11,7 @@ from genesis.inbox.writer import ResponseWriter
 
 @pytest.fixture
 def writer(tmp_path: Path) -> ResponseWriter:
-    return ResponseWriter(watch_path=tmp_path, timezone="America/New_York")
+    return ResponseWriter(watch_path=tmp_path, timezone="Europe/Berlin")
 
 
 @pytest.mark.asyncio

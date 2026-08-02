@@ -163,14 +163,14 @@ class TestBuildActionSpine:
         from genesis.learning.procedural.struggle_detector import build_spine_and_haystack
 
         path = self._write_jsonl([
-            self._tool_use_entry("Bash", {"command": "gh api repos/WingedGuardian/Genesis"}, "t1"),
+            self._tool_use_entry("Bash", {"command": "gh api repos/example-org/example-repo"}, "t1"),
             self._tool_result_entry("t1", "ok"),
             self._user_text_entry("try again"),
         ])
         spine, haystack = build_spine_and_haystack(path)
         assert any(e["type"] == "user" for e in spine)
         assert any(e["type"] == "tool" for e in spine)
-        assert "gh api repos/WingedGuardian/Genesis" in haystack
+        assert "gh api repos/example-org/example-repo" in haystack
         assert "try again" not in haystack  # user text never grounds a procedure
 
     def test_haystack_excludes_exitplanmode(self):

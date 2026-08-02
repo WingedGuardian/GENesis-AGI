@@ -42,6 +42,25 @@ ruff check . && pytest -v
 
 **For features or larger changes** — use the standard open-source flow below.
 
+### Avoiding install-specific data
+
+Genesis scans contributions for machine-specific details so nothing personal
+reaches the public repo. Two things keep your PRs clean:
+
+- **Use RFC 5737 ranges for example IPs** — `192.0.2.0/24`, `198.51.100.0/24`,
+  `203.0.113.0/24` (and `2001:db8::/32` for IPv6). These are reserved for
+  documentation and are never flagged. Real private-range addresses (any
+  `10.x`, `172.16–31.x`, `192.168.x`, `100.64–127.x`, or `fc00::/7` ULA) trigger
+  a **non-blocking CI warning** so you can swap them — they won't block your PR,
+  but please use the doc ranges.
+- **Keep home paths generic** — write `/home/<user>/…` or `~/…`, not a real
+  username. Absolute `/home/<user>/genesis` and CC project-dir slugs are flagged.
+
+Install-specific *exact* values (private hostnames, repo names, account IDs) are
+matched only from a per-install fingerprint file and a private CI secret — never
+from anything tracked in this repo — so forks and outside contributors are never
+gated on values they can't know.
+
 ### Standard flow (features, larger changes)
 
 1. **Open an issue or Discussion first** — describe what you want to change and why.

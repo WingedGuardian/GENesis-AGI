@@ -408,20 +408,15 @@ async def extract_procedure(
         )
         return None
 
-    # Skip if an explicit-teach procedure already covers this task_type
-    try:
-        from genesis.db.crud.procedural import find_by_task_type
-
-        existing = await find_by_task_type(db, data["task_type"])
-        if existing and existing.get("draft") == 0:
-            logger.info(
-                "Skipped extraction for %s: explicit-teach %s exists",
-                data["task_type"],
-                existing["id"],
-            )
-            return None
-    except Exception:
-        pass  # Non-critical guard — continue with extraction if check fails
+    # NOTE: there is intentionally no "skip if an explicit-teach exists for this
+    # task_type" early guard. A slug is a coarse topic bucket that can hold many
+    # DISTINCT lessons, so skipping on any explicit sibling would discard a
+    # genuinely different lesson (the exact over-suppression the store-layer fix
+    # avoids). Same-PRINCIPLE dedup against explicit siblings is handled by the
+    # novelty gate below (it compares against every same-slug row, explicit
+    # included), and an auto-extraction can never overwrite a matched
+    # explicit-teach — store_procedure_checked skips that case. This is the
+    # principle-aware path both layers defer to.
 
     # ── Same-type novelty gate ───────────────────────────────────────────
     # Skip if a near-duplicate principle already exists for this task_type.

@@ -24,16 +24,16 @@ def test_no_distinctive_tokens_is_one():
 
 
 def test_real_command_grounds_high():
-    haystack = '{"command": "gh api repos/WingedGuardian/Genesis --jq .name"}'
+    haystack = '{"command": "gh api repos/example-org/example-repo --jq .name"}'
     score = grounding_score(
-        ["Run `gh api repos/WingedGuardian/Genesis --jq .name` to read the repo"],
+        ["Run `gh api repos/example-org/example-repo --jq .name` to read the repo"],
         haystack,
     )
     assert score >= 0.75
 
 
 def test_fabricated_command_grounds_low():
-    haystack = '{"command": "gh api repos/WingedGuardian/Genesis"}'
+    haystack = '{"command": "gh api repos/example-org/example-repo"}'
     score = grounding_score(
         ["Run `frobnicate --quux /nonsense/path/here` to fix it"],
         haystack,
@@ -43,7 +43,7 @@ def test_fabricated_command_grounds_low():
 
 def test_placeholder_normalization_grounds_templated_step():
     # A templated step should ground against the concrete command that ran.
-    haystack = '{"command": "gh api repos/WingedGuardian/Genesis/code-scanning"}'
+    haystack = '{"command": "gh api repos/example-org/example-repo/code-scanning"}'
     score = grounding_score(
         ["gh api repos/<owner>/<repo>/code-scanning"],
         haystack,
