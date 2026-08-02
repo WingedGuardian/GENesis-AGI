@@ -317,10 +317,19 @@ def _resolve_file_for_write(name: str) -> tuple[Path | None, Path | None]:
             return candidate, _MEMORY_DIR
         return None, None
 
-    # Identity files
+    # Identity files — allow EDITING an existing file, or CREATING one that ships
+    # only as a ``.example`` seed (e.g. USER.md: gitignored + per-install, so a
+    # fresh box has no USER.md to edit, only USER.md.example). The ``.example``
+    # sibling is the whitelist signal: only a file the repo already seeds can be
+    # created from the web — never an arbitrary new identity file. ``basename`` is
+    # the last path segment (no slashes), and the caller re-checks
+    # ``is_relative_to`` on the resolved target, so this cannot escape the dir.
     basename = name.split("/")[-1]
     candidate = _IDENTITY_DIR / basename
     if candidate.is_file():
+        return candidate, _IDENTITY_DIR
+    example = _IDENTITY_DIR / f"{basename}.example"
+    if example.is_file() and candidate.parent.resolve() == _IDENTITY_DIR.resolve():
         return candidate, _IDENTITY_DIR
     return None, None
 

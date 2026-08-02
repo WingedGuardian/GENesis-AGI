@@ -336,6 +336,69 @@ def _build_alerts(providers: dict) -> list[dict]:
     return alerts
 
 
+def build_key_validator(
+    provider_type: str, key: str, base_url: str | None = None
+) -> tuple[str, dict[str, str]] | None:
+    """Return ``(url, headers)`` for a lightweight GET that validates ``key`` for
+    ``provider_type``, or ``None`` when the provider has no known validation
+    endpoint (local / CC-managed / unrecognized types).
+
+    Single source of truth shared by the scheduled :func:`validate_api_keys`
+    (which pulls the key from ``os.environ``) and the on-demand dashboard key
+    test (:func:`test_single_key`, which passes a just-saved value directly).
+    Keep the provider list in lockstep here.
+    """
+    if provider_type == "groq":
+        return ("https://api.groq.com/openai/v1/models", {"Authorization": f"Bearer {key}"})
+    if provider_type == "mistral":
+        return ("https://api.mistral.ai/v1/models", {"Authorization": f"Bearer {key}"})
+    if provider_type == "openrouter":
+        return ("https://openrouter.ai/api/v1/models", {"Authorization": f"Bearer {key}"})
+    if provider_type == "deepseek":
+        return ("https://api.deepseek.com/v1/models", {"Authorization": f"Bearer {key}"})
+    if provider_type == "google":
+        return (f"https://generativelanguage.googleapis.com/v1beta/models?key={key}", {})
+    if provider_type == "zenmux":
+        url = base_url or "https://zenmux.ai/api/v1"
+        return (f"{url}/models", {"Authorization": f"Bearer {key}"})
+    if provider_type == "anthropic":
+        return (
+            "https://api.anthropic.com/v1/models",
+            {"x-api-key": key, "anthropic-version": "2023-06-01"},
+        )
+    return None
+
+
+async def test_single_key(
+    provider_type: str, key: str, base_url: str | None = None
+) -> dict[str, object]:
+    """Live-validate ONE provider key with a real HTTP GET; return
+    ``{"valid": bool, "error"?: str}``.
+
+    Unlike :func:`validate_api_keys` (env-sourced + cached), this tests a value
+    passed directly — the dashboard key-test path, where a just-saved key is not
+    yet in ``os.environ`` (which is stale until a server restart).
+    """
+    validator = build_key_validator(provider_type, key, base_url)
+    if validator is None:
+        return {
+            "valid": False,
+            "error": f"no live-validation endpoint for provider type '{provider_type}'",
+        }
+    url, headers = validator
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers)
+    except Exception as exc:  # noqa: BLE001 - any failure reported as invalid
+        return {"valid": False, "error": str(exc)}
+    if resp.status_code < 400:
+        return {"valid": True}
+    error_text = resp.text[:200] if resp.text else str(resp.status_code)
+    return {"valid": False, "error": f"HTTP {resp.status_code}: {error_text}"}
+
+
 async def validate_api_keys(routing_config: RoutingConfig | None) -> None:
     """Test each provider's API key with a lightweight call. Cache results."""
     if not routing_config:
@@ -359,22 +422,9 @@ async def validate_api_keys(routing_config: RoutingConfig | None) -> None:
         if not key:
             continue
 
-        base_url = provider_cfg.base_url
-        if ptype == "groq":
-            validators[ptype] = ("https://api.groq.com/openai/v1/models", {"Authorization": f"Bearer {key}"})
-        elif ptype == "mistral":
-            validators[ptype] = ("https://api.mistral.ai/v1/models", {"Authorization": f"Bearer {key}"})
-        elif ptype == "openrouter":
-            validators[ptype] = ("https://openrouter.ai/api/v1/models", {"Authorization": f"Bearer {key}"})
-        elif ptype == "deepseek":
-            validators[ptype] = ("https://api.deepseek.com/v1/models", {"Authorization": f"Bearer {key}"})
-        elif ptype == "google":
-            validators[ptype] = (f"https://generativelanguage.googleapis.com/v1beta/models?key={key}", {})
-        elif ptype == "zenmux":
-            url = base_url or "https://zenmux.ai/api/v1"
-            validators[ptype] = (f"{url}/models", {"Authorization": f"Bearer {key}"})
-        elif ptype == "anthropic":
-            validators[ptype] = ("https://api.anthropic.com/v1/models", {"x-api-key": key, "anthropic-version": "2023-06-01"})
+        validator = build_key_validator(ptype, key, provider_cfg.base_url)
+        if validator is not None:
+            validators[ptype] = validator
 
     now_iso = datetime.now(UTC).isoformat()
     async with httpx.AsyncClient(timeout=10.0) as client:
