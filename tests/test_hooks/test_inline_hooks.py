@@ -140,28 +140,28 @@ class TestBashHookWorktreeServe:
 
 
 class TestBashHookWorktreeForceRemove:
-    """Block git worktree remove --force (destroys uncommitted work)."""
+    """The INLINE mega-guard no longer owns `git worktree remove --force` (2026-08,
+    PR-Guards): it duplicated worktree_cwd_guard.py (which blocks ALL `git worktree
+    remove`, force or not — see tests/test_hooks/test_worktree_guard.py) and
+    scripts/bash_safety_hook.sh (which still blocks the --force form). The inline
+    guard now passes these through (returncode 0)."""
 
-    def test_worktree_remove_force_blocked(self, bash_hook_command: str) -> None:
-        """git worktree remove --force .claude/worktrees/foo -> BLOCKED."""
+    def test_worktree_remove_force_not_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(
             bash_hook_command,
             {"command": "git worktree remove --force .claude/worktrees/foo"},
         )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
+        assert result.returncode == 0
 
-    def test_worktree_remove_f_blocked(self, bash_hook_command: str) -> None:
-        """git worktree remove -f .claude/worktrees/foo -> BLOCKED."""
+    def test_worktree_remove_f_not_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(
             bash_hook_command,
             {"command": "git worktree remove -f .claude/worktrees/foo"},
         )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
+        assert result.returncode == 0
 
     def test_worktree_remove_without_force_allowed(self, bash_hook_command: str) -> None:
-        """git worktree remove .claude/worktrees/foo -> allowed (no --force)."""
+        """git worktree remove .claude/worktrees/foo -> allowed by the inline guard."""
         result = run_hook(
             bash_hook_command,
             {"command": "git worktree remove .claude/worktrees/foo"},
@@ -525,51 +525,40 @@ class TestBashHookBackgroundPipe:
 
 
 class TestBashHookGitPushForce:
-    """Block force pushes."""
+    """The INLINE mega-guard no longer owns force-push detection (2026-08,
+    PR-Guards): that whole-command substring check carried a false positive
+    (`git push origin main && rm -f x`), so it was removed. Force push is now
+    owned by the tracked git_push_guard.py (argv-based, hard-blocks force to
+    origin — see tests/test_hooks/test_push_create_override.py) and by
+    scripts/bash_safety_hook.sh (segment-scoped — see
+    tests/test_scripts/test_bash_safety_hook.py). These assert the inline guard
+    PASSES force-push commands through (returncode 0); it is not the owner."""
 
-    def test_git_push_force_blocked(self, bash_hook_command: str) -> None:
-        """git push --force origin main -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push --force origin main"},
-        )
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
-        assert "Force push" in result.stderr
+    def test_git_push_force_not_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git push --force origin main"})
+        assert result.returncode == 0
 
-    def test_git_push_f_blocked(self, bash_hook_command: str) -> None:
-        """git push -f -> BLOCKED."""
+    def test_git_push_f_not_inline_blocked(self, bash_hook_command: str) -> None:
         result = run_hook(bash_hook_command, {"command": "git push -f"})
-        assert result.returncode == 2
-        assert "BLOCKED" in result.stderr
+        assert result.returncode == 0
 
-    def test_git_push_f_with_remote_blocked(self, bash_hook_command: str) -> None:
-        """git push -f origin feature -> BLOCKED."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push -f origin feature"},
-        )
-        assert result.returncode == 2
+    def test_git_push_f_with_remote_not_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git push -f origin feature"})
+        assert result.returncode == 0
 
-    def test_git_push_u_then_f_blocked(self, bash_hook_command: str) -> None:
-        """git push -u origin -f main -> BLOCKED (-f anywhere after 'git push')."""
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push -u origin -f main"},
-        )
-        assert result.returncode == 2
+    def test_git_push_u_then_f_not_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git push -u origin -f main"})
+        assert result.returncode == 0
 
-    def test_git_push_force_with_lease_blocked(self, bash_hook_command: str) -> None:
-        """git push --force-with-lease -> BLOCKED.
+    def test_git_push_force_with_lease_not_inline_blocked(self, bash_hook_command: str) -> None:
+        result = run_hook(bash_hook_command, {"command": "git push --force-with-lease origin main"})
+        assert result.returncode == 0
 
-        The pattern *"--force"* matches --force-with-lease too. This is
-        intentional — even safe-ish force pushes require explicit user approval.
-        """
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push --force-with-lease origin main"},
-        )
-        assert result.returncode == 2
+    def test_push_then_rm_f_fp_gone(self, bash_hook_command: str) -> None:
+        """The exact FP that motivated the removal: a plain push next to an
+        unrelated `rm -f` no longer false-blocks at the inline guard."""
+        result = run_hook(bash_hook_command, {"command": "git push origin main && rm -f /tmp/x"})
+        assert result.returncode == 0
 
     def test_git_push_normal_allowed(self, bash_hook_command: str) -> None:
         """git push origin feature-branch -> allowed (no force)."""
@@ -771,13 +760,8 @@ class TestBashHookErrorMessages:
         assert "PYTHONPATH" in result.stderr
         assert "worktree" in result.stderr.lower()
 
-    def test_force_push_suggests_pr(self, bash_hook_command: str) -> None:
-        result = run_hook(
-            bash_hook_command,
-            {"command": "git push --force origin main"},
-        )
-        assert result.returncode == 2
-        assert "PR" in result.stderr
+    # (force-push is no longer owned by the inline guard — its PR-suggesting
+    # message now lives in git_push_guard.py / bash_safety_hook.sh.)
 
     def test_reset_hard_suggests_stash(self, bash_hook_command: str) -> None:
         result = run_hook(bash_hook_command, {"command": "git reset --hard"})
@@ -826,18 +810,21 @@ class TestBashHookEdgeCases:
         assert result.returncode == 2
 
     def test_chained_command_with_blocked(self, bash_hook_command: str) -> None:
-        """Command chained with && containing blocked op -> BLOCKED."""
+        """Command chained with && containing an inline-owned blocked op -> BLOCKED.
+
+        (Uses `git reset --hard`, still owned by the inline guard; force-push
+        moved to git_push_guard/bash_safety.)"""
         result = run_hook(
             bash_hook_command,
-            {"command": "ls -la && git push --force origin main"},
+            {"command": "ls -la && git reset --hard"},
         )
         assert result.returncode == 2
 
     def test_piped_command_with_blocked(self, bash_hook_command: str) -> None:
-        """Piped command containing blocked op -> BLOCKED."""
+        """Piped command containing an inline-owned blocked op -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
-            {"command": "echo yes | git push --force origin main"},
+            {"command": "echo yes | git reset --hard"},
         )
         assert result.returncode == 2
 
@@ -1122,31 +1109,38 @@ class TestSettingsStructure:
         The inline bash hook handles git/pip patterns. The rm-rf guard is
         a separate Python script referenced via destructive_command_guard.
         """
+        import re
         from pathlib import Path
 
-        # Collect all Bash hook commands and any scripts they reference
+        repo_root = next(
+            (a for a in Path(__file__).resolve().parents if (a / "scripts" / "hooks").is_dir()),
+            None,
+        )
+
+        # Collect all Bash hook commands AND every referenced hooks/<name>.py
+        # guard script — force-push/worktree checks moved OUT of the inline blob
+        # into the dedicated guards (git_push_guard.py, worktree_cwd_guard.py),
+        # so "collectively covered" must include their source.
         combined = ""
         for entry in settings["hooks"]["PreToolUse"]:
-            if entry.get("matcher") == "Bash":
-                for hook in entry.get("hooks", []):
-                    cmd = hook.get("command", "")
-                    combined += cmd + "\n"
-                    # If it references an external script, read that too
-                    if "destructive_command_guard" in cmd:
-                        here = Path(__file__).resolve()
-                        for ancestor in here.parents:
-                            script = ancestor / "scripts" / "hooks" / "destructive_command_guard.py"
-                            if script.exists():
-                                combined += script.read_text()
-                                break
+            if entry.get("matcher") != "Bash":
+                continue
+            for hook in entry.get("hooks", []):
+                cmd = hook.get("command", "")
+                combined += cmd + "\n"
+                if repo_root:
+                    for name in re.findall(r"hooks/(\w+)\.py", cmd):
+                        script = repo_root / "scripts" / "hooks" / f"{name}.py"
+                        if script.exists():
+                            combined += script.read_text()
 
         assert "pip install" in combined
         assert "worktree" in combined
-        assert "rm" in combined and "rf" in combined  # rm -rf in Python script
-        assert "git push" in combined
+        assert "rm" in combined and "rf" in combined  # rm -rf in the destructive guard
+        assert "git push" in combined  # git_push_guard.py
         assert "--force" in combined or "force" in combined
-        assert "git reset --hard" in combined
-        assert "git clean" in combined
+        assert "git reset --hard" in combined  # inline blob (kept)
+        assert "git clean" in combined  # inline blob (kept)
 
     def test_webfetch_hook_checks_youtube(self, webfetch_hook_command: str) -> None:
         """WebFetch hook command contains YouTube pattern check."""
