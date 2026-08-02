@@ -259,9 +259,12 @@ def _normalize_repo(value: str) -> str | None:
     if not value or "$" in value or "`" in value:
         return None
     v = value.strip().split("://", 1)[-1]  # strip scheme if a URL
-    if v.startswith("github.com/"):
-        v = v[len("github.com/") :]
     parts = [p for p in v.split("/") if p]
+    # Drop a leading github.com HOST COMPONENT (exact match of the first path
+    # segment — NOT a substring test, which would mishandle `github.com.evil/…`
+    # or `evilgithub.com/…`; CodeQL py/incomplete-url-substring-sanitization).
+    if parts and parts[0] == "github.com":
+        parts = parts[1:]
     if len(parts) != 2:  # not a plain OWNER/REPO (host-prefixed / malformed)
         return None
     return f"{parts[0]}/{parts[1]}"
@@ -1590,7 +1593,10 @@ def main() -> int:
             # An explicit --repo/-R (or PR URL) retargets EVERY gate below —
             # without it, merging a cross-repo PR checked the CWD repo's
             # same-numbered PR (wrong-repo gate; 2026-07-26 incident).
-            merge_repo = _merge_target_repo(merge_seg.argv, cmd)
+            # Pass the merge SEGMENT's raw text (not the whole compound command)
+            # so an unrelated segment's PR URL cannot select the gated repo
+            # (`echo …/other/repo/pull/9 && gh pr merge 12` must gate the cwd repo).
+            merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
             if merge_repo is _REPO_UNRESOLVED:
                 print(
                     "BLOCKED: cannot resolve the target repo of this --repo/-R "

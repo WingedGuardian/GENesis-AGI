@@ -229,6 +229,44 @@ class TestBraceExpansion:
         assert r.returncode == 2
 
 
+class TestShellVariableOperands:
+    """REGRESSION (Codex P1, 2026-08-02): a protected target assigned to a
+    shell-local variable in the same command — `TARGET=~/genesis/data; rm -rf
+    "$TARGET"` — is invisible to expandvars, so the operand `$TARGET` didn't
+    match; bash then deletes the DB dir. An rm operand carrying an unresolved
+    `$var` now triggers a WHOLE-command substring fallback (the literal is in
+    the assignment segment)."""
+
+    def test_var_assignment_then_rm_blocks(self, fake_home):
+        r = _run(f'TARGET={H}/genesis/data; rm -rf "$TARGET"', fake_home)
+        assert r.returncode == 2
+
+    def test_var_assignment_db_file_blocks(self, fake_home):
+        r = _run(f'T={H}/genesis/data/genesis.db; rm -f "$T"', fake_home)
+        assert r.returncode == 2
+
+    def test_unresolved_var_no_protected_mention_allowed(self, fake_home):
+        """An opaque $var rm with NO protected path anywhere → allowed."""
+        r = _run('rm -rf "$BUILD_DIR"', fake_home)
+        assert r.returncode == 0, r.stderr
+
+    def test_resolvable_env_var_to_protected_blocks(self, fake_home):
+        """A resolvable env var pointing at a protected dir is caught directly."""
+        import os
+
+        env = dict(os.environ)
+        env["HOME"] = str(fake_home)
+        env["GD"] = f"{fake_home}/genesis/data"
+        import json
+        import subprocess
+
+        payload = json.dumps({"tool_input": {"command": "rm -rf $GD"}, "tool_name": "Bash"})
+        r = subprocess.run(
+            [_PYTHON, str(_SCRIPT)], input=payload, capture_output=True, text=True, env=env
+        )
+        assert r.returncode == 2
+
+
 class TestPayloadEdges:
     def test_empty_command(self, fake_home):
         r = _run("", fake_home)

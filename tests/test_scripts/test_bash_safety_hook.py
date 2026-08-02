@@ -22,8 +22,10 @@ Default cwd for _run is a NON-genesis temp dir, so the push/PR/merge gates run
 (as they did before the dedup). In-genesis behavior is covered explicitly.
 """
 
+import atexit
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -36,6 +38,7 @@ HOOK = _REPO_ROOT / "scripts" / "bash_safety_hook.sh"
 # A stable non-git directory so `git rev-parse --git-common-dir` fails →
 # in_genesis=0 → the push/PR/merge gates run (pre-dedup behavior).
 _OUTSIDE = tempfile.mkdtemp(prefix="bash_safety_outside_")
+atexit.register(shutil.rmtree, _OUTSIDE, ignore_errors=True)
 
 
 def _run(

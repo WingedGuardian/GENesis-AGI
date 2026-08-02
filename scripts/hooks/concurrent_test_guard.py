@@ -56,9 +56,29 @@ def _argv_is_pytest(argv: list[str]) -> bool:
     if base == "pytest":
         return True
     if base.startswith("python"):
+        # `python -m pytest …`
         for i, tok in enumerate(argv[1:-1], start=1):
             if tok == "-m" and argv[i + 1] == "pytest":
                 return True
+        # A venv console-script launched via its Python shebang commonly appears
+        # as `python /venv/bin/pytest …` (the repo's normal invocation). The
+        # entrypoint is the FIRST non-flag argument; recognize it by basename so
+        # a real running suite is not missed (Codex P2). `-c`/`-m` values are
+        # skipped so their operand can't be misread as the script.
+        i = 1
+        while i < len(argv):
+            tok = argv[i]
+            if tok in ("-m", "-c", "-W", "-X"):  # flags that consume the next token
+                i += 2
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            # First non-flag = the script to run. A console-script entrypoint is
+            # a PATH (`/venv/bin/pytest`); require the slash so a bare
+            # `python pytest` (running a local file named pytest, not a suite)
+            # is not misread as a run.
+            return "/" in tok and os.path.basename(tok) == "pytest"
     return False
 
 

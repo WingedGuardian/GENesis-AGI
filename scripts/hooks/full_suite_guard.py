@@ -71,7 +71,10 @@ def _is_full_suite(cmd: str) -> bool:
                 # A -k/-m selector (separate value or =form) narrows the run to
                 # a named subset — treating it as "full suite" was a cosmetic FP.
                 _sep_val = arg in ("-k", "-m") and i + 1 < len(args)
-                _eq_form = arg.startswith(("-k", "-m", "--keyword", "--markers")) and "=" in arg
+                # `--markers=…` is not a real pytest invocation (bare --markers
+                # just lists markers), so it is not a selector; --keyword is the
+                # long form of -k and stays.
+                _eq_form = arg.startswith(("-k", "-m", "--keyword")) and "=" in arg
                 _glued = arg.startswith(("-k", "-m")) and len(arg) > 2 and "=" not in arg
                 if _sep_val or _eq_form or _glued:
                     has_selector = True

@@ -47,6 +47,15 @@ class TestArgvClassifier:
     def test_python3_m_pytest(self):
         assert _argv_is_pytest(["python3", "-m", "pytest"])
 
+    def test_venv_console_script_via_shebang(self):
+        """Codex P2: `pytest` (venv console script) launched via its python
+        shebang appears as `python /venv/bin/pytest …` — must be recognized,
+        else the repo's normal run is missed and a concurrent run allowed."""
+        assert _argv_is_pytest(["python", "/home/u/genesis/.venv/bin/pytest", "-q"])
+
+    def test_full_python_path_console_script(self):
+        assert _argv_is_pytest(["/usr/bin/python3.12", "/venv/bin/pytest", "tests/x.py"])
+
     def test_full_python_path_m_pytest(self):
         assert _argv_is_pytest(["/usr/bin/python3.12", "-m", "pytest", "-q"])
 

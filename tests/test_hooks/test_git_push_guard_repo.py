@@ -98,6 +98,27 @@ class TestMergeTargetRepo:
         argv = ["gh", "pr", "merge", "https://github.com/octo/other/pull/9", "--repo", "octo/voice"]
         assert _merge_target_repo(argv, cmd) == "octo/voice"
 
+    def test_url_in_unrelated_segment_ignored(self):
+        """REGRESSION (Codex P1): a PR URL in an UNRELATED segment must not
+        select the gated repo — _merge_target_repo receives only the merge
+        segment's raw text, so the whole-command URL is invisible here."""
+        # The merge segment alone (what main() passes) has no URL → None (cwd).
+        assert (
+            _merge_target_repo(["gh", "pr", "merge", "12", "--admin"], "gh pr merge 12 --admin")
+            is None
+        )
+
+    def test_github_host_component_exact_not_substring(self):
+        """CodeQL: a look-alike host must not be accepted as github.com."""
+        assert (
+            _merge_target_repo(["gh", "pr", "merge", "5", "--repo", "github.com.evil/o/r"], "")
+            is _mod._REPO_UNRESOLVED
+        )
+        assert (
+            _merge_target_repo(["gh", "pr", "merge", "5", "--repo", "evilgithub.com/o/r"], "")
+            is _mod._REPO_UNRESOLVED
+        )
+
     def test_variable_repo_is_unresolved_sentinel(self):
         """A present-but-unresolvable --repo must be DISTINCT from 'no --repo'
         (None) so the caller fails closed rather than gating the cwd repo."""

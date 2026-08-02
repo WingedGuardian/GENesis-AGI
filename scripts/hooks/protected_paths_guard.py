@@ -41,6 +41,7 @@ import os
 import re
 import shlex
 import sys
+from fnmatch import fnmatch
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -101,7 +102,6 @@ def _has_glob(token: str) -> bool:
 
 def _operand_blocks(operand: str, cwd: str | None, dirs: list[str], files: list[str]) -> str | None:
     """Reason string if deleting ``operand`` would destroy protected data."""
-    from fnmatch import fnmatch
 
     expanded = _expand(operand, cwd)
     if expanded is None:
@@ -201,7 +201,7 @@ def main() -> int:
     for seg in analyze(cmd):
         if seg.exe not in ("rm", "rmdir"):
             continue
-        unresolved_here = False
+        seg_unresolved = False
         for raw_operand in _rm_operands(seg.argv):
             # Bash brace-expands an unquoted operand before rm runs, so check
             # each real target (rm -rf ~/genesis/{data,logs} → …/data, …/logs).
@@ -209,12 +209,24 @@ def main() -> int:
                 reason = _operand_blocks(operand, cwd, dirs, files)
                 if reason:
                     return _block(reason)
-                if _expand(operand, cwd) is None:
-                    unresolved_here = True
-        if unresolved_here:
-            # A relative rm target with no resolvable base: substring-check
-            # THIS SEGMENT's raw text (not the whole command — that would
-            # resurrect the mention-only false positive this rewrite kills).
+                if "$" in os.path.expandvars(operand):
+                    # An UNRESOLVED shell variable target (rm "$TARGET" where
+                    # $TARGET is a shell-local, not an env var): expandvars can't
+                    # see the assignment, and the real path is usually set in
+                    # ANOTHER segment (TARGET=~/genesis/data; rm "$TARGET"). Check
+                    # the WHOLE command. Narrow trigger — a resolvable $HOME/… is
+                    # already expanded (no `$` left) and handled by _operand_blocks,
+                    # so this neither fires on env vars nor resurrects the
+                    # mention-only FP (which has no opaque-$var operand).
+                    reason = _legacy_substring_block(cmd, dirs)
+                    if reason:
+                        return _block(reason)
+                elif _expand(operand, cwd) is None:
+                    seg_unresolved = True
+        if seg_unresolved:
+            # A relative rm target with no resolvable base: substring-check THIS
+            # SEGMENT's raw text (not the whole command — that would resurrect
+            # the mention-only false positive this rewrite kills).
             reason = _legacy_substring_block(seg.raw, dirs)
             if reason:
                 return _block(reason)
