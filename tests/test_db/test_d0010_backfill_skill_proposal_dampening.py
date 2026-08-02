@@ -1,4 +1,4 @@
-"""d0009 — align pre-existing skill_proposal observations to propose-only.
+"""d0010 — align pre-existing skill_proposal observations to propose-only.
 
 Pre-propose-only proposal rows carry category=NULL (the exact-match dampening
 misses them) and a 14d expiry (they'd auto-resolve before review). This migration
@@ -12,7 +12,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta
 
-import genesis.db.data_migrations.d0009_backfill_skill_proposal_dampening as d0009
+import genesis.db.data_migrations.d0010_backfill_skill_proposal_dampening as d0010
 
 
 def _seed(path, rows) -> None:
@@ -72,13 +72,13 @@ def test_backfills_category_and_extends_expiry(tmp_path, monkeypatch):
             ("o-other", "bug_identified", 0, None, "not json", created, old_expiry),
         ],
     )
-    monkeypatch.setattr(d0009, "genesis_db_path", lambda: str(tmp_path / "genesis.db"))
+    monkeypatch.setattr(d0010, "genesis_db_path", lambda: str(tmp_path / "genesis.db"))
 
-    assert d0009.verify() is False
-    result = d0009.migrate()
+    assert d0010.verify() is False
+    result = d0010.migrate()
     assert result["category_filled"] == 1
     assert result["expires_at_bumped"] == 1
-    assert d0009.verify() is True
+    assert d0010.verify() is True
 
     db = sqlite3.connect(tmp_path / "genesis.db")
     rows = {
@@ -97,12 +97,12 @@ def test_backfills_category_and_extends_expiry(tmp_path, monkeypatch):
     assert rows["o-other"][2] == old_expiry
 
     # Idempotent: a second run heals nothing.
-    assert d0009.migrate() == {"category_filled": 0, "expires_at_bumped": 0}
+    assert d0010.migrate() == {"category_filled": 0, "expires_at_bumped": 0}
 
 
 def test_noop_on_fresh_install(tmp_path, monkeypatch):
     _seed(tmp_path / "genesis.db", [])
-    monkeypatch.setattr(d0009, "genesis_db_path", lambda: str(tmp_path / "genesis.db"))
-    assert d0009.verify() is True
-    assert d0009.migrate() == {"category_filled": 0, "expires_at_bumped": 0}
-    assert d0009.verify() is True
+    monkeypatch.setattr(d0010, "genesis_db_path", lambda: str(tmp_path / "genesis.db"))
+    assert d0010.verify() is True
+    assert d0010.migrate() == {"category_filled": 0, "expires_at_bumped": 0}
+    assert d0010.verify() is True
