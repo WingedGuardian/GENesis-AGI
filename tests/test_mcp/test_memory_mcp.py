@@ -638,11 +638,15 @@ async def test_reference_lookup_non_credentials_no_audit():
 
 
 async def test_reference_lookup_hybrid_vector_path():
-    """I1 regression: reference_lookup must also consult the vector retriever.
+    """Regression: a vector hit must hydrate by Qdrant point ID, not primary key.
 
-    Builds a reference entry via reference_store, then simulates a vector
-    hit that returns it (no FTS match for the semantic query), and verifies
-    the result surfaces.
+    Builds a reference entry via reference_store, then simulates a vector hit
+    that returns it (no FTS match for the semantic query), and verifies the
+    result surfaces. The retriever returns ``memory_id`` = the Qdrant point ID
+    (what ``store.store`` returns, stored as ``knowledge_units.qdrant_id``) —
+    NOT the primary key. Hydrating that via ``knowledge.get`` (primary-key
+    lookup) matched nothing and dropped every reference; this asserts the
+    qdrant_id-keyed hydration path returns the entry.
     """
     from types import SimpleNamespace
 
@@ -683,13 +687,15 @@ async def test_reference_lookup_hybrid_vector_path():
                 ),
             )
 
-            # Semantic query that does NOT match any FTS5 token in the body.
-            # "ohio buckeyes fan" vs body containing "Ohio State fan persona" —
-            # FTS5 matches "ohio" and "fan" so FTS would still return this;
-            # test that the vector path ALSO returns it when FTS misses by
-            # querying with tokens that aren't in the body.
+            # Anti-remasking guard: the Qdrant point ID and the primary key are
+            # different UUIDs. The prior test mocked memory_id=unit_id, which
+            # masked the bug. Production returns the Qdrant point ID.
+            assert unit_id != "q-vector-1"
+
+            # Retriever returns the Qdrant point ID (== store.store's return,
+            # stored as qdrant_id), NOT the primary key.
             mock_retriever.recall = AsyncMock(return_value=[
-                SimpleNamespace(memory_id=unit_id, score=0.87),
+                SimpleNamespace(memory_id="q-vector-1", score=0.87),
             ])
 
             results = await tools["reference_lookup"].fn(
@@ -705,7 +711,12 @@ async def test_reference_lookup_hybrid_vector_path():
 
 
 async def test_reference_lookup_hybrid_merges_both_paths():
-    """Vector and FTS hits for the same entry merge to origin='both'."""
+    """Vector and FTS hits for the same entry merge to origin='both'.
+
+    Genuinely exercises cross-id-space dedup: the vector hit carries the Qdrant
+    point ID while FTS carries the primary key, so the merge must resolve the
+    vector hit to its primary key to recognise them as the same entry.
+    """
     from types import SimpleNamespace
 
     import aiosqlite
@@ -740,8 +751,11 @@ async def test_reference_lookup_hybrid_merges_both_paths():
                 description="Public example forum for testing",
             )
 
+            # Vector hit carries the Qdrant point ID (store.store's return),
+            # FTS carries the primary key — dedup must still merge them.
+            assert uid != "q-both"
             mock_retriever.recall = AsyncMock(return_value=[
-                SimpleNamespace(memory_id=uid, score=0.9),
+                SimpleNamespace(memory_id="q-both", score=0.9),
             ])
 
             results = await tools["reference_lookup"].fn(
@@ -750,6 +764,112 @@ async def test_reference_lookup_hybrid_merges_both_paths():
             assert len(results) == 1
             assert results[0]["unit_id"] == uid
             assert results[0]["origin"] == "both"
+        finally:
+            mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_reference_lookup_vector_hit_without_knowledge_unit_skipped():
+    """A vector hit with no knowledge_units row is excluded, not an error.
+
+    The episodic collection holds plain memories alongside stored references;
+    a vector hit whose Qdrant point ID has no knowledge_units row is not a
+    reference and must be dropped cleanly (no exception, no bogus row).
+    """
+    from types import SimpleNamespace
+
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.schema import create_all_tables
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        await create_all_tables(real_db)
+
+        mock_store = AsyncMock()
+        mock_store.store = AsyncMock(return_value="q-orphan")
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
+        mock_store._embeddings = MagicMock()
+        mock_store._embeddings.model_name = "m"
+
+        mock_retriever = AsyncMock()
+        # Qdrant point ID with no matching knowledge_units.qdrant_id row.
+        mock_retriever.recall = AsyncMock(return_value=[
+            SimpleNamespace(memory_id="not-a-knowledge-unit", score=0.95),
+        ])
+
+        old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+        try:
+            mod._store = mock_store
+            mod._db = real_db
+            mod._retriever = mock_retriever
+            mod._qdrant = MagicMock()
+
+            tools = await _get_tools()
+            results = await tools["reference_lookup"].fn(
+                query="xyzzy-no-match-in-body",  # FTS returns nothing either
+            )
+            assert results == []
+        finally:
+            mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_reference_lookup_hydration_error_degrades_to_fts():
+    """A vector-hydration DB error degrades to FTS-only, never a total failure.
+
+    reference_lookup's vector-retriever and FTS paths are both fail-open; the
+    qdrant_id hydration step must be too, so a transient DB fault on that one
+    query can't sink an otherwise-successful lookup.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.schema import create_all_tables
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        await create_all_tables(real_db)
+
+        mock_store = AsyncMock()
+        mock_store.store = AsyncMock(return_value="q-degrade")
+        mock_store.delete = AsyncMock(return_value={"metadata": 1, "fts5": 1})
+        mock_store._embeddings = MagicMock()
+        mock_store._embeddings.model_name = "m"
+
+        mock_retriever = AsyncMock()
+        mock_retriever.recall = AsyncMock(return_value=[])
+
+        old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+        try:
+            mod._store = mock_store
+            mod._db = real_db
+            mod._retriever = mock_retriever
+            mod._qdrant = MagicMock()
+
+            tools = await _get_tools()
+            uid = await tools["reference_store"].fn(
+                kind="url",
+                identifier="degrade forum",
+                value="https://example.com/degrade",
+                description="Public example forum for degrade testing",
+            )
+
+            # Vector hydration raises; FTS still matches "degrade forum".
+            mock_retriever.recall = AsyncMock(return_value=[
+                SimpleNamespace(memory_id="q-degrade", score=0.9),
+            ])
+            with patch.object(
+                mod.knowledge, "get_by_qdrant_ids",
+                new_callable=AsyncMock, side_effect=RuntimeError("db locked"),
+            ):
+                results = await tools["reference_lookup"].fn(
+                    query="degrade forum", kind="url",
+                )
+            # FTS path still surfaces the entry — degraded, not empty, no raise.
+            assert len(results) == 1
+            assert results[0]["unit_id"] == uid
+            assert results[0]["origin"] == "fts"
         finally:
             mod._store, mod._db, mod._retriever, mod._qdrant = old
 

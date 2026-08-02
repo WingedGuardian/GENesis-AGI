@@ -116,14 +116,39 @@ async def knowledge_recall(
     except Exception:
         logger.warning("knowledge_fts search failed", exc_info=True)
 
+    # A retriever ``memory_id`` is the Qdrant point ID (== knowledge_units
+    # .qdrant_id), NOT the primary key. Map each vector hit back to its
+    # knowledge_units.id so (a) dedup against the FTS path — whose unit_id IS
+    # the primary key — actually matches, and (b) the returned unit_id is the
+    # usable primary key. Fall back to the raw Qdrant ID when no row exists so
+    # a hit is never dropped (unlike a stored reference, a generic knowledge
+    # vector may legitimately lack a knowledge_units row). Fail-open on a DB
+    # error to the raw ID — same best-effort stance as the FTS path above; a
+    # remap failure must not break recall.
+    try:
+        by_qdrant = await memory_mod.knowledge.get_by_qdrant_ids(
+            memory_mod._db, [r.memory_id for r in vector_results]
+        )
+    except Exception:
+        logger.warning("knowledge_recall: qdrant_id remap failed", exc_info=True)
+        by_qdrant = {}
+
     seen_ids: set[str] = set()
     merged: list[dict] = []
 
     for r in vector_results:
-        seen_ids.add(r.memory_id)
+        unit_id = (by_qdrant.get(r.memory_id) or {}).get("id") or r.memory_id
+        # Self-dedup on the resolved id (symmetric with the FTS loop below):
+        # two Qdrant points resolving to the same knowledge_units row must not
+        # produce two rows. (A stale orphaned point with no row still resolves
+        # to its own raw id and can't be deduped here — that is a separate
+        # stale-point cleanup concern, out of scope for this id-space fix.)
+        if unit_id in seen_ids:
+            continue
+        seen_ids.add(unit_id)
         merged.append(
             {
-                "unit_id": r.memory_id,
+                "unit_id": unit_id,
                 "content": r.content,
                 "source": r.source,
                 "source_doc": r.source,
@@ -634,7 +659,7 @@ async def reference_lookup(
     # Pull extra candidates so the post-filter to project_type=reference
     # doesn't leave us short of the requested limit.
     vector_limit = max(limit * 3, 10)
-    vector_hits: list[dict] = []
+    vector_qids: list[str] = []
     try:
         vector_results = await memory_mod._retriever.recall(
             query,
@@ -643,14 +668,9 @@ async def reference_lookup(
             # Gate rerank at the tool boundary (see knowledge_recall above).
             rerank=graph_expansion.reranker_enabled(),
         )
-        for r in vector_results:
-            vector_hits.append(
-                {
-                    "unit_id": r.memory_id,
-                    "score": getattr(r, "score", 0.0),
-                    "origin": "vector",
-                }
-            )
+        # A retriever ``memory_id`` is the Qdrant point ID (== knowledge_units
+        # .qdrant_id), NOT the primary key — keep them in rank order.
+        vector_qids = [r.memory_id for r in vector_results]
     except Exception:
         logger.warning(
             "reference_lookup: vector path failed, falling back to FTS only",
@@ -673,19 +693,44 @@ async def reference_lookup(
             exc_info=True,
         )
 
-    # Merge + dedup by unit_id, tracking origin.
-    seen: dict[str, str] = {}  # unit_id -> origin
-    for v in vector_hits:
-        seen[v["unit_id"]] = "vector"
+    # Resolve vector hits to their knowledge_units rows by Qdrant point ID.
+    # This MUST key on qdrant_id: the retriever's memory_id is the Qdrant point
+    # ID, so hydrating via knowledge.get (which looks up the primary key) would
+    # match nothing and silently drop every vector hit — the bug this fixes.
+    # Fail-open to FTS-only on a DB error, matching the vector-retriever and FTS
+    # paths above (both wrapped): a hydration fault must not turn an otherwise
+    # successful lookup into a total failure.
+    try:
+        by_qdrant = await memory_mod.knowledge.get_by_qdrant_ids(memory_mod._db, vector_qids)
+    except Exception:
+        logger.warning("reference_lookup: qdrant_id hydration failed, FTS-only", exc_info=True)
+        by_qdrant = {}
+
+    # Merge + dedup by knowledge_units.id, tracking origin. Vector hits keep
+    # their rank order (strongest first); FTS-only hits follow. Dedup now works
+    # because both paths are keyed in the same (primary-key) id space.
+    candidates: dict[str, dict] = {}  # unit_id -> {"row": row|None, "origin": str}
+    for qid in vector_qids:
+        row = by_qdrant.get(qid)
+        if row is None:
+            # Vector hit with no knowledge_units row — a plain episodic memory,
+            # not a stored reference. It cannot be a reference entry, so it is
+            # correctly excluded here (the project_type filter would drop it
+            # anyway); nothing broken is being suppressed.
+            continue
+        candidates.setdefault(row["id"], {"row": row, "origin": "vector"})
     for f in fts_results:
         uid = f["unit_id"]
-        seen[uid] = "both" if uid in seen else "fts"
+        if uid in candidates:
+            candidates[uid]["origin"] = "both"
+        else:
+            candidates[uid] = {"row": None, "origin": "fts"}
 
-    # Hydrate each candidate from knowledge_units, filtering post-hoc by
-    # project_type / domain (vector hits weren't filtered at retrieval time).
+    # Hydrate remaining (FTS-only) candidates and apply the post-hoc
+    # project_type / domain filter (vector hits weren't filtered at retrieval).
     full_rows: list[dict] = []
-    for uid, origin in seen.items():
-        row = await memory_mod.knowledge.get(memory_mod._db, uid)
+    for uid, info in candidates.items():
+        row = info["row"] or await memory_mod.knowledge.get(memory_mod._db, uid)
         if row is None:
             continue
         if row.get("project_type") != _REFERENCE_PROJECT:
@@ -702,11 +747,19 @@ async def reference_lookup(
                 "confidence": row["confidence"],
                 "source_doc": row["source_doc"],
                 "ingested_at": row["ingested_at"],
-                "origin": origin,
+                "origin": info["origin"],
             }
         )
         if len(full_rows) >= limit:
             break
+
+    logger.debug(
+        "reference_lookup: vector=%d fts=%d candidates=%d returned=%d",
+        len(vector_qids),
+        len(fts_results),
+        len(candidates),
+        len(full_rows),
+    )
 
     # Audit trail: log access for any credentials-kind entry that surfaces,
     # regardless of whether it came from the vector or FTS path.

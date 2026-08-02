@@ -42,6 +42,39 @@ async def test_get_nonexistent(db):
     assert await knowledge.get(db, "nonexistent") is None
 
 
+async def test_get_by_qdrant_ids_maps_on_qdrant_id_not_pk(db):
+    """The helper keys on qdrant_id, not the primary key — the whole point.
+
+    A retriever result's memory_id is the Qdrant point ID, which equals
+    knowledge_units.qdrant_id and is a DIFFERENT UUID from the primary key.
+    Looking a vector hit up by primary key (knowledge.get) matches nothing;
+    this helper must match on qdrant_id.
+    """
+    uid = await knowledge.insert(
+        db,
+        project_type="reference",
+        domain="reference.network",
+        source_doc="t",
+        concept="host login",
+        body="ssh host",
+        qdrant_id="qd-point-1",
+    )
+    assert uid != "qd-point-1"  # the two id spaces are distinct
+
+    # Maps by qdrant_id → row, keyed by qdrant_id.
+    by_qdrant = await knowledge.get_by_qdrant_ids(db, ["qd-point-1"])
+    assert set(by_qdrant) == {"qd-point-1"}
+    assert by_qdrant["qd-point-1"]["id"] == uid
+
+    # The primary key is NOT a qdrant_id → no match (the exact prod failure).
+    assert await knowledge.get_by_qdrant_ids(db, [uid]) == {}
+
+
+async def test_get_by_qdrant_ids_empty_and_missing(db):
+    assert await knowledge.get_by_qdrant_ids(db, []) == {}
+    assert await knowledge.get_by_qdrant_ids(db, ["nope1", "nope2"]) == {}
+
+
 async def test_insert_with_all_fields(db):
     uid = await knowledge.insert(
         db,

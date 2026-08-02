@@ -92,6 +92,35 @@ async def get(db: aiosqlite.Connection, unit_id: str) -> dict | None:
         return dict(zip(columns, row, strict=False))
 
 
+async def get_by_qdrant_ids(
+    db: aiosqlite.Connection, qdrant_ids: list[str]
+) -> dict[str, dict]:
+    """Map Qdrant point IDs → knowledge_units rows (missing IDs omitted).
+
+    Qdrant point IDs map to ``knowledge_units.qdrant_id`` (NOT ``.id``) — the
+    same contract as ``increment_retrieved_batch``. A retriever result's
+    ``memory_id`` is the Qdrant point ID, so hydrating a vector hit back to its
+    knowledge_units row must key on ``qdrant_id``, not the primary key (keying
+    on ``.id`` silently matches nothing — the two are independent UUIDs). Uses
+    the ``idx_knowledge_units_qdrant_id`` index. Returned dict is keyed by
+    ``qdrant_id``.
+    """
+    if not qdrant_ids:
+        return {}
+    placeholders = ",".join("?" for _ in qdrant_ids)
+    async with db.execute(
+        f"SELECT * FROM knowledge_units WHERE qdrant_id IN ({placeholders})",
+        qdrant_ids,
+    ) as cursor:
+        rows = await cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+    result: dict[str, dict] = {}
+    for row in rows:
+        record = dict(zip(columns, row, strict=False))
+        result[record["qdrant_id"]] = record
+    return result
+
+
 async def find_by_unique_key(
     db: aiosqlite.Connection,
     *,
