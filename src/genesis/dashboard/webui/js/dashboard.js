@@ -2241,6 +2241,10 @@
             });
             const d = await resp.json();
             if (resp.ok) {
+              // Setting DASHBOARD_PASSWORD here activates the /api mutation gate
+              // immediately; authenticate the session so this editor path (an
+              // advertised password-setup route) doesn't 401 the user's next action.
+              if (keyName === 'DASHBOARD_PASSWORD') { await this._establishSession(val); }
               this.secretsEditing = {...this.secretsEditing, [keyName]: false};
               delete this.secretsValues[keyName];
               this.secretsMessage = {type: 'restart', text: `${keyName} saved. Changes take effect after server restart.`};
@@ -2267,6 +2271,18 @@
         },
         get setupProvider() { return this.setupProviders[this.setupProviderIdx] || this.setupProviders[0]; },
         dismissSetupCard() { this.setupCardDismissed = true; },
+        async _establishSession(password) {
+          // After DASHBOARD_PASSWORD is (re)set, os.environ updates immediately and
+          // the /api mutation gate activates THIS request — log the session in with
+          // the new password so the user isn't 401'd on their next action. Shared by
+          // the wizard and the Provider Keys editor.
+          try {
+            await fetchApi("/api/genesis/auth/login", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({password}),
+            });
+          } catch (e) { /* non-fatal: user can log in manually */ }
+        },
         async setupSavePassword() {
           const val = (this.setupPassword || "").trim();
           if (!val) { this.setupMsg = {type: "error", text: "Enter a password"}; return; }
@@ -2277,16 +2293,7 @@
               body: JSON.stringify({keys: {DASHBOARD_PASSWORD: val}}),
             });
             if (resp.ok) {
-              // Saving the password updates os.environ immediately, so the /api
-              // mutation gate is active THIS request. Authenticate the session with
-              // the password just set — otherwise the next wizard POST (key test/
-              // save, finish) would 401 and bounce to login mid-flow.
-              try {
-                await fetchApi("/api/genesis/auth/login", {
-                  method: "POST", headers: {"Content-Type": "application/json"},
-                  body: JSON.stringify({password: val}),
-                });
-              } catch (e) { /* non-fatal: user can log in manually */ }
+              await this._establishSession(val);
               this.setupPassword = "";
               await this.loadSetupStatus();
               this.setupMsg = {type: "ok", text: "Password saved — you're logged in, and the dashboard now requires this password."};
@@ -2370,10 +2377,19 @@
           // Persist first-run completion so the card stops reappearing AND the two
           // other behaviors keyed on the marker (the CC onboarding prompt and the
           // ego-cadence first-run suppression) clear. Every path to the "Done" step
-          // funnels through here.
+          // funnels through here. fetchApi resolves (does not throw) on a non-2xx,
+          // so gate on resp.ok: if the marker write fails, STAY on this step and
+          // surface the error rather than showing Done over a still-unonboarded box.
+          let ok = false;
           try {
-            await fetchApi("/api/genesis/setup-complete", {method: "POST"});
-          } catch (e) { /* best-effort; the card also hides on dismiss */ }
+            const resp = await fetchApi("/api/genesis/setup-complete", {method: "POST"});
+            ok = !!(resp && resp.ok);
+            if (!ok) {
+              const d = resp ? await resp.json().catch(() => ({})) : {};
+              this.setupMsg = {type: "error", text: d.error || "Could not save completion (disk/permissions?). Try again."};
+            }
+          } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
+          if (!ok) return;
           await this.loadSetupStatus();
           this.setupStep = 4;
         },
