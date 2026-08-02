@@ -617,3 +617,5 @@ def test_fingerprint_missing_file_warns(tmp_path, clean_diff):
         f.kind == FindingKind.FINGERPRINT and f.severity == Severity.WARN
         for f in r.findings
     )
+    # The scan did NOT run, so it must not be reported as executed.
+    assert "fingerprint" not in r.scanners_run

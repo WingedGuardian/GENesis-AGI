@@ -247,8 +247,15 @@ jobs:
         # Secrets are NOT readable in `if:`, so the empty check is done in-shell
         # after env-mapping; an `if:` keyed on secrets.* would be silently empty
         # (never runs = false green).
+        # Skip Dependabot too: its PRs are same-repo (non-fork) so they'd enter
+        # this step, but Dependabot-triggered workflows receive Dependabot
+        # secrets, not ordinary Actions secrets, so GENESIS_PRIVATE_PATTERNS is
+        # empty and the fail-loud check would break every dependency-bump PR.
+        # Dependency bumps never introduce install identifiers; the class-warn
+        # scan remains their floor.
         if: >-
           github.repository == 'WingedGuardian/GENesis-AGI' &&
+          github.actor != 'dependabot[bot]' &&
           (github.event_name != 'pull_request' ||
            github.event.pull_request.head.repo.fork == false)
         env:
@@ -270,20 +277,24 @@ jobs:
           pf="$(mktemp)"
           printf '%s' "$PRIV" > "$pf"
 
-          # Collect ADDED lines for this PR/push (+ PR body). Diff, not whole
-          # tree — pre-existing legit content is out of scope by construction.
-          # Keep all '^+' lines INCLUDING the '+++ b/path' headers: those carry
-          # only repo-relative paths (which never match an exact install value),
-          # and a '^+++' filter would drop added content beginning with '++'.
+          # Collect ADDED lines across EVERY commit's patch in the range — NOT
+          # the net tree-to-tree diff. A value added in one commit and removed in
+          # a later commit of the same PR/push leaves the net diff clean, yet the
+          # value stays in published Git history and becomes an ancestor of main
+          # (Codex P1). `git log -p --no-merges` emits each non-merge commit's
+          # patch; pre-existing legit content is still out of scope (only commits
+          # in this range are shown). Keep all '^+' lines INCLUDING the
+          # '+++ b/path' headers (repo-relative paths never match an exact install
+          # value, and a '^+++' filter would drop added content beginning '++').
           added=""
           body=""
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            added="$(git diff "${PR_BASE_SHA}...HEAD" 2>/dev/null | grep -E '^\+' || true)"
+            added="$(git log -p --no-merges "${PR_BASE_SHA}..HEAD" 2>/dev/null | grep -E '^\+' || true)"
             body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
           elif git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
-            added="$(git diff "${PUSH_BEFORE}" "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
+            added="$(git log -p --no-merges "${PUSH_BEFORE}..${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
           else
-            # New branch / unknown base — scan just the tip commit's additions.
+            # New branch / unknown base — scan the tip commit's patch (best effort).
             added="$(git show "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
           fi
 

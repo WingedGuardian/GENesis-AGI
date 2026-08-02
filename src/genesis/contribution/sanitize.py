@@ -675,6 +675,10 @@ def scan_diff(
         findings.extend(_check_fingerprints(parsed, fingerprint_file))
         scanners_run.append("fingerprint")
     else:
+        # File absent: the exact-value scan did NOT run, so do NOT record it in
+        # scanners_run (whose contract is scanners that actually executed — the
+        # CLI/PR body render that list). The WARN finding is the explicit signal
+        # that exact-value coverage was skipped.
         findings.append(
             Finding(
                 kind=FindingKind.FINGERPRINT,
@@ -689,7 +693,6 @@ def scan_diff(
                 detail=str(fingerprint_file),
             )
         )
-        scanners_run.append("fingerprint")
 
     # 7. detect-secrets (required floor)
     ran, secret_hits = _run_detect_secrets(parsed)
