@@ -1,5 +1,87 @@
 
 
+    <!-- First-run onboarding wizard (Setup card). Shown on Overview until the
+         install is onboarded (~/.genesis/setup-complete). Dismissible. Every step
+         reuses an EXISTING route (secrets PUT, keys/test, config-files PUT); this
+         card changes no auth behavior. -->
+    <template x-if="$store.genesisDashboard.activeTab === 'overview' && $store.genesisDashboard.showSetupCard">
+      <div class="panel" x-data="{s: $store.genesisDashboard}" style="border:1px solid #2196F3;">
+        <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+          <span><span class="material-symbols-outlined">rocket_launch</span> Welcome — finish setting up Genesis</span>
+          <button @click="s.dismissSetupCard()" title="Dismiss" style="background:none;border:none;color:var(--color-text-secondary,#888);cursor:pointer;font-size:1rem;line-height:1;">✕</button>
+        </div>
+        <div style="padding:0.75rem 1rem;font-size:0.85rem;">
+          <!-- progress -->
+          <div style="display:flex;gap:0.75rem;margin-bottom:0.6rem;font-size:0.72rem;color:var(--color-text-secondary,#888);flex-wrap:wrap;">
+            <span :style="s.setupStep>=1?'color:#2196F3;font-weight:600':''">1 · Password</span>
+            <span :style="s.setupStep>=2?'color:#2196F3;font-weight:600':''">2 · Model key</span>
+            <span :style="s.setupStep>=3?'color:#2196F3;font-weight:600':''">3 · Identity</span>
+            <span :style="s.setupStep>=4?'color:#2196F3;font-weight:600':''">✓ Done</span>
+          </div>
+          <!-- status chips (from setup-status) -->
+          <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-bottom:0.75rem;font-size:0.75rem;color:var(--color-text-secondary,#999);">
+            <span x-text="(s.setupStatus&&s.setupStatus.password_set?'✓':'○')+' dashboard password'"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.llm_key_present?'✓':'○')+' chat model key'"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.embedding_key_present?'✓':'○')+' embedding key'"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.identity_set?'✓':'○')+' identity (USER.md)'"></span>
+          </div>
+
+          <!-- Step 1: dashboard password -->
+          <div x-show="s.setupStep===1">
+            <p style="margin:0 0 0.5rem;">Set a dashboard password so only you can reach this UI. (Optional — you can skip.)</p>
+            <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+              <input type="password" x-model="s.setupPassword" placeholder="New dashboard password" style="flex:1;min-width:180px;padding:0.4rem;">
+              <button class="btn" @click="s.setupSavePassword()" :disabled="s.setupBusy">Save</button>
+              <button class="btn-secondary" @click="s.setupStep=2">Skip</button>
+            </div>
+          </div>
+
+          <!-- Step 2: model / embedding key -->
+          <div x-show="s.setupStep===2">
+            <p style="margin:0 0 0.5rem;">Add an API key so Genesis can think. Pick a provider, paste the key, test it, save.</p>
+            <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+              <select x-model.number="s.setupProviderIdx" @change="s.setupKeyTest=null" style="padding:0.4rem;">
+                <template x-for="(p, idx) in s.setupProviders" :key="p.keyName">
+                  <option :value="idx" x-text="p.label"></option>
+                </template>
+              </select>
+              <input type="password" x-model="s.setupKeyValue" placeholder="Paste API key" style="flex:1;min-width:180px;padding:0.4rem;">
+              <button class="btn-secondary" @click="s.setupTestKey()" :disabled="!!s.setupBusy || s.setupKeyTest==='testing'" x-show="s.setupProvider && s.setupProvider.testable">Test</button>
+              <button class="btn" @click="s.setupSaveKey()" :disabled="!!s.setupBusy">Save</button>
+            </div>
+            <div style="margin-top:0.4rem;font-size:0.75rem;">
+              <span x-show="s.setupKeyTest==='testing'">Testing…</span>
+              <span x-show="s.setupKeyTest && s.setupKeyTest!=='testing' && s.setupKeyTest.valid===true" style="color:#5cb85c;">✓ Key works</span>
+              <span x-show="s.setupKeyTest && s.setupKeyTest!=='testing' && s.setupKeyTest.valid===false" style="color:#d9534f;" x-text="'✗ '+((s.setupKeyTest&&s.setupKeyTest.error)||'invalid')"></span>
+              <span x-show="s.setupKeyTest && s.setupKeyTest.valid===null" style="color:#f0ad4e;" x-text="(s.setupKeyTest&&s.setupKeyTest.error)||''"></span>
+            </div>
+            <div style="margin-top:0.4rem;"><button class="btn-secondary" @click="s.setupEnterIdentity()">Skip</button></div>
+          </div>
+
+          <!-- Step 3: identity (USER.md) -->
+          <div x-show="s.setupStep===3">
+            <p style="margin:0 0 0.5rem;">Tell Genesis who you are — this seeds USER.md. Edit and save.</p>
+            <textarea x-model="s.setupIdentity" rows="6" style="width:100%;box-sizing:border-box;font-family:monospace;font-size:0.78rem;padding:0.4rem;"></textarea>
+            <div style="margin-top:0.4rem;display:flex;gap:0.5rem;">
+              <button class="btn" @click="s.setupSaveIdentity()" :disabled="!!s.setupBusy">Save</button>
+              <button class="btn-secondary" @click="s.setupStep=4">Skip</button>
+            </div>
+          </div>
+
+          <!-- Step 4: done -->
+          <div x-show="s.setupStep===4">
+            <p style="margin:0;">🎉 You're set. Restart the server to apply the password and keys, then explore the tabs. This card hides once onboarding completes.</p>
+            <div style="margin-top:0.5rem;"><button class="btn" @click="s.dismissSetupCard()">Close</button></div>
+          </div>
+
+          <!-- inline message -->
+          <div x-show="s.setupMsg" style="margin-top:0.5rem;font-size:0.78rem;"
+               :style="s.setupMsg && s.setupMsg.type==='error' ? 'color:#d9534f' : 'color:#f0ad4e'"
+               x-text="s.setupMsg ? s.setupMsg.text : ''"></div>
+        </div>
+      </div>
+    </template>
+
     <!-- Panel 1: System Health [Tab: overview] -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
       <div class="panel-header">
