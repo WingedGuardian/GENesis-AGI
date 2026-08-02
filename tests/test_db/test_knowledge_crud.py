@@ -61,13 +61,34 @@ async def test_get_by_qdrant_ids_maps_on_qdrant_id_not_pk(db):
     )
     assert uid != "qd-point-1"  # the two id spaces are distinct
 
-    # Maps by qdrant_id → row, keyed by qdrant_id.
+    # Maps by qdrant_id → list of rows, keyed by qdrant_id.
     by_qdrant = await knowledge.get_by_qdrant_ids(db, ["qd-point-1"])
     assert set(by_qdrant) == {"qd-point-1"}
-    assert by_qdrant["qd-point-1"]["id"] == uid
+    assert [r["id"] for r in by_qdrant["qd-point-1"]] == [uid]
 
     # The primary key is NOT a qdrant_id → no match (the exact prod failure).
     assert await knowledge.get_by_qdrant_ids(db, [uid]) == {}
+
+
+async def test_get_by_qdrant_ids_preserves_shared_point(db):
+    """Two units sharing one Qdrant point are BOTH returned, never collapsed.
+
+    MemoryStore.store dedups identical content to a single Qdrant point, so two
+    units with the same body but different (project_type, domain, concept) keys
+    share a qdrant_id (the column is not UNIQUE). Collapsing to one row would
+    silently drop the other and could resolve a vector hit to the wrong unit.
+    """
+    uid_a = await knowledge.insert(
+        db, project_type="reference", domain="reference.url", source_doc="t",
+        concept="entry A", body="same body", qdrant_id="shared-point",
+    )
+    uid_b = await knowledge.insert(
+        db, project_type="genesis-infra", domain="claude-code", source_doc="t",
+        concept="entry B", body="same body", qdrant_id="shared-point",
+    )
+    by_qdrant = await knowledge.get_by_qdrant_ids(db, ["shared-point"])
+    assert set(by_qdrant) == {"shared-point"}
+    assert {r["id"] for r in by_qdrant["shared-point"]} == {uid_a, uid_b}
 
 
 async def test_get_by_qdrant_ids_empty_and_missing(db):

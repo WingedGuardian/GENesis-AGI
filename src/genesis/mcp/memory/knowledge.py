@@ -137,12 +137,15 @@ async def knowledge_recall(
     merged: list[dict] = []
 
     for r in vector_results:
-        unit_id = (by_qdrant.get(r.memory_id) or {}).get("id") or r.memory_id
-        # Self-dedup on the resolved id (symmetric with the FTS loop below):
-        # two Qdrant points resolving to the same knowledge_units row must not
-        # produce two rows. (A stale orphaned point with no row still resolves
-        # to its own raw id and can't be deduped here — that is a separate
-        # stale-point cleanup concern, out of scope for this id-space fix.)
+        # A Qdrant point can back multiple units (shared-content dedup), so
+        # resolve to a primary key only when it's unambiguous. On 0 rows (no
+        # knowledge_units row) or >1 (an ambiguous shared point) fall back to
+        # the raw Qdrant id — never mislabel with an arbitrary unit's pk, which
+        # could wrongly suppress that unit's FTS result.
+        hit_rows = by_qdrant.get(r.memory_id, [])
+        unit_id = hit_rows[0]["id"] if len(hit_rows) == 1 else r.memory_id
+        # Self-dedup on the resolved id (symmetric with the FTS loop below): two
+        # vector hits resolving to the same row must not produce two results.
         if unit_id in seen_ids:
             continue
         seen_ids.add(unit_id)
@@ -711,14 +714,14 @@ async def reference_lookup(
     # because both paths are keyed in the same (primary-key) id space.
     candidates: dict[str, dict] = {}  # unit_id -> {"row": row|None, "origin": str}
     for qid in vector_qids:
-        row = by_qdrant.get(qid)
-        if row is None:
-            # Vector hit with no knowledge_units row — a plain episodic memory,
-            # not a stored reference. It cannot be a reference entry, so it is
-            # correctly excluded here (the project_type filter would drop it
-            # anyway); nothing broken is being suppressed.
-            continue
-        candidates.setdefault(row["id"], {"row": row, "origin": "vector"})
+        # A Qdrant point can back multiple units (shared-content dedup), and a
+        # point with no knowledge_units row (a plain episodic memory) yields an
+        # empty list. Add every backing row as a candidate; the project_type /
+        # domain filter below keeps only the reference rows — so a point shared
+        # by a reference and a non-reference resolves to the reference without
+        # dropping it, and a non-reference point is correctly excluded.
+        for row in by_qdrant.get(qid, []):
+            candidates.setdefault(row["id"], {"row": row, "origin": "vector"})
     for f in fts_results:
         uid = f["unit_id"]
         if uid in candidates:
