@@ -29,6 +29,38 @@ _spec = importlib.util.spec_from_file_location("hook_input", _HOOKS_DIR / "hook_
 _hook_input = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_hook_input)
 run_guard = _hook_input.run_guard
+brace_expand = _hook_input.brace_expand
+
+
+class TestBraceExpand:
+    def test_no_brace(self):
+        assert brace_expand("a/b/c") == ["a/b/c"]
+
+    def test_simple_comma(self):
+        assert sorted(brace_expand("a/{b,c}")) == ["a/b", "a/c"]
+
+    def test_trailing_comma_empty_option(self):
+        assert sorted(brace_expand("a/{b,}")) == ["a/", "a/b"]
+
+    def test_multiple_groups(self):
+        assert sorted(brace_expand("{a,b}/{c,d}")) == ["a/c", "a/d", "b/c", "b/d"]
+
+    def test_nested(self):
+        # A superset (with harmless duplicates) is fine for a guard — it never
+        # MISSES a target. bash yields {a,b,c}; we cover at least those.
+        assert set(brace_expand("{a,{b,c}}")) == {"a", "b", "c"}
+
+    def test_single_item_brace_no_comma_is_literal(self):
+        # No comma → not an expansion; bash leaves it literal.
+        assert brace_expand("x{data}") == ["x{data}"]
+
+    def test_numeric_range_not_expanded(self):
+        assert brace_expand("v{1..3}") == ["v{1..3}"]
+
+    def test_brace_bomb_raises(self):
+        bomb = "".join("{a,b}" for _ in range(20)) + "/x"
+        with pytest.raises(ValueError, match="too large"):
+            brace_expand(bomb)
 
 
 # ---------------------------------------------------------------------------

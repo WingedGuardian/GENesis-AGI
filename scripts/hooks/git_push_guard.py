@@ -239,47 +239,65 @@ def _get_push_remote_and_branch(seg, cwd: str | None = None) -> tuple[str | None
     return remote, branch
 
 
+# A gh --repo/-R (or PR URL) is PRESENT but cannot be resolved to a plain
+# github.com OWNER/REPO (a shell variable, an enterprise HOST/OWNER/REPO, a URL
+# with extra path). Callers MUST fail closed on this — gating the cwd repo while
+# gh merges elsewhere is exactly the wrong-repo bug _merge_target_repo prevents.
+_REPO_UNRESOLVED = object()
+
+
 def _normalize_repo(value: str) -> str | None:
-    """Normalize a gh --repo value (OWNER/REPO, HOST/OWNER/REPO, or URL) to
-    the OWNER/REPO form usable in both `gh --repo` and `gh api repos/…` paths.
-    Returns None for a value we cannot see through (e.g. a shell variable) —
-    callers then fail closed on the gh calls it feeds."""
+    """A plain github.com OWNER/REPO from a gh --repo value, or None if it cannot
+    be resolved to one.
+
+    Accepts ``owner/repo``, ``github.com/owner/repo``, and a github.com URL.
+    Returns None for a shell variable (``$X`` / backtick), an enterprise
+    ``HOST/OWNER/REPO`` (would misnormalize to github.com and gate the wrong
+    repo), or any other shape — the caller turns None-when-present into a
+    fail-closed block. Genesis is github.com-only, so refusing the exotic forms
+    is safe (a user can re-issue as OWNER/REPO)."""
     if not value or "$" in value or "`" in value:
         return None
-    v = value.split("://", 1)[-1]  # strip scheme if a URL
+    v = value.strip().split("://", 1)[-1]  # strip scheme if a URL
+    if v.startswith("github.com/"):
+        v = v[len("github.com/") :]
     parts = [p for p in v.split("/") if p]
-    if len(parts) < 2:
+    if len(parts) != 2:  # not a plain OWNER/REPO (host-prefixed / malformed)
         return None
-    return f"{parts[-2]}/{parts[-1]}"
+    return f"{parts[0]}/{parts[1]}"
 
 
-def _merge_target_repo(argv: list[str], cmd: str) -> str | None:
-    """The repo a `gh pr merge` explicitly targets, normalized, or None.
+def _merge_target_repo(argv: list[str], cmd: str):
+    """The repo a `gh pr merge` explicitly targets. Returns one of:
 
-    Sources, in order: an explicit `--repo <v>` / `--repo=<v>` / `-R <v>` /
-    `-R<v>` anywhere in the segment argv (gh pflag accepts any position), else
-    the owner/repo of a full PR URL in the command. None = no explicit target
-    → the gates use gh's cwd-repo resolution (current behavior).
+    * ``str`` — a normalized github.com OWNER/REPO to gate against;
+    * ``None`` — NO explicit ``--repo``/``-R``/URL → gate gh's cwd repo (default);
+    * ``_REPO_UNRESOLVED`` — an explicit target we cannot resolve → caller fails
+      CLOSED. This is the fix for the residual the first cut missed: a variable
+      ``--repo "$X"`` normalized to None and was indistinguishable from "no
+      --repo", so the gates silently ran against the cwd repo while gh merged
+      ``$X`` — re-opening the 2026-07-26 wrong-repo class through the fix itself.
 
-    Why this exists (2026-07-26 incident): every merge gate ran `gh pr view
-    <N>` / `gh api repos/:owner/:repo/…` against the CWD repo, so merging a
-    cross-repo PR checked the WRONG repo's PR #N — a permanent false block
-    when that PR is closed/UNKNOWN, or worse a wrong-PR gate PASS.
+    Sources: ``--repo <v>`` / ``--repo=<v>`` / ``-R <v>`` / ``-R<v>`` anywhere in
+    the segment argv (gh pflag accepts any position), else a full PR URL in cmd.
     """
     argv = argv or []
     i = 0
     while i < len(argv):
         tok = argv[i]
         if tok in ("--repo", "-R") and i + 1 < len(argv):
-            return _normalize_repo(argv[i + 1])
+            return _normalize_repo(argv[i + 1]) or _REPO_UNRESOLVED
         if tok.startswith("--repo="):
-            return _normalize_repo(tok.split("=", 1)[1])
+            return _normalize_repo(tok.split("=", 1)[1]) or _REPO_UNRESOLVED
         if tok.startswith("-R") and len(tok) > 2 and not tok.startswith("--"):
-            return _normalize_repo(tok[2:])  # glued short form -Rowner/repo
+            return _normalize_repo(tok[2:]) or _REPO_UNRESOLVED  # glued -Rowner/repo
         i += 1
     url = re.search(r"(?:https?://)?([^/\s]+)/([^/\s]+)/([^/\s]+)/pull/\d+", cmd)
     if url:
-        return _normalize_repo(f"{url.group(2)}/{url.group(3)}")
+        host, owner, repo = url.group(1), url.group(2), url.group(3)
+        if "." in host and host != "github.com":
+            return _REPO_UNRESOLVED  # enterprise host — can't gate via github.com
+        return _normalize_repo(f"{owner}/{repo}") or _REPO_UNRESOLVED
     return None
 
 
@@ -1573,6 +1591,18 @@ def main() -> int:
             # without it, merging a cross-repo PR checked the CWD repo's
             # same-numbered PR (wrong-repo gate; 2026-07-26 incident).
             merge_repo = _merge_target_repo(merge_seg.argv, cmd)
+            if merge_repo is _REPO_UNRESOLVED:
+                print(
+                    "BLOCKED: cannot resolve the target repo of this --repo/-R "
+                    "merge (a variable, an enterprise host, or an odd URL).",
+                    file=sys.stderr,
+                )
+                print(
+                    "Specify it as OWNER/REPO so the CI/review gates check the "
+                    "right repository, not the current directory's.",
+                    file=sys.stderr,
+                )
+                return 2
             pr_num = _resolve_pr_number(cmd, repo=merge_repo)
             if pr_num is None:
                 print(

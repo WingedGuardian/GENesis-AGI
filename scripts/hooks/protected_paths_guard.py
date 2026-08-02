@@ -44,7 +44,7 @@ import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import read_payload, run_guard, tool_input  # noqa: E402
+from hook_input import brace_expand, read_payload, run_guard, tool_input  # noqa: E402
 from shell_parse import analyze  # noqa: E402
 
 # Directories that must never be deleted.  Relative to $HOME.
@@ -202,12 +202,15 @@ def main() -> int:
         if seg.exe not in ("rm", "rmdir"):
             continue
         unresolved_here = False
-        for operand in _rm_operands(seg.argv):
-            reason = _operand_blocks(operand, cwd, dirs, files)
-            if reason:
-                return _block(reason)
-            if _expand(operand, cwd) is None:
-                unresolved_here = True
+        for raw_operand in _rm_operands(seg.argv):
+            # Bash brace-expands an unquoted operand before rm runs, so check
+            # each real target (rm -rf ~/genesis/{data,logs} → …/data, …/logs).
+            for operand in brace_expand(raw_operand):
+                reason = _operand_blocks(operand, cwd, dirs, files)
+                if reason:
+                    return _block(reason)
+                if _expand(operand, cwd) is None:
+                    unresolved_here = True
         if unresolved_here:
             # A relative rm target with no resolvable base: substring-check
             # THIS SEGMENT's raw text (not the whole command — that would

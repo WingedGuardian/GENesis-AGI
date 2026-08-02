@@ -70,7 +70,10 @@ def _is_full_suite(cmd: str) -> bool:
             if arg.startswith("-"):
                 # A -k/-m selector (separate value or =form) narrows the run to
                 # a named subset — treating it as "full suite" was a cosmetic FP.
-                if arg in ("-k", "-m") and i + 1 < len(args) or arg.startswith(("-k", "-m", "--keyword", "--markers")) and "=" in arg:
+                _sep_val = arg in ("-k", "-m") and i + 1 < len(args)
+                _eq_form = arg.startswith(("-k", "-m", "--keyword", "--markers")) and "=" in arg
+                _glued = arg.startswith(("-k", "-m")) and len(arg) > 2 and "=" not in arg
+                if _sep_val or _eq_form or _glued:
                     has_selector = True
                 # Flag — skip it (and its value if it takes one)
                 if arg in (

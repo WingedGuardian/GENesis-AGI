@@ -29,7 +29,7 @@ import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload, run_guard  # noqa: E402
+from hook_input import brace_expand, field, read_payload, run_guard  # noqa: E402
 
 # Legacy single-token pattern — kept as the fallback when shlex cannot
 # tokenize the command (unmatched quotes etc.).
@@ -160,9 +160,13 @@ def _rm_violations(cmd: str) -> list[str] | None:
 
         if recursive and force:
             for operand in operands:
-                reason = _check_target(operand)
-                if reason:
-                    violations.append(reason)
+                # Bash brace-expands an unquoted operand before rm runs, so the
+                # depth check must see each real target, not the opaque
+                # `~/genesis/{data,logs}` token (which is depth-4 and passes).
+                for expanded in brace_expand(operand):
+                    reason = _check_target(expanded)
+                    if reason:
+                        violations.append(reason)
     return violations
 
 

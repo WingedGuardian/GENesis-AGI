@@ -194,6 +194,41 @@ class TestUnparseableFallback:
         assert r.returncode == 0, r.stderr
 
 
+class TestBraceExpansion:
+    """REGRESSION (adversarial review, 2026-08-01): bash brace-expands an
+    unquoted operand BEFORE rm runs, so `rm -rf ~/genesis/{data,logs}` deletes
+    the protected DB dir — but the guard saw one opaque, non-glob, depth-4 token
+    and allowed it. Each real expansion must now be checked."""
+
+    def test_comma_brace_hits_protected_dir(self, fake_home):
+        r = _run(f"rm -rf {H}/genesis/{{data,logs}}", fake_home)
+        assert r.returncode == 2
+        assert "genesis/data" in r.stderr
+
+    def test_trailing_comma_expands_to_parent(self, fake_home):
+        """`{data,}` → data AND '' → the parent dir (an ancestor) blocks."""
+        r = _run(f"rm -rf {H}/genesis/{{data,}}", fake_home)
+        assert r.returncode == 2
+
+    def test_glob_under_expanded_protected(self, fake_home):
+        r = _run(f"rm -rf {H}/genesis/{{data,logs}}/*", fake_home)
+        assert r.returncode == 2
+
+    def test_nested_brace_reaches_protected(self, fake_home):
+        r = _run(f"rm -rf {H}/genesis/{{da{{ta,}},logs}}", fake_home)
+        assert r.returncode == 2
+
+    def test_unrelated_brace_allowed(self, fake_home):
+        r = _run(f"rm -rf {H}/tmp/build/{{a,b,c}}", fake_home)
+        assert r.returncode == 0, r.stderr
+
+    def test_brace_bomb_fails_closed(self, fake_home):
+        """A combinatorial blow-up raises → run_guard fails CLOSED (blocks)."""
+        bomb = "rm -rf " + "".join("{a,b}" for _ in range(20)) + "/x"
+        r = _run(bomb, fake_home)
+        assert r.returncode == 2
+
+
 class TestPayloadEdges:
     def test_empty_command(self, fake_home):
         r = _run("", fake_home)

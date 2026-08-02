@@ -96,6 +96,13 @@ class TestFullSuiteSelector:
     def test_path_still_recognized(self):
         assert _fsg._is_full_suite("pytest tests/test_x.py") is False
 
+    def test_glued_k_selector(self):
+        """Glued short form `-kfoo` is a selector, not the full suite (NOTE 4)."""
+        assert _fsg._is_full_suite("pytest -kfoo") is False
+
+    def test_glued_m_selector(self):
+        assert _fsg._is_full_suite("pytest -mslow") is False
+
     def test_k_without_value_is_full_suite(self):
         """A dangling -k with no value is not a real selection."""
         assert _fsg._is_full_suite("pytest -k") is True

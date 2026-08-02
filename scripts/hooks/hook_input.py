@@ -160,6 +160,49 @@ def run_guard(main_fn, name: str) -> None:
     sys.exit(code if isinstance(code, int) else 0)
 
 
+_BRACE_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+_BRACE_MAX = 1024
+
+
+def brace_expand(token: str) -> list[str]:
+    """Expand a bash comma-brace token into the paths it actually produces.
+
+    ``a/{b,c}`` → ``["a/b", "a/c"]``; ``a/{b,}`` → ``["a/b", "a/"]`` (an empty
+    option yields the parent). Recurses so multiple/nested groups expand. A
+    token with no comma-brace returns ``[token]`` unchanged.
+
+    Why the rm guards need this: bash brace-expands an unquoted target BEFORE
+    ``rm`` ever runs, so ``rm -rf ~/genesis/{data,logs}`` deletes
+    ``~/genesis/data`` — but a guard that inspects the single opaque token
+    ``~/genesis/{data,logs}`` sees no glob, no exact/ancestor match, and a
+    depth of 4, so it waves the command through. Expanding first makes each real
+    target visible to the depth/protected checks.
+
+    Numeric ranges (``{1..3}``) are deliberately NOT expanded — a rare shape for
+    a deletion target. An absurd combinatorial blow-up (a brace bomb) raises
+    ValueError; callers are run_guard-wrapped, so that fails CLOSED (blocks).
+    Quote/expansion nuances are handled by shlex upstream, matching the sibling
+    guards' "shlex is the sole authority on quoting" posture.
+    """
+    result: list[str] = []
+    stack = [token]
+    while stack:
+        t = stack.pop()
+        m = _BRACE_RE.search(t)
+        if not m:
+            result.append(t)
+            if len(result) > _BRACE_MAX:
+                raise ValueError("brace expansion too large — refusing (fail closed)")
+            continue
+        pre, post = t[: m.start()], t[m.end() :]
+        opts = m.group(1).split(",")
+        if len(stack) + len(opts) > _BRACE_MAX:
+            raise ValueError("brace expansion too large — refusing (fail closed)")
+        for opt in opts:
+            stack.append(pre + opt + post)
+    return result
+
+
 def strip_quoted(command: str) -> str:
     """Return ``command`` with quoted regions removed.
 
