@@ -1236,7 +1236,17 @@ verified: 9037d45b 2026-07-07
 - **contribution/**: `python -m genesis contribute <sha>` — sanitize-then-PR
   upstream, pseudonymous. `sanitize.scan_diff()` is FAIL-CLOSED (8 scanners;
   any finding stops). Its forbidden-globs floor duplicates
-  `config/protected_paths.yaml` — keep in sync.
+  `config/protected_paths.yaml` — keep in sync. **Leak-detection is three-layer,
+  no private value hardcoded in tracked source** (a public scanner must not name
+  what it redacts): (1) generic CLASS patterns in the tree — all RFC1918, CGNAT,
+  fc00::/7 ULA, `/home/<user>` shapes, reusing `scripts/check_portability.sh`
+  vocabulary; (2) EXACT install values in the local, generated fingerprint file
+  (`~/.genesis/release-fingerprints.txt`, see `contribution/fingerprints.py`) —
+  consumed by `_check_fingerprints`, the commit-msg hook, and the pre-push hook;
+  (3) the same exact values in the `GENESIS_PRIVATE_PATTERNS` CI secret. CI is
+  WARN-not-block on the broad classes (never hard-blocks a contributor's legit
+  RFC1918 example); only exact-value matches hard-fail, on canonical non-fork
+  PRs. Procedure: `public-repo leak-detection design`.
 - **bookmark/**: two-tier session bookmarks stored as episodic memories +
   a lookup table; enrichment runs on surplus compute.
 - **workflows/**: YAML DAG executor — GROUNDWORK(workflow-engine), built with
