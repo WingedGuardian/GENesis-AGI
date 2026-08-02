@@ -41,16 +41,23 @@ def _payload(tool_name: str, tool_input: dict) -> str:
     )
 
 
-def _run(script_rel: str, stdin: str, *, env_var: str | None = None):
+def _run(script_rel: str, stdin: str, *, env_var: str | None = None, dispatched: bool = False):
     """Run a hook script, payload on stdin (or the legacy env var). Returns CompletedProcess.
 
     CLAUDE_TOOL_INPUT is scrubbed from the child env so a stray value on the
-    test host can never mask a stdin-parsing regression.
+    test host can never mask a stdin-parsing regression. ``dispatched`` stamps
+    GENESIS_CC_SESSION=1 for guards whose block path is dispatched-only
+    (pretool_check); it is force-cleared otherwise so the suite is deterministic
+    regardless of whether pytest itself runs in a dispatched session.
     """
     import os
 
     env = dict(os.environ)
     env.pop("CLAUDE_TOOL_INPUT", None)
+    if dispatched:
+        env["GENESIS_CC_SESSION"] = "1"
+    else:
+        env.pop("GENESIS_CC_SESSION", None)
     piped = stdin
     if env_var is not None:
         env["CLAUDE_TOOL_INPUT"] = env_var
@@ -98,6 +105,10 @@ _BLOCKING_CASES = [
         {"command": "git commit --no-verify -m x"},
         True,
     ),
+    # pretool_check blocks CRITICAL paths in a DISPATCHED session only (matches
+    # the config's "direct sessions allowed" intent); the case runs dispatched so
+    # the block path is exercised. Its interactive-allow behavior is asserted
+    # separately below.
     ("pretool_check.py", "Write", {"file_path": "/x/secrets.env", "content": "a"}, True),
     ("pretool_check.py", "Write", {"file_path": "/x/normal.py", "content": "a"}, False),
 ]
@@ -106,12 +117,25 @@ _BLOCKING_CASES = [
 @pytest.mark.parametrize("script,tool,ti,must_block", _BLOCKING_CASES)
 def test_guard_acts_on_real_stdin_payload(script, tool, ti, must_block):
     """Each guard must (not) block when fed the real stdin+nested payload."""
-    proc = _run(script, _payload(tool, ti))
+    # pretool_check's block path is dispatched-only; every other guard here
+    # hard-blocks in any session.
+    proc = _run(script, _payload(tool, ti), dispatched=(script == "pretool_check.py"))
     blocked = proc.returncode == 2
     assert blocked is must_block, (
         f"{script} returncode={proc.returncode} (want block={must_block}); "
         f"stderr={proc.stderr[:200]!r}"
     )
+
+
+def test_pretool_check_interactive_does_not_block():
+    """A direct interactive session (no GENESIS_CC_SESSION) is allowed to edit a
+    CRITICAL path — the block targets dispatched/relay channels only."""
+    proc = _run(
+        "pretool_check.py",
+        _payload("Write", {"file_path": "/x/secrets.env", "content": "a"}),
+        dispatched=False,
+    )
+    assert proc.returncode == 0, f"interactive critical-path edit must be allowed: {proc.stderr!r}"
 
 
 def test_legacy_env_var_still_honored():
