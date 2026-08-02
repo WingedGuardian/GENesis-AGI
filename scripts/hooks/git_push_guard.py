@@ -25,7 +25,7 @@ import sys
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
 # (importlib does not add the file's dir to sys.path).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload  # noqa: E402
+from hook_input import field, read_payload, run_guard  # noqa: E402
 from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
@@ -239,6 +239,71 @@ def _get_push_remote_and_branch(seg, cwd: str | None = None) -> tuple[str | None
     return remote, branch
 
 
+# A gh --repo/-R (or PR URL) is PRESENT but cannot be resolved to a plain
+# github.com OWNER/REPO (a shell variable, an enterprise HOST/OWNER/REPO, a URL
+# with extra path). Callers MUST fail closed on this — gating the cwd repo while
+# gh merges elsewhere is exactly the wrong-repo bug _merge_target_repo prevents.
+_REPO_UNRESOLVED = object()
+
+
+def _normalize_repo(value: str) -> str | None:
+    """A plain github.com OWNER/REPO from a gh --repo value, or None if it cannot
+    be resolved to one.
+
+    Accepts ``owner/repo``, ``github.com/owner/repo``, and a github.com URL.
+    Returns None for a shell variable (``$X`` / backtick), an enterprise
+    ``HOST/OWNER/REPO`` (would misnormalize to github.com and gate the wrong
+    repo), or any other shape — the caller turns None-when-present into a
+    fail-closed block. Genesis is github.com-only, so refusing the exotic forms
+    is safe (a user can re-issue as OWNER/REPO)."""
+    if not value or "$" in value or "`" in value:
+        return None
+    v = value.strip().split("://", 1)[-1]  # strip scheme if a URL
+    parts = [p for p in v.split("/") if p]
+    # Drop a leading github.com HOST COMPONENT (exact match of the first path
+    # segment — NOT a substring test, which would mishandle `github.com.evil/…`
+    # or `evilgithub.com/…`; CodeQL py/incomplete-url-substring-sanitization).
+    if parts and parts[0] == "github.com":
+        parts = parts[1:]
+    if len(parts) != 2:  # not a plain OWNER/REPO (host-prefixed / malformed)
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _merge_target_repo(argv: list[str], cmd: str):
+    """The repo a `gh pr merge` explicitly targets. Returns one of:
+
+    * ``str`` — a normalized github.com OWNER/REPO to gate against;
+    * ``None`` — NO explicit ``--repo``/``-R``/URL → gate gh's cwd repo (default);
+    * ``_REPO_UNRESOLVED`` — an explicit target we cannot resolve → caller fails
+      CLOSED. This is the fix for the residual the first cut missed: a variable
+      ``--repo "$X"`` normalized to None and was indistinguishable from "no
+      --repo", so the gates silently ran against the cwd repo while gh merged
+      ``$X`` — re-opening the 2026-07-26 wrong-repo class through the fix itself.
+
+    Sources: ``--repo <v>`` / ``--repo=<v>`` / ``-R <v>`` / ``-R<v>`` anywhere in
+    the segment argv (gh pflag accepts any position), else a full PR URL in cmd.
+    """
+    argv = argv or []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--repo", "-R") and i + 1 < len(argv):
+            return _normalize_repo(argv[i + 1]) or _REPO_UNRESOLVED
+        if tok.startswith("--repo="):
+            return _normalize_repo(tok.split("=", 1)[1]) or _REPO_UNRESOLVED
+        if tok.startswith("-R") and len(tok) > 2 and not tok.startswith("--"):
+            return _normalize_repo(tok[2:]) or _REPO_UNRESOLVED  # glued -Rowner/repo
+        i += 1
+    url = re.search(r"(?:https?://)?([^/\s]+)/([^/\s]+)/([^/\s]+)/pull/\d+", cmd)
+    if url:
+        host, owner, repo = url.group(1), url.group(2), url.group(3)
+        if "." in host and host != "github.com":
+            return _REPO_UNRESOLVED  # enterprise host — can't gate via github.com
+        return _normalize_repo(f"{owner}/{repo}") or _REPO_UNRESOLVED
+    return None
+
+
 def _extract_pr_number(cmd: str) -> str | None:
     """PR number from a gh pr merge command (bare number, #N, or URL)."""
     match = re.search(r"\bgh pr merge\b(.*)$", cmd, re.DOTALL)
@@ -275,7 +340,12 @@ def _extract_pr_number(cmd: str) -> str | None:
     return None
 
 
-def _resolve_pr_number(cmd: str) -> str | None:
+def _repo_args(repo: str | None) -> list[str]:
+    """gh CLI args selecting an explicit target repo (empty = cwd repo)."""
+    return ["--repo", repo] if repo else []
+
+
+def _resolve_pr_number(cmd: str, repo: str | None = None) -> str | None:
     """Command PR number, else the current branch's open PR.
 
     No-arg `gh pr merge` from a PR branch is valid gh usage, but it
@@ -283,13 +353,18 @@ def _resolve_pr_number(cmd: str) -> str | None:
     `if pr_num:`) — the 2026-07-10 audit points at this as a mechanism
     behind findings-ignored merges. Resolution failure is the caller's
     signal to fail CLOSED for merge commands.
+
+    With an explicit ``repo`` and no number in the command, `gh pr view
+    --repo` errors (a selector is required) → None → the caller fails CLOSED.
+    That is deliberate: resolving the CWD branch's PR *number* and gating it
+    against a DIFFERENT repo would re-create the wrong-PR bug this fix kills.
     """
     pr_num = _extract_pr_number(cmd)
     if pr_num:
         return pr_num
     try:
         result = subprocess.run(
-            ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
+            ["gh", "pr", "view", *_repo_args(repo), "--json", "number", "--jq", ".number"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -302,11 +377,21 @@ def _resolve_pr_number(cmd: str) -> str | None:
     return None
 
 
-def _check_mergeable(pr_num: str) -> str | None:
+def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
     """Query GitHub for PR mergeable status. Returns MERGEABLE/UNKNOWN/CONFLICTING or None."""
     try:
         result = subprocess.run(
-            ["gh", "pr", "view", pr_num, "--json", "mergeable", "--jq", ".mergeable"],
+            [
+                "gh",
+                "pr",
+                "view",
+                pr_num,
+                *_repo_args(repo),
+                "--json",
+                "mergeable",
+                "--jq",
+                ".mergeable",
+            ],
             capture_output=True,
             text=True,
             timeout=10,
@@ -327,7 +412,7 @@ _CI_GREEN = {"SUCCESS"}
 _CI_TERMINAL_STATUSES = {"COMPLETED"}
 
 
-def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
+def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
     """Classify a PR's CI check-runs.
 
     Returns ``(state, problem_checks)`` where state is one of:
@@ -351,6 +436,7 @@ def _pr_ci_status(pr_num: str) -> tuple[str, list[str]]:
                     "pr",
                     "view",
                     pr_num,
+                    *_repo_args(repo),
                     "--json",
                     "statusCheckRollup",
                     "--jq",
@@ -467,6 +553,7 @@ def _check_inline_review_findings(
     pr_num: str,
     *,
     force: bool = False,
+    repo: str | None = None,
 ) -> tuple[bool, str]:
     """Scan INLINE review comments for P1/P2 badge findings.
 
@@ -486,7 +573,7 @@ def _check_inline_review_findings(
             [
                 "gh",
                 "api",
-                f"repos/:owner/:repo/pulls/{pr_num}/comments",
+                f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/comments",
                 "--paginate",
                 "--jq",
                 ".[] | {id: .id, reply_to: .in_reply_to_id, "
@@ -537,7 +624,9 @@ def _check_inline_review_findings(
     return False, ""
 
 
-def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool, str]:
+def _check_pr_review_findings(
+    pr_num: str, *, force: bool = False, repo: str | None = None
+) -> tuple[bool, str]:
     """Check PR comments for unresolved automated review findings.
 
     Returns (should_block, message).
@@ -558,7 +647,7 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
             [
                 "gh",
                 "api",
-                f"repos/:owner/:repo/issues/{pr_num}/comments",
+                f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
                 "--jq",
                 "[.[] | {login: .user.login, type: .user.type, body: .body}]",
             ],
@@ -1501,7 +1590,26 @@ def main() -> int:
             # Check mergeable status before allowing merge. Merge is
             # the one command that fails CLOSED: if we can't tell which
             # PR this is, we can't run the gates, so we don't merge.
-            pr_num = _resolve_pr_number(cmd)
+            # An explicit --repo/-R (or PR URL) retargets EVERY gate below —
+            # without it, merging a cross-repo PR checked the CWD repo's
+            # same-numbered PR (wrong-repo gate; 2026-07-26 incident).
+            # Pass the merge SEGMENT's raw text (not the whole compound command)
+            # so an unrelated segment's PR URL cannot select the gated repo
+            # (`echo …/other/repo/pull/9 && gh pr merge 12` must gate the cwd repo).
+            merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
+            if merge_repo is _REPO_UNRESOLVED:
+                print(
+                    "BLOCKED: cannot resolve the target repo of this --repo/-R "
+                    "merge (a variable, an enterprise host, or an odd URL).",
+                    file=sys.stderr,
+                )
+                print(
+                    "Specify it as OWNER/REPO so the CI/review gates check the "
+                    "right repository, not the current directory's.",
+                    file=sys.stderr,
+                )
+                return 2
+            pr_num = _resolve_pr_number(cmd, repo=merge_repo)
             if pr_num is None:
                 print(
                     "BLOCKED: cannot resolve which PR this merges "
@@ -1515,7 +1623,7 @@ def main() -> int:
                 )
                 return 2
             if pr_num:
-                mergeable = _check_mergeable(pr_num)
+                mergeable = _check_mergeable(pr_num, repo=merge_repo)
                 if mergeable == "UNKNOWN":
                     print(
                         f"BLOCKED: PR #{pr_num} mergeable status is UNKNOWN.",
@@ -1542,7 +1650,7 @@ def main() -> int:
                 # `# ci-override` is appended (never waived by --admin or
                 # # review-override). Fail-OPEN on "unknown" so a transient API
                 # hiccup can't wedge merges.
-                ci_state, ci_bad = _pr_ci_status(pr_num)
+                ci_state, ci_bad = _pr_ci_status(pr_num, repo=merge_repo)
                 ci_override = has_trailing_override(merge_seg.raw, "ci-override")
                 if ci_state in ("red", "pending") and not ci_override:
                     print(
@@ -1572,6 +1680,7 @@ def main() -> int:
                 should_block, review_msg = _check_pr_review_findings(
                     pr_num,
                     force=force_override,
+                    repo=merge_repo,
                 )
                 if should_block:
                     print(
@@ -1586,6 +1695,7 @@ def main() -> int:
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,
+                    repo=merge_repo,
                 )
                 if should_block:
                     print(
@@ -1663,11 +1773,17 @@ def main() -> int:
                 "branch already on the remote) — no push, so no separate approval"
             )
 
-    except Exception:
-        pass  # Fail-open on any error — never block legitimate work
+    except (json.JSONDecodeError, KeyError):
+        # A malformed/partial payload is a parse-ambiguity fail-open (matches the
+        # sibling guards). Any OTHER exception is an orchestration BUG and must
+        # NOT silently allow a push/merge — it propagates to run_guard(), which
+        # fails CLOSED (exit 2). The per-check network/parse helpers keep their
+        # own intentional inner fail-opens; this only removes the blanket
+        # swallow-everything that turned real bugs into silent allows.
+        return 0
 
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_guard(main, "git_push_guard")

@@ -2,8 +2,40 @@
 # PreToolUse hook for Bash commands — blocks destructive operations.
 # CC passes tool input as JSON on stdin with schema:
 #   { "tool_input": { "command": "..." }, "tool_name": "Bash", ... }
+#
+# This is the GLOBAL chokepoint (user-level ~/.claude/settings.json): it fires
+# for EVERY Bash call in EVERY directory, including non-genesis projects where
+# the project-level Python guards are not loaded.
+#
+# 2026-08 rewrite (guard-correctness PR):
+#   * rm checks DELEGATE to the token-parsing Python guards
+#     (scripts/hooks/destructive_command_guard.py + protected_paths_guard.py)
+#     instead of substring globs — the old *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*
+#     cases blocked rm -rf on ANY absolute path, ANY ~/ path, and ANY
+#     .-prefixed relative (.venv, .pytest_cache): a standing false-positive
+#     cluster. USER-APPROVED POLICY (2026-08-01): deep non-protected paths
+#     (depth >= 4) are now deletable everywhere; shallow/broad targets and the
+#     protected data dirs (genesis data/DB, transcripts, backups, snapshots,
+#     browser profiles) stay hard-blocked. If the guards are unavailable or
+#     crash, the legacy globs run instead (degraded, never open).
+#   * force-push detection is scoped to the SEGMENT containing `git push`
+#     (split on ; && || | and newlines) — `rm -f x && git push` is not a
+#     force push. Residual (documented): the split is quote-naive, so a
+#     separator inside quotes can hide a same-segment -f from THIS hook;
+#     inside genesis the argv-based git_push_guard still catches it.
+#   * the soft push/PR reminders and the gh-pr-merge gate are SKIPPED inside
+#     the genesis repo for interactive sessions — the project-level
+#     git_push_guard runs the same (richer) gates there, and the duplicate
+#     cost 2x live gh API calls per merge (audit D4). Dispatched sessions
+#     (GENESIS_CC_SESSION=1) keep this belt until project-hook coverage in
+#     autonomous sessions is separately verified.
 
-CMD=$(jq -r '.tool_input.command // empty' 2>/dev/null)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Capture the payload ONCE — jq consumes stdin, and the rm delegation below
+# needs the verbatim payload to re-feed the Python guards.
+RAW=$(cat)
+CMD=$(printf '%s' "$RAW" | jq -r '.tool_input.command // empty' 2>/dev/null)
 [ -z "$CMD" ] && exit 0
 
 # Bash allowlist gate — scoped background profiles (e.g. "steward") export
@@ -33,6 +65,19 @@ if [ -n "$GENESIS_BASH_ALLOWLIST" ]; then
     esac
 fi
 
+# Is the CURRENT cwd inside a genesis checkout — i.e. one whose project-level
+# git_push_guard.py is loaded for this session? Detected by resolving the
+# repo's MAIN worktree root (git-common-dir's parent, so a linked worktree
+# resolves to main) and checking it carries the project push guard. This is
+# cwd-based, not tied to where THIS user-level script physically lives, so it
+# works for the deployed main-tree copy and any worktree copy alike.
+_in_genesis=0
+_gc=$(git rev-parse --git-common-dir 2>/dev/null)
+if [ -n "$_gc" ]; then
+    _main_root=$(cd "$(dirname "$_gc")" 2>/dev/null && pwd)
+    [ -n "$_main_root" ] && [ -f "$_main_root/scripts/hooks/git_push_guard.py" ] && _in_genesis=1
+fi
+
 # pip install -e from/to worktree — catches both explicit worktree paths AND
 # "pip install -e ." run from inside a worktree directory.
 if echo "$CMD" | grep -qE "pip install.*(-e|--editable)"; then
@@ -40,7 +85,6 @@ if echo "$CMD" | grep -qE "pip install.*(-e|--editable)"; then
     # Check 1: explicit worktree path in command
     echo "$CMD" | grep -qiE "worktree" && _block=1
     # Check 2: CWD is a git worktree (git-common-dir != git-dir)
-    _gc=$(git rev-parse --git-common-dir 2>/dev/null)
     _gd=$(git rev-parse --git-dir 2>/dev/null)
     [ -n "$_gc" ] && [ -n "$_gd" ] && [ "$_gc" != "$_gd" ] && _block=1
     if [ "$_block" = 1 ]; then
@@ -63,7 +107,6 @@ if echo "$CMD" | grep -qE "genesis[[:space:]]+serve"; then
     # Check 1: explicit worktree path anywhere in the command (incl. PYTHONPATH=)
     echo "$CMD" | grep -qiE "worktree" && _block=1
     # Check 2: CWD is a git worktree (git-common-dir != git-dir)
-    _gc=$(git rev-parse --git-common-dir 2>/dev/null)
     _gd=$(git rev-parse --git-dir 2>/dev/null)
     [ -n "$_gc" ] && [ -n "$_gd" ] && [ "$_gc" != "$_gd" ] && _block=1
     if [ "$_block" = 1 ]; then
@@ -83,13 +126,44 @@ if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
     exit 2
 fi
 
-# Hard-blocked destructive commands — checked BEFORE the softer push/PR warnings
-# below, because the generic "git push" warning (exit 0) would otherwise
-# short-circuit a force-push before this block could hard-block it.
+# rm safety — delegate to the token-parsing Python guards (one parser, zero
+# divergence with the project-level hooks). Pre-filtered on *rm* so the
+# python spawn cost (~50ms) is paid only when an rm might be present.
 case "$CMD" in
-    *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*)  # "rm -rf ." also covers ".."
-        echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
-        exit 2;;
+    *rm*)
+        _delegated=0
+        _py=$(command -v python3 2>/dev/null || true)
+        if [ -n "$_py" ] \
+           && [ -f "$SCRIPT_DIR/hooks/destructive_command_guard.py" ] \
+           && [ -f "$SCRIPT_DIR/hooks/protected_paths_guard.py" ]; then
+            _delegated=1
+            for _guard in destructive_command_guard.py protected_paths_guard.py; do
+                _rc=0
+                printf '%s' "$RAW" | "$_py" "$SCRIPT_DIR/hooks/$_guard" >&2 || _rc=$?
+                if [ "$_rc" -eq 2 ]; then
+                    exit 2
+                elif [ "$_rc" -ne 0 ]; then
+                    # Guard crashed/unusable — fall back to the legacy globs
+                    # below (degraded, never open).
+                    _delegated=0
+                    break
+                fi
+            done
+        fi
+        if [ "$_delegated" -eq 0 ]; then
+            case "$CMD" in
+                *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*)  # "rm -rf ." also covers ".."
+                    echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
+                    exit 2;;
+            esac
+        fi
+        ;;
+esac
+
+# Other hard-blocked destructive commands — checked BEFORE the softer push/PR
+# warnings below, because the generic "git push" warning (exit 0) would
+# otherwise short-circuit a force-push before this block could hard-block it.
+case "$CMD" in
     *"git reset --hard"*)
         echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
         exit 2;;
@@ -98,16 +172,34 @@ case "$CMD" in
         exit 2;;
 esac
 
-# Force push — hard-block. MUST precede the soft "git push" warning below (which
-# exits 0). Match -f only as a FLAG token — a whitespace-delimited short-flag
-# cluster containing 'f' (so '-f', '-fv', '-uf' all count; 'f' is force-only
-# among push short flags). The leading start/space anchor is what keeps a branch
-# name that merely CONTAINS "-f" — e.g. "skill-funnel", "bug-fix" — from looking
-# like a force push. Also covers any --force* variant.
-if echo "$CMD" | grep -qE 'git push' \
-   && echo "$CMD" | grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|--force'; then
+# Force push — hard-block. MUST precede the soft "git push" warning below
+# (which exits 0). Scoped to the SEGMENT containing `git push`: split the
+# command on shell separators and require the force flag in the SAME segment,
+# so `rm -f x && git push` is not a force push (the old whole-command grep
+# false-matched exactly that). Match -f only as a FLAG token — a
+# whitespace-delimited short-flag cluster containing 'f' ('-f', '-fv', '-uf';
+# 'f' is force-only among push short flags); a branch name that merely
+# CONTAINS "-f" (skill-funnel, bug-fix) never matches. Also covers --force*.
+_force_push=0
+while IFS= read -r _seg; do
+    printf '%s' "$_seg" | grep -qE 'git push' || continue
+    if printf '%s' "$_seg" | grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|--force'; then
+        _force_push=1
+    fi
+done <<EOF
+$(printf '%s' "$CMD" | sed -E 's/\|\||&&|;|\|/\n/g')
+EOF
+if [ "$_force_push" -eq 1 ]; then
     echo "BLOCKED: Force push not allowed. Use a PR." >&2
     exit 2
+fi
+
+# Inside the genesis repo, an INTERACTIVE session's push/PR/merge is gated by
+# the richer project-level git_push_guard (native approval dialogs, CI/review
+# gates) — running this hook's duplicates there only doubles the live gh API
+# calls and stderr noise (audit D4). Dispatched sessions keep the belt.
+if [ "$_in_genesis" -eq 1 ] && [ "${GENESIS_CC_SESSION:-}" != "1" ]; then
+    exit 0
 fi
 
 # Push / PR protection — remind to get explicit user approval
@@ -157,8 +249,11 @@ if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
     _repo=$(echo "$CMD" | grep -oP -- '--repo \K\S+' || true)
     [ -n "$_repo" ] && _repo_args=(--repo "$_repo")
     if [ -z "$_pr_num" ]; then
-        # No number in the command — resolve the current branch's open PR
-        _pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null || true)
+        # No number in the command — resolve the open PR, honoring an explicit
+        # --repo (the old bare `gh pr view` resolved the CWD branch's PR number
+        # and then gated it against the OTHER repo — wrong-PR gate). With
+        # --repo and no selector gh errors → _pr_num stays empty → fail CLOSED.
+        _pr_num=$(gh pr view "${_repo_args[@]}" --json number --jq '.number' 2>/dev/null || true)
     fi
     if [ -z "$_pr_num" ]; then
         echo "BLOCKED: cannot resolve which PR this merges (no number in the command, no open PR for the current branch)." >&2
