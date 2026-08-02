@@ -458,8 +458,12 @@ def models_md_synthesis_enabled() -> bool:
     concern), distinct from the global ``runtime.paused`` gate. Set
     ``GENESIS_MODELS_MD_SYNTHESIS_OFF=1`` in secrets.env or
     ``models_md_synthesis.enabled: false`` in ``~/.genesis/config/genesis.yaml``.
-    The check is per-run, so a flip takes effect on the next weekly tick with no
-    restart. Fails toward ON (env read can't raise, local config swallows).
+    The runner evaluates this per weekly tick, but a change takes effect only
+    after a genesis-server restart: a running process's env is static and
+    ``_local_config()`` caches the YAML parse for the process lifetime (same
+    restart requirement as ``build_lane_enabled``). The weekly cadence leaves
+    ample time to restart before the next run. Fails toward ON (env read can't
+    raise, local config swallows).
     """
     env_val = os.environ.get("GENESIS_MODELS_MD_SYNTHESIS_OFF")
     if env_val is not None:
