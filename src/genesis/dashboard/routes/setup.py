@@ -27,20 +27,24 @@ _SETUP_COMPLETE_MARKER = Path.home() / ".genesis" / "setup-complete"
 # A configured value for any of these counts as "an LLM key is present" for the
 # wizard's key step. Kept broad on purpose — the wizard only needs to know that
 # SOME usable chat provider is configured, not which one.
+# Canonical env-var names as defined in secrets.env.example (the dashboard secrets
+# registry only accepts these). Note the provider-suffix forms for Anthropic /
+# Google / OpenAI — NOT API_KEY_* — must match exactly or a fresh install that
+# already configured them reads as "missing".
 _LLM_KEY_NAMES = (
-    "API_KEY_ANTHROPIC",
+    "ANTHROPIC_API_KEY",
     "API_KEY_OPENROUTER",
     "API_KEY_GROQ",
     "API_KEY_DEEPSEEK",
     "API_KEY_MISTRAL",
-    "API_KEY_GOOGLE",
+    "GOOGLE_API_KEY",
     "API_KEY_ZENMUX",
 )
 _EMBEDDING_KEY_NAMES = (
     "API_KEY_VOYAGE",
     "API_KEY_DEEPINFRA",
-    "API_KEY_OPENAI",
-    "API_KEY_GOOGLE",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
 )
 
 _UNSET_SENTINELS = ("", "None", "NA")
@@ -123,3 +127,25 @@ async def keys_test():
 
     result = await test_single_key(provider_type, key)
     return jsonify(result)
+
+
+@blueprint.route("/api/genesis/setup-complete", methods=["POST"])
+def setup_complete():
+    """Write the ``~/.genesis/setup-complete`` marker — the wizard's final step.
+
+    Idempotent. This is the SAME marker the terminal onboarding skill writes at
+    its end: it stops the Setup card from reappearing, and clears the two other
+    first-run behaviors keyed on it (the CC foreground onboarding prompt and the
+    ego-cadence first-run suppression). Without this, completing the wizard would
+    leave the install perpetually "not onboarded".
+    """
+    from datetime import UTC, datetime
+
+    try:
+        _SETUP_COMPLETE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        if not _SETUP_COMPLETE_MARKER.exists():
+            _SETUP_COMPLETE_MARKER.write_text(datetime.now(UTC).isoformat() + "\n")
+    except OSError as exc:
+        logger.error("Failed to write setup-complete marker: %s", exc)
+        return jsonify({"error": "could not write marker"}), 500
+    return jsonify({"status": "ok", "onboarded": True})

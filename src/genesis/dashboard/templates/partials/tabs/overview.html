@@ -64,7 +64,7 @@
             <textarea x-model="s.setupIdentity" rows="6" style="width:100%;box-sizing:border-box;font-family:monospace;font-size:0.78rem;padding:0.4rem;"></textarea>
             <div style="margin-top:0.4rem;display:flex;gap:0.5rem;">
               <button class="btn" @click="s.setupSaveIdentity()" :disabled="!!s.setupBusy">Save</button>
-              <button class="btn-secondary" @click="s.setupStep=4">Skip</button>
+              <button class="btn-secondary" @click="s.setupFinish()">Skip</button>
             </div>
           </div>
 

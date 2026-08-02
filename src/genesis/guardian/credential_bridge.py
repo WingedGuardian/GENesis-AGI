@@ -107,8 +107,19 @@ _CC_TOKEN_SOURCE = Path("~/.genesis/cc_oauth_token.env").expanduser()
 # escrowed to the shared mount so the host-side Guardian can bearer-auth its
 # /api/genesis/guardian-dialogue POST when the dashboard gates /api mutations.
 _INTERNAL_TOKEN_FILENAME = "internal_api_token.env"  # noqa: S105 - filename constant, not a token
-_INTERNAL_TOKEN_SOURCE = Path("~/.genesis/internal_api_token").expanduser()
 _INTERNAL_TOKEN_KEY = "GENESIS_INTERNAL_API_TOKEN"  # noqa: S105 - env-var name, not a token
+
+
+def _internal_token_source() -> Path:
+    """Container-side path of the raw internal token, honoring ``GENESIS_HOME``.
+
+    Must match where the dashboard writes it (``genesis.env.internal_api_token_path``
+    → ``genesis_home()/internal_api_token``); a hardcoded ``~/.genesis`` would miss
+    a customized home and leave the host Guardian without a bearer.
+    """
+    gh = os.environ.get("GENESIS_HOME")
+    base = Path(gh).expanduser() if gh else Path("~/.genesis").expanduser()
+    return base / "internal_api_token"
 _KEY_MAP_CC_TOKEN = {
     "CLAUDE_CODE_OAUTH_TOKEN": "CLAUDE_CODE_OAUTH_TOKEN",
     "GENESIS_CC_TOKEN_CREATED_AT": "GENESIS_CC_TOKEN_CREATED_AT",
@@ -436,7 +447,7 @@ def propagate_internal_api_token(
     inactive on a box with no dashboard password). ``secrets_path`` is accepted
     (and ignored) so the combined bridge can call every leg with one signature.
     """
-    src = source_path or _INTERNAL_TOKEN_SOURCE
+    src = source_path or _internal_token_source()
     out_dir = (shared_dir or _CONTAINER_SHARED_DIR) / _CREDS_SUBDIR
     try:
         token = src.read_text().strip()

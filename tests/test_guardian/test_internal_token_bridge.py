@@ -46,12 +46,26 @@ def test_load_missing_returns_none(tmp_path: Path) -> None:
     assert cb.load_internal_api_token(str(tmp_path / "nope")) is None
 
 
+def test_propagate_honors_genesis_home(tmp_path: Path, monkeypatch) -> None:
+    """The source path follows GENESIS_HOME (matching where the dashboard writes
+    it), not a hardcoded ~/.genesis — else the host Guardian gets no token."""
+    gh = tmp_path / "custom-home"
+    gh.mkdir()
+    (gh / "internal_api_token").write_text("tok-home\n")
+    monkeypatch.setenv("GENESIS_HOME", str(gh))
+
+    out = cb.propagate_internal_api_token(shared_dir=tmp_path / "shared")
+    assert out is not None
+    assert cb.load_internal_api_token(str(tmp_path)) == "tok-home"
+
+
 def test_combined_bridge_includes_internal_token(tmp_path: Path, monkeypatch) -> None:
     """The combined awareness-tick bridge propagates the internal token too."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    src = tmp_path / "internal_api_token"
-    src.write_text("tok-xyz\n")
-    monkeypatch.setattr(cb, "_INTERNAL_TOKEN_SOURCE", src)
+    gh = tmp_path / "gh"
+    gh.mkdir()
+    (gh / "internal_api_token").write_text("tok-xyz\n")
+    monkeypatch.setenv("GENESIS_HOME", str(gh))
     secrets = tmp_path / "secrets.env"
     secrets.write_text("TELEGRAM_BOT_TOKEN=bot\n")
 

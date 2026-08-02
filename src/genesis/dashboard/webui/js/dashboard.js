@@ -304,7 +304,7 @@
         setupIdentityLoaded: false,
         setupProviders: [
           {label: "OpenRouter (chat)",     keyName: "API_KEY_OPENROUTER", providerType: "openrouter", testable: true},
-          {label: "Anthropic (chat)",      keyName: "API_KEY_ANTHROPIC",  providerType: "anthropic",  testable: true},
+          {label: "Anthropic (chat)",      keyName: "ANTHROPIC_API_KEY",  providerType: "anthropic",  testable: true},
           {label: "Groq (chat)",           keyName: "API_KEY_GROQ",       providerType: "groq",       testable: true},
           {label: "DeepSeek (chat)",       keyName: "API_KEY_DEEPSEEK",   providerType: "deepseek",   testable: true},
           {label: "Mistral (chat)",        keyName: "API_KEY_MISTRAL",    providerType: "mistral",    testable: true},
@@ -2277,9 +2277,19 @@
               body: JSON.stringify({keys: {DASHBOARD_PASSWORD: val}}),
             });
             if (resp.ok) {
+              // Saving the password updates os.environ immediately, so the /api
+              // mutation gate is active THIS request. Authenticate the session with
+              // the password just set — otherwise the next wizard POST (key test/
+              // save, finish) would 401 and bounce to login mid-flow.
+              try {
+                await fetchApi("/api/genesis/auth/login", {
+                  method: "POST", headers: {"Content-Type": "application/json"},
+                  body: JSON.stringify({password: val}),
+                });
+              } catch (e) { /* non-fatal: user can log in manually */ }
               this.setupPassword = "";
               await this.loadSetupStatus();
-              this.setupMsg = {type: "restart", text: "Password saved — protects the dashboard UI after the next server restart."};
+              this.setupMsg = {type: "ok", text: "Password saved — you're logged in, and the dashboard now requires this password."};
               this.setupStep = 2;
             } else {
               const d = await resp.json().catch(() => ({}));
@@ -2348,13 +2358,24 @@
               method: "PUT", headers: {"Content-Type": "application/json"},
               body: JSON.stringify({content: this.setupIdentity}),
             });
-            if (resp.ok) { await this.loadSetupStatus(); this.setupStep = 4; }
+            if (resp.ok) { await this.setupFinish(); }
             else {
               const d = await resp.json().catch(() => ({}));
               this.setupMsg = {type: "error", text: d.error || "Save failed"};
             }
           } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
           this.setupBusy = false;
+        },
+        async setupFinish() {
+          // Persist first-run completion so the card stops reappearing AND the two
+          // other behaviors keyed on the marker (the CC onboarding prompt and the
+          // ego-cadence first-run suppression) clear. Every path to the "Done" step
+          // funnels through here.
+          try {
+            await fetchApi("/api/genesis/setup-complete", {method: "POST"});
+          } catch (e) { /* best-effort; the card also hides on dismiss */ }
+          await this.loadSetupStatus();
+          this.setupStep = 4;
         },
 
         // Map env var names → provider_type values from model_routing.yaml.

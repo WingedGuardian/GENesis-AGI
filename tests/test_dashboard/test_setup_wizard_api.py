@@ -51,12 +51,37 @@ def test_setup_status_fresh_install(wiz):
 def test_setup_status_reads_persisted_secrets_not_env(wiz, monkeypatch):
     # A password + LLM key persisted to secrets.env must show as present even
     # though os.environ (stale until restart) does NOT contain them.
-    monkeypatch.delenv("API_KEY_ANTHROPIC", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
-    wiz["secrets"].write_text("DASHBOARD_PASSWORD=pw\nAPI_KEY_ANTHROPIC=sk-xxx\n")
+    wiz["secrets"].write_text("DASHBOARD_PASSWORD=pw\nANTHROPIC_API_KEY=sk-xxx\n")
     body = wiz["client"].get("/api/genesis/setup-status").get_json()
     assert body["password_set"] is True
     assert body["llm_key_present"] is True
+
+
+def test_setup_status_uses_canonical_registry_key_names(wiz):
+    # The provider-suffix forms (ANTHROPIC_API_KEY / GOOGLE_API_KEY / OPENAI_API_KEY)
+    # are the registry's canonical names; the API_KEY_* forms must NOT count, or a
+    # fresh install that configured them would read as "missing".
+    wiz["secrets"].write_text("ANTHROPIC_API_KEY=a\nOPENAI_API_KEY=o\n")
+    body = wiz["client"].get("/api/genesis/setup-status").get_json()
+    assert body["llm_key_present"] is True  # ANTHROPIC_API_KEY
+    assert body["embedding_key_present"] is True  # OPENAI_API_KEY
+    # A wrong-form name must not register as present.
+    wiz["secrets"].write_text("API_KEY_ANTHROPIC=a\n")
+    assert wiz["client"].get("/api/genesis/setup-status").get_json()["llm_key_present"] is False
+
+
+def test_setup_complete_writes_marker_idempotently(wiz):
+    assert not wiz["marker"].exists()
+    resp = wiz["client"].post("/api/genesis/setup-complete")
+    assert resp.status_code == 200
+    assert resp.get_json()["onboarded"] is True
+    assert wiz["marker"].exists()
+    first = wiz["marker"].read_text()
+    # A second call is a no-op (does not rewrite the timestamp).
+    assert wiz["client"].post("/api/genesis/setup-complete").status_code == 200
+    assert wiz["marker"].read_text() == first
 
 
 def test_setup_status_marker_and_embedding(wiz):
