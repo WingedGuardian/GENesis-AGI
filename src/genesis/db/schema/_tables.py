@@ -1287,7 +1287,7 @@ TABLES = {
             verification_notes TEXT,
             pinned           INTEGER NOT NULL DEFAULT 0,
             kind             TEXT NOT NULL DEFAULT 'follow_up' CHECK (
-                kind IN ('follow_up', 'tabled')
+                kind IN ('follow_up', 'tabled', 'idea')
             ),
             domain           TEXT CHECK (
                 domain IN ('internal', 'user_world')

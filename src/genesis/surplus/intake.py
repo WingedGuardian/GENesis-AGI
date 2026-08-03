@@ -574,37 +574,55 @@ async def run_intake(
         ]
         stats.scoring_skipped = True
 
-    # Step 3a: Ephemeral first-party ideation (self-directed brainstorm /
-    # unblock / audit output) is NOT durable knowledge — stage it in
-    # surplus_insights for the ideas-review lifecycle (TTL decay) instead of
-    # immortalizing it as a knowledge_unit. Keyed on the TRUE task type
-    # (source_task_type), preserved distinct from the collapsed IntakeSource.
-    from genesis.surplus.types import is_ephemeral_ideation
+    # Step 3a: Ephemeral first-party ideation is kept OUT of the immortal
+    # knowledge_units KB (PR-1). WS-M PR-2 splits it by semantics, keyed on the
+    # TRUE task type (source_task_type), preserved distinct from the collapsed
+    # IntakeSource:
+    #   • IDEAS (brainstorm) → surplus_insights staging (later promoted into the
+    #     follow_ups 'idea' review lane).
+    #   • SELF-OBSERVATIONS (audits / gap-cluster / unblock / prompt-review) →
+    #     the observation lane (TTL + resolve + dashboard/morning-report
+    #     surfacing), at priority="low" so they never crowd the capped daily
+    #     digest while staying browsable in the observations panel.
+    from genesis.surplus.types import is_ephemeral_ideation, is_idea_ideation
 
     if is_ephemeral_ideation(source_task_type):
+        route_ideas = is_idea_ideation(source_task_type)
         drive = _valid_drive(drive_alignment)
+        routed = 0
         for scored in scored_findings:
             try:
-                sid = await _route_to_staging(scored, db=db, drive_alignment=drive)
-                stats.staged_ids.append(sid)
-                stats.routed_staging += 1
+                if route_ideas:
+                    sid = await _route_to_staging(
+                        scored, db=db, drive_alignment=drive
+                    )
+                    stats.staged_ids.append(sid)
+                    stats.routed_staging += 1
+                else:
+                    await _route_to_observation(
+                        scored, db=db, priority="low", skip_if_duplicate=True
+                    )
+                    stats.routed_observation += 1
+                routed += 1
             except Exception as exc:
                 logger.error(
-                    "Intake staging failed for finding '%s': %s",
+                    "Intake ideation routing failed for finding '%s': %s",
                     scored.finding.title[:50], exc, exc_info=True,
                 )
                 stats.errors.append(f"{scored.finding.title[:50]}: {exc}")
         logger.info(
-            "Intake(staging): source=%s task=%s findings=%d staged=%d errors=%d",
-            stats.source, source_task_type, stats.findings_count,
-            stats.routed_staging, len(stats.errors),
+            "Intake(ideation): source=%s task=%s dest=%s findings=%d "
+            "routed=%d errors=%d",
+            stats.source, source_task_type,
+            "staging" if route_ideas else "observation",
+            stats.findings_count, routed, len(stats.errors),
         )
-        # If EVERY staging write failed, raise so the caller falls back
-        # (dispatch re-stages into surplus_insights via its own path).
-        if stats.findings_count > 0 and stats.routed_staging == 0 and stats.errors:
+        # If EVERY write failed, raise so the caller falls back (dispatch
+        # re-stages into surplus_insights via its own path).
+        if stats.findings_count > 0 and routed == 0 and stats.errors:
             raise RuntimeError(
-                f"Intake staging failed for all {stats.findings_count} findings: "
-                f"{stats.errors[0]}"
+                f"Intake ideation routing failed for all "
+                f"{stats.findings_count} findings: {stats.errors[0]}"
             )
         return stats
 
@@ -720,16 +738,22 @@ async def _route_to_observation(
     scored: ScoredFinding,
     *,
     db: aiosqlite.Connection,
+    priority: str = "medium",
+    skip_if_duplicate: bool = False,
 ) -> None:
-    """Create an observation for pattern-level insights."""
+    """Create an observation for pattern-level insights.
+
+    ``skip_if_duplicate`` (used by the self-observation ideation path) keys on
+    source + content_hash so a re-emitted identical finding is idempotent —
+    matching the content-hash-id upsert idempotency of the staging path. The
+    legacy pattern-insight caller keeps the default (priority="medium", no
+    dedup) so its behaviour is unchanged.
+    """
     from genesis.db.crud import observations
 
     obs_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
-    content = (
-        f"{scored.finding.title}\n\n"
-        f"{scored.finding.content}"
-    )
+    content = f"{scored.finding.title}\n\n{scored.finding.content}"
     if scored.finding.relevance:
         content += f"\n\nRelevance: {scored.finding.relevance}"
 
@@ -739,8 +763,9 @@ async def _route_to_observation(
         source=f"intake:{scored.source.value}",
         type=scored.source_task_type or "intelligence_finding",
         content=content[:2000],
-        priority="medium",
+        priority=priority,
         created_at=now,
+        skip_if_duplicate=skip_if_duplicate,
     )
 
 

@@ -14,7 +14,7 @@
       <div class="panel-body">
         <!-- Tier toggle: follow_up | tabled | all -->
         <div style="display:flex; gap:0.25rem; margin-bottom:0.6rem; align-items:center; flex-wrap:wrap;">
-          <template x-for="tier in [{k:'follow_up',l:'Follow-ups'},{k:'tabled',l:'Tabled'},{k:'',l:'All'}]" :key="tier.l">
+          <template x-for="tier in [{k:'follow_up',l:'Follow-ups'},{k:'tabled',l:'Tabled'},{k:'idea',l:'Ideas'},{k:'',l:'All'}]" :key="tier.l">
             <button style="font-size:0.7rem; padding:0.2rem 0.7rem; border-radius:3px; cursor:pointer; border:1px solid #555;"
                     :style="$store.genesisDashboard.cockpitFilters.kind === tier.k ? 'background:rgba(33,150,243,0.18); color:#2196F3; border-color:rgba(33,150,243,0.4); font-weight:600;' : 'background:transparent; color:var(--color-text-secondary);'"
                     @click="$store.genesisDashboard.cockpitFilters.kind = tier.k; $store.genesisDashboard.cockpitApplyFilter()"

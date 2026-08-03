@@ -183,6 +183,18 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "quarantined_reflection": timedelta(days=14),
     "code_audit": timedelta(days=14),
     "cc_memory_staleness": timedelta(days=14),
+    # WS-M PR-2 self-observation ideation — self-directed audits / gap-cluster /
+    # unblock / prompt-review output routed here (instead of the immortal KB) by
+    # surplus/intake.py Step 3a. Meta-observations about Genesis's own state:
+    # NOT in INTERNAL_OBS_TYPES (they surface in the dashboard observations panel
+    # for review), written at priority="low" so they never crowd the capped
+    # morning-report digest. 14d matches the sibling audit/meta types above.
+    "gap_clustering": timedelta(days=14),
+    "wing_audit": timedelta(days=14),
+    "self_unblock": timedelta(days=14),
+    "memory_audit": timedelta(days=14),
+    "procedure_audit": timedelta(days=14),
+    "prompt_effectiveness_review": timedelta(days=14),
     # provider_failure resolves on breaker recovery (ProviderEscalation); the
     # explicit TTL is only a backstop for a provider that never comes back
     # (= the previous implicit default, made explicit to silence the warning).

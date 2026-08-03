@@ -42,7 +42,7 @@ _COCKPIT_STATUSES = (
 )
 # Terminal states hidden by the cockpit's default "hide done" view.
 _DONE_STATUSES = ["completed", "failed"]
-_BATCH_ACTIONS = ("done", "delete", "tabled", "follow_up")
+_BATCH_ACTIONS = ("done", "delete", "tabled", "follow_up", "idea")
 
 
 @blueprint.route("/api/genesis/follow-ups/cockpit")
