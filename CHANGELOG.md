@@ -17,8 +17,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   password, adding a model or embedding API key — with a live "test this key"
   button that makes a real call so you know it works before saving — and writing
   your identity profile (USER.md), which can now be created straight from the web.
-  A banner also nudges you to set a password whenever the dashboard is open
-  without one.
+  The card reflects a live **readiness floor** — a genuinely usable Genesis needs
+  Claude Code logged in, at least one chat/routing key, and at least one embedding
+  key — so it shows honestly what's still missing (including a reminder to run
+  `claude login` in a terminal, which the web UI can't do for you) rather than ever
+  claiming "done" over an install that can't yet think. A banner also nudges you to
+  set a password whenever the dashboard is open without one.
 
 ### Changed
 

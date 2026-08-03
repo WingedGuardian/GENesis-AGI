@@ -77,15 +77,22 @@ def mock_idle_detector():
 
 @pytest.fixture(autouse=True)
 def _setup_complete_marker(tmp_path, monkeypatch):
-    """Ensure the onboarding marker exists so ego gates pass by default.
+    """Ensure the onboarding marker exists AND the functional floor is met so ego
+    gates pass by default.
 
-    Tests that specifically check onboarding-incomplete behavior override
-    Path.home() themselves.
+    The cadence gate now requires BOTH the bootstrap marker and the live functional
+    floor (CC login + LLM + embedding keys). Tests that specifically check
+    onboarding-incomplete behavior override Path.home() / the floor themselves.
     """
     genesis_dir = tmp_path / ".genesis"
     genesis_dir.mkdir()
     (genesis_dir / "setup-complete").write_text("2026-01-01")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from genesis.onboarding import floor as _floor
+
+    monkeypatch.setattr(
+        _floor, "compute_floor", lambda *a, **k: _floor.FloorStatus(True, True, True)
+    )
 
 
 @pytest.fixture
@@ -351,6 +358,23 @@ class TestCadenceTick:
     ):
         # Remove the marker created by autouse fixture
         (tmp_path / ".genesis" / "setup-complete").unlink()
+        await cadence._on_tick()
+        mock_session.run_unified_cycle.assert_not_called()
+        assert cadence._signal_queue.empty()
+
+    async def test_tick_skips_when_floor_unmet(
+        self,
+        cadence,
+        mock_session,
+        monkeypatch,
+    ):
+        # Marker present (autouse) but the live functional floor is unmet (e.g. CC
+        # not logged in, or no keys) → autonomy must not run.
+        from genesis.onboarding import floor as _floor
+
+        monkeypatch.setattr(
+            _floor, "compute_floor", lambda *a, **k: _floor.FloorStatus(False, False, False)
+        )
         await cadence._on_tick()
         mock_session.run_unified_cycle.assert_not_called()
         assert cadence._signal_queue.empty()

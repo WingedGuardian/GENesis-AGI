@@ -290,7 +290,7 @@
         secretsSaving: false,
         secretsValues: {},        // key_name → input value during edit
         // ── First-run onboarding wizard (Setup card on Overview) ──
-        setupStatus: null,        // {onboarded,password_set,llm_key_present,embedding_key_present,identity_set}
+        setupStatus: null,        // {onboarded,password_set,cc_oauth,llm_key_present,embedding_key_present,floor_met,identity_set}
         setupCardDismissed: false,
         pwNudgeDismissed: false,
         setupStep: 1,             // 1=password 2=key 3=identity 4=done
@@ -303,8 +303,10 @@
         setupIdentity: "",
         setupIdentityLoaded: false,
         setupProviders: [
+          // Anthropic is intentionally NOT offered: routing has no `type: anthropic`
+          // provider (Claude routes via OpenRouter), so a bare ANTHROPIC_API_KEY is
+          // collected-but-never-consumed. Offer only routing-consumed providers.
           {label: "OpenRouter (chat)",     keyName: "API_KEY_OPENROUTER", providerType: "openrouter", testable: true},
-          {label: "Anthropic (chat)",      keyName: "ANTHROPIC_API_KEY",  providerType: "anthropic",  testable: true},
           {label: "Groq (chat)",           keyName: "API_KEY_GROQ",       providerType: "groq",       testable: true},
           {label: "DeepSeek (chat)",       keyName: "API_KEY_DEEPSEEK",   providerType: "deepseek",   testable: true},
           {label: "Mistral (chat)",        keyName: "API_KEY_MISTRAL",    providerType: "mistral",    testable: true},
@@ -2265,9 +2267,12 @@
         },
         get showSetupCard() {
           const s = this.setupStatus;
-          // Show while the install is not fully onboarded (marker absent) and the
-          // user has not dismissed it this session. A configured box never sees it.
-          return !!s && !s.onboarded && !this.setupCardDismissed;
+          // Show while the install is not FUNCTIONAL (live floor unmet) and the user
+          // has not dismissed it this session. A functional box never sees it. The
+          // `setupStep>1` clause keeps the card visible once the user has started
+          // stepping through it, so it doesn't vanish mid-flow if the floor flips
+          // to met after they save the last key (they still see the Done summary).
+          return !!s && (!s.floor_met || this.setupStep > 1) && !this.setupCardDismissed;
         },
         get setupProvider() { return this.setupProviders[this.setupProviderIdx] || this.setupProviders[0]; },
         dismissSetupCard() { this.setupCardDismissed = true; },
@@ -2374,22 +2379,13 @@
           this.setupBusy = false;
         },
         async setupFinish() {
-          // Persist first-run completion so the card stops reappearing AND the two
-          // other behaviors keyed on the marker (the CC onboarding prompt and the
-          // ego-cadence first-run suppression) clear. Every path to the "Done" step
-          // funnels through here. fetchApi resolves (does not throw) on a non-2xx,
-          // so gate on resp.ok: if the marker write fails, STAY on this step and
-          // surface the error rather than showing Done over a still-unonboarded box.
-          let ok = false;
-          try {
-            const resp = await fetchApi("/api/genesis/setup-complete", {method: "POST"});
-            ok = !!(resp && resp.ok);
-            if (!ok) {
-              const d = resp ? await resp.json().catch(() => ({})) : {};
-              this.setupMsg = {type: "error", text: d.error || "Could not save completion (disk/permissions?). Try again."};
-            }
-          } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
-          if (!ok) return;
+          // The wizard does NOT write the ~/.genesis/setup-complete marker — that
+          // marker means "bootstrap finished" and is owned by bootstrap.sh / the
+          // terminal onboarding skill. Completion here just advances to the Done
+          // step, which honestly reflects the LIVE floor (floor_met + its legs):
+          // if keys / CC login are still missing it shows "almost there — still
+          // needed …" rather than a false "you're all set". Re-read status first so
+          // the summary reflects anything just saved.
           await this.loadSetupStatus();
           this.setupStep = 4;
         },

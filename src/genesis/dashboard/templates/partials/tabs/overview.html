@@ -1,9 +1,10 @@
 
 
     <!-- First-run onboarding wizard (Setup card). Shown on Overview until the
-         install is onboarded (~/.genesis/setup-complete). Dismissible. Every step
-         reuses an EXISTING route (secrets PUT, keys/test, config-files PUT); this
-         card changes no auth behavior. -->
+         install is FUNCTIONAL (live floor_met: CC login + an LLM key + an embedding
+         key), NOT merely until the bootstrap marker exists. The wizard writes no
+         marker. Dismissible. Every step reuses an EXISTING route (secrets PUT,
+         keys/test, config-files PUT); this card changes no auth behavior. -->
     <template x-if="$store.genesisDashboard.activeTab === 'overview' && $store.genesisDashboard.showSetupCard">
       <div class="panel" x-data="{s: $store.genesisDashboard}" style="border:1px solid #2196F3;">
         <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
@@ -20,9 +21,10 @@
           </div>
           <!-- status chips (from setup-status) -->
           <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-bottom:0.75rem;font-size:0.75rem;color:var(--color-text-secondary,#999);">
-            <span x-text="(s.setupStatus&&s.setupStatus.password_set?'✓':'○')+' dashboard password'"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.cc_oauth?'✓':'○')+' Claude Code login'" :style="s.setupStatus&&!s.setupStatus.cc_oauth?'color:#f0ad4e':''"></span>
             <span x-text="(s.setupStatus&&s.setupStatus.llm_key_present?'✓':'○')+' chat model key'"></span>
             <span x-text="(s.setupStatus&&s.setupStatus.embedding_key_present?'✓':'○')+' embedding key'"></span>
+            <span x-text="(s.setupStatus&&s.setupStatus.password_set?'✓':'○')+' dashboard password'"></span>
             <span x-text="(s.setupStatus&&s.setupStatus.identity_set?'✓':'○')+' identity (USER.md)'"></span>
           </div>
 
@@ -68,9 +70,22 @@
             </div>
           </div>
 
-          <!-- Step 4: done -->
+          <!-- Step 4: done — honest summary keyed on the LIVE floor -->
           <div x-show="s.setupStep===4">
-            <p style="margin:0;">🎉 You're set. Restart the server to apply the password and keys, then explore the tabs. This card hides once onboarding completes.</p>
+            <template x-if="s.setupStatus && s.setupStatus.floor_met">
+              <p style="margin:0;">🎉 Genesis has what it needs to run — a brain (Claude Code login), a chat model, and embeddings. Restart the server to apply any just-saved password/keys, then explore the tabs.</p>
+            </template>
+            <template x-if="s.setupStatus && !s.setupStatus.floor_met">
+              <div>
+                <p style="margin:0 0 0.4rem;">Almost there — Genesis isn't fully functional yet. Still needed:</p>
+                <ul style="margin:0 0 0.2rem 1.1rem;padding:0;">
+                  <li x-show="!s.setupStatus.cc_oauth">Log in to Claude Code — run <code>claude login</code> in a terminal (the wizard can't do this for you).</li>
+                  <li x-show="!s.setupStatus.llm_key_present">A chat / routing model key (step 2 — e.g. OpenRouter, Groq, Mistral).</li>
+                  <li x-show="!s.setupStatus.embedding_key_present">An embedding key for memory (step 2 — e.g. Voyage, DeepInfra, OpenAI).</li>
+                </ul>
+                <p style="margin:0.2rem 0 0;font-size:0.72rem;color:var(--color-text-secondary,#888);">This card stays until the floor is met. You can close it for now.</p>
+              </div>
+            </template>
             <div style="margin-top:0.5rem;"><button class="btn" @click="s.dismissSetupCard()">Close</button></div>
           </div>
 
