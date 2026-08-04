@@ -9,8 +9,12 @@ Install-agnostic: no live retriever, Qdrant, network, or DB.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from genesis.memory import proactive as P
 from genesis.memory.intent import classify_stance
@@ -718,3 +722,33 @@ def test_is_garbage_predicate():
     assert is_garbage("---\ntype: observation\n") is True
     assert is_garbage("{just braces, no json keys}") is False
     assert is_garbage("--- not frontmatter, just dashes") is False
+
+
+# --- cancellation observability (the 503 path) ------------------------------
+
+
+async def test_proactive_context_logs_partial_timings_on_cancellation(caplog):
+    """When the route budget expires mid-flight the coroutine is cancelled;
+    proactive_context must log WHICH phase was in flight + the partial timings
+    (the signal the 503 path previously discarded) and RE-RAISE CancelledError.
+
+    Embed completes on the fast fake retriever, so cancellation lands in the
+    recall phase — the log names phase=recall with embed already timed.
+    """
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch(
+            "genesis.mcp.memory.core._proactive_impl",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ),
+        caplog.at_level(logging.WARNING),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await P.proactive_context(prompt="what did we decide", session_id="s")
+
+    warns = [r.getMessage() for r in caplog.records if "CANCELLED at phase" in r.getMessage()]
+    assert warns, "cancellation must emit a WARNING naming the in-flight phase"
+    assert "phase=recall" in warns[0]
+    # partial timings carry the completed embed phase but NOT recall (never finished)
+    assert "'embed'" in warns[0]
+    assert "'recall'" not in warns[0]
