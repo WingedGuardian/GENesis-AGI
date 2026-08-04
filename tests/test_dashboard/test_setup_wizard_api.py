@@ -96,7 +96,7 @@ def test_setup_status_embedding_leg_only_real_backends(wiz):
     wiz["secrets"].write_text("API_KEY_VOYAGE=v\nOPENAI_API_KEY=o\nGOOGLE_API_KEY=g\n")
     body = wiz["client"].get("/api/genesis/setup-status").get_json()
     assert body["embedding_key_present"] is False
-    assert body["llm_key_present"] is True  # openai / google ARE LLM providers
+    assert body["llm_key_present"] is True  # google (gemini-free) is chain-referenced
     # A real embedding backend flips it.
     wiz["secrets"].write_text("API_KEY_QWEN=q\n")
     assert (

@@ -312,7 +312,7 @@
           {label: "Mistral (chat)",          keyName: "API_KEY_MISTRAL",    providerType: "mistral",    kind: "chat",      testable: true},
           {label: "NVIDIA NIM (chat)",       keyName: "API_KEY_NVIDIA_NIM", providerType: "nvidia_nim", kind: "chat",      testable: false},
           {label: "DeepInfra (embeddings)",  keyName: "API_KEY_DEEPINFRA",  providerType: "deepinfra",  kind: "embedding", testable: false},
-          {label: "Qwen / DashScope (chat + embeddings)", keyName: "API_KEY_QWEN", providerType: "qwen", kind: "embedding", testable: false},
+          {label: "Qwen / DashScope (embeddings)", keyName: "API_KEY_QWEN", providerType: "qwen", kind: "embedding", testable: false},
         ],
         secretsMessage: null,     // {type, text}
 

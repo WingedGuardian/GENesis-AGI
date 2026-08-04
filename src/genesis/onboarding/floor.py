@@ -42,36 +42,39 @@ UNSET_SENTINELS = ("", "None", "NA")
 
 # ── LLM floor: derived from what routing ACTUALLY consumes ─────────────────────
 # The set of LLM keys that satisfy the floor is NOT hand-maintained (a hard-coded
-# list drifted three times: it once counted a dead Anthropic key, later missed
-# NVIDIA/Qwen/MiniMax/xAI and counted a disabled DeepSeek). Instead the LLM leg is
-# derived live from ``config/model_routing.yaml``: any ENABLED, key-requiring
-# provider whose key is configured satisfies it. Key resolution uses the SAME three
-# env-var patterns as the runtime resolver
-# ``routing.litellm_delegate._resolve_api_key`` — kept in sync by a parity test.
+# list drifted repeatedly: it once counted a dead Anthropic key, then missed
+# NVIDIA and counted a disabled DeepSeek, then counted providers that are DECLARED
+# but referenced by no active call-site chain). Instead the LLM leg is derived from
+# the SAME merged routing config the router itself loads — ``routing.config.
+# load_config`` (which applies the install-local ``model_routing.local.yaml``
+# overlay + env expansion) — and from the provider TYPES actually referenced in some
+# call-site ``chain``. A provider that is enabled but in no chain is never used, so
+# its key must not satisfy the floor. Key resolution uses the SAME three env-var
+# patterns as the runtime resolver ``routing.litellm_delegate._resolve_api_key``
+# (parity test).
 
 # Provider types that need NO API key (local backends) — excluded from the LLM leg.
 _KEYLESS_PROVIDER_TYPES = frozenset({"ollama", "lmstudio"})
 
-# Only used if model_routing.yaml can't be parsed: a superset of the current enabled
-# cloud providers' key names, so the floor degrades to "reasonable", never "empty".
+# Only used if the routing config can't be loaded: the key names for the currently
+# chain-referenced cloud provider types, so the floor degrades to "reasonable",
+# never "empty". (The live path derives this from the merged config.)
 _LLM_KEY_NAMES_FALLBACK: tuple[str, ...] = (
     "API_KEY_OPENROUTER",
     "API_KEY_GROQ",
     "API_KEY_MISTRAL",
     "GOOGLE_API_KEY",
-    "OPENAI_API_KEY",
     "API_KEY_ZENMUX",
     "API_KEY_NVIDIA_NIM",
-    "API_KEY_QWEN",
-    "API_KEY_MINIMAX",
-    "API_KEY_XAI",
 )
 
 # Cloud EMBEDDING backends actually consumed by ``providers/embedding.py`` (deepinfra
-# + dashscope/qwen). NOTE: Voyage is rerank-ONLY, and there is no OpenAI/Google
-# embedding backend — counting those (as an earlier hard-coded list did) let a box
-# with no real embedding backend read as "floor met". Local Ollama embeddings are
-# keyless (a bonus, not a floor-satisfier — the floor measures cloud capability).
+# + dashscope/qwen). These do NOT route through model_routing call-sites, so they are
+# pinned here rather than derived. NOTE: Voyage is rerank-ONLY, and there is no
+# OpenAI/Google embedding backend — counting those (as an earlier hard-coded list
+# did) let a box with no real embedding backend read as "floor met". Local Ollama
+# embeddings are keyless (a bonus, not a floor-satisfier — the floor measures cloud
+# capability).
 EMBEDDING_KEY_NAMES: tuple[str, ...] = ("API_KEY_DEEPINFRA", "API_KEY_QWEN")
 
 _ROUTING_CONFIG_PATH = repo_root() / "config" / "model_routing.yaml"
@@ -180,37 +183,37 @@ def _has_any(secrets: Mapping[str, str], names: tuple[str, ...]) -> bool:
 
 
 @lru_cache(maxsize=1)
-def _enabled_cloud_provider_types() -> tuple[str, ...]:
-    """Enabled, key-requiring provider TYPES from ``config/model_routing.yaml``.
+def _chain_referenced_cloud_provider_types() -> tuple[str, ...]:
+    """Key-requiring provider TYPES that are actually USED by routing.
 
-    This is what makes the LLM floor track ACTUAL routing consumption instead of a
-    hand-maintained list. Cached — the routing config is static at runtime. Returns
-    ``()`` on any parse failure, which signals the static fallback.
+    Loaded through the router's OWN ``routing.config.load_config`` (so the
+    install-local ``model_routing.local.yaml`` overlay + env expansion are honored,
+    exactly as the runtime sees them), then reduced to the provider types referenced
+    by at least one call-site ``chain`` — a declared-but-unchained provider is never
+    routed, so its key must not satisfy the floor. Local/keyless types are excluded.
+
+    Cached — the routing config is static at runtime. Returns ``()`` on any load
+    failure, which signals the static fallback.
     """
     try:
-        import yaml
+        from genesis.routing.config import load_config
 
-        data = yaml.safe_load(_ROUTING_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        cfg = load_config(_ROUTING_CONFIG_PATH, check_api_keys=False)
     except Exception:  # noqa: BLE001 - fall back rather than raise into the floor
         logger.warning(
-            "floor: could not read %s; using static LLM key fallback",
+            "floor: could not load routing config %s; using static LLM key fallback",
             _ROUTING_CONFIG_PATH,
             exc_info=True,
         )
         return ()
+    referenced: set[str] = set()
+    for call_site in cfg.call_sites.values():
+        referenced.update(getattr(call_site, "chain", ()) or ())
     types: set[str] = set()
-    for prov in (data.get("providers") or {}).values():
-        if not isinstance(prov, dict):
-            continue
-        enabled = prov.get("enabled", True)
-        # Literal false (or the string "false") = disabled. An env-templated value
-        # like "${GENESIS_ENABLE_OLLAMA:-true}" is only used by local types, which
-        # are excluded below regardless, so treating it as enabled is safe.
-        if enabled is False or str(enabled).strip().lower() == "false":
-            continue
-        ptype = prov.get("type")
-        if isinstance(ptype, str) and ptype not in _KEYLESS_PROVIDER_TYPES:
-            types.add(ptype)
+    for name in referenced:
+        prov = cfg.providers.get(name)  # cfg.providers holds only ENABLED providers
+        if prov is not None and prov.provider_type not in _KEYLESS_PROVIDER_TYPES:
+            types.add(prov.provider_type)
     return tuple(sorted(types))
 
 
@@ -231,11 +234,11 @@ def provider_key_present(provider_type: str, secrets: Mapping[str, str]) -> bool
 
 
 def _llm_key_present(secrets: Mapping[str, str]) -> bool:
-    """True when an ENABLED cloud LLM provider has its key configured."""
-    types = _enabled_cloud_provider_types()
+    """True when a chain-referenced cloud LLM provider has its key configured."""
+    types = _chain_referenced_cloud_provider_types()
     if types:
         return any(provider_key_present(t, secrets) for t in types)
-    # Config unreadable → check the static superset directly (rare degraded path).
+    # Config unloadable → check the static fallback directly (rare degraded path).
     return _has_any(secrets, _LLM_KEY_NAMES_FALLBACK)
 
 

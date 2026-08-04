@@ -152,14 +152,15 @@ def test_google_key_counts_for_llm_not_embedding(monkeypatch):
     assert f.floor_met is False
 
 
-def test_qwen_key_counts_for_both_legs(monkeypatch):
-    # API_KEY_QWEN is consumed by BOTH the qwen LLM provider and the dashscope
-    # embedding backend.
+def test_qwen_counts_for_embedding_not_llm(monkeypatch):
+    # API_KEY_QWEN drives the dashscope EMBEDDING backend, but the qwen LLM provider
+    # (qwen-plus) is in no active call-site chain — so it must NOT satisfy the LLM
+    # leg. A Qwen-only install is therefore not floor_met.
     _oauth(monkeypatch, True)
     f = compute_floor({"API_KEY_QWEN": "q"})
-    assert f.llm_key_present is True
     assert f.embedding_key_present is True
-    assert f.floor_met is True
+    assert f.llm_key_present is False
+    assert f.floor_met is False
 
 
 def test_voyage_does_not_satisfy_embedding(monkeypatch):
@@ -168,11 +169,12 @@ def test_voyage_does_not_satisfy_embedding(monkeypatch):
     assert compute_floor({"API_KEY_VOYAGE": "v"}).embedding_key_present is False
 
 
-def test_openai_key_is_llm_not_embedding(monkeypatch):
-    # openai is an enabled LLM provider; there is no OpenAI embedding backend.
+def test_openai_key_declared_but_unchained_does_not_count(monkeypatch):
+    # openai is declared+enabled but referenced by no active call-site chain, and
+    # there is no OpenAI embedding backend → an OpenAI key satisfies NEITHER leg.
     _oauth(monkeypatch, True)
     f = compute_floor({"OPENAI_API_KEY": "o"})
-    assert f.llm_key_present is True
+    assert f.llm_key_present is False
     assert f.embedding_key_present is False
 
 
@@ -190,13 +192,19 @@ def test_sentinel_values_do_not_count(monkeypatch):
         assert f.llm_key_present is False, f"{bad!r} should not count"
 
 
-def test_config_derivation_excludes_local_and_disabled():
-    from genesis.onboarding.floor import _enabled_cloud_provider_types
+def test_config_derivation_only_chain_referenced_cloud_types():
+    from genesis.onboarding.floor import _chain_referenced_cloud_provider_types
 
-    types = set(_enabled_cloud_provider_types())
-    assert "nvidia_nim" in types and "qwen" in types  # enabled cloud
-    assert "ollama" not in types and "lmstudio" not in types  # keyless/local
-    assert "deepseek" not in types and "github" not in types  # enabled:false
+    types = set(_chain_referenced_cloud_provider_types())
+    # In some active call-site chain:
+    assert {"openrouter", "groq", "mistral", "nvidia_nim"} <= types
+    # Keyless/local excluded even though chain-referenced (lmstudio):
+    assert "ollama" not in types and "lmstudio" not in types
+    # Declared+enabled but referenced by NO chain → excluded:
+    assert "qwen" not in types and "openai" not in types
+    assert "xai" not in types and "minimax" not in types
+    # Disabled providers are absent from cfg.providers entirely:
+    assert "deepseek" not in types and "github" not in types
 
 
 def test_key_pattern_parity_with_runtime(monkeypatch):
@@ -218,16 +226,16 @@ def test_key_pattern_parity_with_runtime(monkeypatch):
 
 
 def test_llm_fallback_when_config_unreadable(monkeypatch, tmp_path):
-    from genesis.onboarding.floor import _enabled_cloud_provider_types
+    from genesis.onboarding.floor import _chain_referenced_cloud_provider_types
 
     monkeypatch.setattr(floor_mod, "_ROUTING_CONFIG_PATH", tmp_path / "nope.yaml")
-    _enabled_cloud_provider_types.cache_clear()
+    _chain_referenced_cloud_provider_types.cache_clear()
     try:
         _oauth(monkeypatch, True)
         # Static fallback still recognizes a known cloud key.
         assert compute_floor({"API_KEY_GROQ": "x"}).llm_key_present is True
     finally:
-        _enabled_cloud_provider_types.cache_clear()
+        _chain_referenced_cloud_provider_types.cache_clear()
 
 
 def test_as_dict_shape(monkeypatch):
