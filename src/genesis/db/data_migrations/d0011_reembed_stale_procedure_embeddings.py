@@ -23,11 +23,11 @@ from __future__ import annotations
 import logging
 import sqlite3
 
-from genesis.env import genesis_db_path
-from genesis.learning.procedural.stale_embedding_repair import (
+from genesis.db.data_migrations.stale_embedding_repair import (
     count_stale_procedure_embeddings,
     reembed_stale_procedure_embeddings,
 )
+from genesis.env import genesis_db_path
 
 logger = logging.getLogger(__name__)
 

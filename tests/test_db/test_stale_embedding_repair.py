@@ -16,7 +16,7 @@ import sqlite3
 
 import pytest
 
-from genesis.learning.procedural import stale_embedding_repair as sr
+from genesis.db.data_migrations import stale_embedding_repair as sr
 from genesis.learning.procedural.embedding import pack_embedding
 
 
@@ -149,10 +149,22 @@ def test_noop_when_no_multiversion_rows_needs_no_embedder(tmp_path):
     assert result == {"targeted": 0, "stale": 0, "unresolvable": 0, "reembedded": 0}
 
 
+class _UnavailableProvider:
+    async def embed(self, text):
+        from genesis.memory.embeddings import EmbeddingUnavailableError
+
+        raise EmbeddingUnavailableError("backends down")
+
+
 def test_fail_closed_when_embedder_unavailable(tmp_path, monkeypatch):
     path = _make_db(tmp_path)
     _insert(path, "A", "A-current", version=2, emb_text="A-OLD")  # a real candidate
-    monkeypatch.setattr(sr, "get_embedding_provider", lambda: None)
+    # No injected provider -> the migration constructs a local EmbeddingProvider;
+    # simulate the backend being down so embed() raises.
+    monkeypatch.setattr(
+        "genesis.memory.embeddings.EmbeddingProvider",
+        lambda *a, **k: _UnavailableProvider(),
+    )
 
     with pytest.raises(RuntimeError, match="embedder unavailable"):
         sr.reembed_stale_procedure_embeddings(path, provider=None)
@@ -164,9 +176,12 @@ def test_migration_migrate_then_verify(tmp_path, monkeypatch):
 
     path = _make_db(tmp_path)
     _insert(path, "A", "A-current", version=2, emb_text="A-OLD")
-    provider = _FakeProvider()
     monkeypatch.setattr(mig, "genesis_db_path", lambda: path)
-    monkeypatch.setattr(sr, "get_embedding_provider", lambda: provider)
+    # migrate() injects no provider -> it constructs a local EmbeddingProvider;
+    # patch that construction to our deterministic fake.
+    monkeypatch.setattr(
+        "genesis.memory.embeddings.EmbeddingProvider", lambda *a, **k: _FakeProvider()
+    )
 
     summary = mig.migrate()
     assert summary == {"targeted": 1, "stale": 1, "unresolvable": 0, "reembedded": 1}

@@ -40,7 +40,6 @@ from genesis.db.data_migrations._util import commit_in_batches
 from genesis.env import genesis_db_path
 from genesis.learning.procedural.embedding import (
     cosine_similarity,
-    get_embedding_provider,
     pack_embedding,
     unpack_embedding,
 )
@@ -71,8 +70,49 @@ def _candidates(conn: sqlite3.Connection) -> list[tuple[str, str, bytes | None]]
     return [(r[0], r[1], r[2]) for r in cur.fetchall()]
 
 
-async def _embed_all(provider, texts: list[str]) -> list[list[float]]:
-    return [await provider.embed(t) for t in texts]
+async def _aclose_provider(provider) -> None:
+    """Best-effort close of a migration-local provider's backend httpx clients on
+    THIS loop (the composite ``EmbeddingProvider`` has no ``aclose()``). Defensive:
+    a no-op if the internal shape changes, and never fails the migration."""
+    for backend in getattr(provider, "_backends", None) or []:
+        aclose = getattr(getattr(backend, "_client", None), "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 - cleanup must never fail the migration
+                logger.debug("reembed_stale: backend client close failed", exc_info=True)
+
+
+def _embed_texts(texts: list[str], provider) -> list[list[float]]:
+    """Embed all texts on ONE ``asyncio.run`` loop.
+
+    With no injected provider, construct a migration-LOCAL ``EmbeddingProvider``
+    created, used, AND closed on THIS loop — never the shared
+    ``get_embedding_provider()`` singleton, whose httpx connection pools are bound
+    to the server's main loop: driving it from this throwaway worker-thread loop
+    (or leaving a pooled connection bound to it) would break the migration or a
+    later live embed (Codex P2 on #1286). Fail-CLOSED: an unavailable embedder
+    surfaces as ``RuntimeError``.
+    """
+    if not texts:
+        return []
+    from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
+
+    async def _run() -> list[list[float]]:
+        prov = provider
+        owns = prov is None
+        if owns:
+            prov = EmbeddingProvider()
+        try:
+            return [await prov.embed(t) for t in texts]
+        finally:
+            if owns:
+                await _aclose_provider(prov)
+
+    try:
+        return asyncio.run(_run())
+    except EmbeddingUnavailableError as e:
+        raise RuntimeError(f"embedder unavailable; cannot re-embed stale procedures: {e}") from e
 
 
 def _classify(candidates, provider) -> tuple[list[tuple[str, bytes, bytes | None]], list[str]]:
@@ -94,7 +134,7 @@ def _classify(candidates, provider) -> tuple[list[tuple[str, bytes, bytes | None
     if not candidates:
         return [], []
     texts = [c[1] for c in candidates]
-    vectors = asyncio.run(_embed_all(provider, texts))
+    vectors = _embed_texts(texts, provider)
     writable: list[tuple[str, bytes, bytes | None]] = []
     unresolvable: list[str] = []
     for (pid, _principle, stored), vec in zip(candidates, vectors, strict=True):
@@ -121,9 +161,6 @@ def count_stale_procedure_embeddings(conn: sqlite3.Connection, provider=None) ->
     candidates = _candidates(conn)
     if not candidates:
         return 0
-    provider = provider or get_embedding_provider()
-    if provider is None:
-        raise RuntimeError("embedder unavailable; cannot verify embedding freshness")
     writable, unresolvable = _classify(candidates, provider)
     return len(writable) + len(unresolvable)
 
@@ -154,11 +191,7 @@ def reembed_stale_procedure_embeddings(
     if not candidates:
         return {"targeted": 0, "stale": 0, "unresolvable": 0, "reembedded": 0}
 
-    provider = provider or get_embedding_provider()
-    if provider is None:
-        raise RuntimeError("embedder unavailable; cannot re-embed stale procedures")
-
-    writable, unresolvable = _classify(candidates, provider)  # network embeds happen here
+    writable, unresolvable = _classify(candidates, provider)  # migration-local embeds happen here
     summary = {
         "targeted": len(candidates),
         "stale": len(writable),
