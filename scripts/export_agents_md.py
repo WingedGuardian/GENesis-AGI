@@ -42,6 +42,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 import generate_skill_catalog as _gsc  # noqa: E402
 
+try:  # robust frontmatter parsing; degrade to the scanner's value if absent
+    import yaml as _yaml
+except ImportError:  # pragma: no cover - yaml ships with the venv
+    _yaml = None
+
 # --------------------------------------------------------------------------- #
 # body scope — never export the brain
 # --------------------------------------------------------------------------- #
@@ -122,10 +127,46 @@ def parse_mcp_tools(mcp_root: Path) -> list[dict]:
             if _is_brain_tool(node.name, server):
                 continue
             doc = (ast.get_docstring(node) or "").strip()
-            desc = doc.splitlines()[0].strip() if doc else ""
+            # First paragraph (to the first blank line), whitespace-normalized —
+            # docstrings whose summary wraps across physical lines must not be
+            # truncated mid-sentence by a naive first-line split.
+            para = doc.split("\n\n", 1)[0]
+            desc = " ".join(para.split())
             tools.append({"name": node.name, "description": desc, "server": server})
     tools.sort(key=lambda t: (t["server"], t["name"]))
     return tools
+
+
+def _frontmatter_description(skill_dir: Path) -> str | None:
+    """Full, whitespace-normalized description from a skill's frontmatter.
+
+    The shared catalog scanner uses a line-based regex that truncates on
+    apostrophes/quotes and unfolded multi-line values; a proper YAML load of
+    the frontmatter block recovers the complete description. Returns None (so
+    the caller keeps the scanner's value) if yaml is unavailable or the block
+    doesn't parse to a usable string.
+    """
+    if _yaml is None:
+        return None
+    for md in ("SKILL.md", "skill.md", "README.md"):
+        p = skill_dir / md
+        if not p.exists():
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        if not text.startswith("---"):
+            return None
+        end = text.find("\n---", 3)
+        if end == -1:
+            return None
+        try:
+            data = _yaml.safe_load(text[3:end]) or {}
+        except _yaml.YAMLError:
+            return None
+        desc = data.get("description") if isinstance(data, dict) else None
+        if isinstance(desc, str) and desc.strip():
+            return " ".join(desc.split())
+        return None
+    return None
 
 
 def collect_skills(repo_root: Path) -> list[dict]:
@@ -135,15 +176,20 @@ def collect_skills(repo_root: Path) -> list[dict]:
     install-specific ``~/.genesis/skill-library`` is intentionally NOT
     scanned (a shipped AGENTS.md must stay generalizable and must not leak
     a user's private skill names). Tier-1 wins on a name collision.
+    Descriptions are re-parsed with YAML so they aren't truncated.
     """
     tier1 = _gsc._scan_tier(repo_root / ".claude" / "skills", 1, repo_root)
     seen = {s["name"].lower() for s in tier1}
-    tier2: list[dict] = []
+    skills = list(tier1)
     for s in _gsc._scan_tier(repo_root / "src" / "genesis" / "skills", 2, repo_root):
         if s["name"].lower() not in seen:
-            tier2.append(s)
+            skills.append(s)
             seen.add(s["name"].lower())
-    return tier1 + tier2
+    for s in skills:
+        full = _frontmatter_description(repo_root / s["path"])
+        if full:
+            s["description"] = full
+    return skills
 
 
 def render_block(skills: list[dict], tools: list[dict]) -> str:

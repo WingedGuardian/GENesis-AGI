@@ -42,20 +42,20 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **aws-fde-delivery** — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
 - **browser-automation** — Web automation with 4-layer escalation (Fetch, Genesis Browser, On-Demand MCP, Computer Use), anti-detection, and persistent profiles
 - **cc-update** — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
-- **code-intelligence** — Code understanding tool selection. Use when exploring architecture,
+- **code-intelligence** — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
 - **content-publish** — End-to-end content creation and publishing. Takes a topic (or generates one), drafts in the user's voice, gets approval via Telegram, and publishes to Medium via browser automation. Invoke with "publish a post about X", "write and publish to Medium", "content-publish", or when an ego-dispatched session needs to create and distribute content.
 - **debugging** — Systematic debugging of issues — use when a test fails, runtime error occurs, unexpected behavior is reported, or an awareness tick produces anomalous results
 - **deliverable-builder** — Produce a professional, send-ready deliverable on the user's behalf — in the correct file format (never raw markdown), in the user's voice, structured to lead with the strongest material, and free of document-level AI tells. Runs a gated pipeline with a fresh-context verification policeman and a Stop-hook that won't let the session finish without a verified PASS. Use when producing a job take-home, client report, executive one-pager, slide deck, proposal, or anything going out under the user's name.
 - **evaluate** — Evaluate technologies and competitive developments against Genesis architecture
 - **forecasting** — Superforecasting with calibrated reasoning, Brier score tracking, and prediction ledger management
 - **genesis-development** — This skill should be used when developing, debugging, refactoring, or building Genesis itself — tasks like "fix this in Genesis", "add a new MCP tool", "wire up the runtime", "Genesis won't start", "create a worktree", "debug the bridge", or "add a capability". Applies to any task modifying files under src/, .claude/, or tests/. Do NOT load for Genesis-as-tool work ("summarize this", "write a LinkedIn post", "research X") or general questions unrelated to Genesis internals.
-- **genesis-voice** — Apply when Genesis writes as itself — outreach, public content, community posts, emails, DMs. Not for writing in the user
-- **gitnexus-cli** — Use when the user needs to run GitNexus CLI commands like analyze/index a repo, check status, clean the index, generate a wiki, or list indexed repos. Examples: \
-- **gitnexus-debugging** — Use when the user is debugging a bug, tracing an error, or asking why something fails. Examples: \
-- **gitnexus-exploring** — Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: \
-- **gitnexus-guide** — Use when the user asks about GitNexus itself — available tools, how to query the knowledge graph, MCP resources, graph schema, or workflow reference. Examples: \
-- **gitnexus-impact-analysis** — Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: \
-- **gitnexus-refactoring** — Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: \
+- **genesis-voice** — Apply when Genesis writes as itself — outreach, public content, community posts, emails, DMs. Not for writing in the user's voice (that's voice-master). Activate when Genesis is the author, not the ghostwriter.
+- **gitnexus-cli** — Use when the user needs to run GitNexus CLI commands like analyze/index a repo, check status, clean the index, generate a wiki, or list indexed repos. Examples: "Index this repo", "Reanalyze the codebase", "Generate a wiki"
+- **gitnexus-debugging** — Use when the user is debugging a bug, tracing an error, or asking why something fails. Examples: "Why is X failing?", "Where does this error come from?", "Trace this bug"
+- **gitnexus-exploring** — Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: "How does X work?", "What calls this function?", "Show me the auth flow"
+- **gitnexus-guide** — Use when the user asks about GitNexus itself — available tools, how to query the knowledge graph, MCP resources, graph schema, or workflow reference. Examples: "What GitNexus tools are available?", "How do I use GitNexus?"
+- **gitnexus-impact-analysis** — Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: "Is it safe to change X?", "What depends on this?", "What will break?"
+- **gitnexus-refactoring** — Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: "Rename this function", "Extract this into a module", "Refactor this class", "Move this to a separate file"
 - **integrate-module** — Turn any external program into a Genesis module via structured discovery, connection mapping, config generation, and verification.
 - **lead-generation** — Prospect discovery, enrichment, scoring, and reporting against an Ideal Customer Profile
 - **linkedin-comment-strategy** — This skill should be used when the user asks to "write a comment for this LinkedIn post", "help me respond to this post", "what should I comment on this", "craft a LinkedIn comment", or when Genesis identifies high-value posts in the user's network worth engaging with. Also triggered by "how should I engage on LinkedIn" or "help me be more visible on LinkedIn".
@@ -102,7 +102,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `browser_sessions` — List logged-in sessions from the persistent browser profile.
 - `browser_snapshot` — Return the accessibility tree of the current page.
 - `browser_upload` — Upload a file to a file input element on the current page.
-- `build_lane_status` — What has the autonomous capability-build lane done — and how well do its
+- `build_lane_status` — What has the autonomous capability-build lane done — and how well do its verdicts track your decisions?
 - `campaign_create` — Create and activate a new campaign.
 - `campaign_list` — List all campaigns with status and health indicators.
 - `campaign_pause` — Pause a campaign (stops scheduling, keeps state).
@@ -128,7 +128,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `module_call` — Execute an operation on an external module.
 - `module_list` — List all external modules and their available operations.
 - `provider_activity` — Per-provider call metrics: counts, error rates, latency percentiles, cache hits.
-- `session_charter` — Read a session's charter: immutable origin, living mission/pointers,
+- `session_charter` — Read a session's charter: immutable origin, living mission/pointers, and the full ledger with item ids and status counts.
 - `session_charter_update` — Set the session's living mission and/or edit its pointer list.
 - `session_config` — Set model and/or effort for a Genesis conversation session.
 - `session_ledger_add` — Record an agreement/TODO as a durable ledger row on the session charter.
@@ -153,7 +153,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 **genesis-outreach**
 
 - `outreach_digest` — Generate a digest of recent outreach activity.
-- `outreach_engagement` — Record an engagement OUTCOME (useful, engaged, acted_on, acknowledged,
+- `outreach_engagement` — Record an engagement OUTCOME (useful, engaged, acted_on, acknowledged, not_useful, ambivalent, ignored; 'replied' maps to 'useful').
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
 - `outreach_preferences` — Get/set user channel preferences and quiet hours.
 - `outreach_queue` — View recent outreach messages.

@@ -22,6 +22,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 # Load the stdlib script as a module (not a package — use importlib).
 _SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "export_agents_md.py"
 _spec = importlib.util.spec_from_file_location("export_agents_md", _SCRIPT_PATH)
@@ -243,8 +245,6 @@ def test_update_raises_on_dangling_start_marker(tmp_path):
     corrupted = f"# Prose\n\n{_exp.START_MARKER}\nhalf-written\n"
     block = f"{_exp.START_MARKER}\nnew\n{_exp.END_MARKER}\n"
 
-    import pytest
-
     with pytest.raises(ValueError):
         _exp.update_agents_md(corrupted, block)
 
@@ -252,8 +252,6 @@ def test_update_raises_on_dangling_start_marker(tmp_path):
 def test_update_raises_on_dangling_end_marker(tmp_path):
     corrupted = f"# Prose\n\nleftover\n{_exp.END_MARKER}\n"
     block = f"{_exp.START_MARKER}\nnew\n{_exp.END_MARKER}\n"
-
-    import pytest
 
     with pytest.raises(ValueError):
         _exp.update_agents_md(corrupted, block)
@@ -263,7 +261,54 @@ def test_update_raises_on_reversed_markers(tmp_path):
     corrupted = f"# Prose\n\n{_exp.END_MARKER}\nx\n{_exp.START_MARKER}\n"
     block = f"{_exp.START_MARKER}\nnew\n{_exp.END_MARKER}\n"
 
-    import pytest
-
     with pytest.raises(ValueError):
         _exp.update_agents_md(corrupted, block)
+
+
+# --------------------------------------------------------------------------- #
+# description completeness (Codex P2 regressions)
+# --------------------------------------------------------------------------- #
+def test_parse_mcp_tools_joins_wrapped_first_paragraph(tmp_path):
+    """A summary that wraps across physical lines must not be truncated to the
+    first line — the whole first paragraph is kept, whitespace-normalized."""
+    path = tmp_path / "recon_mcp.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "from fastmcp import FastMCP\n"
+        'mcp = FastMCP("genesis-recon")\n\n'
+        "@mcp.tool()\n"
+        "async def recon_config(x: str) -> dict:\n"
+        '    """View or modify the recon configuration\n'
+        "    across watchlist, schedule, and sources.\n\n"
+        "    Longer detail is dropped.\n"
+        '    """\n'
+        "    return {}\n",
+        encoding="utf-8",
+    )
+
+    tools = _exp.parse_mcp_tools(tmp_path)
+
+    assert tools[0]["description"] == (
+        "View or modify the recon configuration across watchlist, schedule, and sources."
+    )
+    assert "Longer detail" not in tools[0]["description"]
+
+
+def test_collect_skills_recovers_description_past_apostrophe(tmp_path):
+    """The line-based catalog regex truncates a description at the first
+    apostrophe; collect_skills re-parses with YAML to keep it whole."""
+    repo = tmp_path / "repo"
+    skill = repo / ".claude" / "skills" / "taste"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: taste\n"
+        "description: Use for Genesis's own dashboard and other UIs.\n"
+        "---\n# taste\n",
+        encoding="utf-8",
+    )
+
+    skills = _exp.collect_skills(repo)
+
+    row = next(s for s in skills if s["name"] == "taste")
+    assert row["description"] == "Use for Genesis's own dashboard and other UIs."
