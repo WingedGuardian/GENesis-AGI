@@ -76,3 +76,35 @@ def test_identical_content_is_noop(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "already identical" in result.stdout
+
+
+def test_unset_home_and_no_output_dir_does_not_abort(tmp_path):
+    """Regression: with HOME unset AND GENESIS_OUTPUT_DIR unset, the $HOME
+    default must not abort under `set -u`. A getent shim redirects HOME to a tmp
+    home; the script should resolve it and reach the normal missing-overlay exit
+    (not a "HOME: unbound variable" crash)."""
+    repo = _fake_repo(tmp_path)
+    fake_home = tmp_path / "pwhome"
+    fake_home.mkdir()
+    shim_bin = tmp_path / "bin"
+    shim_bin.mkdir()
+    getent = shim_bin / "getent"
+    getent.write_text('#!/bin/sh\necho "u:x:$(id -u):$(id -g)::${FAKE_HOME}:/bin/sh"\n')
+    getent.chmod(0o755)
+
+    env = {
+        "PATH": f"{shim_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "FAKE_HOME": str(fake_home),
+    }  # no HOME, no GENESIS_OUTPUT_DIR
+    result = subprocess.run(
+        ["/bin/bash", str(repo / "scripts" / "promote_models_md.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert "unbound variable" not in result.stderr
+    # Resolved HOME to the passwd home; overlay absent there → guarded exit 1.
+    assert result.returncode == 1
+    assert str(fake_home / ".genesis" / "output" / "models.md") in result.stderr

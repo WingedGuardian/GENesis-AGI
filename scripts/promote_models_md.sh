@@ -17,6 +17,16 @@
 # Idempotent: a plain copy. Writes nothing if the overlay is absent.
 set -euo pipefail
 
+# Resolve HOME robustly: a stripped-env interactive shell can leave HOME unset,
+# which under `set -u` would abort at the $HOME default below. Fall back to the
+# passwd entry, then a conventional path. (Only referenced when GENESIS_OUTPUT_DIR
+# is also unset, but the default is still evaluated, so guard it.)
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || HOME="/home/$(id -un)"
+    export HOME
+fi
+
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 OVERLAY="${GENESIS_OUTPUT_DIR:-$HOME/.genesis/output}/models.md"
 TRACKED="$REPO_ROOT/docs/reference/models.md"

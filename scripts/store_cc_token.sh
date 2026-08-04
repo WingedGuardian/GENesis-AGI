@@ -22,6 +22,18 @@
 
 set -euo pipefail
 
+# Resolve HOME robustly. This install's stripped-env interactive shells can
+# leave HOME unset (a recurring pattern here — same class as the gh/update.sh
+# "HOME: unbound variable" failures), which under `set -u` would abort at the
+# first ${HOME} use below before any token is read. Fall back to the passwd
+# entry for the current uid, then a conventional path, and export so any child
+# inherits it.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || HOME="/home/$(id -un)"
+    export HOME
+fi
+
 TOKEN_FILE="${HOME}/.genesis/cc_oauth_token.env"
 SHARED_FILE="${HOME}/.genesis/shared/guardian/cc_oauth_token.env"
 
