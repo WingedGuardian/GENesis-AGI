@@ -31,10 +31,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   including the endpoint that reads and writes your saved keys — stayed reachable
   by anyone who could open the dashboard. With a password set, state-changing API
   calls now require your login session (Genesis's own components authenticate with
-  an internal token). Read-only calls, the voice API, and local loopback callers
-  are unaffected. If one of your own local integrations breaks, set
-  `GENESIS_DASHBOARD_API_AUTH=off` to disable just this gate without removing the
-  password.
+  an internal token). The gate is applied in every supported hosting mode (both the
+  standalone server and Agent Zero), so no mode leaves the API open. Read-only
+  calls and the voice API are unaffected. If one of your own local integrations
+  breaks, set `GENESIS_DASHBOARD_API_AUTH=off` to disable just this gate without
+  removing the password.
 
 ### Fixed
 

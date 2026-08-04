@@ -227,6 +227,23 @@ def check_api_mutation_auth():
     return jsonify({"error": "authentication required"}), 401
 
 
+def apply_api_mutation_gate(app) -> None:
+    """Mint the internal API token and register the app-level ``/api`` mutation gate.
+
+    EVERY supported host that mounts the dashboard/outreach blueprints must call
+    this, or setting ``DASHBOARD_PASSWORD`` would leave ``/api`` mutations
+    unauthenticated in that mode (the blueprint-level auth hook deliberately exempts
+    ``/api/*``). Idempotent — guarded by a flag on the app so a double-call (or a
+    host that both creates the app and re-registers blueprints) can't stack the
+    hook.
+    """
+    if getattr(app, "_genesis_api_mutation_gate_applied", False):
+        return
+    get_or_create_internal_api_token()  # mint once (0600) before the gate needs it
+    app.before_request(check_api_mutation_auth)
+    app._genesis_api_mutation_gate_applied = True
+
+
 # ── Routes ────────────────────────────────────────────────────────────
 
 @blueprint.route("/api/genesis/auth/status")

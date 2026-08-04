@@ -72,8 +72,8 @@ def test_setup_status_reads_persisted_secrets_not_env(wiz, monkeypatch):
 
 
 def test_setup_status_floor_met_requires_all_three_legs(wiz):
-    # LLM + embedding present AND cc_oauth True → floor met.
-    wiz["secrets"].write_text("API_KEY_GROQ=g\nAPI_KEY_VOYAGE=v\n")
+    # LLM (groq) + embedding (deepinfra) present AND cc_oauth True → floor met.
+    wiz["secrets"].write_text("API_KEY_GROQ=g\nAPI_KEY_DEEPINFRA=d\n")
     body = wiz["client"].get("/api/genesis/setup-status").get_json()
     assert body["floor_met"] is True
     # Drop CC login → floor no longer met even with both keys.
@@ -83,22 +83,25 @@ def test_setup_status_floor_met_requires_all_three_legs(wiz):
 
 def test_setup_status_anthropic_does_not_count_as_llm(wiz):
     # ANTHROPIC_API_KEY is not routing-consumed → must not register as an LLM key.
-    wiz["secrets"].write_text("ANTHROPIC_API_KEY=sk-ant\nOPENAI_API_KEY=o\n")
+    wiz["secrets"].write_text("ANTHROPIC_API_KEY=sk-ant\nAPI_KEY_DEEPINFRA=d\n")
     body = wiz["client"].get("/api/genesis/setup-status").get_json()
     assert body["llm_key_present"] is False
-    assert body["embedding_key_present"] is True  # OPENAI_API_KEY counts for embeddings
+    assert body["embedding_key_present"] is True  # deepinfra is a real embedding backend
     assert body["floor_met"] is False
 
 
-def test_setup_status_uses_canonical_registry_key_names(wiz):
-    # The provider-suffix forms (GOOGLE_API_KEY / OPENAI_API_KEY) are canonical;
-    # the API_KEY_* mis-forms must NOT count.
-    wiz["secrets"].write_text("GOOGLE_API_KEY=g\nOPENAI_API_KEY=o\n")
+def test_setup_status_embedding_leg_only_real_backends(wiz):
+    # Only DeepInfra / Qwen are real embedding backends. Voyage (rerank-only) and a
+    # bare OpenAI/Google key must NOT satisfy the embedding leg.
+    wiz["secrets"].write_text("API_KEY_VOYAGE=v\nOPENAI_API_KEY=o\nGOOGLE_API_KEY=g\n")
     body = wiz["client"].get("/api/genesis/setup-status").get_json()
-    assert body["llm_key_present"] is True  # GOOGLE_API_KEY
-    assert body["embedding_key_present"] is True  # OPENAI_API_KEY / GOOGLE_API_KEY
-    wiz["secrets"].write_text("API_KEY_GOOGLE=g\n")  # wrong form
-    assert wiz["client"].get("/api/genesis/setup-status").get_json()["llm_key_present"] is False
+    assert body["embedding_key_present"] is False
+    assert body["llm_key_present"] is True  # openai / google ARE LLM providers
+    # A real embedding backend flips it.
+    wiz["secrets"].write_text("API_KEY_QWEN=q\n")
+    assert (
+        wiz["client"].get("/api/genesis/setup-status").get_json()["embedding_key_present"] is True
+    )
 
 
 def test_setup_complete_endpoint_removed(wiz):
@@ -111,7 +114,7 @@ def test_setup_complete_endpoint_removed(wiz):
 def test_setup_status_onboarded_reflects_marker_only(wiz):
     # `onboarded` mirrors the bootstrap marker; it is decoupled from floor_met.
     wiz["marker"].write_text("2026-08-03\n")
-    wiz["secrets"].write_text("API_KEY_VOYAGE=vk\n")
+    wiz["secrets"].write_text("API_KEY_DEEPINFRA=dk\n")
     body = wiz["client"].get("/api/genesis/setup-status").get_json()
     assert body["onboarded"] is True
     assert body["embedding_key_present"] is True

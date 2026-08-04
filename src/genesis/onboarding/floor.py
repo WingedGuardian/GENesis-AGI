@@ -30,40 +30,51 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
-from genesis.env import secrets_path
+from genesis.env import repo_root, secrets_path
 
 logger = logging.getLogger(__name__)
 
-# Canonical env-var names, exactly as defined in ``secrets.env.example`` (the
-# dashboard secrets registry only accepts these forms). Note the provider-suffix
-# forms for Google / OpenAI — NOT ``API_KEY_*`` — must match or a fresh install
-# that configured them would read as "missing".
-#
-# ANTHROPIC_API_KEY is intentionally EXCLUDED from the LLM set: routing has no
-# ``type: anthropic`` provider (the ``anthropic/claude-*`` entries in
-# ``config/model_routing.yaml`` are OpenRouter *slugs* under ``type: openrouter``),
-# and a standing directive forbids wiring ANTHROPIC_API_KEY into the runtime. A
-# bare Anthropic key therefore does NOT make Genesis able to think — counting it
-# would let a non-functional install read as "floor met".
-LLM_KEY_NAMES: tuple[str, ...] = (
-    "API_KEY_OPENROUTER",
-    "API_KEY_GROQ",
-    "API_KEY_DEEPSEEK",
-    "API_KEY_MISTRAL",
-    "GOOGLE_API_KEY",
-    "API_KEY_ZENMUX",
-)
-EMBEDDING_KEY_NAMES: tuple[str, ...] = (
-    "API_KEY_VOYAGE",
-    "API_KEY_DEEPINFRA",
-    "OPENAI_API_KEY",
-    "GOOGLE_API_KEY",
-)
-
 # Values that mean "not really set" even when the key line exists in secrets.env.
 UNSET_SENTINELS = ("", "None", "NA")
+
+# ── LLM floor: derived from what routing ACTUALLY consumes ─────────────────────
+# The set of LLM keys that satisfy the floor is NOT hand-maintained (a hard-coded
+# list drifted three times: it once counted a dead Anthropic key, later missed
+# NVIDIA/Qwen/MiniMax/xAI and counted a disabled DeepSeek). Instead the LLM leg is
+# derived live from ``config/model_routing.yaml``: any ENABLED, key-requiring
+# provider whose key is configured satisfies it. Key resolution uses the SAME three
+# env-var patterns as the runtime resolver
+# ``routing.litellm_delegate._resolve_api_key`` — kept in sync by a parity test.
+
+# Provider types that need NO API key (local backends) — excluded from the LLM leg.
+_KEYLESS_PROVIDER_TYPES = frozenset({"ollama", "lmstudio"})
+
+# Only used if model_routing.yaml can't be parsed: a superset of the current enabled
+# cloud providers' key names, so the floor degrades to "reasonable", never "empty".
+_LLM_KEY_NAMES_FALLBACK: tuple[str, ...] = (
+    "API_KEY_OPENROUTER",
+    "API_KEY_GROQ",
+    "API_KEY_MISTRAL",
+    "GOOGLE_API_KEY",
+    "OPENAI_API_KEY",
+    "API_KEY_ZENMUX",
+    "API_KEY_NVIDIA_NIM",
+    "API_KEY_QWEN",
+    "API_KEY_MINIMAX",
+    "API_KEY_XAI",
+)
+
+# Cloud EMBEDDING backends actually consumed by ``providers/embedding.py`` (deepinfra
+# + dashscope/qwen). NOTE: Voyage is rerank-ONLY, and there is no OpenAI/Google
+# embedding backend — counting those (as an earlier hard-coded list did) let a box
+# with no real embedding backend read as "floor met". Local Ollama embeddings are
+# keyless (a bonus, not a floor-satisfier — the floor measures cloud capability).
+EMBEDDING_KEY_NAMES: tuple[str, ...] = ("API_KEY_DEEPINFRA", "API_KEY_QWEN")
+
+_ROUTING_CONFIG_PATH = repo_root() / "config" / "model_routing.yaml"
 
 
 @dataclass(frozen=True)
@@ -168,6 +179,66 @@ def _has_any(secrets: Mapping[str, str], names: tuple[str, ...]) -> bool:
     return any(str(secrets.get(n, "")).strip() not in UNSET_SENTINELS for n in names)
 
 
+@lru_cache(maxsize=1)
+def _enabled_cloud_provider_types() -> tuple[str, ...]:
+    """Enabled, key-requiring provider TYPES from ``config/model_routing.yaml``.
+
+    This is what makes the LLM floor track ACTUAL routing consumption instead of a
+    hand-maintained list. Cached — the routing config is static at runtime. Returns
+    ``()`` on any parse failure, which signals the static fallback.
+    """
+    try:
+        import yaml
+
+        data = yaml.safe_load(_ROUTING_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 - fall back rather than raise into the floor
+        logger.warning(
+            "floor: could not read %s; using static LLM key fallback",
+            _ROUTING_CONFIG_PATH,
+            exc_info=True,
+        )
+        return ()
+    types: set[str] = set()
+    for prov in (data.get("providers") or {}).values():
+        if not isinstance(prov, dict):
+            continue
+        enabled = prov.get("enabled", True)
+        # Literal false (or the string "false") = disabled. An env-templated value
+        # like "${GENESIS_ENABLE_OLLAMA:-true}" is only used by local types, which
+        # are excluded below regardless, so treating it as enabled is safe.
+        if enabled is False or str(enabled).strip().lower() == "false":
+            continue
+        ptype = prov.get("type")
+        if isinstance(ptype, str) and ptype not in _KEYLESS_PROVIDER_TYPES:
+            types.add(ptype)
+    return tuple(sorted(types))
+
+
+def provider_key_present(provider_type: str, secrets: Mapping[str, str]) -> bool:
+    """Whether a key for ``provider_type`` is configured in ``secrets``.
+
+    Uses the SAME three env-var patterns as the runtime key resolver
+    ``genesis.routing.litellm_delegate._resolve_api_key`` (``API_KEY_{TYPE}`` /
+    ``{TYPE}_API_KEY`` / ``{TYPE}_API_TOKEN``), so "is a provider usable" means the
+    same thing to the floor and to routing. Kept in sync by
+    ``tests/test_onboarding/test_floor.py::test_key_pattern_parity_with_runtime``.
+    """
+    service = provider_type.upper()
+    for pattern in (f"API_KEY_{service}", f"{service}_API_KEY", f"{service}_API_TOKEN"):
+        if str(secrets.get(pattern, "")).strip() not in UNSET_SENTINELS:
+            return True
+    return False
+
+
+def _llm_key_present(secrets: Mapping[str, str]) -> bool:
+    """True when an ENABLED cloud LLM provider has its key configured."""
+    types = _enabled_cloud_provider_types()
+    if types:
+        return any(provider_key_present(t, secrets) for t in types)
+    # Config unreadable → check the static superset directly (rare degraded path).
+    return _has_any(secrets, _LLM_KEY_NAMES_FALLBACK)
+
+
 def compute_floor(secrets: Mapping[str, str] | None = None) -> FloorStatus:
     """Compute the live floor.
 
@@ -179,6 +250,6 @@ def compute_floor(secrets: Mapping[str, str] | None = None) -> FloorStatus:
         secrets = read_persisted_secrets()
     return FloorStatus(
         cc_oauth=cc_oauth_present(),
-        llm_key_present=_has_any(secrets, LLM_KEY_NAMES),
+        llm_key_present=_llm_key_present(secrets),
         embedding_key_present=_has_any(secrets, EMBEDDING_KEY_NAMES),
     )

@@ -425,13 +425,9 @@ class StandaloneAdapter:
         # mutations when a dashboard password is set. The gate is registered
         # APP-LEVEL (not blueprint-level) so it covers every blueprint uniformly —
         # the dashboard blueprint AND the separate outreach_api blueprint.
-        from genesis.dashboard.auth import (
-            check_api_mutation_auth,
-            get_or_create_internal_api_token,
-        )
+        from genesis.dashboard.auth import apply_api_mutation_gate
 
-        get_or_create_internal_api_token()
-        app.before_request(check_api_mutation_auth)
+        apply_api_mutation_gate(app)
 
         # Login page (on app, not blueprint — must be reachable before auth)
         @app.route("/genesis/login")

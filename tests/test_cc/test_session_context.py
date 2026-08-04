@@ -386,7 +386,7 @@ class TestOnboardingInjection:
         result = self._run(
             flag_dir,
             tmp_path,
-            secrets_body="API_KEY_GROQ=x\nAPI_KEY_VOYAGE=y\n",
+            secrets_body="API_KEY_GROQ=x\nAPI_KEY_DEEPINFRA=y\n",
             token="tok-test",
         )
         assert "FIRST-RUN ONBOARDING" not in result.stdout

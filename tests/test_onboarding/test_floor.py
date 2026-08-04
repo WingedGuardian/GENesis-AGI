@@ -94,9 +94,14 @@ def _oauth(monkeypatch, value: bool) -> None:
     monkeypatch.setattr(floor_mod, "cc_oauth_present", lambda: value)
 
 
+# These run against the REAL version-controlled config/model_routing.yaml (the LLM
+# leg is derived from its enabled providers), so the provider names below reflect the
+# actual routing config.
+
+
 def test_floor_met_when_all_three_legs_present(monkeypatch):
     _oauth(monkeypatch, True)
-    f = compute_floor({"API_KEY_OPENROUTER": "x", "API_KEY_VOYAGE": "y"})
+    f = compute_floor({"API_KEY_OPENROUTER": "x", "API_KEY_DEEPINFRA": "y"})
     assert (f.cc_oauth, f.llm_key_present, f.embedding_key_present, f.floor_met) == (
         True,
         True,
@@ -112,40 +117,122 @@ def test_floor_unmet_missing_embedding(monkeypatch):
 
 def test_floor_unmet_missing_llm(monkeypatch):
     _oauth(monkeypatch, True)
-    assert compute_floor({"API_KEY_VOYAGE": "y"}).floor_met is False
+    f = compute_floor({"API_KEY_DEEPINFRA": "y"})  # embedding present, no LLM
+    assert f.embedding_key_present is True
+    assert f.llm_key_present is False
+    assert f.floor_met is False
 
 
 def test_floor_unmet_missing_cc_oauth(monkeypatch):
     _oauth(monkeypatch, False)
-    assert compute_floor({"API_KEY_OPENROUTER": "x", "API_KEY_VOYAGE": "y"}).floor_met is False
+    assert compute_floor({"API_KEY_OPENROUTER": "x", "API_KEY_DEEPINFRA": "y"}).floor_met is False
 
 
 def test_anthropic_key_does_not_satisfy_llm_leg(monkeypatch):
+    # No type:anthropic provider in routing → a bare Anthropic key is not usable.
     _oauth(monkeypatch, True)
-    f = compute_floor({"ANTHROPIC_API_KEY": "sk-ant-xxx", "API_KEY_VOYAGE": "y"})
-    assert f.llm_key_present is False  # not routing-consumed → must not count
+    f = compute_floor({"ANTHROPIC_API_KEY": "sk-ant-xxx", "API_KEY_DEEPINFRA": "y"})
+    assert f.llm_key_present is False
     assert f.floor_met is False
 
 
-def test_google_key_counts_for_both_legs(monkeypatch):
-    # GOOGLE_API_KEY is in both the LLM and embedding sets.
+def test_nvidia_only_satisfies_llm_leg(monkeypatch):
+    # Regression: an install whose only cloud LLM credential is NVIDIA NIM must count
+    # (nvidia_nim is an enabled routing provider).
+    _oauth(monkeypatch, True)
+    assert compute_floor({"API_KEY_NVIDIA_NIM": "x"}).llm_key_present is True
+
+
+def test_google_key_counts_for_llm_not_embedding(monkeypatch):
+    # google is an enabled LLM provider; there is NO google embedding backend.
     _oauth(monkeypatch, True)
     f = compute_floor({"GOOGLE_API_KEY": "g"})
+    assert f.llm_key_present is True
+    assert f.embedding_key_present is False
+    assert f.floor_met is False
+
+
+def test_qwen_key_counts_for_both_legs(monkeypatch):
+    # API_KEY_QWEN is consumed by BOTH the qwen LLM provider and the dashscope
+    # embedding backend.
+    _oauth(monkeypatch, True)
+    f = compute_floor({"API_KEY_QWEN": "q"})
     assert f.llm_key_present is True
     assert f.embedding_key_present is True
     assert f.floor_met is True
 
 
+def test_voyage_does_not_satisfy_embedding(monkeypatch):
+    # Voyage is rerank-only — it must not satisfy the embedding leg.
+    _oauth(monkeypatch, True)
+    assert compute_floor({"API_KEY_VOYAGE": "v"}).embedding_key_present is False
+
+
+def test_openai_key_is_llm_not_embedding(monkeypatch):
+    # openai is an enabled LLM provider; there is no OpenAI embedding backend.
+    _oauth(monkeypatch, True)
+    f = compute_floor({"OPENAI_API_KEY": "o"})
+    assert f.llm_key_present is True
+    assert f.embedding_key_present is False
+
+
+def test_disabled_provider_key_does_not_count(monkeypatch):
+    # deepseek is enabled:false in model_routing.yaml → a bare DeepSeek key is not
+    # usable, so it must not satisfy the LLM leg.
+    _oauth(monkeypatch, True)
+    assert compute_floor({"API_KEY_DEEPSEEK": "d"}).llm_key_present is False
+
+
 def test_sentinel_values_do_not_count(monkeypatch):
     _oauth(monkeypatch, True)
     for bad in ("", "None", "NA", "   "):
-        f = compute_floor({"API_KEY_GROQ": bad, "API_KEY_VOYAGE": "y"})
+        f = compute_floor({"API_KEY_GROQ": bad, "API_KEY_DEEPINFRA": "y"})
         assert f.llm_key_present is False, f"{bad!r} should not count"
+
+
+def test_config_derivation_excludes_local_and_disabled():
+    from genesis.onboarding.floor import _enabled_cloud_provider_types
+
+    types = set(_enabled_cloud_provider_types())
+    assert "nvidia_nim" in types and "qwen" in types  # enabled cloud
+    assert "ollama" not in types and "lmstudio" not in types  # keyless/local
+    assert "deepseek" not in types and "github" not in types  # enabled:false
+
+
+def test_key_pattern_parity_with_runtime(monkeypatch):
+    # The floor's provider_key_present must accept exactly what routing's
+    # _resolve_api_key accepts (the three env-var naming patterns).
+    from genesis.onboarding.floor import provider_key_present
+    from genesis.routing.litellm_delegate import _resolve_api_key
+
+    for ptype, envname in (
+        ("groq", "API_KEY_GROQ"),
+        ("google", "GOOGLE_API_KEY"),
+        ("nvidia_nim", "API_KEY_NVIDIA_NIM"),
+        ("openai", "OPENAI_API_KEY"),
+    ):
+        monkeypatch.setenv(envname, "v")
+        assert _resolve_api_key(ptype) == "v"
+        assert provider_key_present(ptype, {envname: "v"}) is True
+        monkeypatch.delenv(envname)
+
+
+def test_llm_fallback_when_config_unreadable(monkeypatch, tmp_path):
+    from genesis.onboarding.floor import _enabled_cloud_provider_types
+
+    monkeypatch.setattr(floor_mod, "_ROUTING_CONFIG_PATH", tmp_path / "nope.yaml")
+    _enabled_cloud_provider_types.cache_clear()
+    try:
+        _oauth(monkeypatch, True)
+        # Static fallback still recognizes a known cloud key.
+        assert compute_floor({"API_KEY_GROQ": "x"}).llm_key_present is True
+    finally:
+        _enabled_cloud_provider_types.cache_clear()
 
 
 def test_as_dict_shape(monkeypatch):
     _oauth(monkeypatch, True)
-    d = compute_floor({"API_KEY_GROQ": "x", "OPENAI_API_KEY": "o"}).as_dict()
+    d = compute_floor({"API_KEY_GROQ": "x", "API_KEY_DEEPINFRA": "o"}).as_dict()
     assert d == {
         "cc_oauth": True,
         "llm_key_present": True,

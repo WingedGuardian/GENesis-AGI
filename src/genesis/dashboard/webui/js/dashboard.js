@@ -303,15 +303,16 @@
         setupIdentity: "",
         setupIdentityLoaded: false,
         setupProviders: [
-          // Anthropic is intentionally NOT offered: routing has no `type: anthropic`
-          // provider (Claude routes via OpenRouter), so a bare ANTHROPIC_API_KEY is
-          // collected-but-never-consumed. Offer only routing-consumed providers.
-          {label: "OpenRouter (chat)",     keyName: "API_KEY_OPENROUTER", providerType: "openrouter", testable: true},
-          {label: "Groq (chat)",           keyName: "API_KEY_GROQ",       providerType: "groq",       testable: true},
-          {label: "DeepSeek (chat)",       keyName: "API_KEY_DEEPSEEK",   providerType: "deepseek",   testable: true},
-          {label: "Mistral (chat)",        keyName: "API_KEY_MISTRAL",    providerType: "mistral",    testable: true},
-          {label: "Voyage (embeddings)",   keyName: "API_KEY_VOYAGE",     providerType: "voyage",     testable: false},
-          {label: "DeepInfra (embeddings)", keyName: "API_KEY_DEEPINFRA", providerType: "deepinfra",  testable: false},
+          // Only routing-CONSUMED providers are offered, tagged by which floor leg
+          // they satisfy. Anthropic is excluded (no type:anthropic provider — Claude
+          // routes via OpenRouter); Voyage is excluded (rerank-only, not embedding);
+          // DeepSeek is excluded (enabled:false in model_routing.yaml).
+          {label: "OpenRouter (chat)",       keyName: "API_KEY_OPENROUTER", providerType: "openrouter", kind: "chat",      testable: true},
+          {label: "Groq (chat)",             keyName: "API_KEY_GROQ",       providerType: "groq",       kind: "chat",      testable: true},
+          {label: "Mistral (chat)",          keyName: "API_KEY_MISTRAL",    providerType: "mistral",    kind: "chat",      testable: true},
+          {label: "NVIDIA NIM (chat)",       keyName: "API_KEY_NVIDIA_NIM", providerType: "nvidia_nim", kind: "chat",      testable: false},
+          {label: "DeepInfra (embeddings)",  keyName: "API_KEY_DEEPINFRA",  providerType: "deepinfra",  kind: "embedding", testable: false},
+          {label: "Qwen / DashScope (chat + embeddings)", keyName: "API_KEY_QWEN", providerType: "qwen", kind: "embedding", testable: false},
         ],
         secretsMessage: null,     // {type, text}
 
@@ -2334,10 +2335,25 @@
               body: JSON.stringify({keys: {[this.setupProvider.keyName]: key}}),
             });
             if (resp.ok) {
+              const savedName = this.setupProvider.keyName;
               this.setupKeyValue = ""; this.setupKeyTest = null;
               await this.loadSetupStatus();
-              this.setupMsg = {type: "restart", text: `${this.setupProvider.keyName} saved — active after the next server restart.`};
-              await this.setupEnterIdentity();
+              const s = this.setupStatus || {};
+              // The floor needs BOTH a chat/LLM key and an embedding key. Keep
+              // collecting on step 2 until both legs are satisfied, rather than
+              // advancing to identity after a single key (which left the wizard
+              // unable to complete the floor in one pass). Auto-select a provider
+              // of the still-missing kind so the next save is one click away.
+              if (s.llm_key_present && s.embedding_key_present) {
+                this.setupMsg = {type: "restart", text: `${savedName} saved — chat + embedding keys set. Active after the next server restart.`};
+                await this.setupEnterIdentity();
+              } else {
+                const needKind = !s.llm_key_present ? "chat" : "embedding";
+                const needLabel = needKind === "chat" ? "a chat / model key" : "an embedding key (DeepInfra or Qwen)";
+                const idx = this.setupProviders.findIndex(p => p.kind === needKind);
+                if (idx >= 0) { this.setupProviderIdx = idx; }
+                this.setupMsg = {type: "ok", text: `${savedName} saved. Now add ${needLabel} to finish the floor — or Skip.`};
+              }
             } else {
               const d = await resp.json().catch(() => ({}));
               this.setupMsg = {type: "error", text: d.error || "Save failed"};
