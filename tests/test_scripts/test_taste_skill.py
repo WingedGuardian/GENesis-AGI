@@ -26,8 +26,11 @@ def test_taste_skill_frontmatter_parses():
     assert info is not None
     assert info["name"] == "taste"
     assert info["description"].strip()  # non-empty description
-    assert "design" in info["keywords"]
+    assert "ui" in info["keywords"]
     assert "taste" in info["keywords"]
+    # `design` is deliberately excluded — too broad (fires on "design the DB
+    # schema" / "design an API") and would burn a Tier-1 nudge slot.
+    assert "design" not in info["keywords"]
 
 
 def test_taste_skill_indexed_in_tier1():

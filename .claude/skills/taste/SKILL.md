@@ -7,7 +7,7 @@ description: >
   so the output has a point of view instead of defaulting to the timid,
   uniform look that reads as "AI made this". Applies to Genesis's OWN
   dashboard UI, not only things built for others.
-keywords: [design, ui, taste, layout, visual, dashboard, aesthetic, slop, variance, motion, density, spacing, typography, style, frontend, css]
+keywords: [ui, taste, layout, visual, dashboard, aesthetic, slop, variance, motion, density, spacing, typography, frontend, css]
 consumer: cc_foreground
 ---
 
