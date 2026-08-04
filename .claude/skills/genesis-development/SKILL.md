@@ -121,6 +121,67 @@ fixed anything. (Origin: 2026-07-17 — a stale-decision recurrence was
 "fixed" with a hand-written memory + directive; the propagation
 mechanism that failed to write them stayed broken.)
 
+### Debugging Discipline (phase-gated)
+
+Adapted from superpowers `systematic-debugging`. "Find root causes" is a value;
+these are the GATES that make it enforceable:
+
+- **Iron Law: no fix proposals until root-cause investigation completes.**
+  Investigation (read the full error, reproduce, check recent changes, gather
+  evidence) is a phase that FINISHES before any fix is proposed — never propose
+  fixes in the same breath as the symptom. "It's probably X, let me fix that"
+  = investigation skipped.
+- **Fix-attempt cap: 3 failed fixes → STOP and question the architecture.**
+  The debugging twin of the review escalation cap, with the same mechanics
+  (count attempts visibly; the cap consumes standing approval). Each failed fix
+  revealing a new problem in a different place is not bad luck — it is the
+  signature of a wrong architecture or a wrong problem statement. Do not
+  attempt fix #4; bring the pattern to the user.
+- **Boundary instrumentation for multi-component failures.** When the path
+  crosses components (hook → server → engine; CI → build → deploy), don't
+  reason about where it breaks — LOG entry/exit at each boundary, run ONCE,
+  and let the evidence localize the failing component before investigating it.
+  (The "starved vs broken" check — inputs before regression-hunting — is the
+  special case of this.)
+- **Read the reference implementation COMPLETELY before deriving from it.**
+  When a change must mirror what another subsystem does (what routing consumes,
+  what the runtime resolves, what a protocol expects), read that subsystem's
+  path END-TO-END first and derive from its own code/loader — never
+  incrementally guess-and-patch toward it. Incremental spec discovery is how a
+  review loop runs 7 rounds. (Origin: PR #1281 — the onboarding floor's key
+  list was wrong three times until it was derived from the router's own
+  `load_config` + call-site chains.)
+- **Condition-based waiting.** When a fix or test must wait for a state change,
+  poll the CONDITION (with a bounded deadline), never sleep an arbitrary
+  duration — arbitrary sleeps are flaky under load and slow everywhere else.
+  This complements the Timeout Policy (which governs the values).
+
+### Test-First Discipline
+
+Adapted from superpowers `test-driven-development`, scoped to where it pays:
+
+- **Bug fixes: failing reproduction test FIRST — always.** Before touching the
+  code, write the minimal test that reproduces the bug and WATCH IT FAIL for
+  the expected reason. Then fix; the same test proves the fix and pins the
+  regression. A repro test written after the fix proves nothing (it never
+  caught the bug).
+- **Verify-RED, always and everywhere.** Any new test must be seen to FAIL
+  (correctly) at least once — via the bug, a reverted fix, or a deliberately
+  broken assertion — before its green is trusted. A test that has only ever
+  passed may be testing nothing; a whole suite passing every review round
+  while a reviewer keeps finding real spec bugs is the tell that the tests
+  encode the same wrong spec as the code.
+- **Contested/subtle specs: write the expectations first.** When what-should-
+  happen is itself under discussion (which keys count, which states clear an
+  alarm), enumerate the expectation table as failing tests BEFORE implementing
+  — it forces the spec question to surface at design time instead of review
+  round 4.
+- **Anti-patterns (binding):** never assert on a mock's behavior when the real
+  code path can run; never add test-only methods/branches to production
+  classes; fakes implement the real contract (real method names, real return
+  types — import them). Test setup so complex it needs its own debugging =
+  the design is too coupled; fix the design.
+
 ### Code Intelligence — pick the right lane
 
 **Serena (Python LSP) is always live** — it parses current files per query, so
@@ -258,6 +319,8 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
 | "I'll add the follow-up later" | Follow-ups not created in-session are lost. Create it now while context is fresh. |
 | "I don't need a skill for this" | If a skill exists, use it. The using-superpowers Red Flags table exists for this exact rationalization. |
+| "This review round is the same class, it doesn't really count" | The visible round counter decides what counts, not you. Update it every cycle; at the cap, STOP. |
+| "The user already said proceed, so I can keep looping" | The escalation/fix-attempt caps CONSUME standing approval. Round 4+ (or fix #4) on an old instruction is a violation, not obedience. |
 | "I can read the summary instead of the source" | Summaries lose context. If you're about to change code, read the code, not the description of it. |
 | "The missing data was the problem — I wrote it, so it's fixed" | The mechanism that failed to write it is the problem. Hand-written artifacts are data repair, not a fix (see Instance-Fix vs Class-Fix Gate). |
 
@@ -345,18 +408,42 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   The second reviewer should see the improved code, not the same unfixed diff
   both would otherwise review; parallel also doubles review spend per baseline.
   (Standing user directive.)
-- **Escalation cap — stop and raise after 3 rounds that each find NEW defects.**
+- **Escalation cap — a HARD BLOCK at 3 rounds that each find NEW defects.**
   A *round* = one review→fix→re-review iteration (local reviewer rounds and
-  cloud-bot re-review rounds count together, per change). If a **4th round still
-  surfaces NEW findings** (3 prior rounds each already fixed *distinct* issues),
-  STOP and raise it to the user before continuing — summarize what each round
-  found and why the surface is wider than scoped, and let the user choose: keep
-  hardening, switch to a robust-by-construction redesign, narrow scope, or shelve.
-  Caveats: **multiple findings in a single pass = one round** (not an escalation);
-  the same defect reappearing (an incomplete prior fix) is a fix-it-properly
-  issue, not an escalation trigger. This complements the enumerate-class-then-lock
-  convergence discipline — the cap is the escalation trigger when the class won't
-  lock within ≤3 rounds.
+  cloud-bot re-review rounds count together, per change). The cap is enforced
+  by three mechanics, not by vibes:
+  1. **Visible round counter.** From round 1, the plan file (or task list)
+     carries `Review rounds: N (cap 3)`, updated every cycle. Rounds are a
+     tracked artifact — "it's the same class, it doesn't really count" is
+     exactly the rationalization the counter exists to kill.
+  2. **The block point is BEFORE dispatching the next review.** The check is
+     "am I about to trigger round 4+?" — evaluated at the mechanical moment
+     (the `@codex review` comment, the re-push, the reviewer dispatch), never
+     after reading the next batch of findings.
+  3. **The cap CONSUMES standing approval.** A prior "proceed", "merge when
+     clean", or "keep going until Codex is green" is VOID once the cap fires.
+     Continuing a round-4+ loop on an earlier instruction is a violation, not
+     obedience — STOP, post the round ledger (round → what it found → what it
+     cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
+     and get a FRESH decision: keep hardening, switch to a robust-by-
+     construction redesign, narrow scope, or shelve.
+  Caveats: **multiple findings in a single pass = one round** (not an
+  escalation); the same defect reappearing (an incomplete prior fix) is a
+  fix-it-properly issue, not an escalation trigger. This complements the
+  enumerate-class-then-lock convergence discipline — the cap is the escalation
+  trigger when the class won't lock within ≤3 rounds. (Origin: PR #1281 ran ~7
+  reviewer rounds because a standing "proceed once clean" silently carried
+  through rounds 4–6.)
+- **External review feedback is a set of claims to VERIFY, not orders.** For
+  every bot/external finding: check it against the actual code (its stated
+  mechanism may be wrong even when the underlying concern is real — quote the
+  disproving file:line), check whether the "fix" breaks existing behavior or
+  violates YAGNI, and push back with technical reasoning when it's wrong for
+  this codebase. A finding that conflicts with the user's prior design
+  decisions (e.g. live network calls in a hot autonomy gate, weakening an
+  approval gate) is a STOP-and-discuss, never an auto-fix. Chasing a reviewer's
+  green checkmark with a change you believe is wrong is a discipline failure.
+  No performative agreement — state the verified fix, or the reasoned pushback.
 
 ## Pre-Commit Gate
 
