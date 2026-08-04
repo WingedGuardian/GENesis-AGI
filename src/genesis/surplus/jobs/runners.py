@@ -179,9 +179,11 @@ async def run_github_discovery(sched: SchedulerContext) -> None:
 async def run_models_md_synthesis(sched: SchedulerContext) -> None:
     """Run weekly models.md synthesis (Sunday 8am UTC).
 
-    Dispatches a CC background session to update docs/reference/models.md
-    from recent model intelligence findings.  Fire-and-forget: job health
-    records the dispatch outcome, not the session completion.
+    Dispatches a CC background session to refresh the LOCAL models.md overlay
+    (``~/.genesis/output/models.md``) from recent model intelligence findings —
+    no git commit, so a clone's weekly run never diverges tracked source.
+    Fire-and-forget: job health records the dispatch outcome, not the session
+    completion.
     """
     try:
         from genesis.runtime import GenesisRuntime
@@ -190,6 +192,10 @@ async def run_models_md_synthesis(sched: SchedulerContext) -> None:
             return
     except Exception:
         pass
+    from genesis.env import models_md_synthesis_enabled
+    if not models_md_synthesis_enabled():
+        logger.debug("Models.md synthesis skipped (disabled via lever)")
+        return
     if sched._models_md_synthesis_job is None:
         record_failure("models_md_synthesis", "job not wired")
         return

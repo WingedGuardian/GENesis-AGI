@@ -38,7 +38,7 @@ import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import read_payload, tool_input  # noqa: E402
+from hook_input import read_payload, run_guard, tool_input  # noqa: E402
 
 # Matches 'git worktree remove' with optional flags
 _WORKTREE_REMOVE = re.compile(r"\bgit\s+worktree\s+remove\b")
@@ -292,4 +292,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_guard(main, "worktree_cwd_guard")
