@@ -183,6 +183,13 @@ def _check_auth():
 # unsetting the dashboard password, if an unforeseen machine caller breaks.
 _API_AUTH_OFF = ("off", "0", "false", "no")
 
+# Genesis-OWNED API route prefixes the gate protects. Scoped deliberately: in Agent
+# Zero hosting mode the gate is installed on AZ's host-owned Flask app, so a broad
+# "/api/" match would also reject AZ's OWN native /api/* routes. Every Genesis
+# mutation route lives under one of these (dashboard + outreach are /api/genesis/*;
+# the tool API is /api/t/*), so this covers all of ours and none of the host's.
+_GENESIS_API_PREFIXES = ("/api/genesis/", "/api/t/")
+
 
 def check_api_mutation_auth():
     """App-level gate: require auth for ``/api/**`` STATE-CHANGING requests when a
@@ -194,12 +201,13 @@ def check_api_mutation_auth():
     hook would miss.
 
     Open (returns None): everything when no password is set; when the kill switch
-    ``GENESIS_DASHBOARD_API_AUTH=off`` is set; any non-``/api`` path (HTML is
-    handled by the blueprint gate; ``/v1/*`` enforces its own bearer);
-    GET/HEAD/OPTIONS (non-mutating — guardian/health probes and dashboard polling
-    stay open); and the ``/api/genesis/auth/*`` login/logout endpoints. A mutation
-    passes with a valid session cookie OR a valid internal bearer token; otherwise
-    the request is rejected with 401.
+    ``GENESIS_DASHBOARD_API_AUTH=off`` is set; any path outside the Genesis-owned
+    API prefixes ``_GENESIS_API_PREFIXES`` (HTML is handled by the blueprint gate;
+    ``/v1/*`` enforces its own bearer; a co-hosting framework's own ``/api/*`` routes
+    are left alone); GET/HEAD/OPTIONS (non-mutating — guardian/health probes and
+    dashboard polling stay open); and the ``/api/genesis/auth/*`` login/logout
+    endpoints. A mutation passes with a valid session cookie OR a valid internal
+    bearer token; otherwise the request is rejected with 401.
     """
     if not get_dashboard_password():
         return None
@@ -207,7 +215,7 @@ def check_api_mutation_auth():
         return None
 
     path = request.path
-    if not path.startswith("/api/"):
+    if not path.startswith(_GENESIS_API_PREFIXES):
         return None
     if path.startswith("/api/genesis/auth/"):
         return None

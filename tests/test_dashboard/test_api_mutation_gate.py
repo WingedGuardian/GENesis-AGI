@@ -34,6 +34,14 @@ def client(tmp_path, monkeypatch):
     def login_stub():
         return jsonify({"ok": True})
 
+    @app.route("/api/t/mytool", methods=["POST"])
+    def tool_stub():
+        return jsonify({"ok": True})
+
+    @app.route("/api/host/native", methods=["POST"])
+    def host_native_stub():
+        return jsonify({"ok": True})
+
     @app.route("/v1/voice/thing", methods=["POST"])
     def v1_stub():
         return jsonify({"ok": True})
@@ -89,6 +97,20 @@ def test_auth_endpoints_exempt(client, monkeypatch):
 def test_v1_surface_exempt(client, monkeypatch):
     _pw(monkeypatch)
     assert client.post("/v1/voice/thing").status_code == 200
+
+
+def test_tool_api_prefix_is_gated(client, monkeypatch):
+    # /api/t/* is a Genesis-owned mutation surface → gated.
+    _pw(monkeypatch)
+    assert client.post("/api/t/mytool").status_code == 401
+
+
+def test_non_genesis_api_route_is_left_open(client, monkeypatch):
+    # A co-hosting framework's OWN /api/* route (not Genesis-owned) must NOT be
+    # gated, even with a password set — else enabling the password would break the
+    # host's unrelated API in Agent Zero mode.
+    _pw(monkeypatch)
+    assert client.post("/api/host/native").status_code == 200
 
 
 def test_kill_switch_disables_gate(client, monkeypatch):

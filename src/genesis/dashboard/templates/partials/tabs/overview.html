@@ -81,7 +81,7 @@
                 <ul style="margin:0 0 0.2rem 1.1rem;padding:0;">
                   <li x-show="!s.setupStatus.cc_oauth">Log in to Claude Code — run <code>claude login</code> in a terminal (the wizard can't do this for you).</li>
                   <li x-show="!s.setupStatus.llm_key_present">A chat / routing model key (step 2 — e.g. OpenRouter, Groq, Mistral).</li>
-                  <li x-show="!s.setupStatus.embedding_key_present">An embedding key for memory (step 2 — e.g. Voyage, DeepInfra, OpenAI).</li>
+                  <li x-show="!s.setupStatus.embedding_key_present">An embedding key for memory (step 2 — DeepInfra or Qwen).</li>
                 </ul>
                 <p style="margin:0.2rem 0 0;font-size:0.72rem;color:var(--color-text-secondary,#888);">This card stays until the floor is met. You can close it for now.</p>
               </div>
