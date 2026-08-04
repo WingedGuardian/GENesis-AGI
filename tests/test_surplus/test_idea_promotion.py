@@ -203,3 +203,41 @@ def test_settings_validator():
     assert v({"cap_per_run": 0})  # non-positive rejected
     assert v({"cap_per_run": -3})
     assert v({"bogus": 1})  # unknown key rejected
+
+
+def test_config_nonbool_enabled_degrades_to_disabled(monkeypatch):
+    """Codex P2: a hand-edited `enabled: "false"` overlay (bypasses the settings
+    validator) must NOT read as truthy — degrade toward disabled."""
+    from genesis.surplus import promotion_config as pc
+
+    monkeypatch.setattr(pc, "load_config", lambda: {"enabled": "false", "cap_per_run": 20})
+    assert pc.is_enabled() is False
+    monkeypatch.setattr(pc, "load_config", lambda: {"enabled": 1, "cap_per_run": 20})
+    assert pc.is_enabled() is False  # int is not a bool → disabled
+    monkeypatch.setattr(pc, "load_config", lambda: {"enabled": True, "cap_per_run": 20})
+    assert pc.is_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_summary_counts_by_kind_separates_idea_from_tabled(db):
+    """Codex P2: with a third 'idea' kind, tabled/idea counts must be computed
+    per-kind, not by subtraction (which lumped idea into tabled)."""
+    for k in ("follow_up", "tabled", "idea"):
+        await fu_crud.create(
+            db,
+            content=f"c-{k}",
+            source="s",
+            strategy="surplus_task",
+            kind=k,
+            domain="internal",
+            dedup_key=k,
+            id=k,
+        )
+    tabled = await fu_crud.get_summary_counts(db, kind="tabled")
+    idea = await fu_crud.get_summary_counts(db, kind="idea")
+    fu_only = await fu_crud.get_summary_counts(db, include_tabled=False)
+    all_kinds = await fu_crud.get_summary_counts(db, include_tabled=True)
+    assert sum(tabled.values()) == 1
+    assert sum(idea.values()) == 1  # NOT lumped into tabled
+    assert sum(fu_only.values()) == 1  # follow_up lane only
+    assert sum(all_kinds.values()) == 3

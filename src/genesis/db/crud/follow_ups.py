@@ -372,14 +372,24 @@ async def get_summary_counts(
     db: aiosqlite.Connection,
     *,
     include_tabled: bool = True,
+    kind: str | None = None,
 ) -> dict[str, int]:
     """Get counts by status for dashboard badges.
 
     include_tabled defaults True (existing callers unchanged); pass False to
-    count only the actionable ``follow_up`` lane."""
-    kind_where = "" if include_tabled else "WHERE kind = 'follow_up' "
+    count only the actionable ``follow_up`` lane. When ``kind`` is set, count
+    ONLY that specific kind (overrides include_tabled) — so a lane like
+    ``'tabled'`` or ``'idea'`` is counted directly rather than by subtraction,
+    which would conflate the non-follow_up kinds once a third kind exists."""
+    if kind is not None:
+        kind_where = "WHERE kind = ? "
+        params: tuple = (kind,)
+    else:
+        kind_where = "" if include_tabled else "WHERE kind = 'follow_up' "
+        params = ()
     cursor = await db.execute(
-        f"SELECT status, COUNT(*) FROM follow_ups {kind_where}GROUP BY status"
+        f"SELECT status, COUNT(*) FROM follow_ups {kind_where}GROUP BY status",
+        params,
     )
     return {row[0]: row[1] for row in await cursor.fetchall()}
 

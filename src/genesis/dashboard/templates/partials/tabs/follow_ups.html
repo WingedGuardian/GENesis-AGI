@@ -213,7 +213,7 @@
                     </select>
                     <button x-show="item.kind !== 'tabled'" @click.stop="$store.genesisDashboard.cockpitMoveKind(item.id, 'tabled')"
                             style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(149,117,205,0.1); color:#9575cd; border:1px solid rgba(149,117,205,0.25);">→ Tabled</button>
-                    <button x-show="item.kind === 'tabled'" @click.stop="$store.genesisDashboard.cockpitMoveKind(item.id, 'follow_up')"
+                    <button x-show="item.kind !== 'follow_up'" @click.stop="$store.genesisDashboard.cockpitMoveKind(item.id, 'follow_up')"
                             style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);">→ Follow-up</button>
                     <select @click.stop
                             @change.stop="$store.genesisDashboard.cockpitSetDomain(item.id, $event.target.value); $event.target.selectedIndex=0;"

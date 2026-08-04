@@ -83,9 +83,12 @@ def is_enabled() -> bool:
     """
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return False
-    cfg = load_config()
-    # Hand-edited unquoted `enabled: off` parses as YAML-1.1 boolean False.
-    return bool(cfg.get("enabled", True))
+    value = load_config().get("enabled", True)
+    # Only a real bool enables. A non-bool (e.g. a hand-edited `enabled: "false"`
+    # string — which bool() would read as truthy) degrades toward LESS write
+    # authority: disabled. `enabled: off`/`no` parse as YAML-1.1 booleans and
+    # pass through unchanged.
+    return value if isinstance(value, bool) else False
 
 
 def cap_per_run() -> int:
