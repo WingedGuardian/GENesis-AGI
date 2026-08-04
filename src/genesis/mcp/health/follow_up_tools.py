@@ -205,8 +205,12 @@ async def _impl_follow_up_list(
             "total": sum(counts.values()),
         }
         if not include_tabled:
-            all_counts = await follow_ups.get_summary_counts(db, include_tabled=True)
-            result["tabled_count"] = sum(all_counts.values()) - sum(counts.values())
+            # Count each non-follow_up lane DIRECTLY (not by subtraction, which
+            # would lump 'idea' into 'tabled' now that a third kind exists).
+            tabled_counts = await follow_ups.get_summary_counts(db, kind="tabled")
+            idea_counts = await follow_ups.get_summary_counts(db, kind="idea")
+            result["tabled_count"] = sum(tabled_counts.values())
+            result["idea_count"] = sum(idea_counts.values())
         return result
     except Exception as exc:
         logger.error("follow_up_list failed", exc_info=True)

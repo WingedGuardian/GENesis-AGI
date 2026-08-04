@@ -17,6 +17,23 @@
 # Idempotent: a plain copy. Writes nothing if the overlay is absent.
 set -euo pipefail
 
+# Resolve HOME robustly: a stripped-env interactive shell can leave HOME unset,
+# which under `set -u` would abort at the $HOME default below. Fall back to the
+# passwd entry, then a conventional path. (Only referenced when GENESIS_OUTPUT_DIR
+# is also unset, but the default is still evaluated, so guard it.)
+if [ -z "${HOME:-}" ]; then
+    # Resolve from passwd (field 6), matching Python's expanduser. Fail closed
+    # rather than guessing /home/<user>, so we never resolve the overlay path
+    # to a location that disagrees with the rest of the system.
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    if [ -z "$HOME" ]; then
+        echo "ERROR: HOME is unset and could not be resolved from passwd." >&2
+        echo "Re-run with HOME exported (or set GENESIS_OUTPUT_DIR)." >&2
+        exit 1
+    fi
+    export HOME
+fi
+
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 OVERLAY="${GENESIS_OUTPUT_DIR:-$HOME/.genesis/output}/models.md"
 TRACKED="$REPO_ROOT/docs/reference/models.md"
