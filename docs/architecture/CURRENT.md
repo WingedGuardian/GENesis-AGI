@@ -1233,6 +1233,11 @@ verified: 9037d45b 2026-07-07
   injection hook and by autonomous-session resources. Skill refinement is a
   tracked cognitive-file modification (`learning/skills/applicator.py`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
+  Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
+  inventory (skills + action tools, never memory/brain) into a managed
+  `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
+  runtimes — on-demand and committed (re-run when skills/MCP tools change;
+  `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
 - **contribution/**: `python -m genesis contribute <sha>` — sanitize-then-PR
   upstream, pseudonymous. `sanitize.scan_diff()` is FAIL-CLOSED (8 scanners;
   any finding stops). Its forbidden-globs floor duplicates

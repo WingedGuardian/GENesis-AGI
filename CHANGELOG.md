@@ -9,6 +9,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Genesis's skills and tools are now portable to other AI coding tools.** A
+  new generator writes an auto-maintained inventory of Genesis's skills and
+  action tools into `AGENTS.md` — the cross-tool entry point that Cursor,
+  Codex, and other agent runtimes read — so Genesis's capability layer travels
+  with the repo instead of being locked to one harness. The inventory is
+  body-scope only: it lists what Genesis can *do*, and deliberately excludes
+  its memory and cognition. Refresh it any time with
+  `python scripts/export_agents_md.py`.
+
 ### Fixed
 
 - **Re-embedding a memory no longer downgrades its recall ranking.** When a
