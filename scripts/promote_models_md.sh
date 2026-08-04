@@ -22,8 +22,15 @@ set -euo pipefail
 # passwd entry, then a conventional path. (Only referenced when GENESIS_OUTPUT_DIR
 # is also unset, but the default is still evaluated, so guard it.)
 if [ -z "${HOME:-}" ]; then
+    # Resolve from passwd (field 6), matching Python's expanduser. Fail closed
+    # rather than guessing /home/<user>, so we never resolve the overlay path
+    # to a location that disagrees with the rest of the system.
     HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
-    [ -n "$HOME" ] || HOME="/home/$(id -un)"
+    if [ -z "$HOME" ]; then
+        echo "ERROR: HOME is unset and could not be resolved from passwd." >&2
+        echo "Re-run with HOME exported (or set GENESIS_OUTPUT_DIR)." >&2
+        exit 1
+    fi
     export HOME
 fi
 

@@ -66,16 +66,15 @@ def test_unset_home_falls_back_via_getent(tmp_path):
     assert "HOME" not in env
 
     # SAFETY: prove the guard resolves HOME *into* tmp_path BEFORE running the
-    # real store — otherwise a broken shim would let the script's own
-    # /home/<user> fallback resolve to the real home and write the fake token
-    # over the production ~/.genesis/cc_oauth_token.env.
+    # real store — mirrors the script's resolution (passwd, fail-closed) so a
+    # broken shim can't let the store write the fake token to a real path.
     probe = subprocess.run(
         [
             "/bin/bash",
             "-c",
             'if [ -z "${HOME:-}" ]; then '
             'HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""; '
-            '[ -n "$HOME" ] || HOME="/home/$(id -un)"; fi; printf %s "$HOME"',
+            'fi; printf %s "$HOME"',
         ],
         env=env,
         capture_output=True,
@@ -88,6 +87,27 @@ def test_unset_home_falls_back_via_getent(tmp_path):
     token_file = fake_home / ".genesis" / "cc_oauth_token.env"
     assert token_file.exists(), "token not written to the passwd-resolved home"
     assert f"CLAUDE_CODE_OAUTH_TOKEN={_TOKEN}" in token_file.read_text()
+
+
+def test_unset_home_unresolvable_fails_closed(tmp_path):
+    """HOME unset AND passwd yields no home → fail closed, write nothing.
+
+    Guessing /home/<user> could disagree with credential_bridge.py's
+    passwd-based expanduser (root=/root, custom homes), silently storing the
+    token where Guardian never reads it. The script must error, not guess.
+    """
+    shim_bin = tmp_path / "bin"
+    shim_bin.mkdir()
+    getent = shim_bin / "getent"
+    getent.write_text("#!/bin/sh\nexit 0\n")  # succeeds but prints NO home field
+    getent.chmod(0o755)
+
+    env = {"PATH": f"{shim_bin}:{_BASE_PATH}"}  # no HOME
+    r = _run(env, _TOKEN + "\n")
+    assert r.returncode == 1, f"expected fail-closed exit 1; stderr={r.stderr!r}"
+    assert "could not be resolved" in r.stderr.lower()
+    # Nothing written anywhere (it errored before mkdir).
+    assert _TOKEN not in (r.stdout + r.stderr)
 
 
 def test_argv_token_is_rejected(tmp_path):

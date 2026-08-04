@@ -29,8 +29,18 @@ set -euo pipefail
 # entry for the current uid, then a conventional path, and export so any child
 # inherits it.
 if [ -z "${HOME:-}" ]; then
+    # Resolve from passwd (field 6) — the SAME source Python's expanduser/
+    # Path.home() uses when HOME is unset, so this script and credential_bridge.py
+    # agree on the token path. Fail CLOSED if it can't be resolved: guessing
+    # /home/<user> could write the credential where the bridge never reads it
+    # (root=/root, custom homes), silently reporting success while Guardian
+    # gets nothing.
     HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
-    [ -n "$HOME" ] || HOME="/home/$(id -un)"
+    if [ -z "$HOME" ]; then
+        echo "ERROR: HOME is unset and could not be resolved from passwd." >&2
+        echo "Re-run with HOME exported, e.g.:  HOME=\"\$(getent passwd \"\$(id -u)\" | cut -d: -f6)\" $0" >&2
+        exit 1
+    fi
     export HOME
 fi
 
