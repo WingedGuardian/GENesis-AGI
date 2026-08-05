@@ -350,9 +350,20 @@ async def _server_rpc(path: str, payload: dict, *, read_timeout_s: float) -> dic
     host = os.environ.get("GENESIS_DASHBOARD_HOST", "127.0.0.1")
     port = os.environ.get("GENESIS_DASHBOARD_PORT", "5000")
     url = f"http://{host}:{port}{path}"
+    # Internal bearer so the POST passes the server's /api mutation gate when a
+    # dashboard password is set. Absent token → no header (gate inactive).
+    headers: dict[str, str] = {}
+    try:
+        from genesis.env import read_internal_api_token
+
+        _tok = read_internal_api_token()
+        if _tok:
+            headers["Authorization"] = f"Bearer {_tok}"
+    except Exception:
+        pass
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout_s, connect=5.0)) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             return resp.json()
     except httpx.HTTPStatusError as exc:

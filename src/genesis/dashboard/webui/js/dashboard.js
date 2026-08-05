@@ -289,6 +289,31 @@
         secretsEditing: {},       // key_name → true when input open
         secretsSaving: false,
         secretsValues: {},        // key_name → input value during edit
+        // ── First-run onboarding wizard (Setup card on Overview) ──
+        setupStatus: null,        // {onboarded,password_set,cc_oauth,llm_key_present,embedding_key_present,floor_met,identity_set}
+        setupCardDismissed: false,
+        pwNudgeDismissed: false,
+        setupStep: 1,             // 1=password 2=key 3=identity 4=done
+        setupBusy: false,
+        setupMsg: null,           // {type,text}
+        setupPassword: "",
+        setupProviderIdx: 0,
+        setupKeyValue: "",
+        setupKeyTest: null,       // 'testing' | {valid,error}
+        setupIdentity: "",
+        setupIdentityLoaded: false,
+        setupProviders: [
+          // Only routing-CONSUMED providers are offered, tagged by which floor leg
+          // they satisfy. Anthropic is excluded (no type:anthropic provider — Claude
+          // routes via OpenRouter); Voyage is excluded (rerank-only, not embedding);
+          // DeepSeek is excluded (enabled:false in model_routing.yaml).
+          {label: "OpenRouter (chat)",       keyName: "API_KEY_OPENROUTER", providerType: "openrouter", kind: "chat",      testable: true},
+          {label: "Groq (chat)",             keyName: "API_KEY_GROQ",       providerType: "groq",       kind: "chat",      testable: true},
+          {label: "Mistral (chat)",          keyName: "API_KEY_MISTRAL",    providerType: "mistral",    kind: "chat",      testable: true},
+          {label: "NVIDIA NIM (chat)",       keyName: "API_KEY_NVIDIA_NIM", providerType: "nvidia_nim", kind: "chat",      testable: false},
+          {label: "DeepInfra (embeddings)",  keyName: "API_KEY_DEEPINFRA",  providerType: "deepinfra",  kind: "embedding", testable: false},
+          {label: "Qwen / DashScope (embeddings)", keyName: "API_KEY_QWEN", providerType: "qwen", kind: "embedding", testable: false},
+        ],
         secretsMessage: null,     // {type, text}
 
         fetchState: {
@@ -611,6 +636,7 @@
             this.fetchEgoStatus(),
             this.fetchApprovals(),
             this.fetchObservationsSummary(),
+            this.loadSetupStatus(),
           ]);
 
           // Initialize tab from URL hash and fetch tab-specific data
@@ -2218,6 +2244,10 @@
             });
             const d = await resp.json();
             if (resp.ok) {
+              // Setting DASHBOARD_PASSWORD here activates the /api mutation gate
+              // immediately; authenticate the session so this editor path (an
+              // advertised password-setup route) doesn't 401 the user's next action.
+              if (keyName === 'DASHBOARD_PASSWORD') { await this._establishSession(val); }
               this.secretsEditing = {...this.secretsEditing, [keyName]: false};
               delete this.secretsValues[keyName];
               this.secretsMessage = {type: 'restart', text: `${keyName} saved. Changes take effect after server restart.`};
@@ -2228,6 +2258,154 @@
           } catch (e) { this.secretsMessage = {type: 'error', text: e.message}; }
           this.secretsSaving = false;
         },
+
+        // ── First-run onboarding wizard methods ──────────────────
+        async loadSetupStatus() {
+          try {
+            const resp = await fetchApi("/api/genesis/setup-status");
+            if (resp && resp.ok) { this.setupStatus = await resp.json(); }
+          } catch (e) { /* non-fatal: card simply stays hidden */ }
+        },
+        get showSetupCard() {
+          const s = this.setupStatus;
+          // Show while the install is not FUNCTIONAL (live floor unmet) and the user
+          // has not dismissed it this session. A functional box never sees it. The
+          // `setupStep>1` clause keeps the card visible once the user has started
+          // stepping through it, so it doesn't vanish mid-flow if the floor flips
+          // to met after they save the last key (they still see the Done summary).
+          return !!s && (!s.floor_met || this.setupStep > 1) && !this.setupCardDismissed;
+        },
+        get setupProvider() { return this.setupProviders[this.setupProviderIdx] || this.setupProviders[0]; },
+        dismissSetupCard() { this.setupCardDismissed = true; },
+        async _establishSession(password) {
+          // After DASHBOARD_PASSWORD is (re)set, os.environ updates immediately and
+          // the /api mutation gate activates THIS request — log the session in with
+          // the new password so the user isn't 401'd on their next action. Shared by
+          // the wizard and the Provider Keys editor.
+          try {
+            await fetchApi("/api/genesis/auth/login", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({password}),
+            });
+          } catch (e) { /* non-fatal: user can log in manually */ }
+        },
+        async setupSavePassword() {
+          const val = (this.setupPassword || "").trim();
+          if (!val) { this.setupMsg = {type: "error", text: "Enter a password"}; return; }
+          this.setupBusy = true; this.setupMsg = null;
+          try {
+            const resp = await fetchApi("/api/genesis/secrets", {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({keys: {DASHBOARD_PASSWORD: val}}),
+            });
+            if (resp.ok) {
+              await this._establishSession(val);
+              this.setupPassword = "";
+              await this.loadSetupStatus();
+              this.setupMsg = {type: "ok", text: "Password saved — you're logged in, and the dashboard now requires this password."};
+              this.setupStep = 2;
+            } else {
+              const d = await resp.json().catch(() => ({}));
+              this.setupMsg = {type: "error", text: d.error || "Save failed"};
+            }
+          } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
+          this.setupBusy = false;
+        },
+        async setupTestKey() {
+          const key = (this.setupKeyValue || "").trim();
+          if (!key) { this.setupMsg = {type: "error", text: "Enter a key first"}; return; }
+          const prov = this.setupProvider;
+          if (!prov.testable) { this.setupKeyTest = {valid: null, error: "No live test for this provider — it is validated on next restart."}; return; }
+          this.setupKeyTest = "testing"; this.setupMsg = null;
+          try {
+            const resp = await fetchApi("/api/genesis/keys/test", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({provider_type: prov.providerType, key}),
+            });
+            this.setupKeyTest = await resp.json();
+          } catch (e) { this.setupKeyTest = {valid: false, error: e.message}; }
+        },
+        async setupSaveKey() {
+          const key = (this.setupKeyValue || "").trim();
+          if (!key) { this.setupMsg = {type: "error", text: "Enter a key"}; return; }
+          this.setupBusy = true; this.setupMsg = null;
+          try {
+            const resp = await fetchApi("/api/genesis/secrets", {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({keys: {[this.setupProvider.keyName]: key}}),
+            });
+            if (resp.ok) {
+              const savedName = this.setupProvider.keyName;
+              this.setupKeyValue = ""; this.setupKeyTest = null;
+              await this.loadSetupStatus();
+              const s = this.setupStatus || {};
+              // The floor needs BOTH a chat/LLM key and an embedding key. Keep
+              // collecting on step 2 until both legs are satisfied, rather than
+              // advancing to identity after a single key (which left the wizard
+              // unable to complete the floor in one pass). Auto-select a provider
+              // of the still-missing kind so the next save is one click away.
+              if (s.llm_key_present && s.embedding_key_present) {
+                this.setupMsg = {type: "restart", text: `${savedName} saved — chat + embedding keys set. Active after the next server restart.`};
+                await this.setupEnterIdentity();
+              } else {
+                const needKind = !s.llm_key_present ? "chat" : "embedding";
+                const needLabel = needKind === "chat" ? "a chat / model key" : "an embedding key (DeepInfra or Qwen)";
+                const idx = this.setupProviders.findIndex(p => p.kind === needKind);
+                if (idx >= 0) { this.setupProviderIdx = idx; }
+                this.setupMsg = {type: "ok", text: `${savedName} saved. Now add ${needLabel} to finish the floor — or Skip.`};
+              }
+            } else {
+              const d = await resp.json().catch(() => ({}));
+              this.setupMsg = {type: "error", text: d.error || "Save failed"};
+            }
+          } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
+          this.setupBusy = false;
+        },
+        async setupEnterIdentity() {
+          this.setupStep = 3;
+          if (this.setupIdentityLoaded) return;
+          // Pre-fill from USER.md, falling back to its shipped .example seed.
+          try {
+            let resp = await fetchApi("/api/genesis/config-files/USER.md");
+            let data = (resp && resp.ok) ? await resp.json() : null;
+            let content = data && data.content;
+            if (!content || content === "(failed to read file)") {
+              resp = await fetchApi("/api/genesis/config-files/USER.md.example");
+              data = (resp && resp.ok) ? await resp.json() : null;
+              content = (data && data.content) || "";
+              if (content === "(failed to read file)") content = "";
+            }
+            this.setupIdentity = content;
+          } catch (e) { this.setupIdentity = ""; }
+          this.setupIdentityLoaded = true;
+        },
+        async setupSaveIdentity() {
+          this.setupBusy = true; this.setupMsg = null;
+          try {
+            const resp = await fetchApi("/api/genesis/config-files/USER.md", {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({content: this.setupIdentity}),
+            });
+            if (resp.ok) { await this.setupFinish(); }
+            else {
+              const d = await resp.json().catch(() => ({}));
+              this.setupMsg = {type: "error", text: d.error || "Save failed"};
+            }
+          } catch (e) { this.setupMsg = {type: "error", text: e.message}; }
+          this.setupBusy = false;
+        },
+        async setupFinish() {
+          // The wizard does NOT write the ~/.genesis/setup-complete marker — that
+          // marker means "bootstrap finished" and is owned by bootstrap.sh / the
+          // terminal onboarding skill. Completion here just advances to the Done
+          // step, which honestly reflects the LIVE floor (floor_met + its legs):
+          // if keys / CC login are still missing it shows "almost there — still
+          // needed …" rather than a false "you're all set". Re-read status first so
+          // the summary reflects anything just saved.
+          await this.loadSetupStatus();
+          this.setupStep = 4;
+        },
+
         // Map env var names → provider_type values from model_routing.yaml.
         // MAINTENANCE: update when adding new providers to config/model_routing.yaml.
         _KEY_TO_PROVIDER_TYPES: {

@@ -89,6 +89,26 @@ class StandaloneAdapter:
         # dashboard route still needs the loop reference.
         self._app.config["GENESIS_EVENT_LOOP"] = self._loop
 
+        # Event-loop lag sampler — names the hog behind recall 503s. Dashboard
+        # routes bridge sync→async onto THIS loop and enforce their budget
+        # thread-side (dashboard/_blueprint.py), so when background cognition
+        # (awareness tick, reflection/session-observer dispatch, repo-bundle
+        # publish) blocks the loop, the recall coroutine can't progress and the
+        # route 503s even though recall itself is fast. This samples scheduling
+        # drift so a lag spike is timestamp-correlatable with those log lines.
+        # Cheap (wakes 2×/s, one subtraction); threshold + on/off are env levers.
+        from genesis.util.tasks import tracked_task
+
+        lag_sampler_task = None
+        if os.environ.get("GENESIS_LOOP_LAG_SAMPLER", "1").lower() not in (
+            "0",
+            "false",
+            "off",
+        ):
+            lag_sampler_task = tracked_task(
+                self._loop_lag_sampler(), name="loop-lag-sampler",
+            )
+
         # Create shared ConversationLoop for the OpenClaw endpoint.
         # Same pattern as _start_telegram() but without channel-specific
         # wiring (TTS, reply waiter, etc.).
@@ -138,13 +158,72 @@ class StandaloneAdapter:
                     uptime_h = (time.monotonic() - start_time) / 3600
                     logger.info("Standalone heartbeat: uptime=%.1fh", uptime_h)
 
-        from genesis.util.tasks import tracked_task
-
         heartbeat_task = tracked_task(_heartbeat(), name="standalone-heartbeat")
 
         # Block until shutdown
         await self._shutdown_event.wait()
         heartbeat_task.cancel()
+        if lag_sampler_task is not None:
+            lag_sampler_task.cancel()
+
+    async def _loop_lag_sampler(self) -> None:
+        """Sample event-loop scheduling drift; WARN when the loop stalls.
+
+        Sleeps a fixed interval and measures how much longer than the interval
+        the wake-up actually took — that excess is time the loop spent unable to
+        schedule ready callbacks (blocked in synchronous work on some task).
+        When drift exceeds the threshold we log at WARNING so the stall is
+        timestamp-correlatable with awareness-tick / dispatch / bundle log lines,
+        naming what starves the recall coroutine behind the route 503s.
+
+        Debounced per stall EPISODE: one WARNING when drift first crosses the
+        threshold, one INFO with the peak drift when it clears. A sustained
+        multi-minute stall (the worst case, and exactly when log noise competes
+        with other diagnostics) would otherwise emit a line every interval.
+
+        Env levers (no restart of the feature's *logic* required to retune):
+        ``GENESIS_LOOP_LAG_WARN_MS`` (default 250) — drift threshold to warn at;
+        ``GENESIS_LOOP_LAG_SAMPLER`` (0/false/off) — disables the sampler at
+        startup. Best-effort: any error ends the sampler without touching serve.
+        """
+        interval = 0.5
+        try:
+            threshold_ms = float(os.environ.get("GENESIS_LOOP_LAG_WARN_MS", "250"))
+        except ValueError:
+            threshold_ms = 250.0
+        loop = asyncio.get_running_loop()
+        lagging = False
+        peak_ms = 0.0
+        try:
+            while not self._shutdown_event.is_set():
+                t0 = loop.time()
+                await asyncio.sleep(interval)
+                drift_ms = (loop.time() - t0 - interval) * 1000
+                if drift_ms > threshold_ms:
+                    peak_ms = max(peak_ms, drift_ms)
+                    if not lagging:
+                        # Entering a stall episode — warn once, then suppress
+                        # per-sample noise until it clears.
+                        lagging = True
+                        logger.warning(
+                            "event-loop lag %.0fms (interval %.0fms) — background "
+                            "work is starving the loop; recall 503s correlate here "
+                            "(further lag suppressed until it clears)",
+                            drift_ms,
+                            interval * 1000,
+                        )
+                elif lagging:
+                    # Episode cleared — report the peak so the stall's severity is
+                    # in the journal without the per-sample flood.
+                    logger.info(
+                        "event-loop lag cleared (peak %.0fms, drift back under %.0fms)",
+                        peak_ms,
+                        threshold_ms,
+                    )
+                    lagging = False
+                    peak_ms = 0.0
+        except asyncio.CancelledError:
+            pass
 
     async def _voice_last_breath(self) -> None:
         """Best-effort spoken shutdown notice via the held VoiceChannelAdapter.
@@ -419,6 +498,15 @@ class StandaloneAdapter:
         app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
         app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
         app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB (knowledge uploads)
+
+        # Internal API token + /api mutation gate. Mint the token once at boot
+        # (mode 0600) so trusted loopback/host callers can authenticate to /api
+        # mutations when a dashboard password is set. The gate is registered
+        # APP-LEVEL (not blueprint-level) so it covers every blueprint uniformly —
+        # the dashboard blueprint AND the separate outreach_api blueprint.
+        from genesis.dashboard.auth import apply_api_mutation_gate
+
+        apply_api_mutation_gate(app)
 
         # Login page (on app, not blueprint — must be reachable before auth)
         @app.route("/genesis/login")
