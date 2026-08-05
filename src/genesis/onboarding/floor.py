@@ -6,8 +6,14 @@ unconditionally at the end of every install, and the terminal onboarding skill
 writes it too). It says nothing about whether the install can *think*.
 
 The floor, by contrast, is **computed live** from persisted state every time it is
-asked — so it stays correct if a key is later removed or expires, which a one-shot
-marker file could never represent. A functional install needs:
+asked — so it stays correct if a key is later removed, which a one-shot marker
+file could never represent. It is deliberately **presence-based**: it checks that
+keys are *configured*, never that they are currently *valid* — live validation
+belongs to the routing circuit breakers (which route around a failing provider)
+and the wizard's on-demand ``keys/test`` endpoint, NOT to a check on the
+ego-tick / session-start hot path, where per-call network validation would add
+latency, burn quota, and turn any transient provider blip into a silent autonomy
+stop. A functional install needs:
 
 * a working brain — Claude Code OAuth login (primary cognition is ``claude -p``);
 * at least one routing-consumed **LLM** key; and
@@ -231,6 +237,17 @@ def provider_key_present(provider_type: str, secrets: Mapping[str, str]) -> bool
         if str(secrets.get(pattern, "")).strip() not in UNSET_SENTINELS:
             return True
     return False
+
+
+def invalidate_provider_type_cache() -> None:
+    """Drop the cached chain-referenced provider-type set.
+
+    Called by ``routing.router.Router.reload_config`` after a hot-reload of the
+    routing config (dashboard ``routing/reload`` + per-call-site PUT), so the
+    floor re-derives from the freshly-written config file instead of serving the
+    pre-reload set until a server restart.
+    """
+    _chain_referenced_cloud_provider_types.cache_clear()
 
 
 def _llm_key_present(secrets: Mapping[str, str]) -> bool:

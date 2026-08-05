@@ -238,6 +238,43 @@ def test_llm_fallback_when_config_unreadable(monkeypatch, tmp_path):
         _chain_referenced_cloud_provider_types.cache_clear()
 
 
+def test_invalidate_provider_type_cache_refreshes_derivation(monkeypatch, tmp_path):
+    """A routing hot-reload must be able to refresh the floor's provider-type set
+    WITHOUT a server restart — otherwise the ego gate/dashboard keep honoring a
+    de-chained provider's key (or rejecting a newly-chained one) until restart."""
+    from genesis.onboarding.floor import (
+        _chain_referenced_cloud_provider_types,
+        invalidate_provider_type_cache,
+    )
+
+    _chain_referenced_cloud_provider_types.cache_clear()
+    try:
+        # Seed the cache from the real config (contains groq etc.).
+        assert "groq" in _chain_referenced_cloud_provider_types()
+
+        # Point at a minimal alternate config where only mistral is chained.
+        alt = tmp_path / "model_routing.yaml"
+        alt.write_text(
+            "providers:\n"
+            "  only-prov:\n"
+            "    type: mistral\n"
+            "    model: mistral-small-latest\n"
+            "    free: true\n"
+            "call_sites:\n"
+            "  site_x:\n"
+            "    chain: [only-prov]\n"
+        )
+        monkeypatch.setattr(floor_mod, "_ROUTING_CONFIG_PATH", alt)
+
+        # Still cached: the stale set is served until invalidation.
+        assert "groq" in _chain_referenced_cloud_provider_types()
+
+        invalidate_provider_type_cache()
+        assert _chain_referenced_cloud_provider_types() == ("mistral",)
+    finally:
+        _chain_referenced_cloud_provider_types.cache_clear()
+
+
 def test_as_dict_shape(monkeypatch):
     _oauth(monkeypatch, True)
     d = compute_floor({"API_KEY_GROQ": "x", "API_KEY_DEEPINFRA": "o"}).as_dict()
