@@ -427,6 +427,13 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: keep hardening, switch to a robust-by-
      construction redesign, narrow scope, or shelve.
+  These three are backstopped by a **machine layer**, so the cap holds even if a
+  session's own discipline lapses: `review_state.py` keeps a per-branch review-round
+  counter (bumped on every `mark`, on a distinct staged diff), and the commit gate
+  (`review_enforcement_commit.py`) HARD-BLOCKS the commit at `ESCALATION_ROUND_CAP`
+  (3) rounds unless the command carries a deliberate trailing `# escalation-ack`.
+  The ack is a conscious, logged act (like `# review-override`); adding it WITHOUT a
+  fresh user decision is the same violation as ignoring the prose above.
   Caveats: **multiple findings in a single pass = one round** (not an
   escalation); the same defect reappearing (an incomplete prior fix) is a
   fix-it-properly issue, not an escalation trigger. This complements the

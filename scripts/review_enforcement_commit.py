@@ -27,6 +27,7 @@ from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
     git_subcommand,
+    has_trailing_override,
     split_segments,
 )
 
@@ -387,10 +388,13 @@ def main() -> None:
 
     try:
         from review_state import (
+            ESCALATION_ROUND_CAP,
             get_current_branch,
+            get_review_round,
             has_code_changes,
             has_valid_review_marker,
             is_review_current,
+            reset_review_round,
         )
     except ImportError:
         # If review_state.py is missing, fail open — don't block
@@ -422,6 +426,42 @@ def main() -> None:
         if staged and all(_is_docs_or_config(p) for p in staged):
             sys.exit(0)
 
+    # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP review→fix→re-review
+    # rounds on this change, block the commit until an explicit '# escalation-ack'
+    # trailing comment — a machine-enforced STOP so a review loop can't silently run
+    # long on a standing "proceed" (see genesis-development SKILL.md). Checked BEFORE
+    # Rule 2 ON PURPOSE: a '# review-override' (which exits Rule 2 early) must NOT be
+    # able to sneak a past-cap commit through — the two acknowledgments are
+    # independent. Like review-override, the ack does NOT bypass Rule 0 (--no-verify)
+    # or Rule 1 (main-branch), checked above. Recognition mirrors _commit_override:
+    # a clean trailing comment on EVERY commit segment (all(), so one ack can't
+    # license a chained sibling commit). NOTE: on a nested `bash -c 'git commit …'`
+    # the ack must sit on the INNER command (the sigil isn't propagated to wrappers);
+    # the documented `git commit … # escalation-ack` form is a plain segment.
+    round_n = get_review_round(cwd=cwd)
+    if round_n >= ESCALATION_ROUND_CAP:
+        commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
+        acked = bool(commit_segs) and all(
+            has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
+        )
+        if not acked:
+            _deny(
+                f"BLOCKED: review escalation cap reached — this change has had {round_n} "
+                f"review rounds (cap {ESCALATION_ROUND_CAP}). The review→fix loop has run "
+                "long. STOP and get a FRESH user decision on how to proceed (keep "
+                "hardening / switch to a robust-by-construction redesign / narrow scope / "
+                "shelve), then acknowledge that decision with a trailing shell comment "
+                "(outside any quotes):\n"
+                '  git commit -m "your message"  # escalation-ack'
+            )
+            return
+        # Acked = a fresh decision to continue → reset the round budget so the next
+        # stop is a fresh cap away, not per-commit friction for the branch's whole
+        # life. Reset stands even if a later rule blocks THIS commit: the
+        # acknowledgment was made, and erring toward less friction only happens
+        # AFTER a conscious ack.
+        reset_review_round(cwd=cwd)
+
     # Rule 2: Block commits without review (on branches)
     # Race condition: when command is "git add X && git commit", nothing is
     # staged yet at hook time because git add hasn't run. Detect git add in
@@ -438,7 +478,8 @@ def main() -> None:
     if rule2_blocks:
         # A trailing '# review-override' comment (outside quotes) acknowledges
         # accepted findings and bypasses ONLY this review gate — never Rule 0
-        # (--no-verify) or Rule 1 (main-branch), which are checked above.
+        # (--no-verify), Rule 1 (main-branch), or Rule 3 (escalation cap), all
+        # checked above.
         override = _commit_override(command, segs)
         if override == "valid":
             print(

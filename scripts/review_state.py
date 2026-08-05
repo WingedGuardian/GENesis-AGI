@@ -34,6 +34,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
+# Per-worktree review-ROUND counter (escalation cap). Deliberately a SEPARATE store
+# from the marker above: review_invalidate_on_commit clears the marker after every
+# commit, but the round count must SURVIVE commits — a review→fix→re-review loop
+# commits between rounds, and the whole point is to notice when that loop runs long.
+_ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
+# After this many review rounds on one change, the commit gate blocks pending an
+# explicit '# escalation-ack'. Mirrors the genesis-development SKILL.md prose cap.
+ESCALATION_ROUND_CAP = 3
 # Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
 # so an in-flight review from before an upgrade isn't lost mid-session.
 _LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
@@ -218,7 +226,10 @@ def mark_reviewed(agent_output_path: str | None = None, cwd: str | None = None) 
         "agent_evidence": agent_msg,
     }
     state_file.write_text(json.dumps(state, indent=2))
-    print(f"Review marker written: {state['diff_hash']}")
+    # Count this review round (escalation cap). A distinct staged diff on the same
+    # branch advances the count; re-marking the same diff does not. Best-effort.
+    round_n = bump_review_round(cwd=cwd)
+    print(f"Review marker written: {state['diff_hash']} (round {round_n})")
     return True
 
 
@@ -235,6 +246,113 @@ def clear_marker(cwd: str | None = None) -> None:
     for path in (_state_file(cwd), _LEGACY_STATE_FILE):
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
+
+
+# ── Review-round counter (escalation cap) ─────────────────────────────────────
+# Counts review→fix→re-review rounds per change so the commit gate can force a
+# conscious stop after ESCALATION_ROUND_CAP rounds. Kept in a per-worktree file
+# SEPARATE from the marker (the marker is wiped on every commit; the round count
+# must persist across the commits a review loop makes between rounds). A "round"
+# = one review mark on a DISTINCT staged diff on the same branch; re-marking the
+# same diff is not a new round, and a branch change resets the count.
+
+
+def _round_file(cwd: str | None = None) -> Path:
+    """Per-worktree round-counter path (same worktree key as the marker)."""
+    return _ROUND_DIR / f"{_worktree_key(cwd)}.json"
+
+
+def _staged_content_hash(cwd: str | None = None) -> str:
+    """SHA-256 of the FULL staged diff (``git diff --cached``) — content, not stat.
+
+    Round detection must distinguish two genuinely different fixes to the same
+    file: ``get_current_diff_hash`` hashes ``--stat`` (file + line counts only), so
+    ``x = 2`` → ``x = 3`` collide under it. This hashes the actual staged content so
+    any real change since the last mark reads as a new round.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=cwd,
+        )
+        content = result.stdout
+        if not content.strip():
+            return "clean"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return "unknown"
+
+
+def _load_round(cwd: str | None = None) -> dict:
+    try:
+        p = _round_file(cwd)
+        if p.exists():
+            return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def get_review_round(cwd: str | None = None) -> int:
+    """Review rounds recorded for the CURRENT branch's change.
+
+    Returns 0 when the stored count is for a different branch (a new change starts
+    fresh) or when no count exists. Never raises.
+    """
+    state = _load_round(cwd)
+    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+        return 0
+    try:
+        return int(state.get("round", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_review_round(cwd: str | None = None) -> int:
+    """Record one more review round for the current branch; return the new count.
+
+    A genuine new round (the staged diff changed since the last mark on this
+    branch) increments; re-marking the SAME diff does not (idempotent); a branch
+    change resets to 1. Best-effort — never raises into the caller.
+    """
+    branch = get_current_branch(cwd=cwd)
+    content_hash = _staged_content_hash(cwd=cwd)
+    # Nothing meaningfully staged ("clean") or a git error ("unknown") is NOT a
+    # review round — counting it would inflate toward a false-positive cap block
+    # (e.g. a mark run before the next fix is staged, or a transient git timeout).
+    if content_hash in ("clean", "unknown"):
+        return get_review_round(cwd=cwd)
+    state = _load_round(cwd)
+    if not state or state.get("branch") != branch:
+        state = {"branch": branch, "round": 1, "last_hash": content_hash}
+    elif state.get("last_hash") != content_hash:
+        state = {
+            "branch": branch,
+            "round": int(state.get("round", 0)) + 1,
+            "last_hash": content_hash,
+        }
+    # else: same branch + same staged diff → same round (idempotent re-mark).
+    try:
+        rf = _round_file(cwd)
+        rf.parent.mkdir(parents=True, exist_ok=True)
+        rf.write_text(json.dumps(state, indent=2))
+    except OSError:
+        pass
+    try:
+        return int(state.get("round", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def reset_review_round(cwd: str | None = None) -> None:
+    """Delete the round counter (e.g. after the change lands). Never raises."""
+    import contextlib
+
+    with contextlib.suppress(OSError):
+        _round_file(cwd).unlink(missing_ok=True)
 
 
 def get_current_branch(cwd: str | None = None) -> str:
