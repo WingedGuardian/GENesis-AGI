@@ -73,6 +73,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - **shelve** — Shelve the current session — create a bookmark so you can find and resume it later with /unshelve.
 - **stealth-browser** — Anti-detection behavioral rules for stealth browser automation
 - **subsystem-map** — This skill should be used before answering "does Genesis have X", "does Genesis lack X", auditing Genesis capabilities, comparing Genesis to an external system, or reviewing/summarizing the architecture. It routes to the canonical judgment-layer subsystem map so audits start from the map, not from a cold grep. Also fires after changing a subsystem's capabilities, to keep the map current.
+- **taste** — Use before generating, editing, or reviewing any user interface — a dashboard panel, a landing page, an email, a slide, an app screen. Sets three deliberate design dials (variance, motion, density) BEFORE generation so the output has a point of view instead of defaulting to the timid, uniform look that reads as "AI made this". Applies to Genesis's OWN dashboard UI, not only things built for others.
 - **triage-calibration** — Daily triage accuracy calibration — use during scheduled calibration runs to verify triage classification accuracy against few-shot examples and adjust confidence thresholds
 - **unshelve** — Search for shelved sessions — find past bookmarked sessions by keyword or browse recent ones.
 - **user_evaluate** — Evaluate content for personal relevance to the user using the user model
