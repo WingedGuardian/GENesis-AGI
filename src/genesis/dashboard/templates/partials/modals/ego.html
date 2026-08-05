@@ -272,6 +272,14 @@
               </div>
               <!-- Proposal list -->
               <div style="max-height: 450px; overflow-y: auto;">
+                <!-- Stale-revision (409) notice: the proposal changed since it was rendered -->
+                <template x-if="$store.genesisDashboard.egoModal.resolveError">
+                  <div style="font-size: 0.72rem; padding: 0.4rem 0.6rem; margin-bottom: 0.5rem; border: 1px solid #f0ad4e; background: rgba(240,173,78,0.12); color: #f0ad4e; border-radius: 4px; display: flex; gap: 0.5rem; align-items: center;">
+                    <span x-text="$store.genesisDashboard.egoModal.resolveError"></span>
+                    <button style="margin-left: auto; border: none; background: none; color: var(--color-text-secondary); cursor: pointer;"
+                            @click="$store.genesisDashboard.egoModal.resolveError = ''">&times;</button>
+                  </div>
+                </template>
                 <template x-if="$store.genesisDashboard.egoModal.proposals.filter(p => !$store.genesisDashboard.egoModal.proposalFilter || p.status === $store.genesisDashboard.egoModal.proposalFilter).length === 0">
                   <div class="empty-state" style="font-size: 0.78rem;">No proposals match this filter.</div>
                 </template>
@@ -291,6 +299,11 @@
                       <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px;"
                             :style="`background: ${p.status === 'approved' ? 'rgba(76,175,80,0.15)' : p.status === 'rejected' ? 'rgba(217,83,79,0.15)' : p.status === 'expired' ? 'rgba(136,136,136,0.15)' : 'rgba(240,173,78,0.15)'}; color: ${p.status === 'approved' ? '#4caf50' : p.status === 'rejected' ? '#d9534f' : p.status === 'expired' ? '#888' : '#f0ad4e'}`"
                             x-text="p.status"></span>
+                      <!-- Revision badge (only once revised — dark until reconcile revise ships) -->
+                      <template x-if="p.revision_num > 1">
+                        <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 3px; background: rgba(156,39,176,0.15); color: #ce93d8;"
+                              x-text="'rev ' + p.revision_num"></span>
+                      </template>
                       <!-- Confidence bar -->
                       <div style="display: flex; align-items: center; gap: 0.3rem; margin-left: auto;">
                         <div style="width: 40px; height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
@@ -315,6 +328,10 @@
                       </template>
                       <template x-if="p.resolved_at">
                         <span x-text="'Resolved: ' + $store.genesisDashboard.formatDateTime(p.resolved_at)"></span>
+                      </template>
+                      <!-- Premise re-validation time — shown only after an actual reaffirm (differs from created) -->
+                      <template x-if="p.last_validated_at && p.last_validated_at !== p.created_at">
+                        <span x-text="'Verified: ' + $store.genesisDashboard.formatDateTime(p.last_validated_at)"></span>
                       </template>
                     </div>
                     <!-- User response (if resolved) -->

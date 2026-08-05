@@ -253,6 +253,9 @@ async def ego_proposals():
                 "recurring": bool(p.get("recurring", 0)),
                 "ego_source": p.get("ego_source"),
                 "realist_verdict": p.get("realist_verdict"),
+                "revision_num": p.get("revision_num", 1),
+                "revalidate_at": p.get("revalidate_at"),
+                "last_validated_at": p.get("last_validated_at"),
             }
             for p in pending
         ]
@@ -368,6 +371,9 @@ async def ego_proposals_all():
                 "execution_plan": p.get("execution_plan"),
                 "recurring": bool(p.get("recurring", 0)),
                 "ego_source": p.get("ego_source"),
+                "revision_num": p.get("revision_num", 1),
+                "revalidate_at": p.get("revalidate_at"),
+                "last_validated_at": p.get("last_validated_at"),
             }
             for p in proposals
         ]
@@ -391,13 +397,46 @@ async def ego_proposal_resolve(proposal_id: str):
         return jsonify({"ok": False, "error": "status must be 'approved' or 'rejected'"}), 400
 
     user_response = body.get("response", "")
+    # PR-6a resolve-side guard: pin the resolve to the revision the browser
+    # rendered (sent in the POST body). Absent → None → unguarded (behaves as
+    # today); NEVER default to 1. Coerce a stringified body value to int so a
+    # well-formed guard cannot misfire on a type mismatch.
+    expected_revision = body.get("revision_num")
+    if isinstance(expected_revision, str):
+        expected_revision = int(expected_revision) if expected_revision.isdigit() else None
     updated = await ego_crud.resolve_proposal(
         rt._db,
         proposal_id,
         status=status,
         user_response=user_response,
+        expected_revision=expected_revision,
     )
     if not updated:
+        # Disambiguate a stale-revision refusal (row still pending but revised
+        # since the browser rendered it) from a genuinely gone / already-resolved
+        # proposal — the client shows a re-review prompt on 409, an error on 404.
+        fresh = None
+        try:
+            fresh = await ego_crud.get_proposal(rt._db, proposal_id)
+        except Exception:
+            fresh = None
+        if (
+            fresh is not None
+            and fresh.get("status") == "pending"
+            and expected_revision is not None
+            and fresh.get("revision_num") != expected_revision
+        ):
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "stale_revision",
+                        "message": "This proposal was revised — re-review before resolving.",
+                        "revision_num": fresh.get("revision_num"),
+                    }
+                ),
+                409,
+            )
         return jsonify({"ok": False, "error": "proposal not found or not pending"}), 404
 
     # Shared post-resolution hook: journal + J-9 + decision capture +
