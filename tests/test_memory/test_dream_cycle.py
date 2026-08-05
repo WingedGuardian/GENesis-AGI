@@ -897,3 +897,160 @@ class TestAsyncYielding:
         # First call should be _scroll_and_group_sync
         first_call_fn = mock_to_thread.call_args_list[0][0][0]
         assert first_call_fn.__name__ == "_scroll_and_group_sync"
+
+
+# ── Importance shield wiring (worklist embedding + drain re-check) ────────────
+
+
+def _conf_cluster(confs, wing="memory", room="store", tag=""):
+    """Cluster with explicit per-member confidence (for shield tests)."""
+    return [
+        {
+            "id": f"{tag}{wing}-{room}-{i}",
+            "wing": wing,
+            "room": room,
+            "payload": {"content": f"fact {i}", "confidence": c, "wing": wing, "room": room},
+        }
+        for i, c in enumerate(confs)
+    ]
+
+
+class TestShieldWorklistEmbedding:
+    @pytest.mark.asyncio
+    async def test_persist_embeds_shield_block(self, db):
+        """When shield_thresholds is passed, each slice payload carries them so
+        the drain can re-check against the frozen bar."""
+        clusters = _clusters_of_sizes(3)
+        await _persist_worklist(
+            db, clusters, weekly_run_id="w",
+            shield_thresholds={"activation_threshold": 0.42, "centrality_threshold": None},
+        )
+        cursor = await db.execute(
+            "SELECT payload_json FROM deferred_work_queue WHERE work_type = ?",
+            (WORKLIST_WORK_TYPE,),
+        )
+        payload = json.loads((await cursor.fetchone())[0])
+        assert payload["shield"] == {"activation_threshold": 0.42, "centrality_threshold": None}
+
+    @pytest.mark.asyncio
+    async def test_persist_without_thresholds_has_no_shield_block(self, db):
+        """Backward compatible: no shield_thresholds → no shield block."""
+        await _persist_worklist(db, _clusters_of_sizes(2), weekly_run_id="w")
+        cursor = await db.execute(
+            "SELECT payload_json FROM deferred_work_queue WHERE work_type = ?",
+            (WORKLIST_WORK_TYPE,),
+        )
+        payload = json.loads((await cursor.fetchone())[0])
+        assert "shield" not in payload
+
+
+class TestShieldRunWiring:
+    @pytest.mark.asyncio
+    async def test_run_computes_shield_and_passes_thresholds(self, db):
+        """End-to-end through run(): the shield computes real thresholds over the
+        scrolled population and threads them into _persist_worklist."""
+        mock_qdrant = MagicMock()
+        with patch(_SCROLL) as mock_scroll, patch(_SEARCH) as mock_search, \
+             patch(_BATCH_VEC) as mock_vec, patch(
+                 "genesis.memory.dream_cycle._persist_worklist",
+                 new_callable=AsyncMock,
+                 return_value={"enqueued": 0, "oversize_flagged": 0, "superseded": 0},
+             ) as mock_persist:
+            mock_scroll.return_value = (
+                [
+                    {"id": "p1", "payload": {"wing": "memory", "room": "store",
+                                             "content": "fact A", "confidence": 0.9}},
+                    {"id": "p2", "payload": {"wing": "memory", "room": "store",
+                                             "content": "fact A rephrased", "confidence": 0.8}},
+                ],
+                None,
+            )
+            mock_search.return_value = [{"id": "p2", "score": 0.92, "payload": {}}]
+            mock_vec.return_value = {"p1": [0.1] * 768, "p2": [0.1] * 768}
+
+            report = await run(
+                qdrant=mock_qdrant, db=db, router=AsyncMock(),
+                store=AsyncMock(), dry_run=True,
+            )
+
+        assert report["shield"]["enabled"] is True
+        # Real activation percentile computed over the 2 scrolled points.
+        assert report["shield"]["activation_threshold"] is not None
+        assert report["shield"]["population"] == 2
+        # Thresholds were threaded into the worklist persist call.
+        passed = mock_persist.call_args.kwargs["shield_thresholds"]
+        assert passed is not None
+        assert "activation_threshold" in passed
+
+
+class TestShieldDrainRecheck:
+    @pytest.mark.asyncio
+    async def test_drain_trims_high_confidence_member(self, db):
+        """A member crossing the confidence floor is filtered at drain; the
+        unshielded remainder (>=2) still merges."""
+        cluster = _conf_cluster([0.4, 0.4, 0.99])  # 3rd shielded by floor 0.95
+        await _persist_worklist(
+            db, [cluster], weekly_run_id="w",
+            shield_thresholds={"activation_threshold": 999.0, "centrality_threshold": None},
+        )
+        report = await run_synthesis_drain(
+            qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+            router=AsyncMock(), store=AsyncMock(), budget=10, dry_run=True,
+        )
+        assert report["drained"] == 1
+        assert report["shield_members_skipped"] == 1
+        assert report["would_merge"] == 1  # 2 survivors still mergeable
+        assert report["shield_skipped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_drain_shield_drops_cluster_below_two(self, db):
+        """Shield removing a member from a 2-cluster leaves <2 survivors → the
+        cluster is completed as a shield-skip, distinct from stale-skip."""
+        cluster = _conf_cluster([0.4, 0.99])
+        await _persist_worklist(
+            db, [cluster], weekly_run_id="w",
+            shield_thresholds={"activation_threshold": 999.0, "centrality_threshold": None},
+        )
+        report = await run_synthesis_drain(
+            qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+            router=AsyncMock(), store=AsyncMock(), budget=10, dry_run=True,
+        )
+        assert report["shield_skipped"] == 1
+        assert report["stale_skipped"] == 0
+        assert report["would_merge"] == 0
+        cursor = await db.execute(
+            "SELECT status FROM deferred_work_queue WHERE work_type = ?",
+            (WORKLIST_WORK_TYPE,),
+        )
+        assert [r["status"] for r in await cursor.fetchall()] == ["completed"]
+
+    @pytest.mark.asyncio
+    async def test_drain_missing_shield_block_counted_not_filtered(self, db):
+        """A pre-upgrade slice (no shield block) is NOT filtered but is counted —
+        the counter is the PR2 live-flip precondition (must reach 0)."""
+        cluster = _conf_cluster([0.99, 0.99])  # would all be shielded IF filtered
+        await _persist_worklist(db, [cluster], weekly_run_id="w")  # no thresholds
+        report = await run_synthesis_drain(
+            qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+            router=AsyncMock(), store=AsyncMock(), budget=10, dry_run=True,
+        )
+        assert report["shield_missing_thresholds"] == 1
+        assert report["shield_members_skipped"] == 0
+        assert report["would_merge"] == 1  # unfiltered — still merges
+
+    @pytest.mark.asyncio
+    async def test_drain_shield_kill_switch_disables_filtering(self, db, monkeypatch):
+        """With the shield disabled, a slice carrying thresholds is NOT filtered."""
+        from genesis.memory import dream_shield_config
+        monkeypatch.setattr(dream_shield_config, "shield_enabled", lambda: False)
+        cluster = _conf_cluster([0.99, 0.99])
+        await _persist_worklist(
+            db, [cluster], weekly_run_id="w",
+            shield_thresholds={"activation_threshold": 0.0, "centrality_threshold": None},
+        )
+        report = await run_synthesis_drain(
+            qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+            router=AsyncMock(), store=AsyncMock(), budget=10, dry_run=True,
+        )
+        assert report["shield_members_skipped"] == 0
+        assert report["would_merge"] == 1

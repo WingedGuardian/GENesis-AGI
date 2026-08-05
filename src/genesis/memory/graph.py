@@ -200,12 +200,17 @@ async def traverse(
 
 async def centrality_scores(
     db: aiosqlite.Connection,
-    top_n: int = 100,
+    top_n: int | None = 100,
 ) -> list[tuple[str, float]]:
-    """Return top-N memories by betweenness centrality.
+    """Return memories ranked by betweenness centrality.
 
     Identifies memories that are "bridges" between clusters of knowledge.
     Requires NetworkX; returns empty list if unavailable.
+
+    ``top_n`` caps the returned slice; ``top_n=None`` returns EVERY scored
+    node (the full ranking). Betweenness is computed over all nodes regardless
+    — ``top_n`` is only a post-sort slice — so ``None`` adds no compute cost,
+    just a longer list.
     """
     if not _NX_AVAILABLE:
         return []
@@ -219,7 +224,7 @@ async def centrality_scores(
     k = min(200, n_nodes) if n_nodes > 200 else None
     scores = nx.betweenness_centrality(G, k=k)
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return ranked[:top_n]
+    return ranked if top_n is None else ranked[:top_n]
 
 
 # ─── CTE fallbacks ───────────────────────────────────────────────────────────

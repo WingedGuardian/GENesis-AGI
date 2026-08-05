@@ -36,7 +36,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 51bfbb35 2026-07-30
+verified: 7706dc2f 2026-08-05
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -143,6 +143,20 @@ weekly clustering (Sun 4am) persists a value-ranked worklist to
 change (#892). `_CapacityBreaker` aborts on consecutive provider exhaustion.
 `_cross_wing_scan` writes `memory_links` even under dry_run — intentional
 additive layer, not a leak.
+
+**Importance shield (Phase 2c)** — `memory/dream_shield.py` +
+`memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local
+overlay; env kill-switch `GENESIS_DREAM_SHIELD_DISABLED`). Before enqueue, the
+weekly pass removes high-salience members from clusters (skip-member) so the
+merge path never consolidates them away: shielded if activation ≥ collection
+percentile (production `compute_activation`), OR raw confidence ≥ a floor
+(default 0.98, above the 0.95 extraction-default spike), OR betweenness
+centrality ≥ the nonzero percentile. Thresholds freeze into each slice; the
+drain re-checks live members via `shield_filter_live` (catches salience that
+rose mid-week) and counts `shield_missing_thresholds` — which must be 0 before
+any live flip. Centrality persistence widened from top-500 to all-nonzero
+(`dream_centrality.py`, `graph.centrality_scores(top_n=None)`) so the shield has
+a real bridge-node population; `centrality_cache` gains its first reader.
 
 **Do not touch:** the drain's shadow hardwiring; the dry_run-independent link
 write. **Trap:** with no embedding provider registered, memory silently
