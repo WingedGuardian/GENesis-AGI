@@ -52,6 +52,29 @@ class TestLoadEgoConfig:
         # Falls back to defaults
         assert config.cadence_minutes == 60
 
+    def test_partial_revalidation_override_merges_over_defaults(self, tmp_config):
+        """Codex P2 regression: a partial revalidation_interval_hours override
+        must merge OVER the full defaults — omitted urgencies keep their
+        declared cadence instead of collapsing to the consumer-side 72h
+        fallback (critical 6→72, low 168→72)."""
+        tmp_config.write_text(yaml.dump({
+            "revalidation_interval_hours": {"high": 12},
+        }))
+        config = load_ego_config(tmp_config)
+        assert config.revalidation_interval_hours == {
+            "critical": 6,
+            "high": 12,
+            "normal": 72,
+            "low": 168,
+        }
+
+    def test_full_revalidation_override_respected(self, tmp_config):
+        """A complete override replaces every default value."""
+        full = {"critical": 1, "high": 2, "normal": 3, "low": 4}
+        tmp_config.write_text(yaml.dump({"revalidation_interval_hours": full}))
+        config = load_ego_config(tmp_config)
+        assert config.revalidation_interval_hours == full
+
 
 class TestSaveEgoConfig:
     def test_roundtrip(self, tmp_config):

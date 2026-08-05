@@ -629,15 +629,28 @@ class ProposalWorkflow:
         # RENDERED at, so a reply resolving this digest pins the revision the
         # user actually saw. A concurrent revise (PR-6b) bumps revision_num;
         # resolve_proposals passes this as expected_revision so a stale resolve
-        # refuses instead of clobbering the newer version. Keyed by batch_id
-        # (all resolve_proposals receives). Written only after a successful
-        # delivery. Every row is revision_num=1 until PR-6b introduces revise,
-        # so today this is a no-op match.
+        # refuses instead of clobbering the newer version. Keyed by DELIVERY id
+        # (each digest message pins its own snapshot — re-delivering a batch
+        # after a revise must not retarget replies to the older digest onto the
+        # newer snapshot). The batch-keyed copy is the fallback for resolves
+        # with no delivery context (bare "approve all" / bulk paths, which act
+        # on the LATEST digest by construction) and for digests sent before
+        # delivery-keying shipped. Written only after a successful delivery.
+        # Every row is revision_num=1 until PR-6b introduces revise, so today
+        # this is a no-op match.
         try:
+            snapshot_json = json.dumps(
+                {p["id"]: p.get("revision_num", 1) for p in proposals}
+            )
+            await ego_crud.set_state(
+                self._db,
+                key=f"revision_snapshot:{delivery_id}",
+                value=snapshot_json,
+            )
             await ego_crud.set_state(
                 self._db,
                 key=f"revision_snapshot:{batch_id}",
-                value=json.dumps({p["id"]: p.get("revision_num", 1) for p in proposals}),
+                value=snapshot_json,
             )
         except Exception:
             logger.debug(
@@ -673,10 +686,15 @@ class ProposalWorkflow:
         self,
         batch_id: str,
         decisions: dict[int, tuple[str, str | None]],
+        *,
+        delivery_id: str | None = None,
     ) -> dict[str, str]:
         """Apply parsed decisions to proposals in the batch.
 
         ``decisions`` maps 1-based index → (status, optional reason).
+        ``delivery_id`` identifies the digest message the user replied to,
+        when known — it selects the revision snapshot for THAT digest so a
+        reply to an older delivery cannot resolve against a newer snapshot.
         Returns ``{proposal_id: final_status}``.
 
         On rejection with a reason, automatically stores a correction
@@ -686,12 +704,23 @@ class ProposalWorkflow:
         results: dict[str, str] = {}
 
         # PR-6a resolve-side guard: pin each resolve to the revision the user saw
-        # in the digest (snapshotted at send_digest). Missing snapshot → None →
-        # unguarded (behaves as today); NEVER default to 1, or pre-existing
-        # digests and bulk "approve all pending" would refuse legitimate resolves.
+        # in the digest (snapshotted at send_digest). The delivery-keyed snapshot
+        # is authoritative (per-digest); the batch-keyed one is the fallback for
+        # resolves with no delivery context and for digests sent before
+        # delivery-keying shipped. Missing snapshot → None → unguarded (behaves
+        # as today); NEVER default to 1, or pre-existing digests and bulk
+        # "approve all pending" would refuse legitimate resolves.
         rev_snapshot: dict[str, int] = {}
         try:
-            snap_raw = await ego_crud.get_state(self._db, f"revision_snapshot:{batch_id}")
+            snap_raw = None
+            if delivery_id:
+                snap_raw = await ego_crud.get_state(
+                    self._db, f"revision_snapshot:{delivery_id}"
+                )
+            if not snap_raw:
+                snap_raw = await ego_crud.get_state(
+                    self._db, f"revision_snapshot:{batch_id}"
+                )
             if snap_raw:
                 rev_snapshot = json.loads(snap_raw)
         except Exception:

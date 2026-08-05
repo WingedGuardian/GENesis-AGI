@@ -59,6 +59,21 @@ def load_ego_config(path: Path | None = None) -> EgoConfig:
             ):
                 continue
             kwargs[field_name] = value
+    # revalidation_interval_hours is a defaults-COMPLETE mapping: consumers
+    # .get(urgency) and fall back to normal/72 only for MISSING keys, so a
+    # partial YAML override like {"high": 12} must merge OVER the declared
+    # defaults — wholesale replacement silently collapses omitted urgencies
+    # to 72h (critical 6→72, low 168→72). Other dict fields (e.g.
+    # dispatch_model_overrides) are empty-by-default override maps where
+    # wholesale assignment IS the semantics — do not blanket-merge those.
+    if "revalidation_interval_hours" in kwargs:
+        _reval_defaults = EgoConfig.__dataclass_fields__[
+            "revalidation_interval_hours"
+        ].default_factory()
+        kwargs["revalidation_interval_hours"] = {
+            **_reval_defaults,
+            **kwargs["revalidation_interval_hours"],
+        }
     return EgoConfig(**kwargs)
 
 
