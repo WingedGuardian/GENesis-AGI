@@ -20,12 +20,6 @@ from genesis.observability.provider_activity import ProviderActivityTracker
 
 logger = logging.getLogger(__name__)
 
-# How long a staleness verdict is cached before re-reading update_history. The
-# verdict is effectively permanent for a process's life (it can only flip
-# not-stale→stale, once, when a deploy lands), so a coarse TTL keeps this to at
-# most one DB read/minute even under repeated guarded calls.
-_STALE_TTL_S = 60.0
-
 
 def _same_commit(a: str | None, b: str | None) -> bool:
     """True if two commit refs denote the same commit, tolerating short/full SHA.
@@ -66,8 +60,10 @@ class InstrumentationMiddleware(Middleware):
         self._tracker = tracker
         self._server = server_name
         self._db = db
-        # (monotonic_ts, is_stale) — see _STALE_TTL_S / _is_stale.
-        self._stale_cache: tuple[float, bool] | None = None
+        # Latches True once a post-spawn deploy is confirmed (staleness is
+        # monotonic — it never reverts). A False verdict is deliberately NOT
+        # cached; see _is_stale.
+        self._is_stale_latched: bool = False
 
     async def on_call_tool(self, context, call_next):
         """Wrap tool invocations with timing, error tracking, and a per-call
@@ -152,12 +148,22 @@ class InstrumentationMiddleware(Middleware):
 
     async def _is_stale(self) -> bool:
         """True iff a successful deploy landed AFTER this subprocess started, on a
-        DIFFERENT commit than it was spawned at. Verdict cached ~60s.
+        DIFFERENT commit than it was spawned at.
+
+        Staleness is MONOTONIC — once a newer deploy exists it never reverts — so
+        a True verdict latches permanently (no further DB reads). A False verdict
+        is deliberately NOT cached: caching it would open a window where a deploy
+        landing just after a not-stale check is masked until the cache expired,
+        letting a guarded call run stale code in exactly the window the guard must
+        cover. Guarded tools are rare (procedure_store only), so re-reading the
+        tiny update_history row each not-yet-stale call is negligible.
 
         Fail-open: any uncertainty (no db, unknown spawn identity, empty history,
         parse/db error) returns False — the guard fires only on POSITIVE
         confirmation of staleness, never on a failed check.
         """
+        if self._is_stale_latched:
+            return True
         if self._db is None:
             return False
         from genesis.observability import mcp_spawn_identity as si
@@ -165,10 +171,6 @@ class InstrumentationMiddleware(Middleware):
         sc, sa = si.spawn_commit(), si.spawn_at()
         if not sc or not sa:
             return False
-        now = time.monotonic()
-        if self._stale_cache is not None and now - self._stale_cache[0] < _STALE_TTL_S:
-            return self._stale_cache[1]
-        stale = False
         try:
             from datetime import datetime
 
@@ -183,11 +185,10 @@ class InstrumentationMiddleware(Middleware):
                     and datetime.fromisoformat(completed_at)
                     > datetime.fromisoformat(sa)
                 ):
-                    stale = True
+                    self._is_stale_latched = True
+                    return True
         except Exception:
             logger.debug(
                 "MCP staleness check failed; treating as not stale", exc_info=True
             )
-            stale = False
-        self._stale_cache = (now, stale)
-        return stale
+        return False

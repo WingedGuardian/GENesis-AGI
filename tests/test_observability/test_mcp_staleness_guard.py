@@ -199,14 +199,28 @@ async def test_mixed_timezone_offsets_compared_by_instant(monkeypatch):
         await _run(_mw(_FakeDB()), "procedure_store")
 
 
-async def test_stale_verdict_is_cached(monkeypatch):
+async def test_stale_verdict_latches(monkeypatch):
+    # A confirmed-stale verdict latches → no repeat DB reads (staleness is
+    # monotonic, so once true it stays true for the process's life).
     _set_spawn(monkeypatch, SPAWN_FULL, T_SPAWN)
     calls: list = []
     _set_deploy(monkeypatch, (T_AFTER, DEPLOY_DIFF), counter=calls)
     mw = _mw(_FakeDB())
     assert await mw._is_stale() is True
     assert await mw._is_stale() is True
-    assert len(calls) == 1  # second read served from the ~60s cache
+    assert len(calls) == 1  # second call served from the latch
+
+
+async def test_negative_verdict_not_cached_across_deploy(monkeypatch):
+    # Codex P2 regression: a not-stale verdict must NOT be cached — a deploy
+    # landing right after a clean check must be seen on the very NEXT call, not
+    # masked by a stale cached False (the exact window the guard must cover).
+    _set_spawn(monkeypatch, SPAWN_FULL, T_SPAWN)
+    mw = _mw(_FakeDB())
+    _set_deploy(monkeypatch, None)  # no qualifying deploy yet
+    assert await mw._is_stale() is False
+    _set_deploy(monkeypatch, (T_AFTER, DEPLOY_DIFF))  # deploy lands after spawn
+    assert await mw._is_stale() is True  # seen immediately, no stale False cache
 
 
 async def test_db_error_fails_open(monkeypatch):
