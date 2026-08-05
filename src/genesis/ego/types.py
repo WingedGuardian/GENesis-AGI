@@ -182,6 +182,13 @@ class EgoConfig:
     genesis_cadence_minutes: int = 90  # base interval for genesis ego
     genesis_max_interval_minutes: int = 240  # backoff ceiling for genesis ego
     max_pending_proposals: int = 15  # auto-table oldest unranked when exceeded
+    # Revalidation cadence (PR-6a): per-urgency hours after which a pending
+    # proposal's premises are flagged "due for re-check" by the reconcile
+    # stage. NEVER a kill path — overdue only queues verification (locked
+    # decision #2: user latency never kills a proposal). Config-derived.
+    revalidation_interval_hours: dict = field(
+        default_factory=lambda: {"critical": 6, "high": 48, "normal": 72, "low": 168}
+    )
     # Additive ego autonomy — cap on ACTIVE goals in the genesis ego's OWN
     # lane (origin='genesis_ego'). Pausing frees a slot; the paused tail is
     # deliberately unbounded (user decision 2026-07-16) and reported in the

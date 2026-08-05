@@ -1493,3 +1493,43 @@ class TestReconcilePrompt:
         assert "(board is empty)" in p
         assert "(no active jobs)" in p
         assert "user-facing (CEO)" in p
+
+    def test_overdue_board_item_flagged_due(self):
+        """revalidate_at in the past -> ⚠due marker; future -> no marker."""
+        board = [
+            {
+                "id": "pastitem",
+                "action_type": "investigate",
+                "content": "OVERDUE_ITEM",
+                "revision_num": 1,
+                "revalidate_at": "2000-01-01T00:00:00+00:00",
+            },
+            {
+                "id": "futureitem",
+                "action_type": "investigate",
+                "content": "FRESH_ITEM",
+                "revision_num": 1,
+                "revalidate_at": "2999-01-01T00:00:00+00:00",
+            },
+        ]
+        p = _build_reconcile_prompt([_draft()], board, {}, ego_source="genesis_ego_cycle")
+        lines = [ln for ln in p.splitlines() if "id=" in ln and "action=" in ln]
+        overdue = next(ln for ln in lines if "OVERDUE_ITEM" in ln)
+        fresh = next(ln for ln in lines if "FRESH_ITEM" in ln)
+        assert "⚠due" in overdue
+        assert "⚠due" not in fresh
+        assert "overdue for premise re-validation" in p
+
+    def test_board_item_without_revalidate_at_not_flagged(self):
+        """A board row with no revalidate_at never carries the due marker."""
+        board = [
+            {
+                "id": "b1",
+                "action_type": "investigate",
+                "content": "NO_REVAL",
+                "revision_num": 1,
+            }
+        ]
+        p = _build_reconcile_prompt([_draft()], board, {}, ego_source="user_ego_cycle")
+        board_line = next(ln for ln in p.splitlines() if "NO_REVAL" in ln)
+        assert "⚠due" not in board_line

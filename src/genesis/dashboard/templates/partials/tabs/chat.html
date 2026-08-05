@@ -189,6 +189,14 @@
           <template x-if="!['loading','error'].includes($store.genesisDashboard.panelState('comms')) && $store.genesisDashboard.commsProposals.length === 0">
             <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">No proposals. The ego hasn't produced any proposals yet.</div>
           </template>
+          <!-- Stale-revision (409) notice: the proposal changed since it was rendered -->
+          <template x-if="$store.genesisDashboard.commsResolveError">
+            <div style="font-size:0.72rem; padding:0.4rem 0.6rem; margin-bottom:0.5rem; border:1px solid #f0ad4e; background:rgba(240,173,78,0.12); color:#f0ad4e; border-radius:4px; display:flex; gap:0.5rem; align-items:center;">
+              <span x-text="$store.genesisDashboard.commsResolveError"></span>
+              <button style="margin-left:auto; border:none; background:none; color:var(--color-text-secondary); cursor:pointer;"
+                      @click="$store.genesisDashboard.commsResolveError = ''">&times;</button>
+            </div>
+          </template>
           <template x-for="p in $store.genesisDashboard.commsProposals.filter(p => !$store.genesisDashboard.commsProposalFilter || p.status === $store.genesisDashboard.commsProposalFilter)" :key="p.id">
             <div style="border:1px solid var(--color-border); border-radius:6px; padding:0.75rem; margin-bottom:0.5rem;">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.3rem;">
@@ -210,6 +218,9 @@
                   <span x-show="p.urgency && p.urgency !== 'normal'" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px;"
                         :style="p.urgency === 'high' || p.urgency === 'critical' ? 'background:rgba(239,154,154,0.15); color:#ef9a9a;' : ''"
                         x-text="p.urgency"></span>
+                  <!-- Revision badge (dark until reconcile revise ships — revision_num stays 1) -->
+                  <span x-show="p.revision_num > 1" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px; background:rgba(156,39,176,0.15); color:#ce93d8;"
+                        x-text="'rev ' + p.revision_num"></span>
                 </div>
                 <span style="font-size:0.65rem; color:var(--color-text-secondary);"
                       x-text="$store.genesisDashboard.formatDateTime(p.created_at)"></span>
