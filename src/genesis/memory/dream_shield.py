@@ -74,6 +74,21 @@ class ShieldState:
     population: int = 0
 
 
+def _safe_confidence(payload: dict) -> float:
+    """Payload confidence coerced to a float — None/non-numeric → 0.5.
+
+    A present-but-null ``confidence`` makes ``payload.get("confidence", 0.5)``
+    return ``None`` (the default applies only to ABSENT keys), and ``None >=
+    float`` raises ``TypeError``. One such payload must not crash the floor
+    comparison (weekly: disables the shield for the worklist; drain: propagates
+    after mark_processing and stalls the shadow drain).
+    """
+    v = payload.get("confidence", 0.5)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0.5
+    return float(v)
+
+
 def _activation_for(point: dict, link_count: int, now: str) -> float:
     """Production activation for one point, mirroring HybridRetriever's field
     extraction (retrieval.py ``_compute_activations``). Missing ``created_at``
@@ -87,7 +102,7 @@ def _activation_for(point: dict, link_count: int, now: str) -> float:
     payload = point.get("payload", {})
     try:
         return compute_activation(
-            confidence=payload.get("confidence", 0.5),
+            confidence=_safe_confidence(payload),
             created_at=payload.get("created_at") or now,
             retrieved_count=payload.get("retrieved_count", 0),
             link_count=link_count,
@@ -161,7 +176,16 @@ async def compute_shield_state(
 
     activation_threshold = _percentile(list(activation_by_id.values()), act_pct)
 
-    centrality_by_id = await _centrality_map(db)
+    # Centrality percentile over the LIVE population only. centrality_cache is
+    # built from the full memory_links graph (deprecated nodes included — dream
+    # soft-deletes keep metadata/links for rollback), so restrict to the current
+    # point ids before thresholding — otherwise stale high-centrality deprecated
+    # rows inflate the bar and a live bridge that should be protected stays
+    # mergeable (activation uses only these live points, so the populations must
+    # match).
+    point_ids = {pt["id"] for pt in points}
+    full_centrality = await _centrality_map(db)
+    centrality_by_id = {mid: v for mid, v in full_centrality.items() if mid in point_ids}
     nonzero = [v for v in centrality_by_id.values() if v > 0.0]
     centrality_threshold = _percentile(nonzero, cent_pct) if nonzero else None
 
@@ -197,7 +221,7 @@ def _member_is_shielded(member: dict, state: ShieldState) -> bool:
     mid = member["id"]
     return _shielded(
         state.activation_by_id.get(mid, 0.0),
-        member.get("payload", {}).get("confidence", 0.5),
+        _safe_confidence(member.get("payload", {})),
         state.centrality_by_id.get(mid, 0.0),
         act_thr=state.activation_threshold,
         cent_thr=state.centrality_threshold,
@@ -269,7 +293,7 @@ async def shield_filter_live(
         act = _activation_for(m, link_counts.get(mid, (0, 0))[0], now_str)
         if _shielded(
             act,
-            m.get("payload", {}).get("confidence", 0.5),
+            _safe_confidence(m.get("payload", {})),
             cent_map.get(mid, 0.0),
             act_thr=activation_threshold,
             cent_thr=centrality_threshold,

@@ -153,6 +153,61 @@ async def test_shield_filter_live_survives_malformed_created_at(monkeypatch, db)
     assert {m["id"] for m in survivors} == {"bad", "a", "b"}
 
 
+async def test_compute_shield_state_survives_null_confidence(monkeypatch, db):
+    """A payload with explicit `confidence: null` must not crash the floor
+    comparison (`.get(k, default)` returns None when the key is present-but-null,
+    and None >= float raises TypeError)."""
+    _enable(monkeypatch)
+    # Recent, high-activation neighbours set the bar; the null-confidence member
+    # is old (low activation) so only the confidence floor could shield it.
+    good = [_point(f"g{i}", retrieved_count=10, days_old=1) for i in range(3)]
+    nullc = {
+        "id": "nc",
+        "payload": {
+            "confidence": None,
+            "created_at": _iso_days_ago(300),
+            "retrieved_count": 0,
+            "source": "session_extraction",
+        },
+    }
+    state = await dream_shield.compute_shield_state(db, [*good, nullc], now=NOW)
+    assert state is not None
+    # Must not raise; coerced to the 0.5 default → below the 0.98 floor, and old
+    # → below the activation bar → not shielded.
+    assert dream_shield._member_is_shielded(nullc, state) is False
+
+
+async def test_shield_filter_live_survives_null_confidence(monkeypatch, db):
+    """Drain-time floor comparison must not crash on null confidence — otherwise
+    it propagates AFTER the item is marked processing and stalls the drain."""
+    _enable(monkeypatch)
+    nullc = {"id": "nc", "payload": {"confidence": None, "created_at": _iso_days_ago(1)}}
+    a, b = _point("a", confidence=0.4), _point("b", confidence=0.4)
+    survivors, n = await dream_shield.shield_filter_live(
+        db, [nullc, a, b], activation_threshold=0.30, centrality_threshold=None, now=NOW
+    )
+    assert n == 0
+    assert {m["id"] for m in survivors} == {"nc", "a", "b"}
+
+
+async def test_centrality_percentile_excludes_out_of_population(monkeypatch, db):
+    """The centrality percentile must be computed over the LIVE population only.
+    A high-centrality deprecated node still in the cache (dream soft-deletes keep
+    metadata/links) must not inflate the threshold and under-shield live bridges."""
+    _enable(monkeypatch, centrality_percentile=0.5)
+    await db.executemany(
+        "INSERT INTO centrality_cache (memory_id, centrality_score, computed_at) VALUES (?,?,?)",
+        [("ghost", 0.99, NOW), ("m0", 0.01, NOW), ("m1", 0.02, NOW), ("m2", 0.03, NOW)],
+    )
+    await db.commit()
+    points = [_point("m0"), _point("m1"), _point("m2")]  # 'ghost' NOT in population
+    state = await dream_shield.compute_shield_state(db, points, now=NOW)
+    # p0.5 over the in-population {0.01,0.02,0.03} = 0.02; if 'ghost' 0.99 leaked
+    # in it would be 0.03. Also 'ghost' must not appear in the by_id map.
+    assert state.centrality_threshold == 0.02
+    assert "ghost" not in state.centrality_by_id
+
+
 async def test_apply_shield_none_state_is_noop():
     clusters = [[_point("a"), _point("b")]]
     out, stats = dream_shield.apply_shield_to_clusters(clusters, None)
