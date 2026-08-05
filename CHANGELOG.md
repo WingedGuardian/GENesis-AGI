@@ -48,6 +48,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **No more spurious embedding error on restart.** A one-time procedure-embedding
+  repair runs shortly after boot; on some installs it fired before the network was
+  warm and logged a scary "all embedding backends failed" error with a full
+  traceback on every restart, even though it harmlessly retried on the next boot.
+  The repair now waits for boot I/O to settle and retries a cold-start blip before
+  giving up, and a not-yet-ready dependency is logged as a quiet, tracebackless
+  "will retry next boot" notice rather than an error. Operators can tune or disable
+  the wait with `GENESIS_DATA_MIGRATION_BOOT_DELAY_S` (seconds; `0` to disable).
+
 - **Re-embedding a memory no longer downgrades its recall ranking.** When a
   memory's vector was rebuilt (after a vector-store outage, or by the nightly
   repair job), its priority class was silently recomputed from the text alone —

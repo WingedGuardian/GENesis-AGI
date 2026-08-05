@@ -33,6 +33,20 @@ from genesis.db.connection import MIGRATION_BUSY_TIMEOUT_MS
 
 logger = logging.getLogger(__name__)
 
+
+class MigrationDependencyUnavailable(RuntimeError):
+    """A data migration's external dependency (embedding provider, Qdrant, …) was
+    not reachable, so the migration could not complete — but this is EXPECTED and
+    transient, typically a cold boot before network egress / a local service is
+    warm. The runner records it as failed (so it replays on the next boot, exactly
+    like any other failure) but logs it at WARNING WITHOUT a traceback — a genuine
+    migration bug raises some OTHER exception and keeps the ERROR+traceback.
+
+    Subclasses ``RuntimeError`` so existing ``except RuntimeError`` dependency
+    guards (e.g. d0011 ``verify()``) keep catching it unchanged.
+    """
+
+
 # 100 keeps each committed batch comfortably under the server's 5s busy_timeout
 # even for a fan-out migration (e.g. d0006's ~7 DELETEs/item ⇒ ~700 statements
 # per batch, sub-second), while amortizing commit/fsync overhead across items.
