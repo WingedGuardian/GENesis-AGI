@@ -2758,8 +2758,19 @@ def _build_reconcile_prompt(
         f'[{i}] action={d.get("action_type", "")} :: {_clip(d.get("content", ""))}'
         for i, d in enumerate(drafts)
     ]
+    _now_iso = datetime.now(UTC).isoformat()
+
+    def _due(b: dict) -> str:
+        # Revalidation-cadence flag (PR-6a): a pending proposal past its
+        # revalidate_at is overdue for a premise re-check. Advisory only —
+        # never a kill (locked decision #2). Both are isoformat() UTC
+        # strings (+00:00), so lexical compare == chronological (same basis
+        # as the created_at ordering used by list_pending_proposals).
+        rv = b.get("revalidate_at")
+        return " ⚠due" if rv and str(rv) < _now_iso else ""
+
     board_lines = [
-        f'- id={str(b.get("id", ""))[:12]} rev={b.get("revision_num", 1)} '
+        f'- id={str(b.get("id", ""))[:12]} rev={b.get("revision_num", 1)}{_due(b)} '
         f'action={b.get("action_type", "")} :: {_clip(b.get("content", ""))}'
         for b in board
     ] or ["(board is empty)"]
@@ -2794,6 +2805,8 @@ already handled.
 {nl.join(draft_lines) if draft_lines else "(none)"}
 
 ## Pending board (already awaiting user decision)
+(A ⚠due flag = this pending item is overdue for premise re-validation;
+prefer a verdict that re-checks it against current reality.)
 {nl.join(board_lines)}
 
 ## Covered work — deterministic ground truth (NOT memory)

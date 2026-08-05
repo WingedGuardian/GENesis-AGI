@@ -210,14 +210,39 @@ async def comms_resolve_proposal(proposal_id: str):
         return jsonify({"error": "status must be 'approved' or 'rejected'"}), 400
 
     user_response = data.get("user_response", "")
+    # PR-6a resolve-side guard: pin the resolve to the revision the browser
+    # rendered (sent in the body). Absent → None → unguarded (as before); NEVER
+    # default to 1. Coerce a stringified body value defensively.
+    expected_revision = data.get("revision_num")
+    if isinstance(expected_revision, str):
+        expected_revision = int(expected_revision) if expected_revision.isdigit() else None
 
     ok = await ego.resolve_proposal(
         rt.db,
         proposal_id,
         status=status,
         user_response=user_response or None,
+        expected_revision=expected_revision,
     )
     if not ok:
+        # Distinguish a stale-revision refusal (revised since rendered) from a
+        # gone / already-resolved proposal so the client can prompt a re-review.
+        fresh = None
+        try:
+            fresh = await ego.get_proposal(rt.db, proposal_id)
+        except Exception:
+            fresh = None
+        if (
+            fresh is not None
+            and fresh.get("status") == "pending"
+            and expected_revision is not None
+            and fresh.get("revision_num") != expected_revision
+        ):
+            return jsonify({
+                "error": "stale_revision",
+                "message": "This proposal was revised — re-review before resolving.",
+                "revision_num": fresh.get("revision_num"),
+            }), 409
         return jsonify({"error": "Proposal not found or already resolved"}), 404
 
     # Shared post-resolution hook: journal + J-9 + decision capture +

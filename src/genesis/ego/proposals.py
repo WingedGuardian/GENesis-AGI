@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
@@ -151,6 +151,16 @@ def _format_digest(
         # Confidence badge
         confidence = p.get("confidence", 0.0)
         lines.append(f"\n[{confidence:.2f} confidence]")
+
+        # PR-6a: revision + revalidation surfacing. Dark until reconcile
+        # revise/reaffirm ships — revision_num stays 1 and last_validated_at
+        # equals created_at today, so neither line renders yet.
+        revision = p.get("revision_num", 1)
+        if revision and revision > 1:
+            lines.append(f"[rev {revision}]")
+        last_validated = p.get("last_validated_at")
+        if last_validated and last_validated != p.get("created_at"):
+            lines.append(f"<i>verified as of {_ESC(str(last_validated)[:16])}</i>")
 
         # WS-2 P4 arbitration annotations (annotate-only; never suppresses).
         badge = p.get("_calibration_badge")
@@ -312,6 +322,16 @@ class ProposalWorkflow:
         batch_id = uuid.uuid4().hex[:16]
         created_at = datetime.now(UTC).isoformat()
 
+        # Revalidation cadence (PR-6a): stamp revalidate_at per urgency so the
+        # reconcile stage can flag proposals whose premises are due for a
+        # re-check. NEVER a kill path — overdue only queues verification
+        # (locked decision #2). Config-derived; degrades to EgoConfig defaults.
+
+        from genesis.ego.config import load_ego_config
+
+        _reval_intervals = load_ego_config().revalidation_interval_hours
+        _created_dt = datetime.fromisoformat(created_at)
+
         # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
         # hallucinated goal_ids from persisting).
         valid_goal_ids: set[str] | None = None
@@ -383,6 +403,10 @@ class ProposalWorkflow:
                 except Exception:
                     logger.warning("Proposal dedup check failed, proceeding", exc_info=True)
 
+            _urg = p.get("urgency", "normal")
+            _reval_hours = _reval_intervals.get(_urg, _reval_intervals.get("normal", 72))
+            _revalidate_at = (_created_dt + timedelta(hours=_reval_hours)).isoformat()
+
             await ego_crud.create_proposal(
                 self._db,
                 id=pid,
@@ -410,6 +434,8 @@ class ProposalWorkflow:
                 expected_outputs=_serialize_expected_outputs(
                     p.get("expected_outputs"),
                 ),
+                revalidate_at=_revalidate_at,
+                last_validated_at=created_at,
             )
             ids.append(pid)
             created_proposals.append(p)
@@ -599,6 +625,38 @@ class ProposalWorkflow:
             value=delivery_id,
         )
 
+        # PR-6a resolve-side guard: snapshot the revision each proposal was
+        # RENDERED at, so a reply resolving this digest pins the revision the
+        # user actually saw. A concurrent revise (PR-6b) bumps revision_num;
+        # resolve_proposals passes this as expected_revision so a stale resolve
+        # refuses instead of clobbering the newer version. Keyed by DELIVERY id
+        # (each digest message pins its own snapshot — re-delivering a batch
+        # after a revise must not retarget replies to the older digest onto the
+        # newer snapshot). The batch-keyed copy is the fallback for resolves
+        # with no delivery context (bare "approve all" / bulk paths, which act
+        # on the LATEST digest by construction) and for digests sent before
+        # delivery-keying shipped. Written only after a successful delivery.
+        # Every row is revision_num=1 until PR-6b introduces revise, so today
+        # this is a no-op match.
+        try:
+            snapshot_json = json.dumps(
+                {p["id"]: p.get("revision_num", 1) for p in proposals}
+            )
+            await ego_crud.set_state(
+                self._db,
+                key=f"revision_snapshot:{delivery_id}",
+                value=snapshot_json,
+            )
+            await ego_crud.set_state(
+                self._db,
+                key=f"revision_snapshot:{batch_id}",
+                value=snapshot_json,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to write revision snapshot for %s", batch_id, exc_info=True
+            )
+
         # GROUNDWORK(digest-rate-limit): record delivery timestamp for
         # rate limiting. Written even when gate is disabled so the
         # timestamp is ready when the gate is flipped on.
@@ -628,10 +686,15 @@ class ProposalWorkflow:
         self,
         batch_id: str,
         decisions: dict[int, tuple[str, str | None]],
+        *,
+        delivery_id: str | None = None,
     ) -> dict[str, str]:
         """Apply parsed decisions to proposals in the batch.
 
         ``decisions`` maps 1-based index → (status, optional reason).
+        ``delivery_id`` identifies the digest message the user replied to,
+        when known — it selects the revision snapshot for THAT digest so a
+        reply to an older delivery cannot resolve against a newer snapshot.
         Returns ``{proposal_id: final_status}``.
 
         On rejection with a reason, automatically stores a correction
@@ -639,6 +702,31 @@ class ProposalWorkflow:
         """
         proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
         results: dict[str, str] = {}
+
+        # PR-6a resolve-side guard: pin each resolve to the revision the user saw
+        # in the digest (snapshotted at send_digest). The delivery-keyed snapshot
+        # is authoritative (per-digest); the batch-keyed one is the fallback for
+        # resolves with no delivery context and for digests sent before
+        # delivery-keying shipped. Missing snapshot → None → unguarded (behaves
+        # as today); NEVER default to 1, or pre-existing digests and bulk
+        # "approve all pending" would refuse legitimate resolves.
+        rev_snapshot: dict[str, int] = {}
+        try:
+            snap_raw = None
+            if delivery_id:
+                snap_raw = await ego_crud.get_state(
+                    self._db, f"revision_snapshot:{delivery_id}"
+                )
+            if not snap_raw:
+                snap_raw = await ego_crud.get_state(
+                    self._db, f"revision_snapshot:{batch_id}"
+                )
+            if snap_raw:
+                rev_snapshot = json.loads(snap_raw)
+        except Exception:
+            logger.debug(
+                "Failed to load revision snapshot for %s", batch_id, exc_info=True
+            )
 
         for idx, (status, reason) in decisions.items():
             if idx < 1 or idx > len(proposals):
@@ -649,6 +737,7 @@ class ProposalWorkflow:
                 prop["id"],
                 status=status,
                 user_response=reason,
+                expected_revision=rev_snapshot.get(prop["id"]),
             )
             if updated:
                 results[prop["id"]] = status

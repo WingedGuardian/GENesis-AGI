@@ -52,6 +52,29 @@ class TestLoadEgoConfig:
         # Falls back to defaults
         assert config.cadence_minutes == 60
 
+    def test_partial_revalidation_override_merges_over_defaults(self, tmp_config):
+        """Codex P2 regression: a partial revalidation_interval_hours override
+        must merge OVER the full defaults — omitted urgencies keep their
+        declared cadence instead of collapsing to the consumer-side 72h
+        fallback (critical 6→72, low 168→72)."""
+        tmp_config.write_text(yaml.dump({
+            "revalidation_interval_hours": {"high": 12},
+        }))
+        config = load_ego_config(tmp_config)
+        assert config.revalidation_interval_hours == {
+            "critical": 6,
+            "high": 12,
+            "normal": 72,
+            "low": 168,
+        }
+
+    def test_full_revalidation_override_respected(self, tmp_config):
+        """A complete override replaces every default value."""
+        full = {"critical": 1, "high": 2, "normal": 3, "low": 4}
+        tmp_config.write_text(yaml.dump({"revalidation_interval_hours": full}))
+        config = load_ego_config(tmp_config)
+        assert config.revalidation_interval_hours == full
+
 
 class TestSaveEgoConfig:
     def test_roundtrip(self, tmp_config):
@@ -244,3 +267,49 @@ class TestMaxActiveEgoGoalsValidation:
         assert validate_ego_config({"max_active_ego_goals": -1})
         assert validate_ego_config({"max_active_ego_goals": 2.5})
         assert validate_ego_config({"max_active_ego_goals": "5"})
+
+
+class TestRevalidationIntervalValidation:
+    def test_default_present(self):
+        assert EgoConfig().revalidation_interval_hours == {
+            "critical": 6,
+            "high": 48,
+            "normal": 72,
+            "low": 168,
+        }
+
+    def test_valid_dict_accepted(self):
+        assert (
+            validate_ego_config({"revalidation_interval_hours": {"high": 12, "low": 200}})
+            == []
+        )
+
+    def test_non_dict_rejected(self):
+        assert validate_ego_config({"revalidation_interval_hours": [1, 2]})
+
+    def test_unknown_urgency_rejected(self):
+        errs = validate_ego_config({"revalidation_interval_hours": {"bogus": 5}})
+        assert any("unknown urgency" in e for e in errs)
+
+    def test_nonpositive_rejected(self):
+        assert validate_ego_config({"revalidation_interval_hours": {"high": 0}})
+        assert validate_ego_config({"revalidation_interval_hours": {"high": -3}})
+
+    def test_bool_rejected(self):
+        assert validate_ego_config({"revalidation_interval_hours": {"high": True}})
+
+    def test_scalar_dict_field_degrades_to_default(self, tmp_config):
+        # A hand-edited scalar for a dict field bypasses validate_ego_config;
+        # load must degrade it to the default, not persist a shape that
+        # crashes runtime .get() (e.g. in create_batch).
+        tmp_config.write_text(yaml.dump({"revalidation_interval_hours": 72}))
+        config = load_ego_config(tmp_config)
+        assert config.revalidation_interval_hours == {
+            "critical": 6,
+            "high": 48,
+            "normal": 72,
+            "low": 168,
+        }
+        # class-fix: same protection for the pre-existing dispatch_model_overrides
+        tmp_config.write_text(yaml.dump({"dispatch_model_overrides": "opus"}))
+        assert load_ego_config(tmp_config).dispatch_model_overrides == {}

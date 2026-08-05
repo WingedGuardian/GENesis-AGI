@@ -125,6 +125,7 @@
           expandedCycle: null,
           rejectingId: null,
           rejectReason: "",
+          resolveError: "",
           fetch: { state: "idle", lastSuccess: null, error: null },
         },
         egoStatus: null,
@@ -193,6 +194,7 @@
         commsCategoryFilter: null,
         commsRejectingId: null,
         commsRejectReason: '',
+        commsResolveError: '',
 
         // ── Directives & goals (ego visibility — read + user retire) ──
         // Shared by the Chat-tab strips and the ego-modal Overview card.
@@ -1476,11 +1478,25 @@
         },
         async resolveCommsProposal(proposalId, status, userResponse) {
           try {
-            await fetchApi(`/api/genesis/comms/proposals/${proposalId}/resolve`, {
+            // Pin the resolve to the revision we rendered (optimistic-concurrency
+            // guard). Looked up from the same list the card renders; omit if not
+            // found → server resolves unguarded (as before this PR).
+            const prop = (this.commsProposals || []).find((p) => p.id === proposalId);
+            const payload = { status, user_response: userResponse || "" };
+            if (prop && prop.revision_num != null) payload.revision_num = prop.revision_num;
+            const resp = await fetchApi(`/api/genesis/comms/proposals/${proposalId}/resolve`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ status, user_response: userResponse || "" }),
+              body: JSON.stringify(payload),
             });
+            if (resp && resp.status === 409) {
+              // Revised since rendered — surface a re-review prompt and refresh.
+              let msg = "This proposal was revised — re-review before resolving.";
+              try { const d = await resp.json(); if (d && d.message) msg = d.message; } catch {}
+              this.commsResolveError = msg;
+            } else {
+              this.commsResolveError = '';
+            }
             this.commsRejectingId = null;
             this.commsRejectReason = '';
             await this.fetchComms();
@@ -4382,14 +4398,28 @@
 
         async resolveEgoProposal(id, status, response) {
           try {
+            // Pin the resolve to the revision we rendered (optimistic-concurrency
+            // guard). Looked up from the same list the buttons render from; if
+            // absent, we omit it and the server resolves unguarded (as before).
+            const prop = (this.egoModal.proposals || []).find((p) => p.id === id);
+            const payload = { status, response: response || "" };
+            if (prop && prop.revision_num != null) payload.revision_num = prop.revision_num;
             const resp = await fetchApi("/api/genesis/ego/proposals/" + id + "/resolve", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ status, response: response || "" }),
+              body: JSON.stringify(payload),
             });
             if (resp?.ok) {
               this.egoModal.rejectingId = null;
               this.egoModal.rejectReason = "";
+              this.egoModal.resolveError = "";
+              await this.fetchEgoDetail();
+            } else if (resp && resp.status === 409) {
+              // The proposal was revised since it was rendered — surface a
+              // re-review prompt and refresh so the user sees the new revision.
+              let msg = "This proposal was revised — re-review before resolving.";
+              try { const d = await resp.json(); if (d && d.message) msg = d.message; } catch {}
+              this.egoModal.resolveError = msg;
               await this.fetchEgoDetail();
             }
           } catch (e) { console.warn("Proposal resolve failed:", e); }
