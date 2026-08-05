@@ -68,7 +68,10 @@ index-request consumer; see `scripts/code_intel_runner.sh`) with
 NOT auto-enabled — `systemctl --user start/stop genesis-code-intel-freeze` to
 arm/disarm; holds both index locks so nothing indexes while armed; see
 `scripts/code_intel_freeze.sh`). MCP servers are CC child processes
-(not systemd) — code changes take effect on next CC session start.
+(not systemd) — code changes take effect on next CC session start. A
+post-deploy stale-code guard blocks the one similarity-refine MCP tool
+(`procedure_store`) on a still-running pre-deploy session until restart
+(`mcp_staleness_guard` setting: `block`/`warn`/`off`).
 
 ## Common Commands
 
