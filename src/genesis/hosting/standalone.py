@@ -176,6 +176,11 @@ class StandaloneAdapter:
         timestamp-correlatable with awareness-tick / dispatch / bundle log lines,
         naming what starves the recall coroutine behind the route 503s.
 
+        The WARN also carries ``executor=`` — the default-executor pending depth
+        (PR-2c). A lag episode with a deep executor queue means ``to_thread`` work
+        (Qdrant recall, awareness-tick git) is saturating the thread pool, which
+        loop drift alone cannot distinguish from pure loop starvation.
+
         Debounced per stall EPISODE: one WARNING when drift first crosses the
         threshold, one INFO with the peak drift when it clears. A sustained
         multi-minute stall (the worst case, and exactly when log noise competes
@@ -186,6 +191,8 @@ class StandaloneAdapter:
         ``GENESIS_LOOP_LAG_SAMPLER`` (0/false/off) — disables the sampler at
         startup. Best-effort: any error ends the sampler without touching serve.
         """
+        from genesis.util.loop_diag import default_executor_pending
+
         interval = 0.5
         try:
             threshold_ms = float(os.environ.get("GENESIS_LOOP_LAG_WARN_MS", "250"))
@@ -207,10 +214,11 @@ class StandaloneAdapter:
                         lagging = True
                         logger.warning(
                             "event-loop lag %.0fms (interval %.0fms) — background "
-                            "work is starving the loop; recall 503s correlate here "
-                            "(further lag suppressed until it clears)",
+                            "work is starving the loop; recall 503s correlate here; "
+                            "executor=%s (further lag suppressed until it clears)",
                             drift_ms,
                             interval * 1000,
+                            default_executor_pending(),
                         )
                 elif lagging:
                     # Episode cleared — report the peak so the stall's severity is

@@ -35,8 +35,42 @@ from typing import Any
 
 from genesis.memory import graph_expansion
 from genesis.memory.intent import classify_intent, classify_stance
+from genesis.util.loop_diag import default_executor_pending
 
 logger = logging.getLogger(__name__)
+
+# Recall sub-stage timers written incrementally into the engine ``stats`` dict by
+# ``retrieval._proactive_impl`` as each stage completes (vector/FTS/expand/…). Folded
+# into ``timings_ms`` on BOTH the success path and the cancellation path, so a 503 that
+# dies mid-recall still names the last stage that finished (the stage AFTER the last
+# present key is where the coroutine was starved). ``rerank_ms`` is folded separately
+# because its ``timings`` key drops the ``_ms`` suffix like the rest but is set on its
+# own stage. Keep in sync with the writers in ``retrieval.py``.
+_RECALL_SUBSTAGE_KEYS: tuple[str, ...] = (
+    "vector_ms",
+    "event_ms",
+    "expand_ms",
+    "fts_ms",
+    "expired_ms",
+    "activation_ms",
+    "breadcrumbs_ms",
+    "assembly_ms",
+)
+
+
+def _fold_engine_substages(timings: dict[str, Any], engine_stats: dict[str, Any]) -> None:
+    """Copy whatever recall sub-stage timers have been populated into ``timings``.
+
+    ``engine_stats`` is mutated in place by the engine as each stage finishes, so on a
+    mid-recall cancellation the completed stages are already present — this surfaces
+    them (minus the ``_ms`` suffix) so the 503 log attributes the stall to a stage.
+    """
+    for key in _RECALL_SUBSTAGE_KEYS:
+        if key in engine_stats:
+            timings[key.removesuffix("_ms")] = engine_stats[key]
+    if "rerank_ms" in engine_stats:
+        timings["rerank"] = engine_stats["rerank_ms"]
+
 
 # ---------------------------------------------------------------------------
 # Config — intent-aware budget + rerank posture, live-read from
@@ -588,6 +622,11 @@ async def proactive_context(
     # best-effort `except Exception` blocks never swallow it.
     timings: dict[str, Any] = {}
     phase = "embed"
+    # Monotonic clock at the start of the in-flight `phase`, so on cancellation we can
+    # report how long the coroutine was stuck in the phase that got cancelled
+    # (`phase_wall_ms`) — the recall phase completes in ~0.5s but a 503 burns ~4s in it,
+    # and that gap is the whole question PR-2c answers. Updated at each phase transition.
+    phase_started_at = time.monotonic()
     vector: list[float] | None = None
     engine_stats: dict[str, Any] = {}
     try:
@@ -619,6 +658,7 @@ async def proactive_context(
         kb_slots = max(1, budget // 3)
         phase = "recall"
         t_recall = time.monotonic()
+        phase_started_at = t_recall
         dicts = await _core._proactive_impl(
             prompt,
             limit=budget,
@@ -637,6 +677,7 @@ async def proactive_context(
 
         phase = "enrich"
         t_enrich = time.monotonic()
+        phase_started_at = t_enrich
         # PR-4b (ac27b693): route these post-recall reads off the shared write
         # lock onto recall's read-only pool via the same _ro_read seam recall's
         # own reads use. Both are pure indexed SELECTs (memory_metadata PK /
@@ -661,6 +702,7 @@ async def proactive_context(
 
         phase = "procedure"
         t_proc = time.monotonic()
+        phase_started_at = t_proc
         procedure = None
         if vector:
             procedure = await _surface_procedure(db, vector)
@@ -707,10 +749,23 @@ async def proactive_context(
         # timings gathered so far — the signal the 503 previously discarded —
         # rather than assert a cause, then re-raise so the task completes as
         # cancelled.
+        #
+        # PR-2c: the ~4s that a cancelled recall burns is the open question, so pull in
+        # three signals the bare phase name lacked. (1) Fold the recall sub-stage timers
+        # the engine already wrote into `engine_stats` before the cancel — the stage
+        # after the last present key is where it starved (an EMPTY fold ⇒ died in the
+        # first stage, the Qdrant `to_thread` vector search). (2) `phase_wall_ms` — how
+        # long we sat in the cancelled phase, so recall's ~0.5s success cost vs the ~4s
+        # cancel is explicit. (3) The default-executor pending depth: a deep queue with
+        # low loop-lag means `to_thread` (Qdrant/git) saturation, NOT loop starvation —
+        # the alternative the lag sampler can't see. All best-effort, log-only.
+        _fold_engine_substages(timings, engine_stats)
+        timings["phase_wall_ms"] = round((time.monotonic() - phase_started_at) * 1000, 1)
         timings["cancelled_after_ms"] = round((time.monotonic() - t0) * 1000, 1)
         logger.warning(
-            "proactive recall CANCELLED at phase=%s; partial timings=%s",
+            "proactive recall CANCELLED at phase=%s; executor=%s; partial timings=%s",
             phase,
+            default_executor_pending(),
             timings,
         )
         raise
@@ -720,26 +775,14 @@ async def proactive_context(
 
     timings["total"] = round((time.monotonic() - t0) * 1000, 1)
     total_ms = timings["total"]
-    if "rerank_ms" in engine_stats:
-        timings["rerank"] = engine_stats["rerank_ms"]
     # Sub-stage breakdown of the `recall` bucket (ac27b693): surfaced so a slow
     # recall can be attributed to a specific stage from the journal alone,
     # instead of guessed. PR-4 added the read-stage timers (event/expired/
     # breadcrumbs) + assembly so the previously-unaccounted recall residual
     # (read-lock contention) is now attributable. Present only when recall
-    # populated them.
-    for _k in (
-        "vector_ms",
-        "event_ms",
-        "expand_ms",
-        "fts_ms",
-        "expired_ms",
-        "activation_ms",
-        "breadcrumbs_ms",
-        "assembly_ms",
-    ):
-        if _k in engine_stats:
-            timings[_k.removesuffix("_ms")] = engine_stats[_k]
+    # populated them. Same fold the cancellation path uses (PR-2c) so both the
+    # success and 503 logs carry an identical sub-stage vocabulary.
+    _fold_engine_substages(timings, engine_stats)
     if total_ms > _SLOW_RECALL_LOG_MS:
         # One INFO line per slow call so a latency regression is diagnosable
         # from the journal alone (the 503 path discards timings_ms entirely —
