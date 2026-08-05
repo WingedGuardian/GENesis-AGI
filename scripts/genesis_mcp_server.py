@@ -545,6 +545,13 @@ def main(argv: list[str] | None = None) -> None:
         _run_disabled_stub(transport_kwargs)
         return
 
+    # Snapshot this subprocess's code identity ONCE, before any tool can run, so
+    # the stale-code guard can detect a deploy that lands after this start. Must
+    # be eager (not lazy-on-first-guarded-call) — see mcp_spawn_identity.
+    from genesis.observability.mcp_spawn_identity import capture_spawn_identity
+
+    capture_spawn_identity()
+
     bootstrapper = _BOOTSTRAPPERS[args.server]
     try:
         bootstrapper(transport_kwargs)
