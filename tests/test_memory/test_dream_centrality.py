@@ -100,3 +100,38 @@ async def test_centrality_runs_in_dry_run(phase_kwargs):
     db = phase_kwargs["db"]
     cursor = await db.execute("SELECT COUNT(*) FROM centrality_cache")
     assert (await cursor.fetchone())[0] == 1  # written even in dry_run
+
+
+async def test_centrality_requests_all_nodes(phase_kwargs):
+    """Widened persistence: centrality_scores is called with top_n=None so the
+    full scored population (not just top-500) is available to the shield."""
+    with patch(
+        "genesis.memory.graph.centrality_scores",
+        new_callable=AsyncMock,
+        return_value=[("mem-1", 0.5)],
+    ) as mock_scores:
+        await run_centrality_recompute(**phase_kwargs)
+
+    _, kwargs = mock_scores.call_args
+    assert kwargs.get("top_n") is None
+
+
+async def test_centrality_skips_zero_scores(phase_kwargs):
+    """Zero-betweenness nodes (the vast majority) are NOT persisted — otherwise
+    a percentile over the cache degenerates to 0 and shields everything."""
+    mock_scores = [("bridge", 0.42), ("z1", 0.0), ("z2", 0.0)]
+
+    with patch(
+        "genesis.memory.graph.centrality_scores",
+        new_callable=AsyncMock,
+        return_value=mock_scores,
+    ):
+        report = await run_centrality_recompute(**phase_kwargs)
+
+    assert report["nodes_scored"] == 3  # all computed
+    assert report["nodes_persisted"] == 1  # only the nonzero one
+
+    db = phase_kwargs["db"]
+    cursor = await db.execute("SELECT memory_id FROM centrality_cache")
+    rows = [r[0] for r in await cursor.fetchall()]
+    assert rows == ["bridge"]

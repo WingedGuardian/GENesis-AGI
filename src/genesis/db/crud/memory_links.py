@@ -100,6 +100,29 @@ async def batch_link_counts(
     return {mid: (total_map.get(mid, 0), inbound_map.get(mid, 0)) for mid in memory_ids}
 
 
+async def all_link_counts(db: aiosqlite.Connection) -> dict[str, int]:
+    """Total (bidirectional) link count for EVERY id in ``memory_links``.
+
+    One aggregate query over the whole table — no IN-lists. Intended for
+    full-collection passes (the dream-cycle importance shield scores every
+    memory), where the per-id-set :func:`batch_link_counts` would issue ~N/400
+    chunked queries. Callers that only need a specific id-set should keep using
+    :func:`batch_link_counts`.
+
+    Returns ``{memory_id: total_links}`` for every id that appears as a source
+    or target; ids with no links are simply absent (treat as 0). ``total_links``
+    matches the ``total`` element of :func:`batch_link_counts`.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT id, COUNT(*) FROM ("
+        "  SELECT source_id AS id FROM memory_links"
+        "  UNION ALL"
+        "  SELECT target_id AS id FROM memory_links"
+        ") GROUP BY id",
+    )
+    return {row[0]: row[1] for row in rows}
+
+
 async def inter_candidate_links(
     db: aiosqlite.Connection,
     memory_ids: list[str],

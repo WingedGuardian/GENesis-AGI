@@ -100,6 +100,8 @@ async def run_dream_cycle() -> None:
                     f"{report.get('worklist_enqueued', 0)} enqueued for "
                     f"daily drain, "
                     f"{report.get('oversize_flagged', 0)} oversize flagged, "
+                    f"{report.get('shield', {}).get('members_shielded', 0)} "
+                    f"members shielded, "
                     f"{len(report.get('errors', []))} errors"
                 ),
                 priority="low",
@@ -219,6 +221,9 @@ async def run_dream_synthesis_drain() -> None:
                     f"{report.get('drained', 0)} drained, "
                     f"{report.get('would_merge', 0)} would merge, "
                     f"{report.get('stale_skipped', 0)} stale, "
+                    f"{report.get('shield_members_skipped', 0)} members shielded, "
+                    f"{report.get('shield_skipped', 0)} shield-skipped, "
+                    f"{report.get('shield_missing_thresholds', 0)} missing-thresholds, "
                     f"{len(report.get('errors', []))} errors"
                 ),
                 priority="low",
