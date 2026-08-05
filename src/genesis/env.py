@@ -205,6 +205,35 @@ def recall_read_pool_size() -> int:
         return DEFAULT_READ_POOL_SIZE
 
 
+# SQLite busy_timeout default (ms). Defined HERE, not in db/connection.py: it is
+# an env-tunable default (see db_busy_timeout_ms below), and env.py must sit
+# below the db layer in the import graph — connection.py re-exports it for its
+# historical importers (structural review on WS-1 PR-1).
+BUSY_TIMEOUT_MS = 5000
+
+
+def db_busy_timeout_ms() -> int:
+    """SQLite ``busy_timeout`` (ms) for Genesis connections (default
+    ``BUSY_TIMEOUT_MS``, 5000).
+
+    How long SQLite itself waits for the WAL writer slot before surfacing
+    "database is locked". Overridable via ``GENESIS_DB_BUSY_TIMEOUT_MS`` per
+    PROCESS — the MCP child entrypoint raises it to 15s for itself (N MCP writer
+    processes race ONE writer slot with no queue fairness; 5s loses to any
+    server-side batch), while the server keeps the default. Floored at 100ms so
+    a typo can't turn every contended write into an instant failure; missing or
+    non-integer values fall back to the default. It lengthens how long a write
+    WAITS — it never shortens or skips work.
+    """
+    raw = os.environ.get("GENESIS_DB_BUSY_TIMEOUT_MS", "").strip()
+    if not raw:
+        return BUSY_TIMEOUT_MS
+    try:
+        return max(100, int(raw))
+    except ValueError:
+        return BUSY_TIMEOUT_MS
+
+
 def recall_rerank_gate_off() -> bool:
     """True when the recall rerank rate-gate + circuit-breaker must NOT be built
     (kill switch).

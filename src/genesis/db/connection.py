@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
@@ -18,13 +19,15 @@ from typing import Any
 import aiosqlite
 from aiosqlite.context import Result
 
-from genesis.env import genesis_db_path
+# BUSY_TIMEOUT_MS moved to genesis.env (it is an env-tunable default; env.py
+# sits below this module in the import graph) — re-exported here for the many
+# historical `from genesis.db.connection import BUSY_TIMEOUT_MS` importers.
+from genesis.env import BUSY_TIMEOUT_MS as BUSY_TIMEOUT_MS
+from genesis.env import db_busy_timeout_ms, genesis_db_path
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = genesis_db_path()
-
-BUSY_TIMEOUT_MS = 5000
 
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
 # 256 MiB. SQLite's default is ~2 MiB, which forces hot read paths to keep
@@ -53,6 +56,51 @@ DEFAULT_READ_POOL_SIZE = 4
 # "database is locked". The runner reconciles against schema_migrations either
 # way, but this keeps the common case quiet.
 MIGRATION_BUSY_TIMEOUT_MS = 60000
+
+# Application-level lock-retry schedule (WS-1 PR-1, follow-up 2d88740d).
+# "database is locked" under a multi-process write convoy is usually a LOST
+# busy-wait poll race, not a long-held lock: SQLite's busy_timeout handler has no
+# queue fairness, so with N processes writing in bursts one waiter can lose every
+# re-poll for its whole timeout. A short jittered retry re-enters the race
+# desynchronized and wins the writer slot in almost all such episodes. Delays are
+# sleeps BETWEEN attempts — every attempt still gets the full PRAGMA busy_timeout
+# wait inside SQLite first.
+#
+# ACCEPTED WORST CASE (deliberate, per-process): an EXHAUSTED episode holds the
+# SerializedConnection's asyncio lock for every attempt + backoff — on the
+# server's 5s default ≈ 4x5s + ~1.75s ≈ 22s with all of that process's shared-
+# connection DB ops queued behind it (MCP children set 15s → ≈62s, argued at
+# their setdefault site in scripts/genesis_mcp_server.py). Why acceptable: an
+# exhausted episode requires ONE write to lose four consecutive full
+# busy_timeout waits — i.e. a continuously-wedged writer slot for the whole
+# window, a regime where every write in every process is failing regardless and
+# failing this one faster helps nothing. The common convoy-loss case clears in
+# the first 250ms retry and never blocks anyone longer than today's single 5s
+# wait. Regression signal: the exhaustion WARN below firing in a QUIET period
+# (no concurrent sessions) means a genuine long-holder, not convoy loss —
+# reopen that hunt rather than tuning these delays.
+_WRITE_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0)
+
+# ±20% jitter so waiters that lost the SAME poll race don't re-collide in
+# lockstep on each retry.
+_JITTER_LOW = 0.8
+_JITTER_HIGH = 1.2
+
+# Test seam: tests patch `connection._async_sleep` rather than asyncio.sleep
+# (patching the shared asyncio module would affect every other coroutine in the
+# test process, including pytest-asyncio's own machinery).
+_async_sleep = asyncio.sleep
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    """True for SQLite lock errors: "database is locked" (SQLITE_BUSY) AND
+    "database table is locked" (SQLITE_LOCKED), case-insensitive.
+
+    Same predicate shape as ``db/migrations/runner.py`` — duplicated, not
+    imported: this module is lower-level than the migration runner and must not
+    depend on it.
+    """
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
 
 
 class SerializedConnection:
@@ -148,6 +196,72 @@ class SerializedConnection:
                 logger.error("DB reconnection failed", exc_info=True)
         raise exc
 
+    async def _retry_locked(self, fn: Callable[[], Awaitable[Any]]) -> Any:
+        """Run one DB call with bounded jittered retry on lock errors.
+
+        The CALLER holds ``self._lock``, and it stays held across retries
+        deliberately: releasing mid-episode would let another coroutine
+        interleave its statements into this coroutine's still-open implicit
+        transaction (the exact corruption this class exists to prevent).
+
+        ``fn`` must dereference ``self._conn`` PER CALL (a lambda, never a
+        captured bound method): an exhaustion-triggered reconnect in a previous
+        episode swaps ``_conn``, and a captured method would pin the closed one.
+
+        Retrying the same call is idempotent at the SQLite level (legacy
+        implicit-BEGIN mode, the only mode this module uses — no
+        ``isolation_level`` is ever set):
+        - a locked ``execute``/``executemany`` never applied its statement;
+        - a locked COMMIT leaves the transaction open (re-commit commits it) —
+          or, in the WAL post-commit-autocheckpoint case, the frame is already
+          durable and the connection is out of the transaction, so re-commit
+          no-ops;
+        - ROLLBACK likewise (and a permanently-failed ROLLBACK is the worse
+          outcome: it wedges ``in_transaction=True`` until restart).
+        ``executescript`` is deliberately NOT routed through this helper — a
+        script can partially apply before the lock error, so re-running it is
+        not idempotent.
+
+        On exhaustion this falls through to ``_handle_lock_error``, so the
+        consecutive-error counter now counts exhausted EPISODES rather than raw
+        failed calls — reconnect-after-N semantics are preserved at an
+        episode granularity. Only ``sqlite3.OperationalError`` lock errors are
+        retried; everything else (including ``CancelledError`` during the
+        sleep) propagates immediately.
+        """
+        attempts = len(_WRITE_RETRY_DELAYS) + 1
+        slept = 0.0
+        for attempt in range(1, attempts + 1):
+            try:
+                result = await fn()
+                self._reset_error_count()
+                return result
+            except sqlite3.OperationalError as e:
+                if not _is_lock_error(e):
+                    raise
+                if attempt >= attempts:
+                    logger.warning(
+                        "DB lock persisted through %d attempts (%.2fs of retry backoff"
+                        " on top of busy_timeout) — giving up; a lock error in a QUIET"
+                        " period (no concurrent sessions) points at a long-holder, not"
+                        " convoy loss",
+                        attempts,
+                        slept,
+                    )
+                    await self._handle_lock_error(e)  # counts the episode; re-raises
+                    raise  # unreachable (belt-and-suspenders, matches existing style)
+                delay = _WRITE_RETRY_DELAYS[attempt - 1] * random.uniform(_JITTER_LOW, _JITTER_HIGH)
+                slept += delay
+                logger.debug(
+                    "DB locked (attempt %d/%d) — retrying in %.0fms",
+                    attempt,
+                    attempts,
+                    delay * 1000,
+                )
+                await _async_sleep(delay)
+        msg = "unreachable: retry loop exits via return or raise"
+        raise AssertionError(msg)
+
     # -- Operations that return Result (support both await and async with) --
 
     def execute(
@@ -157,14 +271,7 @@ class SerializedConnection:
     ) -> Result:
         async def _locked() -> aiosqlite.Cursor:
             async with self._lock:
-                try:
-                    result = await self._conn.execute(sql, parameters)
-                    self._reset_error_count()
-                    return result
-                except sqlite3.OperationalError as e:
-                    if "locked" in str(e):
-                        await self._handle_lock_error(e)
-                    raise
+                return await self._retry_locked(lambda: self._conn.execute(sql, parameters))
 
         return Result(_locked())
 
@@ -174,15 +281,12 @@ class SerializedConnection:
         parameters: Iterable[Iterable[Any]],
     ) -> Result:
         async def _locked() -> aiosqlite.Cursor:
+            # Materialize BEFORE the retry loop: a generator argument would be
+            # consumed by a failed first attempt, so the retry would silently
+            # execute zero/partial rows and "succeed".
+            params = list(parameters)
             async with self._lock:
-                try:
-                    result = await self._conn.executemany(sql, parameters)
-                    self._reset_error_count()
-                    return result
-                except sqlite3.OperationalError as e:
-                    if "locked" in str(e):
-                        await self._handle_lock_error(e)
-                    raise
+                return await self._retry_locked(lambda: self._conn.executemany(sql, params))
 
         return Result(_locked())
 
@@ -193,14 +297,9 @@ class SerializedConnection:
     ) -> Result:
         async def _locked() -> list[aiosqlite.Row]:
             async with self._lock:
-                try:
-                    result = await self._conn.execute_fetchall(sql, parameters)
-                    self._reset_error_count()
-                    return result
-                except sqlite3.OperationalError as e:
-                    if "locked" in str(e):
-                        await self._handle_lock_error(e)
-                    raise
+                return await self._retry_locked(
+                    lambda: self._conn.execute_fetchall(sql, parameters)
+                )
 
         return Result(_locked())
 
@@ -211,18 +310,14 @@ class SerializedConnection:
     ) -> Result:
         async def _locked() -> tuple | None:
             async with self._lock:
-                try:
-                    result = await self._conn.execute_insert(sql, parameters)
-                    self._reset_error_count()
-                    return result
-                except sqlite3.OperationalError as e:
-                    if "locked" in str(e):
-                        await self._handle_lock_error(e)
-                    raise
+                return await self._retry_locked(lambda: self._conn.execute_insert(sql, parameters))
 
         return Result(_locked())
 
     def executescript(self, sql: str) -> Result:
+        # Deliberately NOT retried (see _retry_locked docstring): a script can
+        # partially apply before the lock error, so re-running it is not
+        # idempotent. Keeps the pre-retry behavior: count + re-raise.
         async def _locked() -> aiosqlite.Cursor:
             async with self._lock:
                 try:
@@ -230,7 +325,7 @@ class SerializedConnection:
                     self._reset_error_count()
                     return result
                 except sqlite3.OperationalError as e:
-                    if "locked" in str(e):
+                    if _is_lock_error(e):
                         await self._handle_lock_error(e)
                     raise
 
@@ -240,17 +335,15 @@ class SerializedConnection:
 
     async def commit(self) -> None:
         async with self._lock:
-            try:
-                await self._conn.commit()
-                self._reset_error_count()
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e):
-                    await self._handle_lock_error(e)
-                raise
+            await self._retry_locked(lambda: self._conn.commit())
 
     async def rollback(self) -> None:
+        # Retried like commit (idempotent in legacy isolation mode): a locked
+        # ROLLBACK that never lands leaves in_transaction=True permanently —
+        # the exact wedge this class exists to prevent. Previously this path
+        # had NO lock handling at all.
         async with self._lock:
-            await self._conn.rollback()
+            await self._retry_locked(lambda: self._conn.rollback())
 
     async def close(self) -> None:
         async with self._lock:
@@ -293,7 +386,9 @@ async def get_db(
         await conn.execute("PRAGMA journal_mode=WAL")
         if foreign_keys:
             await conn.execute("PRAGMA foreign_keys=ON")
-        await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Env-tunable per PROCESS (GENESIS_DB_BUSY_TIMEOUT_MS): MCP children
+        # raise it to ride out server-side write bursts; default 5000.
+        await conn.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
         await conn.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
         # synchronous=NORMAL is the safe, standard setting under WAL (no
         # corruption risk; at most the last txn is lost on power loss). get_db
@@ -339,7 +434,7 @@ async def get_raw_db(
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
         await db.execute("PRAGMA journal_size_limit=67108864")  # 64 MB WAL file cap
         await db.execute(f"PRAGMA cache_size={CACHE_SIZE_KIB}")  # 256 MiB page cache
         # NOTE: intentionally NOT setting `foreign_keys=ON` here (get_db does).
@@ -374,7 +469,7 @@ async def open_ro_connection(
     uri = f"file:{Path(path)}?mode=ro"
     conn = await aiosqlite.connect(uri, uri=True)
     conn.row_factory = aiosqlite.Row
-    await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    await conn.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
     await conn.execute(f"PRAGMA cache_size={cache_size_kib}")
     return conn
 

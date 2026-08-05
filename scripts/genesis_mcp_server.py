@@ -226,7 +226,8 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
     async def _lifespan(server) -> AsyncIterator[None]:
         from qdrant_client import QdrantClient
 
-        from genesis.db.connection import get_db
+        from genesis.db.connection import ReadConnectionPool, get_db
+        from genesis.env import recall_read_pool_off, recall_read_pool_size
         from genesis.mcp.memory_mcp import init
         from genesis.memory.embeddings import EmbeddingProvider
         from genesis.memory.reranker import VoyageReranker
@@ -234,6 +235,25 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
 
         # Long-lived shared connection via SerializedConnection (see _bootstrap_health).
         db = await get_db(_DEFAULT_DB, foreign_keys=False)
+
+        # Read-only recall pool (WS-1 PR-1): reads leave the shared write
+        # connection, so this child stops contending for the WAL writer slot on
+        # every recall read — fewer convoy participants. Mirrors the server-side
+        # wiring in runtime/init/memory.py: same size knob, same kill switch,
+        # and failure degrades to read_pool=None (all reads on the shared
+        # connection — the pre-pool behavior), never a startup failure.
+        read_pool = None
+        if not recall_read_pool_off():
+            try:
+                pool = ReadConnectionPool(_DEFAULT_DB, size=recall_read_pool_size())
+                await pool.open()
+                read_pool = pool
+            except Exception:
+                logger.warning(
+                    "recall read pool unavailable — reads stay on the shared connection",
+                    exc_info=True,
+                )
+                read_pool = None
 
         try:
 
@@ -258,11 +278,19 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             # full runtime. Degrades to a no-op without API_KEY_VOYAGE.
             reranker = VoyageReranker()
             init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
-                 activity_tracker=tracker, reranker=reranker)
+                 activity_tracker=tracker, reranker=reranker, read_pool=read_pool)
             clear_mcp_crash("memory")
             yield
         finally:
-            await db.close()
+            # Pool FIRST, then db: an in-flight read that loses the close race
+            # gets ReadPoolClosed from acquire() and falls back to the shared
+            # connection, which must therefore still be open. Nested so a pool
+            # close failure can never leak the db handle.
+            try:
+                if read_pool is not None:
+                    await read_pool.close()
+            finally:
+                await db.close()
 
     if not _DEFAULT_DB.exists():
         logger.error("DB not found at %s — memory MCP cannot start", _DEFAULT_DB)
@@ -509,6 +537,14 @@ def main(argv: list[str] | None = None) -> None:
         "GENESIS_MCP_HTTP_TOKEN",
         # Discord bot (used by discord-bot MCP server)
         "DISCORD_BOT_TOKEN",
+        # SQLite busy_timeout override (must pass the allowlist or a
+        # secrets.env-set value would be silently dropped before the
+        # setdefault below)
+        "GENESIS_DB_BUSY_TIMEOUT_MS",
+        # Recall read-pool knobs — _bootstrap_memory honors the same kill
+        # switch + size as the server runtime, so a secrets.env-configured
+        # value must reach the child too (Codex P2 on #1302)
+        "GENESIS_RECALL_READ_POOL_OFF", "GENESIS_RECALL_READ_POOL_SIZE",
     }
     import os
 
@@ -521,6 +557,19 @@ def main(argv: list[str] | None = None) -> None:
         for key, value in dotenv_values(secrets).items():
             if key in _MCP_VARS and key not in os.environ and value:
                 os.environ[key] = value
+
+    # MCP children wait LONGER for the WAL writer slot than the server's 5s
+    # default (WS-1 PR-1, follow-up 2d88740d): N child processes race ONE
+    # writer slot with no queue fairness, so a child's write loses to any
+    # server-side batch that outlasts 5s. 15s lengthens how long a write
+    # WAITS — it never shortens or skips work. setdefault AFTER the secrets
+    # load so an operator override (env or secrets.env) wins; applied at
+    # connect time by get_db/get_raw_db/open_ro_connection via
+    # env.db_busy_timeout_ms(). Worst case if the DB is genuinely wedged:
+    # 4 attempts x 15s + ~1.75s backoff ≈ 62s for one write episode (the
+    # SerializedConnection retry holds its asyncio lock throughout) — accepted:
+    # failing that write faster would help nothing.
+    os.environ.setdefault("GENESIS_DB_BUSY_TIMEOUT_MS", "15000")
 
     transport_kwargs = _build_transport_kwargs(args)
 
