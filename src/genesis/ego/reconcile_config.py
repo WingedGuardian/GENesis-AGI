@@ -25,10 +25,14 @@ degrades to DEFAULTS; an invalid ``mode`` degrades to ``shadow`` (never a silent
 hides the feature). The env kill switch ``GENESIS_EGO_RECONCILE_DISABLED=1``
 forces ``off`` (no reconcile CC call runs).
 
-NOTE (PR-5 → PR-6 dependency): flipping ``mode: live`` is only safe once PR-6's
-resolve-side ``expected_revision`` guards are wired into the Telegram/MCP/
-dashboard resolve paths — otherwise a live revise reintroduces the approve-time
-TOCTOU that versioned revision exists to close. Until then, keep ``shadow``.
+NOTE (live-apply safety): a live ``revise`` mutates a pending item's content and
+bumps its ``revision_num``, which would reintroduce the approve-time TOCTOU
+(a user approving content they never saw) unless every resolve path pins the
+revision the user was shown. Those resolve-side ``expected_revision`` guards
+shipped in #1257 (Telegram/MCP/dashboard/comms all pass the rendered revision).
+PR-6b's live-apply is built on top of them, so the TOCTOU is closed. The flip to
+``mode: live`` remains a deliberate user action gated on shadow-soak + replay
+evidence — never flipped automatically.
 
 Dependency rule: stdlib + yaml + genesis.env + genesis._config_overlay only;
 ``genesis.mcp.health.settings`` imports the public ``MODES`` / ``INT_KNOBS``
