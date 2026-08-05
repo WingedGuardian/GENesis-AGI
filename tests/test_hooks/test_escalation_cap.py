@@ -248,3 +248,45 @@ def test_corrupt_round_counter_does_not_crash(repo, _isolate_rounds):
     rf.write_text(json.dumps({"branch": branch, "round": "not-an-int", "last_hash": "old"}))
     result = review_state.bump_review_round(cwd=str(repo))  # must not raise
     assert result == 1  # coerced the bad value to 0, then +1
+
+
+# ── Malformed counter-file shape (round-3 class fix) ──────────────────────
+
+
+def _write_round_file(repo, content: str) -> None:
+    rf = review_state._round_file(cwd=str(repo))
+    rf.parent.mkdir(parents=True, exist_ok=True)
+    rf.write_text(content)
+
+
+@pytest.mark.parametrize("bad", ["[]", "42", '"str"', "null", "[1, 2, 3]"])
+def test_load_round_returns_empty_for_non_dict(repo, _isolate_rounds, bad):
+    # Valid JSON that is not an object (manual edit / schema skew) must normalize to
+    # {} at the load boundary, so no caller's .get() can ever raise.
+    _write_round_file(repo, bad)
+    assert review_state._load_round(cwd=str(repo)) == {}
+
+
+def test_get_review_round_no_crash_on_truthy_non_dict(repo, _isolate_rounds):
+    # A TRUTHY non-dict ([1,2,3], 42) is the real crasher (empty [] is falsy and was
+    # already short-circuited) — get_review_round must fail open to 0, not raise.
+    _write_round_file(repo, "[1, 2, 3]")
+    assert review_state.get_review_round(cwd=str(repo)) == 0
+
+
+def test_bump_no_crash_on_truthy_non_dict(repo, _isolate_rounds):
+    _write_round_file(repo, "42")
+    _stage(repo, "a = 2\n")
+    assert review_state.bump_review_round(cwd=str(repo)) == 1  # treats as fresh, no crash
+
+
+def test_gate_fails_open_on_non_dict_counter(repo, home):
+    # End-to-end: a truthy non-dict counter file must NOT crash the commit gate.
+    _stage(repo, "a = 2\n")
+    assert _mark(repo, home).returncode == 0
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    rf.parent.mkdir(parents=True, exist_ok=True)
+    rf.write_text("[1, 2, 3]")  # non-dict → gate must fail open, not crash
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr

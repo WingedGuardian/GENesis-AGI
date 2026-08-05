@@ -292,10 +292,21 @@ def _staged_content_hash(cwd: str | None = None) -> str:
 
 
 def _load_round(cwd: str | None = None) -> dict:
+    """Read the round-counter file, normalizing ANY non-dict content to ``{}``.
+
+    Validating the shape once, here at the single load boundary, is the whole
+    class-fix for malformed counters: valid JSON that is not an object (``[1,2,3]``,
+    ``42``, ``"str"`` from a manual edit / schema skew) would otherwise reach a
+    caller's ``.get()`` and raise ``AttributeError``, defeating the fail-open
+    contract. Every caller now provably receives a dict → their ``.get`` can't
+    raise → any malformed shape collapses to "no counter → fail open". Never raises.
+    """
     try:
         p = _round_file(cwd)
         if p.exists():
-            return json.loads(p.read_text())
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                return data
     except (json.JSONDecodeError, OSError):
         pass
     return {}
