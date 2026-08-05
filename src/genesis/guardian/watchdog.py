@@ -502,16 +502,15 @@ class GuardianWatchdog:
         """
         import aiosqlite
 
-        from genesis.db.connection import BUSY_TIMEOUT_MS
         from genesis.db.crud import update_history
-        from genesis.env import genesis_db_path
+        from genesis.env import db_busy_timeout_ms, genesis_db_path
 
         db_path = genesis_db_path()
         if not db_path.exists():
             return None
         try:
             async with aiosqlite.connect(str(db_path)) as db:
-                await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+                await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
                 return await update_history.last_successful_deploy_commit(db)
         except Exception:
             return None
