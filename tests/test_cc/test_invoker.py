@@ -1158,6 +1158,40 @@ def test_classify_error_quota_from_stdout(invoker):
     assert isinstance(err, CCQuotaExhaustedError)
 
 
+def test_classify_error_session_limit(invoker):
+    """The Max-plan session-limit wording must classify as a typed limit error,
+    not generic CCProcessError. Regression for the exact live-captured message
+    (reflex signal CCProcessError×cc): before the fix it matched NO pattern
+    ("hit your limit" is not a substring of "hit your session limit"), fell
+    through to CCProcessError, and the rate-limit park/resume layer never
+    engaged — background sessions died instead of parking.
+    """
+    from genesis.cc.exceptions import CCProcessError, CCQuotaExhaustedError
+
+    # Exact live message (tz preserved; not private).
+    err = invoker._classify_error(
+        "", stdout_text="You've hit your session limit · resets 4:10am (America/Los_Angeles)"
+    )
+    assert isinstance(err, CCQuotaExhaustedError)
+    assert not isinstance(err, CCProcessError)
+    # raw_text must be carried so the park layer can parse the reset.
+    assert err.raw_text is not None and "session limit" in err.raw_text.lower()
+
+
+def test_classify_error_weekly_limit(invoker):
+    """Weekly-limit wording also classifies as a typed limit error (quota-side),
+    covering the message family, not just the session instance."""
+    from genesis.cc.exceptions import CCProcessError, CCQuotaExhaustedError
+
+    for msg in [
+        "You've hit your weekly limit · resets Monday 9am",
+        "Weekly limit reached for your plan",
+    ]:
+        err = invoker._classify_error(msg)
+        assert isinstance(err, CCQuotaExhaustedError), f"Failed for: {msg}"
+        assert not isinstance(err, CCProcessError)
+
+
 @pytest.mark.asyncio
 async def test_status_callback_on_quota_exhaustion():
     """Quota exhaustion triggers UNAVAILABLE status callback."""

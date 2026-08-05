@@ -6,19 +6,23 @@ promise — resume is self-validating (a still-limited re-run re-parks), so an
 imprecise or missing reset only changes WHEN the first re-attempt fires, not
 whether the parked work survives.
 
-CRITICAL UNKNOWN — verify against the first real captured event: the exact
-field layout of a CC ``rate_limit_event`` payload is not documented, and the
-prose form ("resets Xpm") is only known from a code comment. This parser
-therefore searches defensively for common reset-time keys and falls back to
-prose; on any miss it returns ``None`` and the scheduler uses its cadence
-floor. A weekly limit with only a wall-clock time is day-ambiguous → ``None``
-(never guess "next 5pm").
+Prose form CONFIRMED against a real captured event (2026-08, reflex signal
+CCProcessError×cc): a wall-clock reset time in the ACCOUNT's local zone, named
+in a trailing ``(IANA/Zone)`` hint — e.g. ``"You've hit your session limit ·
+resets 4:10am (America/Los_Angeles)"``. The parser resolves that hint (falling
+back to ``now``'s tz when absent) so a UTC-clocked server does not schedule the
+resume hours off. The structured ``rate_limit_event`` payload layout is still
+undocumented, so key search stays defensive; on any miss it returns ``None`` and
+the scheduler uses its cadence floor. A weekly limit that NAMES a weekday
+("resets Monday 9am") resolves to that day's next occurrence; a weekly limit
+with only a BARE wall-clock is day-ambiguous → ``None`` (never guess "next 5pm").
 """
 
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
+from zoneinfo import ZoneInfo
 
 # limit_kind vocabulary — kept tiny; only used to size backoff and to decide
 # whether a bare wall-clock prose time is day-ambiguous.
@@ -154,11 +158,64 @@ _CLOCK_RE = re.compile(
     r"reset[a-z ]*?(?:at\s*)?(?P<h>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<ap>am|pm)",
     re.IGNORECASE,
 )
+# Weekday-bearing wall-clock, e.g. "resets Monday 9am". A named day makes a
+# WEEKLY reset UNambiguous (unlike a bare clock), so it can be resolved to a
+# concrete next-occurrence instead of dropped to None.
+_WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+# Match only genuine weekday tokens (3-letter abbrev OR full name), ``\b``-bounded
+# both ends so a word merely STARTING with a day prefix (``month``→mon,
+# ``friendly``→fri) can't false-match. Separator allows a comma ("Monday, 9am").
+# The map key is the captured token's first 3 letters.
+_WEEKDAY_CLOCK_RE = re.compile(
+    r"reset[a-z ]*?\b(?P<wd>mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|"
+    r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b[,\s]+(?:at\s*)?"
+    r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<ap>am|pm)",
+    re.IGNORECASE,
+)
+# A trailing IANA zone hint, e.g. "resets 4:10am (America/Los_Angeles)". The CC CLI
+# renders the reset time in the ACCOUNT's local zone, not the container's — so a
+# bare wall-clock parsed in ``now``'s tz (UTC on a server) lands hours off. Case
+# preserved: IANA zone keys are case-sensitive.
+_TZ_HINT_RE = re.compile(r"\(([A-Za-z]+(?:/[A-Za-z0-9_+-]+)+)\)")
+
+
+def _extract_tz_hint(text: str) -> tzinfo | None:
+    """A trailing ``(Area/Location)`` zone hint as a tzinfo, or None.
+
+    Best-effort: an absent or unresolvable zone (no tzdata, bad name) returns
+    None so the caller falls back to naive parsing in ``now``'s tz — never
+    raises, never worse than pre-hint behavior."""
+    m = _TZ_HINT_RE.search(text)
+    if not m:
+        return None
+    try:
+        return ZoneInfo(m.group(1))
+    except Exception:
+        return None
+
+
+def _clock_24h(h: str, minute: str | None, ap: str) -> tuple[int, int]:
+    """(hour_group, minute_group, am/pm) → 24h (hour, minute)."""
+    hour = int(h) % 12
+    if ap.lower() == "pm":
+        hour += 12
+    return hour, int(minute or 0)
+
+
+def _account_ref(now: datetime, text: str) -> tuple[datetime, tzinfo | None]:
+    """``now`` shifted into the account's zone if the prose names one, else
+    ``now`` unchanged. Returns ``(ref, tz)``; a wall-clock built on ``ref`` is
+    handed back to ``now``'s tz only when ``tz`` is not None."""
+    tz = _extract_tz_hint(text)
+    return (now.astimezone(tz), tz) if tz is not None else (now, None)
 
 
 def _reset_from_prose(text: str, now: datetime, limit_kind: str) -> datetime | None:
     """Parse a reset time from CC's prose. Relative durations are unambiguous;
-    a bare wall-clock time is day-ambiguous for a WEEKLY limit → None."""
+    a weekday-bearing wall-clock ("Monday 9am") resolves to the next occurrence;
+    a BARE wall-clock is day-ambiguous for a WEEKLY limit → None. A wall-clock
+    carrying an ``(IANA/Zone)`` hint is resolved in that zone (the account's
+    local zone) and returned in ``now``'s tz."""
     if not text:
         return None
     low = text.lower()
@@ -171,20 +228,39 @@ def _reset_from_prose(text: str, now: datetime, limit_kind: str) -> datetime | N
         if hours or mins:
             return now + timedelta(hours=hours, minutes=mins)
 
-    # Wall-clock: "resets 5pm" / "resets at 11:30 am".
+    # Weekday wall-clock: "resets Monday 9am" — a named day is unambiguous even
+    # for a weekly cap, so resolve the NEXT occurrence of that weekday/time
+    # (account-zone-aware) rather than dropping to the cadence floor. Checked
+    # before the bare-clock branch since the bare regex would also match here.
+    w = _WEEKDAY_CLOCK_RE.search(low)
+    if w:
+        hour, minute = _clock_24h(w.group("h"), w.group("min"), w.group("ap"))
+        target_wd = _WEEKDAYS[w.group("wd").lower()[:3]]
+        ref, tz = _account_ref(now, text)
+        days_ahead = (target_wd - ref.weekday()) % 7
+        candidate = ref.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(
+            days=days_ahead
+        )
+        if candidate <= ref:  # today-but-already-past → next week
+            candidate += timedelta(days=7)
+        return candidate.astimezone(now.tzinfo) if tz is not None else candidate
+
+    # Bare wall-clock: "resets 5pm" / "resets at 11:30 am" / "resets 4:10am (America/Los_Angeles)".
     c = _CLOCK_RE.search(low)
     if c:
         if limit_kind == WEEKLY:
             # Which day? Unknowable from a bare clock time — don't guess.
             return None
-        hour = int(c.group("h")) % 12
-        if c.group("ap").lower() == "pm":
-            hour += 12
-        minute = int(c.group("min") or 0)
-        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if candidate <= now:
+        hour, minute = _clock_24h(c.group("h"), c.group("min"), c.group("ap"))
+        # Resolve the wall-clock in the account's zone when the CLI names it
+        # (search the ORIGINAL-case text — zone keys are case-sensitive), then
+        # hand back a datetime in ``now``'s tz. No hint → parse in ``now``'s tz
+        # exactly as before (unchanged behavior).
+        ref, tz = _account_ref(now, text)
+        candidate = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= ref:
             candidate += timedelta(days=1)
-        return candidate
+        return candidate.astimezone(now.tzinfo) if tz is not None else candidate
     return None
 
 
