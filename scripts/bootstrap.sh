@@ -423,6 +423,66 @@ fi
 if [[ -x "$SKILLSPECTOR_DIR/.venv/bin/skillspector" ]]; then
     echo "  SkillSpector: installed at $SKILLSPECTOR_DIR/.venv/bin/skillspector"
 fi
+
+# OfficeCLI (iOfficeAI — high-fidelity .xlsx/.pptx/.docx renderer for the
+# deliverable-builder skill; optional external binary, not vendored). The runtime
+# capability probe (_init_office_deliverables) resolves this pinned path; absent
+# → the skill falls back to pandoc/CSV and `office_deliverables` shows degraded.
+OCLI_VERSION="1.0.143"
+OCLI_DIR="$HOME/.genesis/deps/officecli"
+# Arch → release asset. OfficeCLI ships linux x64 + arm64; any other arch skips
+# (skill falls back to pandoc/CSV) — never fatal.
+case "$(uname -m)" in
+    x86_64)        OCLI_ARCH="x64" ;;
+    aarch64|arm64) OCLI_ARCH="arm64" ;;
+    *)             OCLI_ARCH="" ;;
+esac
+# Literal SHA256 pins — committed + review-gated. NOT fetched from the release's
+# SHA256SUMS: that is trust-on-first-use (a compromised release swaps binary AND
+# checksum in lockstep). Bump these deliberately whenever OCLI_VERSION changes.
+OCLI_SHA256_x64="6a29c598a789b57c92c03e560907d3f131a4bd0a068785b1d338a86fc31a58a7"
+OCLI_SHA256_arm64="c50298e4698fcd1b15fe1a0f096405ad260b5c84d4440882582d0bba1e57bd49"
+if [[ -z "$OCLI_ARCH" ]]; then
+    echo "  OfficeCLI: unsupported arch $(uname -m) — skipping (deliverable-builder uses pandoc/CSV)"
+else
+    OCLI_BIN="$OCLI_DIR/officecli-linux-$OCLI_ARCH"
+    _ocli_sha_var="OCLI_SHA256_$OCLI_ARCH"; OCLI_SHA256="${!_ocli_sha_var}"
+    # Trust the on-disk binary ONLY if it matches the committed literal hash.
+    # This is the idempotency guard AND the anti-tamper check in one: a matching
+    # hash means it's exactly the pinned version (skip), while a stale binary from
+    # an older pin, or a tampered one that merely reports the right --version,
+    # fails the hash and gets re-fetched. (Version-awareness falls out for free —
+    # a version bump changes the pinned hash, so the old binary no longer matches.)
+    _ocli_verify() { [[ -f "$OCLI_BIN" ]] && echo "${OCLI_SHA256}  ${OCLI_BIN}" | sha256sum -c - >/dev/null 2>&1; }
+    if _ocli_verify; then
+        chmod +x "$OCLI_BIN"  # ensure executable even on the already-verified path
+    else
+        echo "  OfficeCLI $OCLI_VERSION ($OCLI_ARCH) not present/verified — installing..."
+        mkdir -p "$OCLI_DIR"
+        OCLI_URL="https://github.com/iOfficeAI/OfficeCLI/releases/download/v${OCLI_VERSION}/officecli-linux-${OCLI_ARCH}"
+        # curl is PRIMARY: a public release asset needs no auth, so it works on a
+        # fresh install with no gh login. gh is the fallback. timeout guards a hung
+        # connection (~35MB binary; 300s is generous); one retry rides out a blip.
+        _ocli_fetch() {
+            rm -f "$OCLI_BIN"
+            timeout 300 curl -fSL "$OCLI_URL" -o "$OCLI_BIN" 2>/dev/null \
+                || ( cd "$OCLI_DIR" && timeout 300 gh release download "v${OCLI_VERSION}" \
+                        --repo iOfficeAI/OfficeCLI --pattern "officecli-linux-${OCLI_ARCH}" --clobber 2>/dev/null )
+        }
+        _ocli_fetch || { sleep 2; _ocli_fetch; } \
+            || echo "  WARNING: OfficeCLI download failed (deliverable-builder uses pandoc/CSV until installed)"
+        # Verify the freshly-downloaded binary against the committed pin; refuse on mismatch.
+        if _ocli_verify; then
+            chmod +x "$OCLI_BIN"
+        elif [[ -f "$OCLI_BIN" ]]; then
+            rm -f "$OCLI_BIN"
+            echo "  WARNING: OfficeCLI checksum mismatch — refusing binary (deliverable-builder uses pandoc/CSV)"
+        fi
+    fi
+    if [[ -x "$OCLI_BIN" ]]; then
+        echo "  OfficeCLI: installed at $OCLI_BIN ($OCLI_VERSION)"
+    fi
+fi
 echo
 
 # --- Python venv ---

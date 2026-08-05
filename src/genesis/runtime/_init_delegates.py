@@ -195,3 +195,31 @@ class _InitDelegatesMixin:
             logger.info("Guardian heartbeat not found (Guardian may not be installed)")
         except (json.JSONDecodeError, ValueError, OSError) as exc:
             logger.info("Guardian heartbeat unreadable: %s", exc)
+
+    def _init_office_deliverables(self) -> None:
+        """Resolve the optional OfficeCLI render backend; never raises.
+
+        Sets ``self._officecli_path`` to the PINNED bootstrap-provisioned binary
+        (``~/.genesis/deps/officecli/officecli-linux-<arch>``) if present and
+        executable, else None. It deliberately does NOT fall back to a
+        ``PATH``-resolved ``officecli``: that binary is unpinned (never
+        checksum-verified against the committed hash) AND would not match the
+        exact path the deliverable-builder skill invokes (``$OCLI`` = the pinned
+        path), so a PATH hit would report ``active`` while the skill's command
+        fails. None → capability ``degraded`` (skill falls back to pandoc/CSV).
+        MUST NOT raise, or _run_init_step records ``failed`` instead of ``degraded``.
+        """
+        import os
+        import platform
+
+        self._officecli_path = None
+        try:
+            arch = "arm64" if platform.machine() in ("aarch64", "arm64") else "x64"
+            pinned = Path.home() / ".genesis" / "deps" / "officecli" / f"officecli-linux-{arch}"
+            if pinned.is_file() and os.access(pinned, os.X_OK):
+                self._officecli_path = str(pinned)
+        except Exception as exc:  # noqa: BLE001 - probe is best-effort, never fatal
+            # Path.home() can raise RuntimeError (unresolvable HOME); any failure
+            # must degrade, never propagate (→ _run_init_step would mark "failed").
+            logger.info("OfficeCLI probe failed (treating as absent): %s", exc)
+            self._officecli_path = None

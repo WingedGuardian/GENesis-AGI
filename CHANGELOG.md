@@ -11,6 +11,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Real spreadsheets and polished decks from the deliverable builder.** When the
+  optional OfficeCLI tool is present, Genesis now produces genuine `.xlsx` files
+  (with working formulas and cell formatting) and higher-fidelity `.pptx` decks,
+  instead of falling back to CSV or a basic pandoc slide export. It renders,
+  screenshots the result to check the layout, and catches broken or stale formulas
+  before the file reaches you. The tool is installed automatically during setup;
+  if it is unavailable, the builder degrades cleanly to the previous CSV/pandoc path.
+
 - **First-run setup wizard on the dashboard.** A new install can go from a fresh
   dashboard to a working, connected Genesis without touching a terminal. A
   dismissible Setup card on the Overview tab walks you through setting a dashboard

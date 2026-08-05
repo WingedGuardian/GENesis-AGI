@@ -208,6 +208,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._deferred_work_queue: DeferredWorkQueue | None = None
         self._cc_budget_tracker: CCBudgetTracker | None = None
         self._health_data: HealthDataService | None = None
+        # Optional external OfficeCLI binary (deliverable-builder render backend);
+        # resolved by _init_office_deliverables, None when not provisioned.
+        self._officecli_path: str | None = None
         self._activity_tracker: ProviderActivityTracker | None = None
         self._span_writer: SpanWriter | None = None
         self._outreach_pipeline: OutreachPipeline | None = None
@@ -483,6 +486,10 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             await self._run_init_step_async("reflex", self._init_reflex)
         self._run_init_step("guardian", self._probe_guardian_status)
 
+        # Unconditional (also in readonly probes): optional OfficeCLI render
+        # backend. Present → active; absent → degraded (never fatal).
+        self._run_init_step("office_deliverables", self._init_office_deliverables)
+
         if _full:
             await self._run_init_step_async(
                 "guardian_monitoring",
@@ -744,6 +751,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "modules": "_module_registry",
         "pipeline": "_pipeline_orchestrator",
         "campaigns": "_campaign_runner",
+        "office_deliverables": "_officecli_path",
     }
 
     def _run_init_step(self, name: str, func) -> None:

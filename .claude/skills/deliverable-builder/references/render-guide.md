@@ -11,8 +11,8 @@ Intake from audience + purpose, using the matrix below.
 | Job take-home / technical submission | Hiring team (email) | **PDF** | `pandoc --pdf-engine=xelatex` + a `visual_style` font (below), or `/make-pdf` for branded polish |
 | Client report | External stakeholder | **PDF**, or **DOCX** if they'll edit | `pandoc` / `pandoc --reference-doc=template.docx` |
 | Executive one-pager | C-suite / board | **PDF** (1 page) | `/make-pdf` (preferred for design), else `pandoc` |
-| Slide deck | Present vs. edit | **PDF** (beamer) / **PPTX** (editable) | `pandoc -t beamer` / `pandoc -t pptx` |
-| Data hand-off (tabular) | Analyst / client | **XLSX** | *deferred v1* — `xlsxwriter` not installed; flag and offer CSV (`pandoc -t csv` / write `.csv`) |
+| Slide deck | Present vs. edit | **PDF** (beamer) / **PPTX** (editable) | **OfficeCLI** for a polished editable deck *if `office_deliverables` is active*; else `pandoc -t beamer` (PDF) / `pandoc -t pptx` (basic editable) |
+| Data hand-off (tabular) | Analyst / client | **XLSX** | **OfficeCLI** for a real `.xlsx` (formulas + formatting) *if `office_deliverables` is active*; else flag + offer **CSV** (`pandoc -t csv` / write `.csv`). `xlsxwriter`/`openpyxl` are NOT installed — OfficeCLI or CSV, never a python xlsx lib |
 | Diagram | Reviewer | SVG/PNG embedded in the primary format | `/drawio-skill` |
 | Internal spec / wiki / blog draft | Eng team / CMS | Markdown | (repo / CMS) — the only cases raw `.md` is allowed |
 
@@ -20,7 +20,14 @@ Intake from audience + purpose, using the matrix below.
 **Lato, Georgia, Liberation Sans/Serif, Arial, Noto Sans/Serif** (via `fc-list`); the `make-pdf`
 skill (`~/.claude/skills/gstack/make-pdf/`, needs the browse daemon), `drawio-skill`,
 `fpdf`/`fitz` in the venv. **NOT installed** (do not assume): marp, typst, weasyprint,
-wkhtmltopdf, docxtpl, python-docx, python-pptx, xlsxwriter, openpyxl.
+wkhtmltopdf, docxtpl, python-docx, python-pptx, xlsxwriter, openpyxl, LibreOffice/soffice.
+
+**Conditionally available — OfficeCLI** (`~/.genesis/deps/officecli/officecli-linux-<arch>`,
+bootstrap-provisioned): real `.xlsx`/`.pptx`/`.docx` with a render→inspect→fix loop. It is
+OPTIONAL — check before use. It is active when the SessionStart `capabilities.json` shows
+`office_deliverables: active`, or belt-and-suspenders inline:
+`OCLI="$HOME/.genesis/deps/officecli/officecli-linux-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')"; test -x "$OCLI"`.
+If absent, fall back to the pandoc/CSV rows above — never call a missing binary.
 
 ## The font IS a tell — pick it from `visual_style`
 
@@ -76,6 +83,47 @@ templated, escalate the `visual_style`: *designed* → `/make-pdf` or `/design-h
 separate Gate-1 calls. See `structure-altitude.md` for the effort-artifact tells (elaborate
 tables, dense formatting) that read as AI *only* when the target is human-made. Match what the
 user asked for; do not impose a one-size "looks human" default.
+
+## OfficeCLI — high-fidelity Office with a render→inspect→fix loop (when active)
+
+Use for real `.xlsx` (formulas + cell formatting) and polished `.pptx` when
+`office_deliverables` is active. All commands are headless (no display needed).
+`OCLI` resolves as in the note above. OfficeCLI keeps the file "open" in a resident
+process — **`save` (flush, keep warm) or `close` (flush + release) before any
+non-OfficeCLI reader** (a screenshot of external state, a `zipfile` check, delivery).
+
+```bash
+# XLSX — create, author cells/formulas/formatting, add a second sheet
+"$OCLI" create "$OUT.xlsx" --force
+"$OCLI" add "$OUT.xlsx" / --type sheet --prop name=Summary
+"$OCLI" set "$OUT.xlsx" /Sheet1/A1 --prop value="Item" --prop bold=true
+"$OCLI" set "$OUT.xlsx" /Sheet1/B2 --prop value=10
+"$OCLI" set "$OUT.xlsx" /Sheet1/B4 --prop formula="SUM(B2:B3)" --prop numberformat="#,##0"
+"$OCLI" save "$OUT.xlsx"
+# formula prop OMITS the leading '='; OfficeCLI has a built-in evaluator (view text shows B4=35).
+
+# PPTX — title slide + content slide (bullets = literal \n between items)
+"$OCLI" create "$OUT.pptx" --force
+"$OCLI" add "$OUT.pptx" / --type slide --prop layout="Title Slide" --prop title="Quarterly Review" --prop text="Analytics Team"
+"$OCLI" add "$OUT.pptx" / --type slide --prop layout="Title and Content" --prop title="Highlights" --prop text="Revenue up 12 percent\nTwo new markets\nHeadcount 45"
+"$OCLI" save "$OUT.pptx"
+```
+
+**The render→inspect→fix loop (the reason to use OfficeCLI over pandoc):**
+
+```bash
+# 1. RENDER a screenshot to LOOK at layout (PNG; write to ~/tmp, never cc-tmp)
+"$OCLI" view "$OUT.xlsx" screenshot -o ~/tmp/ocli_shot.png    # xlsx 1600x1200; pptx --grid N for all slides
+# 2. INSPECT for semantic defects — `view issues` is the DETECTOR (not `validate`,
+#    which only checks OOXML schema and passes even on a broken formula ref).
+"$OCLI" view "$OUT.xlsx" issues --json    # {"data":{"count":N,"issues":[{subtype,path,message}]}}
+# 3. FIX any issue (broken/stale formula, missing-sheet ref, low-contrast slide), save, re-inspect to count:0.
+```
+
+Relevant `view issues` subtypes: xlsx `formula_not_evaluated`, `formula_cache_stale`,
+`formula_ref_missing_sheet`, `formula_eval_error`, `definedname_broken`; pptx
+`slide_field_not_evaluated`, `notes_unresolved_rid`, `low_contrast`, `broken_part_ref`.
+Clean up the screenshot PNG(s) after inspecting.
 
 ## After rendering — update the spec
 
