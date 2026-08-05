@@ -526,7 +526,17 @@ class CCInvoker:
         # Session expiry
         if "session" in lower and ("not found" in lower or "expired" in lower):
             return CCSessionError(stderr_text or stdout_text)
-        # Hard quota exhaustion (usage limit hit for hours — distinct from 429)
+        # Hard quota exhaustion (usage limit hit for hours — distinct from 429).
+        # "session limit" / "weekly limit" are the Max-plan rolling-window and
+        # weekly ceilings: real multi-minute-to-hours lockouts that reset at a
+        # defined time, NOT transient 429s. The CLI wording varies ("You've hit
+        # your session limit · resets 4:10am", "weekly limit reached", "usage
+        # limit reached") — cover the family, not one instance. Before this,
+        # "hit your session limit" matched NO pattern (the RATE list has "hit
+        # your limit" but "session" splits the substring) and fell through to
+        # generic CCProcessError, so the rate-limit park/resume layer never
+        # engaged and background sessions died instead of parking (reflex signal
+        # CCProcessError×cc, 2026-07/08).
         _QUOTA_PATTERNS = (
             "usage limit",
             "quota exceeded",
@@ -534,6 +544,8 @@ class CCInvoker:
             "usage cap",
             "spending limit",
             "token limit exceeded",
+            "session limit",
+            "weekly limit",
         )
         if any(p in lower for p in _QUOTA_PATTERNS):
             return CCQuotaExhaustedError(stderr_text or stdout_text, raw_text=combined)
