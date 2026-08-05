@@ -577,6 +577,57 @@ class TestSynthesisDrain:
         rows = await cursor.fetchall()
         assert [r["status"] for r in rows] == ["completed"]
 
+    @pytest.mark.asyncio
+    async def test_live_drain_rewires_external_links(self, db):
+        """LIVE merge copies an original's external edge onto the synthesis so it
+        does not dangle on the deprecated original (COPY — original keeps its edge)."""
+        from genesis.db.crud import memory_links
+
+        cluster = _fake_cluster(2)  # ids memory-store-0, memory-store-1
+        await _persist_worklist(db, [cluster], weekly_run_id="w")
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated) VALUES (?,?,0)",
+            ("ext-neighbor", "2026-01-01T00:00:00+00:00"),
+        )
+        await memory_links.create(
+            db, source_id="memory-store-0", target_id="ext-neighbor",
+            link_type="supports", strength=0.7, created_at="2026-01-01",
+        )
+        await db.commit()
+
+        store = AsyncMock()
+        store.store = AsyncMock(return_value="new-synth-id")
+        store.linker = None
+        synthesis_json = json.dumps({
+            "content": "Merged fact 0 and fact 1 into one canonical record",
+            "tags": ["test"], "confidence": 0.9, "memory_class": "fact",
+            "wing": "memory", "room": "store", "synthesis_notes": "combined",
+        })
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=[
+            MagicMock(success=True, content=synthesis_json),
+            MagicMock(success=True, content=json.dumps({"verdict": "PASS"})),
+        ])
+
+        with patch(_UPDATE):
+            report = await run_synthesis_drain(
+                qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+                router=router, store=store, budget=10, dry_run=False,
+            )
+
+        assert report["links_copied"] >= 1
+        syn_pairs = {
+            (link["source_id"], link["target_id"])
+            for link in await memory_links.get_links_for(db, "new-synth-id")
+        }
+        assert ("new-synth-id", "ext-neighbor") in syn_pairs  # rewired
+        # COPY: the (now-deprecated) original still holds its edge.
+        orig_pairs = {
+            (link["source_id"], link["target_id"])
+            for link in await memory_links.get_links_for(db, "memory-store-0")
+        }
+        assert ("memory-store-0", "ext-neighbor") in orig_pairs
+
 
 # ── Rollback ─────────────────────────────────────────────────────────────
 

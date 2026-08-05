@@ -123,6 +123,111 @@ async def all_link_counts(db: aiosqlite.Connection) -> dict[str, int]:
     return {row[0]: row[1] for row in rows}
 
 
+async def copy_external_links(
+    db: aiosqlite.Connection,
+    *,
+    from_ids: list[str],
+    to_id: str,
+    now: str | None = None,
+) -> int:
+    """Copy every edge touching ``from_ids`` onto ``to_id``, preserving edge
+    direction, ``link_type`` and ``strength``.
+
+    Used when the dream cycle merges ``from_ids`` (the originals) into a synthesis
+    ``to_id``: without this, deprecating the originals leaves their external
+    neighbours' edges dangling on soft-deleted nodes (graph expansion drops them
+    at read time but they still waste traversal budget and inflate link counts).
+
+    Rules:
+      * **COPY, not MOVE** — the originals' own edges are left in place, so this
+        is reversible: the dream ``rollback`` hard-deletes all of ``to_id``'s
+        links, which includes these copies. (The originals' edges are pruned
+        later, aged, by ``dream_link_repair``.)
+      * Skip **intra-set** edges (both endpoints in ``from_ids ∪ {to_id}``) — they
+        would become self-loops or internal duplicates.
+      * Skip an external endpoint that is **absent from ``memory_metadata`` or
+        deprecated** — never recreate an edge to a dead node.
+      * **Collision** (``to_id`` already linked to that neighbour with that type/
+        direction, or several originals share a neighbour) keeps the MAX strength.
+
+    Returns the number of distinct external edges written onto ``to_id``.
+    """
+    if not from_ids:
+        return 0
+    now_iso = now or datetime.now(UTC).isoformat()
+    internal = set(from_ids) | {to_id}
+
+    # 1. All edges touching any original.
+    _CHUNK = 400
+    edges: list[tuple[str, str, str, float]] = []
+    for off in range(0, len(from_ids), _CHUNK):
+        chunk = from_ids[off : off + _CHUNK]
+        ph = ",".join("?" * len(chunk))
+        rows = await db.execute_fetchall(
+            f"SELECT source_id, target_id, link_type, strength FROM memory_links "  # noqa: S608 - placeholders bound
+            f"WHERE source_id IN ({ph}) OR target_id IN ({ph})",
+            chunk + chunk,
+        )
+        edges.extend((r[0], r[1], r[2], r[3]) for r in rows)
+
+    # 2. Re-point each edge's original endpoint to to_id; keep the external end.
+    #    Dedup to the strongest edge per (source, target, link_type).
+    candidates: dict[tuple[str, str, str], float] = {}
+    external_ids: set[str] = set()
+    for src, tgt, ltype, strength in edges:
+        if src in from_ids and tgt not in internal:
+            new_src, new_tgt, ext = to_id, tgt, tgt
+        elif tgt in from_ids and src not in internal:
+            new_src, new_tgt, ext = src, to_id, src
+        else:
+            continue  # intra-set / self-loop
+        external_ids.add(ext)
+        key = (new_src, new_tgt, ltype)
+        candidates[key] = max(candidates.get(key, 0.0), strength)
+
+    if not candidates:
+        return 0
+
+    # 3. Drop edges whose external endpoint is absent or deprecated.
+    live_external: set[str] = set()
+    ext_list = list(external_ids)
+    for off in range(0, len(ext_list), _CHUNK):
+        chunk = ext_list[off : off + _CHUNK]
+        ph = ",".join("?" * len(chunk))
+        rows = await db.execute_fetchall(
+            f"SELECT memory_id FROM memory_metadata "  # noqa: S608 - placeholders bound
+            f"WHERE memory_id IN ({ph}) AND deprecated = 0",
+            chunk,
+        )
+        live_external.update(r[0] for r in rows)
+
+    def _ext_of(src: str, tgt: str) -> str:
+        return tgt if src == to_id else src
+
+    written = 0
+    for (new_src, new_tgt, ltype), strength in candidates.items():
+        if _ext_of(new_src, new_tgt) not in live_external:
+            continue
+        await db.execute(
+            "INSERT INTO memory_links (source_id, target_id, link_type, strength, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(source_id, target_id, link_type) "
+            "DO UPDATE SET strength = MAX(strength, excluded.strength)",
+            (new_src, new_tgt, ltype, strength, now_iso),
+        )
+        written += 1
+
+    if written:
+        await db.commit()
+        try:
+            from genesis.memory.graph import invalidate_graph_cache
+
+            invalidate_graph_cache()
+        except Exception:
+            pass
+    return written
+
+
 async def inter_candidate_links(
     db: aiosqlite.Connection,
     memory_ids: list[str],

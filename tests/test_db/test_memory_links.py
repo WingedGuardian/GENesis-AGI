@@ -507,3 +507,86 @@ async def test_all_link_counts_agrees_with_batch_link_counts(db):
     batch = await memory_links.batch_link_counts(db, ids)
     for mid in ids:
         assert all_counts[mid] == batch[mid][0], f"total mismatch for {mid}"
+
+
+# ── copy_external_links (dream merge link rewiring) ──────────────────────────
+
+
+async def _meta(db, mid, deprecated=0):
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at, deprecated) VALUES (?, ?, ?)",
+        (mid, "2026-01-01T00:00:00+00:00", deprecated),
+    )
+    await db.commit()
+
+
+async def _mk(db, s, t, lt="supports", strength=0.5):
+    await memory_links.create(
+        db, source_id=s, target_id=t, link_type=lt, strength=strength, created_at="2026-01-01"
+    )
+
+
+async def test_copy_external_links_preserves_direction(db):
+    await _meta(db, "ext_out")
+    await _meta(db, "ext_in")
+    await _mk(db, "O1", "ext_out", strength=0.7)  # O1 as source
+    await _mk(db, "ext_in", "O1", strength=0.6)  # O1 as target
+    n = await memory_links.copy_external_links(db, from_ids=["O1"], to_id="SYN")
+    assert n == 2
+    pairs = {
+        (link["source_id"], link["target_id"])
+        for link in await memory_links.get_links_for(db, "SYN")
+    }
+    assert ("SYN", "ext_out") in pairs  # direction preserved: SYN as source
+    assert ("ext_in", "SYN") in pairs  # direction preserved: SYN as target
+    # COPY not MOVE — originals untouched
+    assert len(await memory_links.get_links_for(db, "O1")) == 2
+
+
+async def test_copy_external_links_skips_intra_set(db):
+    await _mk(db, "O1", "O2")  # both in from_ids → internal, would self-loop
+    n = await memory_links.copy_external_links(db, from_ids=["O1", "O2"], to_id="SYN")
+    assert n == 0
+    assert await memory_links.get_links_for(db, "SYN") == []
+
+
+async def test_copy_external_links_skips_edge_to_synthesis(db):
+    await _meta(db, "SYN")
+    await _mk(db, "O1", "SYN", lt="extends")  # endpoint IS the synthesis → self-loop
+    n = await memory_links.copy_external_links(db, from_ids=["O1"], to_id="SYN")
+    assert n == 0
+
+
+async def test_copy_external_links_skips_deprecated_and_absent(db):
+    await _meta(db, "dep", deprecated=1)  # deprecated external endpoint
+    await _mk(db, "O1", "dep")
+    await _mk(db, "O1", "absent")  # 'absent' has no metadata row
+    n = await memory_links.copy_external_links(db, from_ids=["O1"], to_id="SYN")
+    assert n == 0
+    assert await memory_links.get_links_for(db, "SYN") == []
+
+
+async def test_copy_external_links_collision_keeps_max_strength(db):
+    await _meta(db, "ext")
+    await _mk(db, "O1", "ext", strength=0.5)
+    await _mk(db, "O2", "ext", strength=0.9)
+    n = await memory_links.copy_external_links(db, from_ids=["O1", "O2"], to_id="SYN")
+    assert n == 1  # deduped to a single SYN->ext edge
+    links = [
+        link for link in await memory_links.get_links_for(db, "SYN") if link["target_id"] == "ext"
+    ]
+    assert len(links) == 1
+    assert links[0]["strength"] == 0.9  # max of 0.5 / 0.9
+
+
+async def test_copy_external_links_conflict_with_existing_keeps_max(db):
+    await _meta(db, "ext")
+    await _mk(db, "SYN", "ext", strength=0.3)  # synthesis already linked, weaker
+    await _mk(db, "O1", "ext", strength=0.8)
+    n = await memory_links.copy_external_links(db, from_ids=["O1"], to_id="SYN")
+    assert n == 1
+    links = [
+        link for link in await memory_links.get_links_for(db, "SYN") if link["target_id"] == "ext"
+    ]
+    assert len(links) == 1
+    assert links[0]["strength"] == 0.8  # bumped from 0.3
