@@ -55,6 +55,16 @@ from genesis.runtime.init import (
 
 logger = logging.getLogger("genesis.runtime")
 
+# OfficeCLI pinned SHA256 per arch. MUST stay in sync with the literal pins in
+# scripts/bootstrap.sh (OCLI_SHA256_x64 / OCLI_SHA256_arm64) — bump both together
+# on a version change (a drift-guard test asserts they match). The runtime probe
+# re-verifies the on-disk binary against this so a corrupted/replaced binary is
+# NOT used to render a deliverable (it degrades to pandoc/CSV instead).
+_OFFICECLI_SHA256 = {
+    "x64": "6a29c598a789b57c92c03e560907d3f131a4bd0a068785b1d338a86fc31a58a7",  # pragma: allowlist secret
+    "arm64": "c50298e4698fcd1b15fe1a0f096405ad260b5c84d4440882582d0bba1e57bd49",  # pragma: allowlist secret
+}
+
 
 class _InitDelegatesMixin:
     """Mixin: per-subsystem bootstrap step delegates."""
@@ -200,15 +210,18 @@ class _InitDelegatesMixin:
         """Resolve the optional OfficeCLI render backend; never raises.
 
         Sets ``self._officecli_path`` to the PINNED bootstrap-provisioned binary
-        (``~/.genesis/deps/officecli/officecli-linux-<arch>``) if present and
-        executable, else None. It deliberately does NOT fall back to a
-        ``PATH``-resolved ``officecli``: that binary is unpinned (never
-        checksum-verified against the committed hash) AND would not match the
-        exact path the deliverable-builder skill invokes (``$OCLI`` = the pinned
-        path), so a PATH hit would report ``active`` while the skill's command
-        fails. None → capability ``degraded`` (skill falls back to pandoc/CSV).
-        MUST NOT raise, or _run_init_step records ``failed`` instead of ``degraded``.
+        (``~/.genesis/deps/officecli/officecli-linux-<arch>``) only if it is
+        present, executable, AND its SHA256 matches the committed pin — else None.
+
+        It re-verifies the checksum (not just the executable bit) so a corrupted,
+        partially-written, or replaced binary is never used to render a user
+        deliverable — the capability degrades to pandoc/CSV instead. It also does
+        NOT fall back to a ``PATH``-resolved ``officecli``: that binary is unpinned
+        AND would not match the exact path the deliverable-builder skill invokes
+        (``$OCLI`` = the pinned path). None → capability ``degraded``. MUST NOT
+        raise, or _run_init_step records ``failed`` instead of ``degraded``.
         """
+        import hashlib
         import os
         import platform
 
@@ -216,8 +229,20 @@ class _InitDelegatesMixin:
         try:
             arch = "arm64" if platform.machine() in ("aarch64", "arm64") else "x64"
             pinned = Path.home() / ".genesis" / "deps" / "officecli" / f"officecli-linux-{arch}"
-            if pinned.is_file() and os.access(pinned, os.X_OK):
-                self._officecli_path = str(pinned)
+            expected = _OFFICECLI_SHA256.get(arch)
+            if expected and pinned.is_file() and os.access(pinned, os.X_OK):
+                h = hashlib.sha256()
+                with open(pinned, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                if h.hexdigest() == expected:
+                    self._officecli_path = str(pinned)
+                else:
+                    logger.warning(
+                        "OfficeCLI binary at %s failed checksum verification — "
+                        "treating as absent (deliverable-builder uses pandoc/CSV)",
+                        pinned,
+                    )
         except Exception as exc:  # noqa: BLE001 - probe is best-effort, never fatal
             # Path.home() can raise RuntimeError (unresolvable HOME); any failure
             # must degrade, never propagate (→ _run_init_step would mark "failed").
