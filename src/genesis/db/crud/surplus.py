@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import aiosqlite
 
 
@@ -87,6 +89,35 @@ async def count_pending(db: aiosqlite.Connection) -> int:
     )
     row = await cursor.fetchone()
     return row[0] if row else 0
+
+
+async def list_promotable_ideas(
+    db: aiosqlite.Connection,
+    *,
+    task_types: Sequence[str],
+    limit: int,
+) -> list[dict]:
+    """Pending, unexpired staged ideation rows eligible for promotion into the
+    follow_ups 'idea' review lane (WS-M PR-2).
+
+    Filtered to ``task_types`` (surplus_insights is a shared table — only genuine
+    IDEA task types graduate) and ttl-unexpired (matching purge_expired's parser).
+    Ordered oldest-first (FIFO): curated ideas all tie at ~0.6 confidence, so
+    created_at order is the fair graduation order and guarantees every item is
+    seen before it decays when capacity suffices.
+    """
+    if not task_types:
+        return []
+    placeholders = ", ".join("?" for _ in task_types)
+    cursor = await db.execute(
+        "SELECT * FROM surplus_insights "
+        "WHERE promotion_status = 'pending' "
+        f"AND source_task_type IN ({placeholders}) "  # noqa: S608 - bound params
+        "AND (ttl = '' OR datetime(REPLACE(ttl, 'T', ' ')) >= datetime('now')) "
+        "ORDER BY created_at ASC LIMIT ?",
+        (*task_types, limit),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def promote(db: aiosqlite.Connection, id: str, *, promoted_to: str) -> bool:

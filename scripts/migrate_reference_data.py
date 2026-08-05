@@ -395,6 +395,12 @@ async def _ingest_entry(
         memory_class="fact",  # bypass 0.7x auto-reference penalty
         concept=entry.identifier,
         tags_json=tags_json,
+        # References live in episodic_memory alongside other personal data —
+        # match reference_store's invariant (mcp/memory/knowledge.py). Without
+        # this, ingest defaults to collection="knowledge_base", stranding
+        # migrated refs' vectors outside reference_lookup's episodic search.
+        collection="episodic_memory",
+        memory_type="episodic",
     )
     # ingest_knowledge_unit doesn't return the inserted flag directly;
     # we just return the ID here and count totals at the call site.

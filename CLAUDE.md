@@ -7,7 +7,7 @@ Genesis v3 is an autonomous AI agent system.
 Channels (Telegram, Dashboard, OpenClaw) → Cognitive Core (CCInvoker, triage,
 reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
 (SQLite WAL, Qdrant, ~/.genesis/) → Observability (event bus, health).
-89 packages, ~192K LOC. Use `codebase_navigate` MCP to explore.
+Use `codebase_navigate` MCP to explore.
 
 ## Environment
 

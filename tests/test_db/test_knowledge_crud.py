@@ -42,6 +42,60 @@ async def test_get_nonexistent(db):
     assert await knowledge.get(db, "nonexistent") is None
 
 
+async def test_get_by_qdrant_ids_maps_on_qdrant_id_not_pk(db):
+    """The helper keys on qdrant_id, not the primary key — the whole point.
+
+    A retriever result's memory_id is the Qdrant point ID, which equals
+    knowledge_units.qdrant_id and is a DIFFERENT UUID from the primary key.
+    Looking a vector hit up by primary key (knowledge.get) matches nothing;
+    this helper must match on qdrant_id.
+    """
+    uid = await knowledge.insert(
+        db,
+        project_type="reference",
+        domain="reference.network",
+        source_doc="t",
+        concept="host login",
+        body="ssh host",
+        qdrant_id="qd-point-1",
+    )
+    assert uid != "qd-point-1"  # the two id spaces are distinct
+
+    # Maps by qdrant_id → list of rows, keyed by qdrant_id.
+    by_qdrant = await knowledge.get_by_qdrant_ids(db, ["qd-point-1"])
+    assert set(by_qdrant) == {"qd-point-1"}
+    assert [r["id"] for r in by_qdrant["qd-point-1"]] == [uid]
+
+    # The primary key is NOT a qdrant_id → no match (the exact prod failure).
+    assert await knowledge.get_by_qdrant_ids(db, [uid]) == {}
+
+
+async def test_get_by_qdrant_ids_preserves_shared_point(db):
+    """Two units sharing one Qdrant point are BOTH returned, never collapsed.
+
+    MemoryStore.store dedups identical content to a single Qdrant point, so two
+    units with the same body but different (project_type, domain, concept) keys
+    share a qdrant_id (the column is not UNIQUE). Collapsing to one row would
+    silently drop the other and could resolve a vector hit to the wrong unit.
+    """
+    uid_a = await knowledge.insert(
+        db, project_type="reference", domain="reference.url", source_doc="t",
+        concept="entry A", body="same body", qdrant_id="shared-point",
+    )
+    uid_b = await knowledge.insert(
+        db, project_type="genesis-infra", domain="claude-code", source_doc="t",
+        concept="entry B", body="same body", qdrant_id="shared-point",
+    )
+    by_qdrant = await knowledge.get_by_qdrant_ids(db, ["shared-point"])
+    assert set(by_qdrant) == {"shared-point"}
+    assert {r["id"] for r in by_qdrant["shared-point"]} == {uid_a, uid_b}
+
+
+async def test_get_by_qdrant_ids_empty_and_missing(db):
+    assert await knowledge.get_by_qdrant_ids(db, []) == {}
+    assert await knowledge.get_by_qdrant_ids(db, ["nope1", "nope2"]) == {}
+
+
 async def test_insert_with_all_fields(db):
     uid = await knowledge.insert(
         db,

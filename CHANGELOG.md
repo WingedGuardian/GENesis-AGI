@@ -24,6 +24,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   claiming "done" over an install that can't yet think. A banner also nudges you to
   set a password whenever the dashboard is open without one.
 
+- **Genesis's skills and tools are now portable to other AI coding tools.** A
+  new generator writes an auto-maintained inventory of Genesis's skills and
+  action tools into `AGENTS.md` — the cross-tool entry point that Cursor,
+  Codex, and other agent runtimes read — so Genesis's capability layer travels
+  with the repo instead of being locked to one harness. The inventory is
+  body-scope only: it lists what Genesis can *do*, and deliberately excludes
+  its memory and cognition. Refresh it any time with
+  `python scripts/export_agents_md.py`.
+
 ### Changed
 
 - **Setting a dashboard password now also protects the API.** Previously
@@ -56,6 +65,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   lessons this way. Procedures are now matched by the similarity of the lesson
   itself: a genuine refinement still updates in place, but a distinct lesson is
   kept as its own procedure instead of overwriting an unrelated one.
+
+- **Legacy procedures with stale similarity vectors are re-embedded on update.**
+  The procedure-overwrite fix above matches lessons by similarity, but a
+  procedure edited many times before that fix shipped kept a similarity vector
+  describing an *older* version of the lesson — which could still misjudge a new
+  distinct lesson as "the same" and overwrite it. Installs are healed
+  automatically on update: a one-time pass re-embeds each repeatedly-edited
+  procedure from its current text so the matching is trustworthy (a clean no-op
+  where nothing was stale).
 
 ### Added
 

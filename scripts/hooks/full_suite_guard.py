@@ -57,15 +57,27 @@ def _is_full_suite(cmd: str) -> bool:
         if not args_str:
             return True  # bare "pytest" with no args
 
-        # Split remaining args and check if any is a path (not a flag)
+        # Split remaining args and check if any is a path (not a flag) OR a
+        # -k/-m selector with a value (a targeted subset, NOT the full suite).
         args = args_str.split()
         has_path = False
+        has_selector = False
         i = 0
         while i < len(args):
             arg = args[i]
             if arg in (">", "2>&1", "|"):
                 break  # redirection/pipe — stop parsing
             if arg.startswith("-"):
+                # A -k/-m selector (separate value or =form) narrows the run to
+                # a named subset — treating it as "full suite" was a cosmetic FP.
+                _sep_val = arg in ("-k", "-m") and i + 1 < len(args)
+                # `--markers=…` is not a real pytest invocation (bare --markers
+                # just lists markers), so it is not a selector; --keyword is the
+                # long form of -k and stays.
+                _eq_form = arg.startswith(("-k", "-m", "--keyword")) and "=" in arg
+                _glued = arg.startswith(("-k", "-m")) and len(arg) > 2 and "=" not in arg
+                if _sep_val or _eq_form or _glued:
+                    has_selector = True
                 # Flag — skip it (and its value if it takes one)
                 if arg in (
                     "-k",
@@ -85,7 +97,7 @@ def _is_full_suite(cmd: str) -> bool:
                 break
             i += 1
 
-        if not has_path:
+        if not has_path and not has_selector:
             return True
 
     return False

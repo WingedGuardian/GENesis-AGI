@@ -674,6 +674,42 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _idea_lane_decay_sweep() -> None:
+            # Soft-age-out un-triaged ideas in the surplus-ideation review lane
+            # (source='surplus_ideation', kind='idea'): status→completed after
+            # 45d, then reaped by the retention sweep. Mechanical TTL, like the
+            # inbox marker decay above — the review lane must not grow unbounded.
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping idea lane decay",
+                    exc_info=True,
+                )
+                return
+            try:
+                from genesis.db.crud import follow_ups
+
+                decayed = await follow_ups.decay_stale_ideas(rt._db)
+                rt.record_job_success("idea_lane_decay")
+                if decayed:
+                    logger.info(
+                        "Idea lane decay: aged out %d un-triaged idea(s)",
+                        decayed,
+                    )
+            except Exception as exc:
+                rt.record_job_failure("idea_lane_decay", exc=exc)
+                logger.exception("Idea lane decay sweep failed")
+
+        rt._learning_scheduler.add_job(
+            _idea_lane_decay_sweep,
+            CronTrigger(hour=4, minute=45, timezone=user_timezone()),
+            id="idea_lane_decay",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _run_recovery() -> None:
             if rt._recovery_orchestrator is not None:
                 try:

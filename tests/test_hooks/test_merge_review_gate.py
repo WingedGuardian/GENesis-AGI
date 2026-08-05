@@ -1420,14 +1420,18 @@ class TestCiGateEndToEnd:
         }
 
     def _patch_merge_ok(self, guard_module, monkeypatch):
-        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n: "MERGEABLE")
+        # The gate functions gained a `repo` kwarg (cross-repo --repo threading);
+        # the fakes accept it (and ignore it) so the signatures still match.
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         monkeypatch.setattr(
-            guard_module, "_check_pr_review_findings", lambda n, force=False: (False, "")
+            guard_module,
+            "_check_pr_review_findings",
+            lambda n, force=False, repo=None: (False, ""),
         )
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False: (False, ""),
+            lambda n, force=False, repo=None: (False, ""),
         )
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
