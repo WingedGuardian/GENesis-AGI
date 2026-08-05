@@ -37,7 +37,10 @@ def main() -> None:
     if is_review_current():
         sys.exit(0)
 
-    # Unreviewed changes exist — inject warning
+    # Unreviewed changes exist — inject the base reminder UNCONDITIONALLY first.
+    # The deterministic review-scope manifest below is strictly ADDITIVE: it is
+    # built and appended behind its own guards so a manifest error can never
+    # truncate or suppress this core reminder.
     print(
         "MANDATORY: Unreviewed code changes detected. "
         "You MUST run /review and dispatch the superpowers:code-reviewer agent "
@@ -57,6 +60,17 @@ def main() -> None:
         "Ask: 'If the system restarts now, will this actually work?' "
         "If you cannot answer yes WITH EVIDENCE, you are not done."
     )
+
+    # Additive: deterministic per-file review-scope manifest. Fully fail-open —
+    # any import/build error is swallowed so the base reminder above stands alone.
+    try:
+        from review_scope import build_manifest, render_reminder_block
+
+        block = render_reminder_block(build_manifest())
+        if block:
+            print("\n" + block)
+    except Exception:  # noqa: BLE001 - manifest is best-effort, never load-bearing
+        pass
 
 
 if __name__ == "__main__":
