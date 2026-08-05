@@ -41,6 +41,51 @@ def test_wallclock_already_passed_rolls_to_tomorrow():
     assert reset == (NOW + timedelta(days=1)).replace(hour=9, minute=0)
 
 
+def test_prose_wallclock_honors_tz_hint():
+    """A trailing (IANA/Zone) hint is the account's local zone — resolve the
+    wall-clock there, not in the server's UTC. Regression for the live-captured
+    session-limit message that parsed ~hours off without this.
+    """
+    # 2026-08-03 09:00 UTC == 02:00 America/Los_Angeles (PDT, UTC-7). The message
+    # says the session resets at 4:10am PT → 11:10 UTC the SAME day (~1h out in
+    # wall terms), NOT the naive-UTC parse of 04:10 UTC which, being already past
+    # 09:00, would roll to the next day (hours off).
+    now = datetime(2026, 8, 3, 9, 0, 0, tzinfo=UTC)
+    kind, reset = parse_reset(
+        raw_text="You've hit your session limit · resets 4:10am (America/Los_Angeles)",
+        now=now,
+    )
+    assert kind == SESSION
+    assert reset == datetime(2026, 8, 3, 11, 10, 0, tzinfo=UTC)
+
+
+def test_prose_wallclock_tz_hint_rolls_to_tomorrow_in_zone():
+    """When the account-zone wall-clock has already passed, roll a day — the
+    comparison happens in the account zone, not UTC."""
+    # 2026-08-03 15:00 UTC == 08:00 PT. A 4:10am PT reset already passed today in
+    # PT → next day 4:10am PT == 2026-08-04 11:10 UTC.
+    now = datetime(2026, 8, 3, 15, 0, 0, tzinfo=UTC)
+    _, reset = parse_reset(
+        raw_text="hit your session limit · resets 4:10am (America/Los_Angeles)",
+        now=now,
+    )
+    assert reset == datetime(2026, 8, 4, 11, 10, 0, tzinfo=UTC)
+
+
+def test_prose_wallclock_no_tz_hint_unchanged():
+    """No zone hint → parse in ``now``'s tz exactly as before (unchanged path)."""
+    kind, reset = parse_reset(raw_text="Session limit — resets 5pm", now=NOW)
+    assert kind == SESSION
+    assert reset == NOW.replace(hour=17, minute=0)
+
+
+def test_prose_wallclock_invalid_tz_hint_falls_back():
+    """An unresolvable zone name must NOT raise — fall back to naive parsing."""
+    kind, reset = parse_reset(raw_text="session limit resets 5pm (Not/AZone)", now=NOW)
+    assert kind == SESSION
+    assert reset == NOW.replace(hour=17, minute=0)
+
+
 def test_event_epoch_seconds():
     ts = int((NOW + timedelta(hours=3)).timestamp())
     _, reset = parse_reset(raw_event={"type": "rate_limit_event", "resetsAt": ts}, now=NOW)

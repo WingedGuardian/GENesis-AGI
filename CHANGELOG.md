@@ -48,6 +48,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Background work now survives Claude session/weekly limits instead of failing.**
+  When Claude Code hit its Max-plan session or weekly usage limit, the message
+  ("You've hit your session limit · resets 4:10am") wasn't recognized as a limit
+  at all — it was treated as a generic crash, so the background session died and
+  its work was lost rather than being parked to auto-resume when the limit reset.
+  These limits are now recognized, and the resume is scheduled from the real
+  reset time in your account's own timezone (previously a bare reset time could
+  be read in the server's timezone and land hours off).
+
 - **Re-embedding a memory no longer downgrades its recall ranking.** When a
   memory's vector was rebuilt (after a vector-store outage, or by the nightly
   repair job), its priority class was silently recomputed from the text alone —

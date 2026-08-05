@@ -6,19 +6,22 @@ promise — resume is self-validating (a still-limited re-run re-parks), so an
 imprecise or missing reset only changes WHEN the first re-attempt fires, not
 whether the parked work survives.
 
-CRITICAL UNKNOWN — verify against the first real captured event: the exact
-field layout of a CC ``rate_limit_event`` payload is not documented, and the
-prose form ("resets Xpm") is only known from a code comment. This parser
-therefore searches defensively for common reset-time keys and falls back to
-prose; on any miss it returns ``None`` and the scheduler uses its cadence
-floor. A weekly limit with only a wall-clock time is day-ambiguous → ``None``
-(never guess "next 5pm").
+Prose form CONFIRMED against a real captured event (2026-08, reflex signal
+CCProcessError×cc): a wall-clock reset time in the ACCOUNT's local zone, named
+in a trailing ``(IANA/Zone)`` hint — e.g. ``"You've hit your session limit ·
+resets 4:10am (America/Los_Angeles)"``. The parser resolves that hint (falling
+back to ``now``'s tz when absent) so a UTC-clocked server does not schedule the
+resume hours off. The structured ``rate_limit_event`` payload layout is still
+undocumented, so key search stays defensive; on any miss it returns ``None`` and
+the scheduler uses its cadence floor. A weekly limit with only a wall-clock time
+is day-ambiguous → ``None`` (never guess "next 5pm").
 """
 
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
+from zoneinfo import ZoneInfo
 
 # limit_kind vocabulary — kept tiny; only used to size backoff and to decide
 # whether a bare wall-clock prose time is day-ambiguous.
@@ -154,11 +157,33 @@ _CLOCK_RE = re.compile(
     r"reset[a-z ]*?(?:at\s*)?(?P<h>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<ap>am|pm)",
     re.IGNORECASE,
 )
+# A trailing IANA zone hint, e.g. "resets 4:10am (America/Los_Angeles)". The CC CLI
+# renders the reset time in the ACCOUNT's local zone, not the container's — so a
+# bare wall-clock parsed in ``now``'s tz (UTC on a server) lands hours off. Case
+# preserved: IANA zone keys are case-sensitive.
+_TZ_HINT_RE = re.compile(r"\(([A-Za-z]+(?:/[A-Za-z0-9_+-]+)+)\)")
+
+
+def _extract_tz_hint(text: str) -> tzinfo | None:
+    """A trailing ``(Area/Location)`` zone hint as a tzinfo, or None.
+
+    Best-effort: an absent or unresolvable zone (no tzdata, bad name) returns
+    None so the caller falls back to naive parsing in ``now``'s tz — never
+    raises, never worse than pre-hint behavior."""
+    m = _TZ_HINT_RE.search(text)
+    if not m:
+        return None
+    try:
+        return ZoneInfo(m.group(1))
+    except Exception:
+        return None
 
 
 def _reset_from_prose(text: str, now: datetime, limit_kind: str) -> datetime | None:
     """Parse a reset time from CC's prose. Relative durations are unambiguous;
-    a bare wall-clock time is day-ambiguous for a WEEKLY limit → None."""
+    a bare wall-clock time is day-ambiguous for a WEEKLY limit → None. A wall-
+    clock time carrying an ``(IANA/Zone)`` hint is resolved in that zone (the
+    account's local zone) and returned in ``now``'s tz."""
     if not text:
         return None
     low = text.lower()
@@ -171,7 +196,7 @@ def _reset_from_prose(text: str, now: datetime, limit_kind: str) -> datetime | N
         if hours or mins:
             return now + timedelta(hours=hours, minutes=mins)
 
-    # Wall-clock: "resets 5pm" / "resets at 11:30 am".
+    # Wall-clock: "resets 5pm" / "resets at 11:30 am" / "resets 4:10am (America/Los_Angeles)".
     c = _CLOCK_RE.search(low)
     if c:
         if limit_kind == WEEKLY:
@@ -181,10 +206,16 @@ def _reset_from_prose(text: str, now: datetime, limit_kind: str) -> datetime | N
         if c.group("ap").lower() == "pm":
             hour += 12
         minute = int(c.group("min") or 0)
-        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if candidate <= now:
+        # Resolve the wall-clock in the account's zone when the CLI names it
+        # (search the ORIGINAL-case text — zone keys are case-sensitive), then
+        # hand back a datetime in ``now``'s tz. No hint → parse in ``now``'s tz
+        # exactly as before (unchanged behavior).
+        tz = _extract_tz_hint(text)
+        ref = now.astimezone(tz) if tz is not None else now
+        candidate = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= ref:
             candidate += timedelta(days=1)
-        return candidate
+        return candidate.astimezone(now.tzinfo) if tz is not None else candidate
     return None
 
 
