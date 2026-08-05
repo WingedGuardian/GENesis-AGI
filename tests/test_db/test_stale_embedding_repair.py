@@ -238,6 +238,25 @@ def test_migration_migrate_then_verify(tmp_path, monkeypatch):
     assert _emb_of(path, "A") == pack_embedding(_fake_vec("A-current"))
 
 
+def test_verify_propagates_dependency_unavailable(tmp_path, monkeypatch):
+    # Regression (Codex #1296 P2): a cold embedder DURING verify() must let the
+    # sentinel PROPAGATE (so the runner defers with a WARN), NOT be swallowed into
+    # a False that triggers the generic verify-failed ERROR path.
+    from genesis.db.data_migrations import d0011_reembed_stale_procedure_embeddings as mig
+    from genesis.db.data_migrations._util import MigrationDependencyUnavailable
+
+    monkeypatch.setattr(sr, "_EMBED_RETRY_BASE_DELAY_S", 0.0)
+    monkeypatch.setattr(sr, "_EMBED_ATTEMPTS", 1)
+    path = _make_db(tmp_path)
+    _insert(path, "A", "A-current", version=2, emb_text="A-OLD")  # a candidate → embedder needed
+    monkeypatch.setattr(mig, "genesis_db_path", lambda: path)
+    monkeypatch.setattr(
+        "genesis.memory.embeddings.EmbeddingProvider", lambda *a, **k: _UnavailableProvider()
+    )
+    with pytest.raises(MigrationDependencyUnavailable):
+        mig.verify()
+
+
 class _ConcurrentRefineProvider:
     """Simulates a genuine refine landing on the row DURING the embed phase —
     between the migration's candidate read (T0) and its write."""

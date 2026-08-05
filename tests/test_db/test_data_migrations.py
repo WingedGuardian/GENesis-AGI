@@ -288,6 +288,28 @@ async def test_runner_dependency_unavailable_warns_not_errors(db, monkeypatch, c
     assert not any(r.exc_info for r in recs)  # no traceback attached
 
 
+async def test_runner_verify_dependency_unavailable_warns_not_errors(db, monkeypatch, caplog):
+    # End-to-end (Codex #1296 P2): migrate() succeeds but verify() raises the
+    # sentinel (embedder went cold in between) → runner WARN-and-defers rather than
+    # taking the verify-failed ERROR path, so no spurious boot ERROR.
+    import logging
+
+    from genesis.db.data_migrations._util import MigrationDependencyUnavailable
+
+    def verify():
+        raise MigrationDependencyUnavailable("cold during verify")
+
+    _patch_migrations(monkeypatch, {"d0001_x": _fake_module(lambda: {"ok": 1}, verify)})
+    with caplog.at_level(logging.DEBUG, logger="genesis.db.data_migrations.runner"):
+        outcomes = await DataMigrationRunner(db).run_pending()
+
+    assert outcomes[0].get("deferred") is True
+    recs = [r for r in caplog.records if r.name == "genesis.db.data_migrations.runner"]
+    assert any(r.levelno == logging.WARNING and "deferred" in r.getMessage() for r in recs)
+    assert not any(r.levelno >= logging.ERROR for r in recs)  # no verify-failed ERROR
+    assert await crud.get_status(db, "d0001") == "failed"  # idempotent replay next boot
+
+
 async def test_runner_genuine_exception_still_logs_error_with_traceback(db, monkeypatch, caplog):
     # A NON-sentinel exception (a real migration bug) must still hit ERROR+traceback —
     # the WARN demotion is scoped to the dependency-unavailable sentinel only.
