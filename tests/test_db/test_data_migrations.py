@@ -26,6 +26,14 @@ async def db():
     await conn.close()
 
 
+@pytest.fixture(autouse=True)
+def _no_boot_settle_delay(monkeypatch):
+    """Disable the data-migration boot-settle delay by default so tests that call
+    run_data_migrations() don't wait the real 120s. The delay's own tests override
+    this and patch asyncio.sleep."""
+    monkeypatch.setenv("GENESIS_DATA_MIGRATION_BOOT_DELAY_S", "0")
+
+
 async def test_migration_0060_idempotent_after_create_all_tables():
     """The REAL boot path: init_db runs create_all_tables (which creates
     data_migrations from _tables.py) BEFORE the migration runner. Migration
@@ -254,6 +262,107 @@ def test_no_duplicate_migration_prefixes_in_tree():
             f"duplicate {label} prefix(es) {dupes} in {directory} — "
             "rename the newer file to the next free prefix"
         )
+
+
+async def test_runner_dependency_unavailable_warns_not_errors(db, monkeypatch, caplog):
+    # A cold-boot transient (embedder/Qdrant not warm) raises the sentinel: the
+    # runner defers it (marked failed -> replays next boot) and logs at WARNING
+    # with NO traceback — not the scary ERROR+traceback reserved for real bugs.
+    import logging
+
+    from genesis.db.data_migrations._util import MigrationDependencyUnavailable
+
+    def cold():
+        raise MigrationDependencyUnavailable("embedder unavailable after 3 attempts")
+
+    _patch_migrations(monkeypatch, {"d0001_x": _fake_module(cold, lambda: True)})
+    with caplog.at_level(logging.DEBUG, logger="genesis.db.data_migrations.runner"):
+        outcomes = await DataMigrationRunner(db).run_pending()
+
+    assert outcomes[0]["success"] is False
+    assert outcomes[0].get("deferred") is True
+    assert await crud.get_status(db, "d0001") == "failed"  # retryable -> replays next boot
+    recs = [r for r in caplog.records if r.name == "genesis.db.data_migrations.runner"]
+    assert any(r.levelno == logging.WARNING and "deferred" in r.getMessage() for r in recs)
+    assert not any(r.levelno >= logging.ERROR for r in recs)  # no ERROR
+    assert not any(r.exc_info for r in recs)  # no traceback attached
+
+
+async def test_runner_verify_dependency_unavailable_warns_not_errors(db, monkeypatch, caplog):
+    # End-to-end (Codex #1296 P2): migrate() succeeds but verify() raises the
+    # sentinel (embedder went cold in between) → runner WARN-and-defers rather than
+    # taking the verify-failed ERROR path, so no spurious boot ERROR.
+    import logging
+
+    from genesis.db.data_migrations._util import MigrationDependencyUnavailable
+
+    def verify():
+        raise MigrationDependencyUnavailable("cold during verify")
+
+    _patch_migrations(monkeypatch, {"d0001_x": _fake_module(lambda: {"ok": 1}, verify)})
+    with caplog.at_level(logging.DEBUG, logger="genesis.db.data_migrations.runner"):
+        outcomes = await DataMigrationRunner(db).run_pending()
+
+    assert outcomes[0].get("deferred") is True
+    recs = [r for r in caplog.records if r.name == "genesis.db.data_migrations.runner"]
+    assert any(r.levelno == logging.WARNING and "deferred" in r.getMessage() for r in recs)
+    assert not any(r.levelno >= logging.ERROR for r in recs)  # no verify-failed ERROR
+    assert await crud.get_status(db, "d0001") == "failed"  # idempotent replay next boot
+
+
+async def test_runner_genuine_exception_still_logs_error_with_traceback(db, monkeypatch, caplog):
+    # A NON-sentinel exception (a real migration bug) must still hit ERROR+traceback —
+    # the WARN demotion is scoped to the dependency-unavailable sentinel only.
+    import logging
+
+    def boom():
+        raise RuntimeError("a real migration bug")
+
+    _patch_migrations(monkeypatch, {"d0001_x": _fake_module(boom, lambda: True)})
+    with caplog.at_level(logging.WARNING, logger="genesis.db.data_migrations.runner"):
+        await DataMigrationRunner(db).run_pending()
+
+    recs = [r for r in caplog.records if r.name == "genesis.db.data_migrations.runner"]
+    assert any(r.levelno == logging.ERROR and r.exc_info for r in recs)
+    assert await crud.get_status(db, "d0001") == "failed"
+
+
+async def test_run_data_migrations_waits_boot_settle_delay(db, monkeypatch):
+    # The entry point sleeps the configured boot-settle delay before running.
+    slept = {"secs": None}
+
+    async def fake_sleep(secs):
+        slept["secs"] = secs
+
+    monkeypatch.setattr(runner_mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setenv("GENESIS_DATA_MIGRATION_BOOT_DELAY_S", "7")  # overrides autouse 0
+    monkeypatch.setattr(DataMigrationRunner, "_discover", lambda self: [])
+    await runner_mod.run_data_migrations(db)
+    assert slept["secs"] == 7.0
+
+
+def test_boot_delay_rejects_non_finite_and_garbage(monkeypatch):
+    # inf would make asyncio.sleep(inf) hang migrations forever; nan / garbage are
+    # also nonsense — all fall back to the default rather than a hang or crash.
+    for bad in ("inf", "-inf", "nan", "not-a-number", ""):
+        monkeypatch.setenv("GENESIS_DATA_MIGRATION_BOOT_DELAY_S", bad)
+        assert runner_mod._boot_settle_delay_s() == runner_mod._DEFAULT_BOOT_SETTLE_DELAY_S
+    # A negative finite value clamps to 0 (disabled), not the default.
+    monkeypatch.setenv("GENESIS_DATA_MIGRATION_BOOT_DELAY_S", "-5")
+    assert runner_mod._boot_settle_delay_s() == 0.0
+
+
+async def test_run_data_migrations_no_delay_when_zero(db, monkeypatch):
+    slept = {"called": False}
+
+    async def fake_sleep(secs):
+        slept["called"] = True
+
+    monkeypatch.setattr(runner_mod.asyncio, "sleep", fake_sleep)
+    # autouse fixture already set the env to "0"
+    monkeypatch.setattr(DataMigrationRunner, "_discover", lambda self: [])
+    await runner_mod.run_data_migrations(db)
+    assert slept["called"] is False
 
 
 async def test_runner_redispatches_orphaned_running(db, monkeypatch):

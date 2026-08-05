@@ -159,6 +159,7 @@ class _UnavailableProvider:
 def test_fail_closed_when_embedder_unavailable(tmp_path, monkeypatch):
     path = _make_db(tmp_path)
     _insert(path, "A", "A-current", version=2, emb_text="A-OLD")  # a real candidate
+    monkeypatch.setattr(sr, "_EMBED_RETRY_BASE_DELAY_S", 0.0)  # don't sleep between retries
     # No injected provider -> the migration constructs a local EmbeddingProvider;
     # simulate the backend being down so embed() raises.
     monkeypatch.setattr(
@@ -168,6 +169,54 @@ def test_fail_closed_when_embedder_unavailable(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="embedder unavailable"):
         sr.reembed_stale_procedure_embeddings(path, provider=None)
+    assert _emb_of(path, "A") == pack_embedding(_fake_vec("A-OLD"))  # no half-heal
+
+
+class _FlakyProvider:
+    """EmbeddingUnavailableError for the first ``fail_times`` embed calls, then
+    succeeds — a cold-boot network blip (DNS/egress not warm) that clears on retry."""
+
+    def __init__(self, fail_times: int):
+        self.fail_times = fail_times
+        self.attempts = 0
+
+    async def embed(self, text: str) -> list[float]:
+        from genesis.memory.embeddings import EmbeddingUnavailableError
+
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise EmbeddingUnavailableError("cold boot: backends not warm yet")
+        return _fake_vec(text)
+
+
+def test_embed_retries_then_succeeds_on_transient(tmp_path, monkeypatch):
+    # A transient cold-boot embedder failure must NOT fail the one-time heal: the
+    # bounded retry recovers once the backend warms.
+    monkeypatch.setattr(sr, "_EMBED_RETRY_BASE_DELAY_S", 0.0)  # no real sleeps
+    path = _make_db(tmp_path)
+    _insert(path, "A", "A-current", version=2, emb_text="A-OLD")
+    provider = _FlakyProvider(fail_times=2)  # fails twice, third attempt succeeds
+
+    result = sr.reembed_stale_procedure_embeddings(path, provider=provider)
+
+    assert result == {"targeted": 1, "stale": 1, "unresolvable": 0, "reembedded": 1}
+    assert provider.attempts == 3  # two failures + one success
+    assert _emb_of(path, "A") == pack_embedding(_fake_vec("A-current"))  # healed
+
+
+def test_embed_raises_dependency_unavailable_after_exhausting_retries(tmp_path, monkeypatch):
+    from genesis.db.data_migrations._util import MigrationDependencyUnavailable
+
+    monkeypatch.setattr(sr, "_EMBED_RETRY_BASE_DELAY_S", 0.0)
+    monkeypatch.setattr(sr, "_EMBED_ATTEMPTS", 2)
+    path = _make_db(tmp_path)
+    _insert(path, "A", "A-current", version=2, emb_text="A-OLD")
+
+    # A persistently-down embedder raises the sentinel (which is a RuntimeError
+    # subclass, so existing `except RuntimeError` dependency-guards still catch it).
+    with pytest.raises(MigrationDependencyUnavailable):
+        sr.reembed_stale_procedure_embeddings(path, provider=_UnavailableProvider())
+    assert issubclass(MigrationDependencyUnavailable, RuntimeError)
     assert _emb_of(path, "A") == pack_embedding(_fake_vec("A-OLD"))  # no half-heal
 
 
@@ -187,6 +236,25 @@ def test_migration_migrate_then_verify(tmp_path, monkeypatch):
     assert summary == {"targeted": 1, "stale": 1, "unresolvable": 0, "reembedded": 1}
     assert mig.verify() is True
     assert _emb_of(path, "A") == pack_embedding(_fake_vec("A-current"))
+
+
+def test_verify_propagates_dependency_unavailable(tmp_path, monkeypatch):
+    # Regression (Codex #1296 P2): a cold embedder DURING verify() must let the
+    # sentinel PROPAGATE (so the runner defers with a WARN), NOT be swallowed into
+    # a False that triggers the generic verify-failed ERROR path.
+    from genesis.db.data_migrations import d0011_reembed_stale_procedure_embeddings as mig
+    from genesis.db.data_migrations._util import MigrationDependencyUnavailable
+
+    monkeypatch.setattr(sr, "_EMBED_RETRY_BASE_DELAY_S", 0.0)
+    monkeypatch.setattr(sr, "_EMBED_ATTEMPTS", 1)
+    path = _make_db(tmp_path)
+    _insert(path, "A", "A-current", version=2, emb_text="A-OLD")  # a candidate → embedder needed
+    monkeypatch.setattr(mig, "genesis_db_path", lambda: path)
+    monkeypatch.setattr(
+        "genesis.memory.embeddings.EmbeddingProvider", lambda *a, **k: _UnavailableProvider()
+    )
+    with pytest.raises(MigrationDependencyUnavailable):
+        mig.verify()
 
 
 class _ConcurrentRefineProvider:

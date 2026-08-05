@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
+from genesis.db.data_migrations._util import MigrationDependencyUnavailable
 from genesis.db.data_migrations.stale_embedding_repair import (
     count_stale_procedure_embeddings,
     reembed_stale_procedure_embeddings,
@@ -49,13 +50,18 @@ def verify() -> bool:
     embed of its current principle.
 
     Reached only after a successful ``migrate()`` (same run), so the embedder is
-    normally still up. If it went away in between, treat as not-done (retry next
-    boot) rather than raising."""
+    normally still up. If it went cold in between, let the dependency sentinel
+    PROPAGATE so the runner's WARN-and-defer path handles it (marks failed →
+    idempotent replay next boot) — NOT the generic verify-failed ERROR path, which
+    would reintroduce the spurious cold-boot ERROR this migration's fix removes."""
     db = sqlite3.connect(f"file:{genesis_db_path()}?mode=ro", uri=True)
     try:
         return count_stale_procedure_embeddings(db) == 0
+    except MigrationDependencyUnavailable:
+        raise  # runner classifies this as "dependency not ready" → WARN, retry next boot
     except RuntimeError:
-        logger.warning("d0011 verify: embedder unavailable — deferring to next boot")
+        # Any OTHER RuntimeError: keep the conservative not-done behavior.
+        logger.warning("d0011 verify: unexpected embedder error — deferring to next boot")
         return False
     finally:
         db.close()
