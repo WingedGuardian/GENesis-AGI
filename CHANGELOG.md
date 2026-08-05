@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **First-run setup wizard on the dashboard.** A new install can go from a fresh
+  dashboard to a working, connected Genesis without touching a terminal. A
+  dismissible Setup card on the Overview tab walks you through setting a dashboard
+  password, adding a model or embedding API key — with a live "test this key"
+  button that makes a real call so you know it works before saving — and writing
+  your identity profile (USER.md), which can now be created straight from the web.
+  The card reflects a live **readiness floor** — a genuinely usable Genesis needs
+  Claude Code logged in, at least one chat/routing key, and at least one embedding
+  key — so it shows honestly what's still missing (including a reminder to run
+  `claude login` in a terminal, which the web UI can't do for you) rather than ever
+  claiming "done" over an install that can't yet think. A banner also nudges you to
+  set a password whenever the dashboard is open without one.
+
 - **Genesis's skills and tools are now portable to other AI coding tools.** A
   new generator writes an auto-maintained inventory of Genesis's skills and
   action tools into `AGENTS.md` — the cross-tool entry point that Cursor,
@@ -19,6 +32,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   body-scope only: it lists what Genesis can *do*, and deliberately excludes
   its memory and cognition. Refresh it any time with
   `python scripts/export_agents_md.py`.
+
+### Changed
+
+- **Setting a dashboard password now also protects the API.** Previously
+  `DASHBOARD_PASSWORD` guarded only the web pages, while the underlying API —
+  including the endpoint that reads and writes your saved keys — stayed reachable
+  by anyone who could open the dashboard. With a password set, state-changing API
+  calls now require your login session (Genesis's own components authenticate with
+  an internal token). The gate is applied in every supported hosting mode (both the
+  standalone server and Agent Zero), so no mode leaves the API open. Read-only
+  calls and the voice API are unaffected. If one of your own local integrations
+  breaks, set `GENESIS_DASHBOARD_API_AUTH=off` to disable just this gate without
+  removing the password.
 
 ### Fixed
 

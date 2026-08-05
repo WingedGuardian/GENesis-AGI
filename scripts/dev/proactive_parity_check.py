@@ -34,6 +34,22 @@ REPO = Path(__file__).resolve().parents[2]
 HOOK = REPO / "scripts" / "proactive_memory_hook.py"
 ENDPOINT = "/api/genesis/hook/recall"
 
+
+def _headers() -> dict[str, str]:
+    """Content-Type + internal bearer, so the POST passes the server's /api
+    mutation gate when a dashboard password is set (absent token → no bearer)."""
+    headers = {"Content-Type": "application/json"}
+    gh = os.environ.get("GENESIS_HOME")
+    token_path = (Path(gh).expanduser() if gh else Path.home() / ".genesis") / "internal_api_token"
+    try:
+        tok = token_path.read_text().strip()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+    except OSError:
+        pass
+    return headers
+
+
 _ID_RE = re.compile(r"id:([0-9a-f]{8})")
 _MEM_LINE_RE = re.compile(r"^\[(Memory|KB·|Memory·external)")
 
@@ -94,7 +110,7 @@ def _run_endpoint(prompt: str, sid: str) -> tuple[set[str], int, float]:
     req = urllib.request.Request(  # noqa: S310 - loopback dev tool, fixed http scheme
         _server_base() + ENDPOINT,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=_headers(),
         method="POST",
     )
     t0 = time.monotonic()

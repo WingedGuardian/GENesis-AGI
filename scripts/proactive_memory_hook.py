@@ -1045,8 +1045,19 @@ async def _call_server(
         # HTTP_PROXY/ALL_PROXY here would route the payload (the user's prompt)
         # through an external proxy when NO_PROXY doesn't cover 127.0.0.1 — a
         # data-leak / failure path. A localhost call must never use a proxy.
+        # Internal bearer so this POST passes the server's /api mutation gate when
+        # a dashboard password is set. Absent token → no header (gate inactive).
+        headers: dict[str, str] = {}
+        try:
+            from genesis.env import read_internal_api_token
+
+            _tok = read_internal_api_token()
+            if _tok:
+                headers["Authorization"] = f"Bearer {_tok}"
+        except Exception:
+            pass
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-            resp = await client.post(_RECALL_ENDPOINT, json=payload)
+            resp = await client.post(_RECALL_ENDPOINT, json=payload, headers=headers)
         if resp.status_code != 200:
             detail = ""
             try:

@@ -377,3 +377,29 @@ async def test_expire_orphans_preserves_all_when_active_set_empty():
         assert "prov_x" in expired_targets
         pending_ids = {p["id"] for p in await dl_crud.query_pending(db)}
         assert all_id in pending_ids
+
+
+def test_reload_config_invalidates_floor_provider_cache(monkeypatch):
+    """reload_config() must invalidate the onboarding floor's cached provider-type
+    set (inside reload_config itself, so EVERY caller — both dashboard reload
+    routes and any future one — refreshes the floor, not just known routes)."""
+    from genesis.onboarding import floor as floor_mod
+    from genesis.routing.router import Router
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        floor_mod, "invalidate_provider_type_cache",
+        lambda: called.__setitem__("n", called["n"] + 1),
+    )
+
+    old_config = _make_config()
+    breakers = CircuitBreakerRegistry(old_config.providers)
+    router = Router(
+        config=old_config,
+        breakers=breakers,
+        cost_tracker=MagicMock(),
+        degradation=MagicMock(),
+        delegate=AsyncMock(),
+    )
+    router.reload_config(_make_config())
+    assert called["n"] == 1

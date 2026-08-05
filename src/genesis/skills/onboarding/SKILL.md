@@ -3,9 +3,10 @@ name: onboarding
 description: >
   First-run onboarding — guides new users through Genesis setup on their first
   CC session. Configures user profile, essential API keys, Telegram, GitHub
-  backup, and service verification. Triggered automatically when
-  ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to
-  "run setup" or "reconfigure [section]".
+  backup, and service verification. Triggered automatically while the install is
+  not yet FUNCTIONAL (the setup floor — Claude Code login + an LLM key + an
+  embedding key — is unmet), not merely while ~/.genesis/setup-complete is absent.
+  Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
 consumer: cc_foreground
 phase: setup
 skill_type: workflow
@@ -18,9 +19,13 @@ skill_type: workflow
 Guide a new user through Genesis setup on their first interactive CC session.
 By the end, every critical subsystem is configured and verified live.
 
-This skill is triggered automatically when `~/.genesis/setup-complete` does not
-exist. It can also be invoked manually by asking Genesis to "run setup" or
-"reconfigure [section]" to re-run specific sections.
+This skill is triggered automatically while the install is not yet **functional**
+— i.e. the setup *floor* (`genesis.onboarding.floor`: Claude Code login + at least
+one LLM/routing key + at least one embedding key) is unmet. It is NOT gated on the
+`~/.genesis/setup-complete` marker (that marker means "bootstrap finished" and does
+not imply a working brain). So a bootstrapped box that is still missing keys is
+still guided here. It can also be invoked manually by asking Genesis to "run setup"
+or "reconfigure [section]" to re-run specific sections.
 
 ## Pre-Conditions
 

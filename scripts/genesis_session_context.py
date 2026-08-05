@@ -346,26 +346,37 @@ def main() -> None:
                     first = False
 
     # 1.5. First-run onboarding detection
-    # If setup-complete marker is absent and this is a foreground session,
-    # inject the onboarding skill prompt so Genesis guides the user through setup.
-    if not is_genesis_session and not _SETUP_COMPLETE.exists():
-        onboarding_skill = _SKILLS_DIR / "onboarding" / "SKILL.md"
-        if onboarding_skill.exists():
-            if not first:
-                _emit("\n\n---\n\n")
-            _emit(
-                "## FIRST-RUN ONBOARDING REQUIRED\n\n"
-                "This is a fresh Genesis installation — `~/.genesis/setup-complete` "
-                "does not exist. **Before doing anything else**, run the onboarding "
-                "flow to configure the system.\n\n"
-                "The onboarding skill is at: "
-                "`src/genesis/skills/onboarding/SKILL.md`\n\n"
-                "Read the skill file and follow its steps. Do not skip this — the "
-                "user needs a working system before Genesis can be useful.\n\n"
-                "If the user's first message is unrelated to setup, acknowledge it "
-                "but explain that you need to complete onboarding first."
-            )
-            first = False
+    # Inject the onboarding prompt while the install is not yet FUNCTIONAL — the
+    # live floor (CC login + an LLM key + an embedding key), not merely while the
+    # bootstrap marker is absent. So a bootstrapped-but-keyless box is still guided.
+    # If the floor helper can't be imported for any reason, fall back to the marker.
+    if not is_genesis_session:
+        try:
+            from genesis.onboarding.floor import compute_floor
+
+            _needs_onboarding = not compute_floor().floor_met
+        except Exception:  # noqa: BLE001 - hook must never crash the session
+            _needs_onboarding = not _SETUP_COMPLETE.exists()
+        if _needs_onboarding:
+            onboarding_skill = _SKILLS_DIR / "onboarding" / "SKILL.md"
+            if onboarding_skill.exists():
+                if not first:
+                    _emit("\n\n---\n\n")
+                _emit(
+                    "## FIRST-RUN ONBOARDING REQUIRED\n\n"
+                    "Genesis is **not fully functional yet** — the setup floor is "
+                    "unmet (it needs Claude Code logged in, at least one LLM/routing "
+                    "API key, and at least one embedding key). **Before doing "
+                    "anything else**, run the onboarding flow to finish configuring "
+                    "the system.\n\n"
+                    "The onboarding skill is at: "
+                    "`src/genesis/skills/onboarding/SKILL.md`\n\n"
+                    "Read the skill file and follow its steps. Do not skip this — the "
+                    "user needs a working system before Genesis can be useful.\n\n"
+                    "If the user's first message is unrelated to setup, acknowledge it "
+                    "but explain that you need to complete onboarding first."
+                )
+                first = False
 
     # Load last session data once — used for cognitive state tier + temporal awareness
     last_session_data = _load_last_session_data()
