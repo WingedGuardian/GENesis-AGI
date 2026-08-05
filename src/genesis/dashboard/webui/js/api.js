@@ -4,9 +4,13 @@
  * Simplified version of Agent Zero's api.js. Requests are same-origin, so the
  * Flask session cookie rides along automatically; when a dashboard password is
  * set, that cookie authenticates /api mutations (the server gates POST/PUT/
- * DELETE/PATCH). CSRF is covered by the SameSite=Lax session cookie (a cross-site
- * mutation carries no cookie), so no CSRF token exchange is needed here. On a 401
- * (expired/missing session) fetchApi redirects to the login page.
+ * DELETE/PATCH). CSRF: these same-origin fetches carry the browser's
+ * Sec-Fetch-Site: same-origin header, which the server's mutation gate requires
+ * for cookie-authed mutations (SameSite=Lax alone does NOT stop a same-site
+ * sibling origin from riding the cookie), so no CSRF token exchange is needed
+ * here. On a 401 (expired/missing session) fetchApi redirects to the login page;
+ * a 403 (cross-origin cookie mutation refused) is not something these same-origin
+ * requests produce.
  */
 
 // Exponential backoff state for server error recovery.

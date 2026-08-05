@@ -73,7 +73,9 @@ def test_valid_session_cookie_passes(client, monkeypatch):
     _pw(monkeypatch)
     with client.session_transaction() as sess:
         sess["authenticated"] = True
-    assert client.post("/api/genesis/thing").status_code == 200
+    # A real same-origin browser fetch always carries Sec-Fetch-Site: same-origin.
+    resp = client.post("/api/genesis/thing", headers={"Sec-Fetch-Site": "same-origin"})
+    assert resp.status_code == 200
 
 
 def test_valid_internal_bearer_passes(client, monkeypatch):
@@ -140,6 +142,92 @@ def test_apply_gate_idempotent_and_wires(tmp_path, monkeypatch):
     assert hooks.count(auth_mod.check_api_mutation_auth) == 1
     assert app.test_client().post("/api/genesis/thing").status_code == 401  # actually gates
     auth_mod._internal_token_cache = None
+
+
+# ── CSRF: cookie-authed mutations must be same-origin (bearer path is immune) ──
+#
+# SameSite=Lax attaches the session cookie on same-SITE requests (a sibling origin
+# on another port/subdomain of the dashboard host), so a cookie alone is not proof
+# of same-origin intent. These assert the Sec-Fetch-Site (primary) + Origin
+# (fallback) same-origin check, fail-closed when neither signal is present.
+
+
+def _authed(client):
+    with client.session_transaction() as sess:
+        sess["authenticated"] = True
+
+
+def test_cookie_same_origin_sec_fetch_passes(client, monkeypatch):
+    _pw(monkeypatch)
+    _authed(client)
+    resp = client.post("/api/genesis/thing", headers={"Sec-Fetch-Site": "same-origin"})
+    assert resp.status_code == 200
+
+
+def test_cookie_sec_fetch_none_passes(client, monkeypatch):
+    # Sec-Fetch-Site: none = a direct user action (typed URL / bookmark), not a
+    # cross-origin ride — treated as safe per the OWASP fetch-metadata policy.
+    _pw(monkeypatch)
+    _authed(client)
+    resp = client.post("/api/genesis/thing", headers={"Sec-Fetch-Site": "none"})
+    assert resp.status_code == 200
+
+
+def test_cookie_same_site_sec_fetch_blocked(client, monkeypatch):
+    # The core threat: a same-site sibling origin riding the SameSite=Lax cookie.
+    _pw(monkeypatch)
+    _authed(client)
+    resp = client.post("/api/genesis/thing", headers={"Sec-Fetch-Site": "same-site"})
+    assert resp.status_code == 403
+
+
+def test_cookie_cross_site_sec_fetch_blocked(client, monkeypatch):
+    _pw(monkeypatch)
+    _authed(client)
+    resp = client.post("/api/genesis/thing", headers={"Sec-Fetch-Site": "cross-site"})
+    assert resp.status_code == 403
+
+
+def test_cookie_no_headers_fail_closed(client, monkeypatch):
+    # Neither Sec-Fetch-Site nor Origin — a cookie-authed mutation with no
+    # same-origin signal is refused (a real machine caller uses the bearer).
+    _pw(monkeypatch)
+    _authed(client)
+    assert client.post("/api/genesis/thing").status_code == 403
+
+
+def test_cookie_origin_fallback_matches_host(client, monkeypatch):
+    # No Sec-Fetch-Site (old browser) → Origin host must match the request Host.
+    _pw(monkeypatch)
+    _authed(client)
+    resp = client.post("/api/genesis/thing", headers={"Origin": "http://localhost"})
+    assert resp.status_code == 200
+
+
+def test_cookie_origin_fallback_mismatch_blocked(client, monkeypatch):
+    _pw(monkeypatch)
+    _authed(client)
+    resp = client.post("/api/genesis/thing", headers={"Origin": "http://evil.example"})
+    assert resp.status_code == 403
+
+
+def test_bearer_immune_to_cross_origin(client, monkeypatch):
+    # A valid internal bearer is CSRF-immune — origin headers must not block it.
+    _pw(monkeypatch)
+    token = auth_mod.get_or_create_internal_api_token()
+    resp = client.post(
+        "/api/genesis/thing",
+        headers={"Authorization": f"Bearer {token}", "Sec-Fetch-Site": "cross-site"},
+    )
+    assert resp.status_code == 200
+
+
+def test_csrf_not_enforced_when_kill_switch_off(client, monkeypatch):
+    _pw(monkeypatch)
+    monkeypatch.setenv("GENESIS_DASHBOARD_API_AUTH", "off")
+    _authed(client)
+    resp = client.post("/api/genesis/thing", headers={"Sec-Fetch-Site": "cross-site"})
+    assert resp.status_code == 200
 
 
 def test_agent_zero_adapter_applies_mutation_gate(monkeypatch):
