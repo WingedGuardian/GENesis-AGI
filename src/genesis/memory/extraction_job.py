@@ -670,7 +670,7 @@ async def _enqueue_procedure_rebuild(
             payload=json.dumps(
                 {"session_id": session_id, "cc_session_id": cc_session_id}
             ),
-            reason="procedure builder provider-exhausted; watermark already advanced",
+            reason="provider exhausted — auto-rebuild queued (self-healing; drains next extraction cycle)",
             staleness_policy=DRAIN,
         )
     except Exception:
