@@ -440,8 +440,8 @@ esac
 # Literal SHA256 pins — committed + review-gated. NOT fetched from the release's
 # SHA256SUMS: that is trust-on-first-use (a compromised release swaps binary AND
 # checksum in lockstep). Bump these deliberately whenever OCLI_VERSION changes.
-OCLI_SHA256_x64="6a29c598a789b57c92c03e560907d3f131a4bd0a068785b1d338a86fc31a58a7"
-OCLI_SHA256_arm64="c50298e4698fcd1b15fe1a0f096405ad260b5c84d4440882582d0bba1e57bd49"
+OCLI_SHA256_x64="6a29c598a789b57c92c03e560907d3f131a4bd0a068785b1d338a86fc31a58a7"  # pragma: allowlist secret  (public release checksum, not a secret)
+OCLI_SHA256_arm64="c50298e4698fcd1b15fe1a0f096405ad260b5c84d4440882582d0bba1e57bd49"  # pragma: allowlist secret  (public release checksum, not a secret)
 if [[ -z "$OCLI_ARCH" ]]; then
     echo "  OfficeCLI: unsupported arch $(uname -m) — skipping (deliverable-builder uses pandoc/CSV)"
 else
