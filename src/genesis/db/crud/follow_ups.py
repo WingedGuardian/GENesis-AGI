@@ -51,6 +51,7 @@ async def create(
     priority: str = "medium",
     pinned: bool = False,
     kind: str = "follow_up",
+    revisit_condition: str | None = None,
     domain: str | None = None,
     goal_id: str | None = None,
     dedup_key: str | None = None,
@@ -69,9 +70,9 @@ async def create(
     await db.execute(
         """INSERT INTO follow_ups
            (id, source, source_session, content, reason, strategy,
-            scheduled_at, status, priority, pinned, kind, domain, goal_id,
-            dedup_key, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+            scheduled_at, status, priority, pinned, kind, revisit_condition,
+            domain, goal_id, dedup_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             fid,
             source,
@@ -83,6 +84,7 @@ async def create(
             priority,
             int(pinned),
             kind,
+            revisit_condition.strip() if revisit_condition and revisit_condition.strip() else None,
             domain,
             goal_id,
             dedup_key,
@@ -370,14 +372,24 @@ async def get_summary_counts(
     db: aiosqlite.Connection,
     *,
     include_tabled: bool = True,
+    kind: str | None = None,
 ) -> dict[str, int]:
     """Get counts by status for dashboard badges.
 
     include_tabled defaults True (existing callers unchanged); pass False to
-    count only the actionable ``follow_up`` lane."""
-    kind_where = "" if include_tabled else "WHERE kind = 'follow_up' "
+    count only the actionable ``follow_up`` lane. When ``kind`` is set, count
+    ONLY that specific kind (overrides include_tabled) — so a lane like
+    ``'tabled'`` or ``'idea'`` is counted directly rather than by subtraction,
+    which would conflate the non-follow_up kinds once a third kind exists."""
+    if kind is not None:
+        kind_where = "WHERE kind = ? "
+        params: tuple = (kind,)
+    else:
+        kind_where = "" if include_tabled else "WHERE kind = 'follow_up' "
+        params = ()
     cursor = await db.execute(
-        f"SELECT status, COUNT(*) FROM follow_ups {kind_where}GROUP BY status"
+        f"SELECT status, COUNT(*) FROM follow_ups {kind_where}GROUP BY status",
+        params,
     )
     return {row[0]: row[1] for row in await cursor.fetchall()}
 
@@ -521,6 +533,45 @@ async def purge_completed(
     return cursor.rowcount
 
 
+async def _decay_stale(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    kind: str,
+    older_than_days: int,
+) -> int:
+    """Soft-decay stale NON-TERMINAL follow_ups of a ``(source, kind)`` lane.
+
+    A status flip (not a DELETE): every non-terminal row (``pending`` and —
+    defensively — ``blocked``/``in_progress``/``scheduled``) older than
+    *older_than_days* is flipped to ``completed`` with a decay note, so the
+    retention sweep (``purge_completed``) can later hard-delete it. Terminal
+    ``completed``/``failed`` rows already carry a ``completed_at`` and are the
+    purge sweep's job — excluding them keeps the two sweeps' responsibilities
+    disjoint (without this breadth a ``blocked`` marker would be immortal, skipped
+    by both). Shared by the inbox-marker and idea-lane decays.
+    """
+    older_than_days = max(1, older_than_days)
+    cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute(
+        "UPDATE follow_ups "
+        "SET status = 'completed', completed_at = ?, resolution_notes = ? "
+        "WHERE source = ? "
+        "AND kind = ? "
+        "AND status NOT IN ('completed', 'failed') "
+        "AND created_at < ?",
+        (
+            _now_iso(),
+            f"decayed: not promoted within {older_than_days}d",
+            source,
+            kind,
+            cutoff,
+        ),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def decay_stale_inbox_markers(
     db: aiosqlite.Connection,
     *,
@@ -533,34 +584,30 @@ async def decay_stale_inbox_markers(
     ego judgment (the ego has no authority to discard a user-curated marker). A
     marker that is never promoted eventually goes stale; this sweep ages such
     markers out by marking them ``completed`` with a decay note after
-    *older_than_days*.
-
-    This is a SOFT transition (a status flip, not a DELETE): the row is retained
-    and could be reactivated before the retention sweep (``purge_completed``)
-    eventually hard-deletes it. It targets every NON-TERMINAL tabled inbox
-    marker (``pending`` and — defensively — ``blocked``/``in_progress``/
-    ``scheduled`` a marker could be moved into via the cockpit/ego): terminal
-    ``completed``/``failed`` rows already carry a ``completed_at`` and are reaped
-    by ``purge_completed``, so excluding them here keeps the two sweeps'
-    responsibilities disjoint. Without this breadth a ``blocked`` tabled marker
-    would be immortal — decay (pending-only) and purge (completed/failed-only)
-    would both skip it. Non-inbox / non-tabled follow-ups are left untouched.
+    *older_than_days*. Non-inbox / non-tabled follow-ups are left untouched.
 
     Returns the number of markers decayed.
     """
-    older_than_days = max(1, older_than_days)
-    cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
-    cursor = await db.execute(
-        "UPDATE follow_ups "
-        "SET status = 'completed', completed_at = ?, resolution_notes = ? "
-        "WHERE source = 'inbox_evaluation' "
-        "AND kind = 'tabled' "
-        "AND status NOT IN ('completed', 'failed') "
-        "AND created_at < ?",
-        (_now_iso(), f"decayed: not promoted within {older_than_days}d", cutoff),
+    return await _decay_stale(
+        db, source="inbox_evaluation", kind="tabled", older_than_days=older_than_days
     )
-    await db.commit()
-    return cursor.rowcount
+
+
+async def decay_stale_ideas(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 45,
+) -> int:
+    """Soft-decay un-triaged staged-ideation ideas (``source='surplus_ideation'``,
+    ``kind='idea'``) never converted to an actionable follow-up or dismissed — so
+    the review lane doesn't grow unbounded. Same soft-flip → ``purge_completed``
+    reap lifecycle as the inbox marker decay.
+
+    Returns the number of ideas decayed.
+    """
+    return await _decay_stale(
+        db, source="surplus_ideation", kind="idea", older_than_days=older_than_days
+    )
 
 
 async def get_recently_completed(
@@ -600,7 +647,7 @@ async def get_recently_completed(
 # dashboard Follow-ups tab). Pure data layer; kept here alongside the table.
 # ---------------------------------------------------------------------------
 
-_VALID_KIND = {"follow_up", "tabled"}
+_VALID_KIND = {"follow_up", "tabled", "idea"}
 _VALID_DOMAIN = {"internal", "user_world"}
 _VALID_PRIORITY = {"low", "medium", "high", "critical"}
 _VALID_STATUS = {
@@ -611,6 +658,19 @@ _VALID_STATUS = {
     "failed",
     "blocked",
 }
+
+# Work-state → lane derivation. The MCP follow_up_create/update handlers take a
+# `work_state` (the item's actual state) and DERIVE `kind`, so priority can't leak
+# into the hot(follow_up)/cold(tabled) lane choice. `blocked_on_trigger` additionally
+# requires a `revisit_condition` (the trigger being waited on). See CC memory
+# followup_kind_conflation. Enforced at the MCP handler (judgment callers); rule-based
+# programmatic callers (e.g. inbox WATCH/BOOKMARK markers) set `kind` directly.
+WORK_STATE_TO_KIND = {
+    "ready": "follow_up",
+    "blocked_on_trigger": "follow_up",
+    "deferred_cold": "tabled",
+}
+VALID_WORK_STATE = frozenset(WORK_STATE_TO_KIND)
 
 # Allowlisted sort keys → ORDER BY fragment (never interpolate caller input).
 # Every fragment floats pinned rows to the top (pinned is a "keep visible"
@@ -650,6 +710,24 @@ async def set_kind(db: aiosqlite.Connection, id: str, kind: str) -> bool:
     cursor = await db.execute(
         "UPDATE follow_ups SET kind = ? WHERE id = ?",
         (kind, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def set_revisit_condition(
+    db: aiosqlite.Connection, id: str, revisit_condition: str | None
+) -> bool:
+    """Set/clear a follow-up's revisit_condition — the trigger that resurfaces a
+    tabled item or the event a blocked follow_up waits on. None/whitespace clears it.
+
+    Targeted single-column write (mirrors set_kind/set_pinned): never a
+    read-modify-write of the row, so it can't reopen the #1198 lost-update race.
+    """
+    value = revisit_condition.strip() if revisit_condition and revisit_condition.strip() else None
+    cursor = await db.execute(
+        "UPDATE follow_ups SET revisit_condition = ? WHERE id = ?",
+        (value, id),
     )
     await db.commit()
     return cursor.rowcount > 0

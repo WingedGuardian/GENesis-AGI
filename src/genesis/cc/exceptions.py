@@ -35,6 +35,24 @@ class CCMCPError(CCError):
         self.server_name = server_name
 
 
+class CCNetworkOfflineError(CCError):
+    """The network is hard-OFFLINE and the CC endpoint needs the internet.
+
+    Raised by the CCInvoker's pre-spawn network preflight (PR-3 outage
+    resilience) when the connectivity sentinel reports a fresh OFFLINE state,
+    the parking lever is ``live``, and the target endpoint classifies as WAN
+    (Anthropic's API, or any non-LAN provider). It fires *before* the subprocess
+    is spawned, so a dead-network dispatch fails in well under a second instead
+    of hanging up to ``CCInvocation.timeout_s`` (7200s default) — the 45-55min
+    hangs observed in the 2026-07-28 outage.
+
+    A ``CCError`` subclass so every existing terminal handler already catches it;
+    it is added to conversation.py's fast-re-raise tuples so a resume turn does
+    NOT mis-treat it as a stale-resume failure (which would needlessly fail a
+    live CC session).
+    """
+
+
 class _CCLimitError(CCError):
     """Shared base for rate-limit / quota errors — carries the reset signal.
 

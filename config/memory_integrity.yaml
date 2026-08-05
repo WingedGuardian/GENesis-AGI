@@ -1,29 +1,44 @@
-# Memory integrity Phase 0 — "make silence loud".
+# Memory integrity — Phase 0 detection ("make silence loud") + Phase 1 repair.
 #
-# Two scheduled read-only jobs consult this file (merged with
+# The scheduled jobs consult this file (merged with
 # ~/.genesis/config/memory_integrity.local.yaml) on EVERY run, so a
 # settings_update("memory_integrity", {...}) or hand edit takes effect at the
 # next scheduled run — no restart:
-#   - memory_consistency_check (03:50 local) — verifies memory_metadata <-> Qdrant
-#     <-> memory_fts agree.
 #   - recall_health_probe (03:20 local) — runs an install-local golden query set
 #     through the real recall pipeline and tracks hit-rate / rank drift.
+#   - memory_consistency_check (03:50 local) — verifies memory_metadata <-> Qdrant
+#     <-> memory_fts agree.
+#   - memory_reconcile (04:40 local, mode=active only) — repairs aged cross-store
+#     drift: deletes orphaned "ghost" vectors (payloads exported first) and
+#     re-queues "lying mirror" memories so their vectors are rebuilt.
 #
-# Master switch: false stops both jobs before any work.
+# Master switch: false stops all jobs before any work.
 enabled: true
 
 # Mode: off | passive | active
 #   off     — jobs do not run.
-#   passive — (default) run the read-only checks and surface findings (persist +
-#             posture alert + dashboard tile). NEVER repairs. All of Phase 0.
-#   active  — RESERVED for Phase 1 (write-path/reconcile repair). Not yet
-#             implemented; coerced to passive with a warning.
-# An invalid value degrades to passive (still observing) — never a silent off.
-mode: passive
+#   passive — read-only checks + surfacing only (persist + posture alert +
+#             dashboard tile). NEVER repairs.
+#   active  — (default) passive + the nightly reconcile repair job (tombstone
+#             drain, ghost delete with payload export, mirror re-queue).
+#             Repair is serialized against deletes from every process: the
+#             per-memory-id lock in-process, delete-intent tombstones + the
+#             atomic requeue guard cross-process. Opt out with `mode: passive`.
+# An invalid value degrades to passive (still observing, never repairing) —
+# never a silent off.
+mode: active
+
+# ── reconcile repair lane (mode=active only) ─────────────────────────────
+repair_min_age_seconds: 3600  # never touch an offender younger than this (in-flight writes)
+max_repairs_per_run: 500      # per-run work cap; hitting it sets capped=1 on the run row
 
 # ── consistency checker ──────────────────────────────────────────────────
 sample_fraction: 1.0        # 1.0 = exact full scan (a few seconds at ~30k memories)
-max_points: 500000          # Qdrant scroll budget; exceeding it sets truncated=1
+max_points: 500000          # Qdrant scroll budget; exceeding it sets truncated=1.
+                            # NOTE: the reconcile lane skips MIRROR repair on any
+                            # run that truncates (can't prove vector absence from a
+                            # partial point set), so a corpus above this cap leaves
+                            # lying mirrors unrepaired — raise it if you outgrow it.
 severe_min_count: 5         # lying_mirror + fts_invisible >= this → degraded
 pollution_min_count: 50     # ghost/unexpected/deprecated floor
 pollution_fraction: 0.01    # ...or this fraction of the corpus, whichever is higher

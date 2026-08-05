@@ -23,8 +23,10 @@ def _reset_mi_table_cache():
     from genesis.db.crud import memory_integrity as _mi
 
     _mi._tables_verified = False
+    _mi._reconcile_table_verified = False
     yield
     _mi._tables_verified = False
+    _mi._reconcile_table_verified = False
 
 
 @dataclass

@@ -34,7 +34,7 @@ from pathlib import Path
 _DB_PATH = Path(
     os.environ.get("GENESIS_DB_PATH", "")
     or Path.home() / "genesis" / "data" / "genesis.db"
-)
+).expanduser()  # honor ~/... overrides like genesis.env.genesis_db_path()
 
 # Markers in tool_output that indicate an Edit failure surfaced in a
 # nominally-successful call (defensive; hard failures arrive via

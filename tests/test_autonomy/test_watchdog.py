@@ -85,6 +85,9 @@ def _make_checker(
         secrets_path=str(secrets_path or tmp_path / "secrets.env"),
         state_file=str(tmp_path / "watchdog_state.json"),
         stabilization_s=kwargs.get("stabilization_s", 600),
+        flap_window_s=kwargs.get("flap_window_s", 21600),
+        flap_threshold=kwargs.get("flap_threshold", 3),
+        flap_backoff_max_s=kwargs.get("flap_backoff_max_s", 7200),
     )
 
 
@@ -126,6 +129,109 @@ class TestDeployInProgress:
         # guard adds zero behavior change outside a deploy window.
         checker = _make_checker(tmp_path, stale_status)
         assert checker.check() is WatchdogAction.RESTART
+
+
+class TestFlapDamping:
+    """Slow recurring same-reason restarts (spaced beyond the stabilization
+    window, so consecutive_failures keeps resetting) must eventually back off and
+    surface a warning, instead of restarting forever (2026-07 outage: 25x/12h)."""
+
+    def _seed(self, count, reason="zombie_scheduler", age_s=5):
+        now = time.time()
+        return {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [{"ts": now - age_s, "reason": reason} for _ in range(count)],
+        }
+
+    def test_backs_off_after_threshold(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        assert (
+            checker._restart_if_allowed(self._seed(3), reason="zombie_scheduler")
+            is WatchdogAction.BACKOFF
+        )
+
+    def test_below_threshold_still_restarts(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        assert (
+            checker._restart_if_allowed(self._seed(2), reason="zombie_scheduler")
+            is WatchdogAction.RESTART
+        )
+
+    def test_different_reasons_dont_cross_count(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        now = time.time()
+        state = {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [
+                {"ts": now - 5, "reason": "zombie_scheduler"},
+                {"ts": now - 5, "reason": "zombie_scheduler"},
+                {"ts": now - 5, "reason": "stale_status_restart"},
+            ],
+        }
+        assert (
+            checker._restart_if_allowed(state, reason="zombie_scheduler")
+            is WatchdogAction.RESTART
+        )
+
+    def test_history_pruned_past_window(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(
+            tmp_path, stale_status, flap_threshold=3, flap_window_s=100, backoff_max_s=10
+        )
+        now = time.time()
+        state = {
+            "consecutive_failures": 0,
+            "next_attempt_after": None,
+            "restart_history": [
+                {"ts": now - 500, "reason": "zombie_scheduler"},  # outside 100s window
+                {"ts": now - 5, "reason": "zombie_scheduler"},
+                {"ts": now - 5, "reason": "zombie_scheduler"},
+            ],
+        }
+        assert (
+            checker._restart_if_allowed(state, reason="zombie_scheduler")
+            is WatchdogAction.RESTART
+        )
+
+    def test_alert_enqueued_once_on_flap(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3, backoff_max_s=10)
+        with patch("genesis.guardian.alert.queue.enqueue_alert") as mock_alert:
+            checker._restart_if_allowed(self._seed(3), reason="zombie_scheduler")
+        mock_alert.assert_called_once()
+        assert mock_alert.call_args.kwargs["dedupe_key"] == "watchdog:flap:zombie_scheduler"
+        assert mock_alert.call_args.kwargs["severity"] == "warning"
+
+    def test_record_failure_appends_history(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status)
+        state = {"consecutive_failures": 0, "restart_history": []}
+        checker._record_failure(state, reason="zombie_scheduler")
+        assert len(state["restart_history"]) == 1
+        assert state["restart_history"][0]["reason"] == "zombie_scheduler"
+
+    def test_reset_state_preserves_history(self, tmp_path: Path, fresh_status: Path):
+        checker = _make_checker(tmp_path, fresh_status, stabilization_s=0)
+        state_file = tmp_path / "watchdog_state.json"
+        now = time.time()
+        state_file.write_text(
+            json.dumps({
+                "consecutive_failures": 3,
+                "last_restart_at": now - 1000,
+                "restart_history": [{"ts": now - 10, "reason": "zombie_scheduler"}],
+            })
+        )
+        checker.check()
+        state = json.loads(state_file.read_text())
+        assert state["consecutive_failures"] == 0  # healthy reset
+        assert len(state["restart_history"]) == 1  # but history preserved
+
+    def test_legacy_state_without_history_ok(self, tmp_path: Path, stale_status: Path):
+        checker = _make_checker(tmp_path, stale_status, flap_threshold=3)
+        action = checker._restart_if_allowed(
+            {"consecutive_failures": 0, "next_attempt_after": None},
+            reason="zombie_scheduler",
+        )
+        assert action is WatchdogAction.RESTART  # no restart_history key → no crash
 
 
 class TestHealthy:
@@ -620,3 +726,78 @@ class TestRestartBridge:
         with patch.object(wd.subprocess, "run", side_effect=[inactive, active]), \
                 patch.object(wd.time, "sleep"):
             assert wd._wait_until_active("genesis-server.service", timeout_s=30) is True
+
+
+class TestNetworkSuppression:
+    """PR-2: zombie-restart suppression during a network outage (F4/F7).
+
+    Unit-tests the guard directly: it must suppress ONLY on a FRESH degraded/
+    offline probe, and fail toward restart on absent / stale / normal / garbled
+    connectivity — the safety-critical over-suppression path.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fixed_tuning(self, monkeypatch):
+        # Pin the staleness threshold (3× steady = 360s) so the fresh/stale
+        # boundary is independent of any local resilience.yaml overlay.
+        from genesis.resilience import network_config
+
+        monkeypatch.setattr(
+            network_config, "structural",
+            lambda cfg=None: network_config.NetworkTuning(
+                dns_tcp_anchors=("a",), ip_anchors=("b",), probe_port=443,
+                probe_timeout_s=3, fast_cadence_s=20, steady_cadence_s=120,
+                offline_all_fail_rounds=2, online_clean_rounds=3,
+                stable_online_s=300, merge_gap_s=600,
+            ),
+        )
+
+    def _checker(self, tmp_path: Path, fresh_status: Path) -> WatchdogChecker:
+        return _make_checker(tmp_path, fresh_status)
+
+    def _net(self, state: str, *, age_s: float) -> dict:
+        ts = (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat()
+        return {"state": state, "last_probe_at": ts}
+
+    def test_fresh_offline_suppresses(self, tmp_path: Path, fresh_status: Path):
+        c = self._checker(tmp_path, fresh_status)
+        assert c._network_suppresses_restart({"network": self._net("OFFLINE", age_s=10)}) is True
+
+    def test_fresh_degraded_suppresses(self, tmp_path: Path, fresh_status: Path):
+        c = self._checker(tmp_path, fresh_status)
+        assert c._network_suppresses_restart({"network": self._net("DEGRADED", age_s=10)}) is True
+
+    def test_fresh_normal_does_not_suppress(self, tmp_path: Path, fresh_status: Path):
+        c = self._checker(tmp_path, fresh_status)
+        assert c._network_suppresses_restart({"network": self._net("NORMAL", age_s=10)}) is False
+
+    def test_absent_network_does_not_suppress(self, tmp_path: Path, fresh_status: Path):
+        c = self._checker(tmp_path, fresh_status)
+        assert c._network_suppresses_restart({}) is False
+
+    def test_stale_offline_does_not_suppress(self, tmp_path: Path, fresh_status: Path):
+        # F4: a dead sentinel freezes the field OFFLINE while the status-writer
+        # keeps the file fresh — must NOT strand a wedged server unrestarted.
+        c = self._checker(tmp_path, fresh_status)
+        assert c._network_suppresses_restart(
+            {"network": self._net("OFFLINE", age_s=10_000)}
+        ) is False
+
+    def test_garbled_timestamp_does_not_suppress(self, tmp_path: Path, fresh_status: Path):
+        c = self._checker(tmp_path, fresh_status)
+        assert c._network_suppresses_restart(
+            {"network": {"state": "OFFLINE", "last_probe_at": "nonsense"}}
+        ) is False
+
+    def test_missing_timestamp_does_not_suppress(self, tmp_path: Path, fresh_status: Path):
+        c = self._checker(tmp_path, fresh_status)
+        assert c._network_suppresses_restart({"network": {"state": "OFFLINE"}}) is False
+
+    def test_future_timestamp_does_not_suppress(self, tmp_path: Path, fresh_status: Path):
+        # Codex F6: a future last_probe_at (clock skew / bad data) yields negative
+        # age — must fail toward restart, not suppress.
+        c = self._checker(tmp_path, fresh_status)
+        future = (datetime.now(UTC) + timedelta(seconds=300)).isoformat()
+        assert c._network_suppresses_restart(
+            {"network": {"state": "OFFLINE", "last_probe_at": future}}
+        ) is False

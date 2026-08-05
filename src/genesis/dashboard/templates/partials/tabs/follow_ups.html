@@ -14,7 +14,7 @@
       <div class="panel-body">
         <!-- Tier toggle: follow_up | tabled | all -->
         <div style="display:flex; gap:0.25rem; margin-bottom:0.6rem; align-items:center; flex-wrap:wrap;">
-          <template x-for="tier in [{k:'follow_up',l:'Follow-ups'},{k:'tabled',l:'Tabled'},{k:'',l:'All'}]" :key="tier.l">
+          <template x-for="tier in [{k:'follow_up',l:'Follow-ups'},{k:'tabled',l:'Tabled'},{k:'idea',l:'Ideas'},{k:'',l:'All'}]" :key="tier.l">
             <button style="font-size:0.7rem; padding:0.2rem 0.7rem; border-radius:3px; cursor:pointer; border:1px solid #555;"
                     :style="$store.genesisDashboard.cockpitFilters.kind === tier.k ? 'background:rgba(33,150,243,0.18); color:#2196F3; border-color:rgba(33,150,243,0.4); font-weight:600;' : 'background:transparent; color:var(--color-text-secondary);'"
                     @click="$store.genesisDashboard.cockpitFilters.kind = tier.k; $store.genesisDashboard.cockpitApplyFilter()"
@@ -173,6 +173,11 @@
                       <strong>Reason:</strong> <span x-text="item.reason"></span>
                     </div>
                   </template>
+                  <template x-if="item.revisit_condition">
+                    <div style="margin-bottom:0.3rem; color:var(--color-text-secondary); font-size:0.68rem;">
+                      <strong>Revisit when:</strong> <span x-text="item.revisit_condition"></span>
+                    </div>
+                  </template>
                   <div style="display:flex; gap:0.5rem; font-size:0.62rem; color:var(--color-text-secondary); flex-wrap:wrap; margin-bottom:0.4rem;">
                     <span x-text="'Strategy: ' + (item.strategy || 'unknown')"></span>
                     <span x-text="'Source: ' + (item.source || 'unknown')"></span>
@@ -208,7 +213,7 @@
                     </select>
                     <button x-show="item.kind !== 'tabled'" @click.stop="$store.genesisDashboard.cockpitMoveKind(item.id, 'tabled')"
                             style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(149,117,205,0.1); color:#9575cd; border:1px solid rgba(149,117,205,0.25);">→ Tabled</button>
-                    <button x-show="item.kind === 'tabled'" @click.stop="$store.genesisDashboard.cockpitMoveKind(item.id, 'follow_up')"
+                    <button x-show="item.kind !== 'follow_up'" @click.stop="$store.genesisDashboard.cockpitMoveKind(item.id, 'follow_up')"
                             style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);">→ Follow-up</button>
                     <select @click.stop
                             @change.stop="$store.genesisDashboard.cockpitSetDomain(item.id, $event.target.value); $event.target.selectedIndex=0;"

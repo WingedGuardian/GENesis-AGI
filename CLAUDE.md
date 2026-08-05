@@ -7,7 +7,7 @@ Genesis v3 is an autonomous AI agent system.
 Channels (Telegram, Dashboard, OpenClaw) → Cognitive Core (CCInvoker, triage,
 reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
 (SQLite WAL, Qdrant, ~/.genesis/) → Observability (event bus, health).
-89 packages, ~192K LOC. Use `codebase_navigate` MCP to explore.
+Use `codebase_navigate` MCP to explore.
 
 ## Environment
 
@@ -370,13 +370,20 @@ When a user shares a file path or URL in conversation:
   derail this session — or the user directs it as separate. Otherwise do it
   now, even if unrelated/unasked; "already noted in a PR/comment" is not a
   reason to also create a row. Valid ones: create via `follow_up_create` MCP,
-  never leave as just text. **Two lanes** (`kind` on a follow-up): `follow_up`
-  = committed work, actionable, dispatched/surfaced (the FIX-NOW-or-valid-defer
-  cases above); `tabled` = an awareness record — "tracked, keep a record, not
-  acting near-term" — bug-tracker semantics, never dispatched or surfaced as
-  action. Genuine someday/maybe and deferred known bugs go to `tabled`, not a
-  `follow_up` row. (Inbox WATCH/BOOKMARK markers auto-route to `tabled` and
-  soft-decay after 60d.)
+  never leave as just text. **`follow_up_create` takes a `work_state`, not a raw
+  lane** — declare the item's state and the tool DERIVES the lane, so priority
+  never decides it. It is an INTENT/tractability axis, NOT priority (a low-priority
+  item you still intend to do is `ready`, never `deferred_cold`):
+  `ready` (actionable now, just needs doing) and `blocked_on_trigger` (intended,
+  waiting on a specific time/event — REQUIRES a `revisit_condition`) → the HOT
+  `follow_up` lane (committed, actionable, dispatched/surfaced — the
+  FIX-NOW-or-valid-defer cases above); `deferred_cold` (consciously NOT pursuing
+  near-term — vague/hard/someday) → the COLD `tabled` lane (an awareness record,
+  bug-tracker semantics, never dispatched or surfaced). Genuine someday/maybe and
+  deferred known bugs are `deferred_cold`, not the hot lane. (`follow_up_update`
+  moves lanes via the same `work_state` — there is no raw-`kind` lane override on
+  either surface, so priority can't pick the lane on update either. Inbox
+  WATCH/BOOKMARK markers auto-route to `tabled` and soft-decay after 60d.)
 - **No laziness.** Find root causes. No temporary fixes. No shortcuts.
   Don't EVER mute the symptom — fix the problem.
 - **Read before writing.** Never modify code you haven't fully read.
@@ -386,8 +393,8 @@ When a user shares a file path or URL in conversation:
 - **NEVER hide broken things — FIX THEM.** Fix the root cause, not the
   symptom. This is a thinking rule, not just a code rule.
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
-  bug you consciously defer becomes a `tabled` record (bug-tracker lane above),
-  never a silent drop.
+  bug you consciously defer becomes a `tabled` record (`work_state="deferred_cold"`,
+  bug-tracker lane above), never a silent drop.
 - **Data repair is not a fix.** If a mechanism failed to write or propagate
   something, hand-writing the missing artifact (memory, directive, row, flag)
   repairs ONE instance on ONE install. Label it "data repair", and fix the

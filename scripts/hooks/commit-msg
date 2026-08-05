@@ -1,17 +1,47 @@
 #!/bin/bash
 # Genesis commit-msg hook — block private infrastructure details in commit messages.
 #
-# Patterns match install-specific IPs, personal email, AWS account IDs,
-# and private hostnames. Covers the gap that gitleaks (file-content only)
-# does not scan commit messages.
+# Two layers, mirroring the contribution sanitizer:
+#   1. Generic RFC1918 / CGNAT / IPv6-ULA address CLASSES — never this install's
+#      literal values (a tracked scanner must not name what it redacts). Doc
+#      examples should use the RFC 5737 ranges (192.0.2.x / 198.51.100.x /
+#      203.0.113.x), which are deliberately NOT matched.
+#   2. This install's EXACT non-classable identifiers (private repo/host names,
+#      hardware, tokens) read from the local release-fingerprint file when
+#      present — zero private bytes are tracked in this file.
+# Covers the gap that gitleaks (file-content only) does not scan commit messages.
 
-PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:|046056[0-9]{6}|moonandstar|zorror|assistant1'
+MSG_FILE="$1"
 
-if grep -qE "$PATTERNS" "$1"; then
+# Layer 1 — address classes. Kept byte-identical to scripts/check_portability.sh
+# and sanitize.py _PORTABILITY_PATTERNS (a drift test asserts parity). Uses
+# [0-9] so it is valid ERE for grep -E.
+CLASS_PATTERNS='\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b|\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b|\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b[fF][cdCD][0-9a-fA-F]{2}:'
+
+blocked=0
+
+if grep -qE "$CLASS_PATTERNS" "$MSG_FILE"; then
     echo ""
-    echo "BLOCKED: Commit message contains private infrastructure details."
-    echo ""
-    grep -nE "$PATTERNS" "$1"
+    echo "BLOCKED: Commit message contains a private-range network address."
+    grep -nE "$CLASS_PATTERNS" "$MSG_FILE"
+    blocked=1
+fi
+
+# Layer 2 — exact install fingerprints (local file; comment/blank lines stripped
+# so grep -E -f receives pure ERE patterns). Report line numbers only — never
+# echo which fingerprint matched (the matched text is the private value).
+FP_FILE="${GENESIS_RELEASE_FINGERPRINTS:-$HOME/.genesis/release-fingerprints.txt}"
+if [ -f "$FP_FILE" ]; then
+    FP_PATTERNS="$(grep -vE '^[[:space:]]*(#|$)' "$FP_FILE" || true)"
+    if [ -n "$FP_PATTERNS" ] && printf '%s\n' "$FP_PATTERNS" | grep -qE -f - "$MSG_FILE"; then
+        echo ""
+        echo "BLOCKED: Commit message contains an install-specific private identifier."
+        printf '%s\n' "$FP_PATTERNS" | grep -nE -f - "$MSG_FILE" | cut -d: -f1 | sort -un | sed 's/^/  line /'
+        blocked=1
+    fi
+fi
+
+if [ "$blocked" -eq 1 ]; then
     echo ""
     echo "Remove private IPs, hostnames, or account IDs from the commit message."
     echo "If this is a false positive, commit with --no-verify (but think twice)."

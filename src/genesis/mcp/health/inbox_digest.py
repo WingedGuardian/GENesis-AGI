@@ -66,14 +66,22 @@ async def _impl_inbox_digest(
         # 3. Recent completed evaluations
         evals = await inbox_crud.get_recent_completed(db, days=days)
 
+        # 4. Pending ideas (surplus-ideation review lane, WS-M PR-2). The same
+        # review spine as inbox follow-ups, filtered to the 'idea' kind.
+        ideas = await fu_crud.query_page(
+            db, kind="idea", source="surplus_ideation", status="pending", limit=25,
+        )
+
         # Build formatted output
-        formatted = _format_digest(pending, resolved, evals, days)
+        formatted = _format_digest(pending, resolved, evals, days, ideas)
 
         # Summary line
         parts = [f"{len(pending)} pending"]
         if resolved:
             parts.append(f"{len(resolved)} resolved")
         parts.append(f"{len(evals)} evaluated")
+        if ideas:
+            parts.append(f"{len(ideas)} ideas")
         summary = f"Inbox digest ({days}d): {', '.join(parts)}"
 
         return {
@@ -81,6 +89,7 @@ async def _impl_inbox_digest(
             "pending_follow_ups": pending,
             "resolved_follow_ups": resolved,
             "recent_evaluations": evals,
+            "pending_ideas": ideas,
             "formatted": formatted,
         }
     except Exception as exc:
@@ -93,8 +102,10 @@ def _format_digest(
     resolved: list[dict],
     evals: list[dict],
     days: int,
+    ideas: list[dict] | None = None,
 ) -> str:
     """Format digest data into markdown tables."""
+    ideas = ideas or []
     lines = [f"## Inbox Digest — Last {days} Days", ""]
 
     # Pending action items
@@ -108,6 +119,18 @@ def _format_digest(
             content = fu.get("content", "")[:120]
             strategy = fu.get("strategy", "")
             lines.append(f"| {priority} | {content} | {strategy} |")
+        lines.append("")
+
+    # Pending ideas (surplus-ideation review lane)
+    if ideas:
+        lines.append(f"### Pending Ideas ({len(ideas)} items)")
+        lines.append("")
+        lines.append("| Idea | Source |")
+        lines.append("|------|--------|")
+        for fu in ideas:
+            content = fu.get("content", "")[:120]
+            src = fu.get("source", "")
+            lines.append(f"| {content} | {src} |")
         lines.append("")
 
     # Resolved items
@@ -142,7 +165,7 @@ def _format_digest(
             lines.append(f"| {date} | {source_file} | {response} |")
         lines.append("")
 
-    if not pending and not resolved and not evals:
+    if not pending and not resolved and not evals and not ideas:
         lines.append("No inbox activity in this period.")
         lines.append("")
 

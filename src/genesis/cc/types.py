@@ -371,8 +371,8 @@ def cc_project_key(working_dir: str) -> str:
     CC names each project's transcript directory under
     ``~/.claude/projects/`` by replacing every non-alphanumeric character
     in the absolute path with ``-`` (consecutive separators are NOT
-    collapsed).  e.g. ``/home/u/.genesis/background-sessions`` →
-    ``-home-u--genesis-background-sessions`` (the ``/.`` becomes ``--``).
+    collapsed).  e.g. ``/home/USER/.genesis/background-sessions`` →
+    ``-home-USER--genesis-background-sessions`` (the ``/.`` becomes ``--``).
 
     Replicating the FULL encoding (not just ``/`` → ``-``) matters because
     the background-session dir is ``~/.genesis/...``: the leading dot must

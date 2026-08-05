@@ -135,15 +135,19 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     "memory_integrity": SettingsDomain(
         name="memory_integrity",
         description=(
-            "Memory integrity Phase 0 (make silence loud) — master `enabled` "
-            "+ `mode` off/passive/active plus checker/probe knobs. Passive "
-            "(default) runs two read-only jobs: a cross-backend consistency "
-            "check (memory_metadata <-> Qdrant <-> memory_fts) and a recall-"
-            "health probe over an install-local golden set, surfacing findings "
-            "via a posture alert + dashboard tile. `active` is reserved for "
-            "Phase 1 repair (coerced to passive). Read live per run — takes "
-            "effect next scheduled run. Kill switch: "
-            "GENESIS_MEMORY_INTEGRITY_DISABLED=1."
+            "Memory integrity — master `enabled` + `mode` off/passive/active "
+            "plus checker/probe/repair knobs. Passive runs two read-only jobs: "
+            "a cross-backend consistency check (memory_metadata <-> Qdrant <-> "
+            "memory_fts) and a recall-health probe over an install-local golden "
+            "set, surfacing findings via a posture alert + dashboard tile. "
+            "Active (default) adds the Phase-1 nightly reconcile job that "
+            "drains delete-intent tombstones and repairs aged drift (ghost "
+            "vectors deleted with payload export; lying mirrors re-queued for "
+            "re-embed) — knobs repair_min_age_seconds / max_repairs_per_run. "
+            "Repair is serialized against deletes from every process (per-id "
+            "lock in-process; tombstones + atomic requeue guard "
+            "cross-process). Read live per run — takes effect next scheduled "
+            "run. Kill switch: GENESIS_MEMORY_INTEGRITY_DISABLED=1."
         ),
         config_filename="memory_integrity.yaml",
         readonly=False,
@@ -236,6 +240,20 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="ego_reconcile.yaml",
         readonly=False,
         needs_restart=False,  # re-read every ego cycle
+    ),
+    "surplus_ideation_promotion": SettingsDomain(
+        name="surplus_ideation_promotion",
+        description=(
+            "Surplus ideation → follow_ups 'idea' review lane promotion (WS-M PR-2). "
+            "master `enabled` + `cap_per_run`. When on, the surplus maintenance GC "
+            "graduates pending staged brainstorm ideas into the cockpit 'idea' lane, "
+            "capped per pass (FIFO). off (or env "
+            "GENESIS_SURPLUS_IDEATION_PROMOTION_DISABLED=1) stops promotion — staged "
+            "ideas just TTL-decay. Read live each GC pass — no restart."
+        ),
+        config_filename="surplus_ideation_promotion.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read every GC pass
     ),
     "voice_act": SettingsDomain(
         name="voice_act",
@@ -537,7 +555,7 @@ def _validate_tts(changes: dict) -> list[str]:
 def _validate_resilience(changes: dict) -> list[str]:
     """Validate resilience config changes."""
     errors: list[str] = []
-    valid_top_keys = {"flapping", "recovery", "cc", "status", "notifications"}
+    valid_top_keys = {"flapping", "recovery", "cc", "status", "notifications", "network"}
 
     for key in changes:
         if key not in valid_top_keys:
@@ -563,6 +581,28 @@ def _validate_resilience(changes: dict) -> list[str]:
     if isinstance(cc, dict):
         _validate_positive_int(cc, "max_sessions_per_hour", errors)
         _validate_float_range(cc, "throttle_threshold_pct", 0.0, 1.0, errors)
+
+    network = changes.get("network", {})
+    if isinstance(network, dict):
+        from genesis.resilience.network_config import BACKUP_RETRY_MODES, PARKING_MODES
+
+        pm = network.get("parking_mode")
+        if pm is not None and pm not in PARKING_MODES:
+            errors.append(f"network.parking_mode must be one of {PARKING_MODES}")
+        bpr = network.get("backup_push_retry")
+        if bpr is not None and bpr not in BACKUP_RETRY_MODES:
+            errors.append(f"network.backup_push_retry must be one of {BACKUP_RETRY_MODES}")
+        for field in (
+            "probe_port",
+            "probe_timeout_s",
+            "fast_cadence_s",
+            "steady_cadence_s",
+            "offline_all_fail_rounds",
+            "online_clean_rounds",
+            "stable_online_s",
+            "merge_gap_s",
+        ):
+            _validate_positive_int(network, field, errors)
 
     return errors
 
@@ -1238,8 +1278,30 @@ def _validate_memory_integrity(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_surplus_ideation_promotion(changes: dict) -> list[str]:
+    """Validate surplus ideation-promotion lever changes (see
+    genesis.surplus.promotion_config). Runtime already fails safe (disabled on a
+    bad `enabled`, default cap on a bad knob); this rejects bad WRITES so
+    settings_update reports the error instead of silently persisting e.g.
+    `enabled: "false"` (truthy) or a zero cap."""
+    from genesis.surplus.promotion_config import INT_KNOBS
+
+    errors: list[str] = []
+    valid_keys = ("enabled", *INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego_reconcile": _validate_ego_reconcile,
+    "surplus_ideation_promotion": _validate_surplus_ideation_promotion,
     "memory_integrity": _validate_memory_integrity,
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,

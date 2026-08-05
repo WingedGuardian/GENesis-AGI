@@ -286,6 +286,15 @@ async def test_memory_core_facts_drops_external_dispatched_enforce(
             payload["origin_class"] = origin
         return SimpleNamespace(id=mid, payload=payload)
 
+    # Scrolled points need metadata rows — metadata-less points are ghosts and
+    # the core_facts ghost filter drops them before the gate under test runs.
+    for _mid in ("ext-1", "fp-1"):
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+            (_mid, "2026-01-01T00:00:00+00:00"),
+        )
+    await db.commit()
+
     qdrant = MagicMock()
     qdrant.scroll.return_value = (
         [
@@ -332,6 +341,11 @@ async def test_memory_core_facts_enriches_legacy_payload_from_sqlite(
     await db.execute(
         "INSERT INTO memory_metadata (memory_id, created_at, origin_class) VALUES (?, ?, ?)",
         ("legacy-ext", "2026-01-01T00:00:00+00:00", "external_untrusted"),
+    )
+    # fp-1 needs a metadata row too — the ghost filter drops metadata-less points.
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+        ("fp-1", "2026-01-01T00:00:00+00:00"),
     )
     await db.commit()
 
@@ -952,6 +966,14 @@ async def test_memory_core_facts_refills_after_enforced_drops(config_dirs, monke
         if origin is not None:
             payload["origin_class"] = origin
         return SimpleNamespace(id=mid, payload=payload)
+
+    # Metadata rows for the scrolled points (ghost filter drops metadata-less ids).
+    for _mid in ("ext-hi", "fp-lo"):
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+            (_mid, "2026-01-01T00:00:00+00:00"),
+        )
+    await db.commit()
 
     qdrant = MagicMock()
     qdrant.scroll.return_value = (

@@ -796,10 +796,16 @@ retry:
     max_retries: 4
     base_delay_ms: 1000
     max_delay_ms: 60000
-    # Generous safety net only — should never fire in normal operation. Dream /
-    # reflection / ego are exactly where a single completion may legitimately
-    # take a while across failovers; we only stop the pathology, not cognition.
-    max_total_s: 1800
+    # Safety net for background dispatches (dream / reflection / ego / surplus).
+    # MUST stay comfortably under the watchdog's 900s scheduler-heartbeat zombie
+    # threshold (autonomy/watchdog.py _check_scheduler_heartbeats): a background
+    # route_call that outlives it lets the surplus heartbeat go stale and the
+    # watchdog restarts the WHOLE server — which, during the 2026-07 outage,
+    # produced 25+ restart-kills in a day (was 1800s = 2x the threshold, so a
+    # single stalled dispatch always tripped it). 600s still allows ~5 sequential
+    # 120s hard-timeout attempts across the chain; it bounds ONE completion's
+    # retry-multiplier, not cognition. Guarded by test_retry_profiles_under_watchdog_threshold.
+    max_total_s: 600
 surplus:
   idle_threshold_minutes: 15
   dispatch_interval_minutes: 5

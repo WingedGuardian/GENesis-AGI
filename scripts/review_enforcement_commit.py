@@ -35,9 +35,17 @@ from shell_parse import (  # noqa: E402
 # Fail closed on it — treat as main (block Rule 1) and do NOT take the docs skip.
 _CWD_UNKNOWN = object()
 
-# Cheap early-out: a raw command that never mentions "git commit" is not a
-# commit. Actual detection (through wrappers, bash -c, etc.) uses shell_parse.
-_COMMIT_PATTERN = re.compile(r"\bgit\s+commit\b")
+# Cheap early-out: a command with no "commit" TOKEN cannot be a git commit, so
+# skip the shell_parse pass. It must gate on the token alone, NOT on a rigid
+# "git commit" adjacency — `git -C <dir> commit` and `git -c k=v commit` put
+# global options between "git" and "commit", so `\bgit\s+commit\b` MISSED them
+# and let those commit forms skip the ENTIRE gate (review, --no-verify, and the
+# direct-to-main block). Precise detection is still shell_parse's `analyze()` +
+# `git_subcommand` below; this only decides whether to run it. Kept identical in
+# review_invalidate_on_commit.py (the PostToolUse invalidator) — the pair must
+# detect the same set of commits or the marker cleared drifts from the one
+# checked. Guarded by test_commit_pattern_matches_git_dash_c_and_dash_C.
+_COMMIT_PATTERN = re.compile(r"\bcommit\b")
 
 
 def _commit_override(command: str, segs: list) -> str:
@@ -89,11 +97,29 @@ def _is_docs_or_config(path: str) -> bool:
 
 
 def _seg_dash_C(argv) -> str | None:
-    """The dir named by a ``git -C <dir>`` in a segment's argv, else None."""
+    """The dir named by a GLOBAL ``git -C <dir>`` in a segment's argv, else None.
+
+    Only the ``-C`` that precedes the git SUBCOMMAND is the "run as if started in
+    <dir>" global option. A ``-C`` AFTER the subcommand is that subcommand's own
+    flag with a different meaning — for ``git commit -C <commit>`` it reuses that
+    commit's message/authorship and ``<commit>`` is a commit-ish (e.g. ``HEAD``),
+    NOT a directory. Scanning the whole argv (the old behavior) mistook
+    ``git commit -C HEAD`` for a ``-C HEAD`` worktree redirect and resolved a
+    bogus ``<cwd>/HEAD`` dir. So walk only the global-option prefix and stop at
+    the first non-option token (the subcommand)."""
     argv = argv or []
-    for i, tok in enumerate(argv):
+    i = 1  # argv[0] is the executable ("git")
+    while i < len(argv):
+        tok = argv[i]
         if tok == "-C" and i + 1 < len(argv):
             return argv[i + 1]
+        if tok in _GIT_GLOBAL_VALUE_FLAGS:  # another global value-flag: skip flag+value
+            i += 2
+            continue
+        if tok.startswith("-"):  # a global boolean flag (e.g. --no-pager)
+            i += 1
+            continue
+        break  # reached the subcommand — any later -C belongs to it, not to git
     return None
 
 

@@ -12,6 +12,7 @@ from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links as memory_links_crud
 from genesis.db.crud import pending_embeddings
+from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.linker import MemoryLinker
@@ -507,8 +508,37 @@ class MemoryStore:
         retryable rather than leaving an orphaned "ghost" point. A memory that
         never had a vector (``fts5_only``/``pending``/``failed``) locates to
         nothing and deletes cleanly.
+
+        Serialized per ``memory_id`` against the re-embed/reconcile-requeue paths
+        (``memory/_locks.py``): the whole locate→delete→cascade sequence holds the
+        id-lock, so a concurrent ``EmbeddingRecoveryWorker`` upsert or reconcile
+        requeue of the same memory cannot interleave and resurrect a vector the
+        user just deleted.
         """
+        async with memory_id_lock(memory_id):
+            return await self._delete_locked(memory_id)
+
+    async def _delete_locked(self, memory_id: str) -> dict:
         results: dict[str, bool | int] = {}
+
+        # 0. WRITE-AHEAD delete intent (Codex #1270 P1): record the tombstone
+        # BEFORE touching Qdrant, not just on the defer path. The intent stays
+        # open across the whole point-delete→cascade span, so the recovery
+        # worker's tombstone check (SQLite, cross-process) blocks a concurrent
+        # re-embed from resurrecting the vector even when THIS delete succeeds
+        # — the process-local id-lock cannot serialize the MCP process. Also
+        # crash-safe: a process dying mid-cascade leaves the intent for the
+        # nightly drain to complete. Best-effort — a failed write never blocks
+        # the delete itself. Step 7 closes it on success; a defer leaves it
+        # open as the durable retry record.
+        from genesis.memory.delete_tombstones import (
+            complete_open_tombstones,
+            enqueue_tombstone,
+        )
+
+        tombstoned = await enqueue_tombstone(
+            self._db, memory_id=memory_id, reason="delete_in_progress"
+        )
 
         # 1. Locate the point (unreliable collection column → check both) and
         # delete only where it lives. retrieve/delete raise on a real Qdrant error
@@ -534,7 +564,12 @@ class MemoryStore:
                 "Qdrant unavailable during delete of %s — deferring to keep stores "
                 "consistent (no orphan)", memory_id, exc_info=True,
             )
+            # The write-ahead tombstone (step 0) stays OPEN — it is the durable
+            # retry record: visible to every process, it blocks requeue/re-embed
+            # of this memory and is drained (delete re-attempted) by the nightly
+            # reconcile lane.
             results["deferred"] = True
+            results["tombstoned"] = tombstoned
             results["metadata"] = False
             results["fts5"] = False
             return results
@@ -575,5 +610,17 @@ class MemoryStore:
                 "entity_mentions delete failed for %s", memory_id, exc_info=True,
             )
             results["mentions_deleted"] = False
+
+        # 7. Close every open delete-intent tombstone: the cascade completed
+        # (this covers step 0's write-ahead intent, any earlier deferred
+        # attempt's row, and multi-process duplicates), so the recorded intent
+        # is satisfied — leaving it open would only make the reconcile lane
+        # re-attempt a no-op delete. Best-effort.
+        try:
+            await complete_open_tombstones(self._db, memory_id=memory_id)
+        except Exception:
+            logger.warning(
+                "tombstone close-out failed for %s", memory_id, exc_info=True,
+            )
 
         return results

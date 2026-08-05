@@ -128,6 +128,81 @@ def session_id(payload: dict, default: str = "unknown") -> str:
     return env_sid or default
 
 
+def run_guard(main_fn, name: str) -> None:
+    """Run a fail-closed guard's ``main()``, turning an UNEXPECTED crash into a
+    BLOCK (exit 2) instead of the exit 1 that CC treats as a *non-blocking* error.
+
+    Why: CC's PreToolUse contract is "exit 2 = block; ANY other code = non-blocking
+    error → the tool RUNS". So an uncaught exception in a guard (exit 1) is a silent
+    FAIL-OPEN — the destructive command it was meant to stop executes anyway. For the
+    handful of irreversible-action guards (recursive rm, protected-path delete,
+    worktree removal, push/merge, CRITICAL-path Write/Edit) that is the wrong
+    direction; they must fail CLOSED.
+
+    ``main_fn`` returns the intended exit code (0 allow / 2 block). Any ``Exception``
+    it raises is caught here, logged loudly (so a guard bug is visible, per "never
+    hide broken things"), and converted to exit 2. ``SystemExit``/``KeyboardInterrupt``
+    (``BaseException``, not ``Exception``) propagate untouched. This only catches what
+    the guard did NOT handle — a guard's OWN documented inner fail-opens (parse-
+    ambiguity paths that deliberately ``return 0``) are unaffected.
+
+    Only wire this for guards where fail-closed is correct — never for advisory or
+    convenience guards, which must stay fail-open so a bug never blocks legit work.
+    """
+    try:
+        code = main_fn()
+    except Exception as exc:  # noqa: BLE001 — fail CLOSED on ANY unexpected error
+        print(
+            f"GUARD ERROR ({name}): failing CLOSED (blocking) — {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    sys.exit(code if isinstance(code, int) else 0)
+
+
+_BRACE_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+_BRACE_MAX = 1024
+
+
+def brace_expand(token: str) -> list[str]:
+    """Expand a bash comma-brace token into the paths it actually produces.
+
+    ``a/{b,c}`` → ``["a/b", "a/c"]``; ``a/{b,}`` → ``["a/b", "a/"]`` (an empty
+    option yields the parent). Recurses so multiple/nested groups expand. A
+    token with no comma-brace returns ``[token]`` unchanged.
+
+    Why the rm guards need this: bash brace-expands an unquoted target BEFORE
+    ``rm`` ever runs, so ``rm -rf ~/genesis/{data,logs}`` deletes
+    ``~/genesis/data`` — but a guard that inspects the single opaque token
+    ``~/genesis/{data,logs}`` sees no glob, no exact/ancestor match, and a
+    depth of 4, so it waves the command through. Expanding first makes each real
+    target visible to the depth/protected checks.
+
+    Numeric ranges (``{1..3}``) are deliberately NOT expanded — a rare shape for
+    a deletion target. An absurd combinatorial blow-up (a brace bomb) raises
+    ValueError; callers are run_guard-wrapped, so that fails CLOSED (blocks).
+    Quote/expansion nuances are handled by shlex upstream, matching the sibling
+    guards' "shlex is the sole authority on quoting" posture.
+    """
+    result: list[str] = []
+    stack = [token]
+    while stack:
+        t = stack.pop()
+        m = _BRACE_RE.search(t)
+        if not m:
+            result.append(t)
+            if len(result) > _BRACE_MAX:
+                raise ValueError("brace expansion too large — refusing (fail closed)")
+            continue
+        pre, post = t[: m.start()], t[m.end() :]
+        opts = m.group(1).split(",")
+        if len(stack) + len(opts) > _BRACE_MAX:
+            raise ValueError("brace expansion too large — refusing (fail closed)")
+        for opt in opts:
+            stack.append(pre + opt + post)
+    return result
+
+
 def strip_quoted(command: str) -> str:
     """Return ``command`` with quoted regions removed.
 

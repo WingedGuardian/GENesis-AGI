@@ -63,8 +63,9 @@ class TaskType(StrEnum):
 #     success = the action ran; they don't target the KB, so all-discard is normal.
 #   - Pipeline intermediates (RESEARCH_QUERY_GEN, PROMPT_REVIEW_CATALOG,
 #     PROMPT_REVIEW_SAMPLE): their output feeds the *next* pipeline step, not the
-#     KB, so intake legitimately discards it. Only the pipeline *terminals*
-#     (ANTICIPATORY_RESEARCH, PROMPT_EFFECTIVENESS_REVIEW) produce KB-bound insight.
+#     KB, so intake legitimately discards it. Of the pipeline *terminals*, only
+#     ANTICIPATORY_RESEARCH is KB-bound; PROMPT_EFFECTIVENESS_REVIEW is first-party
+#     ideation, STAGED not KB-routed (see EPHEMERAL_IDEATION_TASK_TYPES below).
 #   - Monitoring/probe types (INFRASTRUCTURE_MONITOR, CC_MEMORY_STALENESS): a
 #     "nothing noteworthy / all healthy" pass is the EXPECTED good outcome, and
 #     their status content isn't durable knowledge — all-discard isn't a failure.
@@ -107,6 +108,80 @@ INSIGHT_PRODUCING_TASK_TYPES: frozenset[TaskType] = frozenset({
 KB_ROUTING_TASK_TYPES: frozenset[TaskType] = INSIGHT_PRODUCING_TASK_TYPES | {
     TaskType.BOOKMARK_ENRICHMENT,
 }
+
+
+# EPHEMERAL first-party ideation — self-directed brainstorm / unblock / audit
+# output. These are Genesis-authored work-items and system flags, NOT durable
+# external knowledge, so the intake pipeline keeps them OUT of the immortal
+# knowledge_units KB (PR-1's intent). They stay in KB_ROUTING_TASK_TYPES (so
+# dispatch still calls run_intake); run_intake's Step 3a reroutes them off the
+# KB path by checking is_ephemeral_ideation() on the TRUE task type. EXCLUDES
+# ANTICIPATORY_RESEARCH (genuine web-cited knowledge) and CODE_AUDIT (its own
+# curated FindingsBridge ingestion path — see dispatch.py::_route_insights).
+#
+# WS-M PR-2 splits ephemeral ideation into TWO populations with distinct honest
+# homes (content-verified: the two are genuinely different animals):
+#   • IDEA_TASK_TYPES — genuine feature ideas (brainstorm output) → staged in
+#     surplus_insights, then promoted into the follow_ups 'idea' review lane.
+#   • SELF_OBSERVATION_TASK_TYPES — meta-patterns / audits / blocker analyses
+#     about Genesis's own state → the observation lane (TTL + resolve +
+#     dashboard/morning-report surfacing), via _route_to_observation.
+# A type MUST be in exactly ONE subset; EPHEMERAL_IDEATION_TASK_TYPES is their
+# union (kept as the Step-3a intercept guard so neither subset falls through to
+# the KB route loop).
+IDEA_TASK_TYPES: frozenset[TaskType] = frozenset({
+    TaskType.BRAINSTORM_SELF,
+    TaskType.BRAINSTORM_USER,
+    TaskType.META_BRAINSTORM,
+})
+
+SELF_OBSERVATION_TASK_TYPES: frozenset[TaskType] = frozenset({
+    TaskType.SELF_UNBLOCK,
+    TaskType.GAP_CLUSTERING,
+    TaskType.WING_AUDIT,
+    TaskType.MEMORY_AUDIT,
+    TaskType.PROCEDURE_AUDIT,
+    TaskType.PROMPT_EFFECTIVENESS_REVIEW,
+})
+
+EPHEMERAL_IDEATION_TASK_TYPES: frozenset[TaskType] = (
+    IDEA_TASK_TYPES | SELF_OBSERVATION_TASK_TYPES
+)
+
+
+def is_ephemeral_ideation(task_type: str) -> bool:
+    """True if a surplus task-type string is ephemeral first-party ideation.
+
+    Accepts the raw task-type string (e.g. ``"self_unblock"``) as carried on
+    ``ScoredFinding.source_task_type``; unknown/empty strings → False (default
+    to durable routing — never over-shelve on an unrecognised type).
+    """
+    try:
+        return TaskType(task_type) in EPHEMERAL_IDEATION_TASK_TYPES
+    except ValueError:
+        return False
+
+
+def is_idea_ideation(task_type: str) -> bool:
+    """True if the surplus task-type is a genuine feature IDEA (brainstorm).
+
+    Ideas are staged in surplus_insights and promoted into the follow_ups
+    'idea' review lane. Unknown/empty strings → False.
+    """
+    try:
+        return TaskType(task_type) in IDEA_TASK_TYPES
+    except ValueError:
+        return False
+
+
+def is_self_observation_ideation(task_type: str) -> bool:
+    """True if the surplus task-type is a self-observation (audit / gap-cluster /
+    unblock / prompt-review) routed to the observation lane. Unknown/empty → False.
+    """
+    try:
+        return TaskType(task_type) in SELF_OBSERVATION_TASK_TYPES
+    except ValueError:
+        return False
 
 
 class ComputeTier(StrEnum):

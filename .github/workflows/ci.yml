@@ -95,6 +95,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history so the private-pattern exact scan can diff the PR/push
+          # against its base (added lines only — pre-existing legit content like
+          # /home/<user> in provisioning scripts is never re-flagged).
+          fetch-depth: 0
 
       - uses: actions/setup-python@v7
         with:
@@ -146,45 +151,38 @@ jobs:
           /tmp/gitleaks detect --no-git --redact -c .gitleaks.toml --source .
           echo "Leak scan (gitleaks): CLEAN"
 
-      - name: Portability scan (user-specific content)
+      - name: Class scan (advisory — non-gating)
+        # Broad RFC1918 / CGNAT / IPv6-ULA and /home/<user> CLASSES, surfaced as
+        # GitHub warnings and NEVER gating. Rationale: CI must not hard-block an
+        # external contributor for a legitimate private-range example (e.g.
+        # 10.0.0.1 in a docker-compose). This install's EXACT values are
+        # hard-gated by the private-pattern exact scan below. Doc examples should
+        # use the RFC 5737 ranges (192.0.2.x / 198.51.100.x / 203.0.113.x), which
+        # are deliberately not matched. Network-address class vocabulary comes
+        # from scripts/check_portability.sh --warn (single source of truth).
         run: |
           set -euo pipefail
-          # Exclude files that legitimately contain machine-specific
-          # patterns as data (scanner definitions, install scripts, etc.).
-          SCAN_EXCLUDES=(
-            --glob '!**/.git/**'
-            --glob '!**/src/genesis/contribution/sanitize.py'
-            --glob '!**/tests/test_contribution/test_sanitize.py'
-            --glob '!**/host-setup.sh'
-            --glob '!**/install.sh'
-            --glob '!**/install_guardian.sh'
-            --glob '!**/uninstall.sh'
-            --glob '!**/src/genesis/util/tz.py'
-            --glob '!**/src/genesis/dashboard/templates/genesis_dashboard.html'
-            --glob '!**/config/modules/career-agent.yaml'
-            --glob '!**/config/external-modules/**'
-            --glob '!**/tests/**'
-            --glob '!**/.github/workflows/ci.yml'
-          )
-          hits=$(
-            rg -n --hidden "${SCAN_EXCLUDES[@]}" \
-              -e 'America/New_York' \
-              -e '/home/[a-z][a-z0-9_-]*/genesis' \
-              src/ config/ scripts/ .github/ \
-              2>/dev/null || true
-          )
-          if [[ -n "$hits" ]]; then
-            echo "::error::Portability scan found user-specific content:"
-            printf '%s\n' "$hits"
-            exit 1
+          net="$(bash scripts/check_portability.sh --warn 2>/dev/null || true)"
+          # Home-path + CC-slug classes (check_portability owns network only).
+          # Exclude scanner-definition files that embed these patterns as data.
+          paths="$(rg -n --hidden \
+            --glob '!**/.git/**' \
+            --glob '!**/src/genesis/contribution/sanitize.py' \
+            --glob '!**/scripts/hooks/commit-msg' \
+            --glob '!**/scripts/check_portability.sh' \
+            --glob '!**/.github/workflows/ci.yml' \
+            -e '/home/[a-z_][a-z0-9_-]*/genesis' \
+            -e '/home/[a-z_][a-z0-9_-]*/\.[A-Za-z]' \
+            -e '-home-[a-z0-9-]+-genesis' \
+            . 2>/dev/null || true)"
+          findings="$(printf '%s\n%s\n' "$net" "$paths" | grep -vE '^[[:space:]]*$' || true)"
+          if [[ -n "$findings" ]]; then
+            printf '%s\n' "$findings" | sed 's/^/::warning::/'
+            n="$(printf '%s\n' "$findings" | wc -l)"
+            echo "Class scan: $n advisory finding(s) — non-gating."
+          else
+            echo "Class scan: CLEAN"
           fi
-          echo "Portability scan: CLEAN"
-
-      - name: Portability scan (network-address classes)
-        run: |
-          set -euo pipefail
-          bash scripts/check_portability.sh
-          echo "Portability scan (address classes): CLEAN"
 
       - name: Email scan
         run: |
@@ -237,20 +235,70 @@ jobs:
           fi
           echo "Binary/data artifact scan: CLEAN"
 
-      - name: PR description scan
-        if: github.event_name == 'pull_request'
+      - name: Private-pattern exact scan (hard gate)
+        # The REAL install identifiers (private repo/host names, subnets,
+        # hardware, tokens) come from the GENESIS_PRIVATE_PATTERNS repo secret —
+        # ZERO such values are tracked in this repo. Scans the PR/push ADDED
+        # lines + PR body (NOT the whole tree: pre-existing legit content such as
+        # /home/<user> in provisioning scripts must not be re-flagged). Never
+        # echoes matched content — counts only. Hard-fails on the canonical repo
+        # for non-fork PRs and pushes; SKIPS on forks / other installs (no secret,
+        # and they cannot know these values — the class scan above is their floor).
+        # Secrets are NOT readable in `if:`, so the empty check is done in-shell
+        # after env-mapping; an `if:` keyed on secrets.* would be silently empty
+        # (never runs = false green).
+        # Skip Dependabot too: its PRs are same-repo (non-fork) so they'd enter
+        # this step, but Dependabot-triggered workflows receive Dependabot
+        # secrets, not ordinary Actions secrets, so GENESIS_PRIVATE_PATTERNS is
+        # empty and the fail-loud check would break every dependency-bump PR.
+        # Dependency bumps never introduce install identifiers; the class-warn
+        # scan remains their floor.
+        if: >-
+          github.repository == 'WingedGuardian/GENesis-AGI' &&
+          github.actor != 'dependabot[bot]' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.fork == false)
         env:
+          PRIV: ${{ secrets.GENESIS_PRIVATE_PATTERNS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          body=$(gh pr view ${{ github.event.pull_request.number }} --json body -q .body 2>/dev/null || echo "")
-          PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:|046056[0-9]{6}|moonandstar|zorror|assistant1'
-          if echo "$body" | grep -qE "$PATTERNS"; then
-            echo "::error::PR description contains private infrastructure details"
-            echo "$body" | grep -nE "$PATTERNS" || true
-            exit 1
+          # Write the raw secret; scripts/ci/private_pattern_scan.py does ALL
+          # filtering + validation (blank/comment lines, empty set, malformed
+          # ERE) in tested Python — the fragile parts that repeatedly bit the
+          # former inline-shell gate. It exits 0=clean, 1=leak (counts only,
+          # never content), 3=fail-loud (unprovisioned/corrupt secret); set -e
+          # propagates a nonzero exit as the gate's failure.
+          pf="$(mktemp)"
+          printf '%s' "$PRIV" > "$pf"
+
+          # Collect ADDED lines across EVERY commit's patch in the range — NOT
+          # the net tree-to-tree diff. A value added in one commit and removed in
+          # a later commit of the same PR/push leaves the net diff clean, yet the
+          # value stays in published Git history and becomes an ancestor of main
+          # (Codex P1). `git log -p --no-merges` emits each non-merge commit's
+          # patch; pre-existing legit content is still out of scope (only commits
+          # in this range are shown). Keep all '^+' lines INCLUDING the
+          # '+++ b/path' headers (repo-relative paths never match an exact install
+          # value, and a '^+++' filter would drop added content beginning '++').
+          added=""
+          body=""
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            added="$(git log -p --no-merges "${PR_BASE_SHA}..HEAD" 2>/dev/null | grep -E '^\+' || true)"
+            body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
+          elif git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            added="$(git log -p --no-merges "${PUSH_BEFORE}..${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
+          else
+            # New branch / unknown base — scan the tip commit's patch (best effort).
+            added="$(git show "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
           fi
-          echo "PR description scan: CLEAN"
+
+          printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
 
   migration-check:
     # Catch duplicate migration prefixes before merge — two PRs creating
@@ -307,6 +355,21 @@ jobs:
         run: pip install pyyaml
       - name: Subsystem-map drift guard
         run: python scripts/check_subsystem_map.py
+
+  hook-versions-check:
+    # Completeness backstop for .genesis-hook-versions: every version of a
+    # tracked git hook that ever shipped on main must be recorded, or a
+    # community install still carrying it gets wedged (sync-hooks.sh treats an
+    # unrecorded hash as "user-modified" and never updates it). The checker
+    # walks FULL hook history, so this job checks out fetch-depth: 0; it skips
+    # gracefully on a shallow clone. See scripts/check_hook_versions_complete.sh.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Hook-version ledger completeness guard
+        run: bash scripts/check_hook_versions_complete.sh
 
   cc-node-lockstep:
     # Enforce the CC↔Node pin lockstep: NODE_MAJOR in scripts/lib/cc_version.sh

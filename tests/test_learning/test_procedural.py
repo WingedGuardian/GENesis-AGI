@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from genesis.learning.procedural.embedding import pack_embedding
 from genesis.learning.procedural.matcher import find_best_match, find_relevant
 from genesis.learning.procedural.maturity import get_maturity_stage
 from genesis.learning.procedural.operations import (
@@ -17,6 +18,18 @@ from genesis.learning.procedural.operations import (
     update_confidence,
 )
 from genesis.learning.types import MaturityStage
+
+
+def _emb(*idx: int) -> bytes:
+    """A 1024-d embedding BLOB with 1.0 at the given indices (rest 0).
+
+    ``_emb(0)`` vs ``_emb(0)`` → cosine 1.0 (same procedure); ``_emb(0)`` vs
+    ``_emb(1)`` → cosine 0.0 (distinct). Lets the identity tests exercise the
+    similarity gate without a live embedder."""
+    v = [0.0] * 1024
+    for i in idx:
+        v[i] = 1.0
+    return pack_embedding(v)
 
 # ─── Maturity ─────────────────────────────────────────────────────────────────
 
@@ -364,24 +377,25 @@ async def test_find_relevant_still_hides_draft_extractor_writes(db):
 
 
 @pytest.mark.asyncio
-async def test_store_checked_exact_match_upserts(db):
-    """Same task_type → update existing, preserve counts, bump version."""
+async def test_store_checked_same_principle_refines_in_place(db):
+    """Same task_type AND same principle (embedding match ≥ threshold) → update
+    in place, preserve counts, bump version."""
     proc_id = await store_procedure(
         db, task_type="deploy-safety", principle="original",
         steps=["step-a"], tools_used=["Bash"], context_tags=["deploy"],
-        draft=0, success_count=3, confidence=0.8,
+        draft=0, success_count=3, confidence=0.8, principle_embedding=_emb(0),
     )
     result = await store_procedure_checked(
-        db, task_type="deploy-safety", principle="updated principle",
+        db, task_type="deploy-safety", principle="original, refined",
         steps=["step-b", "step-c"], tools_used=["Bash"],
-        context_tags=["deploy", "safety"],
+        context_tags=["deploy", "safety"], principle_embedding=_emb(0),
     )
     assert result.action == "updated"
     assert result.procedure_id == proc_id
-    # Read back and verify
+    assert result.matched_similarity == pytest.approx(1.0)
     from genesis.db.crud.procedural import get_by_id
     row = await get_by_id(db, proc_id)
-    assert row["principle"] == "updated principle"
+    assert row["principle"] == "original, refined"
     assert json.loads(row["steps"]) == ["step-b", "step-c"]
     assert row["version"] == 2  # bumped
     assert row["success_count"] == 3  # preserved
@@ -389,24 +403,159 @@ async def test_store_checked_exact_match_upserts(db):
 
 
 @pytest.mark.asyncio
-async def test_store_checked_auto_skips_explicit(db):
-    """Auto-extracted should not overwrite explicit-teach."""
+async def test_store_checked_distinct_principle_same_slug_creates(db):
+    """THE DATA-LOSS FIX: a DISTINCT lesson sharing a task_type slug must NOT
+    overwrite the existing row — it becomes a new sibling. (Regression: this
+    used to blindly upsert-by-slug, serially destroying ~30 code_review
+    lessons on a single row.)"""
+    proc_id = await store_procedure(
+        db, task_type="code-review", principle="check completed_at on pruned tables",
+        steps=["a"], tools_used=["Bash"], context_tags=["review"],
+        draft=0, success_count=5, confidence=0.9, principle_embedding=_emb(0),
+    )
+    result = await store_procedure_checked(
+        db, task_type="code-review", principle="verify origin_class on recall",
+        steps=["b"], tools_used=["Bash"], context_tags=["review"],
+        principle_embedding=_emb(1),  # orthogonal → NOT the same procedure
+    )
+    assert result.action == "created"
+    assert result.procedure_id != proc_id
+    from genesis.db.crud.procedural import get_by_id, list_by_task_type
+    orig = await get_by_id(db, proc_id)
+    assert orig["principle"] == "check completed_at on pruned tables"  # untouched
+    assert orig["version"] == 1
+    rows = await list_by_task_type(db, "code-review")
+    assert len(rows) == 2  # both lessons coexist under the slug
+
+
+@pytest.mark.asyncio
+async def test_store_checked_no_embedding_creates_failsafe(db):
+    """No embedding to prove sameness → CREATE, never overwrite (fail-safe: a
+    duplicate is cleanable, an overwrite is irreversible)."""
+    proc_id = await store_procedure(
+        db, task_type="deploy-safety", principle="original",
+        steps=["a"], tools_used=["Bash"], context_tags=["deploy"],
+        draft=0, success_count=3, confidence=0.8,  # no principle_embedding
+    )
+    result = await store_procedure_checked(
+        db, task_type="deploy-safety", principle="different lesson",
+        steps=["b"], tools_used=["Bash"], context_tags=["deploy"],
+    )
+    assert result.action == "created"
+    from genesis.db.crud.procedural import get_by_id
+    assert (await get_by_id(db, proc_id))["principle"] == "original"  # untouched
+
+
+@pytest.mark.asyncio
+async def test_store_checked_auto_skips_matched_explicit(db):
+    """Auto-extraction must not overwrite an explicit-teach of the SAME
+    procedure (embedding-confirmed match)."""
     proc_id = await store_procedure(
         db, task_type="manual-task", principle="human taught",
         steps=["do-this"], tools_used=["Bash"], context_tags=["manual"],
-        draft=0, success_count=1, confidence=2 / 3,
+        draft=0, success_count=1, confidence=2 / 3, principle_embedding=_emb(0),
     )
     result = await store_procedure_checked(
-        db, task_type="manual-task", principle="auto extracted",
-        steps=["maybe-this"], tools_used=["Bash"],
-        context_tags=["manual"], draft=1, confidence=0.0,
+        db, task_type="manual-task", principle="human taught, auto paraphrase",
+        steps=["maybe-this"], tools_used=["Bash"], context_tags=["manual"],
+        draft=1, confidence=0.0, principle_embedding=_emb(0),  # same → matches
     )
     assert result.action == "skipped"
     assert proc_id in result.conflicting_ids
-    # Original unchanged
+    from genesis.db.crud.procedural import get_by_id
+    assert (await get_by_id(db, proc_id))["principle"] == "human taught"
+
+
+@pytest.mark.asyncio
+async def test_store_checked_auto_distinct_from_explicit_creates(db):
+    """The auto-skips-explicit guard is per-MATCHED-procedure, not per-slug: an
+    auto-extraction of a DISTINCT lesson under a slug that has an explicit-teach
+    still CREATES (does not skip)."""
+    proc_id = await store_procedure(
+        db, task_type="manual-task", principle="human taught A",
+        steps=["do-this"], tools_used=["Bash"], context_tags=["manual"],
+        draft=0, success_count=1, confidence=2 / 3, principle_embedding=_emb(0),
+    )
+    result = await store_procedure_checked(
+        db, task_type="manual-task", principle="unrelated lesson B",
+        steps=["other"], tools_used=["Bash"], context_tags=["manual"],
+        draft=1, confidence=0.0, principle_embedding=_emb(1),  # distinct
+    )
+    assert result.action == "created"
+    assert result.procedure_id != proc_id
+
+
+@pytest.mark.asyncio
+async def test_store_checked_explicit_refine_promotes_draft(db):
+    """An explicit teach (draft=0) refining a MATCHED auto-extracted row
+    (draft=1) promotes it to explicit AND seeds recall-gating confidence/
+    success_count — otherwise the 'promoted' row (auto confidence 0.0) stays
+    invisible to recall, which gates on confidence, not draft."""
+    proc_id = await store_procedure(
+        db, task_type="t", principle="auto p", steps=["a"], tools_used=["Bash"],
+        context_tags=["x"], draft=1, success_count=0, confidence=0.0,
+        principle_embedding=_emb(0),
+    )
+    result = await store_procedure_checked(
+        db, task_type="t", principle="auto p, refined", steps=["b"],
+        tools_used=["Bash"], context_tags=["x"], draft=0,
+        success_count=1, confidence=2 / 3,
+        principle_embedding=_emb(0),
+    )
+    assert result.action == "updated"
     from genesis.db.crud.procedural import get_by_id
     row = await get_by_id(db, proc_id)
-    assert row["principle"] == "human taught"
+    assert row["draft"] == 0  # promoted
+    # ...and now actually recallable: matcher.find_relevant filters confidence<0.3
+    assert row["confidence"] == pytest.approx(2 / 3)
+    assert row["success_count"] == 1
+    # ...and lifted off the DORMANT tier to the explicit-teach's requested tier
+    # (recall applies a stricter threshold to DORMANT rows).
+    assert row["activation_tier"] == "LIBRARY"
+
+
+@pytest.mark.asyncio
+async def test_store_checked_refine_updates_stored_embedding(db):
+    """Refining in place must also update principle_embedding — otherwise future
+    matching and proactive surfacing trust a BLOB describing the OLD text (the
+    refined row could even be re-classified as a distinct sibling later)."""
+    proc_id = await store_procedure(
+        db, task_type="t", principle="original", steps=["a"], tools_used=["Bash"],
+        context_tags=["x"], draft=0, success_count=1, confidence=0.7,
+        principle_embedding=_emb(0),
+    )
+    # cosine([1, 0.6, 0...], [1, 0, 0...]) ≈ 0.857 ≥ threshold → same procedure,
+    # but a DIFFERENT blob than the stored one.
+    near = pack_embedding([1.0, 0.6] + [0.0] * 1022)
+    result = await store_procedure_checked(
+        db, task_type="t", principle="original, reworded", steps=["b"],
+        tools_used=["Bash"], context_tags=["x"], principle_embedding=near,
+    )
+    assert result.action == "updated"
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, proc_id)
+    assert bytes(row["principle_embedding"]) == near  # embedding follows the new text
+
+
+@pytest.mark.asyncio
+async def test_store_checked_promote_does_not_lower_earned_confidence(db):
+    """Promotion raises confidence to the explicit seed but never LOWERS a
+    value the auto row already earned through successful use."""
+    proc_id = await store_procedure(
+        db, task_type="t2", principle="well-used auto", steps=["a"],
+        tools_used=["Bash"], context_tags=["x"], draft=1, success_count=9,
+        confidence=0.9, principle_embedding=_emb(0),
+    )
+    await store_procedure_checked(
+        db, task_type="t2", principle="well-used auto, refined", steps=["b"],
+        tools_used=["Bash"], context_tags=["x"], draft=0,
+        success_count=1, confidence=2 / 3, principle_embedding=_emb(0),
+    )
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, proc_id)
+    assert row["draft"] == 0
+    assert row["confidence"] == pytest.approx(0.9)  # earned value preserved
+    assert row["success_count"] == 9
 
 
 @pytest.mark.asyncio

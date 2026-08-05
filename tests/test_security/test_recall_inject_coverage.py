@@ -362,6 +362,11 @@ KNOWN_QDRANT_READ_SITES: dict[str, tuple[str, str]] = {
         "one-time reconcile migration; retrieves orphaned ghost payloads to export "
         "before deletion — never prompted",
     ),
+    "memory/integrity_repair.py::_export_ghosts": (
+        "infra",
+        "periodic reconcile lane (Phase 1); retrieves orphaned ghost payloads to "
+        "export before deletion — never prompted",
+    ),
     "eval/bench/isolation.py::_scroll_usage": (
         "infra",
         "bench snapshot usage-payload copy between collections",

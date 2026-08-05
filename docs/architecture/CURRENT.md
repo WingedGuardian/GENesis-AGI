@@ -36,8 +36,38 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 9decfd6f 2026-07-18
+verified: 51bfbb35 2026-07-30
 ```
+
+**Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
+`memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
+points; "lying mirror" rows claiming a vector that's gone) is structurally
+possible. `memory/integrity.py` (Phase 0) detects nightly via set algebra and
+persists reports; `memory/integrity_repair.py` (Phase 1, `memory_reconcile`
+job 04:40, `integrity_config` mode `active` — the default) repairs aged
+offenders nightly: open delete-intent tombstones drained first (deferred
+deletes re-attempted through the full store cascade; attempted ids excluded
+from that run's ghost/mirror sets), ghosts deleted (payload exported to a
+date-stamped JSONL under `~/.genesis/output/` first), mirrors re-queued
+through `pending_embeddings.requeue_for_reembed` so `EmbeddingRecoveryWorker`
+rebuilds the real vector. Repair is serialized against deletes from EVERY
+process: in-process via the per-memory-id lock (`memory/_locks.py`);
+cross-process via DB-backed tombstones (`memory/delete_tombstones.py`, rows on
+`deferred_work_queue`, written by `MemoryStore.delete()` when Qdrant is down)
+plus an atomic metadata/tombstone guard inside `requeue_for_reembed` (single
+SQL statement — SQLite's cross-process write lock makes it atomic vs a delete
+in any process, e.g. the genesis-memory MCP server's `reference_delete`). The
+irreducible floor (documented, self-healing): the recovery worker's
+SQLite-check→Qdrant-upsert micro-window vs a concurrent full delete can still
+strand a ghost until the next nightly sweep. Truncation asymmetry is
+load-bearing: a truncated point scroll keeps ghost classification sound
+(metadata read is complete) but makes mirror classification unsound (can't
+prove absence) — mirrors are skipped under truncation. Repair never consumes
+Phase 0's (possibly sampled) report — it re-enumerates exactly. Audit rows:
+`memory_reconcile_runs` (migration 0074). One-time historical cleanup was
+d0008; `MemoryStore.delete()` is point-first + fail-closed (defers, returning
+`{"deferred": True}` and recording a tombstone, when Qdrant is unavailable —
+callers must honor it).
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
 stack.** Deep path: `memory/retrieval.py` `HybridRetriever.recall` (bitemporal
@@ -317,7 +347,11 @@ verified: 0e65071c 2026-07-21
   cron jobs (via MCP) that dispatch background DirectSessions. Distinct from
   `surplus/scheduler.py`.
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
-  follow-ups into surplus tasks; retention sweep on the learning scheduler.
+  follow-ups into surplus tasks; retention sweep on the learning scheduler. The
+  `follow_up_create`/`update` MCP tools take a `work_state`
+  (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
+  cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
+  requires a `revisit_condition` (nullable column on `follow_ups`).
 - GROUNDWORK: v4-parallel-dispatch, v4-surplus-tasks, v4-rate-tracking.
 
 ## 5. Information intake & research
@@ -1004,6 +1038,27 @@ verified: b662f3e3 2026-07-17
   probes before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
+  `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
+  public anchors) on a cadence and publishes a 3-state `network` axis
+  (NORMAL/DEGRADED/OFFLINE) with asymmetric hysteresis — it OWNS its hysteresis
+  and opts out of the state machine's symmetric flap protection. The axis drives
+  watchdog zombie-restart suppression (a restart can't fix an ISP outage), the
+  `is_any_degraded` recovery gate (at OFFLINE only — don't re-dispatch into a
+  dead network), and the dashboard "Internet" light. Two OFFLINE-parking
+  consumers (PR-3) gate on `network.parking_mode` (off/shadow/live, default
+  shadow) through the shared `network_config.parking_decision()` gate: the
+  **CC-invoker network preflight** (`cc/invoker.py::_network_preflight` — raises
+  `CCNetworkOfflineError` BEFORE the subprocess spawns for a WAN endpoint,
+  turning a `timeout_s`-bounded hang (7200s default) into a sub-second fail; a
+  LAN CC peer, classified via `util/netclass.py`, still runs), and the
+  **surplus tier filter** (`surplus/dispatch.py::_filter_tiers_for_network` —
+  strips cloud compute tiers so internet-dependent tasks stay `pending` instead
+  of churning `failed`). The axis stays DELIBERATELY excluded from
+  `to_legacy_degradation_level` (broader legacy-level call-site shedding remains
+  deferred/tabled). Lever/kill-switch in `network_config.py`
+  (`GENESIS_NETWORK_SENTINEL_DISABLED`); window store `~/.genesis/network_state.json`
+  (`network_state.py`, stdlib-only, self-bounding). Consumers staleness-check the
+  sentinel's own `last_probe_at` and fail toward their safe default.
 - **observability/**: event bus dispatches inline AND logs every event;
   persist-queue overflow drops events but emits a rate-limited "dropped"
   meta-event (WS-17). Two health layers (async probes vs systemd shell-out);
@@ -1178,10 +1233,25 @@ verified: 9037d45b 2026-07-07
   injection hook and by autonomous-session resources. Skill refinement is a
   tracked cognitive-file modification (`learning/skills/applicator.py`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
+  Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
+  inventory (skills + action tools, never memory/brain) into a managed
+  `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
+  runtimes — on-demand and committed (re-run when skills/MCP tools change;
+  `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
 - **contribution/**: `python -m genesis contribute <sha>` — sanitize-then-PR
   upstream, pseudonymous. `sanitize.scan_diff()` is FAIL-CLOSED (8 scanners;
   any finding stops). Its forbidden-globs floor duplicates
-  `config/protected_paths.yaml` — keep in sync.
+  `config/protected_paths.yaml` — keep in sync. **Leak-detection is three-layer,
+  no private value hardcoded in tracked source** (a public scanner must not name
+  what it redacts): (1) generic CLASS patterns in the tree — all RFC1918, CGNAT,
+  fc00::/7 ULA, `/home/<user>` shapes, reusing `scripts/check_portability.sh`
+  vocabulary; (2) EXACT install values in the local, generated fingerprint file
+  (`~/.genesis/release-fingerprints.txt`, see `contribution/fingerprints.py`) —
+  consumed by `_check_fingerprints`, the commit-msg hook, and the pre-push hook;
+  (3) the same exact values in the `GENESIS_PRIVATE_PATTERNS` CI secret. CI is
+  WARN-not-block on the broad classes (never hard-blocks a contributor's legit
+  RFC1918 example); only exact-value matches hard-fail, on canonical non-fork
+  PRs. Procedure: `public-repo leak-detection design`.
 - **bookmark/**: two-tier session bookmarks stored as episodic memories +
   a lookup table; enrichment runs on surplus compute.
 - **workflows/**: YAML DAG executor — GROUNDWORK(workflow-engine), built with

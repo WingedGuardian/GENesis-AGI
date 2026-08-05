@@ -1287,13 +1287,16 @@ TABLES = {
             verification_notes TEXT,
             pinned           INTEGER NOT NULL DEFAULT 0,
             kind             TEXT NOT NULL DEFAULT 'follow_up' CHECK (
-                kind IN ('follow_up', 'tabled')
+                kind IN ('follow_up', 'tabled', 'idea')
             ),
             domain           TEXT CHECK (
                 domain IN ('internal', 'user_world')
             ),
             goal_id          TEXT,
-            dedup_key        TEXT
+            dedup_key        TEXT,
+            -- Declared LAST so a fresh CREATE matches the migration 0075
+            -- ALTER ... ADD COLUMN (which appends) — fresh/migrated column-order parity.
+            revisit_condition TEXT
         )
     """,
     "file_modifications": """
@@ -2169,6 +2172,23 @@ TABLES = {
             duration_ms       INTEGER
         )
     """,
+    "memory_reconcile_runs": """
+        CREATE TABLE IF NOT EXISTS memory_reconcile_runs (
+            id                        TEXT PRIMARY KEY,          -- uuid4 hex
+            created_at                TEXT NOT NULL DEFAULT (datetime('now')),
+            status                    TEXT NOT NULL CHECK (status IN ('ok', 'partial', 'skipped', 'failed')),
+            ghosts_deleted            INTEGER NOT NULL DEFAULT 0,
+            ghost_delete_failed       INTEGER NOT NULL DEFAULT 0,
+            mirrors_requeued          INTEGER NOT NULL DEFAULT 0,
+            mirrors_skipped_no_content INTEGER NOT NULL DEFAULT 0,
+            tombstones_drained        INTEGER NOT NULL DEFAULT 0,
+            truncated                 INTEGER NOT NULL DEFAULT 0, -- 1 = point scroll hit budget (mirrors skipped)
+            capped                    INTEGER NOT NULL DEFAULT 0, -- 1 = per-run repair cap cut the work list
+            duration_ms               INTEGER,
+            details_json              TEXT,                       -- run detail (skipped-stale counts, samples)
+            unknown_reason            TEXT                        -- set iff status='skipped'/'failed' on dependency outage
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2511,6 +2531,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_mcr_status ON memory_consistency_reports(status, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_rpr_created ON recall_probe_runs(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_rpr_status ON recall_probe_runs(status, created_at)",
+    # Memory integrity Phase 1 — reconcile-run audit rows
+    "CREATE INDEX IF NOT EXISTS idx_mrr_created ON memory_reconcile_runs(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_mrr_status ON memory_reconcile_runs(status, created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

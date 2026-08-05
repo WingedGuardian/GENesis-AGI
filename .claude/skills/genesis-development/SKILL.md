@@ -337,6 +337,27 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   and the pre-emit quote gate (a finding must quote its motivating
   file:line or be confidence-capped).
 
+### Review-loop discipline
+
+- **One reviewer at a time — NEVER run two review agents simultaneously.** Run
+  one reviewer (e.g. Codex), apply/verify its findings, then run the next
+  reviewer (e.g. Claude) on the *fixed* code — sequential, never in parallel.
+  The second reviewer should see the improved code, not the same unfixed diff
+  both would otherwise review; parallel also doubles review spend per baseline.
+  (Standing user directive.)
+- **Escalation cap — stop and raise after 3 rounds that each find NEW defects.**
+  A *round* = one review→fix→re-review iteration (local reviewer rounds and
+  cloud-bot re-review rounds count together, per change). If a **4th round still
+  surfaces NEW findings** (3 prior rounds each already fixed *distinct* issues),
+  STOP and raise it to the user before continuing — summarize what each round
+  found and why the surface is wider than scoped, and let the user choose: keep
+  hardening, switch to a robust-by-construction redesign, narrow scope, or shelve.
+  Caveats: **multiple findings in a single pass = one round** (not an escalation);
+  the same defect reappearing (an incomplete prior fix) is a fix-it-properly
+  issue, not an escalation trigger. This complements the enumerate-class-then-lock
+  convergence discipline — the cap is the escalation trigger when the class won't
+  lock within ≤3 rounds.
+
 ## Pre-Commit Gate
 
 Verify before any commit:
@@ -415,6 +436,19 @@ defaults, or tests. Resolve repo paths via `genesis.env.repo_root()` /
 (`gh repo view --json nameWithOwner`) — a configured slug can name a
 real-but-wrong repo and return plausible stale data. Shipped config defaults
 must work on a fresh install with ZERO overlay.
+
+**Leak-detection patterns follow the same rule — never hardcode an install's
+private literals into a tracked scanner.** A public repo's CI grep / gitleaks
+rule / commit-msg hook / contribution sanitizer must ship only generic CLASS
+patterns (all RFC1918, IPv6 ULA per RFC 4193, `/home/<user>` shapes — see
+`scripts/check_portability.sh`). This install's SPECIFIC literals (its
+hostnames, subnets, ULA prefixes, private repo name, timezone) live only in the
+GENERATED `~/.genesis/release-fingerprints.txt` (built by
+`genesis.contribution.fingerprints` at bootstrap; hand-edited section preserved,
+backed up via `backup.sh`) and — opt-in — the public repo's
+`GENESIS_PRIVATE_PATTERNS` Actions secret. A scanner that must exclude its own
+definition files from scanning is self-allowlisting a leak. See procedure
+`public_repo_leak_detection_design`.
 
 **Tenant-neutral, not tenant-shaped.** Genesis is a single-user sovereign
 system. Build clean single-user code; do NOT pre-genericise for multi-tenancy —

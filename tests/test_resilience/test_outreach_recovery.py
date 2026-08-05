@@ -85,6 +85,110 @@ async def test_failed_retry_resets_to_pending(worker):
 
 
 @pytest.mark.asyncio
+async def test_rejected_marks_completed_no_retry(worker):
+    """Governance-dedup REJECTED is terminal — the item is completed, not retried.
+
+    Regression: during the 2026-07 outage a delivered alert's duplicates each
+    came back REJECTED, were misread as failures, reset_to_pending, and burned
+    all 5 retries + filed junk delivery_exhausted observations.
+    """
+    from genesis.outreach.types import OutreachStatus
+
+    result = MagicMock()
+    result.status = OutreachStatus.REJECTED
+    result.error = None
+    worker._pipeline.submit_raw = AsyncMock(return_value=result)
+
+    item = _make_item(attempts=1)
+    await worker._retry(item)
+
+    worker._queue.mark_completed.assert_awaited_once_with("item-1")
+    worker._queue.reset_to_pending.assert_not_awaited()
+    worker._queue.mark_discarded.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_held_marks_completed_no_retry(worker):
+    """HELD (WS-8 email autonomy gate) is terminal — the hold store owns delivery.
+
+    Retrying re-gates and records a new pending hold each cycle; the resolution
+    watcher resumes held sends independently, so the deferred-queue copy must
+    stop retrying.
+    """
+    from genesis.outreach.types import OutreachStatus
+
+    result = MagicMock()
+    result.status = OutreachStatus.HELD
+    result.error = None
+    worker._pipeline.submit_raw = AsyncMock(return_value=result)
+
+    item = _make_item(attempts=1, channel="email")
+    await worker._retry(item)
+
+    worker._queue.mark_completed.assert_awaited_once_with("item-1")
+    worker._queue.reset_to_pending.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rejected_creates_no_observation(worker):
+    """A terminal REJECTED must not file a delivery_exhausted observation."""
+    from unittest.mock import patch
+
+    from genesis.outreach.types import OutreachStatus
+
+    result = MagicMock()
+    result.status = OutreachStatus.REJECTED
+    result.error = None
+    worker._pipeline.submit_raw = AsyncMock(return_value=result)
+
+    item = _make_item(attempts=1)
+    with patch("genesis.db.crud.observations.create", new_callable=AsyncMock) as mock_obs:
+        await worker._retry(item)
+
+    mock_obs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_still_retries(worker):
+    """A genuine send FAILED still resets to pending (unchanged behavior)."""
+    from genesis.outreach.types import OutreachStatus
+
+    result = MagicMock()
+    result.status = OutreachStatus.FAILED
+    result.error = "adapter down"
+    worker._pipeline.submit_raw = AsyncMock(return_value=result)
+
+    item = _make_item(attempts=1)
+    await worker._retry(item)
+
+    worker._queue.reset_to_pending.assert_awaited_once_with("item-1")
+    worker._queue.mark_completed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ignored_discarded_no_retry(worker):
+    """IGNORED (self-addressed / unresolved recipient) is a PERMANENT non-delivery
+    — discard it, do not burn retries or file a delivery_exhausted observation."""
+    from unittest.mock import patch
+
+    from genesis.outreach.types import OutreachStatus
+
+    result = MagicMock()
+    result.status = OutreachStatus.IGNORED
+    result.error = "no recipient resolved"
+    worker._pipeline.submit_raw = AsyncMock(return_value=result)
+
+    item = _make_item(attempts=1, channel="email")
+    with patch("genesis.db.crud.observations.create", new_callable=AsyncMock) as mock_obs:
+        await worker._retry(item)
+
+    worker._queue.mark_discarded.assert_awaited_once()
+    assert "ignored" in worker._queue.mark_discarded.call_args[0][1].lower()
+    worker._queue.reset_to_pending.assert_not_awaited()
+    mock_obs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_exhausted_creates_observation(worker):
     """After max retries, item is discarded and observation created."""
     from unittest.mock import patch

@@ -114,6 +114,18 @@ main() {
             || echo "retrieval_efficacy prune exited $?"
     fi
 
+    echo "--- memory-reconcile ghost-export retention prune (>45d) ---"
+    # The nightly reconcile lane writes a date-stamped JSONL per run day
+    # (date-stamped precisely so this age prune works — an append-forever file
+    # would refresh its mtime every run); d0008's one-shot export ages out the
+    # same way. The exports are a recovery net, not an archive.
+    if [ -d "$HOME/.genesis/output" ]; then
+        find "$HOME/.genesis/output" -maxdepth 1 -type f \
+            \( -name 'memory_reconcile_ghost_export-*.jsonl' -o -name 'd0008_ghost_export.jsonl' \) \
+            -mtime +45 -delete 2>/dev/null \
+            || echo "reconcile ghost-export prune exited $?"
+    fi
+
     echo "=== genesis-disk-hygiene done ==="
 }
 

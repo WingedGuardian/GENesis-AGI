@@ -145,6 +145,62 @@ async def schedule_model_eval(sched: SchedulerContext) -> None:
         )
 
 
+async def _promote_staged_ideas(db: aiosqlite.Connection) -> int:
+    """Graduate pending staged ideation into the follow_ups 'idea' review lane.
+
+    WS-M PR-2. Capped + FIFO + idempotent (a stable dedup_key spans all statuses
+    so a completed/dismissed idea is never recreated, and promote() flips the
+    staged row out of 'pending' so the next pass skips it). Crash-consistent: the
+    follow_up create and the surplus promote are separate commits, so a crash
+    between them leaves the staged row pending with its follow_up already present
+    — the next pass's exists_by_dedup_key precheck reconciles it. Gated by the
+    surplus_ideation_promotion settings lever; returns the count promoted.
+    """
+    import hashlib
+
+    import aiosqlite as _aiosqlite
+
+    from genesis.db.crud import follow_ups as fu_crud
+    from genesis.surplus.promotion_config import cap_per_run, is_enabled
+    from genesis.surplus.types import IDEA_TASK_TYPES
+
+    if not is_enabled():
+        return 0
+
+    task_types = [str(t) for t in IDEA_TASK_TYPES]
+    rows = await surplus_crud.list_promotable_ideas(db, task_types=task_types, limit=cap_per_run())
+    promoted = 0
+    for row in rows:
+        sid = row["id"]
+        dedup_key = hashlib.sha256(f"surplus_ideation|{sid}".encode()).hexdigest()
+        try:
+            if await fu_crud.exists_by_dedup_key(db, dedup_key):
+                # Follow-up already exists (a prior crash-interrupted pass, or a
+                # user-completed idea) — flip the staged row out of pending.
+                await surplus_crud.promote(db, sid, promoted_to="follow_up:dedup")
+                continue
+            reason = f"{row['source_task_type']} · {row['drive_alignment']}"
+            fid = await fu_crud.create(
+                db,
+                content=row["content"],
+                source="surplus_ideation",
+                strategy="surplus_task",
+                reason=reason,
+                kind="idea",
+                domain="internal",
+                dedup_key=dedup_key,
+            )
+            await surplus_crud.promote(db, sid, promoted_to=f"follow_up:{fid}")
+            promoted += 1
+        except _aiosqlite.IntegrityError:
+            # Lost a dedup race (unique dedup index) — the follow_up exists;
+            # reconcile by flipping the staged row out of pending.
+            await surplus_crud.promote(db, sid, promoted_to="follow_up:dedup")
+        except Exception:
+            logger.warning("Idea promotion failed for surplus insight %s", sid, exc_info=True)
+    return promoted
+
+
 async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
     """GC operations — each wrapped individually so one failure doesn't skip the rest."""
     # Purge expired surplus insights (TTL enforcement)
@@ -154,6 +210,22 @@ async def _run_maintenance_gc(db: aiosqlite.Connection) -> None:
             logger.info("Purged %d expired surplus insights", purged)
     except Exception:
         logger.warning("GC: surplus insights purge failed", exc_info=True)
+
+    # Hard-delete long-discarded surplus insights (bound inert-row accumulation)
+    try:
+        deleted = await surplus_crud.purge_discarded(db, older_than_days=30)
+        if deleted:
+            logger.info("Deleted %d long-discarded surplus insights", deleted)
+    except Exception:
+        logger.warning("GC: surplus discarded purge failed", exc_info=True)
+
+    # Promote pending staged ideation into the follow_ups 'idea' review lane
+    try:
+        promoted = await _promote_staged_ideas(db)
+        if promoted:
+            logger.info("Promoted %d staged ideas to the 'idea' review lane", promoted)
+    except Exception:
+        logger.warning("GC: idea promotion failed", exc_info=True)
 
     # GC: remove completed/failed pending_embeddings older than 30 days
     try:

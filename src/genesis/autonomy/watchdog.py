@@ -64,6 +64,9 @@ class WatchdogChecker:
         secrets_path: str | Path | None = None,
         state_file: str | Path = "~/.genesis/watchdog_state.json",
         stabilization_s: int = 120,
+        flap_window_s: int = 21600,
+        flap_threshold: int = 3,
+        flap_backoff_max_s: int = 7200,
         remediation_registry: RemediationRegistry | None = None,
         outreach_fn: OutreachFn | None = None,
     ) -> None:
@@ -78,6 +81,9 @@ class WatchdogChecker:
         self._secrets_path = Path(resolved_secrets).expanduser()
         self._state_path = Path(state_file).expanduser()
         self._stabilization_s = stabilization_s
+        self._flap_window_s = flap_window_s
+        self._flap_threshold = flap_threshold
+        self._flap_backoff_max_s = flap_backoff_max_s
         self._remediation_registry = remediation_registry
         self._outreach_fn = outreach_fn
         self._target_service = self._detect_target_service()
@@ -117,6 +123,9 @@ class WatchdogChecker:
                 backoff_max_s=wd.get("backoff_max_seconds", 300),
                 config_validation=wd.get("config_validation", True),
                 stabilization_s=wd.get("stabilization_seconds", 120),
+                flap_window_s=wd.get("flap_window_seconds", 21600),
+                flap_threshold=wd.get("flap_threshold", 3),
+                flap_backoff_max_s=wd.get("flap_backoff_max_seconds", 7200),
             )
         except (yaml.YAMLError, OSError, AttributeError):
             logger.warning("Failed to load watchdog config — using defaults", exc_info=True)
@@ -181,6 +190,19 @@ class WatchdogChecker:
                     )
                     return WatchdogAction.SKIP
 
+                # Connectivity forgiveness (PR-2): a zombie scheduler during a
+                # network outage is surplus dispatch stalled on dead-network
+                # provider calls — a restart cannot fix an ISP outage (it just
+                # wipes in-memory circuit-breaker state and re-walks the dead
+                # chain slowly). Skip while the network is degraded/offline.
+                if self._network_suppresses_restart(status):
+                    logger.info(
+                        "Zombie detected (%s) but network degraded/offline "
+                        "(fresh probe) — restart can't fix connectivity, skipping",
+                        ", ".join(zombie),
+                    )
+                    return WatchdogAction.SKIP
+
                 logger.warning(
                     "Zombie scheduler detected: %s — triggering restart",
                     ", ".join(zombie),
@@ -199,6 +221,46 @@ class WatchdogChecker:
         state = self._load_state()
         return self._restart_if_allowed(state, reason="stale_status_restart")
 
+    def _network_suppresses_restart(self, status: dict) -> bool:
+        """True ONLY when a FRESH sentinel probe reports degraded/offline.
+
+        Fails safe (returns False → allow restart) on: absent network field,
+        missing/garbled timestamp, or a STALE probe (dead/stalled sentinel).
+        status.json's own top-level freshness is not sufficient — the 60s
+        status-writer loop refreshes the file timestamp independently of the
+        sentinel, so a dead sentinel + live writer would look fresh forever with
+        a frozen network field. We therefore staleness-check the sentinel's OWN
+        last_probe_at, so a genuinely wedged server with a healthy network is
+        never left unrestarted.
+        """
+        try:
+            from datetime import UTC, datetime
+
+            from genesis.resilience import network_config, network_state
+
+            net = status.get("network")
+            if not isinstance(net, dict):
+                return False
+            if net.get("state") not in ("DEGRADED", "OFFLINE"):
+                return False
+            age = network_state.probe_age_s(net, datetime.now(UTC))
+            # None (absent/garbled) OR negative (a future timestamp from clock
+            # skew / bad data) → not a trustworthy fresh probe; fail toward restart.
+            if age is None or age < 0:
+                return False
+            threshold = network_config.structural().staleness_threshold_s
+            if age > threshold:
+                logger.info(
+                    "Network field stale (%.0fs > %ds) — NOT suppressing restart",
+                    age, threshold,
+                )
+                return False
+            return True
+        except Exception:
+            # Any failure in the connectivity check must fail toward restart.
+            logger.debug("Network suppression check failed — allowing restart", exc_info=True)
+            return False
+
     def _restart_if_allowed(self, state: dict, *, reason: str) -> WatchdogAction:
         """Shared restart logic: backoff → validation → restart or skip."""
         # Defer restarts while a deploy is running. update.sh intentionally stops
@@ -213,6 +275,35 @@ class WatchdogChecker:
                 "Deploy in progress — deferring %s restart until it completes", reason,
             )
             return WatchdogAction.SKIP
+
+        # Flap damping: a SLOW recurring same-reason restart (spaced beyond the
+        # 120s stabilization window, so consecutive_failures keeps resetting to
+        # 0) would otherwise restart forever — restart cannot fix a persistent
+        # external cause (the 2026-07 outage flapped zombie_scheduler ~25x/12h).
+        # Once >= flap_threshold same-reason restarts land within flap_window,
+        # apply an escalating (capped) backoff and surface ONE durable warning
+        # instead of silently restarting again. This is a BACKOFF, never a
+        # permanent refusal — it self-heals once the window prunes. Rapid crash
+        # recovery is unaffected (that trips consecutive_failures/backoff below,
+        # within the stabilization window). PR-2 will additionally suppress
+        # zombie restarts outright when the connectivity sentinel reports offline.
+        now = time.time()
+        same_reason = [
+            h for h in state.get("restart_history", [])
+            if h.get("reason") == reason and now - h.get("ts", 0) <= self._flap_window_s
+        ]
+        if len(same_reason) >= self._flap_threshold:
+            over = len(same_reason) - self._flap_threshold + 1
+            flap_backoff = min(self._flap_backoff_max_s, self._backoff_max * (2**over))
+            last_ts = max(h["ts"] for h in same_reason)
+            if now < last_ts + flap_backoff:
+                self._alert_flap(reason, len(same_reason), flap_backoff)
+                logger.warning(
+                    "Flap damping: %d '%s' restarts within %ds — backing off "
+                    "%.0fs (restart cannot fix a recurring same-reason failure)",
+                    len(same_reason), reason, self._flap_window_s, flap_backoff,
+                )
+                return WatchdogAction.BACKOFF
 
         if state["consecutive_failures"] >= self._max_restarts:
             logger.error(
@@ -420,7 +511,7 @@ class WatchdogChecker:
                 return json.loads(self._state_path.read_text())
             except (json.JSONDecodeError, OSError):
                 pass
-        return {"consecutive_failures": 0, "next_attempt_after": None, "last_reason": None, "last_restart_at": None, "last_check_at": None}
+        return {"consecutive_failures": 0, "next_attempt_after": None, "last_reason": None, "last_restart_at": None, "last_check_at": None, "restart_history": []}
 
     def _save_state(self, state: dict) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -430,16 +521,54 @@ class WatchdogChecker:
             logger.error("Failed to save watchdog state to %s", self._state_path, exc_info=True)
 
     def _record_failure(self, state: dict, *, reason: str) -> None:
+        now = time.time()
         state["consecutive_failures"] += 1
         state["last_reason"] = reason
-        state["last_restart_at"] = time.time()
+        state["last_restart_at"] = now
+        # Rolling per-reason restart history for flap damping. Recorded on
+        # every actual restart decision (never on a backoff-skip), pruned to
+        # the flap window. Deliberately survives _reset_state so SLOW
+        # recurrences (spaced beyond the 120s stabilization window, which
+        # resets consecutive_failures to 0) are still counted — the hole that
+        # let the 2026-07 outage flap ~25x/12h.
+        history = [
+            h for h in state.get("restart_history", [])
+            if now - h.get("ts", 0) <= self._flap_window_s
+        ]
+        history.append({"ts": now, "reason": reason})
+        state["restart_history"] = history
         # Exponential backoff: initial * 2^(failures-1), capped
         backoff = min(
             self._backoff_initial * (2 ** (state["consecutive_failures"] - 1)),
             self._backoff_max,
         )
-        state["next_attempt_after"] = time.time() + backoff
+        state["next_attempt_after"] = now + backoff
         self._save_state(state)
+
+    def _alert_flap(self, reason: str, count: int, backoff_s: float) -> None:
+        """Surface ONE durable warning that the watchdog is flap-damping a
+        recurring same-reason restart. Routed through the alert queue (drained
+        to the owner by the awareness tick) because the oneshot watchdog has no
+        outreach pipeline; the dedupe_key collapses repeats to a single live
+        entry per reason. Best-effort — never raises."""
+        try:
+            from genesis.guardian.alert.queue import enqueue_alert
+
+            enqueue_alert(
+                Path.home() / ".genesis" / "alerts" / "queue",
+                severity="warning",
+                source="watchdog",
+                title="Watchdog flap-damping repeated restarts",
+                body=(
+                    f"{count} '{reason}' restarts within {self._flap_window_s}s — "
+                    f"backing off {backoff_s:.0f}s. Restart cannot fix a recurring "
+                    f"same-reason failure; investigate the root cause "
+                    f"(e.g. connectivity loss or a crash loop)."
+                ),
+                dedupe_key=f"watchdog:flap:{reason}",
+            )
+        except Exception:
+            logger.debug("flap alert enqueue failed", exc_info=True)
 
     def _reset_state(self) -> None:
         if not self._state_path.exists():
@@ -471,6 +600,13 @@ class WatchdogChecker:
                     logger.error("Failed to save watchdog state", exc_info=True)
                 return
 
+        # Preserve the rolling restart history (pruned) across a healthy reset
+        # — wiping it here is exactly what let slow recurrences dodge damping.
+        now = time.time()
+        history = [
+            h for h in state.get("restart_history", [])
+            if now - h.get("ts", 0) <= self._flap_window_s
+        ]
         try:
             self._state_path.write_text(
                 json.dumps({
@@ -479,6 +615,7 @@ class WatchdogChecker:
                     "last_reason": None,
                     "last_restart_at": None,
                     "last_check_at": datetime.now(UTC).isoformat(),
+                    "restart_history": history,
                 })
             )
         except OSError:

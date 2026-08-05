@@ -60,7 +60,18 @@ def main() -> int:
             "timing profiles, and the VNC trusted input technique for bypassing "
             "Cloudflare Turnstile checkboxes."
         )
-        print(json.dumps({"additionalContext": nudge}))
+        # Reaches the model ONLY via hookSpecificOutput.additionalContext;
+        # a top-level additionalContext key is silently discarded.
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": nudge,
+                    }
+                }
+            )
+        )
 
     except (json.JSONDecodeError, KeyError):
         pass  # Fail-open

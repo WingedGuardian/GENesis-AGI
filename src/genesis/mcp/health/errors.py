@@ -622,6 +622,24 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
         )
         current_ids.add(alert_id)
 
+    # Internet connectivity. WARNING (not CRITICAL): the container Sentinel can't
+    # fix an ISP outage, so this stays out of the Sentinel-waking CRITICAL tier.
+    # Fires only on a confirmed OFFLINE (down) — DEGRADED/unknown/absent do not
+    # alert (a slow or unmonitored network is not an incident). The infra probe
+    # already staleness-guards, so a stale sentinel reads 'unknown', not 'down'.
+    internet = snap.get("infrastructure", {}).get("internet", {})
+    if isinstance(internet, dict) and internet.get("status") == "down":
+        alert_id = "infra:internet_down"
+        detail = internet.get("message") or "offline"
+        alerts.append(
+            {
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": f"Internet connectivity down ({detail})",
+            }
+        )
+        current_ids.add(alert_id)
+
     if _activity_tracker is not None:
         emb_summary = _activity_tracker.summary("episodic_memory_embedding")
         if (

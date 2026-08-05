@@ -9,8 +9,100 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **Genesis's skills and tools are now portable to other AI coding tools.** A
+  new generator writes an auto-maintained inventory of Genesis's skills and
+  action tools into `AGENTS.md` — the cross-tool entry point that Cursor,
+  Codex, and other agent runtimes read — so Genesis's capability layer travels
+  with the repo instead of being locked to one harness. The inventory is
+  body-scope only: it lists what Genesis can *do*, and deliberately excludes
+  its memory and cognition. Refresh it any time with
+  `python scripts/export_agents_md.py`.
+
 ### Fixed
 
+- **Re-embedding a memory no longer downgrades its recall ranking.** When a
+  memory's vector was rebuilt (after a vector-store outage, or by the nightly
+  repair job), its priority class was silently recomputed from the text alone —
+  discarding any deliberate classification and, for reference-style entries,
+  re-applying a ranking penalty that lowered how often they surfaced. Rebuilds
+  now preserve the stored class. Installs that already drifted are healed
+  automatically on update: a one-time pass re-syncs each memory's stored class
+  onto its vector (a clean no-op if nothing drifted).
+
+- **Learned procedures no longer overwrite each other.** Genesis identified a
+  stored "how-to" procedure by its coarse topic label alone, so two genuinely
+  different lessons that happened to share a label would silently replace one
+  another — each new lesson destroying the previous one under the same row. On
+  one install a single `code_review` row had absorbed (and lost) ~30 distinct
+  lessons this way. Procedures are now matched by the similarity of the lesson
+  itself: a genuine refinement still updates in place, but a distinct lesson is
+  kept as its own procedure instead of overwriting an unrelated one.
+
+- **Legacy procedures with stale similarity vectors are re-embedded on update.**
+  The procedure-overwrite fix above matches lessons by similarity, but a
+  procedure edited many times before that fix shipped kept a similarity vector
+  describing an *older* version of the lesson — which could still misjudge a new
+  distinct lesson as "the same" and overwrite it. Installs are healed
+  automatically on update: a one-time pass re-embeds each repeatedly-edited
+  procedure from its current text so the matching is trustworthy (a clean no-op
+  where nothing was stale).
+
+### Added
+
+- **Memory self-healing is now on by default, and deletes survive outages.**
+  Two upgrades complete the memory-repair story: (1) when a memory delete
+  can't finish because the vector store is unreachable, the intent is now
+  recorded as a durable "tombstone" — the nightly repair job re-attempts the
+  delete until it completes, and nothing will rebuild that memory's vector in
+  the meantime; (2) repair is now safe against deletes from every Genesis
+  process (not just the main server), so the nightly reconcile job runs by
+  default (`memory_integrity` mode `active`). Set `mode: passive` in your
+  local overlay for detection-only. Recall also stops surfacing "ghost"
+  leftovers: results whose backing record was deleted are filtered out of
+  vector search and ambient core-facts instead of reappearing until the
+  nightly sweep. (This treats any vector without a metadata record as a
+  ghost — including pre-metadata-era legacy vectors on long-lived installs;
+  those become invisible to semantic recall and are removed by the nightly
+  repair with their contents exported first.)
+
+- **Genesis can now repair memory drift automatically (opt-in).** Building on
+  the Memory Integrity checks (which detect drift between the memory database
+  and the vector store) and the one-time startup cleanup, a nightly repair job
+  fixes any drift that reappears: orphaned "ghost" vectors are removed (their
+  contents exported to `~/.genesis/output/` first as a safety net), and
+  memories that silently lost their vector are re-queued so full semantic
+  search is restored. Enable it by setting `memory_integrity` mode to `active`
+  (it becomes the default in an upcoming release, once repairs are fully
+  serialized against deletes from every Genesis process);
+  `GENESIS_MEMORY_INTEGRITY_DISABLED=1` turns the memory-integrity jobs off
+  entirely. Every repair run is recorded, so what changed is always auditable.
+
+### Changed
+
+- **The push-approval prompt now appears only on a branch's first push, not on
+  every push.** Publishing a branch to the public repo still asks for your
+  approval the first time — that's the moment code actually goes public — but
+  re-pushing fixes to a branch that's already on the remote (the normal
+  PR-iteration loop) no longer re-prompts. A genuinely new branch prompts again,
+  pushing to `main` still prompts, force-pushes are still hard-blocked, and
+  autonomous/dispatched sessions still can't push at all. The check reads the live
+  remote and fails safe: any uncertainty (unreachable remote, ambiguous target)
+  falls back to asking.
+
+### Fixed
+
+- **Committing with `git -C` or `git -c` no longer skips the code-review gate.**
+  The safety hook that blocks commits until a review is recorded (and blocks
+  `--no-verify` and direct commits to `main`) recognized only the plain
+  `git commit` form. Commits written as `git -C <dir> commit` or
+  `git -c key=val commit` — a form these sessions use routinely for worktrees —
+  slipped past it entirely and committed with no review check at all. The gate
+  now recognizes those forms, so every commit is held to the same review rule,
+  and the matching post-commit cleanup clears the review for the exact worktree
+  the commit landed in (not the shell's directory), so one review can't silently
+  authorize a later unrelated commit.
 - **Deleting a memory no longer risks leaving an orphaned vector behind.** A
   memory lives across SQLite and a vector store; if the vector store hiccupped
   mid-delete, Genesis used to remove the memory's records but leave its vector
@@ -26,6 +118,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   state — so a memory that was retired or superseded while its vector was still
   pending stays excluded from recall instead of quietly reappearing, and its real
   confidence is preserved rather than reset to a default.
+- **Internet outages no longer leave a mess behind.** A long connectivity loss
+  used to pile up hundreds of duplicate queued alerts, spam the health view with
+  false "delivery exhausted" warnings, and — worst — put Genesis in an endless
+  restart loop (it announced "going offline" over and over because restarting
+  can't fix a dead network). Now: a repeated delivery failure for the same alert
+  is de-duplicated instead of re-queued; a duplicate that was already delivered,
+  or an email held for your approval, is treated as done rather than retried into
+  a false failure; deferred messages actually expire on their 4-hour deadline
+  instead of lingering forever; and the watchdog, after restarting a few times
+  for the same reason, backs off and sends you one warning instead of restarting
+  on a loop.
+- **Genesis now sheds low-priority background work when its providers are
+  struggling.** The degradation system that's meant to skip non-essential work
+  (surplus brainstorms, the morning report) during a provider brownout was wired
+  up but never actually triggered on provider failures — it does now, so a rough
+  patch for the model providers no longer drags every background task down with it.
 
 ### Added
 
@@ -2145,7 +2253,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 - **The contribution sanitizer now blocks Tailscale addresses before they can reach the public
   repo.** When you prepare a community contribution, the pre-push privacy scan now catches Tailscale
-  CGNAT and Tailscale IPv6 addresses, and flags the full private `10.176` subnet range (not just two
+  CGNAT and Tailscale IPv6 addresses, and flags the full private RFC1918 subnet range (not just two
   hard-coded addresses) — closing a gap where these install-specific addresses could otherwise slip
   into a public PR. The commit-message guard gained the same IPv6 coverage.
 

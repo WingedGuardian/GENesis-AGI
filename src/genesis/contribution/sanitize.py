@@ -76,23 +76,40 @@ DEFAULT_FORBIDDEN_GLOBS: tuple[str, ...] = (
     "config/modules/automaton-supervisor.yaml",
 )
 
-# Portability patterns — things that should never appear in a
-# public-facing contribution. Copied from the release script's
-# phase 8 portability scan.
+# Portability patterns — install-specific SHAPES that should never appear in a
+# public-facing contribution. These are generic CLASSES (all RFC1918 space, the
+# IPv6 ULA space per RFC 4193, and /home/<user> path shapes) — deliberately NOT
+# this install's literal values. A public scanner must never name what it
+# redacts, so exact install values live ONLY in the local fingerprint file
+# (see _check_fingerprints) and the CI secret, never in tracked source.
+#
+# The network regexes are kept byte-identical to scripts/check_portability.sh so
+# there is a single source of truth for the class vocabulary; a cross-surface
+# drift test asserts these, the commit-msg hook, and check_portability.sh all
+# agree. Use [0-9] (not \d) so every pattern is valid under BOTH Python re and
+# grep -E — the commit-msg hook consumes the same class vocabulary via grep -E.
+#
+# These are a strict superset of the former install-specific literals: each old
+# literal is a member of its class (a specific /16 within RFC1918 10/8, a
+# specific /24 within 192.168/16, specific ULA prefixes within RFC 4193 space, a
+# specific home path within /home/<user>), so no prior coverage is lost. Labels
+# use CIDR shorthand (no full dotted-quad) so this file does not self-match the
+# class scan.
 _PORTABILITY_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"/home/ubuntu/genesis", "absolute path /home/ubuntu/genesis"),
-    (r"/home/ubuntu/agent-zero", "absolute path /home/ubuntu/agent-zero"),
-    (r"/home/ubuntu/\.[A-Za-z]", "absolute path to user dotfile"),
-    (r"-home-ubuntu-genesis", "CC project dir slug"),
-    (r"10\.176\.\d{1,3}\.\d{1,3}", "private 10.176 subnet IP"),
-    (r"100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}", "Tailscale CGNAT IP"),
-    (r"192\.168\.50\.\d+", "private subnet IP"),
-    (r"\bWingedGuardian/(Genesis|genesis-backups)\b", "private repo reference"),
-    (r"\bAmerica/New_York\b", "hardcoded user timezone"),
-    (r"\bfd42:e3ba\b", "container IPv6 prefix"),
-    (r"\bfd4d:77b8\b", "host IPv6 prefix"),
-    (r"\bfd7a:", "Tailscale IPv6 prefix"),
-    (r"\b5070ti\b", "hardware reference"),
+    (r"/home/[a-z_][a-z0-9_-]*/genesis", "absolute /home/<user>/genesis path"),
+    (r"/home/[a-z_][a-z0-9_-]*/\.[A-Za-z]", "absolute path to a user dotfile"),
+    (r"-home-[a-z0-9-]+-genesis", "CC project-dir slug"),
+    (r"\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b", "private 10/8 address"),
+    (
+        r"\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b",
+        "private 172.16/12 address",
+    ),
+    (r"\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b", "private 192.168/16 address"),
+    (
+        r"\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b",
+        "CGNAT 100.64/10 address",
+    ),
+    (r"\b[fF][cdCD][0-9a-fA-F]{2}:", "IPv6 ULA prefix (RFC 4193)"),
 )
 
 # Email regex — loosely based on the release script's pattern.
@@ -647,10 +664,35 @@ def scan_diff(
     findings.extend(_check_emails(parsed))
     scanners_run.append("email_allowlist")
 
-    # 6. Fingerprints (optional — only runs if file exists)
+    # 6. Fingerprints (optional — only runs if file exists). The generic
+    #    portability classes above are always-on, but this install's EXACT
+    #    non-classable values (private repo/host names, hardware, tokens) are
+    #    only caught when the fingerprint file is present. A missing file is a
+    #    provisioning gap, so surface it as a non-blocking WARN (does not affect
+    #    `ok`) rather than silently skipping — run bootstrap to generate it.
+    #    (The awareness posture check is the standing-alert companion to this.)
     if fingerprint_file and fingerprint_file.is_file():
         findings.extend(_check_fingerprints(parsed, fingerprint_file))
         scanners_run.append("fingerprint")
+    else:
+        # File absent: the exact-value scan did NOT run, so do NOT record it in
+        # scanners_run (whose contract is scanners that actually executed — the
+        # CLI/PR body render that list). The WARN finding is the explicit signal
+        # that exact-value coverage was skipped.
+        findings.append(
+            Finding(
+                kind=FindingKind.FINGERPRINT,
+                severity=Severity.WARN,
+                message=(
+                    "Release fingerprint file not found — this install's exact "
+                    "private identifiers are not being scanned. Run bootstrap "
+                    "(or `python -m genesis.contribution.fingerprints --write`) "
+                    "to generate it."
+                ),
+                scanner="fingerprint",
+                detail=str(fingerprint_file),
+            )
+        )
 
     # 7. detect-secrets (required floor)
     ran, secret_hits = _run_detect_secrets(parsed)

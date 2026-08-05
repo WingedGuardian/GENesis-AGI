@@ -38,11 +38,32 @@ _CACHE_PATH = Path(
 
 
 def _load_triggers() -> list[dict]:
-    """Load YAML trigger cache. Returns empty list on any error."""
+    """Load the trigger cache. Returns an empty list on any error.
+
+    This is a PreToolUse hook — it runs in a fresh process on EVERY tool call,
+    so ``import yaml`` (~40ms) would be paid every time. Prefer the JSON sidecar
+    (stdlib ``json``, already imported) when it is at least as fresh as the YAML
+    source of truth; only fall back to parsing the YAML (lazy import) otherwise.
+    The mtime guard (nanosecond, exact) ensures a YAML regenerated without a
+    matching sidecar is never served stale from an older JSON.
+
+    The sidecar path is derived from ``_CACHE_PATH`` here (not a module constant)
+    so an override of ``_CACHE_PATH`` alone keeps the two consistent. A sidecar
+    that decodes but is not ``{"triggers": [...]}`` (e.g. ``{}`` or ``[]``) is
+    treated as a miss and falls through to the YAML — never trusted, never a crash.
+    """
+    json_path = _CACHE_PATH.with_suffix(".json")
+    try:
+        if json_path.stat().st_mtime_ns >= _CACHE_PATH.stat().st_mtime_ns:
+            data = json.loads(json_path.read_text())
+            if isinstance(data, dict) and isinstance(data.get("triggers"), list):
+                return data["triggers"]
+    except (OSError, ValueError):
+        pass  # missing/corrupt/stale sidecar → fall back to the YAML
     try:
         import yaml
         data = yaml.safe_load(_CACHE_PATH.read_text())
-        return data.get("triggers", []) if data else []
+        return data.get("triggers", []) if isinstance(data, dict) else []
     except Exception:
         return []
 

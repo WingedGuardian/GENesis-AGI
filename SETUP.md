@@ -23,6 +23,13 @@ After bootstrap:
 2. Start Claude Code: `claude` in the genesis directory
 3. All hooks and MCP servers activate automatically
 
+> **Two install paths.** This bare-metal `bootstrap.sh` quick-start targets
+> developers and restores: it configures infrastructure and expects you to add
+> keys manually (steps above). For a guided, container-based install that walks
+> you through API keys, profile, and channels interactively, use
+> `scripts/host-setup.sh` (see the README) — it runs first-run onboarding
+> automatically, and you can re-trigger it with `/setup` if it doesn't start.
+
 ## Minimum Viable Setup
 
 Genesis needs at least one LLM provider. The cheapest path:
@@ -85,7 +92,7 @@ Populates the voice exemplar library with samples of your writing style.
 3. Add to `secrets.env`:
    ```
    TELEGRAM_BOT_TOKEN=your_bot_token
-   TELEGRAM_USER_ID=your_user_id
+   TELEGRAM_ALLOWED_USERS=your_numeric_user_id   # comma-separated for multiple
    ```
 
 ## Configuration Files

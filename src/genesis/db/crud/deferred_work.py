@@ -153,6 +153,101 @@ async def count_pending_in(
     return int(row[0])
 
 
+async def count_open_by_identity(
+    db: aiosqlite.Connection,
+    *,
+    work_type: str,
+    topic: str,
+    category: str,
+    signal_type: str | None,
+) -> int:
+    """Count OPEN (pending or processing) rows for a work_type matching the FULL
+    outreach dedup identity ``(topic, category, signal_type)`` stored in
+    ``payload_json``.
+
+    Dedup-at-defer: repeated delivery failures of the SAME message must not each
+    enqueue a fresh row. Both the recovery worker's retry (which moves the
+    original to 'processing' before re-attempting, then re-defers on failure)
+    and the alert-drain re-submit loop go through ``_defer`` — counting
+    'processing' as well as 'pending' closes both amplification paths (2026-07
+    outage: 690 duplicate rows for one backup-alert topic).
+
+    Keys on the SAME ``(signal_type, topic, category)`` identity governance uses
+    (``outreach/governance.py``), NOT topic alone. A topic is reused across
+    message TYPES (e.g. ``autonomy/executor/engine.py`` emits progress, success,
+    alert, and blocker under one ``Task <id>`` topic); a topic-only guard would
+    suppress a later blocker behind an open progress row and permanently drop it.
+    (The alert-drain dupes share one identity so they still collapse to a single
+    row; the recovery worker rewrites signal_type to ``deferred_retry`` on its
+    retries, so that path stabilises at ~2 rows/message — still vs 690 — while
+    distinct message types stay independently deliverable.)
+
+    ``json_valid`` + ``CASE`` guard each extraction so a corrupt ``payload_json``
+    row (external corruption — ``_defer`` always writes valid JSON) is skipped
+    rather than raising ``OperationalError``, which would propagate through
+    ``has_open`` into ``_defer``'s broad handler and silently drop EVERY new
+    delivery until the bad row is cleared. ``COALESCE(..., '')`` makes a
+    missing/NULL signal_type or category match cleanly (SQL ``NULL = ?`` is never
+    true). The read-then-insert dedup was designed single-writer; one
+    work_type is now multi-process (``memory_deferred_delete`` — both
+    genesis-server and the genesis-memory MCP process enqueue) but explicitly
+    DUP-TOLERANT: duplicate open tombstones are all closed together and a
+    double-drained delete is idempotent (memory/delete_tombstones.py). For any
+    future work_type that is NOT dup-tolerant, the ``idx_rlp_open_dedup``
+    partial-unique-index pattern (``cc_rate_limit_parks``) is the upgrade path.
+    """
+    cursor = await db.execute(
+        """SELECT COUNT(*) FROM deferred_work_queue
+           WHERE work_type = ?
+             AND status IN ('pending', 'processing')
+             AND (CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.topic') END) = ?
+             AND COALESCE(CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.category') END, '') = ?
+             AND COALESCE(CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.signal_type') END, '')
+                 = COALESCE(?, '')""",
+        (work_type, topic, category, signal_type),
+    )
+    row = await cursor.fetchone()
+    return int(row[0])
+
+
+async def complete_open_by_identity(
+    db: aiosqlite.Connection,
+    *,
+    work_type: str,
+    topic: str,
+    category: str,
+    signal_type: str | None,
+    completed_at: str,
+) -> int:
+    """Mark every OPEN (pending/processing) row matching the payload dedup
+    identity ``(topic, category, signal_type)`` as completed. Returns the count.
+
+    The inverse of :func:`count_open_by_identity` — used when the deferred
+    work's outcome was achieved out-of-band (e.g. a memory delete succeeded on
+    retry through the normal path, so its delete-intent tombstone is obsolete).
+    Same ``json_valid`` guards: a corrupt row is skipped, never raises.
+    """
+    cursor = await db.execute(
+        """UPDATE deferred_work_queue
+           SET status = 'completed', completed_at = ?
+           WHERE work_type = ?
+             AND status IN ('pending', 'processing')
+             AND (CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.topic') END) = ?
+             AND COALESCE(CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.category') END, '') = ?
+             AND COALESCE(CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.signal_type') END, '')
+                 = COALESCE(?, '')""",
+        (completed_at, work_type, topic, category, signal_type),
+    )
+    await db.commit()
+    return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+
 async def count_recovery_pending(
     db: aiosqlite.Connection,
     *,

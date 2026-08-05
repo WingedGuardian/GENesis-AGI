@@ -130,7 +130,6 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "learning": timedelta(days=14),
     "learning_regression": timedelta(days=14),
     "skill_evolution": timedelta(days=14),
-    "skill_proposal": timedelta(days=14),
     "scope_clarification": timedelta(days=14),
     "interpretation_correction": timedelta(days=14),
     "merged_observation": timedelta(days=14),
@@ -167,6 +166,11 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     # stays visible for adjudication.
     "skill_replay_verdict": timedelta(days=30),
     # ── 60-day (action-required, real issues) ──────────────────────────
+    # skill_proposal: the propose-only human-review queue — an autonomous skill
+    # edit staged for a human/CC to review + apply. Must NOT self-erase quickly
+    # (resolve_expired auto-resolves on TTL), which would silently empty the
+    # only safety queue; 60d gives real review headroom.
+    "skill_proposal": timedelta(days=60),
     "bug_identified": timedelta(days=60),
     "tech_debt": timedelta(days=60),
     "architecture_risk": timedelta(days=60),
@@ -179,6 +183,18 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "quarantined_reflection": timedelta(days=14),
     "code_audit": timedelta(days=14),
     "cc_memory_staleness": timedelta(days=14),
+    # WS-M PR-2 self-observation ideation — self-directed audits / gap-cluster /
+    # unblock / prompt-review output routed here (instead of the immortal KB) by
+    # surplus/intake.py Step 3a. Meta-observations about Genesis's own state:
+    # NOT in INTERNAL_OBS_TYPES (they surface in the dashboard observations panel
+    # for review), written at priority="low" so they never crowd the capped
+    # morning-report digest. 14d matches the sibling audit/meta types above.
+    "gap_clustering": timedelta(days=14),
+    "wing_audit": timedelta(days=14),
+    "self_unblock": timedelta(days=14),
+    "memory_audit": timedelta(days=14),
+    "procedure_audit": timedelta(days=14),
+    "prompt_effectiveness_review": timedelta(days=14),
     # provider_failure resolves on breaker recovery (ProviderEscalation); the
     # explicit TTL is only a backstop for a provider that never comes back
     # (= the previous implicit default, made explicit to silence the warning).
@@ -586,6 +602,7 @@ async def exists_recent_by_type(
     source: str,
     type: str,
     window_minutes: int = 30,
+    category: str | None = None,
     category_like: str | None = None,
     category_not_like: str | None = None,
 ) -> bool:
@@ -593,6 +610,8 @@ async def exists_recent_by_type(
 
     Used as a cooldown gate to prevent near-duplicate observations from
     LLM reflections that produce different wording for the same system state.
+    ``category`` scopes the check to an EXACT category (use this when the value
+    may contain SQL ``LIKE`` metacharacters, e.g. a skill name with ``_``).
     ``category_like`` / ``category_not_like`` scope the check to categories
     matching (or not matching) a SQL LIKE pattern (e.g. ``"%:user"``) so
     cooldowns can mirror an ego-visibility partition — a reflection visible to
@@ -608,6 +627,9 @@ async def exists_recent_by_type(
         "AND created_at > ? "
     )
     params: list = [source, type, cutoff]
+    if category is not None:
+        query += "AND category = ? "
+        params.append(category)
     if category_like is not None:
         query += "AND category LIKE ? "
         params.append(category_like)

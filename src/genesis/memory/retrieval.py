@@ -619,6 +619,32 @@ async def _expired_candidate_ids(
     return {row[0] for row in rows}
 
 
+async def metadata_missing_ids(
+    db: aiosqlite.Connection,
+    candidate_ids: set[str],
+) -> set[str]:
+    """Return the subset of ``candidate_ids`` with NO ``memory_metadata`` row.
+
+    Ghost detector for the recall path: a Qdrant point whose metadata row is
+    gone is a deleted memory's leftover vector ("ghost" — e.g. the recovery
+    worker's upsert racing a cross-process delete). Its payload carries the
+    deleted content, so without a filter it flows straight back into recall
+    until the nightly reconcile sweep removes it. Callers must apply this ONLY
+    to vector-only candidates — legacy FTS rows without metadata are
+    deliberately kept (the long-standing fail-open for pre-metadata content).
+    """
+    if not candidate_ids:
+        return set()
+    placeholders = ",".join("?" * len(candidate_ids))
+    sql = (
+        f"SELECT memory_id FROM memory_metadata "  # noqa: S608 - literal SQL fragments; values bound as parameters
+        f"WHERE memory_id IN ({placeholders})"
+    )
+    cursor = await db.execute(sql, tuple(candidate_ids))
+    rows = await cursor.fetchall()
+    return candidate_ids - {str(row[0]) for row in rows}
+
+
 class HybridRetriever:
     """Hybrid retrieval: Qdrant vectors + FTS5 text + activation scoring, fused via RRF."""
 
@@ -1437,6 +1463,33 @@ class HybridRetriever:
                 qdrant_by_id.pop(mid, None)
                 fts_by_id.pop(mid, None)
             event_memory_ids = [m for m in event_memory_ids if m not in expired]
+
+        # Ghost filter: a VECTOR-ONLY candidate (Qdrant hit, no FTS hit) with
+        # no memory_metadata row is a deleted memory's leftover point — its
+        # payload would resurface deleted content until the nightly reconcile
+        # sweep. Scoped to vector-only ids ON PURPOSE: an FTS row without
+        # metadata is legacy pre-metadata content and stays recallable (the
+        # long-standing fail-open). Same degrade-open posture as the expiry
+        # filter: a DB failure keeps candidates rather than crashing recall.
+        vector_only = {mid for mid in all_ids if mid in qdrant_by_id and mid not in fts_by_id}
+        if vector_only:
+            try:
+                ghost_ids = await self._ro_read(metadata_missing_ids, vector_only)
+            except Exception:
+                logger.warning(
+                    "ghost filter failed, returning unfiltered candidates",
+                    exc_info=True,
+                )
+                ghost_ids = set()
+            if ghost_ids:
+                logger.info(
+                    "recall: dropped %d ghost candidate(s) (vector without metadata row)",
+                    len(ghost_ids),
+                )
+                all_ids -= ghost_ids
+                for mid in ghost_ids:
+                    qdrant_by_id.pop(mid, None)
+                event_memory_ids = [m for m in event_memory_ids if m not in ghost_ids]
         return all_ids, event_memory_ids
 
     async def _compute_activations(

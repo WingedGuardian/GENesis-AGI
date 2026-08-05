@@ -35,3 +35,15 @@ post-commit:a4d13b7b0c7e1540e28c553e15e0b07476bc10f6cd60737e59e76964426f09f0
 post-commit:6860283dc98d1fe5afcc7e332f3ebae7b2ce7ea95996de6870c43b5cb155d974
 commit-msg:94eff83990218255032996070991936f134b0f929febeba5053b7715a3c9d39a
 prepare-commit-msg:51b8fc7537264d3b5eeb2f21c3e7fa75a4528d77976ac21e138f7f1642b9e7da
+
+# Backfill (2026-08-01): historical versions that shipped on main but were never
+# recorded — they predate the commit that added the hook to the tracked set, so
+# the per-commit gate never captured them. Without these entries sync-hooks.sh
+# mis-classifies an install still carrying one as "user-modified" and never
+# updates it (commit-msg:f239fd3e was found live-wedged on this install). Found
+# by scripts/check_hook_versions_complete.sh, now a CI backstop.
+commit-msg:f239fd3eac3a780fd4b68c39a1769f65548640afeeb7300ff3288c6b2a2cbcb9
+post-commit:a5ca9f5a58f95e3db43534b5e852603c4caa5d2d975411ccc45333e4f6d0ad45
+pre-commit:843e381812f98c37f94d3d7853e2b3518e8802840bb10527443faf586066a1a7
+pre-commit:a5d39a2359d4bb6f86911b53c3cbc429aca570770ce71274c14992332db65041
+commit-msg:9415de0a03a816c3cc5b4b9b4e5df9847419284f68defc46a6df77daf817e779

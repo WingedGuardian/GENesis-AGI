@@ -219,6 +219,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._task_verifier: object | None = None
         self._protected_paths: object | None = None
         self._resilience_state_machine: object | None = None
+        self._network_sentinel: object | None = None
         self._status_writer: object | None = None
         self._recovery_orchestrator: object | None = None
         self._result_writer: object | None = None
@@ -656,6 +657,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             ("campaign_runner", self._campaign_runner),
             ("awareness_loop", self._awareness_loop),
             ("cc_fallback_probe", self._cc_fallback_probe_worker),
+            ("network_sentinel", self._network_sentinel),
             ("reflex_ingestor", self._reflex_ingestor),
         ]:
             if component is None:
