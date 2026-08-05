@@ -541,6 +541,10 @@ def main(argv: list[str] | None = None) -> None:
         # secrets.env-set value would be silently dropped before the
         # setdefault below)
         "GENESIS_DB_BUSY_TIMEOUT_MS",
+        # Recall read-pool knobs — _bootstrap_memory honors the same kill
+        # switch + size as the server runtime, so a secrets.env-configured
+        # value must reach the child too (Codex P2 on #1302)
+        "GENESIS_RECALL_READ_POOL_OFF", "GENESIS_RECALL_READ_POOL_SIZE",
     }
     import os
 

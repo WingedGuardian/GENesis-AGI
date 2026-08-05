@@ -19,13 +19,15 @@ from typing import Any
 import aiosqlite
 from aiosqlite.context import Result
 
+# BUSY_TIMEOUT_MS moved to genesis.env (it is an env-tunable default; env.py
+# sits below this module in the import graph) — re-exported here for the many
+# historical `from genesis.db.connection import BUSY_TIMEOUT_MS` importers.
+from genesis.env import BUSY_TIMEOUT_MS as BUSY_TIMEOUT_MS
 from genesis.env import db_busy_timeout_ms, genesis_db_path
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = genesis_db_path()
-
-BUSY_TIMEOUT_MS = 5000
 
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
 # 256 MiB. SQLite's default is ~2 MiB, which forces hot read paths to keep

@@ -205,6 +205,13 @@ def recall_read_pool_size() -> int:
         return DEFAULT_READ_POOL_SIZE
 
 
+# SQLite busy_timeout default (ms). Defined HERE, not in db/connection.py: it is
+# an env-tunable default (see db_busy_timeout_ms below), and env.py must sit
+# below the db layer in the import graph — connection.py re-exports it for its
+# historical importers (structural review on WS-1 PR-1).
+BUSY_TIMEOUT_MS = 5000
+
+
 def db_busy_timeout_ms() -> int:
     """SQLite ``busy_timeout`` (ms) for Genesis connections (default
     ``BUSY_TIMEOUT_MS``, 5000).
@@ -218,8 +225,6 @@ def db_busy_timeout_ms() -> int:
     non-integer values fall back to the default. It lengthens how long a write
     WAITS — it never shortens or skips work.
     """
-    from genesis.db.connection import BUSY_TIMEOUT_MS
-
     raw = os.environ.get("GENESIS_DB_BUSY_TIMEOUT_MS", "").strip()
     if not raw:
         return BUSY_TIMEOUT_MS
