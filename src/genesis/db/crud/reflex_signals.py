@@ -61,6 +61,19 @@ _REOPENABLE = (
     "fix_failed",
 )
 
+# Clean terminal dispositions — a signal already here has been CONSCIOUSLY closed
+# (fixed / dismissed / arc-merged), so a manual re-resolution is a no-op. Kept
+# distinct from ``_REOPENABLE`` (the recurrence-reopen policy, a superset) on
+# purpose: the failure/expiry terminals (``diagnose_failed`` / ``fix_failed`` /
+# ``card_expired``) are STUCK signals a human should still be able to dispose,
+# so they are deliberately absent here.
+TERMINAL_DISPOSED = (
+    "resolved",
+    "dismissed_notbug",
+    "dismissed_wontfix",
+    "merged",
+)
+
 
 def _row_to_dict(row: tuple) -> dict:
     return dict(zip(_COLS, row, strict=True))
@@ -165,6 +178,12 @@ async def set_status(
 
 async def get_by_fingerprint(db: aiosqlite.Connection, fingerprint: str) -> dict | None:
     cursor = await db.execute(f"{_SELECT} WHERE fingerprint = ?", (fingerprint,))
+    row = await cursor.fetchone()
+    return _row_to_dict(tuple(row)) if row is not None else None
+
+
+async def get_by_id(db: aiosqlite.Connection, signal_id: str) -> dict | None:
+    cursor = await db.execute(f"{_SELECT} WHERE id = ?", (signal_id,))
     row = await cursor.fetchone()
     return _row_to_dict(tuple(row)) if row is not None else None
 
