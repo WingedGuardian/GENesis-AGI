@@ -945,14 +945,18 @@ async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -
             # Get all proposals in this batch and resolve them all
             proposals = await ego_crud.list_proposals_by_batch(ctx.db, batch_id)
             all_decisions = {i + 1: (status, reason) for i in range(len(proposals))}
+            # reply_to_id IS the delivery id of the digest being replied to —
+            # it pins the revision snapshot of that exact digest.
             results = await ctx.proposal_workflow.resolve_proposals(
                 batch_id,
                 all_decisions,
+                delivery_id=reply_to_id,
             )
         else:
             results = await ctx.proposal_workflow.resolve_proposals(
                 batch_id,
                 decisions,
+                delivery_id=reply_to_id,
             )
 
         # Send confirmation

@@ -51,11 +51,29 @@ def load_ego_config(path: Path | None = None) -> EgoConfig:
     for field_name, field_obj in EgoConfig.__dataclass_fields__.items():
         if field_name in raw:
             value = raw[field_name]
-            # Guard: YAML null → None for dict fields would crash .get()
-            # at runtime. Fall back to the field default instead.
-            if value is None and field_obj.default_factory is not dataclasses.MISSING:
+            # Guard: for factory (dict/list) fields, a YAML null OR a
+            # wrong-typed scalar would crash runtime .get()/.items(). Fall
+            # back to the field default instead of persisting a bad shape.
+            if field_obj.default_factory is not dataclasses.MISSING and not isinstance(
+                value, type(field_obj.default_factory())
+            ):
                 continue
             kwargs[field_name] = value
+    # revalidation_interval_hours is a defaults-COMPLETE mapping: consumers
+    # .get(urgency) and fall back to normal/72 only for MISSING keys, so a
+    # partial YAML override like {"high": 12} must merge OVER the declared
+    # defaults — wholesale replacement silently collapses omitted urgencies
+    # to 72h (critical 6→72, low 168→72). Other dict fields (e.g.
+    # dispatch_model_overrides) are empty-by-default override maps where
+    # wholesale assignment IS the semantics — do not blanket-merge those.
+    if "revalidation_interval_hours" in kwargs:
+        _reval_defaults = EgoConfig.__dataclass_fields__[
+            "revalidation_interval_hours"
+        ].default_factory()
+        kwargs["revalidation_interval_hours"] = {
+            **_reval_defaults,
+            **kwargs["revalidation_interval_hours"],
+        }
     return EgoConfig(**kwargs)
 
 
@@ -150,6 +168,22 @@ def validate_ego_config(changes: dict) -> list[str]:
             for action, model in v.items():
                 if model not in valid_models:
                     errors.append(f"dispatch_model_overrides[{action}]: model must be one of {valid_models}")
+    if "revalidation_interval_hours" in changes:
+        v = changes["revalidation_interval_hours"]
+        if not isinstance(v, dict):
+            errors.append("revalidation_interval_hours must be a dict")
+        else:
+            _valid_urg = {"critical", "high", "normal", "low"}
+            for _urg, _hours in v.items():
+                if _urg not in _valid_urg:
+                    errors.append(
+                        f"revalidation_interval_hours: unknown urgency {_urg!r} "
+                        f"(must be one of {sorted(_valid_urg)})"
+                    )
+                elif not isinstance(_hours, (int, float)) or isinstance(_hours, bool) or _hours <= 0:
+                    errors.append(
+                        f"revalidation_interval_hours[{_urg}] must be a positive number"
+                    )
     if "calibration_injection_enabled" in changes and not isinstance(
         changes["calibration_injection_enabled"], bool
     ):
