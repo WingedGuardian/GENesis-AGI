@@ -752,3 +752,41 @@ async def test_proactive_context_logs_partial_timings_on_cancellation(caplog):
     # partial timings carry the completed embed phase but NOT recall (never finished)
     assert "'embed'" in warns[0]
     assert "'recall'" not in warns[0]
+    # PR-2c: the WARN now also carries the executor gauge, the wall time spent in the
+    # cancelled phase, and the total-since-start — the signals for attributing the ~4s.
+    assert "executor=" in warns[0]
+    assert "phase_wall_ms" in warns[0]
+    assert "cancelled_after_ms" in warns[0]
+
+
+async def test_proactive_context_cancellation_folds_completed_substages(caplog):
+    """PR-2c: recall sub-stage timers the engine wrote into ``stats`` BEFORE the
+    cancel must appear in the 503 WARN, so the log names the stage the coroutine
+    starved in. Simulate a recall that finished the vector + FTS stages (writing
+    their timers into the passed ``stats`` sink) and is then cancelled mid-flight.
+    """
+
+    async def _partial_then_cancel(prompt, **kwargs):
+        stats = kwargs.get("stats")
+        if stats is not None:
+            # Engine writes these incrementally as each stage completes; a cancel
+            # after FTS leaves vector+fts present but not the later stages.
+            stats["vector_ms"] = 210.5
+            stats["fts_ms"] = 44.2
+        raise asyncio.CancelledError
+
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=_partial_then_cancel),
+        caplog.at_level(logging.WARNING),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await P.proactive_context(prompt="what did we decide", session_id="s")
+
+    warns = [r.getMessage() for r in caplog.records if "CANCELLED at phase" in r.getMessage()]
+    assert warns, "cancellation must emit a WARNING"
+    # Completed stages fold in (suffix stripped); never-reached stages stay absent.
+    assert "'vector'" in warns[0]
+    assert "'fts'" in warns[0]
+    assert "'activation'" not in warns[0]
+    assert "'assembly'" not in warns[0]
