@@ -15,6 +15,7 @@ import os
 import secrets
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import jsonify, redirect, request, session
 
@@ -191,6 +192,54 @@ _API_AUTH_OFF = ("off", "0", "false", "no")
 _GENESIS_API_PREFIXES = ("/api/genesis/", "/api/t/")
 
 
+# CSRF: Sec-Fetch-Site values that indicate a request is NOT a cross-origin ride.
+# ``same-origin`` = our own page's fetch; ``none`` = a direct user action (typed
+# URL / bookmark). ``same-site`` and ``cross-site`` are the CSRF-risky values.
+_SAFE_FETCH_SITES = frozenset({"same-origin", "none"})
+
+
+def _origin_matches_host(url: str) -> bool:
+    """True when ``url``'s host[:port] equals the request's ``Host`` header.
+
+    Host comparison is case-insensitive (hostnames are per RFC; browsers already
+    lowercase, this covers hand-crafted same-origin tooling) — a case mismatch can
+    only make the check stricter (fail-closed), never open a bypass.
+    """
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        return False
+    return bool(netloc) and netloc.lower() == (request.host or "").lower()
+
+
+def _is_same_origin_request() -> bool:
+    """Whether a state-changing request is same-origin — the CSRF check for the
+    cookie auth path.
+
+    ``SameSite=Lax`` attaches the session cookie on same-*site* requests too (a
+    sibling origin on another port/subdomain of the dashboard host), so a valid
+    cookie is not proof of same-origin intent. Primary signal is ``Sec-Fetch-Site``
+    (browser-set, unforgeable by page JS, present on every current browser): safe
+    iff ``same-origin`` or ``none``. When it is absent (older browser / non-browser
+    client) fall back to matching the ``Origin`` (then ``Referer``) host against the
+    request ``Host``. When NO same-origin signal is present at all, **fail closed** —
+    a legitimate machine caller authenticates with the internal bearer, not the
+    cookie, so a cookie-only request with no origin signal is refused (per the OWASP
+    CSRF Fetch-Metadata guidance: treat absent Sec-Fetch-* as unknown, do not fail
+    open).
+    """
+    sec_fetch_site = request.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if sec_fetch_site:
+        return sec_fetch_site in _SAFE_FETCH_SITES
+    origin = request.headers.get("Origin", "").strip()
+    if origin:
+        return _origin_matches_host(origin)
+    referer = request.headers.get("Referer", "").strip()
+    if referer:
+        return _origin_matches_host(referer)
+    return False
+
+
 def check_api_mutation_auth():
     """App-level gate: require auth for ``/api/**`` STATE-CHANGING requests when a
     dashboard password is set.
@@ -206,8 +255,10 @@ def check_api_mutation_auth():
     ``/v1/*`` enforces its own bearer; a co-hosting framework's own ``/api/*`` routes
     are left alone); GET/HEAD/OPTIONS (non-mutating — guardian/health probes and
     dashboard polling stay open); and the ``/api/genesis/auth/*`` login/logout
-    endpoints. A mutation passes with a valid session cookie OR a valid internal
-    bearer token; otherwise the request is rejected with 401.
+    endpoints. A mutation passes with a valid internal bearer token, OR a valid
+    session cookie on a same-origin request (Sec-Fetch-Site / Origin — CSRF guard).
+    A cookie-authed cross-origin/originless mutation is rejected 403; a request with
+    no credential at all is rejected 401.
     """
     if not get_dashboard_password():
         return None
@@ -222,15 +273,23 @@ def check_api_mutation_auth():
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
 
-    # Trusted browser session (same-origin cookie)?
-    if is_authenticated():
-        return None
-    # Trusted machine caller (internal bearer token)?
+    # Trusted machine caller (internal bearer token) — CSRF-immune (an attacker
+    # cannot read the 0600 token file), so it is checked FIRST and is
+    # origin-independent.
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         expected = get_or_create_internal_api_token()
         if expected and hmac.compare_digest(auth_header[7:], expected):
             return None
+
+    # Trusted browser session (session cookie). A cookie is NOT proof of
+    # same-origin intent (``SameSite=Lax`` still attaches it on a same-site sibling
+    # origin), so a cookie-authed mutation must ALSO be same-origin — CSRF
+    # defense-in-depth. Fail-closed on a cross-origin/originless cookie request.
+    if is_authenticated():
+        if _is_same_origin_request():
+            return None
+        return jsonify({"error": "cross-origin request refused"}), 403
 
     return jsonify({"error": "authentication required"}), 401
 

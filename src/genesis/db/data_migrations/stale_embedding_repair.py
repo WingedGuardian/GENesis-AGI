@@ -35,8 +35,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 
-from genesis.db.data_migrations._util import commit_in_batches
+from genesis.db.data_migrations._util import (
+    MigrationDependencyUnavailable,
+    commit_in_batches,
+)
 from genesis.env import genesis_db_path
 from genesis.learning.procedural.embedding import (
     cosine_similarity,
@@ -51,6 +55,16 @@ logger = logging.getLogger(__name__)
 # (older) principle => stale. Well clear of the ~0.85 same-procedure bar and of
 # genuine distinct-lesson cosines, so it cleanly separates fresh from stale.
 FRESH_MATCH_THRESHOLD = 0.99
+
+# Bounded retry for a COLD-BOOT embedder blip (DNS/egress/TLS not warm yet). This
+# complements the data-migration runner's boot-settle delay: the delay moves the
+# first attempt past warmup, and these retries absorb any residual jitter around
+# it. Sync (this runs in the runner's worker thread via asyncio.to_thread), so the
+# sleeps block only this migration's thread, never an event loop. Exhausting them
+# raises MigrationDependencyUnavailable so the runner defers quietly (retry next
+# boot) instead of logging a scary ERROR+traceback for an expected transient.
+_EMBED_ATTEMPTS = 3
+_EMBED_RETRY_BASE_DELAY_S = 2.0  # exponential backoff between attempts: 2s, 4s
 
 
 def _candidates(conn: sqlite3.Connection) -> list[tuple[str, str, bytes | None]]:
@@ -91,8 +105,16 @@ def _embed_texts(texts: list[str], provider) -> list[list[float]]:
     ``get_embedding_provider()`` singleton, whose httpx connection pools are bound
     to the server's main loop: driving it from this throwaway worker-thread loop
     (or leaving a pooled connection bound to it) would break the migration or a
-    later live embed (Codex P2 on #1286). Fail-CLOSED: an unavailable embedder
-    surfaces as ``RuntimeError``.
+    later live embed (Codex P2 on #1286). A fresh provider is built on EACH retry
+    attempt (a new loop per ``asyncio.run``), so a cold-boot connection failure
+    doesn't poison later attempts. Fail-CLOSED after the bounded retry: a
+    persistently unavailable embedder surfaces as ``MigrationDependencyUnavailable``
+    (a ``RuntimeError`` subclass).
+
+    ``provider`` is INJECTED only in tests (with loop-agnostic fakes): an injected
+    provider is reused as-is across every retry's ``asyncio.run`` loop, so a real
+    httpx-backed provider must NEVER be injected here — the production path passes
+    ``None`` so each attempt builds and closes its own loop-bound provider.
     """
     if not texts:
         return []
@@ -109,10 +131,26 @@ def _embed_texts(texts: list[str], provider) -> list[list[float]]:
             if owns:
                 await _aclose_provider(prov)
 
-    try:
-        return asyncio.run(_run())
-    except EmbeddingUnavailableError as e:
-        raise RuntimeError(f"embedder unavailable; cannot re-embed stale procedures: {e}") from e
+    last_exc: EmbeddingUnavailableError | None = None
+    for attempt in range(1, _EMBED_ATTEMPTS + 1):
+        try:
+            return asyncio.run(_run())
+        except EmbeddingUnavailableError as e:
+            last_exc = e
+            if attempt < _EMBED_ATTEMPTS:
+                backoff = _EMBED_RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+                logger.warning(
+                    "reembed_stale: embedder unavailable (attempt %d/%d), retrying in %.0fs (%s)",
+                    attempt,
+                    _EMBED_ATTEMPTS,
+                    backoff,
+                    e,
+                )
+                time.sleep(backoff)
+    raise MigrationDependencyUnavailable(
+        f"embedder unavailable after {_EMBED_ATTEMPTS} attempts; "
+        f"cannot re-embed stale procedures: {last_exc}"
+    ) from last_exc
 
 
 def _classify(candidates, provider) -> tuple[list[tuple[str, bytes, bytes | None]], list[str]]:
@@ -155,8 +193,9 @@ def count_stale_procedure_embeddings(conn: sqlite3.Connection, provider=None) ->
 
     Used by the migration's ``verify()``. Unresolvable (bad-dimension) rows are
     counted as stale so ``verify()`` does not pass while they remain unverified.
-    Raises ``RuntimeError`` if no embedder is configured — the caller cannot
-    confirm freshness and should treat the migration as not-yet-done.
+    Raises ``MigrationDependencyUnavailable`` (a ``RuntimeError`` subclass) if the
+    embedder stays unavailable across the bounded retry — the caller cannot confirm
+    freshness and should treat the migration as not-yet-done.
     """
     candidates = _candidates(conn)
     if not candidates:
@@ -172,8 +211,9 @@ def reembed_stale_procedure_embeddings(
 
     Sync; opens its own read + write sqlite connections. Clean no-op (no provider
     needed) when there are no ``version > 1`` rows. Otherwise fail-CLOSED: raises
-    ``RuntimeError`` if the embedder is unavailable, so a one-time heal is retried
-    next boot rather than recording success with rows left stale.
+    ``MigrationDependencyUnavailable`` (a ``RuntimeError`` subclass) if the embedder
+    stays unavailable across the bounded retry, so a one-time heal is retried next
+    boot rather than recording success with rows left stale.
 
     Concurrency-safe against a live refine: the write is a compare-and-swap on the
     T0 stored embedding, so if a genuine refine lands on a targeted row between the

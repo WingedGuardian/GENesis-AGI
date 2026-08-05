@@ -46,7 +46,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   breaks, set `GENESIS_DASHBOARD_API_AUTH=off` to disable just this gate without
   removing the password.
 
+### Security
+
+- **The dashboard API is now hardened against cross-site request forgery (CSRF).**
+  With a password set, a state-changing API call authenticated by your login
+  cookie must now originate from the dashboard itself (verified via the browser's
+  `Sec-Fetch-Site`/`Origin` headers). Previously another page — including a
+  separate service sharing your dashboard's host — could ride your logged-in
+  session to trigger dashboard actions; that path is now refused. Genesis's own
+  components (which use an internal token) and read-only calls are unaffected, and
+  the same `GENESIS_DASHBOARD_API_AUTH=off` switch disables this along with the
+  rest of the gate.
+
 ### Fixed
+
+- **No more spurious embedding error on restart.** A one-time procedure-embedding
+  repair runs shortly after boot; on some installs it fired before the network was
+  warm and logged a scary "all embedding backends failed" error with a full
+  traceback on every restart, even though it harmlessly retried on the next boot.
+  The repair now waits for boot I/O to settle and retries a cold-start blip before
+  giving up, and a not-yet-ready dependency is logged as a quiet, tracebackless
+  "will retry next boot" notice rather than an error. Operators can tune or disable
+  the wait with `GENESIS_DATA_MIGRATION_BOOT_DELAY_S` (seconds; `0` to disable).
 
 - **Re-embedding a memory no longer downgrades its recall ranking.** When a
   memory's vector was rebuilt (after a vector-store outage, or by the nightly
