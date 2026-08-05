@@ -1,4 +1,11 @@
-"""Reflex ingestion — task.failed events → fingerprinted signal rows.
+"""Reflex ingestion — task.failed / job.failed events → fingerprinted signal rows.
+
+Two afferent sources feed the same pipeline: ``task.failed`` (crashed
+``tracked_task`` coroutines) and ``job.failed`` (exception-driven background-job
+failures, funnelled onto the bus by the PR-2a job-health path). Only
+exception-driven failures are ingested — an event without an ``error_type``
+(a semantic/reason-only failure) belongs to the job-health/Sentinel lane, not
+the reflex arc.
 
 Two-stage by design (mirrors the event bus's own persistence path): the
 bus subscriber only ENQUEUES — the event bus dispatches listeners inline
@@ -74,13 +81,29 @@ class ReflexIngestor:
 
     async def handle_event(self, event: GenesisEvent) -> None:
         try:
-            if event.event_type != "task.failed" or not self._enabled:
+            if event.event_type not in ("task.failed", "job.failed") or not self._enabled:
                 return
             details = getattr(event, "details", None) or {}
+            # Reflex ingests SCREAMING bugs — real exceptions. failure_details()
+            # sets error_type IFF an exception caused the failure; a semantic,
+            # reason-only failure carries error_reason and NO error_type and
+            # belongs to a different lane (recorded by job_health / owned by the
+            # Sentinel), not the reflex arc. Both current emitters fire
+            # exception-only (task.failed always; job.failed's PR-2a funnel gates
+            # on `exc is not None`), so today this guard is defense-in-depth
+            # honoring the failure_details contract — without it, a future
+            # reason-only event would MANUFACTURE a bogus "UnknownError" signal,
+            # the opposite of surfacing a real problem.
+            error_type = details.get("error_type")
+            # behavioral-lint: ignore no-hide-problems — lane-routing, not hiding
+            # (see the contract note above; reason-only failures stay visible via
+            # job_health).
+            if not error_type:
+                return
             payload = {
                 "task_name": str(details.get("task_name") or "unnamed"),
                 "error": str(details.get("error") or ""),
-                "error_type": str(details.get("error_type") or "UnknownError"),
+                "error_type": str(error_type),
                 "error_frames": [str(f) for f in (details.get("error_frames") or [])],
                 "subsystem": str(getattr(event, "subsystem", "") or "health"),
             }
@@ -90,7 +113,7 @@ class ReflexIngestor:
                 self._dropped += 1
                 if self._dropped % _DROP_WARN_EVERY == 1:
                     logger.warning(
-                        "Reflex ingest queue full — dropped %d task.failed events so far",
+                        "Reflex ingest queue full — dropped %d failure events so far",
                         self._dropped,
                     )
         except Exception:  # never break the bus — reflex is an observer

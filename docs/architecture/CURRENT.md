@@ -687,8 +687,8 @@ verified: ca875c4b 2026-07-24
   their own domain `.failed` pass `emit_event=False` to avoid double-counting.
   Fire-and-forget (a broken emit never blocks the `job_health` write), and
   `job.failed` is in the ego's `_REFLEX_OWNED_EVENT_TYPES` so it never spins a
-  reactive ego cycle. Dark until reflex intake widens (`ingest.py` still drops
-  non-`task.failed`).
+  reactive ego cycle. Ingested by the reflex arc as of PR-2b (`ingest.py`
+  consumes `job.failed`, guarded on `error_type` presence).
 - **perception/**: the real-time reflection engine — MICRO (and LIGHT without
   a CC bridge) run in-process via the router; DEEP/STRATEGIC go to the CC
   reflection bridge. GROUNDWORK: user-model-synthesis, pre-execution-gate
@@ -1286,16 +1286,17 @@ verified: 9037d45b 2026-07-07
 
 ## 14. Reflex arc — self-bug detection & repair
 
-The afferent nerve for Genesis's own screaming bugs: detect `task.failed`
-exceptions, fingerprint/dedup them, and (later phases) diagnose → card →
-fix under a human-gated tier model. **PR1 (dark) + PR1.5 (observability)**
-— ingestion scaffolding and its watch surface; no cards/sessions/LLM yet.
-Spec: `docs/superpowers/specs/2026-07-21-reflex-arc-design.md`.
+The afferent nerve for Genesis's own screaming bugs: detect `task.failed` /
+`job.failed` exceptions, fingerprint/dedup them, and (later phases) diagnose →
+card → fix under a human-gated tier model. **PR1 (dark) + PR1.5 (observability)
++ PR-2b (job.failed intake) + PR-2c (manual resolve/dismiss with verdict)** —
+ingestion, its watch surface, and the human exit lane; no auto diagnose/fix
+sessions/LLM yet. Spec: `docs/superpowers/specs/2026-07-21-reflex-arc-design.md`.
 
 ```yaml subsystem-map
 entry: reflex-arc
 modules: [reflex]
-verified: 302066ad 2026-07-23
+verified: 4cc75d50 2026-08-05
 ```
 
 - **reflex/**: `fingerprint.py` (pure: normalize task name, line-number-free
@@ -1318,9 +1319,11 @@ verified: 302066ad 2026-07-23
   108d, verified two installs). The **funnel (2026-07-23)** adds the real
   stream: `runtime/_job_health.record_job_failure` emits a throttled
   `job.failed` for every exception-driven background-job failure (see the
-  scheduled-job telemetry entry). Emitted now but NOT yet ingested —
-  `ingest.py` still drops non-`task.failed`; widening intake to `job.failed` is
-  the gated PR-2b.
+  scheduled-job telemetry entry). **Ingested as of PR-2b**: `ingest.py`
+  consumes `task.failed` AND `job.failed`, guarded on `error_type` presence so
+  only real exceptions become signals (a reason-only failure has no
+  `error_type` and stays in the job-health/Sentinel lane — the
+  `failure_details` contract).
 - **Trap**: BOTH `task.failed` and `job.failed` are carved out of the ego
   reactive path (`runtime/init/ego._is_reflex_owned_event`) — reflex owns that
   class; the ego's message-keyed dedup can't absorb variable-payload failure
@@ -1339,9 +1342,18 @@ verified: 302066ad 2026-07-23
   sites (`knowledge/orchestrator` tree_task, `health_data` single-flight,
   `events._db_writer`) stay bare with in-code comments — wrapping would
   double-report exceptions their callers already handle.
-- GROUNDWORK: diagnose lane (PR2), fix lane (PR3) — `reflex_diagnoses` /
-  `reflex_verdicts` writers and the card/gate/dispatch flow are NOT yet
-  built; the tables are inert scaffolding in PR1.
+- **Human exit (PR-2c)**: `reflex_signal_resolve` MCP tool moves a signal to a
+  terminal status — `fixed`→`resolved` (real bug fixed out-of-band, e.g. a
+  normal PR; no verdict row, it isn't a card judgment), `not_a_bug`/`wont_fix`→
+  `dismissed_*` + a taste-corpus verdict (`db/crud/reflex_verdicts.record`, the
+  first writer of that table; `verdict_point='diagnose_card'`). Idempotent on
+  terminal signals; the status transition is guarded on the observed status so a
+  race is a conflict, never a clobber. Until the auto diagnose lane ships this is
+  the ONLY way a signal leaves `new`.
+- GROUNDWORK: auto diagnose lane (PR2), fix lane (PR3) — `reflex_diagnoses` has
+  no writer yet and the card/gate/dispatch flow is NOT built. `reflex_verdicts`
+  is now live (manual dismissals, PR-2c); its diagnose/fix/promotion verdict
+  points remain groundwork.
 
 ---
 
