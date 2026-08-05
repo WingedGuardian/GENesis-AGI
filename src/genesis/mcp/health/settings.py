@@ -225,6 +225,21 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every reaper pass
     ),
+    "mcp_staleness_guard": SettingsDomain(
+        name="mcp_staleness_guard",
+        description=(
+            "MCP stale-code guard — master `enabled` + `mode` block/warn/off. "
+            "A CC session's MCP subprocess runs code from its start commit and "
+            "never reloads; after a deploy it goes stale. block (default) refuses "
+            "overwrite/refine-class tools (procedure_store) on a stale subprocess "
+            "with a 'restart this session' error; warn logs and allows; off "
+            "disables. Read live per guarded call — takes effect immediately, no "
+            "restart. Env kill switch GENESIS_MCP_STALENESS_GUARD=1 forces off."
+        ),
+        config_filename="mcp_staleness_guard.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per guarded call
+    ),
     "ego_reconcile": SettingsDomain(
         name="ego_reconcile",
         description=(
@@ -971,6 +986,23 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_mcp_staleness_guard(changes: dict) -> list[str]:
+    """Validate MCP stale-code-guard lever changes (see
+    genesis.observability.mcp_staleness_guard_config)."""
+    from genesis.observability.mcp_staleness_guard_config import MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key not in ("enabled", "mode"):
+            errors.append(f"Unknown key '{key}'. Valid: enabled, mode")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_ws2_ledger(changes: dict) -> list[str]:
     """Validate ws2_ledger consumer-lever changes (see
     genesis.ledger.ws2_ledger_config)."""
@@ -1306,6 +1338,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "cc_foreground_reaper": _validate_cc_foreground_reaper,
+    "mcp_staleness_guard": _validate_mcp_staleness_guard,
     "voice_act": _validate_voice_act,
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,

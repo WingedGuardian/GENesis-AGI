@@ -480,3 +480,30 @@ async def test_neighbors_of_exclude_link_types_empty_is_noop(db):
     )
     rows = await memory_links.neighbors_of(db, ["seed"], exclude_link_types=())
     assert [r["memory_id"] for r in rows] == ["n1"]
+
+
+async def test_all_link_counts_empty_table(db):
+    assert await memory_links.all_link_counts(db) == {}
+
+
+async def test_all_link_counts_counts_both_directions(db):
+    # a—b, a—c, d—a : a touches 3 edges; b,c,d touch 1 each.
+    for s, t in [("a", "b"), ("a", "c"), ("d", "a")]:
+        await memory_links.create(
+            db, source_id=s, target_id=t, link_type="supports", created_at="2026-01-01"
+        )
+    counts = await memory_links.all_link_counts(db)
+    assert counts == {"a": 3, "b": 1, "c": 1, "d": 1}
+
+
+async def test_all_link_counts_agrees_with_batch_link_counts(db):
+    edges = [("x", "y"), ("y", "z"), ("x", "z"), ("x", "w")]
+    for s, t in edges:
+        await memory_links.create(
+            db, source_id=s, target_id=t, link_type="supports", created_at="2026-01-01"
+        )
+    all_counts = await memory_links.all_link_counts(db)
+    ids = ["x", "y", "z", "w"]
+    batch = await memory_links.batch_link_counts(db, ids)
+    for mid in ids:
+        assert all_counts[mid] == batch[mid][0], f"total mismatch for {mid}"

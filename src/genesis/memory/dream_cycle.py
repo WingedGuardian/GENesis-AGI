@@ -274,6 +274,50 @@ async def run(
         logger.warning("Cross-wing scan failed", exc_info=True)
         report["cross_wing_findings"] = []
 
+    # Phase 2c — Importance shield. Remove high-salience members (percentile
+    # activation / centrality, or a confidence floor) from clusters BEFORE they
+    # are enqueued, so the merge path never consolidates them away. Thresholds
+    # are computed over the true (non-deprecated) population in `buckets` here
+    # and frozen into each slice for the drain's live re-check. A shield failure
+    # must degrade toward LESS write authority — but pre-live (drain is SHADOW)
+    # the safe degradation is to enqueue UNSHIELDED and flag loudly: the drain's
+    # `shield_missing_thresholds` counter then stays non-zero, which is the
+    # explicit precondition gate on the future live-merge flip.
+    shield_thresholds: dict[str, Any] | None = None
+    try:
+        from genesis.memory import dream_shield
+
+        flat_points = [p for pts in buckets.values() for p in pts]
+        shield_state = await dream_shield.compute_shield_state(db, flat_points)
+        all_clusters, shield_stats = dream_shield.apply_shield_to_clusters(
+            all_clusters, shield_state,
+        )
+        if shield_state is not None:
+            shield_thresholds = {
+                "activation_threshold": shield_state.activation_threshold,
+                "centrality_threshold": shield_state.centrality_threshold,
+            }
+        report["shield"] = {
+            "enabled": shield_state is not None,
+            "activation_threshold": (
+                shield_state.activation_threshold if shield_state else None
+            ),
+            "centrality_threshold": (
+                shield_state.centrality_threshold if shield_state else None
+            ),
+            "population": shield_state.population if shield_state else 0,
+            **shield_stats,
+        }
+    except Exception as exc:
+        report["errors"].append({"phase": "shield", "error": str(exc)})
+        report["shield"] = {"enabled": False, "error": str(exc)}
+        logger.warning(
+            "Dream cycle %s: importance shield failed — enqueuing UNSHIELDED "
+            "(shadow-safe; the drain's shield_missing_thresholds gate blocks the "
+            "live flip): %s",
+            run_id[:8], exc, exc_info=True,
+        )
+
     # Phase 3 — Persist the value-ranked synthesis worklist for the daily drain.
     # Destructive synthesis/deprecate moved OUT of this weekly pass into
     # run_synthesis_drain (bounded daily slices). This enqueue runs in ALL modes:
@@ -283,6 +327,7 @@ async def run(
     try:
         worklist = await _persist_worklist(
             db, all_clusters, weekly_run_id=run_id, cap=WORKLIST_CAP,
+            shield_thresholds=shield_thresholds,
         )
         report["worklist_enqueued"] = worklist["enqueued"]
         report["oversize_flagged"] = worklist["oversize_flagged"]
@@ -376,10 +421,17 @@ async def _persist_worklist(
     *,
     weekly_run_id: str,
     cap: int = WORKLIST_CAP,
+    shield_thresholds: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     """Persist the top-value clusters as the daily-drain worklist.
 
     Returns ``{"enqueued": n, "oversize_flagged": n, "superseded": n}``.
+
+    ``shield_thresholds`` (when set) is frozen into each slice payload as a
+    ``shield`` block, so the daily drain re-checks live members against the same
+    activation/centrality bar the weekly pass used (catching salience that rose
+    during the drain week). Absent it, slices carry no block — backward
+    compatible with pre-shield rows.
 
     Supersedes any prior ``dream_synthesis_slice`` rows (a fresh full re-cluster
     is authoritative) via an explicit synchronous supersede — NOT a staleness
@@ -406,13 +458,16 @@ async def _persist_worklist(
 
     enqueued = 0
     for cluster in ranked:
-        payload = json.dumps({
+        payload_dict: dict[str, Any] = {
             "member_ids": [item["id"] for item in cluster],
             "wing": cluster[0].get("wing", "general"),
             "room": cluster[0].get("room", "uncategorized"),
             "weekly_run_id": weekly_run_id,
             "value_score": len(cluster),
-        })
+        }
+        if shield_thresholds is not None:
+            payload_dict["shield"] = shield_thresholds
+        payload = json.dumps(payload_dict)
         item_id = await queue.enqueue(
             WORKLIST_WORK_TYPE, None, MEMORY_OPS, payload,
             "dream_cycle weekly synthesis worklist",
@@ -505,6 +560,15 @@ async def run_synthesis_drain(
         "memories_deprecated": 0, "adversarial_blocked": 0,
         "shrink_gate_blocked": 0, "rollback_flagged": False,
         "aborted_capacity": False, "aborted_infra": False, "errors": [],
+        # Importance-shield drain re-check (see dream_shield.shield_filter_live):
+        #  - shield_members_skipped: individual members removed from clusters
+        #  - shield_skipped: clusters completed as no-op because shielding left
+        #    <2 mergeable members (distinct from stale_skipped)
+        #  - shield_missing_thresholds: slices with no frozen shield block while
+        #    the shield is enabled (pre-upgrade rows / enqueue-time shield
+        #    failure) — must reach 0 before the PR2 live-merge flip
+        "shield_members_skipped": 0, "shield_skipped": 0,
+        "shield_missing_thresholds": 0,
     }
 
     # Preflight: don't consume the worklist when Qdrant is unreachable — a dead
@@ -557,16 +621,46 @@ async def run_synthesis_drain(
             )
             break
         report["drained"] += 1
-        if len(cluster) < 2:
-            # Normal lifecycle outcome (members deprecated since Sunday), not a
-            # failure — completed, so it doesn't surface on the dashboard
-            # errors view via query_failed (FM-5).
-            await queue.mark_completed(item["id"])
-            report["stale_skipped"] += 1
-            logger.info(
-                "Dream drain %s: slice stale (<2 live members) — completed as "
-                "no-op", run_id[:8],
+
+        # Importance-shield re-check against the FROZEN thresholds in the slice.
+        # A member whose salience rose during the drain week (e.g. retrieved
+        # more) is removed here even though it passed at enqueue. Enable state
+        # is read LIVE inside shield_filter_live, so an operator can disable the
+        # shield mid-week. A slice with no shield block predates the shield (or
+        # its enqueue-time computation failed) — do NOT filter (no bar to filter
+        # against), but count it: this counter must be 0 before the live flip.
+        from genesis.memory import dream_shield, dream_shield_config
+
+        shield_block = payload.get("shield")
+        n_shielded = 0
+        if shield_block is not None:
+            cluster, n_shielded = await dream_shield.shield_filter_live(
+                db, cluster,
+                activation_threshold=shield_block.get("activation_threshold"),
+                centrality_threshold=shield_block.get("centrality_threshold"),
             )
+            report["shield_members_skipped"] += n_shielded
+        elif dream_shield_config.shield_enabled():
+            report["shield_missing_thresholds"] += 1
+
+        if len(cluster) < 2:
+            # <2 mergeable members: a normal lifecycle no-op — completed, so it
+            # doesn't surface on the dashboard errors view (FM-5). Attribute the
+            # skip to the shield when shielding caused the shrink, else to
+            # staleness (members deprecated since Sunday).
+            await queue.mark_completed(item["id"])
+            if n_shielded > 0:
+                report["shield_skipped"] += 1
+                logger.info(
+                    "Dream drain %s: slice shielded below 2 members — completed "
+                    "as no-op", run_id[:8],
+                )
+            else:
+                report["stale_skipped"] += 1
+                logger.info(
+                    "Dream drain %s: slice stale (<2 live members) — completed "
+                    "as no-op", run_id[:8],
+                )
             continue
         pending.append((item, cluster))
 

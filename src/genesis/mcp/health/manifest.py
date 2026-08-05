@@ -9,7 +9,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.db.connection import BUSY_TIMEOUT_MS
+from genesis.env import db_busy_timeout_ms
 from genesis.mcp.health import mcp  # noqa: E402
 from genesis.mcp.health.constants import JOB_STALE_GAP_DAYS
 
@@ -271,7 +271,7 @@ async def _impl_job_health() -> dict:
 
     try:
         async with aiosqlite.connect(str(_DB_PATH)) as db:
-            await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
             cursor = await db.execute(
                 "SELECT job_name, last_run, last_success, last_failure, "
                 "last_error, consecutive_failures FROM job_health"

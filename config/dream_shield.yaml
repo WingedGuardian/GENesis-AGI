@@ -1,0 +1,32 @@
+# Dream-cycle importance-shield policy.
+#
+# Protects high-salience memories from being consolidated away by the dream
+# merge path. Enabled by default. Edit the user overlay
+# (~/.genesis/config/dream_shield.local.yaml) to change these per install;
+# this shipped file is the zero-overlay default and must work as-is.
+#
+# Off switches: set `enabled: false` here/overlay, or export
+# GENESIS_DREAM_SHIELD_DISABLED=1 (scheduler-level kill switch).
+
+enabled: true
+
+# Shield a member at/above this percentile of the collection's live activation
+# distribution (0.90 = protect the top ~10% most-salient memories from merge).
+activation_percentile: 0.90
+
+# Shield a member at/above this percentile of the NONZERO betweenness-centrality
+# distribution (bridge-node protection). Ignored when the centrality cache is
+# empty (fresh install) — the shield falls back to activation + confidence only.
+centrality_percentile: 0.90
+
+# Shield any member at/above this raw confidence regardless of activation.
+# Catches rare-but-critical, rarely-retrieved memories that activation alone
+# would miss. Set above the common 0.95 extraction-default (only the deliberately
+# high-confidence tail, ~6% of memories, clears 0.98) — a lower floor would make
+# a fifth of the store merge-immune.
+confidence_floor: 0.98
+
+# Weekly link-repair prunes the graph edges of nodes deprecated at least this
+# many days ago. MUST exceed the manual dream-rollback review window — rollback
+# restores deprecated memories but CANNOT restore their pruned edges.
+deprecated_edge_prune_days: 30

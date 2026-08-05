@@ -18,6 +18,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   screenshots the result to check the layout, and catches broken or stale formulas
   before the file reaches you. The tool is installed automatically during setup;
   if it is unavailable, the builder degrades cleanly to the previous CSV/pandoc path.
+- **Stale-code guard for procedure storage after a deploy.** A Claude Code
+  session loads its Genesis tools once when it starts and keeps running that
+  version until it restarts, so a fix shipped by a deploy stays dormant in an
+  already-open session. For the one tool that rewrites a learned procedure by
+  similarity match, acting on outdated matching logic could silently overwrite
+  the wrong procedure. Genesis now detects that a deploy landed after the session
+  started and blocks that tool with a clear "restart this session" message until
+  you do. Read tools and append-only writes are unaffected. Tunable via the
+  `mcp_staleness_guard` setting (`block` default, `warn`, or `off`).
 
 - **First-run setup wizard on the dashboard.** A new install can go from a fresh
   dashboard to a working, connected Genesis without touching a terminal. A
