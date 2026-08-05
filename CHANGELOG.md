@@ -46,6 +46,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   breaks, set `GENESIS_DASHBOARD_API_AUTH=off` to disable just this gate without
   removing the password.
 
+### Security
+
+- **The dashboard API is now hardened against cross-site request forgery (CSRF).**
+  With a password set, a state-changing API call authenticated by your login
+  cookie must now originate from the dashboard itself (verified via the browser's
+  `Sec-Fetch-Site`/`Origin` headers). Previously another page — including a
+  separate service sharing your dashboard's host — could ride your logged-in
+  session to trigger dashboard actions; that path is now refused. Genesis's own
+  components (which use an internal token) and read-only calls are unaffected, and
+  the same `GENESIS_DASHBOARD_API_AUTH=off` switch disables this along with the
+  rest of the gate.
+
 ### Fixed
 
 - **Re-embedding a memory no longer downgrades its recall ranking.** When a
