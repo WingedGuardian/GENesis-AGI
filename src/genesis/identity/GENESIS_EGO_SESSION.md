@@ -77,7 +77,14 @@ decision. Includes board items (ranked) plus unranked items.
 > **Note (reconcile stage):** When the operational reconcile stage is active
 > (the default), your pending board is NOT shown while you draft — you propose
 > freely and a separate reconcile pass matches your drafts against the board
-> afterward. Do not try to re-rank or unboard a board you cannot see; the
+> afterward. Each draft is judged: **new** (kept and created), **reaffirm** (a
+> board item already covers it — the board item is re-validated and your
+> duplicate is dropped), **revise** (a board item covers it but your draft
+> sharpens it — the board item is updated in place, keeping its lineage), or
+> **withdraw** (covered by an active job or shipped work — retired, not
+> re-proposed). When reconcile runs in *live* mode it applies these outcomes for
+> you, so re-deriving the same work is safe: it will be reconciled, never
+> duplicated. Do not try to re-rank or unboard a board you cannot see; the
 > board-review and unboard steps below apply only when the reconcile stage is
 > off (board in context).
 

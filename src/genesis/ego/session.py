@@ -1430,15 +1430,23 @@ class EgoSession:
         return snapshot
 
     async def _reconcile_drafts(self, proposals: list[dict]) -> list[dict]:
-        """PR-5 reconcile stage — OBSERVE-ONLY. Match this cycle's drafts against
-        the ego-scoped pending board + a deterministic covered-work snapshot and
-        LOG the per-draft verdicts (new/reaffirm/revise/withdraw). Applies
-        NOTHING — verdict application lands in PR-6. Returns drafts unchanged and
-        is fully fail-open: any error passes the drafts through untouched.
+        """Reconcile stage. Match this cycle's drafts against the ego-scoped
+        pending board + a deterministic covered-work snapshot, get a per-draft
+        verdict (new/reaffirm/revise/withdraw), and — in ``live`` mode — apply
+        the board verdicts, returning only the surviving drafts (those still to
+        be created). Fully fail-open: any error passes the drafts through
+        untouched.
 
-        Gated by the ego_reconcile settings lever: off = the stage does not run
-        (no extra CC call); shadow/live both observe-only in PR-5 (live's apply
-        is PR-6).
+        Gated by the ego_reconcile settings lever:
+          - ``off``    — the stage does not run (no extra CC call).
+          - ``shadow`` — run + LOG the verdicts, apply NOTHING; drafts returned
+            unchanged (the default; the observation signal for the replay gate).
+          - ``live``   — apply verdicts via ``_apply_reconcile_verdicts``:
+            reaffirm/revise the matched board item, withdraw covered work, and
+            drop the reconciled drafts; only ``new``/unresolved drafts survive to
+            the realist → create. Live-``revise`` depends on the resolve-side
+            ``expected_revision`` guards (PR-6a) being deployed — the flip is
+            gated on that (see reconcile_config).
         """
         self._last_reconcile_cost_usd = 0.0
         if not proposals:
@@ -1462,6 +1470,13 @@ class EgoSession:
             self._last_reconcile_cost_usd = output.cost_usd
             verdicts = _parse_reconcile_response(output.text, len(proposals))
             self._log_reconcile_verdicts(mode, verdicts, proposals, board, covered)
+            if mode == "live":
+                # PR-6b: apply board verdicts and return ONLY the surviving
+                # drafts (those still to create). Everything before the apply
+                # loop is read-only, so an error here still fails open safely.
+                return await self._apply_reconcile_verdicts(
+                    proposals, verdicts, board
+                )
         except Exception:
             logger.warning(
                 "Reconcile stage failed, passing drafts through", exc_info=True
@@ -1507,6 +1522,215 @@ class EgoSession:
                 str(prop.get("content", ""))[:80].replace("\n", " "),
                 str(v.get("reason", ""))[:120],
             )
+
+    async def _apply_reconcile_verdicts(
+        self,
+        proposals: list[dict],
+        verdicts: dict[int, dict],
+        board: list[dict],
+    ) -> list[dict]:
+        """PR-6b LIVE apply of reconcile verdicts. Returns the SURVIVING drafts
+        (those still to be created), which flow to the realist -> create_batch
+        exactly as today. Board verdicts (reaffirm/withdraw/revise) are applied
+        here and their drafts dropped from the returned list.
+
+        Per-draft fail-open: each draft is KEPT-as-new unless a mutation SUCCEEDS
+        and warrants dropping it. One draft's failure fails open THAT draft only
+        and never abandons an already-committed board decision — so a mid-loop
+        error cannot bubble to the caller's outer except and return the full
+        input list (which would double-create a draft whose board twin was
+        already mutated). All DB writes happen inside the per-draft try; the only
+        code before the loop (prefix_map build) is read-only.
+
+        target_id resolution: the reconcile prompt renders board ids truncated to
+        12 chars, so the model can only ever emit a 12-char prefix. We map that
+        prefix back to the FULL id from the exact board snapshot reconcile was
+        shown; an unmatched or ambiguous prefix downgrades the verdict to "new"
+        (fail-safe), so a hallucinated/mistranscribed id never mutates the wrong
+        proposal.
+        """
+        prefix_map: dict[str, list[tuple[str, dict]]] = {}
+        for b in board:
+            bid = str(b.get("id", "") or "")
+            if bid:
+                prefix_map.setdefault(bid[:12], []).append((bid, b))
+
+        survivors: list[dict] = []
+        for i, draft in enumerate(proposals):
+            try:
+                v = verdicts.get(i) or {}
+                verdict = v.get("verdict", "new")
+                raw_target = v.get("target_id")
+
+                if verdict == "new":
+                    survivors.append(draft)
+                    continue
+
+                # withdraw with NO board target = covered-work invalidated a
+                # FRESH draft that has no board twin -> DROP the draft (do not
+                # create it). This is NOT a board withdrawal, and is decoupled
+                # from the 24h guard: the draft is covered regardless of any
+                # board item's age.
+                if verdict == "withdraw" and not raw_target:
+                    logger.info(
+                        "Reconcile[live] draft[%d] dropped — covered-work, no board twin :: %s",
+                        i,
+                        str(draft.get("content", ""))[:80].replace("\n", " "),
+                    )
+                    continue
+
+                matches = (
+                    prefix_map.get(str(raw_target)[:12]) if raw_target else None
+                )
+                if not matches or len(matches) != 1:
+                    logger.info(
+                        "Reconcile[live] draft[%d] verdict=%s target=%r unresolved "
+                        "-> keep as new",
+                        i,
+                        verdict,
+                        raw_target,
+                    )
+                    survivors.append(draft)
+                    continue
+                full_id, board_row = matches[0]
+
+                if verdict == "reaffirm":
+                    ok = await ego_crud.reaffirm_proposal(self._db, full_id)
+                    logger.info(
+                        "Reconcile[live] draft[%d] reaffirm %s (ok=%s)",
+                        i,
+                        full_id[:12],
+                        ok,
+                    )
+                    # Board item covers it -> drop the fresh re-derivation. A
+                    # False ok means the board item is no longer pending
+                    # (approved/withdrawn/tabled) — re-creating it would either
+                    # duplicate approved work or resurrect a rejected one, so
+                    # dropping is correct in every case.
+                    continue
+
+                if verdict == "withdraw":
+                    retired = await self._reconcile_withdraw(
+                        full_id, board_row, v.get("reason")
+                    )
+                    logger.info(
+                        "Reconcile[live] draft[%d] withdraw %s (board_retired=%s)",
+                        i,
+                        full_id[:12],
+                        retired,
+                    )
+                    # Duplicate of an invalidated/covered item -> drop the draft
+                    # whether or not the board retire fired (24h guard may defer).
+                    continue
+
+                if verdict == "revise":
+                    applied = await self._reconcile_revise(
+                        full_id, board_row, draft, v.get("reason")
+                    )
+                    if applied:
+                        continue  # board item sharpened in place -> drop draft
+                    survivors.append(draft)  # race/dedup/non-pending -> keep new
+                    continue
+
+                survivors.append(draft)  # unknown verdict -> keep
+            except Exception:
+                logger.warning(
+                    "Reconcile[live] draft[%d] apply failed — keeping as new",
+                    i,
+                    exc_info=True,
+                )
+                survivors.append(draft)
+        return survivors
+
+    async def _reconcile_withdraw(
+        self, proposal_id: str, board_row: dict, reason: str | None
+    ) -> bool:
+        """Withdraw a board item invalidated by covered-work, honoring the 24h
+        user-protection guard (mirrors the ego-directed withdraw path,
+        session.py withdrawn-ids loop): no withdraw of an item delivered < 24h
+        ago. Returns True iff the board item was retired. The caller drops the
+        draft regardless (reconcile judged it a duplicate/covered)."""
+        created = str(board_row.get("created_at", "") or "")
+        if created:
+            try:
+                age = datetime.now(UTC) - datetime.fromisoformat(created)
+                if age.total_seconds() < 86400:
+                    logger.info(
+                        "Reconcile[live] withdraw of %s deferred (%.1fh old, <24h guard)",
+                        proposal_id[:12],
+                        age.total_seconds() / 3600,
+                    )
+                    return False
+            except (ValueError, TypeError):
+                pass  # unparseable timestamp — allow withdrawal
+        ok = await ego_crud.withdraw_proposal(
+            self._db,
+            proposal_id,
+            user_response=(reason or "reconcile: covered by shipped/active work"),
+        )
+        if ok:
+            with contextlib.suppress(Exception):
+                from genesis.db.crud import intervention_journal as journal_crud
+
+                await journal_crud.resolve(
+                    self._db, proposal_id, outcome_status="withdrawn"
+                )
+        return ok
+
+    async def _reconcile_revise(
+        self, proposal_id: str, board_row: dict, draft: dict, reason: str | None
+    ) -> bool:
+        """Apply a reconcile 'revise' verdict: sharpen a pending board item in
+        place with the draft's content. Architect ruling A — apply directly; the
+        USER APPROVAL on the pending board is the safety gate, the realist is a
+        quality pre-filter only, and action_type is immutable in revise_proposal.
+
+        Guard-first via revise_proposal (pending + revision-num atomic guard, no
+        revert path). Hash-dedup pre-check (revise_proposal does NOT dedup): if
+        the sharpened content already exists on another pending/approved
+        proposal, skip the revise and keep the draft as new — create_batch's own
+        hash-dedup then collapses it. Returns True only if the revise applied."""
+        from genesis.ego.integrity import content_hash as _content_hash
+
+        new_content = str(draft.get("content", "") or "")
+        if not new_content:
+            return False
+        if await ego_crud.has_pending_proposal_with_hash(
+            self._db, _content_hash(new_content)
+        ):
+            logger.info(
+                "Reconcile[live] revise of %s skipped — content duplicates an "
+                "existing pending item",
+                proposal_id[:12],
+            )
+            return False
+        try:
+            expected = int(board_row.get("revision_num", 1) or 1)
+        except (ValueError, TypeError):
+            expected = 1
+        new_rev = await ego_crud.revise_proposal(
+            self._db,
+            proposal_id,
+            expected_revision=expected,
+            content=new_content,
+            rationale=draft.get("rationale"),
+            confidence=draft.get("confidence"),
+            execution_plan=draft.get("execution_plan"),
+            expected_outputs=draft.get("expected_outputs"),
+            revised_by=self._source_tag,
+            reason=(reason or "reconcile: sharpened from a fresh blind draft"),
+        )
+        if new_rev is None:
+            logger.info(
+                "Reconcile[live] revise of %s not applied "
+                "(race/non-pending/rev-mismatch) -> keep draft",
+                proposal_id[:12],
+            )
+            return False
+        logger.info(
+            "Reconcile[live] revised %s -> rev %d", proposal_id[:12], new_rev
+        )
+        return True
 
     async def _filter_proposals(
         self,
@@ -2814,7 +3038,8 @@ For EACH draft (by index) output exactly one verdict:
 
 Judge the SEMANTIC match yourself; do not require identical wording. When unsure, prefer "new".
 
-Output STRICT JSON only — an array with one object per draft:
+Output ONLY the JSON array — no preamble, no explanation, no code fence, no text
+before or after it. One object per draft, index-aligned:
 [{{"index": 0, "verdict": "new|reaffirm|revise|withdraw", "target_id": "<board id or null>", "reason": "<one line>"}}]
 """
 
@@ -2840,6 +3065,17 @@ def _parse_reconcile_response(
         if match:
             with contextlib.suppress(json.JSONDecodeError):
                 parsed = json.loads(match.group(1).strip())
+    if parsed is None:
+        # Robust extraction: anchor on the real array-of-objects start "[{"
+        # (optional whitespace between), greedy to the last "}]". Immune to
+        # preamble prose containing stray brackets like "The draft [0] ...",
+        # which the naive find("[")/rfind("]") slice below mis-grabs → JSON
+        # error → every draft silently defaults to "new" (PR-6b replay gate
+        # measured this firing ~13% of the time, whenever the model preambles).
+        match = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
+        if match:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(match.group(0))
     if parsed is None:
         first = text.find("[")
         last = text.rfind("]")
