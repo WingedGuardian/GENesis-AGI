@@ -219,3 +219,32 @@ def test_clean_staged_mark_does_not_inflate(repo, _isolate_rounds):
     assert review_state.bump_review_round(cwd=str(repo)) == 1
     _git(repo, "commit", "-qm", "wip")  # staged area now clean
     assert review_state.bump_review_round(cwd=str(repo)) == 1  # no inflation
+
+
+def test_docs_only_commit_still_blocked_at_cap(repo, home):
+    # The hard stop must NOT be bypassable by file extension: a docs/skill-only
+    # commit at the cap (which would otherwise hit the docs-skip) is still blocked.
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    _git(repo, "commit", "-qm", "land code")  # clear staging (direct git, no gate)
+    (repo / "README.md").write_text("# docs change\n")
+    _git(repo, "add", "-A")  # staged set is now docs-only
+    res = _run_hook('git commit -m "docs"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "escalation cap" in res.stderr
+    # ...and an ack lets the docs commit through.
+    res2 = _run_hook('git commit -m "docs"  # escalation-ack', repo, home)
+    assert res2.returncode == 0, res2.stderr
+
+
+def test_corrupt_round_counter_does_not_crash(repo, _isolate_rounds):
+    # A non-integer 'round' (corrupt / partial write / version skew) must NOT raise
+    # from bump — marking a review must always succeed (best-effort counter).
+    import json
+
+    _stage(repo, "a = 2\n")
+    rf = review_state._round_file(cwd=str(repo))
+    rf.parent.mkdir(parents=True, exist_ok=True)
+    branch = review_state.get_current_branch(cwd=str(repo))
+    rf.write_text(json.dumps({"branch": branch, "round": "not-an-int", "last_hash": "old"}))
+    result = review_state.bump_review_round(cwd=str(repo))  # must not raise
+    assert result == 1  # coerced the bad value to 0, then +1

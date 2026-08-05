@@ -227,8 +227,13 @@ def mark_reviewed(agent_output_path: str | None = None, cwd: str | None = None) 
     }
     state_file.write_text(json.dumps(state, indent=2))
     # Count this review round (escalation cap). A distinct staged diff on the same
-    # branch advances the count; re-marking the same diff does not. Best-effort.
-    round_n = bump_review_round(cwd=cwd)
+    # branch advances the count; re-marking the same diff does not. Best-effort:
+    # marking the review must ALWAYS succeed even if the counter is unwritable, so a
+    # counter problem can never leave the user stuck behind the review gate.
+    try:
+        round_n = bump_review_round(cwd=cwd)
+    except Exception:  # noqa: BLE001 - the counter must never block marking a review
+        round_n = 0
     print(f"Review marker written: {state['diff_hash']} (round {round_n})")
     return True
 
@@ -329,11 +334,15 @@ def bump_review_round(cwd: str | None = None) -> int:
     if not state or state.get("branch") != branch:
         state = {"branch": branch, "round": 1, "last_hash": content_hash}
     elif state.get("last_hash") != content_hash:
-        state = {
-            "branch": branch,
-            "round": int(state.get("round", 0)) + 1,
-            "last_hash": content_hash,
-        }
+        # A distinct staged diff → new round. Coerce the stored round defensively:
+        # a corrupt / partial-write / version-skewed value must NOT raise here, or
+        # it would crash `mark` and leave the user stuck behind the gate (this
+        # counter is best-effort — see the never-raises contract).
+        try:
+            prev = int(state.get("round", 0))
+        except (TypeError, ValueError):
+            prev = 0
+        state = {"branch": branch, "round": prev + 1, "last_hash": content_hash}
     # else: same branch + same staged diff → same round (idempotent re-mark).
     try:
         rf = _round_file(cwd)

@@ -411,33 +411,20 @@ def main() -> None:
         )
         return
 
-    # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
-    # or config carries no code to review (adaptive-review "review level: None"),
-    # so skip Rule 2 for it. Conservative fail-toward-review default: we skip ONLY
-    # when (a) the commit is PURE — it cannot add/select content beyond the
-    # current index (no pathspec, no -a/-i/-o/-p, and no git add/rm/mv/reset in
-    # the chain, P1-D) — AND (b) the staged set is non-empty and every path is on
-    # the docs/config allowlist. An impure commit, an empty staged set, a diff we
-    # cannot read, or an ambiguous cwd (already blocked by Rule 1) falls through
-    # to normal enforcement — never skipped. Placed AFTER Rule 0 (--no-verify) and
-    # Rule 1 (main-branch) so it can never weaken those hard blocks.
-    if not _commit_may_add_content(segs):
-        staged = _staged_files(cwd)
-        if staged and all(_is_docs_or_config(p) for p in staged):
-            sys.exit(0)
-
     # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP review→fix→re-review
     # rounds on this change, block the commit until an explicit '# escalation-ack'
     # trailing comment — a machine-enforced STOP so a review loop can't silently run
     # long on a standing "proceed" (see genesis-development SKILL.md). Checked BEFORE
-    # Rule 2 ON PURPOSE: a '# review-override' (which exits Rule 2 early) must NOT be
-    # able to sneak a past-cap commit through — the two acknowledgments are
-    # independent. Like review-override, the ack does NOT bypass Rule 0 (--no-verify)
-    # or Rule 1 (main-branch), checked above. Recognition mirrors _commit_override:
-    # a clean trailing comment on EVERY commit segment (all(), so one ack can't
-    # license a chained sibling commit). NOTE: on a nested `bash -c 'git commit …'`
-    # the ack must sit on the INNER command (the sigil isn't propagated to wrappers);
-    # the documented `git commit … # escalation-ack` form is a plain segment.
+    # both the docs/config skip AND Rule 2 ON PURPOSE: the hard stop must not be
+    # bypassable by file extension (a reviewed prompt/skill/docs-only commit at the
+    # cap would otherwise sneak past via the docs skip), nor by '# review-override'
+    # (which exits Rule 2 early) — the two acknowledgments are independent. Like
+    # review-override, the ack does NOT bypass Rule 0 (--no-verify) or Rule 1
+    # (main-branch), checked above. Recognition mirrors _commit_override: a clean
+    # trailing comment on EVERY commit segment (all(), so one ack can't license a
+    # chained sibling commit). NOTE: on a nested `bash -c 'git commit …'` the ack
+    # must sit on the INNER command (the sigil isn't propagated to wrappers); the
+    # documented `git commit … # escalation-ack` form is a plain segment.
     round_n = get_review_round(cwd=cwd)
     if round_n >= ESCALATION_ROUND_CAP:
         commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
@@ -461,6 +448,22 @@ def main() -> None:
         # acknowledgment was made, and erring toward less friction only happens
         # AFTER a conscious ack.
         reset_review_round(cwd=cwd)
+
+    # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
+    # or config carries no code to review (adaptive-review "review level: None"),
+    # so skip Rule 2 for it. Conservative fail-toward-review default: we skip ONLY
+    # when (a) the commit is PURE — it cannot add/select content beyond the
+    # current index (no pathspec, no -a/-i/-o/-p, and no git add/rm/mv/reset in
+    # the chain, P1-D) — AND (b) the staged set is non-empty and every path is on
+    # the docs/config allowlist. An impure commit, an empty staged set, a diff we
+    # cannot read, or an ambiguous cwd (already blocked by Rule 1) falls through
+    # to normal enforcement — never skipped. Placed AFTER Rule 0 (--no-verify),
+    # Rule 1 (main-branch), and Rule 3 (escalation cap) so it can never weaken
+    # those hard blocks.
+    if not _commit_may_add_content(segs):
+        staged = _staged_files(cwd)
+        if staged and all(_is_docs_or_config(p) for p in staged):
+            sys.exit(0)
 
     # Rule 2: Block commits without review (on branches)
     # Race condition: when command is "git add X && git commit", nothing is
