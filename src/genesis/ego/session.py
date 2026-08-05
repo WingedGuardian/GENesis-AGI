@@ -1624,6 +1624,28 @@ class EgoSession:
                     continue
 
                 if verdict == "revise":
+                    # A revise mutates the board item's content + bumps
+                    # revision_num, which only stays TOCTOU-safe if every pending
+                    # digest for that item is revision-snapshot-protected (so a
+                    # stale reply refuses). A digest sent before #1257 shipped
+                    # snapshotting has none — resolve_proposals then falls back to
+                    # expected_revision=None (unguarded). For such an item, revise
+                    # would reopen the approve-time race; reaffirm instead (keep
+                    # the board item as-is, drop the duplicate draft) — no TOCTOU
+                    # and no duplicate. Only the sharpening is deferred until the
+                    # item is next re-digested (with a snapshot) or resolved.
+                    if not await self._revision_snapshot_exists(
+                        board_row.get("batch_id")
+                    ):
+                        ok = await ego_crud.reaffirm_proposal(self._db, full_id)
+                        logger.info(
+                            "Reconcile[live] draft[%d] revise->reaffirm %s "
+                            "(digest not snapshot-protected; TOCTOU-safe) ok=%s",
+                            i,
+                            full_id[:12],
+                            ok,
+                        )
+                        continue  # drop the duplicate draft
                     applied = await self._reconcile_revise(
                         full_id, board_row, draft, v.get("reason")
                     )
@@ -1676,6 +1698,22 @@ class EgoSession:
                     self._db, proposal_id, outcome_status="withdrawn"
                 )
         return ok
+
+    async def _revision_snapshot_exists(self, batch_id: object) -> bool:
+        """True iff the proposal's delivery batch has a revision snapshot — i.e.
+        its digest was sent after #1257 shipped snapshotting, so a resolve of it
+        is revision-guarded. A missing snapshot (pre-#1257 digest, or never
+        digested) means a resolve would be unguarded, so a live revise of that
+        item is unsafe. Fail-closed (return False) on any error."""
+        if not batch_id:
+            return False
+        try:
+            snap = await ego_crud.get_state(
+                self._db, f"revision_snapshot:{batch_id}"
+            )
+            return bool(snap)
+        except Exception:
+            return False
 
     async def _reconcile_revise(
         self, proposal_id: str, board_row: dict, draft: dict, reason: str | None
@@ -3046,8 +3084,12 @@ For EACH draft (by index) output exactly one verdict:
 - "new": nothing above covers it — genuinely novel work.
 - "reaffirm": a pending board item ALREADY covers it — put the board id in target_id.
 - "revise": a board item covers it but this draft sharpens/updates it — target_id = board id.
-- "withdraw": a board item is INVALIDATED by covered-work (an active job already does it,
-  or a merged PR closed it) — target_id = the board id to retire, reason = the evidence.
+- "withdraw": the work is ALREADY COVERED by covered-work (an active job already does it,
+  or a merged PR closed it). If a pending board item covers the same work, set target_id =
+  that board id to retire it. If NO board item matches but the draft itself is already
+  covered by an active job or merged PR, still use "withdraw" with target_id = null — this
+  drops the redundant draft (there is nothing on the board to retire, but the work is
+  handled). Put the covering evidence in reason.
 
 Judge the SEMANTIC match yourself; do not require identical wording. When unsure, prefer "new".
 

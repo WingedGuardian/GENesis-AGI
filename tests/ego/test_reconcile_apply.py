@@ -10,6 +10,7 @@ a lightweight EgoSession via ``__new__`` rather than the full constructor.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -43,8 +44,20 @@ def sess(db):
     return s
 
 
-async def _board_item(db, *, id: str, content: str = "board work", age_hours: float = 48.0) -> dict:
-    """Insert a pending board proposal aged `age_hours` and return its row dict."""
+async def _board_item(
+    db,
+    *,
+    id: str,
+    content: str = "board work",
+    age_hours: float = 48.0,
+    batch: str = "batch_default",
+    snapshotted: bool = True,
+) -> dict:
+    """Insert a pending board proposal aged `age_hours` and return its row dict.
+
+    By default writes a revision_snapshot for its batch (so a live revise of it
+    is TOCTOU-safe). Pass ``snapshotted=False`` to simulate a pre-#1257 digest
+    with no snapshot (revise must then reaffirm-fallback)."""
     created = (datetime.now(UTC) - timedelta(hours=age_hours)).isoformat()
     await ego_crud.create_proposal(
         db,
@@ -52,11 +65,14 @@ async def _board_item(db, *, id: str, content: str = "board work", age_hours: fl
         action_type="investigate",
         content=content,
         status="pending",
+        batch_id=batch,
         created_at=created,
         content_hash=content_hash(content),
         content_size=len(content.encode()),
         ego_source="genesis_ego_cycle",
     )
+    if snapshotted:
+        await ego_crud.set_state(db, key=f"revision_snapshot:{batch}", value=json.dumps({id: 1}))
     row = await ego_crud.get_proposal(db, id)
     return dict(row)
 
@@ -182,6 +198,32 @@ class TestApplyVerdicts:
             ("rv11rv11rv110000",),
         )
         assert (await cur.fetchone())["content"] == "stale text"
+
+    async def test_revise_unsnapshotted_reaffirms_instead(self, sess, db):
+        """Codex P2: a revise verdict on a board item whose digest has NO revision
+        snapshot (e.g. a pre-#1257 digest) must NOT revise — that would reopen the
+        approve-time TOCTOU on a late reply (resolve falls back to unguarded). It
+        reaffirms instead: board item kept as-is, duplicate draft dropped, content
+        unchanged. No duplicate is created."""
+        board_row = await _board_item(
+            db,
+            id="nosnap1nosnap100",
+            content="original",
+            batch="pre1257batch",
+            snapshotted=False,
+        )
+        assert board_row["last_validated_at"] is None
+        drafts = [_draft("sharper content the model wanted to apply")]
+        survivors = await sess._apply_reconcile_verdicts(
+            drafts,
+            {0: {"verdict": "revise", "target_id": "nosnap1nosna"}},
+            [board_row],
+        )
+        assert survivors == []  # duplicate draft dropped, NOT kept-as-new
+        row = await ego_crud.get_proposal(db, "nosnap1nosnap100")
+        assert row["content"] == "original"  # NOT revised (no snapshot)
+        assert row["revision_num"] == 1
+        assert row["last_validated_at"] is not None  # reaffirmed instead
 
 
 # ---------------------------------------------------------------------------
