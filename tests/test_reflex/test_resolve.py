@@ -180,3 +180,38 @@ class TestResolveTool:
         # transition still committed
         assert (await signals_crud.get_by_id(db, sig["id"]))["status"] == "dismissed_notbug"
         assert await verdicts_crud.list_for_signal(db, sig["id"]) == []
+
+    async def test_partial_then_retry_repairs_the_missing_verdict(self, db, monkeypatch):
+        # A transient verdict-write failure must be recoverable via the same API:
+        # the retry sees a terminal status with NO matching verdict and REPAIRS it
+        # (writes the missing corpus row) instead of no-op'ing forever.
+        sig = await _seed_signal(db)
+        real_record = verdicts_crud.record
+        calls = {"n": 0}
+
+        async def _flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("verdict store down")
+            return await real_record(*a, **k)
+
+        monkeypatch.setattr(verdicts_crud, "record", _flaky)
+
+        out1 = await _impl_reflex_signal_resolve(
+            db, signal_id=sig["id"], disposition="not_a_bug", rationale="x", now=NOW
+        )
+        assert out1["status"] == "partial"
+        assert await verdicts_crud.list_for_signal(db, sig["id"]) == []
+
+        out2 = await _impl_reflex_signal_resolve(
+            db, signal_id=sig["id"], disposition="not_a_bug", rationale="x", now=NOW
+        )
+        assert out2["status"] == "repaired"
+        verdicts = await verdicts_crud.list_for_signal(db, sig["id"])
+        assert len(verdicts) == 1 and verdicts[0]["verdict"] == "dismiss_notbug"
+
+        # once the verdict exists, a further retry is a genuine no-op
+        out3 = await _impl_reflex_signal_resolve(
+            db, signal_id=sig["id"], disposition="not_a_bug", rationale="x", now=NOW
+        )
+        assert out3["status"] == "noop"

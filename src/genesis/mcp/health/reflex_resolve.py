@@ -49,6 +49,62 @@ _SNAPSHOT_FIELDS = (
 )
 
 
+async def _record_verdict(
+    db, signal: dict, disposition: str, verdict: str, resolved_by: str, rationale: str, now: str
+) -> tuple[str | None, bool]:
+    """Write one taste-corpus verdict for a signal. Returns ``(verdict_id, failed)``.
+
+    Never raises: a verdict-store failure is logged and reported as ``failed=True``
+    (the caller surfaces ``partial``), so a signal's terminal transition is never
+    unwound and the tool never crashes on a corpus-write blip."""
+    from genesis.db.crud import reflex_verdicts as verdicts_crud
+
+    context = {k: signal.get(k) for k in _SNAPSHOT_FIELDS}
+    context["disposition"] = disposition
+    context["rationale"] = rationale
+    try:
+        verdict_id = await verdicts_crud.record(
+            db,
+            signal_id=signal["id"],
+            verdict_point="diagnose_card",
+            verdict=verdict,
+            resolved_by=resolved_by,
+            context_snapshot=context,
+            now=now,
+        )
+        return verdict_id, False
+    except Exception:
+        logger.error(
+            "reflex_signal_resolve: verdict write failed for %s (status transition stands)",
+            signal["id"],
+            exc_info=True,
+        )
+        return None, True
+
+
+def _result(
+    status: str,
+    signal_id: str,
+    new_status: str,
+    verdict: str | None,
+    verdict_id: str | None,
+    rationale: str,
+    failed: bool,
+) -> dict:
+    out = {
+        "status": status,
+        "signal_id": signal_id,
+        "new_status": new_status,
+        "verdict": verdict,
+        "verdict_id": verdict_id,
+        "rationale": rationale,
+    }
+    if failed:
+        out["verdict_write_failed"] = True
+        out["message"] = "signal resolved, but the taste-corpus verdict write failed (logged)"
+    return out
+
+
 async def _impl_reflex_signal_resolve(
     db,
     *,
@@ -76,11 +132,33 @@ async def _impl_reflex_signal_resolve(
     current = signal["status"]
     to_status, verdict = _DISPOSITIONS[disposition]
 
-    # Idempotent: a CONSCIOUSLY-closed signal (resolved/dismissed/merged) → no-op,
-    # and crucially no second verdict row. Uses TERMINAL_DISPOSED, NOT _REOPENABLE:
-    # a failure/expiry signal (diagnose_failed/fix_failed/card_expired) is exactly
-    # the kind of stuck signal this tool exists to close, so it stays resolvable.
+    # Already CONSCIOUSLY closed (resolved/dismissed/merged) → no-op — EXCEPT the
+    # partial-write recovery case: a prior call moved the status but its verdict
+    # write failed (returned 'partial'), so the corpus row is missing. If this
+    # retry matches that disposition and the expected verdict truly isn't recorded,
+    # REPAIR it here — a transient DB blip must not cause permanent taste-corpus
+    # loss with no way back through the API. TERMINAL_DISPOSED (not _REOPENABLE):
+    # failure/expiry signals stay resolvable.
     if current in signals_crud.TERMINAL_DISPOSED:
+        if verdict is not None and current == to_status:
+            existing = await verdicts_crud.list_for_signal(db, signal_id)
+            already_recorded = any(
+                v.get("verdict_point") == "diagnose_card" and v.get("verdict") == verdict
+                for v in existing
+            )
+            if not already_recorded:
+                verdict_id, failed = await _record_verdict(
+                    db, signal, disposition, verdict, resolved_by, rationale, now
+                )
+                return _result(
+                    "partial" if failed else "repaired",
+                    signal_id,
+                    current,
+                    verdict,
+                    verdict_id,
+                    rationale,
+                    failed,
+                )
         return {
             "status": "noop",
             "message": f"signal already disposed ({current})",
@@ -101,46 +179,14 @@ async def _impl_reflex_signal_resolve(
         }
 
     verdict_id: str | None = None
-    verdict_write_failed = False
+    failed = False
     if verdict is not None:
-        context = {k: signal.get(k) for k in _SNAPSHOT_FIELDS}
-        context["disposition"] = disposition
-        context["rationale"] = rationale
-        try:
-            verdict_id = await verdicts_crud.record(
-                db,
-                signal_id=signal_id,
-                verdict_point="diagnose_card",
-                verdict=verdict,
-                resolved_by=resolved_by,
-                context_snapshot=context,
-                now=now,
-            )
-        except Exception:
-            # Status already moved; a missing corpus row is recoverable, a raised
-            # tool is not. Log loudly and surface a PARTIAL result rather than
-            # unwind the transition — a caller checking status=="ok" must NOT be
-            # told the taste-corpus write (this tool's core deliverable) landed.
-            verdict_write_failed = True
-            logger.error(
-                "reflex_signal_resolve: status set to %s but verdict write failed for %s",
-                to_status,
-                signal_id,
-                exc_info=True,
-            )
-
-    result = {
-        "status": "partial" if verdict_write_failed else "ok",
-        "signal_id": signal_id,
-        "new_status": to_status,
-        "verdict": verdict,
-        "verdict_id": verdict_id,
-        "rationale": rationale,
-    }
-    if verdict_write_failed:
-        result["verdict_write_failed"] = True
-        result["message"] = "signal resolved, but the taste-corpus verdict write failed (logged)"
-    return result
+        verdict_id, failed = await _record_verdict(
+            db, signal, disposition, verdict, resolved_by, rationale, now
+        )
+    return _result(
+        "partial" if failed else "ok", signal_id, to_status, verdict, verdict_id, rationale, failed
+    )
 
 
 @mcp.tool()
