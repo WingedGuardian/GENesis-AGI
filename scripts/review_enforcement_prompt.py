@@ -58,11 +58,15 @@ def main() -> None:
         "result (e.g., if you wired a notification, confirm it actually sends; "
         "if you fixed a data path, confirm the data actually flows). "
         "Ask: 'If the system restarts now, will this actually work?' "
-        "If you cannot answer yes WITH EVIDENCE, you are not done."
+        "If you cannot answer yes WITH EVIDENCE, you are not done.",
+        flush=True,  # flush BEFORE the manifest's git calls: hook stdout is
+        # block-buffered (piped), so if the manifest git work overruns the 10s
+        # hook timeout and Python is killed, the base reminder must already be out.
     )
 
     # Additive: deterministic per-file review-scope manifest. Fully fail-open —
     # any import/build error is swallowed so the base reminder above stands alone.
+    # build_manifest self-bounds its total git time under the hook timeout.
     try:
         from review_scope import build_manifest, render_reminder_block
 

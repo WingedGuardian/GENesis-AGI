@@ -38,6 +38,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 # Reuse ONLY the sibling github-aware docs/config classifier (scripts/ is not a
 # package — same sys.path trick the other enforcement hooks use).
@@ -53,7 +54,13 @@ except ImportError:  # pragma: no cover - sibling always present in scripts/
         return ext.lower() in {".md", ".rst", ".txt", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
 
 
-_GIT_TIMEOUT = 10
+_GIT_TIMEOUT = 10  # per-call ceiling when no deadline is in force
+# The UserPromptSubmit hook runs with a 10s timeout. build_manifest bounds its
+# TOTAL serial git time under that so it never overruns the hook (which, on a
+# block-buffered pipe, could otherwise get killed before the base reminder flushes
+# — but the hook flushes first, so the worst case is a missing manifest, never a
+# missing reminder). Headroom left for the reminder print + Python startup.
+_MANIFEST_GIT_BUDGET = 6.0
 _MAX_LISTED_FILES = 50  # LOUD-truncate beyond this; the true total is always printed
 
 # ── scope taxonomy — MIRRORS gstack-diff-scope, first-match-wins ──────────────
@@ -282,14 +289,25 @@ def _specialists(scope_tags: set[str], diff_lines: int) -> list[str]:
 
 
 # ── git plumbing — fail-open, always timed ────────────────────────────────────
-def _git(args: list[str], cwd: str | None) -> str | None:
-    """Run a git command; return stdout, or None on ANY error (fail-open)."""
+def _git(args: list[str], cwd: str | None, deadline: float | None = None) -> str | None:
+    """Run a git command; return stdout, or None on ANY error (fail-open).
+
+    ``deadline`` (a ``time.monotonic()`` value) caps the per-call timeout by the
+    time remaining in the manifest's total git budget — so several serial calls
+    can't collectively overrun the hook timeout. Past the deadline → None.
+    """
+    timeout = _GIT_TIMEOUT
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        timeout = min(_GIT_TIMEOUT, remaining)
     try:
         result = subprocess.run(
             ["git", *args],
             capture_output=True,
             text=True,
-            timeout=_GIT_TIMEOUT,
+            timeout=timeout,
             cwd=cwd,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, UnicodeDecodeError):
@@ -302,24 +320,24 @@ def _git(args: list[str], cwd: str | None) -> str | None:
     return result.stdout
 
 
-def _base_ref(cwd: str | None) -> str | None:
+def _base_ref(cwd: str | None, deadline: float | None = None) -> str | None:
     """Resolve the base ref to diff against.
 
     Primary: ``origin/HEAD`` symbolic ref. But that is UNSET on most fresh
     clones / CI checkouts, so the fallback chain (origin/main → origin/master →
     main → master) is the common path, not a rare one.
     """
-    out = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd)
+    out = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd, deadline)
     if out and out.strip().startswith("refs/remotes/"):
         return out.strip()[len("refs/remotes/") :]  # e.g. "origin/main"
     for cand in ("origin/main", "origin/master", "main", "master"):
-        if _git(["rev-parse", "--verify", "--quiet", cand], cwd) not in (None, ""):
+        if _git(["rev-parse", "--verify", "--quiet", cand], cwd, deadline) not in (None, ""):
             return cand
     return None
 
 
-def _merge_base(base: str, cwd: str | None) -> str | None:
-    out = _git(["merge-base", base, "HEAD"], cwd)
+def _merge_base(base: str, cwd: str | None, deadline: float | None = None) -> str | None:
+    out = _git(["merge-base", base, "HEAD"], cwd, deadline)
     if not out or not out.strip():
         return None
     return out.strip()
@@ -330,8 +348,11 @@ def _parse_name_status_z(text: str) -> list[dict]:
 
     -z emits paths VERBATIM (no quoting/escaping), so paths containing tabs or
     newlines parse correctly — unlike the default tab-and-newline format. Tokens:
-    ``<status>\\0<path>\\0`` for A/M/D; ``<status>\\0<src>\\0<dst>\\0`` for R/C,
-    where the DEST is the current reviewable file.
+    ``<status>\\0<path>\\0`` for A/M/D; ``<status>\\0<src>\\0<dst>\\0`` for R/C.
+    For a rename/copy BOTH sides are emitted as records (mirroring the commit
+    gate's ``_staged_files``): a rename FROM reviewable code TO an excluded dest
+    (``src/auth.py -> README.md``) would otherwise drop the removed code from
+    coverage entirely.
     """
     tokens = text.split("\x00")
     files: list[dict] = []
@@ -346,15 +367,18 @@ def _parse_name_status_z(text: str) -> list[dict]:
         if ct in ("R", "C"):
             if i + 2 >= n:
                 break  # malformed tail — stop rather than misparse
-            path = tokens[i + 2]  # dst
+            src, dst = tokens[i + 1], tokens[i + 2]
             i += 3
+            for p in (src, dst):  # both sides — either may be the reviewable one
+                if p:
+                    files.append({"path": p, "change_type": ct})
         else:
             if i + 1 >= n:
                 break
             path = tokens[i + 1]
             i += 2
-        if path:
-            files.append({"path": path, "change_type": ct})
+            if path:
+                files.append({"path": path, "change_type": ct})
     return files
 
 
@@ -413,20 +437,23 @@ def build_manifest(cwd: str | None = None, base: str | None = None) -> dict | No
     scope_tag}], specialists}``. None on any git failure / no resolvable base /
     no merge-base — the caller then prints its base reminder unchanged.
     """
-    base_ref = base or _base_ref(cwd)
+    # Bound TOTAL serial git time under the 10s hook timeout (the base reminder is
+    # already flushed, so an overrun only costs the manifest, never the reminder).
+    deadline = time.monotonic() + _MANIFEST_GIT_BUDGET
+    base_ref = base or _base_ref(cwd, deadline)
     if not base_ref:
         return None
-    mb = _merge_base(base_ref, cwd)
+    mb = _merge_base(base_ref, cwd, deadline)
     if not mb:
         return None
-    name_status = _git(["diff", "-z", "--name-status", "-M", mb], cwd)
+    name_status = _git(["diff", "-z", "--name-status", "-M", mb], cwd, deadline)
     if name_status is None:
         return None
 
     # Fail-open must be all-or-nothing: if numstat fails after name-status
     # succeeded, a partial manifest would carry a WRONG diff_lines (→ wrong
     # specialist gating) and skip binary exclusion. Return None instead.
-    numstat = _git(["diff", "-z", "--numstat", "-M", mb], cwd)
+    numstat = _git(["diff", "-z", "--numstat", "-M", mb], cwd, deadline)
     if numstat is None:
         return None
     diff_lines, binary_paths = _parse_numstat_z(numstat)

@@ -406,10 +406,10 @@ def test_build_manifest_fail_open_when_numstat_fails(tmp_path, monkeypatch):
     _git(repo, "commit", "-qm", "work")
     real_git = _rs._git
 
-    def fake_git(args, cwd):
+    def fake_git(args, cwd, deadline=None):
         if "--numstat" in args:
             return None
-        return real_git(args, cwd)
+        return real_git(args, cwd, deadline)
 
     monkeypatch.setattr(_rs, "_git", fake_git)
     assert _rs.build_manifest(cwd=str(repo)) is None
@@ -420,7 +420,8 @@ def test_parse_name_status_z_handles_rename_and_tab_paths():
     text = "M\x00src/a.py\x00A\x00weird\tname.py\x00R100\x00old.py\x00new.py\x00"
     recs = _rs._parse_name_status_z(text)
     got = {r["path"]: r["change_type"] for r in recs}
-    assert got == {"src/a.py": "M", "weird\tname.py": "A", "new.py": "R"}
+    # Rename emits BOTH sides now (src+dst) so a code source isn't dropped.
+    assert got == {"src/a.py": "M", "weird\tname.py": "A", "old.py": "R", "new.py": "R"}
 
 
 def test_parse_numstat_z_normal_binary_and_rename():
@@ -446,6 +447,47 @@ def test_git_fail_open_on_unicode_decode_error(monkeypatch):
 
     monkeypatch.setattr(_rs.subprocess, "run", boom)
     assert _rs._git(["diff"], None) is None
+
+
+def test_git_returns_none_past_deadline(monkeypatch):
+    # Codex P2: a deadline in the past must short-circuit to None (bounds the
+    # manifest's total git time under the hook timeout) without even calling git.
+    called = {"n": 0}
+
+    def spy(*a, **k):
+        called["n"] += 1
+        raise AssertionError("should not run past deadline")
+
+    monkeypatch.setattr(_rs.subprocess, "run", spy)
+    assert _rs._git(["diff"], None, deadline=_rs.time.monotonic() - 1) is None
+    assert called["n"] == 0
+
+
+def test_parse_name_status_z_rename_emits_both_sides():
+    # Codex P2: rename FROM reviewable code TO an excluded dest must still surface
+    # the source, else removed code is dropped from coverage.
+    text = "R100\x00src/auth.py\x00README.md\x00"
+    recs = _rs._parse_name_status_z(text)
+    paths = {r["path"] for r in recs}
+    assert paths == {"src/auth.py", "README.md"}
+    assert all(r["change_type"] == "R" for r in recs)
+
+
+def test_build_manifest_rename_to_docs_keeps_code_source(tmp_path):
+    repo = _mk_repo(tmp_path)
+    (repo / "auth.py").write_text("def login():\n    return 1\n" * 20)
+    _git(repo, "add", "auth.py")
+    _git(repo, "commit", "-qm", "add code")
+    base_tip = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "checkout", "-q", "-b", "feat/rename-to-docs")
+    _git(repo, "mv", "auth.py", "NOTES.md")  # code -> docs rename
+    _git(repo, "commit", "-qm", "rename to docs")
+    m = _rs.build_manifest(cwd=str(repo), base=base_tip)
+    assert m is not None
+    reviewable = {f["path"] for f in m["files"] if f["review_required"]}
+    assert "auth.py" in reviewable  # removed code still named
+    excluded = {f["path"] for f in m["files"] if not f["review_required"]}
+    assert "NOTES.md" in excluded  # docs dest excluded
 
 
 # --------------------------------------------------------------------------- #
