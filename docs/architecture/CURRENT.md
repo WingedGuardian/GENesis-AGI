@@ -997,10 +997,23 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, infra_profile, env.py, _config_overlay.py]
+          restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
 verified: b662f3e3 2026-07-17
 ```
 
+- **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
+  install usable" signal (CC OAuth login + ≥1 routing LLM key + ≥1 embedding key),
+  computed on demand from persisted `secrets.env` + CC OAuth state. The LLM leg is
+  **derived from the router's own merged config** (`routing.config.load_config`,
+  honoring the `model_routing.local.yaml` overlay) reduced to the provider types
+  referenced by an active call-site `chain` — resolved via the same env-var patterns
+  as `litellm_delegate._resolve_api_key` — so it can't drift from what routing
+  actually uses (a declared-but-unchained provider doesn't count); the embedding leg
+  pins to the real cloud backends (`API_KEY_DEEPINFRA`/`API_KEY_QWEN`). Deliberately decoupled
+  from the `~/.genesis/setup-complete` marker (which means only "bootstrap
+  finished"). Single source of truth shared by three surfaces: the dashboard
+  `setup-status` route, the ego cadence gate (`_should_run` requires marker AND
+  `floor_met`), and the CC session-start onboarding prompt.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, ~113 CREATE TABLE; docs

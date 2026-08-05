@@ -243,3 +243,121 @@ class TestEgoFollowUps:
             assert len(data) == 1
             assert data[0]["id"] == "f1"
             assert data[0]["strategy"] == "ego_judgment"
+
+
+# ── PR-6a: revision guard + surfacing ───────────────────────────────
+
+
+class TestEgoRevisionGuard:
+    def test_proposals_all_surfaces_revision_fields(self, client):
+        """The /all payload (what the resolve card reads) carries revision_num
+        + revalidate_at + last_validated_at; absent revision_num defaults to 1."""
+        rt = _mock_runtime()
+        proposals = [
+            {
+                "id": "p1", "action_type": "research", "action_category": "learning",
+                "content": "c", "rationale": "r", "confidence": 0.8,
+                "urgency": "normal", "alternatives": "", "status": "pending",
+                "user_response": None, "cycle_id": "c1", "batch_id": "b1",
+                "created_at": "2026-04-20T10:00:00Z", "resolved_at": None,
+                "expires_at": None, "revision_num": 3,
+                "revalidate_at": "2026-05-01T00:00:00Z",
+                "last_validated_at": "2026-04-25T00:00:00Z",
+            },
+            {
+                "id": "p2", "action_type": "research", "action_category": "learning",
+                "content": "c", "rationale": "r", "confidence": 0.8,
+                "urgency": "normal", "alternatives": "", "status": "pending",
+                "user_response": None, "cycle_id": "c1", "batch_id": "b1",
+                "created_at": "2026-04-20T10:00:00Z", "resolved_at": None,
+                "expires_at": None,  # no revision fields → defaults
+            },
+        ]
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.list_proposals", new_callable=AsyncMock, return_value=proposals),
+        ):
+            MockRT.instance.return_value = rt
+            data = client.get("/api/genesis/ego/proposals/all").get_json()
+        assert data[0]["revision_num"] == 3
+        assert data[0]["revalidate_at"] == "2026-05-01T00:00:00Z"
+        assert data[0]["last_validated_at"] == "2026-04-25T00:00:00Z"
+        # Absent → default 1 / None, never KeyError.
+        assert data[1]["revision_num"] == 1
+        assert data[1]["revalidate_at"] is None
+        assert data[1]["last_validated_at"] is None
+
+    def test_resolve_passes_expected_revision(self, client):
+        rt = _mock_runtime()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.resolve_proposal", new_callable=AsyncMock, return_value=True) as mock_resolve,
+            patch("genesis.db.crud.ego.get_proposal", new_callable=AsyncMock, return_value=None),
+        ):
+            MockRT.instance.return_value = rt
+            resp = client.post(
+                "/api/genesis/ego/proposals/p1/resolve",
+                json={"status": "approved", "revision_num": 2},
+            )
+        assert resp.get_json()["ok"] is True
+        assert mock_resolve.call_args[1]["expected_revision"] == 2
+
+    def test_resolve_without_revision_is_unguarded(self, client):
+        """FOOTGUN GUARD: a body without revision_num maps to expected_revision
+        None (unguarded, as today) — NEVER a hardcoded 1."""
+        rt = _mock_runtime()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.resolve_proposal", new_callable=AsyncMock, return_value=True) as mock_resolve,
+            patch("genesis.db.crud.ego.get_proposal", new_callable=AsyncMock, return_value=None),
+        ):
+            MockRT.instance.return_value = rt
+            client.post(
+                "/api/genesis/ego/proposals/p1/resolve",
+                json={"status": "approved"},
+            )
+        assert mock_resolve.call_args[1]["expected_revision"] is None
+
+    def test_resolve_stale_revision_returns_409(self, client):
+        """resolve refused + row still pending at a different revision → 409
+        stale_revision with the fresh revision, so the client can re-review."""
+        rt = _mock_runtime()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.resolve_proposal", new_callable=AsyncMock, return_value=False),
+            patch(
+                "genesis.db.crud.ego.get_proposal",
+                new_callable=AsyncMock,
+                return_value={"id": "p1", "status": "pending", "revision_num": 5},
+            ),
+        ):
+            MockRT.instance.return_value = rt
+            resp = client.post(
+                "/api/genesis/ego/proposals/p1/resolve",
+                json={"status": "approved", "revision_num": 2},
+            )
+        assert resp.status_code == 409
+        data = resp.get_json()
+        assert data["error"] == "stale_revision"
+        assert data["revision_num"] == 5
+
+    def test_resolve_already_resolved_stays_404(self, client):
+        """A guard miss where the row is no longer pending (already resolved)
+        is a 404, not a false stale-revision 409."""
+        rt = _mock_runtime()
+        with (
+            patch("genesis.runtime.GenesisRuntime") as MockRT,
+            patch("genesis.db.crud.ego.resolve_proposal", new_callable=AsyncMock, return_value=False),
+            patch(
+                "genesis.db.crud.ego.get_proposal",
+                new_callable=AsyncMock,
+                return_value={"id": "p1", "status": "approved", "revision_num": 2},
+            ),
+        ):
+            MockRT.instance.return_value = rt
+            resp = client.post(
+                "/api/genesis/ego/proposals/p1/resolve",
+                json={"status": "approved", "revision_num": 2},
+            )
+        assert resp.status_code == 404
+

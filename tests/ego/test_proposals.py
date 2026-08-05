@@ -349,6 +349,34 @@ class TestProposalWorkflow:
         digest = workflow.format_digest(props, "b1")
         assert "<b>HOW:</b>" not in digest
 
+    async def test_format_digest_surfaces_revision_and_verified(self, workflow):
+        """rev badge + 'verified as of' render when non-default (a revised /
+        reaffirmed proposal); this is the PR-6b-facing surfacing."""
+        props = [
+            {
+                "action_type": "investigate", "content": "c", "confidence": 0.9,
+                "revision_num": 3, "created_at": "2026-07-01T00:00:00+00:00",
+                "last_validated_at": "2026-07-05T12:00:00+00:00",
+            }
+        ]
+        digest = workflow.format_digest(props, "b1")
+        assert "[rev 3]" in digest
+        assert "verified as of 2026-07-05T12:00" in digest
+
+    async def test_format_digest_dark_when_default(self, workflow):
+        """Fresh proposals (revision_num=1, last_validated_at==created_at) show
+        neither badge — no noise while the reconcile revise path is dark."""
+        props = [
+            {
+                "action_type": "investigate", "content": "c", "confidence": 0.9,
+                "revision_num": 1, "created_at": "2026-07-01T00:00:00+00:00",
+                "last_validated_at": "2026-07-01T00:00:00+00:00",
+            }
+        ]
+        digest = workflow.format_digest(props, "b1")
+        assert "[rev" not in digest
+        assert "verified as of" not in digest
+
     async def test_send_digest_calls_topic_manager(
         self, workflow, db, mock_topic_manager,
     ):
@@ -447,6 +475,155 @@ class TestProposalWorkflow:
         assert results[ids[0]] == "rejected"
         row = await ego_crud.get_proposal(db, ids[0])
         assert row["status"] == "rejected"
+
+    async def test_create_batch_stamps_revalidation(self, workflow, db):
+        """create_batch stamps revalidate_at per urgency; last_validated_at=created_at."""
+        from datetime import datetime
+
+        props = [
+            {"action_type": "investigate", "content": "high one", "urgency": "high"},
+            {"action_type": "investigate", "content": "low one", "urgency": "low"},
+            {"action_type": "investigate", "content": "default normal one"},
+        ]
+        batch_id, ids, _ = await workflow.create_batch(props)
+        rows = {
+            r["content"]: r
+            for r in await ego_crud.list_proposals_by_batch(db, batch_id)
+        }
+
+        def _delta_h(row):
+            c = datetime.fromisoformat(row["created_at"])
+            rv = datetime.fromisoformat(row["revalidate_at"])
+            return round((rv - c).total_seconds() / 3600)
+
+        for r in rows.values():
+            assert r["last_validated_at"] == r["created_at"]
+            assert r["revalidate_at"] > r["created_at"]
+
+        # EgoConfig defaults: high=48h, low=168h, normal=72h
+        assert _delta_h(rows["high one"]) == 48
+        assert _delta_h(rows["low one"]) == 168
+        assert _delta_h(rows["default normal one"]) == 72
+
+    async def test_create_proposal_direct_no_revalidation_stays_null(self, db):
+        """Informational path (direct create_proposal) leaves revalidation NULL."""
+        await ego_crud.create_proposal(
+            db,
+            id="info1",
+            action_type="j9_regression",
+            content="eval regression alert",
+        )
+        row = await ego_crud.get_proposal(db, "info1")
+        assert row["revalidate_at"] is None
+        assert row["last_validated_at"] is None
+
+    async def test_send_digest_writes_revision_snapshot(self, workflow, db):
+        """send_digest snapshots {id: revision_num} under BOTH the delivery id
+        (authoritative — pins the exact digest a reply targets) and the batch
+        id (fallback for bare/bulk resolves with no delivery context)."""
+        import json
+
+        batch_id, ids, _ = await workflow.create_batch(_sample_proposals(2))
+        await workflow.send_digest(batch_id)
+        # Fresh proposals are all revision_num=1 (no revise until PR-6b).
+        expected = {ids[0]: 1, ids[1]: 1}
+        for key in ("revision_snapshot:msg12345", f"revision_snapshot:{batch_id}"):
+            raw = await ego_crud.get_state(db, key)
+            assert raw is not None, key
+            assert json.loads(raw) == expected
+
+    async def test_reply_to_stale_delivery_refuses_newer_revision(
+        self, workflow, db, mock_topic_manager,
+    ):
+        """Codex P1 regression: re-delivering a batch after a revise must not
+        let a reply to the OLDER digest resolve against the NEWER snapshot.
+        The delivery-keyed snapshot pins each digest independently."""
+        batch_id, ids, _ = await workflow.create_batch(_sample_proposals(1))
+        mock_topic_manager.send_to_category.side_effect = ["d1", "d2"]
+
+        await workflow.send_digest(batch_id)  # d1 snapshots rev 1
+        await db.execute(
+            "UPDATE ego_proposals SET revision_num = 2 WHERE id = ?", (ids[0],)
+        )
+        await db.commit()
+        await workflow.send_digest(batch_id)  # d2 snapshots rev 2
+
+        # Reply to the OLD digest (saw rev 1; row is now rev 2) → refused.
+        results = await workflow.resolve_proposals(
+            batch_id, {1: ("approved", None)}, delivery_id="d1"
+        )
+        assert ids[0] not in results
+        assert (await ego_crud.get_proposal(db, ids[0]))["status"] == "pending"
+
+        # Reply to the CURRENT digest (saw rev 2) → resolves.
+        results = await workflow.resolve_proposals(
+            batch_id, {1: ("approved", None)}, delivery_id="d2"
+        )
+        assert results.get(ids[0]) == "approved"
+        assert (await ego_crud.get_proposal(db, ids[0]))["status"] == "approved"
+
+    async def test_resolve_unknown_delivery_falls_back_to_batch_snapshot(
+        self, workflow, db,
+    ):
+        """A delivery id with no snapshot (e.g. pre-deploy digest) falls back
+        to the batch-keyed snapshot rather than going unguarded."""
+        batch_id, ids, _ = await workflow.create_batch(_sample_proposals(1))
+        await workflow.send_digest(batch_id)  # batch snapshot at rev 1
+        await db.execute(
+            "UPDATE ego_proposals SET revision_num = 2 WHERE id = ?", (ids[0],)
+        )
+        await db.commit()
+
+        # Unknown delivery key → batch fallback (rev 1) → stale → refused.
+        results = await workflow.resolve_proposals(
+            batch_id, {1: ("approved", None)}, delivery_id="no-such-delivery"
+        )
+        assert ids[0] not in results
+        assert (await ego_crud.get_proposal(db, ids[0]))["status"] == "pending"
+
+    async def test_resolve_refuses_stale_revision(self, workflow, db):
+        """A row revised (revision_num bumped) after the digest is refused on
+        resolve — expected_revision no longer matches — while its unchanged
+        sibling resolves. The atomic optimistic-concurrency guard."""
+        batch_id, ids, _ = await workflow.create_batch(_sample_proposals(2))
+        await workflow.send_digest(batch_id)  # snapshot both at rev 1
+        # Simulate a concurrent revise bumping proposal #1 after the digest.
+        await db.execute(
+            "UPDATE ego_proposals SET revision_num = 2 WHERE id = ?", (ids[0],)
+        )
+        await db.commit()
+
+        results = await workflow.resolve_proposals(
+            batch_id, {1: ("approved", None), 2: ("approved", None)}
+        )
+
+        # The stale one is refused (absent from results, stays pending); the
+        # unchanged one resolves.
+        assert ids[0] not in results
+        assert results.get(ids[1]) == "approved"
+        assert (await ego_crud.get_proposal(db, ids[0]))["status"] == "pending"
+        assert (await ego_crud.get_proposal(db, ids[1]))["status"] == "approved"
+
+    async def test_resolve_missing_snapshot_stays_unguarded(self, workflow, db):
+        """FOOTGUN GUARD: with no snapshot (e.g. a pre-deploy digest), the
+        resolve must fall back to expected_revision=None (unguarded), NOT
+        default to 1 — otherwise a row at revision_num!=1 would wrongly refuse.
+        A row bumped to rev 2 with no snapshot must still resolve."""
+        batch_id, ids, _ = await workflow.create_batch(_sample_proposals(1))
+        # No send_digest → no revision_snapshot row exists for this batch.
+        await db.execute(
+            "UPDATE ego_proposals SET revision_num = 2 WHERE id = ?", (ids[0],)
+        )
+        await db.commit()
+
+        results = await workflow.resolve_proposals(
+            batch_id, {1: ("approved", None)}
+        )
+
+        # Resolves despite revision_num=2, proving the missing snapshot mapped
+        # to None (unguarded), not a hardcoded 1.
+        assert results.get(ids[0]) == "approved"
+        assert (await ego_crud.get_proposal(db, ids[0]))["status"] == "approved"
 
 
 class TestValidateBatch:

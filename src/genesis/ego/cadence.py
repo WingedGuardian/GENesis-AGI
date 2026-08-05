@@ -1200,11 +1200,33 @@ class EgoCadenceManager:
 
     def _should_run(self, *, skip_idle_check: bool = False) -> bool:
         """Check all gates. Returns True if the cycle should proceed."""
-        # Don't run before onboarding completes
+        # Don't run before bootstrap has finished (marker) AND the install is
+        # actually functional (live floor: CC login + LLM + embedding keys).
+        # The marker preserves bootstrap's "don't run until I've finished"
+        # guarantee; the floor adds "don't run autonomy without a working brain".
         setup_marker = Path.home() / ".genesis" / "setup-complete"
         if not setup_marker.exists():
-            logger.debug("Ego cycle skipped — onboarding not complete")
+            logger.debug("Ego cycle skipped — bootstrap not complete (marker absent)")
             return False
+        # Floor gate is fail-CLOSED for an autonomy gate: if the floor is unmet —
+        # including because secrets.env momentarily couldn't be read (the floor
+        # helper logs that at WARNING) — we can't confirm a working brain, so we
+        # skip rather than act. Only a catastrophic import/helper crash (e.g. a
+        # broken deploy) falls through fail-OPEN on the marker alone, so a code bug
+        # can't wedge autonomy forever.
+        try:
+            from genesis.onboarding.floor import compute_floor
+
+            if not compute_floor().floor_met:
+                logger.debug(
+                    "Ego cycle skipped — install not functional "
+                    "(floor unmet: needs CC login + an LLM key + an embedding key)"
+                )
+                return False
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Ego floor check crashed; proceeding on marker alone", exc_info=True
+            )
 
         if self._paused:
             logger.debug("Ego cycle skipped — paused")

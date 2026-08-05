@@ -100,6 +100,18 @@ class Router:
         for name in new_config.providers:
             self.breakers.get(name)  # get-or-create
 
+        # The onboarding floor derives its accepted LLM provider types from this
+        # config's call-site chains (lru-cached). Invalidate here — inside
+        # reload_config, so EVERY caller refreshes it — or the ego gate/dashboard
+        # would keep honoring the pre-reload provider set until a restart. A floor
+        # glitch must never break a routing reload, hence the guard.
+        try:
+            from genesis.onboarding.floor import invalidate_provider_type_cache
+
+            invalidate_provider_type_cache()
+        except Exception:  # noqa: BLE001
+            logger.debug("Floor provider-type cache invalidation failed", exc_info=True)
+
         added = new_sites - old_sites
         removed = old_sites - new_sites
         if added or removed:

@@ -331,51 +331,71 @@ class TestStatusHeaderStdinModel:
 
 
 class TestOnboardingInjection:
-    """Tests for first-run onboarding detection in SessionStart hook."""
+    """First-run onboarding detection — gated on the LIVE functional floor
+    (``genesis.onboarding.floor``: Claude Code login + an LLM key + an embedding
+    key), NOT merely on the ``~/.genesis/setup-complete`` marker.
 
-    def test_onboarding_fires_when_setup_complete_absent(self, flag_dir: Path) -> None:
-        """No setup-complete marker → onboarding prompt injected."""
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
-        result = subprocess.run(
+    The subprocess must import THIS tree's genesis (which has the floor module), so
+    PYTHONPATH points at the worktree src. ``SECRETS_PATH`` + ``CLAUDE_CODE_OAUTH_TOKEN``
+    drive the floor legs deterministically.
+    """
+
+    _SRC = str(Path(__file__).resolve().parents[2] / "src")
+
+    def _run(self, flag_dir, tmp_path, *, secrets_body="", token=None, extra=None):
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text(secrets_body)
+        env = {
+            "HOME": str(flag_dir.parent),
+            "PATH": "/usr/bin",
+            "PYTHONPATH": self._SRC,
+            "SECRETS_PATH": str(secrets),
+        }
+        if token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        if extra:
+            env.update(extra)
+        return subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
             capture_output=True,
             text=True,
             env=env,
-            timeout=10,
+            timeout=15,
         )
+
+    def test_onboarding_fires_when_floor_unmet(self, flag_dir: Path, tmp_path: Path) -> None:
+        """No CC token + empty secrets → floor unmet → onboarding prompt injected."""
+        result = self._run(flag_dir, tmp_path)
         assert "FIRST-RUN ONBOARDING REQUIRED" in result.stdout
         assert "src/genesis/skills/onboarding/SKILL.md" in result.stdout
         assert result.returncode == 0
 
-    def test_onboarding_suppressed_when_setup_complete_exists(self, flag_dir: Path) -> None:
-        """setup-complete marker present → no onboarding prompt."""
-        (flag_dir / "setup-complete").write_text("2026-03-28T16:00:00-04:00")
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
-        result = subprocess.run(
-            [_PYTHON, str(_CONTEXT_SCRIPT)],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=10,
+    def test_onboarding_fires_with_marker_when_floor_unmet(
+        self, flag_dir: Path, tmp_path: Path
+    ) -> None:
+        """The decoupling: a bootstrapped box (marker present) that is still keyless
+        is not functional, so onboarding is STILL injected."""
+        (flag_dir / "setup-complete").write_text("2026-08-03T00:00:00-04:00")
+        result = self._run(flag_dir, tmp_path)
+        assert "FIRST-RUN ONBOARDING REQUIRED" in result.stdout
+        assert result.returncode == 0
+
+    def test_onboarding_suppressed_when_floor_met(self, flag_dir: Path, tmp_path: Path) -> None:
+        """CC logged in (token) + an LLM key + an embedding key → functional → silent
+        (marker absent notwithstanding)."""
+        result = self._run(
+            flag_dir,
+            tmp_path,
+            secrets_body="API_KEY_GROQ=x\nAPI_KEY_DEEPINFRA=y\n",
+            token="tok-test",
         )
         assert "FIRST-RUN ONBOARDING" not in result.stdout
         assert result.returncode == 0
 
-    def test_onboarding_skipped_for_bridge_sessions(self, flag_dir: Path) -> None:
-        """Bridge sessions (GENESIS_CC_SESSION=1) never get onboarding."""
-        # No setup-complete marker — would normally trigger onboarding
-        env = {
-            "HOME": str(flag_dir.parent),
-            "PATH": "/usr/bin",
-            "GENESIS_CC_SESSION": "1",
-        }
-        result = subprocess.run(
-            [_PYTHON, str(_CONTEXT_SCRIPT)],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=10,
-        )
+    def test_onboarding_skipped_for_bridge_sessions(self, flag_dir: Path, tmp_path: Path) -> None:
+        """Bridge sessions (GENESIS_CC_SESSION=1) never get onboarding, floor unmet
+        notwithstanding."""
+        result = self._run(flag_dir, tmp_path, extra={"GENESIS_CC_SESSION": "1"})
         assert "FIRST-RUN ONBOARDING" not in result.stdout
         assert result.returncode == 0
 
