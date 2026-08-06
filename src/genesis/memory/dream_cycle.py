@@ -557,7 +557,7 @@ async def run_synthesis_drain(
         "run_id": run_id, "dry_run": dry_run,
         "drained": 0, "stale_skipped": 0, "would_merge": 0,
         "clusters_merged": 0, "clusters_skipped_large": 0,
-        "memories_deprecated": 0, "adversarial_blocked": 0,
+        "memories_deprecated": 0, "links_copied": 0, "adversarial_blocked": 0,
         "shrink_gate_blocked": 0, "rollback_flagged": False,
         "aborted_capacity": False, "aborted_infra": False, "errors": [],
         # Importance-shield drain re-check (see dream_shield.shield_filter_live):
@@ -1047,6 +1047,9 @@ async def _synthesize_clusters(
             )
             merged += 1
             report["memories_deprecated"] += result["deprecated_count"]
+            report["links_copied"] = (
+                report.get("links_copied", 0) + result.get("links_copied", 0)
+            )
             breaker.record_progress()
         except SynthesisBlockedError as exc:
             # Adversarial review or shrink gate blocked this cluster.
@@ -1225,6 +1228,7 @@ async def _synthesize_and_deprecate(
 
     # Deprecate originals
     deprecated_count = 0
+    deprecated_at = datetime.now(UTC).isoformat()
     for original_id in original_ids:
         try:
             # Qdrant: mark as deprecated
@@ -1237,11 +1241,13 @@ async def _synthesize_and_deprecate(
                     "synthesized_into": new_memory_id,
                 },
             )
-            # SQLite: mark as deprecated
+            # SQLite: mark as deprecated. deprecated_at is the authoritative
+            # deprecation time for link aging — the synthesis's created_at is
+            # unreliable (store()'s exact-dedup can return an old memory).
             await db.execute(
                 "UPDATE memory_metadata SET deprecated = 1, "
-                "dream_cycle_run_id = ? WHERE memory_id = ?",
-                (run_id, original_id),
+                "dream_cycle_run_id = ?, deprecated_at = ? WHERE memory_id = ?",
+                (run_id, deprecated_at, original_id),
             )
             deprecated_count += 1
         except Exception:
@@ -1249,6 +1255,25 @@ async def _synthesize_and_deprecate(
                 "Failed to deprecate memory %s", original_id, exc_info=True,
             )
     await db.commit()
+
+    # Rewire the originals' external edges onto the synthesis (COPY): without
+    # this, deprecating the originals leaves every external neighbour's edge
+    # dangling on a soft-deleted node. COPY (not MOVE) keeps the originals'
+    # edges in place so the dream rollback stays reversible — it hard-deletes
+    # the synthesis's links (including these copies); the originals' now-stale
+    # edges are pruned later, aged, by dream_link_repair. Best-effort: a rewire
+    # failure must not undo a completed merge.
+    links_copied = 0
+    try:
+        from genesis.db.crud import memory_links as links_crud
+        links_copied = await links_crud.copy_external_links(
+            db, from_ids=original_ids, to_id=new_memory_id,
+        )
+    except Exception:
+        logger.warning(
+            "Dream cycle: external link rewire failed for %s",
+            new_memory_id, exc_info=True,
+        )
 
     # Create links from synthesis to originals
     if store.linker:
@@ -1279,6 +1304,7 @@ async def _synthesize_and_deprecate(
         "new_memory_id": new_memory_id,
         "deprecated_count": deprecated_count,
         "original_ids": original_ids,
+        "links_copied": links_copied,
     }
 
 
@@ -1297,6 +1323,14 @@ async def rollback(
     2. Clear their deprecated flag (Qdrant + SQLite)
     3. Find synthesized memories created by this run (by tag)
     4. Hard-delete the syntheses (they're derived, not original data)
+
+    Link handling: the merge COPIES each original's external edges onto the
+    synthesis, so deleting the synthesis (step 4, which also removes all of its
+    ``memory_links`` rows) cleans up the copies — the restored originals keep
+    their own edges, which were never touched. This holds only INSIDE the
+    ``deprecated_edge_prune_days`` window: after it, ``dream_link_repair`` prunes
+    the aged originals' (non-``extends``) edges, and rollback cannot recreate
+    them. Run rollbacks within that window.
     """
     from genesis.qdrant.collections import update_payload
 
@@ -1319,7 +1353,7 @@ async def rollback(
         try:
             await db.execute(
                 "UPDATE memory_metadata SET deprecated = 0, "
-                "dream_cycle_run_id = NULL WHERE memory_id = ?",
+                "dream_cycle_run_id = NULL, deprecated_at = NULL WHERE memory_id = ?",
                 (mid,),
             )
             update_payload(

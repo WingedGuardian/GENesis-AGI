@@ -1497,6 +1497,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE memory_metadata ADD COLUMN dream_cycle_run_id TEXT",
         "memory_metadata.dream_cycle_run_id")
 
+    # Dream merge link rewiring: authoritative deprecation timestamp used to age
+    # out a soft-deleted original's stale links after the rollback window (the
+    # synthesis's created_at is unreliable — store()'s exact-dedup can return an
+    # old pre-existing memory). NULL for non-dream deprecations.
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN deprecated_at TEXT",
+        "memory_metadata.deprecated_at")
+
     # Memory supersession: track which memory replaced this one (PR #551+).
     await _try_alter(db,
         "ALTER TABLE memory_metadata ADD COLUMN superseded_by TEXT",
