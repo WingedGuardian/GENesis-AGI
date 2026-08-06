@@ -38,6 +38,8 @@
 
 ---
 
+**Run your own personal AGI.** Genesis is a complete, open cognitive architecture—clone it, run your own instance, and extend the core. What follows is the case for why that's worth doing.
+
 We have the most capable AI models ever created, and we're using them like search bars with better grammar.
 
 Every other AI agent puts you in the driver's seat—and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step.
@@ -630,6 +632,12 @@ Standalone libraries extracted from Genesis, stabilized against production use:
 V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've read this far and something here resonates—the memory architecture, the autonomy model, or the audacity of building a self-evolving agent—there's work to do.
 
 **What contributing looks like:** Install it, run it, push it into territory it hasn't been. The cognitive architecture is complete—what it needs now is people who want to help it earn the claim rather than just read about it.
+
+**The contribution surface** — the core is built to be extended. The four places to dig in:
+- **Memory subsystem** — 4-layer hybrid retrieval (Qdrant vectors + SQLite FTS5 + multi-factor scoring). Start at [Memory](#memory) · deep dive: [`memory-deep-dive.md`](docs/architecture/memory-deep-dive.md)
+- **Ego architecture** — the dual-ego autonomous cycle and the earned-autonomy trust model. Start at [How it thinks](#how-it-thinks) and [Earned autonomy](#earned-autonomy) · deep dive: [`autonomy-deep-dive.md`](docs/architecture/autonomy-deep-dive.md)
+- **Skills runtime** — the pluggable capability layer agents load at runtime. Start at [Modules](#modules)
+- **MCP layer** — the four MCP servers (memory · recon · health · outreach) that expose Genesis's tools to its reasoning engine. See the [architecture docs](docs/architecture/)
 
 **Where to start:**
 - **[Discord](https://discord.gg/Zkc3XMQpJX)** — the hub. Ask questions, share what you're working on
