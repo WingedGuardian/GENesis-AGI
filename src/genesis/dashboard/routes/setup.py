@@ -22,6 +22,7 @@ from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 from genesis.onboarding.floor import UNSET_SENTINELS, compute_floor, read_persisted_secrets
+from genesis.onboarding.readiness import compute_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,11 @@ def setup_status():
     ``floor_met`` (and its three legs ``cc_oauth`` / ``llm_key_present`` /
     ``embedding_key_present``) is the LIVE "is this Genesis functional" signal;
     ``onboarded`` is the separate "bootstrap finished" marker, kept for display.
+
+    Also emits the cumulative readiness tier ABOVE the floor
+    (``genesis.onboarding.readiness``): ``tier`` (0..3) + ``tier_name`` plus the
+    two gates the floor does not cover — ``telegram_configured`` (T2, proactive
+    reach) and ``ego_enabled`` (T3). All additive; existing fields unchanged.
     """
     # Read secrets.env once; reuse for both the floor and the password check.
     secrets = read_persisted_secrets()
@@ -60,17 +66,32 @@ def setup_status():
     except OSError:
         logger.warning("setup-status: could not read USER.md", exc_info=True)
 
-    return jsonify(
-        {
-            "onboarded": _SETUP_COMPLETE_MARKER.is_file(),
-            "password_set": secrets_have_password,
-            "cc_oauth": floor.cc_oauth,
-            "llm_key_present": floor.llm_key_present,
-            "embedding_key_present": floor.embedding_key_present,
-            "floor_met": floor.floor_met,
-            "identity_set": identity_set,
-        }
-    )
+    # Ego-loop enable state gates T3 (the user-controlled driver of autonomous
+    # behaviour). Resolved fail-safe: this route drives first-run and must NEVER
+    # 500 — an unreadable ego config degrades to "ego off" (worst case shows T2
+    # instead of T3), never a crash. Lazy import (mirrors routes/ego.py) so the
+    # ego module is not pulled at blueprint import time.
+    try:
+        from genesis.ego.config import load_ego_config
+
+        ego_enabled = bool(load_ego_config().enabled)
+    except Exception:  # noqa: BLE001 - setup-status must never raise into first-run
+        logger.warning("setup-status: ego config unreadable; ego_enabled=False", exc_info=True)
+        ego_enabled = False
+
+    readiness = compute_readiness(secrets=secrets, ego_enabled=ego_enabled)
+
+    payload = {
+        "onboarded": _SETUP_COMPLETE_MARKER.is_file(),
+        "password_set": secrets_have_password,
+        "cc_oauth": floor.cc_oauth,
+        "llm_key_present": floor.llm_key_present,
+        "embedding_key_present": floor.embedding_key_present,
+        "floor_met": floor.floor_met,
+        "identity_set": identity_set,
+    }
+    payload.update(readiness.as_dict())
+    return jsonify(payload)
 
 
 @blueprint.route("/api/genesis/keys/test", methods=["POST"])
