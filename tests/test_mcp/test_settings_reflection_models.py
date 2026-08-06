@@ -20,6 +20,17 @@ def test_has_form_on_dashboard():
     assert "reflection_models" in _FORM_DOMAINS
 
 
+def test_domain_description_scopes_cli_path_per_depth():
+    """P2 (#1261): the description must accurately scope these to the CLI path —
+    deep/strategic are CLI-PRIMARY (dispatch: cli), light uses this value only on
+    CLI fallback. Guards against the inverted 'CLI-fallback-only for all depths'
+    wording (deep/strategic route cli by design, so this file is their real lever)."""
+    desc = _DOMAIN_REGISTRY["reflection_models"].description.lower()
+    assert "cli" in desc
+    assert "primary" in desc  # deep/strategic named as CLI-primary, not a fallback
+    assert "fallback" in desc  # light's CLI-fallback case still named
+
+
 def test_valid_changes_pass():
     assert _validate({"deep": {"effort": "xhigh"}}) == []
     assert _validate({"deep": {"model": "opus"}}) == []

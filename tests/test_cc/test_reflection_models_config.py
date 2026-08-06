@@ -103,6 +103,43 @@ def test_read_live_no_cache(config_dirs):
     assert rmc.effort_for_depth(Depth.DEEP) == EffortLevel.HIGH  # next call, no cache
 
 
+# ── editor_view: conditional effort exposure (P2 — Codex #1261) ──────────
+
+
+def test_editor_view_exposes_effort_for_effort_capable_model():
+    """Switching a depth to an effort-capable model must surface an effort key so
+    the dashboard renders a control (else the hidden hardcoded value is silently
+    used). Light shipped as Haiku with no effort; as Sonnet it must gain one."""
+    view = rmc.editor_view({"light": {"model": "sonnet"}})
+    assert view["light"]["model"] == "sonnet"
+    assert view["light"].get("effort")  # a concrete default is exposed
+    assert view["light"]["effort"] in {"low", "medium", "high", "xhigh", "max"}
+
+
+def test_editor_view_hides_effort_for_effortless_model():
+    """Haiku ignores --effort at dispatch, so the editor must NOT show an effort
+    control for it — even if a stale effort key is present in the served config."""
+    view = rmc.editor_view({"light": {"model": "haiku", "effort": "low"}})
+    assert view["light"] == {"model": "haiku"}
+
+
+def test_editor_view_keeps_existing_effort_for_capable_model():
+    view = rmc.editor_view({"deep": {"model": "sonnet", "effort": "xhigh"}})
+    assert view["deep"] == {"model": "sonnet", "effort": "xhigh"}
+
+
+def test_editor_view_does_not_mutate_input():
+    src = {"light": {"model": "haiku", "effort": "low"}}
+    rmc.editor_view(src)
+    assert src == {"light": {"model": "haiku", "effort": "low"}}  # unchanged
+
+
+def test_editor_view_ignores_non_dict_and_unknown():
+    view = rmc.editor_view({"light": "oops", "deep": {"model": "opus"}})
+    assert view["light"] == "oops"  # left as-is, never crashes
+    assert view["deep"].get("effort")  # opus is effort-capable → exposed
+
+
 # ── shipped base file sanity ─────────────────────────────────────────────
 
 

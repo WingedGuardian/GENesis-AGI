@@ -58,6 +58,13 @@ async def settings_get(domain_name: str):
     if not domain:
         return jsonify({"error": f"Unknown domain: {domain_name}"}), 404
     data = _load_yaml_merged(domain.config_filename)
+    if domain_name == "reflection_models":
+        # Expose an effort control only for depths whose model supports effort
+        # (Haiku shows model only; switching a depth to Sonnet/Opus/Fable surfaces
+        # effort). Pure view transform — the stored config is untouched.
+        from genesis.cc.reflection_bridge.reflection_models_config import editor_view
+
+        data = editor_view(data)
     _strip_hidden(domain, data)
     return jsonify({"domain": domain_name, "config": data, "readonly": domain.readonly})
 

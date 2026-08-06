@@ -1,5 +1,13 @@
 # Reflection depth → model/effort mapping.
 #
+# SCOPE — governs reflections that run on the Claude Code CLI path.
+#   * deep + strategic run on the CLI BY DESIGN (dispatch: cli in
+#     config/model_routing.yaml), so THIS file is their primary model/effort.
+#   * light runs primarily via the API free-model chain (4_light_reflection) and
+#     uses its value here (Haiku) only when it falls back to the CLI.
+# So editing deep/strategic here changes their real model/effort; editing light
+# here changes only its CLI-fallback behavior.
+#
 # Read live per reflection (no restart) by
 # genesis.cc.reflection_bridge.reflection_models_config, which the reflection
 # bridge (_bridge.py) and prompt resolver (_prompts.py) both delegate to.

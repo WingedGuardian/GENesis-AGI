@@ -127,10 +127,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reflection thinks harder by default.** The model and reasoning effort behind
   each reflection depth — light, deep, and strategic — used to be fixed in code.
   They're now a settings domain you can edit live from the dashboard Config tab
-  (a new **Reflection Models** panel), with no restart. The defaults also move to
-  the new `xhigh` reasoning tier: Deep reflection steps up from `high`, and
-  Strategic settles at `xhigh` (from `max`). Light stays on Haiku, which doesn't
-  use an effort setting at all, so it exposes only a model choice.
+  (a new **Reflection Models** panel), with no restart. These govern reflections
+  running on the Claude Code CLI path: Deep and Strategic run on the CLI by
+  design, so this is their primary model/effort; Light runs primarily via the API
+  free-model chain and uses its value only when it falls back to the CLI. An
+  effort control appears only for effort-capable models — switch a depth off Haiku
+  and an effort setting surfaces (Haiku ignores effort at dispatch). The defaults
+  also move to the new `xhigh` reasoning tier: Deep steps up from `high`, and
+  Strategic settles at `xhigh` (from `max`).
 
 - **`git push` in an interactive Claude Code session now asks for your approval
   instead of hard-stopping.** This safety hook used to block the command outright

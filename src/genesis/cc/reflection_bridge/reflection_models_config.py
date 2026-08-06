@@ -128,3 +128,40 @@ def effort_for_depth(depth: Depth) -> EffortLevel | None:
         )
         fallback = _HARDCODED_DEFAULTS.get(key, {}).get("effort")
         return EffortLevel(fallback) if fallback else None
+
+
+def editor_view(config: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a served reflection_models config for the dashboard editor.
+
+    The generic settings editor only renders keys present in the served config, so
+    an ``effort`` control appears for a depth only when the config carries an
+    ``effort`` key. Expose ``effort`` for exactly the depths whose selected model
+    supports it:
+
+      * effort-capable model (Sonnet/Opus/Fable) with no ``effort`` key → inject
+        the default effort so the control renders. Without this, switching a depth
+        off Haiku silently applies the hidden hardcoded value with no way to edit
+        it (Codex P2 on #1261).
+      * effort-less model (Haiku) → drop any ``effort`` key so no misleading
+        control shows; the invoker omits ``--effort`` for Haiku at dispatch.
+
+    Pure view transform over a COPY — never mutates the stored config, so it is
+    safe to call on the merged yaml the dashboard route serves.
+    """
+    from genesis.cc.types import CCModel, model_supports_effort
+
+    view = copy.deepcopy(config)
+    for key, fields in view.items():
+        if not isinstance(fields, dict):
+            continue
+        model_raw = fields.get("model")
+        try:
+            supports = bool(model_raw) and model_supports_effort(CCModel(model_raw))
+        except ValueError:
+            supports = False
+        if supports:
+            if not fields.get("effort"):
+                fields["effort"] = _HARDCODED_DEFAULTS.get(key, {}).get("effort") or "medium"
+        else:
+            fields.pop("effort", None)
+    return view

@@ -391,10 +391,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     "reflection_models": SettingsDomain(
         name="reflection_models",
         description=(
-            "Reflection depth → model/effort (light/deep/strategic). Read live "
-            "per reflection by cc.reflection_bridge.reflection_models_config (no "
-            "restart). Haiku (light) ignores effort — the invoker omits --effort "
-            "for it, so light carries no effort key."
+            "Reflection depth → model/effort (light/deep/strategic) for "
+            "reflections that run on the Claude Code CLI path. Deep and strategic "
+            "run on the CLI by design (dispatch: cli in model_routing.yaml), so "
+            "these are their PRIMARY model/effort; light runs primarily via the "
+            "API free-model chain and uses its value (Haiku) only on CLI fallback. "
+            "Read live per reflection (no restart). An effort control shows only "
+            "for effort-capable models — Haiku ignores --effort."
         ),
         config_filename="reflection_models.yaml",
         readonly=False,
