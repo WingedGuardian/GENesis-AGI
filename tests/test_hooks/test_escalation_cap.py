@@ -374,3 +374,52 @@ def test_gate_fails_open_on_non_dict_counter(repo, home):
     rf.write_text("[1, 2, 3]")  # non-dict → gate must fail open, not crash
     res = _run_hook('git commit -m "wip"', repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ── Malformed counter-file VALUE (round-5 class fix: 1e999 → inf → OverflowError) ──
+
+
+def test_coerce_finite_int_rejects_non_finite():
+    # int(float('inf')) raises OverflowError (not caught by TypeError/ValueError);
+    # int(nan) raises ValueError. The helper must absorb ALL of them → default.
+    assert review_state._coerce_finite_int(float("inf")) == 0
+    assert review_state._coerce_finite_int(float("-inf")) == 0
+    assert review_state._coerce_finite_int(float("nan")) == 0
+    assert review_state._coerce_finite_int("not-a-number") == 0
+    assert review_state._coerce_finite_int(None) == 0
+    assert review_state._coerce_finite_int(5) == 5
+    assert review_state._coerce_finite_int(3.9) == 3  # finite float still truncates
+
+
+def test_load_round_coerces_non_finite_round_to_zero(repo, _isolate_rounds):
+    # A well-formed dict whose 'round' is a non-finite JSON number (1e999 → inf)
+    # must be coerced to 0 at the load boundary — int(inf) OverflowError escapes the
+    # plain int() guards and would crash the gate. Both the load boundary and
+    # get_review_round must fail open to 0.
+    branch = review_state.get_current_branch(cwd=str(repo))
+    _write_round_file(repo, '{"branch": "' + branch + '", "round": 1e999, "last_hash": "x"}')
+    assert review_state._load_round(cwd=str(repo))["round"] == 0
+    assert review_state.get_review_round(cwd=str(repo)) == 0
+
+
+def test_bump_no_crash_on_infinity_round(repo, _isolate_rounds):
+    # A defect-bearing bump over an infinity 'round' must not raise; it coerces the
+    # bad value to 0 and increments to 1.
+    branch = review_state.get_current_branch(cwd=str(repo))
+    _write_round_file(repo, '{"branch": "' + branch + '", "round": 1e999, "last_hash": "old"}')
+    _stage(repo, "a = 2\n")
+    assert review_state.bump_review_round(cwd=str(repo)) == 1
+
+
+def test_gate_fails_open_on_infinity_round(repo, home):
+    # End-to-end: the gate calls get_review_round() unguarded; an infinity 'round'
+    # in the counter file must fail open (round→0 < cap → allowed), not crash.
+    _stage(repo, "a = 2\n")
+    assert _mark(repo, home).returncode == 0
+    branch = review_state.get_current_branch(cwd=str(repo))
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    rf.parent.mkdir(parents=True, exist_ok=True)
+    rf.write_text('{"branch": "' + branch + '", "round": 1e999, "last_hash": "x"}')
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr

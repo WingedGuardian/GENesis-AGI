@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import time
@@ -314,21 +315,46 @@ def _staged_content_hash(cwd: str | None = None) -> str:
         return "unknown"
 
 
-def _load_round(cwd: str | None = None) -> dict:
-    """Read the round-counter file, normalizing ANY non-dict content to ``{}``.
+def _coerce_finite_int(value: object, default: int = 0) -> int:
+    """Best-effort finite int from a persisted JSON value; ``default`` otherwise.
 
-    Validating the shape once, here at the single load boundary, is the whole
-    class-fix for malformed counters: valid JSON that is not an object (``[1,2,3]``,
-    ``42``, ``"str"`` from a manual edit / schema skew) would otherwise reach a
-    caller's ``.get()`` and raise ``AttributeError``, defeating the fail-open
-    contract. Every caller now provably receives a dict → their ``.get`` can't
-    raise → any malformed shape collapses to "no counter → fail open". Never raises.
+    Closes the malformed-counter VALUE class at a single point: a valid JSON number
+    like ``1e999`` parses to ``float('inf')``, and ``int(inf)`` raises ``OverflowError``
+    (NOT a subclass of ``TypeError``/``ValueError``), so a plain ``int()`` guard would
+    let it escape and crash the gate — violating the never-raises/fail-open contract.
+    Rejecting non-finite floats and catching ``OverflowError`` here means no persisted
+    round value can ever raise, however corrupt. Never raises.
+    """
+    try:
+        if isinstance(value, float) and not math.isfinite(value):
+            return default
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _load_round(cwd: str | None = None) -> dict:
+    """Read the round-counter file, normalizing shape AND the round VALUE.
+
+    Validating once, here at the single load boundary, is the whole class-fix for
+    malformed counters. Two sub-classes are closed here:
+      - SHAPE: valid JSON that is not an object (``[1,2,3]``, ``42``, ``"str"`` from a
+        manual edit / schema skew) would reach a caller's ``.get()`` and raise
+        ``AttributeError`` — normalized to ``{}``.
+      - VALUE: a well-formed dict whose ``round`` is pathological (``1e999`` → inf →
+        ``int()`` ``OverflowError``; a non-numeric string; null) — coerced to a finite
+        int via ``_coerce_finite_int`` so every caller provably gets a clean ``int``.
+    Every caller therefore receives a dict with a finite-int ``round`` → nothing a
+    corrupt file contains can raise → it collapses to "no/zero counter → fail open".
+    Never raises.
     """
     try:
         p = _round_file(cwd)
         if p.exists():
             data = json.loads(p.read_text())
             if isinstance(data, dict):
+                if "round" in data:
+                    data["round"] = _coerce_finite_int(data.get("round"))
                 return data
     except (json.JSONDecodeError, OSError):
         pass
@@ -344,10 +370,7 @@ def get_review_round(cwd: str | None = None) -> int:
     state = _load_round(cwd)
     if not state or state.get("branch") != get_current_branch(cwd=cwd):
         return 0
-    try:
-        return int(state.get("round", 0))
-    except (TypeError, ValueError):
-        return 0
+    return _coerce_finite_int(state.get("round", 0))
 
 
 def _write_round(state: dict, cwd: str | None = None) -> None:
@@ -397,17 +420,12 @@ def bump_review_round(cwd: str | None = None, *, clean: bool = False) -> int:
         # round defensively: a corrupt / partial-write / version-skewed value must
         # NOT raise here, or it would crash `mark` and leave the user stuck behind
         # the gate (this counter is best-effort — see the never-raises contract).
-        try:
-            prev = int(state.get("round", 0))
-        except (TypeError, ValueError):
-            prev = 0
+        # _coerce_finite_int also absorbs the `1e999`→inf→OverflowError value class.
+        prev = _coerce_finite_int(state.get("round", 0))
         state = {"branch": branch, "round": prev + 1, "last_hash": content_hash}
     # else: same branch + same staged diff → same round (idempotent re-mark).
     _write_round(state, cwd)
-    try:
-        return int(state.get("round", 0))
-    except (TypeError, ValueError):
-        return 0
+    return _coerce_finite_int(state.get("round", 0))
 
 
 def reset_review_round(cwd: str | None = None) -> None:
