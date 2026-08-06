@@ -1037,6 +1037,11 @@ class EgoSession:
                 # (content, career, etc.) are rejected and auto-escalated.
                 if proposals and self._source_tag == "genesis_ego_cycle":
                     proposals = self._enforce_domain_boundary(proposals)
+                    # Operate-vs-develop deterministic floor (roadmap gate):
+                    # marks dev-artifact proposals; they are created then
+                    # immediately tabled in _process_proposals (recoverable,
+                    # never digested). Runs post-realist unconditionally.
+                    proposals = self._flag_develop_scope(proposals)
                 elif proposals and self._source_tag == "user_ego_cycle":
                     proposals = await self._enforce_user_domain_boundary(proposals)
 
@@ -1595,7 +1600,15 @@ class EgoSession:
                 full_id, board_row = matches[0]
 
                 if verdict == "reaffirm":
-                    ok = await ego_crud.reaffirm_proposal(self._db, full_id)
+                    from genesis.ego.config import next_revalidate_at
+
+                    ok = await ego_crud.reaffirm_proposal(
+                        self._db,
+                        full_id,
+                        revalidate_at=next_revalidate_at(
+                            board_row.get("urgency", "normal"),
+                        ),
+                    )
                     logger.info(
                         "Reconcile[live] draft[%d] reaffirm %s (ok=%s)",
                         i,
@@ -1637,7 +1650,15 @@ class EgoSession:
                     if not await self._revision_snapshot_exists(
                         board_row.get("batch_id")
                     ):
-                        ok = await ego_crud.reaffirm_proposal(self._db, full_id)
+                        from genesis.ego.config import next_revalidate_at
+
+                        ok = await ego_crud.reaffirm_proposal(
+                            self._db,
+                            full_id,
+                            revalidate_at=next_revalidate_at(
+                                board_row.get("urgency", "normal"),
+                            ),
+                        )
                         logger.info(
                             "Reconcile[live] draft[%d] revise->reaffirm %s "
                             "(digest not snapshot-protected; TOCTOU-safe) ok=%s",
@@ -1746,6 +1767,9 @@ class EgoSession:
             expected = int(board_row.get("revision_num", 1) or 1)
         except (ValueError, TypeError):
             expected = 1
+        from genesis.ego.config import next_revalidate_at
+        from genesis.ego.proposals import _serialize_expected_outputs
+
         new_rev = await ego_crud.revise_proposal(
             self._db,
             proposal_id,
@@ -1754,9 +1778,18 @@ class EgoSession:
             rationale=draft.get("rationale"),
             confidence=draft.get("confidence"),
             execution_plan=draft.get("execution_plan"),
-            expected_outputs=draft.get("expected_outputs"),
+            # Serialize: the LLM draft carries a dict; the column is TEXT.
+            # An unserialized dict would fail parameter binding and lose the
+            # revise to the keep-as-new fallback.
+            expected_outputs=_serialize_expected_outputs(
+                draft.get("expected_outputs"),
+            ),
             revised_by=self._source_tag,
             reason=(reason or "reconcile: sharpened from a fresh blind draft"),
+            # A revise IS a premise re-validation — advance the cadence clock.
+            revalidate_at=next_revalidate_at(
+                board_row.get("urgency", "normal"),
+            ),
         )
         if new_rev is None:
             logger.info(
@@ -1942,6 +1975,126 @@ class EgoSession:
         "system_monitoring", "genesis_maintenance",
     })
 
+    # Develop-work markers — the deterministic floor of the operate-vs-develop
+    # boundary (identity doc "Operate, Don't Develop" + realist rule 8). NARROW
+    # by design: only unambiguous dev-artifact signatures belong here, because
+    # this layer must stay near-zero false-positive on operate work. Fuzzy
+    # phrasing (read-only code tracing vs live-symptom diagnosis) is judged by
+    # the realist rubric, never this list.
+    # Cause-mentions must NOT match: a symptom diagnosis that names a refactor
+    # or migration as the suspected CAUSE ("backups fail since the scheduler
+    # refactor", "migration 0071 failed — investigate") is operate. Markers
+    # therefore require ACTION phrasing (verb + object), not the bare noun.
+    _DEVELOP_MARKER_PATTERNS = (
+        re.compile(r"\breview\b[^.\n]{0,80}?\bpull.?requests?\b", re.IGNORECASE),
+        re.compile(r"\breview\b[^.\n]{0,80}?\bpr\s*#\d+", re.IGNORECASE),
+        re.compile(r"\bpull.?requests?\b[^.\n]{0,60}?\b(?:review|merge|approv)", re.IGNORECASE),
+        re.compile(r"\b(?:merge|approve)\b[^.\n]{0,40}?\bpr\s*#\d+", re.IGNORECASE),
+        re.compile(
+            r"\brefactor(?:ing)?\s+(?:the|a|an|this|that)\s+\w+|\brefactor\s+of\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:run|write|create|apply|author|build|add)\b[^.\n]{0,40}?"
+            r"\bschema\s+migrations?\b"
+            r"|\bchange\b[^.\n]{0,30}?\b(?:database|db)\s+schema\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\b(?:write|produce|apply|author)\s+(?:a\s+)?patch\b", re.IGNORECASE),
+        # Install-script edits (editing, NOT running — "run the install script"
+        # is operate; the update.sh dispatch is a legitimate ops lever).
+        re.compile(
+            r"\b(?:edit|modif(?:y|ies)|rewrite|patch|amend)\b[^.\n]{0,50}?"
+            r"\b(?:install script|host.?setup|bootstrap\.sh|scripts/[\w./-]+\.sh|\.sh\b)",
+            re.IGNORECASE,
+        ),
+        # Source-file / source-code edits (object must be code, so "fix the
+        # wedged service" and "update the dashboard status" do NOT match).
+        re.compile(
+            r"\b(?:edit|modif(?:y|ies)|rewrite|patch|fix)\b[^.\n]{0,50}?"
+            r"\b(?:src/genesis|source code|source file|\.py\b)",
+            re.IGNORECASE,
+        ),
+        # Config-VALUE changes (thresholds, intervals, weights, caps — "user
+        # decisions" per the identity doc). Value-change verb + config noun;
+        # a bare noun in a symptom ("the timeout keeps firing") does not match.
+        re.compile(
+            r"\b(?:raise|lower|increase|decrease|set|bump|adjust|tune|change)\b"
+            r"[^.\n]{0,40}?\b(?:threshold|interval|routing weight|budget cap|"
+            r"failure limit|retry count|backoff)\b",
+            re.IGNORECASE,
+        ),
+    )
+
+    def _flag_develop_scope(self, proposals: list[dict]) -> list[dict]:
+        """Mark develop-scope proposals for tabling (genesis ego only).
+
+        Deterministic floor of the operate-vs-develop boundary. While
+        ``genesis_self_development_enabled`` is False (the roadmap default),
+        a proposal that is unambiguously dev-artifact work — a SELF_MODIFY /
+        AUTONOMOUS_BUILD action domain, or an explicit develop marker (PR
+        review/merge, refactor, schema change, patch) — is marked here and
+        TABLED right after creation in ``_process_proposals``: it lands as a
+        recoverable row on the tabled lane, never deleted, never digested.
+        Runs after the realist unconditionally (same guarantee as
+        ``_enforce_domain_boundary``), so a realist outage cannot leak
+        develop work. Flipping the config flag to True disables the gate
+        without code changes (the self-development unlock path).
+        """
+        try:
+            from genesis.ego.config import load_ego_config
+
+            if load_ego_config().genesis_self_development_enabled:
+                return proposals
+        except Exception:
+            # Config read failure → keep enforcing (fail toward LESS autonomy).
+            logger.warning(
+                "develop-gate config read failed — enforcing", exc_info=True,
+            )
+
+        try:
+            from genesis.autonomy.classification import classify_domain
+            from genesis.autonomy.types import ActionDomain
+        except Exception:
+            classify_domain = None
+            ActionDomain = None
+            logger.warning(
+                "develop-gate classifier import failed — marker scan only",
+                exc_info=True,
+            )
+
+        for p in proposals:
+            reason = None
+            if classify_domain is not None:
+                try:
+                    domain = classify_domain(
+                        p.get("action_type", ""), p.get("execution_plan") or "",
+                    )
+                    if domain in (
+                        ActionDomain.SELF_MODIFY, ActionDomain.AUTONOMOUS_BUILD,
+                    ):
+                        reason = f"action domain {domain.value}"
+                except Exception:
+                    logger.warning(
+                        "develop-gate classify_domain failed for proposal",
+                        exc_info=True,
+                    )
+            if reason is None:
+                text = f"{p.get('content', '')} {p.get('execution_plan') or ''}"
+                for pat in self._DEVELOP_MARKER_PATTERNS:
+                    match = pat.search(text)
+                    if match:
+                        reason = f"develop marker {match.group(0)!r}"
+                        break
+            if reason:
+                p["_develop_scope"] = reason
+                logger.warning(
+                    "Genesis ego develop-scope proposal will be tabled (%s): %s",
+                    reason,
+                    p.get("content", "")[:80],
+                )
+        return proposals
+
     def _enforce_domain_boundary(
         self,
         proposals: list[dict],
@@ -2052,20 +2205,28 @@ class EgoSession:
         try:
             # Auto-table oldest unranked proposals when queue exceeds cap.
             # Respects the 24h guard — proposals < 24h old are not tabled.
+            # The cap is TOTAL across both egos (one user-facing board of 15),
+            # so the count is global; eviction is global-oldest-unranked-first
+            # regardless of which ego authored the tabled item.
             try:
-                all_pending = await ego_crud.list_pending_proposals(
-                    self._db, ego_source=self._source_tag,
-                )
+                all_pending = await ego_crud.list_pending_proposals(self._db)
                 # Informational eval rows (j9/gauntlet) are acknowledge-only and
                 # must not consume the approval-queue cap — otherwise a burst of
                 # eval regressions could auto-table real, actionable proposals.
                 pending, _informational = partition_informational(all_pending)
                 max_pending = getattr(self._config, "max_pending_proposals", 15)
-                if len(pending) + len(proposals) > max_pending:
+                # Develop-gate-flagged drafts are created-then-tabled and
+                # never occupy the board — counting them would evict real
+                # pending proposals to make room for rows that instantly
+                # leave.
+                _incoming = sum(
+                    1 for p in proposals if not p.get("_develop_scope")
+                )
+                if len(pending) + _incoming > max_pending:
                     unranked = [
                         p for p in pending if p.get("rank") is None
                     ]
-                    excess = len(pending) + len(proposals) - max_pending
+                    excess = len(pending) + _incoming - max_pending
                     oldest = sorted(
                         unranked, key=lambda x: x.get("created_at", ""),
                     )
@@ -2116,6 +2277,41 @@ class EgoSession:
                     )
             except Exception:
                 logger.warning("Failed to create intervention journal entries", exc_info=True)
+
+            # Develop-scope tabling (roadmap gate): rows flagged by
+            # _flag_develop_scope were created above so they exist as
+            # recoverable tabled records — never deleted. Tabled BEFORE the
+            # digest send; send_digest ships only still-pending rows.
+            for pid, prop in zip(ids, created, strict=False):
+                if prop.get("_develop_scope"):
+                    try:
+                        await ego_crud.table_proposal(self._db, pid)
+                        logger.info(
+                            "Tabled develop-scope proposal %s (%s) — "
+                            "self-development disabled",
+                            pid[:12],
+                            prop["_develop_scope"],
+                        )
+                        # Mirror every other tabling path: resolve the journal
+                        # row so it doesn't sit open forever.
+                        try:
+                            from genesis.db.crud import (
+                                intervention_journal as journal_crud,
+                            )
+
+                            await journal_crud.resolve(
+                                self._db,
+                                pid,
+                                outcome_status="tabled",
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        logger.warning(
+                            "Failed to table develop-scope proposal %s",
+                            pid,
+                            exc_info=True,
+                        )
 
             # Structural validation — annotates digest, doesn't block
             validation_issues = await self._proposals.validate_batch(proposals)
@@ -2198,6 +2394,16 @@ class EgoSession:
                     proposal_id, _brief_prop.get("action_type"),
                 )
                 continue
+
+            # The ego-authored brief prompt does not necessarily mention the
+            # proposal's expected_outputs — append the same required-files
+            # block _build_dispatch_prompt renders, or the dispatched session
+            # is never told the deliverable path that verification will check.
+            _eo_block = _required_outputs_block(
+                _brief_prop.get("expected_outputs") if _brief_prop else None,
+            )
+            if _eo_block:
+                prompt = f"{prompt}\n{_eo_block}"
 
             # Append content firewall rules to ego-authored dispatch prompt.
             # The ego writes the brief prompt directly — this safety net
@@ -2834,35 +3040,11 @@ class EgoSession:
             f"\nRationale: {prop.get('rationale') or ''}",
         ]
 
-        # Post-dispatch verification context
-        eo_raw = prop.get("expected_outputs")
-        if eo_raw:
-            try:
-                import json as _json
-
-                parsed_eo = _json.loads(eo_raw) if isinstance(eo_raw, str) else eo_raw
-                if isinstance(parsed_eo, dict) and parsed_eo.get("files"):
-                    eo_lines = [
-                        "\n## CRITICAL — Required Output Files",
-                        "You MUST save output to these EXACT file paths.",
-                        "The system auto-verifies these paths after completion.",
-                        "Do NOT rename, add suffixes, version numbers, or use",
-                        "different filenames.",
-                        "",
-                    ]
-                    for fpath in parsed_eo["files"]:
-                        eo_lines.append(f"  - {fpath}")
-                    if parsed_eo.get("min_size_bytes"):
-                        eo_lines.append(
-                            f"\nMin size: {parsed_eo['min_size_bytes']} bytes"
-                        )
-                    if parsed_eo.get("required_strings"):
-                        eo_lines.append(
-                            f"Required content: {', '.join(parsed_eo['required_strings'])}"
-                        )
-                    parts.append("\n".join(eo_lines))
-            except (ValueError, TypeError):
-                pass
+        # Post-dispatch verification context (shared renderer — the
+        # execution-brief path appends the same block).
+        eo_block = _required_outputs_block(prop.get("expected_outputs"))
+        if eo_block:
+            parts.append(eo_block)
 
         # World model context — ONLY for non-content dispatches.
         # Content dispatches get minimal context to prevent information
@@ -2959,6 +3141,49 @@ _CONTENT_DISPATCH_KEYWORDS = frozenset({
 })
 # "content" omitted — too broad for substring matching (matches
 # "content_hash", "content error rate"). Caught by action_type check.
+
+
+def _required_outputs_block(eo_raw: str | dict | None) -> str:
+    """Render ``expected_outputs`` as the "Required Output Files" prompt block.
+
+    Shared by ``_build_dispatch_prompt`` and the execution-brief path so every
+    dispatched session — whichever path built its prompt — is told the exact
+    deliverable paths that post-dispatch verification will check (file
+    existence is a hard verification signal; a session never told the path
+    would fail verification through no fault of its own). Returns ``""`` when
+    there is nothing valid to render.
+
+    Renders through ``parse_expected_outputs`` — the SAME validator the
+    post-dispatch verifier uses — so a structurally malformed spec
+    (``{"files": 123}``, non-string ``required_strings``) yields an empty
+    block rather than raising while iterating/joining, and the rendered block
+    can never disagree with what verification will actually check.
+    """
+    from genesis.ego.verification import parse_expected_outputs
+
+    raw = json.dumps(eo_raw) if isinstance(eo_raw, dict) else eo_raw
+    try:
+        parsed = parse_expected_outputs(raw)
+    except (ValueError, TypeError):
+        return ""
+    if parsed is None:
+        return ""
+    eo_lines = [
+        "\n## CRITICAL — Required Output Files",
+        "You MUST save output to these EXACT file paths.",
+        "The system auto-verifies these paths after completion.",
+        "Do NOT rename, add suffixes, version numbers, or use",
+        "different filenames.",
+        "",
+    ]
+    eo_lines.extend(f"  - {fpath}" for fpath in parsed.files)
+    if parsed.min_size_bytes:
+        eo_lines.append(f"\nMin size: {parsed.min_size_bytes} bytes")
+    if parsed.required_strings:
+        eo_lines.append(
+            f"Required content: {', '.join(parsed.required_strings)}"
+        )
+    return "\n".join(eo_lines)
 
 
 def _is_content_dispatch(prop: dict) -> bool:
@@ -3252,12 +3477,19 @@ monitoring, or internal maintenance.
         operate_rule = """
 8. **Operate vs develop (operations ego only).** These proposals should
    OPERATE the running system (diagnose, pull reversible operational levers,
-   dispatch remediation for a specific defect), NOT DEVELOP it. If a proposal
-   would write or refactor code, change a database schema, edit an install
-   script, or alter a configuration *value* (threshold, interval, routing
-   weight, budget cap), REJECT it: "Develop, not operate — escalate the
-   change to the user." A remediation dispatch for a specific operational
-   defect is fine; building a feature or redesigning a subsystem is not.
+   dispatch remediation for a specific defect), NOT DEVELOP it. REJECT a
+   proposal ("Develop, not operate — escalate the change to the user") when
+   it would: write or refactor code, change a database schema, edit an
+   install script, alter a configuration *value* (threshold, interval,
+   routing weight, budget cap) — OR do dev-artifact work even read-only:
+   review/approve a pull request, trace source code to scope a fix or
+   refactor, audit code quality or design. The test is the deliverable: a
+   patch or patch-plan = develop. Symptom carve-out: diagnosing a LIVE
+   operational symptom (failing backup, stuck breaker, silent emitter) is
+   operate even when the trail leads into code — PASS it when the stated
+   deliverable is an escalation of findings, not a code change. A
+   remediation dispatch for a specific operational defect is fine; building
+   a feature or redesigning a subsystem is not.
 """
 
     # Build Rule #1 based on ego source — genesis ego is allowed to
@@ -3271,7 +3503,11 @@ monitoring, or internal maintenance.
    checks, observation queries) should still be done in-cycle, but
    proposing a background session to diagnose a complex issue is a
    legitimate maintenance action. PASS these unless they are clearly
-   something the ego could resolve with a single MCP tool call."""
+   something the ego could resolve with a single MCP tool call. Every
+   dispatch/investigate proposal must name a concrete deliverable in
+   expected_outputs (the findings file the dispatched session will write);
+   when one is missing, AMEND the proposal to add it rather than
+   rejecting."""
     else:
         rule_1 = """
 1. **Read operations are NOT proposals.** Investigating, researching, reading,

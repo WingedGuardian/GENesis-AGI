@@ -181,7 +181,14 @@ class EgoConfig:
     # Genesis ego (COO) independent scheduling — defaults match user ego
     genesis_cadence_minutes: int = 90  # base interval for genesis ego
     genesis_max_interval_minutes: int = 240  # backoff ceiling for genesis ego
-    max_pending_proposals: int = 15  # auto-table oldest unranked when exceeded
+    max_pending_proposals: int = 15  # TOTAL across both egos — auto-table oldest unranked when exceeded
+    # Roadmap flag: Genesis developing itself (writing/refactoring its own code,
+    # reviewing PRs, scoping refactors) is OFF until explicitly unlocked. While
+    # False, the genesis ego's develop-scope proposals are deterministically
+    # tabled (never deleted) by the domain-boundary gate. Flip to True to unlock
+    # self-development when that capability is earned; the gate then passes
+    # develop-class proposals through to normal approval.
+    genesis_self_development_enabled: bool = False
     # Revalidation cadence (PR-6a): per-urgency hours after which a pending
     # proposal's premises are flagged "due for re-check" by the reconcile
     # stage. NEVER a kill path — overdue only queues verification (locked

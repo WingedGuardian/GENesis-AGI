@@ -23,6 +23,25 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **The operations ego stays out of development work.** Genesis's COO ego no
+  longer proposes Genesis-development tasks (reviewing pull requests, scoping
+  refactors, patch-planning) — those are deterministically moved to the tabled
+  lane instead of reaching your approval queue, while genuine operational
+  diagnosis (a failing backup, a stuck provider) still flows normally. When you
+  later choose to unlock self-development, one config flag
+  (`genesis_self_development_enabled`) turns the guardrail off.
+- **One proposal queue of 15, not 15 per ego.** The pending-proposal cap now
+  counts both egos together, so the approval board can no longer grow to ~30
+  items.
+- **Stale proposals get premise re-checks.** Older pending proposals were
+  invisible to the premise-revalidation cadence (the field was never
+  backfilled) and re-validated items stayed flagged as overdue forever; both
+  are fixed, so dead proposals stop lingering on the board.
+- **Every ego investigation names its deliverable.** Investigation dispatches
+  from the operations ego now always carry a concrete output file that
+  post-dispatch verification checks, and both dispatch paths tell the session
+  exactly where to write it.
+
 - **Real spreadsheets and polished decks from the deliverable builder.** When the
   optional OfficeCLI tool is present, Genesis now produces genuine `.xlsx` files
   (with working formulas and cell formatting) and higher-fidelity `.pptx` decks,

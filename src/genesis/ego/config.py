@@ -10,6 +10,7 @@ import dataclasses
 import logging
 import os
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -188,6 +189,10 @@ def validate_ego_config(changes: dict) -> list[str]:
         changes["calibration_injection_enabled"], bool
     ):
         errors.append("calibration_injection_enabled must be a boolean")
+    if "genesis_self_development_enabled" in changes and not isinstance(
+        changes["genesis_self_development_enabled"], bool
+    ):
+        errors.append("genesis_self_development_enabled must be a boolean")
     if "outcome_bus_capability_feed" in changes and not isinstance(
         changes["outcome_bus_capability_feed"], bool
     ):
@@ -232,3 +237,17 @@ def validate_ego_config(changes: dict) -> list[str]:
         if not isinstance(v, int) or isinstance(v, bool) or v < 1:
             errors.append("capability_improvement_max_signals must be integer >= 1")
     return errors
+
+
+def next_revalidate_at(urgency: str, *, from_dt: datetime | None = None) -> str:
+    """Next premise-recheck timestamp for a proposal of *urgency*.
+
+    One home for the revalidation-cadence math: ``create_batch`` uses it for
+    the initial stamp and the reconcile live-apply uses it to advance the
+    clock on reaffirm/revise (a just-revalidated item must not stay ⚠due).
+    Config-derived; degrades to the EgoConfig defaults.
+    """
+    intervals = load_ego_config().revalidation_interval_hours
+    hours = intervals.get(urgency, intervals.get("normal", 72))
+    base = from_dt if from_dt is not None else datetime.now(UTC)
+    return (base + timedelta(hours=hours)).isoformat()

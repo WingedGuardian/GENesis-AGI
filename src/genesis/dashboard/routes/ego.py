@@ -585,6 +585,12 @@ async def ego_directives():
 
     active = await ego_crud.list_directives(rt._db, statuses=("active",), limit=50)
     resolved = await ego_crud.list_directives(rt._db, statuses=("completed", "cancelled"), limit=5)
+    # Recency window: directives resolve rarely, so without a cutoff the same
+    # handful of resolved rows lingers in this history for months.
+    from datetime import UTC, datetime, timedelta
+
+    _cutoff = (datetime.now(UTC) - timedelta(days=14)).isoformat()
+    resolved = [d for d in resolved if (d.get("resolved_at") or "") >= _cutoff]
     return jsonify(
         {
             "active": [_directive_view(d) for d in active],
