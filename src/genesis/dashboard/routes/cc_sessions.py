@@ -26,6 +26,8 @@ import aiosqlite
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+from genesis.observability.commit_identity import is_stale
+from genesis.observability.mcp_spawn_store import read_spawn_identity
 
 logger = logging.getLogger(__name__)
 
@@ -61,30 +63,6 @@ def _age_seconds(iso_ts: str | None, now: datetime) -> float | None:
     if ts is None:
         return None
     return round((now - ts).total_seconds(), 1)
-
-
-def _stale_against_deploy(
-    started_at: str | None, deploy: tuple[str, str] | None
-) -> tuple[bool, str | None, str | None]:
-    """Whether a live proc predates the last code-changing deploy.
-
-    ``deploy`` is ``(completed_at, new_commit)`` from
-    ``update_history.last_code_changing_update``, or None. Returns
-    ``(stale_code, stale_since, deploy_commit)``. Fail-open: an unknown start
-    time, no deploy, or an unparseable timestamp yields ``(False, None, None)``
-    — a passive indicator must never falsely flag. Compares by true instant so
-    mixed-offset ISO timestamps behave correctly.
-    """
-    if not deploy or not started_at:
-        return False, None, None
-    completed_at, new_commit = deploy
-    st = _parse_iso_utc(started_at)
-    ct = _parse_iso_utc(completed_at)
-    if st is None or ct is None:
-        return False, None, None
-    if st < ct:
-        return True, completed_at, (new_commit or None)
-    return False, None, None
 
 
 async def _charter_lookup(db, cc_ids: list[str]) -> tuple[dict[str, dict], bool]:
@@ -148,12 +126,26 @@ async def _collect_detail(
     """Assemble the modal payload. `slots` and `deploy` are passed in so tests
     inject fakes instead of scanning /proc or reading update_history.
 
-    `deploy` is `(completed_at, new_commit)` of the last CODE-CHANGING deploy
-    (or None); each live proc that started before it is flagged `stale_code`
-    (running pre-deploy MCP-tool code — restart to load the fix). Default None →
-    nothing stale (empty-state / fresh install)."""
+    `deploy` is `(completed_at, new_commit)` of the last successful deploy
+    (`update_history.last_successful_update`, or None). A live proc is flagged
+    `stale_code` iff its PERSISTED (spawn_commit, spawn_at) — read per slot,
+    pid-validated — is BEHIND that deploy: commit differs AND the deploy completed
+    after the proc started. This is the exact `commit_identity.is_stale` verdict
+    Part A's guard uses, so a session AHEAD of the last recorded deploy (main tree
+    advanced by a manual `git pull`) is NOT flagged. Fail-open: unknown identity or
+    no deploy → not stale. Default None → nothing stale (empty-state)."""
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
+
+    def _slot_stale(slot: str | None, spid: int | None) -> tuple[bool, str | None]:
+        """(stale, deploy_commit_to_restart_to) for a live slot proc."""
+        ident = read_spawn_identity(slot, spid)
+        if not ident or not deploy:
+            return False, None
+        completed_at, new_commit = deploy
+        if is_stale(ident[0], ident[1], completed_at, new_commit):
+            return True, new_commit
+        return False, None
 
     cutoff = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     cursor = await db.execute(_RECENT_WINDOW_SQL, (cutoff,))
@@ -182,7 +174,7 @@ async def _collect_detail(
         pid = row.get("pid")
         if pid in slot_by_pid and pid not in consumed:
             s = slot_by_pid[pid]
-            stale, stale_since, deploy_commit = _stale_against_deploy(s.get("started_at"), deploy)
+            stale, dc = _slot_stale(s.get("slot"), s.get("pid"))
             live = {
                 "slot": s.get("slot"),
                 "pid": s.get("pid"),
@@ -190,8 +182,7 @@ async def _collect_detail(
                 "slot_status": s.get("status"),
                 "started_at": s.get("started_at"),
                 "stale_code": stale,
-                "stale_since": stale_since,
-                "deploy_commit": deploy_commit,
+                "deploy_commit": dc,
             }
             if stale:
                 stats["stale_code"] += 1
@@ -241,10 +232,9 @@ async def _collect_detail(
         if s.get("pid") is None or s["pid"] in consumed:
             continue
         d = dict(s)
-        stale, stale_since, deploy_commit = _stale_against_deploy(s.get("started_at"), deploy)
+        stale, dc = _slot_stale(s.get("slot"), s.get("pid"))
         d["stale_code"] = stale
-        d["stale_since"] = stale_since
-        d["deploy_commit"] = deploy_commit
+        d["deploy_commit"] = dc
         if stale:
             stats["stale_code"] += 1
         unmatched_slots.append(d)
@@ -263,7 +253,7 @@ async def _collect_detail(
 async def cc_sessions_detail():
     """Per-session detail for the CC Sessions modal: DB rows × live procs ×
     charters, with discrepancy flags."""
-    from genesis.db.crud.update_history import last_code_changing_update
+    from genesis.db.crud.update_history import last_successful_update
     from genesis.observability.cc_slots import enumerate_cc_slots
     from genesis.runtime import GenesisRuntime
 
@@ -272,7 +262,7 @@ async def cc_sessions_detail():
         return jsonify({"error": "not bootstrapped"}), 503
 
     slots = enumerate_cc_slots()
-    deploy = await last_code_changing_update(rt.db)
+    deploy = await last_successful_update(rt.db)  # (completed_at, new_commit) | None
     return jsonify(await _collect_detail(rt.db, slots, deploy=deploy))
 
 

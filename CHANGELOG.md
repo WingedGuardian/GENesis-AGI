@@ -27,6 +27,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   started and blocks that tool with a clear "restart this session" message until
   you do. Read tools and append-only writes are unaffected. Tunable via the
   `mcp_staleness_guard` setting (`block` default, `warn`, or `off`).
+- **See which Claude Code sessions are running pre-deploy code.** The dashboard
+  CC Sessions view now shows a "stale — restart" badge on any live session whose
+  loaded tool code is older than the current deploy, so you can tell at a glance
+  which sessions to restart to pick up the latest fixes (a session keeps its
+  startup code until you restart it). The check compares the session's actual
+  loaded commit against the deployed commit and only flags sessions that are
+  genuinely BEHIND it — so a session already on the current code, one started
+  mid-deploy, or one ahead of the last recorded deploy is never falsely flagged.
+  Passive and advisory only; a session with no recorded commit shows nothing
+  rather than guessing.
 
 - **First-run setup wizard on the dashboard.** A new install can go from a fresh
   dashboard to a working, connected Genesis without touching a terminal. A

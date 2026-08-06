@@ -125,10 +125,24 @@ def _slot(
     }
 
 
-# Staleness fixtures relative to _NOW (2026-07-14T12:00:00Z).
-_DEPLOY = ("2026-07-14T11:00:00+00:00", "abc1234")  # last code-changing deploy
-_STARTED_BEFORE = "2026-07-14T09:00:00+00:00"  # predates deploy → stale
-_STARTED_AFTER = "2026-07-14T11:30:00+00:00"  # after deploy → fresh
+# Commit-identity + time staleness fixtures. deploy = (completed_at, new_commit).
+_DEPLOY = ("2026-07-14T11:00:00+00:00", "abc1234")
+# (spawn_commit, spawn_at):
+_SPAWN_BEHIND = ("0000000000000000000000000000000000000000", "2026-07-14T09:00:00+00:00")
+_SPAWN_FRESH = ("abc1234def5678", "2026-07-14T09:00:00+00:00")  # commit matches → not stale
+_SPAWN_AHEAD = ("ffffffffffffffffffffffffffffffffffffffff", "2026-07-14T13:00:00+00:00")
+#   ^ started AFTER the deploy (main tree advanced past it) → NOT stale despite differing.
+
+
+def _patch_spawn(monkeypatch, mapping: dict):
+    """Point the route's read_spawn_identity at a fake {(slot, pid): (commit,
+    spawn_at)} map; the dashboard cross-checks pid internally."""
+    import genesis.dashboard.routes.cc_sessions as mod
+
+    def fake(slot, live_pid):
+        return mapping.get((slot, live_pid))
+
+    monkeypatch.setattr(mod, "read_spawn_identity", fake)
 
 
 # ── Route level ──────────────────────────────────────────────────────────────
@@ -153,7 +167,8 @@ def test_route_registered_on_dashboard_blueprint(app):
 # ── Helper level (real db fixture, injected slots) ───────────────────────────
 
 
-async def test_slot_merge_by_pid(db):
+async def test_slot_merge_by_pid(db, monkeypatch):
+    _patch_spawn(monkeypatch, {})  # hermetic: never read the real ~/.genesis
     await _seed_charter_tables(db)
     await _seed_session(db, sid="s1", pid=100)
     result = await _collect_detail(db, [_slot("1", 100), _slot("2", 200)], now=_NOW)
@@ -165,7 +180,6 @@ async def test_slot_merge_by_pid(db):
         "slot_status": "healthy",
         "started_at": None,
         "stale_code": False,
-        "stale_since": None,
         "deploy_commit": None,
     }
     assert row["flags"] == []
@@ -575,86 +589,78 @@ async def test_pulse_confirm_resolves_annotation_before_ledger_write(db, monkeyp
     assert order == ["confirmed"]  # annotation resolved BEFORE the ledger mutate
 
 
-# ── Part B: stale-code visibility (started_at vs last code-changing deploy) ───
+# ── Part B: stale-code visibility (spawn commit vs deployed commit, identity) ─
 
 
 @pytest.mark.asyncio
-async def test_live_stale_code_flagged_when_started_before_deploy(db):
+async def test_live_stale_when_behind_deploy(db, monkeypatch):
+    # Spawn commit differs AND the session started before the deploy → behind.
     await _seed_charter_tables(db)
     await _seed_session(db, sid="s1", pid=100)
-    result = await _collect_detail(
-        db,
-        [_slot("1", 100, started_at=_STARTED_BEFORE)],
-        now=_NOW,
-        deploy=_DEPLOY,
-    )
+    _patch_spawn(monkeypatch, {("1", 100): _SPAWN_BEHIND})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=_DEPLOY)
     live = result["sessions"][0]["live"]
     assert live["stale_code"] is True
-    assert live["stale_since"] == _DEPLOY[0]
-    assert live["deploy_commit"] == "abc1234"
+    assert live["deploy_commit"] == _DEPLOY[1]  # new_commit — what to restart TO
     assert result["stats"]["stale_code"] == 1
 
 
 @pytest.mark.asyncio
-async def test_live_not_stale_when_started_after_deploy(db):
+async def test_live_not_stale_when_spawn_matches_deploy_prefix(db, monkeypatch):
+    # Spawn (full SHA) shares the deploy's (short SHA) prefix → identity match.
     await _seed_charter_tables(db)
     await _seed_session(db, sid="s1", pid=100)
-    result = await _collect_detail(
-        db,
-        [_slot("1", 100, started_at=_STARTED_AFTER)],
-        now=_NOW,
-        deploy=_DEPLOY,
-    )
+    _patch_spawn(monkeypatch, {("1", 100): _SPAWN_FRESH})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=_DEPLOY)
     live = result["sessions"][0]["live"]
     assert live["stale_code"] is False
-    assert live["stale_since"] is None
     assert live["deploy_commit"] is None
     assert result["stats"]["stale_code"] == 0
 
 
 @pytest.mark.asyncio
-async def test_no_deploy_means_never_stale(db):
-    # Empty-state / fresh install / only no-op re-runs → CRUD returns None →
-    # nothing is ever flagged even for an old session.
+async def test_live_not_stale_when_ahead_of_deploy(db, monkeypatch):
+    # Session started AFTER the last recorded deploy (main tree advanced past it
+    # via a manual git pull): commit differs but it is AHEAD, not behind → NOT
+    # stale. This is the case identity-alone would wrongly flag.
     await _seed_charter_tables(db)
     await _seed_session(db, sid="s1", pid=100)
-    result = await _collect_detail(
-        db,
-        [_slot("1", 100, started_at=_STARTED_BEFORE)],
-        now=_NOW,
-        deploy=None,
-    )
+    _patch_spawn(monkeypatch, {("1", 100): _SPAWN_AHEAD})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=_DEPLOY)
     assert result["sessions"][0]["live"]["stale_code"] is False
     assert result["stats"]["stale_code"] == 0
 
 
 @pytest.mark.asyncio
-async def test_unknown_started_at_not_stale(db):
-    # /proc start time unreadable → started_at None → fail-open, never flagged.
+async def test_unknown_identity_not_stale(db, monkeypatch):
+    # Pre-feature session (no persisted identity) → read returns None → fail-open.
     await _seed_charter_tables(db)
     await _seed_session(db, sid="s1", pid=100)
-    result = await _collect_detail(
-        db,
-        [_slot("1", 100, started_at=None)],
-        now=_NOW,
-        deploy=_DEPLOY,
-    )
+    _patch_spawn(monkeypatch, {})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=_DEPLOY)
     assert result["sessions"][0]["live"]["stale_code"] is False
 
 
 @pytest.mark.asyncio
-async def test_unmatched_slot_carries_staleness(db):
+async def test_no_deploy_marker_never_stale(db, monkeypatch):
+    # Empty-state / fresh install → last_successful_update None → nothing flagged.
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    _patch_spawn(monkeypatch, {("1", 100): _SPAWN_BEHIND})
+    result = await _collect_detail(db, [_slot("1", 100)], now=_NOW, deploy=None)
+    assert result["sessions"][0]["live"]["stale_code"] is False
+    assert result["stats"]["stale_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unmatched_slot_carries_identity_staleness(db, monkeypatch):
     # A live proc with no matching cc_sessions row must not be a blind spot.
     await _seed_charter_tables(db)
-    result = await _collect_detail(
-        db,
-        [_slot("7", 700, started_at=_STARTED_BEFORE)],
-        now=_NOW,
-        deploy=_DEPLOY,
-    )
+    _patch_spawn(monkeypatch, {("7", 700): _SPAWN_BEHIND})
+    result = await _collect_detail(db, [_slot("7", 700)], now=_NOW, deploy=_DEPLOY)
     assert result["sessions"] == []
     unmatched = result["unmatched_slots"]
     assert len(unmatched) == 1
     assert unmatched[0]["stale_code"] is True
-    assert unmatched[0]["deploy_commit"] == "abc1234"
+    assert unmatched[0]["deploy_commit"] == _DEPLOY[1]
     assert result["stats"]["stale_code"] == 1

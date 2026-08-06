@@ -52,6 +52,28 @@ prune_tmp() {
         -exec rm -rf {} + 2>/dev/null || echo "tmp prune exited $?"
 }
 
+# prune_mcp_spawn DIR — remove ~/.genesis/mcp-spawn/<slot> files whose recorded
+# session pid (first token) is no longer alive. These pin a CC session's MCP
+# spawn commit so the dashboard can render a stale-code badge; once the session
+# is gone the file is stale (a new session on the slot overwrites it, so this
+# only cleans ENDED slots). Bounded by slot count regardless — this keeps it
+# tidy and reclaims a slot that is never reused. Also sweeps leftover atomic-
+# write temp files (.slot.XXXX) from a crashed write.
+prune_mcp_spawn() {
+    local dir="${1:-$HOME/.genesis/mcp-spawn}"
+    [ -d "$dir" ] || return 0
+    local f pid
+    for f in "$dir"/*; do
+        [ -f "$f" ] || continue          # literal glob on empty dir → skip
+        pid="$(awk '{print $1; exit}' "$f" 2>/dev/null)"
+        case "$pid" in
+            ''|*[!0-9]*) rm -f "$f" 2>/dev/null ;;               # malformed
+            *) kill -0 "$pid" 2>/dev/null || rm -f "$f" 2>/dev/null ;;  # dead pid
+        esac
+    done
+    find "$dir" -maxdepth 1 -type f -name '.*' -mmin +60 -delete 2>/dev/null || true
+}
+
 main() {
     if [ -z "$VENV_PY" ]; then
         echo "disk_hygiene: no python interpreter found" >&2
@@ -80,6 +102,9 @@ main() {
 
     echo "--- ~/tmp age prune (>7d) ---"
     prune_tmp "$HOME/tmp"
+
+    echo "--- mcp-spawn identity prune (dead-pid slots) ---"
+    prune_mcp_spawn "$HOME/.genesis/mcp-spawn"
 
     echo "--- attention snapshot GC (label-aware) ---"
     "$VENV_PY" "$REPO_DIR/scripts/attention_snapshot_gc.py" --home-days 60 --omi-days 14 \

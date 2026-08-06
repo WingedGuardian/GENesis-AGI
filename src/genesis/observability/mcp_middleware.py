@@ -15,20 +15,19 @@ from typing import Any
 
 from fastmcp.server.middleware import Middleware
 
+from genesis.observability.commit_identity import is_stale
+from genesis.observability.commit_identity import (
+    same_commit as _same_commit,  # noqa: F401 — re-exported for Part A's guard test
+)
 from genesis.observability.mcp_guarded_tools import GUARDED_MCP_TOOLS
 from genesis.observability.provider_activity import ProviderActivityTracker
 
 logger = logging.getLogger(__name__)
 
-
-def _same_commit(a: str | None, b: str | None) -> bool:
-    """True if two commit refs denote the same commit, tolerating short/full SHA.
-
-    ``update_history.new_commit`` is a SHORT sha (e.g. ``b08a95c8``); the spawn
-    identity is the FULL ``rev-parse HEAD``. Neither length is fixed, so compare
-    by prefix in both directions rather than equality.
-    """
-    return bool(a and b and (a.startswith(b) or b.startswith(a)))
+# Staleness verdict (`is_stale`) + the prefix-tolerant compare (`same_commit`) live
+# in the stdlib-only ``commit_identity`` leaf so the dashboard (Part B) shares the
+# SAME verdict without importing ``fastmcp`` via this module. ``_same_commit`` is
+# re-exported for Part A's existing guard test.
 
 
 class InstrumentationMiddleware(Middleware):
@@ -172,19 +171,12 @@ class InstrumentationMiddleware(Middleware):
         if not sc or not sa:
             return False
         try:
-            from datetime import datetime
-
             from genesis.db.crud.update_history import last_successful_update
 
             row = await last_successful_update(self._db)
             if row is not None:
                 completed_at, new_commit = row
-                if (
-                    new_commit
-                    and not _same_commit(sc, new_commit)
-                    and datetime.fromisoformat(completed_at)
-                    > datetime.fromisoformat(sa)
-                ):
+                if is_stale(sc, sa, completed_at, new_commit):
                     self._is_stale_latched = True
                     return True
         except Exception:
