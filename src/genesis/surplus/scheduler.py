@@ -35,6 +35,7 @@ from genesis.surplus.types import SurplusExecutor, TaskType
 
 if TYPE_CHECKING:
     from genesis.memory.store import MemoryStore
+    from genesis.recon.account_activity import AccountActivityMonitor
     from genesis.recon.gatherer import ReconGatherer
     from genesis.routing.router import Router
 
@@ -118,6 +119,7 @@ class SurplusScheduler:
         # self._executor for any type without a registered entry.
         self._executors: dict[TaskType, SurplusExecutor] = {}
         self._recon_gatherer: ReconGatherer | None = None
+        self._account_activity_monitor: AccountActivityMonitor | None = None
         self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._models_md_synthesis_job = None  # Set via set_models_md_synthesis_job()
         self._skill_security_scan_job = None  # Set via set_skill_security_scan_job()
@@ -207,6 +209,10 @@ class SurplusScheduler:
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
         self._recon_gatherer = gatherer
+
+    def set_account_activity_monitor(self, monitor: AccountActivityMonitor) -> None:
+        """Set the GitHub account-activity monitor (2h external-activity poll)."""
+        self._account_activity_monitor = monitor
 
     def set_model_intelligence_job(self, job) -> None:
         """Set the ModelIntelligenceJob for scheduled model landscape scanning."""
@@ -301,6 +307,16 @@ class SurplusScheduler:
             self.run_recon_gather,
             CronTrigger(day_of_week="tue,fri", hour=1, minute=45, timezone=user_timezone()),
             id="recon_gather",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+        # GitHub account-activity monitor: every 2h local. Deterministic (no
+        # LLM) external-activity watch. CronTrigger, never IntervalTrigger
+        # (which resets on restart).
+        self._scheduler.add_job(
+            self.run_account_activity_monitor,
+            CronTrigger(hour="*/2", timezone=user_timezone()),
+            id="account_activity_monitor",
             max_instances=1,
             misfire_grace_time=3600,
         )
@@ -720,6 +736,10 @@ class SurplusScheduler:
     async def run_recon_gather(self) -> None:
         """Check watchlist projects for new GitHub releases and star counts."""
         await runner_jobs.run_recon_gather(self)
+
+    async def run_account_activity_monitor(self) -> None:
+        """Poll owner repos for external GitHub activity (every 2h)."""
+        await runner_jobs.run_account_activity_monitor(self)
 
     async def run_model_intelligence(self) -> None:
         """Run model intelligence scan (weekly)."""

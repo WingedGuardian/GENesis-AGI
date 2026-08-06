@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from genesis.recon.gh_cli import run_gh
+from genesis.recon.gh_cli import run_gh, run_gh_checked
 
 
 def _mock_subprocess(stdout: str, returncode: int = 0):
@@ -65,3 +65,32 @@ async def test_os_error_returns_empty():
     with patch("asyncio.create_subprocess_exec", side_effect=OSError("gh not found")):
         result = await run_gh("gh", "api", "test")
     assert result == ""
+
+
+# ── run_gh_checked: the (ok, stdout) contract that lets callers tell an error
+#    apart from an empty-but-successful result (a cursor must NOT advance on a
+#    failed poll). ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_checked_success_is_ok_with_stdout():
+    with patch("asyncio.create_subprocess_exec", side_effect=_mock_subprocess("[]")):
+        ok, out = await run_gh_checked("gh", "api", "test")
+    assert ok is True
+    assert out == "[]"  # a genuinely-empty-but-successful poll is (True, "[]")
+
+
+@pytest.mark.asyncio
+async def test_checked_nonzero_exit_is_not_ok():
+    with patch("asyncio.create_subprocess_exec", side_effect=_mock_subprocess("boom", returncode=1)):
+        ok, out = await run_gh_checked("gh", "api", "test")
+    assert ok is False
+    assert out == ""
+
+
+@pytest.mark.asyncio
+async def test_checked_os_error_is_not_ok():
+    with patch("asyncio.create_subprocess_exec", side_effect=OSError("gh not found")):
+        ok, out = await run_gh_checked("gh", "api", "test")
+    assert ok is False
+    assert out == ""
