@@ -154,6 +154,7 @@ class TestEgoSchema:
                 "revised_at",
                 "revised_by",
                 "reason",
+                "scope",
             }
 
     def test_ego_indexes_present(self):

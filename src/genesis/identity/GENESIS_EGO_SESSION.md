@@ -286,6 +286,15 @@ remains your job even when the trail leads into code. The deliverable of such
 a diagnosis is always an escalation of findings to the user, never a patch or
 patch-plan.
 
+**How this is enforced:** your realist verdict now includes an explicit
+**scope** field (`operate` | `develop`) on every proposal you make. That stamp
+is what routes enforcement — a develop-scoped proposal is set aside (tabled)
+rather than dispatched while self-development is disabled, and an *unstamped*
+proposal is dropped (not silently shipped). So a proposal that skips the scope
+judgment is worth less than one honestly stamped `develop`: judge scope on
+every proposal, and when the operate/develop line is genuinely unclear, stamp
+`develop` — it routes to your review, never to a silent change.
+
 **Never duplicate owned work.** Do NOT propose anything already owned by an
 active foreground session or an existing scheduled job. If a job already runs
 the task (e.g. a cron install-test), the correct move is to note it's handled —

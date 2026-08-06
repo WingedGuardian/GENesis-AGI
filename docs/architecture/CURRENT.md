@@ -473,7 +473,7 @@ them.
 ```yaml subsystem-map
 entry: ego-self-model
 modules: [ego, identity, deliberation]
-verified: f6cb6d83 2026-08-05
+verified: 94be12b3 2026-08-06
 ```
 
 - **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)
@@ -490,16 +490,23 @@ verified: f6cb6d83 2026-08-05
   `_NEVER_DISPATCH_ACTION_TYPES` blocklist lives in `session.py`. Dispatches
   record `follow_ups` rows for accountability. `integrity.py` chain-verify is
   GROUNDWORK, explicitly NOT wired.
-- **Operate-vs-develop gate (2026-08-05)**: while
-  `EgoConfig.genesis_self_development_enabled` is False (roadmap default), the
-  COO's dev-artifact proposals (PR review, refactor, patch, schema work — even
-  read-only) are deterministically create-then-TABLED
-  (`session._flag_develop_scope` + the tabling loop in `_process_proposals`;
-  journal-resolved; dedup vs tabled twins so no per-cycle churn). Symptom-driven
-  diagnosis stays operate (escalation-only deliverable) — the realist rubric
-  (rule 8 + Rule 1) judges the fuzzy cases; markers stay near-zero-FP by design
-  (replay-verified over the full historical board). Flip the flag to unlock
-  self-development; delete flag + gate to remove.
+- **Operate-vs-develop scope stamp (2026-08-06)**: the boundary is LLM-judged,
+  structure-enforced. The realist emits a per-proposal `scope` (`operate` |
+  `develop`) on every genesis-ego proposal (rubric = realist rule 8; the
+  `autonomy.classify_domain` SELF_MODIFY/AUTONOMOUS_BUILD fast-path overrides
+  it); the reconcile `revise` verdict re-scopes sharpened content (it authors
+  content pre-realist). Persisted on `ego_proposals.scope`/`scope_revision`
+  (migration 0078; genesis-ego pending rows that passed the realist were
+  grandfathered `operate`). Deterministic enforcement at the chokepoints every
+  proposal crosses: **create** (`create_batch` — unstamped genesis draft
+  DROPPED fail-closed; `develop` + self-dev-disabled created-then-TABLED;
+  `operate` persisted), **revise** (`_reconcile_revise` refuses to apply an
+  unscoped/develop-when-disabled sharpen — keeps the draft as a survivor for the
+  realist), **dispatch-claim** (`claim_proposal_for_dispatch(allow_develop=…)` —
+  a develop row is unclaimable on BOTH dispatch paths while disabled). Fail-
+  closed uniformly: any absent stamp ⇒ dropped, never shipped. `EgoConfig.
+  genesis_self_development_enabled` flips enforcement off (unlock); the regex
+  marker gate it replaced (`_flag_develop_scope`) is deleted.
 - **Pending cap is TOTAL across both egos** (15): `_process_proposals` counts
   the global pending pool (informational rows excluded; develop-flagged
   incoming excluded) and evicts global-oldest-unranked (24h guard). Evo-origin

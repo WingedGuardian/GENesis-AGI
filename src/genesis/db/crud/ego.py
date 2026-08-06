@@ -452,6 +452,8 @@ async def create_proposal(
     expected_outputs: str | None = None,
     revalidate_at: str | None = None,
     last_validated_at: str | None = None,
+    scope: str | None = None,
+    scope_revision: int | None = None,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -463,9 +465,10 @@ async def create_proposal(
             batch_id, created_at, expires_at, rank, execution_plan,
             recurring, memory_basis, realist_verdict, realist_reasoning,
             ego_source, goal_id, content_hash, content_size,
-            original_content, expected_outputs, revalidate_at, last_validated_at)
+            original_content, expected_outputs, revalidate_at, last_validated_at,
+            scope, scope_revision)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?)""",
         (
             id,
             action_type,
@@ -494,6 +497,8 @@ async def create_proposal(
             expected_outputs,
             revalidate_at,
             last_validated_at,
+            scope,
+            scope_revision,
         ),
     )
     await db.commit()
@@ -643,6 +648,7 @@ async def insert_proposal_revision(
     expected_outputs: str | None,
     revised_by: str | None,
     reason: str | None,
+    scope: str | None = None,
 ) -> None:
     """Append a prior-values snapshot to ego_proposal_revisions.
 
@@ -653,8 +659,9 @@ async def insert_proposal_revision(
     await db.execute(
         """INSERT INTO ego_proposal_revisions
            (id, proposal_id, revision_num, content, rationale, confidence,
-            execution_plan, expected_outputs, revised_at, revised_by, reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            execution_plan, expected_outputs, revised_at, revised_by, reason,
+            scope)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             uuid4().hex,
             proposal_id,
@@ -667,6 +674,7 @@ async def insert_proposal_revision(
             datetime.now(UTC).isoformat(),
             revised_by,
             reason,
+            scope,
         ),
     )
 
@@ -684,6 +692,8 @@ async def revise_proposal(
     revised_by: str | None = None,
     reason: str | None = None,
     revalidate_at: str | None = None,
+    scope: str | None = None,
+    scope_revision: int | None = None,
 ) -> int | None:
     """Version-revise a PENDING proposal in place (reconcile revise verdict).
 
@@ -709,7 +719,7 @@ async def revise_proposal(
 
     cursor = await db.execute(
         "SELECT content, rationale, confidence, execution_plan, expected_outputs, "
-        "revision_num, status FROM ego_proposals WHERE id = ?",
+        "revision_num, status, scope FROM ego_proposals WHERE id = ?",
         (id,),
     )
     prior = await cursor.fetchone()
@@ -726,7 +736,9 @@ async def revise_proposal(
         "execution_plan = COALESCE(?, execution_plan), "
         "expected_outputs = COALESCE(?, expected_outputs), revision_num = ?, "
         "content_hash = ?, content_size = ?, last_validated_at = ?, "
-        "revalidate_at = COALESCE(?, revalidate_at) "
+        "revalidate_at = COALESCE(?, revalidate_at), "
+        "scope = COALESCE(?, scope), "
+        "scope_revision = CASE WHEN ? IS NOT NULL THEN ? ELSE scope_revision END "
         "WHERE id = ? AND status = 'pending' AND revision_num = ?",
         (
             content,
@@ -739,6 +751,9 @@ async def revise_proposal(
             new_size,
             datetime.now(UTC).isoformat(),
             revalidate_at,
+            scope,
+            scope_revision,
+            scope_revision,
             id,
             expected_revision,
         ),
@@ -758,6 +773,7 @@ async def revise_proposal(
         expected_outputs=prior["expected_outputs"],
         revised_by=revised_by,
         reason=reason,
+        scope=prior["scope"],
     )
     await db.commit()
     return new_revision
@@ -816,6 +832,8 @@ async def execute_proposal(
 async def claim_proposal_for_dispatch(
     db: aiosqlite.Connection,
     id: str,
+    *,
+    allow_develop: bool = True,
 ) -> bool:
     """Atomically claim an approved proposal for dispatch.
 
@@ -824,16 +842,28 @@ async def claim_proposal_for_dispatch(
     double-dispatch when multiple callers (cadence, Telegram, dashboard)
     race to claim the same proposal.
 
+    Scope enforcement (last line): when ``allow_develop`` is False (Genesis
+    self-development disabled), a ``scope='develop'`` row is UNCLAIMABLE — the
+    guard refuses it here, atomically, regardless of which dispatch path
+    (execution-brief or approved-sweep) races to claim it. Rows with a NULL
+    scope are NOT blocked by this guard: only genesis-ego proposals are ever
+    scoped, and an unscoped approved row is either a user-ego proposal (out of
+    this boundary) or a grandfathered/legacy row; the create/revise chokepoints
+    are where an unjudged *genesis-ego* draft is stopped, so blocking NULL here
+    would wrongly strand every user-ego dispatch. Callers pass
+    ``allow_develop=genesis_self_development_enabled``.
+
     Unlike execute_proposal(), this does NOT set resolved_at — the
     original resolved_at timestamp must be preserved for the 48h
     staleness guard.
 
-    Returns True if claimed, False if already claimed by another path.
+    Returns True if claimed, False if already claimed OR blocked by scope.
     """
+    scope_guard = "" if allow_develop else "AND (scope IS NULL OR scope != 'develop') "
     cursor = await db.execute(
         "UPDATE ego_proposals SET status = 'executed', "
         "user_response = 'dispatching' "
-        "WHERE id = ? AND status = 'approved'",
+        f"WHERE id = ? AND status = 'approved' {scope_guard}",
         (id,),
     )
     await db.commit()
