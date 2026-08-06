@@ -2176,21 +2176,26 @@ class EgoSession:
                 # eval regressions could auto-table real, actionable proposals.
                 pending, _informational = partition_informational(all_pending)
                 max_pending = getattr(self._config, "max_pending_proposals", 15)
-                # Count only incoming that will REMAIN pending: a genesis-ego
-                # draft that is unstamped (dropped at create) or develop-scoped
-                # (tabled at create when self-dev is off) instantly leaves the
-                # board, so counting it would evict a real pending proposal to
-                # make room for a row that never stays. Genesis-ego 'operate'
-                # and all user-ego drafts count. (A genesis-ego develop draft
-                # under a self-development-enabled install is a rare future case
-                # and merely undercounts — erring toward LESS eviction, safe.)
-                _incoming = sum(
-                    1 for p in proposals
-                    if not (
-                        self._source_tag == "genesis_ego_cycle"
-                        and p.get("_realist_scope") != "operate"
-                    )
-                )
+                # Count only incoming that will REMAIN pending, so the cap never
+                # evicts a real row to make room for one that instantly leaves.
+                # Genesis-ego: 'operate' stays; unstamped is dropped at create
+                # (never counts); 'develop' is tabled when self-dev is disabled
+                # (doesn't count) but STAYS pending when enabled (counts, so an
+                # enabled install's develop proposals are subject to the cap like
+                # any other). All user-ego drafts count.
+                _self_dev_on = self._self_development_enabled()
+
+                def _stays_pending(p: dict) -> bool:
+                    if self._source_tag != "genesis_ego_cycle":
+                        return True
+                    sc = p.get("_realist_scope")
+                    if sc == "operate":
+                        return True
+                    if sc == "develop":
+                        return _self_dev_on
+                    return False  # unstamped → dropped at create
+
+                _incoming = sum(1 for p in proposals if _stays_pending(p))
                 if len(pending) + _incoming > max_pending:
                     unranked = [
                         p for p in pending if p.get("rank") is None
@@ -3216,10 +3221,24 @@ def _build_reconcile_prompt(
     def _clip(text: object, n: int = 200) -> str:
         return str(text or "")[:n].replace("\n", " ").replace("|", "/")
 
-    draft_lines = [
-        f'[{i}] action={d.get("action_type", "")} :: {_clip(d.get("content", ""))}'
-        for i, d in enumerate(drafts)
-    ]
+    # A genesis-ego revise carries a scope judgment for the SHARPENED content,
+    # so the reconcile LLM must see the COMPLETE draft (content + execution_plan)
+    # — a scope stamp made on a clipped draft can mis-classify develop work that
+    # lives in the plan or past the clip. User-ego drafts keep the compact clip.
+    _genesis = ego_source == "genesis_ego_cycle"
+
+    def _draft_line(i: int, d: dict) -> str:
+        action = d.get("action_type", "")
+        if _genesis:
+            content = str(d.get("content", "") or "").replace("\n", " ").replace("|", "/")
+            plan = str(d.get("execution_plan", "") or "").replace("\n", " ").replace("|", "/")
+            line = f"[{i}] action={action} :: {content}"
+            if plan:
+                line += f"  || execution_plan: {plan}"
+            return line
+        return f'[{i}] action={action} :: {_clip(d.get("content", ""))}'
+
+    draft_lines = [_draft_line(i, d) for i, d in enumerate(drafts)]
     _now_iso = datetime.now(UTC).isoformat()
 
     def _due(b: dict) -> str:
@@ -3403,11 +3422,27 @@ def _build_realist_prompt(
         history_lines.append("*No recent proposals.*")
 
     proposal_lines = []
+    # Genesis-ego proposals carry a scope judgment (rule 8), so the realist must
+    # see the COMPLETE proposal — develop intent can live in the execution_plan
+    # or past a truncation point, and a scope stamp made on partial input can
+    # mis-classify develop work as operate. User-ego keeps the compact form
+    # (no scope field, and cost matters more there).
+    _genesis = ego_source == "genesis_ego_cycle"
     for i, p in enumerate(proposals):
-        content = (p.get("content") or "")[:300].replace("\n", " ")
         action = p.get("action_type", "?")
         conf = p.get("confidence", 0.0)
-        proposal_lines.append(f"{i}. [{action}] (confidence: {conf:.2f}) {content}")
+        if _genesis:
+            content = (p.get("content") or "").replace("\n", " ")
+            plan = (p.get("execution_plan") or "").replace("\n", " ")
+            line = f"{i}. [{action}] (confidence: {conf:.2f}) {content}"
+            if plan:
+                line += f"  || execution_plan: {plan}"
+            proposal_lines.append(line)
+        else:
+            content = (p.get("content") or "")[:300].replace("\n", " ")
+            proposal_lines.append(
+                f"{i}. [{action}] (confidence: {conf:.2f}) {content}"
+            )
 
     # Domain boundary context — ego-specific jurisdiction framing.
     ego_section = ""

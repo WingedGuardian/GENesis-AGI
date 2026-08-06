@@ -75,6 +75,43 @@ class TestRealistScopeContract:
         )
         assert v[0]["scope"] == "operate"
 
+    def test_genesis_realist_sees_full_content_and_plan(self):
+        """The scope judge must see the COMPLETE proposal (Codex P1): full
+        content + execution_plan, not a 300-char clip."""
+        long_content = "operate-looking preamble " * 20  # > 300 chars
+        p = _build_realist_prompt(
+            [
+                {
+                    "content": long_content + "THEN go refactor the router",
+                    "action_type": "investigate",
+                    "execution_plan": "edit src/genesis/routing/engine.py",
+                }
+            ],
+            [],
+            ego_source="genesis_ego_cycle",
+        )
+        assert "go refactor the router" in p  # past the old 300-char clip
+        assert "execution_plan: edit src/genesis/routing/engine.py" in p
+
+    def test_genesis_reconcile_sees_full_content_and_plan(self):
+        from genesis.ego.session import _build_reconcile_prompt
+
+        long_content = "sharpen preamble " * 20
+        p = _build_reconcile_prompt(
+            [
+                {
+                    "content": long_content + "THEN rewrite the module",
+                    "action_type": "investigate",
+                    "execution_plan": "patch src/genesis/x.py",
+                }
+            ],
+            [],
+            {"jobs": [], "stale_jobs": [], "merged_prs": []},
+            ego_source="genesis_ego_cycle",
+        )
+        assert "rewrite the module" in p
+        assert "execution_plan: patch src/genesis/x.py" in p
+
 
 # ── SELF_MODIFY fast-path override in _filter_proposals apply-loop ─────────
 
@@ -357,6 +394,7 @@ class TestGlobalCapWithScope:
         sess._proposals.create_batch = AsyncMock(return_value=("b", [], []))
         sess._proposals.validate_batch = AsyncMock(return_value=[])
         sess._proposals.send_digest = AsyncMock(return_value=None)
+        sess._self_development_enabled = EgoSession._self_development_enabled
         sess._process_proposals = EgoSession._process_proposals.__get__(sess)
 
         # One operate incoming → 15+1 > 15 → evict the global-oldest unranked.
@@ -391,6 +429,7 @@ class TestGlobalCapWithScope:
         sess._proposals.create_batch = AsyncMock(return_value=("b", [], []))
         sess._proposals.validate_batch = AsyncMock(return_value=[])
         sess._proposals.send_digest = AsyncMock(return_value=None)
+        sess._self_development_enabled = EgoSession._self_development_enabled
         sess._process_proposals = EgoSession._process_proposals.__get__(sess)
 
         # A develop incoming will be tabled, so it must NOT evict a real pending.
@@ -400,6 +439,42 @@ class TestGlobalCapWithScope:
         )
         cur = await db.execute("SELECT COUNT(*) FROM ego_proposals WHERE status='pending'")
         assert (await cur.fetchone())[0] == 15  # nothing evicted
+
+    @pytest.mark.asyncio
+    async def test_develop_incoming_counts_when_enabled(self, db, monkeypatch):
+        """Codex P2: when self-development is ENABLED, a develop draft stays
+        pending, so it must count toward the cap and evict the oldest."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        _patch_flag(monkeypatch, True)  # self-development ENABLED
+        for i in range(15):
+            created = (datetime.now(UTC) - timedelta(hours=200 - i)).isoformat()
+            await ego_crud.create_proposal(
+                db,
+                id=f"r{i}",
+                action_type="investigate",
+                content=f"r{i}",
+                created_at=created,
+                ego_source="user_ego_cycle",
+            )
+        sess = MagicMock()
+        sess._source_tag = "genesis_ego_cycle"
+        sess._db = db
+        sess._config = MagicMock()
+        sess._config.max_pending_proposals = 15
+        sess._proposals = MagicMock()
+        sess._proposals.create_batch = AsyncMock(return_value=("b", [], []))
+        sess._proposals.validate_batch = AsyncMock(return_value=[])
+        sess._proposals.send_digest = AsyncMock(return_value=None)
+        sess._self_development_enabled = EgoSession._self_development_enabled
+        sess._process_proposals = EgoSession._process_proposals.__get__(sess)
+
+        await sess._process_proposals(
+            [{"action_type": "investigate", "content": "dev", "_realist_scope": "develop"}],
+            "c1",
+        )
+        cur = await db.execute("SELECT COUNT(*) FROM ego_proposals WHERE status='pending'")
+        assert (await cur.fetchone())[0] == 14  # develop counts under flag-on → evicts
 
 
 class TestDeliverableAndAudit:
