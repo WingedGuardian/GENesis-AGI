@@ -402,13 +402,22 @@ async def set_mode(db: aiosqlite.Connection, mode: str, ego_key: str = "ego_mode
 async def has_pending_proposal_with_hash(
     db: aiosqlite.Connection,
     content_hash: str,
+    *,
+    statuses: tuple[str, ...] = ("pending", "approved"),
 ) -> bool:
-    """Check if a pending or approved proposal with this content hash exists."""
+    """Check if a proposal with this content hash exists in *statuses*.
+
+    Default statuses preserve the original pending/approved dedup semantics.
+    The develop-gate passes ``("pending", "approved", "tabled")`` so a
+    persistent dev-artifact idea the gate already tabled is not re-created
+    (and re-tabled, and re-journaled) every ego cycle.
+    """
+    placeholders = ",".join("?" for _ in statuses)
     cursor = await db.execute(
         "SELECT 1 FROM ego_proposals "
-        "WHERE content_hash = ? AND status IN ('pending', 'approved') "
+        f"WHERE content_hash = ? AND status IN ({placeholders}) "
         "LIMIT 1",
-        (content_hash,),
+        (content_hash, *statuses),
     )
     return await cursor.fetchone() is not None
 
@@ -599,15 +608,24 @@ async def resolve_proposal(
     return cursor.rowcount > 0
 
 
-async def reaffirm_proposal(db: aiosqlite.Connection, id: str) -> bool:
+async def reaffirm_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    revalidate_at: str | None = None,
+) -> bool:
     """Mark a pending proposal validated-as-of-now (reconcile reaffirm verdict).
 
-    Touches only ``last_validated_at``; status/rank/content are unchanged.
-    Returns True if a pending row was updated.
+    Touches ``last_validated_at`` and — when the caller provides the next
+    cadence stamp — advances ``revalidate_at``, so a just-reaffirmed item does
+    not stay perpetually ⚠due. Status/rank/content are unchanged. Returns True
+    if a pending row was updated.
     """
     cursor = await db.execute(
-        "UPDATE ego_proposals SET last_validated_at = ? WHERE id = ? AND status = 'pending'",
-        (datetime.now(UTC).isoformat(), id),
+        "UPDATE ego_proposals SET last_validated_at = ?, "
+        "revalidate_at = COALESCE(?, revalidate_at) "
+        "WHERE id = ? AND status = 'pending'",
+        (datetime.now(UTC).isoformat(), revalidate_at, id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -665,6 +683,7 @@ async def revise_proposal(
     expected_outputs: str | None = None,
     revised_by: str | None = None,
     reason: str | None = None,
+    revalidate_at: str | None = None,
 ) -> int | None:
     """Version-revise a PENDING proposal in place (reconcile revise verdict).
 
@@ -706,7 +725,8 @@ async def revise_proposal(
         "rationale = COALESCE(?, rationale), confidence = COALESCE(?, confidence), "
         "execution_plan = COALESCE(?, execution_plan), "
         "expected_outputs = COALESCE(?, expected_outputs), revision_num = ?, "
-        "content_hash = ?, content_size = ?, last_validated_at = ? "
+        "content_hash = ?, content_size = ?, last_validated_at = ?, "
+        "revalidate_at = COALESCE(?, revalidate_at) "
         "WHERE id = ? AND status = 'pending' AND revision_num = ?",
         (
             content,
@@ -718,6 +738,7 @@ async def revise_proposal(
             new_hash,
             new_size,
             datetime.now(UTC).isoformat(),
+            revalidate_at,
             id,
             expected_revision,
         ),

@@ -352,10 +352,10 @@ class TestFailSafe:
 
         real_reaffirm = ego_crud.reaffirm_proposal
 
-        async def flaky_reaffirm(dbc, pid):
+        async def flaky_reaffirm(dbc, pid, **kwargs):
             if pid == "boom1boom1boom00":
                 raise RuntimeError("boom")
-            return await real_reaffirm(dbc, pid)
+            return await real_reaffirm(dbc, pid, **kwargs)
 
         monkeypatch.setattr(ego_crud, "reaffirm_proposal", flaky_reaffirm)
 

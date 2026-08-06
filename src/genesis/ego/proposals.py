@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
@@ -326,10 +326,8 @@ class ProposalWorkflow:
         # reconcile stage can flag proposals whose premises are due for a
         # re-check. NEVER a kill path — overdue only queues verification
         # (locked decision #2). Config-derived; degrades to EgoConfig defaults.
+        from genesis.ego.config import next_revalidate_at
 
-        from genesis.ego.config import load_ego_config
-
-        _reval_intervals = load_ego_config().revalidation_interval_hours
         _created_dt = datetime.fromisoformat(created_at)
 
         # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
@@ -389,11 +387,20 @@ class ProposalWorkflow:
             # Dedup: skip if identical content already pending/approved.
             # Skip check for empty content to avoid false collisions on
             # the fixed SHA-256 of the empty string.
+            # Develop-gate-flagged drafts also dedup against TABLED rows:
+            # the gate tables them on creation, and without this a persistent
+            # dev-artifact idea would be re-created + re-tabled every cycle.
             if hash_val:
+                _dedup_statuses = (
+                    ("pending", "approved", "tabled")
+                    if p.get("_develop_scope")
+                    else ("pending", "approved")
+                )
                 try:
                     if await ego_crud.has_pending_proposal_with_hash(
                         self._db,
                         hash_val,
+                        statuses=_dedup_statuses,
                     ):
                         logger.info(
                             "Proposal dedup: skipping exact duplicate (hash=%s)",
@@ -403,9 +410,39 @@ class ProposalWorkflow:
                 except Exception:
                     logger.warning("Proposal dedup check failed, proceeding", exc_info=True)
 
-            _urg = p.get("urgency", "normal")
-            _reval_hours = _reval_intervals.get(_urg, _reval_intervals.get("normal", 72))
-            _revalidate_at = (_created_dt + timedelta(hours=_reval_hours)).isoformat()
+            _revalidate_at = next_revalidate_at(
+                p.get("urgency", "normal"), from_dt=_created_dt,
+            )
+
+            # Deliverable floor (genesis/operations ego only): an
+            # investigation/dispatch proposal must carry a verifiable
+            # deliverable so post-dispatch verification always applies —
+            # bare "probe/diagnose/trace" dispatches with nothing to check
+            # were unverifiable by construction. The default lands in the
+            # user-facing output plane; ~ is expanded by the verifier
+            # (verification._resolve_path) and the dispatch prompt renders
+            # the exact path. Scoped to the genesis ego: user-ego dispatch
+            # flows (content publishing etc.) have their own deliverable
+            # semantics and are deliberately untouched.
+            _eo_serialized = _serialize_expected_outputs(
+                p.get("expected_outputs"),
+            )
+            if (
+                _eo_serialized is None
+                and ego_source == "genesis_ego_cycle"
+                and p.get("action_type") in ("dispatch", "investigate")
+            ):
+                _eo_serialized = json.dumps(
+                    {
+                        "files": [f"~/.genesis/output/ego-reports/{pid}.md"],
+                        "min_size_bytes": 500,
+                    }
+                )
+                logger.info(
+                    "Proposal %s: injected default expected_outputs "
+                    "(deliverable floor)",
+                    pid,
+                )
 
             await ego_crud.create_proposal(
                 self._db,
@@ -431,9 +468,7 @@ class ProposalWorkflow:
                 content_hash=hash_val,
                 content_size=_content_size(proposal_content),
                 original_content=p.get("_original_content"),
-                expected_outputs=_serialize_expected_outputs(
-                    p.get("expected_outputs"),
-                ),
+                expected_outputs=_eo_serialized,
                 revalidate_at=_revalidate_at,
                 last_validated_at=created_at,
             )
@@ -552,6 +587,17 @@ class ProposalWorkflow:
                     pass  # Malformed timestamp — proceed with delivery
 
         proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
+        # Digest ships only still-pending rows: proposals tabled between
+        # creation and delivery (develop-scope gate, queue cap) are recoverable
+        # records on the tabled lane, not approval requests.
+        _non_pending = sum(1 for p in proposals if p.get("status") != "pending")
+        if _non_pending:
+            logger.info(
+                "Digest for batch %s excludes %d non-pending proposal(s)",
+                batch_id,
+                _non_pending,
+            )
+            proposals = [p for p in proposals if p.get("status") == "pending"]
         if not proposals:
             logger.warning("No proposals found for batch %s", batch_id)
             return None
