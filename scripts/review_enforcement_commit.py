@@ -411,10 +411,13 @@ def main() -> None:
         )
         return
 
-    # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP review→fix→re-review
-    # rounds on this change, block the commit until an explicit '# escalation-ack'
-    # trailing comment — a machine-enforced STOP so a review loop can't silently run
-    # long on a standing "proceed" (see genesis-development SKILL.md). Checked BEFORE
+    # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP CONSECUTIVE
+    # defect-bearing review→fix→re-review rounds on this change (a clean review
+    # resets the streak — see review_state.bump_review_round), block the commit
+    # until an explicit '# escalation-ack' trailing comment — a machine-enforced
+    # STOP so a genuine review→fix loop can't silently run long on a standing
+    # "proceed" (see genesis-development SKILL.md), while honestly-clean
+    # multi-commit development never trips. Checked BEFORE
     # both the docs/config skip AND Rule 2 ON PURPOSE: the hard stop must not be
     # bypassable by file extension (a reviewed prompt/skill/docs-only commit at the
     # cap would otherwise sneak past via the docs skip), nor by '# review-override'
@@ -433,9 +436,10 @@ def main() -> None:
         )
         if not acked:
             _deny(
-                f"BLOCKED: review escalation cap reached — this change has had {round_n} "
-                f"review rounds (cap {ESCALATION_ROUND_CAP}). The review→fix loop has run "
-                "long. STOP and get a FRESH user decision on how to proceed (keep "
+                f"BLOCKED: review escalation cap reached — {round_n} consecutive review "
+                f"rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). The "
+                "review→fix loop has run long. STOP and get a FRESH user decision on how "
+                "to proceed (keep "
                 "hardening / switch to a robust-by-construction redesign / narrow scope / "
                 "shelve), then acknowledge that decision with a trailing shell comment "
                 "(outside any quotes):\n"

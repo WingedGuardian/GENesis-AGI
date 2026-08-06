@@ -19,7 +19,8 @@ not installed on many hosts.
 
 CLI usage:
     python3 review_state.py status     # prints current review state
-    python3 review_state.py mark --agent-output <path>
+    python3 review_state.py mark --agent-output <path>          # defect-bearing round
+    python3 review_state.py mark --agent-output <path> --clean  # clean round → reset streak
     python3 review_state.py diff-hash  # prints current diff hash
 """
 
@@ -195,12 +196,23 @@ def _verify_agent_output(path: str) -> tuple[bool, str]:
     return True, f"Agent output valid ({int(age)}s old, {p.stat().st_size} bytes)"
 
 
-def mark_reviewed(agent_output_path: str | None = None, cwd: str | None = None) -> bool:
+def mark_reviewed(
+    agent_output_path: str | None = None,
+    cwd: str | None = None,
+    *,
+    clean: bool = False,
+) -> bool:
     """Write the per-worktree review marker after verifying evidence.
 
     The authoritative gate is Check 2 (code-reviewer agent output). Check 1
     (gstack telemetry) is advisory — it annotates the marker but never refuses,
     because gstack is not installed on many hosts (see ``_verify_review_log``).
+
+    ``clean`` records the OUTCOME of the review for the escalation counter: pass
+    ``clean=True`` when the review surfaced NO new BLOCKER/SHOULD-FIX/P1/P2
+    finding — it resets the defect-bearing-round streak (circuit-breaker
+    reset-on-success). The default (``clean=False``) counts the round as
+    defect-bearing. See ``bump_review_round``.
 
     Returns True if the marker was written, False if the authoritative evidence
     check failed.
@@ -226,15 +238,16 @@ def mark_reviewed(agent_output_path: str | None = None, cwd: str | None = None) 
         "agent_evidence": agent_msg,
     }
     state_file.write_text(json.dumps(state, indent=2))
-    # Count this review round (escalation cap). A distinct staged diff on the same
-    # branch advances the count; re-marking the same diff does not. Best-effort:
-    # marking the review must ALWAYS succeed even if the counter is unwritable, so a
-    # counter problem can never leave the user stuck behind the review gate.
+    # Update the escalation counter (see bump_review_round). A defect-bearing round
+    # on a distinct staged diff advances the streak; a clean round resets it.
+    # Best-effort: marking the review must ALWAYS succeed even if the counter is
+    # unwritable, so a counter problem can never leave the user stuck behind the gate.
     try:
-        round_n = bump_review_round(cwd=cwd)
+        round_n = bump_review_round(cwd=cwd, clean=clean)
     except Exception:  # noqa: BLE001 - the counter must never block marking a review
         round_n = 0
-    print(f"Review marker written: {state['diff_hash']} (round {round_n})")
+    label = "clean → streak reset" if clean else f"round {round_n}"
+    print(f"Review marker written: {state['diff_hash']} ({label})")
     return True
 
 
@@ -254,12 +267,22 @@ def clear_marker(cwd: str | None = None) -> None:
 
 
 # ── Review-round counter (escalation cap) ─────────────────────────────────────
-# Counts review→fix→re-review rounds per change so the commit gate can force a
-# conscious stop after ESCALATION_ROUND_CAP rounds. Kept in a per-worktree file
-# SEPARATE from the marker (the marker is wiped on every commit; the round count
-# must persist across the commits a review loop makes between rounds). A "round"
-# = one review mark on a DISTINCT staged diff on the same branch; re-marking the
-# same diff is not a new round, and a branch change resets the count.
+# Counts CONSECUTIVE defect-bearing review→fix→re-review rounds per change so the
+# commit gate can force a conscious stop after ESCALATION_ROUND_CAP rounds. Kept
+# in a per-worktree file SEPARATE from the marker (the marker is wiped on every
+# commit; the round count must persist across the commits a review loop makes
+# between rounds).
+#
+# A round counts (advances the streak) only when the review it records surfaced a
+# NEW defect — the caller passes clean=False (the default) — AND the staged diff
+# is distinct from the last-counted one on this branch. A CLEAN review round
+# (clean=True: the review found no BLOCKER/SHOULD-FIX/P1/P2 finding) RESETS the
+# streak to 0 — circuit-breaker reset-on-success. This makes the machine
+# implement the SKILL.md cap literally ("3 rounds that each find NEW defects"):
+# honestly-clean multi-commit development (three independent clean reviews) never
+# trips, while a genuine review→fix loop that keeps surfacing defects still stops
+# at round 3. A branch change resets the count; re-marking the same diff does not
+# advance it.
 
 
 def _round_file(cwd: str | None = None) -> Path:
@@ -327,40 +350,60 @@ def get_review_round(cwd: str | None = None) -> int:
         return 0
 
 
-def bump_review_round(cwd: str | None = None) -> int:
-    """Record one more review round for the current branch; return the new count.
-
-    A genuine new round (the staged diff changed since the last mark on this
-    branch) increments; re-marking the SAME diff does not (idempotent); a branch
-    change resets to 1. Best-effort — never raises into the caller.
-    """
-    branch = get_current_branch(cwd=cwd)
-    content_hash = _staged_content_hash(cwd=cwd)
-    # Nothing meaningfully staged ("clean") or a git error ("unknown") is NOT a
-    # review round — counting it would inflate toward a false-positive cap block
-    # (e.g. a mark run before the next fix is staged, or a transient git timeout).
-    if content_hash in ("clean", "unknown"):
-        return get_review_round(cwd=cwd)
-    state = _load_round(cwd)
-    if not state or state.get("branch") != branch:
-        state = {"branch": branch, "round": 1, "last_hash": content_hash}
-    elif state.get("last_hash") != content_hash:
-        # A distinct staged diff → new round. Coerce the stored round defensively:
-        # a corrupt / partial-write / version-skewed value must NOT raise here, or
-        # it would crash `mark` and leave the user stuck behind the gate (this
-        # counter is best-effort — see the never-raises contract).
-        try:
-            prev = int(state.get("round", 0))
-        except (TypeError, ValueError):
-            prev = 0
-        state = {"branch": branch, "round": prev + 1, "last_hash": content_hash}
-    # else: same branch + same staged diff → same round (idempotent re-mark).
+def _write_round(state: dict, cwd: str | None = None) -> None:
+    """Persist the round-counter state (best-effort — never raises)."""
     try:
         rf = _round_file(cwd)
         rf.parent.mkdir(parents=True, exist_ok=True)
         rf.write_text(json.dumps(state, indent=2))
     except OSError:
         pass
+
+
+def bump_review_round(cwd: str | None = None, *, clean: bool = False) -> int:
+    """Update the defect-bearing-round streak for the current branch; return it.
+
+    ``clean=True`` — the review found no new BLOCKER/SHOULD-FIX/P1/P2 finding —
+    RESETS the streak to 0 (circuit-breaker reset-on-success) and returns 0,
+    regardless of whether the staged diff changed (a clean re-probe of the same
+    diff still closes the breaker).
+
+    ``clean=False`` (default, a defect-bearing round) increments when the staged
+    diff changed since the last counted mark on this branch; re-marking the SAME
+    diff does not (idempotent); a branch change resets to 1.
+
+    Best-effort — never raises into the caller.
+    """
+    branch = get_current_branch(cwd=cwd)
+    content_hash = _staged_content_hash(cwd=cwd)
+    # A CLEAN round resets the streak unconditionally — the review declared the
+    # current state defect-free, so no review→fix loop is in progress. Record the
+    # current content hash so the NEXT defect-bearing mark on a distinct diff
+    # correctly reads as a new (round-1) streak.
+    if clean:
+        _write_round({"branch": branch, "round": 0, "last_hash": content_hash}, cwd)
+        return 0
+    # Defect-bearing round. Nothing meaningfully staged ("clean") or a git error
+    # ("unknown") is NOT a review round — counting it would inflate toward a
+    # false-positive cap block (e.g. a mark run before the next fix is staged, or
+    # a transient git timeout).
+    if content_hash in ("clean", "unknown"):
+        return get_review_round(cwd=cwd)
+    state = _load_round(cwd)
+    if not state or state.get("branch") != branch:
+        state = {"branch": branch, "round": 1, "last_hash": content_hash}
+    elif state.get("last_hash") != content_hash:
+        # A distinct staged diff → new defect-bearing round. Coerce the stored
+        # round defensively: a corrupt / partial-write / version-skewed value must
+        # NOT raise here, or it would crash `mark` and leave the user stuck behind
+        # the gate (this counter is best-effort — see the never-raises contract).
+        try:
+            prev = int(state.get("round", 0))
+        except (TypeError, ValueError):
+            prev = 0
+        state = {"branch": branch, "round": prev + 1, "last_hash": content_hash}
+    # else: same branch + same staged diff → same round (idempotent re-mark).
+    _write_round(state, cwd)
     try:
         return int(state.get("round", 0))
     except (TypeError, ValueError):
@@ -413,12 +456,15 @@ def main() -> None:
         print(get_current_diff_hash())
 
     elif cmd == "mark":
-        # Parse --agent-output argument
+        # Parse --agent-output <path> and the optional --clean flag.
         agent_path = None
+        clean = False
         for i, arg in enumerate(sys.argv[2:], 2):
             if arg == "--agent-output" and i + 1 < len(sys.argv):
                 agent_path = sys.argv[i + 1]
-        if not mark_reviewed(agent_path):
+            elif arg == "--clean":
+                clean = True
+        if not mark_reviewed(agent_path, clean=clean):
             sys.exit(1)
 
     else:

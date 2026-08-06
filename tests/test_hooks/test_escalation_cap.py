@@ -110,6 +110,56 @@ def test_reset_clears(repo, _isolate_rounds):
     assert review_state.get_review_round(cwd=str(repo)) == 0
 
 
+# ── Defect-bearing streak + reset-on-clean (option (e), round-4 fix) ───────
+
+
+def test_clean_mark_resets_streak(repo, _isolate_rounds):
+    # The counter tracks CONSECUTIVE defect-bearing rounds. Two defect-bearing
+    # rounds, then a clean review, must reset the streak to 0 — and the NEXT
+    # defect-bearing round starts fresh at 1, not resume at 3.
+    _stage(repo, "a = 2\n")
+    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    _stage(repo, "a = 3\n")
+    assert review_state.bump_review_round(cwd=str(repo)) == 2
+    assert review_state.bump_review_round(cwd=str(repo), clean=True) == 0
+    assert review_state.get_review_round(cwd=str(repo)) == 0
+    _stage(repo, "a = 4\n")
+    assert review_state.bump_review_round(cwd=str(repo)) == 1
+
+
+def test_clean_resets_even_on_same_diff(repo, _isolate_rounds):
+    # A clean re-probe of the SAME staged diff still closes the breaker (reset),
+    # even though a defect-bearing re-mark of the same diff would be idempotent.
+    _stage(repo, "a = 2\n")
+    assert review_state.bump_review_round(cwd=str(repo)) == 1
+    assert review_state.bump_review_round(cwd=str(repo)) == 1  # same diff, idempotent
+    assert review_state.bump_review_round(cwd=str(repo), clean=True) == 0
+
+
+def test_defect_mark_on_same_diff_after_clean_reset_stays_zero(repo, _isolate_rounds):
+    # A clean reset records last_hash=<current>; a defect-bearing re-mark of the
+    # IDENTICAL staged diff is idempotent (nothing changed) → streak stays 0. The
+    # moment a real fix is staged (hash changes) the streak resumes at 1.
+    _stage(repo, "a = 2\n")
+    review_state.bump_review_round(cwd=str(repo))  # round 1
+    review_state.bump_review_round(cwd=str(repo), clean=True)  # reset, last_hash=H(a=2)
+    assert review_state.bump_review_round(cwd=str(repo)) == 0  # same diff → no new round
+    _stage(repo, "a = 3\n")
+    assert review_state.bump_review_round(cwd=str(repo)) == 1  # real change resumes at 1
+
+
+def test_defect_bearing_streak_still_reaches_cap_after_clean(repo, _isolate_rounds):
+    # Reset-on-clean must NOT defang the cap: after a clean reset, three fresh
+    # defect-bearing rounds still reach the cap (a genuine loop is still caught).
+    _stage(repo, "a = 2\n")
+    review_state.bump_review_round(cwd=str(repo))
+    review_state.bump_review_round(cwd=str(repo), clean=True)  # reset
+    for i, val in enumerate(("b = 1\n", "b = 2\n", "b = 3\n"), 1):
+        _stage(repo, val)
+        assert review_state.bump_review_round(cwd=str(repo)) == i
+    assert review_state.get_review_round(cwd=str(repo)) == review_state.ESCALATION_ROUND_CAP
+
+
 # ── Gate integration tests (review_enforcement_commit, subprocess) ────────
 
 
@@ -134,17 +184,20 @@ def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProce
     )
 
 
-def _mark(repo: Path, home: Path) -> subprocess.CompletedProcess:
+def _mark(repo: Path, home: Path, *, clean: bool = False) -> subprocess.CompletedProcess:
     (home / ".genesis" / "last_code_review.txt").write_text("adversarial review: OK\n")
     env = {**os.environ, "HOME": str(home)}
+    args = [
+        sys.executable,
+        str(_REVIEW_STATE),
+        "mark",
+        "--agent-output",
+        str(home / ".genesis" / "last_code_review.txt"),
+    ]
+    if clean:
+        args.append("--clean")
     return subprocess.run(
-        [
-            sys.executable,
-            str(_REVIEW_STATE),
-            "mark",
-            "--agent-output",
-            str(home / ".genesis" / "last_code_review.txt"),
-        ],
+        args,
         cwd=str(repo),
         env=env,
         capture_output=True,
@@ -211,6 +264,37 @@ def test_ack_resets_budget_no_permanent_friction(repo, home):
     assert _mark(repo, home).returncode == 0  # one fresh review → round 1
     r2 = _run_hook('git commit -m "wip2"', repo, home)
     assert r2.returncode == 0, r2.stderr  # under cap again, no ack needed
+
+
+def test_codex_scenario_independent_clean_reviews_never_block(repo, home):
+    # Codex round-4 finding, verbatim: "When a branch contains three independently
+    # reviewed commits, or simply three clean reviews of distinct staged diffs,
+    # [the old counter] increments every time ... The commit gate then hard-blocks
+    # routine multi-commit development at round 3 even though no escalating
+    # review→fix loop occurred." With reset-on-clean the streak stays 0 throughout,
+    # so four clean-reviewed commits all pass the gate.
+    for i in range(1, 5):
+        _stage(repo, f"clean_{i} = {i}\n")
+        m = _mark(repo, home, clean=True)
+        assert m.returncode == 0, m.stderr
+        res = _run_hook(f'git commit -m "commit {i}"', repo, home)
+        assert res.returncode == 0, res.stdout + res.stderr
+        _git(repo, "commit", "-qm", f"commit {i}")  # actually land it
+
+
+def test_clean_mark_via_cli_prevents_block_after_defect_rounds(repo, home):
+    # Full CLI plumbing: two defect-bearing rounds, then a clean review via the
+    # `--clean` flag resets the streak, so the next commit is not blocked.
+    _reach_rounds(repo, home, 2)  # 2 defect-bearing rounds
+    _stage(repo, "clean_pass = 1\n")
+    m = _mark(repo, home, clean=True)
+    assert m.returncode == 0, m.stderr
+    assert "streak reset" in m.stdout
+    key = review_state._worktree_key(cwd=str(repo))
+    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
+    assert json.loads(rf.read_text())["round"] == 0
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
 
 
 def test_clean_staged_mark_does_not_inflate(repo, _isolate_rounds):
