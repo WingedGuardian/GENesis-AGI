@@ -561,6 +561,28 @@ async def test_update_full_length_unknown_id_not_prefix_guessed(db):
     assert res.get("error_code") == "not_found", res
 
 
+async def test_update_accepts_id_tagged_full_handle(db):
+    """A full-length id handed in as an ``id:<32hex>`` handle — the exact shape the
+    proactive hook / memory_expand emit — must resolve and update end-to-end. RED
+    before the passthrough-normalization fix: the ``id:``-tagged string reached
+    exact-match get_by_id un-normalized → not_found, silently dropping the update."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="tagged-handle row",
+            reason="r",
+            strategy="user_input_needed",
+            work_state="ready",
+        )
+        fid = created["id"]
+        res = await follow_up_tools._impl_follow_up_update(
+            "id:" + fid, status="completed", resolution_notes="closed via tagged id"
+        )
+    assert "error" not in res, res
+    assert res["id"] == fid
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+
+
 # ─── H2: reject the orphan-making status='scheduled' transition ───────────────
 # status='scheduled' is set ONLY by link_task() atomically with linked_task_id.
 # follow_up_update can set the status but not the link, so a manual

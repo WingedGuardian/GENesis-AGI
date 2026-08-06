@@ -1206,7 +1206,12 @@ async def _check_follow_up_watchdog(db) -> None:
         classes = sorted({c for c, _ in findings})
         critical = any(r.get("priority") == "critical" for _, r in findings)
         priority = "critical" if critical else base_priority
-        alert_key = ",".join(classes) + ":" + priority
+        # Key on the FULL offender id set (ALL findings, not the display slice) as well
+        # as class + priority. When the offender set changes but class + priority don't,
+        # a class-only key leaves the stale alert deduped forever with its original
+        # ids/count while the newly-stuck row stays hidden — defeating the watchdog (P1).
+        offender_key = ",".join(sorted(r["id"] for _, r in findings))
+        alert_key = ",".join(classes) + ":" + priority + "|" + offender_key
         now = time.monotonic()
         if (
             now - _last_fu_watchdog_alert_at < _FU_WATCHDOG_COOLDOWN_S
@@ -1236,8 +1241,9 @@ async def _check_follow_up_watchdog(db) -> None:
             f"in NO surface: not actionable, not dispatched, not linked-active), "
             f"{len(past_due)} past-due scheduled (scheduled_at elapsed, dispatcher never "
             f"actuated). Fix each via follow_up_update (the 8-char id prefix now resolves): "
-            f"give it a real trigger (work_state='blocked_on_trigger' + revisit_condition), "
-            f"complete it, or fail it. [{rows}"
+            f"set status='blocked' with a blocked_reason (+ a revisit_condition), or "
+            f"complete/fail it. NOTE: work_state alone changes the lane/kind, NOT status — "
+            f"an orphan left status='scheduled' stays invisible. [{rows}"
             + (f" | (+{more} more)]" if more else "]")
         )
         created = await observations.create(

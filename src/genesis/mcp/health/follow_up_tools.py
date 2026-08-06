@@ -280,6 +280,14 @@ async def _impl_follow_up_update(
         if outcome == _id_resolve.RESOLVED and matches[0] != follow_up_id:
             resolved_from = follow_up_id
             follow_up_id = matches[0]
+        elif outcome == _id_resolve.PASSTHROUGH and matches and matches[0] != follow_up_id:
+            # A full-length / tagged / whitespace-padded handle (e.g. the
+            # ``id:<32hex>`` the proactive hook emits) is normalized by the resolver
+            # but not "resolved from a prefix". Adopt the normalized id for the exact
+            # lookup — WITHOUT a resolved_from note (it's transparent normalization,
+            # not prefix disambiguation). Skipping this leaves the exact lookup on the
+            # raw ``id:``-tagged string, which misses though the row exists.
+            follow_up_id = matches[0]
 
         existing = await follow_ups.get_by_id(db, follow_up_id)
         if not existing:

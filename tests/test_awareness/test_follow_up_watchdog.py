@@ -219,6 +219,43 @@ async def test_resolves_when_rows_fixed(db):
     assert await _alerts(db) == []
 
 
+async def test_offender_set_change_supersedes_stale_alert(db):
+    """P1: when the offender SET changes but class+priority don't, the stale alert
+    must be superseded and a NEW alert must name the currently-stuck row. The dedup
+    key includes the offender ids, not just class+priority — otherwise the morning
+    report keeps listing an already-fixed row and hides the newly-stuck one."""
+    a = await _mk_orphaned_scheduled(db)
+    await loop._check_follow_up_watchdog(db)
+    alerts = await _alerts(db)
+    assert len(alerts) == 1
+    assert a[:8] in alerts[0]["content"]
+
+    # Fix A, and strand a DIFFERENT row B of the SAME class + priority.
+    await fu_crud.update_status(db, a, "completed")
+    b = await _mk_orphaned_scheduled(db)
+    # Reset the in-process cooldown so only DB-level dedup is under test.
+    loop._last_fu_watchdog_alert_at = 0.0
+    loop._last_fu_watchdog_alert_key = ""
+    await loop._check_follow_up_watchdog(db)
+
+    alerts = await _alerts(db)
+    assert len(alerts) == 1
+    assert b[:8] in alerts[0]["content"]  # the newly-stuck row surfaces
+    assert a[:8] not in alerts[0]["content"]  # the fixed row no longer listed
+
+
+async def test_remediation_prescribes_visible_status_change(db):
+    """P2: the alert's remediation must prescribe a VISIBLE status change. A
+    work_state change alone sets kind/revisit_condition, NOT status, so it can't
+    un-strand an orphan — the advice must not tell the operator otherwise."""
+    await _mk_orphaned_scheduled(db)
+    await loop._check_follow_up_watchdog(db)
+    content = (await _alerts(db))[0]["content"]
+    assert "status='blocked'" in content
+    # must NOT prescribe a bare work_state change as the repair
+    assert "work_state='blocked_on_trigger'" not in content
+
+
 async def test_critical_row_escalates_priority(db):
     await _mk_orphaned_scheduled(db, priority="critical")
     await loop._check_follow_up_watchdog(db)

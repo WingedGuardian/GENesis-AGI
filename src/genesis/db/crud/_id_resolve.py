@@ -10,7 +10,8 @@ graph-bake-off row: an 8-char prefix passed to ``follow_up_update``).
 This mirrors ``genesis.mcp.memory.core._resolve_id_prefixes`` /
 ``genesis.db.crud.memory.match_id_prefix``: a unique prefix resolves; an
 ambiguous prefix is never guessed; full-length and non-hex ids pass through
-untouched; DB errors fail open (identical behaviour to no resolver).
+as the NORMALIZED id (an ``id:`` tag / whitespace / case stripped, never
+prefix-matched); DB errors fail open to that same normalized id.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 RESOLVED = "resolved"  # exactly one match — matches == [full_id]
 AMBIGUOUS = "ambiguous"  # >1 match — matches == candidate ids (never guessed)
 NOT_FOUND = "not_found"  # zero matches for a prefix-shaped id — matches == []
-PASSTHROUGH = "passthrough"  # not prefix-shaped (full/non-hex) — matches == [raw]
+PASSTHROUGH = "passthrough"  # not prefix-shaped (full/non-hex) — matches == [mid] (normalized)
 
 # table/id_column are ALWAYS developer-supplied literals, never caller input.
 # Guarded so they can never reach f-string interpolation as anything but a plain
@@ -55,14 +56,16 @@ async def resolve_unique_prefix(
       * ``RESOLVED``    → ``matches == [full_id]``
       * ``AMBIGUOUS``   → ``matches`` are the candidate ids (>=2, for the error)
       * ``NOT_FOUND``   → ``matches == []`` (prefix-shaped but nothing matched)
-      * ``PASSTHROUGH`` → ``matches == [raw_id]`` (full-length / non-hex / too short)
+      * ``PASSTHROUGH`` → ``matches == [mid]`` — the NORMALIZED id (an ``id:`` tag,
+        whitespace, and case stripped); full-length / non-hex / too short, so never
+        prefix-matched, but returned normalized so an exact lookup still hits.
     """
     if not _IDENT_RE.match(table) or not _IDENT_RE.match(id_column):
         raise ValueError(f"unsafe identifier: table={table!r} id_column={id_column!r}")
 
     mid = raw_id.strip().lower().removeprefix("id:")
     if len(mid) >= full_len or not _prefix_re(min_len).match(mid):
-        return [raw_id], PASSTHROUGH
+        return [mid], PASSTHROUGH
 
     try:
         # LIMIT 3 → distinguish unique (1) from ambiguous (>=2) AND let the caller
@@ -74,7 +77,7 @@ async def resolve_unique_prefix(
         matches = [str(r[0]) for r in await cursor.fetchall()]
     except Exception:
         logger.debug("prefix resolution failed for %r on %s", raw_id, table, exc_info=True)
-        return [raw_id], PASSTHROUGH
+        return [mid], PASSTHROUGH
 
     if len(matches) == 1:
         return matches, RESOLVED

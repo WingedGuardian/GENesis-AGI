@@ -88,6 +88,34 @@ async def test_db_error_fails_open():
     assert matches == ["abcd1234"]
 
 
+async def test_tagged_and_padded_full_ids_normalize_on_passthrough():
+    """A full-length id handed in with an ``id:`` tag, surrounding whitespace, or
+    uppercase must pass through as the NORMALIZED id — so the caller's exact lookup
+    still hits the row. Regression: passthrough previously echoed the raw string,
+    so ``id:<32hex>`` reached exact-match lookups un-normalized and missed."""
+    async with aiosqlite.connect(":memory:") as db:
+        await _mk(db, "abcd1234" + "0" * 24)
+        for raw in ("id:" + "f" * 32, "  " + "f" * 32 + "  ", "F" * 32):
+            matches, outcome = await _resolve(db, raw)
+            assert outcome == _id_resolve.PASSTHROUGH, raw
+            assert matches == ["f" * 32], raw
+
+
+async def test_db_error_fail_open_normalizes():
+    """The DB-error fail-open branch must ALSO return the normalized id (parity with
+    the prefix-shape passthrough and the memory resolver) — a short hex prefix with
+    an ``id:`` tag reaches the LIKE query, which raises with no table, then fails
+    open to the normalized ``mid``, not the raw."""
+    async with aiosqlite.connect(":memory:") as db:
+        # No table `t` → the LIKE query raises → fail open. ``id:ABCD`` is a valid
+        # short prefix shape, so it reaches the query rather than the length gate.
+        matches, outcome = await _id_resolve.resolve_unique_prefix(
+            db, table="t", id_column="id", raw_id="id:ABCD"
+        )
+    assert outcome == _id_resolve.PASSTHROUGH
+    assert matches == ["abcd"]
+
+
 async def test_bad_identifier_rejected():
     """table/id_column are developer literals — a non-identifier must raise, not
     reach string interpolation."""
