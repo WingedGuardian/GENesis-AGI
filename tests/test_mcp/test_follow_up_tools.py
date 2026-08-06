@@ -485,3 +485,131 @@ async def test_notes_only_does_not_write_stale_status(db):
     row = await follow_ups.get_by_id(db, fid)
     assert row["status"] == "completed"  # stale in_progress NOT written back
     assert row["resolution_notes"] == "fg note"
+
+
+# ─── H4a/H4c: short-prefix id resolution + loud failed lookups ────────────────
+# Root cause of the July graph-bake-off loss: a session passed an 8-char id
+# prefix to follow_up_update; exact-match get_by_id returned a soft "not found"
+# dict the session skimmed past, so a hard-dated commitment silently died.
+
+
+async def test_update_accepts_unique_8char_prefix(db):
+    """THE incident repro: an 8-char hex prefix must resolve to the row and the
+    update must land. RED today (exact-match get_by_id → not-found dict)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="commit the bake-off",
+            reason="r",
+            strategy="user_input_needed",
+            work_state="ready",
+        )
+        fid = created["id"]
+        res = await follow_up_tools._impl_follow_up_update(
+            fid[:8], priority="high", resolution_notes="revived"
+        )
+    assert "error" not in res, res
+    assert res["id"] == fid
+    assert res.get("resolved_from") == fid[:8]
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["priority"] == "high"
+    assert row["resolution_notes"] == "revived"
+
+
+async def test_update_not_found_is_loud(db):
+    """A truly-unknown id must return error_code='not_found' and a message that
+    states the NON-EFFECT explicitly. RED today (bare string, no error_code)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_update(
+            "ffffffffffffffffffffffffffffffff", status="completed"
+        )
+    assert res.get("error_code") == "not_found", res
+    assert "did NOT" in res["error"] or "NOTHING" in res["error"]
+
+
+async def test_update_ambiguous_prefix_rejected_no_write(db):
+    """An ambiguous prefix must be rejected (error_code='ambiguous_id') and change
+    NOTHING — never guess a row."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        a = await follow_up_tools._impl_follow_up_create(
+            content="row A", reason="r", strategy="ego_judgment", work_state="ready"
+        )
+        b = await follow_up_tools._impl_follow_up_create(
+            content="row B", reason="r", strategy="ego_judgment", work_state="ready"
+        )
+        # Force a shared 8-char prefix.
+        await db.execute(
+            "UPDATE follow_ups SET id = ? WHERE id = ?", ("dead0001" + "a" * 24, a["id"])
+        )
+        await db.execute(
+            "UPDATE follow_ups SET id = ? WHERE id = ?", ("dead0001" + "b" * 24, b["id"])
+        )
+        await db.commit()
+        res = await follow_up_tools._impl_follow_up_update("dead0001", priority="critical")
+    assert res.get("error_code") == "ambiguous_id", res
+    row_a = await follow_ups.get_by_id(db, "dead0001" + "a" * 24)
+    assert row_a["priority"] != "critical"  # no write happened
+
+
+async def test_update_full_length_unknown_id_not_prefix_guessed(db):
+    """A full-length (32-char) unknown id must NOT be prefix-matched to a
+    coincidental longer/shorter row — it passes through to a clean not-found."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        await follow_up_tools._impl_follow_up_create(
+            content="real", reason="r", strategy="ego_judgment", work_state="ready"
+        )
+        res = await follow_up_tools._impl_follow_up_update("0" * 32, status="completed")
+    assert res.get("error_code") == "not_found", res
+
+
+# ─── H2: reject the orphan-making status='scheduled' transition ───────────────
+# status='scheduled' is set ONLY by link_task() atomically with linked_task_id.
+# follow_up_update can set the status but not the link, so a manual
+# follow_up_update(status='scheduled') orphans the row invisibly (not in
+# get_actionable / get_scheduled_due / get_linked_active). This is what July 10
+# attempted. blocked is visible and intentionally NOT gated.
+
+
+async def test_update_scheduled_without_link_rejected(db):
+    """follow_up_update(status='scheduled') on an unlinked row is rejected with
+    error_code='scheduled_needs_link' and changes nothing. RED today (succeeds,
+    orphans the row)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="revisit later", reason="r", strategy="user_input_needed", work_state="ready"
+        )
+        fid = created["id"]
+        res = await follow_up_tools._impl_follow_up_update(fid, status="scheduled")
+    assert res.get("error_code") == "scheduled_needs_link", res
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "pending"  # unchanged — no orphan created
+
+
+async def test_update_scheduled_with_existing_link_allowed(db):
+    """A row that already carries a linked_task_id CAN be set scheduled (it stays
+    visible via get_linked_active) — the gate only blocks the orphan case."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="linked", reason="r", strategy="surplus_task", work_state="ready"
+        )
+        fid = created["id"]
+        await follow_ups.link_task(db, fid, "task-123")  # sets linked_task_id + scheduled
+        # Move it off scheduled, then re-affirm scheduled via the tool.
+        await follow_ups.update_status(db, fid, "in_progress")
+        res = await follow_up_tools._impl_follow_up_update(fid, status="scheduled")
+    assert "error" not in res, res
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "scheduled"
+
+
+async def test_update_blocked_still_works_untouched(db):
+    """Regression guard: 'blocked' is visible in get_actionable and is NOT gated —
+    the bare-blocked_reason contract stays intact after H2."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="thing", reason="r", strategy="ego_judgment", work_state="ready"
+        )
+        fid = created["id"]
+        res = await follow_up_tools._impl_follow_up_update(fid, blocked_reason="waiting on PR")
+    assert res["status"] == "blocked"
+    actionable = await follow_ups.get_actionable(db, limit=50)
+    assert any(r["id"] == fid for r in actionable)  # still visible

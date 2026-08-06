@@ -119,6 +119,21 @@ async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
     return dict(row) if row else None
 
 
+async def resolve_id(db: aiosqlite.Connection, id_or_prefix: str) -> tuple[list[str], str]:
+    """Resolve a full id OR a short hex prefix to the follow_up row(s).
+
+    Thin wrapper over the shared resolver so ``follow_up_update`` accepts the
+    same short handles the proactive hook / memory_expand hand out. Returns
+    ``(matches, outcome)`` — see ``crud/_id_resolve``. follow_up ids are
+    ``uuid4().hex`` (32-char, no dashes).
+    """
+    from genesis.db.crud._id_resolve import resolve_unique_prefix
+
+    return await resolve_unique_prefix(
+        db, table="follow_ups", id_column="id", raw_id=id_or_prefix, full_len=32
+    )
+
+
 async def get_pending(
     db: aiosqlite.Connection,
     *,
