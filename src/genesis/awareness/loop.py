@@ -1468,7 +1468,14 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
         rss = slot.get("rss_mb", 0.0)
         if rss < SLOT_RSS_WARN_MB:
             continue
-        key = str(slot.get("slot", "?"))
+        # slot may be None for an unregistered/manual interactive session (comm
+        # walk with no GENESIS_SLOT and no spawn file); key the cooldown by pid so
+        # such sessions don't collide on one bucket. (Cognitive `claude -p` calls
+        # are already excluded upstream, so every row here is a real session.)
+        raw_slot = slot.get("slot")
+        pid = slot.get("pid")
+        key = str(raw_slot) if raw_slot is not None else f"pid:{pid}"
+        label = f"slot cc-{raw_slot}" if raw_slot is not None else f"pid {pid}"
         last = _last_slot_alert_at.get(key)
         if last is not None and (now - last) < _SLOT_ALERT_COOLDOWN_S:
             continue
@@ -1485,15 +1492,15 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
                 source="cc_slot_monitor",
                 type="infrastructure_alert",
                 content=(
-                    f"CC slot cc-{key} (pid {slot.get('pid')}) is using "
+                    f"CC {label} (pid {pid}) is using "
                     f"{rss / 1024:.1f} GB RAM (warn {SLOT_RSS_WARN_MB // 1024} GB, "
                     f"crit {SLOT_RSS_CRIT_MB // 1024} GB). A single Claude Code "
-                    f"session may be leaking — consider restarting slot cc-{key}."
+                    f"session may be leaking — consider restarting {label}."
                 ),
                 priority=priority,
                 created_at=datetime.now(UTC).isoformat(),
             )
-            logger.warning("CC slot memory alert: cc-%s %.1f GB (%s)", key, rss / 1024, priority)
+            logger.warning("CC slot memory alert: %s %.1f GB (%s)", label, rss / 1024, priority)
         except Exception:
             logger.debug("Failed to create cc_slot alert observation", exc_info=True)
 

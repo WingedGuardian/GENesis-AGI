@@ -49,6 +49,17 @@ async def test_warn_is_high_priority_not_critical(_reset_cooldown_and_mock_creat
 
 
 @pytest.mark.asyncio
+async def test_null_slot_session_alerts_with_pid_key_and_label(_reset_cooldown_and_mock_create):
+    # An unregistered/manual interactive session has slot=None; it must still
+    # alert, keyed and labeled by pid (not collapsed onto a shared "None" bucket).
+    create = _reset_cooldown_and_mock_create
+    await loop._check_cc_slot_memory(object(), slots=[_slot(None, 6500, pid=98765)])
+    create.assert_awaited_once()
+    assert "pid 98765" in create.await_args.kwargs["content"]
+    assert "pid:98765" in loop._last_slot_alert_at  # cooldown keyed by pid, not "None"
+
+
+@pytest.mark.asyncio
 async def test_below_warn_no_alert(_reset_cooldown_and_mock_create):
     create = _reset_cooldown_and_mock_create
     await loop._check_cc_slot_memory(object(), slots=[_slot("1", 950)])

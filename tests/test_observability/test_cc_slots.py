@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 
-from genesis.observability import cc_slots
+import pytest
+
+from genesis.observability import cc_slots, mcp_spawn_store
 from genesis.observability.cc_slots import (
     SLOT_RSS_CRIT_MB,
     SLOT_RSS_WARN_MB,
@@ -15,8 +17,28 @@ from genesis.observability.cc_slots import (
     slot_status,
 )
 
+# Interactive slots run WITHOUT -p; every headless `claude -p` cognitive/background
+# call runs WITH it. cmdline is NUL-separated argv.
+_INTERACTIVE_CMD = b"claude\x00--dangerously-skip-permissions\x00"
+_PRINT_CMD = b"claude\x00-p\x00do a thing\x00--model\x00sonnet\x00"
 
-def _make_proc_entry(root, pid: int, comm: str, slot: str | None, rss_kb: int | None):
+
+@pytest.fixture(autouse=True)
+def _isolate_spawn_dir(tmp_path, monkeypatch):
+    """enumerate_cc_slots reads the mcp-spawn file plane for slot labels; point it
+    at an empty tmp so tests never read the real ~/.genesis/mcp-spawn. Tests that
+    exercise the plane override _SPAWN_DIR again (last setattr wins)."""
+    monkeypatch.setattr(mcp_spawn_store, "_SPAWN_DIR", tmp_path / "_spawn_isolated")
+
+
+def _make_proc_entry(
+    root,
+    pid: int,
+    comm: str,
+    slot: str | None,
+    rss_kb: int | None,
+    cmdline: bytes | None = _INTERACTIVE_CMD,
+):
     d = root / str(pid)
     d.mkdir()
     (d / "comm").write_text(comm + "\n")
@@ -24,6 +46,8 @@ def _make_proc_entry(root, pid: int, comm: str, slot: str | None, rss_kb: int | 
         (d / "environ").write_bytes(b"PATH=/usr/bin\x00GENESIS_SLOT=" + slot.encode() + b"\x00LANG=C\x00")
     else:
         (d / "environ").write_bytes(b"PATH=/usr/bin\x00LANG=C\x00")
+    if cmdline is not None:
+        (d / "cmdline").write_bytes(cmdline)
     if rss_kb is not None:
         (d / "status").write_text(f"Name:\t{comm}\nVmPeak:\t{rss_kb + 100} kB\nVmRSS:\t{rss_kb} kB\n")
 
@@ -54,40 +78,72 @@ class TestSlotStatus:
 
 
 class TestEnumerateCcSlots:
-    def test_filters_and_labels(self, tmp_path, monkeypatch):
+    def test_includes_interactive_labels_and_excludes_cognitive(self, tmp_path, monkeypatch):
+        # Comm-based: label from environ when readable; an interactive claude with
+        # NO slot is still a session (slot=None); a headless `claude -p` cognitive
+        # call is NOT a session and is excluded.
         monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
         _make_proc_entry(tmp_path, 1001, "claude", "3", 870_000)          # slot 3, healthy
         _make_proc_entry(tmp_path, 1002, "node", "3", 120_000)            # not claude → skip
-        _make_proc_entry(tmp_path, 1003, "claude", None, 500_000)         # no GENESIS_SLOT → skip
+        _make_proc_entry(tmp_path, 1003, "claude", None, 500_000)         # interactive, no slot → INCLUDED (slot None)
         _make_proc_entry(tmp_path, 1004, "claude", "7", 7 * 1024 * 1024)  # slot 7, CRIT (7 GB)
+        _make_proc_entry(
+            tmp_path, 1005, "claude", None, 400_000, cmdline=_PRINT_CMD
+        )  # cognitive `claude -p` → EXCLUDED
         (tmp_path / "notapid").mkdir()  # non-numeric entry ignored
 
         rows = enumerate_cc_slots()
-        slots = {r["slot"]: r for r in rows}
-        assert set(slots) == {"3", "7"}
-        assert slots["3"]["status"] == "healthy"
-        assert slots["3"]["rss_mb"] == round(870_000 / 1024, 1)
-        assert slots["3"]["pid"] == 1001
-        assert slots["7"]["status"] == "error"
-        # sorted by slot label
-        assert [r["slot"] for r in rows] == ["3", "7"]
+        by_pid = {r["pid"]: r for r in rows}
+        assert set(by_pid) == {1001, 1003, 1004}
+        assert by_pid[1001]["slot"] == "3" and by_pid[1001]["status"] == "healthy"
+        assert by_pid[1001]["rss_mb"] == round(870_000 / 1024, 1)
+        assert by_pid[1003]["slot"] is None  # interactive but unregistered
+        assert by_pid[1004]["slot"] == "7" and by_pid[1004]["status"] == "error"
 
-    def test_two_claude_sharing_a_slot_larger_rss_wins(self, tmp_path, monkeypatch):
+    def test_slot_label_from_spawn_plane_when_environ_absent(self, tmp_path, monkeypatch):
+        # The server-sandbox case: environ carries no readable GENESIS_SLOT, but the
+        # mcp-spawn file plane maps pid→slot. The label must come from the plane.
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        spawn = tmp_path / "spawn"
+        spawn.mkdir()
+        (spawn / "5").write_text(f"4242 {'a' * 40} 2026-08-06T00:00:00+00:00\n")
+        monkeypatch.setattr(mcp_spawn_store, "_SPAWN_DIR", spawn)
+        _make_proc_entry(tmp_path, 4242, "claude", None, 700_000)  # no environ slot
+        rows = enumerate_cc_slots()
+        assert len(rows) == 1
+        assert rows[0]["pid"] == 4242 and rows[0]["slot"] == "5"
+
+    def test_stale_spawn_slot_on_headless_pid_is_excluded(self, tmp_path, monkeypatch):
+        # A stale spawn-file maps a slot to a pid the OS has since reused for a
+        # headless `claude -p` cognitive call. cmdline is authoritative → the call
+        # must be EXCLUDED, never labeled with the stale slot as a live session.
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        spawn = tmp_path / "spawn"
+        spawn.mkdir()
+        (spawn / "3").write_text(f"7777 {'a' * 40} 2026-08-06T00:00:00+00:00\n")
+        monkeypatch.setattr(mcp_spawn_store, "_SPAWN_DIR", spawn)
+        # pid 7777 is now a headless cognitive call (cmdline has -p)
+        _make_proc_entry(tmp_path, 7777, "claude", None, 500_000, cmdline=_PRINT_CMD)
+        assert enumerate_cc_slots() == []
+
+    def test_two_claude_same_slot_label_both_kept_pid_keyed(self, tmp_path, monkeypatch):
+        # Rows are keyed by pid now (each live claude = one row); a shared slot label
+        # (anomalous) surfaces BOTH rather than silently hiding one.
         monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
         _make_proc_entry(tmp_path, 2001, "claude", "2", 500_000)
         _make_proc_entry(tmp_path, 2002, "claude", "2", 900_000)
         rows = enumerate_cc_slots()
-        assert len(rows) == 1
-        assert rows[0]["pid"] == 2002
-        assert rows[0]["rss_mb"] == round(900_000 / 1024, 1)
+        assert {r["pid"] for r in rows} == {2001, 2002}
+        assert all(r["slot"] == "2" for r in rows)
 
-    def test_numeric_slot_ordering(self, tmp_path, monkeypatch):
-        # "10" must follow "9", not sort lexicographically before it
+    def test_ordering_numeric_then_unlabeled(self, tmp_path, monkeypatch):
+        # "10" follows "9"; unlabeled (None) interactive sessions sort last.
         monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
         _make_proc_entry(tmp_path, 3001, "claude", "9", 800_000)
         _make_proc_entry(tmp_path, 3002, "claude", "10", 800_000)
         _make_proc_entry(tmp_path, 3003, "claude", "2", 800_000)
-        assert [r["slot"] for r in enumerate_cc_slots()] == ["2", "9", "10"]
+        _make_proc_entry(tmp_path, 3004, "claude", None, 800_000)  # unlabeled → last
+        assert [r["slot"] for r in enumerate_cc_slots()] == ["2", "9", "10", None]
 
     def test_empty_proc_returns_empty(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
@@ -96,6 +152,34 @@ class TestEnumerateCcSlots:
     def test_missing_proc_dir_returns_empty_not_raise(self, monkeypatch):
         monkeypatch.setattr(cc_slots, "_PROC", "/nonexistent/proc/path")
         assert enumerate_cc_slots() == []
+
+
+class TestIsInteractive:
+    def _cmdline(self, tmp_path, monkeypatch, pid, raw):
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        (tmp_path / str(pid)).mkdir()
+        (tmp_path / str(pid) / "cmdline").write_bytes(raw)
+
+    def test_interactive_no_print_flag(self, tmp_path, monkeypatch):
+        self._cmdline(tmp_path, monkeypatch, 10, _INTERACTIVE_CMD)
+        assert cc_slots._is_interactive(10) is True
+
+    def test_short_print_flag_excluded(self, tmp_path, monkeypatch):
+        self._cmdline(tmp_path, monkeypatch, 11, _PRINT_CMD)
+        assert cc_slots._is_interactive(11) is False
+
+    def test_long_print_flag_excluded(self, tmp_path, monkeypatch):
+        self._cmdline(tmp_path, monkeypatch, 12, b"claude\x00--print\x00hi\x00")
+        assert cc_slots._is_interactive(12) is False
+
+    def test_permissions_flag_not_mistaken_for_print(self, tmp_path, monkeypatch):
+        # exact-arg match: --dangerously-skip-permissions must NOT match -p
+        self._cmdline(tmp_path, monkeypatch, 13, b"claude\x00--dangerously-skip-permissions\x00")
+        assert cc_slots._is_interactive(13) is True
+
+    def test_unreadable_cmdline_is_non_interactive(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        assert cc_slots._is_interactive(999_999) is False
 
 
 # ── start-time (btime + /proc/<pid>/stat field 22) ──────────────────────────

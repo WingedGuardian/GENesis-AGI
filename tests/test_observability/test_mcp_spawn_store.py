@@ -73,6 +73,34 @@ class TestPersistRead:
         store.persist_spawn_commit("4", 111, FULL, AT)  # must not raise
 
 
+class TestEnumerateSpawnSlots:
+    def test_lists_slot_and_pid(self, tmp_path, monkeypatch):
+        _point_dir(tmp_path, monkeypatch)
+        store.persist_spawn_commit("4", 45285, FULL, AT)
+        store.persist_spawn_commit("7", 1615462, FULL, AT)
+        assert sorted(store.enumerate_spawn_slots()) == [("4", 45285), ("7", 1615462)]
+
+    def test_missing_dir_returns_empty(self, tmp_path, monkeypatch):
+        _point_dir(tmp_path, monkeypatch)  # dir not created
+        assert store.enumerate_spawn_slots() == []
+
+    def test_skips_temp_and_malformed(self, tmp_path, monkeypatch):
+        _point_dir(tmp_path, monkeypatch)
+        d = tmp_path / "mcp-spawn"
+        d.mkdir()
+        (d / "4").write_text(f"45285 {FULL} {AT}\n")  # valid
+        (d / ".4.tmp9x").write_text(f"999 {FULL} {AT}\n")  # atomic-write temp → skip
+        (d / "5").write_text("only two\n")  # not 3 tokens → skip
+        (d / "6").write_text(f"notapid {FULL} {AT}\n")  # non-numeric pid → skip
+        assert store.enumerate_spawn_slots() == [("4", 45285)]
+
+    def test_slot_by_pid_reverse_map(self, tmp_path, monkeypatch):
+        _point_dir(tmp_path, monkeypatch)
+        store.persist_spawn_commit("4", 45285, FULL, AT)
+        store.persist_spawn_commit("7", 1615462, FULL, AT)
+        assert store.slot_by_pid() == {45285: "4", 1615462: "7"}
+
+
 class TestSessionPid:
     def test_parent_is_claude(self, tmp_path, monkeypatch):
         monkeypatch.setattr(store, "_PROC", str(tmp_path))

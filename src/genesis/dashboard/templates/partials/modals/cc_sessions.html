@@ -33,7 +33,7 @@
               </div>
               <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px;"
                    :style="`background: rgba(59,130,246,0.12); color: #3b82f6;`"
-                   title="Live claude processes carrying GENESIS_SLOT (from /proc) — informational, not a filter">
+                   title="Live interactive claude sessions (from /proc) — informational, not a filter">
                 <span x-text="($store.genesisDashboard.ccSessionsModal.data.stats?.live_procs || 0)"></span> live procs
               </div>
               <div style="font-size: 0.82rem; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; transition: opacity 0.15s;"
@@ -80,7 +80,7 @@
                         :title="'idle'"
                         x-text="s.idle_s != null ? $store.genesisDashboard.formatAgeSeconds(s.idle_s) + ' idle' : '-'"></span>
                   <span style="min-width: 108px;" :style="`color: ${s.live ? '#3b82f6' : 'var(--color-text-secondary)'}`"
-                        x-text="s.live ? ('#' + s.live.slot + ' pid ' + s.live.pid + ' ' + (s.live.rss_mb / 1024).toFixed(1) + 'G') : '—'"></span>
+                        x-text="s.live ? ((s.live.slot ? '#' + s.live.slot + ' ' : '') + 'pid ' + s.live.pid + ' ' + (s.live.rss_mb / 1024).toFixed(1) + 'G') : '—'"></span>
                   <template x-if="$store.genesisDashboard.ccSessionsModal.data.charters_available">
                     <span style="min-width: 130px; flex: 1; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;"
                           :title="s.charter ? ((s.charter.mission || 'no mission') + ' · ' + s.charter.compaction_count + ' compactions · ' + s.charter.ledger_open + ' open of ' + s.charter.ledger_total) : 'no charter'"
@@ -108,7 +108,7 @@
                 <div style="font-size: 0.78rem; font-weight: 600; color: #d9534f; margin-bottom: 0.3rem;">Live processes with no DB session row</div>
                 <template x-for="u in $store.genesisDashboard.ccSessionsModal.data.unmatched_slots" :key="u.pid">
                   <div style="font-size: 0.75rem; color: #f87171; display: flex; gap: 0.4rem; align-items: center;">
-                    <span x-text="'#' + u.slot + ' pid ' + u.pid + ' ' + (u.rss_mb / 1024).toFixed(1) + 'G (' + u.status + ')'"></span>
+                    <span x-text="(u.slot ? '#' + u.slot + ' ' : '') + 'pid ' + u.pid + ' ' + (u.rss_mb / 1024).toFixed(1) + 'G (' + u.status + ')'"></span>
                     <template x-if="u.stale_code">
                       <span style="font-size: 0.68rem; padding: 0.05rem 0.35rem; border-radius: 4px; background: rgba(240,173,78,0.15); color: #f0ad4e; white-space: nowrap;"
                             :title="'This process is running pre-deploy code (deployed commit ' + (u.deploy_commit || '?') + '). Restart it to load the deployed code.'"
