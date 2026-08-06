@@ -767,6 +767,42 @@ class TestSynthesisDrainCapacityRecovery:
         assert all(r["status"] == "pending" for r in rows)
 
     @pytest.mark.asyncio
+    async def test_capacity_abort_does_not_charge_retry_cap(self, db):
+        """During a provider-outage abort, even slices already at the cap
+        boundary are RESET, not capped — the breaker lets only a few slices get
+        an LLM call per drain, so charging the rest (claimed-but-unattempted, or
+        exhausted-during-outage) would drop never-recoverable work after a few
+        outage days. The cap is for slice-specific poison, not systemic outages."""
+        n = _CAPACITY_ABORT_THRESHOLD + 1
+        clusters = [_fake_cluster(2, room=f"r{i}") for i in range(n)]
+        await _persist_worklist(db, clusters, weekly_run_id="w")
+        # Pre-age EVERY slice to the cap boundary: absent the outage gate, this
+        # drain's claim (attempt _SLICE_ATTEMPT_CAP) would complete them all.
+        await db.execute(
+            "UPDATE deferred_work_queue SET attempts = ? WHERE work_type = ?",
+            (_SLICE_ATTEMPT_CAP - 1, WORKLIST_WORK_TYPE),
+        )
+        await db.commit()
+        points: dict[str, dict] = {}
+        for c in clusters:
+            points.update(_live_points(c))
+        router = AsyncMock()
+        router.route_call = AsyncMock(
+            return_value=MagicMock(success=False, error="All providers exhausted")
+        )
+
+        report = await run_synthesis_drain(
+            qdrant=_drain_qdrant(points), db=db,
+            router=router, store=AsyncMock(), budget=100, dry_run=False,
+        )
+
+        assert report["aborted_capacity"] is True
+        assert report["slices_capped"] == 0  # outage → nothing charged the cap
+        assert report["slices_reset"] == n
+        rows = await self._rows(db)
+        assert all(r["status"] == "pending" for r in rows)
+
+    @pytest.mark.asyncio
     async def test_quality_blocked_slice_still_completed(self, db):
         """A genuine quality block (adversarial review ran and FAILed — not a
         capacity failure) still COMPLETES the slice; it must NOT be reset. Only

@@ -553,10 +553,13 @@ async def run_synthesis_drain(
         blocked/errored clusters re-surface in next week's re-cluster).
       * CAPACITY failure (provider chain exhausted, adversarial review exhausted,
         or a breaker-trip/budget cutoff that left the slice untried) → RESET to
-        pending so a future drain retries it, up to ``_SLICE_ATTEMPT_CAP`` claims;
-        past the cap it is completed with a WARNING (no infinite retry). This is
-        the recovery net for cognition lost to a transient provider outage — the
-        prior behavior completed these unconditionally and dropped the work.
+        pending so a future drain retries it. This is the recovery net for
+        cognition lost to a transient provider outage — the prior behavior
+        completed these unconditionally and dropped the work. The
+        ``_SLICE_ATTEMPT_CAP`` retry cap (complete-with-WARNING, no infinite
+        retry) is charged ONLY to a slice that exhausts its OWN synthesis in a
+        drain that did not abort on capacity — never to un-attempted slices, nor
+        to any slice during a provider-outage abort (see the disposition loop).
       * infrastructure failure (Qdrant unreachable) aborts the drain WITHOUT
         consuming items — a preflight ping guards the start, and a mid-drain
         rehydrate error resets the in-flight item to pending (FM-2).
@@ -698,38 +701,52 @@ async def run_synthesis_drain(
             run_id=run_id, qdrant=qdrant, db=db, router=router, store=store,
             max_merges=budget, max_cluster_size=MAX_CLUSTER_SIZE, report=report,
         )
-        # Per-slice disposition. Capacity failures (provider exhaustion, or a
-        # breaker/max_merges cutoff that left a slice untried) are RECOVERABLE:
-        # reset them to pending so a future drain retries — up to
-        # _SLICE_ATTEMPT_CAP claims, after which the slice is completed with a
-        # WARNING (no infinite retry; the weekly re-cluster re-surfaces its
-        # members). Everything else — merged, quality-blocked, non-capacity
-        # error — is completed, matching the value-ranked "attempted once, then
-        # re-cluster" design. attempts was already incremented by the
-        # mark_processing claim above, so item["attempts"] (the pre-claim value)
-        # + 1 is this drain's attempt number.
+        # Per-slice disposition. Capacity failures are RECOVERABLE — reset to
+        # pending so a future drain retries. Everything else — merged,
+        # quality-blocked, non-capacity error — is completed, matching the
+        # value-ranked "attempted once, then re-cluster" design.
+        #
+        # The retry cap is charged ONLY to a slice that genuinely got an LLM
+        # attempt and exhausted in a drain that did NOT hit a global capacity
+        # abort — i.e. a slice that keeps failing its OWN synthesis while the
+        # system is otherwise healthy (a poison slice). It is deliberately NOT
+        # charged to:
+        #   * "unattempted" slices — the breaker tripped (or budget cut off)
+        #     before they got an LLM call, yet the claim already bumped their
+        #     attempts; charging them would drop never-tried work (during an
+        #     outage the breaker lets only ~_CAPACITY_ABORT_THRESHOLD slices
+        #     through per drain, so the rest would hit the cap in 3 outage days
+        #     and recreate the cognition-loss this fix prevents), and
+        #   * ANY slice when the whole drain aborted on capacity — those
+        #     failures are systemic (provider outage), not slice-specific.
+        # Un-capped slices survive to the next drain; the weekly supersede()
+        # replaces the worklist wholesale, so they can't accumulate forever.
+        capacity_abort = report["aborted_capacity"]
         for (item, _cluster), outcome in zip(pending, outcomes, strict=True):
-            if outcome in ("exhausted", "unattempted"):
-                attempt_no = item["attempts"] + 1
-                if attempt_no >= _SLICE_ATTEMPT_CAP:
-                    report["slices_capped"] += 1
-                    logger.warning(
-                        "Dream drain %s: slice %s capacity-failed on attempt %d "
-                        "(cap %d) — completing without further retry; members "
-                        "re-surface in next week's re-cluster.",
-                        run_id[:8], item["id"][:8], attempt_no, _SLICE_ATTEMPT_CAP,
-                    )
-                    await queue.mark_completed(item["id"])
-                else:
-                    report["slices_reset"] += 1
-                    logger.info(
-                        "Dream drain %s: slice %s capacity-failed (%s) on attempt "
-                        "%d — reset to pending for retry.",
-                        run_id[:8], item["id"][:8], outcome, attempt_no,
-                    )
-                    await queue.reset_to_pending(item["id"])
-            else:
+            if outcome not in ("exhausted", "unattempted"):
                 await queue.mark_completed(item["id"])
+                continue
+            # attempts was bumped by the mark_processing claim above, so
+            # item["attempts"] (pre-claim) + 1 is this drain's claim number.
+            attempt_no = item["attempts"] + 1
+            charge_cap = outcome == "exhausted" and not capacity_abort
+            if charge_cap and attempt_no >= _SLICE_ATTEMPT_CAP:
+                report["slices_capped"] += 1
+                logger.warning(
+                    "Dream drain %s: slice %s exhausted its own synthesis on "
+                    "attempt %d (cap %d) — completing without further retry; "
+                    "members re-surface in next week's re-cluster.",
+                    run_id[:8], item["id"][:8], attempt_no, _SLICE_ATTEMPT_CAP,
+                )
+                await queue.mark_completed(item["id"])
+            else:
+                report["slices_reset"] += 1
+                logger.info(
+                    "Dream drain %s: slice %s capacity-failed (%s) on attempt "
+                    "%d — reset to pending for retry.",
+                    run_id[:8], item["id"][:8], outcome, attempt_no,
+                )
+                await queue.reset_to_pending(item["id"])
 
     logger.info(
         "Dream drain %s (%s): drained=%d stale=%d would_merge=%d merged=%d deprecated=%d",
