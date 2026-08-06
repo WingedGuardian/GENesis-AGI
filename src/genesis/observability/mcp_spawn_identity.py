@@ -18,10 +18,14 @@ fails open (never blocks a process whose code identity is unknowable).
 
 from __future__ import annotations
 
+import logging
+import os
 from datetime import UTC, datetime
 
 from genesis.env import repo_root
 from genesis.observability.git_health import _CHEAP_TIMEOUT_S, _run_git
+
+logger = logging.getLogger(__name__)
 
 _spawn_commit: str | None = None
 _spawn_at: str | None = None
@@ -39,6 +43,23 @@ def capture_spawn_identity() -> None:
     _spawn_at = datetime.now(UTC).isoformat()
     rc, out, _ = _run_git(repo_root(), "rev-parse", "HEAD", timeout=_CHEAP_TIMEOUT_S)
     _spawn_commit = out.strip() if rc == 0 and out.strip() else None
+
+    # Part B: also PERSIST the spawn commit (keyed by GENESIS_SLOT, validated by
+    # the claude session pid on read) so the dashboard — a DIFFERENT process —
+    # can render a stale-code badge. Fully isolated in its own try/except: a
+    # persistence failure must NEVER perturb the in-memory identity the Part A
+    # guard depends on. No-op for a non-slotted (headless) launch.
+    try:
+        slot = os.environ.get("GENESIS_SLOT")
+        if slot and _spawn_commit:
+            from genesis.observability.mcp_spawn_store import (
+                persist_spawn_commit,
+                session_pid,
+            )
+
+            persist_spawn_commit(slot, session_pid(), _spawn_commit, _spawn_at)
+    except Exception:
+        logger.debug("spawn-commit persistence failed (non-fatal)", exc_info=True)
 
 
 def spawn_commit() -> str | None:

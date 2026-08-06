@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 
 from genesis.observability import cc_slots
 from genesis.observability.cc_slots import (
@@ -10,6 +11,7 @@ from genesis.observability.cc_slots import (
     SLOT_RSS_WARN_MB,
     enumerate_cc_slots,
     read_proc_rss_mb,
+    read_proc_start_iso,
     slot_status,
 )
 
@@ -94,3 +96,85 @@ class TestEnumerateCcSlots:
     def test_missing_proc_dir_returns_empty_not_raise(self, monkeypatch):
         monkeypatch.setattr(cc_slots, "_PROC", "/nonexistent/proc/path")
         assert enumerate_cc_slots() == []
+
+
+# ── start-time (btime + /proc/<pid>/stat field 22) ──────────────────────────
+
+
+def _write_btime(root, btime: int):
+    """Fake /proc/stat carrying a btime line (plus noise lines)."""
+    (root / "stat").write_text(
+        f"cpu  1 2 3 4\nbtime {btime}\nprocesses 12345\n"
+    )
+
+
+def _write_stat(root, pid: int, comm: str, starttime_ticks: int):
+    """Fake /proc/<pid>/stat. comm is parenthesised and may contain spaces/parens
+    — field 22 (starttime) sits 19 tokens after the LAST ')'."""
+    d = root / str(pid)
+    d.mkdir(exist_ok=True)
+    # fields 3..21 (state..itrealvalue) = 19 placeholder tokens, then field 22.
+    tail = " ".join(["0"] * 19 + [str(starttime_ticks)])
+    (d / "stat").write_text(f"{pid} ({comm}) {tail} 0 0 0\n")
+
+
+class TestReadProcStartIso:
+    def test_computes_wall_start_from_btime_and_ticks(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        btime = 1_700_000_000
+        ticks = 500_000
+        _write_btime(tmp_path, btime)
+        _write_stat(tmp_path, 4242, "claude", ticks)
+        clk = os.sysconf("SC_CLK_TCK")
+        expected = datetime.fromtimestamp(btime + ticks / clk, UTC).isoformat()
+        assert read_proc_start_iso(4242) == expected
+
+    def test_comm_with_inner_parens_and_spaces(self, tmp_path, monkeypatch):
+        # The comm field itself contains ')' and a space; rsplit(')',1) must
+        # still land on field 22, not choke on the inner paren.
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        btime = 1_700_000_000
+        ticks = 12_345
+        _write_btime(tmp_path, btime)
+        _write_stat(tmp_path, 4243, "weird (name) proc", ticks)
+        clk = os.sysconf("SC_CLK_TCK")
+        expected = datetime.fromtimestamp(btime + ticks / clk, UTC).isoformat()
+        assert read_proc_start_iso(4243) == expected
+
+    def test_missing_pid_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        _write_btime(tmp_path, 1_700_000_000)
+        assert read_proc_start_iso(999_999) is None
+
+    def test_missing_btime_returns_none(self, tmp_path, monkeypatch):
+        # No /proc/stat btime → cannot anchor → None (never a bogus time).
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        _write_stat(tmp_path, 4244, "claude", 500_000)
+        assert read_proc_start_iso(4244) is None
+
+    def test_malformed_stat_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        _write_btime(tmp_path, 1_700_000_000)
+        (tmp_path / "4245").mkdir()
+        (tmp_path / "4245" / "stat").write_text("garbage no parens here\n")
+        assert read_proc_start_iso(4245) is None
+
+    def test_enumerate_includes_started_at(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        btime = 1_700_000_000
+        ticks = 777_000
+        _write_btime(tmp_path, btime)
+        _make_proc_entry(tmp_path, 5001, "claude", "1", 800_000)
+        _write_stat(tmp_path, 5001, "claude", ticks)
+        clk = os.sysconf("SC_CLK_TCK")
+        expected = datetime.fromtimestamp(btime + ticks / clk, UTC).isoformat()
+        rows = enumerate_cc_slots()
+        assert rows[0]["started_at"] == expected
+
+    def test_enumerate_started_at_none_when_stat_absent(self, tmp_path, monkeypatch):
+        # Existing-test compatibility: no stat/btime → started_at present as None,
+        # never raising and never dropping the slot.
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        _make_proc_entry(tmp_path, 5002, "claude", "1", 800_000)
+        rows = enumerate_cc_slots()
+        assert rows[0]["started_at"] is None
