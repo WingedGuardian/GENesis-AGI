@@ -17,11 +17,14 @@ never drift:
   the whole ``GenesisRuntime`` onto the ``setup-status`` hot path and ``sys.exit``\\s on
   a missing file — so both it and readiness call the extracted stdlib-only loader.) A
   parity test still pins the two equal across quoted / commented / malformed shapes.
-* **T3 Autonomous** — the ego/awareness loop is enabled (``ego.enabled``), the
-  user-controlled driver of proactive behaviour. NOTE: the autonomy subsystem has
-  **no on/off switch** — its manager/dispatcher are always initialised on a running
-  install and gated per-action by the mandatory approval gate — so "autonomy" is not
-  a tier gate; the ego loop is the honest signal for "acts on its own".
+* **T3 Autonomous** — the ego/awareness loop is enabled (``ego.enabled``) AND
+  bootstrap is complete (the ``~/.genesis/setup-complete`` marker, surfaced as
+  ``onboarded``). Both are required because ``EgoCadenceManager._should_run()`` rejects
+  every cycle when the marker is absent (``ego/cadence.py``), so an enabled-but-not-yet-
+  onboarded ego cannot actually act. The ego loop is the honest signal for "acts on its
+  own"; the autonomy subsystem itself has **no on/off switch** (its manager/dispatcher
+  are always initialised and gated per-action by the mandatory approval gate), so
+  "autonomy" is not a tier gate.
 
 Tiers are cumulative: a tier is reached only when its own gate AND all lower gates
 are met, so de-configuring a lower capability visibly drops the level (matching the
@@ -29,9 +32,20 @@ floor's live-recompute philosophy). Everything else that makes an install *good*
 rather than *minimal* — web-search availability, autonomy posture, surplus, voice,
 the dashboard password — is enrichment surfaced by the panel, never a tier gate.
 
-Like the floor, readiness is **presence-based and pure over persisted state plus one
-injected bool** (``ego_enabled``, resolved by the route from the ego config so this
-module needs no runtime/ego import) — safe on the ``setup-status`` hot path.
+Like the floor, readiness is **presence-based and pure over persisted state plus two
+injected bools** (``ego_enabled`` from the ego config and ``onboarded`` from the marker,
+both resolved by the route so this module needs no runtime/ego import) — safe on the
+``setup-status`` hot path.
+
+**Presence-based limitation (deliberate):** readiness answers "is this *configured* to
+work", not "is it running right now", exactly as the floor reports "LLM key present"
+even if that provider is momentarily down. It therefore does NOT reflect *runtime*
+disables that leave persisted config intact — e.g. launching with
+``python -m genesis serve --no-telegram`` skips the Telegram adapter
+(``hosting/standalone.py``) while the credentials remain, so T2 still reports Connected.
+Capturing that would require live-runtime coupling on the hot path (and would never end
+— any number of runtime conditions can suppress a configured capability); it is out of
+scope for this signal by design.
 """
 
 from __future__ import annotations
@@ -93,6 +107,7 @@ class ReadinessStatus:
     floor: FloorStatus
     telegram_configured: bool  # T2 — proactive Telegram reach
     ego_enabled: bool  # T3 — ego/awareness loop enabled
+    onboarded: bool  # T3 — ~/.genesis/setup-complete marker (the ego gate needs it)
 
     @property
     def tier(self) -> int:
@@ -101,7 +116,12 @@ class ReadinessStatus:
             return 0
         if not self.telegram_configured:
             return 1
-        if not self.ego_enabled:
+        # T3 (Autonomous) requires BOTH the ego loop enabled AND bootstrap complete:
+        # EgoCadenceManager._should_run() rejects every cycle when the
+        # ~/.genesis/setup-complete marker is absent (ego/cadence.py), so an enabled
+        # ego that is not onboarded still cannot act — reporting Autonomous there
+        # would contradict `onboarded: false`.
+        if not (self.ego_enabled and self.onboarded):
             return 2
         return 3
 
@@ -126,16 +146,18 @@ def compute_readiness(
     secrets: Mapping[str, str] | None = None,
     *,
     ego_enabled: bool,
+    onboarded: bool,
     secrets_text: str | None = None,
 ) -> ReadinessStatus:
     """Compute the cumulative readiness tier.
 
     ``secrets`` (dotenv-parsed) drives the floor legs; ``secrets_text`` (raw
     ``secrets.env`` text) drives the T2 Telegram gate via the adapter's manual parse.
-    Both default to a live read. ``ego_enabled`` is **injected** (not read here) so
-    this module needs no runtime/ego import on the hot path — the route resolves it
-    from the ego config and passes it in. Never raises (delegates to never-raise
-    reads).
+    Both default to a live read. ``ego_enabled`` (ego config) and ``onboarded`` (the
+    ``~/.genesis/setup-complete`` marker) are **injected** — both gate T3, since the
+    ego cadence requires the marker AND ``ego.enabled`` to run — so this module needs
+    no runtime/ego import on the hot path (the route resolves both and passes them in).
+    Never raises (delegates to never-raise reads).
     """
     if secrets is None:
         secrets = read_persisted_secrets()
@@ -146,4 +168,5 @@ def compute_readiness(
         floor=floor,
         telegram_configured=_telegram_reach_configured(secrets_text),
         ego_enabled=bool(ego_enabled),
+        onboarded=bool(onboarded),
     )

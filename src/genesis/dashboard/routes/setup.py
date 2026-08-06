@@ -78,15 +78,20 @@ def setup_status():
         logger.warning("setup-status: ego config unreadable; ego_enabled=False", exc_info=True)
         ego_enabled = False
 
+    # The setup-complete marker gates T3 (the ego cadence won't run without it), so it
+    # is read ONCE here and threaded into readiness AND the payload — one snapshot, so
+    # `onboarded` and the tier can never contradict each other.
+    onboarded = _SETUP_COMPLETE_MARKER.is_file()
+
     # Compute readiness ONCE and read the floor legs from its snapshot, so the
     # payload's floor fields and the tier can never disagree (compute_floor reads the
     # live CC-OAuth state, so a second independent computation could flip mid-request
     # and report e.g. floor_met=false alongside tier 3 — a cumulative-contract break).
-    readiness = compute_readiness(secrets=secrets, ego_enabled=ego_enabled)
+    readiness = compute_readiness(secrets=secrets, ego_enabled=ego_enabled, onboarded=onboarded)
     floor = readiness.floor
 
     payload = {
-        "onboarded": _SETUP_COMPLETE_MARKER.is_file(),
+        "onboarded": onboarded,
         "password_set": secrets_have_password,
         "cc_oauth": floor.cc_oauth,
         "llm_key_present": floor.llm_key_present,

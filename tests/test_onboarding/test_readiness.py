@@ -32,8 +32,15 @@ def _floor(met: bool) -> FloorStatus:
     return FloorStatus(cc_oauth=met, llm_key_present=met, embedding_key_present=met)
 
 
-def _status(*, floor_met: bool, telegram: bool, ego: bool) -> ReadinessStatus:
-    return ReadinessStatus(floor=_floor(floor_met), telegram_configured=telegram, ego_enabled=ego)
+def _status(
+    *, floor_met: bool, telegram: bool, ego: bool, onboarded: bool = True
+) -> ReadinessStatus:
+    return ReadinessStatus(
+        floor=_floor(floor_met),
+        telegram_configured=telegram,
+        ego_enabled=ego,
+        onboarded=onboarded,
+    )
 
 
 # ── Tier truth table (the cumulative gate logic) ───────────────────────────────
@@ -68,6 +75,14 @@ def test_ego_without_telegram_does_not_reach_tier3():
     assert _status(floor_met=True, telegram=False, ego=True).tier == 1
 
 
+def test_not_onboarded_caps_at_tier2():
+    # Ego enabled but bootstrap marker absent → the ego cadence can't run, so T3 is
+    # NOT reached (avoids "onboarded: false" alongside Autonomous).
+    assert _status(floor_met=True, telegram=True, ego=True, onboarded=False).tier == 2
+    # With the marker present, the same config reaches T3.
+    assert _status(floor_met=True, telegram=True, ego=True, onboarded=True).tier == 3
+
+
 def test_tier_names_cover_every_tier():
     names = {
         _status(floor_met=fm, telegram=tg, ego=eg).tier_name
@@ -89,8 +104,8 @@ def test_as_dict_shape_excludes_floor_legs():
         "telegram_configured": True,
         "ego_enabled": True,
     }
-    # Floor legs are emitted by the route, NOT duplicated here.
-    assert "floor_met" not in d and "cc_oauth" not in d
+    # Floor legs AND `onboarded` are emitted by the route, NOT duplicated here.
+    assert "floor_met" not in d and "cc_oauth" not in d and "onboarded" not in d
 
 
 # ── T2 gate: _telegram_reach_configured (raw-text, adapter-manual semantics) ────
@@ -231,11 +246,17 @@ def floor_met(monkeypatch):
     # embedding leg is _has_any(secrets, EMBEDDING_KEY_NAMES) — supply a key below.
 
 
-def test_compute_readiness_threads_secrets_text_and_ego(floor_met):
+def test_compute_readiness_threads_secrets_text_ego_and_onboarded(floor_met):
     secrets = {"API_KEY_DEEPINFRA": "di-xxx"}  # satisfies the floor embedding leg
     tg = "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345\n"
-    assert compute_readiness(secrets=secrets, secrets_text=tg, ego_enabled=False).tier == 2
-    assert compute_readiness(secrets=secrets, secrets_text=tg, ego_enabled=True).tier == 3
+    base = dict(secrets=secrets, secrets_text=tg, onboarded=True)
+    assert compute_readiness(**base, ego_enabled=False).tier == 2
+    assert compute_readiness(**base, ego_enabled=True).tier == 3
+    # Ego enabled but NOT onboarded (marker absent) → capped at T2.
+    assert (
+        compute_readiness(secrets=secrets, secrets_text=tg, ego_enabled=True, onboarded=False).tier
+        == 2
+    )
 
 
 def test_compute_readiness_reads_file_when_text_omitted(floor_met, tmp_path, monkeypatch):
@@ -243,7 +264,7 @@ def test_compute_readiness_reads_file_when_text_omitted(floor_met, tmp_path, mon
     secrets_file = tmp_path / "secrets.env"
     secrets_file.write_text("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345\n")
     monkeypatch.setattr(readiness_mod, "secrets_path", lambda: secrets_file)
-    r = compute_readiness(secrets={"API_KEY_DEEPINFRA": "d"}, ego_enabled=False)
+    r = compute_readiness(secrets={"API_KEY_DEEPINFRA": "d"}, ego_enabled=False, onboarded=True)
     assert r.telegram_configured is True
     assert r.tier == 2
 
@@ -251,7 +272,7 @@ def test_compute_readiness_reads_file_when_text_omitted(floor_met, tmp_path, mon
 def test_compute_readiness_floor_reuse_parity(floor_met):
     # readiness.floor must BE the floor's own computation (no drift).
     secrets = {"API_KEY_DEEPINFRA": "di-xxx"}
-    r = compute_readiness(secrets=secrets, secrets_text="", ego_enabled=False)
+    r = compute_readiness(secrets=secrets, secrets_text="", ego_enabled=False, onboarded=True)
     assert r.floor.as_dict() == floor_mod.compute_floor(secrets=secrets).as_dict()
     assert r.floor.floor_met is True
 
@@ -261,10 +282,14 @@ def test_compute_readiness_floor_unmet_is_tier0(monkeypatch):
     # telegram + ego "configured".
     monkeypatch.setattr(floor_mod, "cc_oauth_present", lambda: False)
     tg = "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345\n"
-    assert compute_readiness(secrets={}, secrets_text=tg, ego_enabled=True).tier == 0
+    assert (
+        compute_readiness(secrets={}, secrets_text=tg, ego_enabled=True, onboarded=True).tier == 0
+    )
 
 
 def test_compute_readiness_ego_flag_is_coerced_bool(floor_met):
     tg = "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\n"
-    r = compute_readiness(secrets={"API_KEY_DEEPINFRA": "d"}, secrets_text=tg, ego_enabled=1)
+    r = compute_readiness(
+        secrets={"API_KEY_DEEPINFRA": "d"}, secrets_text=tg, ego_enabled=1, onboarded=True
+    )
     assert r.ego_enabled is True

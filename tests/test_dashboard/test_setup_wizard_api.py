@@ -179,16 +179,25 @@ def test_setup_status_token_without_allowed_users_stays_tier1(wiz):
     assert body["tier"] == 1
 
 
-def test_setup_status_tier3_autonomous_when_ego_enabled(wiz):
-    # Floor + telegram + ego loop enabled → Autonomous (T3).
+def test_setup_status_tier3_autonomous_needs_ego_and_marker(wiz):
+    # Floor + telegram + ego loop enabled + bootstrap marker → Autonomous (T3).
     wiz["secrets"].write_text(
         _functional_secrets() + "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345\n"
     )
     wiz["monkeypatch"].setattr(
         wiz["ego_config"], "load_ego_config", lambda *a, **k: SimpleNamespace(enabled=True)
     )
+    # Without the setup-complete marker the ego cadence can't run → capped at T2,
+    # and `onboarded` must not be True alongside an Autonomous tier.
     body = wiz["client"].get("/api/genesis/setup-status").get_json()
     assert body["ego_enabled"] is True
+    assert body["onboarded"] is False
+    assert body["tier"] == 2
+
+    # With the marker present, the same config reaches Autonomous.
+    wiz["marker"].write_text("2026-08-06\n")
+    body = wiz["client"].get("/api/genesis/setup-status").get_json()
+    assert body["onboarded"] is True
     assert body["tier"] == 3
     assert body["tier_name"] == "Autonomous"
 
