@@ -122,10 +122,9 @@ def chunk_messages(
 ) -> list[list[ConversationMessage]]:
     """Split messages into chunks for extraction.
 
-    Each chunk contains up to ``chunk_size`` messages.  Chunks preserve
-    message order and never split a user+assistant pair across chunks
-    (best effort — if the last message in a chunk is a user message,
-    the next assistant message starts the next chunk).
+    Each chunk contains up to ``chunk_size`` messages. Messages are split
+    into consecutive chunks of up to ``chunk_size`` while preserving their
+    original order.
     """
     if not messages:
         return []
