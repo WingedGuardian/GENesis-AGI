@@ -3,11 +3,10 @@ activity on the owner's repos.
 
 Runs every ~2h from the surplus scheduler. It answers one question with `gh`
 calls and no LLM: did a real, external human (not the owner, not a bot/org) act
-on one of the owner's flagship repos — open a PR/issue, comment, or post a
-discussion? Genuine external activity is recorded as a ``github_account_activity``
-observation (the 6h digest campaign consumes these); a FIRST-TIME external
-contributor (or, in C2a-2, a security advisory / account notice) additionally
-pushes an immediate Telegram ping.
+on one of the owner's flagship repos — open a PR/issue, comment, post a
+discussion, or reply on one? Genuine external activity is recorded as a
+``github_account_activity`` observation (the 6h digest campaign consumes these);
+a FIRST-TIME external contributor additionally pushes an immediate Telegram ping.
 
 Design notes:
 - **SIBLING to ``ReconGatherer``**, not a method on it — that class has a
@@ -18,9 +17,20 @@ Design notes:
 - **run_gh_checked** (not ``run_gh``) so a failed poll is distinguishable from an
   empty one — a rate-limited poll must NOT advance the cursor (or a contributor
   who acted during the failed window is lost forever).
+- **created_at, not updated_at.** GitHub's ``?since=`` filters on *updated_at*, so
+  an old issue that is merely edited/closed/labeled re-surfaces and would be
+  mis-recorded as new activity by its ORIGINAL author. We key everything on the
+  immutable ``created_at`` and filter ``cursor < created_at <= watermark`` — so
+  only genuine new contributions count, each with the correct actor.
+- **Watermark cursor.** ``wm`` is captured BEFORE polling; the cursor advances to
+  ``wm`` (not the newest event's ts), so an event created mid-poll — after one
+  feed's request but before another's — is never skipped (it re-fetches next
+  tick; ``since`` is exclusive and event-dedup makes the overlap a no-op).
 - **State:** per-repo cursor in a home-anchored JSON sidecar (mutable,
-  must-never-expire — the ``pr_watch`` precedent); event-dedup + first-time via
-  the observation-hash primitive (no new table).
+  must-never-expire — the ``pr_watch`` precedent); event-dedup + first-contact via
+  the observation-hash primitive (no new table). A non-delivered first-time ping
+  is held in a ``github_ping_pending`` marker and retried each tick until it
+  lands, so a failed delivery never silently burns the first-contact signal.
 - **Modes** (``github_steward_config``): ``off`` / ``observe`` (record, never
   ping — first-deploy default, seeds the seen-actor set) / ``live`` (ping).
 """
@@ -40,15 +50,32 @@ import aiosqlite
 from genesis.db.crud import observations
 from genesis.env import genesis_home
 from genesis.recon import github_steward_config as steward_cfg
-from genesis.recon.gh_cli import run_gh, run_gh_checked
+from genesis.recon.gh_cli import run_gh_checked
 
 logger = logging.getLogger(__name__)
 
 _SOURCE = "recon"
 _ACTIVITY_TYPE = "github_account_activity"
 _ACTOR_SEEN_TYPE = "github_actor_seen"
+_PENDING_TYPE = "github_ping_pending"
 _GH_TIMEOUT = 20
 _SIDECAR_VERSION = 1
+
+
+def _now_z() -> str:
+    """UTC now as a ``Z``-suffixed second-precision ISO timestamp — the same
+    shape GitHub returns, so cursor/created_at lexical compares are chronological.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _norm_ts(v: str) -> str:
+    """Normalize a stored timestamp to ``Z`` form. Legacy cursors were written
+    via ``isoformat()`` (``+00:00`` suffix), which sorts WRONG against GitHub's
+    ``Z`` timestamps (``'Z' > '+'``); normalize so comparisons stay correct."""
+    if v.endswith("+00:00"):
+        return v[:-6] + "Z"
+    return v
 
 
 @dataclass(frozen=True)
@@ -67,13 +94,13 @@ class ActivityResult:
 @dataclass(frozen=True)
 class ActivityEvent:
     repo: str
-    kind: str  # "pr" | "issue" | "comment" | "discussion"
+    kind: str  # "pr" | "issue" | "comment" | "discussion" | "discussion_comment"
     node_id: str
     actor: str
     number: int | None
     title: str
     url: str
-    updated_at: str
+    created_at: str
 
 
 def _event_hash(repo: str, kind: str, node_id: str) -> str:
@@ -82,6 +109,13 @@ def _event_hash(repo: str, kind: str, node_id: str) -> str:
 
 def _actor_hash(login: str) -> str:
     return hashlib.sha256(f"actor:{login.lower()}".encode()).hexdigest()[:32]
+
+
+def _pending_hash(login: str) -> str:
+    """Hash namespace for the retry marker — DISTINCT from ``_actor_hash`` so a
+    still-pending actor is never mistaken for an already-seen one (a shared hash
+    would make the first-contact check treat "ping owed" as "already told")."""
+    return hashlib.sha256(f"pending:{login.lower()}".encode()).hexdigest()[:32]
 
 
 class AccountActivityMonitor:
@@ -114,7 +148,7 @@ class AccountActivityMonitor:
             data = json.loads(path.read_text())
             if isinstance(data, dict):
                 cur = data.get("cursors", {})
-                return {k: v for k, v in cur.items() if isinstance(v, str)}
+                return {k: _norm_ts(v) for k, v in cur.items() if isinstance(v, str)}
         except FileNotFoundError:
             return {}
         except Exception:
@@ -180,22 +214,28 @@ class AccountActivityMonitor:
                 break
         return selected
 
-    async def _is_automation(self, login: str, denylist: set[str]) -> bool:
-        """True for bots/orgs/denylisted logins (cached per login)."""
+    async def _is_automation(self, login: str, denylist: set[str]) -> bool | None:
+        """True for bots/orgs/denylisted logins, False for confirmed humans, or
+        None when the human/bot verdict can't be resolved (the ``users/{login}``
+        lookup failed). The caller must NOT drop a None-verdict event — it holds
+        the cursor so a transient API failure never loses a possible human. Only
+        confirmed verdicts are cached (per login); an unresolved lookup retries
+        next tick."""
         key = login.lower()
         if key in self._automation_cache:
             return self._automation_cache[key]
-        verdict = False
         if login.endswith("[bot]") or key in denylist:
-            verdict = True
-        else:
-            out = await run_gh("gh", "api", f"users/{login}", "--jq", ".type", timeout=_GH_TIMEOUT)
-            # Unresolved (empty on error) → treat as automation-unknown → NOT a
-            # confirmed human, so we don't ping; recorded as observation only.
-            verdict = out.strip() in ("Bot", "Organization")
-            if not out.strip():
-                # Don't cache an unresolved lookup — retry next sighting.
-                return True
+            self._automation_cache[key] = True
+            return True
+        # run_gh_checked (not run_gh) so a FAILED lookup is distinguishable from a
+        # resolved-but-non-bot type — a rate-limited/timed-out classification must
+        # not masquerade as "confirmed automation" and silently drop the event.
+        ok, out = await run_gh_checked(
+            "gh", "api", f"users/{login}", "--jq", ".type", timeout=_GH_TIMEOUT
+        )
+        if not ok or not out.strip():
+            return None  # unresolved — do NOT cache, do NOT drop; retry next tick
+        verdict = out.strip() in ("Bot", "Organization")
         self._automation_cache[key] = verdict
         return verdict
 
@@ -219,12 +259,25 @@ class AccountActivityMonitor:
         denylist = {d.lower() for d in steward_cfg.str_list(cfg, "automation_denylist")}
         max_events = steward_cfg.knob_int(cfg, "max_events_per_tick")
         cursors = self._load_cursors()
-        now_iso = datetime.now(UTC).isoformat()
+        # Watermark: captured BEFORE any poll. Every cursor advances to this, so
+        # an event created between two feeds' requests can't be skipped.
+        wm = _now_z()
         result_errors = 0
         new_events = 0
         pinged = 0
         baselined = 0
         details: list[str] = []
+
+        # Deliver any owed retry pings first (live only) — actor-global, so this
+        # runs independent of which repo produced them.
+        if mode == "live":
+            try:
+                redelivered = await self._drain_pending(mode)
+                if redelivered:
+                    pinged += redelivered
+                    details.append(f"retry: delivered {redelivered} owed ping(s)")
+            except Exception:
+                logger.warning("github steward: pending-drain failed", exc_info=True)
 
         for repo in repos:
             since = cursors.get(repo)
@@ -237,33 +290,45 @@ class AccountActivityMonitor:
                 continue
 
             # Per-repo first sight (no cursor yet) → baseline SILENTLY: seed
-            # seen-actors, no records/pings, cursor := now. Per-repo, NOT global:
+            # seen-actors, no records/pings, cursor := wm. Per-repo, NOT global:
             # a repo newly entering the auto-select set / newly pinned must
             # baseline too, else its whole history replays as "new" (ping storm).
             if since is None:
                 seeded = await self._seed_actors(events)
-                cursors[repo] = now_iso
+                cursors[repo] = wm
                 baselined += 1
                 details.append(f"{repo}: baselined ({seeded} actors seeded)")
                 continue
 
-            # Process oldest-first, capped.
-            events.sort(key=lambda e: e.updated_at)
-            truncated = len(events) > max_events
+            # created_at watermark window: strictly after the cursor (exclusive,
+            # like GitHub's `since`), up to and including the watermark. This is
+            # what turns an edited-old-item (old created_at) into a no-op and
+            # defers a mid-poll event (created_at > wm) to the next tick.
+            window = [e for e in events if e.created_at and since < e.created_at <= wm]
+            window.sort(key=lambda e: e.created_at)
+            truncated = len(window) > max_events
             if truncated:
                 logger.warning(
-                    "github steward: %s had %d events (cap %d) — processing oldest "
-                    "%d; the rest are deferred to the next tick",
+                    "github steward: %s had %d in-window events (cap %d) — processing "
+                    "oldest %d; the rest are deferred to the next tick",
                     repo,
-                    len(events),
+                    len(window),
                     max_events,
                     max_events,
                 )
-            processed = events[:max_events]
+            processed = window[:max_events]
+            classify_failed = False
             for ev in processed:
                 if ev.actor.lower() == owner.lower():
                     continue
-                if await self._is_automation(ev.actor, denylist):
+                auto = await self._is_automation(ev.actor, denylist)
+                if auto is None:
+                    # Human/bot verdict unresolved (lookup failed) — NEVER drop a
+                    # possible human. Flag the repo so its cursor holds and this
+                    # event re-fetches next tick (dedup absorbs any overlap).
+                    classify_failed = True
+                    continue
+                if auto:
                     continue
                 did_ping = await self._record_event(ev, mode)
                 new_events += 1
@@ -271,24 +336,31 @@ class AccountActivityMonitor:
                     pinged += 1
                     details.append(f"PING {repo}#{ev.number} by {ev.actor} ({ev.kind})")
 
-            # Advance the cursor. GitHub's `since` is EXCLUSIVE ("updated after"),
-            # so the cursor must never move past — nor, on a truncation that
-            # splits a same-second group, even TO — an unprocessed event's ts (its
-            # deferred twin would then never satisfy `after` and be lost). Deferred
-            # events re-fetch next tick; dedup makes any overlap a no-op.
-            if processed:
-                if not truncated:
-                    cursors[repo] = processed[-1].updated_at or since
-                else:
-                    boundary = events[max_events].updated_at  # first deferred event
-                    safe = [
-                        e.updated_at
-                        for e in processed
-                        if e.updated_at and boundary and e.updated_at < boundary
-                    ]
-                    # If every processed event ties the boundary second, hold the
-                    # old cursor (re-fetch the window next tick — loud, never drops).
-                    cursors[repo] = safe[-1] if safe else since
+            # A repo with an unresolved classification holds its cursor entirely
+            # (like a poll error): re-poll next tick when the lookup may succeed.
+            # Already-recorded events dedup, already-pinged actors stay seen, so
+            # re-processing is idempotent.
+            if classify_failed:
+                details.append(f"{repo}: classify unresolved — cursor held")
+                continue
+
+            # Advance the cursor. No truncation → advance to the watermark (the
+            # whole window is done). Truncation → advance only to the newest
+            # PROCESSED created_at that is STRICTLY BEFORE the first deferred
+            # event's ts — because `since` is exclusive, landing ON a split
+            # same-second group would strand the deferred twin. If every
+            # processed event ties that boundary, hold the old cursor (re-fetch
+            # the window next tick — loud, never drops).
+            if not truncated:
+                cursors[repo] = wm
+            elif processed:
+                boundary = window[max_events].created_at
+                safe = [
+                    e.created_at
+                    for e in processed
+                    if e.created_at and boundary and e.created_at < boundary
+                ]
+                cursors[repo] = safe[-1] if safe else since
 
         self._save_cursors(cursors)
         return ActivityResult(
@@ -307,9 +379,11 @@ class AccountActivityMonitor:
         """Poll one repo's issues/PRs, comments, and discussions since the cursor.
 
         Returns (ok, events). ok=False if ANY sub-poll errored (so the caller
-        holds the cursor). Events are unsorted; the caller time-sorts + caps and
-        derives the next cursor from the events it actually processes. No
-        ``--paginate``: the cursor + 2h window bound each poll under one page.
+        holds the cursor). Events are unsorted and carry ``created_at``; the
+        caller applies the ``cursor < created_at <= wm`` window, sorts + caps.
+        Always ``--paginate``: the ``since`` window is usually one page, but a
+        stale cursor (post-downtime) or a busy repo must never silently drop a
+        second page of contributors.
         """
         events: list[ActivityEvent] = []
         since_q = f"since={since}&" if since else ""
@@ -318,12 +392,14 @@ class AccountActivityMonitor:
         ok, out = await run_gh_checked(
             "gh",
             "api",
-            f"repos/{repo}/issues?{since_q}state=all&per_page=100&sort=updated&direction=asc",
+            f"repos/{repo}/issues?{since_q}state=all&per_page=100&sort=updated&direction=desc",
+            "--paginate",
+            "--slurp",
             timeout=_GH_TIMEOUT,
         )
         if not ok:
             return False, []
-        for row in _parse_json_list(out):
+        for row in _parse_paged(out):
             actor = (row.get("user") or {}).get("login", "")
             if not actor:
                 continue
@@ -337,7 +413,7 @@ class AccountActivityMonitor:
                     number=row.get("number"),
                     title=(row.get("title") or "")[:120],
                     url=row.get("html_url", ""),
-                    updated_at=row.get("updated_at", ""),
+                    created_at=row.get("created_at", ""),
                 )
             )
 
@@ -345,12 +421,14 @@ class AccountActivityMonitor:
         ok, out = await run_gh_checked(
             "gh",
             "api",
-            f"repos/{repo}/issues/comments?{since_q}per_page=100&sort=updated&direction=asc",
+            f"repos/{repo}/issues/comments?{since_q}per_page=100&sort=updated&direction=desc",
+            "--paginate",
+            "--slurp",
             timeout=_GH_TIMEOUT,
         )
         if not ok:
             return False, []
-        for row in _parse_json_list(out):
+        for row in _parse_paged(out):
             actor = (row.get("user") or {}).get("login", "")
             if not actor:
                 continue
@@ -363,12 +441,12 @@ class AccountActivityMonitor:
                     number=_issue_num(row.get("issue_url", "")),
                     title=(row.get("body") or "")[:120],
                     url=row.get("html_url", ""),
-                    updated_at=row.get("updated_at", ""),
+                    created_at=row.get("created_at", ""),
                 )
             )
 
-        # 3. Discussions (GraphQL — REST doesn't cover them)
-        disc_ok, disc_events = await self._poll_discussions(repo, since)
+        # 3. Discussions + their comments (GraphQL — REST doesn't cover them)
+        disc_ok, disc_events = await self._poll_discussions(repo, since is None)
         if not disc_ok:
             return False, []
         events.extend(disc_events)
@@ -376,13 +454,21 @@ class AccountActivityMonitor:
         return True, events
 
     async def _poll_discussions(
-        self, repo: str, since: str | None
+        self, repo: str, baseline: bool
     ) -> tuple[bool, list[ActivityEvent]]:
+        """Discussions AND their comments, each as its own event with its own
+        ``createdAt`` + author. The caller applies the created_at window, so a
+        new external REPLY on an old discussion surfaces while an old discussion
+        merely bumped by an owner reply does not.
+        """
         owner, _, name = repo.partition("/")
+        first = 100 if baseline else 25
+        # Concatenate `first` (avoid f-string brace-escaping against GraphQL {}).
         query = (
             "query($o:String!,$n:String!){repository(owner:$o,name:$n){"
-            "discussions(first:25,orderBy:{field:UPDATED_AT,direction:DESC}){"
-            "nodes{number title updatedAt id author{login}}}}}"
+            "discussions(first:" + str(first) + ",orderBy:{field:UPDATED_AT,direction:DESC}){"
+            "nodes{number title createdAt url id author{login} "
+            "comments(last:20){nodes{id createdAt url author{login}}}}}}}"
         )
         ok, out = await run_gh_checked(
             "gh",
@@ -406,28 +492,42 @@ class AccountActivityMonitor:
                 .get("repository", {})
                 .get("discussions", {})
                 .get("nodes", [])
-            )
+            ) or []
         except Exception:
             return True, []  # malformed graphql payload — treat as no discussions
         for node in nodes:
-            updated = node.get("updatedAt", "")
-            if since and updated and updated <= since:
-                continue
-            actor = (node.get("author") or {}).get("login", "")
-            if not actor:
-                continue
-            events.append(
-                ActivityEvent(
-                    repo=repo,
-                    kind="discussion",
-                    node_id=str(node.get("id")),
-                    actor=actor,
-                    number=node.get("number"),
-                    title=(node.get("title") or "")[:120],
-                    url="",
-                    updated_at=updated,
+            number = node.get("number")
+            title = (node.get("title") or "")[:120]
+            d_actor = (node.get("author") or {}).get("login", "")
+            if d_actor:
+                events.append(
+                    ActivityEvent(
+                        repo=repo,
+                        kind="discussion",
+                        node_id=str(node.get("id")),
+                        actor=d_actor,
+                        number=number,
+                        title=title,
+                        url=node.get("url", ""),
+                        created_at=node.get("createdAt", ""),
+                    )
                 )
-            )
+            for c in (node.get("comments") or {}).get("nodes", []) or []:
+                c_actor = (c.get("author") or {}).get("login", "")
+                if not c_actor:
+                    continue
+                events.append(
+                    ActivityEvent(
+                        repo=repo,
+                        kind="discussion_comment",
+                        node_id=str(c.get("id")),
+                        actor=c_actor,
+                        number=number,
+                        title=title,
+                        url=c.get("url", ""),
+                        created_at=c.get("createdAt", ""),
+                    )
+                )
         return True, events
 
     async def _seed_actors(self, events: list[ActivityEvent]) -> int:
@@ -443,7 +543,7 @@ class AccountActivityMonitor:
                     type=_ACTOR_SEEN_TYPE,
                     content=f"seen:{ev.actor}",
                     priority="low",
-                    created_at=datetime.now(UTC).isoformat(),
+                    created_at=_now_z(),
                     content_hash=h,
                     skip_if_duplicate=True,
                 )
@@ -451,9 +551,11 @@ class AccountActivityMonitor:
         return seeded
 
     async def _record_event(self, ev: ActivityEvent, mode: str) -> bool:
-        """Record an external-activity observation; ping iff first-time + live.
+        """Record an external-activity observation; ping iff first-contact + live.
 
-        Returns True iff a ping was sent.
+        First-contact is collapsed to the ACTOR across both the seen-marker and
+        the pending-marker: a returning contributor OR a still-pending one never
+        re-pings. Returns True iff a ping was DELIVERED this call.
         """
         ev_hash = _event_hash(ev.repo, ev.kind, ev.node_id)
         # Dedup: already processed this exact event → nothing to do.
@@ -461,11 +563,22 @@ class AccountActivityMonitor:
             return False
 
         actor_h = _actor_hash(ev.actor)
-        first_time = not await observations.exists_by_hash(
-            self._db, source=_SOURCE, content_hash=actor_h
+        pending_h = _pending_hash(ev.actor)
+        # Contact owed unless we have already told them (seen) or currently have a
+        # retry queued for them (pending). The seen-marker is checked across ALL
+        # rows (permanent — a contributor never decays back to first-time, even
+        # after its 90d row is TTL-resolved). The pending-marker is checked
+        # UNRESOLVED-ONLY: once the daily TTL sweep resolves an abandoned (never
+        # delivered) pending row, it must STOP suppressing — otherwise a resolved
+        # row would read as "already contacted" forever and the contributor could
+        # never be pinged again. An expired pending re-arms first-contact.
+        seen = await observations.exists_by_hash(self._db, source=_SOURCE, content_hash=actor_h)
+        pending = await observations.exists_by_hash(
+            self._db, source=_SOURCE, content_hash=pending_h, unresolved_only=True
         )
+        first_time = not (seen or pending)
 
-        now = datetime.now(UTC).isoformat()
+        now = _now_z()
         summary = json.dumps(
             {
                 "repo": ev.repo,
@@ -477,6 +590,8 @@ class AccountActivityMonitor:
                 "first_time": first_time,
             }
         )
+        # Always record the activity observation — the durable record the 6h
+        # digest consumes (dedup by event hash).
         await observations.create(
             self._db,
             id=uuid.uuid4().hex,
@@ -488,37 +603,131 @@ class AccountActivityMonitor:
             content_hash=ev_hash,
             skip_if_duplicate=True,
         )
-        # Mark actor seen (first write wins; 90d TTL).
-        if first_time:
-            await observations.create(
-                self._db,
-                id=uuid.uuid4().hex,
-                source=_SOURCE,
-                type=_ACTOR_SEEN_TYPE,
-                content=f"seen:{ev.actor}",
-                priority="low",
-                created_at=now,
-                content_hash=actor_h,
-                skip_if_duplicate=True,
-            )
 
-        # Priority ping: a first-time external contributor. Only in live mode.
-        if first_time and mode == "live":
-            return await self._ping(ev)
+        if not first_time:
+            return False
+
+        if mode != "live":
+            # Observe: seed the seen-marker (no ping expected), so the eventual
+            # live flip does not treat this actor as first-time.
+            await self._mark_seen(ev.actor, now)
+            return False
+
+        # Live first-contact: attempt the ping.
+        if await self._ping(ev):
+            await self._mark_seen(ev.actor, now)
+            return True
+
+        # Not delivered — queue a durable retry (do NOT mark seen; the actor
+        # stays owed a ping until one lands). Keyed by actor, so a second event
+        # by the same actor while pending neither re-pings nor duplicates this.
+        await observations.create(
+            self._db,
+            id=uuid.uuid4().hex,
+            source=_SOURCE,
+            type=_PENDING_TYPE,
+            content=json.dumps(self._ping_payload(ev)),
+            priority="medium",
+            created_at=now,
+            content_hash=pending_h,
+            skip_if_duplicate=True,
+        )
         return False
 
+    async def _mark_seen(self, actor: str, now: str) -> None:
+        await observations.create(
+            self._db,
+            id=uuid.uuid4().hex,
+            source=_SOURCE,
+            type=_ACTOR_SEEN_TYPE,
+            content=f"seen:{actor}",
+            priority="low",
+            created_at=now,
+            content_hash=_actor_hash(actor),
+            skip_if_duplicate=True,
+        )
+
+    @staticmethod
+    def _ping_payload(ev: ActivityEvent) -> dict:
+        return {
+            "repo": ev.repo,
+            "kind": ev.kind,
+            "node_id": ev.node_id,
+            "actor": ev.actor,
+            "number": ev.number,
+            "title": ev.title,
+            "url": ev.url,
+        }
+
+    async def _drain_pending(self, mode: str) -> int:
+        """Re-attempt owed first-time pings. On delivery, mark the actor seen and
+        resolve the pending marker; otherwise leave it for the next tick. Returns
+        the count delivered this call."""
+        rows = await observations.query(
+            self._db, source=_SOURCE, type=_PENDING_TYPE, resolved=False, limit=100
+        )
+        delivered = 0
+        for row in rows:
+            try:
+                payload = json.loads(row["content"])
+            except Exception:
+                continue
+            actor = payload.get("actor", "")
+            if not actor:
+                continue
+            pending_h = _pending_hash(actor)
+            # Defensive: an actor seen via another path → resolve the stale
+            # pending WITHOUT a duplicate ping.
+            if await observations.exists_by_hash(
+                self._db, source=_SOURCE, content_hash=_actor_hash(actor)
+            ):
+                await observations.resolve_by_content_hash(
+                    self._db,
+                    source=_SOURCE,
+                    content_hash=pending_h,
+                    resolved_at=_now_z(),
+                    resolution_notes="actor already seen",
+                )
+                continue
+            ev = ActivityEvent(
+                repo=payload.get("repo", ""),
+                kind=payload.get("kind", ""),
+                node_id=str(payload.get("node_id", "")),
+                actor=actor,
+                number=payload.get("number"),
+                title=payload.get("title", ""),
+                url=payload.get("url", ""),
+                created_at="",
+            )
+            if await self._ping(ev):
+                await self._mark_seen(actor, _now_z())
+                await observations.resolve_by_content_hash(
+                    self._db,
+                    source=_SOURCE,
+                    content_hash=pending_h,
+                    resolved_at=_now_z(),
+                    resolution_notes="retry delivered",
+                )
+                delivered += 1
+            # else: leave the pending row unresolved — retried next tick.
+        return delivered
+
     async def _ping(self, ev: ActivityEvent) -> bool:
+        """Send the first-time-contributor ping. Returns True ONLY on a confirmed
+        DELIVERED result — a FAILED/IGNORED/REJECTED verdict (submit_raw does not
+        raise on these) must not count as delivered."""
         pipeline = self._pipeline()
         if pipeline is None:
             logger.warning("github steward: pipeline unavailable — cannot ping %s", ev.actor)
             return False
-        from genesis.outreach.types import OutreachCategory, OutreachRequest
+        from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
 
         verb = {
             "pr": "opened PR",
             "issue": "opened issue",
             "comment": "commented on",
             "discussion": "started discussion",
+            "discussion_comment": "replied on discussion",
         }.get(ev.kind, "acted on")
         num = f"#{ev.number}" if ev.number else ""
         text = f"👋 First-time contributor: {ev.actor} {verb} {ev.repo}{num}\n{ev.title}".strip()
@@ -535,12 +744,19 @@ class AccountActivityMonitor:
             verbatim=True,
         )
         try:
-            await pipeline.submit_raw(text, request)
-            logger.info("github steward: pinged first-time contributor %s on %s", ev.actor, ev.repo)
-            return True
+            result = await pipeline.submit_raw(text, request)
         except Exception:
             logger.error("github steward: ping failed for %s", ev.actor, exc_info=True)
             return False
+        if result is not None and result.status == OutreachStatus.DELIVERED:
+            logger.info("github steward: pinged first-time contributor %s on %s", ev.actor, ev.repo)
+            return True
+        logger.warning(
+            "github steward: ping to %s not delivered (status=%s) — will retry",
+            ev.actor,
+            getattr(result, "status", None),
+        )
+        return False
 
 
 # ── module helpers ────────────────────────────────────────────────────────
@@ -552,6 +768,27 @@ def _parse_json_list(out: str) -> list[dict]:
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def _parse_paged(out: str) -> list[dict]:
+    """Flatten a ``gh api --paginate --slurp`` payload — an outer array whose
+    elements are each page's array — into a flat list of rows. A plain (single,
+    non-slurped) array is returned as-is, so this is safe on both shapes."""
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    flat: list[dict] = []
+    for item in data:
+        if isinstance(item, list):
+            flat.extend(x for x in item if isinstance(x, dict))
+        elif isinstance(item, dict):
+            flat.append(item)
+    return flat
 
 
 def _issue_num(issue_url: str) -> int | None:
