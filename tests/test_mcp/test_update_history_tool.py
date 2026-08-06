@@ -210,3 +210,67 @@ class TestUpdateHistoryRecent:
         entry = result["entries"][0]
         assert entry["failure_reason"] == "health check timeout after 60s"
         assert entry["degraded_subsystems"] == "awareness,memory"
+
+
+# ── last_code_changing_update CRUD reader (Part B: stale-session visibility) ──
+
+
+class TestLastCodeChangingUpdate:
+    """The reader that ignores no-op ``update.sh`` re-runs (new_commit==old_commit)
+    so a session isn't shown stale against a deploy that changed no code."""
+
+    async def _read(self, db_path: Path):
+        from genesis.db.crud.update_history import last_code_changing_update
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            return await last_code_changing_update(db)
+
+    async def test_none_on_empty_table(self, tmp_path):
+        db_path = tmp_path / "genesis.db"
+        await _init_update_history(db_path)
+        assert await self._read(db_path) is None
+
+    async def test_picks_newest_code_changing(self, tmp_path):
+        db_path = tmp_path / "genesis.db"
+        await _init_update_history(db_path)
+        await _insert_entry(
+            db_path, id="a", old_commit="aaa0000", new_commit="bbb1111",
+            completed_at="2026-04-10T12:00:30+00:00",
+        )
+        await _insert_entry(
+            db_path, id="b", old_commit="bbb1111", new_commit="ccc2222",
+            completed_at="2026-04-11T12:00:30+00:00",
+        )
+        assert await self._read(db_path) == ("2026-04-11T12:00:30+00:00", "ccc2222")
+
+    async def test_skips_noop_rerun_even_if_newest(self, tmp_path):
+        # A newer success row that changed NO code (new==old) must not win.
+        db_path = tmp_path / "genesis.db"
+        await _init_update_history(db_path)
+        await _insert_entry(
+            db_path, id="real", old_commit="aaa0000", new_commit="bbb1111",
+            completed_at="2026-04-10T12:00:30+00:00",
+        )
+        await _insert_entry(
+            db_path, id="noop", old_commit="bbb1111", new_commit="bbb1111",
+            completed_at="2026-04-12T12:00:30+00:00",
+        )
+        assert await self._read(db_path) == ("2026-04-10T12:00:30+00:00", "bbb1111")
+
+    async def test_none_when_only_noop_rows(self, tmp_path):
+        db_path = tmp_path / "genesis.db"
+        await _init_update_history(db_path)
+        await _insert_entry(
+            db_path, id="noop", old_commit="bbb1111", new_commit="bbb1111",
+        )
+        assert await self._read(db_path) is None
+
+    async def test_skips_non_success_rows(self, tmp_path):
+        # A failed row that changed the target commit must not count as deployed.
+        db_path = tmp_path / "genesis.db"
+        await _init_update_history(db_path)
+        await _insert_entry(
+            db_path, id="fail", old_commit="aaa0000", new_commit="ddd3333",
+            status="failed", completed_at="2026-04-13T12:00:30+00:00",
+        )
+        assert await self._read(db_path) is None

@@ -109,8 +109,26 @@ async def _seed_charter_tables(db, *, with_rows: bool = False):
     await db.commit()
 
 
-def _slot(slot: str, pid: int, rss_mb: float = 512.0, status: str = "healthy") -> dict:
-    return {"slot": slot, "pid": pid, "rss_mb": rss_mb, "status": status}
+def _slot(
+    slot: str,
+    pid: int,
+    rss_mb: float = 512.0,
+    status: str = "healthy",
+    started_at: str | None = None,
+) -> dict:
+    return {
+        "slot": slot,
+        "pid": pid,
+        "rss_mb": rss_mb,
+        "status": status,
+        "started_at": started_at,
+    }
+
+
+# Staleness fixtures relative to _NOW (2026-07-14T12:00:00Z).
+_DEPLOY = ("2026-07-14T11:00:00+00:00", "abc1234")  # last code-changing deploy
+_STARTED_BEFORE = "2026-07-14T09:00:00+00:00"  # predates deploy → stale
+_STARTED_AFTER = "2026-07-14T11:30:00+00:00"  # after deploy → fresh
 
 
 # ── Route level ──────────────────────────────────────────────────────────────
@@ -140,7 +158,16 @@ async def test_slot_merge_by_pid(db):
     await _seed_session(db, sid="s1", pid=100)
     result = await _collect_detail(db, [_slot("1", 100), _slot("2", 200)], now=_NOW)
     (row,) = result["sessions"]
-    assert row["live"] == {"slot": "1", "pid": 100, "rss_mb": 512.0, "slot_status": "healthy"}
+    assert row["live"] == {
+        "slot": "1",
+        "pid": 100,
+        "rss_mb": 512.0,
+        "slot_status": "healthy",
+        "started_at": None,
+        "stale_code": False,
+        "stale_since": None,
+        "deploy_commit": None,
+    }
     assert row["flags"] == []
     assert [s["pid"] for s in result["unmatched_slots"]] == [200]
     assert result["stats"]["live_procs"] == 2
@@ -227,6 +254,7 @@ async def test_empty_state(db):
         "discrepant": 0,
         "completed_24h": 0,
         "failed_24h": 0,
+        "stale_code": 0,
     }
 
 
@@ -545,3 +573,88 @@ async def test_pulse_confirm_resolves_annotation_before_ledger_write(db, monkeyp
     payload, code = await _resolve_pulse(db, "a1", "confirmed")
     assert code == 200 and payload["item_absorbed"] is True
     assert order == ["confirmed"]  # annotation resolved BEFORE the ledger mutate
+
+
+# ── Part B: stale-code visibility (started_at vs last code-changing deploy) ───
+
+
+@pytest.mark.asyncio
+async def test_live_stale_code_flagged_when_started_before_deploy(db):
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    result = await _collect_detail(
+        db,
+        [_slot("1", 100, started_at=_STARTED_BEFORE)],
+        now=_NOW,
+        deploy=_DEPLOY,
+    )
+    live = result["sessions"][0]["live"]
+    assert live["stale_code"] is True
+    assert live["stale_since"] == _DEPLOY[0]
+    assert live["deploy_commit"] == "abc1234"
+    assert result["stats"]["stale_code"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_not_stale_when_started_after_deploy(db):
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    result = await _collect_detail(
+        db,
+        [_slot("1", 100, started_at=_STARTED_AFTER)],
+        now=_NOW,
+        deploy=_DEPLOY,
+    )
+    live = result["sessions"][0]["live"]
+    assert live["stale_code"] is False
+    assert live["stale_since"] is None
+    assert live["deploy_commit"] is None
+    assert result["stats"]["stale_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_no_deploy_means_never_stale(db):
+    # Empty-state / fresh install / only no-op re-runs → CRUD returns None →
+    # nothing is ever flagged even for an old session.
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    result = await _collect_detail(
+        db,
+        [_slot("1", 100, started_at=_STARTED_BEFORE)],
+        now=_NOW,
+        deploy=None,
+    )
+    assert result["sessions"][0]["live"]["stale_code"] is False
+    assert result["stats"]["stale_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_started_at_not_stale(db):
+    # /proc start time unreadable → started_at None → fail-open, never flagged.
+    await _seed_charter_tables(db)
+    await _seed_session(db, sid="s1", pid=100)
+    result = await _collect_detail(
+        db,
+        [_slot("1", 100, started_at=None)],
+        now=_NOW,
+        deploy=_DEPLOY,
+    )
+    assert result["sessions"][0]["live"]["stale_code"] is False
+
+
+@pytest.mark.asyncio
+async def test_unmatched_slot_carries_staleness(db):
+    # A live proc with no matching cc_sessions row must not be a blind spot.
+    await _seed_charter_tables(db)
+    result = await _collect_detail(
+        db,
+        [_slot("7", 700, started_at=_STARTED_BEFORE)],
+        now=_NOW,
+        deploy=_DEPLOY,
+    )
+    assert result["sessions"] == []
+    unmatched = result["unmatched_slots"]
+    assert len(unmatched) == 1
+    assert unmatched[0]["stale_code"] is True
+    assert unmatched[0]["deploy_commit"] == "abc1234"
+    assert result["stats"]["stale_code"] == 1

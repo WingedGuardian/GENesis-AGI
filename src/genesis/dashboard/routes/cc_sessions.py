@@ -44,17 +44,47 @@ _RECENT_WINDOW_SQL = (
 )
 
 
-def _age_seconds(iso_ts: str | None, now: datetime) -> float | None:
-    """Seconds since an ISO timestamp, treating naive values as UTC."""
+def _parse_iso_utc(iso_ts: str | None) -> datetime | None:
+    """Parse an ISO timestamp to a tz-aware UTC datetime (naive → UTC), or None."""
     if not iso_ts:
         return None
     try:
         ts = datetime.fromisoformat(iso_ts)
     except (ValueError, TypeError):
         return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
+
+
+def _age_seconds(iso_ts: str | None, now: datetime) -> float | None:
+    """Seconds since an ISO timestamp, treating naive values as UTC."""
+    ts = _parse_iso_utc(iso_ts)
+    if ts is None:
+        return None
     return round((now - ts).total_seconds(), 1)
+
+
+def _stale_against_deploy(
+    started_at: str | None, deploy: tuple[str, str] | None
+) -> tuple[bool, str | None, str | None]:
+    """Whether a live proc predates the last code-changing deploy.
+
+    ``deploy`` is ``(completed_at, new_commit)`` from
+    ``update_history.last_code_changing_update``, or None. Returns
+    ``(stale_code, stale_since, deploy_commit)``. Fail-open: an unknown start
+    time, no deploy, or an unparseable timestamp yields ``(False, None, None)``
+    — a passive indicator must never falsely flag. Compares by true instant so
+    mixed-offset ISO timestamps behave correctly.
+    """
+    if not deploy or not started_at:
+        return False, None, None
+    completed_at, new_commit = deploy
+    st = _parse_iso_utc(started_at)
+    ct = _parse_iso_utc(completed_at)
+    if st is None or ct is None:
+        return False, None, None
+    if st < ct:
+        return True, completed_at, (new_commit or None)
+    return False, None, None
 
 
 async def _charter_lookup(db, cc_ids: list[str]) -> tuple[dict[str, dict], bool]:
@@ -109,9 +139,19 @@ async def _charter_lookup(db, cc_ids: list[str]) -> tuple[dict[str, dict], bool]
     return charters, True
 
 
-async def _collect_detail(db, slots: list[dict], now: datetime | None = None) -> dict:
-    """Assemble the modal payload. `slots` is passed in so tests inject fakes
-    instead of scanning /proc."""
+async def _collect_detail(
+    db,
+    slots: list[dict],
+    now: datetime | None = None,
+    deploy: tuple[str, str] | None = None,
+) -> dict:
+    """Assemble the modal payload. `slots` and `deploy` are passed in so tests
+    inject fakes instead of scanning /proc or reading update_history.
+
+    `deploy` is `(completed_at, new_commit)` of the last CODE-CHANGING deploy
+    (or None); each live proc that started before it is flagged `stale_code`
+    (running pre-deploy MCP-tool code — restart to load the fix). Default None →
+    nothing stale (empty-state / fresh install)."""
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
 
@@ -135,18 +175,26 @@ async def _collect_detail(db, slots: list[dict], now: datetime | None = None) ->
         "discrepant": 0,
         "completed_24h": 0,
         "failed_24h": 0,
+        "stale_code": 0,
     }
     for row in rows:
         live = None
         pid = row.get("pid")
         if pid in slot_by_pid and pid not in consumed:
             s = slot_by_pid[pid]
+            stale, stale_since, deploy_commit = _stale_against_deploy(s.get("started_at"), deploy)
             live = {
                 "slot": s.get("slot"),
                 "pid": s.get("pid"),
                 "rss_mb": s.get("rss_mb"),
                 "slot_status": s.get("status"),
+                "started_at": s.get("started_at"),
+                "stale_code": stale,
+                "stale_since": stale_since,
+                "deploy_commit": deploy_commit,
             }
+            if stale:
+                stats["stale_code"] += 1
             consumed.add(pid)
 
         flags: list[str] = []
@@ -186,9 +234,20 @@ async def _collect_detail(db, slots: list[dict], now: datetime | None = None) ->
             }
         )
 
-    unmatched_slots = [
-        dict(s) for s in slots if s.get("pid") is not None and s["pid"] not in consumed
-    ]
+    # Unmatched live procs are still live procs — carry the same staleness so a
+    # slot with no matching DB row isn't a visibility blind spot.
+    unmatched_slots = []
+    for s in slots:
+        if s.get("pid") is None or s["pid"] in consumed:
+            continue
+        d = dict(s)
+        stale, stale_since, deploy_commit = _stale_against_deploy(s.get("started_at"), deploy)
+        d["stale_code"] = stale
+        d["stale_since"] = stale_since
+        d["deploy_commit"] = deploy_commit
+        if stale:
+            stats["stale_code"] += 1
+        unmatched_slots.append(d)
     stats["discrepant"] += len(unmatched_slots)
 
     return {
@@ -204,6 +263,7 @@ async def _collect_detail(db, slots: list[dict], now: datetime | None = None) ->
 async def cc_sessions_detail():
     """Per-session detail for the CC Sessions modal: DB rows × live procs ×
     charters, with discrepancy flags."""
+    from genesis.db.crud.update_history import last_code_changing_update
     from genesis.observability.cc_slots import enumerate_cc_slots
     from genesis.runtime import GenesisRuntime
 
@@ -212,7 +272,8 @@ async def cc_sessions_detail():
         return jsonify({"error": "not bootstrapped"}), 503
 
     slots = enumerate_cc_slots()
-    return jsonify(await _collect_detail(rt.db, slots))
+    deploy = await last_code_changing_update(rt.db)
+    return jsonify(await _collect_detail(rt.db, slots, deploy=deploy))
 
 
 # ── per-session cockpit detail (session-manager PR-4b) ──────────────────────

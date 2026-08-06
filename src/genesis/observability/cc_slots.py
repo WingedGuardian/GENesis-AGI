@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import UTC, datetime
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,51 @@ def read_proc_rss_mb(pid: int) -> float | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def _read_btime() -> int | None:
+    """Boot time (epoch seconds) from ``/proc/stat``'s ``btime`` line, or None.
+
+    Read fresh each call (not cached) so tests that repoint ``_PROC`` see their
+    own fake; the caller reads it at most once per slot on a cold dashboard
+    fetch, so the cost is trivial.
+    """
+    try:
+        with open(f"{_PROC}/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def read_proc_start_iso(pid: int) -> str | None:
+    """Wall-clock start time of a pid as an ISO-8601 UTC string, or None.
+
+    Computed as ``btime + starttime_ticks / CLK_TCK`` where ``starttime`` is
+    field 22 of ``/proc/<pid>/stat`` (clock ticks since boot). The ``comm``
+    field (2) is parenthesised and may itself contain spaces or ``)``, so the
+    line is split after the LAST ``)`` — everything after that is whitespace-
+    delimited starting at field 3 (state), making ``starttime`` index 19.
+    Verified to-the-second against ``ps lstart`` on this host. Returns None on
+    any read/parse failure or an implausible clock tick (fail-open: the caller
+    treats an unknown start time as "not stale", never falsely flagging).
+    """
+    btime = _read_btime()
+    if btime is None:
+        return None
+    try:
+        with open(f"{_PROC}/{pid}/stat") as f:
+            after = f.read().rsplit(")", 1)[1].split()
+        starttime_ticks = int(after[19])
+        clk = os.sysconf("SC_CLK_TCK")
+        if clk <= 0:
+            return None
+        wall = btime + starttime_ticks / clk
+        return datetime.fromtimestamp(wall, UTC).isoformat()
+    except (OSError, ValueError, IndexError, OverflowError):
+        return None
 
 
 def _slot_label(pid: int) -> str | None:
@@ -63,7 +109,14 @@ def slot_status(rss_mb: float) -> str:
 
 
 def enumerate_cc_slots() -> list[dict]:
-    """One row per CC slot: ``{slot, pid, rss_mb, status}``, sorted by slot.
+    """One row per CC slot: ``{slot, pid, rss_mb, status, started_at}``, sorted by
+    slot.
+
+    ``started_at`` is the claude process's wall-clock start (ISO UTC, or None if
+    unreadable) — a faithful proxy for the code version of that session's MCP
+    subprocesses, which spawn with the parent and never reload (used by the
+    dashboard to flag sessions running pre-deploy code). Additive key; existing
+    callers that ignore it are unaffected.
 
     Walks /proc for `claude` processes tagged with GENESIS_SLOT and reads each
     one's VmRSS. If two `claude` processes somehow share a slot, the larger RSS
@@ -93,7 +146,13 @@ def enumerate_cc_slots() -> list[dict]:
             continue
         prev = by_slot.get(label)
         if prev is None or rss > prev["rss_mb"]:
-            by_slot[label] = {"slot": label, "pid": pid, "rss_mb": rss, "status": slot_status(rss)}
+            by_slot[label] = {
+                "slot": label,
+                "pid": pid,
+                "rss_mb": rss,
+                "status": slot_status(rss),
+                "started_at": read_proc_start_iso(pid),
+            }
     # Numeric-aware sort so "10" follows "9" (labels are numeric strings today);
     # any non-numeric label sorts last.
     return sorted(
