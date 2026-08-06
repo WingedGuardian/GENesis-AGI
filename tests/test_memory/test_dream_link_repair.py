@@ -112,11 +112,16 @@ async def test_dry_run_reports_but_no_delete(phase_kwargs):
 NOW = "2026-08-05T00:00:00+00:00"
 
 
-async def _meta(db, mid, *, deprecated=0, run_id=None, created_at="2026-01-01T00:00:00+00:00"):
+OLD = "2020-01-01T00:00:00+00:00"  # well past the 30d window
+RECENT = "2026-08-01T00:00:00+00:00"  # 4 days before NOW → within the window
+
+
+async def _meta(db, mid, *, deprecated=0, run_id=None, deprecated_at=None):
     await db.execute(
-        "INSERT INTO memory_metadata (memory_id, created_at, deprecated, dream_cycle_run_id) "
-        "VALUES (?, ?, ?, ?)",
-        (mid, created_at, deprecated, run_id),
+        "INSERT INTO memory_metadata "
+        "(memory_id, created_at, deprecated, dream_cycle_run_id, deprecated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (mid, "2026-01-01T00:00:00+00:00", deprecated, run_id, deprecated_at),
     )
     await db.commit()
 
@@ -128,33 +133,38 @@ async def _link(db, s, t, lt="supports"):
     await db.commit()
 
 
-async def test_prune_removes_aged_deprecated_edges_keeps_extends(phase_kwargs):
-    """Edges of a long-deprecated dream original are pruned — except the
-    synthesis->original 'extends' provenance link, which survives."""
+async def test_prune_removes_aged_edges_keeps_only_synthesis_provenance(phase_kwargs):
+    """A long-deprecated original's edges are pruned — including an ORDINARY
+    ``extends`` edge (auto_link uses extends for high similarity) — but the
+    synthesis->original provenance ``extends`` survives."""
     db = phase_kwargs["db"]
-    await _meta(db, "orig", deprecated=1, run_id="R")
-    # synthesis stamped synthesis:R, created long ago → aged past the 30d window
-    await _meta(db, "synth", run_id="synthesis:R", created_at="2020-01-01T00:00:00+00:00")
+    await _meta(db, "orig", deprecated=1, run_id="R", deprecated_at=OLD)
+    await _meta(db, "synth", run_id="synthesis:R")  # the live synthesis
     await _meta(db, "neighbor")
-    await _link(db, "orig", "neighbor", "supports")  # stale → pruned
+    await _meta(db, "other")
+    await _link(db, "orig", "neighbor", "supports")  # ordinary → pruned
     await _link(db, "synth", "orig", "extends")  # provenance → kept
+    await _link(db, "orig", "other", "extends")  # ORDINARY extends → pruned (P2)
 
     report = await run_link_repair(**phase_kwargs, now=NOW)
 
-    assert report["deprecated_edges_removed"] >= 1
+    assert report["deprecated_edges_removed"] == 2  # supports + ordinary extends
     from genesis.db.crud import memory_links
 
-    types = {link["link_type"] for link in await memory_links.get_links_for(db, "orig")}
-    assert "supports" not in types
-    assert "extends" in types
+    remaining = {
+        (link["source_id"], link["target_id"], link["link_type"])
+        for link in await memory_links.get_links_for(db, "orig")
+    }
+    assert ("synth", "orig", "extends") in remaining  # provenance survives
+    assert ("orig", "neighbor", "supports") not in remaining
+    assert ("orig", "other", "extends") not in remaining  # ordinary extends pruned
 
 
 async def test_prune_keeps_young_deprecated_edges(phase_kwargs):
-    """A recently-deprecated original (synthesis within the window) is NOT pruned
-    — rollback must still be able to restore it with its edges."""
+    """A recently-deprecated original (within the window) is NOT pruned —
+    rollback must still be able to restore it with its edges."""
     db = phase_kwargs["db"]
-    await _meta(db, "orig", deprecated=1, run_id="R")
-    await _meta(db, "synth", run_id="synthesis:R", created_at="2026-08-01T00:00:00+00:00")  # 4d old
+    await _meta(db, "orig", deprecated=1, run_id="R", deprecated_at=RECENT)
     await _meta(db, "neighbor")
     await _link(db, "orig", "neighbor", "supports")
 
@@ -163,11 +173,11 @@ async def test_prune_keeps_young_deprecated_edges(phase_kwargs):
     assert report["deprecated_edges_removed"] == 0
 
 
-async def test_prune_ignores_deprecated_without_run_id(phase_kwargs):
-    """Entity-adjudication-style deprecations (deprecated=1, run_id NULL) are not
-    dream merges — never pruned by this phase (status quo)."""
+async def test_prune_ignores_deprecated_without_deprecated_at(phase_kwargs):
+    """Non-dream deprecations (deprecated=1 but deprecated_at NULL, e.g. entity
+    adjudication) are never pruned by this phase."""
     db = phase_kwargs["db"]
-    await _meta(db, "ea", deprecated=1, run_id=None)
+    await _meta(db, "ea", deprecated=1, run_id=None, deprecated_at=None)
     await _meta(db, "neighbor")
     await _link(db, "ea", "neighbor", "supports")
 
@@ -179,8 +189,7 @@ async def test_prune_ignores_deprecated_without_run_id(phase_kwargs):
 async def test_prune_dry_run_reports_without_deleting(phase_kwargs):
     db = phase_kwargs["db"]
     phase_kwargs["dry_run"] = True
-    await _meta(db, "orig", deprecated=1, run_id="R")
-    await _meta(db, "synth", run_id="synthesis:R", created_at="2020-01-01T00:00:00+00:00")
+    await _meta(db, "orig", deprecated=1, run_id="R", deprecated_at=OLD)
     await _meta(db, "neighbor")
     await _link(db, "orig", "neighbor", "supports")
 

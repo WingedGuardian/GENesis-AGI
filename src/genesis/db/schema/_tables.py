@@ -1193,6 +1193,10 @@ TABLES = {
             source_subsystem TEXT,
             deprecated       INTEGER NOT NULL DEFAULT 0,
             dream_cycle_run_id TEXT,
+            -- When the dream merge soft-deleted this memory (ISO). The authoritative
+            -- deprecation time — used to age out the original's stale links after the
+            -- rollback window. NULL for non-dream deprecations (e.g. entity adjudication).
+            deprecated_at    TEXT,
             origin_class     TEXT,
             -- GROUNDWORK(voice-graduation-w2): provenance/trust columns for
             -- graduated overheard content — written by the W2 policy drainer,

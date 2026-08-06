@@ -164,9 +164,12 @@ each original's external `memory_links` edges onto the synthesis
 original; COPY not MOVE keeps rollback reversible (it hard-deletes the
 synthesis's links). The originals' now-stale edges are aged out by
 `dream_link_repair`'s second pass at `deprecated_edge_prune_days` (config,
-default 30 — must exceed the rollback review window), EXCEPT `extends`
-provenance links. Aged via the `synthesis:{run_id}` stamp join (no
-`deprecated_at` column).
+default 30 — must exceed the rollback review window), preserving ONLY the
+synthesis→original provenance `extends` edge (ordinary `extends` from
+`auto_link` is pruned). Age comes from the authoritative `deprecated_at`
+column stamped at merge (the synthesis's `created_at` is unreliable —
+`store()`'s exact-dedup can return an old pre-existing memory); non-dream
+deprecations leave `deprecated_at` NULL and are never pruned.
 
 **Do not touch:** the drain's shadow hardwiring; the dry_run-independent link
 write. **Trap:** with no embedding provider registered, memory silently

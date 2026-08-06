@@ -106,6 +106,28 @@ async def run_link_repair(
     return report
 
 
+# An edge of an aged original is KEPT only if it is the synthesis->original
+# provenance link: link_type='extends' AND the source is a synthesis (stamped
+# dream_cycle_run_id LIKE 'synthesis:%'). Everything else — ordinary supports,
+# and ORDINARY extends (auto_link assigns 'extends' at similarity >= 0.90, so the
+# type alone is not provenance) — is pruned. ``?`` binds the aged original id
+# (both as source and target of the candidate edge).
+_PRUNE_EDGES_SQL = (
+    "DELETE FROM memory_links "
+    "WHERE (source_id = ? OR target_id = ?) "
+    "  AND NOT (link_type = 'extends' AND target_id = ? AND source_id IN ("
+    "      SELECT memory_id FROM memory_metadata "
+    "      WHERE dream_cycle_run_id LIKE 'synthesis:%'))"
+)
+_COUNT_PRUNABLE_SQL = (
+    "SELECT COUNT(*) FROM memory_links "
+    "WHERE (source_id = ? OR target_id = ?) "
+    "  AND NOT (link_type = 'extends' AND target_id = ? AND source_id IN ("
+    "      SELECT memory_id FROM memory_metadata "
+    "      WHERE dream_cycle_run_id LIKE 'synthesis:%'))"
+)
+
+
 async def _prune_aged_deprecated_edges(
     db: aiosqlite.Connection,
     report: dict[str, Any],
@@ -113,15 +135,16 @@ async def _prune_aged_deprecated_edges(
     dry_run: bool,
     now: str | None,
 ) -> bool:
-    """Prune non-``extends`` edges of dream-deprecated originals aged past the
-    configured window. Returns True if any edge was deleted (graph dirtied).
+    """Prune a dream-deprecated original's stale edges once it has been
+    deprecated longer than the configured window. Returns True if any edge was
+    deleted (graph dirtied).
 
-    Age is derived from the synthesis stamp — dream deprecation carries no
-    ``deprecated_at`` column, but the synthesis of run ``R`` is stamped
-    ``dream_cycle_run_id = 'synthesis:R'`` while its originals carry ``R``; the
-    synthesis row's ``created_at`` is the deprecation time. Originals with no
-    ``dream_cycle_run_id`` (e.g. entity-adjudication deprecations) are never
-    touched here — nothing prunes those today.
+    Age comes from the authoritative ``deprecated_at`` timestamp stamped at merge
+    (NOT the synthesis's ``created_at``, which ``store()``'s exact-dedup can make
+    an old pre-existing memory's). Only dream deprecations carry ``deprecated_at``
+    — non-dream deprecations (e.g. entity adjudication) leave it NULL and are
+    never touched here. The synthesis->original provenance ``extends`` edge is
+    preserved; every other edge (including ordinary ``extends``) is pruned.
     """
     from genesis.memory import dream_shield_config
 
@@ -132,12 +155,8 @@ async def _prune_aged_deprecated_edges(
     cutoff = (now_dt - timedelta(days=prune_days)).isoformat()
 
     rows = await db.execute_fetchall(
-        "SELECT dep.memory_id FROM memory_metadata dep "
-        "JOIN memory_metadata syn "
-        "  ON syn.dream_cycle_run_id = 'synthesis:' || dep.dream_cycle_run_id "
-        "WHERE dep.deprecated = 1 AND dep.dream_cycle_run_id IS NOT NULL "
-        "GROUP BY dep.memory_id "
-        "HAVING MIN(syn.created_at) < ?",
+        "SELECT memory_id FROM memory_metadata "
+        "WHERE deprecated = 1 AND deprecated_at IS NOT NULL AND deprecated_at < ?",
         (cutoff,),
     )
     aged_ids = [r[0] for r in rows]
@@ -146,25 +165,16 @@ async def _prune_aged_deprecated_edges(
         return False
 
     if dry_run:
-        # Count the non-extends edges that WOULD be removed.
         would = 0
         for mid in aged_ids:
-            rows = await db.execute_fetchall(
-                "SELECT COUNT(*) FROM memory_links "
-                "WHERE (source_id = ? OR target_id = ?) AND link_type != 'extends'",
-                (mid, mid),
-            )
+            rows = await db.execute_fetchall(_COUNT_PRUNABLE_SQL, (mid, mid, mid))
             would += rows[0][0]
         report["would_remove_deprecated"] = would
         return False
 
     removed = 0
     for mid in aged_ids:
-        cursor = await db.execute(
-            "DELETE FROM memory_links "
-            "WHERE (source_id = ? OR target_id = ?) AND link_type != 'extends'",
-            (mid, mid),
-        )
+        cursor = await db.execute(_PRUNE_EDGES_SQL, (mid, mid, mid))
         removed += cursor.rowcount
     await db.commit()
     report["deprecated_edges_removed"] = removed

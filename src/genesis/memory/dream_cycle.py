@@ -1228,6 +1228,7 @@ async def _synthesize_and_deprecate(
 
     # Deprecate originals
     deprecated_count = 0
+    deprecated_at = datetime.now(UTC).isoformat()
     for original_id in original_ids:
         try:
             # Qdrant: mark as deprecated
@@ -1240,11 +1241,13 @@ async def _synthesize_and_deprecate(
                     "synthesized_into": new_memory_id,
                 },
             )
-            # SQLite: mark as deprecated
+            # SQLite: mark as deprecated. deprecated_at is the authoritative
+            # deprecation time for link aging — the synthesis's created_at is
+            # unreliable (store()'s exact-dedup can return an old memory).
             await db.execute(
                 "UPDATE memory_metadata SET deprecated = 1, "
-                "dream_cycle_run_id = ? WHERE memory_id = ?",
-                (run_id, original_id),
+                "dream_cycle_run_id = ?, deprecated_at = ? WHERE memory_id = ?",
+                (run_id, deprecated_at, original_id),
             )
             deprecated_count += 1
         except Exception:
@@ -1350,7 +1353,7 @@ async def rollback(
         try:
             await db.execute(
                 "UPDATE memory_metadata SET deprecated = 0, "
-                "dream_cycle_run_id = NULL WHERE memory_id = ?",
+                "dream_cycle_run_id = NULL, deprecated_at = NULL WHERE memory_id = ?",
                 (mid,),
             )
             update_payload(
