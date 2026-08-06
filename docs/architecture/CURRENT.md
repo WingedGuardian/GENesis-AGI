@@ -484,7 +484,7 @@ them.
 ```yaml subsystem-map
 entry: ego-self-model
 modules: [ego, identity, deliberation]
-verified: 7968d85a 2026-07-16
+verified: f6cb6d83 2026-08-05
 ```
 
 - **Two egos, both LIVE**: user ego (CEO, Opus, MCP profile `user_reflection`)
@@ -501,6 +501,28 @@ verified: 7968d85a 2026-07-16
   `_NEVER_DISPATCH_ACTION_TYPES` blocklist lives in `session.py`. Dispatches
   record `follow_ups` rows for accountability. `integrity.py` chain-verify is
   GROUNDWORK, explicitly NOT wired.
+- **Operate-vs-develop gate (2026-08-05)**: while
+  `EgoConfig.genesis_self_development_enabled` is False (roadmap default), the
+  COO's dev-artifact proposals (PR review, refactor, patch, schema work — even
+  read-only) are deterministically create-then-TABLED
+  (`session._flag_develop_scope` + the tabling loop in `_process_proposals`;
+  journal-resolved; dedup vs tabled twins so no per-cycle churn). Symptom-driven
+  diagnosis stays operate (escalation-only deliverable) — the realist rubric
+  (rule 8 + Rule 1) judges the fuzzy cases; markers stay near-zero-FP by design
+  (replay-verified over the full historical board). Flip the flag to unlock
+  self-development; delete flag + gate to remove.
+- **Pending cap is TOTAL across both egos** (15): `_process_proposals` counts
+  the global pending pool (informational rows excluded; develop-flagged
+  incoming excluded) and evicts global-oldest-unranked (24h guard). Evo-origin
+  rows are now cap-countable (deliberate).
+- **Revalidation cadence is live end-to-end**: `create_batch` stamps
+  `revalidate_at` (shared helper `config.next_revalidate_at`), migration 0077
+  backfilled pre-PR-6a pending rows, and reconcile reaffirm/revise RE-STAMP the
+  clock (a re-validated item leaves ⚠due). Genesis-ego dispatch/investigate
+  proposals get a default `expected_outputs` deliverable
+  (`~/.genesis/output/ego-reports/<id>.md`) when the ego omits one; both
+  dispatch-prompt paths render the required-files block
+  (`_required_outputs_block`).
 - **Goal provenance + additive autonomy (2026-07-16)**: `user_goals.origin`
   ('user' | 'genesis_ego', immutable after create — excluded from `update()`'s
   allow-list; CHECK-constrained; migration 0063). A `genesis_ego`-origin goal

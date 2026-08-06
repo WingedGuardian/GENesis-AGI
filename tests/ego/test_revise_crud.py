@@ -59,6 +59,24 @@ async def test_reaffirm_noop_on_non_pending(db):
     assert (await _row(db))["last_validated_at"] is None
 
 
+async def test_reaffirm_restamps_revalidate_at(db):
+    """A reaffirm IS a premise re-validation — the cadence clock advances,
+    so a just-reaffirmed item does not stay perpetually ⚠due."""
+    await _seed(db)
+    stamp = "2099-01-01T00:00:00+00:00"
+    assert await ego_crud.reaffirm_proposal(db, "p1", revalidate_at=stamp) is True
+    assert (await _row(db))["revalidate_at"] == stamp
+
+
+async def test_reaffirm_without_stamp_preserves_revalidate_at(db):
+    await _seed(db)
+    await db.execute(
+        "UPDATE ego_proposals SET revalidate_at = 'KEEP' WHERE id = 'p1'"
+    )
+    assert await ego_crud.reaffirm_proposal(db, "p1") is True
+    assert (await _row(db))["revalidate_at"] == "KEEP"
+
+
 # ── revise (happy path) ──────────────────────────────────────────────────
 
 
@@ -87,6 +105,21 @@ async def test_revise_bumps_version_and_recomputes_hash(db):
     assert row["last_validated_at"] is not None
     # action_type is immutable
     assert row["action_type"] == "investigate"
+
+
+async def test_revise_restamps_revalidate_at(db):
+    """A revise IS a premise re-validation — the cadence clock advances."""
+    await _seed(db)
+    stamp = "2099-06-01T00:00:00+00:00"
+    new_rev = await ego_crud.revise_proposal(
+        db,
+        "p1",
+        expected_revision=1,
+        content="sharpened content",
+        revalidate_at=stamp,
+    )
+    assert new_rev == 2
+    assert (await _row(db))["revalidate_at"] == stamp
 
 
 async def test_revise_writes_prior_values_to_audit(db):
