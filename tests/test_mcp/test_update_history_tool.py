@@ -257,6 +257,23 @@ class TestLastCodeChangingUpdate:
         )
         assert await self._read(db_path) == ("2026-04-10T12:00:30+00:00", "bbb1111")
 
+    async def test_manual_pull_activation_counts_as_code_changing(self, tmp_path):
+        # update.sh run AFTER a manual `git pull` records old==new (its own pull is
+        # a no-op) but the deployed commit advanced vs the PRIOR deploy — it must
+        # still count, else sessions running the older code go unflagged (Codex P2).
+        db_path = tmp_path / "genesis.db"
+        await _init_update_history(db_path)
+        await _insert_entry(
+            db_path, id="base", old_commit="xxx0000", new_commit="yyy1111",
+            completed_at="2026-04-10T12:00:30+00:00",
+        )
+        await _insert_entry(
+            db_path, id="manual", old_commit="zzz2222", new_commit="zzz2222",
+            completed_at="2026-04-11T12:00:30+00:00",
+        )
+        # zzz2222 != prior new (yyy1111) → code-changing despite old==new.
+        assert await self._read(db_path) == ("2026-04-11T12:00:30+00:00", "zzz2222")
+
     async def test_none_when_only_noop_rows(self, tmp_path):
         db_path = tmp_path / "genesis.db"
         await _init_update_history(db_path)
