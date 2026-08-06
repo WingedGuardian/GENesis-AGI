@@ -10,9 +10,9 @@ from genesis.util.jsonl import ConversationMessage, chunk_messages
 
 def _msgs(n: int) -> list[ConversationMessage]:
     return [
-        ConversationMessage(role="user" if i % 2 == 0 else "assistant",
-                            text=f"message {i}",
-                            line_number=i)
+        ConversationMessage(
+            role="user" if i % 2 == 0 else "assistant", text=f"message {i}", line_number=i
+        )
         for i in range(n)
     ]
 
