@@ -17,6 +17,7 @@ This processor:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -250,9 +251,10 @@ async def process_pending_observations(
     # Adopt crash-stranded .processing files before scanning: the finally-
     # restore below only covers files renamed by THIS run, so a mid-tick
     # crash would otherwise strand its renamed files forever.
-    _recover_stale_processing_files()
+    # Both are synchronous filesystem walks — keep them off the event loop.
+    await asyncio.to_thread(_recover_stale_processing_files)
 
-    obs_files = _find_observation_files()
+    obs_files = await asyncio.to_thread(_find_observation_files)
     if not obs_files:
         return result
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -352,7 +353,8 @@ async def infrastructure(
     try:
         from genesis.observability.cc_slots import enumerate_cc_slots
 
-        infra["cc_slots"] = enumerate_cc_slots()
+        # /proc scan is ~1s of sync syscalls — keep it off the event loop.
+        infra["cc_slots"] = await asyncio.to_thread(enumerate_cc_slots)
     except Exception:
         infra["cc_slots"] = []
 

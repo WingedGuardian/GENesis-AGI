@@ -12,7 +12,7 @@ The charter tables are created with inline DDL matching migration 0058
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from flask import Flask
@@ -162,6 +162,44 @@ def test_detail_503_when_not_bootstrapped(client):
 def test_route_registered_on_dashboard_blueprint(app):
     rules = {rule.rule for rule in app.url_map.iter_rules()}
     assert "/api/genesis/cc-sessions/detail" in rules
+
+
+async def test_detail_route_offloads_slot_enumeration(app, db, monkeypatch):
+    """MW-0 A2: the detail route's ~1s /proc enumeration runs OFF the event loop
+    (asyncio.to_thread), never inline on the request/server loop."""
+    import genesis.dashboard.routes.cc_sessions as mod
+    import genesis.observability.cc_slots as cc_slots_mod
+
+    await _seed_charter_tables(db)
+    _patch_spawn(monkeypatch, {})  # hermetic — never read the real ~/.genesis
+
+    monkeypatch.setattr("genesis.runtime.GenesisRuntime", MagicMock(instance=lambda: _mock_rt(db)))
+    # Deploy resolution is orthogonal to this offload — stub it out.
+    monkeypatch.setattr(
+        "genesis.db.crud.update_history.last_successful_update",
+        AsyncMock(return_value=None),
+    )
+    enum = MagicMock(return_value=[])
+    monkeypatch.setattr(cc_slots_mod, "enumerate_cc_slots", enum)
+
+    dispatched = []
+    real_to_thread = mod.asyncio.to_thread
+
+    async def spy(fn, *a, **k):
+        dispatched.append(fn)
+        return await real_to_thread(fn, *a, **k)
+
+    monkeypatch.setattr(mod.asyncio, "to_thread", spy)
+
+    # The blueprint decorator wraps async views in a run_until_complete sync
+    # shim; await the raw coroutine (__wrapped__) directly on the test's loop so
+    # the aiosqlite db stays on one loop.
+    raw_view = mod.cc_sessions_detail.__wrapped__
+    with app.test_request_context():
+        await raw_view()
+
+    assert enum in dispatched  # enumeration dispatched through to_thread
+    enum.assert_called_once()
 
 
 # ── Helper level (real db fixture, injected slots) ───────────────────────────

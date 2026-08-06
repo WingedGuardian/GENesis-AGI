@@ -1458,7 +1458,8 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
             enumerate_cc_slots,
         )
         if slots is None:
-            slots = enumerate_cc_slots()
+            # /proc scan is ~1s of sync syscalls — keep it off the event loop.
+            slots = await asyncio.to_thread(enumerate_cc_slots)
     except Exception:
         logger.debug("cc_slot memory check: enumeration failed", exc_info=True)
         return
