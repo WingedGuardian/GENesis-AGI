@@ -26,7 +26,10 @@ async def init(rt: GenesisRuntime) -> None:
         from genesis.content.formatter import ContentFormatter
         from genesis.mcp.outreach_mcp import init_outreach_mcp
         from genesis.outreach.config import load_outreach_config
-        from genesis.outreach.engagement import EngagementTracker
+        from genesis.outreach.engagement import (
+            EngagementTracker,
+            make_reply_engagement_bridge,
+        )
         from genesis.outreach.fresh_eyes import FreshEyesReview
         from genesis.outreach.governance import GovernanceGate
         from genesis.outreach.morning_report import MorningReportGenerator
@@ -130,6 +133,14 @@ async def init(rt: GenesisRuntime) -> None:
 
         engagement = EngagementTracker(rt._db)
         rt._engagement_tracker = engagement
+
+        # Bridge matched email replies → outreach_history engagement (mirrors
+        # the thread-tracker wiring above: mail init runs first, so the poller
+        # exists; the mail layer stays outreach-agnostic via injection).
+        reply_poller = getattr(rt, "_reply_poller", None)
+        if reply_poller is not None:
+            reply_poller.set_engagement_bridge(make_reply_engagement_bridge(engagement))
+            logger.info("Reply→engagement bridge wired into reply poller")
 
         morning = MorningReportGenerator(
             rt._health_data, rt._db, drafter,

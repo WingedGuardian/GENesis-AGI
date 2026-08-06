@@ -403,6 +403,8 @@ When a user shares a file path or URL in conversation:
   repairs ONE instance on ONE install. Label it "data repair", and fix the
   mechanism in the same session — or get the user's explicit deferral. Never
   report a data repair as "fixed".
+- **Timezones**: store/compute in UTC; schedule/display via
+  `genesis.env.user_timezone()` (every CronTrigger + user-facing timestamp).
 - **Telegram reminders**: use `outreach_send` with `preferred_timing`,
   NOT the `/schedule` skill (that's Claude Code's remote scheduler).
 - **Cognitive co-pilot, not order taker.** On every task, ask: "what else
