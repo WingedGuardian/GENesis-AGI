@@ -236,6 +236,50 @@ async def get_scheduled_due(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+async def get_orphaned_scheduled(db: aiosqlite.Connection) -> list[dict]:
+    """Hot-lane rows stuck in status='scheduled' with NO linked_task_id.
+
+    status='scheduled' is only legitimate when set by ``link_task`` atomically
+    with a ``linked_task_id`` (so ``get_linked_active`` surfaces it). A scheduled
+    row missing the link is INVISIBLE to every surface — not in ``get_actionable``
+    (excludes 'scheduled'), not in ``get_scheduled_due`` (needs status='pending' +
+    scheduled_at), not in ``get_linked_active`` (needs linked_task_id). This is the
+    black hole the follow_up_update H2 gate now prevents; this reader catches any
+    that pre-date the gate or were written programmatically. Hot lane only.
+    """
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups "
+        "WHERE status = 'scheduled' AND linked_task_id IS NULL AND kind = 'follow_up' "
+        "ORDER BY created_at ASC",
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_past_due_scheduled(db: aiosqlite.Connection, *, grace_hours: int) -> list[dict]:
+    """Hot-lane scheduled_task rows the dispatcher never actuated, >grace_hours past due.
+
+    The dispatcher consumes EXACTLY ``get_scheduled_due``'s set — strategy=
+    'scheduled_task' AND status='pending' AND scheduled_at<=now — and on dispatch
+    the row moves to in_progress then to status='scheduled' with a linked_task_id
+    (tracked thereafter by ``get_linked_active``). So the ONLY state that means
+    "never actuated" is a row STILL in status='pending' with no linked_task_id whose
+    scheduled_at is now >grace_hours old. Narrowing to that avoids false-positiving on
+    healthy dispatched rows simply waiting on idle-gated surplus compute (they are
+    status='scheduled'+linked with a frozen scheduled_at) and avoids double-counting
+    genuine orphans (status='scheduled', caught by get_orphaned_scheduled). Reuses the
+    ``datetime(scheduled_at) <= datetime('now', '-N hours')`` shape. Hot lane only.
+    """
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups "
+        "WHERE strategy = 'scheduled_task' AND status = 'pending' AND linked_task_id IS NULL "
+        "AND kind = 'follow_up' AND scheduled_at IS NOT NULL "
+        "AND datetime(scheduled_at) <= datetime('now', ?) "
+        "ORDER BY scheduled_at ASC",
+        (f"-{int(grace_hours)} hours",),
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
 async def get_linked_active(
     db: aiosqlite.Connection,
     *,

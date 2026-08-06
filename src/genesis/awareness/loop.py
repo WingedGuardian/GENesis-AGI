@@ -1138,6 +1138,156 @@ async def _resolve_deploy_staleness(db) -> None:
         logger.debug("Failed to resolve deploy staleness alerts", exc_info=True)
 
 
+# ── Follow-up hygiene watchdog ────────────────────────────────────────────────
+# Flags hot-lane follow_ups that fell into an invisible/stuck state (the failure
+# class behind the July-2026 graph-bake-off loss): status='scheduled' with no
+# linked_task_id (invisible to every surface — the follow_up_update H2 gate now
+# prevents new ones; this catches pre-gate/programmatic strays), and scheduled_task
+# rows the dispatcher never actuated. Read-and-alert only — one deduped,
+# self-resolving infrastructure_alert (→ morning report). Slow-moving → hourly.
+_FU_WATCHDOG_SOURCE = "follow_up_watchdog"
+_FU_WATCHDOG_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
+_last_fu_watchdog_alert_at: float = 0.0
+_last_fu_watchdog_alert_key: str = ""
+
+
+def _created_before(row: dict, cutoff: datetime) -> bool:
+    """True if the row's created_at is older than cutoff (grace boundary).
+
+    Un-parseable/missing created_at → treat as old (flag it) rather than hide it.
+    """
+    raw = row.get("created_at")
+    if not raw:
+        return True
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt <= cutoff
+    except (ValueError, TypeError):
+        return True
+
+
+async def _check_follow_up_watchdog(db) -> None:
+    """Alert when hot-lane follow-ups are stuck invisible/undispatched.
+
+    Best-effort — the whole body is guarded and never raises into the tick."""
+    global _last_fu_watchdog_alert_at, _last_fu_watchdog_alert_key
+    if db is None:
+        return
+    try:
+        from genesis.awareness import follow_up_watchdog_config as cfg_mod
+
+        if not cfg_mod.is_enabled():
+            # Turning the watchdog off must not strand an already-open alert as
+            # permanently unresolved (every other check reaches its _resolve_*).
+            # Clear its own alerts, then stay quiet.
+            await _resolve_follow_up_watchdog(db)
+            return
+        cfg = cfg_mod.load_config()
+        grace_hours = cfg_mod.knob_int(cfg, "grace_hours")
+        max_listed = cfg_mod.knob_int(cfg, "max_listed")
+        base_priority = cfg_mod.alert_priority(cfg)
+
+        from genesis.db.crud import follow_ups as fu_crud
+
+        cutoff = datetime.now(UTC) - timedelta(hours=grace_hours)
+        orphaned = [
+            r for r in await fu_crud.get_orphaned_scheduled(db) if _created_before(r, cutoff)
+        ]
+        past_due = await fu_crud.get_past_due_scheduled(db, grace_hours=grace_hours)
+
+        findings: list[tuple[str, dict]] = [("orphaned_scheduled", r) for r in orphaned]
+        findings += [("past_due_scheduled", r) for r in past_due]
+        if not findings:
+            await _resolve_follow_up_watchdog(db)
+            return
+
+        classes = sorted({c for c, _ in findings})
+        critical = any(r.get("priority") == "critical" for _, r in findings)
+        priority = "critical" if critical else base_priority
+        alert_key = ",".join(classes) + ":" + priority
+        now = time.monotonic()
+        if (
+            now - _last_fu_watchdog_alert_at < _FU_WATCHDOG_COOLDOWN_S
+            and alert_key == _last_fu_watchdog_alert_key
+        ):
+            return
+
+        content_hash = hashlib.sha256(f"follow_up_watchdog:{alert_key}".encode()).hexdigest()
+        # Keep exactly ONE active alert = the current state.
+        await observations.supersede_except_hash(
+            db,
+            source=_FU_WATCHDOG_SOURCE,
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="superseded by a new follow-up watchdog alert state",
+        )
+
+        listed = findings[:max_listed]
+        rows = " | ".join(
+            f"{r['id'][:8]} · {(r.get('content') or '')[:80]} · {cls}" for cls, r in listed
+        )
+        more = len(findings) - len(listed)
+        content = (
+            f"{len(findings)} hot-lane follow-up(s) are stuck invisible/undispatched: "
+            f"{len(orphaned)} orphaned-scheduled (status='scheduled' with no linked task — "
+            f"in NO surface: not actionable, not dispatched, not linked-active), "
+            f"{len(past_due)} past-due scheduled (scheduled_at elapsed, dispatcher never "
+            f"actuated). Fix each via follow_up_update (the 8-char id prefix now resolves): "
+            f"give it a real trigger (work_state='blocked_on_trigger' + revisit_condition), "
+            f"complete it, or fail it. [{rows}"
+            + (f" | (+{more} more)]" if more else "]")
+        )
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source=_FU_WATCHDOG_SOURCE,
+            type="infrastructure_alert",
+            content=content,
+            priority=priority,
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        if created is None:
+            return  # An unresolved alert for this exact state already exists.
+        _last_fu_watchdog_alert_at = now
+        _last_fu_watchdog_alert_key = alert_key
+        logger.warning(
+            "Follow-up watchdog alert (%s): %d orphaned-scheduled, %d past-due",
+            priority,
+            len(orphaned),
+            len(past_due),
+        )
+    except Exception:
+        logger.debug("Failed follow-up watchdog check", exc_info=True)
+
+
+async def _resolve_follow_up_watchdog(db) -> None:
+    """Resolve outstanding follow-up watchdog alerts once no findings remain."""
+    global _last_fu_watchdog_alert_at, _last_fu_watchdog_alert_key
+    if db is None:
+        return
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source=_FU_WATCHDOG_SOURCE,
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: follow-up hygiene cleared",
+        )
+        if resolved:
+            _last_fu_watchdog_alert_at = 0.0
+            _last_fu_watchdog_alert_key = ""
+            logger.info(
+                "Auto-resolved %d follow-up watchdog alert observation(s)", resolved
+            )
+    except Exception:
+        logger.debug("Failed to resolve follow-up watchdog alerts", exc_info=True)
+
+
 # nodatacow (chattr +C) drift detection: on btrfs, a CoW SQLite DB suffers WAL
 # write-amplification + chronic fragmentation. The install sets +C on data/;
 # this catches regressions (a restore/recreate that dropped the flag). Static
@@ -2309,6 +2459,11 @@ class AwarenessLoop:
                     # consistency/recall-probe rows; slow-moving (daily jobs) →
                     # hourly is ample.
                     await _check_memory_integrity_posture(self._db)
+                    # Follow-up hygiene: hot-lane rows stuck invisible
+                    # (orphaned-scheduled) or undispatched (past-due scheduled).
+                    # Day-scale lifecycle signal → hourly; self-resolves when
+                    # rows gain a trigger or close.
+                    await _check_follow_up_watchdog(self._db)
                 await _check_wal_health(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires
