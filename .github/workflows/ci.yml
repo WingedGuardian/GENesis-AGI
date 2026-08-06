@@ -9,6 +9,14 @@ on:
   schedule:
     - cron: "0 6 * * 1"  # weekly Mon 06:00 UTC — surface new CVEs even without repo activity
 
+# One in-flight CI run per branch: a new push cancels the superseded run so it
+# stops holding runner slots. Many active branches fanning out full CI with no
+# cancellation was saturating the shared runner budget (queue starvation). Never
+# cancel main's post-merge run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 permissions:
   contents: read
 
