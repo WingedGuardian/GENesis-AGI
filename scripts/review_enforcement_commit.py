@@ -27,6 +27,7 @@ from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
     git_subcommand,
+    has_trailing_override,
     split_segments,
 )
 
@@ -387,10 +388,13 @@ def main() -> None:
 
     try:
         from review_state import (
+            ESCALATION_ROUND_CAP,
             get_current_branch,
+            get_review_round,
             has_code_changes,
             has_valid_review_marker,
             is_review_current,
+            reset_review_round,
         )
     except ImportError:
         # If review_state.py is missing, fail open — don't block
@@ -407,6 +411,48 @@ def main() -> None:
         )
         return
 
+    # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP CONSECUTIVE
+    # defect-bearing review→fix→re-review rounds on this change (a clean review
+    # resets the streak — see review_state.bump_review_round), block the commit
+    # until an explicit '# escalation-ack' trailing comment — a machine-enforced
+    # STOP so a genuine review→fix loop can't silently run long on a standing
+    # "proceed" (see genesis-development SKILL.md), while honestly-clean
+    # multi-commit development never trips. Checked BEFORE
+    # both the docs/config skip AND Rule 2 ON PURPOSE: the hard stop must not be
+    # bypassable by file extension (a reviewed prompt/skill/docs-only commit at the
+    # cap would otherwise sneak past via the docs skip), nor by '# review-override'
+    # (which exits Rule 2 early) — the two acknowledgments are independent. Like
+    # review-override, the ack does NOT bypass Rule 0 (--no-verify) or Rule 1
+    # (main-branch), checked above. Recognition mirrors _commit_override: a clean
+    # trailing comment on EVERY commit segment (all(), so one ack can't license a
+    # chained sibling commit). NOTE: on a nested `bash -c 'git commit …'` the ack
+    # must sit on the INNER command (the sigil isn't propagated to wrappers); the
+    # documented `git commit … # escalation-ack` form is a plain segment.
+    round_n = get_review_round(cwd=cwd)
+    if round_n >= ESCALATION_ROUND_CAP:
+        commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
+        acked = bool(commit_segs) and all(
+            has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
+        )
+        if not acked:
+            _deny(
+                f"BLOCKED: review escalation cap reached — {round_n} consecutive review "
+                f"rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). The "
+                "review→fix loop has run long. STOP and get a FRESH user decision on how "
+                "to proceed (keep "
+                "hardening / switch to a robust-by-construction redesign / narrow scope / "
+                "shelve), then acknowledge that decision with a trailing shell comment "
+                "(outside any quotes):\n"
+                '  git commit -m "your message"  # escalation-ack'
+            )
+            return
+        # Acked = a fresh decision to continue → reset the round budget so the next
+        # stop is a fresh cap away, not per-commit friction for the branch's whole
+        # life. Reset stands even if a later rule blocks THIS commit: the
+        # acknowledgment was made, and erring toward less friction only happens
+        # AFTER a conscious ack.
+        reset_review_round(cwd=cwd)
+
     # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
     # or config carries no code to review (adaptive-review "review level: None"),
     # so skip Rule 2 for it. Conservative fail-toward-review default: we skip ONLY
@@ -415,8 +461,9 @@ def main() -> None:
     # the chain, P1-D) — AND (b) the staged set is non-empty and every path is on
     # the docs/config allowlist. An impure commit, an empty staged set, a diff we
     # cannot read, or an ambiguous cwd (already blocked by Rule 1) falls through
-    # to normal enforcement — never skipped. Placed AFTER Rule 0 (--no-verify) and
-    # Rule 1 (main-branch) so it can never weaken those hard blocks.
+    # to normal enforcement — never skipped. Placed AFTER Rule 0 (--no-verify),
+    # Rule 1 (main-branch), and Rule 3 (escalation cap) so it can never weaken
+    # those hard blocks.
     if not _commit_may_add_content(segs):
         staged = _staged_files(cwd)
         if staged and all(_is_docs_or_config(p) for p in staged):
@@ -438,7 +485,8 @@ def main() -> None:
     if rule2_blocks:
         # A trailing '# review-override' comment (outside quotes) acknowledges
         # accepted findings and bypasses ONLY this review gate — never Rule 0
-        # (--no-verify) or Rule 1 (main-branch), which are checked above.
+        # (--no-verify), Rule 1 (main-branch), or Rule 3 (escalation cap), all
+        # checked above.
         override = _commit_override(command, segs)
         if override == "valid":
             print(

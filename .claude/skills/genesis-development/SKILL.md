@@ -427,6 +427,31 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: keep hardening, switch to a robust-by-
      construction redesign, narrow scope, or shelve.
+  These three are backstopped by a **machine layer**, so the cap holds even if a
+  session's own discipline lapses: `review_state.py` keeps a per-branch counter of
+  CONSECUTIVE defect-bearing review rounds, and the commit gate
+  (`review_enforcement_commit.py`) HARD-BLOCKS the commit at `ESCALATION_ROUND_CAP`
+  (3) unless the command carries a deliberate trailing `# escalation-ack`. The
+  counter implements the "each find NEW defects" clause literally — so when you
+  `mark` a review, record its OUTCOME:
+  - Review surfaced a NEW **BLOCKER / SHOULD-FIX / P1 / P2** finding → mark as usual
+    (`python3 scripts/review_state.py mark --agent-output <path>`) — the round counts.
+  - Review surfaced **no** new BLOCKER/SHOULD-FIX/P1/P2 finding → add `--clean`
+    (`… mark --agent-output <path> --clean`) — this RESETS the streak
+    (circuit-breaker reset-on-success), so honestly-clean multi-commit development
+    (independent clean reviews of distinct diffs) never trips the cap.
+
+  A round is CLEAN iff the review found no BLOCKER/SHOULD-FIX/P1/P2. NOTEs, nitpicks,
+  and dispositioned optional-hardening do NOT make a round defect-bearing — without
+  this line a nitpick-prone reviewer would make every round "defect-bearing" and the
+  cap collapses back into raw commit-counting. An unflagged mark counts as
+  defect-bearing by default: a forgotten `--clean` gives a slightly early conscious
+  checkpoint (the safe direction), never a silently-disabled cap. The ack is a
+  conscious, logged act (like `# review-override`); adding it — or falsely passing
+  `--clean` — WITHOUT the honest review result is the same violation as ignoring the
+  prose above (the `--clean` flag mirrors the review record you write to
+  `~/.genesis/last_code_review.txt` at the same moment: falsifying one falsifies the
+  other).
   Caveats: **multiple findings in a single pass = one round** (not an
   escalation); the same defect reappearing (an incomplete prior fix) is a
   fix-it-properly issue, not an escalation trigger. This complements the

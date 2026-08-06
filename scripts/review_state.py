@@ -19,7 +19,8 @@ not installed on many hosts.
 
 CLI usage:
     python3 review_state.py status     # prints current review state
-    python3 review_state.py mark --agent-output <path>
+    python3 review_state.py mark --agent-output <path>          # defect-bearing round
+    python3 review_state.py mark --agent-output <path> --clean  # clean round → reset streak
     python3 review_state.py diff-hash  # prints current diff hash
 """
 
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import time
@@ -34,6 +36,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
+# Per-worktree review-ROUND counter (escalation cap). Deliberately a SEPARATE store
+# from the marker above: review_invalidate_on_commit clears the marker after every
+# commit, but the round count must SURVIVE commits — a review→fix→re-review loop
+# commits between rounds, and the whole point is to notice when that loop runs long.
+_ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
+# After this many review rounds on one change, the commit gate blocks pending an
+# explicit '# escalation-ack'. Mirrors the genesis-development SKILL.md prose cap.
+ESCALATION_ROUND_CAP = 3
 # Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
 # so an in-flight review from before an upgrade isn't lost mid-session.
 _LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
@@ -187,12 +197,23 @@ def _verify_agent_output(path: str) -> tuple[bool, str]:
     return True, f"Agent output valid ({int(age)}s old, {p.stat().st_size} bytes)"
 
 
-def mark_reviewed(agent_output_path: str | None = None, cwd: str | None = None) -> bool:
+def mark_reviewed(
+    agent_output_path: str | None = None,
+    cwd: str | None = None,
+    *,
+    clean: bool = False,
+) -> bool:
     """Write the per-worktree review marker after verifying evidence.
 
     The authoritative gate is Check 2 (code-reviewer agent output). Check 1
     (gstack telemetry) is advisory — it annotates the marker but never refuses,
     because gstack is not installed on many hosts (see ``_verify_review_log``).
+
+    ``clean`` records the OUTCOME of the review for the escalation counter: pass
+    ``clean=True`` when the review surfaced NO new BLOCKER/SHOULD-FIX/P1/P2
+    finding — it resets the defect-bearing-round streak (circuit-breaker
+    reset-on-success). The default (``clean=False``) counts the round as
+    defect-bearing. See ``bump_review_round``.
 
     Returns True if the marker was written, False if the authoritative evidence
     check failed.
@@ -218,7 +239,16 @@ def mark_reviewed(agent_output_path: str | None = None, cwd: str | None = None) 
         "agent_evidence": agent_msg,
     }
     state_file.write_text(json.dumps(state, indent=2))
-    print(f"Review marker written: {state['diff_hash']}")
+    # Update the escalation counter (see bump_review_round). A defect-bearing round
+    # on a distinct staged diff advances the streak; a clean round resets it.
+    # Best-effort: marking the review must ALWAYS succeed even if the counter is
+    # unwritable, so a counter problem can never leave the user stuck behind the gate.
+    try:
+        round_n = bump_review_round(cwd=cwd, clean=clean)
+    except Exception:  # noqa: BLE001 - the counter must never block marking a review
+        round_n = 0
+    label = "clean → streak reset" if clean else f"round {round_n}"
+    print(f"Review marker written: {state['diff_hash']} ({label})")
     return True
 
 
@@ -235,6 +265,175 @@ def clear_marker(cwd: str | None = None) -> None:
     for path in (_state_file(cwd), _LEGACY_STATE_FILE):
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
+
+
+# ── Review-round counter (escalation cap) ─────────────────────────────────────
+# Counts CONSECUTIVE defect-bearing review→fix→re-review rounds per change so the
+# commit gate can force a conscious stop after ESCALATION_ROUND_CAP rounds. Kept
+# in a per-worktree file SEPARATE from the marker (the marker is wiped on every
+# commit; the round count must persist across the commits a review loop makes
+# between rounds).
+#
+# A round counts (advances the streak) only when the review it records surfaced a
+# NEW defect — the caller passes clean=False (the default) — AND the staged diff
+# is distinct from the last-counted one on this branch. A CLEAN review round
+# (clean=True: the review found no BLOCKER/SHOULD-FIX/P1/P2 finding) RESETS the
+# streak to 0 — circuit-breaker reset-on-success. This makes the machine
+# implement the SKILL.md cap literally ("3 rounds that each find NEW defects"):
+# honestly-clean multi-commit development (three independent clean reviews) never
+# trips, while a genuine review→fix loop that keeps surfacing defects still stops
+# at round 3. A branch change resets the count; re-marking the same diff does not
+# advance it.
+
+
+def _round_file(cwd: str | None = None) -> Path:
+    """Per-worktree round-counter path (same worktree key as the marker)."""
+    return _ROUND_DIR / f"{_worktree_key(cwd)}.json"
+
+
+def _staged_content_hash(cwd: str | None = None) -> str:
+    """SHA-256 of the FULL staged diff (``git diff --cached``) — content, not stat.
+
+    Round detection must distinguish two genuinely different fixes to the same
+    file: ``get_current_diff_hash`` hashes ``--stat`` (file + line counts only), so
+    ``x = 2`` → ``x = 3`` collide under it. This hashes the actual staged content so
+    any real change since the last mark reads as a new round.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=cwd,
+        )
+        content = result.stdout
+        if not content.strip():
+            return "clean"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return "unknown"
+
+
+def _coerce_finite_int(value: object, default: int = 0) -> int:
+    """Best-effort finite int from a persisted JSON value; ``default`` otherwise.
+
+    Closes the malformed-counter VALUE class at a single point: a valid JSON number
+    like ``1e999`` parses to ``float('inf')``, and ``int(inf)`` raises ``OverflowError``
+    (NOT a subclass of ``TypeError``/``ValueError``), so a plain ``int()`` guard would
+    let it escape and crash the gate — violating the never-raises/fail-open contract.
+    Rejecting non-finite floats and catching ``OverflowError`` here means no persisted
+    round value can ever raise, however corrupt. Never raises.
+    """
+    try:
+        if isinstance(value, float) and not math.isfinite(value):
+            return default
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _load_round(cwd: str | None = None) -> dict:
+    """Read the round-counter file, normalizing shape AND the round VALUE.
+
+    Validating once, here at the single load boundary, is the whole class-fix for
+    malformed counters. Two sub-classes are closed here:
+      - SHAPE: valid JSON that is not an object (``[1,2,3]``, ``42``, ``"str"`` from a
+        manual edit / schema skew) would reach a caller's ``.get()`` and raise
+        ``AttributeError`` — normalized to ``{}``.
+      - VALUE: a well-formed dict whose ``round`` is pathological (``1e999`` → inf →
+        ``int()`` ``OverflowError``; a non-numeric string; null) — coerced to a finite
+        int via ``_coerce_finite_int`` so every caller provably gets a clean ``int``.
+    Every caller therefore receives a dict with a finite-int ``round`` → nothing a
+    corrupt file contains can raise → it collapses to "no/zero counter → fail open".
+    Never raises.
+    """
+    try:
+        p = _round_file(cwd)
+        if p.exists():
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                if "round" in data:
+                    data["round"] = _coerce_finite_int(data.get("round"))
+                return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def get_review_round(cwd: str | None = None) -> int:
+    """Review rounds recorded for the CURRENT branch's change.
+
+    Returns 0 when the stored count is for a different branch (a new change starts
+    fresh) or when no count exists. Never raises.
+    """
+    state = _load_round(cwd)
+    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+        return 0
+    return _coerce_finite_int(state.get("round", 0))
+
+
+def _write_round(state: dict, cwd: str | None = None) -> None:
+    """Persist the round-counter state (best-effort — never raises)."""
+    try:
+        rf = _round_file(cwd)
+        rf.parent.mkdir(parents=True, exist_ok=True)
+        rf.write_text(json.dumps(state, indent=2))
+    except OSError:
+        pass
+
+
+def bump_review_round(cwd: str | None = None, *, clean: bool = False) -> int:
+    """Update the defect-bearing-round streak for the current branch; return it.
+
+    ``clean=True`` — the review found no new BLOCKER/SHOULD-FIX/P1/P2 finding —
+    RESETS the streak to 0 (circuit-breaker reset-on-success) and returns 0,
+    regardless of whether the staged diff changed (a clean re-probe of the same
+    diff still closes the breaker).
+
+    ``clean=False`` (default, a defect-bearing round) increments when the staged
+    diff changed since the last counted mark on this branch; re-marking the SAME
+    diff does not (idempotent); a branch change resets to 1.
+
+    Best-effort — never raises into the caller.
+    """
+    branch = get_current_branch(cwd=cwd)
+    content_hash = _staged_content_hash(cwd=cwd)
+    # A CLEAN round resets the streak unconditionally — the review declared the
+    # current state defect-free, so no review→fix loop is in progress. Record the
+    # current content hash so the NEXT defect-bearing mark on a distinct diff
+    # correctly reads as a new (round-1) streak.
+    if clean:
+        _write_round({"branch": branch, "round": 0, "last_hash": content_hash}, cwd)
+        return 0
+    # Defect-bearing round. Nothing meaningfully staged ("clean") or a git error
+    # ("unknown") is NOT a review round — counting it would inflate toward a
+    # false-positive cap block (e.g. a mark run before the next fix is staged, or
+    # a transient git timeout).
+    if content_hash in ("clean", "unknown"):
+        return get_review_round(cwd=cwd)
+    state = _load_round(cwd)
+    if not state or state.get("branch") != branch:
+        state = {"branch": branch, "round": 1, "last_hash": content_hash}
+    elif state.get("last_hash") != content_hash:
+        # A distinct staged diff → new defect-bearing round. Coerce the stored
+        # round defensively: a corrupt / partial-write / version-skewed value must
+        # NOT raise here, or it would crash `mark` and leave the user stuck behind
+        # the gate (this counter is best-effort — see the never-raises contract).
+        # _coerce_finite_int also absorbs the `1e999`→inf→OverflowError value class.
+        prev = _coerce_finite_int(state.get("round", 0))
+        state = {"branch": branch, "round": prev + 1, "last_hash": content_hash}
+    # else: same branch + same staged diff → same round (idempotent re-mark).
+    _write_round(state, cwd)
+    return _coerce_finite_int(state.get("round", 0))
+
+
+def reset_review_round(cwd: str | None = None) -> None:
+    """Delete the round counter (e.g. after the change lands). Never raises."""
+    import contextlib
+
+    with contextlib.suppress(OSError):
+        _round_file(cwd).unlink(missing_ok=True)
 
 
 def get_current_branch(cwd: str | None = None) -> str:
@@ -275,12 +474,15 @@ def main() -> None:
         print(get_current_diff_hash())
 
     elif cmd == "mark":
-        # Parse --agent-output argument
+        # Parse --agent-output <path> and the optional --clean flag.
         agent_path = None
+        clean = False
         for i, arg in enumerate(sys.argv[2:], 2):
             if arg == "--agent-output" and i + 1 < len(sys.argv):
                 agent_path = sys.argv[i + 1]
-        if not mark_reviewed(agent_path):
+            elif arg == "--clean":
+                clean = True
+        if not mark_reviewed(agent_path, clean=clean):
             sys.exit(1)
 
     else:
