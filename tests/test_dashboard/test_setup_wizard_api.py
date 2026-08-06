@@ -228,6 +228,27 @@ def test_setup_status_readiness_fields_backward_compatible(wiz):
         assert key in body
 
 
+def test_setup_status_floor_computed_once_snapshot_consistent(wiz):
+    # Regression (Codex #1318): the route must compute the floor ONCE. If
+    # cc_oauth_present flips between calls, a double-computation would let floor_met
+    # (payload) and the tier's floor basis disagree (e.g. floor_met=false + tier 3).
+    calls = {"n": 0}
+
+    def flaky_oauth():
+        calls["n"] += 1
+        return calls["n"] == 1  # True on the first read, False on any later read
+
+    wiz["monkeypatch"].setattr(floor_mod, "cc_oauth_present", flaky_oauth)
+    wiz["secrets"].write_text(
+        _functional_secrets() + "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345\n"
+    )
+    body = wiz["client"].get("/api/genesis/setup-status").get_json()
+    assert calls["n"] == 1, "floor must be computed exactly once per request"
+    # One snapshot → floor_met and the tier agree (tier>=1 iff floor met).
+    assert body["floor_met"] is True
+    assert body["tier"] >= 1
+
+
 def test_keys_test_missing_fields_returns_400(wiz):
     resp = wiz["client"].post("/api/genesis/keys/test", json={"provider_type": "groq"})
     assert resp.status_code == 400

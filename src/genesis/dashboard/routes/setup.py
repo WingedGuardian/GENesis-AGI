@@ -21,7 +21,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
-from genesis.onboarding.floor import UNSET_SENTINELS, compute_floor, read_persisted_secrets
+from genesis.onboarding.floor import UNSET_SENTINELS, read_persisted_secrets
 from genesis.onboarding.readiness import compute_readiness
 
 logger = logging.getLogger(__name__)
@@ -48,9 +48,8 @@ def setup_status():
     two gates the floor does not cover — ``telegram_configured`` (T2, proactive
     reach) and ``ego_enabled`` (T3). All additive; existing fields unchanged.
     """
-    # Read secrets.env once; reuse for both the floor and the password check.
+    # Read secrets.env once; reuse for the floor legs and the password check.
     secrets = read_persisted_secrets()
-    floor = compute_floor(secrets=secrets)
     secrets_have_password = secrets.get("DASHBOARD_PASSWORD", "").strip() not in UNSET_SENTINELS
 
     # Identity considered "set" when USER.md exists and differs from its shipped
@@ -79,7 +78,12 @@ def setup_status():
         logger.warning("setup-status: ego config unreadable; ego_enabled=False", exc_info=True)
         ego_enabled = False
 
+    # Compute readiness ONCE and read the floor legs from its snapshot, so the
+    # payload's floor fields and the tier can never disagree (compute_floor reads the
+    # live CC-OAuth state, so a second independent computation could flip mid-request
+    # and report e.g. floor_met=false alongside tier 3 — a cumulative-contract break).
     readiness = compute_readiness(secrets=secrets, ego_enabled=ego_enabled)
+    floor = readiness.floor
 
     payload = {
         "onboarded": _SETUP_COMPLETE_MARKER.is_file(),
