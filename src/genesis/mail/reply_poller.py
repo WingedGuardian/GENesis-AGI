@@ -123,6 +123,17 @@ class ReplyPoller:
         self._on_reply = on_reply
         self._on_stale_thread = on_stale_thread
         self._max_fetch = max_fetch
+        self._engagement_bridge: ReplyCallback | None = None
+
+    def set_engagement_bridge(self, bridge: ReplyCallback | None) -> None:
+        """Inject the reply→engagement bridge (wired by the runtime).
+
+        Called with ``(thread, reply)`` after each matched reply is recorded,
+        BEFORE the reply handler — so engagement registers even when the
+        handler later declines to act. The mail layer stays agnostic about
+        what the bridge writes (outreach engagement lives a layer up).
+        """
+        self._engagement_bridge = bridge
 
     async def poll(self) -> dict:
         """Run one poll cycle.
@@ -176,6 +187,19 @@ class ReplyPoller:
                     "Reply matched: thread=%s from=%s subject=%r",
                     thread["id"], reply.sender, reply.subject,
                 )
+
+                # Engagement bridge — a matched reply IS an engagement signal,
+                # independent of whether the reply handler acts on it. Failures
+                # log + count but never break reply tracking.
+                if self._engagement_bridge:
+                    try:
+                        await self._engagement_bridge(thread, reply)
+                    except Exception:
+                        logger.error(
+                            "Engagement bridge failed for thread %s",
+                            thread["id"], exc_info=True,
+                        )
+                        stats["errors"] += 1
 
                 # Dispatch to reply handler
                 if self._on_reply:

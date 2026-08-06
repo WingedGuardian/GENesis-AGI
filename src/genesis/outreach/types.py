@@ -74,6 +74,22 @@ ENGAGEMENT_OUTCOMES: frozenset[str] = POSITIVE_ENGAGEMENT_OUTCOMES | frozenset(
 # values like 'delivered'/'opened' are NOT outcomes and are rejected).
 ENGAGEMENT_OUTCOME_ALIASES: dict[str, str] = {"replied": "useful"}
 
+# Signals stamped by AUTOMATION, not by a human judgment: the 24h timeout
+# verdict, the implicit-activity upgrade, and the morning-report auto-ack.
+# A real user reply is strictly stronger evidence than any of these, so the
+# reply→engagement bridge may overwrite them; human-set outcomes (Telegram
+# button presses → 'acted_on'/'acknowledged', manual MCP/dashboard sets)
+# are never overwritten.
+MECHANICAL_ENGAGEMENT_SIGNALS: frozenset[str] = frozenset(
+    {"timeout", "implicit_activity", "auto_digest"}
+)
+
+# SQL IN-list rendering (same trusted-constant rationale as
+# POSITIVE_ENGAGEMENT_SQL_IN above).
+MECHANICAL_ENGAGEMENT_SIGNALS_SQL_IN: str = ", ".join(
+    f"'{s}'" for s in sorted(MECHANICAL_ENGAGEMENT_SIGNALS)
+)
+
 
 class GovernanceVerdict(StrEnum):
     ALLOW = "allow"
