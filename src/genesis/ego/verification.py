@@ -76,10 +76,20 @@ def parse_expected_outputs(raw: str | None) -> ExpectedOutputs | None:
     files = data.get("files")
     if not files or not isinstance(files, list):
         return None
+    # Coerce defensively: a structurally malformed spec (non-numeric
+    # min_size_bytes, non-list required_strings) yields a safe object rather
+    # than raising — callers (verifier + the dispatch-prompt renderer) treat a
+    # bad spec as "no usable spec", never as a crash.
+    try:
+        min_size = int(data.get("min_size_bytes", 0) or 0)
+    except (ValueError, TypeError):
+        min_size = 0
+    raw_required = data.get("required_strings")
+    required = [str(s) for s in raw_required] if isinstance(raw_required, list) else []
     return ExpectedOutputs(
         files=[str(f) for f in files],
-        min_size_bytes=int(data.get("min_size_bytes", 0)),
-        required_strings=list(data.get("required_strings") or []),
+        min_size_bytes=min_size,
+        required_strings=required,
     )
 
 

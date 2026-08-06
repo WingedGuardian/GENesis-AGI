@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from genesis.db.crud import ego as ego_crud
 from genesis.ego.types import partition_informational
+from genesis.ego.verification import parse_expected_outputs
 from genesis.util.approval_words import (
     APPROVE_PHRASES as _SHARED_BARE_APPROVE,
 )
@@ -427,10 +428,16 @@ class ProposalWorkflow:
             _eo_serialized = _serialize_expected_outputs(
                 p.get("expected_outputs"),
             )
+            # Inject when there is no USABLE spec — not merely when the field
+            # is absent. An ego-supplied ``{}`` or a dict without a valid
+            # ``files`` list serializes to a non-None string yet
+            # ``parse_expected_outputs`` (what the verifier uses) reads it as
+            # absent, so keying on ``is None`` alone would leave the dispatch
+            # unverifiable despite the floor.
             if (
-                _eo_serialized is None
-                and ego_source == "genesis_ego_cycle"
+                ego_source == "genesis_ego_cycle"
                 and p.get("action_type") in ("dispatch", "investigate")
+                and parse_expected_outputs(_eo_serialized) is None
             ):
                 _eo_serialized = json.dumps(
                     {

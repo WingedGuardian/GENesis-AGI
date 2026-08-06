@@ -2001,6 +2001,29 @@ class EgoSession:
             re.IGNORECASE,
         ),
         re.compile(r"\b(?:write|produce|apply|author)\s+(?:a\s+)?patch\b", re.IGNORECASE),
+        # Install-script edits (editing, NOT running — "run the install script"
+        # is operate; the update.sh dispatch is a legitimate ops lever).
+        re.compile(
+            r"\b(?:edit|modif(?:y|ies)|rewrite|patch|amend)\b[^.\n]{0,50}?"
+            r"\b(?:install script|host.?setup|bootstrap\.sh|scripts/[\w./-]+\.sh|\.sh\b)",
+            re.IGNORECASE,
+        ),
+        # Source-file / source-code edits (object must be code, so "fix the
+        # wedged service" and "update the dashboard status" do NOT match).
+        re.compile(
+            r"\b(?:edit|modif(?:y|ies)|rewrite|patch|fix)\b[^.\n]{0,50}?"
+            r"\b(?:src/genesis|source code|source file|\.py\b)",
+            re.IGNORECASE,
+        ),
+        # Config-VALUE changes (thresholds, intervals, weights, caps — "user
+        # decisions" per the identity doc). Value-change verb + config noun;
+        # a bare noun in a symptom ("the timeout keeps firing") does not match.
+        re.compile(
+            r"\b(?:raise|lower|increase|decrease|set|bump|adjust|tune|change)\b"
+            r"[^.\n]{0,40}?\b(?:threshold|interval|routing weight|budget cap|"
+            r"failure limit|retry count|backoff)\b",
+            re.IGNORECASE,
+        ),
     )
 
     def _flag_develop_scope(self, proposals: list[dict]) -> list[dict]:
@@ -3128,15 +3151,22 @@ def _required_outputs_block(eo_raw: str | dict | None) -> str:
     deliverable paths that post-dispatch verification will check (file
     existence is a hard verification signal; a session never told the path
     would fail verification through no fault of its own). Returns ``""`` when
-    there is nothing to render.
+    there is nothing valid to render.
+
+    Renders through ``parse_expected_outputs`` — the SAME validator the
+    post-dispatch verifier uses — so a structurally malformed spec
+    (``{"files": 123}``, non-string ``required_strings``) yields an empty
+    block rather than raising while iterating/joining, and the rendered block
+    can never disagree with what verification will actually check.
     """
-    if not eo_raw:
-        return ""
+    from genesis.ego.verification import parse_expected_outputs
+
+    raw = json.dumps(eo_raw) if isinstance(eo_raw, dict) else eo_raw
     try:
-        parsed_eo = json.loads(eo_raw) if isinstance(eo_raw, str) else eo_raw
+        parsed = parse_expected_outputs(raw)
     except (ValueError, TypeError):
         return ""
-    if not isinstance(parsed_eo, dict) or not parsed_eo.get("files"):
+    if parsed is None:
         return ""
     eo_lines = [
         "\n## CRITICAL — Required Output Files",
@@ -3146,13 +3176,12 @@ def _required_outputs_block(eo_raw: str | dict | None) -> str:
         "different filenames.",
         "",
     ]
-    for fpath in parsed_eo["files"]:
-        eo_lines.append(f"  - {fpath}")
-    if parsed_eo.get("min_size_bytes"):
-        eo_lines.append(f"\nMin size: {parsed_eo['min_size_bytes']} bytes")
-    if parsed_eo.get("required_strings"):
+    eo_lines.extend(f"  - {fpath}" for fpath in parsed.files)
+    if parsed.min_size_bytes:
+        eo_lines.append(f"\nMin size: {parsed.min_size_bytes} bytes")
+    if parsed.required_strings:
         eo_lines.append(
-            f"Required content: {', '.join(parsed_eo['required_strings'])}"
+            f"Required content: {', '.join(parsed.required_strings)}"
         )
     return "\n".join(eo_lines)
 

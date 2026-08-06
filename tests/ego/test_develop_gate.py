@@ -109,6 +109,61 @@ class TestFlagDevelopScope:
         out = _gate_session()._flag_develop_scope(proposals)
         assert not any(p.get("_develop_scope") for p in out)
 
+    def test_prohibited_writes_marked(self, monkeypatch):
+        """P1: config/maintenance action types classify as INTERNAL_WRITE (not
+        SELF_MODIFY), so unambiguous prohibited writes must be caught by
+        markers — install-script edits, source edits, config-value tuning."""
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda: EgoConfig(genesis_self_development_enabled=False),
+        )
+        prohibited = [
+            {"action_type": "config", "content": "Edit the install script to add a swap step"},
+            {"action_type": "maintenance", "content": "Modify scripts/host-setup.sh for oom"},
+            {
+                "action_type": "config",
+                "content": "Raise the circuit breaker failure threshold from 3 to 5",
+            },
+            {
+                "action_type": "config",
+                "content": "Increase the backoff interval for the surplus job",
+            },
+            {
+                "action_type": "maintenance",
+                "content": "Rewrite the fallback in src/genesis/providers",
+            },
+        ]
+        out = _gate_session()._flag_develop_scope(prohibited)
+        assert all(p.get("_develop_scope") for p in out), [
+            p["content"] for p in out if not p.get("_develop_scope")
+        ]
+
+    def test_running_scripts_and_symptoms_not_marked(self, monkeypatch):
+        """The same nouns in operate phrasing stay operate: running (not
+        editing) a script, a symptom naming a threshold/interval."""
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda: EgoConfig(genesis_self_development_enabled=False),
+        )
+        operate = [
+            {
+                "action_type": "maintenance",
+                "content": "Run the install script (scripts/update.sh) to resync deploy",
+            },
+            {
+                "action_type": "investigate",
+                "content": "The circuit breaker threshold keeps tripping — diagnose why and escalate",
+            },
+            {
+                "action_type": "investigate",
+                "content": "The retry interval elapsed before the job finished — investigate the cause",
+            },
+        ]
+        out = _gate_session()._flag_develop_scope(operate)
+        assert not any(p.get("_develop_scope") for p in out), [
+            p["content"] for p in out if p.get("_develop_scope")
+        ]
+
     def test_action_type_self_modify_marked(self, monkeypatch):
         monkeypatch.setattr(
             "genesis.ego.config.load_ego_config",
@@ -261,6 +316,26 @@ class TestCreateBatchHygiene:
         assert row["expected_outputs"] is None
 
     @pytest.mark.asyncio
+    async def test_empty_dict_outputs_gets_floor(self, db):
+        """P2: an ego-supplied {} (or dict without usable files) serializes to
+        a non-None string but parses as absent — the floor must still inject."""
+        wf = ProposalWorkflow(db=db, topic_manager=None)
+        _, ids, _ = await wf.create_batch(
+            [
+                {
+                    "action_type": "investigate",
+                    "content": "probe",
+                    "expected_outputs": {},
+                }
+            ],
+            ego_source="genesis_ego_cycle",
+        )
+        row = await ego_crud.get_proposal(db, ids[0])
+        parsed = parse_expected_outputs(row["expected_outputs"])
+        assert parsed is not None
+        assert parsed.files == [f"~/.genesis/output/ego-reports/{ids[0]}.md"]
+
+    @pytest.mark.asyncio
     async def test_ego_supplied_outputs_untouched(self, db):
         wf = ProposalWorkflow(db=db, topic_manager=None)
         eo = {"files": ["~/x.md"], "min_size_bytes": 100}
@@ -318,3 +393,11 @@ class TestRequiredOutputsBlock:
         assert _required_outputs_block("") == ""
         assert _required_outputs_block("not json") == ""
         assert _required_outputs_block(json.dumps({"files": []})) == ""
+
+    def test_malformed_shapes_never_raise(self):
+        """P2: structurally-malformed specs render empty, never TypeError."""
+        assert _required_outputs_block(json.dumps({"files": 123})) == ""
+        assert _required_outputs_block({"files": 123}) == ""
+        # non-string required_strings must not blow up ', '.join(...)
+        block = _required_outputs_block(json.dumps({"files": ["a.md"], "required_strings": 123}))
+        assert "a.md" in block  # renders files, drops the bad required_strings
