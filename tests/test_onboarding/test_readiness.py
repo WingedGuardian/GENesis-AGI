@@ -123,11 +123,14 @@ def test_as_dict_shape_excludes_floor_legs():
         # Double quotes ARE stripped (adapter's .strip('"')) → valid.
         ('TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS="12345"\n', True),
         # Valid token + recipient but a malformed setting the live loader parses
-        # (DAY_BOUNDARY_HOUR) → _load_bridge_config raises → adapter stays stopped →
-        # NOT reachable (the P2 the bot caught).
+        # (DAY_BOUNDARY_HOUR) → the loader raises → adapter stays stopped → NOT
+        # reachable (Codex round-2 P2).
         ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\nDAY_BOUNDARY_HOUR=abc\n", False),
         # A well-formed DAY_BOUNDARY_HOUR does not block reach.
         ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\nDAY_BOUNDARY_HOUR=6\n", True),
+        # str.isdigit() accepts '²' but int() rejects it → the loader raises on the
+        # allowed-user conversion → adapter stopped → NOT reachable (Codex round-3 P2).
+        ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=²\n", False),
     ],
 )
 def test_telegram_reach_configured(text, expected):
@@ -168,6 +171,8 @@ def test_telegram_reach_parity_with_bridge(tmp_path, monkeypatch):
         # Malformed non-telegram setting: the live loader RAISES (adapter stays
         # stopped). "Would the adapter load" is False → replica must also be False.
         "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\nDAY_BOUNDARY_HOUR=abc\n",
+        # str.isdigit()-true / int()-false unicode digit → loader raises → False.
+        "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=²\n",
     ]
     for content in cases:
         secrets_file.write_text(content)
@@ -193,6 +198,26 @@ def test_read_secrets_env_text_non_utf8_is_empty(tmp_path, monkeypatch):
     bad.write_bytes(b"\xff\xfe\x00TELEGRAM_BOT_TOKEN=abc\n")
     monkeypatch.setattr(readiness_mod, "secrets_path", lambda: bad)
     assert _read_secrets_env_text() == ""
+
+
+# ── shared loader contract (channels.bridge_config — the single source of truth) ─
+
+
+def test_build_bridge_config_contract():
+    from genesis.channels.bridge_config import build_bridge_config
+    from genesis.channels.bridge_config import parse_secrets_env_text as p
+
+    assert build_bridge_config(p("")) is None  # missing token
+    assert build_bridge_config(p("TELEGRAM_BOT_TOKEN=abc")) is None  # no recipient
+    cfg = build_bridge_config(p("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345"))
+    assert cfg is not None and cfg["allowed_users"] == {12345}
+    # Values the live adapter chokes on RAISE here too (preserved fail-to-load):
+    with pytest.raises(ValueError):
+        build_bridge_config(
+            p("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\nDAY_BOUNDARY_HOUR=x")
+        )
+    with pytest.raises(ValueError):
+        build_bridge_config(p("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=²"))
 
 
 # ── compute_readiness wiring (threads floor secrets + telegram text + ego) ─────
