@@ -122,6 +122,12 @@ def test_as_dict_shape_excludes_floor_legs():
         ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345 # me\n", False),
         # Double quotes ARE stripped (adapter's .strip('"')) → valid.
         ('TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS="12345"\n', True),
+        # Valid token + recipient but a malformed setting the live loader parses
+        # (DAY_BOUNDARY_HOUR) → _load_bridge_config raises → adapter stays stopped →
+        # NOT reachable (the P2 the bot caught).
+        ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\nDAY_BOUNDARY_HOUR=abc\n", False),
+        # A well-formed DAY_BOUNDARY_HOUR does not block reach.
+        ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\nDAY_BOUNDARY_HOUR=6\n", True),
     ],
 )
 def test_telegram_reach_configured(text, expected):
@@ -159,16 +165,33 @@ def test_telegram_reach_parity_with_bridge(tmp_path, monkeypatch):
         "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345 # me\n",
         'TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS="12345"\n',
         "TELEGRAM_BOT_TOKEN='PLACEHOLDER'\nTELEGRAM_ALLOWED_USERS=12345\n",
+        # Malformed non-telegram setting: the live loader RAISES (adapter stays
+        # stopped). "Would the adapter load" is False → replica must also be False.
+        "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\nDAY_BOUNDARY_HOUR=abc\n",
     ]
     for content in cases:
         secrets_file.write_text(content)
-        live = bridge._load_bridge_config() is not None
+        # A raise from the live loader means "adapter would NOT load" — equivalent to
+        # None for the reach question, so treat it as False (not a test error).
+        try:
+            live = bridge._load_bridge_config() is not None
+        except Exception:  # noqa: BLE001 - a raising loader == not loadable == False
+            live = False
         replica = _telegram_reach_configured(secrets_file.read_text())
         assert replica is live, f"parity mismatch for {content!r}: replica={replica} live={live}"
 
 
 def test_read_secrets_env_text_missing_file_is_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(readiness_mod, "secrets_path", lambda: tmp_path / "nope.env")
+    assert _read_secrets_env_text() == ""
+
+
+def test_read_secrets_env_text_non_utf8_is_empty(tmp_path, monkeypatch):
+    # A non-UTF-8 secrets.env must degrade to "" (not configured), never 500 the
+    # route: read_text() raises UnicodeDecodeError (a ValueError subclass, NOT OSError).
+    bad = tmp_path / "secrets.env"
+    bad.write_bytes(b"\xff\xfe\x00TELEGRAM_BOT_TOKEN=abc\n")
+    monkeypatch.setattr(readiness_mod, "secrets_path", lambda: bad)
     assert _read_secrets_env_text() == ""
 
 

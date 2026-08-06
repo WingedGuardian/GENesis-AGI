@@ -80,17 +80,37 @@ def _telegram_reach_configured(secrets_text: str) -> bool:
     """Whether Genesis can PROACTIVELY reach the owner via Telegram.
 
     Decided from the RAW ``secrets.env`` text exactly as the live adapter start-gate
-    decides it: a non-empty, non-placeholder ``TELEGRAM_BOT_TOKEN`` AND at least one
-    valid numeric id in ``TELEGRAM_ALLOWED_USERS`` (its first entry seeds the default
-    DM recipient, so without it there is no one to message unprompted). Pure — no
-    file IO, no runtime import.
+    decides it: True only when the live adapter would actually LOAD — a non-empty,
+    non-placeholder ``TELEGRAM_BOT_TOKEN`` AND at least one valid numeric id in
+    ``TELEGRAM_ALLOWED_USERS`` (its first entry seeds the default DM recipient) AND
+    every other setting ``_load_bridge_config`` parses is well-formed. A malformed
+    optional setting (e.g. a non-numeric ``DAY_BOUNDARY_HOUR``) makes the live loader
+    RAISE → ``hosting/standalone.py::_start_telegram`` catches it and leaves Telegram
+    stopped → not reachable, so this returns False too (mirrored so the T2 signal
+    can't claim Connected on a config the adapter refuses to load). Pure — no file
+    IO, no runtime import; never raises.
     """
-    secrets = _parse_secrets_env_text(secrets_text)
-    token = secrets.get("TELEGRAM_BOT_TOKEN", "")
-    if not token or token == _TELEGRAM_TOKEN_PLACEHOLDER:
+    try:
+        secrets = _parse_secrets_env_text(secrets_text)
+        token = secrets.get("TELEGRAM_BOT_TOKEN", "")
+        if not token or token == _TELEGRAM_TOKEN_PLACEHOLDER:
+            return False
+        allowed_raw = secrets.get("TELEGRAM_ALLOWED_USERS", "")
+        if not any(uid.strip().isdigit() for uid in allowed_raw.split(",")):
+            return False
+        # Mirror the remaining conversions ``_load_bridge_config`` performs, so a
+        # value that would make the live loader raise (→ adapter stays stopped) is
+        # reported as NOT reachable, not Connected. ``DAY_BOUNDARY_HOUR`` is the one
+        # unguarded ``int()`` in the loader; ``TELEGRAM_FORUM_CHAT_ID`` is guarded
+        # there and mirrored guarded here. The surrounding try/except is a safety net
+        # for any other conversion the loader may grow.
+        forum_raw = secrets.get("TELEGRAM_FORUM_CHAT_ID", "")
+        if forum_raw.strip().lstrip("-").isdigit():
+            int(forum_raw)
+        int(secrets.get("DAY_BOUNDARY_HOUR", "0"))
+    except (ValueError, TypeError):
         return False
-    allowed_raw = secrets.get("TELEGRAM_ALLOWED_USERS", "")
-    return any(uid.strip().isdigit() for uid in allowed_raw.split(","))
+    return True
 
 
 def _read_secrets_env_text() -> str:
@@ -104,7 +124,10 @@ def _read_secrets_env_text() -> str:
     try:
         path = secrets_path()
         return path.read_text() if path.is_file() else ""
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: missing / permission / disk. ValueError covers UnicodeDecodeError
+        # (its subclass) — a non-UTF-8 secrets.env must degrade to "not configured",
+        # NOT 500 the setup-status route. (``except OSError`` alone let it escape.)
         return ""
 
 
