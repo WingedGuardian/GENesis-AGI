@@ -35,6 +35,11 @@ def wiz(tmp_path, monkeypatch):
     monkeypatch.setattr(setup_mod, "_SETUP_COMPLETE_MARKER", marker)
     # setup.py reads secrets via the floor module now — patch it there.
     monkeypatch.setattr(floor_mod, "secrets_path", lambda: secrets_file)
+    # readiness reads the RAW secrets.env text (T2 manual parse) via its OWN
+    # secrets_path import — patch it too so T2 sees the temp file, not the real box.
+    import genesis.onboarding.readiness as readiness_mod
+
+    monkeypatch.setattr(readiness_mod, "secrets_path", lambda: secrets_file)
     # Default: CC is logged in. Individual tests override for floor-leg coverage.
     monkeypatch.setattr(floor_mod, "cc_oauth_present", lambda: True)
 

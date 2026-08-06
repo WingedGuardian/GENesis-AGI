@@ -3,9 +3,11 @@
 Readiness sits ABOVE the functional floor and must:
 * compute a cumulative tier (T0..T3) that a de-configured lower gate visibly drops;
 * gate T2 on Genesis being able to PROACTIVELY reach the owner via Telegram — the
-  EXACT condition the live adapter's start-gate enforces (parity-pinned to
-  ``channels.bridge._load_bridge_config``), incl. rejecting the real
-  "bot token pasted into TELEGRAM_ALLOWED_USERS" mistake;
+  EXACT condition the live adapter's start-gate enforces, computed from the RAW
+  secrets.env text with the adapter's OWN manual parser (NOT dotenv), and
+  parity-pinned to ``channels.bridge._load_bridge_config`` across quoted / commented
+  / interpolated shapes (incl. rejecting the "bot token pasted into
+  TELEGRAM_ALLOWED_USERS" mistake);
 * gate T3 on the injected ``ego_enabled`` bool (the ego/awareness loop);
 * reuse the floor's own computation so the two can never drift.
 """
@@ -15,9 +17,11 @@ from __future__ import annotations
 import pytest
 
 from genesis.onboarding import floor as floor_mod
+from genesis.onboarding import readiness as readiness_mod
 from genesis.onboarding.floor import FloorStatus
 from genesis.onboarding.readiness import (
     ReadinessStatus,
+    _read_secrets_env_text,
     _telegram_reach_configured,
     compute_readiness,
 )
@@ -89,62 +93,86 @@ def test_as_dict_shape_excludes_floor_legs():
     assert "floor_met" not in d and "cc_oauth" not in d
 
 
-# ── T2 gate: _telegram_reach_configured (proactive-reach semantics) ────────────
+# ── T2 gate: _telegram_reach_configured (raw-text, adapter-manual semantics) ────
 
 
 @pytest.mark.parametrize(
-    "secrets, expected",
+    "text, expected",
     [
-        ({}, False),  # nothing configured
-        ({"TELEGRAM_BOT_TOKEN": "abc123"}, False),  # token but no recipient → can't reach
-        ({"TELEGRAM_BOT_TOKEN": "abc123", "TELEGRAM_ALLOWED_USERS": "12345"}, True),
+        ("", False),  # nothing configured
+        ("TELEGRAM_BOT_TOKEN=abc123\n", False),  # token but no recipient → can't reach
+        ("TELEGRAM_BOT_TOKEN=abc123\nTELEGRAM_ALLOWED_USERS=12345\n", True),
         # The real mistake (memory 47a55700): a bot token pasted into ALLOWED_USERS.
         # Non-numeric → no valid recipient → NOT connected.
-        ({"TELEGRAM_BOT_TOKEN": "abc123", "TELEGRAM_ALLOWED_USERS": "abc:token"}, False),
+        ("TELEGRAM_BOT_TOKEN=abc123\nTELEGRAM_ALLOWED_USERS=abc:token\n", False),
         # Placeholder token never counts even with a valid recipient.
-        ({"TELEGRAM_BOT_TOKEN": "PLACEHOLDER", "TELEGRAM_ALLOWED_USERS": "12345"}, False),
+        ("TELEGRAM_BOT_TOKEN=PLACEHOLDER\nTELEGRAM_ALLOWED_USERS=12345\n", False),
         # Empty token never counts.
-        ({"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_ALLOWED_USERS": "12345"}, False),
+        ("TELEGRAM_BOT_TOKEN=\nTELEGRAM_ALLOWED_USERS=12345\n", False),
         # One valid UID among invalid ones still counts.
-        ({"TELEGRAM_BOT_TOKEN": "abc", "TELEGRAM_ALLOWED_USERS": "nope,678"}, True),
+        ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=nope,678\n", True),
         # Whitespace-padded numeric still counts.
-        ({"TELEGRAM_BOT_TOKEN": "abc", "TELEGRAM_ALLOWED_USERS": " 789 "}, True),
+        ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS= 789 \n", True),
+        # Comment lines are ignored; a real value below still parses.
+        ("# a comment\nTELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\n", True),
+        # Manual parse (like the adapter) does NOT strip single quotes → '12345' is
+        # not a valid numeric id → NOT connected (the divergence the review caught).
+        ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS='12345'\n", False),
+        # Manual parse does NOT strip inline comments → "12345 # me" is not numeric.
+        ("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345 # me\n", False),
+        # Double quotes ARE stripped (adapter's .strip('"')) → valid.
+        ('TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS="12345"\n', True),
     ],
 )
-def test_telegram_reach_configured(secrets, expected):
-    assert _telegram_reach_configured(secrets) is expected
+def test_telegram_reach_configured(text, expected):
+    assert _telegram_reach_configured(text) is expected
 
 
 def test_telegram_reach_parity_with_bridge(tmp_path, monkeypatch):
     """The T2 signal must equal the LIVE adapter start-gate, case for case.
 
-    Importing the bridge is heavy (pulls GenesisRuntime), which is exactly why the
-    hot-path helper is a replica — this test is the pin that keeps the replica
-    honest: for every secrets shape, ``_telegram_reach_configured`` agrees with
-    ``_load_bridge_config() is not None``.
+    This is the load-bearing pin: ``_telegram_reach_configured`` must agree with
+    ``channels.bridge._load_bridge_config`` for EVERY secrets shape — including the
+    quoted / inline-comment / interpolation shapes where dotenv (the floor's parser)
+    and the adapter's manual parser diverge. Fails hard (not skip) if the bridge
+    can't import — a silent skip would let parity drift ship unnoticed.
     """
-    bridge = pytest.importorskip("genesis.channels.bridge")
+    try:
+        from genesis.channels import bridge
+    except Exception as exc:  # noqa: BLE001 - the pin must be loud, never skipped
+        pytest.fail(
+            f"bridge must import for the parity pin (got {exc!r}); this test is the "
+            "sole guard against T2 signal drift"
+        )
 
     secrets_file = tmp_path / "secrets.env"
     monkeypatch.setattr(bridge, "secrets_path", lambda: secrets_file)
-    monkeypatch.setattr(floor_mod, "secrets_path", lambda: secrets_file)
 
     cases = [
-        "",
         "TELEGRAM_BOT_TOKEN=abc123\n",
         "TELEGRAM_BOT_TOKEN=abc123\nTELEGRAM_ALLOWED_USERS=12345\n",
         "TELEGRAM_BOT_TOKEN=abc123\nTELEGRAM_ALLOWED_USERS=notanumber\n",
         "TELEGRAM_BOT_TOKEN=PLACEHOLDER\nTELEGRAM_ALLOWED_USERS=12345\n",
         "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=notanum,678\n",
+        # Divergent shapes (dotenv vs manual) — both must now AGREE via manual parse:
+        "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS='12345'\n",
+        "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345 # me\n",
+        'TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS="12345"\n',
+        "TELEGRAM_BOT_TOKEN='PLACEHOLDER'\nTELEGRAM_ALLOWED_USERS=12345\n",
     ]
     for content in cases:
         secrets_file.write_text(content)
         live = bridge._load_bridge_config() is not None
-        replica = _telegram_reach_configured(floor_mod.read_persisted_secrets())
+        replica = _telegram_reach_configured(secrets_file.read_text())
         assert replica is live, f"parity mismatch for {content!r}: replica={replica} live={live}"
 
 
-# ── compute_readiness wiring (threads secrets + ego through the real floor) ─────
+def test_read_secrets_env_text_missing_file_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(readiness_mod, "secrets_path", lambda: tmp_path / "nope.env")
+    assert _read_secrets_env_text() == ""
+
+
+# ── compute_readiness wiring (threads floor secrets + telegram text + ego) ─────
 
 
 @pytest.fixture()
@@ -155,37 +183,40 @@ def floor_met(monkeypatch):
     # embedding leg is _has_any(secrets, EMBEDDING_KEY_NAMES) — supply a key below.
 
 
-def test_compute_readiness_threads_secrets_and_ego(floor_met):
-    secrets = {
-        "API_KEY_DEEPINFRA": "di-xxx",  # satisfies the floor embedding leg
-        "TELEGRAM_BOT_TOKEN": "abc",
-        "TELEGRAM_ALLOWED_USERS": "12345",
-    }
-    assert compute_readiness(secrets=secrets, ego_enabled=False).tier == 2
-    assert compute_readiness(secrets=secrets, ego_enabled=True).tier == 3
+def test_compute_readiness_threads_secrets_text_and_ego(floor_met):
+    secrets = {"API_KEY_DEEPINFRA": "di-xxx"}  # satisfies the floor embedding leg
+    tg = "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345\n"
+    assert compute_readiness(secrets=secrets, secrets_text=tg, ego_enabled=False).tier == 2
+    assert compute_readiness(secrets=secrets, secrets_text=tg, ego_enabled=True).tier == 3
+
+
+def test_compute_readiness_reads_file_when_text_omitted(floor_met, tmp_path, monkeypatch):
+    # When secrets_text is not passed, T2 reads the raw file via secrets_path.
+    secrets_file = tmp_path / "secrets.env"
+    secrets_file.write_text("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345\n")
+    monkeypatch.setattr(readiness_mod, "secrets_path", lambda: secrets_file)
+    r = compute_readiness(secrets={"API_KEY_DEEPINFRA": "d"}, ego_enabled=False)
+    assert r.telegram_configured is True
+    assert r.tier == 2
 
 
 def test_compute_readiness_floor_reuse_parity(floor_met):
     # readiness.floor must BE the floor's own computation (no drift).
     secrets = {"API_KEY_DEEPINFRA": "di-xxx"}
-    r = compute_readiness(secrets=secrets, ego_enabled=False)
+    r = compute_readiness(secrets=secrets, secrets_text="", ego_enabled=False)
     assert r.floor.as_dict() == floor_mod.compute_floor(secrets=secrets).as_dict()
-    assert r.floor.floor_met is True  # legs monkeypatched true + embedding key present
+    assert r.floor.floor_met is True
 
 
 def test_compute_readiness_floor_unmet_is_tier0(monkeypatch):
     # No floor monkeypatch → real legs fail on empty secrets → tier 0 even with
     # telegram + ego "configured".
     monkeypatch.setattr(floor_mod, "cc_oauth_present", lambda: False)
-    secrets = {"TELEGRAM_BOT_TOKEN": "abc", "TELEGRAM_ALLOWED_USERS": "12345"}
-    assert compute_readiness(secrets=secrets, ego_enabled=True).tier == 0
+    tg = "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=12345\n"
+    assert compute_readiness(secrets={}, secrets_text=tg, ego_enabled=True).tier == 0
 
 
 def test_compute_readiness_ego_flag_is_coerced_bool(floor_met):
-    secrets = {
-        "API_KEY_DEEPINFRA": "di-xxx",
-        "TELEGRAM_BOT_TOKEN": "abc",
-        "TELEGRAM_ALLOWED_USERS": "1",
-    }
-    r = compute_readiness(secrets=secrets, ego_enabled=1)  # truthy non-bool
+    tg = "TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_ALLOWED_USERS=1\n"
+    r = compute_readiness(secrets={"API_KEY_DEEPINFRA": "d"}, secrets_text=tg, ego_enabled=1)
     assert r.ego_enabled is True
