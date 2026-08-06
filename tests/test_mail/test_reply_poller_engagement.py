@@ -65,6 +65,7 @@ def _reply(
     subject: str = "Re: your pitch",
     body: str = "Interesting, tell me more.",
     uid: int = 1,
+    extra_headers: str = "",
 ) -> RawEmail:
     raw = (
         f"From: {from_addr}\r\n"
@@ -72,6 +73,7 @@ def _reply(
         f"Subject: {subject}\r\n"
         f"Message-ID: {msg_id}\r\n"
         f"In-Reply-To: {in_reply_to}\r\n"
+        f"{extra_headers}"
         f"\r\n{body}\r\n"
     ).encode()
     return RawEmail(uid=uid, raw_bytes=raw)
@@ -217,6 +219,63 @@ async def test_dashboard_verdict_on_stale_timeout_signal_is_protected(db):
     outcome, signal, _resp = await _engagement(db)
     assert outcome == "not_useful"  # human verdict survives
     assert signal == "timeout"  # row untouched
+
+
+async def test_auto_responder_reply_does_not_count_as_engagement(db):
+    """An out-of-office / auto-reply carries our Message-ID in In-Reply-To and
+    matches the thread — but RFC-3834 auto markers must keep it from inflating
+    the reply rate. Thread is still recorded; engagement is NOT."""
+    await _seed_outreach(db)
+    auto = _reply(extra_headers="Auto-Submitted: auto-replied\r\n", body="I am on vacation.")
+    stats = await _run_poll(
+        db,
+        thread_context={"outreach_id": OUTREACH_ID},
+        with_bridge=True,
+        raws=[auto],
+    )
+    assert stats["matched"] == 1  # thread matched + recorded
+    assert stats["errors"] == 0
+    outcome, _signal, _resp = await _engagement(db)
+    assert outcome is None  # ...but not counted as engagement
+
+
+async def test_precedence_bulk_reply_does_not_count(db):
+    await _seed_outreach(db)
+    bulk = _reply(extra_headers="Precedence: bulk\r\n")
+    await _run_poll(db, thread_context={"outreach_id": OUTREACH_ID}, with_bridge=True, raws=[bulk])
+    outcome, _s, _r = await _engagement(db)
+    assert outcome is None
+
+
+async def test_foreign_sender_reply_does_not_count(db):
+    """A message that merely carries our Message-ID but comes from someone other
+    than the address we mailed (spoof / list echo) must not count as engagement."""
+    await _seed_outreach(db)
+    foreign = _reply(from_addr="stranger@elsewhere.com")
+    await _run_poll(
+        db,
+        thread_context={"outreach_id": OUTREACH_ID},
+        with_bridge=True,
+        raws=[foreign],
+    )
+    outcome, _s, _r = await _engagement(db)
+    assert outcome is None
+
+
+async def test_genuine_reply_with_display_name_still_counts(db):
+    """The sender check compares the bare address, so a reply from the real
+    recipient with a display name ('Target Person <target@example.com>') still
+    registers — guards against a naive full-header string compare."""
+    await _seed_outreach(db)
+    named = _reply(from_addr="Target Person <target@example.com>")
+    await _run_poll(
+        db,
+        thread_context={"outreach_id": OUTREACH_ID},
+        with_bridge=True,
+        raws=[named],
+    )
+    outcome, signal, _r = await _engagement(db)
+    assert (outcome, signal) == ("useful", "user_reply")
 
 
 async def test_wave1_thread_without_outreach_id_degrades(db):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from email.utils import parseaddr
 
 import aiosqlite
 
@@ -37,6 +38,24 @@ def make_reply_engagement_bridge(tracker: EngagementTracker):
             logger.debug(
                 "Reply thread %s context lacks outreach_id — engagement bridge skipped",
                 thread.get("id"),
+            )
+            return
+        # Only a genuine, human reply from the address we actually mailed counts
+        # as engagement. match_reply accepts any message carrying our Message-ID,
+        # so gate out automated mail (OOO/bounce/list) and foreign/spoofed senders
+        # before they inflate the reply rate / resolve ledger predictions.
+        if getattr(reply, "is_auto", False):
+            logger.debug(
+                "Reply on thread %s is automated (OOO/bounce/list) — not counted as engagement",
+                thread.get("id"),
+            )
+            return
+        recipient = (thread.get("recipient") or "").strip().lower()
+        sender_addr = parseaddr(getattr(reply, "sender", "") or "")[1].strip().lower()
+        if recipient and sender_addr and sender_addr != recipient:
+            logger.debug(
+                "Reply on thread %s from %s != recipient %s — not counted as engagement",
+                thread.get("id"), sender_addr, recipient,
             )
             return
         reply_text = getattr(reply, "body_preview", "") or ""

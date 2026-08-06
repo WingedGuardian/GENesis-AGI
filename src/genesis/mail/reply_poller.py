@@ -36,7 +36,7 @@ class ParsedReply:
 
     __slots__ = (
         "message_id", "in_reply_to", "references", "sender",
-        "subject", "body_preview", "imap_uid",
+        "subject", "body_preview", "imap_uid", "is_auto",
     )
 
     def __init__(
@@ -49,6 +49,7 @@ class ParsedReply:
         subject: str,
         body_preview: str,
         imap_uid: int,
+        is_auto: bool = False,
     ) -> None:
         self.message_id = message_id
         self.in_reply_to = in_reply_to
@@ -57,6 +58,33 @@ class ParsedReply:
         self.subject = subject
         self.body_preview = body_preview
         self.imap_uid = imap_uid
+        # True for OOO responders, bounces, and list/bulk mail (RFC 3834 +
+        # common vendor headers). Such a message can carry our Message-ID in
+        # In-Reply-To and match a thread, but must NOT count as engagement.
+        self.is_auto = is_auto
+
+
+# Precedence values that mark automated/bulk mail (RFC 3834 + common usage).
+_AUTO_PRECEDENCE = frozenset({"bulk", "junk", "list", "auto_reply"})
+# Vendor auto-reply markers whose mere presence signals an automated message.
+_AUTO_MARKER_HEADERS = (
+    "X-Auto-Response-Suppress", "X-Autoreply", "X-Autorespond", "X-Autoresponder",
+)
+
+
+def _is_auto_response(msg: email.message.Message) -> bool:
+    """True for automated messages — OOO responders, bounces, list/bulk mail.
+
+    Such a message can carry a tracked Message-ID in ``In-Reply-To`` and match
+    a thread, so it must be filtered before it counts as engagement (RFC 3834
+    ``Auto-Submitted``/``Precedence`` + common vendor headers)."""
+    auto_submitted = (msg.get("Auto-Submitted") or "").strip().lower()
+    if auto_submitted and auto_submitted != "no":
+        return True
+    precedence = (msg.get("Precedence") or "").strip().lower()
+    if precedence in _AUTO_PRECEDENCE:
+        return True
+    return any(msg.get(h) for h in _AUTO_MARKER_HEADERS)
 
 
 def _extract_reply_headers(raw: RawEmail) -> ParsedReply | None:
@@ -84,6 +112,7 @@ def _extract_reply_headers(raw: RawEmail) -> ParsedReply | None:
         subject=parsed.subject,
         body_preview=parsed.body[:500] if parsed.body else "",
         imap_uid=raw.uid,
+        is_auto=_is_auto_response(msg),
     )
 
 

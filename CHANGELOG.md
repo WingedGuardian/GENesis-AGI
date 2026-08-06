@@ -17,7 +17,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   as zero and the prediction ledger graded every real reply as silence. The
   reply poller now writes the engagement back to the outreach record (without
   overwriting a richer outcome you set manually), so reply metrics and ledger
-  calibration reflect reality.
+  calibration reflect reality. Automated messages (out-of-office responders,
+  bounces, list mail) and replies from an address other than the one contacted
+  are filtered out, so they can't inflate the reply rate.
 
 ### Added
 
