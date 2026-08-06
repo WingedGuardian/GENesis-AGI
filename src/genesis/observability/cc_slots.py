@@ -14,7 +14,7 @@ gated and FAILS with EACCES inside genesis-server's systemd sandbox
 (``ProtectSystem=strict``); it only succeeds from an unsandboxed shell. So the
 slot label (``GENESIS_SLOT``, environ-only) is NOT readable in-server. This
 module therefore enriches the slot label from the ``mcp-spawn`` file plane
-(``slot_by_pid``, world-readable) and identifies interactive sessions by cmdline
+(``enumerate_spawn_slots``, world-readable) and identifies interactive sessions by cmdline
 (``/proc/<pid>/cmdline``, world-readable) — neither is ptrace-gated, so both work
 under the sandbox. VmRSS/comm/stat are likewise world-readable. See the
 ``verify_real_runtime_context`` lesson (shipped-green-but-inert since #855).
@@ -148,7 +148,7 @@ def enumerate_cc_slots() -> list[dict]:
     share ``comm=="claude"``) don't masquerade as sessions; cmdline is the
     authoritative signal, checked before any slot label is trusted. The slot label
     is then enrichment: from the process's environ (``GENESIS_SLOT``) when
-    readable, else from the ``mcp-spawn`` file plane (``slot_by_pid``) — the latter
+    readable, else from the ``mcp-spawn`` file plane (``enumerate_spawn_slots``) — the latter
     is the ONLY source that survives genesis-server's ``ProtectSystem`` sandbox,
     where ``/proc/<pid>/environ`` reads return EACCES.
 
@@ -169,14 +169,21 @@ def enumerate_cc_slots() -> list[dict]:
 
     # Lazy import keeps this module a stdlib-only leaf at import time (no cycle —
     # mcp_spawn_store imports nothing from genesis). The file-plane read is the
-    # sandbox-safe slot source.
+    # sandbox-safe slot source. Map pid -> (slot, spawn_at) so a recycled pid can
+    # be rejected below by comparing spawn_at to the live process's start time.
+    spawn_by_pid: dict[int, tuple[str, str]] = {}
+    _rec_current = None
     try:
-        from genesis.observability.mcp_spawn_store import slot_by_pid
+        from genesis.observability.mcp_spawn_store import (
+            enumerate_spawn_slots,
+        )
+        from genesis.observability.mcp_spawn_store import (
+            spawn_record_is_current as _rec_current,
+        )
 
-        spawn_slots = slot_by_pid()
+        spawn_by_pid = {pid: (slot, sat) for slot, pid, sat in enumerate_spawn_slots()}
     except Exception:
         logger.debug("cc_slots: spawn-plane lookup failed", exc_info=True)
-        spawn_slots = {}
 
     rows: list[dict] = []
     for pid in pids:
@@ -192,17 +199,25 @@ def enumerate_cc_slots() -> list[dict]:
         # (possibly OS-reused) pid to a slot. The slot label is enrichment only.
         if not _is_interactive(pid):
             continue
-        slot = _slot_label(pid) or spawn_slots.get(pid)
         rss = read_proc_rss_mb(pid)
         if rss is None:
             continue
+        started_at = read_proc_start_iso(pid)
+        # Slot label: environ (unsandboxed) first, else the spawn-file plane — but
+        # only when the plane record's pid was NOT recycled (its spawn_at is
+        # consistent with this process's start time); otherwise leave it unlabeled.
+        plane = spawn_by_pid.get(pid)
+        plane_slot = (
+            plane[0] if plane and _rec_current and _rec_current(plane[1], started_at) else None
+        )
+        slot = _slot_label(pid) or plane_slot
         rows.append(
             {
                 "slot": slot,
                 "pid": pid,
                 "rss_mb": rss,
                 "status": slot_status(rss),
-                "started_at": read_proc_start_iso(pid),
+                "started_at": started_at,
             }
         )
 

@@ -113,6 +113,23 @@ class TestEnumerateCcSlots:
         assert len(rows) == 1
         assert rows[0]["pid"] == 4242 and rows[0]["slot"] == "5"
 
+    def test_spawn_plane_label_dropped_when_pid_recycled(self, tmp_path, monkeypatch):
+        # The plane maps pid 4242 -> slot 5 with an ancient spawn_at, but this live
+        # interactive process started long AFTER it (pid recycled by the OS) → the
+        # stale label must be dropped (slot None); the process is still listed.
+        monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+        spawn = tmp_path / "spawn"
+        spawn.mkdir()
+        (spawn / "5").write_text(f"4242 {'a' * 40} 1970-01-01T00:00:00+00:00\n")
+        monkeypatch.setattr(mcp_spawn_store, "_SPAWN_DIR", spawn)
+        _write_btime(tmp_path, 1_700_000_000)  # recent boot → proc start >> 1970 spawn_at
+        _make_proc_entry(tmp_path, 4242, "claude", None, 700_000)
+        _write_stat(tmp_path, 4242, "claude", 500_000)
+        rows = enumerate_cc_slots()
+        assert len(rows) == 1
+        assert rows[0]["pid"] == 4242
+        assert rows[0]["slot"] is None
+
     def test_stale_spawn_slot_on_headless_pid_is_excluded(self, tmp_path, monkeypatch):
         # A stale spawn-file maps a slot to a pid the OS has since reused for a
         # headless `claude -p` cognitive call. cmdline is authoritative → the call

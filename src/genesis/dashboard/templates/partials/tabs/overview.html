@@ -757,11 +757,11 @@
                   <span style="color:var(--color-text-secondary);"
                         title="Memory (RSS) used by each concurrent Claude Code worker session — leak detection. Green = healthy, amber ≥ 4 GB, red ≥ 6 GB.">Claude Code Sessions</span>
                   <div style="display:flex; flex-wrap:wrap; gap:0.35rem;">
-                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.slot">
+                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.pid">
                       <span style="font-size:0.7rem; padding:0.05rem 0.3rem; border-radius:3px; background:var(--color-background); white-space:nowrap;"
                             :style="`color: ${slot.status === 'error' ? '#d9534f' : slot.status === 'degraded' ? '#f0ad4e' : '#4caf50'}`"
-                            :title="'Session ' + slot.slot + ' (pid ' + slot.pid + '): ' + (slot.rss_mb / 1024).toFixed(2) + ' GB RSS'"
-                            x-text="'#' + slot.slot + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
+                            :title="(slot.slot ? 'Session ' + slot.slot : 'Unregistered session') + ' (pid ' + slot.pid + '): ' + (slot.rss_mb / 1024).toFixed(2) + ' GB RSS'"
+                            x-text="(slot.slot ? '#' + slot.slot : 'pid ' + slot.pid) + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
                     </template>
                   </div>
                 </div>

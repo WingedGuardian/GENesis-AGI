@@ -74,11 +74,14 @@ class TestPersistRead:
 
 
 class TestEnumerateSpawnSlots:
-    def test_lists_slot_and_pid(self, tmp_path, monkeypatch):
+    def test_lists_slot_pid_and_spawn_at(self, tmp_path, monkeypatch):
         _point_dir(tmp_path, monkeypatch)
         store.persist_spawn_commit("4", 45285, FULL, AT)
         store.persist_spawn_commit("7", 1615462, FULL, AT)
-        assert sorted(store.enumerate_spawn_slots()) == [("4", 45285), ("7", 1615462)]
+        assert sorted(store.enumerate_spawn_slots()) == [
+            ("4", 45285, AT),
+            ("7", 1615462, AT),
+        ]
 
     def test_missing_dir_returns_empty(self, tmp_path, monkeypatch):
         _point_dir(tmp_path, monkeypatch)  # dir not created
@@ -92,13 +95,41 @@ class TestEnumerateSpawnSlots:
         (d / ".4.tmp9x").write_text(f"999 {FULL} {AT}\n")  # atomic-write temp → skip
         (d / "5").write_text("only two\n")  # not 3 tokens → skip
         (d / "6").write_text(f"notapid {FULL} {AT}\n")  # non-numeric pid → skip
-        assert store.enumerate_spawn_slots() == [("4", 45285)]
+        assert store.enumerate_spawn_slots() == [("4", 45285, AT)]
 
-    def test_slot_by_pid_reverse_map(self, tmp_path, monkeypatch):
+
+class TestSpawnRecordIsCurrent:
+    def test_proc_started_before_spawn_at_is_current(self):
+        # legit: the claude process started a beat before its MCP wrote spawn_at
+        assert (
+            store.spawn_record_is_current("2026-08-06T12:00:05+00:00", "2026-08-06T12:00:00+00:00")
+            is True
+        )
+
+    def test_proc_started_well_after_is_stale(self):
+        # recycled pid: the live process started long after the stale record
+        assert (
+            store.spawn_record_is_current("2026-08-06T12:00:00+00:00", "2026-08-06T14:00:00+00:00")
+            is False
+        )
+
+    def test_missing_or_unparseable_times_fail_open(self):
+        assert store.spawn_record_is_current(None, "2026-08-06T12:00:00+00:00") is True
+        assert store.spawn_record_is_current("2026-08-06T12:00:00+00:00", None) is True
+        assert store.spawn_record_is_current("garbage", "also-garbage") is True
+
+    def test_recycled_pid_rejected_by_read_spawn_identity(self, tmp_path, monkeypatch):
         _point_dir(tmp_path, monkeypatch)
-        store.persist_spawn_commit("4", 45285, FULL, AT)
-        store.persist_spawn_commit("7", 1615462, FULL, AT)
-        assert store.slot_by_pid() == {45285: "4", 1615462: "7"}
+        store.persist_spawn_commit("4", 45285, FULL, "2026-08-06T12:00:00+00:00")
+        # same pid, but the live process started 2h after the record → recycled
+        assert store.read_spawn_identity("4", 45285, "2026-08-06T14:00:00+00:00") is None
+        # a process started before spawn_at (genuine) still reads
+        assert store.read_spawn_identity("4", 45285, "2026-08-06T11:59:58+00:00") == (
+            FULL,
+            "2026-08-06T12:00:00+00:00",
+        )
+        # no start time supplied → pid match alone (back-compat, fail-open)
+        assert store.read_spawn_identity("4", 45285) == (FULL, "2026-08-06T12:00:00+00:00")
 
 
 class TestSessionPid:
