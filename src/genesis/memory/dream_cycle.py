@@ -82,6 +82,12 @@ DAILY_SYNTHESIS_BUDGET: int = 100
 # Max top-value clusters the weekly pass persists. Kept under the deferred-work
 # overflow alarm (resilience queue_overflow_threshold=1000) with headroom.
 WORKLIST_CAP: int = 500
+# Max times a capacity-failed drain slice is reset to pending before it is
+# completed with a WARNING instead (no infinite retry). Bounds queue CLAIMS
+# (deferred_work_queue.attempts, ++ on each mark_processing), so ~3 daily drains
+# will re-attempt an outage-blocked slice before it is let go; the weekly
+# re-cluster re-surfaces its members regardless (staleness_policy=DRAIN).
+_SLICE_ATTEMPT_CAP: int = 3
 
 
 class ProvidersExhaustedError(Exception):
@@ -541,14 +547,24 @@ async def run_synthesis_drain(
       * LIVE — synthesizes+deprecates via the same capacity-breaker loop as the old
         weekly path (``_synthesize_clusters`` with ``max_merges=budget``).
 
-    Items attempted this slice are marked completed regardless of per-cluster
-    outcome — unmerged/blocked/aborted clusters simply re-surface in next week's
-    re-cluster (the design is value-ranked, not exhaustive). Exception: on an
-    infrastructure failure (Qdrant unreachable) the drain aborts WITHOUT
-    consuming items — a preflight ping guards the start, and a mid-drain
-    rehydrate error resets the in-flight item to pending (FM-2). A stale slice
-    (<2 live members) is completed as a no-op, not discarded — discard implies
-    failure on the dashboard errors view (FM-5).
+    Slice disposition after synthesis:
+      * merged / quality-blocked / non-capacity error / stale no-op → COMPLETED
+        (the design is value-ranked, not exhaustive — a merged slice is done, and
+        blocked/errored clusters re-surface in next week's re-cluster).
+      * CAPACITY failure (provider chain exhausted, adversarial review exhausted,
+        or a breaker-trip/budget cutoff that left the slice untried) → RESET to
+        pending so a future drain retries it. This is the recovery net for
+        cognition lost to a transient provider outage — the prior behavior
+        completed these unconditionally and dropped the work. The
+        ``_SLICE_ATTEMPT_CAP`` retry cap (complete-with-WARNING, no infinite
+        retry) is charged ONLY to a slice that exhausts its OWN synthesis in a
+        drain that did not abort on capacity — never to un-attempted slices, nor
+        to any slice during a provider-outage abort (see the disposition loop).
+      * infrastructure failure (Qdrant unreachable) aborts the drain WITHOUT
+        consuming items — a preflight ping guards the start, and a mid-drain
+        rehydrate error resets the in-flight item to pending (FM-2).
+      * stale slice (<2 live members) is completed as a no-op, not discarded —
+        discard implies failure on the dashboard errors view (FM-5).
     """
     from genesis.resilience.deferred_work import DeferredWorkQueue
 
@@ -569,6 +585,12 @@ async def run_synthesis_drain(
         #    failure) — must reach 0 before the PR2 live-merge flip
         "shield_members_skipped": 0, "shield_skipped": 0,
         "shield_missing_thresholds": 0,
+        # Capacity-recovery lifecycle (see the per-slice completion loop below):
+        #  - slices_reset: capacity-failed/unattempted slices put back to pending
+        #    for a future drain (recoverable lost work — the FM this PR closes)
+        #  - slices_capped: slices that hit _SLICE_ATTEMPT_CAP and were completed
+        #    with a WARNING instead of retried again (no infinite retry)
+        "slices_reset": 0, "slices_capped": 0,
     }
 
     # Preflight: don't consume the worklist when Qdrant is unreachable — a dead
@@ -674,13 +696,57 @@ async def run_synthesis_drain(
             )
             await queue.mark_completed(item["id"])
     elif pending:
-        await _synthesize_clusters(
+        outcomes = await _synthesize_clusters(
             [c for _, c in pending],
             run_id=run_id, qdrant=qdrant, db=db, router=router, store=store,
             max_merges=budget, max_cluster_size=MAX_CLUSTER_SIZE, report=report,
         )
-        for item, _ in pending:
-            await queue.mark_completed(item["id"])
+        # Per-slice disposition. Capacity failures are RECOVERABLE — reset to
+        # pending so a future drain retries. Everything else — merged,
+        # quality-blocked, non-capacity error — is completed, matching the
+        # value-ranked "attempted once, then re-cluster" design.
+        #
+        # The retry cap is charged ONLY to a slice that genuinely got an LLM
+        # attempt and exhausted in a drain that did NOT hit a global capacity
+        # abort — i.e. a slice that keeps failing its OWN synthesis while the
+        # system is otherwise healthy (a poison slice). It is deliberately NOT
+        # charged to:
+        #   * "unattempted" slices — the breaker tripped (or budget cut off)
+        #     before they got an LLM call, yet the claim already bumped their
+        #     attempts; charging them would drop never-tried work (during an
+        #     outage the breaker lets only ~_CAPACITY_ABORT_THRESHOLD slices
+        #     through per drain, so the rest would hit the cap in 3 outage days
+        #     and recreate the cognition-loss this fix prevents), and
+        #   * ANY slice when the whole drain aborted on capacity — those
+        #     failures are systemic (provider outage), not slice-specific.
+        # Un-capped slices survive to the next drain; the weekly supersede()
+        # replaces the worklist wholesale, so they can't accumulate forever.
+        capacity_abort = report["aborted_capacity"]
+        for (item, _cluster), outcome in zip(pending, outcomes, strict=True):
+            if outcome not in ("exhausted", "unattempted"):
+                await queue.mark_completed(item["id"])
+                continue
+            # attempts was bumped by the mark_processing claim above, so
+            # item["attempts"] (pre-claim) + 1 is this drain's claim number.
+            attempt_no = item["attempts"] + 1
+            charge_cap = outcome == "exhausted" and not capacity_abort
+            if charge_cap and attempt_no >= _SLICE_ATTEMPT_CAP:
+                report["slices_capped"] += 1
+                logger.warning(
+                    "Dream drain %s: slice %s exhausted its own synthesis on "
+                    "attempt %d (cap %d) — completing without further retry; "
+                    "members re-surface in next week's re-cluster.",
+                    run_id[:8], item["id"][:8], attempt_no, _SLICE_ATTEMPT_CAP,
+                )
+                await queue.mark_completed(item["id"])
+            else:
+                report["slices_reset"] += 1
+                logger.info(
+                    "Dream drain %s: slice %s capacity-failed (%s) on attempt "
+                    "%d — reset to pending for retry.",
+                    run_id[:8], item["id"][:8], outcome, attempt_no,
+                )
+                await queue.reset_to_pending(item["id"])
 
     logger.info(
         "Dream drain %s (%s): drained=%d stale=%d would_merge=%d merged=%d deprecated=%d",
@@ -996,7 +1062,7 @@ async def _synthesize_clusters(
     max_merges: int,
     max_cluster_size: int,
     report: dict[str, Any],
-) -> None:
+) -> list[str]:
     """Synthesize/deprecate clusters with a capacity breaker (mutates report).
 
     Aborts early (``report['aborted_capacity']=True``) after
@@ -1004,17 +1070,28 @@ async def _synthesize_clusters(
     run during a provider outage fails fast instead of grinding every cluster
     into a saturated chain. Genuine quality blocks reset the streak and never
     trip the breaker.
+
+    Returns a per-cluster outcome list ALIGNED TO ``all_clusters`` input order
+    (not attempt order) so the drain can decide each slice's queue disposition:
+    ``"merged"`` | ``"blocked"`` (quality gate — permanent for this cluster) |
+    ``"exhausted"`` (capacity failure — recoverable, reset for retry) |
+    ``"error"`` (non-capacity error — re-cluster next week) |
+    ``"skipped_large"`` (permanent) | ``"unattempted"`` (breaker trip or
+    max_merges cutoff left this cluster untried — recoverable, reset).
     """
-    # Deliberate re-sort: the worklist was value-ranked at enqueue, but
-    # rehydration can shrink clusters (members deprecated since Sunday) — the
-    # POST-rehydration size is the fresher value signal, so attempt order may
-    # diverge from queue order for shrunk clusters. PR2's per-item lifecycle
-    # supersedes this batch call.
-    all_clusters.sort(key=len, reverse=True)
+    # Attempt biggest-first (post-rehydration size is the fresher value signal
+    # than the enqueue-time rank), but record outcomes by ORIGINAL index so the
+    # caller can map each result back to its worklist slice — synthesis is not
+    # slice-aware, so the drain owns the queue disposition.
+    order = sorted(
+        range(len(all_clusters)), key=lambda i: len(all_clusters[i]), reverse=True
+    )
+    outcomes: list[str] = ["unattempted"] * len(all_clusters)
     merged = 0
     breaker = _CapacityBreaker(_CAPACITY_ABORT_THRESHOLD)
 
-    for cluster in all_clusters:
+    for idx in order:
+        cluster = all_clusters[idx]
         if merged >= max_merges:
             break
 
@@ -1029,6 +1106,7 @@ async def _synthesize_clusters(
 
         if len(cluster) > max_cluster_size:
             report["clusters_skipped_large"] += 1
+            outcomes[idx] = "skipped_large"
             logger.info(
                 "Dream cycle %s: skipping cluster of %d in %s/%s (too large)",
                 run_id[:8], len(cluster),
@@ -1051,19 +1129,25 @@ async def _synthesize_clusters(
                 report.get("links_copied", 0) + result.get("links_copied", 0)
             )
             breaker.record_progress()
+            outcomes[idx] = "merged"
         except SynthesisBlockedError as exc:
             # Adversarial review or shrink gate blocked this cluster.
             if exc.exhausted:
-                # Block caused by provider exhaustion (capacity), not quality.
+                # Block caused by provider exhaustion (capacity), not quality —
+                # recoverable, so the drain retries this slice.
                 report["adversarial_blocked"] += 1
                 breaker.record_exhaustion()
+                outcomes[idx] = "exhausted"
             else:
                 # Genuine quality gate working as intended — resets the breaker.
+                # Permanent for this cluster; the slice is completed (re-cluster
+                # next week may reshape it).
                 if "catastrophic shrink" in str(exc):
                     report["shrink_gate_blocked"] += 1
                 else:
                     report["adversarial_blocked"] += 1
                 breaker.record_progress()
+                outcomes[idx] = "blocked"
             logger.info(
                 "Dream cycle %s: cluster of %d blocked: %s",
                 run_id[:8], len(cluster), exc,
@@ -1074,6 +1158,7 @@ async def _synthesize_clusters(
                 "error": str(exc),
             })
             breaker.record_exhaustion()
+            outcomes[idx] = "exhausted"
             logger.warning(
                 "Dream cycle %s: synthesis exhausted for cluster of %d: %s",
                 run_id[:8], len(cluster), exc,
@@ -1085,6 +1170,7 @@ async def _synthesize_clusters(
                 "error": str(exc),
             })
             breaker.record_progress()
+            outcomes[idx] = "error"
             logger.warning(
                 "Dream cycle %s: synthesis failed for cluster of %d: %s",
                 run_id[:8], len(cluster), exc, exc_info=True,
@@ -1111,6 +1197,8 @@ async def _synthesize_clusters(
                 run_id[:8], (total_blocked / total_attempted) * 100,
                 total_blocked, total_attempted, run_id,
             )
+
+    return outcomes
 
 
 async def _synthesize_and_deprecate(
