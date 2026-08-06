@@ -34,7 +34,7 @@ you're publishing as Genesis (use content-publish / genesis-voice).
 | 3 | **Structure & altitude** — lead with the answer, action titles, methodology→appendix | `references/structure-altitude.md` | |
 | 4 | **Voice** — make it sound like the user | invoke the **voice-master** skill | |
 | 5 | **Anti-slop** — strip document/sentence AI tells | invoke the **humanizer** skill (voice-calibration off — voice-master already voiced it) | |
-| 6 | **Render** — produce the real file (PDF/DOCX/PPTX); set `status: rendered_unverified` | `references/render-guide.md` (pandoc / `/make-pdf` / `/drawio-skill`) | |
+| 6 | **Render** — produce the real file (PDF/DOCX/PPTX/XLSX); set `status: rendered_unverified` | `references/render-guide.md` (pandoc / `/make-pdf` / `/drawio-skill` / **OfficeCLI** when `office_deliverables` active) | |
 | 7 | **Verify** — fresh-context adversarial PASS/FAIL vs. the frozen criteria | `references/qa-protocol.md` | **Gate 2** (policeman) |
 | 8 | **Sign-off** — user approves the verified artifact | `references/approval-gates.md` | **Gate 3** (interactive) |
 
@@ -70,9 +70,11 @@ after Gate 3. If the user abandons it, set `cancelled`.
   `references/approval-gates.md`.
 
 ## What this does NOT do (yet)
-XLSX (needs `xlsxwriter`; offer CSV), polished decks beyond pandoc-basic, real Telegram file
-*attachment* for autonomous Gate 3 (sends path + summary for now — fast-follow), and the
-`enterprise-ai-skills` / `hallmark` extras. One deliverable at a time.
+Real Telegram file *attachment* for autonomous Gate 3 (sends path + summary for now —
+fast-follow), and the `enterprise-ai-skills` / `hallmark` extras. One deliverable at a time.
+(Real `.xlsx` with formulas and polished `.pptx` decks now work **when the optional OfficeCLI
+backend is present** — see `references/render-guide.md`; without it the builder falls back to
+CSV / pandoc-basic.)
 
 ## Example
 **User:** "Turn my take-home analysis into the submission packet it should have been."

@@ -87,7 +87,7 @@ Establish, and write into the spec:
 - **audience** — who receives this, and what they already know.
 - **purpose** — the job it does for them.
 - **win_condition** — one sentence: what makes this a success in *their* eyes.
-- **format** — a deliberate decision, **not a default**. Use `references/format-guide.md` to form
+- **format** — a deliberate decision, **not a default**. Use `references/render-guide.md` to form
   a recommendation from audience+purpose, then **put it to the user with the alternatives.** The
   most common fork is **PDF (final, fixed) vs DOCX (they'll edit or comment on it)**; decks, XLSX,
   etc. live in the matrix. Confirm before drafting. **Never markdown for an external /

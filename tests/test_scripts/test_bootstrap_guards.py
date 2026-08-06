@@ -151,3 +151,85 @@ def test_s3_dead_repo_example_removed():
     assert "REPO_EXAMPLE" not in cfg
     assert "genesis.yaml.example" not in cfg
     assert "Migrate from repo YAML" not in cfg  # the misleading comment is corrected
+
+
+# ── OfficeCLI: provisioned binary for deliverable-builder (external, optional) ──
+# The render backend for high-fidelity .xlsx/.pptx. Security-critical: a pinned
+# version + a COMMITTED literal SHA256 (not a fetched SHA256SUMS, which is TOFU).
+import re  # noqa: E402
+
+
+def test_officecli_pins_committed_literal_sha256_both_arches():
+    """BLOCKER guard: literal 64-hex SHA256 pins for x64 AND arm64 live in the
+    script (repo-reviewed), so verification can't be defeated by a swapped
+    release. A fetched SHA256SUMS would be trust-on-first-use."""
+    code = _code(BOOTSTRAP)
+    assert re.search(r'OCLI_SHA256_x64="[0-9a-f]{64}"', code)
+    assert re.search(r'OCLI_SHA256_arm64="[0-9a-f]{64}"', code)
+    # ...and it must actually be checked, refusing (deleting) on mismatch.
+    assert "sha256sum -c -" in code
+    assert 'rm -f "$OCLI_BIN"' in code
+    assert "checksum mismatch" in code.lower()
+
+
+def test_officecli_arch_detection_x64_arm64_and_skip():
+    code = _code(BOOTSTRAP)
+    assert 'x86_64)        OCLI_ARCH="x64"' in code or 'x86_64) OCLI_ARCH="x64"' in code
+    assert 'aarch64|arm64) OCLI_ARCH="arm64"' in code
+    # unsupported arch → empty → skip branch (never fatal)
+    assert 'OCLI_ARCH=""' in code
+    assert "unsupported arch" in code
+
+
+def test_officecli_guard_is_checksum_based_not_presence_or_version_only():
+    """The idempotency guard trusts the on-disk binary ONLY if its hash matches
+    the committed pin — which re-verifies an existing binary (anti-tamper) AND
+    re-downloads on a pin bump (the new hash won't match the old binary). NOT a
+    presence-only `-x` skip and NOT a spoofable `--version` check."""
+    code = _code(BOOTSTRAP)
+    assert "_ocli_verify()" in code
+    assert "if _ocli_verify; then" in code  # skip only when the hash matches
+    # anti-tamper: the guard re-hashes; it does NOT trust a bare --version string.
+    assert '"$OCLI_BIN" --version' not in code
+    # verify runs both on the existing binary AND the freshly-downloaded one.
+    assert code.count("_ocli_verify") >= 3
+
+
+def test_officecli_curl_primary_gh_fallback():
+    """curl (no auth needed for a public asset) must be tried BEFORE gh, so a
+    fresh install with no gh login still provisions."""
+    code = _code(BOOTSTRAP)
+    curl_i = code.find('curl -fSL "$OCLI_URL"')
+    gh_i = code.find("gh release download")
+    assert curl_i != -1 and gh_i != -1
+    assert curl_i < gh_i  # curl primary, gh fallback
+
+
+def test_officecli_nonfatal_and_bounded():
+    code = _code(BOOTSTRAP)
+    assert "WARNING: OfficeCLI download failed" in code  # non-fatal echo, never exit 1
+    assert "timeout 300 curl" in code  # bounded fetch
+    assert "sleep 2" in code  # one retry
+
+
+def test_officecli_arch_and_checksum_logic_functional(tmp_path):
+    """Functional: arch mapping + checksum accept/refuse behave correctly."""
+    script = r"""
+    for m in x86_64 aarch64 arm64 riscv64; do
+      case "$m" in x86_64) A="x64";; aarch64|arm64) A="arm64";; *) A="";; esac
+      echo "$m=$A"
+    done
+    f="$1"; good=$(sha256sum "$f" | awk '{print $1}')
+    echo "good  $f" | sed "s/^good/$good/" | sha256sum -c - >/dev/null 2>&1 && echo "good=accept" || echo "good=reject"
+    echo "0000000000000000000000000000000000000000000000000000000000000000  $f" | sha256sum -c - >/dev/null 2>&1 && echo "bad=accept" || echo "bad=reject"
+    """
+    f = tmp_path / "bin"
+    f.write_text("payload")
+    out = subprocess.run(
+        ["bash", "-c", script, "bash", str(f)], capture_output=True, text=True, check=True
+    ).stdout
+    assert "x86_64=x64" in out
+    assert "aarch64=arm64" in out and "arm64=arm64" in out
+    assert "riscv64=" in out  # unsupported → empty
+    assert "good=accept" in out
+    assert "bad=reject" in out  # checksum mismatch refused

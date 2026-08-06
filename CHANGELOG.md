@@ -11,6 +11,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Real spreadsheets and polished decks from the deliverable builder.** When the
+  optional OfficeCLI tool is present, Genesis now produces genuine `.xlsx` files
+  (with working formulas and cell formatting) and higher-fidelity `.pptx` decks,
+  instead of falling back to CSV or a basic pandoc slide export. It renders,
+  screenshots the result to check the layout, and catches broken or stale formulas
+  before the file reaches you. The tool is installed automatically during setup;
+  if it is unavailable, the builder degrades cleanly to the previous CSV/pandoc path.
 - **Stale-code guard for procedure storage after a deploy.** A Claude Code
   session loads its Genesis tools once when it starts and keeps running that
   version until it restarts, so a fix shipped by a deploy stays dormant in an
