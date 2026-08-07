@@ -130,7 +130,17 @@ def test_shared_constants_stable():
     assert cwc.CONTRIBUTOR_ISSUE_ACTION_TYPE == "contributor_issue_post"
     assert cwc.CELL_DOMAIN == "github"
     assert cwc.CELL_VERB == "issue_create"
-    assert cwc.CELL_RISK_CLASS == "public_write"
+    assert cwc.CELL_RISK_CLASS == "bulk"
+
+
+def test_cell_constants_are_valid():
+    """The risk class MUST be a real RiskClass member — an off-enum value would
+    hard-fail the shared capability-grants machinery (CHECK constraint + severity
+    / prior-weight dicts) the moment the enforce stage touches this cell. This
+    guard would have caught the original 'public_write' (not a RiskClass) value."""
+    from genesis.autonomy.types import RiskClass
+
+    assert cwc.CELL_RISK_CLASS in {r.value for r in RiskClass}
 
 
 # ── settings domain ──────────────────────────────────────────────────────

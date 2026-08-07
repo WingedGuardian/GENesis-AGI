@@ -52,9 +52,16 @@ MODES = ("off", "propose_only", "live")
 CONTRIBUTOR_ISSUE_ACTION_TYPE = "contributor_issue_post"
 
 # Capability cell (shadow-gate) for the external GitHub-issue egress door.
+# The risk class MUST be a valid ``genesis.autonomy.types.RiskClass`` member —
+# it keys the shared capability-grants machinery (severity ordering, prior
+# weights, the CHECK constraint), so an off-enum value would hard-fail the
+# future enforce stage. The Work-Log posts a sustained stream of autonomous,
+# publicly-visible issues under the owner's account → BULK, the highest
+# non-financial caution tier, so standing auto-post autonomy must be earned
+# against strong evidence. (Guarded by test_cell_constants_are_valid.)
 CELL_DOMAIN = "github"
 CELL_VERB = "issue_create"
-CELL_RISK_CLASS = "public_write"
+CELL_RISK_CLASS = "bulk"
 
 # Env kill switch — forces `off` from both consumers.
 _DISABLE_ENV = "GENESIS_CONTRIBUTOR_WORKLOG_DISABLED"
@@ -72,6 +79,13 @@ _INT_KNOBS = (
     "retention_days",
     "max_held",
 )
+
+
+def normalize_title(title: str) -> str:
+    """Case- and whitespace-insensitive issue-title key for dedup. Shared by the
+    propose tool (DB-side dedup) and the poster drain (GitHub open-issue dedup) so
+    the two dedup scopes can never drift apart."""
+    return " ".join((title or "").lower().split())
 
 
 def _base_path() -> Path:

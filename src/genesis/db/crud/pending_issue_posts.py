@@ -140,3 +140,27 @@ async def mark_rejected(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+def _iso_days_before(now_iso: str, days: int) -> str:
+    """Return the ISO8601 timestamp *days* before ``now_iso``."""
+    from datetime import datetime, timedelta
+
+    return (datetime.fromisoformat(now_iso) - timedelta(days=days)).isoformat()
+
+
+async def prune_terminal(db: aiosqlite.Connection, *, older_than_days: int = 30, now: str) -> int:
+    """Delete TERMINAL rows (posted / rejected / expired / dry_run) whose terminal
+    timestamp is older than *older_than_days*. ``held`` rows are NEVER pruned —
+    they await the owner indefinitely. ``now`` is injected (never wall-clock) so
+    the cutover is deterministic and testable. Wired into ``disk_hygiene.sh``.
+    Returns the number of rows deleted."""
+    cutoff = _iso_days_before(now, older_than_days)
+    cursor = await db.execute(
+        "DELETE FROM pending_issue_posts "
+        "WHERE status IN ('posted', 'rejected', 'expired', 'dry_run') "
+        "AND COALESCE(posted_at, rejected_at, dry_run_at, held_at) < ?",
+        (cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount if cursor.rowcount is not None else 0

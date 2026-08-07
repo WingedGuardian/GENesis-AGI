@@ -33,6 +33,7 @@ from genesis.autonomy.contributor_worklog_config import (
     effective_mode,
     knob_int,
     load_config,
+    normalize_title,
 )
 from genesis.contribution import scan_prose
 from genesis.contribution.findings import Severity
@@ -41,11 +42,6 @@ from genesis.env import github_public_repo, github_user
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_title(title: str) -> str:
-    """Case- and whitespace-insensitive title key for dedup."""
-    return " ".join(title.lower().split())
 
 
 def _default_repo() -> str:
@@ -108,9 +104,9 @@ async def _impl_contributor_issue_propose(
             "status": "backpressure",
             "reason": f"{held_count} issue(s) already awaiting review (max_held reached)",
         }
-    title_norm = _normalize_title(title)
+    title_norm = normalize_title(title)
     for r in active:
-        if _normalize_title(r["title"]) == title_norm or (
+        if normalize_title(r["title"]) == title_norm or (
             source_ref is not None and r["source_ref"] == source_ref
         ):
             return {

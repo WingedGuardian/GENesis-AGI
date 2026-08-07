@@ -75,7 +75,7 @@ async def test_held_creates_row_and_approval(db, live):
     assert ctx["repo"] == _REPO
     assert ctx["labels"] == ["good first issue", "help wanted"]
     assert ctx["source_follow_up_id"] == "fu-123"
-    assert ctx["cell"] == ["github", "issue_create", "public_write"]
+    assert ctx["cell"] == ["github", "issue_create", "bulk"]
 
 
 @pytest.mark.asyncio
@@ -96,7 +96,7 @@ async def test_blocked_private_ip_creates_no_row(db, live):
     res = await _propose(
         db,
         title="Fix the timeout on the box",
-        body="On the host at 192.168.50.77 the poller hangs; raise the timeout.",
+        body="On the host at 192.168.1.42 the poller hangs; raise the timeout.",
     )
     assert res["status"] == "blocked"
     assert res["reasons"]  # non-empty findings

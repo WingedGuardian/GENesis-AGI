@@ -33,7 +33,7 @@ _ROW = {
     "labels": '["good first issue"]',
     "cell_domain": "github",
     "cell_verb": "issue_create",
-    "cell_risk_class": "public_write",
+    "cell_risk_class": "bulk",
     "held_at": "2026-08-07T00:00:00",
 }
 _TS = "2026-08-07T01:00:00"
@@ -113,7 +113,7 @@ class TestSchema:
                 "(id, request_id, repo, title, body, source, "
                 " cell_domain, cell_verb, cell_risk_class, held_at, status) "
                 "VALUES ('x','r','o/r','t','b','follow_up',"
-                "'github','issue_create','public_write','t','BOGUS')"
+                "'github','issue_create','bulk','t','BOGUS')"
             )
 
     @pytest.mark.asyncio
@@ -152,7 +152,7 @@ class TestCrud:
             source="codebase",
             cell_domain="github",
             cell_verb="issue_create",
-            cell_risk_class="public_write",
+            cell_risk_class="bulk",
             held_at="2026-08-07T00:00:00",
         )
         row = await pip.get_by_id(db, "c1")
@@ -207,6 +207,32 @@ class TestCrud:
         await pip.create(db, **{**_ROW, "id": "p2", "request_id": "req-2"})
         assert await pip.mark_rejected(db, "p2", rejected_at=_TS, expired=True) is True
         assert (await pip.get_by_id(db, "p2"))["status"] == "expired"
+
+    @pytest.mark.asyncio
+    async def test_prune_terminal_keeps_held_and_recent(self, db):
+        # held row (never prunable), an OLD posted row, and a RECENT dry_run row.
+        await pip.create(db, **{**_ROW, "id": "held", "request_id": "r-held"})
+        await pip.create(db, **{**_ROW, "id": "old", "request_id": "r-old"})
+        await pip.mark_posted(
+            db, "old", issue_number=1, issue_url="u", posted_at="2026-01-01T00:00:00"
+        )
+        await pip.create(db, **{**_ROW, "id": "new", "request_id": "r-new"})
+        await pip.mark_dry_run(db, "new", dry_run_at="2026-08-06T00:00:00")
+
+        now = "2026-08-07T00:00:00"
+        deleted = await pip.prune_terminal(db, older_than_days=30, now=now)
+        assert deleted == 1  # only the old posted row
+        assert await pip.get_by_id(db, "old") is None
+        assert (await pip.get_by_id(db, "held"))["status"] == "held"  # held NEVER pruned
+        assert (await pip.get_by_id(db, "new"))["status"] == "dry_run"  # recent kept
+
+    @pytest.mark.asyncio
+    async def test_prune_terminal_never_prunes_held_even_when_ancient(self, db):
+        # a held row with an ancient held_at must survive — it awaits the owner.
+        await pip.create(db, **{**_ROW, "held_at": "2020-01-01T00:00:00"})
+        deleted = await pip.prune_terminal(db, older_than_days=1, now="2026-08-07T00:00:00")
+        assert deleted == 0
+        assert (await pip.get_by_id(db, "p1"))["status"] == "held"
 
     @pytest.mark.asyncio
     async def test_posted_then_reject_is_noop(self, db):

@@ -32,7 +32,7 @@ _TABLE_DDL = """
         source_ref          TEXT,                   -- follow_up id (close-loop link), nullable
         cell_domain         TEXT NOT NULL,          -- capability cell (shadow-gate): 'github'
         cell_verb           TEXT NOT NULL,          -- 'issue_create'
-        cell_risk_class     TEXT NOT NULL,          -- 'public_write'
+        cell_risk_class     TEXT NOT NULL,          -- RiskClass, e.g. 'bulk'
         held_at             TEXT NOT NULL,
         status              TEXT NOT NULL DEFAULT 'held'
                                 CHECK (status IN ('held', 'posted', 'rejected', 'expired', 'dry_run')),
