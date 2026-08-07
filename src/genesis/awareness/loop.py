@@ -1621,11 +1621,26 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
         return
 
     now = time.monotonic()
+    # Evict expired cooldown entries so the pid-keyed map stays bounded to
+    # currently-cooling sessions. Keys are pids (unbounded over the loop's
+    # lifetime); an entry older than the cooldown no longer suppresses anything,
+    # so dropping it is behaviour-neutral and prevents slow growth on a
+    # long-running server.
+    for k in [k for k, t in _last_slot_alert_at.items() if now - t >= _SLOT_ALERT_COOLDOWN_S]:
+        del _last_slot_alert_at[k]
     for slot in slots:
         rss = slot.get("rss_mb", 0.0)
         if rss < SLOT_RSS_WARN_MB:
             continue
-        key = str(slot.get("slot", "?"))
+        # Key the cooldown by PID (unique per process), never the slot label: rows
+        # are pid-keyed and two live claude procs can share a label (or have none),
+        # so a label key would let one process suppress another's alert for an hour.
+        # (Cognitive `claude -p` calls are excluded upstream, so every row here is a
+        # real session.) The display label still prefers the slot when known.
+        raw_slot = slot.get("slot")
+        pid = slot.get("pid")
+        key = f"pid:{pid}"
+        label = f"slot cc-{raw_slot}" if raw_slot is not None else f"pid {pid}"
         last = _last_slot_alert_at.get(key)
         if last is not None and (now - last) < _SLOT_ALERT_COOLDOWN_S:
             continue
@@ -1642,15 +1657,15 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
                 source="cc_slot_monitor",
                 type="infrastructure_alert",
                 content=(
-                    f"CC slot cc-{key} (pid {slot.get('pid')}) is using "
+                    f"CC {label} (pid {pid}) is using "
                     f"{rss / 1024:.1f} GB RAM (warn {SLOT_RSS_WARN_MB // 1024} GB, "
                     f"crit {SLOT_RSS_CRIT_MB // 1024} GB). A single Claude Code "
-                    f"session may be leaking — consider restarting slot cc-{key}."
+                    f"session may be leaking — consider restarting {label}."
                 ),
                 priority=priority,
                 created_at=datetime.now(UTC).isoformat(),
             )
-            logger.warning("CC slot memory alert: cc-%s %.1f GB (%s)", key, rss / 1024, priority)
+            logger.warning("CC slot memory alert: %s %.1f GB (%s)", label, rss / 1024, priority)
         except Exception:
             logger.debug("Failed to create cc_slot alert observation", exc_info=True)
 

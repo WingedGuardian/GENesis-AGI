@@ -50,6 +50,17 @@ async def test_warn_is_high_priority_not_critical(_reset_cooldown_and_mock_creat
 
 
 @pytest.mark.asyncio
+async def test_null_slot_session_alerts_with_pid_key_and_label(_reset_cooldown_and_mock_create):
+    # An unregistered/manual interactive session has slot=None; it must still
+    # alert, keyed and labeled by pid (not collapsed onto a shared "None" bucket).
+    create = _reset_cooldown_and_mock_create
+    await loop._check_cc_slot_memory(object(), slots=[_slot(None, 6500, pid=98765)])
+    create.assert_awaited_once()
+    assert "pid 98765" in create.await_args.kwargs["content"]
+    assert "pid:98765" in loop._last_slot_alert_at  # cooldown keyed by pid, not "None"
+
+
+@pytest.mark.asyncio
 async def test_below_warn_no_alert(_reset_cooldown_and_mock_create):
     create = _reset_cooldown_and_mock_create
     await loop._check_cc_slot_memory(object(), slots=[_slot("1", 950)])
@@ -69,8 +80,26 @@ async def test_cooldown_suppresses_second_alert(_reset_cooldown_and_mock_create)
 @pytest.mark.asyncio
 async def test_distinct_slots_alert_independently(_reset_cooldown_and_mock_create):
     create = _reset_cooldown_and_mock_create
-    await loop._check_cc_slot_memory(object(), slots=[_slot("4", 6500), _slot("5", 6700)])
+    # distinct sessions have distinct pids; cooldown is keyed by pid
+    await loop._check_cc_slot_memory(
+        object(), slots=[_slot("4", 6500, pid=111), _slot("5", 6700, pid=222)]
+    )
     assert create.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_cooldown_keys_are_evicted(_reset_cooldown_and_mock_create):
+    # pid-keyed cooldown must stay bounded: an entry older than the cooldown window
+    # is evicted on the next tick (behaviour-neutral hygiene, not a leak).
+    import time as _time
+
+    now = _time.monotonic()
+    loop._last_slot_alert_at["pid:999"] = now - loop._SLOT_ALERT_COOLDOWN_S - 100  # stale
+    loop._last_slot_alert_at["pid:111"] = now  # fresh, still cooling
+    # a below-threshold tick still runs the eviction pass at the top of the check
+    await loop._check_cc_slot_memory(object(), slots=[_slot("1", 100, pid=1)])
+    assert "pid:999" not in loop._last_slot_alert_at  # stale evicted
+    assert "pid:111" in loop._last_slot_alert_at  # fresh retained
 
 
 @pytest.mark.asyncio

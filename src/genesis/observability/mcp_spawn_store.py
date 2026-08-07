@@ -18,6 +18,7 @@ import contextlib
 import logging
 import os
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -79,14 +80,79 @@ def persist_spawn_commit(
         logger.debug("mcp_spawn_store: persist failed for slot %s", slot, exc_info=True)
 
 
-def read_spawn_identity(slot: str, live_pid: int | None) -> tuple[str, str] | None:
+def enumerate_spawn_slots() -> list[tuple[str, int, str]]:
+    """``(slot_label, recorded_pid, spawn_at)`` for each persisted spawn file.
+
+    These are world-readable regular files (no ptrace-gated read), so this works
+    from the sandboxed genesis-server where ``/proc/<pid>/environ`` is unreadable —
+    it is how an in-server enumerator recovers a live session's slot without the
+    (sandbox-blocked) environ. ``spawn_at`` is returned so the caller can reject a
+    record whose recorded pid was RECYCLED by a newer process (see
+    ``spawn_record_is_current``). Best-effort; never raises. Skips the atomic-write
+    temp files (``mkstemp`` names them ``.<slot>.<rand>`` — dot-prefixed) and any
+    torn/malformed file.
+    """
+    out: list[tuple[str, int, str]] = []
+    try:
+        names = os.listdir(_SPAWN_DIR)
+    except OSError:
+        return out
+    for name in names:
+        if name.startswith("."):  # atomic-write temp file, not a slot
+            continue
+        try:
+            raw = (_SPAWN_DIR / name).read_text().strip()
+        except OSError:
+            continue
+        parts = raw.split()
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        out.append((name, pid, parts[2]))
+    return out
+
+
+def spawn_record_is_current(
+    spawn_at: str | None, proc_start_iso: str | None, grace_s: float = 120.0
+) -> bool:
+    """Whether a live process's start time is consistent with a spawn record.
+
+    A spawn record maps a pid → slot/commit, but the OS can RECYCLE that pid for a
+    different process once the recorded session exits (before disk-hygiene prunes
+    the dead-pid file). The record is about the recorded session only if the live
+    process started no LATER than the record was written (``spawn_at`` is captured
+    at MCP-subprocess start, which is a beat after the claude process itself
+    started, so a genuine match has ``proc_start <= spawn_at``); a recycled pid
+    belongs to a process that started well AFTER the stale ``spawn_at``. A small
+    grace absorbs clock skew. Fail-OPEN (True) when either timestamp is missing or
+    unparseable — the pid match stays the primary signal and a momentarily
+    unreadable ``/proc/<pid>/stat`` must not drop a valid record.
+    """
+    if not spawn_at or not proc_start_iso:
+        return True
+    try:
+        ps = datetime.fromisoformat(proc_start_iso)
+        sa = datetime.fromisoformat(spawn_at)
+    except (ValueError, TypeError):
+        return True
+    return (ps - sa).total_seconds() <= grace_s
+
+
+def read_spawn_identity(
+    slot: str, live_pid: int | None, proc_start_iso: str | None = None
+) -> tuple[str, str] | None:
     """``(commit, spawn_at)`` this slot's CURRENT session was spawned at, or None.
 
-    Returns the pair ONLY if the file's recorded pid == ``live_pid`` (the live
-    claude pid for this slot). A slot reused by a new session whose MCP servers
-    have not rewritten the file yet still carries the OLD pid → mismatch → None
-    (fail-open — no false badge during the brief startup window). Missing or
-    malformed file → None.
+    Returns the pair ONLY if the file's recorded pid == ``live_pid`` AND — when
+    ``proc_start_iso`` is supplied — the live process's start time is consistent
+    with the recorded ``spawn_at`` (``spawn_record_is_current``), so a pid RECYCLED
+    by a new session after the old one exited is not mistaken for the recorded one.
+    A slot reused by a new session whose MCP servers have not rewritten the file
+    yet → pid mismatch (or start-time mismatch) → None (fail-open, no false badge
+    during the brief startup window). Missing or malformed file → None.
     """
     if not slot or live_pid is None:
         return None
@@ -103,5 +169,7 @@ def read_spawn_identity(slot: str, live_pid: int | None) -> tuple[str, str] | No
     except ValueError:
         return None
     if recorded_pid != live_pid or not commit or not spawn_at:
+        return None
+    if not spawn_record_is_current(spawn_at, proc_start_iso):
         return None
     return commit, spawn_at

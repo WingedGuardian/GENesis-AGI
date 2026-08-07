@@ -139,7 +139,7 @@ def _patch_spawn(monkeypatch, mapping: dict):
     spawn_at)} map; the dashboard cross-checks pid internally."""
     import genesis.dashboard.routes.cc_sessions as mod
 
-    def fake(slot, live_pid):
+    def fake(slot, live_pid, proc_start=None):
         return mapping.get((slot, live_pid))
 
     monkeypatch.setattr(mod, "read_spawn_identity", fake)

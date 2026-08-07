@@ -138,9 +138,11 @@ async def _collect_detail(
     now = now or datetime.now(UTC)
     db.row_factory = aiosqlite.Row
 
-    def _slot_stale(slot: str | None, spid: int | None) -> tuple[bool, str | None]:
+    def _slot_stale(
+        slot: str | None, spid: int | None, proc_start: str | None = None
+    ) -> tuple[bool, str | None]:
         """(stale, deploy_commit_to_restart_to) for a live slot proc."""
-        ident = read_spawn_identity(slot, spid)
+        ident = read_spawn_identity(slot, spid, proc_start)
         if not ident or not deploy:
             return False, None
         completed_at, new_commit = deploy
@@ -175,7 +177,7 @@ async def _collect_detail(
         pid = row.get("pid")
         if pid in slot_by_pid and pid not in consumed:
             s = slot_by_pid[pid]
-            stale, dc = _slot_stale(s.get("slot"), s.get("pid"))
+            stale, dc = _slot_stale(s.get("slot"), s.get("pid"), s.get("started_at"))
             live = {
                 "slot": s.get("slot"),
                 "pid": s.get("pid"),

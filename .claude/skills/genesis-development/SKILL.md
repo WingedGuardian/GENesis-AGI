@@ -100,6 +100,21 @@ changes: verify the notification actually arrives. Ask: "If the system
 restarts right now, will this actually work?" If you can't answer yes
 with evidence, you're not done.
 
+**Verify in the REAL runtime context, not a shell proxy.** "Works when I
+run it" is not "works where it runs." Same code + same uid ≠ same context:
+a long-running systemd service (genesis-server, guardian) differs from your
+interactive shell in mount namespace, seccomp, `NoNewPrivileges`, dropped
+caps, and — the one that bites — **ptrace/`/proc` access**. Anything that
+reads `/proc/<other-pid>/{environ,mem,stat}`, another process's env, sockets,
+or namespaced/hardened resources MUST be verified by hitting the **live
+endpoint** (`curl` the real server) or running inside the real service — not
+`python -c` in your shell. (Origin, 2026-08: the CC-slot stale-code badge
+read `/proc/<pid>/environ`, which succeeds in a shell but returns EACCES
+under the server's `ProtectSystem=strict` sandbox — so `enumerate_cc_slots()`
+returned 0 in-server and **three** features shipped green but inert since
+July; the module's docstring claim "same-uid reads succeed" was a shell-tested
+falsehood. The fix routed around the ptrace-gated read entirely.)
+
 ### Instance-Fix vs Class-Fix Gate
 
 When a mechanism failed to write or propagate something (a memory, a
