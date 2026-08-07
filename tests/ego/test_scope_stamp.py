@@ -362,6 +362,42 @@ class TestReconcileReviseScope:
         assert ok is False  # operate item NOT mutated into develop
         assert (await ego_crud.get_proposal(db, "rv3"))["content"] == "stale operate item"
 
+    @pytest.mark.asyncio
+    async def test_retained_develop_plan_blocks_operate_downgrade(self, db, monkeypatch):
+        """Codex round-2 P1: revise_proposal COALESCEs execution_plan, so a
+        develop row revised by an operate draft that omits the plan RETAINS the
+        develop plan. The merged row must be scoped develop (fast-path on the
+        effective plan + no-silent-downgrade), so the revise is refused, not
+        applied with an operate stamp over a code-edit plan."""
+        _patch_flag(monkeypatch, False)
+        await ego_crud.create_proposal(
+            db,
+            id="rv5",
+            action_type="investigate",
+            content="v1 develop",
+            status="pending",
+            ego_source="genesis_ego_cycle",
+            scope="develop",
+            scope_revision=1,
+            execution_plan="edit src/genesis/routing/engine.py",
+        )
+        ok = await _revise_sess(db)._reconcile_revise(
+            "rv5",
+            {
+                "id": "rv5",
+                "revision_num": 1,
+                "urgency": "normal",
+                "action_type": "investigate",
+                "scope": "develop",
+                "execution_plan": "edit src/genesis/routing/engine.py",
+            },
+            {"content": "looks operate now"},  # draft omits execution_plan
+            "r",
+            scope="operate",  # LLM tried to downgrade
+        )
+        assert ok is False  # merged row is develop → not applied
+        assert (await ego_crud.get_proposal(db, "rv5"))["content"] == "v1 develop"
+
 
 # ── deliverable-spec parity + revision audit ──────────────────────────────
 

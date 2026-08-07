@@ -1768,6 +1768,34 @@ class EgoSession:
 
         _is_genesis = self._source_tag == "genesis_ego_cycle"
         if _is_genesis:
+            # Scope the MERGED row, not just the draft. revise_proposal COALESCEs
+            # execution_plan, so a draft that omits it RETAINS the board item's
+            # existing plan — and a develop plan retained under an operate stamp
+            # would ride past the dispatch guard. Re-derive scope against the
+            # EFFECTIVE (post-COALESCE) plan: (1) the SELF_MODIFY fast-path on
+            # that plan forces develop (mirrors the realist apply-loop); (2) a
+            # board item already stamped develop cannot be silently downgraded
+            # to operate when its develop plan is being retained (draft supplies
+            # no replacement plan).
+            _draft_plan = str(draft.get("execution_plan") or "").strip()
+            _effective_plan = _draft_plan or str(
+                board_row.get("execution_plan") or ""
+            )
+            try:
+                from genesis.autonomy.classification import classify_domain
+                from genesis.autonomy.types import ActionDomain
+
+                if classify_domain(
+                    board_row.get("action_type", ""), _effective_plan,
+                ) in (ActionDomain.SELF_MODIFY, ActionDomain.AUTONOMOUS_BUILD):
+                    scope = "develop"
+            except Exception:
+                logger.warning(
+                    "reconcile revise scope fast-path failed", exc_info=True,
+                )
+            if board_row.get("scope") == "develop" and not _draft_plan:
+                scope = "develop"  # retained develop plan → no silent downgrade
+
             if scope not in ("operate", "develop"):
                 logger.info(
                     "Reconcile[live] revise of %s NOT applied — sharpened "
