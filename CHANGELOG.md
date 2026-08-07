@@ -9,6 +9,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **GitHub activity notifications.** Genesis now watches your active GitHub repos
+  every couple of hours and pings you on Telegram when an *external* contributor
+  opens their first PR/issue, comments, starts a discussion, or replies on one —
+  filtering out your own activity, bots, and CI so you only hear about real
+  people. It keys on when things were actually *created*, so an old issue that's
+  merely edited or closed never masquerades as new activity; and if a ping can't
+  be delivered, it's retried until it lands rather than lost. Off by default on a
+  fresh install (it baselines quietly first); enable pings by setting
+  `mode: live` in a `config/github_steward.local.yaml` overlay once it has run.
+  Kill switch: `GENESIS_GITHUB_STEWARD_DISABLED=1`.
+
 ### Fixed
 
 - **Email replies now count as engagement.** When someone replies to an email

@@ -3,7 +3,9 @@
 Single source of truth for invoking the GitHub CLI via subprocess with a
 timeout and uniform failure handling (the process-kill sequence on timeout is
 easy to get subtly wrong, so it lives here rather than being copy-pasted).
-Both ``ReconGatherer`` and ``github_discovery`` use this.
+Both ``ReconGatherer`` and ``github_discovery`` use ``run_gh``; the account
+activity monitor uses ``run_gh_checked`` where it must tell a real error apart
+from an empty result.
 """
 
 from __future__ import annotations
@@ -18,12 +20,12 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 15
 
 
-async def run_gh(*args: str, timeout: int | float = _DEFAULT_TIMEOUT) -> str:
-    """Run a ``gh`` command with a timeout. Returns stdout, or "" on any failure.
+async def _exec_gh(args: tuple[str, ...], timeout: int | float) -> tuple[bool, str]:
+    """Run a ``gh`` command. Returns ``(ok, stdout)``.
 
-    Failure (non-zero exit, timeout, or spawn error) is logged and collapsed to
-    an empty string so callers can treat "no data" uniformly. On timeout the
-    child process is killed and reaped to avoid leaks.
+    ``ok`` is False on non-zero exit, timeout, or spawn error (with ``stdout``
+    then ``""``). The timeout process-kill/reap sequence lives here so both
+    public wrappers share exactly one implementation.
     """
     proc: asyncio.subprocess.Process | None = None
     try:
@@ -40,8 +42,8 @@ async def run_gh(*args: str, timeout: int | float = _DEFAULT_TIMEOUT) -> str:
                 " ".join(args),
                 stderr.decode("utf-8", errors="replace")[:200],
             )
-            return ""
-        return stdout.decode("utf-8", errors="replace").strip()
+            return False, ""
+        return True, stdout.decode("utf-8", errors="replace").strip()
     except TimeoutError:
         logger.warning("gh command timed out: %s", " ".join(args))
         if proc is not None:
@@ -49,7 +51,29 @@ async def run_gh(*args: str, timeout: int | float = _DEFAULT_TIMEOUT) -> str:
                 proc.kill()
             with contextlib.suppress(ProcessLookupError):
                 await proc.wait()
-        return ""
+        return False, ""
     except OSError:
         logger.warning("gh command failed to start: %s", " ".join(args), exc_info=True)
-        return ""
+        return False, ""
+
+
+async def run_gh(*args: str, timeout: int | float = _DEFAULT_TIMEOUT) -> str:
+    """Run a ``gh`` command. Returns stdout, or "" on any failure.
+
+    Failure (non-zero exit, timeout, or spawn error) is logged and collapsed to
+    an empty string so callers can treat "no data" uniformly. Use
+    ``run_gh_checked`` when you must distinguish an error from a genuinely empty
+    result (e.g. a cursor you must NOT advance on a failed poll).
+    """
+    _ok, stdout = await _exec_gh(args, timeout)
+    return stdout
+
+
+async def run_gh_checked(*args: str, timeout: int | float = _DEFAULT_TIMEOUT) -> tuple[bool, str]:
+    """Like ``run_gh`` but returns ``(ok, stdout)``.
+
+    ``ok`` is False iff the command failed (non-zero exit / timeout / spawn
+    error) — letting the caller tell a real error apart from an empty-but-
+    successful result, which ``run_gh`` collapses into the same ``""``.
+    """
+    return await _exec_gh(args, timeout)

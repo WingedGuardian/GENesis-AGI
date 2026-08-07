@@ -72,6 +72,14 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
         # aggregate infrastructure_alert (raised by the awareness cap detector when
         # a run of these accumulates) surfaces to the user.
         "cc_cap_empty_event",
+        # GitHub account-activity monitor — the Telegram ping (priority) and the
+        # 6h digest campaign are the delivery paths; these rows must NOT surface
+        # via the generic observation surfacers (would double-notify).
+        "github_account_activity",
+        "github_actor_seen",
+        # Owed first-time ping the monitor retries each tick until delivered —
+        # internal retry state, never a user-facing surface.
+        "github_ping_pending",
     }
 )
 
@@ -154,6 +162,19 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "test_isolation_gap": timedelta(days=30),
     "operational_gap": timedelta(days=30),
     "interaction_theme": timedelta(days=30),
+    # ── GitHub steward (account-activity monitor) ──────────────────────
+    # Activity events kept 30d for the 6h digest campaign to consume. The
+    # per-actor "seen" marker is written once (first sighting) and never
+    # deleted — the expiry sweep only flips resolved=1, it does not purge rows,
+    # and exists_by_hash checks all rows regardless of resolved state, so a
+    # contributor never decays back to "first-time". If a real purge job is ever
+    # added, give this type a no-expiry TTL to preserve that invariant.
+    "github_account_activity": timedelta(days=30),
+    "github_actor_seen": timedelta(days=90),
+    # Owed first-time ping, retried each ~2h tick. 7d cap: if a ping cannot be
+    # delivered for a week something is badly wrong and the 30d activity row is
+    # the backstop; short so an abandoned marker cannot linger.
+    "github_ping_pending": timedelta(days=7),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),
     # skill-edit Critic shadow verdicts (WS1) — kept 30d (vs 14d for the

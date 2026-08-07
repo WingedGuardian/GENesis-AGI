@@ -389,7 +389,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 9037d45b 2026-07-07
+verified: d37d2214 2026-08-06
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -407,6 +407,17 @@ verified: 9037d45b 2026-07-07
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
   (`recon_findings`/`recon_triage`) — intelligence-only, never auto-acts.
+  `account_activity.py` (`AccountActivityMonitor`, sibling to `ReconGatherer` —
+  which is intentionally no-push) is the exception that DOES push: a 2h
+  deterministic (no-LLM) poll for EXTERNAL activity on owned repos (issues, PRs,
+  comments, discussions + their replies) that pings first-time contributors via
+  `submit_raw` (pipeline lazy-resolved at tick — surplus inits before outreach).
+  Keys on immutable `created_at` (not `updated_at`, which GitHub's `?since=`
+  filters on) with a pre-poll watermark cursor, so an edited/closed old item
+  never masquerades as new. Uses `run_gh_checked` so a failed poll never advances
+  the cursor; an undelivered ping is held in a `github_ping_pending` marker and
+  retried each tick until it lands. `off`/`observe`/`live` lever in
+  `github_steward_config`.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.

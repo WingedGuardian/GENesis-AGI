@@ -88,6 +88,37 @@ async def run_recon_gather(sched: SchedulerContext) -> None:
         record_failure("recon_gather", str(exc))
 
 
+async def run_account_activity_monitor(sched: SchedulerContext) -> None:
+    """Poll owner repos for EXTERNAL GitHub activity; ping first-time contributors."""
+    if sched._account_activity_monitor is None:
+        record_failure("account_activity_monitor", "monitor not wired")
+        return
+    try:
+        result = await sched._account_activity_monitor.gather()
+        if result.new_events or result.pinged or result.errors:
+            logger.info(
+                "GitHub steward: mode=%s repos=%d new=%d pinged=%d errors=%d",
+                result.mode, result.checked_repos, result.new_events,
+                result.pinged, result.errors,
+            )
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.DEBUG,
+                "heartbeat", "account_activity_monitor completed",
+            )
+        record_success("account_activity_monitor")
+    except Exception as exc:
+        logger.exception("Account activity monitor failed")
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.ERROR,
+                "account_activity_monitor.failed",
+                "Account activity monitor failed with exception",
+                **failure_details(exc=exc),
+            )
+        record_failure("account_activity_monitor", str(exc))
+
+
 async def run_model_intelligence(sched: SchedulerContext) -> None:
     """Run model intelligence scan (weekly)."""
     if sched._model_intelligence_job is None:
