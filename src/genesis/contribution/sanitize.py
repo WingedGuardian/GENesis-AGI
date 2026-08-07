@@ -16,7 +16,7 @@ Scanners (all run when inputs are available):
    per finding.
 5. Secrets via `gitleaks detect` if binary is on PATH → BLOCK
    (optional second-layer, MVP-advisory).
-6. Portability patterns — IPs, /home/ubuntu/ paths, hardcoded
+6. Portability patterns — IPs, /home/<user>/ paths, hardcoded
    usernames, known private hostnames → BLOCK.
 7. Fingerprint scan — user-defined strings from
    ~/.genesis/release-fingerprints.txt → BLOCK.
@@ -705,6 +705,103 @@ def scan_diff(
     if ran:
         scanners_run.append("gitleaks")
         findings.extend(gl_hits)
+
+    ok = not any(f.severity == Severity.BLOCK for f in findings)
+    return SanitizerResult(ok=ok, findings=findings, scanners_run=scanners_run)
+
+
+def _parse_prose(text: str) -> _ParsedDiff:
+    """Wrap plain prose as a ``_ParsedDiff`` whose ``added_lines`` are EVERY
+    line of the text.
+
+    ``parse_diff`` only keeps ``+``-prefixed lines under a ``+++ b/<path>``
+    header, so it sees NOTHING in plain prose (an issue body, a comment) and a
+    scan of it fails OPEN. This wrapper hands every line to the raw-string
+    detectors instead. ``file`` is a synthetic ``"<prose>"`` label; line
+    numbers are 1-based to match a human reading the text.
+    """
+    added: list[tuple[str, int, str]] = [
+        ("<prose>", i, line) for i, line in enumerate(text.splitlines(), start=1)
+    ]
+    return _ParsedDiff(
+        file_paths=[],
+        added_lines=added,
+        is_binary=False,
+        size_bytes=len(text.encode("utf-8")),
+    )
+
+
+def scan_prose(
+    text: str,
+    *,
+    fingerprint_file: Path | None = None,
+) -> SanitizerResult:
+    """Fail-closed sanitizer for free TEXT (a drafted issue body, a comment) —
+    the prose analog of :func:`scan_diff`.
+
+    Runs ONLY the raw-string detectors that are meaningful on prose, over
+    EVERY line of *text*: portability classes (IPs, ``/home/<user>`` paths, CC
+    slugs), personal emails outside the allowlist, user fingerprints, and the
+    required ``detect-secrets`` floor. The diff-STRUCTURAL scanners
+    (forbidden-path, gitignore, binary, size) are deliberately skipped — they
+    describe a unified diff's shape, not prose content.
+
+    Do NOT reach for :func:`scan_diff` on prose: it routes through
+    :func:`parse_diff`, which drops every non-``+`` line, so plain text yields
+    zero ``added_lines`` and the scan returns ``ok=True`` regardless of what it
+    contains — a fail-OPEN hole through a fail-CLOSED component. This function
+    closes it.
+
+    Same contract as :func:`scan_diff`: ``ok`` is True iff no BLOCK finding.
+    A missing ``detect-secrets`` binary BLOCKs (the required floor); a missing
+    fingerprint file surfaces a non-blocking WARN (provisioning gap), never a
+    silent skip.
+    """
+    if fingerprint_file is None:
+        env_path = os.environ.get("GENESIS_RELEASE_FINGERPRINTS")
+        if env_path:
+            fingerprint_file = Path(env_path)
+        else:
+            fingerprint_file = Path.home() / ".genesis" / "release-fingerprints.txt"
+
+    parsed = _parse_prose(text)
+    findings: list[Finding] = []
+    scanners_run: list[str] = []
+
+    # Portability (IPs, /home/<user> paths, CC slugs)
+    findings.extend(_check_portability(parsed))
+    scanners_run.append("portability")
+
+    # Personal emails outside the allowlist
+    findings.extend(_check_emails(parsed))
+    scanners_run.append("email_allowlist")
+
+    # Fingerprints (optional — only runs if the file exists). Missing file =
+    # non-blocking WARN, mirroring scan_diff's provision-or-surface handling.
+    if fingerprint_file and fingerprint_file.is_file():
+        findings.extend(_check_fingerprints(parsed, fingerprint_file))
+        scanners_run.append("fingerprint")
+    else:
+        findings.append(
+            Finding(
+                kind=FindingKind.FINGERPRINT,
+                severity=Severity.WARN,
+                message=(
+                    "Release fingerprint file not found — this install's exact "
+                    "private identifiers are not being scanned. Run bootstrap "
+                    "(or `python -m genesis.contribution.fingerprints --write`) "
+                    "to generate it."
+                ),
+                scanner="fingerprint",
+                detail=str(fingerprint_file),
+            )
+        )
+
+    # detect-secrets (required floor — a missing binary BLOCKs, fail-closed)
+    ran, secret_hits = _run_detect_secrets(parsed)
+    if ran:
+        scanners_run.append("detect-secrets")
+        findings.extend(secret_hits)
 
     ok = not any(f.severity == Severity.BLOCK for f in findings)
     return SanitizerResult(ok=ok, findings=findings, scanners_run=scanners_run)
