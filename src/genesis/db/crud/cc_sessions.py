@@ -507,7 +507,7 @@ async def get_extractable(
     status_ph = ",".join("?" for _ in statuses)
     cursor = await db.execute(
         f"SELECT id, cc_session_id, source_tag, last_extracted_at, "
-        f"       last_extracted_line, started_at "
+        f"       last_extracted_line, last_extracted_byte, started_at "
         f"FROM cc_sessions "
         f"WHERE source_tag IN ({tag_ph}) "
         f"  AND status IN ({status_ph}) "
@@ -524,12 +524,26 @@ async def update_extraction_watermark(
     *,
     last_extracted_line: int,
     last_extracted_at: str,
+    last_extracted_byte: int | None = None,
 ) -> bool:
-    """Update the extraction watermark for a session."""
-    cursor = await db.execute(
-        "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? WHERE id = ?",
-        (last_extracted_at, last_extracted_line, id),
-    )
+    """Update the extraction watermark for a session.
+
+    ``last_extracted_byte`` is the incremental-resume hint (byte offset of the
+    START of line ``last_extracted_line``). When None the column is left
+    untouched, preserving any prior value — callers that computed a byte offset
+    pass it; legacy/reference paths omit it.
+    """
+    if last_extracted_byte is None:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? WHERE id = ?",
+            (last_extracted_at, last_extracted_line, id),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ?, "
+            "last_extracted_byte = ? WHERE id = ?",
+            (last_extracted_at, last_extracted_line, last_extracted_byte, id),
+        )
     await db.commit()
     return cursor.rowcount > 0
 

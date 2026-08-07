@@ -22,6 +22,7 @@ enforces this so a new session type can never silently fall out of extraction
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -45,7 +46,7 @@ from genesis.memory.source_verification import compute_jaccard, verify_source_ov
 from genesis.util.jsonl import (
     chunk_messages,
     format_chunk_for_extraction,
-    read_transcript_messages,
+    read_transcript_delta,
 )
 
 if TYPE_CHECKING:
@@ -239,26 +240,63 @@ async def run_extraction_cycle(
             last_line = start_line_override
         else:
             last_line = session.get("last_extracted_line") or 0
-        transcript_path = _find_transcript(transcript_dir, cc_session_id)
+        # Incremental resume: seek to the stored byte offset (= start of line
+        # last_line) and read only the delta. Disabled for reference-only
+        # mining and start_line_override re-reads, which deliberately re-scan.
+        use_incremental = not reference_only_mode and start_line_override is None
+        start_byte = session.get("last_extracted_byte") if use_incremental else None
+
+        # Filesystem discovery + transcript read run OFF the event loop
+        # (asyncio.to_thread): synchronous transcript I/O here was blocking the
+        # loop for 6-7s per cycle and starving memory-recall (503s). The
+        # incremental read above keeps the offloaded work tiny; the offload is
+        # defense-in-depth for a legitimately-large delta. See follow-up 470cec53.
+        transcript_path = await asyncio.to_thread(
+            _find_transcript, transcript_dir, cc_session_id
+        )
         if not transcript_path and session.get("source_tag") == "voice":
             # Voice sessions keep their transcripts outside the CC projects
             # dir (same CC-JSONL format, written by the voice transcript
             # writer) so the CC resume picker never lists them.
-            transcript_path = _find_transcript(voice_transcript_dir(), cc_session_id)
+            transcript_path = await asyncio.to_thread(
+                _find_transcript, voice_transcript_dir(), cc_session_id
+            )
 
         if not transcript_path:
             continue
 
-        # Read new messages since last extraction
-        messages = read_transcript_messages(
+        # Read new messages since last extraction (incremental + off-loop).
+        delta = await asyncio.to_thread(
+            read_transcript_delta,
             transcript_path,
             start_line=last_line,
+            start_byte=start_byte,
         )
+        messages = delta.messages
         if not messages:
+            # No new user/assistant messages. If the file changed (non-message
+            # lines appended), advance BOTH watermarks so the next cycle
+            # stat-gates instead of re-reading from byte 0. Skip in
+            # reference-only mode (leaves prod extraction state untouched) and
+            # when the stat-gate already confirmed nothing changed.
+            if use_incremental and not delta.unchanged:
+                await _update_watermark(
+                    db, session_id, delta.new_line_count,
+                    last_extracted_byte=delta.new_byte_offset,
+                )
             continue
 
         chunks = chunk_messages(messages, chunk_size=chunk_size)
-        max_line = last_line
+        # On a truncation/rotation reset the delta re-emits absolute line numbers
+        # from 0, so the line base must reset too — otherwise max() below pins
+        # max_line to the stale pre-truncation watermark while last_chunk_end_byte
+        # points into the shrunk file, breaking the byte==line invariant. The
+        # empty-branch above already resets by writing delta.new_line_count.
+        max_line = 0 if delta.truncated_reset else last_line
+        # Byte offset of the start of line `max_line` — the incremental resume
+        # point, kept in lock-step with the line watermark below. None until the
+        # chunk loop sets it (guaranteed: this path only runs with ≥1 message).
+        last_chunk_end_byte: int | None = None
         all_keywords: set[str] = set()
         latest_topic = ""
         session_extraction_count = 0
@@ -272,6 +310,10 @@ async def run_extraction_cycle(
             chunk_start = chunk[0].line_number
             chunk_end = chunk[-1].line_number
             max_line = max(max_line, chunk_end + 1)
+            # end_byte of the last message = byte start of line (chunk_end + 1)
+            # = byte start of line `max_line`. Kept in lock-step so the resume
+            # point survives a cap-break (the last processed chunk sets both).
+            last_chunk_end_byte = chunk[-1].end_byte
 
             result = await _extract_chunk(
                 chunk=chunk,
@@ -539,7 +581,10 @@ async def run_extraction_cycle(
         # production extraction state untouched — the next regular cycle
         # will still pick up the same transcripts for episodic storage.
         if not reference_only_mode:
-            await _update_watermark(db, session_id, max_line)
+            await _update_watermark(
+                db, session_id, max_line,
+                last_extracted_byte=last_chunk_end_byte,
+            )
             if all_keywords or latest_topic:
                 await _update_session_index(
                     db, session_id,
@@ -553,8 +598,6 @@ async def run_extraction_cycle(
             # threshold OR the chunk path flagged candidates. Returns 0..N
             # topic-segmented playbooks.
             try:
-                import asyncio
-
                 from genesis.learning.procedural.struggle_detector import (
                     STRUGGLE_THRESHOLD,
                     build_spine_and_haystack,
@@ -697,7 +740,6 @@ async def _drain_procedure_rebuilds(
     attempts exhausted → discard, surfacing an observation so the genuine loss is
     visible, never silent.
     """
-    import asyncio
 
     from genesis.db.crud import deferred_work as dw_crud
     from genesis.learning.procedural.judge import (
@@ -872,8 +914,14 @@ async def _update_watermark(
     db: aiosqlite.Connection,
     session_id: str,
     line_number: int,
+    *,
+    last_extracted_byte: int | None = None,
 ) -> None:
-    """Update the extraction watermark for a session."""
+    """Update the extraction watermark for a session.
+
+    ``last_extracted_byte`` is the incremental-resume hint (byte offset of the
+    start of line ``line_number``); None leaves the stored byte offset untouched.
+    """
     from genesis.db.crud import cc_sessions as sessions_crud
 
     now_iso = datetime.now(UTC).isoformat()
@@ -881,6 +929,7 @@ async def _update_watermark(
         db, session_id,
         last_extracted_line=line_number,
         last_extracted_at=now_iso,
+        last_extracted_byte=last_extracted_byte,
     )
 
 
