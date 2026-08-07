@@ -456,7 +456,7 @@ class EgoCadenceManager:
             )
             if auto_tabled:
                 logger.info(
-                    "Pre-sweep auto-table: %d proposal(s) tabled (>14d)",
+                    "Pre-sweep auto-table: %d proposal(s) tabled (urgency-stale)",
                     auto_tabled,
                 )
         except Exception:

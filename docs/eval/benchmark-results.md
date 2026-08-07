@@ -1,6 +1,6 @@
 # Model Benchmark Results
 
-Last updated: 2026-04-16
+Last updated: 2026-08-07
 
 Benchmark methodology: 3 datasets (classification, extraction, structured_output)
 with 37 total cases. Scores are `passed/attempted` — skipped cases (rate limits,
@@ -13,7 +13,7 @@ Best run per provider. Providers marked (free) cost $0; others are paid.
 
 | Provider | Classification | Extraction | Structured Output | AVG | Notes |
 |---|---|---|---|---|---|
-| groq-free | 12/15 (80%) | 8/12 (67%) | 10/10 (100%) | **82%** | Llama 4 Scout |
+| groq-free | 8/15 (53%) | 8/12 (67%) | 10/10 (100%) | **73%** | gpt-oss-120b — migrated 2026-08-06 from llama-3.3-70b-versatile (Groq EOL 2026-08-16). JSON/extraction parity; mild triage-depth under-bias on classification (exact-match-exaggerated; reasoning_effort tuning gave no gain). Prior llama baseline: 82% |
 | cerebras-qwen | 9/13 (69%) +2sk | 8/11 (73%) +1sk | 9/9 (100%) +1sk | **81%** | Qwen3 235B, 10 RPM |
 | gemini-free | 6/7 (86%) +8sk | 4/7 (57%) +5sk | 3/3 (100%) +7sk | **81%** | Daily quota (20 req/day) |
 | kimi-k2.5 | 10/15 (67%) | 9/12 (75%) | 10/10 (100%) | **81%** | Paid, $0.60/$2/MTok |
@@ -29,7 +29,7 @@ Best run per provider. Providers marked (free) cost $0; others are paid.
 | Provider | Reason | Status |
 |---|---|---|
 | openrouter-deepseek-r1 | Free endpoint removed from OpenRouter (2026-04-15). Provider entry removed from routing config 2026-05-24. | Removed |
-| openrouter-qwen3coder | Returns HTTP 401 "No cookie auth credentials found" on all requests — the Qwen3-Coder free endpoint appears to require browser/cookie auth, not API key (retested 2026-04-16 off-peak) | Disable or investigate |
+| openrouter-qwen3coder | qwen/qwen3-coder:free delisted (0 OpenRouter endpoints, verified live 2026-08-07); provider was unwired. Entry removed from routing config 2026-08-07. | Removed |
 
 ## Key Findings
 

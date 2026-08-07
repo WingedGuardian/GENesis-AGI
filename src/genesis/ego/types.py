@@ -196,6 +196,18 @@ class EgoConfig:
     revalidation_interval_hours: dict = field(
         default_factory=lambda: {"critical": 6, "high": 48, "normal": 72, "low": 168}
     )
+    # Auto-table staleness window, per-urgency hours: how long a pending
+    # proposal may sit before auto_table_stale_proposals moves it to the
+    # recoverable 'tabled' cold lane (NOT deleted — the ego can un-table, and a
+    # still-relevant proposal is re-derived fresh next cycle). Urgency-based,
+    # replacing the old flat 14-day threshold: stale genesis investigations
+    # lingered 6-9 days below 14d and were approved on self-healed signals
+    # (2026-08-06 dispatch review). Values sit at/under the prior 14d backstop.
+    # Defaults-COMPLETE mapping (merged over defaults on load). Unranked
+    # proposals (never boarded) age out faster via a floor (see the sweep).
+    auto_table_ttl_hours: dict = field(
+        default_factory=lambda: {"critical": 48, "high": 72, "normal": 120, "low": 168}
+    )
     # Additive ego autonomy — cap on ACTIVE goals in the genesis ego's OWN
     # lane (origin='genesis_ego'). Pausing frees a slot; the paused tail is
     # deliberately unbounded (user decision 2026-07-16) and reported in the

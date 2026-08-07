@@ -693,47 +693,25 @@ profiles:
     last_reviewed: "2026-06-22"
     review_source: manual
 
-  qwen-2.5-72b:
-    display_name: "Qwen 2.5 72B Instruct"
-    provider: alibaba
-    api_id: "qwen/qwen-2.5-72b-instruct"
-    intelligence_tier: B
-    reasoning: B
-    instruction_following: A
-    anti_sycophancy: B
-    context_window: 131072
-    cost_tier: free
-    cost_per_mtok_in: 0.0
-    cost_per_mtok_out: 0.0
-    latency: moderate
-    strengths:
-      - structured output (reliable JSON)
-      - multilingual capability
-      - free tier on OpenRouter
-    weaknesses:
-      - reasoning depth vs frontier models
-      - creative tasks
-    best_for: [memory_consolidation, fact_extraction, triage, surplus_brainstorm]
-    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation]
-    free_tier:
-      available: true
-      provider: openrouter
-      limits: "free tier variant"
-    last_reviewed: "2026-03-26"
-    review_source: manual
+  # NOTE (2026-08-07): the qwen-2.5-72b profile was removed — openrouter-free no
+  # longer points at qwen/qwen-2.5-72b-instruct (repointed to a curated gemma /
+  # nemotron :free pool), leaving this profile orphaned. See gemma-4-26b below.
 
-  mimo-v2-pro:
-    display_name: "MiMo V2 Pro"
+  mimo-v2.5-pro:
+    display_name: "MiMo V2.5 Pro"
     provider: xiaomi
-    api_id: "xiaomi/mimo-v2-pro"
+    api_id: "xiaomi/mimo-v2.5-pro"
     intelligence_tier: A
     reasoning: A
     instruction_following: A
     anti_sycophancy: B
     context_window: 131072
     cost_tier: cheap
-    cost_per_mtok_in: 0.60
-    cost_per_mtok_out: 2.40
+    # OpenRouter endpoints range ~$0.35-$1.00 in / ~$0.70-$3.00 out per MTok
+    # (2026-08-07). litellm's own DB prices this model, so completion_cost handles
+    # it directly; these are the cost-fallback figures (conservative upper end).
+    cost_per_mtok_in: 1.0
+    cost_per_mtok_out: 3.0
     latency: moderate
     strengths:
       - mathematical reasoning (strong chain-of-thought)
@@ -747,7 +725,7 @@ profiles:
     avoid_for: [foreground_conversation, outreach_draft, creative_writing]
     free_tier:
       available: false
-    last_reviewed: "2026-03-26"
+    last_reviewed: "2026-08-07"
     review_source: manual
 
   deepseek-v3:
@@ -1045,34 +1023,36 @@ profiles:
     last_reviewed: "2026-04-14"
     review_source: manual
 
-  qwen3-coder:
-    display_name: "Qwen3-Coder 480B"
-    provider: alibaba
-    api_id: "qwen/qwen3-coder:free"
+  # gemma-4-26b — primary of the curated openrouter-free :free pool (2026-08-07).
+  # Replaced the orphaned qwen3-coder profile (its qwen/qwen3-coder:free slug was
+  # delisted; the provider was unwired and removed from model_routing.yaml).
+  gemma-4-26b:
+    display_name: "Gemma 4 26B A4B (MoE)"
+    provider: google
+    api_id: "google/gemma-4-26b-a4b-it:free"
     intelligence_tier: B
     reasoning: B
     instruction_following: B
-    anti_sycophancy: C
+    anti_sycophancy: B
     context_window: 262144
     cost_tier: free
     cost_per_mtok_in: 0.0
     cost_per_mtok_out: 0.0
     latency: moderate
     strengths:
-      - code-specialized (SWE-bench 69.6)
-      - large MoE architecture (480B params, 35B active)
-      - 256k context window
+      - reliable structured output / JSON (10/10 on the structured_output golden set, 2026-08-07)
+      - token-efficient (no reasoning-token bloat, clean JSON at tight max_tokens)
+      - genuinely free (:free OpenRouter endpoint)
     weaknesses:
-      - code-focused, weaker on general reasoning
-      - benchmark data sparse (no GPQA/MMLU-Pro scores)
-      - quality unverified for Genesis tasks
-    best_for: [code_work, code_audit]
-    avoid_for: [deep_reflection, strategic_reflection, triage]
+      - smaller MoE, less nuance than 70B+ dense models
+      - creative writing
+    best_for: [extraction, classification, tagging, fact_extraction, surplus_brainstorm]
+    avoid_for: [deep_reflection, strategic_reflection]
     free_tier:
       available: true
       provider: openrouter
-      limits: "OpenRouter free tier (20 RPM, 200-1000 RPD)"
-    last_reviewed: "2026-04-14"
+      limits: "OpenRouter :free endpoint (curated openrouter-free primary; nemotron-3-super-120b:free failover)"
+    last_reviewed: "2026-08-07"
     review_source: manual
 
   deepseek-r1:

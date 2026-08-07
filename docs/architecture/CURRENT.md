@@ -1055,7 +1055,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: 9037d45b 2026-07-07
+verified: 409338c9 2026-08-07
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1072,7 +1072,9 @@ verified: 9037d45b 2026-07-07
   silent non-registration is by design (absence ≠ bug). LLM breaker/health
   logic lives in routing, not here. No embedding provider registered → memory
   silently degrades to FTS5-only.
-- GROUNDWORK: gpt-oss-120b provider defined but unwired into any chain.
+- A load-time guard warns if an `openrouter` provider flagged `free: true` points
+  at a non-`:free` (paid) slug — the openrouter-free billing blind spot
+  (`_detect_mislabeled_free_openrouter`, config-only, visibility not gating).
 
 ## 12. Platform & data
 

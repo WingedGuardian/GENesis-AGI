@@ -9,6 +9,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Free-tier model refresh.** Groq is retiring Llama 3.3 70B (the model behind
+  several of Genesis's free reasoning/extraction/tagging steps) on 2026-08-16, so
+  those steps now use Groq's recommended replacement, gpt-oss-120b. Structured-output
+  and extraction quality are unchanged; triage-depth labeling may shift by about one
+  level on some items. No action needed on your end.
+
+### Fixed
+
+- **A "free" fallback model that was quietly a paid one.** An OpenRouter fallback
+  used by several background steps was labeled free but pointed at a paid model, so
+  on the rare occasions it was reached it could incur spend that Genesis recorded as
+  $0. It now uses a curated pool of genuinely-free models with automatic failover,
+  and Genesis warns at startup if any provider marked "free" actually points at a
+  paid model — so cost tracking can't silently miss real spend. No action needed on
+  your end.
+
 ### Added
 
 - **Contributor Work-Log — a curated supply of newcomer-friendly public issues.**
