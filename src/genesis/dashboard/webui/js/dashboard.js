@@ -2508,7 +2508,7 @@
           // Inbox Monitor
           watch_path: 'Watch Path', response_dir: 'Response Dir Pattern',
           check_interval_seconds: 'Check Interval (sec)', batch_size: 'Batch Size',
-          effort: 'Effort Level', timeout_s: 'Timeout (sec)',
+          effort: 'Effort Level', model: 'Model', timeout_s: 'Timeout (sec)',
           // Outreach
           start: 'Start Time', end: 'End Time',
           default: 'Default Channel', blocker: 'Blocker Channel',
@@ -2644,7 +2644,7 @@
         },
         // Display order for settings domains — most important first
         _DOMAIN_ORDER: [
-          'channels', 'autonomous_cli_policy', 'ego', 'outreach', 'tts',
+          'channels', 'autonomous_cli_policy', 'ego', 'reflection_models', 'outreach', 'tts',
           'inbox_monitor', 'surplus', 'resilience', 'confidence_gates',
           'updates', 'contribution', 'recon_schedules', 'recon_watchlist', 'recon_sources',
           'autonomy', 'autonomy_rules', 'guardian',
@@ -2663,6 +2663,7 @@
           model_routing: 'Model Routing',
           content_sanitization: 'Content Sanitization',
           channels: 'Channels',
+          reflection_models: 'Reflection Models',
           contribution: 'Contribution Offers',
         },
         _sortedDomains(domains) {

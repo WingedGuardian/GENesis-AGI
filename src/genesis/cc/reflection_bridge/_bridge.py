@@ -31,6 +31,7 @@ from genesis.cc.reflection_bridge._prompts import (
     load_prompt_file,
     system_prompt_for_depth,
 )
+from genesis.cc.reflection_bridge.reflection_models_config import effort_for_depth, model_for_depth
 from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType, background_session_dir
 from genesis.db.crud import cc_sessions as cc_sessions_crud
 from genesis.observability.call_site_recorder import record_last_run
@@ -47,12 +48,6 @@ if TYPE_CHECKING:
     from genesis.resilience.deferred_work import DeferredWorkQueue
 
 logger = logging.getLogger(__name__)
-
-_DEPTH_MODEL = {
-    Depth.LIGHT: CCModel.HAIKU,
-    Depth.DEEP: CCModel.SONNET,
-    Depth.STRATEGIC: CCModel.OPUS,
-}
 
 _DEPTH_TIMEOUT_S = {
     Depth.LIGHT: 600,
@@ -135,19 +130,14 @@ class CCReflectionBridge:
     # ── Main reflection entry point ───────────────────────────────────
 
     def _model_for_depth(self, depth: Depth) -> CCModel:
-        return _DEPTH_MODEL.get(depth, CCModel.SONNET)
+        return model_for_depth(depth)
 
     def _effort_for_context(self, depth: Depth, tick=None, escalation_source: str | None = None) -> EffortLevel:
-        """Effort level per depth."""
-        if depth == Depth.STRATEGIC:
-            return EffortLevel.MAX
-        if depth == Depth.LIGHT:
-            return EffortLevel.LOW
-        # Deep: fixed HIGH. Adaptive effort is a V4 executor concern.
+        """Effort level per depth — config-driven via the reflection_models domain."""
         # GROUNDWORK(v4-executor): escalation_source will drive executor effort.
-        if escalation_source:
-            logger.debug("Deep reflection triggered by %s (effort fixed at HIGH)", escalation_source)
-        return EffortLevel.HIGH
+        if depth == Depth.DEEP and escalation_source:
+            logger.debug("Deep reflection triggered by %s", escalation_source)
+        return effort_for_depth(depth) or EffortLevel.MEDIUM
 
     async def _check_throttle(self, priority: int, work_type: str) -> ReflectionResult | None:
         """Check CC budget throttling. Returns a deferred result if throttled, None otherwise."""
