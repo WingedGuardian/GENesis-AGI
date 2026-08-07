@@ -286,7 +286,7 @@ _PROFILE_ADDENDA: dict[str, str] = {
 
 You have: Write, browser MCP tools, memory MCP tools, outreach send.
 You do NOT have: Edit, Bash, NotebookEdit.
-Your final message IS your deliverable. Write files to `~/.genesis/output/`.
+Your final message IS your deliverable. Write files to `~/.genesis/output/`. Persist durable learnings to Genesis memory (`procedure_store` / `observation_write`) — NEVER by writing or editing a `MEMORY.md` index (a dedicated consolidation job owns that file; a hand-edit truncates it and loses the other sessions' context).
 
 {_MISSION_INJECTION}
 """,
@@ -296,7 +296,7 @@ Your final message IS your deliverable. Write files to `~/.genesis/output/`.
 
 You have: Write, memory MCP tools, web tools (web_search, web_fetch).
 You do NOT have: Edit, Bash, NotebookEdit, browser tools.
-Your final message IS your deliverable. Write files to `~/.genesis/output/`.
+Your final message IS your deliverable. Write files to `~/.genesis/output/`. Persist durable learnings to Genesis memory (`procedure_store` / `observation_write`) — NEVER by writing or editing a `MEMORY.md` index (a dedicated consolidation job owns that file; a hand-edit truncates it and loses the other sessions' context).
 
 {_MISSION_INJECTION}
 """,
@@ -316,7 +316,7 @@ Your final message IS your deliverable.
 
 You have: Write, memory MCP tools, web tools, outreach_send.
 You do NOT have: Edit, Bash, NotebookEdit, browser tools.
-Your final message IS your deliverable. Write files to `~/.genesis/output/`.
+Your final message IS your deliverable. Write files to `~/.genesis/output/`. Persist durable learnings to Genesis memory (`procedure_store` / `observation_write`) — NEVER by writing or editing a `MEMORY.md` index (a dedicated consolidation job owns that file; a hand-edit truncates it and loses the other sessions' context).
 
 {_MISSION_INJECTION}
 """,
