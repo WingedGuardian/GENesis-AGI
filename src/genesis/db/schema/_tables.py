@@ -1032,7 +1032,9 @@ TABLES = {
             expected_outputs TEXT,                    -- JSON: post-dispatch verification criteria (files, min_size, required_strings)
             revision_num      INTEGER DEFAULT 1,      -- PR-4 dark: current revision number; PR-5 reconcile bumps on revise
             revalidate_at     TEXT,                   -- PR-4 dark: when the premise is next due for re-validation (set in PR-6)
-            last_validated_at TEXT                    -- PR-4 dark: when the premise was last reaffirmed (set in PR-5)
+            last_validated_at TEXT,                   -- PR-4 dark: when the premise was last reaffirmed (set in PR-5)
+            scope             TEXT,                   -- operate|develop (NULL=unjudged); realist/reconcile-stamped, genesis-ego only
+            scope_revision    INTEGER                 -- revision_num the scope was stamped against (staleness on re-revise)
         )
     """,
     # PR-4 (ego proposal-lifecycle redesign): prior-value audit trail for
@@ -1052,7 +1054,8 @@ TABLES = {
             expected_outputs TEXT,                    -- prior post-dispatch verification criteria (JSON)
             revised_at       TEXT NOT NULL,           -- when the superseding revision was made
             revised_by       TEXT,                    -- ego_source / reconcile stage that made the revision
-            reason           TEXT                     -- why the revision was made
+            reason           TEXT,                    -- why the revision was made
+            scope            TEXT                     -- prior scope (operate|develop) snapshot at this revision
         )
     """,
     "ego_state": """

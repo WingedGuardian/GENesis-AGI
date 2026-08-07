@@ -1037,11 +1037,10 @@ class EgoSession:
                 # (content, career, etc.) are rejected and auto-escalated.
                 if proposals and self._source_tag == "genesis_ego_cycle":
                     proposals = self._enforce_domain_boundary(proposals)
-                    # Operate-vs-develop deterministic floor (roadmap gate):
-                    # marks dev-artifact proposals; they are created then
-                    # immediately tabled in _process_proposals (recoverable,
-                    # never digested). Runs post-realist unconditionally.
-                    proposals = self._flag_develop_scope(proposals)
+                    # Operate-vs-develop scope was stamped on each proposal by
+                    # the realist (_realist_scope); _process_proposals enforces
+                    # it structurally at create (unstamped → dropped fail-closed;
+                    # develop + self-dev-disabled → created-then-tabled).
                 elif proposals and self._source_tag == "user_ego_cycle":
                     proposals = await self._enforce_user_domain_boundary(proposals)
 
@@ -1668,7 +1667,8 @@ class EgoSession:
                         )
                         continue  # drop the duplicate draft
                     applied = await self._reconcile_revise(
-                        full_id, board_row, draft, v.get("reason")
+                        full_id, board_row, draft, v.get("reason"),
+                        scope=v.get("scope"),
                     )
                     if applied:
                         continue  # board item sharpened in place -> drop draft
@@ -1737,7 +1737,8 @@ class EgoSession:
             return False
 
     async def _reconcile_revise(
-        self, proposal_id: str, board_row: dict, draft: dict, reason: str | None
+        self, proposal_id: str, board_row: dict, draft: dict, reason: str | None,
+        *, scope: str | None = None,
     ) -> bool:
         """Apply a reconcile 'revise' verdict: sharpen a pending board item in
         place with the draft's content. Architect ruling A — apply directly; the
@@ -1748,12 +1749,68 @@ class EgoSession:
         revert path). Hash-dedup pre-check (revise_proposal does NOT dedup): if
         the sharpened content already exists on another pending/approved
         proposal, skip the revise and keep the draft as new — create_batch's own
-        hash-dedup then collapses it. Returns True only if the revise applied."""
+        hash-dedup then collapses it. Returns True only if the revise applied.
+
+        Scope re-judgment (genesis-ego): reconcile runs BEFORE the realist, so a
+        revise's sharpened content is never realist-scoped — it must carry a
+        scope from the reconcile verdict, or an operate board item could be
+        mutated into develop work that then dispatches (the revise bypass).
+        Fail closed: if the scope is missing, or is develop while
+        self-development is disabled, do NOT apply the revise — return False so
+        the draft survives to the realist, which scopes it and routes it through
+        the normal create/table path. A valid operate (or develop-with-flag-on)
+        scope is written onto the revised row (pinned to the new revision)."""
         from genesis.ego.integrity import content_hash as _content_hash
 
         new_content = str(draft.get("content", "") or "")
         if not new_content:
             return False
+
+        _is_genesis = self._source_tag == "genesis_ego_cycle"
+        if _is_genesis:
+            # Scope the MERGED row, not just the draft. revise_proposal COALESCEs
+            # execution_plan, so a draft that omits it RETAINS the board item's
+            # existing plan — and a develop plan retained under an operate stamp
+            # would ride past the dispatch guard. Re-derive scope against the
+            # EFFECTIVE (post-COALESCE) plan: (1) the SELF_MODIFY fast-path on
+            # that plan forces develop (mirrors the realist apply-loop); (2) a
+            # board item already stamped develop cannot be silently downgraded
+            # to operate when its develop plan is being retained (draft supplies
+            # no replacement plan).
+            _draft_plan = str(draft.get("execution_plan") or "").strip()
+            _effective_plan = _draft_plan or str(
+                board_row.get("execution_plan") or ""
+            )
+            try:
+                from genesis.autonomy.classification import classify_domain
+                from genesis.autonomy.types import ActionDomain
+
+                if classify_domain(
+                    board_row.get("action_type", ""), _effective_plan,
+                ) in (ActionDomain.SELF_MODIFY, ActionDomain.AUTONOMOUS_BUILD):
+                    scope = "develop"
+            except Exception:
+                logger.warning(
+                    "reconcile revise scope fast-path failed", exc_info=True,
+                )
+            if board_row.get("scope") == "develop" and not _draft_plan:
+                scope = "develop"  # retained develop plan → no silent downgrade
+
+            if scope not in ("operate", "develop"):
+                logger.info(
+                    "Reconcile[live] revise of %s NOT applied — sharpened "
+                    "content unscoped; keeping draft for the realist to scope",
+                    proposal_id[:12],
+                )
+                return False
+            if scope == "develop" and not self._self_development_enabled():
+                logger.info(
+                    "Reconcile[live] revise of %s NOT applied — sharpened "
+                    "content is develop-scope and self-development is disabled; "
+                    "keeping draft (routed to tabled via the normal path)",
+                    proposal_id[:12],
+                )
+                return False
         if await ego_crud.has_pending_proposal_with_hash(
             self._db, _content_hash(new_content)
         ):
@@ -1768,7 +1825,7 @@ class EgoSession:
         except (ValueError, TypeError):
             expected = 1
         from genesis.ego.config import next_revalidate_at
-        from genesis.ego.proposals import _serialize_expected_outputs
+        from genesis.ego.proposals import ensure_deliverable_spec
 
         new_rev = await ego_crud.revise_proposal(
             self._db,
@@ -1777,12 +1834,19 @@ class EgoSession:
             content=new_content,
             rationale=draft.get("rationale"),
             confidence=draft.get("confidence"),
-            execution_plan=draft.get("execution_plan"),
-            # Serialize: the LLM draft carries a dict; the column is TEXT.
-            # An unserialized dict would fail parameter binding and lose the
-            # revise to the keep-as-new fallback.
-            expected_outputs=_serialize_expected_outputs(
+            # Normalize a present-but-empty plan to None so COALESCE RETAINS the
+            # existing plan (an empty string is not SQL NULL and would overwrite
+            # it). Keeps the persisted plan consistent with the "no replacement
+            # plan → retain" judgment above; LLM drafts routinely emit "".
+            execution_plan=(str(draft.get("execution_plan") or "").strip() or None),
+            # Deliverable-floor parity with create_batch: serialize the draft's
+            # spec AND inject the default if it's unusable, so a live-revise
+            # never strips a valid deliverable down to an unverifiable one.
+            expected_outputs=ensure_deliverable_spec(
                 draft.get("expected_outputs"),
+                proposal_id=proposal_id,
+                action_type=board_row.get("action_type", "unknown"),
+                ego_source=self._source_tag,
             ),
             revised_by=self._source_tag,
             reason=(reason or "reconcile: sharpened from a fresh blind draft"),
@@ -1790,6 +1854,10 @@ class EgoSession:
             revalidate_at=next_revalidate_at(
                 board_row.get("urgency", "normal"),
             ),
+            # Re-scope the sharpened content, pinned to the new revision (the
+            # genesis-ego fail-closed checks above guarantee a valid scope here).
+            scope=scope if _is_genesis else None,
+            scope_revision=(expected + 1) if (_is_genesis and scope) else None,
         )
         if new_rev is None:
             logger.info(
@@ -1921,6 +1989,33 @@ class EgoSession:
                 prop["_realist_verdict"] = verdict["verdict"]
                 prop["_realist_reasoning"] = verdict.get("reasoning", "")
 
+                # Scope stamp (genesis-ego only). The LLM's scope judgment,
+                # OVERRIDDEN by the deterministic SELF_MODIFY/AUTONOMOUS_BUILD
+                # fast-path — a structured code_change/refactor action-type (or
+                # a src/genesis path in the plan) is develop regardless of how
+                # the proposal is phrased. Left as None when neither fires;
+                # create_batch drops an unstamped genesis-ego draft (fail-closed).
+                if self._source_tag == "genesis_ego_cycle":
+                    _scope = verdict.get("scope")
+                    try:
+                        from genesis.autonomy.classification import classify_domain
+                        from genesis.autonomy.types import ActionDomain
+
+                        _dom = classify_domain(
+                            prop.get("action_type", ""),
+                            prop.get("execution_plan") or "",
+                        )
+                        if _dom in (
+                            ActionDomain.SELF_MODIFY,
+                            ActionDomain.AUTONOMOUS_BUILD,
+                        ):
+                            _scope = "develop"
+                    except Exception:
+                        logger.warning(
+                            "scope fast-path classify failed", exc_info=True,
+                        )
+                    prop["_realist_scope"] = _scope
+
                 if verdict["verdict"] == "amend" and verdict.get("amended_content"):
                     prop["_original_content"] = prop["content"]
                     prop["content"] = verdict["amended_content"]
@@ -1975,125 +2070,23 @@ class EgoSession:
         "system_monitoring", "genesis_maintenance",
     })
 
-    # Develop-work markers — the deterministic floor of the operate-vs-develop
-    # boundary (identity doc "Operate, Don't Develop" + realist rule 8). NARROW
-    # by design: only unambiguous dev-artifact signatures belong here, because
-    # this layer must stay near-zero false-positive on operate work. Fuzzy
-    # phrasing (read-only code tracing vs live-symptom diagnosis) is judged by
-    # the realist rubric, never this list.
-    # Cause-mentions must NOT match: a symptom diagnosis that names a refactor
-    # or migration as the suspected CAUSE ("backups fail since the scheduler
-    # refactor", "migration 0071 failed — investigate") is operate. Markers
-    # therefore require ACTION phrasing (verb + object), not the bare noun.
-    _DEVELOP_MARKER_PATTERNS = (
-        re.compile(r"\breview\b[^.\n]{0,80}?\bpull.?requests?\b", re.IGNORECASE),
-        re.compile(r"\breview\b[^.\n]{0,80}?\bpr\s*#\d+", re.IGNORECASE),
-        re.compile(r"\bpull.?requests?\b[^.\n]{0,60}?\b(?:review|merge|approv)", re.IGNORECASE),
-        re.compile(r"\b(?:merge|approve)\b[^.\n]{0,40}?\bpr\s*#\d+", re.IGNORECASE),
-        re.compile(
-            r"\brefactor(?:ing)?\s+(?:the|a|an|this|that)\s+\w+|\brefactor\s+of\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\b(?:run|write|create|apply|author|build|add)\b[^.\n]{0,40}?"
-            r"\bschema\s+migrations?\b"
-            r"|\bchange\b[^.\n]{0,30}?\b(?:database|db)\s+schema\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"\b(?:write|produce|apply|author)\s+(?:a\s+)?patch\b", re.IGNORECASE),
-        # Install-script edits (editing, NOT running — "run the install script"
-        # is operate; the update.sh dispatch is a legitimate ops lever).
-        re.compile(
-            r"\b(?:edit|modif(?:y|ies)|rewrite|patch|amend)\b[^.\n]{0,50}?"
-            r"\b(?:install script|host.?setup|bootstrap\.sh|scripts/[\w./-]+\.sh|\.sh\b)",
-            re.IGNORECASE,
-        ),
-        # Source-file / source-code edits (object must be code, so "fix the
-        # wedged service" and "update the dashboard status" do NOT match).
-        re.compile(
-            r"\b(?:edit|modif(?:y|ies)|rewrite|patch|fix)\b[^.\n]{0,50}?"
-            r"\b(?:src/genesis|source code|source file|\.py\b)",
-            re.IGNORECASE,
-        ),
-        # Config-VALUE changes (thresholds, intervals, weights, caps — "user
-        # decisions" per the identity doc). Value-change verb + config noun;
-        # a bare noun in a symptom ("the timeout keeps firing") does not match.
-        re.compile(
-            r"\b(?:raise|lower|increase|decrease|set|bump|adjust|tune|change)\b"
-            r"[^.\n]{0,40}?\b(?:threshold|interval|routing weight|budget cap|"
-            r"failure limit|retry count|backoff)\b",
-            re.IGNORECASE,
-        ),
-    )
+    @staticmethod
+    def _self_development_enabled() -> bool:
+        """Read the roadmap self-development flag, fail-closed.
 
-    def _flag_develop_scope(self, proposals: list[dict]) -> list[dict]:
-        """Mark develop-scope proposals for tabling (genesis ego only).
-
-        Deterministic floor of the operate-vs-develop boundary. While
-        ``genesis_self_development_enabled`` is False (the roadmap default),
-        a proposal that is unambiguously dev-artifact work — a SELF_MODIFY /
-        AUTONOMOUS_BUILD action domain, or an explicit develop marker (PR
-        review/merge, refactor, schema change, patch) — is marked here and
-        TABLED right after creation in ``_process_proposals``: it lands as a
-        recoverable row on the tabled lane, never deleted, never digested.
-        Runs after the realist unconditionally (same guarantee as
-        ``_enforce_domain_boundary``), so a realist outage cannot leak
-        develop work. Flipping the config flag to True disables the gate
-        without code changes (the self-development unlock path).
+        A config read failure returns False (LESS autonomy): develop proposals
+        stay tabled and undispatchable rather than shipping on a bad read.
         """
         try:
             from genesis.ego.config import load_ego_config
 
-            if load_ego_config().genesis_self_development_enabled:
-                return proposals
+            return bool(load_ego_config().genesis_self_development_enabled)
         except Exception:
-            # Config read failure → keep enforcing (fail toward LESS autonomy).
             logger.warning(
-                "develop-gate config read failed — enforcing", exc_info=True,
-            )
-
-        try:
-            from genesis.autonomy.classification import classify_domain
-            from genesis.autonomy.types import ActionDomain
-        except Exception:
-            classify_domain = None
-            ActionDomain = None
-            logger.warning(
-                "develop-gate classifier import failed — marker scan only",
+                "self-development flag read failed — treating as disabled",
                 exc_info=True,
             )
-
-        for p in proposals:
-            reason = None
-            if classify_domain is not None:
-                try:
-                    domain = classify_domain(
-                        p.get("action_type", ""), p.get("execution_plan") or "",
-                    )
-                    if domain in (
-                        ActionDomain.SELF_MODIFY, ActionDomain.AUTONOMOUS_BUILD,
-                    ):
-                        reason = f"action domain {domain.value}"
-                except Exception:
-                    logger.warning(
-                        "develop-gate classify_domain failed for proposal",
-                        exc_info=True,
-                    )
-            if reason is None:
-                text = f"{p.get('content', '')} {p.get('execution_plan') or ''}"
-                for pat in self._DEVELOP_MARKER_PATTERNS:
-                    match = pat.search(text)
-                    if match:
-                        reason = f"develop marker {match.group(0)!r}"
-                        break
-            if reason:
-                p["_develop_scope"] = reason
-                logger.warning(
-                    "Genesis ego develop-scope proposal will be tabled (%s): %s",
-                    reason,
-                    p.get("content", "")[:80],
-                )
-        return proposals
+            return False
 
     def _enforce_domain_boundary(
         self,
@@ -2215,13 +2208,26 @@ class EgoSession:
                 # eval regressions could auto-table real, actionable proposals.
                 pending, _informational = partition_informational(all_pending)
                 max_pending = getattr(self._config, "max_pending_proposals", 15)
-                # Develop-gate-flagged drafts are created-then-tabled and
-                # never occupy the board — counting them would evict real
-                # pending proposals to make room for rows that instantly
-                # leave.
-                _incoming = sum(
-                    1 for p in proposals if not p.get("_develop_scope")
-                )
+                # Count only incoming that will REMAIN pending, so the cap never
+                # evicts a real row to make room for one that instantly leaves.
+                # Genesis-ego: 'operate' stays; unstamped is dropped at create
+                # (never counts); 'develop' is tabled when self-dev is disabled
+                # (doesn't count) but STAYS pending when enabled (counts, so an
+                # enabled install's develop proposals are subject to the cap like
+                # any other). All user-ego drafts count.
+                _self_dev_on = self._self_development_enabled()
+
+                def _stays_pending(p: dict) -> bool:
+                    if self._source_tag != "genesis_ego_cycle":
+                        return True
+                    sc = p.get("_realist_scope")
+                    if sc == "operate":
+                        return True
+                    if sc == "develop":
+                        return _self_dev_on
+                    return False  # unstamped → dropped at create
+
+                _incoming = sum(1 for p in proposals if _stays_pending(p))
                 if len(pending) + _incoming > max_pending:
                     unranked = [
                         p for p in pending if p.get("rank") is None
@@ -2278,19 +2284,19 @@ class EgoSession:
             except Exception:
                 logger.warning("Failed to create intervention journal entries", exc_info=True)
 
-            # Develop-scope tabling (roadmap gate): rows flagged by
-            # _flag_develop_scope were created above so they exist as
-            # recoverable tabled records — never deleted. Tabled BEFORE the
-            # digest send; send_digest ships only still-pending rows.
+            # Develop-scope tabling (roadmap gate): a develop-stamped proposal
+            # created while self-development is disabled was created above (so
+            # it exists as a recoverable tabled record — never deleted) and is
+            # tabled here, BEFORE the digest send; send_digest ships only
+            # still-pending rows.
             for pid, prop in zip(ids, created, strict=False):
-                if prop.get("_develop_scope"):
+                if prop.get("_table_after_create"):
                     try:
                         await ego_crud.table_proposal(self._db, pid)
                         logger.info(
-                            "Tabled develop-scope proposal %s (%s) — "
+                            "Tabled develop-scope proposal %s — "
                             "self-development disabled",
                             pid[:12],
-                            prop["_develop_scope"],
                         )
                         # Mirror every other tabling path: resolve the journal
                         # row so it doesn't sit open forever.
@@ -2502,8 +2508,11 @@ class EgoSession:
 
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (sweep_approved_proposals is a second path).
+            # Scope last line: a develop-stamped row is unclaimable while
+            # self-development is disabled (both dispatch paths pass the flag).
             claimed = await ego_crud.claim_proposal_for_dispatch(
                 self._db, proposal_id,
+                allow_develop=self._self_development_enabled(),
             )
             if not claimed:
                 logger.info(
@@ -2978,8 +2987,11 @@ class EgoSession:
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (_process_execution_briefs is a second path,
             # and sweep can be triggered from cadence, Telegram, and dashboard).
+            # Scope last line: a develop-stamped row is unclaimable while
+            # self-development is disabled.
             claimed = await ego_crud.claim_proposal_for_dispatch(
                 self._db, prop["id"],
+                allow_develop=self._self_development_enabled(),
             )
             if not claimed:
                 logger.debug(
@@ -3241,10 +3253,24 @@ def _build_reconcile_prompt(
     def _clip(text: object, n: int = 200) -> str:
         return str(text or "")[:n].replace("\n", " ").replace("|", "/")
 
-    draft_lines = [
-        f'[{i}] action={d.get("action_type", "")} :: {_clip(d.get("content", ""))}'
-        for i, d in enumerate(drafts)
-    ]
+    # A genesis-ego revise carries a scope judgment for the SHARPENED content,
+    # so the reconcile LLM must see the COMPLETE draft (content + execution_plan)
+    # — a scope stamp made on a clipped draft can mis-classify develop work that
+    # lives in the plan or past the clip. User-ego drafts keep the compact clip.
+    _genesis = ego_source == "genesis_ego_cycle"
+
+    def _draft_line(i: int, d: dict) -> str:
+        action = d.get("action_type", "")
+        if _genesis:
+            content = str(d.get("content", "") or "").replace("\n", " ").replace("|", "/")
+            plan = str(d.get("execution_plan", "") or "").replace("\n", " ").replace("|", "/")
+            line = f"[{i}] action={action} :: {content}"
+            if plan:
+                line += f"  || execution_plan: {plan}"
+            return line
+        return f'[{i}] action={action} :: {_clip(d.get("content", ""))}'
+
+    draft_lines = [_draft_line(i, d) for i, d in enumerate(drafts)]
     _now_iso = datetime.now(UTC).isoformat()
 
     def _due(b: dict) -> str:
@@ -3309,6 +3335,12 @@ For EACH draft (by index) output exactly one verdict:
 - "new": nothing above covers it — genuinely novel work.
 - "reaffirm": a pending board item ALREADY covers it — put the board id in target_id.
 - "revise": a board item covers it but this draft sharpens/updates it — target_id = board id.
+  For a genesis-ego revise, ALSO emit "scope" ("operate" | "develop") judging the
+  SHARPENED content: OPERATE = diagnose/pull a reversible lever/dispatch a
+  specific-defect investigation whose deliverable is escalated findings; DEVELOP =
+  write/refactor code, change a schema, edit an install script, alter a config
+  *value*, or dev-artifact work even read-only (PR review, tracing source to scope
+  a fix). When unsure, "develop".
 - "withdraw": the work is ALREADY COVERED by covered-work (an active job already does it,
   or a merged PR closed it). If a pending board item covers the same work, set target_id =
   that board id to retire it. If NO board item matches but the draft itself is already
@@ -3320,7 +3352,7 @@ Judge the SEMANTIC match yourself; do not require identical wording. When unsure
 
 Output ONLY the JSON array — no preamble, no explanation, no code fence, no text
 before or after it. One object per draft, index-aligned:
-[{{"index": 0, "verdict": "new|reaffirm|revise|withdraw", "target_id": "<board id or null>", "reason": "<one line>"}}]
+[{{"index": 0, "verdict": "new|reaffirm|revise|withdraw", "target_id": "<board id or null>", "reason": "<one line>", "scope": "operate|develop (genesis-ego revise only)"}}]
 """
 
 
@@ -3386,6 +3418,12 @@ def _parse_reconcile_response(
             "target_id": str(target) if target else None,
             "reason": str(entry.get("reason", ""))[:500],
         }
+        # Scope for a revise's sharpened content (genesis-ego). Invalid/absent
+        # stays absent → _reconcile_revise fails closed (keeps the draft as a
+        # survivor for the realist to scope, never mutates the board item).
+        _scope = entry.get("scope")
+        if _scope in ("operate", "develop"):
+            verdicts[idx]["scope"] = _scope
     return verdicts
 
 
@@ -3416,11 +3454,27 @@ def _build_realist_prompt(
         history_lines.append("*No recent proposals.*")
 
     proposal_lines = []
+    # Genesis-ego proposals carry a scope judgment (rule 8), so the realist must
+    # see the COMPLETE proposal — develop intent can live in the execution_plan
+    # or past a truncation point, and a scope stamp made on partial input can
+    # mis-classify develop work as operate. User-ego keeps the compact form
+    # (no scope field, and cost matters more there).
+    _genesis = ego_source == "genesis_ego_cycle"
     for i, p in enumerate(proposals):
-        content = (p.get("content") or "")[:300].replace("\n", " ")
         action = p.get("action_type", "?")
         conf = p.get("confidence", 0.0)
-        proposal_lines.append(f"{i}. [{action}] (confidence: {conf:.2f}) {content}")
+        if _genesis:
+            content = (p.get("content") or "").replace("\n", " ")
+            plan = (p.get("execution_plan") or "").replace("\n", " ")
+            line = f"{i}. [{action}] (confidence: {conf:.2f}) {content}"
+            if plan:
+                line += f"  || execution_plan: {plan}"
+            proposal_lines.append(line)
+        else:
+            content = (p.get("content") or "")[:300].replace("\n", " ")
+            proposal_lines.append(
+                f"{i}. [{action}] (confidence: {conf:.2f}) {content}"
+            )
 
     # Domain boundary context — ego-specific jurisdiction framing.
     ego_section = ""
@@ -3475,22 +3529,36 @@ monitoring, or internal maintenance.
     operate_rule = ""
     if ego_source == "genesis_ego_cycle":
         operate_rule = """
-8. **Operate vs develop (operations ego only).** These proposals should
-   OPERATE the running system (diagnose, pull reversible operational levers,
-   dispatch remediation for a specific defect), NOT DEVELOP it. REJECT a
-   proposal ("Develop, not operate — escalate the change to the user") when
-   it would: write or refactor code, change a database schema, edit an
-   install script, alter a configuration *value* (threshold, interval,
-   routing weight, budget cap) — OR do dev-artifact work even read-only:
-   review/approve a pull request, trace source code to scope a fix or
-   refactor, audit code quality or design. The test is the deliverable: a
-   patch or patch-plan = develop. Symptom carve-out: diagnosing a LIVE
-   operational symptom (failing backup, stuck breaker, silent emitter) is
-   operate even when the trail leads into code — PASS it when the stated
-   deliverable is an escalation of findings, not a code change. A
-   remediation dispatch for a specific operational defect is fine; building
-   a feature or redesigning a subsystem is not.
+8. **Scope stamp — operate vs develop (operations ego only).** For EACH
+   proposal, judge whether it OPERATES the running Genesis system or DEVELOPS
+   it, and emit a "scope" field ("operate" or "develop") on that proposal's
+   output entry. This field is REQUIRED on every genesis-ego proposal.
+   - OPERATE: diagnose health/performance/reliability, pull reversible
+     operational levers (restart, clear a queue, flush a cache, re-run a job),
+     or dispatch an investigation/remediation for a SPECIFIC operational defect
+     whose deliverable is findings escalated to the user.
+   - DEVELOP: write or refactor code, change a database schema, edit an install
+     script, alter a configuration *value* (threshold, interval, routing
+     weight, budget cap) — OR dev-artifact work even read-only: review/approve
+     a pull request, trace source code to scope a fix or refactor, audit code
+     quality or design. The test is the deliverable: a patch or patch-plan =
+     develop.
+   - Symptom carve-out: diagnosing a LIVE operational symptom (failing backup,
+     stuck breaker, silent emitter) is OPERATE even when the trail leads into
+     code, AS LONG AS the stated deliverable is an escalation of findings, not
+     a code change.
+   The scope field does NOT by itself reject a proposal — judge pass/amend/
+   reject on the other rules (feasibility, duplication, actionability). Scope
+   is enforced structurally downstream. When in doubt, stamp "develop" (the
+   safe default: it routes to review, never silently ships).
 """
+
+    # Genesis-ego entries carry the required scope field; user-ego omits it.
+    scope_field = (
+        ', "scope": "operate|develop"'
+        if ego_source == "genesis_ego_cycle"
+        else ""
+    )
 
     # Build Rule #1 based on ego source — genesis ego is allowed to
     # propose investigation dispatches (background sessions for diagnosis),
@@ -3591,7 +3659,7 @@ proposal and return a JSON array of verdicts.
 
 ## Output Format
 Return ONLY a JSON array, one entry per proposal (same order as input):
-[{{"index": 0, "verdict": "pass|amend|reject", "reasoning": "brief explanation", "amended_content": "only if verdict is amend"}}]"""
+[{{"index": 0, "verdict": "pass|amend|reject", "reasoning": "brief explanation", "amended_content": "only if verdict is amend"{scope_field}}}]"""
 
 
 def _parse_realist_response(
@@ -3653,6 +3721,12 @@ def _parse_realist_response(
         }
         if verdict == "amend" and entry.get("amended_content"):
             verdicts[idx]["amended_content"] = str(entry["amended_content"])[:2000]
+        # Scope stamp (genesis-ego only; user-ego entries omit it). An invalid
+        # or absent value stays absent → the create chokepoint treats an
+        # unstamped genesis-ego draft as fail-closed (dropped).
+        _scope = entry.get("scope")
+        if _scope in ("operate", "develop"):
+            verdicts[idx]["scope"] = _scope
 
     return verdicts
 

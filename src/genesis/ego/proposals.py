@@ -56,6 +56,42 @@ def _serialize_expected_outputs(raw: dict | str | None) -> str | None:
     return None
 
 
+def ensure_deliverable_spec(
+    raw: dict | str | None,
+    *,
+    proposal_id: str,
+    action_type: str,
+    ego_source: str | None,
+) -> str | None:
+    """Serialize expected_outputs, injecting the deliverable floor when needed.
+
+    A genesis-ego dispatch/investigate proposal must carry a VERIFIABLE
+    deliverable so post-dispatch verification always applies. Injects a default
+    (``~/.genesis/output/ego-reports/<id>.md``) when there is no USABLE spec —
+    keyed on ``parse_expected_outputs(...) is None`` so an ego-supplied ``{}``
+    (serializes non-None, parses as absent) is caught, not just an absent field.
+    Shared by both proposal writers (``create_batch`` and the reconcile revise
+    path) so a live-revise cannot strip a valid spec down to an unverifiable one.
+    """
+    serialized = _serialize_expected_outputs(raw)
+    if (
+        ego_source == "genesis_ego_cycle"
+        and action_type in ("dispatch", "investigate")
+        and parse_expected_outputs(serialized) is None
+    ):
+        serialized = json.dumps(
+            {
+                "files": [f"~/.genesis/output/ego-reports/{proposal_id}.md"],
+                "min_size_bytes": 500,
+            }
+        )
+        logger.info(
+            "Proposal %s: injected default expected_outputs (deliverable floor)",
+            proposal_id,
+        )
+    return serialized
+
+
 # ---------------------------------------------------------------------------
 # Digest formatting
 # ---------------------------------------------------------------------------
@@ -327,9 +363,22 @@ class ProposalWorkflow:
         # reconcile stage can flag proposals whose premises are due for a
         # re-check. NEVER a kill path — overdue only queues verification
         # (locked decision #2). Config-derived; degrades to EgoConfig defaults.
-        from genesis.ego.config import next_revalidate_at
+        from genesis.ego.config import load_ego_config, next_revalidate_at
 
         _created_dt = datetime.fromisoformat(created_at)
+
+        # Self-development flag (roadmap gate), read once per batch. On a config
+        # read failure, fail toward LESS autonomy (treat as disabled → develop
+        # proposals get tabled, never auto-shipped).
+        try:
+            _self_dev_enabled = load_ego_config().genesis_self_development_enabled
+        except Exception:
+            logger.warning(
+                "self-development flag read failed — treating as disabled",
+                exc_info=True,
+            )
+            _self_dev_enabled = False
+        _is_genesis = ego_source == "genesis_ego_cycle"
 
         # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
         # hallucinated goal_ids from persisting).
@@ -385,16 +434,37 @@ class ProposalWorkflow:
             proposal_content = p.get("content", "")
             hash_val = _content_hash(proposal_content) if proposal_content else None
 
+            # Scope chokepoint (genesis-ego only). The realist stamps
+            # _realist_scope on every genesis-ego draft; enforce it structurally
+            # here — the single create-time gate no phrasing or future writer
+            # can bypass:
+            #   - unstamped (realist errored / omitted / invalid) → DROP,
+            #     fail-closed. The ego re-derives next cycle (blind-drafting
+            #     re-proposes anything real), so nothing is permanently lost and
+            #     nothing UNJUDGED ever reaches the board.
+            #   - develop + self-development disabled → created-then-TABLED
+            #     below (recoverable record, never digested/dispatched).
+            #   - develop + enabled, or operate → created normally, scope persisted.
+            _scope = p.get("_realist_scope") if _is_genesis else None
+            if _is_genesis and _scope not in ("operate", "develop"):
+                logger.warning(
+                    "Genesis-ego proposal DROPPED — scope unjudged (realist "
+                    "unavailable or contract violation); re-derived next cycle: %s",
+                    proposal_content[:80],
+                )
+                continue
+            _will_table = _is_genesis and _scope == "develop" and not _self_dev_enabled
+
             # Dedup: skip if identical content already pending/approved.
             # Skip check for empty content to avoid false collisions on
             # the fixed SHA-256 of the empty string.
-            # Develop-gate-flagged drafts also dedup against TABLED rows:
-            # the gate tables them on creation, and without this a persistent
-            # dev-artifact idea would be re-created + re-tabled every cycle.
+            # Develop drafts that will be tabled also dedup against TABLED rows,
+            # else a persistent dev idea would be re-created + re-tabled every
+            # cycle.
             if hash_val:
                 _dedup_statuses = (
                     ("pending", "approved", "tabled")
-                    if p.get("_develop_scope")
+                    if _will_table
                     else ("pending", "approved")
                 )
                 try:
@@ -415,41 +485,14 @@ class ProposalWorkflow:
                 p.get("urgency", "normal"), from_dt=_created_dt,
             )
 
-            # Deliverable floor (genesis/operations ego only): an
-            # investigation/dispatch proposal must carry a verifiable
-            # deliverable so post-dispatch verification always applies —
-            # bare "probe/diagnose/trace" dispatches with nothing to check
-            # were unverifiable by construction. The default lands in the
-            # user-facing output plane; ~ is expanded by the verifier
-            # (verification._resolve_path) and the dispatch prompt renders
-            # the exact path. Scoped to the genesis ego: user-ego dispatch
-            # flows (content publishing etc.) have their own deliverable
-            # semantics and are deliberately untouched.
-            _eo_serialized = _serialize_expected_outputs(
+            # Deliverable floor (genesis/operations ego only) — shared with the
+            # reconcile revise path so both proposal writers enforce it.
+            _eo_serialized = ensure_deliverable_spec(
                 p.get("expected_outputs"),
+                proposal_id=pid,
+                action_type=p.get("action_type", "unknown"),
+                ego_source=ego_source,
             )
-            # Inject when there is no USABLE spec — not merely when the field
-            # is absent. An ego-supplied ``{}`` or a dict without a valid
-            # ``files`` list serializes to a non-None string yet
-            # ``parse_expected_outputs`` (what the verifier uses) reads it as
-            # absent, so keying on ``is None`` alone would leave the dispatch
-            # unverifiable despite the floor.
-            if (
-                ego_source == "genesis_ego_cycle"
-                and p.get("action_type") in ("dispatch", "investigate")
-                and parse_expected_outputs(_eo_serialized) is None
-            ):
-                _eo_serialized = json.dumps(
-                    {
-                        "files": [f"~/.genesis/output/ego-reports/{pid}.md"],
-                        "min_size_bytes": 500,
-                    }
-                )
-                logger.info(
-                    "Proposal %s: injected default expected_outputs "
-                    "(deliverable floor)",
-                    pid,
-                )
 
             await ego_crud.create_proposal(
                 self._db,
@@ -478,7 +521,14 @@ class ProposalWorkflow:
                 expected_outputs=_eo_serialized,
                 revalidate_at=_revalidate_at,
                 last_validated_at=created_at,
+                scope=_scope,
+                scope_revision=1 if _scope else None,
             )
+            # Signal the tabling loop in _process_proposals (session.py): a
+            # develop proposal created while self-development is disabled is
+            # tabled right after creation — recoverable, never digested.
+            if _will_table:
+                p["_table_after_create"] = True
             ids.append(pid)
             created_proposals.append(p)
 

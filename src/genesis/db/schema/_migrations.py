@@ -1617,6 +1617,18 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN last_validated_at TEXT",
         "ego_proposals.last_validated_at")
 
+    # Scope stamp (operate|develop): base path + numbered migration 0078,
+    # same dual-idempotent pattern as the PR-4 columns above.
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN scope TEXT",
+        "ego_proposals.scope")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN scope_revision INTEGER",
+        "ego_proposals.scope_revision")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposal_revisions ADD COLUMN scope TEXT",
+        "ego_proposal_revisions.scope")
+
     # surplus_tasks.not_before — existed in CREATE TABLE DDL but lacked
     # ALTER TABLE migration for installs created before the column was added.
     await _try_alter(db,
@@ -1954,7 +1966,9 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
                 expected_outputs TEXT,
                 revision_num      INTEGER DEFAULT 1,
                 revalidate_at     TEXT,
-                last_validated_at TEXT
+                last_validated_at TEXT,
+                scope             TEXT,
+                scope_revision    INTEGER
             )
         """)
         await _intersection_copy(db, src="ego_proposals", dst="ego_proposals_rebuild")
