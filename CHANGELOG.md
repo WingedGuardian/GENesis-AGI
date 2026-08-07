@@ -20,7 +20,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   be delivered, it's retried until it lands rather than lost. Off by default on a
   fresh install (it baselines quietly first); enable pings by setting
   `mode: live` in a `config/github_steward.local.yaml` overlay once it has run.
-  Kill switch: `GENESIS_GITHUB_STEWARD_DISABLED=1`.
+  Kill switch: `GENESIS_GITHUB_STEWARD_DISABLED=1`. A companion campaign
+  pre-check (`github_activity_pending`) lets an opt-in digest campaign batch the
+  non-urgent activity into a periodic Telegram summary while only spending on
+  ticks that actually have new activity — quiet windows spawn nothing.
 
 ### Fixed
 

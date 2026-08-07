@@ -318,7 +318,10 @@ verified: 9037d45b 2026-07-07
   campaign names/prompts/targets are USER DATA (DB + private backups), never
   tracked source; zero shipped defaults. `CampaignRunner` cron-ticks
   programmatic prechecks then dispatches DirectSessions; a 120s reaper
-  reconciles finished sessions.
+  reconciles finished sessions. Prechecks receive a `db` handle in their ctx;
+  `github_activity_pending` uses it to gate a digest campaign to ticks with new
+  unresolved `github_account_activity` observations (fail-open on a first run or
+  missing handle) so a quiet window spends nothing.
 - GROUNDWORK across the entry: cross-vendor-review, per-step-verify,
   trace-verify, task-verify (built, dark), outreach-voice,
   autonomous-distribution.
