@@ -1,6 +1,8 @@
 """Tests for outreach domain types."""
 
 from genesis.outreach.types import (
+    OWNER_FACING_CHANNELS,
+    OWNER_FACING_CHANNELS_SQL_IN,
     FreshEyesResult,
     GovernanceResult,
     GovernanceVerdict,
@@ -9,6 +11,19 @@ from genesis.outreach.types import (
     OutreachResult,
     OutreachStatus,
 )
+
+
+def test_owner_channel_is_telegram_only():
+    """Engagement metrics exclude owner-facing channels; today that is Telegram
+    only. Genuine external channels (discord/email) must NOT be owner-facing, or
+    real external engagement would be dropped from the metric."""
+    assert frozenset({"telegram"}) == OWNER_FACING_CHANNELS
+    assert "discord" not in OWNER_FACING_CHANNELS
+    assert "email" not in OWNER_FACING_CHANNELS
+
+
+def test_owner_channels_sql_in_renders_quoted():
+    assert OWNER_FACING_CHANNELS_SQL_IN == "'telegram'"
 
 
 def test_outreach_category_values():

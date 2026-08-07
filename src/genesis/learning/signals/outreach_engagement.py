@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import aiosqlite
 
 from genesis.awareness.types import SignalReading
-from genesis.outreach.types import POSITIVE_ENGAGEMENT_OUTCOMES
+from genesis.outreach.types import OWNER_FACING_CHANNELS_SQL_IN, POSITIVE_ENGAGEMENT_OUTCOMES
 
 
 class OutreachEngagementCollector:
@@ -37,11 +37,16 @@ class OutreachEngagementCollector:
             "outcomes + proposal resolutions with a typed reason. "
             "0.0=no outbound or no engagement"
         )
+        # Count only EXTERNAL outreach (non-owner channel) so the ratio measures
+        # real engagement, not the owner reacting to their own approval/digest
+        # pings. Channel — not category — is the reliable signal (see
+        # genesis.outreach.types). Trusted module constant, not user input.
         cursor = await self._db.execute(
-            "SELECT engagement_outcome, COUNT(*) FROM outreach_history "
-            "WHERE delivered_at >= datetime('now', '-7 days') "
-            "AND engagement_outcome IS NOT NULL "
-            "GROUP BY engagement_outcome"
+            f"SELECT engagement_outcome, COUNT(*) FROM outreach_history "  # noqa: S608
+            f"WHERE delivered_at >= datetime('now', '-7 days') "
+            f"AND engagement_outcome IS NOT NULL "
+            f"AND channel NOT IN ({OWNER_FACING_CHANNELS_SQL_IN}) "
+            f"GROUP BY engagement_outcome"
         )
         rows = await cursor.fetchall()
         total = sum(r[1] for r in rows)

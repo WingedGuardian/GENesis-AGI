@@ -27,6 +27,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Engagement rate now measures real outreach, not your own approval pings.**
+  The "N sent / X% engagement" figure counted every internal Telegram message
+  Genesis sends *you* — approval prompts, the morning digest, blockers, alerts,
+  surplus research posts — as "outreach," so the denominator filled with
+  housekeeping and the engagement rate read near-zero even when genuine posts got
+  normal reactions. It now counts only messages sent to the outside world (your
+  external channels — Discord, email, and the like — rather than your own
+  Telegram), so the rate (on the dashboard, in the awareness signal, and in
+  reflection) reflects how your actual outreach is landing.
+
 - **Email replies now count as engagement.** When someone replies to an email
   Genesis sent (outreach pitch, follow-up), the reply was recorded for thread
   tracking but never registered as an engagement outcome — so reply rates read

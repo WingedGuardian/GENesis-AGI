@@ -37,7 +37,7 @@ async def test_all_engaged_returns_high(db):
     for i in range(3):
         await outreach_crud.create(
             db, id=f"e-{i}", signal_type="surplus", topic=f"T{i}",
-            category="surplus", salience_score=0.8, channel="telegram",
+            category="content", salience_score=0.8, channel="discord",
             message_content="Hi", created_at=now,
         )
         await outreach_crud.record_delivery(db, f"e-{i}", delivered_at=now)
@@ -58,7 +58,7 @@ async def test_positive_set_includes_behavioural(db):
     for i, outcome in enumerate(["useful", "engaged", "acted_on", "acknowledged"]):
         await outreach_crud.create(
             db, id=f"p-{i}", signal_type="surplus", topic=f"P{i}",
-            category="surplus", salience_score=0.8, channel="telegram",
+            category="content", salience_score=0.8, channel="discord",
             message_content="Hi", created_at=now,
         )
         await outreach_crud.record_delivery(db, f"p-{i}", delivered_at=now)
@@ -74,7 +74,7 @@ async def test_mixed_engagement(db):
     for i in range(2):
         await outreach_crud.create(
             db, id=f"eng-{i}", signal_type="surplus", topic=f"E{i}",
-            category="surplus", salience_score=0.8, channel="telegram",
+            category="content", salience_score=0.8, channel="discord",
             message_content="Hi", created_at=now,
         )
         await outreach_crud.record_delivery(db, f"eng-{i}", delivered_at=now)
@@ -82,7 +82,7 @@ async def test_mixed_engagement(db):
     for i in range(2):
         await outreach_crud.create(
             db, id=f"ign-{i}", signal_type="surplus", topic=f"I{i}",
-            category="surplus", salience_score=0.8, channel="telegram",
+            category="content", salience_score=0.8, channel="discord",
             message_content="Hi", created_at=now,
         )
         await outreach_crud.record_delivery(db, f"ign-{i}", delivered_at=now)
@@ -91,6 +91,68 @@ async def test_mixed_engagement(db):
     collector = OutreachEngagementCollector(db)
     reading = await collector.collect()
     assert reading.value == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_owner_channel_excluded_from_denominator(db):
+    """Owner-facing traffic (delivered over the Telegram channel — approvals,
+    digests, etc.) must NOT pollute the engagement denominator. One external
+    Discord reply + three owner-facing Telegram approvals that went unanswered
+    should read 1/1 = 1.0, not 1/4 = 0.25."""
+    now = datetime.now(UTC).isoformat()
+    await outreach_crud.create(
+        db, id="c-0", signal_type="content", topic="post",
+        category="content", salience_score=0.8, channel="discord",
+        message_content="Shipped X", created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "c-0", delivered_at=now)
+    await outreach_crud.record_engagement(
+        db, "c-0", engagement_outcome="useful", engagement_signal="user_reply",
+    )
+    for i in range(3):
+        await outreach_crud.create(
+            db, id=f"appr-{i}", signal_type="approval", topic=f"A{i}",
+            category="approval", salience_score=0.8, channel="telegram",
+            message_content="Approve?", created_at=now,
+        )
+        await outreach_crud.record_delivery(db, f"appr-{i}", delivered_at=now)
+        await outreach_crud.record_engagement(
+            db, f"appr-{i}", engagement_outcome="ignored", engagement_signal="timeout",
+        )
+
+    reading = await OutreachEngagementCollector(db).collect()
+    assert reading.value == 1.0
+
+
+@pytest.mark.asyncio
+async def test_email_notification_counts_as_external(db):
+    """An email-channel 'notification' is a genuine PROSPECT reply, not owner
+    housekeeping (MAIL_REPLY.md). Category alone would wrongly exclude it as
+    relay; channel-based classification correctly COUNTS it. One engaged email
+    reply + one owner-facing Telegram approval → 1/1 = 1.0."""
+    now = datetime.now(UTC).isoformat()
+    await outreach_crud.create(
+        db, id="mail-0", signal_type="notification", topic="re: pitch",
+        category="notification", salience_score=0.8, channel="email",
+        message_content="Thanks — interested", created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "mail-0", delivered_at=now)
+    await outreach_crud.record_engagement(
+        db, "mail-0", engagement_outcome="useful", engagement_signal="user_reply",
+    )
+    # Owner-facing Telegram approval that got no reaction — must not dilute.
+    await outreach_crud.create(
+        db, id="appr-x", signal_type="approval", topic="A",
+        category="approval", salience_score=0.8, channel="telegram",
+        message_content="Approve?", created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "appr-x", delivered_at=now)
+    await outreach_crud.record_engagement(
+        db, "appr-x", engagement_outcome="ignored", engagement_signal="timeout",
+    )
+
+    reading = await OutreachEngagementCollector(db).collect()
+    assert reading.value == 1.0
 
 
 # ── Unified ratio: ego proposals count as outbound (PR decision-propagation)
@@ -170,7 +232,7 @@ async def test_unified_ratio_mixes_surfaces(db):
     for i in range(2):
         await outreach_crud.create(
             db, id=f"m-{i}", signal_type="surplus", topic=f"M{i}",
-            category="surplus", salience_score=0.8, channel="telegram",
+            category="content", salience_score=0.8, channel="discord",
             message_content="Hi", created_at=now,
         )
         await outreach_crud.record_delivery(db, f"m-{i}", delivered_at=now)
