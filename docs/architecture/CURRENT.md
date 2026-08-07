@@ -1062,7 +1062,16 @@ verified: b662f3e3 2026-07-17
   from the `~/.genesis/setup-complete` marker (which means only "bootstrap
   finished"). Single source of truth shared by three surfaces: the dashboard
   `setup-status` route, the ego cadence gate (`_should_run` requires marker AND
-  `floor_met`), and the CC session-start onboarding prompt.
+  `floor_met`), and the CC session-start onboarding prompt. Above the floor,
+  `readiness.py` layers a cumulative 4-tier model on the same primitives —
+  **T0 Bootstrapped → T1 Functional (`floor_met`) → T2 Connected (proactive
+  Telegram reach: bot token + ≥1 valid `TELEGRAM_ALLOWED_USERS` id, parity-pinned
+  to the live adapter start-gate `channels.bridge._load_bridge_config`) → T3
+  Autonomous (`ego.enabled`)**. Pure over secrets + one injected `ego_enabled`
+  bool (no runtime import on the hot path); web-search/autonomy-posture/surplus are
+  enrichment, never tier gates (autonomy has no on/off switch — it's always
+  initialised and gated per-action by the mandatory approval gate). `setup-status`
+  emits `tier`/`tier_name`/`telegram_configured`/`ego_enabled` additively.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, ~113 CREATE TABLE; docs
