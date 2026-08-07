@@ -754,6 +754,32 @@ TABLES = {
             rejected_at         TEXT
         )
     """,
+    # Contributor Work-Log hold store — a curator-drafted, sanitized public
+    # GitHub issue held for owner approval (paired with an approval_requests
+    # row); the resolution watcher posts it on approval. Mirrors
+    # pending_email_sends (WS-8). Migration 0079.
+    "pending_issue_posts": """
+        CREATE TABLE IF NOT EXISTS pending_issue_posts (
+            id                  TEXT PRIMARY KEY,
+            request_id          TEXT NOT NULL UNIQUE,
+            repo                TEXT NOT NULL,
+            title               TEXT NOT NULL,
+            body                TEXT NOT NULL,
+            labels              TEXT,
+            source              TEXT NOT NULL,
+            source_ref          TEXT,
+            cell_domain         TEXT NOT NULL,
+            cell_verb           TEXT NOT NULL,
+            cell_risk_class     TEXT NOT NULL,
+            held_at             TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'held'
+                                    CHECK (status IN ('held', 'posted', 'rejected', 'expired')),
+            issue_number        INTEGER,
+            issue_url           TEXT,
+            posted_at           TEXT,
+            rejected_at         TEXT
+        )
+    """,
     # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously
     # under a GRANTED capability cell (i.e. the gate allowed it without holding
     # for owner approval).  This is the keystone the owner-visibility "Activity"
@@ -2358,6 +2384,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_capability_grants_domain ON capability_grants(domain, state)",
     # WS-8 email gate hold store (drain queries WHERE status='held')
     "CREATE INDEX IF NOT EXISTS idx_pending_email_sends_status ON pending_email_sends(status)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_issue_posts_status ON pending_issue_posts(status)",
     # WS-8 PR-D autonomous-send ledger — per-cell rate-limit window + ledger ordering
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
     "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",
