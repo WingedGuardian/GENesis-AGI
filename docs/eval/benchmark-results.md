@@ -1,6 +1,6 @@
 # Model Benchmark Results
 
-Last updated: 2026-08-06
+Last updated: 2026-08-07
 
 Benchmark methodology: 3 datasets (classification, extraction, structured_output)
 with 37 total cases. Scores are `passed/attempted` — skipped cases (rate limits,
@@ -29,7 +29,7 @@ Best run per provider. Providers marked (free) cost $0; others are paid.
 | Provider | Reason | Status |
 |---|---|---|
 | openrouter-deepseek-r1 | Free endpoint removed from OpenRouter (2026-04-15). Provider entry removed from routing config 2026-05-24. | Removed |
-| openrouter-qwen3coder | Returns HTTP 401 "No cookie auth credentials found" on all requests — the Qwen3-Coder free endpoint appears to require browser/cookie auth, not API key (retested 2026-04-16 off-peak) | Disable or investigate |
+| openrouter-qwen3coder | qwen/qwen3-coder:free delisted (0 OpenRouter endpoints, verified live 2026-08-07); provider was unwired. Entry removed from routing config 2026-08-07. | Removed |
 
 ## Key Findings
 

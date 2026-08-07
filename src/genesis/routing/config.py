@@ -181,6 +181,54 @@ def _expand_env_vars(text: str) -> str:
     return _ENV_PATTERN.sub(repl, text)
 
 
+# OpenRouter free-tier convention: a genuinely-free model carries a ":free"
+# slug suffix; a BARE slug routes to PAID endpoints. So an OpenRouter provider
+# flagged `free: true` whose slug is NOT ":free"-suffixed is a mislabel — a paid
+# model billed at OpenRouter while the router records $0 (`is_free` zeroes cost),
+# so real spend is invisible (the openrouter-free regression, 2026-08). This
+# allowlist holds genuine $0 OpenRouter endpoints that legitimately lack the
+# ":free" suffix (the free-pool meta-router).
+_FREE_OPENROUTER_ALLOWLIST = frozenset({"openrouter/free"})
+
+
+def _detect_mislabeled_free_openrouter(
+    providers: dict[str, ProviderConfig],
+) -> list[str]:
+    """Return warning strings for OpenRouter providers flagged ``free: true``
+    whose model slug — or any curated ``params.extra_body.models`` fallback
+    member — is not ``:free``-suffixed (and not an allowlisted $0 meta-router).
+
+    A config-only, load-time guard (no profile/network dependency). It does NOT
+    gate routing — visibility only, per "cost is observability, not control".
+
+    Scoped to OpenRouter deliberately: the ``:free`` slug convention is
+    OpenRouter-specific. Other providers are free-by-account-tier and
+    legitimately keep list prices in their model_profiles, so a
+    profile-rate-based check would false-positive on them.
+    """
+    findings: list[str] = []
+    for name, cfg in providers.items():
+        if not cfg.is_free or cfg.provider_type != "openrouter":
+            continue
+        slugs = [cfg.model_id]
+        params = cfg.params if isinstance(cfg.params, dict) else {}
+        extra = params.get("extra_body")
+        models = extra.get("models") if isinstance(extra, dict) else None
+        if isinstance(models, list):
+            slugs.extend(m for m in models if isinstance(m, str))
+        suspect = [
+            s
+            for s in slugs
+            if not s.endswith(":free") and s not in _FREE_OPENROUTER_ALLOWLIST
+        ]
+        if suspect:
+            findings.append(
+                f"{name}: free:true but OpenRouter slug(s) are not ':free' "
+                f"(paid endpoint — bills while tracked as $0): {suspect}"
+            )
+    return findings
+
+
 def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     """Parse raw YAML dict into a validated RoutingConfig."""
     if not isinstance(raw, dict):
@@ -251,6 +299,12 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             )
 
         providers[name] = cfg
+
+    # Class-fix guard (2026-08): warn loudly if any OpenRouter provider is
+    # flagged free:true but points at a paid (non-":free") slug — the
+    # openrouter-free billing blind spot. Visibility only; never gates routing.
+    for _finding in _detect_mislabeled_free_openrouter(providers):
+        logger.warning("Mislabeled free provider — %s", _finding)
 
     # --- Call sites ---
     call_sites: dict[str, CallSiteConfig] = {}
