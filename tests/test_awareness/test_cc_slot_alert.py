@@ -8,7 +8,8 @@ split, the per-slot cooldown, and the db-None / below-threshold no-ops.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -90,3 +91,43 @@ async def test_create_failure_never_raises(_reset_cooldown_and_mock_create):
     create.side_effect = RuntimeError("db locked")
     # must not propagate into the tick
     await loop._check_cc_slot_memory(object(), slots=[_slot("4", 6500)])
+
+
+# ── MW-0 A2: the /proc enumeration must run OFF the event loop ───────────────
+
+
+@pytest.mark.asyncio
+async def test_slots_none_offloads_enumeration(monkeypatch):
+    """When slots are not injected, enumerate_cc_slots (~1s of sync /proc
+    syscalls) must be dispatched through asyncio.to_thread, never on the loop."""
+    import genesis.observability.cc_slots as cc_slots_mod
+
+    sentinel = MagicMock(return_value=[])
+    monkeypatch.setattr(cc_slots_mod, "enumerate_cc_slots", sentinel)
+
+    dispatched = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy(fn, *a, **k):
+        dispatched.append(fn)
+        return await real_to_thread(fn, *a, **k)
+
+    monkeypatch.setattr(loop.asyncio, "to_thread", spy)
+
+    await loop._check_cc_slot_memory(object(), slots=None)
+
+    assert sentinel in dispatched  # enumeration went through to_thread
+    sentinel.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_injected_slots_skip_enumeration(monkeypatch):
+    """The slots= injection path must NOT enumerate at all (tests / future
+    snapshot-sharing pass pre-collected slots)."""
+    import genesis.observability.cc_slots as cc_slots_mod
+
+    enum = MagicMock(side_effect=AssertionError("must not enumerate with injected slots"))
+    monkeypatch.setattr(cc_slots_mod, "enumerate_cc_slots", enum)
+
+    await loop._check_cc_slot_memory(object(), slots=[_slot("1", 100)])
+    enum.assert_not_called()

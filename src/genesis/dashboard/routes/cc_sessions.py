@@ -16,6 +16,7 @@ waypoint spine (this is its first reader), and repo-pulse annotations.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -261,7 +262,8 @@ async def cc_sessions_detail():
     if not rt.is_bootstrapped or rt.db is None:
         return jsonify({"error": "not bootstrapped"}), 503
 
-    slots = enumerate_cc_slots()
+    # /proc scan is ~1s of sync syscalls — keep it off the event loop.
+    slots = await asyncio.to_thread(enumerate_cc_slots)
     deploy = await last_successful_update(rt.db)  # (completed_at, new_commit) | None
     return jsonify(await _collect_detail(rt.db, slots, deploy=deploy))
 
