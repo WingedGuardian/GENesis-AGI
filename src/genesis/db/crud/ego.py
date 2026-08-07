@@ -1038,19 +1038,21 @@ async def auto_table_stale_proposals(
     db: aiosqlite.Connection,
     ttl_hours: dict | None = None,
     *,
-    unranked_cap_hours: int = 120,
+    unranked_cap_hours: int = 336,
 ) -> int:
     """Auto-table pending proposals older than their per-urgency staleness
     window, moving them to the recoverable 'tabled' cold lane.
 
-    Urgency-based window (config ``auto_table_ttl_hours``), replacing the old
-    flat 14-day threshold: stale genesis investigations lingered 6-9 days below
-    14d and were approved on self-healed signals (2026-08-06 dispatch review).
+    Urgency-based window (config ``auto_table_ttl_hours``). A BACKSTOP behind the
+    reconcile cycle (which withdraws stale/invalid proposals each pass), NOT the
+    primary staleness mechanism — windows sit generously above observed user
+    decision-latency (median ~1-2d, tail to ~12d; 2026-08-06 review) so only
+    truly-abandoned proposals are swept, never the normal-cadence tail.
     'tabled' is NOT deletion — the ego can un-table, and a still-relevant
     proposal is re-derived fresh next cycle. Unranked proposals (never put on
     the board → lower priority) age out faster, capped at
-    ``unranked_cap_hours`` (default 5d, preserving the prior behaviour).
-    Keeps intervention_journal in sync (same pattern as
+    ``unranked_cap_hours`` (default 14d — a shorter floor than the ranked
+    windows). Keeps intervention_journal in sync (same pattern as
     :func:`expire_stale_proposals`).
 
     Returns count of auto-tabled proposals.
@@ -1061,7 +1063,7 @@ async def auto_table_stale_proposals(
 
             ttl_hours = load_ego_config().auto_table_ttl_hours
         except Exception:  # config unreadable — fall back to safe defaults
-            ttl_hours = {"critical": 48, "high": 72, "normal": 120, "low": 168}
+            ttl_hours = {"critical": 240, "high": 336, "normal": 504, "low": 720}
 
     now_dt = datetime.now(UTC)
     cursor = await db.execute(

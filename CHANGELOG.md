@@ -17,6 +17,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and extraction quality are unchanged; triage-depth labeling may shift by about one
   level on some items. No action needed on your end.
 
+- **Stale ego proposals get tabled on a generous backstop.** Ego proposals you
+  haven't acted on move to the recoverable *tabled* lane on a per-urgency
+  schedule (roughly 10 days for critical up to 30 for low) — a backstop behind
+  the ego's ongoing reconcile review, tuned to sit well past normal decision
+  time so it only clears the genuinely-forgotten. Tabling is reversible, never
+  deletion.
+
 ### Fixed
 
 - **A "free" fallback model that was quietly a paid one.** An OpenRouter fallback
