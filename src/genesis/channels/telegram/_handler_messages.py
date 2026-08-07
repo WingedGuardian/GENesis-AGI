@@ -1229,6 +1229,63 @@ async def _try_ego_correction_store(ctx: HandlerContext, msg) -> bool:
     return False
 
 
+def _is_topic_root_reply(msg) -> bool:
+    """True if ``msg`` is a reply to a forum topic's ROOT service message rather
+    than to a specific message. Telegram sets ``reply_to_message.message_id`` to
+    the topic id (== ``message_thread_id``) for such replies; the root
+    ``forum_topic_created`` service message carries no ``.text``, so it gives the
+    conversation handler no context to act on."""
+    reply_to = getattr(msg, "reply_to_message", None)
+    thread_id = getattr(msg, "message_thread_id", None)
+    if reply_to is None or thread_id is None:
+        return False
+    return getattr(reply_to, "message_id", None) == thread_id
+
+
+async def _try_topic_root_decision_nudge(ctx: HandlerContext, msg) -> bool:
+    """Catch a bare decision ("yes"/"approve"/…) that quote-replies the ROOT of a
+    decision topic (Approvals / Content Review / Ego Proposals) but matched no
+    pending item. Such a reply carries no item context, so letting it fall through
+    would spawn a confused, context-free conversation session ("no charter — what
+    are you confirming?"). Nudge the user to reply to the specific message instead.
+
+    Deliberately does NOT auto-resolve anything (resolving most-recent-pending
+    from an ambiguous topic-root reply risks acting on the WRONG item). Returns
+    True if the message was consumed (caller should return early)."""
+    if not _is_topic_root_reply(msg) or not msg.text:
+        return False
+    if _bare_decision(msg.text) is None:
+        return False
+    thread_id = getattr(msg, "message_thread_id", None)
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        pipeline = rt.outreach_pipeline
+        if pipeline is None or pipeline.topic_manager is None:
+            return False
+        tm = pipeline.topic_manager
+        decision_threads = {
+            tm.get_thread_id("approvals"),
+            tm.get_thread_id("content_review"),
+            tm.get_thread_id("ego_proposals"),
+        }
+    except Exception:
+        return False
+    if thread_id not in decision_threads:
+        return False
+    try:
+        await msg.reply_text(
+            "You replied to the topic itself, so I can't tell which item you mean. "
+            "Reply directly to the specific message (or tap its ✅ button) to "
+            "act on it."
+        )
+    except Exception:
+        log.debug("Failed to send topic-root decision nudge", exc_info=True)
+    log.info("Topic-root bare decision nudged (thread %s)", thread_id)
+    return True
+
+
 async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not ctx.authorized(user.id):
@@ -1356,6 +1413,12 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
                         exc_info=True,
                     )
             return
+
+    # A bare decision quote-replying a decision topic's ROOT (not a specific
+    # item) matched nothing above — nudge instead of spawning a context-free
+    # conversation session. No-op for anything else.
+    if await _try_topic_root_decision_nudge(ctx, msg):
+        return
 
     # Record implicit engagement: user is active after receiving outreach
     if ctx.engagement_tracker and ctx.db:
