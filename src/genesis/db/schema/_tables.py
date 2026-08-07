@@ -773,11 +773,12 @@ TABLES = {
             cell_risk_class     TEXT NOT NULL,
             held_at             TEXT NOT NULL,
             status              TEXT NOT NULL DEFAULT 'held'
-                                    CHECK (status IN ('held', 'posted', 'rejected', 'expired')),
+                                    CHECK (status IN ('held', 'posted', 'rejected', 'expired', 'dry_run')),
             issue_number        INTEGER,
             issue_url           TEXT,
             posted_at           TEXT,
-            rejected_at         TEXT
+            rejected_at         TEXT,
+            dry_run_at          TEXT
         )
     """,
     # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously

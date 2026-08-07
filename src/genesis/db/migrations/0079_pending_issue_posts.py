@@ -35,11 +35,12 @@ _TABLE_DDL = """
         cell_risk_class     TEXT NOT NULL,          -- 'public_write'
         held_at             TEXT NOT NULL,
         status              TEXT NOT NULL DEFAULT 'held'
-                                CHECK (status IN ('held', 'posted', 'rejected', 'expired')),
+                                CHECK (status IN ('held', 'posted', 'rejected', 'expired', 'dry_run')),
         issue_number        INTEGER,                -- captured after a successful post
         issue_url           TEXT,
         posted_at           TEXT,
-        rejected_at         TEXT
+        rejected_at         TEXT,
+        dry_run_at          TEXT                    -- propose_only: approved but not posted (terminal)
     )
 """
 

@@ -7,8 +7,8 @@ hold on rejection/timeout. Mirrors the WS-8 pending_email_sends shape.
 
 Covers the fresh-install path (create_all_tables), the versioned migration
 (up/down/idempotency), the request_id UNIQUE + status CHECK constraints, and the
-held→posted / held→rejected transitions including the double-post guard (a hold
-can leave 'held' exactly once).
+held→posted / held→rejected / held→dry_run transitions including the double-post
+guard (a hold can leave 'held' exactly once; dry_run is terminal).
 """
 
 from __future__ import annotations
@@ -221,3 +221,23 @@ class TestCrud:
         # already 'posted' — reject must not override.
         assert await pip.mark_rejected(db, "p1", rejected_at=_TS) is False
         assert (await pip.get_by_id(db, "p1"))["status"] == "posted"
+
+    @pytest.mark.asyncio
+    async def test_mark_dry_run_once(self, db):
+        # propose_only path: an approved hold is dry-run-terminal — shadow-observed
+        # once, marked 'dry_run', and NEVER posted (flipping the lever to 'live'
+        # must not retro-post it). Same single-flip guard as mark_posted.
+        await pip.create(db, **_ROW)
+        assert await pip.mark_dry_run(db, "p1", dry_run_at=_TS) is True
+        row = await pip.get_by_id(db, "p1")
+        assert row["status"] == "dry_run"
+        assert row["dry_run_at"] == _TS
+        # terminal: a second flip is a no-op, and it never reappears as work.
+        assert await pip.mark_dry_run(db, "p1", dry_run_at=_TS) is False
+        assert await pip.list_held(db) == []
+        # dry_run is terminal — a later post/reject must not override it.
+        assert (
+            await pip.mark_posted(db, "p1", issue_number=9, issue_url="u", posted_at=_TS) is False
+        )
+        assert await pip.mark_rejected(db, "p1", rejected_at=_TS) is False
+        assert (await pip.get_by_id(db, "p1"))["status"] == "dry_run"
