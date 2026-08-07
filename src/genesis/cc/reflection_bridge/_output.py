@@ -34,6 +34,93 @@ def _extract_fenced_json(text: str) -> str:
     return json_match.group(1) if json_match else text
 
 
+# Call site for the prose→JSON salvage retry (chain in config/model_routing.yaml).
+_SALVAGE_CALL_SITE = "41_reflection_json_salvage"
+# Cap the prose fed to the salvage model. Real failing rows are ~1.6k–2.9k chars;
+# this is generous headroom without paying for a runaway payload.
+_SALVAGE_MAX_PROSE_CHARS = 12000
+
+_SALVAGE_PROMPT = """A deep-reflection session produced the analysis below as \
+free-form PROSE instead of the required JSON. Convert it FAITHFULLY into a single \
+JSON object. Do NOT invent content that is not in the prose; omit any field the \
+prose does not address — EXCEPT "cognitive_state_update", which is required \
+(synthesize it from the prose's overall assessment).
+
+Required:
+- "cognitive_state_update": string — a tight, factual summary of the current \
+cognitive state / situation described in the prose.
+
+Optional (include only when the prose supports it):
+- "observations": [string, ...]        (max 5 — the key findings)
+- "learnings": [string, ...]
+- "memory_operations": [{"operation": "dedup|merge|prune|flag_contradiction", \
+"target_ids": ["..."], "reason": "...", "merged_content": "..."}]
+- "surplus_task_requests": [{"task_type": "...", "reason": "...", \
+"priority": 0.0, "drive_alignment": "..."}]
+- "contradictions": [ ... ]
+- "confidence": 0.0
+- "focus_next": string
+
+Output ONLY the JSON object — no markdown fence, no commentary.
+
+PROSE:
+{prose}
+"""
+
+
+def _extract_json_obj(text: str) -> dict | None:
+    """Whether ``text`` yields a reflection JSON dict — the salvage-skip gate.
+
+    Delegates to the CANONICAL extractor used by ``parse_deep_reflection_output``
+    (the production routing parser), so the gate and the parser are provably the
+    same algorithm: salvage fires exactly when routing would fail, never skips
+    when routing would fail, and never wastes a call when routing would succeed.
+    """
+    from genesis.reflection.output_router import extract_reflection_json
+
+    return extract_reflection_json(text)
+
+
+async def salvage_deep_reflection_json(raw_text: str, router) -> str | None:
+    """Salvage a deep-reflection CC session that ended in PROSE (no JSON) by
+    re-deriving the structured payload via one routed LLM call, so the cycle's
+    cognitive output (cognitive_state_update, observations, memory ops, surplus
+    requests) is not silently discarded.
+
+    Returns a strict ```json-fenced string to use in place of ``raw_text`` (parsed
+    identically by the router AND the Telegram topic summary), or None when no
+    salvage is needed (``raw_text`` already parses) or salvage fails (caller then
+    keeps the existing parse-failed behavior — this is strictly additive).
+    """
+    if router is None or not raw_text or not raw_text.strip():
+        return None
+    if _extract_json_obj(raw_text) is not None:
+        return None  # already parseable — nothing to salvage
+    # .replace (not .format) — the prompt embeds literal JSON braces.
+    prompt = _SALVAGE_PROMPT.replace("{prose}", raw_text[:_SALVAGE_MAX_PROSE_CHARS])
+    try:
+        result = await router.route_call(
+            call_site_id=_SALVAGE_CALL_SITE,
+            messages=[{"role": "user", "content": prompt}],
+            suppress_dead_letter=True,
+        )
+    except Exception:
+        logger.warning("Deep-reflection JSON salvage call raised", exc_info=True)
+        return None
+    if not getattr(result, "success", False) or not getattr(result, "content", None):
+        logger.warning(
+            "Deep-reflection JSON salvage produced no usable content (error=%s)",
+            getattr(result, "error", None),
+        )
+        return None
+    obj = _extract_json_obj(result.content)
+    if obj is None:
+        logger.warning("Deep-reflection JSON salvage output was still unparseable")
+        return None
+    # Normalize to a strict ```json fence so both consumers parse it identically.
+    return "```json\n" + json.dumps(obj) + "\n```"
+
+
 async def route_deep_output(
     raw_text: str,
     *,
@@ -414,7 +501,7 @@ async def _store_reflection_summary(
             )
 
 
-def format_topic_summary(depth, output) -> str:
+def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     """Build the Telegram topic message from PARSED reflection fields only.
 
     Raw ``output.text`` must never reach the topic: when the model output is
@@ -422,17 +509,23 @@ def format_topic_summary(depth, output) -> str:
     internal noise, not a summary — it has leaked mid-session artifacts to
     the user verbatim. The topic stays a liveness surface: parse failure
     still produces a one-liner, never silence and never raw text.
+
+    ``text`` overrides ``output.text`` as the parse source — used to pass the
+    salvaged JSON for a deep reflection that ended in prose, so the topic shows
+    a real summary instead of the fallback stub.
     """
+    source_text = text if text is not None else output.text
     header = f"<b>{depth.value} Reflection</b>"
     fallback = (
         f"{header}\n\nReflection completed — output was not parseable; "
         "stored for review."
     )
-    try:
-        data = json.loads(_extract_fenced_json(output.text))
-    except (json.JSONDecodeError, TypeError):
-        return fallback
-    if not isinstance(data, dict):
+    # Use the SAME canonical extractor as the routing parser and the salvage
+    # gate, so the topic never shows the "not parseable" stub for output that
+    # actually routed (e.g. a bare-untagged ``` fence). One algorithm, three
+    # consumers — no divergent parser left.
+    data = _extract_json_obj(source_text)
+    if data is None:
         return fallback
 
     parts = [header]
