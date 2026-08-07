@@ -117,7 +117,9 @@ the queue.
 After 24 hours, table items you no longer recommend. Withdraw only
 genuinely invalid proposals (factually wrong, superseded by events).
 
-Proposals pending longer than 14 days are auto-tabled by the system.
+Proposals pending too long are auto-tabled by the system on a per-urgency
+staleness window (roughly 2 days for critical up to 7 for low; unranked
+proposals age out sooner). Tabling is recoverable, not deletion.
 
 ## Execution
 

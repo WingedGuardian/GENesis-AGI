@@ -75,6 +75,19 @@ class TestLoadEgoConfig:
         config = load_ego_config(tmp_config)
         assert config.revalidation_interval_hours == full
 
+    def test_partial_auto_table_override_merges_over_defaults(self, tmp_config):
+        """A partial auto_table_ttl_hours override merges OVER the full defaults
+        — omitted urgencies keep their declared window (same defaults-complete
+        semantics as revalidation_interval_hours)."""
+        tmp_config.write_text(yaml.dump({"auto_table_ttl_hours": {"high": 24}}))
+        config = load_ego_config(tmp_config)
+        assert config.auto_table_ttl_hours == {
+            "critical": 48,
+            "high": 24,
+            "normal": 120,
+            "low": 168,
+        }
+
 
 class TestSaveEgoConfig:
     def test_roundtrip(self, tmp_config):
@@ -134,6 +147,19 @@ class TestValidateEgoConfig:
         """proposal_expiry_minutes was removed — should not validate."""
         errors = validate_ego_config({"proposal_expiry_minutes": 240})
         assert errors == []  # unknown key, ignored
+
+    def test_invalid_auto_table_ttl_unknown_urgency(self):
+        errors = validate_ego_config({"auto_table_ttl_hours": {"bogus": 12}})
+        assert len(errors) == 1
+        assert "auto_table_ttl_hours" in errors[0]
+
+    def test_invalid_auto_table_ttl_non_positive(self):
+        errors = validate_ego_config({"auto_table_ttl_hours": {"high": 0}})
+        assert len(errors) == 1
+        assert "auto_table_ttl_hours" in errors[0]
+
+    def test_valid_auto_table_ttl(self):
+        assert validate_ego_config({"auto_table_ttl_hours": {"high": 72}}) == []
 
     def test_outcome_bus_capability_feed_rejects_non_bool(self):
         for bad in ("yes", 1, 0, None):
