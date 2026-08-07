@@ -9,6 +9,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Free-tier model refresh.** Groq is retiring Llama 3.3 70B (the model behind
+  several of Genesis's free reasoning/extraction/tagging steps) on 2026-08-16, so
+  those steps now use Groq's recommended replacement, gpt-oss-120b. Structured-output
+  and extraction quality are unchanged; triage-depth labeling may shift by about one
+  level on some items. No action needed on your end.
+
 ### Added
 
 - **GitHub activity notifications.** Genesis now watches your active GitHub repos

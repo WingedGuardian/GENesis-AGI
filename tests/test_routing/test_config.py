@@ -224,6 +224,20 @@ def test_load_full_yaml(monkeypatch):
     assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"
 
+    # groq-free provider — MIGRATED 2026-08-06: Groq deprecated
+    # llama-3.3-70b-versatile (shutdown 2026-08-16) → openai/gpt-oss-120b, its
+    # recommended free-tier replacement. The alias name is kept deliberately so
+    # all 32 call-site chains + 8 code refs resolve the repoint in place.
+    # reasoning_effort=low caps reasoning-token volume under the free-tier TPM
+    # ceiling; no reasoning-suppression param is needed (Groq returns reasoning
+    # in a separate field, so content stays clean JSON — benchmarked 10/10).
+    gf = cfg.providers["groq-free"]
+    assert gf.is_free is True
+    assert gf.provider_type == "groq"
+    assert gf.model_id == "openai/gpt-oss-120b"
+    assert gf.profile == "gpt-oss-120b"
+    assert gf.params == {"extra_body": {"reasoning_effort": "low"}}
+
 
 def test_retry_profiles_under_watchdog_threshold():
     """Every shipped retry profile must set max_total_s BELOW the watchdog's 900s
