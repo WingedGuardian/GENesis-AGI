@@ -211,6 +211,7 @@ class CampaignRunner:
         ctx = {
             "daily_cost": daily_cost,
             "session_runner": self._session_runner,
+            "db": self._db,
         }
 
         from genesis.campaigns.prechecks import run_prechecks
