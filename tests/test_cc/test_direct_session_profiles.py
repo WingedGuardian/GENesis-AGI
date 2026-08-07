@@ -237,6 +237,22 @@ def test_addenda_do_not_mention_reference_store_for_persistence():
         )
 
 
+def test_write_profiles_steer_persistence_to_genesis_memory():
+    """Write+memory investigation profiles must steer durable learnings to
+    Genesis memory (procedure_store/observation_write) and away from hand-editing
+    the CC MEMORY.md index. Background dispatches share one cwd-isolated memory
+    index (separate from the foreground index) that a full-file Write truncates,
+    losing other sessions' consolidated context (2026-08-06 review)."""
+    for profile in ("interact", "research", "campaign"):
+        addendum = _PROFILE_ADDENDA[profile]
+        assert "procedure_store" in addendum, (
+            f"{profile} addendum should point durable learnings at Genesis memory"
+        )
+        assert "MEMORY.md" in addendum, (
+            f"{profile} addendum should warn against editing the MEMORY.md index"
+        )
+
+
 def test_all_addenda_include_mission_injection():
     """All non-perimeter profiles must include the adapt-and-overcome mission text."""
     _PERIMETER_PROFILES = {"mail"}
