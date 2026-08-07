@@ -398,6 +398,42 @@ class TestReconcileReviseScope:
         assert ok is False  # merged row is develop → not applied
         assert (await ego_crud.get_proposal(db, "rv5"))["content"] == "v1 develop"
 
+    @pytest.mark.asyncio
+    async def test_empty_string_plan_retains_not_overwrites(self, db, monkeypatch):
+        """Round-3: a draft with execution_plan='' (present-but-empty, as LLMs
+        emit) must RETAIN the existing plan, not overwrite it with '' — an empty
+        string is not SQL NULL, so COALESCE wouldn't fall back without the
+        normalization. The retained develop plan then keeps the row develop."""
+        _patch_flag(monkeypatch, False)
+        await ego_crud.create_proposal(
+            db,
+            id="rv6",
+            action_type="investigate",
+            content="v1",
+            status="pending",
+            ego_source="genesis_ego_cycle",
+            scope="develop",
+            scope_revision=1,
+            execution_plan="edit src/genesis/x.py",
+        )
+        ok = await _revise_sess(db)._reconcile_revise(
+            "rv6",
+            {
+                "id": "rv6",
+                "revision_num": 1,
+                "urgency": "normal",
+                "action_type": "investigate",
+                "scope": "develop",
+                "execution_plan": "edit src/genesis/x.py",
+            },
+            {"content": "sharper", "execution_plan": ""},  # present-but-EMPTY
+            "r",
+            scope="operate",
+        )
+        assert ok is False  # retained develop plan → merged row develop → refused
+        row = await ego_crud.get_proposal(db, "rv6")
+        assert row["execution_plan"] == "edit src/genesis/x.py"  # retained, not ""
+
 
 # ── deliverable-spec parity + revision audit ──────────────────────────────
 

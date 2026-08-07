@@ -1834,7 +1834,11 @@ class EgoSession:
             content=new_content,
             rationale=draft.get("rationale"),
             confidence=draft.get("confidence"),
-            execution_plan=draft.get("execution_plan"),
+            # Normalize a present-but-empty plan to None so COALESCE RETAINS the
+            # existing plan (an empty string is not SQL NULL and would overwrite
+            # it). Keeps the persisted plan consistent with the "no replacement
+            # plan → retain" judgment above; LLM drafts routinely emit "".
+            execution_plan=(str(draft.get("execution_plan") or "").strip() or None),
             # Deliverable-floor parity with create_batch: serialize the draft's
             # spec AND inject the default if it's unusable, so a live-revise
             # never strips a valid deliverable down to an unverifiable one.
