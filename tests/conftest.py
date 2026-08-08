@@ -69,6 +69,77 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     monkeypatch.setattr(cb_mod, "_STATE_FILE", tmp_path / "cb_state.json")
 
 
+# ── Safety: isolate tests from the install's config overlays ──
+@pytest.fixture(autouse=True)
+def _isolate_user_config_dir(tmp_path, monkeypatch):
+    """Neutralize BOTH overlay vectors so tests never read install-local state.
+
+    ``config/*.local.yaml`` overlays are install-local (e.g. a voice-live
+    install arms ``voice_act.local.yaml`` ``mode: live``). Every loader that
+    calls ``merge_local_overlay`` resolves them from two locations, and BOTH
+    leak into tests unpatched — green on CI (no overlays), red or falsely green
+    on a live install:
+
+    1. **User dir** (``~/.genesis/config/*.local.yaml``) — absolute, so it leaks
+       in the main tree AND in a sibling worktree. Patched by redirecting
+       ``_user_config_dir`` to an empty per-test dir.
+    2. **Repo-relative sibling** (``<repo>/config/*.local.yaml``) — gitignored,
+       present only in the main tree, so a worktree test run structurally can't
+       catch it. When a loader is called with a real repo config path (e.g.
+       ``load_ego_config()`` with no args → ``repo_root()/config/ego.yaml``),
+       ``_resolve_overlay_path`` falls back to the real sibling. We wrap the
+       resolver so any overlay that resolves INSIDE the real repo config dir is
+       redirected to the empty dir. tmp-rooted overlays (the overlay tests'
+       own fixtures, and ``test_config_save``-style tests) are never touched.
+
+    ``security/immunity.py`` binds ``_user_config_dir`` at module level (its own
+    reference), so it is patched separately. The guards in
+    tests/test_config_overlay.py keep this list complete and catch any NEW
+    hand-rolled ``.local.yaml`` resolver that bypasses ``merge_local_overlay``.
+    Independent resolvers (routing, recon, mcp settings) hold their own logic
+    and are tracked for consolidation (follow-up); the MCP ``_USER_CONFIG_DIR``
+    constants are excluded as too import-heavy for an every-test fixture — their
+    tests self-isolate.
+    """
+    from genesis import _config_overlay
+    from genesis.env import repo_root
+    from genesis.security import immunity
+
+    user_dir = tmp_path / "user-config-isolated"
+    monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: user_dir)
+    monkeypatch.setattr(immunity, "_user_config_dir", lambda: user_dir)
+
+    # Vector 2: neutralize the repo-relative sibling fallback.
+    _orig_resolve = _config_overlay._resolve_overlay_path
+
+    def _sandboxed_resolve(base_path):
+        result = _orig_resolve(base_path)
+        try:
+            resolved = result.resolve()
+        except OSError:  # pragma: no cover - defensive (symlink loops)
+            return result
+        # Resolve the real config dir LAZILY (repo_root() reads GENESIS_REPO_ROOT
+        # per call), so a test that re-points GENESIS_REPO_ROOT after fixture
+        # setup is still honored — and the deterministic regression test can aim
+        # a synthetic overlay at it.
+        real_config_dir = (repo_root() / "config").resolve()
+        if resolved.is_relative_to(real_config_dir):
+            # A real install-local overlay — redirect to the guaranteed-absent
+            # isolated dir so the loader falls through to shipped defaults.
+            return user_dir / result.name
+        return result
+
+    monkeypatch.setattr(_config_overlay, "_resolve_overlay_path", _sandboxed_resolve)
+    # immunity.py binds `_resolve_overlay_path` at MODULE level (a by-name
+    # import), so its own reference must be patched too — patching only
+    # _config_overlay's attribute does not reach it (record_demotion() would
+    # otherwise still fall back to the real config/ws3_immunity.local.yaml
+    # sibling). Lazy importers (memory/graph_expansion, ledger/learned_knobs)
+    # re-resolve against the patched _config_overlay each call, so they need no
+    # separate patch. The guard test tracks module-level importers of both names.
+    monkeypatch.setattr(immunity, "_resolve_overlay_path", _sandboxed_resolve)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_ledger_write_failures():
     """Reset the ledger writer + grader failure counters around every test.
