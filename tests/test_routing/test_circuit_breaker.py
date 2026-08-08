@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from genesis.routing.circuit_breaker import (
     _MAX_OPEN_S,
@@ -395,6 +396,33 @@ def test_degradation_l5_all_ollama_down():
         for _ in range(3):
             reg.get(name).record_failure(ErrorCategory.TRANSIENT)
     assert reg.compute_degradation_level() == DegradationLevel.LOCAL_COMPUTE_DOWN
+
+
+def test_legacy_degradation_path_warns_once(caplog):
+    """Entering the count-based legacy fallback (no essential map injected)
+    surfaces a one-time warning so a misconfigured install is not silently
+    mis-degrading — but the warning does not repeat on the same instance."""
+    providers = {"a": _provider("a"), "b": _provider("b")}
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0)
+    with caplog.at_level(logging.WARNING, logger="genesis.routing.circuit_breaker"):
+        reg.compute_degradation_level()
+        reg.compute_degradation_level()  # second call must NOT re-warn
+    hits = [r for r in caplog.records if "LEGACY provider-count fallback" in r.message]
+    assert len(hits) == 1
+
+
+def test_coverage_degradation_path_does_not_warn(caplog):
+    """With an essential-site map injected, the coverage path is used and the
+    legacy-fallback warning never fires."""
+    providers = {
+        "p1": _provider("p1", "openrouter"),
+        "p2": _provider("p2", "google", is_free=True),
+    }
+    essential = {"9_fact_extraction": ["p1", "p2"]}
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0, essential_sites=essential)
+    with caplog.at_level(logging.WARNING, logger="genesis.routing.circuit_breaker"):
+        reg.compute_degradation_level()
+    assert not [r for r in caplog.records if "LEGACY provider-count fallback" in r.message]
 
 
 # --- Save/load round-trip tests ---

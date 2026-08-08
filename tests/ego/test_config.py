@@ -82,10 +82,10 @@ class TestLoadEgoConfig:
         tmp_config.write_text(yaml.dump({"auto_table_ttl_hours": {"high": 24}}))
         config = load_ego_config(tmp_config)
         assert config.auto_table_ttl_hours == {
-            "critical": 48,
+            "critical": 240,
             "high": 24,
-            "normal": 120,
-            "low": 168,
+            "normal": 504,
+            "low": 720,
         }
 
 

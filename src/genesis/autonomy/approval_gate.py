@@ -487,16 +487,24 @@ class AutonomousCliApprovalGate:
     async def approve_all_pending(self, *, resolved_by: str) -> int:
         """Approve every pending approval request.  Returns count approved.
 
-        WS-8 email capability-gate holds are EXCLUDED: each held email is an
-        independent send decision and must be approved individually, never
-        swept by a batch "approve all".
+        Per-item-only action types are EXCLUDED from the batch sweep — each is
+        an independent, irreversible external decision that must be approved
+        individually, never swept by a single "approve all" click (dashboard
+        button OR Telegram ``cli_approve_all``, which both funnel here):
+
+        - WS-8 email capability-gate holds (each held email is one send).
+        - Contributor Work-Log issue holds (each is one public-repo post).
         """
+        from genesis.autonomy.contributor_worklog_config import (
+            CONTRIBUTOR_ISSUE_ACTION_TYPE,
+        )
         from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
 
+        excluded = {EMAIL_GATE_ACTION_TYPE, CONTRIBUTOR_ISSUE_ACTION_TYPE}
         pending = await self._approval_manager.get_pending()
         count = 0
         for req in pending:
-            if req.get("action_type") == EMAIL_GATE_ACTION_TYPE:
+            if req.get("action_type") in excluded:
                 continue
             ok = await self._approval_manager.resolve(
                 req["id"], status="approved", resolved_by=resolved_by,

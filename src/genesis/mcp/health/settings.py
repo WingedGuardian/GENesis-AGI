@@ -132,6 +132,21 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # each worker run is a fresh process
     ),
+    "contributor_worklog": SettingsDomain(
+        name="contributor_worklog",
+        description=(
+            "Contributor Work-Log poster — master `enabled` + `mode` "
+            "off/propose_only/live plus `retention_days`/`max_held` knobs. "
+            "propose_only (default, shipped) proposes public GitHub issues + "
+            "holds each for owner approval but NEVER auto-posts (dry-run); "
+            "live posts approved issues via `gh issue create`. Invalid mode "
+            "degrades to propose_only. Read live by the drain each tick — "
+            "takes effect immediately, no restart."
+        ),
+        config_filename="contributor_worklog.yaml",
+        readonly=False,
+        needs_restart=False,  # drain re-reads each tick
+    ),
     "memory_integrity": SettingsDomain(
         name="memory_integrity",
         description=(
@@ -1171,6 +1186,27 @@ def _validate_repo_pulse(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_contributor_worklog(changes: dict) -> list[str]:
+    """Validate Contributor Work-Log lever changes (see
+    genesis.autonomy.contributor_worklog_config)."""
+    from genesis.autonomy.contributor_worklog_config import _INT_KNOBS, MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", *_INT_KNOBS)
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+        elif key == "mode":
+            if value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
 def _validate_pr_watch(changes: dict) -> list[str]:
     """Validate pr-watch lever changes (see
     genesis.session_awareness.pr_watch_config)."""
@@ -1450,6 +1486,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "session_ledger_shadow": _validate_session_ledger_shadow,
     "ws2_ledger": _validate_ws2_ledger,
     "repo_pulse": _validate_repo_pulse,
+    "contributor_worklog": _validate_contributor_worklog,
     "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,
     "cc_roster": _validate_cc_roster,

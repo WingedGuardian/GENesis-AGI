@@ -35,3 +35,14 @@ automation_denylist: []
 
 # Loud-truncation cap: activity events processed per tick.
 max_events_per_tick: 100
+
+# Account-level notifications lane — surfaces activity BEYOND the flagship repos:
+# @mentions of the owner anywhere, and responses on issues/PRs the owner authored
+# on OTHER people's repos (their outbound contributions). The flagship deep-poll
+# already covers the owner's own repos, so `author`/`subscribed` reasons are
+# filtered to NON-owned repos. `reasons` is the GitHub notification-`reason`
+# allowlist; everything else (ci_activity, subscribed-to-own, ...) is dropped.
+# Both mentions and author-responses ping immediately in `live` mode.
+notifications:
+  enabled: true
+  reasons: ["mention", "team_mention", "author"]

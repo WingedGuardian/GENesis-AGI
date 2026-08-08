@@ -120,6 +120,19 @@ async def _impl_follow_up_create(
         else:
             source = "foreground_session"
 
+        # Sacred-board authorization: the hot `follow_up` board is reserved for
+        # sanctioned (≈ foreground) paths. An autonomous/dispatched CC session's
+        # LLM-authored follow-up is routed to the COLD `tabled` lane — tracked and
+        # surfaceable for review, never auto-dispatched; a human/foreground session
+        # promotes it to the board if warranted. Root cause of the 2026-07-03
+        # fabricated-follow-up incident: an autonomous session minted a board item.
+        # (Templated pipelines that call crud.follow_ups.create() directly bypass
+        # this tool and are governed at their own call sites.)
+        autonomous_routed = False
+        if source == "ego_dispatch" and kind != "tabled":
+            kind = "tabled"
+            autonomous_routed = True
+
         # The session declares domain when it knows; otherwise fall back to the
         # internal-only classifier (returns 'internal' on a keyword hit, else
         # None → stored NULL, never a user_world guess).
@@ -141,12 +154,20 @@ async def _impl_follow_up_create(
             revisit_condition=revisit_condition or None,
         )
         cond = revisit_condition.strip() or None
-        lane_msg = (
-            "Tabled (cold list — consciously not pursuing near-term; tracked, not "
-            "surfaced as actionable work)."
-            if kind == "tabled"
-            else f"Follow-up created (hot list). Strategy: {strategy}."
-        )
+        if autonomous_routed:
+            lane_msg = (
+                "Routed to the tabled (cold) lane: this is an autonomous/dispatched "
+                "session, and the hot follow-up board is reserved for sanctioned "
+                "(foreground) paths. Tracked and surfaceable for review; a foreground "
+                "session can promote it to the board."
+            )
+        elif kind == "tabled":
+            lane_msg = (
+                "Tabled (cold list — consciously not pursuing near-term; tracked, not "
+                "surfaced as actionable work)."
+            )
+        else:
+            lane_msg = f"Follow-up created (hot list). Strategy: {strategy}."
         return {
             "id": fid,
             "status": "pending",
@@ -307,8 +328,23 @@ async def _impl_follow_up_update(
         # pick the lane on update any more than on create. blocked_on_trigger
         # requires a revisit_condition (newly supplied, or already on the row).
         resolved_kind: str | None = None
+        autonomous_promotion_blocked = False
         if work_state is not None:
             resolved_kind = follow_ups.WORK_STATE_TO_KIND[work_state]
+            # Sacred-board authorization (mirror of _impl_follow_up_create): an
+            # autonomous/dispatched session may NOT PROMOTE a follow-up onto the hot
+            # board — only sanctioned (foreground) sessions may. Without this gate an
+            # autonomous session could follow_up_create (→ forced tabled) and then
+            # follow_up_update(work_state='ready') to flip it straight back onto the
+            # board, defeating Part B. Gate ONLY a genuine promotion (off-board → board):
+            # a re-affirm of an already-on-board item (existing kind == 'follow_up') is a
+            # no-op that must NOT demote it, and moving TO tabled stays allowed.
+            if resolved_kind == "follow_up" and existing.get("kind") != "follow_up":
+                import os
+
+                if os.environ.get("GENESIS_CC_SESSION") == "1":
+                    resolved_kind = "tabled"
+                    autonomous_promotion_blocked = True
             effective_cond = (
                 revisit_condition
                 if revisit_condition is not None
@@ -421,7 +457,13 @@ async def _impl_follow_up_update(
             "revisit_condition": refreshed.get("revisit_condition"),
             "priority": refreshed["priority"],
             "pinned": bool(refreshed.get("pinned", 0)),
-            "message": "Follow-up updated.",
+            "message": (
+                "Kept on the tabled (cold) lane: an autonomous/dispatched session "
+                "cannot promote a follow-up onto the hot board — a foreground session "
+                "must do that."
+                if autonomous_promotion_blocked
+                else "Follow-up updated."
+            ),
         }
         if resolved_from is not None:
             # Echo the full id so the caller learns it for subsequent calls.

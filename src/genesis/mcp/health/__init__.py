@@ -68,6 +68,7 @@ from genesis.mcp.health import calibration_status as _calibration_status  # noqa
 from genesis.mcp.health import campaign_tools as _campaign_tools  # noqa: E402, F401
 from genesis.mcp.health import codebase as _codebase  # noqa: E402
 from genesis.mcp.health import cognitive_ledger_tools as _cognitive_ledger_tools  # noqa: E402, F401
+from genesis.mcp.health import contributor_issue as _contributor_issue  # noqa: E402, F401
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
 from genesis.mcp.health import deliberation_tools as _deliberation_tools  # noqa: E402
 from genesis.mcp.health import direct_session_tools as _direct_session_tools  # noqa: E402

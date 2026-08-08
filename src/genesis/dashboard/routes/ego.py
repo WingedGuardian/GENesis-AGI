@@ -338,6 +338,8 @@ async def ego_cadence():
 @_async_route
 async def ego_proposals_all():
     """Return all proposals with optional status filter and limit."""
+    import contextlib
+
     from genesis.db.crud import ego as ego_crud
     from genesis.runtime import GenesisRuntime
 
@@ -349,6 +351,18 @@ async def ego_proposals_all():
     limit = min(request.args.get("limit", 50, type=int), 200)
 
     proposals = await ego_crud.list_proposals(rt._db, status=status, limit=limit)
+    # Surface completed ego-dispatch findings: attach the dispatch session's
+    # output excerpt + transcript pointer so the debrief is discoverable in the
+    # dashboard, not just the 1000-char user_response summary.
+    from genesis.db.crud import cc_sessions as cc_sessions_crud
+
+    # Best-effort: a join failure (e.g. a legacy row with non-JSON metadata) must
+    # never 500 the core proposals list — degrade to no dispatch info.
+    dispatch_map: dict = {}
+    with contextlib.suppress(Exception):
+        dispatch_map = await cc_sessions_crud.dispatch_info_for_proposals(
+            rt._db, [p["id"] for p in proposals]
+        )
     return jsonify(
         [
             {
@@ -374,6 +388,7 @@ async def ego_proposals_all():
                 "revision_num": p.get("revision_num", 1),
                 "revalidate_at": p.get("revalidate_at"),
                 "last_validated_at": p.get("last_validated_at"),
+                "dispatch": dispatch_map.get(p["id"]),
             }
             for p in proposals
         ]

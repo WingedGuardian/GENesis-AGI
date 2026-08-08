@@ -6,6 +6,7 @@ import sqlite3
 
 import aiosqlite
 
+from genesis.outreach.types import OWNER_FACING_CHANNELS_SQL_IN as _OWNER_CHANNELS
 from genesis.outreach.types import POSITIVE_ENGAGEMENT_SQL_IN as _POSITIVE_IN
 
 
@@ -153,7 +154,15 @@ async def find_by_delivery_id(
 
 
 async def get_engagement_stats(db: aiosqlite.Connection, *, days: int = 7) -> dict:
-    """Return engagement statistics for the last N days.
+    """Return EXTERNAL engagement statistics for the last N days.
+
+    Counts only external (non-owner) channels — owner-facing relay traffic
+    (Genesis→owner approvals/digests over Telegram/voice) is not outreach
+    engagement, and including it distorts every consumer: the owner ignoring
+    their own approval pings would inflate the ignore-rate and wrongly throttle
+    genuine external outreach (see governance._engagement_throttle) and mislead
+    the morning report. Channel — not category — is the reliable signal (see
+    genesis.outreach.types). Trusted module constant, not user input.
 
     Returns: {total, engaged, ignored, ambivalent, pending}
     """
@@ -165,7 +174,8 @@ async def get_engagement_stats(db: aiosqlite.Connection, *, days: int = 7) -> di
             SUM(CASE WHEN engagement_outcome = 'ambivalent' THEN 1 ELSE 0 END) AS ambivalent,
             SUM(CASE WHEN engagement_outcome IS NULL THEN 1 ELSE 0 END) AS pending
         FROM outreach_history
-        WHERE delivered_at >= datetime('now', ?)""",
+        WHERE delivered_at >= datetime('now', ?)
+          AND channel NOT IN ({_OWNER_CHANNELS})""",  # noqa: S608 - trusted module constant
         (f"-{days} days",),
     )
     row = await cursor.fetchone()
