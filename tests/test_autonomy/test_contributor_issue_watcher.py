@@ -34,8 +34,22 @@ async def db():
         yield conn
 
 
-async def _seed_held(db, *, title="Add a newcomer task", body="Details.", labels=None, repo=_REPO):
-    """Create a held pending_issue_posts row + its linked approval (pending)."""
+async def _seed_held(
+    db,
+    *,
+    title="Add a newcomer task",
+    body="Details.",
+    labels=None,
+    repo=_REPO,
+    mode="propose_only",
+):
+    """Create a held pending_issue_posts row + its linked approval (pending).
+
+    *mode* is STAMPED on the row (the lever mode at propose time) — the drain
+    honors it for the dry-run-terminal invariant, so a live-posting test must
+    seed ``mode="live"`` (a propose_only-stamped row dry-runs even under a live
+    lever).
+    """
     mgr = ApprovalManager(db=db)
     rid = await mgr.request_approval(
         action_type="contributor_issue_post",
@@ -57,6 +71,7 @@ async def _seed_held(db, *, title="Add a newcomer task", body="Details.", labels
         cell_verb="issue_create",
         cell_risk_class="bulk",
         held_at="2026-08-07T00:00:00",
+        mode=mode,
     )
     return pid, rid, mgr
 
@@ -125,6 +140,45 @@ async def test_propose_only_approved_dry_runs(db, monkeypatch):
     assert (await cur.fetchone())[0] == 1
 
 
+# ── mode STAMPING: flip-window invariants (Codex remediation) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_propose_only_stamped_not_posted_after_live_flip(db, monkeypatch):
+    """The locked 'dry-run is terminal' invariant, at the drain seam: a row
+    PROPOSED under propose_only — approved but not yet drained — must NOT post if
+    the lever flips to live before its tick. The row's STAMPED mode (not the live
+    lever) decides. Without stamping this posts (the Codex BLOCKER)."""
+    gh = _FakeGh(list_out="[]")
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid, rid, mgr = await _seed_held(db, mode="propose_only")  # stamped propose_only
+    await mgr.resolve(rid, status="approved")
+    _mode(monkeypatch, "live")  # lever flipped to live BEFORE the drain tick
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 1
+    assert not gh.created()  # NEVER posts — stamped propose_only is dry-run-terminal
+    assert (await pip.get_by_id(db, pid))["status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_live_stamped_paused_when_lever_flips_to_propose_only(db, monkeypatch):
+    """A live-stamped row posts only while the lever is STILL live. If the owner
+    flips back to propose_only (a deliberate pause), the row is left held — not
+    posted, not dry-run — and resumes on the next live flip."""
+    gh = _FakeGh(list_out="[]")
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    pid, rid, mgr = await _seed_held(db, mode="live")  # stamped live
+    await mgr.resolve(rid, status="approved")
+    _mode(monkeypatch, "propose_only")  # lever paused before the tick
+
+    n = await ciw.drain_pending_issue_posts(_RT(db))
+    assert n == 0
+    assert not gh.created()
+    assert (await pip.get_by_id(db, pid))["status"] == "held"  # paused, awaits live
+    assert (await ar.get_by_id(db, rid))["consumed_at"] is None
+
+
 # ── live: post ─────────────────────────────────────────────────────────────
 
 
@@ -133,7 +187,7 @@ async def test_live_approved_posts_and_records_number(db, monkeypatch):
     _mode(monkeypatch, "live")
     gh = _FakeGh(list_out="[]")  # no existing issue
     monkeypatch.setattr(ciw, "_run_gh", gh)
-    pid, rid, mgr = await _seed_held(db, labels=["good first issue"])
+    pid, rid, mgr = await _seed_held(db, labels=["good first issue"], mode="live")
     await mgr.resolve(rid, status="approved")
 
     n = await ciw.drain_pending_issue_posts(_RT(db))
@@ -165,7 +219,7 @@ async def test_live_adopts_existing_open_issue_no_repost(db, monkeypatch):
     )
     gh = _FakeGh(list_out=existing)
     monkeypatch.setattr(ciw, "_run_gh", gh)
-    pid, rid, mgr = await _seed_held(db, title="Add a newcomer task")
+    pid, rid, mgr = await _seed_held(db, title="Add a newcomer task", mode="live")
     await mgr.resolve(rid, status="approved")
 
     n = await ciw.drain_pending_issue_posts(_RT(db))
@@ -183,7 +237,7 @@ async def test_live_dedup_list_failure_does_not_post(db, monkeypatch):
     _mode(monkeypatch, "live")
     gh = _FakeGh(list_rc=1)
     monkeypatch.setattr(ciw, "_run_gh", gh)
-    pid, rid, mgr = await _seed_held(db)
+    pid, rid, mgr = await _seed_held(db, mode="live")
     await mgr.resolve(rid, status="approved")
 
     n = await ciw.drain_pending_issue_posts(_RT(db))
@@ -197,7 +251,7 @@ async def test_live_create_failure_leaves_held(db, monkeypatch):
     _mode(monkeypatch, "live")
     gh = _FakeGh(list_out="[]", create_rc=1)
     monkeypatch.setattr(ciw, "_run_gh", gh)
-    pid, rid, mgr = await _seed_held(db)
+    pid, rid, mgr = await _seed_held(db, mode="live")
     await mgr.resolve(rid, status="approved")
 
     n = await ciw.drain_pending_issue_posts(_RT(db))

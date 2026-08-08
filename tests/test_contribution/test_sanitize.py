@@ -664,11 +664,13 @@ def test_scan_prose_blocks_home_path(tmp_path):
 def test_scan_prose_clean_ok(tmp_path):
     """Genuinely portable technical prose — the kind a good-first-issue body
     would contain — passes clean."""
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty: scan_prose fails closed on a MISSING file
     r = sanitize.scan_prose(
         "In `src/genesis/parser.py` the `chunk()` helper drops the last token "
         "when the input has no trailing newline. Add a test and fix the "
         "off-by-one. Good first issue.",
-        fingerprint_file=tmp_path / "no-fp.txt",
+        fingerprint_file=fp,
     )
     assert r.ok is True
     assert r.blocking() == []
@@ -725,12 +727,48 @@ def test_scan_prose_detect_secrets_missing_fails_closed(tmp_path):
     assert any(f.kind == FindingKind.SECRET for f in r.blocking())
 
 
+def test_scan_prose_missing_fingerprint_fails_closed(tmp_path):
+    """scan_prose is the TERMINAL egress guard (no CI backstop like scan_diff,
+    whose PR output CI re-scans), so a MISSING fingerprint file fails CLOSED —
+    install-specific literals cannot be scanned, so the draft must not egress."""
+    r = sanitize.scan_prose(
+        "totally benign text",
+        fingerprint_file=tmp_path / "does-not-exist.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r.blocking())
+
+
+def test_scan_prose_detect_secrets_scan_error_fails_closed(tmp_path, monkeypatch):
+    """If the required detect-secrets floor ERRORS on a line (timeout / nonzero
+    exit), scan_prose fails CLOSED — the old `continue` was a fail-OPEN hole in
+    a fail-CLOSED component."""
+    import subprocess as _sp
+
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")
+
+    def boom(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise _sp.TimeoutExpired(cmd, 5)
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(sanitize.subprocess, "run", boom)
+    r = sanitize.scan_prose("a line that cannot be scanned", fingerprint_file=fp)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    )
+
+
 def test_scan_prose_skips_diff_structural_scanners(tmp_path):
     """scan_prose runs ONLY the raw-string detectors — the diff-structural
     scanners (forbidden-path, gitignore, binary, size) are meaningless on prose
     and must not run."""
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty (missing file fails closed)
     r = sanitize.scan_prose(
-        "A clean sentence about `parser.py`.", fingerprint_file=tmp_path / "no-fp.txt"
+        "A clean sentence about `parser.py`.", fingerprint_file=fp
     )
     assert r.ok is True
     for structural in ("forbidden_paths", "gitignored_paths", "binary_check", "size_cap"):

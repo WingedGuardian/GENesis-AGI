@@ -35,6 +35,7 @@ _ROW = {
     "cell_verb": "issue_create",
     "cell_risk_class": "bulk",
     "held_at": "2026-08-07T00:00:00",
+    "mode": "propose_only",
 }
 _TS = "2026-08-07T01:00:00"
 
@@ -117,6 +118,19 @@ class TestSchema:
             )
 
     @pytest.mark.asyncio
+    async def test_rejects_bad_mode(self, db):
+        # mode is CHECK-constrained to the postable lever values; 'off' (which
+        # never creates a row) or any bad value is rejected at the DB.
+        with pytest.raises(aiosqlite.IntegrityError):
+            await db.execute(
+                "INSERT INTO pending_issue_posts "
+                "(id, request_id, repo, title, body, source, "
+                " cell_domain, cell_verb, cell_risk_class, held_at, mode) "
+                "VALUES ('x','r','o/r','t','b','follow_up',"
+                "'github','issue_create','bulk','t','off')"
+            )
+
+    @pytest.mark.asyncio
     async def test_request_id_unique(self, db):
         await pip.create(db, **_ROW)
         with pytest.raises(aiosqlite.IntegrityError):
@@ -154,11 +168,13 @@ class TestCrud:
             cell_verb="issue_create",
             cell_risk_class="bulk",
             held_at="2026-08-07T00:00:00",
+            mode="live",
         )
         row = await pip.get_by_id(db, "c1")
         assert row["labels"] is None
         assert row["source_ref"] is None
         assert row["source"] == "codebase"
+        assert row["mode"] == "live"  # stamped at propose time (dry-run-terminal invariant)
 
     @pytest.mark.asyncio
     async def test_list_held(self, db):

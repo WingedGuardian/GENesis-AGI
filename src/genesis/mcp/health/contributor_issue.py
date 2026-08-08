@@ -150,6 +150,8 @@ async def _impl_contributor_issue_propose(
         cell_verb=CELL_VERB,
         cell_risk_class=CELL_RISK_CLASS,
         held_at=now,
+        mode=mode,  # STAMP the lever mode: a propose_only row stays dry-run even
+        # if the lever later flips to live (dry-run-terminal invariant).
     )
     logger.info(
         "contributor_issue_propose HELD %s → %s (request=%s, mode=%s, source=%s)",

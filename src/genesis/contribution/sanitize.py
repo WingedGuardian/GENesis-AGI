@@ -504,11 +504,39 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
                 timeout=5,
                 check=False,
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            # Fail CLOSED: the REQUIRED secret-scan floor could not run on this
+            # line, so we cannot assert it is secret-free — BLOCK rather than
+            # let an unscanned line pass (the old `continue` was a fail-OPEN hole
+            # through a fail-CLOSED component).
+            hits.append(
+                Finding(
+                    kind=FindingKind.SECRET,
+                    severity=Severity.BLOCK,
+                    message=f"detect-secrets could not scan a line ({type(exc).__name__}) — failing closed",
+                    file=file,
+                    line=line_no,
+                    scanner="detect-secrets",
+                    detail="scan_error",
+                )
+            )
             continue
         # --string prints lines like "<plugin>: True" for positives and
         # "<plugin>: False" for negatives. Parse for any True.
         if proc.returncode != 0:
+            # Same fail-closed rationale: a nonzero exit means the line was not
+            # reliably scanned.
+            hits.append(
+                Finding(
+                    kind=FindingKind.SECRET,
+                    severity=Severity.BLOCK,
+                    message=f"detect-secrets exited {proc.returncode} on a line — failing closed",
+                    file=file,
+                    line=line_no,
+                    scanner="detect-secrets",
+                    detail="nonzero_exit",
+                )
+            )
             continue
         for out_line in proc.stdout.splitlines():
             if ":" not in out_line:
@@ -753,9 +781,10 @@ def scan_prose(
     closes it.
 
     Same contract as :func:`scan_diff`: ``ok`` is True iff no BLOCK finding.
-    A missing ``detect-secrets`` binary BLOCKs (the required floor); a missing
-    fingerprint file surfaces a non-blocking WARN (provisioning gap), never a
-    silent skip.
+    Fail-closed on BOTH required guards: a missing ``detect-secrets`` binary
+    BLOCKs, and — because prose is the TERMINAL egress guard with no CI backstop
+    (unlike scan_diff, whose PR output CI re-scans) — a missing fingerprint file
+    also BLOCKs rather than surfacing a soft WARN.
     """
     if fingerprint_file is None:
         env_path = os.environ.get("GENESIS_RELEASE_FINGERPRINTS")
@@ -776,8 +805,10 @@ def scan_prose(
     findings.extend(_check_emails(parsed))
     scanners_run.append("email_allowlist")
 
-    # Fingerprints (optional — only runs if the file exists). Missing file =
-    # non-blocking WARN, mirroring scan_diff's provision-or-surface handling.
+    # Fingerprints. Unlike scan_diff (whose output is a PR that CI re-scans
+    # against the private-pattern superset), scan_prose is the TERMINAL guard for
+    # a runtime `gh issue create` egress — no downstream backstop. So a missing
+    # fingerprint file fails CLOSED (BLOCK), not a soft WARN.
     if fingerprint_file and fingerprint_file.is_file():
         findings.extend(_check_fingerprints(parsed, fingerprint_file))
         scanners_run.append("fingerprint")
@@ -785,12 +816,12 @@ def scan_prose(
         findings.append(
             Finding(
                 kind=FindingKind.FINGERPRINT,
-                severity=Severity.WARN,
+                severity=Severity.BLOCK,
                 message=(
                     "Release fingerprint file not found — this install's exact "
-                    "private identifiers are not being scanned. Run bootstrap "
-                    "(or `python -m genesis.contribution.fingerprints --write`) "
-                    "to generate it."
+                    "private identifiers cannot be scanned, and prose egresses "
+                    "with no CI backstop. Failing closed. Run bootstrap (or "
+                    "`python -m genesis.contribution.fingerprints --write`)."
                 ),
                 scanner="fingerprint",
                 detail=str(fingerprint_file),

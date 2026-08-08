@@ -772,6 +772,8 @@ TABLES = {
             cell_verb           TEXT NOT NULL,
             cell_risk_class     TEXT NOT NULL,
             held_at             TEXT NOT NULL,
+            mode                TEXT NOT NULL DEFAULT 'propose_only'
+                                    CHECK (mode IN ('propose_only', 'live')),
             status              TEXT NOT NULL DEFAULT 'held'
                                     CHECK (status IN ('held', 'posted', 'rejected', 'expired', 'dry_run')),
             issue_number        INTEGER,

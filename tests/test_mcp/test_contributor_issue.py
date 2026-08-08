@@ -18,6 +18,17 @@ from genesis.mcp.health import contributor_issue as ci
 _REPO = "WingedGuardian/GENesis-AGI"
 
 
+@pytest.fixture(autouse=True)
+def _fingerprints_present(tmp_path, monkeypatch):
+    """scan_prose fails closed on a MISSING fingerprint file (terminal egress
+    guard). CI has no ~/.genesis fingerprint file, so point scan_prose at a
+    present (empty) one — the propose path then depends only on the input, not
+    on the ambient install."""
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text("")
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(fp))
+
+
 @pytest.fixture
 async def db():
     async with aiosqlite.connect(":memory:") as conn:
@@ -64,6 +75,7 @@ async def test_held_creates_row_and_approval(db, live):
     assert json.loads(row["labels"]) == ["good first issue", "help wanted"]
     assert row["cell_domain"] == "github"
     assert row["request_id"] == res["request_id"]
+    assert row["mode"] == "live"  # lever mode STAMPED at propose time (dry-run-terminal invariant)
 
     # linked approval row, correct type/class/context.
     appr = await ar.get_by_id(db, res["request_id"])

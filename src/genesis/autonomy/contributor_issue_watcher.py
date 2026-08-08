@@ -151,14 +151,27 @@ def _labels_of(row: dict) -> list[str]:
 
 
 async def _resolve_approved(rt_db, row: dict, mode: str, now: str) -> bool:
-    """Handle an approved hold under the current mode. Returns True iff the row
-    was resolved (posted / dry-run / adopted). Leaves the row held (returns
-    False) on a transient failure so it retries next cycle."""
+    """Handle an approved hold. *mode* is the CURRENT lever (``effective_mode``
+    at this tick); ``row['mode']`` is the lever STAMPED at propose time. Returns
+    True iff the row was resolved (posted / dry-run / adopted); returns False
+    (leaves the row held) on a transient failure so it retries next cycle.
+
+    Dry-run-terminal invariant: a row proposed under ``propose_only`` is
+    dry-run-terminal REGARDLESS of a later flip to live — the STAMPED mode, not
+    the current lever, decides. Otherwise a row approved during propose_only and
+    still awaiting its drain tick would post the instant the lever flipped to
+    live (the surprise-batch-post-on-flip the invariant exists to prevent). A
+    ``live``-stamped row posts only while the lever is STILL live; if the owner
+    flipped back to propose_only (a deliberate pause), the row is left held and
+    resumes on the next live flip.
+    """
     repo = row["repo"]
     title = row["title"]
     body = row["body"]
 
-    if mode == "propose_only":
+    row_mode = row.get("mode") or mode  # stamped at propose; fall back for legacy rows
+
+    if row_mode != "live":
         # Dry-run-terminal: shadow-observe the egress ONCE (observe-before-enforce)
         # and mark the hold terminal. NEVER posts; a later flip to live won't
         # retro-post it.
@@ -176,7 +189,11 @@ async def _resolve_approved(rt_db, row: dict, mode: str, now: str) -> bool:
             return True
         return False
 
-    # mode == "live": actually post.
+    # row_mode == "live": post only while the lever is STILL live. A flip back to
+    # propose_only pauses posting — leave the row held (retries when live resumes).
+    if mode != "live":
+        return False
+
     title_norm = normalize_title(title)
     ok, existing = _find_open_issue_by_title(repo, title_norm)
     if not ok:

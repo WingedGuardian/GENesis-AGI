@@ -34,6 +34,8 @@ _TABLE_DDL = """
         cell_verb           TEXT NOT NULL,          -- 'issue_create'
         cell_risk_class     TEXT NOT NULL,          -- RiskClass, e.g. 'bulk'
         held_at             TEXT NOT NULL,
+        mode                TEXT NOT NULL DEFAULT 'propose_only'  -- lever mode STAMPED at propose time
+                                CHECK (mode IN ('propose_only', 'live')),
         status              TEXT NOT NULL DEFAULT 'held'
                                 CHECK (status IN ('held', 'posted', 'rejected', 'expired', 'dry_run')),
         issue_number        INTEGER,                -- captured after a successful post

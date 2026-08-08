@@ -30,14 +30,15 @@ async def create(
     cell_verb: str,
     cell_risk_class: str,
     held_at: str,
+    mode: str,
     labels: str | None = None,
     source_ref: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO pending_issue_posts
              (id, request_id, repo, title, body, labels, source, source_ref,
-              cell_domain, cell_verb, cell_risk_class, held_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held')""",
+              cell_domain, cell_verb, cell_risk_class, held_at, mode, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held')""",
         (
             id,
             request_id,
@@ -51,6 +52,7 @@ async def create(
             cell_verb,
             cell_risk_class,
             held_at,
+            mode,
         ),
     )
     await db.commit()
