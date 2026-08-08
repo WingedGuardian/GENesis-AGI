@@ -543,37 +543,31 @@ _INLINE_REVIEW_BOTS = {
 _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
 
 # ── Direct-sqlite-write detection ────────────────────────────────────────────
-# The DML/DDL keyword must be in STATEMENT position (accompanied by INTO / FROM /
-# SET / object type), which is the ONLY change from the historical bare-keyword
-# match. This distinguishes:
-#   - the `REPLACE INTO` statement from the `replace(...)` scalar function
-#     (a read-only SELECT using replace() no longer false-positives), and
-#   - a real `INSERT INTO` from a bare "INSERT"/"UPDATE" appearing in a grep
-#     pattern (e.g. searching this hook's own source) or prose.
-# It is STRICTLY narrower than the old pattern: every real write form still
-# matches (writes always carry the accompanying keyword), so this cannot open a
-# bypass — it only removes false positives. Detection stays on the WHOLE command
-# (not per-segment) ON PURPOSE, so a heredoc/`bash -c`/wrapper that fragments the
-# invocation across segments cannot hide the write.
+# Robust bare-keyword match (the historical approach). A SINGLE statement keyword
+# is inherently immune to shell quoting/escapes AND SQL comments BETWEEN tokens,
+# because it never depends on two tokens being adjacent in the raw command. The
+# ONLY refinement over the historical pattern is a negative lookahead excluding a
+# keyword immediately followed by `(` — i.e. the `replace(...)` scalar FUNCTION
+# (or any keyword-as-function) — so a read-only SELECT using replace() no longer
+# false-positives. This is strictly narrower than the old pattern for reads and
+# IDENTICAL for writes (no real write statement is `KEYWORD(`), so it cannot open
+# a bypass. Detection stays on the WHOLE command so a heredoc/`bash -c`/wrapper
+# cannot fragment and hide a write.
 #
-# The gap between the two keyword tokens is `_TOK_GAP` — whitespace OR a SQLite
-# comment (`/* … */` or `-- … EOL`) — because SQLite permits a comment between
-# statement tokens (`INSERT /*c*/ INTO t`, `DROP /*c*/ TABLE t`); matching only
-# `\s+` there would let a commented write slip past the guard. The UPDATE branch
-# allows any bounded run (incl. quotes, comments, and `;` inside a comment) up to
-# SET, so `UPDATE "t" SET …` and `UPDATE t /* ; */ SET …` are still caught; the
-# 400-char lazy bound keeps it linear (no catastrophic backtracking) and only
-# fails on contrived padding no accidental agent command produces.
-_TOK_GAP = r"(?:\s|/\*[\s\S]*?\*/|--[^\n]*)+"
-_DML_STATEMENT_RE = re.compile(
-    "(?:"
-    r"\bINSERT\b" + _TOK_GAP + r"(?:INTO|OR)\b"
-    r"|\bREPLACE\b" + _TOK_GAP + r"INTO\b"
-    r"|\bUPDATE\b[\s\S]{0,400}?\bSET\b"
-    r"|\bDELETE\b" + _TOK_GAP + r"FROM\b"
-    r"|\bDROP\b" + _TOK_GAP + r"(?:TABLE|INDEX|VIEW|TRIGGER)\b"
-    r"|\bALTER\b" + _TOK_GAP + r"(?:TABLE|INDEX|VIEW)\b"
-    ")",
+# Two earlier approaches were REJECTED for weakening the guard, and this returns
+# to the robust original: (a) exe-scoping + a read-only exemption exempted
+# read-only tokens appearing in write SQL *data* and missed heredocs/wrappers;
+# (b) statement-position two-token matching was bypassable by a SQL comment or a
+# shell escape/quote inserted between the two tokens (`DELETE /*c*/ FROM`,
+# `DELETE\ FROM`, `DELETE' 'FROM`). A single-keyword match has neither failure.
+#
+# Accepted limitation (NOT a regression — the historical guard did the same): a
+# command that merely MENTIONS a bare keyword alongside "sqlite3" without a write
+# (a `grep 'sqlite3 … DELETE' file`, or a read whose STRING VALUE is a keyword
+# like `WHERE s='DELETE'`) still matches. Excluding those needs real SQL/shell
+# parsing — tracked as a follow-up, not worth reintroducing bypass risk for.
+_DML_KEYWORD_RE = re.compile(
+    r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b(?!\s*\()",
     re.IGNORECASE,
 )
 
@@ -581,14 +575,12 @@ _DML_STATEMENT_RE = re.compile(
 def _is_sqlite_write(cmd: str) -> bool:
     """Whether *cmd* issues a direct sqlite3 DML/DDL write.
 
-    Kept intentionally broad — any mention of ``sqlite3`` in the whole command,
-    matching the historical behavior — so segment fragmentation (heredocs),
-    ``bash -c`` nesting, and unrecognized launcher wrappers cannot hide a write.
-    The narrowing is only that the DML must be in statement position (see
-    ``_DML_STATEMENT_RE``), which removes the two false positives without
-    weakening write coverage.
+    Broad on purpose (any mention of ``sqlite3`` in the whole command, matching
+    the historical behavior) so a heredoc/`bash -c`/wrapper cannot fragment and
+    hide the write. A DML keyword must be present in non-function position (the
+    negative lookahead drops the ``replace()`` scalar function).
     """
-    return "sqlite3" in cmd and bool(_DML_STATEMENT_RE.search(cmd))
+    return "sqlite3" in cmd and bool(_DML_KEYWORD_RE.search(cmd))
 
 
 def _inline_title(body: str) -> str:

@@ -8,10 +8,13 @@ DELETE|DROP|ALTER|REPLACE)\\b` — over-broad in two ways reproduced live:
      MENTIONS "sqlite3" alongside the keywords.
 
 The fix keeps the broad whole-command match (so heredocs / wrappers can't hide a
-write) and only narrows the DML to STATEMENT position (INSERT INTO/OR, REPLACE
-INTO, UPDATE...SET, DELETE FROM, DROP/ALTER <object>). That removes both false
-positives without weakening write coverage — the bypass tests below assert real
-writes still block even when read-only-looking tokens appear in the SQL data.
+write) and uses a robust single-keyword match with a negative lookahead that
+excludes a keyword immediately followed by `(` (the `replace()` scalar function).
+A single keyword is immune to shell quoting/escapes and SQL comments between
+tokens — the failure modes that bypassed the earlier statement-position attempt.
+The tests below assert real writes still block (including shell-escaped/quoted
+and commented forms, and read-only-looking tokens in the SQL data), the replace()
+false positive is fixed, and the accepted grep/keyword-as-value limitations hold.
 """
 
 from __future__ import annotations
@@ -111,6 +114,15 @@ class TestRealWritesStillBlocked:
         assert _is_write('sqlite3 genesis.db "UPDATE settings SET query_only_flag = 0"')
         assert _is_write("sqlite3 genesis.db \"DELETE FROM t WHERE reason = 'mode=ro'\"")
 
+    def test_write_with_shell_escaped_space(self):
+        # Bash passes `DELETE FROM t` as one SQL arg; the raw command has a
+        # backslash between the tokens. A single-keyword match still catches it.
+        assert _is_write("sqlite3 db DELETE\\ FROM\\ t")
+
+    def test_write_with_shell_quote_concatenation(self):
+        # `DELETE' 'FROM' 't` concatenates to one arg; quotes sit between tokens.
+        assert _is_write("sqlite3 db DELETE' 'FROM' 't")
+
 
 class TestFalsePositivesNotBlocked:
     def test_readonly_select_with_replace_function(self):
@@ -127,14 +139,6 @@ class TestFalsePositivesNotBlocked:
         # replace() is a scalar function, not the REPLACE INTO statement.
         assert not _is_write("sqlite3 db.sqlite \"SELECT replace(x, 'a', 'b') FROM t\"")
 
-    def test_grep_mentioning_sqlite3_and_bare_keywords(self):
-        # The other live false positive: grepping this hook's own source with bare
-        # (non-statement) keywords in the pattern.
-        cmd = (
-            "grep -n 'sqlite3 are not allowed|INSERT|UPDATE|DELETE' scripts/hooks/git_push_guard.py"
-        )
-        assert not _is_write(cmd)
-
     def test_immutable_uri_read(self):
         assert not _is_write("sqlite3 'file:d?immutable=1' \"SELECT * FROM t\"")
 
@@ -147,3 +151,21 @@ class TestFalsePositivesNotBlocked:
 
     def test_cat_of_sql_file(self):
         assert not _is_write("cat migrations/001_INSERT_INTO_seed.sql")
+
+
+class TestAcceptedLimitations:
+    """Behaviors the robust single-keyword match deliberately keeps (the
+    historical guard did the same — not regressions). Excluding them safely
+    needs SQL/shell parsing; tracked as a follow-up, not worth reintroducing a
+    write-bypass for."""
+
+    def test_grep_of_hook_source_still_blocks(self):
+        # A grep whose pattern names "sqlite3" AND a bare keyword still matches.
+        # Rare (searching the guard's own source); the file-based workaround is to
+        # run such searches without the literal keyword in the command string.
+        assert _is_write("grep -n 'sqlite3 are not allowed|DELETE' scripts/hooks/git_push_guard.py")
+
+    def test_read_with_keyword_string_value_still_blocks(self):
+        # A read whose STRING VALUE is a keyword. The historical guard blocked
+        # this too; distinguishing it needs SQL parsing.
+        assert _is_write("sqlite3 -readonly db \"SELECT * FROM t WHERE action = 'DELETE'\"")
