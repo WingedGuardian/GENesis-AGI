@@ -206,9 +206,13 @@ _last_embed_backlog_band: str = ""
 #     few days (each re-mint re-triggered a paid ego investigation).
 #   - 'medium' priority: a slow user-model stream is never urgent.
 _USER_MODEL_STALE_DAYS = 45
-# Minimum foreground (interactive CC + voice) sessions since the last delta for
-# a silence to count as a possible defect rather than an expected quiet stretch.
-_USER_MODEL_MIN_INTERACTION_SESSIONS = 5
+# Minimum foreground (interactive CC + voice) sessions ACTIVE since the last
+# delta for a silence to count as a possible defect rather than an expected quiet
+# stretch. Counted by last_activity_at (reused long-lived sessions advance it), so
+# 1 is the meaningful floor: a single persistently-reused topic session is enough
+# to mean "the user was present." The 45d threshold + episode dedup keep this from
+# over-firing (at most one medium alert per drought episode).
+_USER_MODEL_MIN_INTERACTION_SESSIONS = 1
 
 
 def _embed_backlog_band(failed: int) -> str:
@@ -405,6 +409,13 @@ async def _check_user_model_staleness(db) -> None:
         # genuine absence is expected, not a defect. The window is the silence
         # since the last delta, or (never-delta) the recent staleness window — so
         # a long-idle install with no recent sessions stays quiet.
+        #
+        # Match on last_activity_at, NOT started_at: a foreground row can be REUSED
+        # across day boundaries (Telegram supergroup topics keep one session and
+        # only advance last_activity_at), so a heavily-used but long-lived session
+        # that STARTED before the anchor would otherwise be miscounted as no
+        # activity — permanently suppressing the alert. last_activity_at reflects
+        # real recent use of both fresh and reused sessions.
         interaction_since = (
             last
             if last is not None
@@ -412,7 +423,7 @@ async def _check_user_model_staleness(db) -> None:
         )
         async with db.execute(
             "SELECT COUNT(*) FROM cc_sessions "
-            "WHERE session_type = 'foreground' AND started_at > ?",
+            "WHERE session_type = 'foreground' AND last_activity_at > ?",
             (interaction_since,),
         ) as cur:
             irow = await cur.fetchone()

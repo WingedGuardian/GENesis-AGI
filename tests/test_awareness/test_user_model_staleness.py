@@ -48,15 +48,26 @@ async def _seed_delta(db, *, days_ago: int) -> None:
 
 
 async def _seed_sessions(
-    db, *, count: int, days_ago: int, session_type: str = "foreground"
+    db,
+    *,
+    count: int,
+    days_ago: int,
+    active_days_ago: int | None = None,
+    session_type: str = "foreground",
 ) -> None:
-    """Seed `count` cc_sessions of `session_type` started `days_ago`."""
-    ts = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    """Seed `count` cc_sessions started `days_ago`, last active `active_days_ago`
+    (defaults to `days_ago`). A reused long-lived session has an old started_at
+    but a recent last_activity_at."""
+    started = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    active = (
+        datetime.now(UTC)
+        - timedelta(days=active_days_ago if active_days_ago is not None else days_ago)
+    ).isoformat()
     for _ in range(count):
         await db.execute(
             "INSERT INTO cc_sessions (id, session_type, model, started_at, last_activity_at) "
             "VALUES (?, ?, 'opus', ?, ?)",
-            (uuid.uuid4().hex, session_type, ts, ts),
+            (uuid.uuid4().hex, session_type, started, active),
         )
     await db.commit()
 
@@ -101,13 +112,17 @@ async def test_stale_without_interaction_stays_quiet():
         await db.close()
 
 
-async def test_stale_below_min_interaction_stays_quiet():
+async def test_reused_session_counted_by_last_activity():
+    """A long-lived foreground session (Telegram topic) started BEFORE the delta
+    but active AFTER it must count as interaction — the gate keys on
+    last_activity_at, not started_at, so it isn't perpetually suppressed."""
     db = await _setup()
     try:
         await _seed_delta(db, days_ago=_STALE)
-        await _seed_sessions(db, count=_USER_MODEL_MIN_INTERACTION_SESSIONS - 1, days_ago=1)
+        # One reused session: started well before the delta, active yesterday.
+        await _seed_sessions(db, count=1, days_ago=_STALE + 30, active_days_ago=1)
         await _check_user_model_staleness(db)
-        assert await _alerts(db) == []
+        assert len(await _alerts(db)) == 1, "reused session (recent last_activity) must count"
     finally:
         await db.close()
 
