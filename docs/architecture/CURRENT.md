@@ -307,7 +307,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 9037d45b 2026-07-07
+verified: 2f0239cb 2026-08-07
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -324,6 +324,21 @@ verified: 9037d45b 2026-07-07
   (hold-for-approval) is the designed next stage. CI
   backstop: `scripts/check_external_io.py` fails on new ungated egress
   endpoints.
+- **The Contributor Work-Log posts public GitHub issues, gated like email.** A
+  server-side MCP tool (`contributor_issue_propose`, genesis-health) sanitizes a
+  curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
+  (title+body+labels — every string that egresses), then HOLDS it: the
+  `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
+  gate). Each hold is per-item owner-approved on the dashboard (excluded from
+  `approve_all_pending`, like email). The `contributor_issue_watcher` drain
+  (every 5 min, learning scheduler) resolves approved holds under the
+  `contributor_worklog` mode lever (`autonomy/contributor_worklog_config.py`,
+  default `propose_only`): `live` → `gh issue create` (shadow-gated door
+  `observe_github_issue_create`, `mark_posted` BEFORE `mark_consumed` +
+  pre-post `gh issue list` dedup for idempotency); `propose_only` → dry-run
+  terminal (never posts). Terminal rows pruned >30d via
+  `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
+  curator campaigns are LOCAL user data (uncommitted).
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.

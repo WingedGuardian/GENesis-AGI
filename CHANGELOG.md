@@ -47,6 +47,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Contributor Work-Log — a curated supply of newcomer-friendly public issues.**
+  Genesis can now turn items from its own backlog or a codebase scan into public
+  GitHub issues for contributors to pick up — but never on its own say-so. Each
+  draft is sanitized server-side (a fail-closed scan of the title, body, *and*
+  labels blocks anything that looks like a private address, path, or secret) and
+  then held for your per-item approval on the dashboard; batch "approve all"
+  deliberately skips these, so every public post is an individual decision. It
+  ships in `propose_only` mode: drafts are proposed and approved but never
+  actually posted (dry-run) until you flip `mode: live` in a
+  `config/contributor_worklog.local.yaml` overlay. Once live, an approved draft
+  posts via `gh issue create`, de-duplicated against already-open issues so a
+  retry can't double-post. Kill switch: `GENESIS_CONTRIBUTOR_WORKLOG_DISABLED=1`.
+
 - **GitHub activity notifications.** Genesis now watches your active GitHub repos
   every couple of hours and pings you on Telegram when an *external* contributor
   opens their first PR/issue, comments, starts a discussion, or replies on one —

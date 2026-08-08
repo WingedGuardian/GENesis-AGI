@@ -486,6 +486,42 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=300,
         )
 
+        # Contributor Work-Log poster — the resolution watcher for held public
+        # GitHub-issue drafts. Drains pending_issue_posts: approved + live → post
+        # via `gh issue create`; approved + propose_only → dry-run terminal;
+        # rejected/expired/orphaned → close out. Mode read live each tick; `off`
+        # short-circuits. max_instances=1 ⇒ no in-drain races.
+        from genesis.autonomy.contributor_issue_watcher import (
+            drain_pending_issue_posts,
+        )
+
+        async def _contributor_issue_drain() -> None:
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping contributor issue drain",
+                    exc_info=True,
+                )
+                return
+            try:
+                n = await drain_pending_issue_posts(rt)
+                rt.record_job_success("contributor_issue_drain")
+                if n:
+                    logger.info("Contributor issue drain resolved %d held draft(s)", n)
+            except Exception as exc:
+                rt.record_job_failure("contributor_issue_drain", exc=exc)
+                raise
+
+        rt._learning_scheduler.add_job(
+            _contributor_issue_drain,
+            CronTrigger(minute="*/5", timezone=user_timezone()),
+            id="contributor_issue_drain",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+
         # WS-8 PR-D capability staleness decay — a GRANTED email cell idle past
         # the half-life lapses back to NOT_DETERMINED (holds again on next use),
         # so standing autonomy can't entrench unused. Daily, INFO-level.
