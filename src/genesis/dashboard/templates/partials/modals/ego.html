@@ -340,6 +340,23 @@
                         <span style="font-weight: 600;">Response:</span> <span x-text="p.user_response"></span>
                       </div>
                     </template>
+                    <!-- Dispatch findings: the completed dispatch session's output, so the
+                         investigation is discoverable beyond the truncated response summary -->
+                    <template x-if="p.dispatch">
+                      <details style="margin-top: 0.3rem;">
+                        <summary style="font-size: 0.72rem; color: var(--color-text-secondary); cursor: pointer; font-weight: 600;">
+                          Dispatch output
+                        </summary>
+                        <pre style="font-size: 0.7rem; color: var(--color-text-secondary); white-space: pre-wrap; word-break: break-word; margin: 0.3rem 0; max-height: 22rem; overflow-y: auto; background: rgba(0,0,0,0.04); padding: 0.4rem; border-radius: 4px;"
+                             x-text="p.dispatch.output_excerpt"></pre>
+                        <div style="font-size: 0.66rem; color: var(--color-text-secondary); opacity: 0.8;">
+                          <span>session: </span><span x-text="p.dispatch.session_id"></span>
+                          <template x-if="p.dispatch.transcript_path">
+                            <span> · transcript: <span x-text="p.dispatch.transcript_path"></span></span>
+                          </template>
+                        </div>
+                      </details>
+                    </template>
                     <!-- Approve/Reject buttons (pending, non-informational only) -->
                     <template x-if="p.status === 'pending' && !$store.genesisDashboard.isInformationalProposal(p)">
                       <div style="margin-top: 0.5rem; display: flex; gap: 0.4rem; align-items: center;">

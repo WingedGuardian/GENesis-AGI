@@ -358,7 +358,23 @@ class CircuitBreakerRegistry:
                 return DegradationLevel.ESSENTIAL
             return DegradationLevel.NORMAL
 
-        # Legacy provider-count fallback (no essential map injected).
+        # Legacy provider-count fallback (no essential map injected). In a
+        # correctly-configured install the essential map is always present
+        # (build_essential_provider_map), so reaching here in production means it
+        # came back empty (a misconfig that essential.py already logs at build
+        # time) and degradation is now the count-based heuristic that can
+        # false-alarm "all paid down => ESSENTIAL". Surface it ONCE per instance
+        # so the fallback is never silent; bare unit-test registries legitimately
+        # hit this and warn once, which is harmless.
+        if not getattr(self, "_legacy_degradation_warned", False):
+            logger.warning(
+                "Degradation is running the LEGACY provider-count fallback: no "
+                "essential-site map was injected. In production this means "
+                "build_essential_provider_map returned empty (a misconfiguration) "
+                "and coverage-based degradation is disabled — cloud degradation may "
+                "false-alarm. Verify the essential provider config."
+            )
+            self._legacy_degradation_warned = True
         cloud_providers = [
             name
             for name, cfg in self._providers.items()

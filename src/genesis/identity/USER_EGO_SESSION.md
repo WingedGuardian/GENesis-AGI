@@ -244,8 +244,9 @@ reasoning rather than withdrawing and re-proposing.
 ### Queue Health
 
 Proposals pending too long are auto-tabled by the system on a per-urgency
-staleness window (roughly 2 days for critical up to 7 for low; unranked
-proposals age out sooner). Tabling is recoverable, not deletion.
+staleness window (roughly 10 days for critical up to 30 for low; unranked
+proposals age out sooner) — a backstop behind the reconcile cycle, not the
+primary staleness path. Tabling is recoverable, not deletion.
 If the queue exceeds 15 pending proposals, consider:
 - Tabling lower-priority items (they can be resurfaced later)
 - Combining related proposals into one

@@ -11,6 +11,7 @@ from genesis.db.crud import (
     cognitive_state,
     observations,
 )
+from genesis.outreach.types import OWNER_FACING_CHANNELS_SQL_IN as _OWNER_CHANNELS
 from genesis.reflection.types import (
     ContextBundle,
     PendingWorkSummary,
@@ -316,11 +317,16 @@ class ContextGatherer:
     async def _outreach_stats(self, db: aiosqlite.Connection) -> dict:
         """Query outreach_history for engagement stats."""
         try:
+            # Count only EXTERNAL outreach (non-owner channel) so reflection sees
+            # real engagement, not the owner reacting to their own approval/digest
+            # pings. Channel — not category — is the reliable signal (see
+            # genesis.outreach.types). Trusted constant, not user input.
             cursor = await db.execute(
-                "SELECT engagement_outcome, COUNT(*) as cnt "
-                "FROM outreach_history "
-                "WHERE engagement_outcome IS NOT NULL "
-                "GROUP BY engagement_outcome"
+                f"SELECT engagement_outcome, COUNT(*) as cnt "  # noqa: S608
+                f"FROM outreach_history "
+                f"WHERE engagement_outcome IS NOT NULL "
+                f"AND channel NOT IN ({_OWNER_CHANNELS}) "
+                f"GROUP BY engagement_outcome"
             )
             rows = await cursor.fetchall()
             return {row[0]: row[1] for row in rows} if rows else {"note": "no outreach data yet"}
@@ -328,15 +334,22 @@ class ContextGatherer:
             return {"note": "no outreach data yet"}
 
     async def _engagement_by_category(self, db: aiosqlite.Connection) -> dict:
-        """30-day engagement feedback by category for Deep reflection context."""
+        """30-day EXTERNAL engagement feedback by category for Deep reflection context.
+
+        Excludes owner-facing channels (same predicate as ``_outreach_stats``) so
+        the category breakdown stays consistent with the external-only calibration
+        beside it — otherwise self-assessment gets contradictory evidence (an
+        external-only rate next to an owner-polluted category view).
+        """
         try:
             cursor = await db.execute(
-                "SELECT category, engagement_outcome, COUNT(*) as cnt "
-                "FROM outreach_history "
-                "WHERE engagement_outcome IS NOT NULL "
-                "  AND engagement_outcome != 'ignored' "
-                "  AND created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-30 days') "
-                "GROUP BY category, engagement_outcome"
+                f"SELECT category, engagement_outcome, COUNT(*) as cnt "  # noqa: S608 - trusted module constant
+                f"FROM outreach_history "
+                f"WHERE engagement_outcome IS NOT NULL "
+                f"  AND engagement_outcome != 'ignored' "
+                f"  AND channel NOT IN ({_OWNER_CHANNELS}) "
+                f"  AND created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-30 days') "
+                f"GROUP BY category, engagement_outcome"
             )
             rows = await cursor.fetchall()
             if not rows:

@@ -1,4 +1,4 @@
-"""WS5 capability SHADOW-gate — observe-only (Discord doors today).
+"""WS5 capability SHADOW-gate — observe-only (Discord + GitHub-issue doors today).
 
 At each autonomous external egress door, record what a capability gate WOULD decide
 (hold vs allow) WITHOUT holding. The lookup is READ-ONLY (no ``apply_event`` /
@@ -13,8 +13,9 @@ EGRESS-GATING CONTRACT — read before wiring ANY new outbound channel:
   voice/TTS, email-to-owner — is not external-world posting (the owner IS the recipient);
   gating it only obstructs the user. There is no gate on these today; keep it that way.
 - **Every autonomous EXTERNAL/public egress MUST be gated** — shadow-observed here now,
-  enforced later. Live external egress today: email (ENFORCES via ``autonomy.email_gate``)
-  and Discord (SHADOW-observed at the 3 doors below). Any FUTURE public channel — Medium,
+  enforced later. Live external egress today: email (ENFORCES via ``autonomy.email_gate``),
+  Discord (SHADOW-observed at the 3 doors below), and GitHub issue-create (SHADOW-observed
+  at the Contributor Work-Log poster door). Any FUTURE public channel — Medium,
   Twitter/X, Slack, autonomous ``distribution.DistributionManager.distribute`` publishing —
   MUST route its send through this shadow-gate before the enforce stage. Do not ship an
   unobserved external door.
@@ -24,10 +25,11 @@ EGRESS-GATING CONTRACT — read before wiring ANY new outbound channel:
   literal endpoint token — those carry a ``# GROUNDWORK(autonomous-distribution)`` marker at
   the call sites (``distribution/manager.py``, ``modules/content_pipeline/module.py``) instead.
 
-Coverage (the three live Discord doors — enumerated, exhaustive):
-- ``deliver`` — ``outreach/pipeline._deliver`` (server process) -> discord webhook
-- ``poll``    — ``mcp/outreach_mcp.outreach_poll`` (outreach subprocess) -> webhook
-- ``reply``   — ``mcp/discord_bot_mcp.send_reply`` (discord-bot subprocess) -> API
+Coverage (the live external doors — enumerated, exhaustive):
+- ``deliver``      — ``outreach/pipeline._deliver`` (server process) -> discord webhook
+- ``poll``         — ``mcp/outreach_mcp.outreach_poll`` (outreach subprocess) -> webhook
+- ``reply``        — ``mcp/discord_bot_mcp.send_reply`` (discord-bot subprocess) -> API
+- ``issue_create`` — ``autonomy/contributor_issue_watcher`` (server process) -> gh issue create
 """
 
 from __future__ import annotations
@@ -88,4 +90,46 @@ async def observe_discord_send(
         )
     except Exception:  # noqa: BLE001 — shadow is best-effort; NEVER break the real send
         logger.debug("capability shadow observe failed (best-effort)", exc_info=True)
+        return False
+
+
+async def observe_github_issue_create(
+    db,
+    *,
+    path: str,
+    verb: str,
+    risk_class: str,
+    target: str | None,
+    content: str | None,
+) -> bool:
+    """Record a GitHub-issue-create capability-shadow observation — the Contributor
+    Work-Log poster's external egress door. Same observe-only contract as
+    :func:`observe_discord_send`: reads the (github, verb, risk_class) cell
+    READ-ONLY (a not-yet-created cell reads ``not_determined`` => ``would_hold``),
+    best-effort, NEVER raises/blocks/mutates. Returns True iff a row was written."""
+    if db is None:
+        return False
+    domain = "github"
+    try:
+        cell = await cg.get_cell(db, domain, verb, risk_class)
+        state = cell["state"] if cell else None
+        would_hold = state != CellState.GRANTED.value
+        text = content or ""
+        return await capability_shadow.record(
+            db,
+            id=str(uuid.uuid4()),
+            observed_at=datetime.now(UTC).isoformat(),
+            path=path,
+            channel=domain,
+            cell_domain=domain,
+            cell_verb=verb,
+            cell_risk_class=risk_class,
+            cell_state=state,
+            would_hold=would_hold,
+            target=target,
+            content_preview=text[:_PREVIEW_MAX],
+            content_hash=hashlib.sha256(text.encode()).hexdigest(),
+        )
+    except Exception:  # noqa: BLE001 — shadow is best-effort; NEVER break the real post
+        logger.debug("capability shadow observe (github) failed (best-effort)", exc_info=True)
         return False

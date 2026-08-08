@@ -28,6 +28,80 @@ _READONLY_DISALLOWED = [
 # disallowed_tools matches tool NAMES (e.g. "Bash"), not command substrings.
 # Hooks fire for ALL sessions including claude -p, so protection is global.
 
+# ── Reflection tool lockdown ──────────────────────────────────────────────
+# Autonomous reflection sessions (DEEP/STRATEGIC) are READ-ONLY: they read
+# freely to investigate, and their ONLY write is an observation (the
+# observation_write tool for interaction_theme observations, plus the structured
+# `observations` output field that the reflection output router parses and writes
+# server-side). Every OTHER registered MCP tool is DENIED — the denylist is
+# DERIVED as (live registry − read-allowlist − observation_write), so a write
+# tool a future PR adds to either server is auto-denied here without a code
+# change. This gives a denylist the safety of an allowlist, which matters because
+# `--allowedTools` is NOT a strict allowlist under `--dangerously-skip-permissions`
+# (verified empirically 2026-08-07 via the init-event tool list: --allowedTools
+# left Bash available; only --disallowedTools removes a tool). The read-allowlist
+# below is the maintained artifact; tests/test_cc/test_reflection_tool_scope.py
+# enforces it stays complete against the live registry.
+_REFLECTION_READ_MCP: frozenset[str] = frozenset({
+    # genesis-health — status / list / get / query (no mutation)
+    "bench_status", "bootstrap_manifest", "build_lane_status", "calibration_status",
+    "campaign_list", "campaign_status", "codebase_navigate", "cognitive_modification_status",
+    "db_schema", "direct_session_list", "direct_session_status", "ego_calibration_status",
+    "ego_goal_list", "experiment_status", "health_alerts", "health_errors", "health_status",
+    "immunity_status", "inbox_digest", "infrastructure_profile", "j9_eval_status", "job_health",
+    "loop_closure_status", "module_list", "provider_activity", "reflex_status",
+    "session_charter", "settings_get", "settings_list",
+    "subsystem_heartbeats", "task_detail", "task_list", "update_history_recent",
+    "follow_up_list", "web_fetch", "web_search",
+    # genesis-memory — recall / query / lookup (no mutation)
+    "conversation_history", "document_query", "knowledge_recall", "knowledge_status",
+    "locate", "memory_expand", "memory_proactive", "memory_recall",
+    "memory_stats", "observation_query", "procedure_recall", "reference_lookup",
+    "reference_export",
+})
+# The single sanctioned reflection write. The rest of reflection's observations
+# flow through the parsed `observations` output field (written server-side), not a tool.
+_REFLECTION_WRITE_MCP: frozenset[str] = frozenset({"observation_write"})
+
+# The MCP servers a reflection session loads (mirrors _MCP_PROFILES["reflection"]).
+_REFLECTION_MCP_SERVERS: tuple[tuple[str, str], ...] = (
+    ("genesis-health", "genesis.mcp.health"),
+    ("genesis-memory", "genesis.mcp.memory"),
+)
+
+# Built-in (non-MCP) write/action tools reflection must NOT have. Read built-ins
+# (Read/Grep/Glob/WebFetch/WebSearch/ToolSearch/CronList/Task{Get,List,Output}/
+# ListMcpResourcesTool/ReadMcpResource*Tool) are left available. CC internals
+# aren't introspectable, so this is an explicit list; the scope test re-checks it.
+# Task/Workflow/Skill are denied because they SPAWN — a subagent would escape the
+# lockdown.
+_REFLECTION_DENY_BUILTINS: tuple[str, ...] = (
+    "Bash", "Write", "Edit", "NotebookEdit",
+    "Task", "Workflow", "Skill",
+    "SendMessage", "ReportFindings",
+    "CronCreate", "CronDelete", "ScheduleWakeup", "Monitor",
+    "TaskCreate", "TaskUpdate", "TaskStop",
+    "RemoteTrigger", "PushNotification", "DesignSync",
+    "EnterWorktree", "ExitWorktree",
+)
+
+
+def _registered_mcp_tool_names(modpath: str) -> list[str]:
+    """Tool names registered on a FastMCP server module's ``mcp`` object.
+
+    Late import (avoids a circular import at module load); tool registration
+    happens at import time via the ``@mcp.tool()`` decorators, and importing the
+    module does NOT start the server (that is ``mcp.run()``).
+    """
+    mod = __import__(modpath, fromlist=["mcp"])
+    server = mod.mcp
+    manager = getattr(server, "_tool_manager", None)
+    tools = getattr(manager, "_tools", None)
+    if isinstance(tools, dict):
+        return list(tools.keys())
+    raise RuntimeError(f"cannot enumerate MCP tools for {modpath!r}")
+
+
 def render_mcp_servers(
     template_path: Path, genesis_root: str, servers: set[str] | None = None,
 ) -> dict:
@@ -71,8 +145,37 @@ _MCP_PROFILES: dict[str, list[str]] = {
 class SessionConfigBuilder:
     """Builds CC session configurations per type."""
 
+    def build_reflection_disallowed(self) -> list[str]:
+        """Denylist that makes a reflection session read-only + observation-writing.
+
+        MCP tools: DERIVED as (live registry − read-allowlist − observation_write),
+        so a future write tool on either reflection server is auto-denied. Built-ins:
+        the explicit write/action set (_REFLECTION_DENY_BUILTINS). If registry
+        enumeration fails, fall back to denying both MCP servers wholesale
+        (``mcp__<server>__*``) — fail-closed: observations still flow through the
+        parsed ``observations`` output field, and no write tool can leak.
+        """
+        disallowed: list[str] = list(_REFLECTION_DENY_BUILTINS)
+        try:
+            for server, modpath in _REFLECTION_MCP_SERVERS:
+                for name in _registered_mcp_tool_names(modpath):
+                    if name in _REFLECTION_READ_MCP or name in _REFLECTION_WRITE_MCP:
+                        continue
+                    disallowed.append(f"mcp__{server}__{name}")
+        except Exception:
+            logger.error(
+                "Reflection MCP tool enumeration failed — denying both MCP servers "
+                "wholesale (fail-closed). DEEP investigation tools are lost until "
+                "this is fixed, but no write tool can leak.",
+                exc_info=True,
+            )
+            disallowed = list(_REFLECTION_DENY_BUILTINS) + [
+                f"mcp__{server}__*" for server, _ in _REFLECTION_MCP_SERVERS
+            ]
+        return disallowed
+
     def build_reflection_config(self, depth: str = "deep") -> dict:
-        """Config for reflection sessions: read-only tools, high effort."""
+        """Config for reflection sessions: read-only tools + observation_write."""
         if depth == "strategic":
             model = CCModel.OPUS
             effort = EffortLevel.MAX
@@ -85,7 +188,7 @@ class SessionConfigBuilder:
             "model": str(model),
             "effort": str(effort),
             "system_prompt": system_prompt,
-            "disallowed_tools": _READONLY_DISALLOWED,
+            "disallowed_tools": self.build_reflection_disallowed(),
             "skip_permissions": True,
         }
 

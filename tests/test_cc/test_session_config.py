@@ -11,6 +11,8 @@ from genesis.cc.session_config import (
     SessionConfigBuilder,
 )
 
+# Full read/deny composition + coverage guardrail live in test_reflection_tool_scope.py.
+
 
 @pytest.fixture
 def builder():
@@ -22,9 +24,15 @@ class TestBuildReflectionConfig:
         cfg = builder.build_reflection_config()
         assert cfg["model"] == "opus"
         assert cfg["effort"] == "high"
-        assert cfg["disallowed_tools"] == _READONLY_DISALLOWED
         assert cfg["skip_permissions"] is True
         assert "system_prompt" in cfg
+        # Reflection is read-only + observation-writing only: the derived denylist
+        # blocks write tools (incl. the built-in write set) while leaving reads and
+        # observation_write available. (Full composition: test_reflection_tool_scope.)
+        denied = set(cfg["disallowed_tools"])
+        assert {"Bash", "Write", "Edit"}.issubset(denied)
+        assert "mcp__genesis-health__follow_up_create" in denied
+        assert "mcp__genesis-memory__observation_write" not in denied
 
     def test_strategic_uses_opus(self, builder):
         cfg = builder.build_reflection_config("strategic")
