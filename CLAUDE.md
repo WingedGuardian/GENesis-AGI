@@ -184,8 +184,12 @@ Applies to every assertion — in conversation, and doubly in anything written t
   sentences. Status claims written to disk carry provenance + date ("per <artifact>, <date>").
 - **A surprising observation is a question, not an answer.** The pull to explain an anomaly
   with a tidy story is precisely the moment to measure instead.
-- **Status of work** (built/unbuilt/pending/shipped/active) comes from artifact enumeration
-  (merged PRs, live DB, running processes) — never from plans, row lists, or prior docs.
+- **Status of work: the evidence must match the SPECIFIC status claimed.** A merged PR
+  proves **merged/built** — never shipped/active (merged ≠ deployed; activation requires
+  the deploy path to have run plus a running-version or log marker). **Live/active** claims
+  need live state (running process, logs, live DB). **Unbuilt/absent** claims need
+  enumeration, not a failed spot-check. Never derive any status from plans, row lists, or
+  prior docs.
 
 ## Confidence Framework
 
