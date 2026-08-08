@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from genesis.db.crud import cc_sessions
-from genesis.util.jsonl import TranscriptDelta
+from genesis.util.jsonl import ConversationMessage, TranscriptDelta
 
 
 def _user(text: str) -> str:
@@ -346,3 +346,68 @@ async def test_io_failure_does_not_advance_watermark(db, tmp_path, monkeypatch):
     row = await cc_sessions.get_by_id(db, "sess-iofail")
     assert row["last_extracted_line"] == 5  # line watermark unchanged
     assert row["last_extracted_byte"] is None  # byte watermark NOT advanced to 0
+
+
+@pytest.mark.asyncio
+async def test_partial_read_failure_does_not_advance_or_extract(db, tmp_path, monkeypatch):
+    """A mid-stream read failure that already parsed SOME messages must NOT advance
+    the watermark OR extract the partial set (the has-messages path honors
+    ``delta.failed`` too).
+
+    ``read_transcript_delta`` returns the messages parsed before an ``OSError`` with
+    ``failed=True``. Committing that partial chunk would advance the watermark past
+    still-unread content on a transient glitch and drop it; the cycle must discard it
+    and retry cleanly next pass.
+    """
+    from genesis.memory import extraction_job
+    from genesis.memory.extraction import Extraction
+
+    await _mk_session(db, "sess-partial")
+    await cc_sessions.update_extraction_watermark(
+        db,
+        "sess-partial",
+        last_extracted_line=2,
+        last_extracted_at="2026-08-07T00:00:00",
+        last_extracted_byte=100,
+    )
+
+    def partial_failed(_path, *, start_line=0, start_byte=None, max_lines=None):
+        msg = ConversationMessage(
+            role="user", text="parsed before the error", line_number=start_line, timestamp=None
+        )
+        msg.end_byte = 150
+        return TranscriptDelta(
+            messages=[msg],
+            new_byte_offset=150,
+            new_line_count=start_line + 1,
+            failed=True,
+        )
+
+    extract_calls: list[dict] = []
+
+    async def spy_extract(**kwargs):
+        extract_calls.append(kwargs)
+        return SimpleNamespace(
+            extractions=[Extraction(content="x", extraction_type="entity", confidence=0.9)],
+            session_keywords=[],
+            session_topic="",
+            parse_error=None,
+        )
+
+    monkeypatch.setattr(
+        extraction_job, "_find_transcript", lambda *_a, **_k: tmp_path / "sess-partial.jsonl"
+    )
+    monkeypatch.setattr(extraction_job, "read_transcript_delta", partial_failed)
+    monkeypatch.setattr(extraction_job, "_extract_chunk", spy_extract)
+
+    await extraction_job.run_extraction_cycle(
+        db=db,
+        store=AsyncMock(),
+        router=AsyncMock(),
+        transcript_dir=tmp_path,
+    )
+
+    row = await cc_sessions.get_by_id(db, "sess-partial")
+    assert row["last_extracted_line"] == 2  # unchanged
+    assert row["last_extracted_byte"] == 100  # NOT advanced to 150
+    assert extract_calls == []  # partial set discarded, never extracted

@@ -285,3 +285,47 @@ def test_io_failure_sets_failed_flag_not_a_stat_gate(tmp_path):
     assert d.failed is True
     assert d.messages == []
     assert d.unchanged is False  # a genuine failure, NOT the stat-gate no-op
+
+
+def test_replaced_file_offset_not_a_line_boundary_resets_to_full_scan(tmp_path):
+    """A same-or-larger REPLACEMENT (not an append) whose stored offset no longer
+    lands on a line boundary must NOT be seeked blindly.
+
+    ``size > start_byte`` alone cannot distinguish an append from a rewrite. If the
+    byte before ``start_byte`` is not a newline, the file was reshaped under us and
+    seeking there would land mid-line and permanently skip content — the reader must
+    fall back to a full scan (``truncated_reset``) instead.
+    """
+    p = tmp_path / "t.jsonl"
+    v1 = [_user("a"), _asst("b")]
+    _write(p, v1)
+    boundary = _line_start_offsets(v1)[1]  # start of line 1 — valid boundary in v1
+
+    # Replace with a DIFFERENT, larger file whose line 0 is long enough that
+    # `boundary` now falls INSIDE its first line (byte[boundary-1] != b"\n").
+    v2 = [_user("x" * (boundary + 50)), _asst("y"), _user("z")]
+    _write(p, v2)
+    assert p.stat().st_size > boundary  # exercises the size>offset seek path
+
+    d = read_transcript_delta(p, start_line=1, start_byte=boundary)
+
+    assert d.truncated_reset is True, "reshaped file was seeked blindly"
+    assert d.failed is False
+    # full re-scan from 0: all three v2 messages, ABSOLUTE line numbers from 0
+    assert [m.line_number for m in d.messages] == [0, 1, 2]
+    assert d.new_line_count == 3
+    assert d.new_byte_offset == p.stat().st_size
+
+
+def test_valid_boundary_append_still_seeks_without_reset(tmp_path):
+    """Control: a genuine append (byte before start_byte IS a newline) still takes
+    the fast seek path — the boundary guard must not false-positive."""
+    p = tmp_path / "t.jsonl"
+    v1 = [_user("a"), _asst("b")]
+    _write(p, v1)
+    first = read_transcript_delta(p, start_line=0, start_byte=None)
+
+    _write(p, v1 + [_user("c")])
+    d = read_transcript_delta(p, start_line=first.new_line_count, start_byte=first.new_byte_offset)
+    assert d.truncated_reset is False
+    assert [m.line_number for m in d.messages] == [2]  # only the appended line

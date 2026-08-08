@@ -272,16 +272,21 @@ async def run_extraction_cycle(
             start_line=last_line,
             start_byte=start_byte,
         )
+        if delta.failed:
+            # Transcript I/O error (stat/read). Discard any partial read and
+            # retry cleanly next cycle. NEVER advance or initialize a watermark
+            # on a failed read — empty OR partial: a partial message set committed
+            # here (readline() raising mid-stream after some lines parsed) would
+            # advance past still-unread content on a transient glitch and drop it.
+            continue
         messages = delta.messages
         if not messages:
             # No new user/assistant messages. If the file changed (non-message
             # lines appended), advance BOTH watermarks so the next cycle
             # stat-gates instead of re-reading from byte 0. Skip in
-            # reference-only mode (leaves prod extraction state untouched),
-            # when the stat-gate already confirmed nothing changed, and when
-            # transcript I/O failed (advancing on a failed read would persist
-            # byte=0 against a nonzero line watermark → whole-file re-read).
-            if use_incremental and not delta.unchanged and not delta.failed:
+            # reference-only mode (leaves prod extraction state untouched) and
+            # when the stat-gate already confirmed nothing changed.
+            if use_incremental and not delta.unchanged:
                 await _update_watermark(
                     db, session_id, delta.new_line_count,
                     last_extracted_byte=delta.new_byte_offset,

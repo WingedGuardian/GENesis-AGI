@@ -127,6 +127,9 @@ def read_transcript_delta(
     Safety:
       * file size == ``start_byte``  → ``unchanged=True`` (stat-gate, no open).
       * file size <  ``start_byte``  → ``truncated_reset=True``, re-read from 0.
+      * file size >  ``start_byte`` but ``byte[start_byte-1]`` is NOT a newline
+        (file rewritten/replaced at a same-or-larger size) → ``truncated_reset``,
+        full scan from 0 — never seek mid-line and silently skip content.
       * a partial trailing line (no newline yet — active append) is NOT
         consumed; ``new_byte_offset`` stays at its start so it is read whole
         on a later call.
@@ -157,7 +160,13 @@ def read_transcript_delta(
     truncated_reset = False
     if start_byte is not None:
         if size == start_byte:
-            # Nothing appended since last read — the cheap stat-gate.
+            # Nothing appended since last read — the cheap stat-gate. This
+            # assumes the file is APPEND-ONLY (CC session transcripts are
+            # UUID-named and only grow): a same-size in-place REPLACEMENT would
+            # be missed here, but that cannot occur for these files, and
+            # detecting it would require persisting file identity (inode/mtime).
+            # The size>offset path below still validates the stored offset is a
+            # real line boundary, so a reshaped larger file self-heals.
             return TranscriptDelta(
                 messages=[],
                 new_byte_offset=start_byte,
@@ -182,6 +191,22 @@ def read_transcript_delta(
     read_failed = False
     try:
         with open(path, "rb") as f:
+            if seeking and seek_pos > 0:
+                # Validate the stored offset is still a line boundary. CC session
+                # transcripts are append-only, so the byte immediately before
+                # seek_pos MUST be a newline. If it is not, the file was rewritten
+                # or replaced under a same-or-larger size (which the size check
+                # above cannot detect), and seeking would land mid-line and
+                # silently skip content. Degrade to a full scan from byte 0 (same
+                # as truncation) so the read self-heals instead of corrupting.
+                f.seek(seek_pos - 1)
+                if f.read(1) != b"\n":
+                    seeking = False
+                    seek_pos = 0
+                    emit_from = 0
+                    line_no = 0
+                    byte_pos = 0
+                    truncated_reset = True
             f.seek(seek_pos)
             while True:
                 raw = f.readline()
