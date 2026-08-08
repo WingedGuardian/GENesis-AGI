@@ -23,6 +23,7 @@ from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.cc.reflection_bridge._output import (
     format_topic_summary,
     route_deep_output,
+    salvage_deep_reflection_json,
     send_to_topic,
     store_reflection_output,
 )
@@ -100,6 +101,8 @@ class CCReflectionBridge:
         self._context_assembler: ContextAssembler | None = None
         self._topic_manager = None
         self._autonomous_dispatcher = None
+        # Model router (route_call) for the deep-reflection JSON salvage retry.
+        self._router = None
 
     # ── Injection setters (for late binding) ──────────────────────────
 
@@ -126,6 +129,11 @@ class CCReflectionBridge:
     def set_autonomous_dispatcher(self, dispatcher: object) -> None:
         """Set the API-first autonomous dispatch router."""
         self._autonomous_dispatcher = dispatcher
+
+    def set_router(self, router: object) -> None:
+        """Set the model router (route_call) used for the deep-reflection JSON
+        salvage retry. Optional — salvage no-ops when unset."""
+        self._router = router
 
     # ── Main reflection entry point ───────────────────────────────────
 
@@ -480,12 +488,36 @@ class CCReflectionBridge:
         except Exception:
             logger.debug("Corpus recording failed (table may not exist yet)", exc_info=True)
 
+        # 4c. Salvage: a DEEP session that ended in PROSE (no fenced JSON) fails
+        # both parse sites and silently discards its cognitive output (~40% of
+        # runs). Re-derive the structured JSON via one routed LLM call and use it
+        # for BOTH routing and the topic summary. The RAW output.text is kept in
+        # the corpus above for audit. Strictly additive: when no salvage is needed
+        # (already parseable) or salvage fails, deep_text stays output.text and
+        # behavior is unchanged.
+        deep_text = output.text
+        if depth == Depth.DEEP:
+            salvaged = await salvage_deep_reflection_json(output.text, self._router)
+            if salvaged is not None:
+                deep_text = salvaged
+                logger.info(
+                    "Deep reflection ended in prose — structured JSON re-derived via salvage"
+                )
+                if self._event_bus:
+                    from genesis.observability.types import Severity, Subsystem
+                    await self._event_bus.emit(
+                        Subsystem.REFLECTION, Severity.WARNING,
+                        "deep_reflection.salvaged",
+                        "Deep reflection ended in prose; structured JSON re-derived via salvage",
+                        depth=depth.value,
+                    )
+
         # 5. Route output
         routing_failed = False
         if self._output_router and depth == Depth.DEEP:
             try:
                 routing_summary = await route_deep_output(
-                    output.text, db=db, output_router=self._output_router,
+                    deep_text, db=db, output_router=self._output_router,
                     gathered_obs_ids=gathered_obs_ids,
                     gathered_surplus_ids=gathered_surplus_ids,
                     tick_signal_names=(
@@ -511,9 +543,11 @@ class CCReflectionBridge:
                 except Exception:
                     logger.warning("Failed to mark influenced observations", exc_info=True)
 
-        # 6. Send to topic — parsed-fields summary only, never raw output.text
+        # 6. Send to topic — parsed-fields summary only, never raw output.text.
+        # Use the salvaged JSON (deep_text) so a prose-ended deep reflection shows
+        # a real summary instead of the "not parseable" stub.
         await send_to_topic(
-            session_id, depth, format_topic_summary(depth, output),
+            session_id, depth, format_topic_summary(depth, output, text=deep_text),
             topic_manager=self._topic_manager,
         )
 
