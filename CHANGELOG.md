@@ -94,6 +94,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   asks you to reply to the specific message (or tap its ✅ button) rather than
   guessing — it deliberately won't act on an ambiguous topic-level reply.
 
+- **Deep reflections no longer silently lose their output.** When a deep
+  reflection ended its session with a plain-prose wrap-up instead of the
+  required structured JSON (~40% of runs), both parsers failed: the Telegram
+  topic showed a "not parseable" stub and — worse — that cycle's cognitive
+  output (updated context summary, observations, memory consolidations, and
+  follow-up research it wanted to queue) was discarded. Genesis now re-derives
+  the structured result from the prose in one follow-up model call, so the
+  reflection's findings are kept and the topic shows a real summary. If the
+  salvage can't recover valid output, behavior is unchanged from before.
+
 - **Engagement rate now measures real outreach, not your own approval pings.**
   The "N sent / X% engagement" figure counted every internal Telegram message
   Genesis sends *you* — approval prompts, the morning digest, blockers, alerts,

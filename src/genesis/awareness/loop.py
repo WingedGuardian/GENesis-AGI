@@ -192,16 +192,27 @@ _last_embed_backlog_alert_at: float = 0.0
 _last_embed_backlog_band: str = ""
 
 # WS-2 M7 — user-model-delta stream staleness. The reflection user-impact path
-# writes deltas to observations(type='user_model_delta'); the stream flatlined
-# ~Mar–Jul 2026 (only 2 deltas ever under the v3 pipeline). Diagnosis
-# (2026-07-15): the 0.90 per-delta confidence gate in reflection_bridge/_output.py
-# sits above the light-reflection model's median output confidence, so almost
-# nothing passes — a THRESHOLD throttle, not a plumbing bug. The behavioral fix
-# (revisit the gate/prompt/model) is a separate PR; this only UN-BLINDS the
-# silence so a future recurrence is caught in days, not months.
-_USER_MODEL_STALE_DAYS = 14
-_USER_MODEL_STALE_COOLDOWN_S = 86400  # at most one alert per day while stale
-_last_user_model_stale_alert_at: float = 0.0
+# writes deltas to observations(type='user_model_delta'). The stream is honestly
+# SPARSE by design: deltas are emitted only when the model of the user genuinely
+# changes (the anti-confabulation prompt returns "no change" otherwise). The
+# 2026-08-06 diagnosis confirmed the pipeline is healthy — a 288-delta burst in
+# an intense March session, then ~3 deltas across 4 months of heavy interaction,
+# all correct. So silence is NOT a defect on its own; the alarm must not flap.
+#   - 45d threshold: well clear of observed honest gaps (19d with heavy use).
+#   - Interaction gate: alert only if foreground sessions ran in the window —
+#     silence during a genuine user absence is expected.
+#   - Episode-scoped DB dedup: one alert per silence episode, immune to the
+#     3-day infrastructure_alert TTL that used to re-mint the same alert every
+#     few days (each re-mint re-triggered a paid ego investigation).
+#   - 'medium' priority: a slow user-model stream is never urgent.
+_USER_MODEL_STALE_DAYS = 45
+# Minimum foreground (interactive CC + voice) sessions ACTIVE since the last
+# delta for a silence to count as a possible defect rather than an expected quiet
+# stretch. Counted by last_activity_at (reused long-lived sessions advance it), so
+# 1 is the meaningful floor: a single persistently-reused topic session is enough
+# to mean "the user was present." The 45d threshold + episode dedup keep this from
+# over-firing (at most one medium alert per drought episode).
+_USER_MODEL_MIN_INTERACTION_SESSIONS = 1
 
 
 def _embed_backlog_band(failed: int) -> str:
@@ -339,13 +350,15 @@ async def _resolve_embedding_backlog(db) -> None:
 
 
 async def _check_user_model_staleness(db) -> None:
-    """WS-2 M7: alert (non-paging 'high') when the user_model_delta stream is silent >14d.
+    """WS-2 M7: alert (non-paging 'medium') when the user_model_delta stream is
+    silent for >= _USER_MODEL_STALE_DAYS DESPITE recent user interaction.
 
-    Surfaced via the established infrastructure_alert observation idiom (dashboard
-    + morning report), NOT alert_events — alert_events has no reader UI in PR-0, so
-    routing the alarm only there would be built-but-blind. Auto-resolves when a
-    fresh delta lands. Best-effort; the whole body never raises into the tick."""
-    global _last_user_model_stale_alert_at
+    The stream is sparse BY DESIGN, so silence alone is not a defect (see the
+    module-level rationale). This is a false-positive-reduced "worth a look"
+    nudge, not a "broken" claim: it requires foreground activity in the window,
+    fires at most once per silence episode, and is medium priority. Surfaced via
+    the infrastructure_alert observation idiom (dashboard + morning report).
+    Auto-resolves when a fresh delta lands. Best-effort; never raises into tick."""
     if db is None:
         return
     try:
@@ -368,11 +381,54 @@ async def _check_user_model_staleness(db) -> None:
             await _resolve_user_model_staleness(db)
             return
 
-        now = time.monotonic()
-        if (
-            _last_user_model_stale_alert_at
-            and now - _last_user_model_stale_alert_at < _USER_MODEL_STALE_COOLDOWN_S
-        ):
+        # Episode-scoped dedup (DB-backed → restart- and TTL-proof): surface a
+        # given silence episode only ONCE.
+        #  - Has a last delta: the episode is "silence since that delta" → an
+        #    alert created after it means already surfaced.
+        #  - No delta EVER: the whole history is one standing episode → ANY prior
+        #    alert (regardless of when) means already surfaced. Anchoring on
+        #    `now - window` here would slide, re-firing every ~window days.
+        if last is not None:
+            dedup_sql = (
+                "SELECT 1 FROM observations WHERE source = 'user_model_staleness_monitor' "
+                "AND type = 'infrastructure_alert' AND created_at > ? LIMIT 1"
+            )
+            dedup_args: tuple = (last,)
+        else:
+            dedup_sql = (
+                "SELECT 1 FROM observations WHERE source = 'user_model_staleness_monitor' "
+                "AND type = 'infrastructure_alert' LIMIT 1"
+            )
+            dedup_args = ()
+        async with db.execute(dedup_sql, dedup_args) as cur:
+            if await cur.fetchone() is not None:
+                return
+
+        # Interaction gate: alert only if the user was actually interacting in the
+        # window (foreground = interactive CC + voice sessions). Silence during a
+        # genuine absence is expected, not a defect. The window is the silence
+        # since the last delta, or (never-delta) the recent staleness window — so
+        # a long-idle install with no recent sessions stays quiet.
+        #
+        # Match on last_activity_at, NOT started_at: a foreground row can be REUSED
+        # across day boundaries (Telegram supergroup topics keep one session and
+        # only advance last_activity_at), so a heavily-used but long-lived session
+        # that STARTED before the anchor would otherwise be miscounted as no
+        # activity — permanently suppressing the alert. last_activity_at reflects
+        # real recent use of both fresh and reused sessions.
+        interaction_since = (
+            last
+            if last is not None
+            else (now_dt - timedelta(days=_USER_MODEL_STALE_DAYS)).isoformat()
+        )
+        async with db.execute(
+            "SELECT COUNT(*) FROM cc_sessions "
+            "WHERE session_type = 'foreground' AND last_activity_at > ?",
+            (interaction_since,),
+        ) as cur:
+            irow = await cur.fetchone()
+        interaction = irow[0] if irow and irow[0] is not None else 0
+        if interaction < _USER_MODEL_MIN_INTERACTION_SESSIONS:
             return
 
         detail = (
@@ -387,23 +443,26 @@ async def _check_user_model_staleness(db) -> None:
             source="user_model_staleness_monitor",
             type="infrastructure_alert",
             content=(
-                f"The user-model learning stream is stale: {detail}. Reflection "
-                f"user-impact deltas (observations type='user_model_delta') feed the "
-                f"user-model evolution job, so a silent stream means Genesis has stopped "
-                f"updating its model of the user. Check the per-delta confidence gate "
-                f"(MIN_DELTA_CONFIDENCE, perception/types.py) against the light model's "
-                f"actual output confidence, and the user_impact rotation's emission "
-                f"volume (how many deltas reflections propose at all)."
+                f"User-model learning stream: {detail}, despite {interaction} "
+                f"foreground session(s) since. Reflection user-impact deltas "
+                f"(observations type='user_model_delta') feed the user-model "
+                f"evolution job. NOTE: this stream is sparse BY DESIGN — deltas are "
+                f"emitted only when the model of the user genuinely changes, so "
+                f"silence is often correct; treat this as a 'worth a look' nudge, "
+                f"not a confirmed defect. Do NOT lower MIN_DELTA_CONFIDENCE or "
+                f"loosen the user_impact prompt to force emissions — that "
+                f"confabulates deltas and corrupts the measured signal. If "
+                f"investigating, trace the user_impact rotation's emission path "
+                f"(reflection proposes a delta -> observations write), not the gate."
             ),
-            priority="high",
+            priority="medium",
             created_at=now_dt.isoformat(),
             content_hash=content_hash,
             skip_if_duplicate=True,
         )
         if created is None:
             return  # An unresolved staleness alert already exists.
-        _last_user_model_stale_alert_at = now
-        logger.warning("User-model staleness alert: %s", detail)
+        logger.info("User-model staleness alert (medium): %s", detail)
     except Exception:
         logger.debug("Failed user-model staleness check", exc_info=True)
 
@@ -412,8 +471,8 @@ async def _resolve_user_model_staleness(db) -> None:
     """Resolve a standing user-model staleness alert once a fresh delta lands.
 
     Unconditional (no in-memory guard) so it survives restart; a cheap no-op when
-    nothing matches. Clears the cooldown so a recovery -> re-staleness re-alerts."""
-    global _last_user_model_stale_alert_at
+    nothing matches. Episode dedup is DB-backed (keyed on the last delta), so a
+    recovery -> re-staleness naturally re-alerts once against the new anchor."""
     if db is None:
         return
     try:
@@ -425,7 +484,6 @@ async def _resolve_user_model_staleness(db) -> None:
             resolution_notes="auto-resolved: a fresh user_model_delta arrived within the window",
         )
         if resolved:
-            _last_user_model_stale_alert_at = 0.0
             logger.info("Auto-resolved %d user-model staleness alert(s)", resolved)
     except Exception:
         logger.debug("Failed to resolve user-model staleness alerts", exc_info=True)
@@ -2467,9 +2525,10 @@ class AwarenessLoop:
                     # signal → hourly; self-resolves on recovery. Best-effort
                     # (guarded internally); collectors never do network I/O.
                     await _check_deploy_staleness(self._db)
-                    # User-model-delta stream staleness (WS-2 M7) — a >14d silent
-                    # stream means Genesis stopped updating its model of the user.
-                    # Slow (14d) signal → hourly; self-resolves on a fresh delta.
+                    # User-model-delta stream staleness (WS-2 M7) — flap-resistant:
+                    # alerts (medium) only when silent >=45d DESPITE recent
+                    # foreground interaction, once per episode (DB dedup, TTL-proof);
+                    # self-resolves on a fresh delta. Slow signal → hourly.
                     await _check_user_model_staleness(self._db)
                     # Infra protection posture (silent-skip closure, Phase 3) —
                     # a stable-unprotected box must never be silent: a missing

@@ -538,6 +538,16 @@ call_sites:
       redundant with existing ones). S-tier only — precision is the safety
       property (validated 0 false-merges on deepseek-v4); fires per novel
       procedure, low volume.
+  41_reflection_json_salvage:
+    chain:
+    - mistral-large-free
+    - gemini-free
+    - openrouter-deepseek-v4
+    default_paid: true
+    description: Salvage a deep-reflection CC session that ended in prose (no
+      fenced JSON) into the required structured JSON, so the cycle's cognitive
+      output (cognitive_state_update, observations, memory_operations, surplus
+      requests) isn't discarded. Quality matters — recovers otherwise-lost work.
   40_ego_focus_selection:
     chain:
     - groq-free
