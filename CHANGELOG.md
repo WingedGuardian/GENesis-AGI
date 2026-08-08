@@ -86,6 +86,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Replying "yes" to an approval topic no longer starts a confused new chat.**
+  If you replied "yes"/"approve" to the *topic itself* (the forum topic header)
+  instead of the specific approval/proposal/content message, Genesis got no
+  context and spun up a fresh conversation that answered "I don't have anything
+  to confirm — what are you saying yes to?". It now recognizes that case and
+  asks you to reply to the specific message (or tap its ✅ button) rather than
+  guessing — it deliberately won't act on an ambiguous topic-level reply.
+
 - **Deep reflections no longer silently lose their output.** When a deep
   reflection ended its session with a plain-prose wrap-up instead of the
   required structured JSON (~40% of runs), both parsers failed: the Telegram
