@@ -166,6 +166,27 @@ Background session transcripts (reflections, inbox, surplus) are stored
 under `~/.genesis/background-sessions/` (outside the repo, so CC's resume
 picker doesn't include them).
 
+## Core Principle: Evidence Must Match the Scope of the Claim
+
+Applies to every assertion — in conversation, and doubly in anything written to disk.
+
+- **Scope matching.** One file supports "this file says X," never "the system does X."
+  One observation supports a question, not a conclusion. A derived list (digest, backlog,
+  index, prior summary, plan doc) supports claims about the LIST — never about the corpus
+  it was derived from. When the user names a corpus, read the corpus, not a proxy.
+- **Evidence tiers.** Every stated fact is one of: **MEASURED** (number + denominator),
+  **READ** (artifact + location, e.g. file:line / PR / live query), **INFERRED** (must be
+  hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
+  claim wears verified grammar and WILL be read as MEASURED/READ.
+- **Permanent-record discipline.** Never write an INFERRED claim into permanent record
+  (memory stores, follow-ups, specs, ledgers, evaluations, comments) in the grammar of a
+  fact — permanent record has no tone of voice; the next session builds on confident
+  sentences. Status claims written to disk carry provenance + date ("per <artifact>, <date>").
+- **A surprising observation is a question, not an answer.** The pull to explain an anomaly
+  with a tidy story is precisely the moment to measure instead.
+- **Status of work** (built/unbuilt/pending/shipped/active) comes from artifact enumeration
+  (merged PRs, live DB, running processes) — never from plans, row lists, or prior docs.
+
 ## Confidence Framework
 
 > Expanded reference with examples, failure modes, and due diligence companion: `.claude/docs/confidence-framework.md`
