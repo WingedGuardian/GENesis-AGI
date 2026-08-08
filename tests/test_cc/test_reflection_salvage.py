@@ -198,7 +198,12 @@ def test_salvage_prompt_requires_full_canonical_set():
     output makes routing report success, silently losing that field. Locking all
     three closes the axis (regression: they were moved to Required one-at-a-time
     across three review rounds)."""
-    required_block = _SALVAGE_PROMPT.split("Optional")[0]
+    # Slice the ACTUAL Required section (between the "Required:" header and the
+    # "Optional" header) — NOT split("Optional")[0], which also captures the
+    # intro sentence that names the fields, so a bullet moved to Optional would
+    # still pass. This asserts each field is a Required BULLET.
+    assert "Required:" in _SALVAGE_PROMPT and "Optional" in _SALVAGE_PROMPT
+    required_block = _SALVAGE_PROMPT.split("Required:")[1].split("Optional")[0]
     for field in ("observations", "confidence", "cognitive_state_update"):
         assert field in required_block, f"canonical-required field {field!r} not in Required block"
 
