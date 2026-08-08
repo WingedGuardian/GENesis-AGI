@@ -216,7 +216,13 @@ def read_transcript_delta(
                     # Partial trailing line (write in progress) — do not
                     # consume; byte_pos stays at its start.
                     break
-                if max_lines is not None and (line_no - start_line) >= max_lines:
+                # Cap counts from the effective scan base, NOT the stored
+                # watermark: after a truncation/boundary reset `emit_from` is 0
+                # while `start_line` is stale, so `line_no - start_line` would let
+                # a bounded read of a rotated transcript run unbounded. In the
+                # normal seeking case emit_from == start_line, so this is
+                # unchanged there.
+                if max_lines is not None and (line_no - emit_from) >= max_lines:
                     break
                 current_line = line_no
                 byte_pos += len(raw)

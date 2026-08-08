@@ -329,3 +329,44 @@ def test_valid_boundary_append_still_seeks_without_reset(tmp_path):
     d = read_transcript_delta(p, start_line=first.new_line_count, start_byte=first.new_byte_offset)
     assert d.truncated_reset is False
     assert [m.line_number for m in d.messages] == [2]  # only the appended line
+
+
+def test_max_lines_capped_after_reset(tmp_path):
+    """``max_lines`` bounds lines processed even AFTER a reset.
+
+    After truncation (or a boundary reset) ``line_no`` restarts at 0 while the
+    stored ``start_line`` is stale. Counting from ``emit_from`` (the effective
+    scan base, 0 after a reset) keeps the cap honest; counting from ``start_line``
+    would let a bounded read of a rotated transcript run unbounded.
+    """
+    p = tmp_path / "t.jsonl"
+    v1 = [_user(f"m{i}") for i in range(8)]
+    _write(p, v1)
+    first = read_transcript_delta(p, start_line=0, start_byte=None)
+    assert first.new_line_count == 8  # watermark at line 8
+
+    # rotate to a SHORTER file (size < stored offset) → truncation reset from 0
+    v2 = [_user("x0"), _user("x1"), _user("x2"), _user("x3")]
+    _write(p, v2)
+    d = read_transcript_delta(
+        p, start_line=first.new_line_count, start_byte=first.new_byte_offset, max_lines=2
+    )
+
+    assert d.truncated_reset is True
+    assert len(d.messages) == 2, "max_lines ignored after reset (counted from stale start_line)"
+    assert [m.line_number for m in d.messages] == [0, 1]
+
+
+def test_max_lines_unchanged_on_normal_seek(tmp_path):
+    """Control: on a normal seek (emit_from == start_line) the cap is unchanged."""
+    p = tmp_path / "t.jsonl"
+    base = [_user("a"), _asst("b")]
+    _write(p, base)
+    first = read_transcript_delta(p, start_line=0, start_byte=None)
+
+    _write(p, base + [_user("c"), _asst("d"), _user("e")])
+    d = read_transcript_delta(
+        p, start_line=first.new_line_count, start_byte=first.new_byte_offset, max_lines=2
+    )
+    assert d.truncated_reset is False
+    assert [m.line_number for m in d.messages] == [2, 3]  # exactly 2, from the watermark
