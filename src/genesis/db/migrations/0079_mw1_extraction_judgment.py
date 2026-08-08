@@ -20,8 +20,12 @@ MW-1 only writes them (# GROUNDWORK(mw-4-*) / (mw-5-*)).
 
 Self-contained + idempotent: each ADD is PRAGMA-guarded (applies via the base
 path OR the numbered runner; whichever ran first, the guard skips). No commit —
-the runner owns the transaction. Unindexed columns, so they need no mirror in
-``_migrate_add_columns`` (the base-path-parity guard is scoped to indexed columns).
+the runner owns the transaction. These columns are ALSO mirrored in
+``_migrate_add_columns`` (guarded ``_try_alter``): create_all_tables runs that
+function but NOT the numbered runner, so a create_all_tables→``MemoryStore.store``
+INSERT on an existing DB (e.g. scripts/migrate_faiss_to_qdrant.py) needs the
+columns present there too. Being unindexed only means the INDEXES-parity guard
+cannot catch the omission — NOT that the mirror is unnecessary. schema_both_build_paths.
 
 (Numbered 0079: 0078 is the highest present; the runner applies by per-id tracking
 and only duplicate prefixes are fatal.)
