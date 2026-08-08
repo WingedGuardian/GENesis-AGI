@@ -57,9 +57,14 @@ Optional (include only when the prose supports it):
 "target_ids": ["..."], "reason": "...", "merged_content": "..."}]
 - "surplus_task_requests": [{"task_type": "...", "reason": "...", \
 "priority": 0.0, "drive_alignment": "..."}]
+- "skill_triggers": [string, ...]
+- "procedure_quarantines": [{"procedure_id": "...", "reason": "..."}]
+- "user_question": {"text": "...", "context": "...", "options": ["...", "..."]}
 - "contradictions": [ ... ]
 - "confidence": 0.0
 - "focus_next": string
+- "alternative_assessment": string
+- "separability": 0.0
 
 Output ONLY the JSON object — no markdown fence, no commentary.
 

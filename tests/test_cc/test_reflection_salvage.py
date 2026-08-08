@@ -13,6 +13,7 @@ import pytest
 
 from genesis.awareness.types import Depth
 from genesis.cc.reflection_bridge._output import (
+    _SALVAGE_PROMPT,
     _extract_json_obj,
     format_topic_summary,
     salvage_deep_reflection_json,
@@ -164,3 +165,52 @@ def test_topic_summary_handles_bare_untagged_fence():
     summary = format_topic_summary(Depth.DEEP, out)
     assert "was not parseable" not in summary
     assert "Groq EOL resolved" in summary
+
+
+# ── salvage schema parity (Codex #1333 finding B) ──────────────────────
+
+
+def test_salvage_prompt_exposes_route_consumed_action_fields():
+    """The salvage prompt MUST expose every canonical field that route()
+    actually acts on — else a prose-ending reflection that raised a user
+    question or a procedure quarantine would have those actions silently
+    dropped while salvage still reports success. user_question →
+    Telegram notification; procedure_quarantines → a real DB quarantine."""
+    for field in (
+        "cognitive_state_update",
+        "observations",
+        "memory_operations",
+        "surplus_task_requests",
+        "user_question",
+        "procedure_quarantines",
+        "skill_triggers",
+        "contradictions",
+    ):
+        assert field in _SALVAGE_PROMPT, f"salvage prompt omits route-consumed field {field!r}"
+
+
+@pytest.mark.asyncio
+async def test_salvage_roundtrips_user_question_and_quarantines():
+    """A salvaged object carrying a user_question and a procedure_quarantine
+    must survive the router parser intact (the fields route() acts on)."""
+    payload = {
+        "cognitive_state_update": "A decision needs the owner; a procedure is failing.",
+        "observations": ["proc X success rate collapsed"],
+        "confidence": 0.7,
+        "user_question": {
+            "text": "Retire procedure X?",
+            "context": "success rate dropped to 20%",
+            "options": ["retire", "keep"],
+        },
+        "procedure_quarantines": [{"procedure_id": "proc-x", "reason": "declining effectiveness"}],
+    }
+    router = _FakeRouter(json.dumps(payload))
+    salvaged = await salvage_deep_reflection_json(PROSE, router)
+    assert salvaged is not None
+    parsed = parse_deep_reflection_output(salvaged)
+    assert not parsed.parse_failed
+    assert parsed.user_question is not None
+    assert parsed.user_question.text == "Retire procedure X?"
+    assert parsed.procedure_quarantines == [
+        {"procedure_id": "proc-x", "reason": "declining effectiveness"}
+    ]
