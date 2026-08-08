@@ -190,13 +190,17 @@ def test_salvage_prompt_exposes_route_consumed_action_fields():
         assert field in _SALVAGE_PROMPT, f"salvage prompt omits route-consumed field {field!r}"
 
 
-def test_salvage_prompt_requires_confidence():
-    """confidence is canonical-required (REFLECTION_DEEP.md) and gates output —
-    a salvage that leaves it optional lets the model omit it, the parser then
-    substitutes the 0.5 sentinel, and the confidence gate passes it uncalibrated.
-    It must sit in the Required block, not Optional."""
+def test_salvage_prompt_requires_full_canonical_set():
+    """The salvage prompt's Required block must be EXACTLY the canonical-required
+    set from REFLECTION_DEEP.md:215 — observations, confidence, and
+    cognitive_state_update. Leaving any of them optional lets the model omit it;
+    the parser then defaults it (empty list / 0.5 sentinel) while the rest of the
+    output makes routing report success, silently losing that field. Locking all
+    three closes the axis (regression: they were moved to Required one-at-a-time
+    across three review rounds)."""
     required_block = _SALVAGE_PROMPT.split("Optional")[0]
-    assert "confidence" in required_block
+    for field in ("observations", "confidence", "cognitive_state_update"):
+        assert field in required_block, f"canonical-required field {field!r} not in Required block"
 
 
 @pytest.mark.asyncio

@@ -43,10 +43,13 @@ _SALVAGE_MAX_PROSE_CHARS = 12000
 _SALVAGE_PROMPT = """A deep-reflection session produced the analysis below as \
 free-form PROSE instead of the required JSON. Convert it FAITHFULLY into a single \
 JSON object. Do NOT invent content that is not in the prose; omit any field the \
-prose does not address — EXCEPT "cognitive_state_update" and "confidence", which \
-are required (synthesize them from the prose's overall assessment).
+prose does not address — EXCEPT "observations", "cognitive_state_update", and \
+"confidence", which are required (synthesize them from the prose's overall \
+assessment).
 
 Required:
+- "observations": [string, ...]        (max 5 — the key discrete findings in \
+the prose; the reflection's concrete conclusions).
 - "cognitive_state_update": string — a tight, factual summary of the current \
 cognitive state / situation described in the prose.
 - "confidence": float 0.0–1.0 — a calibrated confidence in this reflection's \
@@ -54,7 +57,6 @@ conclusions, inferred from the prose's own certainty. Do NOT default to 0.7; \
 below 0.5 signals genuine low confidence.
 
 Optional (include only when the prose supports it):
-- "observations": [string, ...]        (max 5 — the key findings)
 - "learnings": [string, ...]
 - "memory_operations": [{"operation": "dedup|merge|prune|flag_contradiction", \
 "target_ids": ["..."], "reason": "...", "merged_content": "..."}]
