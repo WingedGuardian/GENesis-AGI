@@ -61,6 +61,7 @@ EXPECTED_TABLES = [
     "campaign_runs",
     "capability_grants",  # WS-8 PR-B: per-(domain,verb,risk_class) cells
     "pending_email_sends",  # WS-8 PR-C: email autonomy gate hold store
+    "pending_issue_posts",  # Contributor Work-Log: sanitized issue-draft hold store
     "autonomous_email_sends",  # WS-8 PR-D: autonomous-send ledger (visibility + flag + rate-limit)
     "capability_shadow_events",  # WS5 Stage 2: Discord capability shadow-gate observations
     "immunity_shadow_events",  # WS-3 B1: provenance-gate (injection) shadow observations

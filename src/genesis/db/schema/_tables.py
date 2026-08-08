@@ -754,6 +754,35 @@ TABLES = {
             rejected_at         TEXT
         )
     """,
+    # Contributor Work-Log hold store — a curator-drafted, sanitized public
+    # GitHub issue held for owner approval (paired with an approval_requests
+    # row); the resolution watcher posts it on approval. Mirrors
+    # pending_email_sends (WS-8). Migration 0079.
+    "pending_issue_posts": """
+        CREATE TABLE IF NOT EXISTS pending_issue_posts (
+            id                  TEXT PRIMARY KEY,
+            request_id          TEXT NOT NULL UNIQUE,
+            repo                TEXT NOT NULL,
+            title               TEXT NOT NULL,
+            body                TEXT NOT NULL,
+            labels              TEXT,
+            source              TEXT NOT NULL,
+            source_ref          TEXT,
+            cell_domain         TEXT NOT NULL,
+            cell_verb           TEXT NOT NULL,
+            cell_risk_class     TEXT NOT NULL,
+            held_at             TEXT NOT NULL,
+            mode                TEXT NOT NULL DEFAULT 'propose_only'
+                                    CHECK (mode IN ('propose_only', 'live')),
+            status              TEXT NOT NULL DEFAULT 'held'
+                                    CHECK (status IN ('held', 'posted', 'rejected', 'expired', 'dry_run')),
+            issue_number        INTEGER,
+            issue_url           TEXT,
+            posted_at           TEXT,
+            rejected_at         TEXT,
+            dry_run_at          TEXT
+        )
+    """,
     # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously
     # under a GRANTED capability cell (i.e. the gate allowed it without holding
     # for owner approval).  This is the keystone the owner-visibility "Activity"
@@ -1209,7 +1238,19 @@ TABLES = {
             trust_level      TEXT,
             attribution      TEXT,
             origin_ref       TEXT,
-            capture_clarity  REAL
+            capture_clarity  REAL,
+            -- GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl /
+            -- mw-5-speech-act-protection): MW-1 Tier-0 extraction judgment axes,
+            -- written WRITE-ONLY at extraction time — NOTHING reads them yet.
+            -- All NULLable with NO default: expiry is strictly opt-in
+            -- (durability='temporary' + an elapsed expires_at only), so an
+            -- unclassified row NEVER expires. Contract in memory/judgment.py;
+            -- added to existing DBs by migration 0079.
+            speech_act            TEXT,
+            speech_act_confidence REAL,
+            assertion_provenance  TEXT,
+            durability            TEXT,
+            expires_at            TEXT
         )
     """,
     "graduation_events": """
@@ -2358,6 +2399,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_capability_grants_domain ON capability_grants(domain, state)",
     # WS-8 email gate hold store (drain queries WHERE status='held')
     "CREATE INDEX IF NOT EXISTS idx_pending_email_sends_status ON pending_email_sends(status)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_issue_posts_status ON pending_issue_posts(status)",
     # WS-8 PR-D autonomous-send ledger — per-cell rate-limit window + ledger ordering
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
     "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",

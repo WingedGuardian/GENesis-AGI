@@ -194,8 +194,26 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 0a3fc19d 2026-07-23
+verified: 5dcd9fd4 2026-08-07
 ```
+
+- **Reflection tool lockdown — read-only + observations only**
+  (`session_config.build_reflection_disallowed`, wired at `reflection_bridge/_bridge.py`
+  into the reflection `CCInvocation.disallowed_tools`). Deep/strategic reflections run
+  with a DERIVED denylist = (live `genesis-health` + `genesis-memory` registry − a read
+  allowlist − `observation_write`) + the write/action built-ins (Bash/Write/Edit/Task/
+  Workflow/Skill/…), so a future write tool is auto-denied. `--allowedTools` is NOT a
+  strict allowlist under `--dangerously-skip-permissions` (verified empirically 2026-08-07
+  via the init-event tool list — it left Bash available); only `--disallowedTools` removes
+  a tool, so the scoping is a denylist. Guards (`tests/test_cc/test_reflection_tool_scope.py`):
+  a sentinel asserts known write tools stay denied, a static AST scan rejects any
+  write-shaped tool in the read-allowlist, and a fail-closed check confirms every
+  registered tool is read-allowed or denied (a new upstream tool is auto-denied by the
+  derivation). Reflection previously bypassed
+  all tool scoping (the orphaned `build_reflection_config`/`_READONLY_DISALLOWED` was never
+  wired) — root cause of a 2026-07-03 fabricated follow-up. Sacred-board companion: an
+  autonomous/dispatched session's `follow_up_create` (source=`ego_dispatch`) is routed to
+  the cold `tabled` lane, never the hot board (`mcp/health/follow_up_tools.py`).
 
 - `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split
   candidates). Profile machinery: `PROFILES`, `_PROFILE_ADDENDA`,
@@ -289,7 +307,7 @@ gated — that contract is one-directional.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 9037d45b 2026-07-07
+verified: 2f0239cb 2026-08-07
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -306,6 +324,21 @@ verified: 9037d45b 2026-07-07
   (hold-for-approval) is the designed next stage. CI
   backstop: `scripts/check_external_io.py` fails on new ungated egress
   endpoints.
+- **The Contributor Work-Log posts public GitHub issues, gated like email.** A
+  server-side MCP tool (`contributor_issue_propose`, genesis-health) sanitizes a
+  curator-drafted issue via the fail-closed `contribution/sanitize.py scan_prose`
+  (title+body+labels — every string that egresses), then HOLDS it: the
+  `approval_requests` row FIRST, then `pending_issue_posts` (mirroring the email
+  gate). Each hold is per-item owner-approved on the dashboard (excluded from
+  `approve_all_pending`, like email). The `contributor_issue_watcher` drain
+  (every 5 min, learning scheduler) resolves approved holds under the
+  `contributor_worklog` mode lever (`autonomy/contributor_worklog_config.py`,
+  default `propose_only`): `live` → `gh issue create` (shadow-gated door
+  `observe_github_issue_create`, `mark_posted` BEFORE `mark_consumed` +
+  pre-post `gh issue list` dedup for idempotency); `propose_only` → dry-run
+  terminal (never posts). Terminal rows pruned >30d via
+  `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
+  curator campaigns are LOCAL user data (uncommitted).
 - **`content/egress.py gate()` is LIVE** in the pipeline: anti-slop scrub +
   PII scan for EXTERNAL channels and `content`-category drafts only. Never
   applied to owner channels — don't add them.
@@ -419,7 +452,13 @@ verified: d37d2214 2026-08-06
   filters on) with a pre-poll watermark cursor, so an edited/closed old item
   never masquerades as new. Uses `run_gh_checked` so a failed poll never advances
   the cursor; an undelivered ping is held in a `github_ping_pending` marker and
-  retried each tick until it lands. `off`/`observe`/`live` lever in
+  retried each tick until it lands. An account-level **notifications lane** (repo-
+  independent, same tick, own sidecar cursor) additionally surfaces activity
+  BEYOND owned repos — @mentions anywhere plus responses on the owner's OUTBOUND
+  contributions (`reason=author` on non-owned repos; owner-repo author items are
+  dropped as the deep-poll already has them) — resolving the actor via the
+  notification's `latest_comment_url` and pinging immediately in `live`.
+  `off`/`observe`/`live` lever + `notifications` reason-allowlist in
   `github_steward_config`.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
@@ -1040,7 +1079,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers]
-verified: 9037d45b 2026-07-07
+verified: 409338c9 2026-08-07
 ```
 
 - **routing/**: `config/model_routing.yaml` defines ~54 numbered call sites,
@@ -1057,7 +1096,9 @@ verified: 9037d45b 2026-07-07
   silent non-registration is by design (absence ≠ bug). LLM breaker/health
   logic lives in routing, not here. No embedding provider registered → memory
   silently degrades to FTS5-only.
-- GROUNDWORK: gpt-oss-120b provider defined but unwired into any chain.
+- A load-time guard warns if an `openrouter` provider flagged `free: true` points
+  at a non-`:free` (paid) slug — the openrouter-free billing blind spot
+  (`_detect_mislabeled_free_openrouter`, config-only, visibility not gating).
 
 ## 12. Platform & data
 

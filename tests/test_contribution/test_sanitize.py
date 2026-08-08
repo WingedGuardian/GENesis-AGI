@@ -619,3 +619,161 @@ def test_fingerprint_missing_file_warns(tmp_path, clean_diff):
     )
     # The scan did NOT run, so it must not be reported as executed.
     assert "fingerprint" not in r.scanners_run
+
+
+# ── scan_prose: fail-closed sanitizer for free-text (issue bodies, etc.) ──────
+#
+# The Contributor Work-Log pipeline sanitizes PROSE (a drafted GitHub issue
+# title+body), not a unified diff. scan_diff() CANNOT be reused for that — it
+# routes everything through parse_diff(), which only keeps lines prefixed with
+# `+` under a `+++ b/<path>` header. Plain prose has neither, so parse_diff
+# yields ZERO added_lines → zero findings → ok=True: a FAIL-OPEN path through a
+# fail-CLOSED component. scan_prose() runs the raw-string detectors
+# (portability, emails, fingerprints, detect-secrets) directly on every line,
+# preserving the fail-closed `ok` contract.
+
+
+def test_scan_diff_fails_open_on_prose(tmp_path):
+    """Characterization: scan_diff() on plain prose sees no diff `+` lines, so
+    a private IP + home path sail through as ok=True. This is exactly the
+    fail-open hole scan_prose() exists to close — the paired proof below shows
+    scan_prose() BLOCKs the same text."""
+    prose = "Reach the box at 10.1.2.3 or look under /home/alice/genesis/data."
+    r = sanitize.scan_diff(prose, fingerprint_file=tmp_path / "no-fp.txt")
+    assert r.ok is True  # <-- the bug, pinned: prose is invisible to scan_diff
+
+
+def test_scan_prose_blocks_private_ip(tmp_path):
+    r = sanitize.scan_prose(
+        "Reach the box at 10.1.2.3 to reproduce.",
+        fingerprint_file=tmp_path / "no-fp.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
+
+
+def test_scan_prose_blocks_home_path(tmp_path):
+    r = sanitize.scan_prose(
+        "The config lives at /home/alice/genesis/config.yaml on the box.",
+        fingerprint_file=tmp_path / "no-fp.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.PORTABILITY for f in r.blocking())
+
+
+def test_scan_prose_clean_ok(tmp_path):
+    """Genuinely portable technical prose — the kind a good-first-issue body
+    would contain — passes clean."""
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty: scan_prose fails closed on a MISSING file
+    r = sanitize.scan_prose(
+        "In `src/genesis/parser.py` the `chunk()` helper drops the last token "
+        "when the input has no trailing newline. Add a test and fix the "
+        "off-by-one. Good first issue.",
+        fingerprint_file=fp,
+    )
+    assert r.ok is True
+    assert r.blocking() == []
+
+
+def test_scan_prose_blocks_personal_email(tmp_path):
+    r = sanitize.scan_prose(
+        "Ping alice.jones@gmail.com for context.",
+        fingerprint_file=tmp_path / "no-fp.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.EMAIL for f in r.blocking())
+
+
+def test_scan_prose_blocks_fingerprint(tmp_path):
+    """Install-specific literals (host names, private repo) are caught only by
+    the fingerprint layer — scan_prose must run it when the file is present."""
+    fp = tmp_path / "fp.txt"
+    fp.write_text("SecretHostName\n")
+    r = sanitize.scan_prose(
+        "The failure only reproduces on SecretHostName after a reboot.",
+        fingerprint_file=fp,
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r.blocking())
+
+
+def test_scan_prose_scans_all_lines_not_just_first(tmp_path):
+    """A multi-paragraph body must be scanned in full — a leak on line 3 (not
+    the first line) is still caught. This is the precise property scan_diff
+    loses on prose."""
+    body = (
+        "## Summary\n"
+        "The digest table renders wrong when a cell has a pipe.\n"
+        "Seen live on 192.168.1.50 during testing.\n"
+        "## Steps\n"
+        "1. Add an inbox item with a `|`.\n"
+    )
+    r = sanitize.scan_prose(body, fingerprint_file=tmp_path / "no-fp.txt")
+    assert r.ok is False
+    assert any(
+        f.kind == FindingKind.PORTABILITY and f.line == 3 for f in r.blocking()
+    )
+
+
+def test_scan_prose_detect_secrets_missing_fails_closed(tmp_path):
+    """detect-secrets is the required floor — if the binary is absent, the
+    prose scan fails CLOSED (ok=False), never open."""
+    with patch.object(sanitize.shutil, "which", return_value=None):
+        r = sanitize.scan_prose(
+            "totally benign text", fingerprint_file=tmp_path / "no-fp.txt"
+        )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.SECRET for f in r.blocking())
+
+
+def test_scan_prose_missing_fingerprint_fails_closed(tmp_path):
+    """scan_prose is the TERMINAL egress guard (no CI backstop like scan_diff,
+    whose PR output CI re-scans), so a MISSING fingerprint file fails CLOSED —
+    install-specific literals cannot be scanned, so the draft must not egress."""
+    r = sanitize.scan_prose(
+        "totally benign text",
+        fingerprint_file=tmp_path / "does-not-exist.txt",
+    )
+    assert r.ok is False
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r.blocking())
+
+
+def test_scan_prose_detect_secrets_scan_error_fails_closed(tmp_path, monkeypatch):
+    """If the required detect-secrets floor ERRORS on a line (timeout / nonzero
+    exit), scan_prose fails CLOSED — the old `continue` was a fail-OPEN hole in
+    a fail-CLOSED component."""
+    import subprocess as _sp
+
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")
+
+    def boom(cmd, *a, **k):
+        if cmd and cmd[0] == "detect-secrets":
+            raise _sp.TimeoutExpired(cmd, 5)
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(sanitize.subprocess, "run", boom)
+    r = sanitize.scan_prose("a line that cannot be scanned", fingerprint_file=fp)
+    assert r.ok is False
+    assert any(
+        f.scanner == "detect-secrets" and f.detail == "scan_error" for f in r.blocking()
+    )
+
+
+def test_scan_prose_skips_diff_structural_scanners(tmp_path):
+    """scan_prose runs ONLY the raw-string detectors — the diff-structural
+    scanners (forbidden-path, gitignore, binary, size) are meaningless on prose
+    and must not run."""
+    fp = tmp_path / "fp.txt"
+    fp.write_text("")  # present-but-empty (missing file fails closed)
+    r = sanitize.scan_prose(
+        "A clean sentence about `parser.py`.", fingerprint_file=fp
+    )
+    assert r.ok is True
+    for structural in ("forbidden_paths", "gitignored_paths", "binary_check", "size_cap"):
+        assert structural not in r.scanners_run
+    # ...but the raw-string detectors DID run.
+    assert "portability" in r.scanners_run
+    assert "email_allowlist" in r.scanners_run
+    assert "detect-secrets" in r.scanners_run

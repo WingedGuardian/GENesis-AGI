@@ -64,7 +64,23 @@ DEFAULTS: dict[str, Any] = {
     "automation_denylist": [],
     # Loud-truncation cap: activity events processed per tick.
     "max_events_per_tick": 100,
+    # Account-level notifications lane — surfaces activity BEYOND the flagship
+    # deep-poll: @mentions of the owner anywhere, and responses on issues/PRs the
+    # owner authored on OTHER people's repos (their outbound contributions). The
+    # deep-poll already covers the owner's own repos, so `author`/`subscribed`
+    # items are filtered to NON-owned repos. reasons is the GitHub notification
+    # `reason` allowlist; everything else (ci_activity, subscribed-to-own, ...)
+    # is dropped.
+    "notifications": {
+        "enabled": True,
+        "reasons": ["mention", "team_mention", "author"],
+    },
 }
+
+# GitHub notification `reason`s that are only interesting on repos the owner does
+# NOT own (their outbound contributions) — an owner-repo `author`/`subscribed`
+# notification is self-activity the flagship deep-poll already records.
+OWNED_ONLY_NOTIFICATION_REASONS = frozenset({"author", "subscribed"})
 
 # Public: the settings-domain validator imports these to check knobs.
 INT_KNOBS = ("auto_select_cap", "auto_select_days", "max_events_per_tick")
@@ -135,3 +151,20 @@ def str_list(cfg: dict[str, Any], key: str) -> list[str]:
     if not isinstance(value, list):
         return []
     return [v for v in value if isinstance(v, str) and v.strip()]
+
+
+def notifications_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The notifications sub-config, damage-tolerant. Returns
+    ``{"enabled": bool, "reasons": set[str]}`` — a missing/corrupt sub-dict or an
+    empty/invalid ``reasons`` list falls back to DEFAULTS (never an empty
+    allowlist that would silently surface nothing OR everything)."""
+    raw = cfg.get("notifications")
+    if not isinstance(raw, dict):
+        raw = {}
+    reasons_raw = raw.get("reasons")
+    if not isinstance(reasons_raw, list):
+        reasons_raw = DEFAULTS["notifications"]["reasons"]
+    reasons = {r for r in reasons_raw if isinstance(r, str) and r.strip()}
+    if not reasons:
+        reasons = set(DEFAULTS["notifications"]["reasons"])
+    return {"enabled": bool(raw.get("enabled", True)), "reasons": reasons}

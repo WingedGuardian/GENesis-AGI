@@ -23,6 +23,7 @@ from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.cc.reflection_bridge._output import (
     format_topic_summary,
     route_deep_output,
+    salvage_deep_reflection_json,
     send_to_topic,
     store_reflection_output,
 )
@@ -100,6 +101,8 @@ class CCReflectionBridge:
         self._context_assembler: ContextAssembler | None = None
         self._topic_manager = None
         self._autonomous_dispatcher = None
+        # Model router (route_call) for the deep-reflection JSON salvage retry.
+        self._router = None
 
     # ── Injection setters (for late binding) ──────────────────────────
 
@@ -126,6 +129,11 @@ class CCReflectionBridge:
     def set_autonomous_dispatcher(self, dispatcher: object) -> None:
         """Set the API-first autonomous dispatch router."""
         self._autonomous_dispatcher = dispatcher
+
+    def set_router(self, router: object) -> None:
+        """Set the model router (route_call) used for the deep-reflection JSON
+        salvage retry. Optional — salvage no-ops when unset."""
+        self._router = router
 
     # ── Main reflection entry point ───────────────────────────────────
 
@@ -259,9 +267,44 @@ class CCReflectionBridge:
                 mcp_path = _mcp.build_mcp_config("reflection")
             else:
                 mcp_path = None
+            # Reflection sessions are READ-ONLY + observation-writing only. The
+            # denylist is the reliable scoping mechanism: --allowedTools is NOT a
+            # strict allowlist under --dangerously-skip-permissions (verified
+            # empirically 2026-08-07 — it left Bash available). Derived so future
+            # write tools are auto-denied; see build_reflection_disallowed.
+            reflection_disallowed = _mcp.build_reflection_disallowed()
+            # Fail-closed: if reflection MCP-config generation returned None, use the
+            # EMPTY config so strict_mcp_config (below) can't fall through to CC's
+            # default (user-scoped) MCP discovery — which would load servers (e.g.
+            # gitnexus, codebase-memory-mcp) whose write tools the genesis-only denylist
+            # does NOT cover.
+            if mcp_path is None:
+                mcp_path = _mcp.build_mcp_config("none")
         except Exception:
-            logger.warning("MCP config generation failed, using defaults", exc_info=True)
-            mcp_path = None
+            logger.warning(
+                "MCP/tool config generation failed, using fail-closed defaults",
+                exc_info=True,
+            )
+            # Fail closed: point at the EMPTY MCP config (with strict_mcp_config no other
+            # server can load) AND reuse the full built-in denylist + wildcard MCP denies
+            # (single source of truth — no drift from a hand-maintained literal).
+            from genesis.cc.session_config import (
+                _REFLECTION_DENY_BUILTINS,
+                _REFLECTION_MCP_SERVERS,
+            )
+            from genesis.env import repo_root
+
+            # Resolve the shipped empty MCP config by PATH (no dependency on the
+            # config builder succeeding), so mcp_config is a real empty config rather
+            # than None — avoids relying on the untested "--strict-mcp-config with no
+            # --mcp-config" combination.
+            try:
+                mcp_path = str(repo_root() / "config" / "no_mcp.json")
+            except Exception:
+                mcp_path = None  # last resort; strict_mcp_config still forces zero servers
+            reflection_disallowed = list(_REFLECTION_DENY_BUILTINS) + [
+                f"mcp__{server}__*" for server, _ in _REFLECTION_MCP_SERVERS
+            ]
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (reflection always emits text)
@@ -270,7 +313,12 @@ class CCReflectionBridge:
             timeout_s=_DEPTH_TIMEOUT_S.get(depth, 300),
             system_prompt=self._system_prompt_for_depth(depth),
             skip_permissions=True,
+            disallowed_tools=reflection_disallowed,
             mcp_config=mcp_path,
+            # ONLY the reflection MCP config's servers load — NOT the user-scoped
+            # servers in ~/.claude.json (--mcp-config is additive without this). Makes
+            # the genesis-only derived denylist authoritative. (Matches eval bench arms.)
+            strict_mcp_config=True,
             working_dir=background_session_dir(),
             stream_idle_timeout_ms=(
                 _DEPTH_TIMEOUT_S.get(depth, 300) * 1000
@@ -440,12 +488,36 @@ class CCReflectionBridge:
         except Exception:
             logger.debug("Corpus recording failed (table may not exist yet)", exc_info=True)
 
+        # 4c. Salvage: a DEEP session that ended in PROSE (no fenced JSON) fails
+        # both parse sites and silently discards its cognitive output (~40% of
+        # runs). Re-derive the structured JSON via one routed LLM call and use it
+        # for BOTH routing and the topic summary. The RAW output.text is kept in
+        # the corpus above for audit. Strictly additive: when no salvage is needed
+        # (already parseable) or salvage fails, deep_text stays output.text and
+        # behavior is unchanged.
+        deep_text = output.text
+        if depth == Depth.DEEP:
+            salvaged = await salvage_deep_reflection_json(output.text, self._router)
+            if salvaged is not None:
+                deep_text = salvaged
+                logger.info(
+                    "Deep reflection ended in prose — structured JSON re-derived via salvage"
+                )
+                if self._event_bus:
+                    from genesis.observability.types import Severity, Subsystem
+                    await self._event_bus.emit(
+                        Subsystem.REFLECTION, Severity.WARNING,
+                        "deep_reflection.salvaged",
+                        "Deep reflection ended in prose; structured JSON re-derived via salvage",
+                        depth=depth.value,
+                    )
+
         # 5. Route output
         routing_failed = False
         if self._output_router and depth == Depth.DEEP:
             try:
                 routing_summary = await route_deep_output(
-                    output.text, db=db, output_router=self._output_router,
+                    deep_text, db=db, output_router=self._output_router,
                     gathered_obs_ids=gathered_obs_ids,
                     gathered_surplus_ids=gathered_surplus_ids,
                     tick_signal_names=(
@@ -471,9 +543,11 @@ class CCReflectionBridge:
                 except Exception:
                     logger.warning("Failed to mark influenced observations", exc_info=True)
 
-        # 6. Send to topic — parsed-fields summary only, never raw output.text
+        # 6. Send to topic — parsed-fields summary only, never raw output.text.
+        # Use the salvaged JSON (deep_text) so a prose-ended deep reflection shows
+        # a real summary instead of the "not parseable" stub.
         await send_to_topic(
-            session_id, depth, format_topic_summary(depth, output),
+            session_id, depth, format_topic_summary(depth, output, text=deep_text),
             topic_manager=self._topic_manager,
         )
 

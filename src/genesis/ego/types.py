@@ -196,6 +196,21 @@ class EgoConfig:
     revalidation_interval_hours: dict = field(
         default_factory=lambda: {"critical": 6, "high": 48, "normal": 72, "low": 168}
     )
+    # Auto-table staleness window, per-urgency HOURS (critical 240=10d, high
+    # 336=14d, normal 504=21d, low 720=30d): how long a pending proposal may sit
+    # before auto_table_stale_proposals moves it to the recoverable 'tabled'
+    # cold lane (NOT deleted — the ego can un-table, and a still-relevant
+    # proposal is re-derived fresh next cycle). This is a BACKSTOP behind the
+    # reconcile cycle (which already withdraws stale/invalid proposals each
+    # pass), NOT the primary staleness mechanism — so windows sit generously
+    # ABOVE observed user decision-latency (median ~1-2d, tail to ~12d;
+    # 2026-08-06 review) to catch only the truly-abandoned, never to amputate the
+    # normal-cadence tail. Defaults-COMPLETE mapping (merged over defaults on
+    # load). Unranked proposals (never boarded) age out via a shorter floor (see
+    # the sweep's unranked_cap_hours).
+    auto_table_ttl_hours: dict = field(
+        default_factory=lambda: {"critical": 240, "high": 336, "normal": 504, "low": 720}
+    )
     # Additive ego autonomy — cap on ACTIVE goals in the genesis ego's OWN
     # lane (origin='genesis_ego'). Pausing frees a slot; the paused tail is
     # deliberately unbounded (user decision 2026-07-16) and reported in the

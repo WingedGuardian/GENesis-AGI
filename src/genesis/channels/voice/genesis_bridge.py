@@ -24,6 +24,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from genesis.channels.tts_config import SanitizationSettings, sanitize_for_speech
+
 if TYPE_CHECKING:
     from genesis.channels.voice.handler import VoiceConversationHandler
 
@@ -666,4 +668,10 @@ def _extract_voice_context(ek_text: str, max_chars: int = 500) -> str:
                 context_lines.append(clean)
 
     result = ". ".join(context_lines)
+    if result:
+        # Strip inline markdown (bold/links/inline-code) so the S2S model never
+        # vocalizes "star star" or a raw URL. Reuse the voice-channel sanitizer;
+        # disable its own truncation (max_chars=0) so the caller's max_chars
+        # stays authoritative.
+        result = sanitize_for_speech(result, SanitizationSettings(max_chars=0))
     return result[:max_chars] if result else ""

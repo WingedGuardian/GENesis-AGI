@@ -135,8 +135,10 @@ Review unresolved observations from the past 30 days that are:
 - Still potentially relevant to the user's life dimensions
 
 For each, evaluate:
-- **Still actionable?** If yes, create a follow-up via `follow_up_create` or
-  connect to an existing goal. This anchors the insight so it won't age out.
+- **Still actionable?** If yes, record it as an actionable-insight `observation`
+  (via `observation_write`) so the ego picks it up and can act on it. Reflection
+  does NOT create follow-ups — the follow-up board is reserved for foreground
+  (sanctioned) paths; an observation is reflection's channel for surfacing work.
 - **Stale or irrelevant?** Let it expire naturally. No action needed.
 - **Pattern emerging?** If multiple unanchored insights cluster around the
   same theme, create an `interaction_theme` observation to surface the pattern.
@@ -164,15 +166,18 @@ DROP IT. Stale claims that persist across cycles erode trust. Silence > noise.
 
 **Investigation protocol (MANDATORY before cognitive state regeneration):**
 
-You have full tool access. USE IT. Before accepting any claim, investigate:
+You have full READ tool access (query/status MCP tools, Read/Grep/WebSearch). USE
+IT. (Reflection is read-only — no Bash, no writes except observations.) Before
+accepting any claim, investigate:
 
 1. **Verify escalations**: If light reflection escalated an issue, do not take
    it at face value. Check `health_status`, `job_health`, or `subsystem_heartbeats`
    MCP tools to see the current state. If signals are normal, note "escalation
    not confirmed by current state" and do not propagate.
 2. **Verify carried-forward claims**: If the previous cognitive state asserts
-   "X is broken" or "Y is stale," check it yourself. Query the relevant MCP
-   tool or run a diagnostic command. If the condition has resolved, DROP IT.
+   "X is broken" or "Y is stale," check it yourself. Query the relevant
+   read-only MCP tool (e.g. `health_status`, `job_health`, `db_schema`). If the
+   condition has resolved, DROP IT.
 3. **Prune stale observations**: When reviewing observations for memory
    consolidation, actively PRUNE any whose claims are contradicted by what
    you find during investigation. Use "prune" memory operation with reason

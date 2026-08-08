@@ -1476,3 +1476,41 @@ class TestVoiceActValidator:
         assert _validate_voice_act({"mode": "bananas"})
         assert _validate_voice_act({"enabled": "false"})
         assert _validate_voice_act({"bogus": 1})
+
+
+class TestExtractVoiceContext:
+    """_extract_voice_context strips markdown so the S2S model never vocalizes
+    'star star' or a raw URL (regression for the identity-slice bold/link bug)."""
+
+    def test_strips_bold_inline_code_and_links(self):
+        from genesis.channels.voice.genesis_bridge import _extract_voice_context
+
+        ek = (
+            "### Active Context\n"
+            "- Shipping **the voice pipeline** and [the dashboard](https://example.test/x)\n"
+            "- Reviewing `the config` module\n"
+            "### Next Section\n"
+            "- Should be ignored\n"
+        )
+        out = _extract_voice_context(ek)
+        # No raw markdown reaches the S2S model.
+        assert "*" not in out
+        assert "](" not in out
+        assert "`" not in out
+        assert "https://" not in out
+        # Content words survive the strip.
+        assert "the voice pipeline" in out
+        assert "the dashboard" in out
+        # The following section is excluded.
+        assert "ignored" not in out
+
+    def test_plain_bullets_unchanged(self):
+        from genesis.channels.voice.genesis_bridge import _extract_voice_context
+
+        out = _extract_voice_context("### Active Context\n- First item\n- Second item\n")
+        assert out == "First item. Second item"
+
+    def test_empty_when_no_active_context(self):
+        from genesis.channels.voice.genesis_bridge import _extract_voice_context
+
+        assert _extract_voice_context("### Other\n- x\n") == ""

@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from genesis.memory import judgment
+
 logger = logging.getLogger(__name__)
 
 # Proven extraction pattern from SkillRefiner (src/genesis/learning/skills/refiner.py)
@@ -40,6 +42,25 @@ For each extraction, provide:
   - optionally add "confidence" (0.0-1.0) and "ambiguous": true when you
     are unsure the two names refer to distinct known things
 - temporal: Date or time reference if mentioned (ISO format preferred)
+- speech_act: What KIND of statement this is (its force):
+  - "rule" — a standing directive/policy ("always X", "never Y", "must Z")
+  - "decision" — a settled choice ("we'll use X", "going with Y")
+  - "correction" — fixing a prior mistaken belief ("actually it's X, not Y")
+  - "observation" — a neutral noted fact (DEFAULT when unsure)
+  - "claim" — an asserted belief that could be contested
+  - "preference" — a like/dislike/leaning ("I prefer X")
+  - "question" — an open question
+  (type=decision usually implies speech_act="decision"; a governing rule ⇒ "rule")
+- speech_act_confidence: 0.0-1.0 — how sure you are of the speech_act label
+- provenance: WHO asserted this — "user" (the user stated it), "external"
+  (quoted from a source/doc/third party), or "self_inference" (Genesis inferred
+  it rather than being directly told). Omit if unclear.
+- durability: "permanent" (a lasting truth/rule/decision — DEFAULT) or
+  "temporary" (transient context that will go stale, e.g. "waiting on CI",
+  "currently debugging X"). Only mark "temporary" when it will clearly stop
+  being relevant — a wrong "temporary" causes the memory to be forgotten.
+- expires_at: for "temporary" only — ISO date/time it stops being relevant, if
+  known (otherwise omit)
 
 For each extraction that has a temporal reference AND describes a concrete
 action (something that happened, was decided, or will happen), additionally
@@ -109,6 +130,10 @@ Respond with a JSON object inside backticks containing:
         {"from": "Agentmail", "to": "P-3", "type": "categorized_as"}
       ],
       "temporal": "2026-03-17",
+      "speech_act": "claim",
+      "speech_act_confidence": 0.8,
+      "provenance": "external",
+      "durability": "permanent",
       "event": {"subject": "Genesis", "verb": "evaluated", "object": "Agentmail"}
     },
     {
@@ -168,6 +193,15 @@ class Extraction:
     event_subject: str | None = None
     event_verb: str | None = None
     event_object: str | None = None
+    # MW-1 Tier-0 judgment axes — WRITE-ONLY (consumers = MW-4 ranking/TTL,
+    # MW-5 protection). See memory/judgment.py. speech_act/durability default
+    # to the neutral, unprotected/non-expiring values; assertion_provenance and
+    # expires_at default NULL = unclassified.
+    speech_act: str = "observation"
+    speech_act_confidence: float = 0.5
+    assertion_provenance: str | None = None
+    durability: str = "permanent"
+    expires_at: str | None = None
 
 
 @dataclass
@@ -320,6 +354,17 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
         if scenario is not None:
             scenario = str(scenario).strip() or None
 
+        # MW-1 Tier-0 judgment axes — normalized to known values, defaulting
+        # SAFE (unknown speech_act → observation/unprotected; unknown durability
+        # → permanent/non-expiring; unknown provenance → None). See judgment.py.
+        speech_act = judgment.normalize_speech_act(item.get("speech_act"))
+        speech_act_confidence = judgment.clamp_unit(item.get("speech_act_confidence"))
+        assertion_provenance = judgment.normalize_provenance(item.get("provenance"))
+        durability = judgment.normalize_durability(item.get("durability"))
+        expires_at = item.get("expires_at")
+        if expires_at is not None:
+            expires_at = str(expires_at).strip() or None
+
         extractions.append(Extraction(
             content=content,
             extraction_type=ext_type,
@@ -331,6 +376,11 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
             event_subject=event_subject,
             event_verb=event_verb,
             event_object=event_object,
+            speech_act=speech_act,
+            speech_act_confidence=speech_act_confidence,
+            assertion_provenance=assertion_provenance,
+            durability=durability,
+            expires_at=expires_at,
         ))
 
     return ParsedResponse(
@@ -371,4 +421,10 @@ def extractions_to_store_kwargs(
         "extraction_timestamp": now_iso,
         "source_pipeline": "harvest",
         "valid_at": extraction.temporal,
+        # MW-1 Tier-0 judgment axes — write-only (consumers MW-4/MW-5).
+        "speech_act": extraction.speech_act,
+        "speech_act_confidence": extraction.speech_act_confidence,
+        "assertion_provenance": extraction.assertion_provenance,
+        "durability": extraction.durability,
+        "expires_at": extraction.expires_at,
     }

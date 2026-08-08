@@ -46,6 +46,10 @@ async def init(rt: GenesisRuntime) -> None:
         rt._cc_reflection_bridge.set_output_router(output_router)
         if hasattr(rt, "_context_assembler") and rt._context_assembler is not None:
             rt._cc_reflection_bridge.set_context_assembler(rt._context_assembler)
+        # Router for the deep-reflection JSON salvage retry (optional — salvage
+        # no-ops if unset). rt._router is initialized before reflection.
+        if getattr(rt, "_router", None) is not None:
+            rt._cc_reflection_bridge.set_router(rt._router)
         rt._output_router = output_router
 
         rt._reflection_scheduler = ReflectionScheduler(

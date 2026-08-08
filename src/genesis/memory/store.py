@@ -127,6 +127,11 @@ class MemoryStore:
         project_type: str | None = None,
         supersedes: str | None = None,
         origin_class: str | None = None,
+        speech_act: str | None = None,
+        speech_act_confidence: float | None = None,
+        assertion_provenance: str | None = None,
+        durability: str | None = None,
+        expires_at: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -375,6 +380,18 @@ class MemoryStore:
             invalid_at=invalid_at,
             source_subsystem=source_subsystem,
             origin_class=resolved_origin,
+            # MW-1 Tier-0 judgment axes — write-only to memory_metadata
+            # (consumers MW-4/MW-5). NOT denormalized into the Qdrant payload:
+            # the field is reachable at recall via the search_ranked metadata
+            # join (as origin_class's FTS fallback is), and a consumer that
+            # needs vector-path parity owns adding it to the payload + the
+            # re-embed recovery path together.
+            # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-5-speech-act-protection)
+            speech_act=speech_act,
+            speech_act_confidence=speech_act_confidence,
+            assertion_provenance=assertion_provenance,
+            durability=durability,
+            expires_at=expires_at,
         )
 
         # Mechanical code anchors (entity layer) — regex-only, every write

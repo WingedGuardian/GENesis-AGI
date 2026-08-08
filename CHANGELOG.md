@@ -11,6 +11,65 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **GitHub steward now surfaces responses to your upstream contributions.** Beyond
+  the flagship-repo deep-poll, the account-activity monitor gained an account-level
+  notifications lane: it pings you when someone @mentions you on any repo, or
+  responds on an issue/PR you filed on another project's repo (your outbound
+  contributions — the flagship deep-poll can't see those). Tunable via the
+  `notifications` reason-allowlist in `github_steward.yaml`; respects the same
+  `off`/`observe`/`live` lever and pings immediately in `live`.
+
+### Changed
+
+- **Reflection sessions are now strictly read-only.** Genesis's autonomous
+  background reflections (deep/strategic) can read freely to investigate, but can
+  no longer call any write or action tool — their only output is observations (and
+  the structured reflection result the system parses). Previously reflections ran
+  with unrestricted tool access and could, in rare cases, mint a follow-up or other
+  write from ungrounded reasoning. Relatedly, any follow-up created by an
+  autonomous/dispatched session now lands in the recoverable *tabled* lane for
+  review rather than directly on the actionable follow-up board — the board stays
+  reserved for your (foreground) work. A foreground session can promote a tabled
+  item to the board.
+
+- **Free-tier model refresh.** Groq is retiring Llama 3.3 70B (the model behind
+  several of Genesis's free reasoning/extraction/tagging steps) on 2026-08-16, so
+  those steps now use Groq's recommended replacement, gpt-oss-120b. Structured-output
+  and extraction quality are unchanged; triage-depth labeling may shift by about one
+  level on some items. No action needed on your end.
+
+- **Stale ego proposals get tabled on a generous backstop.** Ego proposals you
+  haven't acted on move to the recoverable *tabled* lane on a per-urgency
+  schedule (roughly 10 days for critical up to 30 for low) — a backstop behind
+  the ego's ongoing reconcile review, tuned to sit well past normal decision
+  time so it only clears the genuinely-forgotten. Tabling is reversible, never
+  deletion.
+
+### Fixed
+
+- **A "free" fallback model that was quietly a paid one.** An OpenRouter fallback
+  used by several background steps was labeled free but pointed at a paid model, so
+  on the rare occasions it was reached it could incur spend that Genesis recorded as
+  $0. It now uses a curated pool of genuinely-free models with automatic failover,
+  and Genesis warns at startup if any provider marked "free" actually points at a
+  paid model — so cost tracking can't silently miss real spend. No action needed on
+  your end.
+
+### Added
+
+- **Contributor Work-Log — a curated supply of newcomer-friendly public issues.**
+  Genesis can now turn items from its own backlog or a codebase scan into public
+  GitHub issues for contributors to pick up — but never on its own say-so. Each
+  draft is sanitized server-side (a fail-closed scan of the title, body, *and*
+  labels blocks anything that looks like a private address, path, or secret) and
+  then held for your per-item approval on the dashboard; batch "approve all"
+  deliberately skips these, so every public post is an individual decision. It
+  ships in `propose_only` mode: drafts are proposed and approved but never
+  actually posted (dry-run) until you flip `mode: live` in a
+  `config/contributor_worklog.local.yaml` overlay. Once live, an approved draft
+  posts via `gh issue create`, de-duplicated against already-open issues so a
+  retry can't double-post. Kill switch: `GENESIS_CONTRIBUTOR_WORKLOG_DISABLED=1`.
+
 - **GitHub activity notifications.** Genesis now watches your active GitHub repos
   every couple of hours and pings you on Telegram when an *external* contributor
   opens their first PR/issue, comments, starts a discussion, or replies on one —
@@ -26,6 +85,34 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   ticks that actually have new activity — quiet windows spawn nothing.
 
 ### Fixed
+
+- **Replying "yes" to an approval topic no longer starts a confused new chat.**
+  If you replied "yes"/"approve" to the *topic itself* (the forum topic header)
+  instead of the specific approval/proposal/content message, Genesis got no
+  context and spun up a fresh conversation that answered "I don't have anything
+  to confirm — what are you saying yes to?". It now recognizes that case and
+  asks you to reply to the specific message (or tap its ✅ button) rather than
+  guessing — it deliberately won't act on an ambiguous topic-level reply.
+
+- **Deep reflections no longer silently lose their output.** When a deep
+  reflection ended its session with a plain-prose wrap-up instead of the
+  required structured JSON (~40% of runs), both parsers failed: the Telegram
+  topic showed a "not parseable" stub and — worse — that cycle's cognitive
+  output (updated context summary, observations, memory consolidations, and
+  follow-up research it wanted to queue) was discarded. Genesis now re-derives
+  the structured result from the prose in one follow-up model call, so the
+  reflection's findings are kept and the topic shows a real summary. If the
+  salvage can't recover valid output, behavior is unchanged from before.
+
+- **Engagement rate now measures real outreach, not your own approval pings.**
+  The "N sent / X% engagement" figure counted every internal Telegram message
+  Genesis sends *you* — approval prompts, the morning digest, blockers, alerts,
+  surplus research posts — as "outreach," so the denominator filled with
+  housekeeping and the engagement rate read near-zero even when genuine posts got
+  normal reactions. It now counts only messages sent to the outside world (your
+  external channels — Discord, email, and the like — rather than your own
+  Telegram), so the rate (on the dashboard, in the awareness signal, and in
+  reflection) reflects how your actual outreach is landing.
 
 - **Email replies now count as engagement.** When someone replies to an email
   Genesis sent (outreach pitch, follow-up), the reply was recorded for thread
