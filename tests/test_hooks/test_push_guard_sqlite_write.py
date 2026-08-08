@@ -65,6 +65,23 @@ class TestRealWritesStillBlocked:
     def test_drop_trigger(self):
         assert _is_write('sqlite3 db.sqlite "DROP TRIGGER trg_t"')
 
+    def test_insert_with_block_comment_between_tokens(self):
+        # SQLite allows a comment between statement tokens — must still block.
+        assert _is_write('sqlite3 db.sqlite "INSERT /* hi */ INTO t VALUES (1)"')
+
+    def test_delete_with_block_comment(self):
+        assert _is_write('sqlite3 db.sqlite "DELETE /* c */ FROM t"')
+
+    def test_drop_with_block_comment(self):
+        assert _is_write('sqlite3 db.sqlite "DROP /* c */ TABLE t"')
+
+    def test_insert_with_line_comment(self):
+        assert _is_write('sqlite3 db.sqlite "INSERT --oops\nINTO t VALUES (1)"')
+
+    def test_update_with_comment_containing_semicolon(self):
+        # A `;` inside a comment before SET must not defeat the UPDATE branch.
+        assert _is_write('sqlite3 db.sqlite "UPDATE t /* ; */ SET x = 1"')
+
     def test_python_sqlite_write(self):
         assert _is_write(
             "python3 -c \"import sqlite3; sqlite3.connect('d').execute('INSERT INTO t VALUES (1)')\""

@@ -554,19 +554,26 @@ _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
 # matches (writes always carry the accompanying keyword), so this cannot open a
 # bypass — it only removes false positives. Detection stays on the WHOLE command
 # (not per-segment) ON PURPOSE, so a heredoc/`bash -c`/wrapper that fragments the
-# invocation across segments cannot hide the write. The UPDATE gap uses `[^;]`
-# (not `[^;'"]`) so a quoted identifier (`UPDATE "t" SET …`) is still caught; the
-# gap is bounded and lazy (no catastrophic backtracking). The 200-char bound is a
-# deliberate practicality tradeoff: a real `UPDATE <table> SET` gap is tiny, so
-# the cap only fails to match contrived padding (a 200+ char comment between the
-# keywords) that no accidental agent command produces.
+# invocation across segments cannot hide the write.
+#
+# The gap between the two keyword tokens is `_TOK_GAP` — whitespace OR a SQLite
+# comment (`/* … */` or `-- … EOL`) — because SQLite permits a comment between
+# statement tokens (`INSERT /*c*/ INTO t`, `DROP /*c*/ TABLE t`); matching only
+# `\s+` there would let a commented write slip past the guard. The UPDATE branch
+# allows any bounded run (incl. quotes, comments, and `;` inside a comment) up to
+# SET, so `UPDATE "t" SET …` and `UPDATE t /* ; */ SET …` are still caught; the
+# 400-char lazy bound keeps it linear (no catastrophic backtracking) and only
+# fails on contrived padding no accidental agent command produces.
+_TOK_GAP = r"(?:\s|/\*[\s\S]*?\*/|--[^\n]*)+"
 _DML_STATEMENT_RE = re.compile(
-    r"(?:\bINSERT\s+(?:INTO|OR)\b"
-    r"|\bREPLACE\s+INTO\b"
-    r"|\bUPDATE\b[^;]{0,200}?\bSET\b"
-    r"|\bDELETE\s+FROM\b"
-    r"|\bDROP\s+(?:TABLE|INDEX|VIEW|TRIGGER)\b"
-    r"|\bALTER\s+(?:TABLE|INDEX|VIEW)\b)",
+    "(?:"
+    r"\bINSERT\b" + _TOK_GAP + r"(?:INTO|OR)\b"
+    r"|\bREPLACE\b" + _TOK_GAP + r"INTO\b"
+    r"|\bUPDATE\b[\s\S]{0,400}?\bSET\b"
+    r"|\bDELETE\b" + _TOK_GAP + r"FROM\b"
+    r"|\bDROP\b" + _TOK_GAP + r"(?:TABLE|INDEX|VIEW|TRIGGER)\b"
+    r"|\bALTER\b" + _TOK_GAP + r"(?:TABLE|INDEX|VIEW)\b"
+    ")",
     re.IGNORECASE,
 )
 
