@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import aiosqlite
 import pytest
 
+from genesis.db.crud import outreach as outreach_crud
 from genesis.db.schema import create_all_tables, seed_data
 from genesis.reflection.context_gatherer import ContextGatherer
 
@@ -266,3 +267,36 @@ class TestCostSummaryRemoved:
         """Cost summary fully removed from ContextBundle."""
         bundle = await gatherer.gather(db)
         assert not hasattr(bundle, "cost_summary")
+
+
+class TestEngagementByCategoryExcludesOwner:
+    @pytest.mark.asyncio
+    async def test_owner_channels_excluded_from_category_breakdown(self, db, gatherer):
+        """_engagement_by_category must exclude owner-facing channels, matching
+        _outreach_stats — otherwise self-assessment sees an external-only rate
+        beside an owner-polluted category view (contradictory evidence). An
+        external discord 'content' engagement stays; an owner telegram 'approval'
+        engagement is dropped."""
+        now = datetime.now(UTC).isoformat()
+        await outreach_crud.create(
+            db, id="ext-c", signal_type="content", topic="post",
+            category="content", salience_score=0.8, channel="discord",
+            message_content="Shipped X", created_at=now,
+        )
+        await outreach_crud.record_delivery(db, "ext-c", delivered_at=now)
+        await outreach_crud.record_engagement(
+            db, "ext-c", engagement_outcome="useful", engagement_signal="user_reply",
+        )
+        await outreach_crud.create(
+            db, id="own-a", signal_type="approval", topic="A",
+            category="approval", salience_score=0.8, channel="telegram",
+            message_content="Approve?", created_at=now,
+        )
+        await outreach_crud.record_delivery(db, "own-a", delivered_at=now)
+        await outreach_crud.record_engagement(
+            db, "own-a", engagement_outcome="acted_on", engagement_signal="user_reply",
+        )
+
+        result = await gatherer._engagement_by_category(db)
+        assert "content" in result
+        assert "approval" not in result
