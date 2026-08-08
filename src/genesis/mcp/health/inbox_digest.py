@@ -97,6 +97,11 @@ async def _impl_inbox_digest(
         return {"error": f"Failed to generate inbox digest: {exc}"}
 
 
+def _cell(value: str) -> str:
+    """Escape a value so it stays inside one Markdown table cell."""
+    return value.replace("\n", " ").replace("|", "\\|")
+
+
 def _format_digest(
     pending: list[dict],
     resolved: list[dict],
@@ -118,7 +123,7 @@ def _format_digest(
             priority = fu.get("priority", "medium")
             content = fu.get("content", "")[:120]
             strategy = fu.get("strategy", "")
-            lines.append(f"| {priority} | {content} | {strategy} |")
+            lines.append(f"| {priority} | {_cell(content)} | {_cell(strategy)} |")
         lines.append("")
 
     # Pending ideas (surplus-ideation review lane)
@@ -130,7 +135,7 @@ def _format_digest(
         for fu in ideas:
             content = fu.get("content", "")[:120]
             src = fu.get("source", "")
-            lines.append(f"| {content} | {src} |")
+            lines.append(f"| {_cell(content)} | {_cell(src)} |")
         lines.append("")
 
     # Resolved items
@@ -144,7 +149,7 @@ def _format_digest(
             notes = (fu.get("resolution_notes") or "—")[:80]
             completed_at = fu.get("completed_at", "")
             age = _relative_age(completed_at)
-            lines.append(f"| {content} | {notes} | {age} |")
+            lines.append(f"| {_cell(content)} | {_cell(notes)} | {age} |")
         lines.append("")
 
     # Recent evaluations
@@ -162,7 +167,7 @@ def _format_digest(
             date = (ev.get("processed_at") or ev.get("created_at") or "")[:10]
             source_file = Path(ev.get("file_path", "")).name
             response = Path(ev.get("response_path", "")).name if ev.get("response_path") else "—"
-            lines.append(f"| {date} | {source_file} | {response} |")
+            lines.append(f"| {date} | {_cell(source_file)} | {_cell(response)} |")
         lines.append("")
 
     if not pending and not resolved and not evals and not ideas:
