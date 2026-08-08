@@ -1209,7 +1209,19 @@ TABLES = {
             trust_level      TEXT,
             attribution      TEXT,
             origin_ref       TEXT,
-            capture_clarity  REAL
+            capture_clarity  REAL,
+            -- GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl /
+            -- mw-5-speech-act-protection): MW-1 Tier-0 extraction judgment axes,
+            -- written WRITE-ONLY at extraction time — NOTHING reads them yet.
+            -- All NULLable with NO default: expiry is strictly opt-in
+            -- (durability='temporary' + an elapsed expires_at only), so an
+            -- unclassified row NEVER expires. Contract in memory/judgment.py;
+            -- added to existing DBs by migration 0079.
+            speech_act            TEXT,
+            speech_act_confidence REAL,
+            assertion_provenance  TEXT,
+            durability            TEXT,
+            expires_at            TEXT
         )
     """,
     "graduation_events": """

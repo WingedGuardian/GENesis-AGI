@@ -339,6 +339,11 @@ async def create_metadata(
     invalid_at: str | None = None,
     source_subsystem: str | None = None,
     origin_class: str | None = None,
+    speech_act: str | None = None,
+    speech_act_confidence: float | None = None,
+    assertion_provenance: str | None = None,
+    durability: str | None = None,
+    expires_at: str | None = None,
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id.
 
@@ -352,6 +357,12 @@ async def create_metadata(
     (owner/first_party/external_untrusted), derived in
     ``MemoryStore.store()``; NULL = legacy/unclassified (gates treat it
     fail-closed at gate time).
+    ``speech_act`` / ``speech_act_confidence`` / ``assertion_provenance`` /
+    ``durability`` / ``expires_at`` are the MW-1 Tier-0 extraction judgment
+    axes — WRITE-ONLY (no reader yet). NULL = unclassified; expiry is opt-in
+    (``durability='temporary'`` + an elapsed canonicalized ``expires_at``
+    only). Contract in ``memory/judgment.py``.
+    # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-5-speech-act-protection)
     """
     # Bitemporal columns are raw TEXT-compared everywhere — canonicalize
     # at the write gate. Unparseable valid_at (LLM temporal strings like
@@ -363,8 +374,9 @@ async def create_metadata(
         "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem, "
-        "origin_class) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "origin_class, speech_act, speech_act_confidence, assertion_provenance, "
+        "durability, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             memory_id,
             created_at,
@@ -378,6 +390,11 @@ async def create_metadata(
             canonical_iso(invalid_at),
             source_subsystem,
             origin_class,
+            speech_act,
+            speech_act_confidence,
+            assertion_provenance,
+            durability,
+            canonical_iso(expires_at),
         ),
     )
     await db.commit()
