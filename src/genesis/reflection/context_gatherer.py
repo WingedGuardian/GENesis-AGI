@@ -334,15 +334,22 @@ class ContextGatherer:
             return {"note": "no outreach data yet"}
 
     async def _engagement_by_category(self, db: aiosqlite.Connection) -> dict:
-        """30-day engagement feedback by category for Deep reflection context."""
+        """30-day EXTERNAL engagement feedback by category for Deep reflection context.
+
+        Excludes owner-facing channels (same predicate as ``_outreach_stats``) so
+        the category breakdown stays consistent with the external-only calibration
+        beside it — otherwise self-assessment gets contradictory evidence (an
+        external-only rate next to an owner-polluted category view).
+        """
         try:
             cursor = await db.execute(
-                "SELECT category, engagement_outcome, COUNT(*) as cnt "
-                "FROM outreach_history "
-                "WHERE engagement_outcome IS NOT NULL "
-                "  AND engagement_outcome != 'ignored' "
-                "  AND created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-30 days') "
-                "GROUP BY category, engagement_outcome"
+                f"SELECT category, engagement_outcome, COUNT(*) as cnt "  # noqa: S608 - trusted module constant
+                f"FROM outreach_history "
+                f"WHERE engagement_outcome IS NOT NULL "
+                f"  AND engagement_outcome != 'ignored' "
+                f"  AND channel NOT IN ({_OWNER_CHANNELS}) "
+                f"  AND created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-30 days') "
+                f"GROUP BY category, engagement_outcome"
             )
             rows = await cursor.fetchall()
             if not rows:

@@ -125,6 +125,50 @@ async def test_owner_channel_excluded_from_denominator(db):
 
 
 @pytest.mark.asyncio
+async def test_get_engagement_stats_excludes_owner_channels(db):
+    """get_engagement_stats feeds the morning report AND governance's
+    engagement_throttle (ignore_rate = ignored/total). Owner-facing channels
+    (telegram approvals, voice notifications) must be excluded or the owner
+    ignoring their own pings would inflate the ignore-rate and wrongly throttle
+    genuine external outreach. One external discord reply + three ignored
+    telegram approvals + one ignored voice ping → total=1, engaged=1, ignored=0."""
+    now = datetime.now(UTC).isoformat()
+    await outreach_crud.create(
+        db, id="ext-0", signal_type="content", topic="post",
+        category="content", salience_score=0.8, channel="discord",
+        message_content="Shipped X", created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "ext-0", delivered_at=now)
+    await outreach_crud.record_engagement(
+        db, "ext-0", engagement_outcome="useful", engagement_signal="user_reply",
+    )
+    for i in range(3):
+        await outreach_crud.create(
+            db, id=f"tg-{i}", signal_type="approval", topic=f"A{i}",
+            category="approval", salience_score=0.8, channel="telegram",
+            message_content="Approve?", created_at=now,
+        )
+        await outreach_crud.record_delivery(db, f"tg-{i}", delivered_at=now)
+        await outreach_crud.record_engagement(
+            db, f"tg-{i}", engagement_outcome="ignored", engagement_signal="timeout",
+        )
+    await outreach_crud.create(
+        db, id="vc-0", signal_type="notification", topic="chime",
+        category="notification", salience_score=0.8, channel="voice",
+        message_content="Heads up", created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "vc-0", delivered_at=now)
+    await outreach_crud.record_engagement(
+        db, "vc-0", engagement_outcome="ignored", engagement_signal="timeout",
+    )
+
+    stats = await outreach_crud.get_engagement_stats(db, days=7)
+    assert stats["total"] == 1
+    assert stats["engaged"] == 1
+    assert stats["ignored"] == 0
+
+
+@pytest.mark.asyncio
 async def test_email_notification_counts_as_external(db):
     """An email-channel 'notification' is a genuine PROSPECT reply, not owner
     housekeeping (MAIL_REPLY.md). Category alone would wrongly exclude it as
