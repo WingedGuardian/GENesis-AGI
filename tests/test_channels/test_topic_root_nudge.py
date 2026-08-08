@@ -90,3 +90,23 @@ async def test_nudge_skips_non_decision_topic():
     with _patch_topics(THREADS):
         assert await _try_topic_root_decision_nudge(MagicMock(), msg) is False
     msg.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "yes, but shorten the title",
+        "no, what alternatives do we have?",
+        "ok change the wording though",
+    ],
+)
+async def test_nudge_skips_decision_prefixed_substantive_reply(text):
+    """A decision-token PREFIX followed by a real instruction must fall through
+    to conversation, NOT be swallowed by the nudge. The nudge uses the
+    whole-message matcher, so only a standalone bare decision triggers it —
+    the leading-token matcher would wrongly consume the instruction here."""
+    msg = _msg(text, 100, 100)  # topic-root reply in the Approvals topic
+    with _patch_topics(THREADS):
+        assert await _try_topic_root_decision_nudge(MagicMock(), msg) is False
+    msg.reply_text.assert_not_called()

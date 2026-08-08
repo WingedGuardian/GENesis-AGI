@@ -22,7 +22,7 @@ from genesis.channels.telegram._handler_helpers import (
 )
 from genesis.channels.telegram.transport.streaming import DraftStreamer, generate_draft_id
 from genesis.channels.telegram.transport.update_dedupe import message_key
-from genesis.util.approval_words import scoped_decision
+from genesis.util.approval_words import phrase_decision, scoped_decision
 
 if TYPE_CHECKING:
     from genesis.channels.telegram._handler_context import HandlerContext
@@ -1254,7 +1254,11 @@ async def _try_topic_root_decision_nudge(ctx: HandlerContext, msg) -> bool:
     True if the message was consumed (caller should return early)."""
     if not _is_topic_root_reply(msg) or not msg.text:
         return False
-    if _bare_decision(msg.text) is None:
+    # Whole-message matcher (NOT the leading-token _bare_decision): a topic-root
+    # reply is not scoped to any item, so "yes, but shorten the title" / "no, what
+    # else?" carry a real instruction that must fall through to conversation — only
+    # a standalone bare decision ("yes"/"approve"/👍) should trigger the nudge.
+    if phrase_decision(msg.text) is None:
         return False
     thread_id = getattr(msg, "message_thread_id", None)
     try:
