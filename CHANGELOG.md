@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Reflection sessions are now strictly read-only.** Genesis's autonomous
+  background reflections (deep/strategic) can read freely to investigate, but can
+  no longer call any write or action tool — their only output is observations (and
+  the structured reflection result the system parses). Previously reflections ran
+  with unrestricted tool access and could, in rare cases, mint a follow-up or other
+  write from ungrounded reasoning. Relatedly, any follow-up created by an
+  autonomous/dispatched session now lands in the recoverable *tabled* lane for
+  review rather than directly on the actionable follow-up board — the board stays
+  reserved for your (foreground) work. A foreground session can promote a tabled
+  item to the board.
+
 - **Free-tier model refresh.** Groq is retiring Llama 3.3 70B (the model behind
   several of Genesis's free reasoning/extraction/tagging steps) on 2026-08-16, so
   those steps now use Groq's recommended replacement, gpt-oss-120b. Structured-output

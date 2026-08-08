@@ -14,6 +14,108 @@ from genesis.mcp.health import follow_up_tools
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _foreground_by_default(monkeypatch):
+    """Pin source='foreground_session' by default so tests are deterministic
+    regardless of the runner's env (a CC session sets GENESIS_CC_SESSION=1 on
+    children, which would otherwise flip source→ego_dispatch and route to tabled).
+    Tests that want the autonomous path set the env explicitly."""
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+
+
+# ─── sacred-board source authorization (autonomous → tabled) ─────────────────
+
+
+async def test_autonomous_dispatch_routed_to_cold_lane(db, monkeypatch):
+    """An autonomous/dispatched CC session's LLM-authored follow-up is forced to
+    the COLD tabled lane even when its work_state would be 'ready' — the hot board
+    is reserved for sanctioned (foreground) paths. Root-cause fix for 030e6ddc."""
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_create(
+            content="an autonomously-suggested task the dispatched session invented",
+            reason="autonomous session proposed it",
+            strategy="ego_judgment",
+            work_state="ready",  # would be hot 'follow_up' from a foreground session
+        )
+    assert res["kind"] == "tabled", res
+    row = await follow_ups.get_by_id(db, res["id"])
+    assert row["kind"] == "tabled"
+    assert row["source"] == "ego_dispatch"
+    # not on the actionable board
+    actionable = await follow_ups.get_actionable(db, limit=50)
+    assert all(r["id"] != res["id"] for r in actionable)
+    assert "cold" in res["message"].lower() or "tabled" in res["message"].lower()
+
+
+async def test_autonomous_cannot_promote_off_tabled_via_update(db, monkeypatch):
+    """The sacred-board guarantee must hold at UPDATE time too: an autonomous
+    session cannot flip a tabled item back onto the hot board via follow_up_update
+    (the create→tabled→update(ready) bypass). Foreground promotion still works."""
+    # Foreground creates a tabled item.
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="cold item",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="deferred_cold",
+        )
+    fid = created["id"]
+    assert created["kind"] == "tabled"
+
+    # Autonomous session tries to promote it to the board → blocked, stays tabled.
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_update(
+            follow_up_id=fid,
+            work_state="ready",
+        )
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["kind"] == "tabled", (res, row["kind"])
+
+    # A foreground session CAN promote it.
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        await follow_up_tools._impl_follow_up_update(follow_up_id=fid, work_state="ready")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["kind"] == "follow_up"
+
+
+async def test_autonomous_reaffirm_of_board_item_does_not_demote(db, monkeypatch):
+    """The update gate fires only on a genuine off-board→board PROMOTION. An autonomous
+    session re-affirming an already-on-board item (work_state='ready' on an existing
+    kind='follow_up', e.g. bumping priority) must NOT silently demote it to tabled."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        created = await follow_up_tools._impl_follow_up_create(
+            content="board item",
+            reason="r",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+    fid = created["id"]
+    assert created["kind"] == "follow_up"
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        await follow_up_tools._impl_follow_up_update(follow_up_id=fid, work_state="ready")
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["kind"] == "follow_up", "autonomous re-affirm must not demote a board item"
+
+
+async def test_foreground_ready_stays_on_the_board(db):
+    """A foreground session's 'ready' follow-up lands on the hot board (unchanged)."""
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        res = await follow_up_tools._impl_follow_up_create(
+            content="fix the thing the user asked for",
+            reason="user asked",
+            strategy="ego_judgment",
+            work_state="ready",
+        )
+    assert res["kind"] == "follow_up", res
+    row = await follow_ups.get_by_id(db, res["id"])
+    assert row["kind"] == "follow_up"
+    assert row["source"] == "foreground_session"
+
+
 # ─── work_state → kind derivation (create) ───────────────────────────────────
 
 

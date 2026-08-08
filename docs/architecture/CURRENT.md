@@ -194,8 +194,26 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 0a3fc19d 2026-07-23
+verified: 5dcd9fd4 2026-08-07
 ```
+
+- **Reflection tool lockdown — read-only + observations only**
+  (`session_config.build_reflection_disallowed`, wired at `reflection_bridge/_bridge.py`
+  into the reflection `CCInvocation.disallowed_tools`). Deep/strategic reflections run
+  with a DERIVED denylist = (live `genesis-health` + `genesis-memory` registry − a read
+  allowlist − `observation_write`) + the write/action built-ins (Bash/Write/Edit/Task/
+  Workflow/Skill/…), so a future write tool is auto-denied. `--allowedTools` is NOT a
+  strict allowlist under `--dangerously-skip-permissions` (verified empirically 2026-08-07
+  via the init-event tool list — it left Bash available); only `--disallowedTools` removes
+  a tool, so the scoping is a denylist. Guards (`tests/test_cc/test_reflection_tool_scope.py`):
+  a sentinel asserts known write tools stay denied, a static AST scan rejects any
+  write-shaped tool in the read-allowlist, and a fail-closed check confirms every
+  registered tool is read-allowed or denied (a new upstream tool is auto-denied by the
+  derivation). Reflection previously bypassed
+  all tool scoping (the orphaned `build_reflection_config`/`_READONLY_DISALLOWED` was never
+  wired) — root cause of a 2026-07-03 fabricated follow-up. Sacred-board companion: an
+  autonomous/dispatched session's `follow_up_create` (source=`ego_dispatch`) is routed to
+  the cold `tabled` lane, never the hot board (`mcp/health/follow_up_tools.py`).
 
 - `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split
   candidates). Profile machinery: `PROFILES`, `_PROFILE_ADDENDA`,
