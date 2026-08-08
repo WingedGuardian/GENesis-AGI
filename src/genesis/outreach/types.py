@@ -102,14 +102,16 @@ MECHANICAL_ENGAGEMENT_SIGNALS_SQL_IN: str = ", ".join(
 # email (MAIL_REPLY.md); 'content' spans Discord posts (external) and Telegram
 # content-review drafts (owner-facing). But every message Genesis sends TO ITS
 # OWNER — approvals, digests, blockers, alerts, reflections, review drafts —
-# goes out over Telegram, while genuine external touches go to Discord / email /
-# (future) other public channels. So the owner surface is the Telegram channel.
+# goes out over Telegram or voice (HA TTS spoken in the owner's home — the owner
+# IS the recipient; see pipeline.py egress-gate + shadow_gate.py), while genuine
+# external touches go to Discord / email / (future) other public channels. So the
+# owner surface is the Telegram and voice channels.
 #
 # We EXCLUDE the owner-facing channels (rather than allowlist external ones), so
 # a NEW external channel counts automatically. The tradeoff: a NEW OWNER-facing
-# delivery channel (e.g. a future owner-directed voice or email digest) MUST be
-# added here, or its rows would be miscounted as external outreach.
-OWNER_FACING_CHANNELS: frozenset[str] = frozenset({"telegram"})
+# delivery channel (e.g. a future owner-directed email digest) MUST be added
+# here, or its rows would be miscounted as external outreach.
+OWNER_FACING_CHANNELS: frozenset[str] = frozenset({"telegram", "voice"})
 
 # SQL IN-list rendering (same trusted-constant rationale as
 # POSITIVE_ENGAGEMENT_SQL_IN above). Trusted module constant — safe to inline.

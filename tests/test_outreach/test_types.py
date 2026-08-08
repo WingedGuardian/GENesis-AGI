@@ -13,17 +13,20 @@ from genesis.outreach.types import (
 )
 
 
-def test_owner_channel_is_telegram_only():
-    """Engagement metrics exclude owner-facing channels; today that is Telegram
-    only. Genuine external channels (discord/email) must NOT be owner-facing, or
-    real external engagement would be dropped from the metric."""
-    assert frozenset({"telegram"}) == OWNER_FACING_CHANNELS
+def test_owner_channels_are_telegram_and_voice():
+    """Engagement metrics exclude owner-facing channels: Telegram AND voice (HA
+    TTS spoken to the owner — the owner is the recipient, so it is not external
+    outreach). Genuine external channels (discord/email) must NOT be owner-facing,
+    or real external engagement would be dropped from the metric."""
+    assert frozenset({"telegram", "voice"}) == OWNER_FACING_CHANNELS
+    assert "voice" in OWNER_FACING_CHANNELS
     assert "discord" not in OWNER_FACING_CHANNELS
     assert "email" not in OWNER_FACING_CHANNELS
 
 
 def test_owner_channels_sql_in_renders_quoted():
-    assert OWNER_FACING_CHANNELS_SQL_IN == "'telegram'"
+    # Sorted rendering: telegram < voice.
+    assert OWNER_FACING_CHANNELS_SQL_IN == "'telegram', 'voice'"
 
 
 def test_outreach_category_values():
