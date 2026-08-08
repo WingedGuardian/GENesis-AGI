@@ -8,6 +8,8 @@ store (no mocking of the crud chain).
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 import pytest
 import pytest_asyncio
@@ -15,6 +17,7 @@ import pytest_asyncio
 from genesis.db.crud import observations
 from genesis.outreach.types import OutreachResult, OutreachStatus
 from genesis.recon.account_activity import (
+    _NOTIF_CURSOR_KEY,
     AccountActivityMonitor,
     ActivityEvent,
     _actor_hash,
@@ -583,3 +586,393 @@ async def test_gather_truncation_boundary_tie_does_not_strand_twin(db, monkeypat
     # a (01:00), strictly before the tie second, so the next exclusive `since`
     # poll re-fetches the whole 02:00 group (b via dedup, c fresh).
     assert mon._load_cursors()[repo] == "2026-08-06T01:00:00Z"
+
+
+# ── account-level notifications lane (mentions + outbound-contribution responses) ──
+
+_REASONS = {"mention", "team_mention", "author"}
+_SINCE = "2026-08-06T00:00:00Z"
+_WM = "2026-08-06T05:00:00Z"
+
+
+def _notif(
+    *,
+    reason="author",
+    repo="someone/litellm",
+    tid="t1",
+    updated="2026-08-06T04:30:00Z",
+    title="My upstream PR",
+    latest_comment_url="LCU",
+    subject_url="SU",
+):
+    owner_login = repo.split("/")[0]
+    subject: dict = {"title": title, "type": "Issue"}
+    if subject_url is not None:
+        subject["url"] = subject_url
+    if latest_comment_url is not None:
+        subject["latest_comment_url"] = latest_comment_url
+    return {
+        "id": tid,
+        "reason": reason,
+        "updated_at": updated,
+        "repository": {"full_name": repo, "owner": {"login": owner_login}},
+        "subject": subject,
+    }
+
+
+def _fake_notif_gh(pages, *, actor="ext-user", actor_error=False, url_actors=None):
+    """Fake ``run_gh_checked``. The ``notifications`` list call returns ``pages``
+    (list of pages, slurped). Any other api call is an actor-resolution lookup →
+    ``{"user":{"login": ...}}`` from ``url_actors[url]`` if given (None → no
+    login), else ``actor``; ``actor_error`` fails every resolution call."""
+
+    async def fn(*args, **kwargs):
+        url = args[2]
+        if url.startswith("notifications"):
+            return True, json.dumps(pages)
+        if actor_error:
+            return False, ""
+        login = (url_actors or {}).get(url, actor)
+        if login is None:
+            return True, json.dumps({})  # resolved, but carries no user login
+        return True, json.dumps({"user": {"login": login}})
+
+    return fn
+
+
+async def _human(login, denylist):
+    return False
+
+
+def _item(**kw):
+    base = {
+        "repo": "someone/litellm",
+        "reason": "author",
+        "thread_id": "t1",
+        "updated_at": "2026-08-06T04:30:00Z",
+        "actor": "maintainer",
+        "number": 5,
+        "title": "My PR",
+        "url": "https://github.com/someone/litellm/issues/5",
+    }
+    base.update(kw)
+    return base
+
+
+async def test_notifications_reason_filter(db, monkeypatch):
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(reason="mention", repo="third/party", tid="m1"),
+            _notif(reason="author", repo="someone/litellm", tid="a1"),
+            _notif(reason="ci_activity", repo="me/own", tid="c1"),
+            _notif(reason="subscribed", repo="x/y", tid="s1"),
+        ]
+    ]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert adv == _WM  # clean sweep → advance to the watermark
+    assert sorted(i["reason"] for i in items) == ["author", "mention"]
+
+
+async def test_notifications_author_owned_repo_dropped(db, monkeypatch):
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(reason="author", repo="me/myrepo", tid="own"),  # owner's own → drop
+            _notif(reason="author", repo="someone/litellm", tid="ext"),  # foreign → keep
+        ]
+    ]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert {i["thread_id"] for i in items} == {"ext"}
+
+
+async def test_notifications_mention_on_owned_repo_kept(db, monkeypatch):
+    """A `mention` is high-signal on ANY repo (only author/subscribed are
+    owner-repo-filtered)."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [[_notif(reason="mention", repo="me/myrepo", tid="mine")]]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert {i["thread_id"] for i in items} == {"mine"}
+
+
+async def test_notifications_window_excludes_out_of_range(db, monkeypatch):
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(reason="mention", tid="old", updated="2026-08-05T00:00:00Z"),  # <= since
+            _notif(reason="mention", tid="future", updated="2026-08-06T06:00:00Z"),  # > wm
+            _notif(reason="mention", tid="in", updated="2026-08-06T04:00:00Z"),
+        ]
+    ]
+    monkeypatch.setattr("genesis.recon.account_activity.run_gh_checked", _fake_notif_gh(pages))
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert {i["thread_id"] for i in items} == {"in"}
+
+
+async def test_notifications_actor_via_latest_comment(db, monkeypatch):
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [[_notif(reason="mention", tid="m", latest_comment_url="LCU", subject_url="SU")]]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, url_actors={"LCU": "commenter"}),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "commenter"
+
+
+async def test_notifications_actor_fallback_to_subject_url(db, monkeypatch):
+    """latest_comment_url carries no login (e.g. mention in the body) → fall back
+    to subject.url."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [[_notif(reason="mention", tid="m", latest_comment_url="LCU", subject_url="SU")]]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, url_actors={"LCU": None, "SU": "body-mentioner"}),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items[0]["actor"] == "body-mentioner"
+
+
+async def test_notifications_hold_on_actor_api_error(db, monkeypatch):
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [[_notif(reason="mention", tid="m")]]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, actor_error=True),
+    )
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert adv is None  # actor resolution failed → HOLD the cursor
+    assert items == []
+
+
+async def test_notifications_skips_owner_and_bot(db, monkeypatch):
+    mon, _ = _mon(db)
+    pages = [
+        [
+            _notif(reason="mention", tid="self", latest_comment_url="Lself", subject_url="Sself"),
+            _notif(reason="mention", tid="bot", latest_comment_url="Lbot", subject_url="Sbot"),
+            _notif(reason="mention", tid="human", latest_comment_url="Lh", subject_url="Sh"),
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(
+            pages,
+            url_actors={
+                "Lself": "me",
+                "Sself": "me",
+                "Lbot": "somebot",
+                "Sbot": "somebot",
+                "Lh": "human1",
+                "Sh": "human1",
+            },
+        ),
+    )
+
+    async def is_auto(login, denylist):
+        return login == "somebot"
+
+    mon._is_automation = is_auto
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert {i["thread_id"] for i in items} == {"human"}
+
+
+async def test_notifications_hold_when_classification_unresolved(db, monkeypatch):
+    mon, _ = _mon(db)
+    pages = [[_notif(reason="mention", tid="m")]]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, actor="human1"),
+    )
+
+    async def is_auto_none(login, denylist):
+        return None  # classification lookup failed
+
+    mon._is_automation = is_auto_none
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert adv is None
+    assert items == []
+
+
+async def test_record_notification_live_pings_and_records(db):
+    mon, pipe = _mon(db)
+    it = _item()
+    assert await mon._record_notification(it, "live") is True
+    assert len(pipe.sent) == 1
+    h = _event_hash(it["repo"], "notification", f"{it['thread_id']}:{it['updated_at']}")
+    assert await _has(db, h)
+
+
+async def test_record_notification_observe_records_no_ping(db):
+    mon, pipe = _mon(db)
+    assert await mon._record_notification(_item(), "observe") is False
+    assert pipe.sent == []
+    assert await _count(db, "github_account_activity") == 1
+
+
+async def test_record_notification_dedup_no_reping(db):
+    mon, pipe = _mon(db)
+    it = _item()
+    assert await mon._record_notification(it, "live") is True
+    assert await mon._record_notification(it, "live") is False  # same thread+updated
+    assert len(pipe.sent) == 1
+    assert await _count(db, "github_account_activity") == 1
+
+
+async def test_record_notification_new_update_repings(db):
+    mon, pipe = _mon(db)
+    assert (
+        await mon._record_notification(
+            _item(thread_id="t", updated_at="2026-08-06T04:00:00Z"), "live"
+        )
+        is True
+    )
+    # same thread, NEW updated_at → distinct event → re-record + re-ping
+    assert (
+        await mon._record_notification(
+            _item(thread_id="t", updated_at="2026-08-06T05:00:00Z"), "live"
+        )
+        is True
+    )
+    assert len(pipe.sent) == 2
+    assert await _count(db, "github_account_activity") == 2
+
+
+async def test_gather_notifications_baseline_first_run(db, monkeypatch, tmp_path):
+    repo = "owner/repo"
+    mon, pipe = _mon(db)
+    _stub_gather(mon, monkeypatch, tmp_path, mode="live", events_by_repo={repo: []})
+    # no cursor file → notifications baseline (adopt wm, never replay the inbox)
+    await mon.gather()
+    assert mon._load_cursors()[_NOTIF_CURSOR_KEY] == _WM
+    assert pipe.sent == []  # baseline never pings
+
+
+async def test_gather_notifications_live_pings_external(db, monkeypatch, tmp_path):
+    repo = "owner/repo"
+    mon, pipe = _mon(db)
+    _stub_gather(mon, monkeypatch, tmp_path, mode="live", events_by_repo={repo: []})
+    (tmp_path / "github_steward").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "github_steward" / "cursors.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "cursors": {
+                    repo: "2026-08-06T00:00:00Z",
+                    _NOTIF_CURSOR_KEY: "2026-08-06T00:00:00Z",
+                },
+            }
+        )
+    )
+    pages = [
+        [_notif(reason="author", repo="someone/litellm", tid="a1", updated="2026-08-06T04:00:00Z")]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, actor="maintainer"),
+    )
+    await mon.gather()
+    assert len(pipe.sent) == 1
+    assert mon._load_cursors()[_NOTIF_CURSOR_KEY] == _WM
+
+
+async def test_notifications_cfg_damage_tolerant():
+    import genesis.recon.github_steward_config as gsc
+
+    default = {"mention", "team_mention", "author"}
+    assert gsc.notifications_cfg(gsc.DEFAULTS)["reasons"] == default
+    assert gsc.notifications_cfg({})["reasons"] == default  # missing sub-dict
+    corrupt = gsc.notifications_cfg({"notifications": {"enabled": False, "reasons": "bad"}})
+    assert corrupt["enabled"] is False
+    assert corrupt["reasons"] == default  # corrupt reasons → defaults
+    custom = gsc.notifications_cfg({"notifications": {"reasons": ["mention"]}})
+    assert custom["reasons"] == {"mention"}
+
+
+async def test_api_to_html_url_issue_and_pr():
+    from genesis.recon.account_activity import _api_to_html_url
+
+    assert (
+        _api_to_html_url("https://api.github.com/repos/o/r/issues/5")
+        == "https://github.com/o/r/issues/5"
+    )
+    # PR subjects use /pulls/<n> in the API; the browser path is /pull/<n>.
+    assert (
+        _api_to_html_url("https://api.github.com/repos/o/r/pulls/9")
+        == "https://github.com/o/r/pull/9"
+    )
+    assert _api_to_html_url("") == ""
+
+
+async def test_notifications_discussion_subject_skipped(db, monkeypatch):
+    """Discussion subjects are GraphQL-only; a REST actor lookup would stall the
+    cursor, so they're skipped CLEANLY (advance, not hold) and never surfaced."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    disc = _notif(reason="mention", tid="disc")
+    disc["subject"]["type"] = "Discussion"
+    pages = [[disc, _notif(reason="mention", tid="iss")]]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, actor="human1"),
+    )
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert adv == _WM  # clean sweep — the discussion is skipped, not held
+    assert {i["thread_id"] for i in items} == {"iss"}
+
+
+async def test_notifications_cap_truncates_and_advances_to_boundary(db, monkeypatch):
+    """More in-window items than the per-tick cap → process the OLDEST N, defer the
+    newer rest, and advance the cursor to the last-processed timestamp (not wm)."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(reason="mention", tid="n1", updated="2026-08-06T01:00:00Z"),
+            _notif(reason="mention", tid="n2", updated="2026-08-06T02:00:00Z"),
+            _notif(reason="mention", tid="n3", updated="2026-08-06T03:00:00Z"),
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, actor="human1"),
+    )
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 2)
+    assert {i["thread_id"] for i in items} == {"n1", "n2"}  # oldest 2; n3 deferred
+    assert adv == "2026-08-06T02:00:00Z"  # boundary, strictly before the deferred n3
+
+
+async def test_gather_notifications_runs_with_no_flagship_repos(db, monkeypatch, tmp_path):
+    """Regression: the account-level notifications lane runs even when NO flagship
+    repos resolve — it is account-level, not repo-scoped."""
+    mon, pipe = _mon(db)
+    _stub_gather(mon, monkeypatch, tmp_path, mode="live", events_by_repo={})
+
+    async def no_repos(cfg, owner):
+        return []
+
+    mon._resolve_flagship_repos = no_repos
+    (tmp_path / "github_steward").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "github_steward" / "cursors.json").write_text(
+        json.dumps({"version": 1, "cursors": {_NOTIF_CURSOR_KEY: "2026-08-06T00:00:00Z"}})
+    )
+    pages = [
+        [_notif(reason="author", repo="someone/litellm", tid="a1", updated="2026-08-06T04:00:00Z")]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, actor="maintainer"),
+    )
+    await mon.gather()
+    assert len(pipe.sent) == 1  # notifications lane pinged despite zero flagship repos
+    assert mon._load_cursors()[_NOTIF_CURSOR_KEY] == _WM
