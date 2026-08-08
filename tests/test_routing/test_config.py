@@ -160,7 +160,10 @@ def test_load_full_yaml(monkeypatch):
     # matcher neural-monitor registration).
     # 2026-07-17: 57 → 59 after entity_adjudication + entity_adjudication_challenge
     # added (entity-node merge-vs-distinct drainer).
-    assert len(cfg.call_sites) == 59
+    # 2026-08-07: 59 → 60 after 41_reflection_json_salvage added (deep-reflection
+    # prose-output salvage retry).
+    assert len(cfg.call_sites) == 60
+    assert "41_reflection_json_salvage" in cfg.call_sites  # deep-reflection salvage (2026-08-07)
     assert cfg.call_sites["repo_pulse"].dispatch == "cli"
     assert cfg.call_sites["repo_pulse"].chain == []
     assert cfg.call_sites["repo_pulse"].never_pays is True
