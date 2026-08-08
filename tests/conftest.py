@@ -71,7 +71,7 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
 
 # ── Safety: isolate tests from the install's config overlays ──
 @pytest.fixture(autouse=True)
-def _isolate_user_config_dir(tmp_path, monkeypatch):
+def _isolate_user_config_dir(tmp_path):
     """Neutralize BOTH overlay vectors so tests never read install-local state.
 
     ``config/*.local.yaml`` overlays are install-local (e.g. a voice-live
@@ -100,14 +100,21 @@ def _isolate_user_config_dir(tmp_path, monkeypatch):
     and are tracked for consolidation (follow-up); the MCP ``_USER_CONFIG_DIR``
     constants are excluded as too import-heavy for an every-test fixture — their
     tests self-isolate.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` rather than the shared ``monkeypatch``
+    fixture: a test that calls ``monkeypatch.undo()`` mid-body (e.g.
+    ``test_learned_knobs``) would otherwise also revert THIS suite-isolation
+    patch — and a subsequent config read in that test would hit the real overlay.
+    An independent instance we undo in teardown is immune to that.
     """
     from genesis import _config_overlay
     from genesis.env import repo_root
     from genesis.security import immunity
 
+    mp = pytest.MonkeyPatch()
     user_dir = tmp_path / "user-config-isolated"
-    monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: user_dir)
-    monkeypatch.setattr(immunity, "_user_config_dir", lambda: user_dir)
+    mp.setattr(_config_overlay, "_user_config_dir", lambda: user_dir)
+    mp.setattr(immunity, "_user_config_dir", lambda: user_dir)
 
     # Vector 2: neutralize the repo-relative sibling fallback.
     _orig_resolve = _config_overlay._resolve_overlay_path
@@ -129,7 +136,7 @@ def _isolate_user_config_dir(tmp_path, monkeypatch):
             return user_dir / result.name
         return result
 
-    monkeypatch.setattr(_config_overlay, "_resolve_overlay_path", _sandboxed_resolve)
+    mp.setattr(_config_overlay, "_resolve_overlay_path", _sandboxed_resolve)
     # immunity.py binds `_resolve_overlay_path` at MODULE level (a by-name
     # import), so its own reference must be patched too — patching only
     # _config_overlay's attribute does not reach it (record_demotion() would
@@ -137,7 +144,11 @@ def _isolate_user_config_dir(tmp_path, monkeypatch):
     # sibling). Lazy importers (memory/graph_expansion, ledger/learned_knobs)
     # re-resolve against the patched _config_overlay each call, so they need no
     # separate patch. The guard test tracks module-level importers of both names.
-    monkeypatch.setattr(immunity, "_resolve_overlay_path", _sandboxed_resolve)
+    mp.setattr(immunity, "_resolve_overlay_path", _sandboxed_resolve)
+    try:
+        yield
+    finally:
+        mp.undo()
 
 
 @pytest.fixture(autouse=True)

@@ -110,6 +110,16 @@ def test_suite_isolates_user_config_dir_from_real_home():
     assert immunity._resolve_overlay_path is _config_overlay._resolve_overlay_path
 
 
+def test_isolation_survives_a_test_calling_monkeypatch_undo(monkeypatch):
+    """A test that calls ``monkeypatch.undo()`` mid-body (e.g. test_learned_knobs)
+    must NOT revert the suite-isolation patch — the fixture owns its own
+    MonkeyPatch instance, independent of the shared ``monkeypatch`` fixture."""
+    real = Path.home() / ".genesis" / "config"
+    monkeypatch.setattr("os.environ", dict(__import__("os").environ))  # any patch
+    monkeypatch.undo()  # reverts THIS test's patches — must not touch the fixture's
+    assert _config_overlay._user_config_dir() != real
+
+
 def test_module_level_user_config_bindings_are_patched_or_listed():
     """Enumerate every module-level binding of a config-overlay seam in src.
 
@@ -183,7 +193,12 @@ def test_no_unisolated_local_yaml_resolver():
     """
     # Hand-rolled resolvers that read a real overlay sibling WITHOUT the shared
     # seam. Independent of merge_local_overlay by design/history; tracked for
-    # consolidation (follow-up e2fd22c5).
+    # consolidation (follow-up e2fd22c5). NOT patched by the autouse fixture on
+    # purpose: routing.config alone costs ~4.3s to import (litellm etc.), so
+    # pulling these into an every-test fixture is prohibitive — consolidation
+    # onto the shared resolver is the correct fix, not a per-test patch. Until
+    # then, their OWN tests that load a real repo path may still merge host
+    # values (a falsely-green risk, not a hard failure).
     independent_resolvers = {
         "guardian/config.py",  # provisioning.local.yaml (guardian state dir)
         "mcp/health/settings.py",  # own _load_yaml_local + _USER_CONFIG_DIR
