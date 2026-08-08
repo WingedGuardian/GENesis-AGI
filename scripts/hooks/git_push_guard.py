@@ -542,6 +542,54 @@ _INLINE_REVIEW_BOTS = {
 # Badge/markup prefix stripped when rendering a finding's title line.
 _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
 
+# ── Direct-sqlite-write detection ────────────────────────────────────────────
+# The DML/DDL keyword must be in STATEMENT position (accompanied by INTO / FROM /
+# SET / object type), which is the ONLY change from the historical bare-keyword
+# match. This distinguishes:
+#   - the `REPLACE INTO` statement from the `replace(...)` scalar function
+#     (a read-only SELECT using replace() no longer false-positives), and
+#   - a real `INSERT INTO` from a bare "INSERT"/"UPDATE" appearing in a grep
+#     pattern (e.g. searching this hook's own source) or prose.
+# It is STRICTLY narrower than the old pattern: every real write form still
+# matches (writes always carry the accompanying keyword), so this cannot open a
+# bypass — it only removes false positives. Detection stays on the WHOLE command
+# (not per-segment) ON PURPOSE, so a heredoc/`bash -c`/wrapper that fragments the
+# invocation across segments cannot hide the write.
+#
+# The gap between the two keyword tokens is `_TOK_GAP` — whitespace OR a SQLite
+# comment (`/* … */` or `-- … EOL`) — because SQLite permits a comment between
+# statement tokens (`INSERT /*c*/ INTO t`, `DROP /*c*/ TABLE t`); matching only
+# `\s+` there would let a commented write slip past the guard. The UPDATE branch
+# allows any bounded run (incl. quotes, comments, and `;` inside a comment) up to
+# SET, so `UPDATE "t" SET …` and `UPDATE t /* ; */ SET …` are still caught; the
+# 400-char lazy bound keeps it linear (no catastrophic backtracking) and only
+# fails on contrived padding no accidental agent command produces.
+_TOK_GAP = r"(?:\s|/\*[\s\S]*?\*/|--[^\n]*)+"
+_DML_STATEMENT_RE = re.compile(
+    "(?:"
+    r"\bINSERT\b" + _TOK_GAP + r"(?:INTO|OR)\b"
+    r"|\bREPLACE\b" + _TOK_GAP + r"INTO\b"
+    r"|\bUPDATE\b[\s\S]{0,400}?\bSET\b"
+    r"|\bDELETE\b" + _TOK_GAP + r"FROM\b"
+    r"|\bDROP\b" + _TOK_GAP + r"(?:TABLE|INDEX|VIEW|TRIGGER)\b"
+    r"|\bALTER\b" + _TOK_GAP + r"(?:TABLE|INDEX|VIEW)\b"
+    ")",
+    re.IGNORECASE,
+)
+
+
+def _is_sqlite_write(cmd: str) -> bool:
+    """Whether *cmd* issues a direct sqlite3 DML/DDL write.
+
+    Kept intentionally broad — any mention of ``sqlite3`` in the whole command,
+    matching the historical behavior — so segment fragmentation (heredocs),
+    ``bash -c`` nesting, and unrecognized launcher wrappers cannot hide a write.
+    The narrowing is only that the DML must be in statement position (see
+    ``_DML_STATEMENT_RE``), which removes the two false positives without
+    weakening write coverage.
+    """
+    return "sqlite3" in cmd and bool(_DML_STATEMENT_RE.search(cmd))
+
 
 def _inline_title(body: str) -> str:
     """First readable line of an inline finding body."""
@@ -1706,13 +1754,11 @@ def main() -> int:
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
-        # NB: match on the raw command, not the unquoted one — the DML keyword
-        # lives inside the quoted SQL argument (sqlite3 db "DELETE FROM ...").
-        if "sqlite3" in cmd and re.search(
-            r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b",
-            cmd,
-            re.IGNORECASE,
-        ):
+        # Whole-command match (never misses a fragmented/wrapped invocation),
+        # narrowed to DML in statement position so the `replace()` scalar
+        # function and bare keywords in a grep pattern no longer false-positive.
+        # See _is_sqlite_write / _DML_STATEMENT_RE.
+        if _is_sqlite_write(cmd):
             print(
                 "BLOCKED: Direct database writes via sqlite3 are not allowed. "
                 "Use CRUD modules or MCP tools instead.",
