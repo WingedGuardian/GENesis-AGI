@@ -185,8 +185,18 @@ def test_salvage_prompt_exposes_route_consumed_action_fields():
         "procedure_quarantines",
         "skill_triggers",
         "contradictions",
+        "confidence",
     ):
         assert field in _SALVAGE_PROMPT, f"salvage prompt omits route-consumed field {field!r}"
+
+
+def test_salvage_prompt_requires_confidence():
+    """confidence is canonical-required (REFLECTION_DEEP.md) and gates output —
+    a salvage that leaves it optional lets the model omit it, the parser then
+    substitutes the 0.5 sentinel, and the confidence gate passes it uncalibrated.
+    It must sit in the Required block, not Optional."""
+    required_block = _SALVAGE_PROMPT.split("Optional")[0]
+    assert "confidence" in required_block
 
 
 @pytest.mark.asyncio
