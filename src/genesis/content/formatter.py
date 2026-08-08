@@ -79,8 +79,12 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r"_{1,3}(.*?)_{1,3}", r"\1", text)
     # Inline code
     text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Images ![alt](url) -> alt
+    text = re.sub(r"!\[([^\]]+)\]\([^)]+\)", r"\1", text)
     # Links [text](url) -> text
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Strikethrough
+    text = re.sub(r"~~(.*?)~~", r"\1", text)
     # Headers
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     return text
