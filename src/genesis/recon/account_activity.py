@@ -874,74 +874,77 @@ class AccountActivityMonitor:
             )
         work = candidates[:max_events]
 
+        # Per-item failures NEVER hold the account-level cursor (one bad item — a
+        # deleted comment, a discussion, a malformed payload — must not freeze the
+        # whole lane). Unresolvable/unsupported items are recorded digest-only
+        # (ping=False) so nothing is silently lost; the cursor always advances.
         items: list[dict] = []
-        hold = False
         for c in work:
             subject = c["subject"]
+            base = {
+                "repo": c["repo"],
+                "reason": c["reason"],
+                "thread_id": c["thread_id"],
+                "updated_at": c["updated"],
+                "number": _issue_num(subject.get("url", "")),
+                "title": (subject.get("title") or "")[:120],
+                "url": _api_to_html_url(subject.get("url", "")),
+            }
             if subject.get("type") == "Discussion":
-                # Discussions are GraphQL-only (a REST actor lookup would fail and
-                # stall the cursor). Skip cleanly + log; GraphQL resolution is a
-                # follow-up. The deep-poll already covers discussions on OWNED
-                # repos — only cross-repo discussion mentions are missed here.
-                logger.info(
-                    "github steward: skipping unsupported Discussion notification on %s",
-                    c["repo"],
-                )
+                # GraphQL-only actor — record for the digest, no ping (follow-up).
+                items.append({**base, "actor": "", "ping": False})
                 continue
-            ok_actor, actor = await self._resolve_notification_actor(subject)
-            if not ok_actor:
-                hold = True  # transient gh error resolving actor → hold + retry
-                break
-            if not actor or actor.lower() == owner.lower():
-                continue  # unresolvable login, or the owner's own activity
+            actor = await self._resolve_notification_actor(subject)
+            if actor is None:
+                items.append({**base, "actor": "", "ping": False})  # unresolved → digest-only
+                continue
+            if actor.lower() == owner.lower():
+                # The owner is the resolved (latest) actor. For author/subscribed
+                # that is self-activity on the owner's own thread → skip entirely.
+                # For a mention it means the owner is merely the latest commenter —
+                # keep the thread (digest-only), don't self-ping, don't drop it.
+                if c["reason"] not in steward_cfg.OWNED_ONLY_NOTIFICATION_REASONS:
+                    items.append({**base, "actor": "", "ping": False})
+                continue
             auto = await self._is_automation(actor, denylist)
-            if auto is None:
-                hold = True  # classification lookup failed → hold + retry
-                break
-            if auto:
-                continue  # bot / org
-            items.append(
-                {
-                    "repo": c["repo"],
-                    "reason": c["reason"],
-                    "thread_id": c["thread_id"],
-                    "updated_at": c["updated"],
-                    "actor": actor,
-                    "number": _issue_num(subject.get("url", "")),
-                    "title": (subject.get("title") or "")[:120],
-                    "url": _api_to_html_url(subject.get("url", "")),
-                }
-            )
+            if auto is True:
+                continue  # bot / org (None → can't tell → surface rather than drop)
+            items.append({**base, "actor": actor, "ping": True})
 
-        if hold:
-            return None, items  # caller holds the cursor; recorded items dedup
-        if truncated:
-            # Advance past the processed batch; the deferred newer items re-poll
-            # next tick. Same-second boundary ties are negligible at notification
-            # granularity (a follow-up if it ever bites).
-            return work[-1]["updated"], items
-        return wm, items
+        # Advance the cursor. Clean sweep → wm. Truncation → the newest processed
+        # timestamp STRICTLY BEFORE the first deferred item (tie-safe: advancing to
+        # a same-second boundary would strand the deferred twin, since `since` is
+        # exclusive); if the whole batch ties the boundary, hold at `since` and
+        # re-poll next tick.
+        if not truncated:
+            return wm, items
+        boundary = candidates[max_events]["updated"]
+        safe = [c["updated"] for c in work if c["updated"] < boundary]
+        return (safe[-1] if safe else since), items
 
-    async def _resolve_notification_actor(self, subject: dict) -> tuple[bool, str | None]:
-        """Resolve the human behind a notification (the feed carries no actor
-        inline). Fetch the latest comment (or the subject itself) and read
-        ``.user.login``. Returns ``(ok, login|None)`` — ``ok=False`` means a gh
-        API error (caller holds the cursor); ``(True, None)`` means resolved but
-        no login (caller skips the item)."""
+    async def _resolve_notification_actor(self, subject: dict) -> str | None:
+        """Best-effort resolve of the human behind a notification (the feed carries
+        no actor inline). Tries ``latest_comment_url`` then ``subject.url``, reading
+        ``.user.login``; a gh error or malformed JSON on one URL just falls through
+        to the next. Returns the login, or ``None`` if unresolved — it NEVER signals
+        a cursor hold, so a single unresolvable item (deleted comment, discussion,
+        malformed payload) can't freeze the account-level lane. The login is a
+        best-effort label: for a mention it is the notification's latest commenter,
+        which may differ from the exact actor that triggered it."""
         for key in ("latest_comment_url", "url"):
             u = subject.get(key)
             if not u:
                 continue
             ok, out = await run_gh_checked("gh", "api", u, timeout=_GH_TIMEOUT)
             if not ok:
-                return False, None
+                continue  # try the next URL — do NOT hold on a per-item error
             try:
                 login = (json.loads(out).get("user") or {}).get("login")
             except Exception:
                 login = None
             if login:
-                return True, login
-        return True, None
+                return login
+        return None
 
     async def _record_notification(self, item: dict, mode: str) -> bool:
         """Record a notification observation; ping immediately in ``live`` mode.
@@ -980,7 +983,9 @@ class AccountActivityMonitor:
             content_hash=ev_hash,
             skip_if_duplicate=True,
         )
-        if mode == "live":
+        # Ping only externally-attributable items (item["ping"]); Discussion /
+        # unresolved-actor / owner-latest items are recorded digest-only.
+        if mode == "live" and item.get("ping"):
             return await self._ping_notification(item)
         return False
 

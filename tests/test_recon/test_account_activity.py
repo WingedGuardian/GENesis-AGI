@@ -654,6 +654,7 @@ def _item(**kw):
         "number": 5,
         "title": "My PR",
         "url": "https://github.com/someone/litellm/issues/5",
+        "ping": True,
     }
     base.update(kw)
     return base
@@ -742,7 +743,10 @@ async def test_notifications_actor_fallback_to_subject_url(db, monkeypatch):
     assert items[0]["actor"] == "body-mentioner"
 
 
-async def test_notifications_hold_on_actor_api_error(db, monkeypatch):
+async def test_notifications_unresolved_actor_recorded_digest_only(db, monkeypatch):
+    """A per-item actor-resolution failure must NOT hold the cursor (that would
+    freeze the whole lane on one bad item, e.g. a deleted comment). The item is
+    recorded digest-only (no ping) and the cursor advances."""
     mon, _ = _mon(db)
     mon._is_automation = _human
     pages = [[_notif(reason="mention", tid="m")]]
@@ -751,11 +755,15 @@ async def test_notifications_hold_on_actor_api_error(db, monkeypatch):
         _fake_notif_gh(pages, actor_error=True),
     )
     adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
-    assert adv is None  # actor resolution failed → HOLD the cursor
-    assert items == []
+    assert adv == _WM  # advances — a single unresolvable item can't stall the lane
+    assert len(items) == 1
+    assert items[0]["ping"] is False and items[0]["actor"] == ""
 
 
-async def test_notifications_skips_owner_and_bot(db, monkeypatch):
+async def test_notifications_bot_skipped_owner_mention_digest_only(db, monkeypatch):
+    """A bot actor is dropped; the owner as the LATEST commenter on a mention is
+    kept digest-only (the mention is real even if the owner replied last); an
+    external human is pinged."""
     mon, _ = _mon(db)
     pages = [
         [
@@ -784,10 +792,15 @@ async def test_notifications_skips_owner_and_bot(db, monkeypatch):
 
     mon._is_automation = is_auto
     _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
-    assert {i["thread_id"] for i in items} == {"human"}
+    by_id = {i["thread_id"]: i for i in items}
+    assert set(by_id) == {"self", "human"}  # bot dropped
+    assert by_id["self"]["ping"] is False  # owner-latest on a mention → digest-only
+    assert by_id["human"]["ping"] is True
 
 
-async def test_notifications_hold_when_classification_unresolved(db, monkeypatch):
+async def test_notifications_classification_unresolved_surfaces(db, monkeypatch):
+    """If bot-classification can't be determined, surface + ping the item rather
+    than drop or hold — never freeze the lane on a classification blip."""
     mon, _ = _mon(db)
     pages = [[_notif(reason="mention", tid="m")]]
     monkeypatch.setattr(
@@ -800,8 +813,8 @@ async def test_notifications_hold_when_classification_unresolved(db, monkeypatch
 
     mon._is_automation = is_auto_none
     adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
-    assert adv is None
-    assert items == []
+    assert adv == _WM
+    assert len(items) == 1 and items[0]["ping"] is True
 
 
 async def test_record_notification_live_pings_and_records(db):
@@ -914,9 +927,10 @@ async def test_api_to_html_url_issue_and_pr():
     assert _api_to_html_url("") == ""
 
 
-async def test_notifications_discussion_subject_skipped(db, monkeypatch):
-    """Discussion subjects are GraphQL-only; a REST actor lookup would stall the
-    cursor, so they're skipped CLEANLY (advance, not hold) and never surfaced."""
+async def test_notifications_discussion_recorded_digest_only(db, monkeypatch):
+    """Discussion subjects are GraphQL-only (no REST actor); they're recorded
+    digest-only (no ping, not held, not dropped) so a cross-repo discussion
+    mention still surfaces in the 6h digest."""
     mon, _ = _mon(db)
     mon._is_automation = _human
     disc = _notif(reason="mention", tid="disc")
@@ -927,8 +941,11 @@ async def test_notifications_discussion_subject_skipped(db, monkeypatch):
         _fake_notif_gh(pages, actor="human1"),
     )
     adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
-    assert adv == _WM  # clean sweep — the discussion is skipped, not held
-    assert {i["thread_id"] for i in items} == {"iss"}
+    assert adv == _WM
+    by_id = {i["thread_id"]: i for i in items}
+    assert set(by_id) == {"disc", "iss"}
+    assert by_id["disc"]["ping"] is False  # discussion → digest-only
+    assert by_id["iss"]["ping"] is True
 
 
 async def test_notifications_cap_truncates_and_advances_to_boundary(db, monkeypatch):
@@ -950,6 +967,54 @@ async def test_notifications_cap_truncates_and_advances_to_boundary(db, monkeypa
     adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 2)
     assert {i["thread_id"] for i in items} == {"n1", "n2"}  # oldest 2; n3 deferred
     assert adv == "2026-08-06T02:00:00Z"  # boundary, strictly before the deferred n3
+
+
+async def test_notifications_truncation_tie_safe_boundary(db, monkeypatch):
+    """If the cap boundary splits a same-second group, the cursor advances to the
+    newest processed ts STRICTLY BEFORE that second — the deferred same-second
+    twin is not stranded by the exclusive `since` (Codex BLOCKER)."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(reason="mention", tid="n1", updated="2026-08-06T01:00:00Z"),
+            _notif(reason="mention", tid="n2", updated="2026-08-06T02:00:00Z"),
+            _notif(reason="mention", tid="n3", updated="2026-08-06T02:00:00Z"),  # ties the deferred
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, actor="human1"),
+    )
+    adv, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 2)
+    assert {i["thread_id"] for i in items} == {"n1", "n2"}
+    # boundary ties n2's second → advance only to n1 (01:00) so n3 re-fetches next tick.
+    assert adv == "2026-08-06T01:00:00Z"
+
+
+async def test_notifications_author_self_reply_skipped(db, monkeypatch):
+    """reason=author on a foreign repo where the owner is the resolved (latest)
+    actor = the owner replied to their own upstream thread → skipped entirely
+    (self-activity, not surfaced)."""
+    mon, _ = _mon(db)
+    mon._is_automation = _human
+    pages = [
+        [
+            _notif(
+                reason="author",
+                repo="someone/litellm",
+                tid="a",
+                latest_comment_url="L",
+                subject_url="S",
+            )
+        ]
+    ]
+    monkeypatch.setattr(
+        "genesis.recon.account_activity.run_gh_checked",
+        _fake_notif_gh(pages, url_actors={"L": "me", "S": "me"}),
+    )
+    _, items = await mon._poll_notifications("me", _SINCE, _WM, _REASONS, set(), 100)
+    assert items == []
 
 
 async def test_gather_notifications_runs_with_no_flagship_repos(db, monkeypatch, tmp_path):
