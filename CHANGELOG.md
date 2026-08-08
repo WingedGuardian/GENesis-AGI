@@ -9,6 +9,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Added
+
+- **GitHub steward now surfaces responses to your upstream contributions.** Beyond
+  the flagship-repo deep-poll, the account-activity monitor gained an account-level
+  notifications lane: it pings you when someone @mentions you on any repo, or
+  responds on an issue/PR you filed on another project's repo (your outbound
+  contributions — the flagship deep-poll can't see those). Tunable via the
+  `notifications` reason-allowlist in `github_steward.yaml`; respects the same
+  `off`/`observe`/`live` lever and pings immediately in `live`.
+
 ### Changed
 
 - **Reflection sessions are now strictly read-only.** Genesis's autonomous

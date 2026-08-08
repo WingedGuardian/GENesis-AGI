@@ -452,7 +452,13 @@ verified: d37d2214 2026-08-06
   filters on) with a pre-poll watermark cursor, so an edited/closed old item
   never masquerades as new. Uses `run_gh_checked` so a failed poll never advances
   the cursor; an undelivered ping is held in a `github_ping_pending` marker and
-  retried each tick until it lands. `off`/`observe`/`live` lever in
+  retried each tick until it lands. An account-level **notifications lane** (repo-
+  independent, same tick, own sidecar cursor) additionally surfaces activity
+  BEYOND owned repos — @mentions anywhere plus responses on the owner's OUTBOUND
+  contributions (`reason=author` on non-owned repos; owner-repo author items are
+  dropped as the deep-poll already has them) — resolving the actor via the
+  notification's `latest_comment_url` and pinging immediately in `live`.
+  `off`/`observe`/`live` lever + `notifications` reason-allowlist in
   `github_steward_config`.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,

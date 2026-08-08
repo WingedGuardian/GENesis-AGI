@@ -60,6 +60,11 @@ _ACTOR_SEEN_TYPE = "github_actor_seen"
 _PENDING_TYPE = "github_ping_pending"
 _GH_TIMEOUT = 20
 _SIDECAR_VERSION = 1
+# Reserved sidecar cursor key for the account-level notifications lane. Safe as a
+# sibling of the per-repo cursors: a real repo key is always "owner/name" (has a
+# "/"), so this "/"-less sentinel can never collide with one, and gather() only
+# ever reads cursors for keys in the resolved repo list — never this one.
+_NOTIF_CURSOR_KEY = "__notifications__"
 
 
 def _now_z() -> str:
@@ -253,8 +258,9 @@ class AccountActivityMonitor:
 
         repos = await self._resolve_flagship_repos(cfg, owner)
         if not repos:
-            logger.info("github steward: no flagship repos resolved — nothing to poll")
-            return ActivityResult(mode=mode)
+            # No flagship repos — the repo loop below no-ops, but the account-level
+            # notifications lane is INDEPENDENT of flagship repos and still runs.
+            logger.info("github steward: no flagship repos resolved — notifications-only tick")
 
         denylist = {d.lower() for d in steward_cfg.str_list(cfg, "automation_denylist")}
         max_events = steward_cfg.knob_int(cfg, "max_events_per_tick")
@@ -361,6 +367,39 @@ class AccountActivityMonitor:
                     if e.created_at and boundary and e.created_at < boundary
                 ]
                 cursors[repo] = safe[-1] if safe else since
+
+        # ── Account-level notifications lane (repo-independent; shares wm) ──
+        # Surfaces activity BEYOND the flagship repos: @mentions of the owner
+        # anywhere + responses on the owner's OUTBOUND contributions (issues/PRs
+        # they filed on others' repos). Own cursor under _NOTIF_CURSOR_KEY.
+        notif = steward_cfg.notifications_cfg(cfg)
+        if notif["enabled"]:
+            n_since = cursors.get(_NOTIF_CURSOR_KEY)
+            if n_since is None:
+                # First run → baseline silently: adopt the watermark, do NOT
+                # replay the existing inbox as pings (storm guard, like repos).
+                cursors[_NOTIF_CURSOR_KEY] = wm
+                details.append("notifications: baselined")
+            else:
+                nc, items = await self._poll_notifications(
+                    owner, n_since, wm, notif["reasons"], denylist, max_events
+                )
+                for item in items:
+                    did = await self._record_notification(item, mode)
+                    new_events += 1
+                    if did:
+                        pinged += 1
+                        details.append(
+                            f"PING notif {item['repo']} ({item['reason']}) by {item['actor']}"
+                        )
+                # next_cursor: the watermark on a clean sweep, a boundary timestamp
+                # on truncation (the newer rest defer to next tick), or None to HOLD
+                # (a transient gh/classification error → re-poll the window next tick;
+                # already-recorded items dedup).
+                if nc is not None:
+                    cursors[_NOTIF_CURSOR_KEY] = nc
+                else:
+                    details.append("notifications: cursor held (error)")
 
         self._save_cursors(cursors)
         return ActivityResult(
@@ -758,6 +797,245 @@ class AccountActivityMonitor:
         )
         return False
 
+    # ── account-level notifications lane ──────────────────────────────────
+    async def _poll_notifications(
+        self,
+        owner: str,
+        since: str,
+        wm: str,
+        reasons: set[str],
+        denylist: set[str],
+        max_events: int,
+    ) -> tuple[str | None, list[dict]]:
+        """Poll the account notifications feed for the configured ``reason``s.
+
+        Returns ``(next_cursor, items)``. ``next_cursor`` is the value to store:
+        the watermark ``wm`` on a clean full sweep; the last-examined item's
+        timestamp on truncation (the newer rest defer to the next tick); or
+        ``None`` to HOLD the cursor (a transient gh/classification error — the
+        window re-polls next tick and already-recorded ``items`` dedup by hash).
+        ``items`` are the external-human notifications to record — owner/bot
+        actors, out-of-window items, and (unsupported) Discussion subjects are
+        filtered out here.
+        """
+        ok, out = await run_gh_checked(
+            "gh",
+            "api",
+            f"notifications?all=true&since={since}&per_page=100",
+            "--paginate",
+            "--slurp",
+            timeout=_GH_TIMEOUT,
+        )
+        if not ok:
+            return None, []  # feed poll failed → hold the cursor
+
+        # Candidate window: reason + updated_at window + owner-repo filter for
+        # author/subscribed. Sorted OLDEST-first so a truncating cap makes forward
+        # progress (process the oldest, advance to that boundary, defer the newer).
+        candidates: list[dict] = []
+        for n in _parse_paged(out):
+            reason = n.get("reason", "")
+            if reason not in reasons:
+                continue
+            updated = n.get("updated_at", "")
+            # updated_at window: strictly after the cursor (exclusive), up to wm.
+            if not (updated and since < updated <= wm):
+                continue
+            repo_obj = n.get("repository") or {}
+            repo = repo_obj.get("full_name", "")
+            if not repo:
+                continue
+            repo_owner = (repo_obj.get("owner") or {}).get("login", "")
+            # author/subscribed are only interesting on repos the owner does NOT
+            # own — an owner-repo one is self-activity the deep-poll already has.
+            if (
+                reason in steward_cfg.OWNED_ONLY_NOTIFICATION_REASONS
+                and repo_owner.lower() == owner.lower()
+            ):
+                continue
+            candidates.append(
+                {
+                    "reason": reason,
+                    "repo": repo,
+                    "updated": updated,
+                    "thread_id": str(n.get("id", "")),
+                    "subject": n.get("subject") or {},
+                }
+            )
+        candidates.sort(key=lambda c: c["updated"])
+        truncated = len(candidates) > max_events
+        if truncated:
+            logger.warning(
+                "github steward: %d in-window notifications (cap %d) — processing the "
+                "oldest %d, deferring the newer rest to the next tick",
+                len(candidates),
+                max_events,
+                max_events,
+            )
+        work = candidates[:max_events]
+
+        # Per-item failures NEVER hold the account-level cursor (one bad item — a
+        # deleted comment, a discussion, a malformed payload — must not freeze the
+        # whole lane). Unresolvable/unsupported items are recorded digest-only
+        # (ping=False) so nothing is silently lost; the cursor always advances.
+        items: list[dict] = []
+        for c in work:
+            subject = c["subject"]
+            base = {
+                "repo": c["repo"],
+                "reason": c["reason"],
+                "thread_id": c["thread_id"],
+                "updated_at": c["updated"],
+                "number": _issue_num(subject.get("url", "")),
+                "title": (subject.get("title") or "")[:120],
+                "url": _api_to_html_url(subject.get("url", "")),
+            }
+            if subject.get("type") == "Discussion":
+                # GraphQL-only actor — record for the digest, no ping (follow-up).
+                items.append({**base, "actor": "", "ping": False})
+                continue
+            actor = await self._resolve_notification_actor(subject)
+            if actor is None:
+                items.append({**base, "actor": "", "ping": False})  # unresolved → digest-only
+                continue
+            if actor.lower() == owner.lower():
+                # The owner is the resolved (latest) actor. For author/subscribed
+                # that is self-activity on the owner's own thread → skip entirely.
+                # For a mention it means the owner is merely the latest commenter —
+                # keep the thread (digest-only), don't self-ping, don't drop it.
+                if c["reason"] not in steward_cfg.OWNED_ONLY_NOTIFICATION_REASONS:
+                    items.append({**base, "actor": "", "ping": False})
+                continue
+            auto = await self._is_automation(actor, denylist)
+            if auto is True:
+                continue  # bot / org (None → can't tell → surface rather than drop)
+            items.append({**base, "actor": actor, "ping": True})
+
+        # Advance the cursor. Clean sweep → wm. Truncation → the newest processed
+        # timestamp STRICTLY BEFORE the first deferred item (tie-safe: advancing to
+        # a same-second boundary would strand the deferred twin, since `since` is
+        # exclusive); if the whole batch ties the boundary, hold at `since` and
+        # re-poll next tick.
+        if not truncated:
+            return wm, items
+        boundary = candidates[max_events]["updated"]
+        safe = [c["updated"] for c in work if c["updated"] < boundary]
+        return (safe[-1] if safe else since), items
+
+    async def _resolve_notification_actor(self, subject: dict) -> str | None:
+        """Best-effort resolve of the human behind a notification (the feed carries
+        no actor inline). Tries ``latest_comment_url`` then ``subject.url``, reading
+        ``.user.login``; a gh error or malformed JSON on one URL just falls through
+        to the next. Returns the login, or ``None`` if unresolved — it NEVER signals
+        a cursor hold, so a single unresolvable item (deleted comment, discussion,
+        malformed payload) can't freeze the account-level lane. The login is a
+        best-effort label: for a mention it is the notification's latest commenter,
+        which may differ from the exact actor that triggered it."""
+        for key in ("latest_comment_url", "url"):
+            u = subject.get(key)
+            if not u:
+                continue
+            ok, out = await run_gh_checked("gh", "api", u, timeout=_GH_TIMEOUT)
+            if not ok:
+                continue  # try the next URL — do NOT hold on a per-item error
+            try:
+                login = (json.loads(out).get("user") or {}).get("login")
+            except Exception:
+                login = None
+            if login:
+                return login
+        return None
+
+    async def _record_notification(self, item: dict, mode: str) -> bool:
+        """Record a notification observation; ping immediately in ``live`` mode.
+
+        Unlike :meth:`_record_event` this is NOT first-contact-gated — every
+        distinct notification update (deduped by thread id + updated_at) is
+        signal, and BOTH mentions and author-responses ping. A failed ping is not
+        retried durably: the observation is always recorded, so the 6h digest is
+        the fallback surface. Returns True iff a ping was DELIVERED this call.
+        """
+        ev_hash = _event_hash(
+            item["repo"], "notification", f"{item['thread_id']}:{item['updated_at']}"
+        )
+        if await observations.exists_by_hash(self._db, source=_SOURCE, content_hash=ev_hash):
+            return False
+        content = json.dumps(
+            {
+                "repo": item["repo"],
+                "kind": f"notification_{item['reason']}",
+                "reason": item["reason"],
+                "actor": item["actor"],
+                "number": item["number"],
+                "title": item["title"],
+                "url": item["url"],
+                "first_time": False,
+            }
+        )
+        await observations.create(
+            self._db,
+            id=uuid.uuid4().hex,
+            source=_SOURCE,
+            type=_ACTIVITY_TYPE,
+            content=content,
+            priority="medium",
+            created_at=_now_z(),
+            content_hash=ev_hash,
+            skip_if_duplicate=True,
+        )
+        # Ping only externally-attributable items (item["ping"]); Discussion /
+        # unresolved-actor / owner-latest items are recorded digest-only.
+        if mode == "live" and item.get("ping"):
+            return await self._ping_notification(item)
+        return False
+
+    async def _ping_notification(self, item: dict) -> bool:
+        """Immediate Telegram ping for a mention / outbound-contribution response.
+        Returns True ONLY on a confirmed DELIVERED result."""
+        pipeline = self._pipeline()
+        if pipeline is None:
+            logger.warning("github steward: pipeline unavailable — cannot ping notification")
+            return False
+        from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
+
+        num = f"#{item['number']}" if item["number"] else ""
+        if item["reason"] in ("mention", "team_mention"):
+            lead = f"💬 {item['actor']} mentioned you in {item['repo']}{num}"
+        else:  # author — a response to one of the owner's outbound contributions
+            lead = f"📨 {item['actor']} responded on your {item['repo']}{num}"
+        text = lead
+        if item["title"]:
+            text += f"\n{item['title']}"
+        if item["url"]:
+            text += f"\n{item['url']}"
+        request = OutreachRequest(
+            category=OutreachCategory.NOTIFICATION,
+            channel="telegram",
+            topic=f"GitHub steward: {item['actor']} {item['reason']} {item['repo']}{num}",
+            context=text,
+            signal_type="github_account_activity",
+            salience_score=0.9,
+            verbatim=True,
+        )
+        try:
+            result = await pipeline.submit_raw(text, request)
+        except Exception:
+            logger.error("github steward: notification ping failed", exc_info=True)
+            return False
+        if result is not None and result.status == OutreachStatus.DELIVERED:
+            logger.info(
+                "github steward: pinged notification (%s) by %s on %s",
+                item["reason"],
+                item["actor"],
+                item["repo"],
+            )
+            return True
+        logger.warning(
+            "github steward: notification ping not delivered (status=%s)",
+            getattr(result, "status", None),
+        )
+        return False
+
 
 # ── module helpers ────────────────────────────────────────────────────────
 def _parse_json_list(out: str) -> list[dict]:
@@ -794,3 +1072,14 @@ def _parse_paged(out: str) -> list[dict]:
 def _issue_num(issue_url: str) -> int | None:
     tail = issue_url.rstrip("/").rsplit("/", 1)[-1] if issue_url else ""
     return int(tail) if tail.isdigit() else None
+
+
+def _api_to_html_url(api_url: str) -> str:
+    """Convert a notification subject's API URL to a browser URL. A PR subject's
+    API URL uses ``/pulls/<n>`` where the browser path is ``/pull/<n>``; issues
+    map straight through. Non-``/repos/`` shapes (e.g. discussions) degrade to the
+    API URL unchanged."""
+    if not api_url:
+        return ""
+    url = api_url.replace("https://api.github.com/repos/", "https://github.com/", 1)
+    return url.replace("/pulls/", "/pull/", 1)
