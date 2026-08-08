@@ -293,3 +293,56 @@ async def test_cap_break_writes_watermark_at_last_processed_chunk(
     # watermark reflects the LAST processed chunk (chunk 0 → line 1), byte in step
     assert row["last_extracted_line"] == 1
     assert row["last_extracted_byte"] == line0_end
+
+
+# --------------------------------------------------------------------------- #
+# transcript I/O failure — BOTH watermarks preserved (never advanced/initialized)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_io_failure_does_not_advance_watermark(db, tmp_path, monkeypatch):
+    """A failed transcript read leaves BOTH watermarks untouched.
+
+    Regression guard for the empty-branch write on a freshly-migrated session
+    (line watermark set, byte watermark NULL): a ``failed=True`` delta must NOT
+    persist ``byte=0`` against the nonzero line watermark — doing so violates the
+    invariant and makes the next cycle seek byte 0 while numbering from the old
+    line, re-reading the ENTIRE transcript (the multi-second loop-block this PR
+    exists to remove).
+    """
+    from genesis.memory import extraction_job
+
+    await _mk_session(db, "sess-iofail")
+    # Migrated state: line watermark advanced, byte watermark still NULL.
+    await cc_sessions.update_extraction_watermark(
+        db, "sess-iofail", last_extracted_line=5, last_extracted_at="2026-08-07T00:00:00"
+    )
+    pre = await cc_sessions.get_by_id(db, "sess-iofail")
+    assert pre["last_extracted_line"] == 5
+    assert pre["last_extracted_byte"] is None  # the state the bug corrupts
+
+    def failed_delta(_path, *, start_line=0, start_byte=None, max_lines=None):
+        # what read_transcript_delta returns on a stat()/read() OSError
+        return TranscriptDelta(
+            messages=[],
+            new_byte_offset=start_byte or 0,
+            new_line_count=start_line,
+            failed=True,
+        )
+
+    monkeypatch.setattr(
+        extraction_job, "_find_transcript", lambda *_a, **_k: tmp_path / "sess-iofail.jsonl"
+    )
+    monkeypatch.setattr(extraction_job, "read_transcript_delta", failed_delta)
+
+    await extraction_job.run_extraction_cycle(
+        db=db,
+        store=AsyncMock(),
+        router=AsyncMock(),
+        transcript_dir=tmp_path,
+    )
+
+    row = await cc_sessions.get_by_id(db, "sess-iofail")
+    assert row["last_extracted_line"] == 5  # line watermark unchanged
+    assert row["last_extracted_byte"] is None  # byte watermark NOT advanced to 0

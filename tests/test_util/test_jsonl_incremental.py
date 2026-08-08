@@ -266,3 +266,22 @@ def test_read_transcript_messages_parity(tmp_path):
     assert [(m.role, m.text, m.line_number) for m in old] == [
         (m.role, m.text, m.line_number) for m in new
     ]
+
+
+def test_io_failure_sets_failed_flag_not_a_stat_gate(tmp_path):
+    """A stat()/read() error returns ``failed=True`` with an empty, NON-``unchanged``
+    delta.
+
+    The empty-result branch in ``run_extraction_cycle`` advances BOTH watermarks
+    whenever ``not unchanged``. Without a distinct failure flag, a transient stat()
+    failure on a freshly-migrated session (``last_extracted_byte`` NULL → ``start_byte``
+    None → ``new_byte_offset`` coerced to 0) paired with a nonzero ``start_line`` would
+    persist byte=0 against that line watermark — the invariant violation that makes the
+    next cycle re-read the ENTIRE transcript from byte 0.
+    """
+    missing = tmp_path / "never_created.jsonl"  # stat() raises FileNotFoundError (OSError)
+    d = read_transcript_delta(missing, start_line=40000, start_byte=None)
+
+    assert d.failed is True
+    assert d.messages == []
+    assert d.unchanged is False  # a genuine failure, NOT the stat-gate no-op

@@ -277,9 +277,11 @@ async def run_extraction_cycle(
             # No new user/assistant messages. If the file changed (non-message
             # lines appended), advance BOTH watermarks so the next cycle
             # stat-gates instead of re-reading from byte 0. Skip in
-            # reference-only mode (leaves prod extraction state untouched) and
-            # when the stat-gate already confirmed nothing changed.
-            if use_incremental and not delta.unchanged:
+            # reference-only mode (leaves prod extraction state untouched),
+            # when the stat-gate already confirmed nothing changed, and when
+            # transcript I/O failed (advancing on a failed read would persist
+            # byte=0 against a nonzero line watermark → whole-file re-read).
+            if use_incremental and not delta.unchanged and not delta.failed:
                 await _update_watermark(
                     db, session_id, delta.new_line_count,
                     last_extracted_byte=delta.new_byte_offset,

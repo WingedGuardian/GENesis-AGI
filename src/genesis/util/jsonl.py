@@ -45,6 +45,7 @@ class TranscriptDelta:
     new_line_count: int
     unchanged: bool = False       # stat-gate hit: file size == start_byte, nothing read
     truncated_reset: bool = False  # stored offset was past EOF → re-read from 0
+    failed: bool = False          # stat()/read() raised — caller MUST NOT advance watermarks
 
 
 def _parse_transcript_line(
@@ -129,6 +130,10 @@ def read_transcript_delta(
       * a partial trailing line (no newline yet — active append) is NOT
         consumed; ``new_byte_offset`` stays at its start so it is read whole
         on a later call.
+      * a ``stat()``/read ``OSError`` → ``failed=True`` (empty result); the
+        caller MUST NOT advance either watermark — persisting the coerced
+        ``byte=0`` against a nonzero line watermark would force a whole-file
+        re-read next cycle.
 
     Opens in BINARY mode: ``stat().st_size`` is directly comparable to the byte
     offset, and splitting on ``b"\\n"`` (0x0A) never tears a multibyte UTF-8
@@ -138,10 +143,15 @@ def read_transcript_delta(
         size = path.stat().st_size
     except OSError:
         logger.warning("Could not stat transcript: %s", path, exc_info=True)
+        # I/O failure — signal it so the caller preserves BOTH watermarks. A
+        # non-failed empty result would let the empty branch persist byte=0
+        # against a nonzero line watermark (invariant violation → whole-file
+        # re-read next cycle).
         return TranscriptDelta(
             messages=[],
             new_byte_offset=start_byte or 0,
             new_line_count=start_line,
+            failed=True,
         )
 
     truncated_reset = False
@@ -169,6 +179,7 @@ def read_transcript_delta(
 
     messages: list[ConversationMessage] = []
     byte_pos = seek_pos
+    read_failed = False
     try:
         with open(path, "rb") as f:
             f.seek(seek_pos)
@@ -194,12 +205,14 @@ def read_transcript_delta(
                     messages.append(msg)
     except OSError:
         logger.warning("Could not read transcript: %s", path, exc_info=True)
+        read_failed = True
 
     return TranscriptDelta(
         messages=messages,
         new_byte_offset=byte_pos,
         new_line_count=line_no,
         truncated_reset=truncated_reset,
+        failed=read_failed,
     )
 
 
