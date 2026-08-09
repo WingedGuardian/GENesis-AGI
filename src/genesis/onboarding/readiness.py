@@ -32,6 +32,14 @@ floor's live-recompute philosophy). Everything else that makes an install *good*
 rather than *minimal* — web-search availability, autonomy posture, surplus, voice,
 the dashboard password — is enrichment surfaced by the panel, never a tier gate.
 
+:class:`EnrichmentStatus` / :func:`compute_enrichment` carry those non-gating signals
+alongside the tier: which premium web-search providers are keyed, whether S2S voice is
+deliberately configured, the ego think-cadence, and the shipped autonomy default level.
+Like the tier, they are presence-based and pure over persisted state plus two injected
+config values (``ego_cadence_minutes`` — which may be fractional — and the ``autonomy_level``
+int), so the module stays free of
+runtime/ego/autonomy imports on the ``setup-status`` hot path.
+
 Like the floor, readiness is **presence-based and pure over persisted state plus two
 injected bools** (``ego_enabled`` from the ego config and ``onboarded`` from the marker,
 both resolved by the route so this module needs no runtime/ego import) — safe on the
@@ -50,14 +58,35 @@ scope for this signal by design.
 
 from __future__ import annotations
 
+import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from genesis.channels.bridge_config import build_bridge_config, parse_secrets_env_text
 from genesis.env import secrets_path
-from genesis.onboarding.floor import FloorStatus, compute_floor, read_persisted_secrets
+from genesis.onboarding.floor import (
+    UNSET_SENTINELS,
+    FloorStatus,
+    compute_floor,
+    read_persisted_secrets,
+)
+
+logger = logging.getLogger(__name__)
 
 _TIER_NAMES = {0: "Bootstrapped", 1: "Functional", 2: "Connected", 3: "Autonomous"}
+
+# Premium (keyed) web-search providers, kept pre-sorted so the enrichment field has a
+# stable order without re-sorting per request. Web search is available regardless of
+# these — the keyless SearXNG primary is the bootstrap default — so this is pure
+# enrichment: "which PAID providers augment the keyless baseline", never a tier gate.
+_WEB_SEARCH_PREMIUM_PROVIDERS = ("brave", "exa", "tavily", "tinyfish")
+
+# Voice S2S provider -> the secrets key that enables it. Mirrors
+# ``channels.voice.config.s2s_enabled`` BUT requires an explicit provider: that module
+# defaults ``VOICE_S2S_PROVIDER`` to "openai", which would count any OpenAI LLM key as
+# "voice configured" — the panel wants deliberate opt-in, not an incidental LLM key.
+_VOICE_PROVIDER_KEYS = {"openai": "OPENAI_API_KEY", "gemini": "GOOGLE_API_KEY"}
 
 
 def _telegram_reach_configured(secrets_text: str) -> bool:
@@ -170,3 +199,146 @@ def compute_readiness(
         ego_enabled=bool(ego_enabled),
         onboarded=bool(onboarded),
     )
+
+
+# ── Enrichment (non-gating capability signals surfaced by the panel) ───────────────
+
+
+def _as_int(value: object, default: int) -> int:
+    """Coerce an injected config value to ``int``, falling back on any bad value.
+
+    Keeps :func:`compute_enrichment` truly never-raising even if the route hands it a
+    non-numeric ego cadence / autonomy level. ``int()`` raises across a WIDER set than
+    is obvious: ``TypeError`` (``None``/list), ``ValueError`` (non-numeric str), AND
+    ``OverflowError`` (``int(float('inf'))`` — a YAML ``.inf`` in a user-overridden ego/
+    autonomy config resolves to a float infinity). All three fall back to ``default``.
+    """
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _as_finite_number(value: object, default: int) -> int | float:
+    """Coerce to a FINITE number, preserving fractional values; fall back on bad input.
+
+    Unlike :func:`_as_int`, this keeps a supported fractional cadence: the ego config
+    validator accepts ``int | float`` (``ego/config.py`` ``validate_ego_config``),
+    ``load_ego_config`` does not int-coerce the scalar, and ``EgoCadenceManager`` passes
+    it straight to APScheduler's ``IntervalTrigger(minutes=…)`` (which runs on floats) —
+    so the display field must report the real interval (``45.5`` stays ``45.5``), not a
+    truncated ``45``. Rejects non-numeric AND non-finite (``inf``/``nan``) → ``default``,
+    keeping the never-raise contract. Whole numbers normalise to ``int`` for clean JSON
+    (``60.0`` → ``60``).
+    """
+    try:
+        n = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(n):
+        return default
+    return int(n) if n.is_integer() else n
+
+
+def _web_search_keyed_providers(secrets: Mapping[str, str]) -> tuple[str, ...]:
+    """Premium web-search providers whose canonical key is configured, in stable order.
+
+    Enrichment only: web search is available regardless (the keyless SearXNG primary is
+    the bootstrap default), so this reports which PAID providers augment it — never a
+    floor/tier gate. Each web-search tool provider reads ONLY its canonical
+    ``API_KEY_<TYPE>`` env var (``web/search.py`` for Brave; ``runtime/init/providers.py``
+    for Tavily/Exa/TinyFish) — NOT routing's 3-pattern resolver — so we check that exact
+    key, not ``provider_key_present`` (whose ``<TYPE>_API_KEY`` / ``_API_TOKEN`` aliases
+    would advertise a provider that its adapter can't actually load). Pure; never raises.
+    """
+    return tuple(
+        p
+        for p in _WEB_SEARCH_PREMIUM_PROVIDERS
+        if str(secrets.get(f"API_KEY_{p.upper()}", "")).strip() not in UNSET_SENTINELS
+    )
+
+
+def _voice_configured(secrets: Mapping[str, str]) -> bool:
+    """Whether S2S voice is DELIBERATELY configured (explicit provider + its key).
+
+    Requires an explicit ``VOICE_S2S_PROVIDER`` (``openai``/``gemini``) in ``secrets``
+    AND that provider's API key present — NOT ``channels.voice.config.s2s_enabled``,
+    whose "openai" default would report voice for any box that merely has an
+    ``OPENAI_API_KEY``.
+
+    The provider value is matched **exactly, without stripping**, to mirror the runtime:
+    ``s2s_provider()`` reads the raw env value and ``s2s_enabled()`` compares it with a
+    bare ``== "openai"``/``"gemini"`` — so a hand-quoted ``" openai "`` (dotenv keeps the
+    inner spaces) would NOT enable voice at runtime, and must not read as configured here
+    either (the same parser-parity trap as the PR-B1 Telegram gate). Pure; never raises.
+    """
+    provider = str(secrets.get("VOICE_S2S_PROVIDER", ""))
+    key_name = _VOICE_PROVIDER_KEYS.get(provider)
+    if key_name is None:
+        return False
+    return str(secrets.get(key_name, "")).strip() not in UNSET_SENTINELS
+
+
+@dataclass(frozen=True)
+class EnrichmentStatus:
+    """Non-gating capability signals surfaced by the readiness panel.
+
+    NONE of these affect the tier (see the module docstring) — they describe how far an
+    install is *enriched* beyond the minimal functional path. Presence-based and pure
+    over persisted state plus two injected config values, like :class:`ReadinessStatus`.
+    """
+
+    web_search_keyed_providers: tuple[str, ...]
+    voice_configured: bool
+    ego_cadence_minutes: int | float  # fractional cadence (e.g. 45.5) preserved
+    autonomy_level: int
+
+    def as_dict(self) -> dict[str, object]:
+        # Distinct key namespace from the tier/floor fields — the route merges all three
+        # dicts into one flat payload, so these must not collide with existing keys.
+        return {
+            "web_search_keyed_providers": list(self.web_search_keyed_providers),
+            "voice_configured": self.voice_configured,
+            "ego_cadence_minutes": self.ego_cadence_minutes,
+            "autonomy_level": self.autonomy_level,
+        }
+
+
+def compute_enrichment(
+    secrets: Mapping[str, str] | None = None,
+    *,
+    ego_cadence_minutes: int | float,
+    autonomy_level: int,
+) -> EnrichmentStatus:
+    """Package the panel's non-gating enrichment signals.
+
+    The two pure signals (web-search keyed providers, voice) are read from ``secrets``
+    (defaulting to a live persisted read); the two injected config values — ``ego_cadence_minutes``
+    (ego config) and ``autonomy_level`` (``config/autonomy.yaml`` default) — are
+    INJECTED by the route, exactly as :func:`compute_readiness` injects ``ego_enabled``,
+    so this module needs no ego/autonomy import on the hot path.
+
+    **Never raises — by construction.** The whole body is wrapped so that ANY
+    exception (a raising ``read_persisted_secrets``, an unforeseen coercion edge, a
+    future signal reader) degrades to an empty enrichment rather than propagating a 500
+    into the first-run ``setup-status`` route. Enrichment is non-gating, so an "unknown"
+    baseline is the correct fail-safe; the per-value guards (``_as_int``) keep the good
+    fields even when one is bad, and this wrap is the backstop for everything else.
+    """
+    try:
+        if secrets is None:
+            secrets = read_persisted_secrets()
+        return EnrichmentStatus(
+            web_search_keyed_providers=_web_search_keyed_providers(secrets),
+            voice_configured=_voice_configured(secrets),
+            ego_cadence_minutes=_as_finite_number(ego_cadence_minutes, 60),
+            autonomy_level=_as_int(autonomy_level, 1),
+        )
+    except Exception:  # noqa: BLE001 - enrichment must never raise into setup-status
+        logger.warning("compute_enrichment failed; returning empty enrichment", exc_info=True)
+        return EnrichmentStatus(
+            web_search_keyed_providers=(),
+            voice_configured=False,
+            ego_cadence_minutes=60,
+            autonomy_level=1,
+        )

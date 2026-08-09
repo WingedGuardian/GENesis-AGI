@@ -22,7 +22,7 @@ from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 from genesis.onboarding.floor import UNSET_SENTINELS, read_persisted_secrets
-from genesis.onboarding.readiness import compute_readiness
+from genesis.onboarding.readiness import compute_enrichment, compute_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,13 @@ def setup_status():
     Also emits the cumulative readiness tier ABOVE the floor
     (``genesis.onboarding.readiness``): ``tier`` (0..3) + ``tier_name`` plus the
     two gates the floor does not cover — ``telegram_configured`` (T2, proactive
-    reach) and ``ego_enabled`` (T3). All additive; existing fields unchanged.
+    reach) and ``ego_enabled`` (T3).
+
+    Finally emits NON-gating enrichment (never affects the floor or the tier):
+    ``web_search_keyed_providers`` (premium providers augmenting the keyless SearXNG
+    baseline), ``voice_configured`` (deliberate S2S opt-in), ``ego_cadence_minutes``
+    (think cadence), and ``autonomy_level`` (shipped autonomy default). All additive;
+    existing fields unchanged.
     """
     # Read secrets.env once; reuse for the floor legs and the password check.
     secrets = read_persisted_secrets()
@@ -73,10 +79,29 @@ def setup_status():
     try:
         from genesis.ego.config import load_ego_config
 
-        ego_enabled = bool(load_ego_config().enabled)
+        _ego_cfg = load_ego_config()
+        ego_enabled = bool(_ego_cfg.enabled)
     except Exception:  # noqa: BLE001 - setup-status must never raise into first-run
         logger.warning("setup-status: ego config unreadable; ego_enabled=False", exc_info=True)
         ego_enabled = False
+        _ego_cfg = None
+
+    # Enrichment: the ego think-cadence (base tick minutes). Read AFTER the ego gate and
+    # kept off its critical path — a bad/absent value must never disturb ego_enabled or
+    # the tier (getattr default when the config is missing/predates the field; a
+    # non-numeric value is coerced safely inside compute_enrichment).
+    ego_cadence_minutes = getattr(_ego_cfg, "cadence_minutes", 60)
+
+    # Enrichment: the shipped autonomy default level (config posture, NOT the live
+    # earned per-install level, which is DB state). The reader is itself fail-safe to L1;
+    # the wrap guards the (unlikely) import failure so first-run can never 500.
+    try:
+        from genesis.autonomy.config_read import read_autonomy_default_level
+
+        autonomy_level = read_autonomy_default_level()
+    except Exception:  # noqa: BLE001 - setup-status must never raise into first-run
+        logger.warning("setup-status: autonomy level unreadable; defaulting to L1", exc_info=True)
+        autonomy_level = 1
 
     # The setup-complete marker gates T3 (the ego cadence won't run without it), so it
     # is read ONCE here and threaded into readiness AND the payload — one snapshot, so
@@ -100,6 +125,15 @@ def setup_status():
         "identity_set": identity_set,
     }
     payload.update(readiness.as_dict())
+
+    # Non-gating enrichment (web-search premium providers, deliberate voice, ego cadence,
+    # autonomy default level). Additive; never affects the floor or the tier.
+    enrichment = compute_enrichment(
+        secrets=secrets,
+        ego_cadence_minutes=ego_cadence_minutes,
+        autonomy_level=autonomy_level,
+    )
+    payload.update(enrichment.as_dict())
     return jsonify(payload)
 
 

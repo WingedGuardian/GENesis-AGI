@@ -1157,7 +1157,14 @@ verified: b662f3e3 2026-07-17
   bool (no runtime import on the hot path); web-search/autonomy-posture/surplus are
   enrichment, never tier gates (autonomy has no on/off switch — it's always
   initialised and gated per-action by the mandatory approval gate). `setup-status`
-  emits `tier`/`tier_name`/`telegram_configured`/`ego_enabled` additively.
+  emits `tier`/`tier_name`/`telegram_configured`/`ego_enabled` additively, plus
+  non-gating **enrichment** from `readiness.compute_enrichment` +
+  `autonomy.config_read.read_autonomy_default_level` (fail-safe, presence-based):
+  `web_search_keyed_providers` (premium providers augmenting the keyless SearXNG
+  baseline), `voice_configured` (explicit `VOICE_S2S_PROVIDER` opt-in — a bare
+  OpenAI LLM key does NOT count), `ego_cadence_minutes`, and `autonomy_level`
+  (shipped config default, not the live earned level). The persistent panel that
+  renders the tier + these chips is PR-B2b (frontend, not yet built).
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, ~113 CREATE TABLE; docs
