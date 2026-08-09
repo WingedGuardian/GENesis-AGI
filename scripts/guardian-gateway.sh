@@ -21,6 +21,8 @@
 #   host-profile    — read-only host body-schema JSON (meminfo/nproc/kernel,
 #                     storage pool, incus version + container limits.*) for the
 #                     container's infra_profile host plane
+#   cc-tmp-apply    — attach ~/.genesis/cc-tmp to its dedicated incus volume IF
+#                     no CC session is live (idempotent; JSON result token)
 #   bundle-status   — read-only offline repo-bundle archive JSON (host-only
 #                     archived `git bundle` copies + newest stamp; F.4 lifeline)
 #   provision-status          — read-only Proxmox host capacity (audit token)
@@ -888,6 +890,35 @@ PYEOF
         PYTHONPATH="$INSTALL_DIR/src" \
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 30 "$VENV_PY" -m genesis.guardian --ram-status
+        ;;
+    cc-tmp-apply)
+        # Host-side cc-tmp isolation apply — attaches ~/.genesis/cc-tmp to its
+        # dedicated incus volume IF no CC session is live (the lib's own guard).
+        # Fired opportunistically by the container's cc_tmp_align_host.sh (a
+        # cold-start oneshot + a periodic timer), so the apply converges during a
+        # quiet window instead of only when a redeploy happens to land quiet.
+        # Emits ONE JSON line on stdout carrying the lib's result token; the lib's
+        # human progress text goes to stderr to preserve the stdout=JSON contract.
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        _CCTMP_LIB="$INSTALL_DIR/scripts/lib/cc_tmp_volume.sh"
+        if [ ! -f "$_CCTMP_LIB" ]; then
+            echo '{"ok": false, "action": "cc-tmp-apply", "error": "cc_tmp_volume lib not found — run update to redeploy"}' >&2
+            exit 1
+        fi
+        # shellcheck source=/dev/null
+        . "$_CCTMP_LIB"
+        cc_tmp_volume_apply 1>&2
+        _cctmp_res="${_cctmpvol_result:-unknown}"
+        _cctmp_procs="${_cctmpvol_claude_procs:-}"
+        _cctmp_applied=false
+        if [ "$_cctmp_res" = "applied" ]; then _cctmp_applied=true; fi
+        if [[ "$_cctmp_procs" =~ ^[0-9]+$ ]]; then
+            _cctmp_procs_json="$_cctmp_procs"
+        else
+            _cctmp_procs_json="null"
+        fi
+        printf '{"ok": true, "action": "cc-tmp-apply", "result": "%s", "claude_procs": %s, "applied": %s}\n' \
+            "$_cctmp_res" "$_cctmp_procs_json" "$_cctmp_applied"
         ;;
     host-profile)
         # Read-only: print the host body-schema JSON (system identity, storage

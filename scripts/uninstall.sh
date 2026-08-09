@@ -406,6 +406,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # Stop all Genesis services (timer first, then service, to prevent restart)
         for unit in genesis-watchdog.timer genesis-watchdog.service \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
+                    genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
@@ -473,9 +474,11 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             # Stop all services (timers first to prevent restart races)
             container_exec "
                 systemctl --user stop genesis-watchdog.timer genesis-watchdog.service 2>/dev/null || true;
+                systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
                 systemctl --user disable genesis-server.service genesis-bridge.service \
-                    genesis-watchdog.timer genesis-watchdog.service qdrant.service 2>/dev/null || true
+                    genesis-watchdog.timer genesis-watchdog.service \
+                    genesis-cc-tmp-align.timer genesis-cc-tmp-align.service qdrant.service 2>/dev/null || true
             "
             ok "Stopped Genesis services"
 

@@ -1173,6 +1173,16 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     done
 fi
 
+# Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
+# timer — the loop above only enables timers). Enable-only (not --now): it is
+# meant to fire in the CC-quiet cold-start window before genesis-server, so
+# arming it for the next boot is correct; the paired timer handles periodic
+# attempts. Without this the cold-start leg would render but never activate.
+if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
+    systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
+        echo "    + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
+fi
+
 # Enable AND start tmp watchgod (OS-level temp protection)
 WATCHGOD_SRC="$REPO_DIR/config/genesis-tmp-watchgod.service"
 if [ -f "$WATCHGOD_SRC" ]; then

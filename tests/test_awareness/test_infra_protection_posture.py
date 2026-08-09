@@ -503,6 +503,13 @@ def test_every_rule_slug_has_detail_text():
     # without detail text would KeyError inside the (swallowed) check. Derive
     # the producible set from the rules themselves.
     producible = set(_infra_missing_protections(_profile(**_ALL_DEFECTS)))
+    # cc-tmp has a reason-branch: _ALL_DEFECTS yields the actionable slug, while
+    # the CONVERGING variant is produced only when the apply marker reports
+    # blocked-on-a-live-CC-session — cover that branch so both cc-tmp slugs are
+    # in the producible set (and neither is an orphan detail entry).
+    prof_blocked = _profile(**_ALL_DEFECTS)
+    prof_blocked["sections"]["storage"]["facts"]["cc_tmp_apply_blocked_on_cc"] = True
+    producible |= set(_infra_missing_protections(prof_blocked))
     assert producible == set(_loop._INFRA_POSTURE_DETAIL)
 
 
@@ -521,6 +528,7 @@ def test_resilience_facts_are_covered():
         "networkd_default_route_keepconfig",
         "network_watchdog_enabled",
         "cc_tmp_isolated",
+        "cc_tmp_apply_blocked_on_cc",
     ):
         assert fact in src, f"posture rules no longer read {fact!r}"
 
@@ -530,3 +538,48 @@ def test_check_is_wired_into_the_tick():
     # pipeline, not just exist as a function.
     src = inspect.getsource(_loop)
     assert "await _check_infra_protection_posture(self._db)" in src
+
+
+# ── cc-tmp apply reason-aware surfacing (converging vs actionable) ────────────
+
+
+def _lxc_unisolated(**storage_extra):
+    prof = _profile(cc_tmp_isolated=False, container="lxc")
+    prof["sections"]["storage"]["facts"].update(storage_extra)
+    return prof
+
+
+def test_blocked_on_cc_surfaces_converging_slug():
+    missing = _infra_missing_protections(_lxc_unisolated(cc_tmp_apply_blocked_on_cc=True))
+    assert "cc_tmp_apply_blocked_on_cc" in missing
+    assert "cc_tmp_shared_fs" not in missing  # not the actionable nag while converging
+
+
+def test_never_attempted_falls_back_to_actionable_slug():
+    # No marker yet (fact absent) → the actionable nag, not the converging one.
+    missing = _infra_missing_protections(_lxc_unisolated())
+    assert "cc_tmp_shared_fs" in missing
+    assert "cc_tmp_apply_blocked_on_cc" not in missing
+
+
+def test_terminal_skip_false_is_actionable():
+    # A terminal skip (unsupported pool / verify-failed) → blocked_on_cc False → actionable.
+    missing = _infra_missing_protections(_lxc_unisolated(cc_tmp_apply_blocked_on_cc=False))
+    assert "cc_tmp_shared_fs" in missing
+    assert "cc_tmp_apply_blocked_on_cc" not in missing
+
+
+def test_isolated_true_silent_regardless_of_reason():
+    prof = _profile(cc_tmp_isolated=True, container="lxc")
+    prof["sections"]["storage"]["facts"]["cc_tmp_apply_blocked_on_cc"] = True
+    missing = _infra_missing_protections(prof)
+    assert "cc_tmp_apply_blocked_on_cc" not in missing
+    assert "cc_tmp_shared_fs" not in missing
+
+
+def test_both_cc_tmp_slugs_have_detail_entries():
+    # Guards the KeyError trap: _check_infra_protection_posture looks up
+    # _INFRA_POSTURE_DETAIL[slug] for every missing slug, so an emittable slug
+    # WITHOUT a detail entry would crash the (best-effort) posture check.
+    assert "cc_tmp_apply_blocked_on_cc" in _loop._INFRA_POSTURE_DETAIL
+    assert "cc_tmp_shared_fs" in _loop._INFRA_POSTURE_DETAIL

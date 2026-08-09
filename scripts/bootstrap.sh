@@ -1053,6 +1053,16 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                 echo "  + $timer_name enabled + started" || true
         fi
     done
+
+    # Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
+    # timer — the loop above only enables timers). Enable-only (not --now): it is
+    # meant to fire in the CC-quiet cold-start window before genesis-server, so
+    # arming it for the next boot is correct; the paired timer handles periodic
+    # attempts. Without this an existing install would render but never activate it.
+    if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
+        systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
+            echo "  + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
+    fi
 else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
 fi

@@ -11,6 +11,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **cc-tmp blast-radius isolation now converges on its own.** The dedicated,
+  size-capped volume that stops a runaway temp write from filling the container
+  root — and taking every Claude Code session down with it — used to attach only
+  during a guardian redeploy that happened to land while no CC session was live,
+  which on a busy install is almost never. A cold-start apply (before the server
+  starts) plus a periodic retry timer now keep trying until a quiet moment is
+  found, and the infrastructure-posture alert tells "converging" apart from
+  "needs attention" so it doesn't nag when it's simply waiting. No action needed;
+  a deliberate container restart closes it immediately.
+
 - **GitHub steward now surfaces responses to your upstream contributions.** Beyond
   the flagship-repo deep-poll, the account-activity monitor gained an account-level
   notifications lane: it pings you when someone @mentions you on any repo, or
