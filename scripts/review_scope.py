@@ -517,6 +517,131 @@ def build_manifest(cwd: str | None = None, base: str | None = None) -> dict | No
     }
 
 
+# ── Substantiality classifier (commit-time review-DEPTH gate) ─────────────────
+# The depth gate distinguishes a SUBSTANTIAL change (needs an adversarial
+# /review-level audit) from a small inline one. It reads the STAGED index
+# (``--cached``), NOT build_manifest's merge-base..working-tree basis: the review
+# marker is keyed to the staged diff (review_state.get_current_diff_hash hashes
+# ``git diff --cached``), so the classifier MUST share that basis or the mark-time
+# level and the commit-time re-check could disagree on a byte-identical staged
+# diff (level thrashing / spurious blocks). Fail-opens to "unknown" so a git error
+# never fabricates a depth requirement — the CI review-depth check is the real
+# backstop; this local layer is advisory anti-autopilot friction.
+_SUBSTANTIAL_DIFF_LINES = 50
+_DOMAIN_SENSITIVE_TAGS = frozenset({"auth", "api", "migrations"})
+
+
+def _parse_numstat_perfile(text: str) -> tuple[dict[str, int], set[str]]:
+    """Parse ``git diff -z --numstat -M`` → ``(per_file_lines, binary_paths)``.
+
+    ``per_file_lines`` maps each path → added+deleted (unlike ``_parse_numstat_z``'s
+    total) so the caller can sum only the REVIEWABLE lines. ``binary_paths`` is the
+    set of files with ``-`` counts (a binary can't be line-counted OR code-reviewed,
+    so the caller excludes them from both line and file counts). For a rename the
+    stats attach to the DST only (one key per rename → no double-count). Mirrors
+    ``_parse_numstat_z``'s -z record shapes (normal: ``<a>\\t<d>\\t<path>\\0``;
+    rename: ``<a>\\t<d>\\t\\0<src>\\0<dst>\\0``).
+    """
+    tokens = text.split("\x00")
+    out: dict[str, int] = {}
+    binary: set[str] = set()
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if not tok:
+            i += 1
+            continue
+        parts = tok.split("\t")
+        if len(parts) < 3:
+            i += 1
+            continue
+        added, deleted = parts[0], parts[1]
+        inline_path = "\t".join(parts[2:])
+        if inline_path == "":  # rename/copy: dst is the token after next (src)
+            path = tokens[i + 2] if i + 2 < n else ""
+            i += 3
+        else:
+            path = inline_path
+            i += 1
+        if not path:
+            continue
+        if added == "-" or deleted == "-":  # binary — not line-countable
+            out[path] = 0
+            binary.add(path)
+            continue
+        try:
+            out[path] = int(added) + int(deleted)
+        except ValueError:
+            out[path] = 0
+    return out, binary
+
+
+def _substantiality_level(records: list[dict], per_file: dict[str, int], binary: set[str]) -> str:
+    """Pure substantiality predicate over parsed diff records — the SHARED core of
+    the staged (--cached) and PR-range (base...HEAD) paths.
+
+    Substantial when ANY holds over the reviewable files (docs-config/binary/vendored
+    excluded): reviewable lines ≥ ``_SUBSTANTIAL_DIFF_LINES`` (50), OR >1 distinct code
+    file, OR a new code file, OR a domain-sensitive ``scope_tag`` (auth/api/migrations).
+    """
+
+    def _reviewable(p: str) -> bool:
+        return p not in binary and not _is_vendored(p) and _category(p) != "docs-config"
+
+    reviewable_lines = sum(n for p, n in per_file.items() if _reviewable(p))
+    # Distinct code files from the numstat MAP — ONE key per rename (dst), so a file
+    # move counts once, not twice (name-status emits both src+dst → the double-count
+    # bug this replaces). Binary excluded (a binary asset is not code to review).
+    code_paths = {p for p in per_file if _reviewable(p) and _category(p) == "code"}
+    scope_tags: set[str] = set()
+    new_code_file = False
+    for rec in records:  # both rename sides here → domain-sensitivity on either side
+        path = rec["path"]
+        if not _reviewable(path):
+            continue
+        tag = _scope_tag(path)
+        if tag:
+            scope_tags.add(tag)
+        if rec["change_type"][:1] == "A" and _category(path) == "code":
+            new_code_file = True  # a NEW code file (renames are R, not A)
+    substantial = (
+        reviewable_lines >= _SUBSTANTIAL_DIFF_LINES
+        or len(code_paths) > 1
+        or new_code_file
+        or bool(scope_tags & _DOMAIN_SENSITIVE_TAGS)
+    )
+    return "substantial" if substantial else "inline"
+
+
+def _classify_diff(diff_args: list[str], cwd: str | None) -> str:
+    """Run the two -z diffs, parse, and classify — or ``"unknown"`` on any git error
+    (fail OPEN: no fabricated depth requirement; the CI check is the backstop)."""
+    name_status = _git(["diff", *diff_args, "-z", "--name-status", "-M"], cwd)
+    numstat = _git(["diff", *diff_args, "-z", "--numstat", "-M"], cwd)
+    if name_status is None or numstat is None:
+        return "unknown"
+    per_file, binary = _parse_numstat_perfile(numstat)
+    return _substantiality_level(_parse_name_status_z(name_status), per_file, binary)
+
+
+def classify_change_substantiality(cwd: str | None = None) -> str:
+    """Substantiality of the STAGED change (--cached) — for the commit-time depth gate.
+
+    Uses the staged index so it shares the review marker's basis (which hashes
+    ``git diff --cached``); a different basis would let the mark-time level and the
+    commit-time re-check disagree on a byte-identical staged diff. Returns
+    ``"substantial"`` | ``"inline"`` | ``"unknown"``.
+    """
+    return _classify_diff(["--cached"], cwd)
+
+
+def classify_range_substantiality(base: str, cwd: str | None = None) -> str:
+    """Substantiality of ``base...HEAD`` — for the CI review-depth check (a PR range,
+    not a staged index). Same predicate, different basis. ``"unknown"`` on git error."""
+    return _classify_diff([f"{base}...HEAD"], cwd)
+
+
 def render_reminder_block(manifest: dict | None) -> str:
     """Human-readable manifest for the review reminder, or "" when nothing to add.
 

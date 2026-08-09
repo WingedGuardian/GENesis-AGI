@@ -429,8 +429,8 @@ def main() -> None:
     # must sit on the INNER command (the sigil isn't propagated to wrappers); the
     # documented `git commit … # escalation-ack` form is a plain segment.
     round_n = get_review_round(cwd=cwd)
+    commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
     if round_n >= ESCALATION_ROUND_CAP:
-        commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
         acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
         )
@@ -438,11 +438,12 @@ def main() -> None:
             _deny(
                 f"BLOCKED: review escalation cap reached — {round_n} consecutive review "
                 f"rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). The "
-                "review→fix loop has run long. STOP and get a FRESH user decision on how "
-                "to proceed (keep "
-                "hardening / switch to a robust-by-construction redesign / narrow scope / "
-                "shelve), then acknowledge that decision with a trailing shell comment "
-                "(outside any quotes):\n"
+                "review→fix loop has run long — the round-2 mode-switch audit did NOT "
+                "converge, which means the DESIGN or the problem statement is likely "
+                "wrong, not just this fix. STOP and get a FRESH user decision on how to "
+                "proceed (robust-by-construction redesign / narrow scope / shelve), then "
+                "acknowledge that decision with a trailing shell comment (outside any "
+                "quotes):\n"
                 '  git commit -m "your message"  # escalation-ack'
             )
             return
@@ -452,6 +453,43 @@ def main() -> None:
         # acknowledgment was made, and erring toward less friction only happens
         # AFTER a conscious ack.
         reset_review_round(cwd=cwd)
+    elif round_n == ESCALATION_ROUND_CAP - 1:
+        # Tier 1 — MODE-SWITCH, one round BEFORE the hard stop. Two consecutive
+        # defect-bearing rounds is the signature of fixing the INSTANCE a reviewer
+        # named instead of the CLASS: round N's narrow patch leaves sibling
+        # edge/boundary/sentinel cases that round N+1 then surfaces. Stopping here
+        # only "fails louder"; the fix is to force a DIFFERENT approach so the loop
+        # CONVERGES in one more round instead of grinding to the round-3 stop. Block
+        # until a '# audit-ack' — NOT a hard stop (the session can proceed once it
+        # has done the audit), and deliberately one round earlier than the cap so
+        # the intervention lands while the loop is still short. Does NOT reset the
+        # counter: a still-narrow fix must still reach the round-3 stop, and a
+        # clean review afterwards resets the streak via bump_review_round(clean).
+        # Independent of '# review-override' (Rule 2) and '# escalation-ack' (above).
+        acked = bool(commit_segs) and all(
+            has_trailing_override(s.raw, sigil="audit-ack") for s in commit_segs
+        )
+        if not acked:
+            _deny(
+                f"BLOCKED (mode-switch): {round_n} consecutive review rounds each "
+                f"surfaced NEW defects (cap {ESCALATION_ROUND_CAP}). You are fixing the "
+                "INSTANCE the reviewer named, not the CLASS — a third round is how the "
+                "loop runs away. Do NOT commit another one-line patch. STOP and switch "
+                "approach:\n"
+                "  1. Dispatch a FRESH-CONTEXT adversarial reviewer (a subagent with "
+                "clean context) over the ENTIRE diff — tell it to exhaustively "
+                "enumerate every edge/boundary/sentinel/hierarchy/error case, "
+                "independent of what the bot flagged.\n"
+                "  2. For any domain semantics in play (cgroup, systemd, SQLite, async, "
+                "timezones, …), READ the authoritative docs/source — do not reason from "
+                "assumption; assumption is what produced the serial defects.\n"
+                "  3. Fix the WHOLE enumerated class in ONE commit — not just the named "
+                "case.\n"
+                "Then acknowledge you did the audit (not another blind patch) with a "
+                "trailing shell comment (outside any quotes):\n"
+                '  git commit -m "your message"  # audit-ack'
+            )
+            return
 
     # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
     # or config carries no code to review (adaptive-review "review level: None"),
@@ -468,6 +506,53 @@ def main() -> None:
         staged = _staged_files(cwd)
         if staged and all(_is_docs_or_config(p) for p in staged):
             sys.exit(0)
+
+    # Rule 2.5: review DEPTH. A SUBSTANTIAL change needs an ADVERSARIAL audit, not a
+    # precision-filtered inline pass — a "no findings" from a confidence-≥80 reviewer
+    # is FALSE CONFIDENCE, not clearance. Checked BEFORE Rule 2 (and its override) so
+    # '# review-override' waives FINDINGS but NOT the depth requirement (D1). A loud,
+    # logged '# depth-ack' is the audited escape for a genuine format mismatch.
+    # Substantiality is taken from the current staged diff OR the marker's RECORDED
+    # level (so a `git add && commit` chain — empty index at hook time — still enforces
+    # via what was reviewed). Fail-OPEN on any classifier/marker error: this is advisory
+    # anti-autopilot friction; the CI review-depth check is the real backstop. Runs
+    # AFTER the docs skip, so a pure-docs commit never reaches it.
+    try:
+        from review_scope import classify_change_substantiality
+
+        staged_level = classify_change_substantiality(cwd=cwd)
+    except Exception:  # noqa: BLE001 - depth is advisory; never crash the gate
+        staged_level = "unknown"
+    try:
+        from review_state import get_marker_depth
+
+        marker_level, is_adversarial = get_marker_depth(cwd=cwd)
+    except Exception:  # noqa: BLE001 - a marker-read error must not block (fail open)
+        marker_level, is_adversarial = None, True
+    if (staged_level == "substantial" or marker_level == "substantial") and not is_adversarial:
+        depth_acked = bool(commit_segs) and all(
+            has_trailing_override(s.raw, sigil="depth-ack") for s in commit_segs
+        )
+        if depth_acked:
+            print(
+                "NOTE: depth-ack honored — substantial-change adversarial-audit "
+                "requirement waived by explicit acknowledgment.",
+                file=sys.stderr,
+            )
+        else:
+            _deny(
+                "BLOCKED (review depth): this is a SUBSTANTIAL change (≥50 reviewable "
+                "lines, or >1 code file, or a new code file, or auth/api/migrations) but the "
+                "review is not an ADVERSARIAL audit. A precision-filtered 'no findings' "
+                "inline pass is FALSE CONFIDENCE, not clearance. Dispatch a genesis-architect "
+                "adversarial audit (assume bugs, enumerate the edge/boundary/sentinel/"
+                "hierarchy class, READ authoritative semantics for any domain code), save it "
+                "to ~/.genesis/last_code_review.txt, then re-mark:\n"
+                "  python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt\n"
+                "If the audit genuinely ran but its format isn't recognized, acknowledge with "
+                "a trailing shell comment (outside any quotes):  # depth-ack"
+            )
+            return
 
     # Rule 2: Block commits without review (on branches)
     # Race condition: when command is "git add X && git commit", nothing is
@@ -507,7 +592,7 @@ def main() -> None:
             return
         _deny(
             "BLOCKED: Code changes exist without review. "
-            "Run /review and dispatch the superpowers:code-reviewer agent first, "
+            "Run /review and dispatch the genesis-architect agent (adversarial audit) first, "
             "then run: python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt\n"
             "If findings are intentionally accepted, append a trailing shell "
             "comment (outside any quotes): '  # review-override'"

@@ -237,10 +237,79 @@ def test_ack_inside_message_does_not_bypass(repo, home):
     assert "escalation cap" in res.stderr
 
 
-def test_below_cap_not_blocked_by_escalation(repo, home):
+def test_first_defect_round_not_blocked(repo, home):
+    # One defect-bearing round (below the mode-switch tier) → allowed with no ack.
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 2)  # 1 round
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+# ── Tier 1: round CAP-1 mode-switch (audit-ack) ───────────────────────────
+
+
+def test_mode_switch_blocks_at_second_defect_round(repo, home):
+    # Two consecutive defect-bearing rounds → the mode-switch tier blocks (one round
+    # BEFORE the hard cap), demanding a fresh-eyes audit rather than another patch.
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)  # 2 rounds
     res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 0, res.stderr  # review current + under cap → allowed
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "mode-switch" in res.stderr
+    assert "audit-ack" in res.stderr
+
+
+def test_audit_ack_allows_past_mode_switch(repo, home):
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    res = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
+def test_audit_ack_inside_message_does_not_bypass(repo, home):
+    # The token buried in -m (not a clean trailing comment) must NOT ack.
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    res = _run_hook('git commit -m "did the audit-ack thing"', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "mode-switch" in res.stderr
+
+
+def test_escalation_ack_does_not_satisfy_mode_switch(repo, home):
+    # The two acks are distinct: at the round-2 mode-switch the gate wants the
+    # AUDIT ack, not the round-3 user-decision ack. A wrong sigil stays blocked.
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "mode-switch" in res.stderr
+
+
+def test_audit_ack_does_not_reset_counter_so_round3_still_hard_stops(repo, home):
+    # The mode-switch ack lets THIS commit through but must NOT reset the streak:
+    # if the "audit" didn't actually converge and a third defect round follows,
+    # the hard cap must still fire. (Only a CLEAN review resets the streak.)
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)  # round 2
+    r_mode = _run_hook('git commit -m "audited"  # audit-ack', repo, home)
+    assert r_mode.returncode == 0, r_mode.stderr
+    _git(repo, "commit", "-qm", "audited")  # land it
+    _stage(repo, "third = 1\n")  # a THIRD distinct defect round
+    assert _mark(repo, home).returncode == 0
+    # Assert via the gate (subprocess under the test HOME) — an in-process
+    # get_review_round() would read the REAL ~/.genesis, not the test home. The
+    # hard stop firing proves the counter reached the cap (audit-ack did NOT reset).
+    r_hard = _run_hook('git commit -m "wip3"', repo, home)
+    assert r_hard.returncode == 2, r_hard.stdout + r_hard.stderr
+    assert "escalation cap" in r_hard.stderr
+
+
+def test_audit_ack_then_clean_review_resets(repo, home):
+    # The intended happy path: mode-switch → do the audit → a CLEAN review resets
+    # the streak, so the branch is back to zero friction (no round-3 stop).
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)  # round 2
+    r_mode = _run_hook('git commit -m "audited"  # audit-ack', repo, home)
+    assert r_mode.returncode == 0, r_mode.stderr
+    _git(repo, "commit", "-qm", "audited")
+    _stage(repo, "post_audit = 1\n")
+    m = _mark(repo, home, clean=True)  # audit converged → clean review resets streak
+    assert m.returncode == 0 and "streak reset" in m.stdout
+    res = _run_hook('git commit -m "wip"', repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
 
 
 def test_review_override_does_not_bypass_cap(repo, home):

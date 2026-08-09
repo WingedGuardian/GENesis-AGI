@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import subprocess
 import sys
 import time
@@ -197,6 +198,73 @@ def _verify_agent_output(path: str) -> tuple[bool, str]:
     return True, f"Agent output valid ({int(age)}s old, {p.stat().st_size} bytes)"
 
 
+# ── Review DEPTH signals (for the substantial-change depth gate) ──────────────
+# A SUBSTANTIAL change needs an ADVERSARIAL audit, not a precision-filtered inline
+# pass. We can't semantically grade a review, so we verify STRUCTURAL engagement
+# markers a shallow "looks good, 88% confident" pass lacks. Deliberately LENIENT on
+# vocabulary (accepts every real reviewer's ladder — genesis-architect
+# BLOCKER/SHOULD-FIX/NOTE, genesis-security CRITICAL/HIGH/LOW, Codex P1/P2/P3, the
+# CODE_AUDITOR JSON contract) but STRICT on engagement (must reference specific
+# code), so it rejects a rubber stamp without false-blocking a differently-shaped
+# real audit. This is an advisory anti-autopilot floor, NOT tamper-proof: a
+# determined same-user agent can hand-write these markers — the real teeth are the
+# CI review-depth check + the independent cloud reviewer + the human merge.
+# Severity-ladder LABELS — matched CASE-SENSITIVELY (uppercase): every real
+# reviewer emits them in caps (genesis-architect BLOCKER/SHOULD-FIX, genesis-security
+# CRITICAL/HIGH/LOW, Codex P1/P2/P3, CODE_AUDITOR JSON "severity":"high" values). NOT
+# IGNORECASE, because lowercase "high confidence"/"low risk"/"medium-sized" is ordinary
+# prose a SHALLOW pass uses — matching it would gut the discriminator (audit finding).
+_LADDER_LABEL_RE = re.compile(r"\b(BLOCKER|SHOULD[- ]FIX|CRITICAL|HIGH|MEDIUM|LOW|P[123])\b")
+# Structural markers that are unambiguous even lowercased (a JSON key / a heading).
+_LADDER_PHRASE_RE = re.compile(r'"severity"\s*:|scope\s*check', re.IGNORECASE)
+# Engagement with SPECIFIC code (not prose) — accept either shape a real reviewer
+# uses: a contiguous ``foo.py:42`` pointer (architect/security/Codex prose), OR the
+# CODE_AUDITOR JSON contract's separate ``"file"``/``"line"`` fields (which never
+# render as ``file:line``). Requiring only the prose form would false-block a
+# legitimate JSON audit.
+_FILE_LINE_RE = re.compile(r"[\w./-]+\.\w+:\d+")
+_JSON_FILE_RE = re.compile(r'"file"\s*:')
+_JSON_LINE_RE = re.compile(r'"line"\s*:')
+_MIN_EVIDENCE_CHARS = 400  # a real audit is substantive, not a one-liner
+
+
+def _evidence_is_adversarial(text: str) -> tuple[bool, str]:
+    """Lenient STRUCTURAL check that review evidence is an adversarial audit.
+
+    NOT semantic grading — requires all three engagement markers a shallow pass
+    lacks: (1) a recognized severity ladder OR a scope-coverage statement, (2)
+    engagement with specific code (a ``file:line`` pointer OR the JSON
+    ``"file"``+``"line"`` finding contract), (3) a minimum length. The conjunction
+    is what makes a casual prose "high confidence" (no code reference) fail while a
+    genuinely clean audit ("Scope Check: … no BLOCKER at foo.py:42") passes.
+    """
+    stripped = text.strip()
+    if len(stripped) < _MIN_EVIDENCE_CHARS:
+        return False, f"evidence too short ({len(stripped)} < {_MIN_EVIDENCE_CHARS} chars)"
+    if not (_LADDER_LABEL_RE.search(text) or _LADDER_PHRASE_RE.search(text)):
+        return False, "no severity ladder / scope-check marker (reads like a shallow pass)"
+    has_engagement = bool(_FILE_LINE_RE.search(text)) or bool(
+        _JSON_FILE_RE.search(text) and _JSON_LINE_RE.search(text)
+    )
+    if not has_engagement:
+        return False, "no file:line engagement (no specific code referenced)"
+    return True, "adversarial-audit structure present"
+
+
+def get_marker_depth(cwd: str | None = None) -> tuple[str | None, bool]:
+    """``(level, adversarial)`` recorded in the current marker; ``(None, False)`` if absent.
+
+    Read by the commit gate's depth check. ``level`` is the computed
+    substantiality at mark time; ``adversarial`` is the derived content-verify
+    result — NEITHER is self-reported by the caller.
+    """
+    state = _load_marker(cwd)
+    if not state:
+        return None, False
+    level = state.get("level")
+    return (level if isinstance(level, str) else None), bool(state.get("adversarial"))
+
+
 def mark_reviewed(
     agent_output_path: str | None = None,
     cwd: str | None = None,
@@ -226,8 +294,27 @@ def mark_reviewed(
     agent_ok, agent_msg = _verify_agent_output(agent_path)
     if not agent_ok:
         print(f"REFUSED: {agent_msg}", file=sys.stderr)
-        print("Dispatch the superpowers:code-reviewer agent first.", file=sys.stderr)
+        print("Dispatch the genesis-architect agent (adversarial audit) first.", file=sys.stderr)
         return False
+
+    # Review-DEPTH signals — COMPUTED here, never self-reported by the caller.
+    # ``level`` is the staged-change substantiality; ``adversarial`` is the derived
+    # result of structurally verifying the evidence. Both fail-soft: a classifier or
+    # read error must never block writing the marker (depth is advisory).
+    try:
+        from review_scope import classify_change_substantiality
+
+        level = classify_change_substantiality(cwd=cwd)
+    except Exception:  # noqa: BLE001 - depth is advisory; never block marking a review
+        level = "unknown"
+    adversarial = False
+    depth_msg = "not checked"
+    try:
+        adversarial, depth_msg = _evidence_is_adversarial(
+            Path(agent_path).read_text(errors="replace")
+        )
+    except OSError as e:
+        depth_msg = f"evidence unreadable ({e})"
 
     # Authoritative evidence present — write the per-worktree marker.
     state_file = _state_file(cwd)
@@ -237,8 +324,21 @@ def mark_reviewed(
         "reviewed_at": datetime.now(UTC).isoformat(),
         "review_evidence": review_msg,  # advisory annotation (gstack corroboration)
         "agent_evidence": agent_msg,
+        "level": level,  # computed substantiality (substantial|inline|unknown)
+        "adversarial": adversarial,  # derived: evidence has adversarial-audit structure
+        "depth_evidence": depth_msg,
     }
     state_file.write_text(json.dumps(state, indent=2))
+    # Loud feedback when a substantial change was marked WITHOUT adversarial-audit
+    # structure: the commit-time depth gate will block it (this is the fast-feedback).
+    if level == "substantial" and not adversarial:
+        print(
+            f"WARNING: substantial change marked with a non-adversarial review ({depth_msg}). "
+            "The commit depth gate will BLOCK this — run a genesis-architect adversarial "
+            "audit (enumerate the edge/boundary/sentinel class; read authoritative "
+            "semantics) and re-mark.",
+            file=sys.stderr,
+        )
     # Update the escalation counter (see bump_review_round). A defect-bearing round
     # on a distinct staged diff advances the streak; a clean round resets it.
     # Best-effort: marking the review must ALWAYS succeed even if the counter is
