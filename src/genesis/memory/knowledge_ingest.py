@@ -68,7 +68,7 @@ async def ingest_knowledge_unit(
 
     ``concept`` overrides the default ``content[:200]`` derivation. The
     reference store uses a structured identifier like
-    ``"ScarletAndRage forum login"``.
+    ``"ExampleForum login"``.
 
     ``tags_json`` overrides the default tags array. Pass a pre-built JSON
     string when the caller needs reference-specific tag layout.

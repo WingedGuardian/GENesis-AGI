@@ -365,7 +365,7 @@ async def knowledge_ingest(
 
     ``concept`` (optional): override the derived ``concept`` field. Defaults to
     ``content[:200]``. The reference store passes a structured identifier here
-    (e.g. ``"ScarletAndRage forum login"``) so that the unique key
+    (e.g. ``"ExampleForum login"``) so that the unique key
     ``(project_type, domain, concept)`` behaves like a dedup key on logical
     identity rather than raw content prefix.
 
@@ -492,7 +492,7 @@ async def reference_store(
     ``kind`` must be one of: credentials, url, network, persona_pointer,
     account, fact.
 
-    ``identifier`` is the human-readable name (e.g. "ScarletAndRage forum
+    ``identifier`` is the human-readable name (e.g. "ExampleForum
     login"). It becomes the unique key ``concept`` field — use the same
     identifier across re-stores to get upsert semantics.
 
@@ -504,7 +504,7 @@ async def reference_store(
     context, purpose, or relationship — not just the value itself.
 
     ``tags`` are optional extra tags for retrieval (e.g. ``["forum",
-    "persona:614buckeye"]``). The ``reference`` tag and the ``kind`` tag are
+    "persona:example"]``). The ``reference`` tag and the ``kind`` tag are
     added automatically.
 
     ``source`` is optional provenance (``session_id``, ``captured_via``,
@@ -622,7 +622,7 @@ async def reference_lookup(
     Combines two paths, same pattern as ``knowledge_recall``:
     1. Vector search via ``HybridRetriever.recall(source="episodic")`` over
        the ``episodic_memory`` Qdrant collection — catches semantic matches
-       ("that forum for Ohio State fans" → "ScarletAndRage forum login")
+       ("that community hobby forum" → "ExampleForum login")
        that keyword search misses. References live in episodic_memory
        alongside other personal data.
     2. FTS5 keyword search over ``knowledge_fts`` — catches exact token

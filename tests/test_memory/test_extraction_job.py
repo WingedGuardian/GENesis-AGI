@@ -328,7 +328,7 @@ class TestRunExtractionCycle:
                 "uuid": "u1",
                 "timestamp": "2026-04-11T12:00:00Z",
                 "message": {"role": "user", "content": [
-                    {"type": "text", "text": "login is 614Buckeye password is OhioState614!Bucks"},
+                    {"type": "text", "text": "login is ForumUser42 password is Passw0rd!x9z"},
                 ]},
             },
         ]
@@ -353,10 +353,10 @@ class TestRunExtractionCycle:
             router.route_call = AsyncMock(return_value=AsyncMock(
                 success=True,
                 content=(
-                    '```json\n{"extractions": [{"content": "ScarletAndRage '
-                    'login: username: 614Buckeye password: OhioState614!Bucks", '
+                    '```json\n{"extractions": [{"content": "HobbyForum '
+                    'login: username: ForumUser42 password: Passw0rd!x9z", '
                     '"type": "entity", "confidence": 0.9, '
-                    '"entities": ["ScarletAndRage"]}]}\n```'
+                    '"entities": ["HobbyForum"]}]}\n```'
                 ),
                 call_site_id="9_fact_extraction",
                 error=None,

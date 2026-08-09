@@ -33,7 +33,7 @@ from genesis.memory.reference_ops import (
 
 _CASES = [
     # (description, value)
-    ("ScarletAndRage forum login for the 614buckeye persona", "admin / Hunter2!xyz"),
+    ("HobbyForum forum login for the example persona", "admin / Hunter2!xyz"),
     ("Edge router admin panel", "https://203.0.113.10/admin"),
     ("Container host on the lab subnet", "203.0.113.42"),
     # value containing the separator + special chars
@@ -52,7 +52,7 @@ def test_parse_roundtrip_mcp_formatter(description, value):
         identifier="Test Entry",
         description=description,
         value=value,
-        tags=["forum", "persona:614buckeye"],
+        tags=["forum", "persona:example"],
         source={"captured_via": "manual", "session_id": "sess123"},
     )
     parsed = parse_reference_body(body)
