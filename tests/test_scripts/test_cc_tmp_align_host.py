@@ -20,7 +20,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ALIGN = REPO_ROOT / "scripts" / "cc_tmp_align_host.sh"
 
 
-def _harness(tmp_path, *, ssh_response="", ssh_rc=0, with_guardian=True, with_key=True):
+def _harness(
+    tmp_path,
+    *,
+    ssh_response="",
+    ssh_rc=0,
+    with_guardian=True,
+    with_key=True,
+    preexisting_marker=None,
+):
     root = tmp_path  # doubles as GENESIS_ROOT (has .venv) and HOME (has .genesis/.ssh)
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     script = root / "scripts" / "cc_tmp_align_host.sh"
@@ -33,6 +41,9 @@ def _harness(tmp_path, *, ssh_response="", ssh_rc=0, with_guardian=True, with_ke
 
     gdir = root / ".genesis"
     gdir.mkdir(exist_ok=True)
+    if preexisting_marker is not None:
+        (gdir / "state").mkdir(parents=True, exist_ok=True)
+        (gdir / "state" / "cc_tmp_apply.json").write_text(json.dumps(preexisting_marker))
     if with_guardian:
         (gdir / "guardian_remote.yaml").write_text("host_ip: 192.0.2.9\nhost_user: opuser\n")
     sshdir = root / ".ssh"
@@ -141,3 +152,44 @@ def test_self_guards_present():
     assert "flock -n" in txt, "must single-flight"
     assert "guardian_remote.yaml" in txt, "must no-op without a guardian"
     assert "cc-tmp-apply" in txt, "must call the gateway verb"
+
+
+# ── stale-marker invalidation on preflight no-op (Codex P2) ──────────────────
+
+
+def test_preflight_noop_clears_stale_marker(tmp_path):
+    # A prior run recorded live-cc; guardian later removed → the no-op path must
+    # invalidate the stale marker so the posture stops falsely reporting
+    # "converging" when nothing is actually being retried.
+    proc, marker = _harness(
+        tmp_path,
+        with_guardian=False,
+        preexisting_marker={
+            "last_attempt_at": "2026-08-09T00:00:00+00:00",
+            "last_reason": "live-cc",
+            "applied": False,
+        },
+    )
+    assert proc.returncode == 0
+    assert marker is None  # stale marker invalidated → collector falls back to actionable
+
+
+def test_missing_key_clears_stale_marker(tmp_path):
+    proc, marker = _harness(
+        tmp_path,
+        with_key=False,
+        preexisting_marker={"last_attempt_at": "x", "last_reason": "live-cc", "applied": False},
+    )
+    assert proc.returncode == 0
+    assert marker is None
+
+
+def test_successful_run_still_overwrites_marker(tmp_path):
+    # A preexisting marker must NOT block a real run from recording its outcome.
+    proc, marker = _harness(
+        tmp_path,
+        ssh_response=_applied_json(result="applied"),
+        preexisting_marker={"last_attempt_at": "old", "last_reason": "live-cc", "applied": False},
+    )
+    assert proc.returncode == 0
+    assert marker["last_reason"] == "applied"

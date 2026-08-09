@@ -37,6 +37,15 @@ GUARDIAN_CONFIG="$HOME/.genesis/guardian_remote.yaml"
 SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
 MARKER="$HOME/.genesis/state/cc_tmp_apply.json"
 
+# Invalidate any prior outcome marker. Called on the preflight no-op paths where
+# the apply can't even be ATTEMPTED this run (no guardian, broken key/venv/config):
+# a stale "live-cc" marker there would keep the awareness posture falsely
+# "converging/patient" when nothing is actually converging. Clearing it makes the
+# collector emit no cc_tmp_apply_* facts, so posture falls back to the honest
+# actionable nag. Safe when absent (rm -f). NOT called on the lock/single-flight
+# skips — another run owns the marker there.
+_invalidate_marker() { rm -f "$MARKER" 2>/dev/null || true; }
+
 # ── Single-flight guard: never let two runs issue concurrent host applies. ──
 LOCKFILE="$HOME/.genesis/locks/cc_tmp_align_host.lock"
 mkdir -p "$(dirname "$LOCKFILE")" 2>/dev/null || true
@@ -52,14 +61,17 @@ fi
 # ── Guardian-less install → clean no-op (no host plane to reach). ──
 if [ ! -f "$GUARDIAN_CONFIG" ]; then
     echo "cc_tmp_align_host: no guardian_remote.yaml — host apply not applicable (no-op)"
+    _invalidate_marker
     exit 0
 fi
 if [ ! -f "$SSH_KEY" ]; then
     echo "cc_tmp_align_host: guardian SSH key $SSH_KEY missing — cannot reach host (skipping)"
+    _invalidate_marker
     exit 0
 fi
 if [ ! -x "$VENV_PY" ]; then
     echo "cc_tmp_align_host: venv python ($VENV_PY) unavailable — cannot parse guardian config (skipping)"
+    _invalidate_marker
     exit 0
 fi
 
@@ -68,6 +80,7 @@ HOST_IP="$("$VENV_PY" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Pat
 HOST_USER="$("$VENV_PY" -c "import yaml, pathlib; print(yaml.safe_load(pathlib.Path('$GUARDIAN_CONFIG').read_text()).get('host_user', 'ubuntu'))" 2>/dev/null || echo "ubuntu")"
 if [ -z "$HOST_IP" ]; then
     echo "cc_tmp_align_host: host_ip unparseable in $GUARDIAN_CONFIG — skipping (non-fatal)"
+    _invalidate_marker
     exit 0
 fi
 
