@@ -542,6 +542,46 @@ _INLINE_REVIEW_BOTS = {
 # Badge/markup prefix stripped when rendering a finding's title line.
 _INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
 
+# ── Direct-sqlite-write detection ────────────────────────────────────────────
+# Robust bare-keyword match (the historical approach). A SINGLE statement keyword
+# is inherently immune to shell quoting/escapes AND SQL comments BETWEEN tokens,
+# because it never depends on two tokens being adjacent in the raw command. The
+# ONLY refinement over the historical pattern is a negative lookahead excluding a
+# keyword immediately followed by `(` — i.e. the `replace(...)` scalar FUNCTION
+# (or any keyword-as-function) — so a read-only SELECT using replace() no longer
+# false-positives. This is strictly narrower than the old pattern for reads and
+# IDENTICAL for writes (no real write statement is `KEYWORD(`), so it cannot open
+# a bypass. Detection stays on the WHOLE command so a heredoc/`bash -c`/wrapper
+# cannot fragment and hide a write.
+#
+# Two earlier approaches were REJECTED for weakening the guard, and this returns
+# to the robust original: (a) exe-scoping + a read-only exemption exempted
+# read-only tokens appearing in write SQL *data* and missed heredocs/wrappers;
+# (b) statement-position two-token matching was bypassable by a SQL comment or a
+# shell escape/quote inserted between the two tokens (`DELETE /*c*/ FROM`,
+# `DELETE\ FROM`, `DELETE' 'FROM`). A single-keyword match has neither failure.
+#
+# Accepted limitation (NOT a regression — the historical guard did the same): a
+# command that merely MENTIONS a bare keyword alongside "sqlite3" without a write
+# (a `grep 'sqlite3 … DELETE' file`, or a read whose STRING VALUE is a keyword
+# like `WHERE s='DELETE'`) still matches. Excluding those needs real SQL/shell
+# parsing — tracked as a follow-up, not worth reintroducing bypass risk for.
+_DML_KEYWORD_RE = re.compile(
+    r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b(?!\s*\()",
+    re.IGNORECASE,
+)
+
+
+def _is_sqlite_write(cmd: str) -> bool:
+    """Whether *cmd* issues a direct sqlite3 DML/DDL write.
+
+    Broad on purpose (any mention of ``sqlite3`` in the whole command, matching
+    the historical behavior) so a heredoc/`bash -c`/wrapper cannot fragment and
+    hide the write. A DML keyword must be present in non-function position (the
+    negative lookahead drops the ``replace()`` scalar function).
+    """
+    return "sqlite3" in cmd and bool(_DML_KEYWORD_RE.search(cmd))
+
 
 def _inline_title(body: str) -> str:
     """First readable line of an inline finding body."""
@@ -1706,13 +1746,11 @@ def main() -> int:
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
-        # NB: match on the raw command, not the unquoted one — the DML keyword
-        # lives inside the quoted SQL argument (sqlite3 db "DELETE FROM ...").
-        if "sqlite3" in cmd and re.search(
-            r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b",
-            cmd,
-            re.IGNORECASE,
-        ):
+        # Whole-command match (never misses a fragmented/wrapped invocation),
+        # narrowed to DML in statement position so the `replace()` scalar
+        # function and bare keywords in a grep pattern no longer false-positive.
+        # See _is_sqlite_write / _DML_STATEMENT_RE.
+        if _is_sqlite_write(cmd):
             print(
                 "BLOCKED: Direct database writes via sqlite3 are not allowed. "
                 "Use CRUD modules or MCP tools instead.",
