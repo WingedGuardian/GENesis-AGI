@@ -244,7 +244,8 @@ def test_setup_status_enrichment_fields_reflect_config(wiz):
     wiz["monkeypatch"].setattr(
         wiz["ego_config"],
         "load_ego_config",
-        lambda *a, **k: SimpleNamespace(enabled=False, cadence_minutes=45),
+        # A fractional cadence must survive the route + jsonify unchanged (not truncated).
+        lambda *a, **k: SimpleNamespace(enabled=False, cadence_minutes=45.5),
     )
     wiz["monkeypatch"].setattr(
         wiz["autonomy_cfg"], "read_autonomy_default_level", lambda *a, **k: 2
@@ -252,7 +253,7 @@ def test_setup_status_enrichment_fields_reflect_config(wiz):
     body = wiz["client"].get("/api/genesis/setup-status").get_json()
     assert body["web_search_keyed_providers"] == ["brave"]
     assert body["voice_configured"] is True
-    assert body["ego_cadence_minutes"] == 45
+    assert body["ego_cadence_minutes"] == 45.5
     assert body["autonomy_level"] == 2
     # Enrichment is non-gating: these do not change the floor/tier.
     assert body["floor_met"] is True

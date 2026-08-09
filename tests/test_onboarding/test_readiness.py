@@ -390,6 +390,19 @@ def test_compute_enrichment_non_coercible_ints_fall_back_never_raises(
     assert e.ego_cadence_minutes == exp_cadence and e.autonomy_level == exp_level
 
 
+def test_compute_enrichment_preserves_fractional_cadence():
+    # A SUPPORTED fractional cadence (validate_ego_config accepts int|float; the scheduler
+    # runs IntervalTrigger on floats) must be reported faithfully, not truncated to int.
+    e = compute_enrichment(secrets={}, ego_cadence_minutes=45.5, autonomy_level=2)
+    assert e.ego_cadence_minutes == 45.5
+    # Whole-number floats normalise to int for clean JSON (60.0 -> 60, not 60.0).
+    e2 = compute_enrichment(secrets={}, ego_cadence_minutes=60.0, autonomy_level=1)
+    assert e2.ego_cadence_minutes == 60 and isinstance(e2.ego_cadence_minutes, int)
+    # A numeric string is still coerced (parity with the old int path).
+    e3 = compute_enrichment(secrets={}, ego_cadence_minutes="90", autonomy_level=1)
+    assert e3.ego_cadence_minutes == 90 and isinstance(e3.ego_cadence_minutes, int)
+
+
 def test_compute_enrichment_backstops_any_internal_raise(monkeypatch):
     # Robust-by-construction: if ANY internal step raises (here a signal reader), the
     # whole computation degrades to empty enrichment rather than 500ing setup-status.

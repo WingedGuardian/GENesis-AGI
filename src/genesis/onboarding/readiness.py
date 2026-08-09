@@ -36,7 +36,8 @@ the dashboard password — is enrichment surfaced by the panel, never a tier gat
 alongside the tier: which premium web-search providers are keyed, whether S2S voice is
 deliberately configured, the ego think-cadence, and the shipped autonomy default level.
 Like the tier, they are presence-based and pure over persisted state plus two injected
-config ints (``ego_cadence_minutes``, ``autonomy_level``), so the module stays free of
+config values (``ego_cadence_minutes`` — which may be fractional — and the ``autonomy_level``
+int), so the module stays free of
 runtime/ego/autonomy imports on the ``setup-status`` hot path.
 
 Like the floor, readiness is **presence-based and pure over persisted state plus two
@@ -58,6 +59,7 @@ scope for this signal by design.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -217,6 +219,27 @@ def _as_int(value: object, default: int) -> int:
         return default
 
 
+def _as_finite_number(value: object, default: int) -> int | float:
+    """Coerce to a FINITE number, preserving fractional values; fall back on bad input.
+
+    Unlike :func:`_as_int`, this keeps a supported fractional cadence: the ego config
+    validator accepts ``int | float`` (``ego/config.py`` ``validate_ego_config``),
+    ``load_ego_config`` does not int-coerce the scalar, and ``EgoCadenceManager`` passes
+    it straight to APScheduler's ``IntervalTrigger(minutes=…)`` (which runs on floats) —
+    so the display field must report the real interval (``45.5`` stays ``45.5``), not a
+    truncated ``45``. Rejects non-numeric AND non-finite (``inf``/``nan``) → ``default``,
+    keeping the never-raise contract. Whole numbers normalise to ``int`` for clean JSON
+    (``60.0`` → ``60``).
+    """
+    try:
+        n = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(n):
+        return default
+    return int(n) if n.is_integer() else n
+
+
 def _web_search_keyed_providers(secrets: Mapping[str, str]) -> tuple[str, ...]:
     """Premium web-search providers whose canonical key is configured, in stable order.
 
@@ -262,12 +285,12 @@ class EnrichmentStatus:
 
     NONE of these affect the tier (see the module docstring) — they describe how far an
     install is *enriched* beyond the minimal functional path. Presence-based and pure
-    over persisted state plus two injected config ints, like :class:`ReadinessStatus`.
+    over persisted state plus two injected config values, like :class:`ReadinessStatus`.
     """
 
     web_search_keyed_providers: tuple[str, ...]
     voice_configured: bool
-    ego_cadence_minutes: int
+    ego_cadence_minutes: int | float  # fractional cadence (e.g. 45.5) preserved
     autonomy_level: int
 
     def as_dict(self) -> dict[str, object]:
@@ -284,13 +307,13 @@ class EnrichmentStatus:
 def compute_enrichment(
     secrets: Mapping[str, str] | None = None,
     *,
-    ego_cadence_minutes: int,
+    ego_cadence_minutes: int | float,
     autonomy_level: int,
 ) -> EnrichmentStatus:
     """Package the panel's non-gating enrichment signals.
 
     The two pure signals (web-search keyed providers, voice) are read from ``secrets``
-    (defaulting to a live persisted read); the two config ints — ``ego_cadence_minutes``
+    (defaulting to a live persisted read); the two injected config values — ``ego_cadence_minutes``
     (ego config) and ``autonomy_level`` (``config/autonomy.yaml`` default) — are
     INJECTED by the route, exactly as :func:`compute_readiness` injects ``ego_enabled``,
     so this module needs no ego/autonomy import on the hot path.
@@ -308,7 +331,7 @@ def compute_enrichment(
         return EnrichmentStatus(
             web_search_keyed_providers=_web_search_keyed_providers(secrets),
             voice_configured=_voice_configured(secrets),
-            ego_cadence_minutes=_as_int(ego_cadence_minutes, 60),
+            ego_cadence_minutes=_as_finite_number(ego_cadence_minutes, 60),
             autonomy_level=_as_int(autonomy_level, 1),
         )
     except Exception:  # noqa: BLE001 - enrichment must never raise into setup-status
