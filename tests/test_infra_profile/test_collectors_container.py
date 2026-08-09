@@ -167,7 +167,16 @@ def test_pid_ceiling_effective_ok(sys_root):
     slice_dir.joinpath("pids.max").write_text("2400\n")
     assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
 
-    # still on systemd's 33% default (1320) → NOT ok (the defect we surface)
+    # a DELIBERATE lower operator override (40% = 1600) is a conscious choice, not
+    # an unprovisioned box — must read as ok, not falsely nagged (Codex P2 regress).
+    slice_dir.joinpath("pids.max").write_text("1600\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # just above the stock default + rounding margin (35% = 1400) → still ok
+    slice_dir.joinpath("pids.max").write_text("1400\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # still on systemd's stock 33% default (1320) → NOT ok (the defect we surface)
     slice_dir.joinpath("pids.max").write_text("1320\n")
     assert _pid_ceiling_effective_ok(sys_root, uid=4242) is False
 

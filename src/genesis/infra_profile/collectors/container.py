@@ -160,6 +160,18 @@ def _oomd_user_slice_kill(etc_root: Path) -> bool:
     return effective == "kill"
 
 
+# systemd's stock per-user-slice default is TasksMax=33% (user-.slice.d/
+# 10-defaults.conf), which it resolves against the container root cgroup's
+# pids.max (verified live: 33% of a 4000 root budget = 1320). The 1.05 factor is
+# a rounding margin above that default: it absorbs systemd's %→count rounding so a
+# slice sitting exactly on the stock default reads as un-raised, while ANY
+# deliberate operator override above ~35% (the docs allow lowering below the 60%
+# floor in consultation) reads as provisioned — the posture check must not nag a
+# conscious choice, only a silent stock default.
+_STOCK_TASKSMAX_FRACTION = 0.33
+_RAISED_TASKSMAX_MARGIN = 1.05
+
+
 def _pid_ceiling_effective_ok(sys_root: Path, uid: int | None = None) -> bool | None:
     """Whether the per-user systemd slice's EFFECTIVE PID/task ceiling is raised
     above systemd's stock 33% default (user-.slice.d/10-defaults.conf).
@@ -168,10 +180,11 @@ def _pid_ceiling_effective_ok(sys_root: Path, uid: int | None = None) -> bool | 
     any runtime `set-property` override into the slice's pids.max — NOT a drop-in
     string-match, so it is correct even when a system.control override coexists
     with the provisioned user-.slice drop-in. True when the slice has no sub-cap
-    (`pids.max == "max"`) or the container root budget is uncapped (the % default
-    is then huge, not a risk) or the effective cap is >= half the root budget
-    (well above the 33% default; the genesis floor is 60%). False when the slice
-    is silently on/near the 33% default. None when it can't be determined
+    (`pids.max == "max"`), or the container root budget is uncapped (the % default
+    then resolves huge, not a risk), or the effective cap is above the stock 33%
+    default by the rounding margin — so ANY deliberate raise (the genesis 60% floor
+    OR a lower operator override, e.g. 40%) reads as provisioned. False ONLY when
+    the slice is still on the stock 33% default. None when it can't be determined
     (unreadable / malformed) — the posture check treats None as silent."""
     if uid is None:
         uid = os.getuid()
@@ -192,7 +205,9 @@ def _pid_ceiling_effective_ok(sys_root: Path, uid: int | None = None) -> bool | 
         return None
     if root_max <= 0:
         return None
-    return slice_max >= 0.5 * root_max
+    # Raised = above systemd's stock 33% default (not "at the genesis 60% floor"):
+    # a deliberate lower override is a conscious choice, not an unprovisioned box.
+    return slice_max > root_max * _STOCK_TASKSMAX_FRACTION * _RAISED_TASKSMAX_MARGIN
 
 
 def _keepconf_effective_in_dir(dropin_dir: Path) -> bool:
