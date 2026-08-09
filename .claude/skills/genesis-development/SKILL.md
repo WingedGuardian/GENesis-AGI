@@ -412,6 +412,40 @@ The enforcement hooks (`review_enforcement_prompt.py`,
 safety nets, not the decision-maker. This protocol provides the
 judgment framework.
 
+### Review depth is machine-checked (the front-stop)
+
+The "substantial → adversarial /review-level audit" decision above is no longer
+left to judgment alone (that judgment is exactly what failed on PR #1353 — an
+under-depth inline pass was self-certified as sufficient). The commit gate now
+COMPUTES substantiality from the staged diff
+(`review_scope.classify_change_substantiality`) and BLOCKS a substantial change
+whose review marker is not an ADVERSARIAL audit (`review_enforcement_commit.py`
+Rule 2.5). A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
+substantial change — not clearance. Depth is override-exempt: a findings
+`# review-override` does NOT waive it; only a loud, logged `# depth-ack` does (the
+audited escape for a genuine format mismatch). "Adversarial" is verified
+STRUCTURALLY — a severity ladder (BLOCKER/SHOULD-FIX/NOTE, CRITICAL/HIGH/LOW,
+P1/P2/P3, or the CODE_AUDITOR JSON contract) + `file:line` engagement + substance —
+so run the real recall-tuned audit (`genesis-architect` / `CODE_AUDITOR.md`); do not
+hand-write a soft prompt.
+
+**Honest enforcement model — where the teeth actually are.** The local hook is
+ADVISORY anti-autopilot friction, NOT tamper-proof: on a single-user-authored repo
+the same actor can edit the hook or hand-write the marker. The enforcing teeth live
+where the author has no control at commit time — the **independent cloud reviewer
+(Codex)** + a **required human approval**, gated by **branch protection**, plus the
+CI `review-depth-check` that recomputes substantiality and flags it loudly on the PR
+(advisory, exit-0-always). The local gate's job is to interrupt autopilot; the real
+gate is external. Do not mistake a green local hook for clearance.
+
+**Close every review with a verdict.** End each review with an explicit
+`Ready to merge: Yes | No | With fixes` + a one-line reason, alongside the
+DONE / DONE_WITH_CONCERNS completion status. And the DON'Ts that keep a review
+honest: never "looks good" without reading the code; never a finding on code you
+did not read; never vague ("improve error handling") — always `file:line` + why it
+matters. (Deliberately NOT a "praise-first / acknowledge strengths" balance: an
+adversarial audit's job is to assume bugs and enumerate the class, not to reassure.)
+
 Two protocol steps apply to every review at "Code-reviewer inline" level or
 above (full definitions in `.claude/agents/genesis-architect.md`):
 
