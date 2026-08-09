@@ -386,13 +386,13 @@ async def test_reference_store_full_roundtrip():
             tools = await _get_tools()
             unit_id = await tools["reference_store"].fn(
                 kind="credentials",
-                identifier="ScarletAndRage forum login",
-                value="614Buckeye / hunter2",
+                identifier="HobbyForum forum login",
+                value="ForumUser42 / hunter2",
                 description=(
-                    "Login for forum.thescarletandrage.com, used by the "
-                    "614Buckeye persona. Ohio State fan forum."
+                    "Login for forum.example-community.org, used by the "
+                    "ForumUser42 persona. hobby community forum."
                 ),
-                tags=["forum", "persona:614buckeye"],
+                tags=["forum", "persona:example"],
                 source={
                     "session_id": "sess-abc",
                     "captured_via": "user_paste",
@@ -405,11 +405,11 @@ async def test_reference_store_full_roundtrip():
             row = await mod.knowledge.get(real_db, unit_id)
             assert row["project_type"] == "reference"
             assert row["domain"] == "reference.credentials"
-            assert row["concept"] == "ScarletAndRage forum login"
-            assert "614Buckeye / hunter2" in row["body"]
-            assert "Ohio State fan forum" in row["body"]
+            assert row["concept"] == "HobbyForum forum login"
+            assert "ForumUser42 / hunter2" in row["body"]
+            assert "hobby community forum" in row["body"]
             assert "forum" in row["tags"]
-            assert "persona:614buckeye" in row["tags"]
+            assert "persona:example" in row["tags"]
             assert "reference" in row["tags"]
             assert "credentials" in row["tags"]
             assert row["qdrant_id"] == "qdrant-cred-1"
@@ -680,10 +680,10 @@ async def test_reference_lookup_hybrid_vector_path():
             tools = await _get_tools()
             unit_id = await tools["reference_store"].fn(
                 kind="persona_pointer",
-                identifier="614Buckeye persona",
-                value="~/.claude/personas/614buckeye/persona.md",
+                identifier="ForumUser42 persona",
+                value="~/.claude/personas/example/persona.md",
                 description=(
-                    "Ohio State fan persona for low-key forum engagement"
+                    "hobby community persona for low-key forum engagement"
                 ),
             )
 

@@ -22,7 +22,7 @@ SEED_CONFIDENCE = 0.95
 # (name, entity_type, summary)
 SEED_ENTITIES: list[tuple[str, str, str]] = [
     ("OMI", "device", "Wearable always-on AI mic (omi.me); evaluated, not adopted"),
-    ("HAOS Voice PE", "device", "Home Assistant Voice Preview Edition — the invested edge device"),
+    ("HAOS Voice PE", "device", "Home Assistant Voice Preview Edition — the target edge device"),
     ("voice-edge-device", "concept", "Category: voice/edge hardware endpoints (wearables, smart speakers)"),
     ("GENesis-Voice", "repo", "Public repo for voice/edge-device software (firmware, esphome, bridges)"),
     ("GENesis-AGI", "repo", "Public primary repo — the Genesis cognitive core"),

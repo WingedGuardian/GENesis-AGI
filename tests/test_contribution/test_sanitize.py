@@ -103,9 +103,9 @@ def test_forbidden_secrets_env_blocks():
 
 def test_forbidden_research_profiles_blocks():
     diff = (
-        "diff --git a/config/research-profiles/jay.yaml b/config/research-profiles/jay.yaml\n"
-        "--- a/config/research-profiles/jay.yaml\n"
-        "+++ b/config/research-profiles/jay.yaml\n"
+        "diff --git a/config/research-profiles/example.yaml b/config/research-profiles/example.yaml\n"
+        "--- a/config/research-profiles/example.yaml\n"
+        "+++ b/config/research-profiles/example.yaml\n"
         "@@ -1 +1 @@\n+topic: foo\n"
     )
     r = sanitize.scan_diff(diff)
@@ -184,7 +184,7 @@ def test_email_blocks_personal():
     diff = (
         "diff --git a/README.md b/README.md\n"
         "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n"
-        "+Contact: jay@somedomain.org\n"
+        "+Contact: someone@somedomain.org\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False

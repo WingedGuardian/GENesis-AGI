@@ -295,12 +295,12 @@ async def test_delete_nonexistent(db):
 async def test_find_by_unique_key_hit(db):
     uid = await knowledge.insert(
         db, project_type="reference", domain="reference.credentials",
-        source_doc="manual", concept="ScarletAndRage login",
+        source_doc="manual", concept="HobbyForum login",
         body="forum creds",
     )
     row = await knowledge.find_by_unique_key(
         db, project_type="reference", domain="reference.credentials",
-        concept="ScarletAndRage login",
+        concept="HobbyForum login",
     )
     assert row is not None
     assert row["id"] == uid
@@ -321,14 +321,14 @@ async def test_find_by_unique_key_miss(db):
 async def test_upsert_insert_path(db):
     uid, inserted = await knowledge.upsert(
         db, project_type="reference", domain="reference.urls",
-        source_doc="session-a", concept="ScarletAndRage forum",
-        body="https://forum.thescarletandrage.com — Ohio State fan forum",
+        source_doc="session-a", concept="HobbyForum forum",
+        body="https://forum.example-community.org — hobby community forum",
     )
     assert inserted is True
     assert uid
     row = await knowledge.get(db, uid)
     assert row is not None
-    assert row["body"] == "https://forum.thescarletandrage.com — Ohio State fan forum"
+    assert row["body"] == "https://forum.example-community.org — hobby community forum"
 
 
 async def test_upsert_update_path_preserves_id(db):

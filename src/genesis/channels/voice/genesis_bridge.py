@@ -127,7 +127,7 @@ _ACT_TOOL_DECLARATIONS = [
             "Store a durable fact the user tells you to remember about "
             "themselves, their preferences, people in their life, or their "
             "world — e.g. 'remember I prefer morning meetings', 'remember my "
-            "wife's name is Sarah'. Call this ONLY when the user explicitly asks "
+            "manager's name is Alex'. Call this ONLY when the user explicitly asks "
             "you to remember or note something for later. Do NOT call it for "
             "questions (use ask_genesis) or ordinary chatter."
         ),

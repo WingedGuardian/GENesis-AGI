@@ -21,21 +21,21 @@ from genesis.memory.reference_extraction import (
 class TestClassifyCredentialPair:
     def test_colon_separated(self):
         ext = Extraction(
-            content="Jay's ScarletAndRage login: username: 614Buckeye password: OhioState614!Bucks",
+            content="The user's HobbyForum login: username: ForumUser42 password: Passw0rd!x9z",
             extraction_type="entity",
             confidence=0.9,
-            entities=["ScarletAndRage", "614Buckeye"],
+            entities=["HobbyForum", "ForumUser42"],
         )
         ref = classify_as_reference(ext)
         assert ref is not None
         assert ref["kind"] == "credentials"
-        assert "614Buckeye" in ref["value"]
-        assert "OhioState614!Bucks" in ref["value"]
-        assert ref["identifier"] == "ScarletAndRage"
+        assert "ForumUser42" in ref["value"]
+        assert "Passw0rd!x9z" in ref["value"]
+        assert ref["identifier"] == "HobbyForum"
 
     def test_natural_language(self):
         ext = Extraction(
-            content="The user's login is 614Buckeye and the password is OhioState614!Bucks",
+            content="The user's login is ForumUser42 and the password is Passw0rd!x9z",
             extraction_type="entity",
             confidence=0.85,
             entities=[],
@@ -101,17 +101,17 @@ class TestClassifyUrl:
     def test_url_with_description(self):
         ext = Extraction(
             content=(
-                "The Ohio State fan forum at https://forum.thescarletandrage.com/ "
-                "is where the 614Buckeye persona posts"
+                "The hobby community forum at https://forum.example-community.org/ "
+                "is where the ForumUser42 persona posts"
             ),
             extraction_type="entity",
             confidence=0.85,
-            entities=["ScarletAndRage"],
+            entities=["HobbyForum"],
         )
         ref = classify_as_reference(ext)
         assert ref is not None
         assert ref["kind"] == "url"
-        assert ref["value"] == "https://forum.thescarletandrage.com/"
+        assert ref["value"] == "https://forum.example-community.org/"
 
     def test_bare_url_rejected(self):
         ext = Extraction(
@@ -166,7 +166,7 @@ class TestClassifyNetwork:
 class TestClassifyNonReference:
     def test_plain_statement(self):
         ext = Extraction(
-            content="Jay decided to move forward with the memory rebalance plan",
+            content="The user decided to move forward with the memory rebalance plan",
             extraction_type="decision",
             confidence=0.9,
         )
@@ -214,12 +214,12 @@ async def test_ingest_classified_extraction(db_with_schema, mock_store):
     """A credential-shaped extraction gets ingested as a reference."""
     ext = Extraction(
         content=(
-            "ScarletAndRage forum login for the 614Buckeye persona: "
-            "username: 614Buckeye password: OhioState614!Bucks"
+            "HobbyForum forum login for the ForumUser42 persona: "
+            "username: ForumUser42 password: Passw0rd!x9z"
         ),
         extraction_type="entity",
         confidence=0.95,
-        entities=["ScarletAndRage"],
+        entities=["HobbyForum"],
     )
     unit_id = await ingest_reference_from_extraction(
         ext,
@@ -239,9 +239,9 @@ async def test_ingest_classified_extraction(db_with_schema, mock_store):
     assert row is not None
     assert row[0] == "reference"
     assert row[1] == "reference.credentials"
-    assert row[2] == "ScarletAndRage"
-    assert "614Buckeye" in row[3]
-    assert "OhioState614!Bucks" in row[3]
+    assert row[2] == "HobbyForum"
+    assert "ForumUser42" in row[3]
+    assert "Passw0rd!x9z" in row[3]
     assert "reference.credentials" in row[3]  # header salt
     assert "credentials" in row[4]
     assert "reference" in row[4]

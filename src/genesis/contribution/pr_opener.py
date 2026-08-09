@@ -81,7 +81,7 @@ def build_pr_body(
 
     All of these fields are MANDATORY per the Phase 6 plan. If a
     section is empty or unavailable, we say so explicitly — never
-    silently omit. Jay uses these to triage.
+    silently omit. The operator uses these to triage.
     """
     install_hash = install.install_id[:8]
     short_sha = source_sha[:12] if source_sha else "unknown"
