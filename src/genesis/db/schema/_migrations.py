@@ -863,6 +863,12 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_line INTEGER DEFAULT 0",
         "cc_sessions.last_extracted_line")
+    # Incremental transcript resume: byte offset of the START of line
+    # last_extracted_line. NULLable, NO default — NULL means "never computed"
+    # → the reader falls back to a full scan from byte 0 once, then populates.
+    await _try_alter(db,
+        "ALTER TABLE cc_sessions ADD COLUMN last_extracted_byte INTEGER",
+        "cc_sessions.last_extracted_byte")
 
     # Memory photographic: expand memory_links CHECK constraint to support
     # typed relationships from conversation extraction (discussed_in,
