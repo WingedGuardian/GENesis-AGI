@@ -1186,7 +1186,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE memory_metadata ADD COLUMN room TEXT",
         "memory_metadata.room")
 
-    # MW-1 Tier-0 extraction judgment axes (0079_mw1_extraction_judgment).
+    # MW-1 Tier-0 extraction judgment axes (0081_mw1_extraction_judgment).
     # These MUST be mirrored here (the base create_all_tables path) and not only
     # in the numbered migration: create_all_tables runs _migrate_add_columns but
     # NOT the numbered runner, so on an existing DB the CREATE TABLE is a no-op

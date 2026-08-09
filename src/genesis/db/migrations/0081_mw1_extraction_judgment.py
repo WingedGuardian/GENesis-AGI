@@ -27,8 +27,9 @@ INSERT on an existing DB (e.g. scripts/migrate_faiss_to_qdrant.py) needs the
 columns present there too. Being unindexed only means the INDEXES-parity guard
 cannot catch the omission — NOT that the mirror is unnecessary. schema_both_build_paths.
 
-(Numbered 0079: 0078 is the highest present; the runner applies by per-id tracking
-and only duplicate prefixes are fatal.)
+(Renumbered 0079 -> 0081: #1341 landed 0079_pending_issue_posts and #1330 owns
+0080, so this migration takes the next free prefix. The runner applies by per-id
+tracking and only duplicate prefixes are fatal.)
 """
 
 from __future__ import annotations
