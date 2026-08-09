@@ -25,6 +25,7 @@ import platform
 import shutil
 import socket
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.infra_profile.types import SectionResult
@@ -32,6 +33,28 @@ from genesis.infra_profile.types import SectionResult
 logger = logging.getLogger(__name__)
 
 _CMD_TIMEOUT = 15.0
+
+# A cc-tmp apply marker is trusted as "converging" only while its attempt
+# timestamp is within this bound — ~3x the genesis-cc-tmp-align timer's 2h
+# (OnUnitInactiveSec=7200) retry cadence. Beyond it the timer is plausibly
+# dead/disabled or a run couldn't update the marker, so a stale "live-cc" must
+# read as actionable rather than "converging forever". This one freshness rule
+# subsumes the dead-timer, lock-open-failure, and marker-write-failure paths.
+_CC_TMP_MARKER_FRESH_S = 6 * 3600
+
+
+def _cc_tmp_marker_fresh(at: object) -> bool:
+    """True if a cc-tmp apply marker's ``last_attempt_at`` is recent enough that
+    the retry timer is plausibly still running. Non-str / unparseable → not fresh."""
+    if not isinstance(at, str) or not at:
+        return False
+    try:
+        ts = datetime.fromisoformat(at)
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - ts).total_seconds() < _CC_TMP_MARKER_FRESH_S
 
 # Filesystem types worth recording as real mounts. Kernel plumbing
 # (proc/sysfs/cgroup2/…) is noise; tmpfs is deliberately IN — tmpfs sizes
@@ -475,21 +498,27 @@ async def collect_storage(
 
     # cc-tmp apply OUTCOME — the container-side opportunistic apply
     # (scripts/cc_tmp_align_host.sh) records its last result in
-    # ~/.genesis/state/cc_tmp_apply.json. Surfacing the reason lets the awareness
-    # posture rule tell "blocked on a live CC session" (converging, patient) apart
-    # from a terminal skip (still needs a human) or never-attempted. Best-effort;
-    # absent/unreadable → silent (a fresh install has no marker until the unit runs).
+    # ~/.genesis/state/cc_tmp_apply.json. The raw reason + timestamp are VOLATILE
+    # scheduling artifacts (they change as CC sessions come and go), so they go in
+    # METRICS — rendered but NEVER hashed, so they can't spam infrastructure_drift
+    # or churn the posture alert. Only the DERIVED cc_tmp_apply_blocked_on_cc is a
+    # FACT, and it is FRESHNESS-BOUNDED (see _cc_tmp_marker_fresh): a "live-cc"
+    # marker reads as "converging" ONLY while recent, so a stale marker (dead
+    # timer, lock-open failure, write failure) falls back to the actionable nag
+    # instead of "converging forever". Best-effort; absent/unreadable → silent.
     try:
         _marker = Path.home() / ".genesis" / "state" / "cc_tmp_apply.json"
         _m = json.loads(_marker.read_text())
         if isinstance(_m, dict):
             _reason = _m.get("last_reason")
-            if isinstance(_reason, str) and _reason:
-                facts["cc_tmp_apply_last_reason"] = _reason
-                facts["cc_tmp_apply_blocked_on_cc"] = _reason == "live-cc"
             _at = _m.get("last_attempt_at")
+            if isinstance(_reason, str) and _reason:
+                metrics["cc_tmp_apply_last_reason"] = _reason
             if isinstance(_at, str) and _at:
-                facts["cc_tmp_apply_last_attempt_at"] = _at
+                metrics["cc_tmp_apply_last_attempt_at"] = _at
+            facts["cc_tmp_apply_blocked_on_cc"] = (
+                _reason == "live-cc" and _cc_tmp_marker_fresh(_at)
+            )
     except (OSError, ValueError):
         pass
 

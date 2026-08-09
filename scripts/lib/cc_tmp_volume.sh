@@ -49,7 +49,12 @@ CCTMPVOL_DEVICE_NAME="${CCTMPVOL_DEVICE_NAME:-cc-tmp}"
 CCTMPVOL_VOLUME_NAME="${CCTMPVOL_VOLUME_NAME:-}" # "" → <container>-cc-tmp (collision-safe per host)
 CCTMPVOL_POOL="${CCTMPVOL_POOL:-}"               # "" → the root device's pool
 CCTMPVOL_MOUNT_PATH="${CCTMPVOL_MOUNT_PATH:-}"   # "" → <container home>/.genesis/cc-tmp
-CCTMPVOL_GUARDIAN_YAML="${CCTMPVOL_GUARDIAN_YAML:-$HOME/.local/state/genesis-guardian/guardian.yaml}"
+# Default matches the authoritative path install_guardian.sh writes + every other
+# gateway verb reads ($INSTALL_DIR/config/guardian.yaml, INSTALL_DIR=.local/share/
+# genesis-guardian). A wrong default here silently resolves the container to the
+# "genesis" literal (container_name never read) — breaking every non-default-name
+# install for BOTH this helper's callers (redeploy + cc-tmp-apply).
+CCTMPVOL_GUARDIAN_YAML="${CCTMPVOL_GUARDIAN_YAML:-$HOME/.local/share/genesis-guardian/config/guardian.yaml}"
 
 # Machine-readable outcome of the LAST cc_tmp_volume_apply, set at every return
 # site (and reset at entry). Lets a caller — the guardian `cc-tmp-apply` verb —

@@ -451,21 +451,42 @@ def _write_marker(home, **fields):
     (home / ".genesis" / "state" / "cc_tmp_apply.json").write_text(json.dumps(fields))
 
 
-async def test_storage_cc_tmp_apply_marker_surfaced(proc_root, sys_root, tmp_path, monkeypatch):
+def _fresh_now() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat()
+
+
+async def test_storage_cc_tmp_apply_volatile_fields_are_metrics_not_facts(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    # The raw reason/timestamp are volatile (change as CC sessions come/go) → they
+    # MUST live in metrics (never hashed), not facts, or they spam infra drift.
     home = tmp_path / "h"
     (home / ".genesis" / "cc-tmp").mkdir(parents=True)
-    _write_marker(
-        home,
-        last_attempt_at="2026-08-09T00:00:00+00:00",
-        last_reason="live-cc",
-        claude_procs=5,
-        applied=False,
-    )
+    _write_marker(home, last_attempt_at=_fresh_now(), last_reason="live-cc", claude_procs=5)
     monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
-    assert result.facts["cc_tmp_apply_last_reason"] == "live-cc"
+    # derived + freshness-bounded → FACT
     assert result.facts["cc_tmp_apply_blocked_on_cc"] is True
-    assert result.facts["cc_tmp_apply_last_attempt_at"] == "2026-08-09T00:00:00+00:00"
+    # raw volatile fields → METRICS, and NOT duplicated into facts
+    assert result.metrics["cc_tmp_apply_last_reason"] == "live-cc"
+    assert "cc_tmp_apply_last_attempt_at" in result.metrics
+    assert "cc_tmp_apply_last_reason" not in result.facts
+    assert "cc_tmp_apply_last_attempt_at" not in result.facts
+
+
+async def test_storage_cc_tmp_apply_stale_marker_not_converging(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    # A live-cc marker whose attempt is OLD (dead/disabled timer, lock/write
+    # failure) must NOT read as converging — the freshness bound flips it.
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    _write_marker(home, last_attempt_at="2020-01-01T00:00:00+00:00", last_reason="live-cc")
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert result.facts["cc_tmp_apply_blocked_on_cc"] is False
 
 
 async def test_storage_cc_tmp_apply_terminal_reason_not_blocked(
@@ -473,16 +494,11 @@ async def test_storage_cc_tmp_apply_terminal_reason_not_blocked(
 ):
     home = tmp_path / "h"
     (home / ".genesis" / "cc-tmp").mkdir(parents=True)
-    _write_marker(
-        home,
-        last_attempt_at="2026-08-09T00:00:00+00:00",
-        last_reason="unsupported-pool",
-        applied=False,
-    )
+    _write_marker(home, last_attempt_at=_fresh_now(), last_reason="unsupported-pool")
     monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
-    assert result.facts["cc_tmp_apply_last_reason"] == "unsupported-pool"
-    assert result.facts["cc_tmp_apply_blocked_on_cc"] is False
+    assert result.facts["cc_tmp_apply_blocked_on_cc"] is False  # not live-cc
+    assert result.metrics["cc_tmp_apply_last_reason"] == "unsupported-pool"
 
 
 async def test_storage_cc_tmp_apply_marker_absent_silent(
@@ -492,8 +508,8 @@ async def test_storage_cc_tmp_apply_marker_absent_silent(
     (home / ".genesis" / "cc-tmp").mkdir(parents=True)  # no state/ marker
     monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
-    assert "cc_tmp_apply_last_reason" not in result.facts
     assert "cc_tmp_apply_blocked_on_cc" not in result.facts
+    assert "cc_tmp_apply_last_reason" not in result.metrics
 
 
 async def test_storage_cc_tmp_apply_marker_corrupt_silent(
@@ -505,4 +521,37 @@ async def test_storage_cc_tmp_apply_marker_corrupt_silent(
     (home / ".genesis" / "state" / "cc_tmp_apply.json").write_text("not valid json {{{")
     monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)  # must not raise
-    assert "cc_tmp_apply_last_reason" not in result.facts
+    assert "cc_tmp_apply_blocked_on_cc" not in result.facts
+
+
+async def test_storage_marker_does_not_churn_facts_hash(proc_root, sys_root, tmp_path, monkeypatch):
+    # Cluster-A regression guard: the SAME converging state sampled at two
+    # different times (different last_attempt_at) must produce IDENTICAL facts, so
+    # section_hash is stable and no spurious infrastructure_drift fires — only the
+    # metrics differ.
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(_container, "_cc_tmp_marker_fresh", lambda _at: True)
+    _write_marker(home, last_attempt_at="2026-08-09T10:00:00+00:00", last_reason="live-cc")
+    first = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    _write_marker(home, last_attempt_at="2026-08-09T10:02:00+00:00", last_reason="live-cc")
+    second = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert first.facts == second.facts  # hashed surface stable across marker churn
+    assert (
+        first.metrics["cc_tmp_apply_last_attempt_at"]
+        != second.metrics["cc_tmp_apply_last_attempt_at"]
+    )
+
+
+def test_cc_tmp_marker_fresh_helper():
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    assert _container._cc_tmp_marker_fresh((now - timedelta(minutes=30)).isoformat()) is True
+    assert _container._cc_tmp_marker_fresh((now - timedelta(hours=12)).isoformat()) is False
+    assert _container._cc_tmp_marker_fresh("2020-01-01T00:00:00+00:00") is False
+    assert _container._cc_tmp_marker_fresh("not-a-timestamp") is False
+    assert _container._cc_tmp_marker_fresh(None) is False
+    # a naive (tz-less) timestamp is treated as UTC, not crashed
+    assert _container._cc_tmp_marker_fresh(now.replace(tzinfo=None).isoformat()) is True

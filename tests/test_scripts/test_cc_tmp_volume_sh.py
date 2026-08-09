@@ -417,3 +417,22 @@ def test_result_token_live_cc_at_recheck(tmp_path):
     rc, res, procs = _result(_sandbox(tmp_path, INCUS_CLAUDE_LIVE_FROM_CALL=2))
     assert rc == 0 and res == "live-cc"
     assert procs == "3"  # count reported at the re-check skip
+
+
+# ── container resolution honors the authoritative guardian.yaml default ──────
+
+
+def test_guardian_yaml_default_resolves_container_name(tmp_path):
+    # The lib's CCTMPVOL_GUARDIAN_YAML default must point at the authoritative
+    # path install_guardian.sh writes ($HOME/.local/share/genesis-guardian/config/
+    # guardian.yaml). If it points elsewhere, container_name is never read and the
+    # apply silently targets the "genesis" literal — breaking non-default installs.
+    env = _sandbox(tmp_path)  # HOME=tmp_path; CCTMPVOL_GUARDIAN_YAML unset → default
+    cfgdir = tmp_path / ".local" / "share" / "genesis-guardian" / "config"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "guardian.yaml").write_text('container_name: "mybox"\n')
+    res = _run(env)
+    assert res.returncode == 0 and "__DONE__" in res.stdout
+    log = _log(tmp_path)
+    assert "info mybox" in log  # incus ops target the configured container
+    assert "genesis-cc-tmp" not in log  # NOT the default-name fallback volume
