@@ -572,6 +572,15 @@ _INFRA_POSTURE_DETAIL = {
         "volume, size-capped so a runaway can never reach the rootfs; requires "
         "a block/CoW-backed storage pool — lvm/zfs/btrfs/ceph)"
     ),
+    "cc_tmp_apply_blocked_on_cc": (
+        "the Claude Code scratch dir (~/.genesis/cc-tmp) still shares a filesystem "
+        "with the container root, but the dedicated-volume apply is CONVERGING: its "
+        "last attempt skipped only because a CC session was live (attaching would "
+        "shadow open temp files). It re-attempts on the next CC-quiet cold-start and "
+        "on a periodic timer (genesis-cc-tmp-align) — no action needed unless this "
+        "persists across many quiet windows. To close it immediately, a deliberate "
+        "container restart runs the apply in the guaranteed-quiet boot window"
+    ),
 }
 
 
@@ -654,7 +663,16 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         _facts("virt").get("container") == "lxc"
         and _facts("storage").get("cc_tmp_isolated") is False
     ):
-        missing.append("cc_tmp_shared_fs")
+        # cc-tmp is on the rootfs either way (fact stays False), but distinguish
+        # the CONVERGING state — the opportunistic apply skipped only because a CC
+        # session was live, and will attach on the next quiet cold-start/lull —
+        # from a state that needs a human (unsupported pool, verify-failed, or
+        # never-attempted). Only the surfaced detail differs; the alert still fires
+        # so the posture stays honest that isolation is not yet in place.
+        if _facts("storage").get("cc_tmp_apply_blocked_on_cc") is True:
+            missing.append("cc_tmp_apply_blocked_on_cc")
+        else:
+            missing.append("cc_tmp_shared_fs")
     return sorted(missing)
 
 

@@ -444,3 +444,65 @@ async def test_storage_cc_tmp_fact_absent_when_missing(proc_root, sys_root, tmp_
     monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
     assert "cc_tmp_isolated" not in result.facts
+
+
+def _write_marker(home, **fields):
+    (home / ".genesis" / "state").mkdir(parents=True, exist_ok=True)
+    (home / ".genesis" / "state" / "cc_tmp_apply.json").write_text(json.dumps(fields))
+
+
+async def test_storage_cc_tmp_apply_marker_surfaced(proc_root, sys_root, tmp_path, monkeypatch):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    _write_marker(
+        home,
+        last_attempt_at="2026-08-09T00:00:00+00:00",
+        last_reason="live-cc",
+        claude_procs=5,
+        applied=False,
+    )
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert result.facts["cc_tmp_apply_last_reason"] == "live-cc"
+    assert result.facts["cc_tmp_apply_blocked_on_cc"] is True
+    assert result.facts["cc_tmp_apply_last_attempt_at"] == "2026-08-09T00:00:00+00:00"
+
+
+async def test_storage_cc_tmp_apply_terminal_reason_not_blocked(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    _write_marker(
+        home,
+        last_attempt_at="2026-08-09T00:00:00+00:00",
+        last_reason="unsupported-pool",
+        applied=False,
+    )
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert result.facts["cc_tmp_apply_last_reason"] == "unsupported-pool"
+    assert result.facts["cc_tmp_apply_blocked_on_cc"] is False
+
+
+async def test_storage_cc_tmp_apply_marker_absent_silent(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)  # no state/ marker
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert "cc_tmp_apply_last_reason" not in result.facts
+    assert "cc_tmp_apply_blocked_on_cc" not in result.facts
+
+
+async def test_storage_cc_tmp_apply_marker_corrupt_silent(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    (home / ".genesis" / "state").mkdir(parents=True)
+    (home / ".genesis" / "state" / "cc_tmp_apply.json").write_text("not valid json {{{")
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)  # must not raise
+    assert "cc_tmp_apply_last_reason" not in result.facts

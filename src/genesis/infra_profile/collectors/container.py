@@ -473,6 +473,26 @@ async def collect_storage(
     except OSError:
         pass
 
+    # cc-tmp apply OUTCOME — the container-side opportunistic apply
+    # (scripts/cc_tmp_align_host.sh) records its last result in
+    # ~/.genesis/state/cc_tmp_apply.json. Surfacing the reason lets the awareness
+    # posture rule tell "blocked on a live CC session" (converging, patient) apart
+    # from a terminal skip (still needs a human) or never-attempted. Best-effort;
+    # absent/unreadable → silent (a fresh install has no marker until the unit runs).
+    try:
+        _marker = Path.home() / ".genesis" / "state" / "cc_tmp_apply.json"
+        _m = json.loads(_marker.read_text())
+        if isinstance(_m, dict):
+            _reason = _m.get("last_reason")
+            if isinstance(_reason, str) and _reason:
+                facts["cc_tmp_apply_last_reason"] = _reason
+                facts["cc_tmp_apply_blocked_on_cc"] = _reason == "live-cc"
+            _at = _m.get("last_attempt_at")
+            if isinstance(_at, str) and _at:
+                facts["cc_tmp_apply_last_attempt_at"] = _at
+    except (OSError, ValueError):
+        pass
+
     return SectionResult(name="storage", facts=facts, metrics=metrics)
 
 
