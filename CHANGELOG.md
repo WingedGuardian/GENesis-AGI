@@ -50,6 +50,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   reserved for your (foreground) work. A foreground session can promote a tabled
   item to the board.
 
+- **All autonomous background sessions are now MCP-scoped by default.** Genesis
+  runs many kinds of background Claude Code sessions (reflection, sentinel,
+  inbox/mail triage, autonomy executor, ego gates, research). These are now secure
+  by default: each session loads only the Genesis MCP tools it is explicitly given
+  and no longer additively inherits the operator's user-scoped MCP servers (e.g.
+  code-editing tools) that were never intended for autonomous use. A session that
+  forgets to scope itself now fails closed (no extra tools) rather than open. Your
+  own foreground conversations are unchanged — they keep the full toolset. This
+  closes a latent tool-scope gap; nothing you'd notice day to day, no action needed.
+
 - **Free-tier model refresh.** Groq is retiring Llama 3.3 70B (the model behind
   several of Genesis's free reasoning/extraction/tagging steps) on 2026-08-16, so
   those steps now use Groq's recommended replacement, gpt-oss-120b. Structured-output

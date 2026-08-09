@@ -253,8 +253,18 @@ class CCInvocation:
     # (probe-verified 2026-07-09). Built-in tools remain available.
     safe_mode: bool = False
     # --strict-mcp-config: CC honors ONLY the servers in --mcp-config, ignoring
-    # user/project-scope MCP configs. Without it, mcp_config is additive.
-    strict_mcp_config: bool = False
+    # user/project-scope MCP configs. Without it, mcp_config is additive — CC
+    # merges in the user-scoped ~/.claude.json servers (gitnexus, codebase-memory,
+    # the claude.ai connectors) and, at repo cwd, project-scoped serena, none of
+    # which any Genesis denylist names. So the default is SECURE-BY-DEFAULT (True):
+    # every session gets --strict-mcp-config unless it opts out. Human-driven
+    # foreground/interactive sessions that legitimately want the full user-scoped
+    # toolset set strict_mcp_config=False explicitly (see cc/conversation.py,
+    # cc/checkpoint.py). A site that forgets fails CLOSED (loses the additive
+    # servers), never open. Pair strict with a real --mcp-config path (a genesis
+    # profile, or config/no_mcp.json for zero servers) — bare strict with no
+    # --mcp-config is an undocumented CC combination; avoid it.
+    strict_mcp_config: bool = True
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
     # Headless CC (-p) waits for dispatched background Workflow/subagent tasks

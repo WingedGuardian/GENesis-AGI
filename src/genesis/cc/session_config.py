@@ -85,6 +85,19 @@ _REFLECTION_DENY_BUILTINS: tuple[str, ...] = (
     "EnterWorktree", "ExitWorktree",
 )
 
+# User/project-scoped MCP servers that CC discovers from ~/.claude.json (+ the
+# repo's .mcp.json at repo cwd): arbitrary-source-edit / graph-mutation tools that
+# bypass the Edit/Write PreToolUse hooks. strict_mcp_config (CCInvocation default
+# True) drops them categorically by making --mcp-config authoritative; these
+# by-name wildcard denies are defense-in-depth for any path that opts out of strict
+# or a future CC scoping change. Shared by build_reflection_disallowed and
+# direct_session._UNIVERSAL_DISALLOW so the two can't drift.
+_USER_SCOPED_MCP_WILDCARDS: tuple[str, ...] = (
+    "mcp__serena__*",
+    "mcp__gitnexus__*",
+    "mcp__codebase-memory-mcp__*",
+)
+
 
 def _registered_mcp_tool_names(modpath: str) -> list[str]:
     """Tool names registered on a FastMCP server module's ``mcp`` object.
@@ -155,7 +168,11 @@ class SessionConfigBuilder:
         (``mcp__<server>__*``) — fail-closed: observations still flow through the
         parsed ``observations`` output field, and no write tool can leak.
         """
-        disallowed: list[str] = list(_REFLECTION_DENY_BUILTINS)
+        # Base = write/action built-ins + user-scoped MCP wildcards (defense-in-depth;
+        # strict_mcp_config already drops the latter categorically).
+        disallowed: list[str] = list(_REFLECTION_DENY_BUILTINS) + list(
+            _USER_SCOPED_MCP_WILDCARDS
+        )
         try:
             for server, modpath in _REFLECTION_MCP_SERVERS:
                 for name in _registered_mcp_tool_names(modpath):
@@ -169,9 +186,11 @@ class SessionConfigBuilder:
                 "this is fixed, but no write tool can leak.",
                 exc_info=True,
             )
-            disallowed = list(_REFLECTION_DENY_BUILTINS) + [
-                f"mcp__{server}__*" for server, _ in _REFLECTION_MCP_SERVERS
-            ]
+            disallowed = (
+                list(_REFLECTION_DENY_BUILTINS)
+                + list(_USER_SCOPED_MCP_WILDCARDS)
+                + [f"mcp__{server}__*" for server, _ in _REFLECTION_MCP_SERVERS]
+            )
         return disallowed
 
     def build_reflection_config(self, depth: str = "deep") -> dict:
