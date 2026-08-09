@@ -121,6 +121,37 @@ async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+async def count_live_rows_for_approval(
+    db: aiosqlite.Connection, request_id: str,
+) -> int:
+    """Count inbox rows still actively bound to an approval request.
+
+    A row is 'live' iff it is in ``processing`` state carrying an
+    ``awaiting_approval:<request_id>`` or ``dispatching:<request_id>`` marker —
+    i.e. a batch that is parked on, or mid-dispatch against, exactly this
+    approval. Invalidated (``approval_invalidated:``), failed, and completed
+    rows do NOT count.
+
+    A return of ``0`` means the approval is **orphaned**: no inbox row will
+    ever be dispatched against it (its rows were invalidated or superseded
+    while the approval was left pending). The monitor uses this to cancel an
+    orphaned approval for recovery — replacing the old blunt age-based
+    staleness cancel — WITHOUT dropping a healthy pending approval that a
+    user simply hasn't answered yet.
+    """
+    cursor = await db.execute(
+        """SELECT COUNT(*) FROM inbox_items
+           WHERE status = 'processing'
+             AND error_message IN (?, ?)""",
+        (
+            f"{AWAITING_APPROVAL_PREFIX}{request_id}",
+            f"{DISPATCHING_PREFIX}{request_id}",
+        ),
+    )
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
 async def claim_for_dispatch(
     db: aiosqlite.Connection, id: str, *, reqid: str,
 ) -> bool:

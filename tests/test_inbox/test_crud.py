@@ -229,3 +229,56 @@ async def test_query_by_batch(db):
     )
     batch1 = await inbox_items.query_by_batch(db, "batch-1")
     assert len(batch1) == 2
+
+
+async def _set_marker(db, item_id: str, marker: str) -> None:
+    await db.execute(
+        "UPDATE inbox_items SET error_message = ? WHERE id = ?",
+        (marker, item_id),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_count_live_rows_for_approval(db):
+    """Only processing rows carrying awaiting_approval:<id> or
+    dispatching:<id> for the SAME request count as live."""
+    req = "req-abc"
+    # 1) awaiting_approval on the target req -> live
+    await inbox_items.create(
+        db, id="await-hit", file_path="/inbox/a.md",
+        content_hash="h", status="processing", created_at="2026-03-10T00:00:00",
+    )
+    await _set_marker(db, "await-hit", f"{inbox_items.AWAITING_APPROVAL_PREFIX}{req}")
+    # 2) dispatching on the target req -> live
+    await inbox_items.create(
+        db, id="disp-hit", file_path="/inbox/b.md",
+        content_hash="h", status="processing", created_at="2026-03-10T00:00:00",
+    )
+    await _set_marker(db, "disp-hit", f"{inbox_items.DISPATCHING_PREFIX}{req}")
+    # 3) invalidated (failed) on the target req -> NOT live
+    await inbox_items.create(
+        db, id="inval", file_path="/inbox/c.md",
+        content_hash="h", status="failed", created_at="2026-03-10T00:00:00",
+    )
+    await _set_marker(
+        db, "inval",
+        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}approval terminal:cancelled",
+    )
+    # 4) awaiting on a DIFFERENT req -> NOT counted for `req`
+    await inbox_items.create(
+        db, id="await-other", file_path="/inbox/d.md",
+        content_hash="h", status="processing", created_at="2026-03-10T00:00:00",
+    )
+    await _set_marker(
+        db, "await-other", f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-other",
+    )
+    # 5) completed row (no marker) -> NOT counted
+    await inbox_items.create(
+        db, id="done", file_path="/inbox/e.md",
+        content_hash="h", status="completed", created_at="2026-03-10T00:00:00",
+    )
+
+    assert await inbox_items.count_live_rows_for_approval(db, req) == 2
+    assert await inbox_items.count_live_rows_for_approval(db, "req-other") == 1
+    assert await inbox_items.count_live_rows_for_approval(db, "no-such-req") == 0
