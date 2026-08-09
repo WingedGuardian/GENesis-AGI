@@ -19,6 +19,7 @@ from pathlib import Path
 
 import yaml
 
+from genesis.autonomy.types import AutonomyLevel
 from genesis.env import repo_root
 
 logger = logging.getLogger(__name__)
@@ -39,11 +40,13 @@ def read_autonomy_default_level(
     """The shipped *default* autonomy level for ``category`` (fail-safe → 1).
 
     Reads ``config/autonomy.yaml``'s ``defaults`` block with ``yaml.safe_load`` and
-    returns ``int(defaults[category])`` floored at ``1``. Returns ``1`` on ANY failure —
-    missing file, unreadable/non-UTF-8 file, malformed YAML, absent ``defaults``/
-    ``category`` key, a non-int value, or a sub-``1`` (0/negative) value — mirroring
-    ``AutonomyStateMachine._load_config``'s graceful fallback, so a surface that reads
-    this (the readiness enrichment) can never be 500'd or misled by a bad config.
+    returns the level validated against the constructible :class:`AutonomyLevel` enum.
+    Returns ``1`` on ANY failure — missing file, unreadable/non-UTF-8 file, malformed
+    YAML, absent ``defaults``/``category`` key, a non-int value, or a value outside the
+    constructible level range (0/negative, or 5–7 which are not yet enum members) —
+    mirroring ``AutonomyStateMachine._load_config``'s graceful fallback, so a surface
+    that reads this (the readiness enrichment) can never be 500'd or advertise a level
+    the runtime couldn't actually construct.
 
     ``category`` defaults to ``direct_session`` — the autonomy category governing
     autonomous CC sessions, the posture most relevant to the "Autonomous" readiness
@@ -58,12 +61,14 @@ def read_autonomy_default_level(
         defaults = data.get("defaults") if isinstance(data, dict) else None
         if not isinstance(defaults, dict):
             return _DEFAULT_LEVEL
-        # Floor at L1: a value < 1 (a 0/negative typo) is a nonsensical autonomy level, so
-        # clamp up to the conservative default. NOT capped above: levels are per-category
-        # (autonomy.yaml `ceilings` run to 7 for direct_session), so a legitimately-high
-        # default must pass through — the category ceiling is enforced by the state
-        # machine, not this generic display read.
-        return max(_DEFAULT_LEVEL, int(defaults[category]))
+        # Validate against the CONSTRUCTIBLE AutonomyLevel enum (currently L1–L4; the
+        # yaml `ceilings` cap ACTIONS, not the level enum — L5–L7 are deferred to V5 and
+        # AutonomyStateMachine.load_or_create_defaults does `AutonomyLevel(level)`, which
+        # ValueErrors on an out-of-range default). `AutonomyLevel(int(...))` raises for
+        # any non-constructible value (0, negatives, 5–7), which the except below maps to
+        # the L1 fail-safe — so this display read can only ever advertise a real level,
+        # and auto-tracks the enum if V5 widens it.
+        return int(AutonomyLevel(int(defaults[category])))
     except (
         OSError,
         ValueError,
