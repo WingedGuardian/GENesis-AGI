@@ -1326,12 +1326,50 @@ def _make_wired_dispatcher(
     return dispatcher
 
 
+async def _seed_parked_row(
+    db,
+    inbox_dir,
+    *,
+    request_id: str,
+    filename: str = "parked.md",
+    content: str = "parked content",
+):
+    """Create a real inbox file + a LIVE awaiting_approval row referencing
+    ``request_id``, so the monitor's orphan-guard sees the approval as still
+    bound to live work (and the resume pass leaves the row parked).
+
+    Returns ``(path, content_hash)``.
+    """
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / filename
+    f.write_text(content)
+    h = compute_hash(f)
+    row_id = f"row-{request_id}"
+    await inbox_items.create(
+        db,
+        id=row_id,
+        file_path=str(f),
+        content_hash=h,
+        status="processing",
+        created_at="2026-03-10T11:00:00+00:00",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET error_message = ? WHERE id = ?",
+        (f"{inbox_items.AWAITING_APPROVAL_PREFIX}{request_id}", row_id),
+    )
+    await db.commit()
+    return f, h
+
+
 @pytest.mark.asyncio
 async def test_precheck_skips_detection_when_site_blocked_no_new_files(
     monitor, inbox_dir, mock_invoker, db,
 ):
-    """When an inbox_evaluation approval is already pending and no new
-    files were added, detection still short-circuits — no dispatch."""
+    """When an inbox_evaluation approval is already pending (with a live
+    parked row) and no new files were added, detection short-circuits —
+    the approval HOLDS, no dispatch and no cancel."""
     pending_site_row = {
         "id": "req-already-pending",
         "status": "pending",
@@ -1348,70 +1386,36 @@ async def test_precheck_skips_detection_when_site_blocked_no_new_files(
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
         decision=decision,
         pending_sites=[pending_site_row],
+        approval_by_id={"req-already-pending": {
+            "id": "req-already-pending", "status": "pending",
+        }},
     )
+    # A live parked row keeps the approval bound to real work (not orphaned).
+    await _seed_parked_row(db, inbox_dir, request_id="req-already-pending")
 
-    # No new files — just run check
+    # No NEW files — just run check
     result = await monitor.check_once()
 
-    # No dispatch happened
+    # No dispatch happened, and the held approval was NOT cancelled.
     monitor._autonomous_dispatcher.route.assert_not_called()
+    monitor._autonomous_dispatcher.approval_gate.approval_manager.cancel.assert_not_called()
     assert result.batches_dispatched == 0
     mock_invoker.run.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_precheck_cancels_stale_approval_and_proceeds(
+async def test_precheck_cancels_orphaned_approval(
     monitor, inbox_dir, mock_invoker, db, clock,
 ):
-    """When a pending inbox approval exceeds _MAX_APPROVAL_STALENESS,
-    the monitor auto-cancels it and proceeds with normal detection
-    instead of blocking indefinitely."""
-    from genesis.inbox.monitor import _MAX_APPROVAL_STALENESS
-
-    # Create an approval that's older than the staleness threshold
-    stale_created = (clock.now - _MAX_APPROVAL_STALENESS - timedelta(hours=1)).isoformat()
+    """A pending inbox approval that NO live inbox row references is
+    orphaned — it can never be dispatched, so the monitor cancels it for
+    recovery and proceeds with normal detection. This holds regardless of
+    the approval's age (no age threshold)."""
+    # A *young* approval, deliberately, to prove the trigger is orphaning and
+    # NOT age. No _seed_parked_row call => zero live rows => orphaned.
+    fresh_created = (clock.now - timedelta(minutes=5)).isoformat()
     pending_site_row = {
-        "id": "req-stale",
-        "status": "pending",
-        "action_type": "autonomous_cli_fallback",
-        "created_at": stale_created,
-        "_context": {
-            "subsystem": "inbox",
-            "policy_id": "inbox_evaluation",
-        },
-    }
-    decision = AutonomousDispatchDecision(
-        mode="allowed", reason="auto-approved",
-    )
-    monitor._autonomous_dispatcher = _make_wired_dispatcher(
-        decision=decision,
-        pending_sites=[pending_site_row],
-    )
-
-    # Drop a file — should be detected because the stale approval is cancelled
-    (inbox_dir / "notes.md").write_text("content after stale approval")
-    result = await monitor.check_once()
-
-    # The stale approval was cancelled and dispatch proceeded
-    monitor._autonomous_dispatcher.approval_gate.approval_manager.cancel.assert_called_once_with(
-        "req-stale",
-    )
-    assert result.items_new == 1
-    assert result.batches_dispatched == 1
-
-
-@pytest.mark.asyncio
-async def test_precheck_does_not_cancel_fresh_approval(
-    monitor, inbox_dir, mock_invoker, db, clock,
-):
-    """A pending approval younger than _MAX_APPROVAL_STALENESS is NOT
-    cancelled — the monitor correctly blocks."""
-    from genesis.inbox.monitor import _MAX_APPROVAL_STALENESS
-
-    # Create an approval that's younger than the staleness threshold
-    fresh_created = (clock.now - _MAX_APPROVAL_STALENESS + timedelta(hours=1)).isoformat()
-    pending_site_row = {
-        "id": "req-fresh",
+        "id": "req-orphan",
         "status": "pending",
         "action_type": "autonomous_cli_fallback",
         "created_at": fresh_created,
@@ -1422,18 +1426,150 @@ async def test_precheck_does_not_cancel_fresh_approval(
     }
     decision = AutonomousDispatchDecision(
         mode="blocked", reason="approval requested",
-        approval_request_id="req-fresh",
+        approval_request_id="req-orphan",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
         decision=decision,
         pending_sites=[pending_site_row],
     )
 
-    # No new files — should block normally
+    # NO new file: the ONLY reason a cancel can happen is the orphan-guard
+    # (a young approval is not stale, and with no new content the legacy
+    # refresh path never fires) — so this cleanly isolates orphan recovery.
     result = await monitor.check_once()
 
+    # The orphaned approval was cancelled for recovery.
+    monitor._autonomous_dispatcher.approval_gate.approval_manager.cancel.assert_called_once_with(
+        "req-orphan",
+    )
+    assert result.batches_dispatched == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_cancel_lost_race_holds_without_routing(
+    monitor, inbox_dir, mock_invoker, db, clock,
+):
+    """TOCTOU guard (Codex P1): if an orphaned approval is APPROVED by the user
+    between find_site_pending() and cancel(), cancel() returns False (the row is
+    no longer pending). The monitor must then HOLD this cycle — it must NOT clear
+    the hold and route new content onto the just-approved, content-agnostic
+    stable-key approval. Hold now; the next scan re-reads a fresh state."""
+    pending_site_row = {
+        "id": "req-race",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "created_at": (clock.now - timedelta(minutes=5)).isoformat(),
+        "_context": {"subsystem": "inbox", "policy_id": "inbox_evaluation"},
+    }
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-race",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision, pending_sites=[pending_site_row],
+    )
+    # Simulate the race: by the time cancel() runs, the row is already resolved
+    # (user approved it) -> resolve() matches 0 pending rows -> returns False.
+    monitor._autonomous_dispatcher.approval_gate.approval_manager.cancel = AsyncMock(
+        return_value=False,
+    )
+    # New content arrives — it must NOT be routed onto the raced approval.
+    (inbox_dir / "raced.md").write_text("new content during the race")
+
+    result = await monitor.check_once()
+
+    disp = monitor._autonomous_dispatcher
+    disp.approval_gate.approval_manager.cancel.assert_called_once_with("req-race")
+    disp.route.assert_not_called()
+    assert result.batches_dispatched == 0
+    # The new file was NOT recorded/dispatched this cycle (the monitor held).
+    row = await (
+        await db.execute(
+            "SELECT COUNT(*) FROM inbox_items WHERE file_path LIKE '%raced.md'",
+        )
+    ).fetchone()
+    assert row[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_precheck_holds_approval_with_live_rows(
+    monitor, inbox_dir, mock_invoker, db, clock,
+):
+    """A pending approval that a live inbox row still references is HELD —
+    never cancelled — no matter how old it is. This is 'block until
+    approved, no re-ask' for healthy approvals."""
+    # Make the approval ancient to prove age does NOT trigger a cancel.
+    ancient_created = (clock.now - timedelta(days=30)).isoformat()
+    pending_site_row = {
+        "id": "req-held",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "created_at": ancient_created,
+        "_context": {
+            "subsystem": "inbox",
+            "policy_id": "inbox_evaluation",
+        },
+    }
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested",
+        approval_request_id="req-held",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[pending_site_row],
+        approval_by_id={"req-held": {"id": "req-held", "status": "pending"}},
+    )
+    # A live parked row referencing the approval => not orphaned => hold.
+    await _seed_parked_row(db, inbox_dir, request_id="req-held")
+
+    # No new files — should hold, not cancel, not dispatch
+    result = await monitor.check_once()
+
+    monitor._autonomous_dispatcher.approval_gate.approval_manager.cancel.assert_not_called()
+    monitor._autonomous_dispatcher.route.assert_not_called()
     assert result.batches_dispatched == 0
     mock_invoker.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pending_inbox_approval_blocks_without_reask(
+    monitor, inbox_dir, mock_invoker, db, clock,
+):
+    """The user's guarantee: a held inbox approval is re-asked ZERO times.
+    Across many scans, with the clock advanced well past any historical
+    re-ask window, the monitor never cancels and never re-routes (which
+    would mint a fresh approval), and the parked row stays live."""
+    pending_site_row = {
+        "id": "req-quiet",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "created_at": (clock.now - timedelta(hours=1)).isoformat(),
+        "_context": {
+            "subsystem": "inbox",
+            "policy_id": "inbox_evaluation",
+        },
+    }
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested",
+        approval_request_id="req-quiet",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[pending_site_row],
+        approval_by_id={"req-quiet": {"id": "req-quiet", "status": "pending"}},
+    )
+    _, _ = await _seed_parked_row(db, inbox_dir, request_id="req-quiet")
+
+    for _ in range(4):
+        clock.now = clock.now + timedelta(hours=12)  # sail past 24h re-ask window
+        await monitor.check_once()
+
+    disp = monitor._autonomous_dispatcher
+    disp.approval_gate.approval_manager.cancel.assert_not_called()
+    disp.route.assert_not_called()
+    from genesis.db.crud import inbox_items
+    row = await inbox_items.get_by_id(db, "row-req-quiet")
+    assert row["status"] == "processing"
+    assert row["error_message"] == f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-quiet"
 
 
 @pytest.mark.asyncio
@@ -1441,8 +1577,15 @@ async def test_precheck_refreshes_when_new_files_added_while_blocked(
     monitor, inbox_dir, mock_invoker, db,
 ):
     """When an inbox_evaluation approval is pending but new files arrive,
-    the stale approval is cancelled and files are detected so a fresh
-    approval reflecting the current inbox state can be created."""
+    the approval is cancelled and files are detected so a fresh approval
+    reflecting the current inbox state can be created.
+
+    Note: this case seeds no live parked row, so under the orphan-guard the
+    approval is cancelled via the orphan path before the refresh path; the
+    end state (file detected, one route()) is equivalent. The genuine
+    refresh-with-live-rows / fold path is pinned separately by
+    ``test_refresh_path_with_live_rows_folds_unchanged_sibling``.
+    """
     pending_site_row = {
         "id": "req-already-pending",
         "status": "pending",
@@ -1477,6 +1620,66 @@ async def test_precheck_refreshes_when_new_files_added_while_blocked(
     )
     # Dispatch was attempted (creating a fresh approval)
     monitor._autonomous_dispatcher.route.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_refresh_path_with_live_rows_folds_unchanged_sibling(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """The genuine refresh path (driver B): when an approval with LIVE parked
+    rows is pending and genuinely-new content arrives, the orphan-guard HOLDS
+    (live rows exist) and falls through to the refresh path — which cancels the
+    held approval, folds the unchanged parked sibling into the batch, and
+    re-parks BOTH files under the fresh approval. This proves the orphan-guard
+    does not short-circuit the fold, and that an unchanged sibling is not
+    stranded (the leapfrog the nag was made of)."""
+    pending_site_row = {
+        "id": "req-a",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "_context": {"subsystem": "inbox", "policy_id": "inbox_evaluation"},
+    }
+    # A fresh approval id is minted after the refresh-cancel.
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-b",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[pending_site_row],
+        approval_by_id={"req-a": {"id": "req-a", "status": "pending"}},
+    )
+    # Live parked row for the UNCHANGED sibling, bound to req-a.
+    await _seed_parked_row(db, inbox_dir, request_id="req-a", filename="held.md")
+
+    # Genuinely-new content arrives while the approval is pending.
+    (inbox_dir / "arrived.md").write_text("brand new content")
+    await monitor.check_once()
+
+    disp = monitor._autonomous_dispatcher
+    # The held approval was cancelled by the REFRESH path (not left uncancelled),
+    # exactly once, for req-a.
+    disp.approval_gate.approval_manager.cancel.assert_called_once_with("req-a")
+
+    # Both the new file AND the folded unchanged sibling are re-parked under the
+    # fresh approval (req-b) — nothing stranded.
+    from genesis.db.crud import inbox_items
+
+    rows = [
+        dict(r)
+        for r in await (
+            await db.execute(
+                "SELECT file_path, status, error_message FROM inbox_items "
+                "WHERE status='processing' AND error_message = ?",
+                (f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-b",),
+            )
+        ).fetchall()
+    ]
+    reparked = {Path(r["file_path"]).name for r in rows}
+    assert reparked == {"held.md", "arrived.md"}, reparked
+
+    # The original parked row for the sibling was superseded (failed), not left live.
+    old = await inbox_items.get_by_id(db, "row-req-a")
+    assert old["status"] == "failed"
 
 
 @pytest.mark.asyncio

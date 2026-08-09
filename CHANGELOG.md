@@ -19,6 +19,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `notifications` reason-allowlist in `github_steward.yaml`; respects the same
   `off`/`observe`/`live` lever and pings immediately in `live`.
 
+### Fixed
+
+- **Inbox approvals no longer nag.** A pending "inbox evaluation" approval now
+  holds until you respond — it is asked once and blocks until approved, like
+  every other approval, instead of re-sending a fresh request every few hours
+  for content that hasn't changed. A stuck (orphaned) approval that can never be
+  dispatched is still auto-recovered, so the monitor never wedges.
+
 ### Changed
 
 - **Reflection sessions are now strictly read-only.** Genesis's autonomous

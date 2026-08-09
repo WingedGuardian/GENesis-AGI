@@ -425,7 +425,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: d37d2214 2026-08-06
+verified: 557d3587 2026-08-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -437,8 +437,12 @@ verified: d37d2214 2026-08-06
 - **inbox/**: file-drop monitor with approval-gated dispatch; phase order
   resume → detect → create → dispatch; `approval_key_stable=True` (ONE
   site-level approval key). The refresh path folds parked files into the
-  batch so approvals fire once (#914). Coherence + URL-failure heuristics gate
-  dispatch.
+  batch so approvals fire once (#914). A pending approval is HELD until the
+  user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
+  when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
+  still references it (`count_live_rows_for_approval`); this replaced the old
+  4h staleness cancel that re-detected unchanged files and nagged. Coherence +
+  URL-failure heuristics gate dispatch.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
