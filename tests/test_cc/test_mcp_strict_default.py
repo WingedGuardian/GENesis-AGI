@@ -16,8 +16,15 @@ from __future__ import annotations
 
 import ast
 import pathlib
+from unittest.mock import MagicMock
 
-from genesis.cc.direct_session import _UNIVERSAL_DISALLOW
+import genesis.cc.direct_session as direct_session
+from genesis.cc.direct_session import (
+    _PROFILE_TO_MCP,
+    _UNIVERSAL_DISALLOW,
+    DirectSessionRequest,
+    DirectSessionRunner,
+)
 from genesis.cc.session_config import (
     _USER_SCOPED_MCP_WILDCARDS,
     SessionConfigBuilder,
@@ -180,3 +187,43 @@ def test_foreground_interactive_sites_opt_out_of_strict():
     user's tools mid-conversation. AST-based so a stray literal can't satisfy it."""
     assert _count_ccinvocations_with_false_strict(_SRC / "cc" / "conversation.py") >= 3
     assert _count_ccinvocations_with_false_strict(_SRC / "cc" / "checkpoint.py") >= 1
+
+
+def test_directsession_builtin_profiles_never_map_to_full():
+    """No BUILT-IN DirectSession profile maps to the "full" MCP profile — every built-in
+    stays strict-scoped. (A built-in silently going "full" would reopen the leak for that
+    profile; only deliberate, trusted install-local overlays may choose "full".)"""
+    assert "full" not in set(_PROFILE_TO_MCP.values())
+
+
+def test_directsession_explicit_full_profile_opts_out_of_strict():
+    """Codex P2 regression guard: build_mcp_config("full") returns None (CC uses its full
+    default), so under the strict-by-default flip a profile that INTENDS full MCP would
+    silently get ZERO servers. _build_invocation must honor an explicit mcp_profile="full"
+    by opting that dispatch out of strict (full means full), while a concrete profile stays
+    strict. Behavioral: exercises the real _build_invocation with a real config builder."""
+    runner = DirectSessionRunner(
+        invoker=MagicMock(),
+        session_manager=MagicMock(),
+        config_builder=SessionConfigBuilder(),
+        runtime=MagicMock(),
+    )
+    # Concrete profile (observe -> reflection) stays strict with a real config.
+    inv_norm = runner._build_invocation(
+        DirectSessionRequest(profile="observe", prompt="hi"), "s-norm"
+    )
+    assert inv_norm.strict_mcp_config is True
+    assert inv_norm.mcp_config  # a real genesis-only config path
+
+    # Remap a valid profile to the "full" MCP profile (simulating a trusted overlay);
+    # the dispatch must opt OUT of strict so CC's full default config is honored.
+    orig = _PROFILE_TO_MCP["observe"]
+    try:
+        direct_session._PROFILE_TO_MCP["observe"] = "full"
+        inv_full = runner._build_invocation(
+            DirectSessionRequest(profile="observe", prompt="hi"), "s-full"
+        )
+    finally:
+        direct_session._PROFILE_TO_MCP["observe"] = orig
+    assert inv_full.strict_mcp_config is False
+    assert inv_full.mcp_config is None
