@@ -3751,9 +3751,19 @@
               + ((cpuFull60 >= 1) ? ", stall " + cpuFull60.toFixed(0) + "%" : "") + ")";
           }
 
-          // Worst-of — memory, disk, or CPU, whichever is worst.
+          // PID budget assessment (per-user slice TasksMax — the 'Cannot fork'
+          // guard). Status is computed server-side; report it when it drives.
+          let pidState = "healthy", pidReason = "";
+          const pids = this.health.infrastructure?.pids;
+          if (pids && (pids.status === "degraded" || pids.status === "error") && pids.pct != null) {
+            pidState = pids.status;
+            pidReason = "PID budget " + pids.status + " (" + pids.pct.toFixed(0)
+              + "%, " + pids.current + "/" + pids.max + " tasks)";
+          }
+
+          // Worst-of — memory, disk, CPU, or PID budget, whichever is worst.
           let worst = { state: memState, reason: memReason };
-          for (const c of [{ state: diskState, reason: diskReason }, { state: cpuState, reason: cpuReason }]) {
+          for (const c of [{ state: diskState, reason: diskReason }, { state: cpuState, reason: cpuReason }, { state: pidState, reason: pidReason }]) {
             if ((stateRank[c.state] || 0) > (stateRank[worst.state] || 0)) worst = c;
           }
           return worst;

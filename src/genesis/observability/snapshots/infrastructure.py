@@ -159,6 +159,65 @@ def _cpu_status(used_pct: float | None) -> str:
     return "healthy"
 
 
+# PID/task-budget % thresholds for the per-user systemd slice. Sustained high
+# occupancy of the slice's pids.max is what precedes `Cannot fork` — it maxes
+# under many concurrent CC sessions (each spawns MCP subprocess trees) while
+# memory/cpu/disk still read green.
+_PID_DEGRADED_PCT = 80.0
+_PID_ERROR_PCT = 90.0
+
+
+def _pid_status(pct: float | None) -> str:
+    """Map PID-budget utilization % → health status. None (no sub-cap) → healthy."""
+    if pct is None:
+        return "healthy"
+    if pct >= _PID_ERROR_PCT:
+        return "error"
+    if pct >= _PID_DEGRADED_PCT:
+        return "degraded"
+    return "healthy"
+
+
+def _user_slice_pids_dir() -> str:
+    """cgroup-v2 pids-controller dir for the current user's systemd slice."""
+    return f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice"
+
+
+def _collect_pid_budget(base_dir: str | None = None) -> dict:
+    """Read the per-user systemd slice PID budget (pids.current / pids.max).
+
+    The task/PID budget is the resource that actually maxes under many concurrent
+    CC sessions — each `claude` spawns MCP subprocess trees — yet nothing else in
+    the snapshot tracks it, so a `Cannot fork` can occur while memory/cpu/disk all
+    read green. `pids.max` reflects the *effective* TasksMax (systemd resolves the
+    configured % into the cgroup), so this read is fork-free and honest.
+
+    Returns {status, current, max, pct}. When the slice has no sub-cap
+    (`pids.max == "max"`), pct is None and status is healthy (the slice inherits
+    the container root budget — not a per-slice risk). Unreadable / zero / malformed
+    → {"status": "unavailable"} — never a false "healthy".
+    """
+    base = base_dir if base_dir is not None else _user_slice_pids_dir()
+    try:
+        with open(f"{base}/pids.current") as f:
+            current = int(f.read().strip())
+        with open(f"{base}/pids.max") as f:
+            raw_max = f.read().strip()
+    except (OSError, ValueError):
+        return {"status": "unavailable"}
+
+    if raw_max == "max":
+        return {"status": "healthy", "current": current, "max": "max", "pct": None}
+    try:
+        max_pids = int(raw_max)
+    except ValueError:
+        return {"status": "unavailable"}
+    if max_pids <= 0:
+        return {"status": "unavailable"}
+    pct = round(current / max_pids * 100, 1)
+    return {"status": _pid_status(pct), "current": current, "max": max_pids, "pct": pct}
+
+
 # Module-level state for delta-based CPU reading (no blocking sleep)
 _last_cpu_reading: tuple[int, int, float] | None = None  # (idle, total, monotonic_time)
 
@@ -342,6 +401,10 @@ async def infrastructure(
         }
     except OSError as exc:
         infra["disk"] = {"status": "error", "error": str(exc)}
+
+    # PID/task budget of the per-user systemd slice — the blind spot that let a
+    # `Cannot fork` happen while every other axis read green. Fork-free cgroup read.
+    infra["pids"] = _collect_pid_budget()
 
     try:
         from genesis.observability.service_status import collect_cc_tmp_usage

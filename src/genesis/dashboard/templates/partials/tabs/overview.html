@@ -751,6 +751,22 @@
                         x-text="($store.genesisDashboard.health.infrastructure.disk.total_gb - $store.genesisDashboard.health.infrastructure.disk.free_gb).toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.disk.total_gb.toFixed(0) + ' GB'"></span>
                 </div>
               </template>
+              <!-- PID budget row (per-user systemd slice TasksMax — 'Cannot fork' guard) -->
+              <template x-if="$store.genesisDashboard.health.infrastructure?.pids?.pct != null">
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;"
+                     title="Per-user systemd slice PID/task budget (pids.current / pids.max). When it fills, new processes fail with 'Cannot fork' even though memory/CPU/disk are fine — each Claude Code session spawns MCP subprocess trees. Amber ≥ 80%, red ≥ 90%.">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">PIDs</span>
+                  <span style="width:3rem; text-align:right; font-weight:600;"
+                        :style="`color: ${$store.genesisDashboard.health.infrastructure.pids.pct > 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct > 80 ? '#f0ad4e' : '#4caf50'}`"
+                        x-text="$store.genesisDashboard.health.infrastructure.pids.pct.toFixed(0) + '%'"></span>
+                  <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
+                    <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                         :style="'width:' + $store.genesisDashboard.health.infrastructure.pids.pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.pids.pct > 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct > 80 ? '#f0ad4e' : '#4caf50')"></div>
+                  </div>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        x-text="$store.genesisDashboard.health.infrastructure.pids.current + '/' + $store.genesisDashboard.health.infrastructure.pids.max"></span>
+                </div>
+              </template>
               <!-- Claude Code sessions row (per-session RSS — leak detection) -->
               <template x-if="($store.genesisDashboard.health.infrastructure?.cc_slots || []).length">
                 <div style="display:flex; flex-direction:column; gap:0.3rem; font-size:0.8rem;">
@@ -767,7 +783,7 @@
                 </div>
               </template>
               <!-- Fallback when no data -->
-              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk">
+              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk && $store.genesisDashboard.health.infrastructure?.pids?.pct == null">
                 <span style="color: #666; font-size: 0.82rem;">no data</span>
               </template>
             </div>

@@ -1728,6 +1728,70 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
             logger.debug("Failed to create cc_slot alert observation", exc_info=True)
 
 
+_last_pid_budget_alert_at: float | None = None
+_PID_BUDGET_ALERT_COOLDOWN_S = 3600  # one alert per hour (a single slice, one scalar)
+
+
+async def _check_pid_budget(db, budget: dict | None = None) -> None:
+    """Alert (explanatorily) when the per-user systemd slice PID/task budget runs low.
+
+    The task budget maxes under many concurrent CC sessions — each `claude` spawns
+    MCP subprocess trees — and precedes `Cannot fork`, while memory/cpu/disk still
+    read green (the blind spot this closes). Uses the status the collector already
+    computed: degraded (>=80%) -> 'high'; error (>=90%) -> 'critical'. The content
+    NAMES the sub-cap and the remedy so a cryptic `Cannot fork` becomes actionable.
+    Fork-free cgroup read; best-effort — never raises into the tick. `budget` may be
+    injected (tests); otherwise it reads live."""
+    global _last_pid_budget_alert_at  # noqa: PLW0603
+    try:
+        if budget is None:
+            from genesis.observability.snapshots.infrastructure import _collect_pid_budget
+
+            budget = _collect_pid_budget()
+    except Exception:
+        logger.debug("pid budget check: read failed", exc_info=True)
+        return
+
+    status = budget.get("status")
+    if status not in ("degraded", "error"):
+        return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+    now = time.monotonic()
+    if (
+        _last_pid_budget_alert_at is not None
+        and (now - _last_pid_budget_alert_at) < _PID_BUDGET_ALERT_COOLDOWN_S
+    ):
+        return
+    if db is None:
+        return  # can't write the observation now; retry next tick (cooldown not consumed)
+    pct = budget.get("pct")
+    current = budget.get("current")
+    maximum = budget.get("max")
+    priority = "critical" if status == "error" else "high"
+    # Set before the await so a failed create still cools per-tick retries.
+    _last_pid_budget_alert_at = now
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="pid_budget_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"User-slice PID budget at {pct:.0f}% ({current}/{maximum} tasks). "
+                f"This is the per-user systemd TasksMax sub-cap — when it fills, new "
+                f"processes fail with 'Cannot fork' even though memory/CPU/disk are "
+                f"fine. Each Claude Code session spawns MCP subprocess trees, so many "
+                f"concurrent sessions can exhaust it. If resources permit, raise the "
+                f"user-.slice TasksMax (Genesis provisions 60% of the container PID "
+                f"budget by default)."
+            ),
+            priority=priority,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        logger.warning("PID budget alert: %s%% (%s/%s, %s)", pct, current, maximum, priority)
+    except Exception:
+        logger.debug("Failed to create pid_budget alert observation", exc_info=True)
+
+
 # CC silent-cap detection. A capped Anthropic subscription makes `claude -p`
 # return empty output (no text, no error, no rate-limit signal) on OUTPUT-EXPECTING
 # cognitive invocations — it reads as a successful completion, so nothing alerts
@@ -2481,6 +2545,11 @@ class AwarenessLoop:
             # still runs during a DB hiccup); the observation write is guarded on
             # db inside the function. Surfaces a single ballooning CC session.
             await _check_cc_slot_memory(self._db)
+
+            # Per-user-slice PID/task-budget check — fork-free cgroup read, guarded
+            # on db internally. The blind spot that let a `Cannot fork` happen while
+            # every other axis read green; the alert explains the sub-cap + remedy.
+            await _check_pid_budget(self._db)
 
             # CC silent-cap detection — counts recent empty-output cognitive
             # completions (recorded by the invoker) and alerts on a run. Guarded
