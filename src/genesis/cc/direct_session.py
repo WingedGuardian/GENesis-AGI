@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from genesis.cc import rate_limit_park, roster
 from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
+from genesis.cc.session_config import _USER_SCOPED_MCP_WILDCARDS
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -151,6 +152,16 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
     "mcp__genesis-memory__knowledge_ingest_source",
+    # ── User-scoped MCP servers (defense-in-depth) ────────────────
+    # strict_mcp_config (CCInvocation default True) already drops these by making
+    # --mcp-config authoritative; deny them by name too so a site that opts out of
+    # strict — or a future CC scoping change — still can't reach their
+    # arbitrary-source-edit / graph-mutation tools (serena replace_symbol_body,
+    # gitnexus rename, codebase-memory delete_project), which bypass the Edit/Write
+    # PreToolUse hooks entirely. NOT exhaustive (a NEW user-scoped server wouldn't be
+    # listed) — strict is the categorical guarantee; this is belt-and-suspenders.
+    # Shared with build_reflection_disallowed via _USER_SCOPED_MCP_WILDCARDS.
+    *_USER_SCOPED_MCP_WILDCARDS,
 ]
 
 _NO_OUTREACH_SEND = [

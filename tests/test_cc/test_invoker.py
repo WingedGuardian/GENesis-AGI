@@ -72,9 +72,29 @@ def test_build_args_strict_mcp_config(invoker):
     )
     args = invoker._build_args(inv)
     assert "--strict-mcp-config" in args
-    # Default stays additive: flag absent unless opted in.
-    default_args = invoker._build_args(CCInvocation(prompt="hello"))
-    assert "--strict-mcp-config" not in default_args
+
+
+def test_build_args_strict_is_default(invoker):
+    """Secure-by-default: a plain invocation emits --strict-mcp-config so
+    --mcp-config is authoritative and user-scoped ~/.claude.json servers can't
+    leak in. (Flipped from opt-in on 2026-08-09; see CCInvocation.strict_mcp_config.)"""
+    args = invoker._build_args(CCInvocation(prompt="hello"))
+    assert "--strict-mcp-config" in args
+
+
+def test_build_args_strict_opt_out(invoker):
+    """Foreground/interactive sites opt out to keep the full user-scoped toolset."""
+    args = invoker._build_args(CCInvocation(prompt="hello", strict_mcp_config=False))
+    assert "--strict-mcp-config" not in args
+
+
+def test_build_args_strict_suppressed_under_bare(invoker):
+    """--bare already disables all MCP; --bare + --strict-mcp-config makes CC exit
+    non-zero (probe-verified), so the invoker must NOT emit strict under bare even
+    when strict_mcp_config is True (which is the default)."""
+    args = invoker._build_args(CCInvocation(prompt="hello", bare=True, strict_mcp_config=True))
+    assert "--bare" in args
+    assert "--strict-mcp-config" not in args
 
 
 def test_build_args_safe_mode(invoker):

@@ -343,7 +343,12 @@ class CCInvoker:
             args += ["--resume", inv.resume_session_id]
         if inv.mcp_config:
             args += ["--mcp-config", inv.mcp_config]
-        if inv.strict_mcp_config:
+        # --bare already disables ALL MCP discovery; combining it with
+        # --strict-mcp-config makes CC exit non-zero (probe-verified, CC 2.1.x),
+        # so skip strict under bare. strict is safe with any other config state:
+        # with a --mcp-config it pins to those servers; with none it yields zero
+        # servers cleanly (probe-verified) — the secure-by-default posture.
+        if inv.strict_mcp_config and not inv.bare:
             args.append("--strict-mcp-config")
         # Register the span-capture PostToolUse hook for this dispatched session.
         # Dispatched sessions run with a cwd outside any git repo, so CC never

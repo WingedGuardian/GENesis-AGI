@@ -71,6 +71,17 @@ it also reaches the `genesis-recon` discovery tools (GitHub/model-intel/skill
 scanning, findings storage) — the only profile that does.
 Use `observe` for read-only investigation.
 
+**MCP scoping is secure-by-default.** `CCInvocation.strict_mcp_config` defaults to
+True, so every background session gets `--strict-mcp-config`: it loads ONLY the
+servers in its generated `--mcp-config` (its `mcp_profile`) and never additively
+inherits the operator's user-scoped `~/.claude.json` MCP servers (Claude Code's
+`--mcp-config` is additive without strict — probe-verified). A profile that maps to
+no genesis servers therefore runs with zero MCP tools (fail-closed), not the
+operator's full set. Only human-driven foreground/interactive sessions
+(`cc/conversation.py`, `cc/checkpoint.py`) opt out (`strict_mcp_config=False`) to
+keep the full user-scoped toolset. As defense-in-depth, `_UNIVERSAL_DISALLOW` also
+denies the user-scoped servers by name (`_USER_SCOPED_MCP_WILDCARDS`).
+
 **`steward` is the one built-in Bash-enabled profile** — its Bash is restricted
 to the `gh` CLI only, enforced by `scripts/bash_safety_hook.sh` via the
 `GENESIS_BASH_ALLOWLIST` env var set from `CCInvocation.bash_allowlist`. It

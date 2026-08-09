@@ -215,6 +215,26 @@ verified: 5dcd9fd4 2026-08-07
   autonomous/dispatched session's `follow_up_create` (source=`ego_dispatch`) is routed to
   the cold `tabled` lane, never the hot board (`mcp/health/follow_up_tools.py`).
 
+- **Secure-by-default MCP scoping (ALL autonomous sessions)** — `CCInvocation.
+  strict_mcp_config` defaults to **True** (`cc/types.py`), so `--mcp-config` is
+  authoritative and the operator's user-scoped `~/.claude.json` servers (additive
+  without strict — probe-verified 2026-08-09) never leak into a background session.
+  `_build_args` suppresses the flag under `--bare` (bare+strict exits non-zero,
+  probe-verified). This is the class fix behind the reflection lockdown above:
+  ~15 autonomous `CCInvocation` sites (reflection, sentinel, inbox/mail, direct_session,
+  ego cycle, autonomy executor/research) were leaking user-scoped MCP write tools.
+  Foreground/interactive sites (`cc/conversation.py` ×3, `cc/checkpoint.py`) opt out
+  with `strict_mcp_config=False` to keep the full toolset; a forgotten site fails
+  closed (zero MCP), never open. The weekly reflection arms
+  (`run_weekly_assessment`/`run_quality_calibration`) now route through the shared
+  `_reflection_lockdown_kwargs` helper alongside `_reflect_inner` (they previously ran
+  unrestricted). `autonomy/executor/step_dispatcher` pins CODE/VERIFICATION steps to
+  the genesis-only `reflection` MCP profile (keeps memory/health, drops the
+  arbitrary-source-edit servers; code edits flow through the audited Write/Edit
+  built-ins). Defense-in-depth: `_USER_SCOPED_MCP_WILDCARDS` denied by name in
+  `_UNIVERSAL_DISALLOW` + the reflection denylist. Guards:
+  `tests/test_cc/test_mcp_strict_default.py`, `tests/test_cc/test_invoker.py`.
+
 - `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split
   candidates). Profile machinery: `PROFILES`, `_PROFILE_ADDENDA`,
   `_PROFILE_SKILLS`, `_PROFILE_TO_MCP` (direct_session.py) +
