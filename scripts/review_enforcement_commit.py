@@ -390,6 +390,7 @@ def main() -> None:
         from review_state import (
             ESCALATION_ROUND_CAP,
             get_current_branch,
+            get_current_diff_hash,
             get_review_round,
             has_code_changes,
             has_valid_review_marker,
@@ -507,16 +508,19 @@ def main() -> None:
         if staged and all(_is_docs_or_config(p) for p in staged):
             sys.exit(0)
 
+    # `git add X && git commit` stages in the SAME command chain: nothing is staged yet
+    # at hook time (git add hasn't run), so we can neither classify the current diff nor
+    # bind the marker to it. Detected once here and reused by Rule 2.5 and Rule 2.
+    stages_in_same_command = any(git_subcommand(s.argv) == "add" for s in segs)
+
     # Rule 2.5: review DEPTH. A SUBSTANTIAL change needs an ADVERSARIAL audit, not a
     # precision-filtered inline pass — a "no findings" from a confidence-≥80 reviewer
     # is FALSE CONFIDENCE, not clearance. Checked BEFORE Rule 2 (and its override) so
     # '# review-override' waives FINDINGS but NOT the depth requirement (D1). A loud,
     # logged '# depth-ack' is the audited escape for a genuine format mismatch.
-    # Substantiality is taken from the current staged diff OR the marker's RECORDED
-    # level (so a `git add && commit` chain — empty index at hook time — still enforces
-    # via what was reviewed). Fail-OPEN on any classifier/marker error: this is advisory
-    # anti-autopilot friction; the CI review-depth check is the real backstop. Runs
-    # AFTER the docs skip, so a pure-docs commit never reaches it.
+    # Fail-OPEN on any classifier/marker error: this is advisory anti-autopilot
+    # friction; the CI review-depth check is the real backstop. Runs AFTER the docs
+    # skip, so a pure-docs commit never reaches it.
     try:
         from review_scope import classify_change_substantiality
 
@@ -526,10 +530,39 @@ def main() -> None:
     try:
         from review_state import get_marker_depth
 
-        marker_level, is_adversarial = get_marker_depth(cwd=cwd)
-    except Exception:  # noqa: BLE001 - a marker-read error must not block (fail open)
-        marker_level, is_adversarial = None, True
-    if (staged_level == "substantial" or marker_level == "substantial") and not is_adversarial:
+        marker_level, marker_adversarial = get_marker_depth(cwd=cwd)
+    except Exception:  # noqa: BLE001 - a marker-read error must not block on the add-chain
+        # path (fail OPEN there); on the normal path the is_review_current() guard below
+        # re-reads the marker and fails CLOSED, the safe direction for the stricter gate.
+        marker_level, marker_adversarial = None, True
+
+    if stages_in_same_command:
+        # Index empty at hook time — the staged classify reads "inline", so depth falls
+        # back to the marker's RECORDED level (else a substantial change staged in the
+        # same chain would slip the gate). We cannot diff-bind here (staging hasn't
+        # happened), so the marker's adversarial bit is trusted as recorded — a KNOWN
+        # add-chain hash-blindness limitation (tracked follow-up), symmetric with Rule 2.
+        depth_level = marker_level
+        depth_is_adversarial = marker_adversarial
+    else:
+        # Normal commit: the staged index IS the commit content, so classify it
+        # directly. Crucially, the marker's adversarial clearance counts ONLY when the
+        # marker genuinely BINDS this diff — is_review_current (marker.diff_hash == the
+        # current staged hash) AND that hash is real, not "unknown"/"clean". Otherwise an
+        # adversarial audit of an EARLIER diff A would falsely clear a later substantial
+        # diff B that a '# review-override' then waives past Rule 2's staleness block,
+        # when B was never audited (the integrity hole this depth gate exists to close).
+        # Excluding "unknown" fails CLOSED on a transient stat-diff error (the depth gate
+        # is the stricter one and has the '# depth-ack' escape) rather than letting the
+        # is_review_current() clean/unknown short-circuit wrong-clear a substantial diff.
+        depth_level = staged_level
+        depth_is_adversarial = (
+            marker_adversarial
+            and is_review_current(cwd=cwd)
+            and get_current_diff_hash(cwd=cwd) not in ("unknown", "clean")
+        )
+
+    if depth_level == "substantial" and not depth_is_adversarial:
         depth_acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="depth-ack") for s in commit_segs
         )
@@ -542,7 +575,7 @@ def main() -> None:
         else:
             _deny(
                 "BLOCKED (review depth): this is a SUBSTANTIAL change (≥50 reviewable "
-                "lines, or >1 code file, or a new code file, or auth/api/migrations) but the "
+                "lines, or >1 code file, or an auth/api/migrations file) but the "
                 "review is not an ADVERSARIAL audit. A precision-filtered 'no findings' "
                 "inline pass is FALSE CONFIDENCE, not clearance. Dispatch a genesis-architect "
                 "adversarial audit (assume bugs, enumerate the edge/boundary/sentinel/"
@@ -554,12 +587,7 @@ def main() -> None:
             )
             return
 
-    # Rule 2: Block commits without review (on branches)
-    # Race condition: when command is "git add X && git commit", nothing is
-    # staged yet at hook time because git add hasn't run. Detect git add in
-    # the same command chain — if present, require the marker file to exist
-    # (the PostToolUse hook deletes it after every commit).
-    stages_in_same_command = any(git_subcommand(s.argv) == "add" for s in segs)
+    # Rule 2: Block commits without review (on branches).
     if stages_in_same_command:
         # Can't check diff hash (staging hasn't happened yet) — require the
         # marker file to exist and not be expired.

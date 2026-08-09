@@ -137,7 +137,9 @@ def test_ci_warns_loudly_on_unknown(tmp_path, capsys, monkeypatch):
 
 
 def test_ci_fails_open_on_exception(tmp_path, capsys, monkeypatch):
-    # An unexpected exception must never fail the build (exit-0-always contract).
+    # An unexpected exception must never fail the build (exit-0-always contract) — but it
+    # must ALSO emit a distinct ::warning:: (Codex P2): a green job with no annotation is
+    # indistinguishable from "not substantial", so a crash must not read as clearance.
     monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
     repo = _mk(tmp_path, {"seed.py": "x = 2\n"})
     import review_scope
@@ -150,3 +152,4 @@ def test_ci_fails_open_on_exception(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert rc == 0
     assert "skipped" in out.lower()
+    assert "::warning" in out and "clearance" in out.lower()

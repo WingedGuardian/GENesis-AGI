@@ -4,9 +4,10 @@ Two units under test (both fail-open / advisory — the CI review-depth check is
 real backstop):
   * review_scope.classify_change_substantiality — STAGED-diff (--cached) based
     substantiality, so it shares the review marker's basis (no mark-vs-commit
-    thrash). Substantial when reviewable lines ≥ 50 OR >1 code file OR a new code
-    file OR a domain-sensitive scope_tag (auth/api/migrations). Docs/binary/vendored
-    lines never inflate it.
+    thrash). A surface-area × risk model: substantial when reviewable lines ≥ 50 OR
+    >1 code file (surface area) OR a domain-sensitive scope_tag (auth/api/migrations —
+    risk). Mere newness of a file is NOT a trigger. Docs/binary/vendored lines never
+    inflate it.
   * review_state._evidence_is_adversarial — lenient STRUCTURAL check (ladder OR
     scope-check) AND file:line engagement AND a length floor, so a real audit in
     any reviewer's vocabulary passes but a shallow "looks good" one-liner fails.
@@ -103,18 +104,43 @@ def test_more_than_one_code_file_is_substantial(tmp_path):
     assert _classify(repo) == "substantial"
 
 
-def test_new_code_file_is_substantial(tmp_path):
+def test_small_new_code_file_is_inline(tmp_path):
+    # Surface-area × risk model: newness ALONE is not substantial. A trivial single new
+    # file of little consequence is INLINE — Rule 2 still requires *a* review, just not
+    # an adversarial audit. It escalates only via line count, >1 file, or a domain scope
+    # (the three tests around this one). (verify-RED: asserted substantial before this.)
     repo = _mk_repo(tmp_path)
-    (repo / "brandnew.py").write_text("def n():\n    return 0\n")  # small but NEW
+    (repo / "brandnew.py").write_text("def n():\n    return 0\n")  # small AND new
+    _git(repo, "add", "brandnew.py")
+    assert _classify(repo) == "inline"
+
+
+def test_large_new_code_file_is_substantial(tmp_path):
+    # A new file is NOT exempt when it carries real surface area (≥50 reviewable lines) —
+    # the line-count trigger fires regardless of add-vs-modify.
+    repo = _mk_repo(tmp_path)
+    (repo / "brandnew.py").write_text(
+        "def n():\n" + "".join(f"    y{i} = {i}\n" for i in range(60))
+    )
     _git(repo, "add", "brandnew.py")
     assert _classify(repo) == "substantial"
 
 
 def test_domain_sensitive_scope_tag_is_substantial(tmp_path):
     repo = _mk_repo(tmp_path)
-    # small, single, existing (not new) — the ONLY trigger is the auth scope_tag
+    # small, single, existing (not new) — the ONLY trigger is the auth scope_tag: a
+    # small change to a CRITICAL file still warrants an adversarial audit (risk axis).
     (repo / "auth_service.py").write_text("def login():\n    return False\n")
     _git(repo, "add", "auth_service.py")
+    assert _classify(repo) == "substantial"
+
+
+def test_small_new_domain_file_is_substantial(tmp_path):
+    # Risk axis for a NEW file: small + single + new, but auth-scoped → substantial.
+    # Newness is not the trigger; the critical scope is.
+    repo = _mk_repo(tmp_path)
+    (repo / "auth_helper.py").write_text("def check():\n    return False\n")  # small, new, auth
+    _git(repo, "add", "auth_helper.py")
     assert _classify(repo) == "substantial"
 
 
@@ -144,7 +170,7 @@ def test_rename_single_code_file_is_inline(tmp_path):
 
 def test_new_binary_asset_is_inline(tmp_path):
     # NOTE 3 (audit-found): a binary asset is not code to review — adding one must not
-    # trip new_code_file → substantial.
+    # inflate substantiality (it is excluded from the reviewable set entirely).
     repo = _mk_repo(tmp_path)
     (repo / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
     _git(repo, "add", "logo.png")

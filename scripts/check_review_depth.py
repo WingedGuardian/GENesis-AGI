@@ -92,6 +92,14 @@ def main(cwd: str | None = None) -> int:
     try:
         return _run(cwd)
     except Exception as e:  # noqa: BLE001 - fail-open advisory: never fail the build
+        # An unexpected import/classifier error must NOT read as clearance: a green job
+        # with no annotation is INDISTINGUISHABLE from "not substantial", the exact
+        # silent-false-inline this check exists to surface. Emit the same DISTINCT
+        # ::warning:: as an uncomputable range before exiting 0.
+        print(
+            "::warning title=Review depth: check errored::review-depth-check could NOT "
+            f"run ({e}) — do NOT treat this as clearance; classify depth manually."
+        )
         print(f"review-depth-check: skipped (unexpected error: {e}).")
         return 0
 

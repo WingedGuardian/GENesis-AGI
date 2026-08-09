@@ -581,9 +581,13 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
     """Pure substantiality predicate over parsed diff records — the SHARED core of
     the staged (--cached) and PR-range (base...HEAD) paths.
 
-    Substantial when ANY holds over the reviewable files (docs-config/binary/vendored
-    excluded): reviewable lines ≥ ``_SUBSTANTIAL_DIFF_LINES`` (50), OR >1 distinct code
-    file, OR a new code file, OR a domain-sensitive ``scope_tag`` (auth/api/migrations).
+    A surface-area × risk model. Substantial when ANY holds over the reviewable files
+    (docs-config/binary/vendored excluded): reviewable lines ≥ ``_SUBSTANTIAL_DIFF_LINES``
+    (50) OR >1 distinct code file (surface area), OR a domain-sensitive ``scope_tag``
+    (auth/api/migrations — risk/importance). NOT triggered by mere newness: a trivial
+    single new file is INLINE (Rule 2 still requires *a* review, just not an adversarial
+    audit), but a small change to a critical auth/api/migration file IS substantial. An
+    adversarial audit tracks consequence, not line count alone.
     """
 
     def _reviewable(p: str) -> bool:
@@ -595,7 +599,6 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
     # bug this replaces). Binary excluded (a binary asset is not code to review).
     code_paths = {p for p in per_file if _reviewable(p) and _category(p) == "code"}
     scope_tags: set[str] = set()
-    new_code_file = False
     for rec in records:  # both rename sides here → domain-sensitivity on either side
         path = rec["path"]
         if not _reviewable(path):
@@ -603,12 +606,9 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
         tag = _scope_tag(path)
         if tag:
             scope_tags.add(tag)
-        if rec["change_type"][:1] == "A" and _category(path) == "code":
-            new_code_file = True  # a NEW code file (renames are R, not A)
     substantial = (
         reviewable_lines >= _SUBSTANTIAL_DIFF_LINES
         or len(code_paths) > 1
-        or new_code_file
         or bool(scope_tags & _DOMAIN_SENSITIVE_TAGS)
     )
     return "substantial" if substantial else "inline"

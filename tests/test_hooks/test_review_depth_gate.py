@@ -170,6 +170,29 @@ def test_depth_ack_inside_quotes_does_not_waive(repo, home):
     assert "review depth" in r.stderr.lower()
 
 
+def test_stale_adversarial_marker_does_not_clear_new_diff(repo, home):
+    # D1-diffbind (Codex P2): an adversarial audit of diff A must NOT clear a DIFFERENT
+    # substantial diff B. The marker is adversarial + current for A; restaging B makes it
+    # stale. Rule 2's staleness block is waivable by '# review-override', so depth must
+    # catch B on its own — the marker's adversarial bit counts ONLY when it is CURRENT for
+    # the staged diff. (verify-RED: B committed cleanly before the diff-binding fix.)
+    #
+    # NOTE the marker's diff_hash is `git diff --cached --stat` (files + line counts, a
+    # pre-existing stat-only design), so B must differ in SHAPE, not just content, for
+    # is_review_current to see it as stale. This closes the realistic case and brings
+    # depth to PARITY with Rule 2's staleness check; a same-shape content swap is a
+    # system-wide stat-hash limitation (tracked follow-up), not specific to this gate.
+    _stage_substantial(repo)  # A: f.py, +60 lines
+    m = _mark(repo, home, _ADVERSARIAL)  # adversarial marker bound to diff A
+    assert m.returncode == 0
+    # restage a DIFFERENT-SHAPE substantial diff B (f.py at +80 lines → stat differs)
+    (repo / "f.py").write_text("base = 1\n" + "".join(f"z{i} = {i}\n" for i in range(80)))
+    _git(repo, "add", "-A")
+    r = _run_hook('git commit -m "x"  # review-override', repo, home)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "review depth" in r.stderr.lower()
+
+
 def test_add_and_commit_chain_falls_back_to_marker_level(repo, home):
     # `git add && commit` in ONE command: the index is EMPTY at hook time, so the
     # current-staged classify reads "inline" — depth must fall back to the marker's
