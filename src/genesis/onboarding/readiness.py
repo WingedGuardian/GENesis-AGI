@@ -66,7 +66,6 @@ from genesis.onboarding.floor import (
     UNSET_SENTINELS,
     FloorStatus,
     compute_floor,
-    provider_key_present,
     read_persisted_secrets,
 )
 
@@ -214,14 +213,21 @@ def _as_int(value: object, default: int) -> int:
 
 
 def _web_search_keyed_providers(secrets: Mapping[str, str]) -> tuple[str, ...]:
-    """Premium web-search providers whose key is configured, sorted.
+    """Premium web-search providers whose canonical key is configured, in stable order.
 
     Enrichment only: web search is available regardless (the keyless SearXNG primary is
     the bootstrap default), so this reports which PAID providers augment it — never a
-    floor/tier gate. Uses the floor's own key-pattern check so "configured" means the
-    same thing here and to routing. Pure; never raises.
+    floor/tier gate. Each web-search tool provider reads ONLY its canonical
+    ``API_KEY_<TYPE>`` env var (``web/search.py`` for Brave; ``runtime/init/providers.py``
+    for Tavily/Exa/TinyFish) — NOT routing's 3-pattern resolver — so we check that exact
+    key, not ``provider_key_present`` (whose ``<TYPE>_API_KEY`` / ``_API_TOKEN`` aliases
+    would advertise a provider that its adapter can't actually load). Pure; never raises.
     """
-    return tuple(p for p in _WEB_SEARCH_PREMIUM_PROVIDERS if provider_key_present(p, secrets))
+    return tuple(
+        p
+        for p in _WEB_SEARCH_PREMIUM_PROVIDERS
+        if str(secrets.get(f"API_KEY_{p.upper()}", "")).strip() not in UNSET_SENTINELS
+    )
 
 
 def _voice_configured(secrets: Mapping[str, str]) -> bool:

@@ -304,7 +304,7 @@ def test_compute_readiness_ego_flag_is_coerced_bool(floor_met):
     [
         ({}, ()),  # nothing keyed → keyless SearXNG baseline only
         ({"API_KEY_BRAVE": "b"}, ("brave",)),
-        ({"BRAVE_API_KEY": "b", "TAVILY_API_KEY": "t"}, ("brave", "tavily")),  # alt patterns
+        ({"API_KEY_BRAVE": "b", "API_KEY_TAVILY": "t"}, ("brave", "tavily")),
         (
             {"API_KEY_EXA": "e", "API_KEY_TINYFISH": "tf", "API_KEY_BRAVE": "b"},
             ("brave", "exa", "tinyfish"),
@@ -312,6 +312,10 @@ def test_compute_readiness_ego_flag_is_coerced_bool(floor_met):
         ({"API_KEY_TAVILY": ""}, ()),  # unset sentinel doesn't count
         ({"API_KEY_TAVILY": "None"}, ()),
         ({"API_KEY_OPENROUTER": "x"}, ()),  # a non-web-search key is ignored
+        # Codex P2 regression: the web adapters read ONLY the canonical API_KEY_<TYPE>,
+        # so routing's alias patterns (<TYPE>_API_KEY / _API_TOKEN) must NOT count — they
+        # would advertise a provider its adapter can't actually load.
+        ({"BRAVE_API_KEY": "b", "TAVILY_API_TOKEN": "t", "EXA_API_KEY": "e"}, ()),
     ],
 )
 def test_web_search_keyed_providers(secrets, expected):
