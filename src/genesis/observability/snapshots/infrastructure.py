@@ -404,7 +404,13 @@ async def infrastructure(
 
     # PID/task budget of the per-user systemd slice — the blind spot that let a
     # `Cannot fork` happen while every other axis read green. Fork-free cgroup read.
-    infra["pids"] = _collect_pid_budget()
+    # _collect_pid_budget already degrades to {"status": "unavailable"} internally;
+    # the guard is defense-in-depth so a future raise here can't kill collection of
+    # the cc_tmp/cc_slots axes that follow (matching this block's own convention).
+    try:
+        infra["pids"] = _collect_pid_budget()
+    except Exception as exc:
+        infra["pids"] = {"status": "error", "error": str(exc)}
 
     try:
         from genesis.observability.service_status import collect_cc_tmp_usage
