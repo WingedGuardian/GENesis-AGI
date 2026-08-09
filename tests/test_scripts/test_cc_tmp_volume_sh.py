@@ -74,10 +74,18 @@ case "$1" in
       pgrep)
         # count form (-c / -xc) prints a number like real `pgrep -c`; the plain
         # existence form (-x) just sets exit status. The lib uses -x for the guard
-        # decision and -xc only to report the count when a session is live.
+        # decision (before create AND again before attach) and -xc to report the
+        # count when a session is live.
         for a in "$@"; do case "$a" in -*c*)
-          if [ "${INCUS_CLAUDE_RUNNING:-0}" = "1" ]; then echo "${INCUS_CLAUDE_COUNT:-3}"; exit 0; else echo 0; exit 1; fi ;;
+          if [ "${INCUS_CLAUDE_RUNNING:-0}" = "1" ] || [ -n "${INCUS_CLAUDE_LIVE_FROM_CALL:-}" ]; then echo "${INCUS_CLAUDE_COUNT:-3}"; exit 0; else echo 0; exit 1; fi ;;
         esac; done
+        # existence form. INCUS_CLAUDE_LIVE_FROM_CALL simulates TOCTOU: not live at
+        # the first guard, live by the Nth existence check (count kept in a file).
+        if [ -n "${INCUS_CLAUDE_LIVE_FROM_CALL:-}" ]; then
+          _pn=$(( $(cat "${INCUS_PGREP_CALLS:-/dev/null}" 2>/dev/null || echo 0) + 1 ))
+          echo "$_pn" > "${INCUS_PGREP_CALLS:-/dev/null}" 2>/dev/null || true
+          [ "$_pn" -ge "$INCUS_CLAUDE_LIVE_FROM_CALL" ] && exit 0 || exit 1
+        fi
         [ "${INCUS_CLAUDE_RUNNING:-0}" = "1" ] && exit 0 || exit 1 ;;
       getent) echo "ubuntu:x:1000:1000::/home/ubuntu:/bin/bash"; exit 0 ;;
       id)
@@ -104,6 +112,7 @@ def _sandbox(tmp_path, **incus_env):
     env = {
         "PATH": f"{bindir}:/usr/bin:/bin",
         "INCUS_LOG": str(tmp_path / "incus.log"),
+        "INCUS_PGREP_CALLS": str(tmp_path / "pgrep_calls"),  # TOCTOU sim counter
         "HOME": str(tmp_path),  # so a stray guardian.yaml lookup can't leak
     }
     env.update({k: str(v) for k, v in incus_env.items()})
@@ -386,3 +395,25 @@ def test_result_token_applied_on_happy_path(tmp_path):
 def test_result_token_verify_failed_rolledback(tmp_path):
     rc, res, _ = _result(_sandbox(tmp_path, INCUS_VERIFY_RC=1))
     assert rc == 0 and res == "verify-failed-rolledback"
+
+
+# ── TOCTOU narrowing: re-check for a live session right before the attach ─────
+
+
+def test_live_cc_between_create_and_attach_skips_attach(tmp_path):
+    # Quiet at the first guard (call 1) → past create; a session launches before
+    # the attach (live from call 2). The pre-attach re-check must abort the attach:
+    # the volume was created (kept for reuse) but is NOT attached over the newly
+    # live session's temp tree.
+    env = _sandbox(tmp_path, INCUS_CLAUDE_LIVE_FROM_CALL=2)
+    res = _run(env)
+    assert res.returncode == 0 and "__DONE__" in res.stdout
+    log = _log(tmp_path)
+    assert "storage volume create" in log  # got past the first guard
+    assert "config device add" not in log  # the re-check aborted the attach
+
+
+def test_result_token_live_cc_at_recheck(tmp_path):
+    rc, res, procs = _result(_sandbox(tmp_path, INCUS_CLAUDE_LIVE_FROM_CALL=2))
+    assert rc == 0 and res == "live-cc"
+    assert procs == "3"  # count reported at the re-check skip

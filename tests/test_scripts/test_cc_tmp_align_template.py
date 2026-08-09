@@ -55,3 +55,12 @@ def test_only_supported_render_placeholders():
     for tmpl in (SVC, TIMER):
         for ph in re.findall(r"__[A-Z_]+__", tmpl.read_text()):
             assert ph in supported, f"unsupported render placeholder {ph} in {tmpl.name}"
+
+
+def test_uninstall_stops_and_disables_the_new_units():
+    # Both container-side uninstall paths (direct + remote) must stop/disable the
+    # new service AND timer, or an uninstall leaves dangling enabled links under
+    # default.target.wants / timers.target.wants (enable != file-glob removal).
+    txt = (REPO_ROOT / "scripts" / "uninstall.sh").read_text()
+    assert txt.count("genesis-cc-tmp-align.timer") >= 2
+    assert txt.count("genesis-cc-tmp-align.service") >= 2

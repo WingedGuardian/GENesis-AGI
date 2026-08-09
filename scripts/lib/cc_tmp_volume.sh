@@ -211,6 +211,23 @@ cc_tmp_volume_apply() {
         echo "  + created storage volume '$pool/$vol' (${size}GiB)."
     fi
 
+    # Re-check for a live CC session IMMEDIATELY before the attach. The guard at
+    # the top ran before the pool/driver/volume-create steps; a session could have
+    # launched in that window (a periodic apply competes with cc-slot / CCInvoker /
+    # interactive `claude` launches, none of which share this lock). This does NOT
+    # fully serialize against launches — an external/interactive `claude` cannot be
+    # made to take a Genesis lock — but it narrows the shadow-a-live-session window
+    # to a single incus call. The deterministic cold-start apply (ordered before
+    # genesis-server) stays the race-free convergence path. The volume just created
+    # is kept and reused by a later apply.
+    if incus exec "$c" -- pgrep -x claude >/dev/null 2>&1; then
+        _cctmpvol_result="live-cc"
+        _cctmpvol_claude_procs="$(incus exec "$c" -- pgrep -xc claude 2>/dev/null || echo '')"
+        echo "  Skipped: a Claude Code session became live before attach — deferring"
+        echo "           to a later apply during a quiet window (volume kept for retry)."
+        return 0
+    fi
+
     # Attach (hot-plug, no restart — spike-proven). Leave the volume on failure
     # so a later apply can retry without re-creating it.
     if ! incus config device add "$c" "$dev" disk \
