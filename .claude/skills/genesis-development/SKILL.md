@@ -166,6 +166,18 @@ these are the GATES that make it enforceable:
   review loop runs 7 rounds. (Origin: PR #1281 — the onboarding floor's key
   list was wrong three times until it was derived from the router's own
   `load_config` + call-site chains.)
+- **Spec required-sets: enforce the WHOLE set at once, and lock it with ONE
+  test.** The spec-facing corollary of the rule above. When a change must make
+  code satisfy a canonical spec's *required-set* — a prompt's required JSON
+  fields, a validator's mandatory keys, an allow-list — read the spec's required
+  list in full and enforce ALL of it in one move; then write a single test
+  asserting the required block == the complete canonical set (not one assertion
+  per field). Adding only the field a reviewer just flagged leaves the next one
+  for the next round, and a per-field test goes green while the next missing
+  field ships. (Origin: PR #1333 — `_SALVAGE_PROMPT`'s Required block was
+  completed one field at a time across three Codex rounds — cognitive_state_update
+  → confidence → observations — for what `REFLECTION_DEEP.md` declares as one
+  closed set `{observations, confidence, cognitive_state_update}`.)
 - **Condition-based waiting.** When a fix or test must wait for a state change,
   poll the CONDITION (with a bounded deadline), never sleep an arbitrary
   duration — arbitrary sleeps are flaky under load and slow everywhere else.
@@ -338,6 +350,7 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "The user already said proceed, so I can keep looping" | The escalation/fix-attempt caps CONSUME standing approval. Round 4+ (or fix #4) on an old instruction is a violation, not obedience. |
 | "I can read the summary instead of the source" | Summaries lose context. If you're about to change code, read the code, not the description of it. |
 | "The missing data was the problem — I wrote it, so it's fixed" | The mechanism that failed to write it is the problem. Hand-written artifacts are data repair, not a fix (see Instance-Fix vs Class-Fix Gate). |
+| "I'll just add the field the reviewer flagged" | A spec's required-set is closed — derive and enforce ALL of it at once, with one test locking the whole set, or the next round finds the next missing field (see Debugging Discipline: spec required-sets). |
 
 ### Code Discovery
 
