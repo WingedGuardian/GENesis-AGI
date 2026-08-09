@@ -194,7 +194,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 5dcd9fd4 2026-08-07
+verified: 437c56c0 2026-08-09
 ```
 
 - **Reflection tool lockdown — read-only + observations only**
