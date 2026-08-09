@@ -39,11 +39,11 @@ def read_autonomy_default_level(
     """The shipped *default* autonomy level for ``category`` (fail-safe → 1).
 
     Reads ``config/autonomy.yaml``'s ``defaults`` block with ``yaml.safe_load`` and
-    returns ``int(defaults[category])``. Returns ``1`` on ANY failure — missing file,
-    unreadable/non-UTF-8 file, malformed YAML, absent ``defaults``/``category`` key, or
-    a non-int value — mirroring ``AutonomyStateMachine._load_config``'s graceful
-    fallback, so a surface that reads this (the readiness enrichment) can never be
-    500'd or misled by a bad config.
+    returns ``int(defaults[category])`` floored at ``1``. Returns ``1`` on ANY failure —
+    missing file, unreadable/non-UTF-8 file, malformed YAML, absent ``defaults``/
+    ``category`` key, a non-int value, or a sub-``1`` (0/negative) value — mirroring
+    ``AutonomyStateMachine._load_config``'s graceful fallback, so a surface that reads
+    this (the readiness enrichment) can never be 500'd or misled by a bad config.
 
     ``category`` defaults to ``direct_session`` — the autonomy category governing
     autonomous CC sessions, the posture most relevant to the "Autonomous" readiness
@@ -58,7 +58,12 @@ def read_autonomy_default_level(
         defaults = data.get("defaults") if isinstance(data, dict) else None
         if not isinstance(defaults, dict):
             return _DEFAULT_LEVEL
-        return int(defaults[category])
+        # Floor at L1: a value < 1 (a 0/negative typo) is a nonsensical autonomy level, so
+        # clamp up to the conservative default. NOT capped above: levels are per-category
+        # (autonomy.yaml `ceilings` run to 7 for direct_session), so a legitimately-high
+        # default must pass through — the category ceiling is enforced by the state
+        # machine, not this generic display read.
+        return max(_DEFAULT_LEVEL, int(defaults[category]))
     except (
         OSError,
         ValueError,

@@ -59,6 +59,23 @@ def test_infinity_value_is_level_1(tmp_path):
     assert read_autonomy_default_level("direct_session", path=cfg) == 1
 
 
+def test_sub_one_level_floors_to_1(tmp_path):
+    # A 0/negative default is a nonsensical autonomy level → clamp UP to the L1 floor
+    # (Codex P2, corrected: only < 1 is invalid).
+    cfg = tmp_path / "autonomy.yaml"
+    cfg.write_text("defaults:\n  direct_session: 0\n  outreach: -3\n")
+    assert read_autonomy_default_level("direct_session", path=cfg) == 1
+    assert read_autonomy_default_level("outreach", path=cfg) == 1
+
+
+def test_high_but_valid_level_passes_through(tmp_path):
+    # direct_session's ceiling is 7 ("effectively uncapped"), so a legitimately-high
+    # default must NOT be clamped down — the generic reader floors, never caps.
+    cfg = tmp_path / "autonomy.yaml"
+    cfg.write_text("defaults:\n  direct_session: 6\n")
+    assert read_autonomy_default_level("direct_session", path=cfg) == 6
+
+
 def test_empty_file_is_level_1(tmp_path):
     cfg = tmp_path / "autonomy.yaml"
     cfg.write_text("")  # yaml.safe_load -> None

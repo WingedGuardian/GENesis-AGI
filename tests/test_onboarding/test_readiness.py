@@ -335,7 +335,10 @@ def test_web_search_keyed_providers(secrets, expected):
         ({"VOICE_S2S_PROVIDER": "gemini", "OPENAI_API_KEY": "sk"}, False),  # wrong key
         ({"VOICE_S2S_PROVIDER": "none", "OPENAI_API_KEY": "sk"}, False),  # explicit off
         ({"VOICE_S2S_PROVIDER": "openai", "OPENAI_API_KEY": ""}, False),  # unset sentinel
-        ({"VOICE_S2S_PROVIDER": " openai ", "OPENAI_API_KEY": "sk"}, True),  # trimmed
+        # Codex P2 parity: the runtime s2s_provider() does NOT strip and compares with a
+        # bare == "openai", so a hand-quoted " openai " (dotenv keeps inner spaces) would
+        # NOT enable voice at runtime — it must NOT read as configured here either.
+        ({"VOICE_S2S_PROVIDER": " openai ", "OPENAI_API_KEY": "sk"}, False),
     ],
 )
 def test_voice_configured(secrets, expected):

@@ -241,9 +241,15 @@ def _voice_configured(secrets: Mapping[str, str]) -> bool:
     Requires an explicit ``VOICE_S2S_PROVIDER`` (``openai``/``gemini``) in ``secrets``
     AND that provider's API key present — NOT ``channels.voice.config.s2s_enabled``,
     whose "openai" default would report voice for any box that merely has an
-    ``OPENAI_API_KEY``. Pure dict read; never raises.
+    ``OPENAI_API_KEY``.
+
+    The provider value is matched **exactly, without stripping**, to mirror the runtime:
+    ``s2s_provider()`` reads the raw env value and ``s2s_enabled()`` compares it with a
+    bare ``== "openai"``/``"gemini"`` — so a hand-quoted ``" openai "`` (dotenv keeps the
+    inner spaces) would NOT enable voice at runtime, and must not read as configured here
+    either (the same parser-parity trap as the PR-B1 Telegram gate). Pure; never raises.
     """
-    provider = str(secrets.get("VOICE_S2S_PROVIDER", "")).strip()
+    provider = str(secrets.get("VOICE_S2S_PROVIDER", ""))
     key_name = _VOICE_PROVIDER_KEYS.get(provider)
     if key_name is None:
         return False
