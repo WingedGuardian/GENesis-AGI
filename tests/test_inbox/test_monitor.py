@@ -1446,6 +1446,51 @@ async def test_precheck_cancels_orphaned_approval(
 
 
 @pytest.mark.asyncio
+async def test_orphan_cancel_lost_race_holds_without_routing(
+    monitor, inbox_dir, mock_invoker, db, clock,
+):
+    """TOCTOU guard (Codex P1): if an orphaned approval is APPROVED by the user
+    between find_site_pending() and cancel(), cancel() returns False (the row is
+    no longer pending). The monitor must then HOLD this cycle — it must NOT clear
+    the hold and route new content onto the just-approved, content-agnostic
+    stable-key approval. Hold now; the next scan re-reads a fresh state."""
+    pending_site_row = {
+        "id": "req-race",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "created_at": (clock.now - timedelta(minutes=5)).isoformat(),
+        "_context": {"subsystem": "inbox", "policy_id": "inbox_evaluation"},
+    }
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-race",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision, pending_sites=[pending_site_row],
+    )
+    # Simulate the race: by the time cancel() runs, the row is already resolved
+    # (user approved it) -> resolve() matches 0 pending rows -> returns False.
+    monitor._autonomous_dispatcher.approval_gate.approval_manager.cancel = AsyncMock(
+        return_value=False,
+    )
+    # New content arrives — it must NOT be routed onto the raced approval.
+    (inbox_dir / "raced.md").write_text("new content during the race")
+
+    result = await monitor.check_once()
+
+    disp = monitor._autonomous_dispatcher
+    disp.approval_gate.approval_manager.cancel.assert_called_once_with("req-race")
+    disp.route.assert_not_called()
+    assert result.batches_dispatched == 0
+    # The new file was NOT recorded/dispatched this cycle (the monitor held).
+    row = await (
+        await db.execute(
+            "SELECT COUNT(*) FROM inbox_items WHERE file_path LIKE '%raced.md'",
+        )
+    ).fetchone()
+    assert row[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_precheck_holds_approval_with_live_rows(
     monitor, inbox_dir, mock_invoker, db, clock,
 ):

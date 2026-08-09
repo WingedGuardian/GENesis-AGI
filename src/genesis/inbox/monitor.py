@@ -704,16 +704,35 @@ class InboxMonitor:
                     "Cancelling orphaned inbox approval %s (no live inbox rows reference it)",
                     pending_id,
                 )
+                cancelled = False
                 try:
                     gate = self._autonomous_dispatcher.approval_gate
-                    await gate.approval_manager.cancel(pending_id)
+                    cancelled = bool(await gate.approval_manager.cancel(pending_id))
                 except Exception:
                     logger.warning(
                         "Failed to cancel orphaned approval %s",
                         pending_id,
                         exc_info=True,
                     )
-                pending = None  # Recovered — proceed with normal detection
+                if cancelled:
+                    pending = None  # Recovered — proceed with normal detection
+                else:
+                    # cancel() returns False (it does not raise) when the row is
+                    # no longer 'pending' — the user APPROVED it between
+                    # find_site_pending() and cancel() (a TOCTOU), or a transient
+                    # DB failure. Do NOT clear the hold and rush into detection:
+                    # a just-approved, content-agnostic stable-key approval would
+                    # otherwise be reused+consumed by unrelated new content in
+                    # this same cycle. Hold now; the next scan re-reads a fresh
+                    # state (an approved request is no longer returned by
+                    # find_site_pending and is consumed via the normal
+                    # resume/dispatch path).
+                    logger.info(
+                        "Orphaned inbox approval %s was not cancellable (raced to "
+                        "resolved, or transient failure) — holding this cycle",
+                        pending_id,
+                    )
+                    return [], []
 
         if pending is not None:
             # Approval pending — scan anyway to detect new content.
