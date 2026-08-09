@@ -1,4 +1,4 @@
-"""MW-1 — 0079 extraction-judgment columns: migration + persistence.
+"""MW-1 — 0081 extraction-judgment columns: migration + persistence.
 
 Covers the STORE side: the five judgment columns exist on both schema build
 paths (numbered migration for legacy DBs, canonical CREATE for fresh DBs), the
@@ -15,7 +15,7 @@ import aiosqlite
 from genesis.db.crud import memory
 from genesis.db.schema import TABLES
 
-_mig = importlib.import_module("genesis.db.migrations.0079_mw1_extraction_judgment")
+_mig = importlib.import_module("genesis.db.migrations.0081_mw1_extraction_judgment")
 
 _JUDGMENT_COLS = {
     "speech_act",
