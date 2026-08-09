@@ -757,11 +757,11 @@
                      title="Per-user systemd slice PID/task budget (pids.current / pids.max). When it fills, new processes fail with 'Cannot fork' even though memory/CPU/disk are fine — each Claude Code session spawns MCP subprocess trees. Amber ≥ 80%, red ≥ 90%.">
                   <span style="width:3.2rem; color:var(--color-text-secondary);">PIDs</span>
                   <span style="width:3rem; text-align:right; font-weight:600;"
-                        :style="`color: ${$store.genesisDashboard.health.infrastructure.pids.pct > 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct > 80 ? '#f0ad4e' : '#4caf50'}`"
+                        :style="`color: ${$store.genesisDashboard.health.infrastructure.pids.pct >= 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct >= 80 ? '#f0ad4e' : '#4caf50'}`"
                         x-text="$store.genesisDashboard.health.infrastructure.pids.pct.toFixed(0) + '%'"></span>
                   <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
                     <div style="height:100%; border-radius:3px; transition:width 0.3s;"
-                         :style="'width:' + $store.genesisDashboard.health.infrastructure.pids.pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.pids.pct > 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct > 80 ? '#f0ad4e' : '#4caf50')"></div>
+                         :style="'width:' + $store.genesisDashboard.health.infrastructure.pids.pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.pids.pct >= 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct >= 80 ? '#f0ad4e' : '#4caf50')"></div>
                   </div>
                   <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
                         x-text="$store.genesisDashboard.health.infrastructure.pids.current + '/' + $store.genesisDashboard.health.infrastructure.pids.max"></span>
