@@ -59,7 +59,17 @@ def read_autonomy_default_level(
         if not isinstance(defaults, dict):
             return _DEFAULT_LEVEL
         return int(defaults[category])
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, yaml.YAMLError):
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        OverflowError,
+        yaml.YAMLError,
+    ):
+        # OverflowError: `int(float('inf'))` from a YAML `.inf` level. KeyError: absent
+        # category. AttributeError: non-dict slipping past the guard. All → conservative L1.
         logger.debug(
             "autonomy default-level read failed for %s (%s); using L%d",
             category,

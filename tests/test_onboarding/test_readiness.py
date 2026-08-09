@@ -369,11 +369,48 @@ def test_compute_enrichment_coerces_injected_ints():
     assert e.ego_cadence_minutes == 45 and e.autonomy_level == 3
 
 
-def test_compute_enrichment_non_coercible_ints_fall_back_never_raises():
-    # A null/garbage cadence (e.g. a user-overridden ego.yaml) or level must NOT raise
-    # into the setup-status route — compute_enrichment coerces to the safe defaults.
-    e = compute_enrichment(secrets={}, ego_cadence_minutes=None, autonomy_level="oops")
-    assert e.ego_cadence_minutes == 60 and e.autonomy_level == 1
+@pytest.mark.parametrize(
+    "cadence, level, exp_cadence, exp_level",
+    [
+        (None, "oops", 60, 1),  # TypeError / ValueError
+        (float("inf"), float("inf"), 60, 1),  # OverflowError: int(inf) (Codex P2)
+        (float("nan"), 3, 60, 3),  # ValueError: int(nan)
+        (["x"], {"y": 1}, 60, 1),  # TypeError on non-scalars
+    ],
+)
+def test_compute_enrichment_non_coercible_ints_fall_back_never_raises(
+    cadence, level, exp_cadence, exp_level
+):
+    # A null/garbage/inf/nan cadence (e.g. a user-overridden ego/autonomy config) must
+    # NOT raise into the setup-status route — _as_int coerces to the safe defaults.
+    e = compute_enrichment(secrets={}, ego_cadence_minutes=cadence, autonomy_level=level)
+    assert e.ego_cadence_minutes == exp_cadence and e.autonomy_level == exp_level
+
+
+def test_compute_enrichment_backstops_any_internal_raise(monkeypatch):
+    # Robust-by-construction: if ANY internal step raises (here a signal reader), the
+    # whole computation degrades to empty enrichment rather than 500ing setup-status.
+    def _boom(_secrets):
+        raise RuntimeError("unexpected reader failure")
+
+    monkeypatch.setattr(readiness_mod, "_web_search_keyed_providers", _boom)
+    e = compute_enrichment(secrets={}, ego_cadence_minutes=90, autonomy_level=2)
+    assert e.as_dict() == {
+        "web_search_keyed_providers": [],
+        "voice_configured": False,
+        "ego_cadence_minutes": 60,
+        "autonomy_level": 1,
+    }
+
+
+def test_compute_enrichment_backstops_raising_secrets_read(monkeypatch):
+    # The never-raise contract also covers a raising read_persisted_secrets (secrets=None).
+    def _boom():
+        raise OSError("secrets.env unreadable mid-read")
+
+    monkeypatch.setattr(readiness_mod, "read_persisted_secrets", _boom)
+    e = compute_enrichment(ego_cadence_minutes=60, autonomy_level=1)
+    assert e.web_search_keyed_providers == () and e.voice_configured is False
 
 
 def test_compute_enrichment_reads_persisted_secrets_when_omitted(monkeypatch):

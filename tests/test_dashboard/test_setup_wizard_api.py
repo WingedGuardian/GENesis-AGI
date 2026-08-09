@@ -258,6 +258,23 @@ def test_setup_status_enrichment_fields_reflect_config(wiz):
     assert body["floor_met"] is True
 
 
+def test_setup_status_overflow_cadence_is_failsafe_not_500(wiz):
+    # A user-overridden ego.yaml with `cadence_minutes: .inf` yields a float infinity;
+    # int(inf) raises OverflowError. compute_enrichment runs OUTSIDE the route's ego
+    # try/except, so this must be caught there (never 500 first-run) and fall back to 60.
+    wiz["monkeypatch"].setattr(
+        wiz["ego_config"],
+        "load_ego_config",
+        lambda *a, **k: SimpleNamespace(enabled=True, cadence_minutes=float("inf")),
+    )
+    wiz["secrets"].write_text(_functional_secrets())
+    resp = wiz["client"].get("/api/genesis/setup-status")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ego_cadence_minutes"] == 60
+    assert body["ego_enabled"] is True  # the bad cadence must not disturb ego/tier
+
+
 def test_setup_status_openai_llm_key_alone_is_not_voice(wiz):
     # Regression guard: s2s_provider() defaults to "openai", so a bare OPENAI_API_KEY
     # (an LLM key) must NOT read as deliberate voice setup.

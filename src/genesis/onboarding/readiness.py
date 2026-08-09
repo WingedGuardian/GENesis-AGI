@@ -57,6 +57,7 @@ scope for this signal by design.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -68,6 +69,8 @@ from genesis.onboarding.floor import (
     compute_floor,
     read_persisted_secrets,
 )
+
+logger = logging.getLogger(__name__)
 
 _TIER_NAMES = {0: "Bootstrapped", 1: "Functional", 2: "Connected", 3: "Autonomous"}
 
@@ -203,12 +206,14 @@ def _as_int(value: object, default: int) -> int:
     """Coerce an injected config value to ``int``, falling back on any bad value.
 
     Keeps :func:`compute_enrichment` truly never-raising even if the route hands it a
-    non-numeric ego cadence / autonomy level (e.g. a ``null`` in a user-overridden
-    config, or a missing attribute resolved to a non-int default).
+    non-numeric ego cadence / autonomy level. ``int()`` raises across a WIDER set than
+    is obvious: ``TypeError`` (``None``/list), ``ValueError`` (non-numeric str), AND
+    ``OverflowError`` (``int(float('inf'))`` — a YAML ``.inf`` in a user-overridden ego/
+    autonomy config resolves to a float infinity). All three fall back to ``default``.
     """
     try:
         return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -282,13 +287,29 @@ def compute_enrichment(
     (defaulting to a live persisted read); the two config ints — ``ego_cadence_minutes``
     (ego config) and ``autonomy_level`` (``config/autonomy.yaml`` default) — are
     INJECTED by the route, exactly as :func:`compute_readiness` injects ``ego_enabled``,
-    so this module needs no ego/autonomy import on the hot path. Never raises.
+    so this module needs no ego/autonomy import on the hot path.
+
+    **Never raises — by construction.** The whole body is wrapped so that ANY
+    exception (a raising ``read_persisted_secrets``, an unforeseen coercion edge, a
+    future signal reader) degrades to an empty enrichment rather than propagating a 500
+    into the first-run ``setup-status`` route. Enrichment is non-gating, so an "unknown"
+    baseline is the correct fail-safe; the per-value guards (``_as_int``) keep the good
+    fields even when one is bad, and this wrap is the backstop for everything else.
     """
-    if secrets is None:
-        secrets = read_persisted_secrets()
-    return EnrichmentStatus(
-        web_search_keyed_providers=_web_search_keyed_providers(secrets),
-        voice_configured=_voice_configured(secrets),
-        ego_cadence_minutes=_as_int(ego_cadence_minutes, 60),
-        autonomy_level=_as_int(autonomy_level, 1),
-    )
+    try:
+        if secrets is None:
+            secrets = read_persisted_secrets()
+        return EnrichmentStatus(
+            web_search_keyed_providers=_web_search_keyed_providers(secrets),
+            voice_configured=_voice_configured(secrets),
+            ego_cadence_minutes=_as_int(ego_cadence_minutes, 60),
+            autonomy_level=_as_int(autonomy_level, 1),
+        )
+    except Exception:  # noqa: BLE001 - enrichment must never raise into setup-status
+        logger.warning("compute_enrichment failed; returning empty enrichment", exc_info=True)
+        return EnrichmentStatus(
+            web_search_keyed_providers=(),
+            voice_configured=False,
+            ego_cadence_minutes=60,
+            autonomy_level=1,
+        )

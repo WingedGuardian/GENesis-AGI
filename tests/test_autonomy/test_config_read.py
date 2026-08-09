@@ -51,6 +51,14 @@ def test_non_int_value_is_level_1(tmp_path):
     assert read_autonomy_default_level("direct_session", path=cfg) == 1
 
 
+def test_infinity_value_is_level_1(tmp_path):
+    # YAML `.inf` parses to float('inf'); int(inf) raises OverflowError (NOT ValueError/
+    # TypeError) — must still fail-safe to L1, honoring the never-raise contract.
+    cfg = tmp_path / "autonomy.yaml"
+    cfg.write_text("defaults:\n  direct_session: .inf\n")
+    assert read_autonomy_default_level("direct_session", path=cfg) == 1
+
+
 def test_empty_file_is_level_1(tmp_path):
     cfg = tmp_path / "autonomy.yaml"
     cfg.write_text("")  # yaml.safe_load -> None
