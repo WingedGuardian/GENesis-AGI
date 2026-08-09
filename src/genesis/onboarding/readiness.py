@@ -32,6 +32,13 @@ floor's live-recompute philosophy). Everything else that makes an install *good*
 rather than *minimal* — web-search availability, autonomy posture, surplus, voice,
 the dashboard password — is enrichment surfaced by the panel, never a tier gate.
 
+:class:`EnrichmentStatus` / :func:`compute_enrichment` carry those non-gating signals
+alongside the tier: which premium web-search providers are keyed, whether S2S voice is
+deliberately configured, the ego think-cadence, and the shipped autonomy default level.
+Like the tier, they are presence-based and pure over persisted state plus two injected
+config ints (``ego_cadence_minutes``, ``autonomy_level``), so the module stays free of
+runtime/ego/autonomy imports on the ``setup-status`` hot path.
+
 Like the floor, readiness is **presence-based and pure over persisted state plus two
 injected bools** (``ego_enabled`` from the ego config and ``onboarded`` from the marker,
 both resolved by the route so this module needs no runtime/ego import) — safe on the
@@ -55,9 +62,27 @@ from dataclasses import dataclass
 
 from genesis.channels.bridge_config import build_bridge_config, parse_secrets_env_text
 from genesis.env import secrets_path
-from genesis.onboarding.floor import FloorStatus, compute_floor, read_persisted_secrets
+from genesis.onboarding.floor import (
+    UNSET_SENTINELS,
+    FloorStatus,
+    compute_floor,
+    provider_key_present,
+    read_persisted_secrets,
+)
 
 _TIER_NAMES = {0: "Bootstrapped", 1: "Functional", 2: "Connected", 3: "Autonomous"}
+
+# Premium (keyed) web-search providers, kept pre-sorted so the enrichment field has a
+# stable order without re-sorting per request. Web search is available regardless of
+# these — the keyless SearXNG primary is the bootstrap default — so this is pure
+# enrichment: "which PAID providers augment the keyless baseline", never a tier gate.
+_WEB_SEARCH_PREMIUM_PROVIDERS = ("brave", "exa", "tavily", "tinyfish")
+
+# Voice S2S provider -> the secrets key that enables it. Mirrors
+# ``channels.voice.config.s2s_enabled`` BUT requires an explicit provider: that module
+# defaults ``VOICE_S2S_PROVIDER`` to "openai", which would count any OpenAI LLM key as
+# "voice configured" — the panel wants deliberate opt-in, not an incidental LLM key.
+_VOICE_PROVIDER_KEYS = {"openai": "OPENAI_API_KEY", "gemini": "GOOGLE_API_KEY"}
 
 
 def _telegram_reach_configured(secrets_text: str) -> bool:
@@ -169,4 +194,95 @@ def compute_readiness(
         telegram_configured=_telegram_reach_configured(secrets_text),
         ego_enabled=bool(ego_enabled),
         onboarded=bool(onboarded),
+    )
+
+
+# ── Enrichment (non-gating capability signals surfaced by the panel) ───────────────
+
+
+def _as_int(value: object, default: int) -> int:
+    """Coerce an injected config value to ``int``, falling back on any bad value.
+
+    Keeps :func:`compute_enrichment` truly never-raising even if the route hands it a
+    non-numeric ego cadence / autonomy level (e.g. a ``null`` in a user-overridden
+    config, or a missing attribute resolved to a non-int default).
+    """
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _web_search_keyed_providers(secrets: Mapping[str, str]) -> tuple[str, ...]:
+    """Premium web-search providers whose key is configured, sorted.
+
+    Enrichment only: web search is available regardless (the keyless SearXNG primary is
+    the bootstrap default), so this reports which PAID providers augment it — never a
+    floor/tier gate. Uses the floor's own key-pattern check so "configured" means the
+    same thing here and to routing. Pure; never raises.
+    """
+    return tuple(p for p in _WEB_SEARCH_PREMIUM_PROVIDERS if provider_key_present(p, secrets))
+
+
+def _voice_configured(secrets: Mapping[str, str]) -> bool:
+    """Whether S2S voice is DELIBERATELY configured (explicit provider + its key).
+
+    Requires an explicit ``VOICE_S2S_PROVIDER`` (``openai``/``gemini``) in ``secrets``
+    AND that provider's API key present — NOT ``channels.voice.config.s2s_enabled``,
+    whose "openai" default would report voice for any box that merely has an
+    ``OPENAI_API_KEY``. Pure dict read; never raises.
+    """
+    provider = str(secrets.get("VOICE_S2S_PROVIDER", "")).strip()
+    key_name = _VOICE_PROVIDER_KEYS.get(provider)
+    if key_name is None:
+        return False
+    return str(secrets.get(key_name, "")).strip() not in UNSET_SENTINELS
+
+
+@dataclass(frozen=True)
+class EnrichmentStatus:
+    """Non-gating capability signals surfaced by the readiness panel.
+
+    NONE of these affect the tier (see the module docstring) — they describe how far an
+    install is *enriched* beyond the minimal functional path. Presence-based and pure
+    over persisted state plus two injected config ints, like :class:`ReadinessStatus`.
+    """
+
+    web_search_keyed_providers: tuple[str, ...]
+    voice_configured: bool
+    ego_cadence_minutes: int
+    autonomy_level: int
+
+    def as_dict(self) -> dict[str, object]:
+        # Distinct key namespace from the tier/floor fields — the route merges all three
+        # dicts into one flat payload, so these must not collide with existing keys.
+        return {
+            "web_search_keyed_providers": list(self.web_search_keyed_providers),
+            "voice_configured": self.voice_configured,
+            "ego_cadence_minutes": self.ego_cadence_minutes,
+            "autonomy_level": self.autonomy_level,
+        }
+
+
+def compute_enrichment(
+    secrets: Mapping[str, str] | None = None,
+    *,
+    ego_cadence_minutes: int,
+    autonomy_level: int,
+) -> EnrichmentStatus:
+    """Package the panel's non-gating enrichment signals.
+
+    The two pure signals (web-search keyed providers, voice) are read from ``secrets``
+    (defaulting to a live persisted read); the two config ints — ``ego_cadence_minutes``
+    (ego config) and ``autonomy_level`` (``config/autonomy.yaml`` default) — are
+    INJECTED by the route, exactly as :func:`compute_readiness` injects ``ego_enabled``,
+    so this module needs no ego/autonomy import on the hot path. Never raises.
+    """
+    if secrets is None:
+        secrets = read_persisted_secrets()
+    return EnrichmentStatus(
+        web_search_keyed_providers=_web_search_keyed_providers(secrets),
+        voice_configured=_voice_configured(secrets),
+        ego_cadence_minutes=_as_int(ego_cadence_minutes, 60),
+        autonomy_level=_as_int(autonomy_level, 1),
     )

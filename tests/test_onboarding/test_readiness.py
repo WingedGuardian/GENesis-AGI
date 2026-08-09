@@ -23,6 +23,7 @@ from genesis.onboarding.readiness import (
     ReadinessStatus,
     _read_secrets_env_text,
     _telegram_reach_configured,
+    compute_enrichment,
     compute_readiness,
 )
 
@@ -293,3 +294,85 @@ def test_compute_readiness_ego_flag_is_coerced_bool(floor_met):
         secrets={"API_KEY_DEEPINFRA": "d"}, secrets_text=tg, ego_enabled=1, onboarded=True
     )
     assert r.ego_enabled is True
+
+
+# ── Enrichment signals (non-gating; surfaced by the panel) ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "secrets, expected",
+    [
+        ({}, ()),  # nothing keyed → keyless SearXNG baseline only
+        ({"API_KEY_BRAVE": "b"}, ("brave",)),
+        ({"BRAVE_API_KEY": "b", "TAVILY_API_KEY": "t"}, ("brave", "tavily")),  # alt patterns
+        (
+            {"API_KEY_EXA": "e", "API_KEY_TINYFISH": "tf", "API_KEY_BRAVE": "b"},
+            ("brave", "exa", "tinyfish"),
+        ),  # sorted, not insertion order
+        ({"API_KEY_TAVILY": ""}, ()),  # unset sentinel doesn't count
+        ({"API_KEY_TAVILY": "None"}, ()),
+        ({"API_KEY_OPENROUTER": "x"}, ()),  # a non-web-search key is ignored
+    ],
+)
+def test_web_search_keyed_providers(secrets, expected):
+    assert readiness_mod._web_search_keyed_providers(secrets) == expected
+
+
+@pytest.mark.parametrize(
+    "secrets, expected",
+    [
+        ({}, False),
+        # An OpenAI LLM key WITHOUT an explicit provider must NOT read as voice (the
+        # false-positive s2s_enabled's "openai" default would cause).
+        ({"OPENAI_API_KEY": "sk"}, False),
+        ({"VOICE_S2S_PROVIDER": "openai"}, False),  # provider but no key
+        ({"VOICE_S2S_PROVIDER": "openai", "OPENAI_API_KEY": "sk"}, True),
+        ({"VOICE_S2S_PROVIDER": "gemini", "GOOGLE_API_KEY": "g"}, True),
+        ({"VOICE_S2S_PROVIDER": "gemini", "OPENAI_API_KEY": "sk"}, False),  # wrong key
+        ({"VOICE_S2S_PROVIDER": "none", "OPENAI_API_KEY": "sk"}, False),  # explicit off
+        ({"VOICE_S2S_PROVIDER": "openai", "OPENAI_API_KEY": ""}, False),  # unset sentinel
+        ({"VOICE_S2S_PROVIDER": " openai ", "OPENAI_API_KEY": "sk"}, True),  # trimmed
+    ],
+)
+def test_voice_configured(secrets, expected):
+    assert readiness_mod._voice_configured(secrets) is expected
+
+
+def test_compute_enrichment_packages_all_signals():
+    secrets = {"API_KEY_BRAVE": "b", "VOICE_S2S_PROVIDER": "openai", "OPENAI_API_KEY": "sk"}
+    e = compute_enrichment(secrets=secrets, ego_cadence_minutes=90, autonomy_level=2)
+    assert e.web_search_keyed_providers == ("brave",)
+    assert e.voice_configured is True
+    assert e.ego_cadence_minutes == 90
+    assert e.autonomy_level == 2
+
+
+def test_compute_enrichment_as_dict_shape_and_types():
+    e = compute_enrichment(secrets={}, ego_cadence_minutes=60, autonomy_level=1)
+    d = e.as_dict()
+    assert d == {
+        "web_search_keyed_providers": [],
+        "voice_configured": False,
+        "ego_cadence_minutes": 60,
+        "autonomy_level": 1,
+    }
+    # Providers must serialize as a JSON list (jsonify can't emit a tuple cleanly here).
+    assert isinstance(d["web_search_keyed_providers"], list)
+
+
+def test_compute_enrichment_coerces_injected_ints():
+    e = compute_enrichment(secrets={}, ego_cadence_minutes="45", autonomy_level="3")
+    assert e.ego_cadence_minutes == 45 and e.autonomy_level == 3
+
+
+def test_compute_enrichment_non_coercible_ints_fall_back_never_raises():
+    # A null/garbage cadence (e.g. a user-overridden ego.yaml) or level must NOT raise
+    # into the setup-status route — compute_enrichment coerces to the safe defaults.
+    e = compute_enrichment(secrets={}, ego_cadence_minutes=None, autonomy_level="oops")
+    assert e.ego_cadence_minutes == 60 and e.autonomy_level == 1
+
+
+def test_compute_enrichment_reads_persisted_secrets_when_omitted(monkeypatch):
+    monkeypatch.setattr(readiness_mod, "read_persisted_secrets", lambda: {"API_KEY_TAVILY": "t"})
+    e = compute_enrichment(ego_cadence_minutes=60, autonomy_level=1)
+    assert e.web_search_keyed_providers == ("tavily",)
