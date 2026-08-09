@@ -265,3 +265,70 @@ def test_update_sh_wires_the_lib_visibly():
     text = (REPO_ROOT / "scripts" / "update.sh").read_text()
     assert "lib/memory_resilience.sh" in text
     assert text.count("memory_resilience_apply") >= 1
+
+
+# ── pid_budget_apply (per-user-slice TasksMax=60% provisioning) ──────────────
+
+
+def _run_pid(env_overlay: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", f'set -euo pipefail; source "{LIB}"; pid_budget_apply'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"HOME": env_overlay.get("MEMRES_ETC_ROOT", "/tmp"), **env_overlay},
+    )
+
+
+def _tasksmax_dropin(env: dict) -> Path:
+    return Path(env["MEMRES_ETC_ROOT"]) / "systemd/system/user-.slice.d/90-genesis-tasksmax.conf"
+
+
+def test_pid_budget_apply_writes_percentage_dropin_and_reloads(tmp_path):
+    env = _stage(tmp_path)
+    result = _run_pid(env)
+    assert result.returncode == 0, result.stderr
+    assert "PID ceiling raised" in result.stdout
+    # A PERCENTAGE (self-calibrating), never an absolute count — the whole point.
+    assert _tasksmax_dropin(env).read_text() == "[Slice]\nTasksMax=60%\n"
+    assert "daemon-reload" in Path(env["SYSTEMCTL_LOG"]).read_text()
+
+
+def test_pid_budget_apply_is_idempotent(tmp_path):
+    env = _stage(tmp_path)
+    _run_pid(env)
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+    result = _run_pid(env)
+    assert result.returncode == 0
+    assert "already provisioned" in result.stdout
+    assert Path(env["SYSTEMCTL_LOG"]).read_text() == ""  # no systemd churn
+
+
+def test_pid_budget_no_sudo_skips_with_posture_surface(tmp_path):
+    env = _stage(tmp_path)
+    env["SUDO_N_RC"] = "1"
+    result = _run_pid(env)
+    assert result.returncode == 0
+    assert "sudo unavailable" in result.stdout
+    assert "posture check" in result.stdout  # surfaces instead of silently capping
+    assert not _tasksmax_dropin(env).exists()
+
+
+def test_pid_budget_no_systemd_skips_cleanly(tmp_path):
+    env = _stage(tmp_path)
+    env["MEMRES_SYSTEMD_RUNTIME_DIR"] = str(tmp_path / "does-not-exist")
+    result = _run_pid(env)
+    assert result.returncode == 0
+    assert "not a systemd system" in result.stdout
+    assert not _tasksmax_dropin(env).exists()
+
+
+def test_pid_budget_dropin_wins_over_systemd_default():
+    # 90- must sort AFTER systemd's stock 10-defaults.conf so last-assignment-wins
+    # makes our 60% the effective cap, not the 33% default.
+    assert "10-defaults.conf" < "90-genesis-tasksmax.conf"
+
+
+def test_bootstrap_and_update_wire_pid_budget_apply():
+    assert "pid_budget_apply" in BOOTSTRAP.read_text()
+    assert "pid_budget_apply" in (REPO_ROOT / "scripts" / "update.sh").read_text()

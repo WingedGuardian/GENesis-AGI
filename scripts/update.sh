@@ -1383,6 +1383,8 @@ if [ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]; then
     # shellcheck source=lib/memory_resilience.sh
     . "$SCRIPT_DIR/lib/memory_resilience.sh"
     memory_resilience_apply
+    # Retrofit the raised PID/task ceiling on existing installs (idempotent).
+    pid_budget_apply
     echo ""
 fi
 

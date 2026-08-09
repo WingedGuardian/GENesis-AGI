@@ -537,6 +537,14 @@ _INFRA_POSTURE_DETAIL = {
         "scripts/bootstrap.sh (installs systemd-oomd and lays the user.slice "
         "drop-in via lib/memory_resilience.sh)"
     ),
+    "pid_ceiling_unprovisioned": (
+        "the per-user systemd slice PID/task ceiling is still on systemd's stock "
+        "33% default (user-.slice.d/10-defaults.conf) — many concurrent Claude "
+        "Code sessions (each spawns MCP subprocess trees) can exhaust it and hit "
+        "'Cannot fork' while memory/CPU read green. Re-run scripts/bootstrap.sh "
+        "(lib/memory_resilience.sh's pid_budget_apply lays a user-.slice "
+        "TasksMax=60% drop-in), or raise TasksMax manually if resources permit"
+    ),
     "host_swap_absent": (
         "the host has no swap — the container's swap allowance has nowhere to "
         "spill, so it is protection on paper only. Add host swap "
@@ -624,6 +632,11 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # pressure-kill policy cannot work, so False there is not actionable.
     if swap_max is not None and memory.get("oomd_user_slice_kill") is False:
         missing.append("oomd_pressure_kill_off")
+    # PID/task ceiling still on systemd's stock 33% default. Explicit False only
+    # (the collector reports the EFFECTIVE cap vs the container root budget);
+    # None/absent (unreadable / no container cap) stays silent.
+    if memory.get("pid_ceiling_effective_ok") is False:
+        missing.append("pid_ceiling_unprovisioned")
     # host_system comes from the guardian host plane; absent = no guardian =
     # no signal. NOT memory.facts.swap_total — that reads 0 on a HEALTHY
     # container (meminfo swap isn't virtualized; verified live 2026-07-16).

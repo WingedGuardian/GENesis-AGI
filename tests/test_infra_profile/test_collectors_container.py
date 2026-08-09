@@ -150,6 +150,46 @@ async def test_oomd_policy_fact_from_dropins(proc_root, sys_root, tmp_path):
     assert result.facts["oomd_user_slice_kill"] is False
 
 
+def test_pid_ceiling_effective_ok(sys_root):
+    # Reflects the EFFECTIVE cgroup pids.max (systemd resolves the configured %
+    # AND any set-property override into it) vs the container root budget — NOT a
+    # drop-in string-match, so a runtime override is judged correctly.
+    from genesis.infra_profile.collectors.container import _pid_ceiling_effective_ok
+
+    cg = sys_root / "fs/cgroup"
+    slice_dir = cg / "user.slice/user-4242.slice"
+    slice_dir.mkdir(parents=True)
+
+    # root=4000 (fixture writes pids.max=15000 → overwrite for determinism)
+    cg.joinpath("pids.max").write_text("4000\n")
+
+    # raised to 60% (2400) → well above the 33% default → ok
+    slice_dir.joinpath("pids.max").write_text("2400\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # still on systemd's 33% default (1320) → NOT ok (the defect we surface)
+    slice_dir.joinpath("pids.max").write_text("1320\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is False
+
+    # no sub-cap on the slice → ok (inherits the root budget)
+    slice_dir.joinpath("pids.max").write_text("max\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # no container root cap → the % default is huge, not a risk → ok
+    slice_dir.joinpath("pids.max").write_text("1320\n")
+    cg.joinpath("pids.max").write_text("max\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # root unreadable → can't determine → None (posture check stays silent)
+    cg.joinpath("pids.max").unlink()
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is None
+
+    # slice file absent → None
+    slice_dir.joinpath("pids.max").unlink()
+    cg.joinpath("pids.max").write_text("4000\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is None
+
+
 async def test_storage_mounts_sorted_and_filtered(proc_root, sys_root):
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
     mounts = result.facts["mounts"]
