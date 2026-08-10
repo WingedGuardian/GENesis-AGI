@@ -1086,7 +1086,7 @@ class EgoCadenceManager:
                 return "ran"
             except Exception as exc:
                 logger.error("Unified cycle failed", exc_info=True)
-                self._record_failure(str(exc))
+                self._record_failure(str(exc), exc=exc)
                 return "ran"
 
             if cycle is None:
@@ -1291,8 +1291,15 @@ class EgoCadenceManager:
         except Exception:
             logger.debug("Failed to record ego job success", exc_info=True)
 
-    def _record_failure(self, error: str) -> None:
-        """Increment circuit breaker, record job failure."""
+    def _record_failure(self, error: str, *, exc: BaseException | None = None) -> None:
+        """Increment circuit breaker, record job failure.
+
+        When an exception caused the failure, pass it as *exc*: ``record_job_failure``
+        then derives ``error_type``/``error_frames`` and emits the throttled
+        ``job.failed`` reflex event (ingested since #1304). Semantic failures with no
+        exception behind them (e.g. "cycle produced no usable output") pass ``exc=None``
+        and stay off the reflex bus — they are not Genesis bugs the reflex arc can act on.
+        """
         self._consecutive_failures += 1
 
         if self._consecutive_failures >= self._config.consecutive_failure_limit:
@@ -1312,6 +1319,7 @@ class EgoCadenceManager:
             GenesisRuntime.instance().record_job_failure(
                 self._session._source_tag,
                 error,
+                exc=exc,
             )
         except ImportError:
             pass

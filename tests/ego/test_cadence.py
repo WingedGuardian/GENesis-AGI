@@ -1625,7 +1625,7 @@ class TestJobHealthKeyPerEgo:
             classmethod(lambda cls: mock_rt),
         )
         cadence._record_failure("boom")
-        mock_rt.record_job_failure.assert_called_once_with(source_tag, "boom")
+        mock_rt.record_job_failure.assert_called_once_with(source_tag, "boom", exc=None)
 
     async def test_two_egos_write_distinct_keys(
         self,
