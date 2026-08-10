@@ -757,6 +757,142 @@ def _check_pr_review_findings(
     return False, ""
 
 
+# ── Codex review FRESHNESS (a CURRENT review must exist, not just no findings) ──
+# The finding scanners above block on UNRESOLVED findings, but a merge can still
+# proceed with NO review at all, or a review of a STALE commit (Codex reviewed A,
+# code B pushed after) — the scans come back empty and the merge sails through
+# unseen. This gate requires Codex's most recent review to cover the PR's current
+# head, compared on the FULL 40-char oid GitHub records for the review
+# (the review object's ``commit_id``) — NOT a short prefix from the body, which a
+# stale prefix (or a ground SHA sharing it) could satisfy. Waived by
+# '# review-override' (the conscious "merge without a current Codex review" case).
+_CODEX_REVIEW_BOT = "chatgpt-codex-connector[bot]"
+
+
+def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The PR's current head commit oid (headRefOid), or None on any error.
+
+    Tests inject via the ``_TEST_GH_HEAD_SHA`` env var so no network is needed.
+    """
+    raw = os.environ.get("_TEST_GH_HEAD_SHA")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_num,
+                    *_repo_args(repo),
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    sha = (raw or "").strip()
+    return sha or None
+
+
+def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The FULL commit oid (``.commit_id``) of Codex's MOST RECENT review, or None
+    if Codex has posted no review (or on any API/parse error).
+
+    Uses GitHub's authoritative per-review ``commit_id`` (the exact 40-char oid
+    the review was submitted against) rather than parsing the review body — so the
+    comparison is a full-oid identity, immune to short-prefix collisions/grinding.
+    The ``/pulls/N/reviews`` endpoint returns reviews oldest-first, so the last
+    Codex entry wins. Tests inject via ``_TEST_GH_CODEX_REVIEWS`` (one JSON object
+    per line: ``{login, commit_id}``). Fail-safe: None on any API/parse error.
+    """
+    raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/reviews",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {login: .user.login, commit_id: .commit_id}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
+        except Exception:
+            return None
+    latest: str | None = None
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
+            continue
+        cid = (obj.get("commit_id") or "").strip().lower()
+        if cid:
+            latest = cid
+    return latest
+
+
+def _check_codex_reviewed_head(
+    pr_num: str, *, force: bool = False, repo: str | None = None
+) -> tuple[bool, str]:
+    """Block a merge unless Codex has reviewed the PR's CURRENT head commit.
+
+    Compares the PR's ``headRefOid`` against the FULL ``commit_id`` of Codex's
+    latest review — an EXACT identity, no prefix match. Fail-CLOSED: if the head
+    cannot be read, or Codex has no review / reviewed a different commit, the
+    merge is BLOCKED. This is an enforcement gate, so an unverifiable review is
+    treated as absent (blocked), NOT waved through — matching ``_check_mergeable``
+    (which blocks on UNKNOWN), not the advisory finding-scanners. ``force`` (a
+    ``# review-override`` on the merge segment) is the conscious escape (e.g. a
+    genuine Codex outage).
+    """
+    if force:
+        return False, ""
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return True, (
+            f"could not read PR #{pr_num}'s head commit to verify a current Codex "
+            f"review (GitHub query failed).\n"
+            f"Retry, or append '# review-override' to merge anyway."
+        )
+    head = head.strip().lower()
+    reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
+    if not reviewed:
+        return True, (
+            f"no Codex review found for PR #{pr_num} at head {head[:12]}.\n"
+            f"Codex reviews on PR-open — it does NOT auto-review a later fix-commit; "
+            f"comment '@codex review' on the PR to review the current head (then wait), "
+            f"or append '# review-override' to merge without a current Codex review "
+            f"(e.g. Codex is down)."
+        )
+    if reviewed != head:
+        return True, (
+            f"Codex's latest review is STALE: it reviewed {reviewed[:12]}, but PR "
+            f"#{pr_num} head is {head[:12]} (new commits pushed after the review).\n"
+            f"Comment '@codex review' on the PR to re-review the current head (Codex "
+            f"does NOT auto-review fix-commits), then wait; or append "
+            f"'# review-override' to merge anyway."
+        )
+    return False, ""
+
+
 def _is_dispatched() -> bool:
     """True in a Genesis-dispatched (autonomous/headless) CC session.
 
@@ -1743,6 +1879,23 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(inline_msg, file=sys.stderr)
+                    return 2
+
+                # Codex must have reviewed the CURRENT head (existence + freshness)
+                # — not merely have no open findings. A not-yet-reviewed or
+                # stale-reviewed head would otherwise merge unseen (the finding
+                # scans come back empty). Waived by # review-override.
+                should_block, fresh_msg = _check_codex_reviewed_head(
+                    pr_num,
+                    force=force_override,
+                    repo=merge_repo,
+                )
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — Codex has not reviewed the current head.",
+                        file=sys.stderr,
+                    )
+                    print(fresh_msg, file=sys.stderr)
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
