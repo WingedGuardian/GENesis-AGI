@@ -71,9 +71,12 @@ set_secret() {
 
 # ── HOME guard ───────────────────────────────────────────────
 # Ensure HOME is set (may be empty in container sessions without login shell)
-# and persisted in /etc/environment so all future sessions inherit it.
+# and persisted in /etc/environment so all future sessions inherit it. Resolve
+# from passwd by uid (robust when the name lookup is missing) and fail closed
+# rather than proceed with HOME="" (which `set -u` would not catch).
 if [ -z "${HOME:-}" ]; then
-    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
 if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
