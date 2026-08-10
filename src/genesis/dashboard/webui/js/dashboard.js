@@ -318,6 +318,10 @@
         ],
         secretsMessage: null,     // {type, text}
 
+        // ── Readiness panel (persistent, Overview) — renders setupStatus; no new fetch ──
+        readinessPanelOpen: true,    // in-memory; smart-defaulted in loadSetupStatus (auto-collapsed at T3)
+        readinessPanelTouched: false, // set once the user toggles, so the smart default stops overriding
+
         fetchState: {
           health: { state: "idle", lastSuccess: null, error: null },
           activity: { state: "idle", lastSuccess: null, error: null },
@@ -2279,8 +2283,40 @@
         async loadSetupStatus() {
           try {
             const resp = await fetchApi("/api/genesis/setup-status");
-            if (resp && resp.ok) { this.setupStatus = await resp.json(); }
+            if (resp && resp.ok) {
+              this.setupStatus = await resp.json();
+              // Smart default for the persistent readiness panel: expanded while there is
+              // still headroom to configure (tier < 3), auto-collapsed once fully Autonomous.
+              // Only until the user manually toggles it — then their choice is respected.
+              if (!this.readinessPanelTouched) {
+                this.readinessPanelOpen = (this.setupStatus?.tier ?? 0) < 3;
+              }
+            }
           } catch (e) { /* non-fatal: card simply stays hidden */ }
+        },
+        toggleReadinessPanel() {
+          this.readinessPanelTouched = true;
+          this.readinessPanelOpen = !this.readinessPanelOpen;
+        },
+        openReadinessPanel() {
+          // Header-nudge target: jump to Overview, force the panel open, scroll to it.
+          this.readinessPanelTouched = true;
+          this.readinessPanelOpen = true;
+          this.navigateTo("overview", "readiness-panel");
+        },
+        get readinessNextStep() {
+          // The single "what unlocks next" line, derived from the cumulative tier.
+          // Config-framed (never implies live behavior); null-safe before setupStatus loads.
+          const s = this.setupStatus;
+          if (!s) return { reached: false, text: "" };
+          const tier = s.tier ?? 0;
+          if (tier <= 0) return { reached: false, text: "Next: T1 Functional — finish the floor (Claude Code login + a chat-model key + an embedding key)." };
+          if (tier === 1) return { reached: false, text: "Next: T2 Connected — add a Telegram bot token + your user id so Genesis can reach you." };
+          if (tier === 2) {
+            const marker = s.onboarded === false ? " (and complete bootstrap)" : "";
+            return { reached: false, text: `Next: T3 Autonomous — enable the ego / awareness loop${marker}.` };
+          }
+          return { reached: true, text: "Fully Autonomous — the ego loop is enabled, gated by the mandatory approval gate." };
         },
         get showSetupCard() {
           const s = this.setupStatus;

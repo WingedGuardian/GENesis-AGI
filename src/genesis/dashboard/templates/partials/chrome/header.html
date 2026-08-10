@@ -144,7 +144,7 @@
          separately by the auth lockdown). -->
     <template x-if="$store.genesisDashboard.setupStatus && $store.genesisDashboard.setupStatus.password_set === false && !$store.genesisDashboard.pwNudgeDismissed">
       <div style="background: rgba(33,150,243,0.12); border: 1px solid #2196F3; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; color: var(--color-text-primary,#e0e0e0); display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
-        <span>🔒 No dashboard password is set — anyone who can reach this URL can view it. Set one from the Setup card on Overview, or Configuration → Provider Keys.</span>
+        <span>🔒 No dashboard password is set — anyone who can reach this URL can view it. <a href="#" @click.prevent="$store.genesisDashboard.openReadinessPanel()" style="color:#2196F3;cursor:pointer;text-decoration:underline;">Set one from the Readiness panel</a>, or Configuration → Provider Keys.</span>
         <button @click="$store.genesisDashboard.pwNudgeDismissed = true" title="Dismiss" style="background:none;border:none;color:var(--color-text-secondary,#888);cursor:pointer;font-size:1rem;line-height:1;">✕</button>
       </div>
     </template>
