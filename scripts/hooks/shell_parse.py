@@ -188,6 +188,20 @@ def _strip_trailing_comment(seg: str) -> str:
     return "".join(out)
 
 
+# The recognized ack/override sigils. A trailing comment may carry several of these
+# together (`# audit-ack depth-ack`), so the leading run of the comment is allowed to
+# contain any of them; the FIRST prose token ends the run. Kept in sync with the
+# sigils actually passed to has_trailing_override across the guard hooks.
+_KNOWN_SIGILS = ("review-override", "depth-ack", "audit-ack", "escalation-ack", "ci-override")
+
+
+def _token_is_sigil(tok: str, sigil: str) -> bool:
+    """Whether ``tok`` IS the sigil token — the sigil optionally followed by
+    punctuation (``review-override:``), but NOT a prefix of a longer word-token
+    (``review-override-x``)."""
+    return bool(re.match(re.escape(sigil) + r"(?![-\w])", tok))
+
+
 def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     """Whether the segment carries a genuine ``# <sigil>`` comment.
 
@@ -195,8 +209,15 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     so a token buried in a quoted message word does not count. ``sigil`` selects
     which override token to detect (``review-override`` by default; the CI-status
     merge gate passes ``ci-override``).
+
+    The sigil must appear in the LEADING contiguous run of recognized ack/override
+    tokens: `# review-override: accepted P2s` (sigil first, prose follows) and
+    `# audit-ack depth-ack` (a run of two sigils — each satisfies its own check)
+    both count, but `# not a review-override` / `# see review-override docs` do NOT
+    — a prose token ahead of the sigil ends the run. This keeps independent acks
+    able to coexist without letting an incidental or negated prose mention waive
+    the gate.
     """
-    token = re.compile(re.escape(sigil) + r"(?![-\w])")
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -217,11 +238,13 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
             i += 1
             continue
         if c == "#" and prev_ws:
-            rest = seg[i + 1 :].strip()
-            # The sigil must be the token, optionally followed by punctuation /
-            # comment text (`# review-override: accepted P2s`), but NOT be a
-            # prefix of a longer token (`review-override-x`, `review-overridexyz`).
-            return bool(token.match(rest))
+            for tok in seg[i + 1 :].split():
+                if _token_is_sigil(tok, sigil):
+                    return True  # the queried sigil, reached within the leading run
+                if not any(_token_is_sigil(tok, s) for s in _KNOWN_SIGILS):
+                    return False  # a prose token ends the leading run of sigils
+                # else: a DIFFERENT recognized sigil — still in the run, keep scanning
+            return False
         prev_ws = c.isspace()
         i += 1
     return False

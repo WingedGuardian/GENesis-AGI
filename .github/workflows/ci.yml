@@ -395,6 +395,30 @@ jobs:
       - name: CC↔Node pin-lockstep guard
         run: python scripts/check_cc_node_lockstep.py
 
+  review-depth-check:
+    # Advisory review-DEPTH visibility: recompute substantiality on the PR range
+    # (base...HEAD, so it needs full history — fetch-depth: 0) and emit a LOUD
+    # ::warning:: annotation when the change is substantial, so the human reviewer
+    # + the independent cloud reviewer apply an adversarial /review-level audit
+    # rather than a lean pass. Advisory BY DESIGN (exit 0 always): a committed audit
+    # artifact is forgeable and the local hook is editable by the same author, so
+    # the enforcing teeth are the independent reviewer + a required human approval
+    # (branch protection), not this check. Stdlib-only. See scripts/check_review_depth.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Review-depth advisory
+        env:
+          # Event base SHA (trusted-format) — robust vs origin/* ref materialization,
+          # matching the leak-detector job. Passed via env (not interpolated into run).
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/check_review_depth.py
+
   test:
     runs-on: ubuntu-latest
     # CI is blocking — local full-suite runs are banned. See procedure
