@@ -899,22 +899,11 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  [9/$TOTAL_STEPS] Setting up Claude Code hooks..."
 
-TEMPLATE="$REPO_DIR/config/claude-settings.json.template"
-TARGET="$REPO_DIR/.claude/settings.json"
 VENV_PYTHON="$VENV_PATH/bin/python"
 
-if [ -f "$TEMPLATE" ]; then
-    mkdir -p "$REPO_DIR/.claude"
-    if [ -f "$TARGET" ]; then
-        echo "    . .claude/settings.json already exists (not overwriting)"
-    else
-        sed "s|{{VENV_PYTHON}}|$VENV_PYTHON|g; s|{{GENESIS_ROOT}}|$REPO_DIR|g" \
-            "$TEMPLATE" > "$TARGET"
-        echo "    + Claude Code hooks configured"
-    fi
-else
-    echo "    - Hook template not found (skipping)"
-fi
+# .claude/settings.json ships tracked in the repo — hooks are pre-configured on
+# every clone, so there is no template to render here. (VENV_PYTHON stays defined:
+# the .mcp.json render below still substitutes it.)
 
 # .mcp.json — MCP server configuration for Claude Code
 MCP_TEMPLATE="$REPO_DIR/config/mcp.json.template"

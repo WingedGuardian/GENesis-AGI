@@ -190,11 +190,11 @@ def test_no_settings_json_pipes_dead_env_var():
     """Static guard: no settings JSON wraps a hook in `echo $CLAUDE_TOOL_INPUT |`.
 
     That wrapper clobbers CC's real stdin with the dead env var — the exact
-    landmine that silently disabled the guards. Covers the live settings and the
-    install-time template.
+    landmine that silently disabled the guards. Covers the tracked settings file
+    (which ships pre-configured on every clone).
     """
     offenders = []
-    for rel in (".claude/settings.json", "config/claude-settings.json.template"):
+    for rel in (".claude/settings.json",):
         path = _REPO / rel
         if not path.exists():
             continue
