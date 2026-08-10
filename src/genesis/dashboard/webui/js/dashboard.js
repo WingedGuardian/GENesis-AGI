@@ -2272,6 +2272,9 @@
               delete this.secretsValues[keyName];
               this.secretsMessage = {type: 'restart', text: `${keyName} saved. Changes take effect after server restart.`};
               this.fetchSecrets();
+              // Keep the readiness panel + password nudge in sync: a provider key
+              // (incl. DASHBOARD_PASSWORD) just changed the setup-status signals.
+              this.loadSetupStatus();
             } else {
               this.secretsMessage = {type: 'error', text: d.error || 'Save failed'};
             }
@@ -2313,10 +2316,17 @@
           if (tier <= 0) return { reached: false, text: "Next: T1 Functional — finish the floor (Claude Code login + a chat-model key + an embedding key)." };
           if (tier === 1) return { reached: false, text: "Next: T2 Connected — add a Telegram bot token + your user id so Genesis can reach you." };
           if (tier === 2) {
-            const marker = s.onboarded === false ? " (and complete bootstrap)" : "";
-            return { reached: false, text: `Next: T3 Autonomous — enable the ego / awareness loop${marker}.` };
+            // T3 needs BOTH ego_enabled AND onboarded; name only the prerequisite(s)
+            // actually missing (an install can have the ego loop on but no marker).
+            const egoOn = s.ego_enabled === true;
+            const onboarded = s.onboarded === true;
+            if (egoOn && !onboarded) return { reached: false, text: "Next: T3 Autonomous — complete bootstrap (the ego loop is on, but the setup-complete marker is missing)." };
+            if (!egoOn && onboarded) return { reached: false, text: "Next: T3 Autonomous — enable the ego / awareness loop." };
+            return { reached: false, text: "Next: T3 Autonomous — enable the ego / awareness loop and complete bootstrap." };
           }
-          return { reached: true, text: "Fully Autonomous — the ego loop is enabled, gated by the mandatory approval gate." };
+          // Do NOT assert the approval gate here: the panel cannot see its effective
+          // state, and the shipped autonomous_cli_policy default is auto-approve.
+          return { reached: true, text: "Fully Autonomous — the ego / awareness loop is enabled." };
         },
         get showSetupCard() {
           const s = this.setupStatus;

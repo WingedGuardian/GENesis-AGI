@@ -138,13 +138,14 @@
                  x-text="(s.readinessNextStep.reached ? '✓ ' : '→ ') + s.readinessNextStep.text"></div>
             <!-- Enrichment chips (config-framed, non-gating) -->
             <div style="display:flex;flex-wrap:wrap;gap:0.4rem;">
-              <span class="chip chip--info"
-                    x-text="'Web search: SearXNG (keyless)' + ((s.setupStatus.web_search_keyed_providers?.length)
-                              ? ' + ' + s.setupStatus.web_search_keyed_providers.length + ' premium ('
-                                + s.setupStatus.web_search_keyed_providers.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(', ') + ')'
-                              : '')"></span>
+              <!-- Only keyed PREMIUM providers are knowable from the payload; the keyless
+                   SearXNG primary is not bootstrap-provisioned, so we do not assert it. -->
+              <span class="chip" :class="s.setupStatus.web_search_keyed_providers?.length ? 'chip--info' : 'chip--off'"
+                    x-text="'Web search premium: ' + ((s.setupStatus.web_search_keyed_providers?.length)
+                              ? s.setupStatus.web_search_keyed_providers.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(', ')
+                              : 'none keyed')"></span>
               <span class="chip" :class="s.setupStatus.voice_configured ? 'chip--ok' : 'chip--off'"
-                    x-text="s.setupStatus.voice_configured ? 'Voice: configured' : 'Voice: off'"></span>
+                    x-text="s.setupStatus.voice_configured ? 'Voice: configured' : 'Voice: not configured'"></span>
               <span class="chip" :class="s.setupStatus.ego_enabled ? 'chip--ok' : 'chip--off'"
                     x-text="s.setupStatus.ego_enabled ? ('Ego cadence: ' + (s.setupStatus.ego_cadence_minutes ?? '—') + ' min (configured)') : 'Ego loop: off'"></span>
               <span class="chip chip--info"
