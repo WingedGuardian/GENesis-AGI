@@ -409,10 +409,17 @@ async def test_build_lane_section_renders(db, mock_health, mock_drafter, monkeyp
                     source_file="New Genesis Capabilities.md",
                     verdict="dont_build", verdict_reason="brain-not-body scope")
 
-    async def fake_ci(url):
+    async def fake_ci(url, *, actions_degraded=None):
         return "passing"
 
     monkeypatch.setattr(_mr_mod, "_pr_ci_status", fake_ci)
+
+    async def _not_degraded():
+        return False
+
+    # _get_build_lane_section resolves the incident state once before the gather;
+    # stub it so the test makes no real githubstatus network call.
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _not_degraded)
 
     gen = MorningReportGenerator(mock_health, db, mock_drafter)
     section = await gen._get_build_lane_section()
@@ -444,6 +451,144 @@ async def test_pr_ci_status_none_on_empty_or_no_url(monkeypatch):
     monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
     assert await _mr_mod._pr_ci_status("https://x/pull/1") is None
     assert await _mr_mod._pr_ci_status("") is None
+
+
+# --- GitHub Actions outage pre-flight (distinguish infra outage from real failure) ---
+
+
+class _FakeStatusResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeStatusClient:
+    """Async-context-manager stand-in for httpx.AsyncClient."""
+
+    def __init__(self, *, payload=None, exc=None):
+        self._payload = payload
+        self._exc = exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url):
+        if self._exc is not None:
+            raise self._exc
+        return _FakeStatusResp(self._payload)
+
+
+@pytest.mark.asyncio
+async def test_github_actions_degraded_reads_indicator(monkeypatch):
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(payload={"status": {"indicator": "none"}}),
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(payload={"status": {"indicator": "major"}}),
+    )
+    assert await _mr_mod._github_actions_degraded() is True
+
+
+@pytest.mark.asyncio
+async def test_github_actions_degraded_fails_open(monkeypatch):
+    # Unreachable / malformed status page must NOT report degraded — never mask
+    # a real CI failure as an infra outage.
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(exc=RuntimeError("boom")),
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(payload={}),  # no 'status' key
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_annotates_on_actions_incident(monkeypatch):
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"conclusion": "FAILURE"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+
+    async def _degraded():
+        return True
+
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _degraded)
+    out = await _mr_mod._pr_ci_status("https://x/pull/1")
+    assert out is not None and out.startswith("failing")
+    assert "GitHub Actions" in out  # incident annotation present
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_no_annotation_when_not_degraded(monkeypatch):
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"conclusion": "FAILURE"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+
+    async def _not_degraded():
+        return False
+
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _not_degraded)
+    assert await _mr_mod._pr_ci_status("https://x/pull/1") == "failing"
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_annotates_pending_branch(monkeypatch):
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"status": "IN_PROGRESS"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+
+    async def _degraded():
+        return True
+
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _degraded)
+    out = await _mr_mod._pr_ci_status("https://x/pull/1")
+    assert out is not None and out.startswith("pending")
+    assert "GitHub Actions" in out
+
+
+@pytest.mark.asyncio
+async def test_pr_ci_status_honors_precomputed_degraded(monkeypatch):
+    # When actions_degraded is supplied by the caller, the per-call status check
+    # must NOT run (resolved once per report, not per PR).
+    import genesis.recon.gh_cli as gh_cli
+
+    async def fake_run_gh(*args, timeout=None):
+        return '{"statusCheckRollup": [{"conclusion": "FAILURE"}]}'
+
+    monkeypatch.setattr(gh_cli, "run_gh", fake_run_gh)
+
+    async def _boom():
+        raise AssertionError("must not resolve per-call when precomputed")
+
+    monkeypatch.setattr(_mr_mod, "_github_actions_degraded", _boom)
+
+    out = await _mr_mod._pr_ci_status("https://x/pull/1", actions_degraded=True)
+    assert out is not None and out.startswith("failing") and "GitHub Actions" in out
+    assert await _mr_mod._pr_ci_status("https://x/pull/1", actions_degraded=False) == "failing"
 
 
 # --- message_queue finding closure (confirm_delivery) ---

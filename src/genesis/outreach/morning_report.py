@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
+import httpx
 
 from genesis.content.drafter import ContentDrafter
 from genesis.content.types import DraftRequest, FormatTarget
@@ -61,8 +62,33 @@ _STALE_PRIORITY_DEMOTION = {"critical": "high", "high": "medium", "medium": "med
 _BUILD_PR_CI_TIMEOUT_S = 20  # per-PR gh call; PRs are checked concurrently
 _MAX_BUILD_PR_CHECKS = 10    # cap concurrent gh calls (rate-limit safety)
 
+_GITHUB_STATUS_URL = "https://www.githubstatus.com/api/v2/status.json"
+_GH_STATUS_TIMEOUT_S = 5  # preflight only; a slow/unreachable status page fails open
 
-async def _pr_ci_status(pr_url: str) -> str | None:
+
+async def _github_actions_degraded() -> bool:
+    """True only when GitHub reports an ACTIVE incident (status indicator != none).
+
+    Fail-OPEN: any error, timeout, or malformed payload returns False, so a real
+    CI failure is never masked as an infra outage — this only ever ADDS a hedged
+    'incident' annotation when GitHub positively confirms one. Uses the summary
+    indicator (not per-component) intentionally; the annotation is hedged, so a
+    non-Actions incident at worst adds a soft, clearly-conditional note.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_GH_STATUS_TIMEOUT_S) as client:
+            resp = await client.get(_GITHUB_STATUS_URL)
+            resp.raise_for_status()
+            indicator = ((resp.json() or {}).get("status") or {}).get("indicator")
+        return str(indicator or "none").lower() != "none"
+    except Exception:
+        logger.debug("githubstatus preflight failed; failing open", exc_info=True)
+        return False
+
+
+async def _pr_ci_status(
+    pr_url: str, *, actions_degraded: bool | None = None
+) -> str | None:
     """One-shot CI rollup for a draft build PR via
     ``gh pr view <url> --json statusCheckRollup``. Returns a compact word
     ('passing'/'failing'/'pending'/'no checks'), or None on error/timeout.
@@ -70,6 +96,10 @@ async def _pr_ci_status(pr_url: str) -> str | None:
     Uses the shared ``run_gh`` helper, which kills+reaps the child process on
     timeout (the process-kill sequence is easy to get subtly wrong, so it is
     not re-implemented here).
+
+    ``actions_degraded`` is the GitHub-incident state, resolved ONCE per report
+    by the caller and passed in so an outage does not trigger one status GET per
+    failing PR. When ``None`` (default), it is resolved lazily per call.
     """
     import json
 
@@ -87,7 +117,18 @@ async def _pr_ci_status(pr_url: str) -> str | None:
         checks = json.loads(raw).get("statusCheckRollup") or []
     except (ValueError, TypeError):
         return None
-    return _summarize_ci_rollup(checks)
+    summary = _summarize_ci_rollup(checks)
+    # A GitHub Actions outage surfaces as 'failing' (runner startup/cancel) or a
+    # stuck 'pending' — annotate (never suppress) when GitHub confirms an incident.
+    if summary in ("failing", "pending"):
+        degraded = (
+            actions_degraded
+            if actions_degraded is not None
+            else await _github_actions_degraded()
+        )
+        if degraded:
+            return f"{summary} (GitHub Actions incident, may not be a code issue)"
+    return summary
 
 
 def _summarize_ci_rollup(checks: list) -> str:
@@ -652,8 +693,17 @@ class MorningReportGenerator:
 
         if open_prs:
             checked = open_prs[:_MAX_BUILD_PR_CHECKS]
+            # Resolve the GitHub-incident state ONCE per report — it is global to
+            # all PRs; resolving per-PR would fire N concurrent identical status
+            # GETs during an outage (exactly when this path is hot).
+            actions_degraded = await _github_actions_degraded()
             ci_states = await asyncio.gather(
-                *[_pr_ci_status(r.get("pr_url") or "") for r in checked]
+                *[
+                    _pr_ci_status(
+                        r.get("pr_url") or "", actions_degraded=actions_degraded
+                    )
+                    for r in checked
+                ]
             )
             lines.append("")
             lines.append("Open build PRs (draft, awaiting your review/merge):")
