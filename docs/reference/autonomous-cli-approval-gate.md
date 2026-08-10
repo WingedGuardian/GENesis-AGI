@@ -7,6 +7,22 @@ Approvals are delivered to Telegram with inline buttons and gated
 per-call-site so the system **pauses** a call site while an approval
 is in flight instead of queuing duplicate prompts.
 
+## Shipped default & override
+
+The gate ships **ON by default**: `config/autonomous_cli_policy.yaml` commits
+`manual_approval_required: true`, so a fresh clone is safe-by-default — no
+autonomous background Claude Code session runs without an explicit user approval.
+
+Note *which* layer provides that guarantee: the `AutonomousCliPolicy` dataclass
+default is also `True`, but that is **not** what protects a fresh install.
+`load_autonomous_cli_policy` honors the committed YAML value whenever the key is
+present (it is), so the **shipped file — not the code default — is the effective
+default**. A machine that deliberately runs unattended overrides the posture via
+a gitignored `config/autonomous_cli_policy.local.yaml` overlay (user-dir-first,
+deep-merged over the committed file). A guardrail test
+(`test_committed_policy_ships_manual_approval_required_true`) pins the committed
+value so the safe default cannot silently regress.
+
 ## Delivery destination
 
 Approvals are posted to the `"Approvals"` topic in the supergroup

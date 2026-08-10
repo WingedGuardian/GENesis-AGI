@@ -31,6 +31,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The autonomous-CLI approval gate now ships ON by default.** Every background
+  Claude Code session Genesis dispatches must be rooted in an explicit user
+  approval — but the committed policy config shipped the gate *off*, so a fresh
+  clone with no local overlay would auto-approve autonomous sessions without
+  asking. The shipped default is now `manual_approval_required: true`; a machine
+  that deliberately runs unattended still opts out through its own gitignored
+  overlay. A guardrail test pins the committed config, so the loader's
+  file-wins-over-code-default behavior can never silently ship the gate off again.
+
 - **Inbox approvals no longer nag.** A pending "inbox evaluation" approval now
   holds until you respond — it is asked once and blocks until approved, like
   every other approval, instead of re-sending a fresh request every few hours
