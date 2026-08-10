@@ -420,7 +420,14 @@ under-depth inline pass was self-certified as sufficient). The commit gate now
 COMPUTES substantiality from the staged diff
 (`review_scope.classify_change_substantiality`) and BLOCKS a substantial change
 whose review marker is not an ADVERSARIAL audit (`review_enforcement_commit.py`
-Rule 2.5). A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
+Rule 2.5). Substantiality is a surface-area × risk model — ≥50 reviewable lines OR
+>1 code file OR an auth/api/migrations file OR an **executable prompt/agent/skill
+surface** (`.claude/agents|commands|skills/*`, `src/genesis/skills/*`), so the
+"Prompt / LLM behavior → both + extra scrutiny" row above is machine-enforced (a
+trivial edit to one is depth-audited). User-sovereign top-level CAPS docs
+(`SOUL.md`/`USER.md`/`CLAUDE.md`) are exempt. Clearance binds the marker to the
+reviewed diff's FULL content, so re-staging different content after the audit
+re-blocks. A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
 substantial change — not clearance. Depth is override-exempt: a findings
 `# review-override` does NOT waive it; only a loud, logged `# depth-ack` does (the
 audited escape for a genuine format mismatch). "Adversarial" is verified

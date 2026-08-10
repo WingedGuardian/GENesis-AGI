@@ -626,6 +626,25 @@ def test_code_file_still_enforced(repo: Path, home: Path) -> None:
     assert "without review" in res.stderr
 
 
+def test_prompt_surface_only_commit_not_skipped(repo: Path, home: Path) -> None:
+    """A prompt/agent surface (.claude/agents/*.md) is NOT docs-config, so a prompt-only
+    commit does NOT take the pure-docs skip — it is substantial (behavior risk) and hits
+    the depth gate."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    res = _run_hook('git commit -m "prompt"', repo, home)
+    assert res.returncode == 2
+    assert "review depth" in res.stderr.lower()
+
+
+def test_user_caps_behavior_doc_only_commit_skips(repo: Path, home: Path) -> None:
+    """User-sovereign CAPS docs (SOUL.md/USER.md) stay docs-config → a commit touching
+    only them still takes the docs skip (the user editing their own behavior files is not
+    gated)."""
+    _restage(repo, {"SOUL.md": "# Who you are\nBe helpful.\n", "USER.md": "# User\nBrief.\n"})
+    res = _run_hook('git commit -m "soul"', repo, home)
+    assert res.returncode == 0, res.stderr
+
+
 def test_mixed_docs_and_code_enforced(repo: Path, home: Path) -> None:
     """One code file among docs → the whole set is NOT docs-only → enforced."""
     _restage(repo, {"README.md": "# docs\n", "foo.py": "print(1)\n"})

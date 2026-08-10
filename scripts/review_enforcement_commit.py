@@ -79,6 +79,25 @@ def _commit_override(command: str, segs: list) -> str:
 _DOCS_CONFIG_EXTS = {".md", ".rst", ".txt", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
 _DOCS_CONFIG_BASENAMES = {"CHANGELOG", "LICENSE", ".GITIGNORE"}  # compared upper-cased
 
+# Executable prompt/agent/skill SURFACES: files whose content shapes autonomous LLM
+# behavior (agent + slash-command + skill definitions, and the in-repo skill library).
+# These are NEVER docs/config even when ``.md`` — an autonomous system editing its own
+# prompts is high-consequence (genesis-development SKILL.md requires prompt/LLM-behavior
+# changes to get adversarial review + a CI warning). User-sovereign top-level CAPS behavior
+# docs (SOUL.md, USER.md, CLAUDE.md) are deliberately NOT here: the user editing their own
+# behavior files is not gated (user sovereignty). Directory prefixes, `/`-normalized.
+_PROMPT_SURFACE_PREFIXES = (
+    ".claude/agents/",
+    ".claude/commands/",
+    ".claude/skills/",
+    "src/genesis/skills/",
+)
+
+
+def _is_prompt_surface(path: str) -> bool:
+    """Whether a path is an executable prompt/agent/skill surface (behavior-shaping)."""
+    return path.replace("\\", "/").startswith(_PROMPT_SURFACE_PREFIXES)
+
 
 def _is_docs_or_config(path: str) -> bool:
     """Whether a staged path is a docs/config file (per the conservative allowlist).
@@ -86,9 +105,13 @@ def _is_docs_or_config(path: str) -> bool:
     Anything under a ``.github/`` directory is NEVER docs/config: GitHub Actions
     workflows are executable CI config (arbitrary ``run:`` with repo secrets), so
     a workflow-only commit MUST still be reviewed even though it is ``.yml``.
+    Likewise an executable prompt/agent/skill SURFACE is never docs/config even when
+    ``.md`` — it shapes autonomous behavior and must reach the review + depth gates.
     """
     norm = path.replace("\\", "/")
     if ".github" in norm.split("/"):  # leading `.github/` or any `/.github/` component
+        return False
+    if _is_prompt_surface(norm):  # behavior surface — reviewable, never docs-skipped
         return False
     base = os.path.basename(norm)
     if base.upper() in _DOCS_CONFIG_BASENAMES:
@@ -390,11 +413,11 @@ def main() -> None:
         from review_state import (
             ESCALATION_ROUND_CAP,
             get_current_branch,
-            get_current_diff_hash,
             get_review_round,
             has_code_changes,
             has_valid_review_marker,
             is_review_current,
+            marker_content_current,
             reset_review_round,
         )
     except ImportError:
@@ -547,20 +570,14 @@ def main() -> None:
     else:
         # Normal commit: the staged index IS the commit content, so classify it
         # directly. Crucially, the marker's adversarial clearance counts ONLY when the
-        # marker genuinely BINDS this diff — is_review_current (marker.diff_hash == the
-        # current staged hash) AND that hash is real, not "unknown"/"clean". Otherwise an
-        # adversarial audit of an EARLIER diff A would falsely clear a later substantial
-        # diff B that a '# review-override' then waives past Rule 2's staleness block,
-        # when B was never audited (the integrity hole this depth gate exists to close).
-        # Excluding "unknown" fails CLOSED on a transient stat-diff error (the depth gate
-        # is the stricter one and has the '# depth-ack' escape) rather than letting the
-        # is_review_current() clean/unknown short-circuit wrong-clear a substantial diff.
+        # marker genuinely BINDS this diff's CONTENT — marker_content_current compares the
+        # recorded FULL-content hash to the staged content (not the stat-only diff_hash,
+        # which a same-shape swap collides under) and fails CLOSED on mismatch/absence/
+        # error. Otherwise an adversarial audit of an EARLIER diff A would falsely clear a
+        # later substantial diff B that a '# review-override' then waives past Rule 2's
+        # staleness block, when B was never audited (the integrity hole this gate closes).
         depth_level = staged_level
-        depth_is_adversarial = (
-            marker_adversarial
-            and is_review_current(cwd=cwd)
-            and get_current_diff_hash(cwd=cwd) not in ("unknown", "clean")
-        )
+        depth_is_adversarial = marker_adversarial and marker_content_current(cwd=cwd)
 
     if depth_level == "substantial" and not depth_is_adversarial:
         depth_acked = bool(commit_segs) and all(
@@ -575,8 +592,9 @@ def main() -> None:
         else:
             _deny(
                 "BLOCKED (review depth): this is a SUBSTANTIAL change (≥50 reviewable "
-                "lines, or >1 code file, or an auth/api/migrations file) but the "
-                "review is not an ADVERSARIAL audit. A precision-filtered 'no findings' "
+                "lines, or >1 code file, or an auth/api/migrations file, or a prompt/agent/"
+                "skill surface) but the review is not an ADVERSARIAL audit. A "
+                "precision-filtered 'no findings' "
                 "inline pass is FALSE CONFIDENCE, not clearance. Dispatch a genesis-architect "
                 "adversarial audit (assume bugs, enumerate the edge/boundary/sentinel/"
                 "hierarchy class, READ authoritative semantics for any domain code), save it "

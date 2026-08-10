@@ -144,6 +144,35 @@ def test_small_new_domain_file_is_substantial(tmp_path):
     assert _classify(repo) == "substantial"
 
 
+def test_small_prompt_surface_is_substantial(tmp_path):
+    # Behavior risk: a small change to an executable prompt/agent surface is substantial —
+    # an autonomous system editing its own prompts is high-consequence (SKILL.md policy).
+    repo = _mk_repo(tmp_path)
+    (repo / ".claude" / "agents").mkdir(parents=True)
+    (repo / ".claude" / "agents" / "reviewer.md").write_text("You are a reviewer.\n")  # tiny
+    _git(repo, "add", "-A")
+    assert _classify(repo) == "substantial"
+
+
+def test_small_skill_surface_is_substantial(tmp_path):
+    # A small edit to a skill package (behavior surface) is substantial.
+    repo = _mk_repo(tmp_path)
+    (repo / ".claude" / "skills" / "foo").mkdir(parents=True)
+    (repo / ".claude" / "skills" / "foo" / "SKILL.md").write_text("do the thing\n")
+    _git(repo, "add", "-A")
+    assert _classify(repo) == "substantial"
+
+
+def test_user_caps_behavior_doc_is_inline(tmp_path):
+    # User-sovereign CAPS behavior docs (SOUL.md/USER.md/CLAUDE.md) are NOT prompt
+    # surfaces: the user editing their own behavior files is not gated (docs-config).
+    repo = _mk_repo(tmp_path)
+    (repo / "SOUL.md").write_text("# Who you are\nBe helpful.\n")
+    (repo / "USER.md").write_text("# The user\nPrefers brevity.\n")
+    _git(repo, "add", "-A")
+    assert _classify(repo) == "inline"
+
+
 def test_large_docs_only_change_is_inline(tmp_path):
     repo = _mk_repo(tmp_path)
     (repo / "seed.md").write_text("seed\n" + "".join(f"line {i}\n" for i in range(80)))

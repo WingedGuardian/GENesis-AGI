@@ -177,16 +177,14 @@ def test_stale_adversarial_marker_does_not_clear_new_diff(repo, home):
     # catch B on its own — the marker's adversarial bit counts ONLY when it is CURRENT for
     # the staged diff. (verify-RED: B committed cleanly before the diff-binding fix.)
     #
-    # NOTE the marker's diff_hash is `git diff --cached --stat` (files + line counts, a
-    # pre-existing stat-only design), so B must differ in SHAPE, not just content, for
-    # is_review_current to see it as stale. This closes the realistic case and brings
-    # depth to PARITY with Rule 2's staleness check; a same-shape content swap is a
-    # system-wide stat-hash limitation (tracked follow-up), not specific to this gate.
-    _stage_substantial(repo)  # A: f.py, +60 lines
-    m = _mark(repo, home, _ADVERSARIAL)  # adversarial marker bound to diff A
+    # Depth clearance binds the marker's FULL-content hash (marker_content_current), so
+    # even a SAME-SHAPE swap — B shares A's files and ±line counts, differing only in
+    # content — is caught (the stat-only diff_hash would collide and wrongly read current).
+    _stage_substantial(repo)  # A: f.py, +60 lines of "x{i} = {i}"
+    m = _mark(repo, home, _ADVERSARIAL)  # adversarial marker bound to diff A's content
     assert m.returncode == 0
-    # restage a DIFFERENT-SHAPE substantial diff B (f.py at +80 lines → stat differs)
-    (repo / "f.py").write_text("base = 1\n" + "".join(f"z{i} = {i}\n" for i in range(80)))
+    # restage a SAME-SHAPE substantial diff B (f.py, +60 lines, different content)
+    (repo / "f.py").write_text("base = 1\n" + "".join(f"z{i} = {i}\n" for i in range(60)))
     _git(repo, "add", "-A")
     r = _run_hook('git commit -m "x"  # review-override', repo, home)
     assert r.returncode == 2, r.stdout + r.stderr

@@ -46,12 +46,17 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 try:
-    from review_enforcement_commit import _is_docs_or_config
+    from review_enforcement_commit import _is_docs_or_config, _is_prompt_surface
 except ImportError:  # pragma: no cover - sibling always present in scripts/
 
     def _is_docs_or_config(path: str) -> bool:
         _, ext = os.path.splitext(path)
         return ext.lower() in {".md", ".rst", ".txt", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+
+    def _is_prompt_surface(path: str) -> bool:
+        return path.replace("\\", "/").startswith(
+            (".claude/agents/", ".claude/commands/", ".claude/skills/", "src/genesis/skills/")
+        )
 
 
 _GIT_TIMEOUT = 10  # per-call ceiling when no deadline is in force
@@ -584,10 +589,12 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
     A surface-area × risk model. Substantial when ANY holds over the reviewable files
     (docs-config/binary/vendored excluded): reviewable lines ≥ ``_SUBSTANTIAL_DIFF_LINES``
     (50) OR >1 distinct code file (surface area), OR a domain-sensitive ``scope_tag``
-    (auth/api/migrations — risk/importance). NOT triggered by mere newness: a trivial
-    single new file is INLINE (Rule 2 still requires *a* review, just not an adversarial
-    audit), but a small change to a critical auth/api/migration file IS substantial. An
-    adversarial audit tracks consequence, not line count alone.
+    (auth/api/migrations — risk/importance), OR an executable prompt/agent/skill SURFACE
+    (behavior risk — a change to what shapes autonomous LLM behavior). NOT triggered by
+    mere newness: a trivial single new file is INLINE (Rule 2 still requires *a* review,
+    just not an adversarial audit), but a small change to a critical file (auth/api/
+    migration or a prompt surface) IS substantial. An adversarial audit tracks
+    consequence, not line count alone.
     """
 
     def _reviewable(p: str) -> bool:
@@ -599,6 +606,7 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
     # bug this replaces). Binary excluded (a binary asset is not code to review).
     code_paths = {p for p in per_file if _reviewable(p) and _category(p) == "code"}
     scope_tags: set[str] = set()
+    prompt_surface = False
     for rec in records:  # both rename sides here → domain-sensitivity on either side
         path = rec["path"]
         if not _reviewable(path):
@@ -606,10 +614,13 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
         tag = _scope_tag(path)
         if tag:
             scope_tags.add(tag)
+        if _is_prompt_surface(path):  # behavior-shaping surface, even a small edit
+            prompt_surface = True
     substantial = (
         reviewable_lines >= _SUBSTANTIAL_DIFF_LINES
         or len(code_paths) > 1
         or bool(scope_tags & _DOMAIN_SENSITIVE_TAGS)
+        or prompt_surface
     )
     return "substantial" if substantial else "inline"
 

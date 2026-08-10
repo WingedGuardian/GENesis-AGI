@@ -133,6 +133,22 @@ def is_review_current(cwd: str | None = None) -> bool:
     return bool(state) and state.get("diff_hash") == current
 
 
+def marker_content_current(cwd: str | None = None) -> bool:
+    """Whether the marker's recorded FULL-content hash binds the CURRENT staged diff.
+
+    Stricter than :func:`is_review_current` (which compares the stat-only ``diff_hash``,
+    so a same-shape content swap reads as current). Used by the commit depth gate to
+    grant adversarial clearance ONLY when the marked content IS the staged content —
+    an audit of diff A must not clear a different-content diff B of the same shape.
+    Fails CLOSED: a real staged hash that mismatches / is absent / errors → False.
+    """
+    current = _staged_content_hash(cwd=cwd)
+    if current in ("clean", "unknown"):
+        return False  # nothing concrete to bind (or a git error) — never clear on this
+    state = _load_marker(cwd)
+    return bool(state) and state.get("content_hash") == current
+
+
 def has_valid_review_marker(cwd: str | None = None) -> bool:
     """Check if a (per-worktree) review marker exists and is not expired.
 
@@ -321,6 +337,11 @@ def mark_reviewed(
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state = {
         "diff_hash": get_current_diff_hash(cwd=cwd),
+        # FULL-content hash of the reviewed diff. diff_hash is stat-only (files + line
+        # counts), so a same-shape content swap collides under it; the depth gate binds
+        # adversarial clearance to THIS instead, so an audit of diff A cannot clear a
+        # different-content diff B that shares A's shape (see marker_content_current).
+        "content_hash": _staged_content_hash(cwd=cwd),
         "reviewed_at": datetime.now(UTC).isoformat(),
         "review_evidence": review_msg,  # advisory annotation (gstack corroboration)
         "agent_evidence": agent_msg,
