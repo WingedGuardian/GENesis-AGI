@@ -97,6 +97,74 @@
       </div>
     </template>
 
+    <!-- Persistent Readiness panel [Tab: overview]. Stays visible after floor_met (the
+         first-run Setup card does not), surfacing tier, next-tier guidance, and enrichment.
+         Renders the already-loaded setupStatus (no new fetch). Copy is config-framed: the
+         payload is presence-based, so chips describe configuration, not live behavior. -->
+    <div class="panel" id="readiness-panel" x-data="{s: $store.genesisDashboard}"
+         x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;"
+           @click="s.toggleReadinessPanel()">
+        <span style="display:flex;align-items:center;gap:0.3rem;">
+          <span class="material-symbols-outlined" :style="s.readinessPanelOpen ? 'transform:rotate(90deg)' : ''" style="transition:transform 0.2s">chevron_right</span>
+          <span class="material-symbols-outlined">insights</span> Readiness
+        </span>
+        <template x-if="s.setupStatus">
+          <span style="display:inline-flex;gap:0.3rem;align-items:center;">
+            <span class="chip chip--stale" x-show="s.setupStatusStale"
+                  title="The last setup-status refresh failed — this snapshot may be out of date.">stale</span>
+            <span class="chip" :class="'chip--' + (s.setupStatus.tier >= 3 ? 'ok' : (s.setupStatus.tier <= 0 ? 'warn' : 'info'))"
+                  x-text="'Tier ' + (s.setupStatus.tier ?? 0) + ' · ' + (s.setupStatus.tier_name ?? '—')"></span>
+          </span>
+        </template>
+      </div>
+      <div class="panel-body" x-show="s.readinessPanelOpen" x-transition>
+        <template x-if="!s.setupStatus">
+          <div class="empty-state">Readiness status not loaded yet.</div>
+        </template>
+        <template x-if="s.setupStatus">
+          <div style="font-size:0.82rem;">
+            <!-- Tier rail: cumulative T0→T3. Surpassed/ceiling = ✓ ok; current-below-ceiling
+                 = ◆ action (a real next step exists, matching the callout); ahead = ○ off.
+                 T3 is the ceiling (tier_names 0..3), so the current tier AT T3 reads as
+                 achieved, not "needs action". -->
+            <div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:0.6rem;">
+              <template x-for="seg in [{n:0,label:'Bootstrapped'},{n:1,label:'Functional'},{n:2,label:'Connected'},{n:3,label:'Autonomous'}]" :key="seg.n">
+                <span class="chip"
+                      :class="'chip--' + (((s.setupStatus.tier ?? 0) > seg.n || ((s.setupStatus.tier ?? 0) >= 3 && seg.n === 3)) ? 'ok' : ((s.setupStatus.tier ?? 0) === seg.n ? 'action' : 'off'))">
+                  <span x-text="(((s.setupStatus.tier ?? 0) > seg.n || ((s.setupStatus.tier ?? 0) >= 3 && seg.n === 3)) ? '✓' : ((s.setupStatus.tier ?? 0) === seg.n ? '◆' : '○')) + ' T' + seg.n + ' ' + seg.label"></span>
+                </span>
+              </template>
+            </div>
+            <!-- Next-step callout -->
+            <div style="margin-bottom:0.7rem;"
+                 :style="s.readinessNextStep.reached ? 'color:#5cb85c;' : 'color:var(--color-text-secondary,#aaa);'"
+                 x-text="(s.readinessNextStep.reached ? '✓ ' : '→ ') + s.readinessNextStep.text"></div>
+            <!-- Enrichment chips (config-framed, non-gating) -->
+            <div style="display:flex;flex-wrap:wrap;gap:0.4rem;">
+              <!-- Only keyed PREMIUM providers are knowable from the payload; the keyless
+                   SearXNG primary is not bootstrap-provisioned, so we do not assert it. -->
+              <span class="chip" :class="s.setupStatus.web_search_keyed_providers?.length ? 'chip--info' : 'chip--off'"
+                    x-text="'Web search premium: ' + ((s.setupStatus.web_search_keyed_providers?.length)
+                              ? s.setupStatus.web_search_keyed_providers.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(', ')
+                              : 'none keyed')"></span>
+              <span class="chip" :class="s.setupStatus.voice_configured ? 'chip--ok' : 'chip--off'"
+                    x-text="s.setupStatus.voice_configured ? 'Voice: configured' : 'Voice: not configured'"></span>
+              <span class="chip" :class="s.setupStatus.ego_enabled ? 'chip--ok' : 'chip--off'"
+                    x-text="s.setupStatus.ego_enabled ? ('Ego loop: on · ' + (s.setupStatus.ego_cadence_minutes ?? '—') + ' min (config)') : 'Ego loop: off (config)'"></span>
+              <span class="chip chip--info"
+                    x-text="'Autonomy default: L' + (s.setupStatus.autonomy_level ?? 1) + ' · direct_session'"
+                    title="The shipped config default for direct sessions — not a live earned autonomy level."></span>
+              <span class="chip" :class="s.setupStatus.password_set ? 'chip--ok' : 'chip--action'"
+                    :style="s.setupStatus.password_set ? '' : 'cursor:pointer;'"
+                    @click="!s.setupStatus.password_set && s.navigateTo('config', 'provider-keys')"
+                    x-text="s.setupStatus.password_set ? 'Dashboard password: set' : '◆ Set a dashboard password'"></span>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
     <!-- Panel 1: System Health [Tab: overview] -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
       <div class="panel-header">

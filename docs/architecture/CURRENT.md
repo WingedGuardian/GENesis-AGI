@@ -1133,7 +1133,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: b662f3e3 2026-07-17
+verified: 3c514f3e 2026-08-10
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -1163,8 +1163,9 @@ verified: b662f3e3 2026-07-17
   `web_search_keyed_providers` (premium providers augmenting the keyless SearXNG
   baseline), `voice_configured` (explicit `VOICE_S2S_PROVIDER` opt-in — a bare
   OpenAI LLM key does NOT count), `ego_cadence_minutes`, and `autonomy_level`
-  (shipped config default, not the live earned level). The persistent panel that
-  renders the tier + these chips is PR-B2b (frontend, not yet built).
+  (shipped config default, not the live earned level). The persistent Overview
+  **Readiness panel** that renders the tier rail + these enrichment chips (config-
+  framed, refreshed on return to Overview) is **PR-B2b** — shipped.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, ~113 CREATE TABLE; docs

@@ -318,6 +318,11 @@
         ],
         secretsMessage: null,     // {type, text}
 
+        // ── Readiness panel (persistent, Overview) — renders setupStatus; no new fetch ──
+        readinessPanelOpen: true,    // in-memory; smart-defaulted in loadSetupStatus (auto-collapsed at T3)
+        readinessPanelTouched: false, // set once the user toggles, so the smart default stops overriding
+        setupStatusStale: false,     // last refresh failed → the shown snapshot may be out of date
+
         fetchState: {
           health: { state: "idle", lastSuccess: null, error: null },
           activity: { state: "idle", lastSuccess: null, error: null },
@@ -512,6 +517,10 @@
         _onTabChange(oldTab, newTab) {
           this._stopTabIntervals(oldTab);
           this._startTabIntervals(newTab);
+          // Class-fix for stale setup-status: any mutation elsewhere (Provider Keys,
+          // ego/Settings, the wizard) that changes the readiness signals is reflected
+          // when the user returns to Overview — no full page reload, no per-path patching.
+          if (newTab === "overview") { this.loadSetupStatus(); }
         },
 
         _stopTabIntervals(tab) {
@@ -2268,6 +2277,9 @@
               delete this.secretsValues[keyName];
               this.secretsMessage = {type: 'restart', text: `${keyName} saved. Changes take effect after server restart.`};
               this.fetchSecrets();
+              // Keep the readiness panel + password nudge in sync: a provider key
+              // (incl. DASHBOARD_PASSWORD) just changed the setup-status signals.
+              this.loadSetupStatus();
             } else {
               this.secretsMessage = {type: 'error', text: d.error || 'Save failed'};
             }
@@ -2279,8 +2291,66 @@
         async loadSetupStatus() {
           try {
             const resp = await fetchApi("/api/genesis/setup-status");
-            if (resp && resp.ok) { this.setupStatus = await resp.json(); }
-          } catch (e) { /* non-fatal: card simply stays hidden */ }
+            if (resp && resp.ok) {
+              this.setupStatus = await resp.json();
+              this.setupStatusStale = false;
+              // Smart default for the persistent readiness panel: expanded while there is
+              // still headroom to configure (tier < 3), auto-collapsed once fully Autonomous.
+              // Only until the user manually toggles it — then their choice is respected.
+              if (!this.readinessPanelTouched) {
+                this.readinessPanelOpen = (this.setupStatus?.tier ?? 0) < 3;
+              }
+            } else if (this.setupStatus) {
+              // A failed refresh must not keep presenting the previous snapshot as current
+              // (the panel now deliberately re-refreshes on return to Overview).
+              this.setupStatusStale = true;
+            }
+          } catch (e) {
+            if (this.setupStatus) { this.setupStatusStale = true; }
+          }
+        },
+        toggleReadinessPanel() {
+          this.readinessPanelTouched = true;
+          this.readinessPanelOpen = !this.readinessPanelOpen;
+        },
+        openReadinessPanel() {
+          // Header-nudge target: jump to Overview, force the panel open, scroll to it.
+          this.readinessPanelTouched = true;
+          this.readinessPanelOpen = true;
+          this.navigateTo("overview", "readiness-panel");
+        },
+        get readinessNextStep() {
+          // The single "what unlocks next" line, derived from the cumulative tier.
+          // Config-framed (never implies live behavior); null-safe before setupStatus loads.
+          const s = this.setupStatus;
+          if (!s) return { reached: false, text: "" };
+          const tier = s.tier ?? 0;
+          if (tier <= 0) {
+            // Name only the floor legs actually missing (all three booleans are in the payload).
+            const missing = [];
+            if (s.cc_oauth !== true) missing.push("Claude Code login");
+            if (s.llm_key_present !== true) missing.push("a chat-model key");
+            if (s.embedding_key_present !== true) missing.push("an embedding key");
+            const need = missing.length ? missing.join(", ") : "the functional floor";
+            return { reached: false, text: `Next: T1 Functional — add ${need}.` };
+          }
+          // The payload exposes Telegram reach as a single combined bool, so which of the
+          // token / allowed-user-id is missing isn't knowable — use generic wording.
+          if (tier === 1) return { reached: false, text: "Next: T2 Connected — finish Telegram configuration (a bot token + an allowed user id) so Genesis can reach you." };
+          if (tier === 2) {
+            // T3 needs BOTH ego_enabled AND onboarded; name only the prerequisite(s)
+            // actually missing (an install can have the ego loop on but no marker).
+            const egoOn = s.ego_enabled === true;
+            const onboarded = s.onboarded === true;
+            if (egoOn && !onboarded) return { reached: false, text: "Next: T3 Autonomous — complete bootstrap (the ego loop is on, but the setup-complete marker is missing)." };
+            if (!egoOn && onboarded) return { reached: false, text: "Next: T3 Autonomous — enable the ego / awareness loop." };
+            return { reached: false, text: "Next: T3 Autonomous — enable the ego / awareness loop and complete bootstrap." };
+          }
+          // Do NOT assert the approval gate here: the panel cannot see its effective
+          // state, and the shipped autonomous_cli_policy default is auto-approve.
+          // Config-framed ("configured on"), not a liveness claim: ego.enabled is
+          // persisted YAML that only takes effect on the next server restart.
+          return { reached: true, text: "Fully Autonomous — the ego / awareness loop is configured on." };
         },
         get showSetupCard() {
           const s = this.setupStatus;
