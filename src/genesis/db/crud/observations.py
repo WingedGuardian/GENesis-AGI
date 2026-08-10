@@ -80,6 +80,10 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
         # Owed first-time ping the monitor retries each tick until delivered —
         # internal retry state, never a user-facing surface.
         "github_ping_pending",
+        # Career-outreach monitor — per-draft "already nudged the owner" dedup
+        # marker. The owner nudge (Telegram) is the delivery path; these rows must
+        # NOT surface via the generic observation surfacers (would double-notify).
+        "career_outreach_nudged",
     }
 )
 
@@ -175,6 +179,11 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     # delivered for a week something is badly wrong and the 30d activity row is
     # the backstop; short so an abandoned marker cannot linger.
     "github_ping_pending": timedelta(days=7),
+    # Career-outreach monitor — per-draft "already nudged" dedup marker. 30d:
+    # long enough that a still-open staged draft is not re-nudged, bounded so an
+    # abandoned marker cannot linger. The remote radar_status is the source of
+    # truth for draft counts; this row only records "owner already nudged".
+    "career_outreach_nudged": timedelta(days=30),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),
     # skill-edit Critic shadow verdicts (WS1) — kept 30d (vs 14d for the

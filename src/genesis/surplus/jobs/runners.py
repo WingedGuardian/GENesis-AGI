@@ -119,6 +119,58 @@ async def run_account_activity_monitor(sched: SchedulerContext) -> None:
         record_failure("account_activity_monitor", str(exc))
 
 
+async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
+    """Drive the external career-agent engine to stage outreach drafts; nudge owner."""
+    if sched._career_outreach_monitor is None:
+        record_failure("career_outreach_monitor", "monitor not wired")
+        return
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        if GenesisRuntime.instance().paused:
+            logger.debug("Career outreach monitor skipped (Genesis paused)")
+            return
+    except Exception:
+        pass
+    try:
+        result = await sched._career_outreach_monitor.gather()
+        if result.mode != "off" and (
+            result.auto_runs or result.nudged or result.seeded or result.errors
+        ):
+            logger.info(
+                "Career outreach: mode=%s auto_runs=%d working=%d nudged=%d "
+                "seeded=%d errors=%d",
+                result.mode, result.auto_runs, result.drafts_working,
+                result.nudged, result.seeded, result.errors,
+            )
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.DEBUG,
+                "heartbeat", "career_outreach_monitor completed",
+            )
+        # An adapter-level dispatch failure is surfaced as result.errors (NOT an
+        # exception — execute_operation returns an error dict), so a bare
+        # record_success would lie on every failed dispatch. Record failure when
+        # a dispatch errored; an unhealthy remote (health_ok=False, errors=0) is a
+        # clean skip and records success.
+        if result.errors:
+            record_failure(
+                "career_outreach_monitor", "; ".join(result.details) or "dispatch error"
+            )
+        else:
+            record_success("career_outreach_monitor")
+    except Exception as exc:
+        logger.exception("Career outreach monitor failed")
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.ERROR,
+                "career_outreach_monitor.failed",
+                "Career outreach monitor failed with exception",
+                **failure_details(exc=exc),
+            )
+        record_failure("career_outreach_monitor", str(exc))
+
+
 async def run_model_intelligence(sched: SchedulerContext) -> None:
     """Run model intelligence scan (weekly)."""
     if sched._model_intelligence_job is None:
