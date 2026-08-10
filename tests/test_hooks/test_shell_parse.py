@@ -175,6 +175,106 @@ class TestCommitFlagParse:
         assert not _commit_nv("git commit --amend")
 
 
+# ── heredoc bodies are stdin DATA, not executed commands ────────────────────
+#
+# A QUOTED heredoc (``<<'EOF'``) undergoes NO shell expansion, so its body is
+# inert text fed to stdin — it never executes. The parser must NOT split that
+# body into command segments; doing so made a commit-message line like "cd into
+# the module" look like a real ``cd`` (→ cwd UNKNOWN → false "commit to main"
+# block) and made prose mentioning rm/push falsely trip the guards. Skipping a
+# QUOTED body is provably safe (it cannot execute anything). UNQUOTED heredocs
+# DO expand, so those are left conservatively parsed (fail toward over-matching).
+
+
+class TestHeredoc:
+    RF = "-r" + "f"  # keep the recursive-force flag literal out of this file
+    DEEP = "/a/b/c/d"
+
+    def _rm(self) -> str:
+        return "rm " + self.RF + " " + self.DEEP
+
+    def test_quoted_heredoc_body_excluded_from_segments(self):
+        cmd = (
+            "cat > /tmp/m.txt <<'EOF'\n"
+            "fix: change how we cd into the module\n"
+            "prose mentioning git push and other words\n"
+            "EOF\n"
+            "git commit -q -F /tmp/m.txt"
+        )
+        segs = sp.split_segments(cmd)
+        assert not any("cd into the module" in s for s in segs), segs
+        assert not any("prose mentioning" in s for s in segs), segs
+        assert any(s.startswith("cat >") for s in segs), segs
+        assert any("git commit" in s for s in segs), segs
+
+    def test_cd_line_in_body_makes_no_cd_segment(self):
+        cmd = "git commit -q -F - <<'EOF'\ncd /somewhere and do things\nEOF"
+        assert not any(s.startswith("cd ") for s in sp.split_segments(cmd))
+
+    def test_dangerous_command_outside_heredoc_still_seen(self):
+        cmd = "cat > /tmp/n.txt <<'EOF'\nhello\nEOF\n" + self._rm()
+        assert any(self.DEEP in s for s in sp.split_segments(cmd))
+
+    def test_dangerous_command_inside_quoted_heredoc_is_inert_data(self):
+        # SAFETY: a quoted-heredoc body never executes, so an rm/push mentioned in
+        # it is data — it must NOT be seen as a real command (removes a false pos).
+        cmd = f"cat > /tmp/n.txt <<'EOF'\nnote: {self._rm()}\nEOF\ngit commit -F /tmp/n.txt"
+        assert not any(self.DEEP in s for s in sp.split_segments(cmd))
+
+    def test_unterminated_heredoc_fails_open(self):
+        # No closing delimiter → do NOT swallow the rest as data (that could hide a
+        # real command). Fail open: the body is parsed, so a guard still sees it.
+        cmd = f"cat <<'EOF'\nnote\n{self._rm()}"
+        assert any(self.DEEP in s for s in sp.split_segments(cmd))
+
+    def test_here_string_is_not_a_heredoc(self):
+        cmd = "grep foo <<< 'some string'\ngit commit -q -F /tmp/m.txt"
+        assert any("git commit" in s for s in sp.split_segments(cmd))
+
+    def test_dash_heredoc_tab_indented_terminator(self):
+        cmd = "\tcat <<-'EOF'\n\tcd into things\n\tEOF\n\tgit commit -q -F /tmp/m.txt"
+        segs = sp.split_segments(cmd)
+        assert not any("cd into things" in s for s in segs), segs
+        assert any("git commit" in s for s in segs), segs
+
+    def test_commented_out_heredoc_does_not_hide_following_commands(self):
+        # SECURITY: `# <<'EOF'` is a COMMENT — bash does NOT start a heredoc, so the
+        # lines after it are REAL commands. The parser must NOT skip them as a body
+        # (that would hide a dangerous command from the guards).
+        cmd = f"echo hi # <<'EOF'\n{self._rm()}\nEOF"
+        assert any(self.DEEP in s for s in sp.split_segments(cmd))
+
+    def test_heredoc_after_a_comment_line_still_skipped(self):
+        # The in-comment suppression must reset at the newline: a REAL quoted heredoc
+        # on a later line still has its body skipped.
+        cmd = (
+            "echo setup # a comment line\n"
+            "git commit -q -F - <<'EOF'\n"
+            "cd into things in the message\n"
+            "EOF"
+        )
+        assert not any("cd into things" in s for s in sp.split_segments(cmd))
+
+    def test_backtick_scoped_heredoc_does_not_hide_following_commands(self):
+        # SECURITY: `<<'EOF'` inside a same-line-closing backtick is scoped by bash
+        # to the substitution; bash RUNS the following lines, so a guard must still
+        # see them (they must NOT be swallowed as a heredoc body).
+        cmd = f"echo `true <<'EOF'`\n{self._rm()}\nEOF"
+        assert any(self.DEEP in s for s in sp.split_segments(cmd))
+
+    def test_dollar_paren_scoped_heredoc_stays_conservative(self):
+        # `<<'EOF'` inside $(...) is not a top-level heredoc → no body-skip
+        # (conservative). The following command stays visible to the guards.
+        cmd = f"echo $(true <<'EOF')\n{self._rm()}\nEOF"
+        assert any(self.DEEP in s for s in sp.split_segments(cmd))
+
+    def test_unquoted_heredoc_kept_conservative(self):
+        # Unquoted <<EOF bodies DO expand ($(...) executes), so they are left
+        # parsed (conservative / fail-safe). Documents the intentional boundary.
+        cmd = "cat <<EOF\ncd /somewhere\nEOF"
+        assert any("cd /somewhere" in s for s in sp.split_segments(cmd))
+
+
 # ── gh pr subcommand ────────────────────────────────────────────────────
 
 

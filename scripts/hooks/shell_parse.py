@@ -109,6 +109,69 @@ class Segment:
     depth: int = 0  # 0 = top level, >0 = inside a sh -c script
 
 
+def _quoted_heredoc_delim(command: str, i: int) -> tuple[str, bool, int] | None:
+    """If ``command[i:]`` starts a QUOTED heredoc operator, return
+    ``(delimiter, dash_strip, index_after_operator)``; otherwise ``None``.
+
+    Only QUOTED delimiters (``<<'W'`` / ``<<"W"``, optional ``<<-``) are matched:
+    a quoted heredoc body undergoes NO shell expansion (no ``$var`` / ``$(...)`` /
+    backtick), so it is inert data that never executes — excluding that body from
+    segment parsing is provably safe. UNQUOTED heredocs (whose bodies DO expand)
+    are intentionally NOT matched here, so they keep the conservative
+    (over-matching, fail-safe) parse. ``<<<`` (here-string) is not a heredoc.
+    """
+    n = len(command)
+    if command[i : i + 2] != "<<":
+        return None
+    j = i + 2
+    if j < n and command[j] == "<":
+        return None  # `<<<` here-string, not a heredoc
+    dash = False
+    if j < n and command[j] == "-":
+        dash = True
+        j += 1
+    while j < n and command[j] in (" ", "\t"):
+        j += 1
+    if j >= n or command[j] not in ("'", '"'):
+        return None  # bare (unquoted) delimiter → leave to the conservative parse
+    q = command[j]
+    j += 1
+    start = j
+    while j < n and command[j] != q:
+        j += 1
+    if j >= n:
+        return None  # unterminated quote — not a usable delimiter
+    delim = command[start:j]
+    j += 1  # consume closing quote
+    return (delim, dash, j) if delim else None
+
+
+def _skip_heredoc_bodies(command: str, i: int, pending: list[tuple[str, bool]]) -> int:
+    """Advance past the queued heredoc bodies. ``i`` points just after the newline
+    that ended the operator line. Each body runs until a line equal to its
+    delimiter (leading tabs stripped iff the operator was ``<<-``).
+
+    FAIL-OPEN: if any delimiter is never found before end-of-input, return the
+    ORIGINAL ``i`` so the body is parsed normally. Never swallow the remainder as
+    data — that could hide a real command from the guards.
+    """
+    n = len(command)
+    pos = i
+    for delim, dash in pending:
+        found = False
+        while pos < n:
+            eol = command.find("\n", pos)
+            line = command[pos:] if eol == -1 else command[pos:eol]
+            pos = n if eol == -1 else eol + 1
+            probe = line.lstrip("\t") if dash else line
+            if probe.rstrip("\r") == delim:
+                found = True
+                break
+        if not found:
+            return i  # fail-open — do not skip anything
+    return pos
+
+
 def split_segments(command: str) -> list[str]:
     """Split a command line into executed segments on shell operators.
 
@@ -116,9 +179,19 @@ def split_segments(command: str) -> list[str]:
     ``&&``, ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened
     outside quotes) runs to end-of-line and is retained in the segment text so
     override detection can see it.
+
+    Heredoc-aware for QUOTED delimiters (``<<'EOF'``): the operator stays on its
+    command line, but the body (which is inert stdin data, never executed) is
+    skipped — so a message line like ``cd into X`` or a mention of ``rm``/``push``
+    inside a commit-message heredoc is NOT parsed as a real command. See
+    :func:`_quoted_heredoc_delim` for why this is safe.
     """
     segs: list[str] = []
     buf: list[str] = []
+    pending: list[tuple[str, bool]] = []  # (delimiter, dash_strip) heredocs awaiting bodies
+    in_comment = False  # past an unquoted '#' on this line — heredoc ops there are inert
+    bt_open = False  # inside an unclosed backtick `…` command substitution
+    subst_depth = 0  # open $(…) command-substitution nesting
     i, n = 0, len(command)
     quote: str | None = None
     while i < n:
@@ -138,6 +211,31 @@ def split_segments(command: str) -> list[str]:
             buf.append(c)
             i += 1
             continue
+        # A '#' comment (segment-start or whitespace-preceded, outside quotes) runs
+        # to end-of-LINE. A heredoc operator inside a comment is NOT a real heredoc,
+        # so it must NOT trigger a body-skip — doing so would hide the real commands
+        # that follow on later lines (a guard bypass). SECURITY-CRITICAL.
+        if c == "#" and (not buf or buf[-1] in (" ", "\t")):
+            in_comment = True
+        if not in_comment:
+            # Track command-substitution context: a heredoc INSIDE `…` / $(…) is
+            # scoped by bash to that substitution (its body is NOT the following
+            # top-level lines), so a body-skip there could hide real commands. Only
+            # a TOP-LEVEL `<<'DELIM'` earns a body-skip. SECURITY-CRITICAL.
+            if c == "`":
+                bt_open = not bt_open
+            elif c == "$" and i + 1 < n and command[i + 1] == "(":
+                subst_depth += 1
+            elif c == ")" and subst_depth > 0:
+                subst_depth -= 1
+            if not bt_open and subst_depth == 0:
+                hd = _quoted_heredoc_delim(command, i)
+                if hd is not None:
+                    delim, dash, end = hd
+                    pending.append((delim, dash))
+                    buf.append(command[i:end])  # keep the operator text on the command line
+                    i = end
+                    continue
         two = command[i : i + 2]
         if two in ("&&", "||"):
             segs.append("".join(buf))
@@ -148,6 +246,11 @@ def split_segments(command: str) -> list[str]:
             segs.append("".join(buf))
             buf = []
             i += 1
+            if c == "\n":
+                in_comment = False  # a '#' comment ends at the line's newline
+                if pending:
+                    i = _skip_heredoc_bodies(command, i, pending)
+                    pending = []
             continue
         buf.append(c)
         i += 1

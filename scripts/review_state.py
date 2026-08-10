@@ -125,7 +125,16 @@ def _load_marker(cwd: str | None = None) -> dict | None:
 
 
 def is_review_current(cwd: str | None = None) -> bool:
-    """Check if the stored (per-worktree) marker matches current diff state."""
+    """Whether the stored (per-worktree) marker binds the CURRENT staged diff.
+
+    Content-bound, NO time limit: compares the marker's ``diff_hash`` to the
+    current ``git diff --cached`` stat-hash. Used for a plain ``git commit``,
+    where the staged ``--cached`` snapshot IS exactly what will be committed, so
+    validity is pinned to content and never expires while the reviewed diff is
+    still what is staged. (Contrast :func:`has_valid_review_marker`, which is
+    time-bound because it cannot see the content a staging commit will add — the
+    asymmetry is intentional; see that function's docstring.)
+    """
     current = get_current_diff_hash(cwd=cwd)
     if current in ("clean", "unknown"):
         return True  # No changes = no review needed
@@ -150,11 +159,20 @@ def marker_content_current(cwd: str | None = None) -> bool:
 
 
 def has_valid_review_marker(cwd: str | None = None) -> bool:
-    """Check if a (per-worktree) review marker exists and is not expired.
+    """Whether a (per-worktree) review marker exists and is within the TTL.
 
-    Unlike is_review_current(), this does NOT short-circuit on clean staged
-    area. Used when the caller knows changes are about to be staged (e.g.
-    git add && git commit in the same command).
+    Existence + recency (``_MAX_EVIDENCE_AGE_SECONDS``), NOT content. Used when
+    the caller knows content is about to be staged (``git commit -a`` / a pathspec
+    / ``git add && git commit`` in one command): the future commit's content is
+    NOT yet in ``--cached``, so it CANNOT be content-verified at pre-commit time.
+    The TTL is the deliberate safety proxy for "reviewed recently enough to still
+    cover this commit".
+
+    The asymmetry with :func:`is_review_current` (content-bound, no TTL) is
+    INTENTIONAL — content-verify when the commit content is knowable, fall back to
+    a recency bound when it is not. Consequence: a content-adding commit made
+    >TTL after review is re-gated even if the change is unchanged (the
+    conservative direction). Pinned by the ``test_..._worktree_repro`` TTL cases.
     """
     state = _load_marker(cwd)
     if not state:

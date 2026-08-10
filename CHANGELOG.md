@@ -31,6 +31,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The git-guard command parser no longer misreads heredoc bodies.** The shared
+  parser behind the commit/push/rm safety guards split a *quoted* heredoc
+  (`<<'EOF'`) body into command segments — so a commit-message line like "cd into
+  the module" was parsed as a real `cd` and blocked the commit as if it targeted
+  `main`, and prose mentioning `rm`/`push` inside a heredoc body could falsely
+  trip a guard. The parser now skips quoted-heredoc bodies (inert stdin data that
+  never executes), fixing the false blocks without weakening any guard: a real
+  dangerous command *outside* a heredoc is still detected, and an unterminated
+  heredoc fails open. Unquoted heredocs (whose bodies do expand) keep the prior
+  conservative parse.
+
 - **The autonomous-CLI approval gate now ships ON by default.** Every background
   Claude Code session Genesis dispatches must be rooted in an explicit user
   approval — but the committed policy config shipped the gate *off*, so a fresh
