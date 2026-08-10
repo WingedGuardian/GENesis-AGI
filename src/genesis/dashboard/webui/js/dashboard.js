@@ -516,6 +516,10 @@
         _onTabChange(oldTab, newTab) {
           this._stopTabIntervals(oldTab);
           this._startTabIntervals(newTab);
+          // Class-fix for stale setup-status: any mutation elsewhere (Provider Keys,
+          // ego/Settings, the wizard) that changes the readiness signals is reflected
+          // when the user returns to Overview — no full page reload, no per-path patching.
+          if (newTab === "overview") { this.loadSetupStatus(); }
         },
 
         _stopTabIntervals(tab) {
@@ -2313,8 +2317,18 @@
           const s = this.setupStatus;
           if (!s) return { reached: false, text: "" };
           const tier = s.tier ?? 0;
-          if (tier <= 0) return { reached: false, text: "Next: T1 Functional — finish the floor (Claude Code login + a chat-model key + an embedding key)." };
-          if (tier === 1) return { reached: false, text: "Next: T2 Connected — add a Telegram bot token + your user id so Genesis can reach you." };
+          if (tier <= 0) {
+            // Name only the floor legs actually missing (all three booleans are in the payload).
+            const missing = [];
+            if (s.cc_oauth !== true) missing.push("Claude Code login");
+            if (s.llm_key_present !== true) missing.push("a chat-model key");
+            if (s.embedding_key_present !== true) missing.push("an embedding key");
+            const need = missing.length ? missing.join(", ") : "the functional floor";
+            return { reached: false, text: `Next: T1 Functional — add ${need}.` };
+          }
+          // The payload exposes Telegram reach as a single combined bool, so which of the
+          // token / allowed-user-id is missing isn't knowable — use generic wording.
+          if (tier === 1) return { reached: false, text: "Next: T2 Connected — finish Telegram configuration (a bot token + an allowed user id) so Genesis can reach you." };
           if (tier === 2) {
             // T3 needs BOTH ego_enabled AND onboarded; name only the prerequisite(s)
             // actually missing (an install can have the ego loop on but no marker).
