@@ -321,6 +321,7 @@
         // ── Readiness panel (persistent, Overview) — renders setupStatus; no new fetch ──
         readinessPanelOpen: true,    // in-memory; smart-defaulted in loadSetupStatus (auto-collapsed at T3)
         readinessPanelTouched: false, // set once the user toggles, so the smart default stops overriding
+        setupStatusStale: false,     // last refresh failed → the shown snapshot may be out of date
 
         fetchState: {
           health: { state: "idle", lastSuccess: null, error: null },
@@ -2292,14 +2293,21 @@
             const resp = await fetchApi("/api/genesis/setup-status");
             if (resp && resp.ok) {
               this.setupStatus = await resp.json();
+              this.setupStatusStale = false;
               // Smart default for the persistent readiness panel: expanded while there is
               // still headroom to configure (tier < 3), auto-collapsed once fully Autonomous.
               // Only until the user manually toggles it — then their choice is respected.
               if (!this.readinessPanelTouched) {
                 this.readinessPanelOpen = (this.setupStatus?.tier ?? 0) < 3;
               }
+            } else if (this.setupStatus) {
+              // A failed refresh must not keep presenting the previous snapshot as current
+              // (the panel now deliberately re-refreshes on return to Overview).
+              this.setupStatusStale = true;
             }
-          } catch (e) { /* non-fatal: card simply stays hidden */ }
+          } catch (e) {
+            if (this.setupStatus) { this.setupStatusStale = true; }
+          }
         },
         toggleReadinessPanel() {
           this.readinessPanelTouched = true;
@@ -2340,7 +2348,9 @@
           }
           // Do NOT assert the approval gate here: the panel cannot see its effective
           // state, and the shipped autonomous_cli_policy default is auto-approve.
-          return { reached: true, text: "Fully Autonomous — the ego / awareness loop is enabled." };
+          // Config-framed ("configured on"), not a liveness claim: ego.enabled is
+          // persisted YAML that only takes effect on the next server restart.
+          return { reached: true, text: "Fully Autonomous — the ego / awareness loop is configured on." };
         },
         get showSetupCard() {
           const s = this.setupStatus;

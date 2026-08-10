@@ -110,8 +110,12 @@
           <span class="material-symbols-outlined">insights</span> Readiness
         </span>
         <template x-if="s.setupStatus">
-          <span class="chip" :class="'chip--' + (s.setupStatus.tier >= 3 ? 'ok' : (s.setupStatus.tier <= 0 ? 'warn' : 'info'))"
-                x-text="'Tier ' + (s.setupStatus.tier ?? 0) + ' · ' + (s.setupStatus.tier_name ?? '—')"></span>
+          <span style="display:inline-flex;gap:0.3rem;align-items:center;">
+            <span class="chip chip--stale" x-show="s.setupStatusStale"
+                  title="The last setup-status refresh failed — this snapshot may be out of date.">stale</span>
+            <span class="chip" :class="'chip--' + (s.setupStatus.tier >= 3 ? 'ok' : (s.setupStatus.tier <= 0 ? 'warn' : 'info'))"
+                  x-text="'Tier ' + (s.setupStatus.tier ?? 0) + ' · ' + (s.setupStatus.tier_name ?? '—')"></span>
+          </span>
         </template>
       </div>
       <div class="panel-body" x-show="s.readinessPanelOpen" x-transition>
@@ -147,7 +151,7 @@
               <span class="chip" :class="s.setupStatus.voice_configured ? 'chip--ok' : 'chip--off'"
                     x-text="s.setupStatus.voice_configured ? 'Voice: configured' : 'Voice: not configured'"></span>
               <span class="chip" :class="s.setupStatus.ego_enabled ? 'chip--ok' : 'chip--off'"
-                    x-text="s.setupStatus.ego_enabled ? ('Ego cadence: ' + (s.setupStatus.ego_cadence_minutes ?? '—') + ' min (configured)') : 'Ego loop: off'"></span>
+                    x-text="s.setupStatus.ego_enabled ? ('Ego loop: on · ' + (s.setupStatus.ego_cadence_minutes ?? '—') + ' min (config)') : 'Ego loop: off (config)'"></span>
               <span class="chip chip--info"
                     x-text="'Autonomy default: L' + (s.setupStatus.autonomy_level ?? 1) + ' · direct_session'"
                     title="The shipped config default for direct sessions — not a live earned autonomy level."></span>
