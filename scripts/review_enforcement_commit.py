@@ -91,12 +91,22 @@ _PROMPT_SURFACE_PREFIXES = (
     ".claude/commands/",
     ".claude/skills/",
     "src/genesis/skills/",
+    "src/genesis/identity/",  # runtime prompt templates (CODE_AUDITOR, INBOX_EVALUATE, …)
 )
 
 
 def _is_prompt_surface(path: str) -> bool:
-    """Whether a path is an executable prompt/agent/skill surface (behavior-shaping)."""
-    return path.replace("\\", "/").startswith(_PROMPT_SURFACE_PREFIXES)
+    """Whether a path is an executable prompt/agent/skill surface (behavior-shaping).
+
+    Covers the fixed prompt roots above PLUS any ``prompts/`` package under the runtime
+    tree (``src/genesis/autonomy/executor/prompts/``, ``src/genesis/sentinel/prompts/``, …)
+    — the class, not just the named roots. Top-level user CAPS docs stay exempt (they do
+    not live under these paths).
+    """
+    norm = path.replace("\\", "/")
+    return norm.startswith(_PROMPT_SURFACE_PREFIXES) or (
+        norm.startswith("src/genesis/") and "/prompts/" in norm
+    )
 
 
 def _is_docs_or_config(path: str) -> bool:
@@ -526,15 +536,19 @@ def main() -> None:
     # to normal enforcement — never skipped. Placed AFTER Rule 0 (--no-verify),
     # Rule 1 (main-branch), and Rule 3 (escalation cap) so it can never weaken
     # those hard blocks.
-    if not _commit_may_add_content(segs):
+    # Whether the commit may stage content BEYOND the current index — a pathspec, -a/-i/-o/-p,
+    # or a git add/rm/mv/reset in the chain (P1-D). When true the hook-time index does NOT
+    # reflect what will be committed, so we can neither classify the staged diff nor bind the
+    # marker to it; depth (Rule 2.5) and Rule 2 fall back to the recorded/valid marker. This
+    # is the SAME predicate the docs-skip uses, so `git commit -am` / a pathspec commit is
+    # handled exactly like `git add && commit` — NOT just a bare `git add` (which the old
+    # add-only check missed, letting `commit -am` of unstaged substantial work slip the gate).
+    commit_may_add_content = _commit_may_add_content(segs)
+
+    if not commit_may_add_content:
         staged = _staged_files(cwd)
         if staged and all(_is_docs_or_config(p) for p in staged):
             sys.exit(0)
-
-    # `git add X && git commit` stages in the SAME command chain: nothing is staged yet
-    # at hook time (git add hasn't run), so we can neither classify the current diff nor
-    # bind the marker to it. Detected once here and reused by Rule 2.5 and Rule 2.
-    stages_in_same_command = any(git_subcommand(s.argv) == "add" for s in segs)
 
     # Rule 2.5: review DEPTH. A SUBSTANTIAL change needs an ADVERSARIAL audit, not a
     # precision-filtered inline pass — a "no findings" from a confidence-≥80 reviewer
@@ -559,12 +573,14 @@ def main() -> None:
         # re-reads the marker and fails CLOSED, the safe direction for the stricter gate.
         marker_level, marker_adversarial = None, True
 
-    if stages_in_same_command:
-        # Index empty at hook time — the staged classify reads "inline", so depth falls
-        # back to the marker's RECORDED level (else a substantial change staged in the
-        # same chain would slip the gate). We cannot diff-bind here (staging hasn't
-        # happened), so the marker's adversarial bit is trusted as recorded — a KNOWN
-        # add-chain hash-blindness limitation (tracked follow-up), symmetric with Rule 2.
+    if commit_may_add_content:
+        # The hook-time index does NOT reflect what will be committed (`git add && commit`,
+        # `git commit -am`, a pathspec/-i/-o/-p commit, …), so the staged classify reads
+        # "inline"; depth falls back to the marker's RECORDED level (else a substantial
+        # change committed this way would slip the gate). We cannot content-bind here
+        # (the real diff isn't staged yet), so the marker's adversarial bit is trusted as
+        # recorded — a KNOWN content-blindness limitation (tracked follow-up), symmetric
+        # with Rule 2 below.
         depth_level = marker_level
         depth_is_adversarial = marker_adversarial
     else:
@@ -606,9 +622,9 @@ def main() -> None:
             return
 
     # Rule 2: Block commits without review (on branches).
-    if stages_in_same_command:
-        # Can't check diff hash (staging hasn't happened yet) — require the
-        # marker file to exist and not be expired.
+    if commit_may_add_content:
+        # The staged diff at hook time isn't what will be committed (staging deferred, -a,
+        # a pathspec, …) — can't check the diff hash, so require a valid (unexpired) marker.
         rule2_blocks = not has_valid_review_marker(cwd=cwd)
     else:
         rule2_blocks = has_code_changes(cwd=cwd) and not is_review_current(cwd=cwd)

@@ -54,9 +54,16 @@ except ImportError:  # pragma: no cover - sibling always present in scripts/
         return ext.lower() in {".md", ".rst", ".txt", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
 
     def _is_prompt_surface(path: str) -> bool:
-        return path.replace("\\", "/").startswith(
-            (".claude/agents/", ".claude/commands/", ".claude/skills/", "src/genesis/skills/")
-        )
+        norm = path.replace("\\", "/")
+        return norm.startswith(
+            (
+                ".claude/agents/",
+                ".claude/commands/",
+                ".claude/skills/",
+                "src/genesis/skills/",
+                "src/genesis/identity/",
+            )
+        ) or (norm.startswith("src/genesis/") and "/prompts/" in norm)
 
 
 _GIT_TIMEOUT = 10  # per-call ceiling when no deadline is in force

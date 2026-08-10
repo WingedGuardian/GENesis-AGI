@@ -163,6 +163,26 @@ def test_small_skill_surface_is_substantial(tmp_path):
     assert _classify(repo) == "substantial"
 
 
+def test_identity_prompt_template_is_substantial(tmp_path):
+    # Runtime prompt templates under src/genesis/identity/ (CODE_AUDITOR, INBOX_EVALUATE,
+    # …) are behavior surfaces — a small edit is substantial (Codex round-2 P2-D).
+    repo = _mk_repo(tmp_path)
+    (repo / "src" / "genesis" / "identity").mkdir(parents=True)
+    (repo / "src" / "genesis" / "identity" / "CODE_AUDITOR.md").write_text("audit hard\n")
+    _git(repo, "add", "-A")
+    assert _classify(repo) == "substantial"
+
+
+def test_runtime_prompts_dir_is_substantial(tmp_path):
+    # Any prompts/ package under the runtime tree (autonomy/executor/prompts,
+    # sentinel/prompts, …) is a behavior surface — enumerated, not just named roots.
+    repo = _mk_repo(tmp_path)
+    (repo / "src" / "genesis" / "sentinel" / "prompts").mkdir(parents=True)
+    (repo / "src" / "genesis" / "sentinel" / "prompts" / "SENTINEL.md").write_text("watch\n")
+    _git(repo, "add", "-A")
+    assert _classify(repo) == "substantial"
+
+
 def test_user_caps_behavior_doc_is_inline(tmp_path):
     # User-sovereign CAPS behavior docs (SOUL.md/USER.md/CLAUDE.md) are NOT prompt
     # surfaces: the user editing their own behavior files is not gated (docs-config).
