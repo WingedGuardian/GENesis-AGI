@@ -27,7 +27,12 @@ _ALLOWLIST = {
     "generate-ssh-config.sh",
 }
 
-_SET_U = re.compile(r"^\s*set\s+-[a-z]*u", re.M)
+# Any nounset spelling: `u` anywhere in any short-option cluster, any case-mix
+# and order (`set -u`, `set -euo pipefail`, `set -Eeuo pipefail`, `set -e -u`) —
+# Codex P2 2026-08-10: a lowercase-only class missed `-Eeuo` and silently passed
+# scripts/update.sh. No trailing \b after the `u`: in `-euo`/`-Eeuo` the u is
+# mid-cluster. Also covers the long form `set -o nounset` (unused today).
+_SET_U = re.compile(r"^\s*set\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*u|^\s*set\s+.*-o\s+nounset\b", re.M)
 _HOME_USE = re.compile(r"\$\{?HOME\b")
 # A guard that resolves HOME when unset: the passwd-fallback form used by
 # store_cc_token.sh / install.sh / bootstrap.sh, or the ~${SUDO_USER} operator
@@ -41,7 +46,9 @@ _GUARD = re.compile(
 
 
 def _candidate_scripts():
-    for p in sorted(SCRIPTS_DIR.glob("*.sh")):
+    # rglob, not glob: nested entry points (scripts/lib/*.sh) are runnable too —
+    # Codex P2 2026-08-10: the non-recursive scan missed lib/code_intel_index.sh.
+    for p in sorted(SCRIPTS_DIR.rglob("*.sh")):
         text = p.read_text()
         if _SET_U.search(text) and _HOME_USE.search(text):
             yield p, text

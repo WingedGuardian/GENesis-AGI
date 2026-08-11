@@ -19,6 +19,17 @@
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
 
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use (here: the
+# copy-to-temp guard below, before any backup/update work). Fall back to the
+# passwd entry for the current uid (same source Path.home() uses); fail closed
+# if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 # ── Copy-to-temp guard ──────────────────────────────────
 # The update script may update itself during git merge, which would corrupt
 # the running process. Industry standard (Chrome, Homebrew, Windows Update):
