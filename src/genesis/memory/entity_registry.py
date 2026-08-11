@@ -32,7 +32,12 @@ MECHANICAL_TYPES = frozenset({"code_file", "code_symbol", "pr", "commit"})
 
 # Named types that may share identity across type labels (the LLM may
 # call OMI a "product" in one extraction and a "device" in another).
-_CONCEPT_CLUSTER = frozenset({"product", "device", "concept", "subsystem", "repo"})
+# host/install/project (MW-3) join the cluster so typing an existing concept
+# entity as one of them FOLDS onto it (cross-type reuse below) instead of
+# forking a new shard — the load-bearing property of the typing transition.
+_CONCEPT_CLUSTER = frozenset(
+    {"product", "device", "concept", "subsystem", "repo", "host", "install", "project"}
+)
 
 FUZZY_THRESHOLD = 0.85
 

@@ -54,7 +54,11 @@ CALL_SITE_CHALLENGE = "entity_adjudication_challenge"
 _MAX_ATTEMPTS = 5
 # Fuzzy-comparison groups mirror entity_registry.resolve_entity: concept-cluster
 # types are compared cross-type within the cluster; person/org each same-type.
-_CONCEPT_CLUSTER = frozenset({"product", "device", "concept", "subsystem", "repo"})
+# Keep in lockstep with entity_registry._CONCEPT_CLUSTER (host/install/project
+# added in MW-3).
+_CONCEPT_CLUSTER = frozenset(
+    {"product", "device", "concept", "subsystem", "repo", "host", "install", "project"}
+)
 _FUZZY_THRESHOLD = 0.85
 _SNIPPET_CHARS = 300
 _MENTIONS_PER_ENTITY = 3

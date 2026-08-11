@@ -81,8 +81,14 @@ async def get_by_norm_name(
             (norm_name, entity_type),
         )
     else:
+        # Deterministic when a norm_name exists under >1 type: prefer an
+        # active row (so we return a live entity when one exists), then the
+        # oldest — never an arbitrary rows[0]. A merged top row still redirects
+        # below; ordering only decides WHICH row we start from.
         rows = await db.execute_fetchall(
-            "SELECT * FROM entities WHERE norm_name = ?",
+            "SELECT * FROM entities WHERE norm_name = ? "
+            "ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'merged' THEN 1 "
+            "ELSE 2 END, created_at ASC, entity_id ASC",
             (norm_name,),
         )
     if not rows:
@@ -348,6 +354,12 @@ async def merge_entity(
     higher-confidence row wins — a merge must never discard the
     strongest evidence (the loser is often the better-attested record).
     """
+    # Self-merge guard: writing ``merged_into = self`` makes the entity
+    # unresolvable (the _resolve_active seen-set walk dead-ends), so a caller
+    # that resolved both sides to the same row (easy via merge-following
+    # get_by_norm_name) must fail loud, not silently corrupt the row.
+    if loser_id == survivor_id:
+        raise ValueError(f"merge_entity: self-merge refused (loser == survivor == {loser_id!r})")
     now = datetime.now(UTC).isoformat()
     await db.execute(
         "INSERT INTO entity_mentions "

@@ -1761,9 +1761,16 @@ TABLES = {
             norm_name   TEXT NOT NULL,
             entity_type TEXT NOT NULL CHECK (entity_type IN (
                 'code_file','code_symbol','pr','commit',
-                'product','device','repo','subsystem','person','org','concept'
+                'product','device','repo','subsystem','person','org','concept',
+                -- MW-3 §6.4 first-card classes: host = a machine, install = a
+                -- Genesis deployment on a host, project = a user project.
+                'host','install','project'
             )),
             summary     TEXT,
+            -- MW-3 B3 card-materialization state (NULL/0 = never carded =
+            -- today's behavior; refresh job dirties + regenerates).
+            summary_updated_at TEXT,
+            summary_dirty INTEGER NOT NULL DEFAULT 0,
             source      TEXT NOT NULL DEFAULT 'extracted',
             status      TEXT NOT NULL DEFAULT 'active'
                             CHECK (status IN ('active','merged','gone')),
