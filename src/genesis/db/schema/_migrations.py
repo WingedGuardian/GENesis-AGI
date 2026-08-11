@@ -869,6 +869,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_byte INTEGER",
         "cc_sessions.last_extracted_byte")
+    # Per-device voice-session attribution: the satellite (device) id is hashed
+    # into the uuid5 session id and otherwise dropped. NULLable, NO default —
+    # NULL = unknown device (historical rows / a writer that passed none);
+    # captured on a voice session's FIRST registration. Powers the optional
+    # per_device scope of voice_recency_resume; the default (global) ignores it.
+    await _try_alter(db,
+        "ALTER TABLE cc_sessions ADD COLUMN satellite_id TEXT",
+        "cc_sessions.satellite_id")
 
     # Memory photographic: expand memory_links CHECK constraint to support
     # typed relationships from conversation extraction (discussed_in,

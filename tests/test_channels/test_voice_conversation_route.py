@@ -94,6 +94,44 @@ class TestVoiceConversation:
             writer.sync_cumulative.assert_awaited_once_with(
                 body["session_id"],
                 body["turns"],
+                satellite_id=body["satellite_id"],
+            )
+
+    def test_system_prompt_threads_scope_params(self, app):
+        """GET /v1/voice/system_prompt threads ?satellite_id / ?session_id."""
+        from genesis.channels.voice.transcript_writer import transcript_session_id
+
+        bridge = MagicMock()
+        bridge.get_system_prompt.return_value = "PROMPT"
+        app.config["GENESIS_BRIDGE"] = bridge
+        with (
+            patch.dict("os.environ", self._ENV, clear=False),
+            app.test_client() as client,
+        ):
+            resp = client.get(
+                "/v1/voice/system_prompt"
+                "?satellite_id=pe-kitchen&session_id=s2s-pe-kitchen-20260811-000000",
+                headers=self._AUTH,
+            )
+            assert resp.status_code == 200
+            assert resp.get_json() == {"prompt": "PROMPT"}
+            bridge.get_system_prompt.assert_called_once_with(
+                current_session_id=transcript_session_id("s2s-pe-kitchen-20260811-000000"),
+                satellite_id="pe-kitchen",
+            )
+
+    def test_system_prompt_no_params_defaults_none(self, app):
+        bridge = MagicMock()
+        bridge.get_system_prompt.return_value = "P"
+        app.config["GENESIS_BRIDGE"] = bridge
+        with (
+            patch.dict("os.environ", self._ENV, clear=False),
+            app.test_client() as client,
+        ):
+            resp = client.get("/v1/voice/system_prompt", headers=self._AUTH)
+            assert resp.status_code == 200
+            bridge.get_system_prompt.assert_called_once_with(
+                current_session_id=None, satellite_id=None
             )
 
     def test_replay_returns_zero_appended(self, app):
