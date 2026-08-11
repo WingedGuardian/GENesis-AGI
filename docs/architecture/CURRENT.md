@@ -36,7 +36,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 7706dc2f 2026-08-05
+verified: ef6eb541 2026-08-10
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -170,6 +170,28 @@ synthesis→original provenance `extends` edge (ordinary `extends` from
 column stamped at merge (the synthesis's `created_at` is unreliable —
 `store()`'s exact-dedup can return an old pre-existing memory); non-dream
 deprecations leave `deprecated_at` NULL and are never pruned.
+
+**Relationship classifier (MW-2 lean keystone)** —
+`memory/relationship_classifier.py`: coarse relationship judgment
+(`duplicate`/`contradicts`/`succeeded_by`/`distinct` + confidence) between two
+candidate memories, generalizing `entity_resolution.check_semantic_overlap`
+(call site `dream_cycle_relationship_classify`, free-SLM chain, fail-safe
+`distinct@0.0`). This is the function MW-5's merge gate consumes on ≥0.95
+nominees; NOTHING calls it in the runtime yet (probe:
+`scripts/dev/mw2_classifier_probe.py`, read-only vs a DB copy). Migration 0082
+added five NULLable stamping columns to `memory_links` (`proposed_type`,
+`confidence`, `classifier`, `review_state`, `safe_for_boost`) — NULL
+`safe_for_boost` = boost-eligible (legacy default), no backfill, CHECK/PK
+unchanged. Measured 2026-08-10 (n=300 real ≥0.75 edges): 76.7% distinct /
+16.7% duplicate / 5.3% succeeded_by / 1.3% contradicts; `duplicate` ~80%
+hand-scored accurate, `contradicts` OVER-CALLED (bug↔fix pairs) — so MW-5 must
+challenge contradicts verdicts adversarially before acting, and the deferred
+MW-2b machinery (candidate_similar type + CHECK rebuild + write-path change +
+boost gating) is evidence-parked, not planned. The similarity linkers
+(`linker.py` auto_link 0.90/0.75, `connection_pass.py` 0.80) still write
+`extends`/`supports`/`related_to` — types recall ranking never reads
+(`neighbors_of` is strength-only; type matters only via the `contradicts`
+deny-list).
 
 **Do not touch:** the drain's shadow hardwiring; the dry_run-independent link
 write. **Trap:** with no embedding provider registered, memory silently

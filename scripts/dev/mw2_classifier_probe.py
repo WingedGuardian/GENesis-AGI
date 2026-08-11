@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sqlite3
 import sys
@@ -89,8 +90,17 @@ async def run(n: int, batch: int, seed: int) -> int:
             (*_SIMILARITY_TYPES, max(n * 3, n)),
         )
         rows = list(rows)
-        # Stable pseudo-shuffle by seed, then take n (avoids RANDOM() nondeterminism).
-        rows.sort(key=lambda r: hash((seed, r[0], r[1])) & 0xFFFFFFFF)
+
+        # Stable pseudo-shuffle by seed, then take n. Uses md5 (not builtin
+        # hash(): PEP-456 salts str hashing per process, which would make the
+        # same --seed draw a DIFFERENT sample every run — review finding).
+        def _stable_key(r) -> int:
+            digest = hashlib.md5(  # not crypto — a stable shuffle key
+                f"{seed}:{r[0]}:{r[1]}".encode(), usedforsecurity=False
+            ).hexdigest()
+            return int(digest[:8], 16)
+
+        rows.sort(key=_stable_key)
         rows = rows[:n]
         if not rows:
             print("No similarity edges found — nothing to probe.", file=sys.stderr)
