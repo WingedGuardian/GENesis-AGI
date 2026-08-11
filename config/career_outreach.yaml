@@ -1,0 +1,24 @@
+# Career-outreach monitor — operator lever.
+# Semantics: src/genesis/recon/career_outreach_config.py
+#
+# This monitor drives a configured external career-agent module to run
+# job-outreach discovery and stage first-touch DRAFTS, then nudges the owner to
+# review + send. It NEVER sends mail itself — the external module stages drafts
+# into the owner's mail Drafts and the owner clicks Send (draft-and-hold).
+#
+# mode: off | observe | live
+#   off     — monitor does not run. SHIPPED DEFAULT (an actuator stays inert
+#             until the owner opts in).
+#   observe — resolve + seed state, NEVER dispatch a draft-staging run or nudge
+#             (flip off -> observe to seed silently, then observe -> live).
+#   live    — drive due discovery + up to max_auto_runs_per_tick draft-staging
+#             runs, then nudge the owner when NEW drafts were staged.
+#
+# Env kill switch: GENESIS_CAREER_OUTREACH_DISABLED=1 forces off.
+# Install-specific knobs (module names, targeting) belong in the gitignored
+# career_outreach.local.yaml overlay, never here.
+enabled: true
+mode: off
+reasoning_module: ""   # set your career-agent module's name in career_outreach.local.yaml
+max_auto_runs_per_tick: 3
+dispatch_timeout_s: 240

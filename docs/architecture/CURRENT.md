@@ -510,6 +510,20 @@ verified: 557d3587 2026-08-09
   notification's `latest_comment_url` and pinging immediately in `live`.
   `off`/`observe`/`live` lever + `notifications` reason-allowlist in
   `github_steward_config`.
+- **recon/career_outreach.py** (`CareerOutreachMonitor`) — the recon entry that
+  not only pushes but ACTS: a daily surplus-cron ACTUATOR driving a configured
+  external career-agent module (SSH CC dispatch, declared in the install's
+  `~/.genesis` module overlay) to stage first-touch outreach drafts into the
+  owner's mail Drafts (the module never sends — owner clicks Send), then pushing
+  ONE Telegram nudge for newly-staged drafts. Ships `off` (`career_outreach_config`
+  `off`/`observe`/`live` + `GENESIS_CAREER_OUTREACH_DISABLED` kill). Bridge
+  lazy-resolved at tick; `execute_operation` returns an error DICT (never raises)
+  so a dispatch error surfaces → job-health failure; `check_health_cached` gates;
+  absent-module → clean no-op (generic installs). The external engine's own
+  staged-draft state is the source of truth; a `career_outreach_nudged` observation is the
+  per-company nudge-dedup ledger so a re-tick / undelivered nudge never
+  double-nudges. ONE daily job (`max_instances=1` is per-job; a second would race
+  the single remote). Discovery-sweep driving is GROUNDWORK-deferred.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.
