@@ -67,8 +67,10 @@ _GH_STATUS_TIMEOUT_S = 5  # preflight only; a slow/unreachable status page fails
 # Statuspage's documented non-operational component states. An explicit
 # allowlist: any OTHER value (schema-invalid types, new/unknown states,
 # "operational") does NOT count as degraded — fail-open by construction.
+# under_maintenance included (Codex P2): scheduled Actions maintenance stalls
+# CI for infra reasons exactly like an outage does.
 _GH_DEGRADED_STATUSES = frozenset(
-    {"degraded_performance", "partial_outage", "major_outage"}
+    {"degraded_performance", "partial_outage", "major_outage", "under_maintenance"}
 )
 
 

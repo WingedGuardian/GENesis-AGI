@@ -510,6 +510,15 @@ async def test_github_actions_degraded_component_scoped(monkeypatch):
     )
     assert await _mr_mod._github_actions_degraded() is True
 
+    # Scheduled maintenance stalls CI for infra reasons too (Codex P2).
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(
+            payload=_components({"name": "Actions", "status": "under_maintenance"}),
+        ),
+    )
+    assert await _mr_mod._github_actions_degraded() is True
+
     # An UNRELATED component's outage must NOT trip the Actions preflight
     # (the aggregate-indicator approach did — Codex P2).
     monkeypatch.setattr(
