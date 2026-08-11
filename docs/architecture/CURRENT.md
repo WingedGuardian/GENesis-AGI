@@ -493,8 +493,8 @@ verified: 557d3587 2026-08-09
   `off`/`observe`/`live` + `GENESIS_CAREER_OUTREACH_DISABLED` kill). Bridge
   lazy-resolved at tick; `execute_operation` returns an error DICT (never raises)
   so a dispatch error surfaces → job-health failure; `check_health_cached` gates;
-  absent-module → clean no-op (generic installs). The remote `radar_status` is
-  the draft source-of-truth; a `career_outreach_nudged` observation is the
+  absent-module → clean no-op (generic installs). The external engine's own
+  staged-draft state is the source of truth; a `career_outreach_nudged` observation is the
   per-company nudge-dedup ledger so a re-tick / undelivered nudge never
   double-nudges. ONE daily job (`max_instances=1` is per-job; a second would race
   the single remote). Discovery-sweep driving is GROUNDWORK-deferred.

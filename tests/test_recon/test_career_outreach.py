@@ -164,7 +164,9 @@ class _FakeModule:
         autorun_error=None,
         working_error=False,
         working_malformed=False,
+        working_empty_text=False,
         autorun_payload_error=None,
+        autorun_malformed=False,
     ) -> None:
         self._healthy = healthy
         self._autoruns = list(autoruns or [])
@@ -172,7 +174,9 @@ class _FakeModule:
         self._autorun_error = autorun_error  # adapter-level {"error"} for auto-run
         self._working_error = working_error  # adapter-level {"error"} for list
         self._working_malformed = working_malformed  # non-JSON-array list reply
+        self._working_empty_text = working_empty_text  # empty-text list reply
         self._autorun_payload_error = autorun_payload_error  # module-reported {"error"}
+        self._autorun_malformed = autorun_malformed  # unparseable auto-run reply
         self.calls: list[str] = []
 
     async def check_health_cached(self) -> bool:
@@ -186,12 +190,16 @@ class _FakeModule:
                 return {"error": "ssh down"}
             if self._working_malformed:
                 return {"text": "sorry, I could not list them"}
+            if self._working_empty_text:
+                return {"text": ""}
             return {"text": json.dumps(self._working)}
         # auto-run dispatch
         if self._autorun_error is not None:
             return {"error": self._autorun_error}
         if self._autorun_payload_error is not None:
             return {"text": json.dumps({"error": self._autorun_payload_error})}
+        if self._autorun_malformed:
+            return {"text": "sorry, I could not do that"}
         if self._autoruns:
             return {"text": json.dumps(self._autoruns.pop(0))}
         return {"text": json.dumps({"none_left": True})}
@@ -481,6 +489,8 @@ async def test_pause_midtick_halts_dispatches_and_nudge(db, monkeypatch):
     result = await mon.gather()
     assert result.auto_runs == 1 and _autorun_calls(mod) == 1  # 2nd auto-run blocked
     assert result.nudged == 0 and pipe.sent == []  # nudge skipped while paused
+    # Codex r3 P1: the intervening list-staged read (another dispatch) is ALSO skipped.
+    assert not any("READ-ONLY: list" in c for c in mod.calls)
 
 
 @pytest.mark.asyncio
@@ -510,12 +520,13 @@ async def test_module_reported_error_counts_as_failure(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ignored_nudge_is_not_an_error(db, monkeypatch):
-    # Codex P2: a quiet-hours IGNORED nudge is an EXPECTED defer — NOT a failure —
-    # and is not marked (retries next tick).
+async def test_rejected_nudge_is_not_an_error(db, monkeypatch):
+    # Codex r3 P2: submit_raw skips quiet-hours governance so IGNORED never occurs; a
+    # REJECTED nudge is pipeline dedup (the owner already got an identical one) — NOT a
+    # failure, and not re-marked (a harmless re-derive next tick).
     _cfg(monkeypatch, mode="live")
     mod = _FakeModule(autoruns=[], working=[{"company": "Zeta", "contact": "z@zeta.dev"}])
-    mon, pipe = _mon(db, mod, pipe_status=OutreachStatus.IGNORED)
+    mon, pipe = _mon(db, mod, pipe_status=OutreachStatus.REJECTED)
     result = await mon.gather()
     assert result.errors == 0 and result.nudged == 0 and len(pipe.sent) == 1
     assert not await observations.exists_by_hash(
@@ -556,6 +567,69 @@ async def test_nudge_topic_distinguishes_distinct_sets(db):
     await mon._nudge([{"company": "Acme", "contact": ""}])
     await mon._nudge([{"company": "Globex", "contact": ""}])
     assert sent[0].topic != sent[1].topic
+
+
+@pytest.mark.asyncio
+async def test_unparseable_autorun_reply_counts_as_failure(db, monkeypatch):
+    # Codex r3 P2: an unparseable auto-run reply is a protocol failure → errors≥1
+    # (this also surfaces an injection-refusal reply as a job-health failure).
+    _cfg(monkeypatch, mode="live")
+    mon, _ = _mon(db, _FakeModule(autorun_malformed=True, working=[]))
+    result = await mon.gather()
+    assert result.errors >= 1 and result.auto_runs == 0
+
+
+@pytest.mark.asyncio
+async def test_autorun_missing_company_counts_as_failure(db, monkeypatch):
+    # Codex r3 P2: an auto-run reply missing 'company' is a protocol failure → errors≥1.
+    _cfg(monkeypatch, mode="live")
+    mon, _ = _mon(db, _FakeModule(autoruns=[{"draft_summary": "x"}], working=[]))
+    result = await mon.gather()
+    assert result.errors >= 1 and result.auto_runs == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_text_list_reply_is_error(db, monkeypatch):
+    # Codex r3 P2: an empty-TEXT list reply (not "[]") is a protocol violation → error,
+    # so observe never silently under-seeds (which would make live over-nudge).
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(working_empty_text=True))
+    result = await mon.gather()
+    assert result.errors == 1 and result.seeded == 0
+
+
+@pytest.mark.asyncio
+async def test_list_with_no_company_entries_is_error(db, monkeypatch):
+    # Codex r3 P2: a non-empty list whose entries lack 'company' is malformed → error.
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(working=[{"draft_summary": "x"}]))
+    result = await mon.gather()
+    assert result.errors == 1 and result.seeded == 0
+
+
+@pytest.mark.asyncio
+async def test_valid_empty_array_list_is_not_error(db, monkeypatch):
+    # A valid empty array "[]" = genuinely no staged drafts, NOT an error.
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(working=[]))
+    result = await mon.gather()
+    assert result.errors == 0 and result.seeded == 0
+
+
+def test_enabled_string_false_degrades_to_off(monkeypatch, tmp_path):
+    # Codex r3 P2: a string "false" (env-templated YAML) is truthy in Python — the
+    # master switch requires a literal bool and degrades a non-bool to off.
+    p = _write(tmp_path, 'enabled: "false"\nmode: live\n')
+    monkeypatch.setattr(cfg, "_base_path", lambda: p)
+    monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
+    assert cfg.effective_mode() == "off"
+
+
+def test_enabled_nonbool_int_degrades_to_off(monkeypatch, tmp_path):
+    p = _write(tmp_path, "enabled: 1\nmode: live\n")  # truthy int, not literal True
+    monkeypatch.setattr(cfg, "_base_path", lambda: p)
+    monkeypatch.delenv(cfg._ENV_KILL_SWITCH, raising=False)
+    assert cfg.effective_mode() == "off"
 
 
 @pytest.mark.asyncio

@@ -283,7 +283,8 @@ class CareerOutreachMonitor:
                 break
             payload = _parse_json(_reply_text(result))
             if not isinstance(payload, dict):
-                details.append("auto-run: unparseable reply — stopping")
+                errors += 1
+                details.append("auto-run: unparseable reply (protocol failure) — stopping")
                 break
             if payload.get("none_left"):
                 details.append("auto-run: no target accounts left")
@@ -297,7 +298,8 @@ class CareerOutreachMonitor:
                 break
             company = (payload.get("company") or "").strip()
             if not company:
-                details.append("auto-run: reply missing 'company' — stopping")
+                errors += 1
+                details.append("auto-run: reply missing 'company' (protocol failure) — stopping")
                 break
             auto_runs += 1
             details.append(f"staged: {company}")
@@ -311,7 +313,9 @@ class CareerOutreachMonitor:
         # against the engine's existing target backlog.
         nudged = 0
         drafts_working = 0
-        if not adapter_error:
+        if not adapter_error and self._is_paused():
+            details.append("paused mid-tick — skipping staged-draft read + nudge")
+        elif not adapter_error:
             working, err = await self._list_working(mod, timeout)
             if err:
                 errors += 1
@@ -360,16 +364,19 @@ class CareerOutreachMonitor:
                             )
                         nudged = len(fresh)
                         details.append(f"nudged {nudged} new staged draft(s)")
-                    elif status == OutreachStatus.IGNORED:
-                        # Quiet-hours defer — an EXPECTED outcome, not a failure. Not
-                        # marked, so it retries next tick.
-                        details.append(
-                            f"nudge deferred (quiet hours) — {len(fresh)} draft(s) retry next tick"
-                        )
+                    elif status == OutreachStatus.REJECTED:
+                        # Pipeline dedup — an identical nudge went out recently, so the
+                        # owner already has it. NOT a failure; not re-marked (a harmless
+                        # re-derive next tick, dampened by the set-hash topic dedup).
+                        details.append(f"nudge deduped (already sent) — {len(fresh)} draft(s)")
                     else:
-                        # FAILED / REJECTED / no-pipeline / exception — unsuccessful.
-                        # COUNT it so a persistent delivery failure surfaces as a
-                        # job-health failure; not marked, so it retries.
+                        # FAILED / None (no pipeline / exception) — a real delivery
+                        # failure. COUNT it so a persistent failure surfaces as a
+                        # job-health failure; not marked, so it retries. (submit_raw skips
+                        # quiet-hours governance, so IGNORED never occurs here — owner
+                        # nudges deliver immediately, which is correct: owner-facing
+                        # delivery is never gated by contract, and the tick runs at 08:00,
+                        # post-quiet.)
                         errors += 1
                         details.append(
                             f"nudge not delivered (status={status}) — "
@@ -407,26 +414,34 @@ class CareerOutreachMonitor:
         text = _reply_text(result)
         data = _parse_json(text)
         if isinstance(data, list):
-            return [d for d in data if isinstance(d, dict)], False
-        # A NON-EMPTY reply that is not a JSON array is a protocol violation — surface
-        # it as an error (err=True → job-health failure) so a persistently-malformed
-        # module reply is diagnosable, NOT silently indistinguishable from "none"
-        # (which would make observe seed nothing, then live blast the whole backlog).
-        if text.strip():
-            logger.warning(
-                "career outreach: list-staged reply was not a JSON array "
-                "(malformed module reply?): %s",
-                text.strip()[:160],
-            )
-            return [], True
-        return [], False
+            valid = [d for d in data if isinstance(d, dict) and (d.get("company") or "").strip()]
+            if data and not valid:
+                # A non-empty list with no schema-valid (company-bearing) entries is a
+                # protocol violation — surface it, don't silently under-seed.
+                logger.warning(
+                    "career outreach: list-staged reply was a list with no company-bearing "
+                    "entries: %r",
+                    str(data)[:160],
+                )
+                return [], True
+            return valid, False
+        # Empty text or a non-array reply is a protocol violation — the module is
+        # contracted to return a JSON array ("[]" for none). Surface it as an error
+        # (err=True → job-health failure) so it is diagnosable and observe NEVER
+        # under-seeds (which would make a later live tick over-nudge the backlog).
+        logger.warning(
+            "career outreach: list-staged reply was not a JSON array (malformed/empty): %r",
+            (text or "")[:160],
+        )
+        return [], True
 
     async def _nudge(self, fresh: list[dict]):
         """Push ONE owner-facing Telegram nudge for the freshly-staged drafts.
         Returns the delivery ``OutreachStatus`` (``None`` if there is no pipeline or
-        the send raised) so the caller can distinguish DELIVERED (mark), IGNORED
-        (quiet-hours defer — retry, not a failure), and FAILED/REJECTED (a
-        job-health failure)."""
+        the send raised) so the caller can distinguish DELIVERED (mark), REJECTED
+        (pipeline dedup — already sent, not a failure), and FAILED/None (a job-health
+        failure). ``submit_raw`` skips quiet-hours governance, so IGNORED never occurs
+        — owner-facing delivery is intentionally never gated."""
         from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
 
         pipeline = self._pipeline()

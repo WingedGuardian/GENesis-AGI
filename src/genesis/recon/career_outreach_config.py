@@ -123,7 +123,10 @@ def effective_mode() -> str:
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return "off"
     cfg = load_config()
-    if not cfg.get("enabled", True):
+    # Master switch: require a LITERAL boolean True to stay enabled. A non-bool
+    # (e.g. the string "false" from env-templated YAML, or any corruption) degrades
+    # to off — the master actuator switch fails toward LESS authority.
+    if cfg.get("enabled", True) is not True:
         return "off"
     mode = cfg.get("mode")
     if mode is False:

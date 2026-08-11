@@ -181,8 +181,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "github_ping_pending": timedelta(days=7),
     # Career-outreach monitor — per-draft "already nudged" dedup marker. 30d:
     # long enough that a still-open staged draft is not re-nudged, bounded so an
-    # abandoned marker cannot linger. The remote radar_status is the source of
-    # truth for draft counts; this row only records "owner already nudged".
+    # abandoned marker cannot linger. The external engine's own staged-draft state is
+    # the source of truth for draft counts; this row only records "owner already nudged".
     "career_outreach_nudged": timedelta(days=30),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),
