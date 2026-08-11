@@ -135,6 +135,108 @@ class TestMergeMatchHead:
         assert "--repo" not in cmd
         assert cmd == f"gh pr merge 5 --squash --admin --match-head-commit {HEAD}"
 
+    def test_shadowed_as_body_value_is_ignored(self):
+        # `--body --match-head-commit=<sha>` — gh takes the sha as BODY TEXT (no
+        # binding); the scan must NOT read it as an active binding (Codex P1 r3).
+        argv = [
+            "gh",
+            "pr",
+            "merge",
+            "5",
+            "--body",
+            f"--match-head-commit={HEAD}",
+            "--squash",
+            "--admin",
+        ]
+        assert _mod._merge_match_head(argv) is None
+
+    def test_shadowed_as_short_flag_value_is_ignored(self):
+        for vflag in ("-b", "-F", "-t", "-A", "--body-file", "--subject", "--author-email"):
+            argv = ["gh", "pr", "merge", "5", vflag, f"--match-head-commit={HEAD}", "--admin"]
+            assert _mod._merge_match_head(argv) is None, vflag
+
+    def test_real_binding_after_a_body_value(self):
+        # --body consumes 'msg'; the real --match-head-commit still parses.
+        argv = ["gh", "pr", "merge", "5", "--body", "msg", "--match-head-commit", HEAD, "--admin"]
+        assert _mod._merge_match_head(argv) == HEAD
+
+    def test_double_dash_ends_options(self):
+        argv = ["gh", "pr", "merge", "5", "--", f"--match-head-commit={HEAD}"]
+        assert _mod._merge_match_head(argv) is None
+
+    def test_glued_body_containing_flag_is_ignored(self):
+        argv = ["gh", "pr", "merge", "5", f"--body=--match-head-commit={HEAD}", "--admin"]
+        assert _mod._merge_match_head(argv) is None
+
+    def test_short_cluster_swallows_next_token(self):
+        # -db = -d(bool) + -b(value); gh's -b swallows the following
+        # --match-head-commit as BODY text (merges UNBOUND) — must NOT be read as
+        # a binding (audit round 4).
+        for cluster in ("-db", "-dt", "-dA", "-sb", "-mb"):
+            argv = [
+                "gh",
+                "pr",
+                "merge",
+                "5",
+                "--repo",
+                "o/r",
+                cluster,
+                f"--match-head-commit={HEAD}",
+                "--admin",
+            ]
+            assert _mod._merge_match_head(argv) is None, cluster
+
+    def test_bool_cluster_then_real_binding(self):
+        # -ds = two booleans; the real --match-head-commit still binds.
+        argv = ["gh", "pr", "merge", "5", "-ds", "--match-head-commit", HEAD]
+        assert _mod._merge_match_head(argv) == HEAD
+
+    def test_glued_short_body_is_ignored(self):
+        argv = ["gh", "pr", "merge", "5", f"-b--match-head-commit={HEAD}", "--admin"]
+        assert _mod._merge_match_head(argv) is None
+
+
+class TestMergeShadowFlag:
+    def test_detects_content_flags(self):
+        for vflag in (
+            "--body",
+            "-b",
+            "--body-file",
+            "-F",
+            "--subject",
+            "-t",
+            "--author-email",
+            "-A",
+        ):
+            assert _mod._merge_has_shadow_flag(["gh", "pr", "merge", "5", vflag, "x"]), vflag
+        assert _mod._merge_has_shadow_flag(["gh", "pr", "merge", "5", "--body=x"])
+
+    def test_clean_merge_has_no_shadow(self):
+        argv = [
+            "gh",
+            "pr",
+            "merge",
+            "5",
+            "--repo",
+            "o/r",
+            "--squash",
+            "--admin",
+            "--match-head-commit",
+            HEAD,
+        ]
+        assert _mod._merge_has_shadow_flag(argv) is False
+
+    def test_detects_shadow_inside_cluster(self):
+        for cluster in ("-db", "-dt", "-dA", "-sb", "-b"):
+            assert _mod._merge_has_shadow_flag(["gh", "pr", "merge", "5", cluster, "x"]), cluster
+
+    def test_repo_cluster_not_shadow(self):
+        # -R / -dR are --repo (allowed); the value-short stops cluster scanning.
+        assert _mod._merge_has_shadow_flag(["gh", "pr", "merge", "5", "-dR", "o/r"]) is False
+        assert _mod._merge_has_shadow_flag(["gh", "pr", "merge", "5", "-R", "o/r"]) is False
+
+
+class TestMergeMatchHeadRepeat:
     def test_repeated_flag_last_wins(self):
         # gh pflag semantics: the LAST repeated string-flag value is the one gh
         # enforces — the hook must validate that same value, else

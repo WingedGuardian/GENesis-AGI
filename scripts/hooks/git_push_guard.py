@@ -923,26 +923,115 @@ def _suggested_merge_cmd(pr_num: str, verified_head: str, repo: str | None) -> s
     return f"gh pr merge {pr_num} {repo_part}--squash --admin --match-head-commit {verified_head}"
 
 
-def _merge_match_head(argv: list[str]) -> str | None:
-    """The value of ``--match-head-commit`` on a gh pr merge argv, or None.
+# gh pr merge flags that CONSUME the FOLLOWING token as their value (separate
+# form). When scanning for --match-head-commit these values MUST be skipped, else
+# a `--body --match-head-commit=<sha>` — where the sha is --body's VALUE, taken as
+# body TEXT by gh with NO head binding — is misread as an active binding while gh
+# merges unbound (Codex P1, round 3). --repo is gate-relevant (handled elsewhere)
+# but still value-consuming here; --match-head-commit itself consumes its own SHA.
+# NOTE: the risk is the PARSE MODEL (pflag argument consumption + short-flag
+# clustering), not the flag names — the long value-flag set is identical across
+# gh 2.45–2.96 `gh pr merge --help`.
+_GH_MERGE_VALUE_FLAGS = frozenset(
+    {
+        "--body",
+        "-b",
+        "--body-file",
+        "-F",
+        "--subject",
+        "-t",
+        "--author-email",
+        "-A",
+        "--repo",
+        "-R",
+        "--match-head-commit",
+    }
+)
+# Content value-flags (LONG forms) that can SHADOW --match-head-commit as their
+# value and have NO legitimate use on a gated --admin squash-merge. Their mere
+# presence is refused (fail-closed belt over the value-skipping parse). Short
+# forms are handled letter-wise in the cluster helpers below.
+_GH_MERGE_SHADOW_FLAGS = frozenset({"--body", "--body-file", "--subject", "--author-email"})
+# Short flags on gh pr merge. VALUE letters consume a value (glued remainder, else
+# the NEXT token); the rest are booleans (-d/-m/-r/-s). A cluster like `-db` is
+# -d(bool) + -b(value), so gh's -b swallows the FOLLOWING token — a scan treating
+# `-db` as opaque misses that consumption (audit round 4: `-db --match-head-commit=X`
+# merges UNBOUND). SHADOW shorts are the content ones (not -R).
+_GH_MERGE_VALUE_SHORTS = "bFtAR"
+_GH_MERGE_SHADOW_SHORTS = "bFtA"
 
-    Returns the LAST occurrence, mirroring gh's pflag last-value-wins semantics
-    for a repeated string flag (same rule as ``_pr_create_head_raw``). Validating
-    the FIRST value would let ``--match-head-commit <verified> --match-head-commit
-    <other>`` pass the hook on <verified> while gh enforces <other> — re-opening
-    the TOCTOU through the fix itself (Codex P1, round 2).
+
+def _is_short_cluster(tok: str) -> bool:
+    return tok.startswith("-") and not tok.startswith("--") and len(tok) > 1
+
+
+def _short_cluster_consumes_next(tok: str) -> bool:
+    """Whether a ``-<letters>`` short cluster makes gh consume the NEXT argv token
+    as a value — a value-short letter with NO glued remainder after it. Boolean
+    letters before it are consumed in place. Mirrors pflag."""
+    if not _is_short_cluster(tok):
+        return False
+    letters = tok[1:]
+    for j, ch in enumerate(letters):
+        if ch in _GH_MERGE_VALUE_SHORTS:
+            return letters[j + 1 :] == ""  # glued remainder ⇒ value in-token, not next
+    return False
+
+
+def _merge_match_head(argv: list[str]) -> str | None:
+    """The value gh will use for ``--match-head-commit`` on a merge argv, or None.
+
+    Parses with gh-equivalent argument consumption: value-taking flags
+    (``_GH_MERGE_VALUE_FLAGS``) consume the next token, so a --match-head-commit
+    token that is actually ANOTHER flag's value is not misread as a binding. A
+    bare ``--`` ends option parsing (everything after is positional; gh rejects
+    extra positionals). Returns the LAST occurrence — gh pflag last-value-wins
+    (same rule as ``_pr_create_head_raw``); first-wins would let a trailing
+    ``--match-head-commit <other>`` be enforced by gh while the hook validated an
+    earlier value.
     """
     argv = argv or []
     result: str | None = None
     i = 0
     while i < len(argv):
         tok = argv[i]
-        if tok == "--match-head-commit" and i + 1 < len(argv):
-            result = argv[i + 1]
-        elif tok.startswith("--match-head-commit="):
+        if tok == "--":
+            break  # end of options — the rest are positionals gh would reject
+        if tok in _GH_MERGE_VALUE_FLAGS:
+            # Separate-form value flag consumes the NEXT token. When the flag is
+            # --match-head-commit itself, that next token is the value we want.
+            if tok == "--match-head-commit" and i + 1 < len(argv):
+                result = argv[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--match-head-commit="):
             result = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if _short_cluster_consumes_next(tok):
+            i += 2  # cluster's trailing value-short swallows the next token
+            continue
         i += 1
     return result
+
+
+def _merge_has_shadow_flag(argv: list[str]) -> bool:
+    """Whether the merge carries a content flag that could shadow the head-match
+    binding — long form, ``=`` form, bare short, or inside a short cluster
+    (``-db`` etc.). Refused outright as a fail-closed belt."""
+    for tok in argv or []:
+        if tok == "--":
+            break
+        base = tok.split("=", 1)[0]
+        if base in _GH_MERGE_SHADOW_FLAGS:
+            return True
+        if _is_short_cluster(base):
+            for ch in base[1:]:
+                if ch in _GH_MERGE_SHADOW_SHORTS:
+                    return True
+                if ch in _GH_MERGE_VALUE_SHORTS:
+                    break  # a value-short (e.g. -R): the rest is its glued value
+    return False
 
 
 def _is_dispatched() -> bool:
@@ -1957,6 +2046,18 @@ def main() -> int:
                 # rejected if the head moved), making check→merge atomic. Only
                 # engaged when the freshness check ran (not # review-override).
                 if verified_head:
+                    # Fail-closed belt: content value-flags can smuggle a
+                    # --match-head-commit token as their VALUE (gh takes it as
+                    # text → no binding) and have no use on a gated squash-merge.
+                    if _merge_has_shadow_flag(merge_seg.argv):
+                        print(
+                            "BLOCKED: --body/--subject/--body-file/--author-email are "
+                            "not allowed on a gated merge — they can shadow the "
+                            "--match-head-commit binding. Remove them (set a squash "
+                            "message via the GitHub UI if needed).",
+                            file=sys.stderr,
+                        )
+                        return 2
                     match_head = _merge_match_head(merge_seg.argv)
                     if match_head is None:
                         print(
