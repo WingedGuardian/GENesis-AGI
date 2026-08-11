@@ -17,9 +17,9 @@ verdicts (the coarse judgment function shipped by the MW-2 lean keystone):
 All five are NULLable with NO default and NO backfill. NOTHING reads or writes
 them in production yet (# GROUNDWORK(mw-5-merge-gate)): MW-5's merge gate stamps
 verdicts here; the deferred MW-2b (stored-graph reclassification + boost gating)
-was measured 2026-08-10 as not-currently-justified (probe: 76.7% of similarity
-edges benign; unsafe slice mostly harmless duplicates — see
-``~/.genesis/output/mw2_classifier_probe_20260811_013928.json``).
+was measured 2026-08-10/11 as not-currently-justified (probe, corrected
+population: 73.0% of similarity edges benign; unsafe slice mostly harmless
+duplicates — see ``~/.genesis/output/mw2_classifier_probe_20260811_042515.json``).
 
 Deliberately NO CHECK change and NO table rebuild: the link_type allowlist stays
 the 12 types (locked by test_migration_0082's CHECK-unchanged test).

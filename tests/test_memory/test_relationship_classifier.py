@@ -173,3 +173,45 @@ async def test_batch_empty_pairs_returns_empty():
     assert verdicts == []
     # No LLM call for an empty batch.
     router.route_call.assert_not_called()
+
+
+# ── Codex round-1 findings (2026-08-11) ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_nan_confidence_rejected_to_zero_not_one():
+    # json.loads accepts bare NaN; min(1.0, nan) returns 1.0 in Python, so an
+    # unguarded clamp would make a NaN verdict MAXIMALLY trusted (Codex P2).
+    router = _router('{"relationship": "duplicate", "confidence": NaN}')
+    v = await classify_relationship(router, "a", "b")
+    assert v["relationship"] == "duplicate"
+    assert v["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_infinite_confidence_rejected_to_zero():
+    router = _router('{"relationship": "contradicts", "confidence": Infinity}')
+    v = await classify_relationship(router, "a", "b")
+    assert v["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_failsafe_verdicts_carry_failed_marker():
+    # Consumers (the probe's tally, MW-5) must be able to tell "genuinely
+    # distinct" from "classification failed" (Codex P1 on the probe tally).
+    router = _router("not json at all")
+    v = await classify_relationship(router, "a", "b")
+    assert v["failed"] is True
+    ok = _router(json.dumps({"relationship": "distinct", "confidence": 0.8}))
+    v2 = await classify_relationship(ok, "a", "b")
+    assert v2.get("failed") is not True
+
+
+@pytest.mark.asyncio
+async def test_batch_renders_per_pair_newer_hint():
+    # Chronology must survive batching (Codex P2): succeeded_by direction
+    # depends on which memory is newer.
+    router = _router(json.dumps([{"pair_id": 0, "relationship": "succeeded_by", "confidence": 0.9}]))
+    await classify_relationships(router, [("old fact", "new fact")], newers=["b"])
+    prompt = router.route_call.await_args.args[1][0]["content"]
+    assert "NEWER" in prompt

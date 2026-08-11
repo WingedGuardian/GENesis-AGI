@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -109,7 +110,12 @@ def _newer_hint(newer: str | None) -> str:
 
 
 def _failsafe(reasoning: str = "classifier fail-safe → distinct") -> dict[str, Any]:
-    return {"relationship": "distinct", "confidence": 0.0, "reasoning": reasoning}
+    """A verdict that means "classification FAILED", not "genuinely distinct".
+
+    ``failed: True`` lets consumers (the measurement probe's tally, MW-5's
+    gate) exclude fail-safes instead of silently counting them as benign.
+    """
+    return {"relationship": "distinct", "confidence": 0.0, "reasoning": reasoning, "failed": True}
 
 
 def _parse_json(text: str | None) -> Any:
@@ -137,12 +143,18 @@ def _normalize_verdict(raw: dict[str, Any]) -> dict[str, Any]:
     rel = raw.get("relationship")
     reasoning = str(raw.get("reasoning", "") or "")
     if rel not in COARSE_RELATIONSHIPS:
-        return {"relationship": "distinct", "confidence": 0.0, "reasoning": reasoning}
+        # The model responded, but outside the contract — a fail-safe, not a verdict.
+        return {"relationship": "distinct", "confidence": 0.0, "reasoning": reasoning, "failed": True}
     conf = raw.get("confidence")
     # bool is a subclass of int — reject it explicitly so True→1.0 can't sneak in.
     if isinstance(conf, bool) or not isinstance(conf, (int, float)):
         conf = 0.0
-    conf = max(0.0, min(1.0, float(conf)))
+    conf = float(conf)
+    # json.loads accepts bare NaN/Infinity; min(1.0, nan) returns 1.0 in Python,
+    # so an unguarded clamp would make a NaN verdict MAXIMALLY trusted.
+    if not math.isfinite(conf):
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
     return {"relationship": rel, "confidence": conf, "reasoning": reasoning}
 
 
@@ -189,16 +201,28 @@ async def classify_relationship(
         return _failsafe("exception → distinct")
 
 
-def _render_pairs(pairs: Sequence[tuple[str, str]]) -> str:
+def _render_pairs(
+    pairs: Sequence[tuple[str, str]],
+    newers: Sequence[str | None] | None = None,
+) -> str:
+    """Render numbered pairs; ``newers[i]`` ("a"/"b"/None) tags which memory is
+    NEWER so chronology survives batching (succeeded_by direction depends on it)."""
     blocks = []
     for i, (a, b) in enumerate(pairs):
-        blocks.append(f"[{i}]\nMemory A: {a[:_CONTENT_CAP]}\nMemory B: {b[:_CONTENT_CAP]}")
+        newer = newers[i] if newers and i < len(newers) else None
+        tag_a = " (NEWER)" if newer == "a" else ""
+        tag_b = " (NEWER)" if newer == "b" else ""
+        blocks.append(
+            f"[{i}]\nMemory A{tag_a}: {a[:_CONTENT_CAP]}\nMemory B{tag_b}: {b[:_CONTENT_CAP]}"
+        )
     return "\n\n".join(blocks)
 
 
 async def classify_relationships(
     router: Router,
     pairs: Sequence[tuple[str, str]],
+    *,
+    newers: Sequence[str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Batched :func:`classify_relationship` — one LLM call for many pairs.
 
@@ -211,7 +235,7 @@ async def classify_relationships(
     prompt = _BATCH_PROMPT.format(
         definitions=_DEFINITIONS,
         examples=_EXAMPLES,
-        pairs=_render_pairs(pairs),
+        pairs=_render_pairs(pairs, newers),
     )
     try:
         result = await router.route_call(

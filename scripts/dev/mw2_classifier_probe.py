@@ -38,9 +38,10 @@ SNAP = Path.home() / "tmp" / "mw2_probe_snapshot.db"
 OUT_DIR = Path.home() / ".genesis" / "output"
 
 # auto_link writes extends/supports; connection_pass writes related_to. These are
-# the similarity-derived (>=0.75) population MW-2 is about. (Not perfectly isolable
-# from extraction's strength=0.7 or synthesis's strength=1.0 edges — we report the
-# strength spread so the mix is visible.)
+# the similarity-derived (>=0.75) population MW-2 is about. The SELECT's strength
+# window [0.75, 1.0) excludes extraction-emitted typed links (exactly 0.7) and
+# synthesis provenance edges (exactly 1.0); the report's strength spread makes
+# the sampled window visible.
 _SIMILARITY_TYPES = ("extends", "supports", "related_to")
 
 
@@ -82,9 +83,14 @@ async def run(n: int, batch: int, seed: int) -> int:
     db.row_factory = aiosqlite.Row
     try:
         # Deterministic sample: seed sqlite's RANDOM via a stable ORDER key.
+        # Strength window isolates the SIMILARITY population (Codex P1):
+        # extraction-emitted typed links are strength=0.7 exactly and synthesis
+        # provenance edges are 1.0 exactly; auto_link writes cosine >=0.75 and
+        # connection_pass >=0.80, both strictly <1.0 in practice.
         rows = await db.execute_fetchall(
             "SELECT source_id, target_id, link_type, strength FROM memory_links "  # noqa: S608 - placeholders bound
             f"WHERE link_type IN ({','.join('?' * len(_SIMILARITY_TYPES))}) "
+            "AND strength >= 0.75 AND strength < 1.0 "
             "ORDER BY substr(source_id || target_id, 1, 12), source_id "
             "LIMIT ?",
             (*_SIMILARITY_TYPES, max(n * 3, n)),
@@ -107,7 +113,11 @@ async def run(n: int, batch: int, seed: int) -> int:
             return 2
 
         ids = sorted({r[0] for r in rows} | {r[1] for r in rows})
-        hydrated = await memory_crud.hydrate_for_expansion(db, ids)
+        # Chunk to stay under SQLite's 999-bind ceiling at large --n (Codex P2);
+        # hydrate_for_expansion itself builds ONE IN-clause.
+        hydrated: dict[str, dict] = {}
+        for off in range(0, len(ids), 400):
+            hydrated.update(await memory_crud.hydrate_for_expansion(db, ids[off : off + 400]))
 
         pairs: list[tuple[str, str]] = []
         meta: list[dict] = []
@@ -149,11 +159,18 @@ async def run(n: int, batch: int, seed: int) -> int:
             )
 
         # ── tally ──────────────────────────────────────────────────────────
-        dist = Counter(v["relationship"] for v in verdicts)
-        total = len(verdicts)
+        # Fail-safes (LLM/parse failure, out-of-vocab) are NOT verdicts — counting
+        # them as "distinct" would silently deflate the unsafe fraction (Codex P1).
+        classified = [v for v in verdicts if not v.get("failed")]
+        failsafe_count = len(verdicts) - len(classified)
+        dist = Counter(v["relationship"] for v in classified)
+        total = len(classified)
+        if not total:
+            print("Every classification failed — no distribution to report.", file=sys.stderr)
+            return 2
         unsafe = dist["contradicts"] + dist["succeeded_by"] + dist["duplicate"]
         conf_by_rel: dict[str, list[float]] = {r: [] for r in COARSE_RELATIONSHIPS}
-        for v in verdicts:
+        for v in classified:
             conf_by_rel[v["relationship"]].append(v["confidence"])
         strengths = [m["strength"] for m in meta]
 
@@ -165,6 +182,7 @@ async def run(n: int, batch: int, seed: int) -> int:
             "snapshot": str(SNAP),
             "sampled_edges": len(rows),
             "classified_pairs": total,
+            "failsafe_unclassified": failsafe_count,
             "stored_type_mix": dict(Counter(m["stored_link_type"] for m in meta)),
             "strength_spread": {
                 "min": round(min(strengths), 3),
@@ -210,10 +228,17 @@ async def run(n: int, batch: int, seed: int) -> int:
         await db.close()
 
 
+def _positive_int(value: str) -> int:
+    n = int(value)
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {n}")
+    return n
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=300, help="edges to sample")
-    ap.add_argument("--batch", type=int, default=15, help="pairs per LLM call")
+    ap.add_argument("--n", type=_positive_int, default=300, help="edges to sample")
+    ap.add_argument("--batch", type=_positive_int, default=15, help="pairs per LLM call")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
     return asyncio.run(run(args.n, args.batch, args.seed))
