@@ -10,6 +10,33 @@ Catches all variations of pushing to or merging into the main branch:
 - gh pr merge with unresolved review findings (ERROR/[P1]/HARD BLOCK)
 
 Stdlib-only. Fail-open on parse errors (don't block legitimate work).
+
+Threat model (declared — the standing triage rule for the merge gate)
+---------------------------------------------------------------------
+This is a PROCESS gate for a SINGLE-AUTHOR, single-remote, github.com repo whose
+PRs target the default branch. It defends the SESSION'S OWN process failures, not
+an adversary:
+
+  * merging a head Codex never reviewed, or reviewed at an earlier commit
+    (``_check_codex_reviewed_head`` + the ``--match-head-commit`` binding);
+  * a race with the session's OWN later push between check and merge (same
+    binding — GitHub enforces it server-side);
+  * an ACCIDENTAL wrong-repo merge — a bare merge run from another checkout or
+    after a ``cd`` (``_derive_repo_from_cwd``); or an unresolvable ``--repo``;
+  * an ACCIDENTAL base retarget that silently invalidates the review, since the
+    head never moves (``_check_base_is_default``);
+  * an unreadable mergeability / review status read as "clean" (allowlist
+    posture: block unless a DEFINITE good value — MERGEABLE, a current review).
+
+It does NOT model a malicious operator crafting argv to defeat the gate (they own
+``--admin`` and ``# review-override`` already), NOR a multi-actor repo where a
+hostile collaborator force-pushes or retargets. Findings outside this model
+(adversarial argv shaping, hostile-collaborator timelines, non-github hosts) are
+OUT OF SCOPE BY DESIGN — reply as such rather than adding another patch. The
+cluster-safe ``--match-head-commit`` parse + fail-closed shadow-flag belt already
+exceed the model (defense-in-depth), which is fine; they are not an invitation to
+chase every argv-shaping edge. ``# review-override`` is the conscious escape for
+every gate here.
 """
 
 from __future__ import annotations
@@ -304,6 +331,36 @@ def _merge_target_repo(argv: list[str], cmd: str):
     return None
 
 
+def _derive_repo_from_cwd(cwd: str) -> str | None:
+    """The OWNER/REPO gh resolves in directory ``cwd`` (``nameWithOwner``), or None.
+
+    ``gh pr merge`` and ``gh repo view`` share gh's base-repo resolution (git
+    remotes in the working dir + the ``gh-resolved`` config key), so this is the
+    repo a bare (no ``--repo``) merge run FROM ``cwd`` will actually target.
+
+    Root cause this addresses: the hook's gh queries run in the HOOK process's
+    cwd, while gh executes the merge in the Bash tool's effective cwd. When those
+    differ (a ``cd`` before the merge, or the session sitting in another checkout)
+    a bare merge gated the wrong repo. Deriving the repo from the merge's own
+    effective cwd re-aligns them. Tests inject via ``_TEST_GH_DERIVED_REPO``.
+    """
+    raw = os.environ.get("_TEST_GH_DERIVED_REPO")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=cwd,
+            )
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    got = (raw or "").strip()
+    return _normalize_repo(got) if got else None
+
+
 def _extract_pr_number(cmd: str) -> str | None:
     """PR number from a gh pr merge command (bare number, #N, or URL)."""
     match = re.search(r"\bgh pr merge\b(.*)$", cmd, re.DOTALL)
@@ -345,7 +402,7 @@ def _repo_args(repo: str | None) -> list[str]:
     return ["--repo", repo] if repo else []
 
 
-def _resolve_pr_number(cmd: str, repo: str | None = None) -> str | None:
+def _resolve_pr_number(cmd: str, repo: str | None = None, cwd: str | None = None) -> str | None:
     """Command PR number, else the current branch's open PR.
 
     No-arg `gh pr merge` from a PR branch is valid gh usage, but it
@@ -354,20 +411,29 @@ def _resolve_pr_number(cmd: str, repo: str | None = None) -> str | None:
     behind findings-ignored merges. Resolution failure is the caller's
     signal to fail CLOSED for merge commands.
 
-    With an explicit ``repo`` and no number in the command, `gh pr view
-    --repo` errors (a selector is required) → None → the caller fails CLOSED.
-    That is deliberate: resolving the CWD branch's PR *number* and gating it
-    against a DIFFERENT repo would re-create the wrong-PR bug this fix kills.
+    Numberless resolution of the branch's PR:
+      * ``cwd`` given (the merge's repo was DERIVED from that cwd, F3): run
+        ``gh pr view`` IN that dir with NO ``--repo`` — gh resolves the repo and
+        the branch's PR together, exactly as the bare merge will, so the number
+        matches the derived repo (both come from the same dir). Passing ``--repo``
+        here would instead error ("argument required when using the --repo flag").
+      * explicit user ``repo`` and NO ``cwd`` → fail CLOSED (None). Resolving a
+        cwd-branch PR *number* and gating it against a DIFFERENT user-named repo
+        would re-create the wrong-PR bug this gate kills.
+      * neither → gh's own cwd (the hook process's), the legacy behavior.
     """
     pr_num = _extract_pr_number(cmd)
     if pr_num:
         return pr_num
+    if repo is not None and cwd is None:
+        return None  # explicit --repo + numberless → fail CLOSED (see above)
     try:
         result = subprocess.run(
-            ["gh", "pr", "view", *_repo_args(repo), "--json", "number", "--jq", ".number"],
+            ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
             capture_output=True,
             text=True,
             timeout=10,
+            cwd=cwd,  # None ⇒ the hook's own cwd (legacy path)
         )
         resolved = result.stdout.strip()
         if result.returncode == 0 and resolved.isdigit():
@@ -378,7 +444,9 @@ def _resolve_pr_number(cmd: str, repo: str | None = None) -> str | None:
 
 
 def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
-    """Query GitHub for PR mergeable status. Returns MERGEABLE/UNKNOWN/CONFLICTING or None."""
+    """Query GitHub for PR mergeable status. Returns MERGEABLE/UNKNOWN/CONFLICTING,
+    or None on a failed query. Callers fail CLOSED: the merge gate blocks unless
+    the value is a definite MERGEABLE (None/"" — a failed read — no longer merges)."""
     try:
         result = subprocess.run(
             [
@@ -398,7 +466,7 @@ def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
         )
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
-        return None  # Fail-open
+        return None  # unreadable → caller treats as non-MERGEABLE → blocks
 
 
 # Check-run conclusions / statuses that mean the CI is NOT green.
@@ -589,11 +657,28 @@ def _inline_title(body: str) -> str:
     return (first[0].strip() if first else "")[:120]
 
 
+def _scan_unreadable(strict: bool, what: str) -> tuple[bool, str]:
+    """Return value for a finding scan that could NOT be read — a gh error,
+    timeout, or malformed JSON — as distinct from a scan that ran and found
+    nothing (an empty result / Codex quota, which stays clean either way).
+
+    Enforcement (``strict=False``, the default) fails OPEN: a transient gh error
+    must not wedge merges, and the freshness gate already requires a review to
+    EXIST at the head. Report mode (``strict=True``) fails CLOSED so the canonical
+    ``--check-pr`` report never presents an UNREADABLE scan as "ok" / emits a
+    false "all gates pass" (Codex P2, PR #1366).
+    """
+    if strict:
+        return True, f"could not read {what} — review status UNREADABLE (retry), not clean."
+    return False, ""
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
     force: bool = False,
     repo: str | None = None,
+    strict: bool = False,
 ) -> tuple[bool, str]:
     """Scan INLINE review comments for P1/P2 badge findings.
 
@@ -601,7 +686,8 @@ def _check_inline_review_findings(
     thread has a reply (engagement = read) or the merge carries
     '# review-override'. P2 findings never block but are printed to
     stderr one per line — the session must consciously accept them.
-    Fail-open on any error, like _check_pr_review_findings.
+    On an UNREADABLE scan (gh error/timeout/malformed): enforcement fails OPEN;
+    ``strict`` (report mode) fails CLOSED — see ``_scan_unreadable``.
     """
     if force:
         return False, ""  # override NOTE already printed by the body gate
@@ -624,10 +710,10 @@ def _check_inline_review_findings(
             timeout=30,
         )
         if result.returncode != 0:
-            return False, ""
+            return _scan_unreadable(strict, "inline review comments")
         raw = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     except Exception:
-        return False, ""
+        return _scan_unreadable(strict, "inline review comments")
 
     replied_to = {c.get("reply_to") for c in raw if c.get("reply_to")}
     p1: list[str] = []
@@ -665,14 +751,17 @@ def _check_inline_review_findings(
 
 
 def _check_pr_review_findings(
-    pr_num: str, *, force: bool = False, repo: str | None = None
+    pr_num: str, *, force: bool = False, repo: str | None = None, strict: bool = False
 ) -> tuple[bool, str]:
     """Check PR comments for unresolved automated review findings.
 
     Returns (should_block, message).
 
-    Fail-open: returns (False, "") on any error — the hook must never
-    become a single point of failure for merges.
+    On an UNREADABLE scan (gh error/timeout/malformed JSON), enforcement fails
+    OPEN — the hook must never become a single point of failure for merges — while
+    ``strict`` (report mode) fails CLOSED so ``--check-pr`` never reports a failed
+    scan as clean (see ``_scan_unreadable``). An empty result (no comments / Codex
+    quota) is clean either way.
     """
     if force:
         print(
@@ -696,9 +785,9 @@ def _check_pr_review_findings(
             timeout=15,
         )
         if result.returncode != 0:
-            return False, ""  # Fail-open on API error
+            return _scan_unreadable(strict, "review-body comments")  # gh error
     except Exception:
-        return False, ""  # Fail-open
+        return _scan_unreadable(strict, "review-body comments")
 
     output = result.stdout.strip()
     if not output or output == "[]":
@@ -708,7 +797,7 @@ def _check_pr_review_findings(
     try:
         raw_comments = json.loads(output)
     except json.JSONDecodeError:
-        return False, ""  # Fail-open on parse error
+        return _scan_unreadable(strict, "review-body comments")  # malformed JSON
 
     # GitHub API can return "body": null for deleted comments —
     # use `or ""` to coerce None to empty string (get's default only
@@ -755,6 +844,390 @@ def _check_pr_review_findings(
 
     # No bot review comments found — allow (no review posted)
     return False, ""
+
+
+# ── Codex review FRESHNESS (a CURRENT review must exist, not just no findings) ──
+# The finding scanners above block on UNRESOLVED findings, but a merge can still
+# proceed with NO review at all, or a review of a STALE commit (Codex reviewed A,
+# code B pushed after) — the scans come back empty and the merge sails through
+# unseen. This gate requires Codex's most recent review to cover the PR's current
+# head, compared on the FULL 40-char oid GitHub records for the review
+# (the review object's ``commit_id``) — NOT a short prefix from the body, which a
+# stale prefix (or a ground SHA sharing it) could satisfy. Waived by
+# '# review-override' (the conscious "merge without a current Codex review" case).
+_CODEX_REVIEW_BOT = "chatgpt-codex-connector[bot]"
+
+
+def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The PR's current head commit oid (headRefOid), or None on any error.
+
+    Tests inject via the ``_TEST_GH_HEAD_SHA`` env var so no network is needed.
+    """
+    raw = os.environ.get("_TEST_GH_HEAD_SHA")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_num,
+                    *_repo_args(repo),
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    sha = (raw or "").strip()
+    return sha or None
+
+
+def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The FULL commit oid (``.commit_id``) of Codex's MOST RECENT review, or None
+    if Codex has posted no review (or on any API/parse error).
+
+    Uses GitHub's authoritative per-review ``commit_id`` (the exact 40-char oid
+    the review was submitted against) rather than parsing the review body — so the
+    comparison is a full-oid identity, immune to short-prefix collisions/grinding.
+    The ``/pulls/N/reviews`` endpoint returns reviews oldest-first, so the last
+    Codex entry wins. Tests inject via ``_TEST_GH_CODEX_REVIEWS`` (one JSON object
+    per line: ``{login, commit_id}``). Fail-safe: None on any API/parse error.
+    """
+    raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/reviews",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {login: .user.login, commit_id: .commit_id}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
+        except Exception:
+            return None
+    latest: str | None = None
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
+            continue
+        cid = (obj.get("commit_id") or "").strip().lower()
+        if cid:
+            latest = cid
+    return latest
+
+
+def _check_codex_reviewed_head(
+    pr_num: str, *, force: bool = False, repo: str | None = None
+) -> tuple[bool, str, str | None]:
+    """Block a merge unless Codex has reviewed the PR's CURRENT head commit.
+
+    Compares the PR's ``headRefOid`` against the FULL ``commit_id`` of Codex's
+    latest review — an EXACT identity, no prefix match. Fail-CLOSED: if the head
+    cannot be read, or Codex has no review / reviewed a different commit, the
+    merge is BLOCKED. This is an enforcement gate, so an unverifiable review is
+    treated as absent (blocked), NOT waved through — matching ``_check_mergeable``
+    (which blocks on UNKNOWN), not the advisory finding-scanners. ``force`` (a
+    ``# review-override`` on the merge segment) is the conscious escape (e.g. a
+    genuine Codex outage).
+
+    Returns ``(should_block, message, verified_head)`` — ``verified_head`` is the
+    full head oid the review was verified against (only when not blocked and not
+    forced); the caller binds the MERGE to it via ``--match-head-commit`` so a
+    push landing between this check and the merge cannot smuggle an unreviewed
+    head through (TOCTOU — Codex P1, PR #1366).
+    """
+    if force:
+        return False, "", None
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return (
+            True,
+            (
+                f"could not read PR #{pr_num}'s head commit to verify a current Codex "
+                f"review (GitHub query failed).\n"
+                f"Retry, or append '# review-override' to merge anyway."
+            ),
+            None,
+        )
+    head = head.strip().lower()
+    reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
+    if not reviewed:
+        return (
+            True,
+            (
+                f"no Codex review found for PR #{pr_num} at head {head[:12]}.\n"
+                f"Codex reviews on PR-open — it does NOT auto-review a later fix-commit; "
+                f"comment '@codex review' on the PR to review the current head (then wait), "
+                f"or append '# review-override' to merge without a current Codex review "
+                f"(e.g. Codex is down)."
+            ),
+            None,
+        )
+    if reviewed != head:
+        return (
+            True,
+            (
+                f"Codex's latest review is STALE: it reviewed {reviewed[:12]}, but PR "
+                f"#{pr_num} head is {head[:12]} (new commits pushed after the review).\n"
+                f"Comment '@codex review' on the PR to re-review the current head (Codex "
+                f"does NOT auto-review fix-commits), then wait; or append "
+                f"'# review-override' to merge anyway."
+            ),
+            None,
+        )
+    return False, "", head
+
+
+def _pr_base_ref(pr_num: str, repo: str | None = None) -> str | None:
+    """The branch this PR MERGES INTO (``baseRefName``), or None on any error.
+
+    Tests inject via ``_TEST_GH_BASE_REF`` (its own seam, mirroring
+    ``_pr_head_sha``'s ``_TEST_GH_HEAD_SHA`` — one gh interaction per seam keeps
+    each independently fakeable; the extra ``gh pr view`` is cheap on a rare merge).
+    """
+    raw = os.environ.get("_TEST_GH_BASE_REF")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr_num,
+                    *_repo_args(repo),
+                    "--json",
+                    "baseRefName",
+                    "--jq",
+                    ".baseRefName",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    ref = (raw or "").strip()
+    return ref or None
+
+
+def _repo_default_branch(repo: str | None = None) -> str | None:
+    """The repo's default branch name (``defaultBranchRef.name``), or None on error.
+
+    ``gh repo view`` takes the repo as a POSITIONAL (``gh repo view OWNER/REPO``),
+    not ``--repo`` — verified: ``gh pr view`` has no ``defaultBranchRef`` field, so
+    this cannot be folded into the base query. No positional ⇒ gh's cwd repo.
+    Tests inject via ``_TEST_GH_DEFAULT_BRANCH``.
+    """
+    raw = os.environ.get("_TEST_GH_DEFAULT_BRANCH")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "repo",
+                    "view",
+                    *([repo] if repo else []),
+                    "--json",
+                    "defaultBranchRef",
+                    "--jq",
+                    ".defaultBranchRef.name",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            raw = result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return None
+    name = (raw or "").strip()
+    return name or None
+
+
+def _check_base_is_default(
+    pr_num: str, *, force: bool = False, repo: str | None = None
+) -> tuple[bool, str]:
+    """Block unless the PR's base branch == the repo's default branch.
+
+    A PR retargeted AFTER Codex reviewed it still passes the head-freshness gate —
+    the head oid never moved — even though the base change can substantially alter
+    the effective diff (GitHub's review object records no base, so freshness alone
+    cannot see it). This repo's PRs always target the default branch, so a
+    non-default base is anomalous → block. Fail-CLOSED: an unreadable base OR
+    default is treated as unverifiable → block (matching the rest of this gate).
+    ``force`` (a ``# review-override`` on the merge segment) is the conscious
+    escape for a deliberate stacked/non-default PR. Declared threat model: this
+    guards an ACCIDENTAL retarget on a single-author repo, not an adversary.
+    """
+    if force:
+        return False, ""
+    base = _pr_base_ref(pr_num, repo=repo)
+    default = _repo_default_branch(repo=repo)
+    if not base or not default:
+        return (
+            True,
+            (
+                f"could not confirm PR #{pr_num}'s base branch against the repo default "
+                f"(base={base or '?'}, default={default or '?'}) — retry, or append "
+                f"'# review-override' to merge anyway."
+            ),
+        )
+    if base != default:
+        return (
+            True,
+            (
+                f"PR #{pr_num} targets base '{base}', not the default branch '{default}'. "
+                f"A retargeted PR's Codex review may not reflect the new diff — re-run "
+                f"'@codex review' on the PR, or append '# review-override' for a "
+                f"deliberate stacked/non-default PR."
+            ),
+        )
+    return False, ""
+
+
+def _suggested_merge_cmd(pr_num: str, verified_head: str, repo: str | None) -> str:
+    """The exact atomic merge command to copy — PRESERVING an explicit --repo.
+
+    Dropping the target repo from a generated command retargets the merge to the
+    cwd repo, which can merge an unrelated same-numbered PR (Codex P1, round 3).
+    ``repo`` is the already-normalized OWNER/REPO the gates ran against, or None
+    (cwd repo → no --repo).
+    """
+    repo_part = f"--repo {repo} " if repo else ""
+    return f"gh pr merge {pr_num} {repo_part}--squash --admin --match-head-commit {verified_head}"
+
+
+# gh pr merge flags that CONSUME the FOLLOWING token as their value (separate
+# form). When scanning for --match-head-commit these values MUST be skipped, else
+# a `--body --match-head-commit=<sha>` — where the sha is --body's VALUE, taken as
+# body TEXT by gh with NO head binding — is misread as an active binding while gh
+# merges unbound (Codex P1, round 3). --repo is gate-relevant (handled elsewhere)
+# but still value-consuming here; --match-head-commit itself consumes its own SHA.
+# NOTE: the risk is the PARSE MODEL (pflag argument consumption + short-flag
+# clustering), not the flag names — the long value-flag set is identical across
+# gh 2.45–2.96 `gh pr merge --help`.
+_GH_MERGE_VALUE_FLAGS = frozenset(
+    {
+        "--body",
+        "-b",
+        "--body-file",
+        "-F",
+        "--subject",
+        "-t",
+        "--author-email",
+        "-A",
+        "--repo",
+        "-R",
+        "--match-head-commit",
+    }
+)
+# Content value-flags (LONG forms) that can SHADOW --match-head-commit as their
+# value and have NO legitimate use on a gated --admin squash-merge. Their mere
+# presence is refused (fail-closed belt over the value-skipping parse). Short
+# forms are handled letter-wise in the cluster helpers below.
+_GH_MERGE_SHADOW_FLAGS = frozenset({"--body", "--body-file", "--subject", "--author-email"})
+# Short flags on gh pr merge. VALUE letters consume a value (glued remainder, else
+# the NEXT token); the rest are booleans (-d/-m/-r/-s). A cluster like `-db` is
+# -d(bool) + -b(value), so gh's -b swallows the FOLLOWING token — a scan treating
+# `-db` as opaque misses that consumption (audit round 4: `-db --match-head-commit=X`
+# merges UNBOUND). SHADOW shorts are the content ones (not -R).
+_GH_MERGE_VALUE_SHORTS = "bFtAR"
+_GH_MERGE_SHADOW_SHORTS = "bFtA"
+
+
+def _is_short_cluster(tok: str) -> bool:
+    return tok.startswith("-") and not tok.startswith("--") and len(tok) > 1
+
+
+def _short_cluster_consumes_next(tok: str) -> bool:
+    """Whether a ``-<letters>`` short cluster makes gh consume the NEXT argv token
+    as a value — a value-short letter with NO glued remainder after it. Boolean
+    letters before it are consumed in place. Mirrors pflag."""
+    if not _is_short_cluster(tok):
+        return False
+    letters = tok[1:]
+    for j, ch in enumerate(letters):
+        if ch in _GH_MERGE_VALUE_SHORTS:
+            return letters[j + 1 :] == ""  # glued remainder ⇒ value in-token, not next
+    return False
+
+
+def _merge_match_head(argv: list[str]) -> str | None:
+    """The value gh will use for ``--match-head-commit`` on a merge argv, or None.
+
+    Parses with gh-equivalent argument consumption: value-taking flags
+    (``_GH_MERGE_VALUE_FLAGS``) consume the next token, so a --match-head-commit
+    token that is actually ANOTHER flag's value is not misread as a binding. A
+    bare ``--`` ends option parsing (everything after is positional; gh rejects
+    extra positionals). Returns the LAST occurrence — gh pflag last-value-wins
+    (same rule as ``_pr_create_head_raw``); first-wins would let a trailing
+    ``--match-head-commit <other>`` be enforced by gh while the hook validated an
+    earlier value.
+    """
+    argv = argv or []
+    result: str | None = None
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break  # end of options — the rest are positionals gh would reject
+        if tok in _GH_MERGE_VALUE_FLAGS:
+            # Separate-form value flag consumes the NEXT token. When the flag is
+            # --match-head-commit itself, that next token is the value we want.
+            if tok == "--match-head-commit" and i + 1 < len(argv):
+                result = argv[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--match-head-commit="):
+            result = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if _short_cluster_consumes_next(tok):
+            i += 2  # cluster's trailing value-short swallows the next token
+            continue
+        i += 1
+    return result
+
+
+def _merge_has_shadow_flag(argv: list[str]) -> bool:
+    """Whether the merge carries a content flag that could shadow the head-match
+    binding — long form, ``=`` form, bare short, or inside a short cluster
+    (``-db`` etc.). Refused outright as a fail-closed belt."""
+    for tok in argv or []:
+        if tok == "--":
+            break
+        base = tok.split("=", 1)[0]
+        if base in _GH_MERGE_SHADOW_FLAGS:
+            return True
+        if _is_short_cluster(base):
+            for ch in base[1:]:
+                if ch in _GH_MERGE_SHADOW_SHORTS:
+                    return True
+                if ch in _GH_MERGE_VALUE_SHORTS:
+                    break  # a value-short (e.g. -R): the rest is its glued value
+    return False
 
 
 def _is_dispatched() -> bool:
@@ -1637,19 +2110,41 @@ def main() -> int:
             # so an unrelated segment's PR URL cannot select the gated repo
             # (`echo …/other/repo/pull/9 && gh pr merge 12` must gate the cwd repo).
             merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
+            # For a DERIVED (no --repo) merge, the dir gh resolves the repo AND a
+            # numberless branch-PR from — threaded to _resolve_pr_number so a
+            # numberless `gh pr merge` still resolves (an explicit --repo would
+            # error there). None ⇒ an explicit --repo or the legacy no-cwd path.
+            merge_cwd: str | None = None
+            if merge_repo is None:
+                # No explicit --repo/-R: gh resolves the repo from the merge's
+                # EFFECTIVE cwd (payload cwd + any preceding `cd`), which can
+                # differ from the HOOK process's cwd — so the gates' gh queries
+                # (run in the hook's cwd) could check a DIFFERENT repo than the
+                # one gh merges in (a bare merge from another checkout, or after
+                # a `cd`). Derive the repo gh will actually target and gate THAT.
+                # Fail CLOSED only when the cwd is ambiguous (_CWD_UNKNOWN) or gh
+                # can't resolve a repo there; no cwd info at all (None) keeps
+                # today's cwd-based behavior — there is nothing to derive from.
+                eff_cwd = _effective_cwd(cmd, payload, seg=merge_seg)
+                if eff_cwd is _CWD_UNKNOWN:
+                    merge_repo = _REPO_UNRESOLVED
+                elif eff_cwd is not None:
+                    merge_repo = _derive_repo_from_cwd(eff_cwd) or _REPO_UNRESOLVED
+                    merge_cwd = eff_cwd  # resolve a numberless PR in the same dir
             if merge_repo is _REPO_UNRESOLVED:
                 print(
-                    "BLOCKED: cannot resolve the target repo of this --repo/-R "
-                    "merge (a variable, an enterprise host, or an odd URL).",
+                    "BLOCKED: cannot determine which repository this merge targets "
+                    "(an unresolvable --repo/-R value, an enterprise host, an odd "
+                    "URL, or an ambiguous working directory).",
                     file=sys.stderr,
                 )
                 print(
-                    "Specify it as OWNER/REPO so the CI/review gates check the "
+                    "Append --repo OWNER/REPO so the CI/review gates check the "
                     "right repository, not the current directory's.",
                     file=sys.stderr,
                 )
                 return 2
-            pr_num = _resolve_pr_number(cmd, repo=merge_repo)
+            pr_num = _resolve_pr_number(cmd, repo=merge_repo, cwd=merge_cwd)
             if pr_num is None:
                 print(
                     "BLOCKED: cannot resolve which PR this merges "
@@ -1664,19 +2159,26 @@ def main() -> int:
                 return 2
             if pr_num:
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
-                if mergeable == "UNKNOWN":
-                    print(
-                        f"BLOCKED: PR #{pr_num} mergeable status is UNKNOWN.",
-                        file=sys.stderr,
-                    )
-                    print(
-                        "GitHub hasn't finished conflict analysis. Wait and retry.",
-                        file=sys.stderr,
-                    )
-                    return 2
                 if mergeable == "CONFLICTING":
                     print(
                         f"BLOCKED: PR #{pr_num} has merge conflicts. Resolve before merging.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if mergeable != "MERGEABLE":
+                    # Allowlist (fail-CLOSED): anything that is not a definite
+                    # MERGEABLE is unverifiable — UNKNOWN (GitHub still computing
+                    # conflicts), None/"" (the query FAILED; _check_mergeable
+                    # fails OPEN to None), or an unrecognized future state. The
+                    # old `== "UNKNOWN"` check let None/"" sail through and merge.
+                    # Retry is the remedy (a transient gh hiccup resolves).
+                    print(
+                        f"BLOCKED: PR #{pr_num} mergeable status is "
+                        f"'{mergeable or 'unreadable'}', not MERGEABLE.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "GitHub may still be computing it, or the query failed. Wait and retry.",
                         file=sys.stderr,
                     )
                     return 2
@@ -1715,8 +2217,47 @@ def main() -> int:
                         file=sys.stderr,
                     )
 
-                # Check for unresolved review findings
                 force_override = merge_seg.override
+
+                # Base-branch invariant: a PR retargeted AFTER Codex reviewed it
+                # keeps the SAME head oid, so head-freshness alone can't see the
+                # base change that may have altered the effective diff. Require
+                # base == the repo's default branch. Waived by # review-override
+                # for a deliberate stacked/non-default PR.
+                should_block, base_msg = _check_base_is_default(
+                    pr_num,
+                    force=force_override,
+                    repo=merge_repo,
+                )
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — base branch is not the repo default.",
+                        file=sys.stderr,
+                    )
+                    print(base_msg, file=sys.stderr)
+                    return 2
+
+                # Codex must have reviewed the CURRENT head (existence + freshness)
+                # — not merely have no open findings. This runs BEFORE the finding
+                # scans below: a review published between the scans and this check
+                # would otherwise pass freshness while its own P1 comments went
+                # unscanned (the scans came back empty). Freshness first, then
+                # findings. A not-yet-reviewed / stale-reviewed head blocks here.
+                # Waived by # review-override.
+                should_block, fresh_msg, verified_head = _check_codex_reviewed_head(
+                    pr_num,
+                    force=force_override,
+                    repo=merge_repo,
+                )
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — Codex has not reviewed the current head.",
+                        file=sys.stderr,
+                    )
+                    print(fresh_msg, file=sys.stderr)
+                    return 2
+
+                # Unresolved review findings (review body) — now AFTER freshness.
                 should_block, review_msg = _check_pr_review_findings(
                     pr_num,
                     force=force_override,
@@ -1744,6 +2285,48 @@ def main() -> int:
                     )
                     print(inline_msg, file=sys.stderr)
                     return 2
+
+                # Bind the MERGE to the verified head (TOCTOU — Codex P1): a push
+                # landing between the check above and the merge would otherwise
+                # merge an UNREVIEWED head under a stale verification. GitHub
+                # enforces `--match-head-commit` server-side (the merge is
+                # rejected if the head moved), making check→merge atomic. Only
+                # engaged when the freshness check ran (not # review-override).
+                if verified_head:
+                    # Fail-closed belt: content value-flags can smuggle a
+                    # --match-head-commit token as their VALUE (gh takes it as
+                    # text → no binding) and have no use on a gated squash-merge.
+                    if _merge_has_shadow_flag(merge_seg.argv):
+                        print(
+                            "BLOCKED: --body/--subject/--body-file/--author-email are "
+                            "not allowed on a gated merge — they can shadow the "
+                            "--match-head-commit binding. Remove them (set a squash "
+                            "message via the GitHub UI if needed).",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    match_head = _merge_match_head(merge_seg.argv)
+                    if match_head is None:
+                        print(
+                            "BLOCKED: merge must be bound to the Codex-verified head "
+                            "commit so a race with a new push cannot merge an "
+                            "unreviewed head. Re-run with:",
+                            file=sys.stderr,
+                        )
+                        print(
+                            "  " + _suggested_merge_cmd(pr_num, verified_head, merge_repo),
+                            file=sys.stderr,
+                        )
+                        return 2
+                    if match_head.strip().lower() != verified_head:
+                        print(
+                            f"BLOCKED: --match-head-commit {match_head[:12]} does not "
+                            f"equal the Codex-verified head {verified_head[:12]} — the "
+                            f"branch moved (or the sha is stale). Re-verify and use "
+                            f"the current verified head.",
+                            file=sys.stderr,
+                        )
+                        return 2
 
         # ── sqlite3 write operations ────────────────────────────────
         # Whole-command match (never misses a fragmented/wrapped invocation),
@@ -1823,5 +2406,67 @@ def main() -> int:
     return 0
 
 
+def check_pr_report(pr_num: str, repo: str | None = None) -> int:
+    """CANONICAL pre-merge report: run the SAME checks the merge gate enforces.
+
+    This exists so sessions never hand-roll the review check with ad-hoc
+    gh/jq (2026-08-10: a hand-rolled query used the GraphQL bot login on the
+    REST endpoint — `chatgpt-codex-connector` vs `…[bot]` — matched nothing,
+    and the empty result was reported as "Codex clean" while 5 P2 findings sat
+    unread). Report and enforcement share these functions, so a bug in one is a
+    bug in both. The ONE deliberate divergence: the report runs the finding scans
+    in ``strict`` mode, so an UNREADABLE scan (gh error) shows as a failure here
+    rather than fail-open as enforcement does — the report must never issue a
+    false all-clear.
+
+    Prints one line per gate; returns 0 when every gate would pass, 1 otherwise.
+    """
+    failures = 0
+    mergeable = _check_mergeable(pr_num, repo=repo)
+    print(f"mergeable      : {mergeable or 'unreadable'}")
+    # Allowlist, matching the enforcement arm: anything that is not a definite
+    # MERGEABLE (UNKNOWN, None/"" query failure, or a new state) counts as a
+    # failure — the old `in (UNKNOWN, CONFLICTING)` set let None/"" pass.
+    if mergeable != "MERGEABLE":
+        failures += 1
+    ci_state, ci_bad = _pr_ci_status(pr_num, repo=repo)
+    print(f"ci             : {ci_state}{' (' + ', '.join(ci_bad[:6]) + ')' if ci_bad else ''}")
+    if ci_state in ("red", "pending"):
+        failures += 1
+    # Order mirrors the gate: base-invariant → freshness → finding scans, so a
+    # review published mid-run can't pass freshness with its P1s unscanned.
+    blocked, msg = _check_base_is_default(pr_num, repo=repo)
+    print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
+    failures += 1 if blocked else 0
+    blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
+    print(f"codex-at-head  : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (current)'}")
+    if not blocked and verified_head:
+        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
+    failures += 1 if blocked else 0
+    # strict=True: a scan that could not be READ (gh error/malformed) must show as
+    # a failure here, never as "ok" — the report must not issue a false all-clear.
+    blocked, msg = _check_pr_review_findings(pr_num, repo=repo, strict=True)
+    print(f"review-body    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok'}")
+    failures += 1 if blocked else 0
+    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, strict=True)
+    print(
+        f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
+    )
+    failures += 1 if blocked else 0
+    print(
+        "verdict        :",
+        "MERGEABLE (all gates pass)" if failures == 0 else f"{failures} gate(s) would block",
+    )
+    return 0 if failures == 0 else 1
+
+
 if __name__ == "__main__":
+    # Report mode: `git_push_guard.py --check-pr <N> [--repo OWNER/REPO]` — the
+    # canonical pre-merge check (same functions as enforcement). No hook payload.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--check-pr":
+        _repo_arg = None
+        if "--repo" in sys.argv[3:]:
+            _ri = sys.argv.index("--repo")
+            _repo_arg = sys.argv[_ri + 1] if _ri + 1 < len(sys.argv) else None
+        sys.exit(check_pr_report(sys.argv[2], repo=_repo_arg))
     run_guard(main, "git_push_guard")

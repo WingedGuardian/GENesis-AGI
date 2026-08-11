@@ -738,7 +738,29 @@ outlives its incident is a bug.
 
 ## Pre-Merge Gate
 
-`git_push_guard.py` enforces a **hard gate** on review findings:
+**Canonical pre-merge check:** run
+`python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
+BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses
+(mergeable → CI → base-invariant → Codex-freshness → review-body → inline
+findings), so the report and the gate can never disagree — never hand-roll a
+gh/jq review check (a hand-rolled query once used the GraphQL bot login on the
+REST endpoint, matched nothing, and reported "Codex clean" while P2s sat unread).
+When all gates pass it prints the exact atomic merge command to copy
+(`... --match-head-commit <verified-head>`); use that command verbatim.
+
+`git_push_guard.py` enforces a **hard gate** at merge time. Beyond the review
+findings below, a gated `gh pr merge`:
+- must carry `--admin` (explicit approval flag) and be bound to the reviewed head
+  via `--match-head-commit` (GitHub rejects it server-side if the head moved —
+  TOCTOU defense); the `--check-pr` command supplies this;
+- requires Codex to have reviewed the **current head** — Codex does NOT auto-review
+  a later fix-commit, so comment `@codex review` and wait after any push;
+- requires the PR base to equal the repo's default branch (retarget guard);
+- blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
+  does not merge). `# review-override` waives the review/freshness/base gates
+  (not CI — that is `# ci-override`).
+
+The review-findings gate specifically:
 
 1. After CI passes, the merge hook automatically checks PR comments
    for automated review findings (ERROR, [P1], HARD BLOCK).
