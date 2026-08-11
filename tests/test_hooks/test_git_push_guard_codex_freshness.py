@@ -254,3 +254,88 @@ class TestMergeMatchHeadRepeat:
             f"--match-head-commit={HEAD}",
         ]
         assert _mod._merge_match_head(argv) == HEAD
+
+
+class TestPrBaseRef:
+    """_pr_base_ref reads the PR's baseRefName (seam _TEST_GH_BASE_REF)."""
+
+    def test_reads_seam(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "main")
+        assert _mod._pr_base_ref("1") == "main"
+
+    def test_strips_whitespace(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "  release-1.2\n")
+        assert _mod._pr_base_ref("1") == "release-1.2"
+
+    def test_empty_is_none(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "")
+        assert _mod._pr_base_ref("1") is None
+
+
+class TestRepoDefaultBranch:
+    """_repo_default_branch reads defaultBranchRef.name (seam _TEST_GH_DEFAULT_BRANCH)."""
+
+    def test_reads_seam(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
+        assert _mod._repo_default_branch() == "main"
+
+    def test_empty_is_none(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "")
+        assert _mod._repo_default_branch() is None
+
+
+class TestCheckBaseIsDefault:
+    """Base-retarget guard: block unless base == default; fail-CLOSED on unreadable;
+    force waives. Head-pinning can't catch a base change (the head never moves)."""
+
+    def _set(self, monkeypatch, base, default):
+        monkeypatch.setenv("_TEST_GH_BASE_REF", base)
+        monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", default)
+
+    def test_base_equals_default_passes(self, monkeypatch):
+        self._set(monkeypatch, "main", "main")
+        block, msg = _mod._check_base_is_default("1")
+        assert block is False and msg == ""
+
+    def test_base_differs_blocks(self, monkeypatch):
+        self._set(monkeypatch, "release-1.2", "main")
+        block, msg = _mod._check_base_is_default("1")
+        assert block is True and "not the default branch" in msg
+
+    def test_base_unreadable_fails_closed(self, monkeypatch):
+        self._set(monkeypatch, "", "main")
+        block, msg = _mod._check_base_is_default("1")
+        assert block is True and "could not confirm" in msg.lower()
+
+    def test_default_unreadable_fails_closed(self, monkeypatch):
+        self._set(monkeypatch, "main", "")
+        block, _ = _mod._check_base_is_default("1")
+        assert block is True
+
+    def test_force_waives(self, monkeypatch):
+        self._set(monkeypatch, "release-1.2", "main")  # would otherwise block
+        block, _ = _mod._check_base_is_default("1", force=True)
+        assert block is False
+
+
+class TestDeriveRepoFromCwd:
+    """_derive_repo_from_cwd resolves the OWNER/REPO gh targets in a dir
+    (seam _TEST_GH_DERIVED_REPO), normalized; None when unresolvable."""
+
+    def test_reads_seam(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "owner/repo")
+        assert _mod._derive_repo_from_cwd("/x") == "owner/repo"
+
+    def test_normalizes_url_form(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "github.com/owner/repo")
+        assert _mod._derive_repo_from_cwd("/x") == "owner/repo"
+
+    def test_empty_is_none(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "")
+        assert _mod._derive_repo_from_cwd("/x") is None
+
+    def test_unnormalizable_is_none(self, monkeypatch):
+        # A shell-variable / enterprise-host value can't be gated → None → caller
+        # fails closed.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "$VAR")
+        assert _mod._derive_repo_from_cwd("/x") is None

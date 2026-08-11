@@ -1290,6 +1290,28 @@ class TestResolvePrNumber:
         ):
             assert guard_module._resolve_pr_number("gh pr merge --squash") is None
 
+    def test_explicit_repo_numberless_fails_closed_without_gh(self, guard_module):
+        # explicit user --repo + no number + no cwd → None WITHOUT touching gh
+        # (gh pr view --repo errors without a selector; resolving a cwd-branch PR
+        # and gating it against a DIFFERENT repo is the wrong-PR bug).
+        with patch.object(guard_module.subprocess, "run", side_effect=AssertionError):
+            assert guard_module._resolve_pr_number("gh pr merge --squash", repo="o/r") is None
+
+    def test_derived_cwd_numberless_resolves_without_repo_flag(self, guard_module):
+        # A merge whose repo was DERIVED from cwd (F3): the numberless branch PR
+        # resolves by running gh IN that cwd with NO --repo — so it doesn't hit
+        # the `--repo needs a selector` error the previous line guards against.
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="88\n"),
+        ) as run:
+            got = guard_module._resolve_pr_number("gh pr merge --squash", repo="o/r", cwd="/wt")
+        assert got == "88"
+        argv = run.call_args_list[0].args[0]
+        assert "--repo" not in argv
+        assert run.call_args_list[0].kwargs.get("cwd") == "/wt"
+
 
 # ── CI-status merge gate (_pr_ci_status / _has_ci_override) ───────────────
 
@@ -1441,6 +1463,13 @@ class TestCiGateEndToEnd:
             "_check_codex_reviewed_head",
             lambda n, force=False, repo=None: (False, "", None),
         )
+        # Base-branch invariant (PR #1366) also makes real gh calls — mock it
+        # pass-through so this suite stays offline-hermetic.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_base_is_default",
+            lambda n, force=False, repo=None: (False, ""),
+        )
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
         monkeypatch.setenv(
@@ -1520,6 +1549,291 @@ class TestCiStatusUnfinishedStates:
             {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ])
         assert guard_module._pr_ci_status("1") == ("green", [])
+
+
+class TestMergeableAllowlist:
+    """F2: the mergeability gate is an ALLOWLIST — block unless status is a
+    definite MERGEABLE. The old `== UNKNOWN` check let None/'' (a FAILED query;
+    _check_mergeable fails OPEN to None) sail through and merge. Both the
+    enforcement arm and the report close this."""
+
+    def _payload(self, cmd):
+        return {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+        }
+
+    def _patch_downstream(self, guard_module, monkeypatch):
+        # Everything AFTER mergeability passes, so only mergeability decides.
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+        )
+        for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
+
+    @pytest.mark.parametrize("bad", [None, "", "UNKNOWN", "SOMETHING_NEW"])
+    def test_non_mergeable_blocks(self, guard_module, monkeypatch, bad):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: bad)
+        self._patch_downstream(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        assert guard_module.main() == 2
+
+    def test_conflicting_blocks_with_specific_message(self, guard_module, monkeypatch, capsys):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "CONFLICTING")
+        self._patch_downstream(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        assert guard_module.main() == 2
+        assert "merge conflicts" in capsys.readouterr().err
+
+    def test_mergeable_passes(self, guard_module, monkeypatch):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        self._patch_downstream(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        assert guard_module.main() == 0
+
+    def test_report_counts_none_as_failure(self, guard_module, monkeypatch, capsys):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: None)
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
+        for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
+            monkeypatch.setattr(guard_module, name, lambda n, repo=None: (False, ""))
+        assert guard_module.check_pr_report("5") == 1
+        assert "would block" in capsys.readouterr().out
+
+
+class TestRepoDerivationGate:
+    """F3: a bare (no --repo) merge is gated against the repo gh will ACTUALLY
+    target — derived from the merge's effective cwd — not the hook process's cwd.
+    Fail-closed when that cwd is ambiguous or gh can't resolve a repo there."""
+
+    def _payload(self, cmd, cwd=None):
+        p = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}}
+        if cwd is not None:
+            p["cwd"] = cwd
+        return p
+
+    def _patch_ok(self, guard_module, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+        )
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
+
+    def test_derived_repo_threads_into_gates(self, guard_module, monkeypatch):
+        seen = {}
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+
+        def rec_mergeable(n, repo=None):
+            seen["repo"] = repo
+            return "MERGEABLE"
+
+        monkeypatch.setattr(guard_module, "_check_mergeable", rec_mergeable)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin", cwd="/some/other/checkout"),
+        )
+        assert guard_module.main() == 0
+        assert seen["repo"] == "octo/other"
+
+    def test_explicit_repo_skips_derivation(self, guard_module, monkeypatch):
+        seen = {}
+        # Seam would derive octo/other, but --repo must win (no derivation).
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+
+        def rec_mergeable(n, repo=None):
+            seen["repo"] = repo
+            return "MERGEABLE"
+
+        monkeypatch.setattr(guard_module, "_check_mergeable", rec_mergeable)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload(
+                "gh pr merge 5 --repo real/repo --squash --admin", cwd="/some/other/checkout"
+            ),
+        )
+        assert guard_module.main() == 0
+        assert seen["repo"] == "real/repo"
+
+    def test_unresolvable_cwd_repo_blocks(self, guard_module, monkeypatch):
+        # cwd resolves but gh can't name a repo there (seam empty) → fail-closed.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "")
+        self._patch_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin", cwd="/not/a/repo"),
+        )
+        assert guard_module.main() == 2
+
+    def test_ambiguous_cd_blocks(self, guard_module, monkeypatch):
+        # A `cd` to an unresolvable target (shell var) → _CWD_UNKNOWN → fail-closed,
+        # even though a derivation seam is set.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("cd $HOME && gh pr merge 5 --squash --admin", cwd="/repo"),
+        )
+        assert guard_module.main() == 2
+
+    def test_numberless_merge_threads_derived_cwd_to_resolver(self, guard_module, monkeypatch):
+        # Regression (architect audit, round 5): F3 derives an explicit repo for a
+        # numberless merge; _resolve_pr_number must get the DERIVED cwd so the
+        # branch PR still resolves (an explicit --repo would error). Without the
+        # cwd thread, a numberless `gh pr merge` that worked pre-F3 would block.
+        seen = {}
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+
+        def rec_resolve(cmd, repo=None, cwd=None):
+            seen["repo"] = repo
+            seen["cwd"] = cwd
+            return "5"
+
+        monkeypatch.setattr(guard_module, "_resolve_pr_number", rec_resolve)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge --squash --admin", cwd="/some/other/checkout"),
+        )
+        assert guard_module.main() == 0
+        assert seen["repo"] == "octo/other"
+        assert seen["cwd"] == "/some/other/checkout"
+
+    def test_no_cwd_info_keeps_cwd_behavior(self, guard_module, monkeypatch):
+        # Payload without cwd (older CC / test harness): nothing to derive from →
+        # merge_repo stays None (today's cwd-based behavior), NOT a block.
+        seen = {}
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+
+        def rec_mergeable(n, repo=None):
+            seen["repo"] = repo
+            return "MERGEABLE"
+
+        monkeypatch.setattr(guard_module, "_check_mergeable", rec_mergeable)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        assert guard_module.main() == 0
+        assert seen["repo"] is None  # not derived → cwd repo (unchanged behavior)
+
+
+class TestGateOrdering:
+    """F1: Codex freshness must be established BEFORE the finding scans.
+
+    If a review is published between the finding scans and the freshness check,
+    its matching commit_id passes freshness while any P1 comments published with
+    it were never scanned — the merge proceeds with unread findings. Ordering:
+    mergeable → CI → base-invariant → freshness → body findings → inline findings.
+    """
+
+    def _payload(self, cmd):
+        return {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+        }
+
+    def test_freshness_precedes_finding_scans(self, guard_module, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_base_is_default",
+            lambda n, force=False, repo=None: (calls.append("base"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (calls.append("freshness"), (False, "", None))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_pr_review_findings",
+            lambda n, force=False, repo=None: (calls.append("body"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, force=False, repo=None: (calls.append("inline"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin"),
+        )
+        assert guard_module.main() == 0
+        assert "freshness" in calls and "body" in calls and "inline" in calls
+        assert calls.index("freshness") < calls.index("body")
+        assert calls.index("freshness") < calls.index("inline")
+
+    def test_report_freshness_precedes_finding_scans(self, guard_module, monkeypatch, capsys):
+        calls: list[str] = []
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module,
+            "_check_base_is_default",
+            lambda n, force=False, repo=None: (calls.append("base"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (calls.append("freshness"), (False, "", "h"))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_pr_review_findings",
+            lambda n, force=False, repo=None: (calls.append("body"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, force=False, repo=None: (calls.append("inline"), (False, ""))[1],
+        )
+        guard_module.check_pr_report("5")
+        assert calls.index("freshness") < calls.index("body")
+        assert calls.index("freshness") < calls.index("inline")
 
 
 class TestMultiMergeBlocked:
