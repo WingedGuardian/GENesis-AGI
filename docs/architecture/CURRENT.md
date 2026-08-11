@@ -501,7 +501,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 0eb21377 2026-07-10
+verified: 0017242d 2026-08-11
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -518,7 +518,22 @@ verified: 0eb21377 2026-07-10
   is only the MIT origin of the Telegram transport code. Device/edge-side voice
   software (firmware, esphome, S2S/ambient bridges, edge deploy) lives in the
   separate `GENesis-Voice` repo — `channels/voice/` here is only the in-runtime
-  channel.
+  channel. **Voice memory surface** (verified 2026-08-11): the S2S session is NOT
+  memory-blind — `genesis_bridge.get_system_prompt` injects USER.md identity +
+  essential-knowledge Active Context, exposes an `ask_genesis` pull-recall tool
+  (searches the EXTRACTED long-term index only via `HybridRetriever.recall`, so it
+  lags the 1-2h extraction cycle and has NO recency path), and each conversation
+  lands as a transcript + `cc_sessions(source_tag='voice')` row mined by
+  `memory/extraction_job.py`. **Cross-session recency resume** (`voice_recency.py`,
+  gated by `voice_recency_resume` — ships `off`, armed after live E2E): at session
+  start `get_system_prompt` injects the age-stamped tail of the most-recent prior
+  voice conversation, read DIRECTLY from the transcript via a sync `mode=ro` sqlite
+  lookup keyed on `last_activity_at` (NOT status — the 300s idle reaper coincides
+  with the edge's 300s reconnect cache, so a status filter would miss the just-ended
+  session at the exact moment a new one starts), fail-closed to `""`.
+  `cc_sessions.satellite_id` (added via `_migrate_add_columns`, not the base
+  `CREATE TABLE` — mirrors `last_extracted_*`) persists the device for the optional
+  `per_device` scope; default `global`.
 - **dashboard/**: Flask blueprint at `/genesis` (~45 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
   thread detects degraded-but-alive Flask; web terminal.

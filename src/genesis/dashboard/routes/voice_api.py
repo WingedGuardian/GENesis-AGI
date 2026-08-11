@@ -276,7 +276,22 @@ def voice_system_prompt():
         return jsonify({"error": "Genesis bridge not initialized"}), 503
 
     try:
-        return jsonify({"prompt": bridge.get_system_prompt()})
+        # Optional edge-supplied scoping. satellite_id enables per_device recency
+        # resume; the external session id (converted to its row id) gives exact
+        # self-exclusion — otherwise the recency lookup's 60s activity gap alone
+        # keeps a session from resuming its own tail.
+        from genesis.channels.voice.transcript_writer import transcript_session_id
+
+        ext_session = request.args.get("session_id")
+        current_id = transcript_session_id(ext_session) if ext_session else None
+        return jsonify(
+            {
+                "prompt": bridge.get_system_prompt(
+                    current_session_id=current_id,
+                    satellite_id=request.args.get("satellite_id") or None,
+                )
+            }
+        )
     except Exception:
         logger.error("Failed to generate system prompt", exc_info=True)
         return jsonify({"error": "Failed to generate system prompt"}), 500
@@ -446,7 +461,9 @@ async def _land_conversation(data: dict) -> int:
         raise LookupError("Genesis runtime not ready")
 
     writer = await get_shared_writer(rt.db)
-    return await writer.sync_cumulative(data["session_id"], data["turns"])
+    return await writer.sync_cumulative(
+        data["session_id"], data["turns"], satellite_id=data.get("satellite_id")
+    )
 
 
 @voice_api_bp.route("/v1/voice/conversation", methods=["POST"])

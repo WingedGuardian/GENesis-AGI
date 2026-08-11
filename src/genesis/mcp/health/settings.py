@@ -313,6 +313,20 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every tool call
     ),
+    "voice_recency_resume": SettingsDomain(
+        name="voice_recency_resume",
+        description=(
+            "Voice cross-session recency resume — inject the tail of the user's "
+            "most-recent prior voice conversation into the S2S system prompt so the "
+            "model proactively resumes the thread. master `enabled` + `mode` off/live "
+            "(off = no injection, the default). Tuning: `scope` global/per_device, "
+            "`max_turns`, `max_chars`, `max_age_hours` (null = no limit). Ship dark, "
+            "arm after live E2E. Read live at every voice session start — no restart."
+        ),
+        config_filename="voice_recency_resume.yaml",
+        readonly=False,
+        needs_restart=False,  # re-read at every voice session start
+    ),
     "resilience": SettingsDomain(
         name="resilience",
         description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
@@ -1389,6 +1403,38 @@ def _validate_voice_act(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_voice_recency_resume(changes: dict) -> list[str]:
+    """Validate voice recency-resume lever changes (see
+    genesis.channels.voice.voice_recency_resume_config). Rejects bad WRITES so
+    settings_update reports the error instead of silently persisting e.g.
+    `enabled: "false"` (truthy), an unknown `mode`/`scope`, or a non-positive
+    turn/char/age value."""
+    from genesis.channels.voice.voice_recency_resume_config import MODES, SCOPES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "scope", "max_turns", "max_chars", "max_age_hours")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled" and not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+        elif key == "mode" and value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+        elif key == "scope" and value not in SCOPES:
+            errors.append(f"'scope' must be one of {', '.join(SCOPES)}; got {value!r}")
+        elif key in ("max_turns", "max_chars") and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            errors.append(f"'{key}' must be a positive integer; got {value!r}")
+        elif (
+            key == "max_age_hours"
+            and value is not None
+            and (isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0)
+        ):
+            errors.append("'max_age_hours' must be a positive number or null")
+    return errors
+
+
 def _validate_memory_integrity(changes: dict) -> list[str]:
     """Validate memory-integrity lever changes (see
     genesis.memory.integrity_config). Runtime already fail-safe-coerces at read
@@ -1480,6 +1526,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "cc_foreground_reaper": _validate_cc_foreground_reaper,
     "mcp_staleness_guard": _validate_mcp_staleness_guard,
     "voice_act": _validate_voice_act,
+    "voice_recency_resume": _validate_voice_recency_resume,
     "tts": _validate_tts,
     "ws3_immunity": _validate_ws3_immunity,
     "memory_recall": _validate_memory_recall,
