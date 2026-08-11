@@ -912,17 +912,25 @@ def _check_codex_reviewed_head(
 
 
 def _merge_match_head(argv: list[str]) -> str | None:
-    """The value of ``--match-head-commit`` on a gh pr merge argv, or None."""
+    """The value of ``--match-head-commit`` on a gh pr merge argv, or None.
+
+    Returns the LAST occurrence, mirroring gh's pflag last-value-wins semantics
+    for a repeated string flag (same rule as ``_pr_create_head_raw``). Validating
+    the FIRST value would let ``--match-head-commit <verified> --match-head-commit
+    <other>`` pass the hook on <verified> while gh enforces <other> — re-opening
+    the TOCTOU through the fix itself (Codex P1, round 2).
+    """
     argv = argv or []
+    result: str | None = None
     i = 0
     while i < len(argv):
         tok = argv[i]
         if tok == "--match-head-commit" and i + 1 < len(argv):
-            return argv[i + 1]
-        if tok.startswith("--match-head-commit="):
-            return tok.split("=", 1)[1]
+            result = argv[i + 1]
+        elif tok.startswith("--match-head-commit="):
+            result = tok.split("=", 1)[1]
         i += 1
-    return None
+    return result
 
 
 def _is_dispatched() -> bool:

@@ -122,3 +122,21 @@ class TestMergeMatchHead:
 
     def test_absent(self):
         assert _mod._merge_match_head(["gh", "pr", "merge", "5", "--admin"]) is None
+
+    def test_repeated_flag_last_wins(self):
+        # gh pflag semantics: the LAST repeated string-flag value is the one gh
+        # enforces — the hook must validate that same value, else
+        # `--match-head-commit <verified> --match-head-commit <other>` passes the
+        # hook at <verified> while gh merges at <other> (Codex P1, round 2).
+        argv = ["gh", "pr", "merge", "5", "--match-head-commit", HEAD, "--match-head-commit", STALE]
+        assert _mod._merge_match_head(argv) == STALE
+        argv = [
+            "gh",
+            "pr",
+            "merge",
+            "5",
+            "--match-head-commit",
+            STALE,
+            f"--match-head-commit={HEAD}",
+        ]
+        assert _mod._merge_match_head(argv) == HEAD
