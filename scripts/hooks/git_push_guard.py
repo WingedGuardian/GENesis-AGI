@@ -911,6 +911,18 @@ def _check_codex_reviewed_head(
     return False, "", head
 
 
+def _suggested_merge_cmd(pr_num: str, verified_head: str, repo: str | None) -> str:
+    """The exact atomic merge command to copy — PRESERVING an explicit --repo.
+
+    Dropping the target repo from a generated command retargets the merge to the
+    cwd repo, which can merge an unrelated same-numbered PR (Codex P1, round 3).
+    ``repo`` is the already-normalized OWNER/REPO the gates ran against, or None
+    (cwd repo → no --repo).
+    """
+    repo_part = f"--repo {repo} " if repo else ""
+    return f"gh pr merge {pr_num} {repo_part}--squash --admin --match-head-commit {verified_head}"
+
+
 def _merge_match_head(argv: list[str]) -> str | None:
     """The value of ``--match-head-commit`` on a gh pr merge argv, or None.
 
@@ -1954,8 +1966,7 @@ def main() -> int:
                             file=sys.stderr,
                         )
                         print(
-                            f"  gh pr merge {pr_num} --squash --admin "
-                            f"--match-head-commit {verified_head}",
+                            "  " + _suggested_merge_cmd(pr_num, verified_head, merge_repo),
                             file=sys.stderr,
                         )
                         return 2
@@ -2079,9 +2090,7 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     print(f"codex-at-head  : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (current)'}")
     if not blocked and verified_head:
-        print(
-            f"merge-with     : gh pr merge {pr_num} --squash --admin --match-head-commit {verified_head}"
-        )
+        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
     failures += 1 if blocked else 0
     print(
         "verdict        :",

@@ -123,6 +123,18 @@ class TestMergeMatchHead:
     def test_absent(self):
         assert _mod._merge_match_head(["gh", "pr", "merge", "5", "--admin"]) is None
 
+    def test_suggested_cmd_preserves_repo(self):
+        # Dropping --repo retargets a copied merge to the cwd repo (Codex P1 r3).
+        cmd = _mod._suggested_merge_cmd("5", HEAD, "octo/voice")
+        assert "--repo octo/voice" in cmd
+        assert cmd.endswith(f"--match-head-commit {HEAD}")
+        assert "gh pr merge 5 " in cmd
+
+    def test_suggested_cmd_no_repo_when_cwd(self):
+        cmd = _mod._suggested_merge_cmd("5", HEAD, None)
+        assert "--repo" not in cmd
+        assert cmd == f"gh pr merge 5 --squash --admin --match-head-commit {HEAD}"
+
     def test_repeated_flag_last_wins(self):
         # gh pflag semantics: the LAST repeated string-flag value is the one gh
         # enforces — the hook must validate that same value, else
