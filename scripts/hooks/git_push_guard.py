@@ -657,11 +657,28 @@ def _inline_title(body: str) -> str:
     return (first[0].strip() if first else "")[:120]
 
 
+def _scan_unreadable(strict: bool, what: str) -> tuple[bool, str]:
+    """Return value for a finding scan that could NOT be read — a gh error,
+    timeout, or malformed JSON — as distinct from a scan that ran and found
+    nothing (an empty result / Codex quota, which stays clean either way).
+
+    Enforcement (``strict=False``, the default) fails OPEN: a transient gh error
+    must not wedge merges, and the freshness gate already requires a review to
+    EXIST at the head. Report mode (``strict=True``) fails CLOSED so the canonical
+    ``--check-pr`` report never presents an UNREADABLE scan as "ok" / emits a
+    false "all gates pass" (Codex P2, PR #1366).
+    """
+    if strict:
+        return True, f"could not read {what} — review status UNREADABLE (retry), not clean."
+    return False, ""
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
     force: bool = False,
     repo: str | None = None,
+    strict: bool = False,
 ) -> tuple[bool, str]:
     """Scan INLINE review comments for P1/P2 badge findings.
 
@@ -669,7 +686,8 @@ def _check_inline_review_findings(
     thread has a reply (engagement = read) or the merge carries
     '# review-override'. P2 findings never block but are printed to
     stderr one per line — the session must consciously accept them.
-    Fail-open on any error, like _check_pr_review_findings.
+    On an UNREADABLE scan (gh error/timeout/malformed): enforcement fails OPEN;
+    ``strict`` (report mode) fails CLOSED — see ``_scan_unreadable``.
     """
     if force:
         return False, ""  # override NOTE already printed by the body gate
@@ -692,10 +710,10 @@ def _check_inline_review_findings(
             timeout=30,
         )
         if result.returncode != 0:
-            return False, ""
+            return _scan_unreadable(strict, "inline review comments")
         raw = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     except Exception:
-        return False, ""
+        return _scan_unreadable(strict, "inline review comments")
 
     replied_to = {c.get("reply_to") for c in raw if c.get("reply_to")}
     p1: list[str] = []
@@ -733,14 +751,17 @@ def _check_inline_review_findings(
 
 
 def _check_pr_review_findings(
-    pr_num: str, *, force: bool = False, repo: str | None = None
+    pr_num: str, *, force: bool = False, repo: str | None = None, strict: bool = False
 ) -> tuple[bool, str]:
     """Check PR comments for unresolved automated review findings.
 
     Returns (should_block, message).
 
-    Fail-open: returns (False, "") on any error — the hook must never
-    become a single point of failure for merges.
+    On an UNREADABLE scan (gh error/timeout/malformed JSON), enforcement fails
+    OPEN — the hook must never become a single point of failure for merges — while
+    ``strict`` (report mode) fails CLOSED so ``--check-pr`` never reports a failed
+    scan as clean (see ``_scan_unreadable``). An empty result (no comments / Codex
+    quota) is clean either way.
     """
     if force:
         print(
@@ -764,9 +785,9 @@ def _check_pr_review_findings(
             timeout=15,
         )
         if result.returncode != 0:
-            return False, ""  # Fail-open on API error
+            return _scan_unreadable(strict, "review-body comments")  # gh error
     except Exception:
-        return False, ""  # Fail-open
+        return _scan_unreadable(strict, "review-body comments")
 
     output = result.stdout.strip()
     if not output or output == "[]":
@@ -776,7 +797,7 @@ def _check_pr_review_findings(
     try:
         raw_comments = json.loads(output)
     except json.JSONDecodeError:
-        return False, ""  # Fail-open on parse error
+        return _scan_unreadable(strict, "review-body comments")  # malformed JSON
 
     # GitHub API can return "body": null for deleted comments —
     # use `or ""` to coerce None to empty string (get's default only
@@ -2392,8 +2413,11 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     gh/jq (2026-08-10: a hand-rolled query used the GraphQL bot login on the
     REST endpoint — `chatgpt-codex-connector` vs `…[bot]` — matched nothing,
     and the empty result was reported as "Codex clean" while 5 P2 findings sat
-    unread). Report and enforcement share these functions, so they cannot
-    disagree: if this report has a bug, the gate blocks with the same bug.
+    unread). Report and enforcement share these functions, so a bug in one is a
+    bug in both. The ONE deliberate divergence: the report runs the finding scans
+    in ``strict`` mode, so an UNREADABLE scan (gh error) shows as a failure here
+    rather than fail-open as enforcement does — the report must never issue a
+    false all-clear.
 
     Prints one line per gate; returns 0 when every gate would pass, 1 otherwise.
     """
@@ -2419,10 +2443,12 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if not blocked and verified_head:
         print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
     failures += 1 if blocked else 0
-    blocked, msg = _check_pr_review_findings(pr_num, repo=repo)
+    # strict=True: a scan that could not be READ (gh error/malformed) must show as
+    # a failure here, never as "ok" — the report must not issue a false all-clear.
+    blocked, msg = _check_pr_review_findings(pr_num, repo=repo, strict=True)
     print(f"review-body    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok'}")
     failures += 1 if blocked else 0
-    blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
+    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, strict=True)
     print(
         f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
     )

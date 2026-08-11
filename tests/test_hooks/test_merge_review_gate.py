@@ -1618,7 +1618,7 @@ class TestMergeableAllowlist:
             lambda n, force=False, repo=None: (False, "", None),
         )
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, repo=None: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, repo=None, strict=False: (False, ""))
         assert guard_module.check_pr_report("5") == 1
         assert "would block" in capsys.readouterr().out
 
@@ -1755,6 +1755,89 @@ class TestRepoDerivationGate:
         assert seen["repo"] is None  # not derived → cwd repo (unchanged behavior)
 
 
+class TestStrictScanMode:
+    """F-report (Codex P2, round 6): a finding scan that could not be READ (gh
+    error/timeout/malformed) must not be reported as clean. Report mode passes
+    strict=True → an unreadable scan blocks/fails; enforcement (default) stays
+    fail-open for Codex-quota/outage tolerance. An EMPTY result (quota) is clean
+    in both modes."""
+
+    def test_body_error_fails_closed_when_strict(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+        ):
+            block, msg = guard_module._check_pr_review_findings("1", strict=True)
+        assert block is True and "unreadable" in msg.lower()
+
+    def test_body_error_fails_open_by_default(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+        ):
+            block, _ = guard_module._check_pr_review_findings("1")
+        assert block is False
+
+    def test_body_empty_is_clean_even_when_strict(self, guard_module):
+        # Empty (quota / no comments) is NOT an error — clean in both modes.
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="[]"),
+        ):
+            block, _ = guard_module._check_pr_review_findings("1", strict=True)
+        assert block is False
+
+    def test_inline_error_fails_closed_when_strict(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+        ):
+            block, msg = guard_module._check_inline_review_findings("1", strict=True)
+        assert block is True and "unreadable" in msg.lower()
+
+    def test_inline_error_fails_open_by_default(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+        ):
+            block, _ = guard_module._check_inline_review_findings("1")
+        assert block is False
+
+    def test_report_counts_unreadable_scan_as_failure(self, guard_module, monkeypatch, capsys):
+        # The canonical report must not print "all gates pass" when a scan errored.
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", "h"),
+        )
+        # Body scan errors (strict → block); inline clean.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_pr_review_findings",
+            lambda n, repo=None, strict=False: (True, "could not read review-body comments")
+            if strict
+            else (False, ""),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, repo=None, strict=False: (False, ""),
+        )
+        assert guard_module.check_pr_report("5") == 1
+        out = capsys.readouterr().out
+        assert "would block" in out and "all gates pass" not in out
+
+
 class TestGateOrdering:
     """F1: Codex freshness must be established BEFORE the finding scans.
 
@@ -1824,12 +1907,12 @@ class TestGateOrdering:
         monkeypatch.setattr(
             guard_module,
             "_check_pr_review_findings",
-            lambda n, force=False, repo=None: (calls.append("body"), (False, ""))[1],
+            lambda n, repo=None, strict=False: (calls.append("body"), (False, ""))[1],
         )
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None: (calls.append("inline"), (False, ""))[1],
+            lambda n, repo=None, strict=False: (calls.append("inline"), (False, ""))[1],
         )
         guard_module.check_pr_report("5")
         assert calls.index("freshness") < calls.index("body")
