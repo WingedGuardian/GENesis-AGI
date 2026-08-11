@@ -427,6 +427,21 @@ call_sites:
     - mistral-large-free
     - openrouter-gemma4
     retry_profile: background
+  # MW-2 relationship classifier — coarse relationship judgment
+  # (duplicate/contradicts/succeeded_by/distinct) between candidate memory pairs.
+  # Same free-SLM shape / task class as dream_cycle_entity_check; batched, on demand
+  # (MW-2 measurement probe now; MW-5 merge-gate nominees later). §6.2 model tier is
+  # the dial — start on the proven entity-check chain.
+  dream_cycle_relationship_classify:
+    chain:
+    - nvidia-nim-kimi
+    - groq-free
+    - mistral-small-free
+    - openrouter-free
+    - gemini-free
+    - mistral-large-free
+    - openrouter-gemma4
+    retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
   # DeepSeek challenges Kimi's entity judgments.
   dream_cycle_entity_challenge:
