@@ -851,7 +851,7 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
 
 def _check_codex_reviewed_head(
     pr_num: str, *, force: bool = False, repo: str | None = None
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str | None]:
     """Block a merge unless Codex has reviewed the PR's CURRENT head commit.
 
     Compares the PR's ``headRefOid`` against the FULL ``commit_id`` of Codex's
@@ -862,35 +862,67 @@ def _check_codex_reviewed_head(
     (which blocks on UNKNOWN), not the advisory finding-scanners. ``force`` (a
     ``# review-override`` on the merge segment) is the conscious escape (e.g. a
     genuine Codex outage).
+
+    Returns ``(should_block, message, verified_head)`` — ``verified_head`` is the
+    full head oid the review was verified against (only when not blocked and not
+    forced); the caller binds the MERGE to it via ``--match-head-commit`` so a
+    push landing between this check and the merge cannot smuggle an unreviewed
+    head through (TOCTOU — Codex P1, PR #1366).
     """
     if force:
-        return False, ""
+        return False, "", None
     head = _pr_head_sha(pr_num, repo=repo)
     if not head:
-        return True, (
-            f"could not read PR #{pr_num}'s head commit to verify a current Codex "
-            f"review (GitHub query failed).\n"
-            f"Retry, or append '# review-override' to merge anyway."
+        return (
+            True,
+            (
+                f"could not read PR #{pr_num}'s head commit to verify a current Codex "
+                f"review (GitHub query failed).\n"
+                f"Retry, or append '# review-override' to merge anyway."
+            ),
+            None,
         )
     head = head.strip().lower()
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if not reviewed:
-        return True, (
-            f"no Codex review found for PR #{pr_num} at head {head[:12]}.\n"
-            f"Codex reviews on PR-open — it does NOT auto-review a later fix-commit; "
-            f"comment '@codex review' on the PR to review the current head (then wait), "
-            f"or append '# review-override' to merge without a current Codex review "
-            f"(e.g. Codex is down)."
+        return (
+            True,
+            (
+                f"no Codex review found for PR #{pr_num} at head {head[:12]}.\n"
+                f"Codex reviews on PR-open — it does NOT auto-review a later fix-commit; "
+                f"comment '@codex review' on the PR to review the current head (then wait), "
+                f"or append '# review-override' to merge without a current Codex review "
+                f"(e.g. Codex is down)."
+            ),
+            None,
         )
     if reviewed != head:
-        return True, (
-            f"Codex's latest review is STALE: it reviewed {reviewed[:12]}, but PR "
-            f"#{pr_num} head is {head[:12]} (new commits pushed after the review).\n"
-            f"Comment '@codex review' on the PR to re-review the current head (Codex "
-            f"does NOT auto-review fix-commits), then wait; or append "
-            f"'# review-override' to merge anyway."
+        return (
+            True,
+            (
+                f"Codex's latest review is STALE: it reviewed {reviewed[:12]}, but PR "
+                f"#{pr_num} head is {head[:12]} (new commits pushed after the review).\n"
+                f"Comment '@codex review' on the PR to re-review the current head (Codex "
+                f"does NOT auto-review fix-commits), then wait; or append "
+                f"'# review-override' to merge anyway."
+            ),
+            None,
         )
-    return False, ""
+    return False, "", head
+
+
+def _merge_match_head(argv: list[str]) -> str | None:
+    """The value of ``--match-head-commit`` on a gh pr merge argv, or None."""
+    argv = argv or []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--match-head-commit" and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--match-head-commit="):
+            return tok.split("=", 1)[1]
+        i += 1
+    return None
 
 
 def _is_dispatched() -> bool:
@@ -1885,7 +1917,7 @@ def main() -> int:
                 # — not merely have no open findings. A not-yet-reviewed or
                 # stale-reviewed head would otherwise merge unseen (the finding
                 # scans come back empty). Waived by # review-override.
-                should_block, fresh_msg = _check_codex_reviewed_head(
+                should_block, fresh_msg, verified_head = _check_codex_reviewed_head(
                     pr_num,
                     force=force_override,
                     repo=merge_repo,
@@ -1897,6 +1929,37 @@ def main() -> int:
                     )
                     print(fresh_msg, file=sys.stderr)
                     return 2
+
+                # Bind the MERGE to the verified head (TOCTOU — Codex P1): a push
+                # landing between the check above and the merge would otherwise
+                # merge an UNREVIEWED head under a stale verification. GitHub
+                # enforces `--match-head-commit` server-side (the merge is
+                # rejected if the head moved), making check→merge atomic. Only
+                # engaged when the freshness check ran (not # review-override).
+                if verified_head:
+                    match_head = _merge_match_head(merge_seg.argv)
+                    if match_head is None:
+                        print(
+                            "BLOCKED: merge must be bound to the Codex-verified head "
+                            "commit so a race with a new push cannot merge an "
+                            "unreviewed head. Re-run with:",
+                            file=sys.stderr,
+                        )
+                        print(
+                            f"  gh pr merge {pr_num} --squash --admin "
+                            f"--match-head-commit {verified_head}",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    if match_head.strip().lower() != verified_head:
+                        print(
+                            f"BLOCKED: --match-head-commit {match_head[:12]} does not "
+                            f"equal the Codex-verified head {verified_head[:12]} — the "
+                            f"branch moved (or the sha is stale). Re-verify and use "
+                            f"the current verified head.",
+                            file=sys.stderr,
+                        )
+                        return 2
 
         # ── sqlite3 write operations ────────────────────────────────
         # Whole-command match (never misses a fragmented/wrapped invocation),
@@ -1976,5 +2039,56 @@ def main() -> int:
     return 0
 
 
+def check_pr_report(pr_num: str, repo: str | None = None) -> int:
+    """CANONICAL pre-merge report: run the SAME checks the merge gate enforces.
+
+    This exists so sessions never hand-roll the review check with ad-hoc
+    gh/jq (2026-08-10: a hand-rolled query used the GraphQL bot login on the
+    REST endpoint — `chatgpt-codex-connector` vs `…[bot]` — matched nothing,
+    and the empty result was reported as "Codex clean" while 5 P2 findings sat
+    unread). Report and enforcement share these functions, so they cannot
+    disagree: if this report has a bug, the gate blocks with the same bug.
+
+    Prints one line per gate; returns 0 when every gate would pass, 1 otherwise.
+    """
+    failures = 0
+    mergeable = _check_mergeable(pr_num, repo=repo)
+    print(f"mergeable      : {mergeable or 'unknown'}")
+    if mergeable in ("UNKNOWN", "CONFLICTING"):
+        failures += 1
+    ci_state, ci_bad = _pr_ci_status(pr_num, repo=repo)
+    print(f"ci             : {ci_state}{' (' + ', '.join(ci_bad[:6]) + ')' if ci_bad else ''}")
+    if ci_state in ("red", "pending"):
+        failures += 1
+    blocked, msg = _check_pr_review_findings(pr_num, repo=repo)
+    print(f"review-body    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok'}")
+    failures += 1 if blocked else 0
+    blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
+    print(
+        f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
+    )
+    failures += 1 if blocked else 0
+    blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
+    print(f"codex-at-head  : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (current)'}")
+    if not blocked and verified_head:
+        print(
+            f"merge-with     : gh pr merge {pr_num} --squash --admin --match-head-commit {verified_head}"
+        )
+    failures += 1 if blocked else 0
+    print(
+        "verdict        :",
+        "MERGEABLE (all gates pass)" if failures == 0 else f"{failures} gate(s) would block",
+    )
+    return 0 if failures == 0 else 1
+
+
 if __name__ == "__main__":
+    # Report mode: `git_push_guard.py --check-pr <N> [--repo OWNER/REPO]` — the
+    # canonical pre-merge check (same functions as enforcement). No hook payload.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--check-pr":
+        _repo_arg = None
+        if "--repo" in sys.argv[3:]:
+            _ri = sys.argv.index("--repo")
+            _repo_arg = sys.argv[_ri + 1] if _ri + 1 < len(sys.argv) else None
+        sys.exit(check_pr_report(sys.argv[2], repo=_repo_arg))
     run_guard(main, "git_push_guard")

@@ -57,19 +57,19 @@ class TestFreshnessGate:
     def test_current_review_passes(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
-        block, msg = _mod._check_codex_reviewed_head("1")
+        block, msg, _head = _mod._check_codex_reviewed_head("1")
         assert block is False and msg == ""
 
     def test_no_review_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
-        block, msg = _mod._check_codex_reviewed_head("1")
+        block, msg, _head = _mod._check_codex_reviewed_head("1")
         assert block is True and "no codex review" in msg.lower()
 
     def test_stale_review_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))
-        block, msg = _mod._check_codex_reviewed_head("1")
+        block, msg, _head = _mod._check_codex_reviewed_head("1")
         assert block is True and "stale" in msg.lower()
 
     def test_prefix_no_longer_passes(self, monkeypatch):
@@ -78,13 +78,13 @@ class TestFreshnessGate:
         near = HEAD[:12] + "0" * 28  # same 12-char prefix, different full oid
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(near))
-        block, _ = _mod._check_codex_reviewed_head("1")
+        block, _, _head = _mod._check_codex_reviewed_head("1")
         assert block is True
 
     def test_force_override_bypasses(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")  # would otherwise block
-        block, _ = _mod._check_codex_reviewed_head("1", force=True)
+        block, _, _head = _mod._check_codex_reviewed_head("1", force=True)
         assert block is False
 
     def test_head_unresolvable_fails_closed(self, monkeypatch):
@@ -92,5 +92,33 @@ class TestFreshnessGate:
         # (fail-closed, like _check_mergeable's UNKNOWN), not waved through.
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", "")  # empty → None
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
-        block, msg = _mod._check_codex_reviewed_head("1")
+        block, msg, _head = _mod._check_codex_reviewed_head("1")
         assert block is True and "head" in msg.lower()
+
+    def test_pass_returns_verified_head(self, monkeypatch):
+        # The caller binds the merge to this oid via --match-head-commit (TOCTOU).
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and head == HEAD
+
+    def test_force_returns_no_verified_head(self, monkeypatch):
+        # Forced (# review-override) skips verification → no head to bind →
+        # the match-head requirement disengages too.
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
+        block, _, head = _mod._check_codex_reviewed_head("1", force=True)
+        assert block is False and head is None
+
+
+class TestMergeMatchHead:
+    def test_separate_value(self):
+        argv = ["gh", "pr", "merge", "5", "--squash", "--admin", "--match-head-commit", HEAD]
+        assert _mod._merge_match_head(argv) == HEAD
+
+    def test_equals_form(self):
+        argv = ["gh", "pr", "merge", "5", f"--match-head-commit={HEAD}"]
+        assert _mod._merge_match_head(argv) == HEAD
+
+    def test_absent(self):
+        assert _mod._merge_match_head(["gh", "pr", "merge", "5", "--admin"]) is None

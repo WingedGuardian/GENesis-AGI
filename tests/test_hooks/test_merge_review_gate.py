@@ -1433,6 +1433,14 @@ class TestCiGateEndToEnd:
             "_check_inline_review_findings",
             lambda n, force=False, repo=None: (False, ""),
         )
+        # The Codex review-freshness gate (PR #1366) is a real network check —
+        # mock it pass-through (None verified_head also disengages the
+        # --match-head-commit binding) so this suite stays offline-hermetic.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
         monkeypatch.setenv(
