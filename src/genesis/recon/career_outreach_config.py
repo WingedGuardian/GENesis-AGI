@@ -61,11 +61,12 @@ DEFAULTS: dict[str, Any] = {
     # owner's behalf — it stays inert until the owner deliberately opts in.
     "mode": "off",
     # Name of the external reasoning module (as declared in the install's ~/.genesis
-    # module overlay). An absent module → the monitor no-ops cleanly. Config knob,
-    # never a hardcoded literal elsewhere.
-    "reasoning_module": "Career Ops",  # SSH CC dispatch — runs the outreach modes
+    # module overlay). SHIPPED EMPTY so no install-specific module name lands in the
+    # public repo — set it in the gitignored career_outreach.local.yaml overlay.
+    # Empty (or an absent module) → the monitor no-ops cleanly.
+    "reasoning_module": "",
     # Per-tick cap on draft-staging auto-runs (bounds cost + mirrors the remote
-    # engine's own daily cap). Loud-truncation: excess page-worthy accounts wait
+    # engine's own daily cap). Loud-truncation: excess target accounts wait
     # for the next tick, never silently dropped.
     "max_auto_runs_per_tick": 3,
     # Per-dispatch bridge timeout, in seconds. MUST stay under the module's own
@@ -76,6 +77,11 @@ DEFAULTS: dict[str, Any] = {
 
 # Public: the settings-domain validator imports these to check knobs.
 INT_KNOBS = ("max_auto_runs_per_tick", "dispatch_timeout_s")
+
+# Key-specific upper bounds — a typo (e.g. max_auto_runs_per_tick: 3000) must not
+# authorize thousands of sequential draft-staging sessions, and dispatch_timeout_s
+# MUST stay under the module's 300s SSH CC hard cap so OUR timeout fires cleanly.
+_MAX_BY_KNOB: dict[str, int] = {"max_auto_runs_per_tick": 10, "dispatch_timeout_s": 290}
 
 
 def _base_path() -> Path:
@@ -130,11 +136,18 @@ def effective_mode() -> str:
 
 
 def knob_int(cfg: dict[str, Any], key: str) -> int:
-    """Positive-int knob with DEFAULTS fallback — config damage never zeroes a
-    limit or crashes the monitor."""
+    """Positive-int knob with DEFAULTS fallback + a key-specific upper bound —
+    config damage never zeroes a limit, crashes the monitor, or authorizes an
+    unbounded run."""
     value = cfg.get(key)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return int(DEFAULTS[key])
+    cap = _MAX_BY_KNOB.get(key)
+    if cap is not None and value > cap:
+        logger.warning(
+            "career_outreach %s=%d exceeds the max (%d) — clamping down", key, value, cap
+        )
+        return cap
     return value
 
 

@@ -91,6 +91,14 @@ def test_knob_int_damage_tolerant():
     assert cfg.knob_int({}, "dispatch_timeout_s") == d["dispatch_timeout_s"]
 
 
+def test_knob_int_enforces_upper_bounds():
+    # A typo must not authorize an unbounded run; dispatch_timeout_s must stay under
+    # the 300s SSH cap.
+    assert cfg.knob_int({"dispatch_timeout_s": 2400}, "dispatch_timeout_s") == 290
+    assert cfg.knob_int({"max_auto_runs_per_tick": 3000}, "max_auto_runs_per_tick") == 10
+    assert cfg.knob_int({"dispatch_timeout_s": 120}, "dispatch_timeout_s") == 120  # under cap
+
+
 def test_module_name_damage_tolerant():
     d = cfg.DEFAULTS
     assert cfg.module_name({"reasoning_module": "My Ops"}, "reasoning_module") == "My Ops"
@@ -148,13 +156,23 @@ class _FakeModule:
     the read-only list-working dispatch from an auto-run by the prompt text."""
 
     def __init__(
-        self, *, healthy=True, autoruns=None, working=None, autorun_error=None, working_error=False
+        self,
+        *,
+        healthy=True,
+        autoruns=None,
+        working=None,
+        autorun_error=None,
+        working_error=False,
+        working_malformed=False,
+        autorun_payload_error=None,
     ) -> None:
         self._healthy = healthy
         self._autoruns = list(autoruns or [])
         self._working = list(working or [])
-        self._autorun_error = autorun_error
-        self._working_error = working_error
+        self._autorun_error = autorun_error  # adapter-level {"error"} for auto-run
+        self._working_error = working_error  # adapter-level {"error"} for list
+        self._working_malformed = working_malformed  # non-JSON-array list reply
+        self._autorun_payload_error = autorun_payload_error  # module-reported {"error"}
         self.calls: list[str] = []
 
     async def check_health_cached(self) -> bool:
@@ -166,10 +184,14 @@ class _FakeModule:
         if "READ-ONLY: list" in prompt:
             if self._working_error:
                 return {"error": "ssh down"}
+            if self._working_malformed:
+                return {"text": "sorry, I could not list them"}
             return {"text": json.dumps(self._working)}
         # auto-run dispatch
         if self._autorun_error is not None:
             return {"error": self._autorun_error}
+        if self._autorun_payload_error is not None:
+            return {"text": json.dumps({"error": self._autorun_payload_error})}
         if self._autoruns:
             return {"text": json.dumps(self._autoruns.pop(0))}
         return {"text": json.dumps({"none_left": True})}
@@ -193,8 +215,7 @@ def _cfg(monkeypatch, *, mode, cap=3):
         cfg,
         "load_config",
         lambda: {
-            "reasoning_module": "Career Ops",
-            "data_module": "Career Agent",
+            "reasoning_module": "test-module",
             "max_auto_runs_per_tick": cap,
             "dispatch_timeout_s": 240,
         },
@@ -266,7 +287,7 @@ async def test_execute_operation_error_dict_surfaces_error(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_n_zero_no_nudge(db, monkeypatch):
-    # No page-worthy accounts and no working drafts → NO "0 drafts" spam nudge.
+    # No target accounts and no staged drafts → NO "0 drafts" spam nudge.
     _cfg(monkeypatch, mode="live")
     mod = _FakeModule(autoruns=[], working=[])
     mon, pipe = _mon(db, mod)
@@ -344,6 +365,7 @@ async def test_undelivered_nudge_not_marked_retries(db, monkeypatch):
     mon, pipe = _mon(db, mod, pipe_status=OutreachStatus.FAILED)
     result = await mon.gather()
     assert result.nudged == 0 and len(pipe.sent) == 1  # attempted, not delivered
+    assert result.errors >= 1  # FAILED delivery counts as a job-health failure (B5)
     assert not await observations.exists_by_hash(
         db, source="recon", content_hash=_nudge_hash("Zeta")
     )
@@ -413,6 +435,127 @@ async def test_runner_records_failure_on_dispatch_errors(monkeypatch):
     await runners.run_career_outreach_monitor(_Sched())
     assert calls["fail"] and calls["fail"][0][0] == "career_outreach_monitor"
     assert not calls["success"]
+
+
+@pytest.mark.asyncio
+async def test_runner_skips_health_record_when_off(monkeypatch):
+    # Codex P2: mode="off" records NEITHER success nor failure — a disabled install
+    # stays invisible in job-health (surplus convention).
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(mode="off")
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = None
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert not calls["fail"] and not calls["success"]
+
+
+@pytest.mark.asyncio
+async def test_pause_midtick_halts_dispatches_and_nudge(db, monkeypatch):
+    # Codex P1: an owner /pause mid-tick stops the remaining dispatches AND the nudge.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mod = _FakeModule(
+        autoruns=[
+            {"company": "A", "contact": "a", "draft_summary": "s"},
+            {"company": "B", "contact": "b", "draft_summary": "s"},
+        ],
+        working=[{"company": "A", "contact": "a"}],
+    )
+    mon, pipe = _mon(db, mod)
+    state = {"n": 0}
+
+    def paused():
+        state["n"] += 1
+        return state["n"] > 1  # first check False (1 dispatch), then True
+
+    mon._is_paused = paused
+    result = await mon.gather()
+    assert result.auto_runs == 1 and _autorun_calls(mod) == 1  # 2nd auto-run blocked
+    assert result.nudged == 0 and pipe.sent == []  # nudge skipped while paused
+
+
+@pytest.mark.asyncio
+async def test_malformed_list_reply_is_error_observe_and_live(db, monkeypatch):
+    # Codex P2: a NON-EMPTY, non-JSON-array list reply is a protocol violation →
+    # errors≥1 (not a silent empty set that would make observe seed nothing, then
+    # live blast the whole backlog).
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(working_malformed=True))
+    r_obs = await mon.gather()
+    assert r_obs.errors == 1 and r_obs.seeded == 0
+
+    _cfg(monkeypatch, mode="live")
+    mon2, pipe2 = _mon(db, _FakeModule(autoruns=[], working_malformed=True))
+    r_live = await mon2.gather()
+    assert r_live.errors >= 1 and pipe2.sent == []
+
+
+@pytest.mark.asyncio
+async def test_module_reported_error_counts_as_failure(db, monkeypatch):
+    # Codex P2: a module-reported {"error"} in the auto-run payload increments errors
+    # so a persistent module error surfaces as a job-health failure.
+    _cfg(monkeypatch, mode="live")
+    mon, _ = _mon(db, _FakeModule(autorun_payload_error="auth failed", working=[]))
+    result = await mon.gather()
+    assert result.errors >= 1
+
+
+@pytest.mark.asyncio
+async def test_ignored_nudge_is_not_an_error(db, monkeypatch):
+    # Codex P2: a quiet-hours IGNORED nudge is an EXPECTED defer — NOT a failure —
+    # and is not marked (retries next tick).
+    _cfg(monkeypatch, mode="live")
+    mod = _FakeModule(autoruns=[], working=[{"company": "Zeta", "contact": "z@zeta.dev"}])
+    mon, pipe = _mon(db, mod, pipe_status=OutreachStatus.IGNORED)
+    result = await mon.gather()
+    assert result.errors == 0 and result.nudged == 0 and len(pipe.sent) == 1
+    assert not await observations.exists_by_hash(
+        db, source="recon", content_hash=_nudge_hash("Zeta")
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_pipeline_nudge_counts_as_failure(db, monkeypatch):
+    # Codex P2: no pipeline → the nudge cannot be delivered → a job-health failure.
+    _cfg(monkeypatch, mode="live")
+    mod = _FakeModule(autoruns=[], working=[{"company": "Zeta", "contact": "z@zeta.dev"}])
+    mon, _ = _mon(db, mod)
+    mon._pipeline = lambda: None
+    result = await mon.gather()
+    assert result.errors >= 1 and result.nudged == 0
+
+
+@pytest.mark.asyncio
+async def test_nudge_topic_distinguishes_distinct_sets(db):
+    # Codex P2: distinct same-size same-day fresh sets get distinct topics (a stable
+    # set-hash), so submit_raw's 24h (signal_type, topic, category) dedup does not
+    # collapse two genuinely different batches into one.
+    mon = CareerOutreachMonitor(db)
+    sent = []
+
+    class _CapturePipe:
+        async def submit_raw(self, text, request):
+            sent.append(request)
+            return OutreachResult(
+                outreach_id="x",
+                status=OutreachStatus.DELIVERED,
+                channel="telegram",
+                message_content=text,
+            )
+
+    mon._pipeline = lambda: _CapturePipe()
+    await mon._nudge([{"company": "Acme", "contact": ""}])
+    await mon._nudge([{"company": "Globex", "contact": ""}])
+    assert sent[0].topic != sent[1].topic
 
 
 @pytest.mark.asyncio

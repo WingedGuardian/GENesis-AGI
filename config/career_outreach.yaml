@@ -19,6 +19,6 @@
 # career_outreach.local.yaml overlay, never here.
 enabled: true
 mode: off
-reasoning_module: "Career Ops"
+reasoning_module: ""   # set your career-agent module's name in career_outreach.local.yaml
 max_auto_runs_per_tick: 3
 dispatch_timeout_s: 240

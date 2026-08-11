@@ -134,9 +134,12 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         pass
     try:
         result = await sched._career_outreach_monitor.gather()
-        if result.mode != "off" and (
-            result.auto_runs or result.nudged or result.seeded or result.errors
-        ):
+        if result.mode == "off":
+            # Disabled-by-config: record NOTHING (neither success nor failure) so the
+            # actuator stays invisible in job-health on installs that never enabled it
+            # (surplus convention — cf. _guard.SKIP).
+            return
+        if result.auto_runs or result.nudged or result.seeded or result.errors:
             logger.info(
                 "Career outreach: mode=%s auto_runs=%d working=%d nudged=%d "
                 "seeded=%d errors=%d",

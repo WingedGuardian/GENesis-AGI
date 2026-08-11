@@ -4,8 +4,8 @@ career-agent engine to stage first-touch outreach drafts, then nudges the owner.
 Unlike its sibling ``AccountActivityMonitor`` (a sense-and-report monitor), this
 one *acts on the owner's behalf*: on a daily tick it dispatches to a configured
 external "reasoning" module (the install's own career-agent, declared in the
-``~/.genesis`` module overlay) to run that engine's auto-run-to-staged-draft for
-up to ``max_auto_runs_per_tick`` page-worthy accounts, then pushes ONE Telegram
+``~/.genesis`` module overlay) to run that engine's first-touch draft-staging flow
+for up to ``max_auto_runs_per_tick`` target accounts, then pushes ONE Telegram
 nudge listing the newly-staged drafts. It NEVER sends mail — the external engine
 stages drafts into the owner's mail Drafts and the owner clicks Send
 (draft-and-hold). The autonomous act is bounded to discover+draft (reversible);
@@ -26,14 +26,16 @@ Design notes:
   lie on every failed dispatch).
 - **Health gate.** ``check_health_cached()`` (60s TTL) each tick; an unhealthy
   module (remote box down) is a CLEAN skip, not a failure — an expected transient.
+- **Pause-aware.** The pause state is re-checked between external actions, so an
+  owner ``/pause`` mid-tick halts the remaining (each up-to-timeout-long) dispatches.
 - **Absent user-module → clean no-op.** On an install without the career-agent
   overlay module, ``module_registry.get()`` returns ``None`` and the tick returns
   silently (never a job-health failure on a generic install).
-- **State: nudge-dedup only.** The remote engine's ``radar_status`` is the source
-  of truth for which accounts have staged drafts; a ``career_outreach_nudged``
+- **State: nudge-dedup only.** The external engine's own staged-draft state is the
+  source of truth for which accounts have staged drafts; a ``career_outreach_nudged``
   observation (content-hashed per company) records only "the owner has already
   been nudged for this draft", so a re-tick does not re-nudge. Because the nudge
-  list is RE-DERIVED from the working set each tick minus this ledger, a
+  list is RE-DERIVED from the staged-draft set each tick minus this ledger, a
   non-delivered nudge simply retries next tick.
 - **Modes** (``career_outreach_config``): ``off`` (default — inert) / ``observe``
   (seed the nudged-set from the existing backlog, never dispatch a staging run or
@@ -62,27 +64,28 @@ _NUDGE_TYPE = "career_outreach_nudged"
 # The external reasoning module owns account selection, the per-day cap, drafting,
 # and staging; Genesis only drives the cadence + the owner nudge. Each dispatch
 # instructs the module to do exactly ONE account and reply with ONLY compact JSON
-# (its entire reply is the bridge return value — no prose reaches this side).
+# (its entire reply is the bridge return value — no prose reaches this side). The
+# phrasing is generic (outcome, not the module's internal schema) so it works with
+# any career-agent module, not one specific implementation.
 _AUTORUN_PROMPT = (
     "This is Genesis driving your outreach engine (a timed dispatch under the "
-    "bridge's hard cap). Pick your SINGLE top page-worthy account that is NOT yet "
-    "worked (radar_status watch/radar, not already 'working'), and run your "
-    "auto-run-to-staged-draft for it: eval-lite -> find-contact -> draft -> stage "
-    "the first-touch draft into the owner's mail Drafts, then promote it to "
-    "radar_status='working'. NEVER send. Do EXACTLY ONE account. Your ENTIRE reply "
-    "is the return value: reply with ONLY compact JSON, no prose — "
+    "bridge's hard cap). Pick your SINGLE highest-priority target account that you "
+    "have NOT yet drafted a first-touch outreach for, and run your full first-touch "
+    "outreach flow for it (evaluate fit, find the right contact, draft, and stage "
+    "the first-touch draft into the owner's mail Drafts), then mark it as worked in "
+    "your own tracking. NEVER send. Do EXACTLY ONE account. Your ENTIRE reply is "
+    "the return value: reply with ONLY compact JSON, no prose — "
     '{"company":"<name>","contact":"<email-or-name>","draft_summary":"<one line>"} '
-    'if you staged one, or {"none_left":true} if no page-worthy account remains, '
+    'if you staged one, or {"none_left":true} if no target account remains, '
     'or {"error":"<reason>"} if you could not.'
 )
 
 _LIST_WORKING_PROMPT = (
-    "This is Genesis. READ-ONLY: list the accounts currently at "
-    "radar_status='working' (a first-touch draft is already staged in the owner's "
-    "mail Drafts, awaiting the owner's send). Stage nothing, change nothing. Your "
-    "ENTIRE reply is the return value: reply with ONLY a compact JSON array, no "
-    'prose — [{"company":"<name>","contact":"<email-or-name>"}, ...] (empty array '
-    "[] if none)."
+    "This is Genesis. READ-ONLY: list the accounts for which you have already "
+    "staged a first-touch draft (awaiting the owner's send). Stage nothing, change "
+    "nothing. Your ENTIRE reply is the return value: reply with ONLY a compact JSON "
+    'array, no prose — [{"company":"<name>","contact":"<email-or-name>"}, ...] '
+    "(empty array [] if none)."
 )
 
 
@@ -135,10 +138,10 @@ class CareerOutreachResult:
     mode: str = "off"
     health_ok: bool = True
     auto_runs: int = 0  # dispatches that staged a fresh draft
-    drafts_working: int = 0  # accounts seen at radar_status='working'
+    drafts_working: int = 0  # accounts with a staged first-touch draft
     nudged: int = 0  # newly-staged drafts included in a delivered nudge
-    seeded: int = 0  # observe: existing working accounts seeded into the ledger
-    errors: int = 0  # adapter-level dispatch failures (→ job-health FAILURE)
+    seeded: int = 0  # observe: existing staged-draft accounts seeded into the ledger
+    errors: int = 0  # unsuccessful operations (→ job-health FAILURE)
     details: list[str] = field(default_factory=list)
 
 
@@ -169,6 +172,17 @@ class CareerOutreachMonitor:
             logger.debug("career outreach: outreach pipeline not resolvable", exc_info=True)
             return None
 
+    def _is_paused(self) -> bool:
+        """True if the owner has /paused Genesis. Re-checked BETWEEN external actions
+        so a mid-tick pause halts the remaining dispatches (each up to the dispatch
+        timeout long) — /pause promises all background activity stops."""
+        try:
+            from genesis.runtime._core import GenesisRuntime
+
+            return bool(GenesisRuntime.instance().paused)
+        except Exception:
+            return False
+
     # ── main tick ─────────────────────────────────────────────────────────
     async def gather(self) -> CareerOutreachResult:
         mode = cfg.effective_mode()
@@ -182,9 +196,9 @@ class CareerOutreachMonitor:
             return CareerOutreachResult(mode=mode)
 
         reasoning_name = cfg.module_name(conf, "reasoning_module")
-        mod = reg.get(reasoning_name)
+        mod = reg.get(reasoning_name) if reasoning_name else None
         if mod is None:
-            # Absent user-module → clean no-op (a generic install lacks the
+            # Absent/unnamed user-module → clean no-op (a generic install lacks the
             # overlay). NOT a job-health failure — this is expected off-install.
             logger.debug("career outreach: module %r not loaded — no-op", reasoning_name)
             return CareerOutreachResult(mode=mode)
@@ -210,13 +224,13 @@ class CareerOutreachMonitor:
         return await self._live(mod, conf, timeout)
 
     async def _observe_seed(self, mod, timeout: int) -> CareerOutreachResult:
-        """Seed the nudged-ledger from the pre-existing working backlog so a later
-        flip to ``live`` does NOT nudge drafts that were staged before the monitor
-        existed. Never dispatches a staging run, never nudges."""
+        """Seed the nudged-ledger from the pre-existing staged-draft backlog so a
+        later flip to ``live`` does NOT nudge drafts that were staged before the
+        monitor existed. Never dispatches a staging run, never nudges."""
         working, err = await self._list_working(mod, timeout)
         if err:
             return CareerOutreachResult(
-                mode="observe", errors=1, details=["observe: list-working dispatch error"]
+                mode="observe", errors=1, details=["observe: list-staged dispatch error"]
             )
         seeded = 0
         for acct in working:
@@ -240,7 +254,7 @@ class CareerOutreachMonitor:
             mode="observe",
             drafts_working=len(working),
             seeded=seeded,
-            details=[f"observe: seeded {seeded} existing working account(s), no nudge"],
+            details=[f"observe: seeded {seeded} existing staged-draft account(s), no nudge"],
         )
 
     async def _live(self, mod, conf: dict, timeout: int) -> CareerOutreachResult:
@@ -250,9 +264,12 @@ class CareerOutreachMonitor:
         details: list[str] = []
         adapter_error = False
 
-        # 1. Drive up to `cap` auto-run-to-staged-draft dispatches — the module
-        #    self-selects + self-caps (won't re-pick a 'working' one).
+        # 1. Drive up to `cap` first-touch draft-staging dispatches — the module
+        #    self-selects + self-caps (won't re-pick an already-drafted account).
         for _ in range(cap):
+            if self._is_paused():
+                details.append("paused mid-tick — stopping auto-run loop")
+                break
             result = await mod.execute_operation(
                 "dispatch", {"prompt": _AUTORUN_PROMPT, "timeout_s": timeout}
             )
@@ -269,11 +286,13 @@ class CareerOutreachMonitor:
                 details.append("auto-run: unparseable reply — stopping")
                 break
             if payload.get("none_left"):
-                details.append("auto-run: no page-worthy accounts left")
+                details.append("auto-run: no target accounts left")
                 break
             if payload.get("error"):
-                # Module-reported (not adapter) failure for this account — soft
-                # stop, not a job-health failure.
+                # Module-reported failure (e.g. auth/drafting) — COUNT it so a
+                # persistent module error surfaces as a job-health failure, not a
+                # silent green tick; still stop the loop.
+                errors += 1
                 details.append(f"auto-run: module error: {str(payload.get('error'))[:120]}")
                 break
             company = (payload.get("company") or "").strip()
@@ -283,20 +302,20 @@ class CareerOutreachMonitor:
             auto_runs += 1
             details.append(f"staged: {company}")
 
-        # 2. Nudge — RE-DERIVE the nudge list from the current working set minus the
-        #    already-nudged ledger (so an undelivered nudge simply retries next
+        # 2. Nudge — RE-DERIVE the nudge list from the current staged-draft set minus
+        #    the already-nudged ledger (so an undelivered nudge simply retries next
         #    tick). Skip if the box just errored (avoid a second doomed dispatch).
         # GROUNDWORK(career-outreach-discovery): before the auto-run loop, drive any
-        # due discovery sweep here (scoped small, < the 300s cap) to widen the
-        # radar with net-new agentic-AI companies; deferred for the MVP, which
-        # runs against the existing radar backlog.
+        # due discovery step here (scoped small, < the 300s cap) to widen the target
+        # set with net-new candidate companies; deferred for the MVP, which runs
+        # against the engine's existing target backlog.
         nudged = 0
         drafts_working = 0
         if not adapter_error:
             working, err = await self._list_working(mod, timeout)
             if err:
                 errors += 1
-                details.append("nudge: list-working dispatch error")
+                details.append("nudge: list-staged dispatch error")
             else:
                 drafts_working = len(working)
                 fresh = []
@@ -320,8 +339,13 @@ class CareerOutreachMonitor:
                         {"company": company, "contact": (acct.get("contact") or "").strip()}
                     )
                 # N=0 → NO nudge (never a "0 drafts staged" spam message).
-                if fresh:
-                    if await self._nudge(fresh):
+                if fresh and self._is_paused():
+                    details.append(f"paused — skipping nudge for {len(fresh)} draft(s)")
+                elif fresh:
+                    from genesis.outreach.types import OutreachStatus
+
+                    status = await self._nudge(fresh)
+                    if status == OutreachStatus.DELIVERED:
                         for acct in fresh:
                             await observations.create(
                                 self._db,
@@ -336,9 +360,20 @@ class CareerOutreachMonitor:
                             )
                         nudged = len(fresh)
                         details.append(f"nudged {nudged} new staged draft(s)")
-                    else:
+                    elif status == OutreachStatus.IGNORED:
+                        # Quiet-hours defer — an EXPECTED outcome, not a failure. Not
+                        # marked, so it retries next tick.
                         details.append(
-                            f"nudge not delivered — {len(fresh)} draft(s) retry next tick"
+                            f"nudge deferred (quiet hours) — {len(fresh)} draft(s) retry next tick"
+                        )
+                    else:
+                        # FAILED / REJECTED / no-pipeline / exception — unsuccessful.
+                        # COUNT it so a persistent delivery failure surfaces as a
+                        # job-health failure; not marked, so it retries.
+                        errors += 1
+                        details.append(
+                            f"nudge not delivered (status={status}) — "
+                            f"{len(fresh)} draft(s) retry next tick"
                         )
 
         return CareerOutreachResult(
@@ -351,22 +386,21 @@ class CareerOutreachMonitor:
         )
 
     async def _list_working(self, mod, timeout: int) -> tuple[list[dict], bool]:
-        """Ask the reasoning module for the current ``radar_status='working'``
-        accounts (the source of truth for staged drafts). Returns ``(accounts,
-        err)`` where ``err`` is True on an adapter-level dispatch failure (the
-        caller surfaces it). A successful dispatch whose reply is not a JSON array
-        yields ``([], False)`` but is logged at WARNING — a persistently-malformed
-        reply must be diagnosable, not silently indistinguishable from "none"."""
-        # GROUNDWORK(career-outreach-http-read): this reads the working set via an SSH
-        # CC dispatch to the reasoning module (~100s, costs a turn). A future Career
-        # Agent HTTP op returning the radar working-set would be a cheaper/faster read
-        # path — reintroduce a `data_module` config knob pointing at it when it exists.
+        """Ask the reasoning module for the accounts with an already-staged
+        first-touch draft (the source of truth for staged drafts). Returns
+        ``(accounts, err)`` where ``err`` is True on a dispatch failure OR a
+        NON-EMPTY reply that is not a JSON array (a protocol violation the caller
+        surfaces as a job-health failure); a genuinely empty reply is ``([], False)``."""
+        # GROUNDWORK(career-outreach-http-read): this reads the staged-draft set via an
+        # SSH CC dispatch to the reasoning module (~100s, costs a turn). A future HTTP
+        # op returning that set would be a cheaper/faster read path — reintroduce a
+        # `data_module` config knob pointing at it when it exists.
         result = await mod.execute_operation(
             "dispatch", {"prompt": _LIST_WORKING_PROMPT, "timeout_s": timeout}
         )
         if isinstance(result, dict) and result.get("error"):
             logger.info(
-                "career outreach: list-working dispatch error: %s",
+                "career outreach: list-staged dispatch error: %s",
                 str(result.get("error"))[:120],
             )
             return [], True
@@ -374,25 +408,31 @@ class CareerOutreachMonitor:
         data = _parse_json(text)
         if isinstance(data, list):
             return [d for d in data if isinstance(d, dict)], False
-        # Not an adapter failure, but do not swallow a malformed reply silently —
-        # it would otherwise look identical to "no working accounts".
+        # A NON-EMPTY reply that is not a JSON array is a protocol violation — surface
+        # it as an error (err=True → job-health failure) so a persistently-malformed
+        # module reply is diagnosable, NOT silently indistinguishable from "none"
+        # (which would make observe seed nothing, then live blast the whole backlog).
         if text.strip():
             logger.warning(
-                "career outreach: list-working reply was not a JSON array "
+                "career outreach: list-staged reply was not a JSON array "
                 "(malformed module reply?): %s",
                 text.strip()[:160],
             )
+            return [], True
         return [], False
 
-    async def _nudge(self, fresh: list[dict]) -> bool:
+    async def _nudge(self, fresh: list[dict]):
         """Push ONE owner-facing Telegram nudge for the freshly-staged drafts.
-        Returns True ONLY on a confirmed DELIVERED result (submit_raw returns
-        FAILED/IGNORED/REJECTED without raising — those must not count)."""
+        Returns the delivery ``OutreachStatus`` (``None`` if there is no pipeline or
+        the send raised) so the caller can distinguish DELIVERED (mark), IGNORED
+        (quiet-hours defer — retry, not a failure), and FAILED/REJECTED (a
+        job-health failure)."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
+
         pipeline = self._pipeline()
         if pipeline is None:
             logger.warning("career outreach: pipeline unavailable — cannot nudge")
-            return False
-        from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
+            return None
 
         n = len(fresh)
         lines = "\n".join(
@@ -405,13 +445,20 @@ class CareerOutreachMonitor:
             f"📇 Career outreach: {n} draft{plural} staged in your Drafts — "
             f"review + send:\n{lines}{more}"
         )
+        # A stable hash of the fresh company set in the topic — submit_raw dedups on
+        # (signal_type, topic, category) for 24h, so date+count alone would collapse
+        # two DISTINCT same-size batches on one day into one; the set-hash keeps them
+        # distinct while an identical same-day retry still dedups (idempotent resend).
+        set_hash = hashlib.sha256(
+            ",".join(sorted(a["company"].strip().lower() for a in fresh)).encode()
+        ).hexdigest()[:8]
         request = OutreachRequest(
             category=OutreachCategory.NOTIFICATION,
             channel="telegram",
-            # Date-stamped so distinct ticks are not deduped into one, while an
-            # identical same-day fresh-set (an undelivered retry within the day)
-            # dedups rather than double-sends.
-            topic=f"Career outreach: {n} staged draft(s) {datetime.now(UTC).strftime('%Y-%m-%d')}",
+            topic=(
+                f"Career outreach: {n} staged draft(s) "
+                f"{datetime.now(UTC).strftime('%Y-%m-%d')} {set_hash}"
+            ),
             context=text,
             signal_type="career_outreach_nudged",
             salience_score=0.85,
@@ -421,12 +468,10 @@ class CareerOutreachMonitor:
             result = await pipeline.submit_raw(text, request)
         except Exception:
             logger.error("career outreach: nudge failed", exc_info=True)
-            return False
-        if result is not None and result.status == OutreachStatus.DELIVERED:
+            return None
+        status = getattr(result, "status", None)
+        if status == OutreachStatus.DELIVERED:
             logger.info("career outreach: nudged %d staged draft(s)", n)
-            return True
-        logger.warning(
-            "career outreach: nudge not delivered (status=%s) — will retry",
-            getattr(result, "status", None),
-        )
-        return False
+        else:
+            logger.warning("career outreach: nudge not delivered (status=%s) — will retry", status)
+        return status
