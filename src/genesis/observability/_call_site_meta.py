@@ -523,6 +523,14 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": True,
         "see_also": ["dream_cycle_synthesis"],
     },
+    "dream_cycle_relationship_classify": {
+        "description": "MW-2 relationship classifier — coarse relationship judgment (duplicate/contradicts/succeeded_by/distinct) between two candidate memories, with confidence. The reusable function MW-5's merge gate will consume; currently driven only by the MW-2 shadow measurement probe. Fine-grained typing (extends/supports/elaborates) deliberately excluded — unreliable on already-similar pairs.",
+        "category": "consolidation",
+        "frequency": "On demand (MW-2 measurement probe now; MW-5 merge-gate nominees later); batched",
+        "model_tier": "slm",
+        "wired": False,
+        "see_also": ["dream_cycle_entity_check"],
+    },
     "dream_cycle_synthesis_challenge": {
         "description": "Adversarial challenge of dream cycle synthesis output. Different provider from synthesis (Kimi challenges DeepSeek) to ensure model independence. Blocks deprecation when information loss detected.",
         "category": "consolidation",

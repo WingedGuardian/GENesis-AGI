@@ -925,6 +925,28 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             "memory_links CHECK constraint migration failed", exc_info=True
         )
 
+    # MW-2 (0082) edge-metadata on memory_links — classifier-verdict stamping
+    # location (GROUNDWORK(mw-5-merge-gate)). Mirrored here because
+    # create_all_tables runs _migrate_add_columns but NOT the numbered runner,
+    # so an existing DB upgraded via the base path needs the columns too
+    # (schema_both_build_paths). All NULLable, no backfill; NULL safe_for_boost
+    # = boost-eligible (legacy default).
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN proposed_type TEXT",
+        "memory_links.proposed_type")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN confidence REAL",
+        "memory_links.confidence")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN classifier TEXT",
+        "memory_links.classifier")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN review_state TEXT",
+        "memory_links.review_state")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN safe_for_boost INTEGER",
+        "memory_links.safe_for_boost")
+
     # Bookmark fix: add source column to session_bookmarks
     await _try_alter(db,
         "ALTER TABLE session_bookmarks ADD COLUMN source TEXT NOT NULL DEFAULT 'auto'",
