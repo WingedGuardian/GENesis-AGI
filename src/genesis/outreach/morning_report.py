@@ -62,25 +62,41 @@ _STALE_PRIORITY_DEMOTION = {"critical": "high", "high": "medium", "medium": "med
 _BUILD_PR_CI_TIMEOUT_S = 20  # per-PR gh call; PRs are checked concurrently
 _MAX_BUILD_PR_CHECKS = 10    # cap concurrent gh calls (rate-limit safety)
 
-_GITHUB_STATUS_URL = "https://www.githubstatus.com/api/v2/status.json"
+_GITHUB_STATUS_URL = "https://www.githubstatus.com/api/v2/components.json"
 _GH_STATUS_TIMEOUT_S = 5  # preflight only; a slow/unreachable status page fails open
+# Statuspage's documented non-operational component states. An explicit
+# allowlist: any OTHER value (schema-invalid types, new/unknown states,
+# "operational") does NOT count as degraded — fail-open by construction.
+_GH_DEGRADED_STATUSES = frozenset(
+    {"degraded_performance", "partial_outage", "major_outage"}
+)
 
 
 async def _github_actions_degraded() -> bool:
-    """True only when GitHub reports an ACTIVE incident (status indicator != none).
+    """True only when the GitHub *Actions* component reports a degraded state.
 
-    Fail-OPEN: any error, timeout, or malformed payload returns False, so a real
-    CI failure is never masked as an infra outage — this only ever ADDS a hedged
-    'incident' annotation when GitHub positively confirms one. Uses the summary
-    indicator (not per-component) intentionally; the annotation is hedged, so a
-    non-Actions incident at worst adds a soft, clearly-conditional note.
+    Component-scoped (``/api/v2/components.json``, the ``Actions`` entry) — the
+    aggregate status indicator also trips on unrelated components (Packages,
+    Codespaces), which would mislabel genuine CI failures as infra incidents.
+    Degraded ONLY when the component's status is a string in the documented
+    non-operational enum (explicit allowlist). Fail-OPEN: any error, timeout,
+    missing component, or malformed/unknown status returns False, so a real CI
+    failure is never masked — this only ever ADDS a hedged 'incident' annotation
+    when GitHub positively confirms an Actions problem.
     """
     try:
         async with httpx.AsyncClient(timeout=_GH_STATUS_TIMEOUT_S) as client:
             resp = await client.get(_GITHUB_STATUS_URL)
             resp.raise_for_status()
-            indicator = ((resp.json() or {}).get("status") or {}).get("indicator")
-        return str(indicator or "none").lower() != "none"
+            components = (resp.json() or {}).get("components") or []
+        for comp in components:
+            if not isinstance(comp, dict):
+                continue
+            if str(comp.get("name") or "").strip().lower() != "actions":
+                continue
+            status = comp.get("status")
+            return isinstance(status, str) and status.lower() in _GH_DEGRADED_STATUSES
+        return False  # Actions component not found → cannot confirm → fail open
     except Exception:
         logger.debug("githubstatus preflight failed; failing open", exc_info=True)
         return False

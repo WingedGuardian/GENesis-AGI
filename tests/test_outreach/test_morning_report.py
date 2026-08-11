@@ -486,19 +486,42 @@ class _FakeStatusClient:
         return _FakeStatusResp(self._payload)
 
 
+def _components(*entries):
+    return {"components": [dict(e) for e in entries]}
+
+
 @pytest.mark.asyncio
-async def test_github_actions_degraded_reads_indicator(monkeypatch):
+async def test_github_actions_degraded_component_scoped(monkeypatch):
+    # Operational Actions → not degraded.
     monkeypatch.setattr(
         _mr_mod.httpx, "AsyncClient",
-        lambda **kw: _FakeStatusClient(payload={"status": {"indicator": "none"}}),
+        lambda **kw: _FakeStatusClient(
+            payload=_components({"name": "Actions", "status": "operational"}),
+        ),
     )
     assert await _mr_mod._github_actions_degraded() is False
 
+    # Degraded Actions → degraded.
     monkeypatch.setattr(
         _mr_mod.httpx, "AsyncClient",
-        lambda **kw: _FakeStatusClient(payload={"status": {"indicator": "major"}}),
+        lambda **kw: _FakeStatusClient(
+            payload=_components({"name": "Actions", "status": "major_outage"}),
+        ),
     )
     assert await _mr_mod._github_actions_degraded() is True
+
+    # An UNRELATED component's outage must NOT trip the Actions preflight
+    # (the aggregate-indicator approach did — Codex P2).
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(
+            payload=_components(
+                {"name": "Packages", "status": "major_outage"},
+                {"name": "Actions", "status": "operational"},
+            ),
+        ),
+    )
+    assert await _mr_mod._github_actions_degraded() is False
 
 
 @pytest.mark.asyncio
@@ -513,7 +536,27 @@ async def test_github_actions_degraded_fails_open(monkeypatch):
 
     monkeypatch.setattr(
         _mr_mod.httpx, "AsyncClient",
-        lambda **kw: _FakeStatusClient(payload={}),  # no 'status' key
+        lambda **kw: _FakeStatusClient(payload={}),  # no 'components' key
+    )
+    assert await _mr_mod._github_actions_degraded() is False
+
+    # Schema-invalid statuses (bool/int/object/unknown string) are NOT outages —
+    # the allowlist rejects them (Codex P2: `true`/`1` must not read as degraded).
+    for bad in (True, 1, {"level": "major"}, "weird_new_state", None):
+        monkeypatch.setattr(
+            _mr_mod.httpx, "AsyncClient",
+            lambda _bad=bad, **kw: _FakeStatusClient(
+                payload=_components({"name": "Actions", "status": _bad}),
+            ),
+        )
+        assert await _mr_mod._github_actions_degraded() is False, bad
+
+    # Actions component absent entirely → cannot confirm → fail open.
+    monkeypatch.setattr(
+        _mr_mod.httpx, "AsyncClient",
+        lambda **kw: _FakeStatusClient(
+            payload=_components({"name": "Packages", "status": "operational"}),
+        ),
     )
     assert await _mr_mod._github_actions_degraded() is False
 
