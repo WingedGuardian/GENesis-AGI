@@ -110,12 +110,15 @@ async def test_confidence_clamped_to_unit_interval():
 
 
 @pytest.mark.asyncio
-async def test_missing_confidence_defaults_low_not_high():
-    # A verdict with no confidence must not be trusted as high-confidence.
+async def test_missing_confidence_is_a_failed_classification():
+    # A valid label WITHOUT a trustworthy confidence is not a verdict — it must
+    # be a fail-safe (failed=True) so tallies/gates never count it as classified
+    # (Codex r2: duplicate@NaN was counted as a real unsafe classification).
     router = _router(json.dumps({"relationship": "duplicate"}))
     v = await classify_relationship(router, "a", "b")
-    assert v["relationship"] == "duplicate"
+    assert v["relationship"] == "distinct"
     assert v["confidence"] == 0.0
+    assert v["failed"] is True
 
 
 @pytest.mark.asyncio
@@ -179,20 +182,23 @@ async def test_batch_empty_pairs_returns_empty():
 
 
 @pytest.mark.asyncio
-async def test_nan_confidence_rejected_to_zero_not_one():
+async def test_nan_confidence_rejected_as_failed():
     # json.loads accepts bare NaN; min(1.0, nan) returns 1.0 in Python, so an
     # unguarded clamp would make a NaN verdict MAXIMALLY trusted (Codex P2).
+    # r2: and it must be FAILED, not a kept label at 0.0 — else tallies count it.
     router = _router('{"relationship": "duplicate", "confidence": NaN}')
     v = await classify_relationship(router, "a", "b")
-    assert v["relationship"] == "duplicate"
+    assert v["relationship"] == "distinct"
     assert v["confidence"] == 0.0
+    assert v["failed"] is True
 
 
 @pytest.mark.asyncio
-async def test_infinite_confidence_rejected_to_zero():
+async def test_infinite_confidence_rejected_as_failed():
     router = _router('{"relationship": "contradicts", "confidence": Infinity}')
     v = await classify_relationship(router, "a", "b")
     assert v["confidence"] == 0.0
+    assert v["failed"] is True
 
 
 @pytest.mark.asyncio

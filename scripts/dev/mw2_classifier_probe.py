@@ -38,10 +38,11 @@ SNAP = Path.home() / "tmp" / "mw2_probe_snapshot.db"
 OUT_DIR = Path.home() / ".genesis" / "output"
 
 # auto_link writes extends/supports; connection_pass writes related_to. These are
-# the similarity-derived (>=0.75) population MW-2 is about. The SELECT's strength
-# window [0.75, 1.0) excludes extraction-emitted typed links (exactly 0.7) and
-# synthesis provenance edges (exactly 1.0); the report's strength spread makes
-# the sampled window visible.
+# the similarity-derived (>=0.75) population MW-2 is about. strength >= 0.75
+# excludes extraction-emitted typed links (exactly 0.7); synthesis provenance
+# edges (extends@1.0) are excluded by SOURCE (dream_cycle_run_id LIKE
+# 'synthesis:%' — the dream_link_repair marker) rather than by strength, so
+# exact-cosine auto_link edges (prime duplicate suspects) STAY in (Codex r2).
 _SIMILARITY_TYPES = ("extends", "supports", "related_to")
 
 
@@ -82,24 +83,36 @@ async def run(n: int, batch: int, seed: int) -> int:
     # dict(row)) requires it, and hydrate_for_expansion's index access still works.
     db.row_factory = aiosqlite.Row
     try:
-        # Deterministic sample: seed sqlite's RANDOM via a stable ORDER key.
-        # Strength window isolates the SIMILARITY population (Codex P1):
-        # extraction-emitted typed links are strength=0.7 exactly and synthesis
-        # provenance edges are 1.0 exactly; auto_link writes cosine >=0.75 and
-        # connection_pass >=0.80, both strictly <1.0 in practice.
+        # FULL eligible population (Codex r2: a pre-LIMIT on a lexicographic
+        # ORDER sampled only the earliest id-prefix cluster and no seed could
+        # ever reach later edges). Similarity population = the 3 types at
+        # strength >= 0.75, minus synthesis-provenance edges (identified by
+        # SOURCE marker, not by strength — exact-cosine auto_link edges stay).
         rows = await db.execute_fetchall(
             "SELECT source_id, target_id, link_type, strength FROM memory_links "  # noqa: S608 - placeholders bound
             f"WHERE link_type IN ({','.join('?' * len(_SIMILARITY_TYPES))}) "
-            "AND strength >= 0.75 AND strength < 1.0 "
-            "ORDER BY substr(source_id || target_id, 1, 12), source_id "
-            "LIMIT ?",
-            (*_SIMILARITY_TYPES, max(n * 3, n)),
+            "AND strength >= 0.75 "
+            "AND NOT (link_type = 'extends' AND source_id IN ("
+            "    SELECT memory_id FROM memory_metadata "
+            "    WHERE dream_cycle_run_id LIKE 'synthesis:%'))",
+            _SIMILARITY_TYPES,
         )
-        rows = list(rows)
+        eligible_edges = len(rows)
 
-        # Stable pseudo-shuffle by seed, then take n. Uses md5 (not builtin
-        # hash(): PEP-456 salts str hashing per process, which would make the
-        # same --seed draw a DIFFERENT sample every run — review finding).
+        # Dedup to UNORDERED pairs (A->B and B->A, or multi-type rows, are the
+        # same content pair — classifying both would double-count it); keep the
+        # strongest row per pair.
+        by_pair: dict[tuple[str, str], tuple] = {}
+        for r in rows:
+            key = (min(r[0], r[1]), max(r[0], r[1]))
+            if key not in by_pair or r[3] > by_pair[key][3]:
+                by_pair[key] = tuple(r)
+        rows = list(by_pair.values())
+        eligible_pairs = len(rows)
+
+        # Stable pseudo-shuffle by seed over the FULL population, then take n.
+        # md5, not builtin hash(): PEP-456 salts str hashing per process, which
+        # would make the same --seed draw a DIFFERENT sample every run.
         def _stable_key(r) -> int:
             digest = hashlib.md5(  # not crypto — a stable shuffle key
                 f"{seed}:{r[0]}:{r[1]}".encode(), usedforsecurity=False
@@ -119,21 +132,56 @@ async def run(n: int, batch: int, seed: int) -> int:
         for off in range(0, len(ids), 400):
             hydrated.update(await memory_crud.hydrate_for_expansion(db, ids[off : off + 400]))
 
+        # created_at per endpoint → per-pair chronology hint (Codex r2: the
+        # batch API accepts newers; the probe must actually supply them).
+        created_at: dict[str, str] = {}
+        for off in range(0, len(ids), 400):
+            chunk = ids[off : off + 400]
+            ph = ",".join("?" * len(chunk))
+            for mid, ca_ts in await db.execute_fetchall(
+                f"SELECT memory_id, created_at FROM memory_metadata "  # noqa: S608 - placeholders bound
+                f"WHERE memory_id IN ({ph})",
+                chunk,
+            ):
+                if ca_ts:
+                    created_at[mid] = ca_ts
+
+        now_iso = datetime.now(UTC).isoformat()
         pairs: list[tuple[str, str]] = []
+        newers: list[str | None] = []
         meta: list[dict] = []
+        skipped_invisible = 0
         for src_id, tgt_id, ltype, strength in rows:
-            ca = (hydrated.get(src_id) or {}).get("content")
-            cb = (hydrated.get(tgt_id) or {}).get("content")
-            if ca and cb:
-                pairs.append((ca, cb))
-                meta.append(
-                    {
-                        "source_id": src_id,
-                        "target_id": tgt_id,
-                        "stored_link_type": ltype,
-                        "strength": strength,
-                    }
-                )
+            row_a = hydrated.get(src_id) or {}
+            row_b = hydrated.get(tgt_id) or {}
+            ca = row_a.get("content")
+            cb = row_b.get("content")
+            if not (ca and cb):
+                continue
+            # Visibility parity with the boost path (graph_expansion skips
+            # bitemporally-expired / deprecated rows): an edge whose endpoint
+            # recall would hide cannot affect boosting — measuring it would
+            # inflate the boost-risk population (Codex r2).
+            visible = True
+            for row in (row_a, row_b):
+                inv = row.get("invalid_at")
+                if (inv is not None and inv <= now_iso) or row.get("deprecated"):
+                    visible = False
+            if not visible:
+                skipped_invisible += 1
+                continue
+            ts_a, ts_b = created_at.get(src_id), created_at.get(tgt_id)
+            newer = ("a" if ts_a > ts_b else "b") if ts_a and ts_b and ts_a != ts_b else None
+            pairs.append((ca, cb))
+            newers.append(newer)
+            meta.append(
+                {
+                    "source_id": src_id,
+                    "target_id": tgt_id,
+                    "stored_link_type": ltype,
+                    "strength": strength,
+                }
+            )
 
         if not pairs:
             print("Edges sampled but no content hydrated — aborting.", file=sys.stderr)
@@ -153,7 +201,9 @@ async def run(n: int, batch: int, seed: int) -> int:
         verdicts: list[dict] = []
         for i in range(0, len(pairs), batch):
             chunk = pairs[i : i + batch]
-            verdicts.extend(await classify_relationships(router, chunk))
+            verdicts.extend(
+                await classify_relationships(router, chunk, newers=newers[i : i + batch])
+            )
             print(
                 f"  classified {min(i + batch, len(pairs))}/{len(pairs)} pairs...", file=sys.stderr
             )
@@ -180,7 +230,10 @@ async def run(n: int, batch: int, seed: int) -> int:
         report = {
             "generated_at": datetime.now(UTC).isoformat(),
             "snapshot": str(SNAP),
-            "sampled_edges": len(rows),
+            "eligible_edges": eligible_edges,
+            "eligible_pairs_deduped": eligible_pairs,
+            "sampled_pairs": len(rows),
+            "skipped_invisible_endpoints": skipped_invisible,
             "classified_pairs": total,
             "failsafe_unclassified": failsafe_count,
             "stored_type_mix": dict(Counter(m["stored_link_type"] for m in meta)),

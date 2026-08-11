@@ -146,15 +146,19 @@ def _normalize_verdict(raw: dict[str, Any]) -> dict[str, Any]:
         # The model responded, but outside the contract — a fail-safe, not a verdict.
         return {"relationship": "distinct", "confidence": 0.0, "reasoning": reasoning, "failed": True}
     conf = raw.get("confidence")
-    # bool is a subclass of int — reject it explicitly so True→1.0 can't sneak in.
-    if isinstance(conf, bool) or not isinstance(conf, (int, float)):
-        conf = 0.0
-    conf = float(conf)
-    # json.loads accepts bare NaN/Infinity; min(1.0, nan) returns 1.0 in Python,
-    # so an unguarded clamp would make a NaN verdict MAXIMALLY trusted.
-    if not math.isfinite(conf):
-        conf = 0.0
-    conf = max(0.0, min(1.0, conf))
+    # A valid label WITHOUT a trustworthy confidence is not a verdict: absent,
+    # non-numeric, bool (a subclass of int — True→1.0 must not sneak in), or
+    # non-finite (json.loads accepts bare NaN/Infinity, and min(1.0, nan)
+    # returns 1.0 in Python — an unguarded clamp would make a NaN verdict
+    # MAXIMALLY trusted). All fail safe, so tallies and confidence gates never
+    # count a malformed response as a real classification.
+    if (
+        isinstance(conf, bool)
+        or not isinstance(conf, (int, float))
+        or not math.isfinite(float(conf))
+    ):
+        return _failsafe(f"invalid confidence for label {rel!r} → fail-safe")
+    conf = max(0.0, min(1.0, float(conf)))
     return {"relationship": rel, "confidence": conf, "reasoning": reasoning}
 
 

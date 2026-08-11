@@ -182,10 +182,13 @@ nominees; NOTHING calls it in the runtime yet (probe:
 added five NULLable stamping columns to `memory_links` (`proposed_type`,
 `confidence`, `classifier`, `review_state`, `safe_for_boost`) — NULL
 `safe_for_boost` = boost-eligible (legacy default), no backfill, CHECK/PK
-unchanged. Measured 2026-08-11 (n=300 real similarity edges, strength window
-[0.75, 1.0), 0 fail-safes): 73.0% distinct / 16.7% duplicate / 8.7%
-succeeded_by / 1.7% contradicts; `duplicate` ~80% hand-scored accurate,
-`contradicts` OVER-CALLED (bug↔fix pairs) — so MW-5 must
+unchanged. Measured 2026-08-11 (n=300 sampled from the FULL ~197k-pair
+similarity population — strength ≥0.75, synthesis-provenance excluded by
+source marker, unordered-pair-deduped, boost-visibility-filtered, 0
+fail-safes): 73.2% distinct / 16.4% duplicate / 10.0% succeeded_by / 0.4%
+contradicts; ~17% of sampled edges had recall-hidden endpoints. `duplicate`
+~80% hand-scored accurate, `contradicts` OVER-CALLED (bug↔fix pairs) — so
+MW-5 must
 challenge contradicts verdicts adversarially before acting, and the deferred
 MW-2b machinery (candidate_similar type + CHECK rebuild + write-path change +
 boost gating) is evidence-parked, not planned. The similarity linkers
