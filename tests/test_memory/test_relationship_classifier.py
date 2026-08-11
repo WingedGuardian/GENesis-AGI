@@ -221,3 +221,39 @@ async def test_batch_renders_per_pair_newer_hint():
     await classify_relationships(router, [("old fact", "new fact")], newers=["b"])
     prompt = router.route_call.await_args.args[1][0]["content"]
     assert "NEWER" in prompt
+
+
+# ── Codex round-3: normalization must be total (per-item failure isolation) ──
+
+
+@pytest.mark.asyncio
+async def test_unhashable_relationship_fails_only_that_item():
+    # relationship=[] is unhashable — `[] in frozenset` raises TypeError. That
+    # must fail-safe THIS item only, never discard valid sibling verdicts.
+    router = _router(
+        json.dumps(
+            [
+                {"pair_id": 0, "relationship": "duplicate", "confidence": 0.9},
+                {"pair_id": 1, "relationship": [], "confidence": 0.8},
+            ]
+        )
+    )
+    verdicts = await classify_relationships(router, [("a0", "b0"), ("a1", "b1")])
+    assert verdicts[0]["relationship"] == "duplicate"
+    assert verdicts[0]["confidence"] == 0.9
+    assert verdicts[1]["relationship"] == "distinct"
+    assert verdicts[1]["failed"] is True
+
+
+@pytest.mark.asyncio
+async def test_astronomical_int_confidence_fails_only_that_item():
+    # A huge JSON integer parses to an arbitrary-precision int; float() of it
+    # raises OverflowError — must fail-safe the item, not the batch.
+    router = _router(
+        '[{"pair_id": 0, "relationship": "distinct", "confidence": 0.7},'
+        ' {"pair_id": 1, "relationship": "duplicate", "confidence": ' + "9" * 400 + "}]"
+    )
+    verdicts = await classify_relationships(router, [("a0", "b0"), ("a1", "b1")])
+    assert verdicts[0]["relationship"] == "distinct"
+    assert verdicts[0]["confidence"] == 0.7
+    assert verdicts[1]["failed"] is True

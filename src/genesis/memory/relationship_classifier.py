@@ -140,9 +140,22 @@ def _normalize_verdict(raw: dict[str, Any]) -> dict[str, Any]:
     becomes ``0.0`` (never silently high). A valid label keeps its clamped
     confidence.
     """
+    # Totality guard (Codex r3): a malformed ITEM must fail alone, never poison
+    # sibling verdicts in a batch. Non-str relationship ([]/{}/None) would raise
+    # TypeError on the frozenset test; an astronomical JSON int raises
+    # OverflowError in float(). Both are handled here; the except is the
+    # belt-and-suspenders for anything else malformed.
+    try:
+        return _normalize_verdict_inner(raw)
+    except Exception:  # noqa: BLE001 — normalization must be total
+        logger.debug("malformed verdict object", exc_info=True)
+        return _failsafe("malformed verdict → fail-safe")
+
+
+def _normalize_verdict_inner(raw: dict[str, Any]) -> dict[str, Any]:
     rel = raw.get("relationship")
     reasoning = str(raw.get("reasoning", "") or "")
-    if rel not in COARSE_RELATIONSHIPS:
+    if not isinstance(rel, str) or rel not in COARSE_RELATIONSHIPS:
         # The model responded, but outside the contract — a fail-safe, not a verdict.
         return {"relationship": "distinct", "confidence": 0.0, "reasoning": reasoning, "failed": True}
     conf = raw.get("confidence")

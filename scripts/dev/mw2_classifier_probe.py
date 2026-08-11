@@ -45,6 +45,10 @@ OUT_DIR = Path.home() / ".genesis" / "output"
 # exact-cosine auto_link edges (prime duplicate suspects) STAY in (Codex r2).
 _SIMILARITY_TYPES = ("extends", "supports", "related_to")
 
+#: Size of the seeded REPRESENTATIVE hand-scoring subset (proportional across
+#: verdicts by construction — stable-key order over all classified pairs).
+_HAND_SCORE_N = 40
+
 
 def snapshot_live_db() -> None:
     """WAL-safe online backup of the live DB → ~/tmp copy (read source, never write it)."""
@@ -86,13 +90,16 @@ async def run(n: int, batch: int, seed: int) -> int:
         # FULL eligible population (Codex r2: a pre-LIMIT on a lexicographic
         # ORDER sampled only the earliest id-prefix cluster and no seed could
         # ever reach later edges). Similarity population = the 3 types at
-        # strength >= 0.75, minus synthesis-provenance edges (identified by
-        # SOURCE marker, not by strength — exact-cosine auto_link edges stay).
+        # strength >= 0.75, minus TRUE synthesis-provenance edges only:
+        # source has the synthesis marker AND strength is exactly 1.0 (the
+        # provenance-edge constant). A live dream-merge also REWIRES originals'
+        # similarity edges onto the synthesis preserving their cosine (<1.0) —
+        # those remain boost-live and stay in the population (Codex r3).
         rows = await db.execute_fetchall(
             "SELECT source_id, target_id, link_type, strength FROM memory_links "  # noqa: S608 - placeholders bound
             f"WHERE link_type IN ({','.join('?' * len(_SIMILARITY_TYPES))}) "
             "AND strength >= 0.75 "
-            "AND NOT (link_type = 'extends' AND source_id IN ("
+            "AND NOT (link_type = 'extends' AND strength = 1.0 AND source_id IN ("
             "    SELECT memory_id FROM memory_metadata "
             "    WHERE dream_cycle_run_id LIKE 'synthesis:%'))",
             _SIMILARITY_TYPES,
@@ -248,34 +255,61 @@ async def run(n: int, batch: int, seed: int) -> int:
             "mean_confidence_by_verdict": {r: _mean(conf_by_rel[r]) for r in COARSE_RELATIONSHIPS},
         }
 
-        # ── hand-scorable sample (all unsafe verdicts + a slice of distinct) ──
-        sample = []
-        distinct_shown = 0
-        for (ca, cb), v, m in zip(pairs, verdicts, meta, strict=True):
-            is_unsafe = v["relationship"] != "distinct"
-            if is_unsafe or distinct_shown < 8:
-                if not is_unsafe:
-                    distinct_shown += 1
-                sample.append(
-                    {
-                        "verdict": v["relationship"],
-                        "confidence": v["confidence"],
-                        "reasoning": v.get("reasoning", ""),
-                        "stored_link_type": m["stored_link_type"],
-                        "strength": m["strength"],
-                        "content_a": ca[:400],
-                        "content_b": cb[:400],
-                    }
-                )
+        # ── hand-scoring artifacts (Codex r3) ─────────────────────────────
+        # (a) hand_score_sample: a SEEDED REPRESENTATIVE subset across ALL
+        #     verdicts (stable-key order, so distinct — 73% of the population —
+        #     is proportionally present and overall accuracy / unsafe
+        #     false-negatives are measurable from the artifact);
+        # (b) unsafe_dump: every predicted-unsafe pair, as a diagnostic section.
+        # Entries carry endpoint ids + the SAME 1500-char span the classifier
+        # saw, so a reviewer can reproduce and score each verdict faithfully.
+        # (Local artifact — ~/.genesis/output is never a public surface.)
+        def _entry(ca: str, cb: str, v: dict, m: dict) -> dict:
+            return {
+                "source_id": m["source_id"],
+                "target_id": m["target_id"],
+                "verdict": v["relationship"],
+                "confidence": v["confidence"],
+                "reasoning": v.get("reasoning", ""),
+                "stored_link_type": m["stored_link_type"],
+                "strength": m["strength"],
+                "content_a": ca[:1500],
+                "content_b": cb[:1500],
+            }
+
+        joined = [
+            (ca, cb, v, m)
+            for (ca, cb), v, m in zip(pairs, verdicts, meta, strict=True)
+            if not v.get("failed")
+        ]
+        rep_order = sorted(
+            joined, key=lambda t: _stable_key((t[3]["source_id"], t[3]["target_id"]))
+        )
+        hand_score_sample = [_entry(ca, cb, v, m) for ca, cb, v, m in rep_order[:_HAND_SCORE_N]]
+        unsafe_dump = [
+            _entry(ca, cb, v, m) for ca, cb, v, m in joined if v["relationship"] != "distinct"
+        ]
 
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         report_path = OUT_DIR / f"mw2_classifier_probe_{stamp}.json"
-        report_path.write_text(json.dumps({"report": report, "sample": sample}, indent=2))
+        report_path.write_text(
+            json.dumps(
+                {
+                    "report": report,
+                    "hand_score_sample": hand_score_sample,
+                    "unsafe_dump": unsafe_dump,
+                },
+                indent=2,
+            )
+        )
 
         print("\n===== MW-2 CHECKPOINT A — classifier probe =====")
         print(json.dumps(report, indent=2))
-        print(f"\nHand-scorable sample ({len(sample)} pairs) + full report → {report_path}")
+        print(
+            f"\nRepresentative hand-score sample ({len(hand_score_sample)}) + "
+            f"unsafe dump ({len(unsafe_dump)}) + full report → {report_path}"
+        )
         return 0
     finally:
         await db.close()
