@@ -176,10 +176,14 @@ def _cd_target(raw: str):
         return _CWD_UNKNOWN
     if len(p) >= 2 and p[0] in "'\"" and p[-1] == p[0]:
         inner = p[1:-1]
-        # Double quotes still expand $/` and collapse backslash escapes — a
-        # literal read of those is unfaithful → UNKNOWN. Single quotes suppress
-        # ALL expansion, so the literal read is always faithful.
-        if p[0] == '"' and any(ch in inner for ch in "$`\\"):
+        # Double quotes still expand $/`, and consume a backslash ONLY before
+        # $ ` " \ or newline (bash manual "Double Quotes"; verified vs bash 5.2:
+        # `"\q"` keeps the backslash literally, `"\$"`/`"\\"` collapse). A literal
+        # read is unfaithful exactly for those — UNKNOWN. A backslash before an
+        # ordinary char (`"/tmp/repo\q"`) is part of the literal pathname and
+        # stays allowed (Codex P2, #1371). Single quotes suppress ALL expansion,
+        # so the literal read is always faithful.
+        if p[0] == '"' and (any(ch in inner for ch in "$`") or re.search(r'\\[$`"\\\n]', inner)):
             return _CWD_UNKNOWN
         return inner
     if " " in p or "\t" in p:
@@ -204,8 +208,11 @@ def _cd_target(raw: str):
     if any(ch in p for ch in "$`*?[{\\()<>"):
         return _CWD_UNKNOWN
     # A RELATIVE target with CDPATH in the environment: bash's cd consults CDPATH
-    # and may enter a directory OUTSIDE the resolved join — unverifiable.
-    if not os.path.isabs(p) and os.environ.get("CDPATH"):
+    # and may enter a directory OUTSIDE the resolved join — unverifiable. EXEMPT
+    # a first pathname component of `.` or `..`: POSIX cd (and bash 5.2, verified)
+    # skips the CDPATH search for those, so `cd ./wt` stays deterministically
+    # resolvable even under CDPATH (Codex P2, #1371).
+    if not os.path.isabs(p) and os.environ.get("CDPATH") and p.split("/", 1)[0] not in (".", ".."):
         return _CWD_UNKNOWN
     return p
 
@@ -269,9 +276,26 @@ def _effective_diff_cwd(command: str, payload: dict, segs: list, commit_seg=None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
     target_raw = getattr(commit_seg, "raw", None) if commit_seg is not None else None
     if target_raw is not None:
+        # Locate commit_seg by POSITION (occurrence index among top-level segments
+        # sharing its raw), not by first-raw-match: in a chain of commits with
+        # IDENTICAL raw text (`cd /wt && git commit -m same; cd /other && git
+        # commit -m same`) a raw-equality break stopped at the FIRST occurrence
+        # for BOTH segments, so the second commit inherited the first's cwd —
+        # bypassing the direct-to-main check AND blinding the different-dirs
+        # check (Codex P1, #1371). Identity (`s is commit_seg`) picks the right
+        # occurrence; depth-0 filtering keeps the count aligned with
+        # split_segments (nested segments don't appear as top-level raws).
+        same_raw = [
+            s for s in segs if getattr(s, "depth", 0) == 0 and getattr(s, "raw", None) == target_raw
+        ]
+        occ = next((i for i, s in enumerate(same_raw) if s is commit_seg), 0)
+        seen = 0
         for raw in split_segments(command):
             if raw == target_raw:
-                break
+                if seen == occ:
+                    break
+                seen += 1
+                continue  # an earlier same-raw occurrence (a commit, never a cd)
             cd = _cd_target(raw)
             if cd is _CWD_UNKNOWN:
                 cur = _CWD_UNKNOWN
@@ -541,7 +565,11 @@ def main() -> None:
     # command. (Same-dir chains — `git commit … ; git commit --amend` — pass.)
     # ``None`` (no payload cwd → the hook's own cwd) counts as its own dir: it is
     # not provably equal to an explicit path, so a mixed chain fails closed.
-    if len(set(seg_cwds)) > 1:
+    # Compare by FILESYSTEM identity (realpath), not string: the same worktree
+    # addressed via its real path and a symlink alias is ONE dir sharing one
+    # review marker/index — a string compare false-blocked it (Codex P2, #1371).
+    distinct_dirs = {os.path.realpath(c) if isinstance(c, str) else c for c in seg_cwds}
+    if len(distinct_dirs) > 1:
         _deny(
             "BLOCKED: this command chains git commits into DIFFERENT directories, "
             "which would share a single review gate (the review marker covers only "

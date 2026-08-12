@@ -1213,3 +1213,110 @@ def test_commit_pattern_matches_git_dash_c_and_dash_C() -> None:
         assert checker_pat.search(f), f"checker pattern missed: {f}"
         assert invalidate_pat.search(f), f"invalidator pattern missed: {f}"
     assert checker_pat.pattern == invalidate_pat.pattern, "hook patterns drifted apart"
+
+
+# ── Codex PR-#1371 findings (P1 + three P2s) ─────────────────────────────────
+
+
+def test_identical_raw_chained_commit_on_main_blocks(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    # Codex P1: two commit segments with IDENTICAL raw text — a raw-equality
+    # break resolved BOTH to the first segment's cwd, so the second commit (on
+    # main) inherited the feature worktree's cwd and bypassed Rule 1 AND the
+    # different-dirs check. Occurrence-index matching must catch it.
+    main_repo = _mainrepo(tmp_path)
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m same; cd {main_repo} && git commit -m same",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "Direct commits to main" in res.stderr
+
+
+def test_identical_raw_chained_different_dirs_block(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Same P1 class, both dirs non-main: identical raws must not blind the
+    # structural different-dirs deny either.
+    other = tmp_path / "other"
+    other.mkdir()
+    _git(other, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(other, "config", "user.email", "t@e.st")
+    _git(other, "config", "user.name", "tester")
+    (other / "f.py").write_text("base = 1\n")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "base")
+    _git(other, "checkout", "-q", "-b", "feature/y")
+    (other / "f.py").write_text("base = 2\n")
+    _git(other, "add", "-A")
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m same; cd {other} && git commit -m same",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "DIFFERENT directories" in res.stderr
+
+
+def test_cdpath_dot_prefixed_relative_cd_allows(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Codex P2: POSIX cd (verified vs bash 5.2) skips the CDPATH search when the
+    # first pathname component is dot or dot-dot — `cd ./sub` is deterministic
+    # even under CDPATH and must not be denied.
+    sub = repo / "sub"
+    sub.mkdir()
+    _mark(repo, home)
+    body = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cd ./sub && git commit -m wip"},
+        "session_id": "test",
+        "cwd": str(repo),
+    }
+    env = {**os.environ, "HOME": str(home), "CDPATH": str(tmp_path)}
+    res = subprocess.run(
+        [sys.executable, str(_HOOK)],
+        input=json.dumps(body),
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_double_quoted_backslash_before_ordinary_char_allows(home: Path, tmp_path: Path) -> None:
+    # Codex P2: bash consumes a backslash in double quotes ONLY before $ ` " \
+    # or newline (verified vs bash 5.2) — a quoted literal pathname containing a
+    # backslash before an ordinary char must not be denied.
+    weird = tmp_path / "repo\\q"  # a real dir whose name contains a backslash
+    weird.mkdir()
+    _git(weird, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(weird, "config", "user.email", "t@e.st")
+    _git(weird, "config", "user.name", "tester")
+    (weird / "f.py").write_text("base = 1\n")
+    _git(weird, "add", "-A")
+    _git(weird, "commit", "-qm", "base")
+    _git(weird, "checkout", "-q", "-b", "feature/bs")
+    (weird / "f.py").write_text("base = 2\n")
+    _git(weird, "add", "-A")
+    _mark(weird, home)
+    res = _run_hook(f'cd "{weird}" && git commit -m wip', weird, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_symlink_alias_same_dir_chain_passes(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Codex P2: the same worktree addressed via its real path and a symlink
+    # alias is ONE dir (one marker, one index) — filesystem identity, not
+    # string equality, decides the different-dirs deny.
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m a && git -C {alias} commit --amend -m b",
+        repo,
+        home,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
