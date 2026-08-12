@@ -16,6 +16,11 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover - pyyaml is a declared dependency
+    yaml = None  # type: ignore[assignment]
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TIER1_DIR = REPO_ROOT / ".claude" / "skills"
 TIER2_DIRS = [
@@ -44,8 +49,61 @@ def _extract_skill_info(skill_dir: Path) -> dict | None:
     return {"name": skill_dir.name, "description": "", "keywords": []}
 
 
+def _normalize_desc(value: object) -> str:
+    """Collapse a scalar (folded/literal/plain/quoted) to one scannable line."""
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
 def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
-    """Parse YAML-like frontmatter from a markdown file."""
+    """Parse YAML frontmatter into name/description/keywords.
+
+    Uses a real YAML parser so descriptions with apostrophes, escaped quotes,
+    or multi-line/folded scalars survive in full (the previous regex truncated
+    them at the first ``'``/``"``/newline, dropping searchable text). Falls back
+    to a best-effort regex parse only when PyYAML is unavailable or the block is
+    not a valid YAML mapping.
+    """
+    if content.startswith("---") and yaml is not None:
+        end = content.find("\n---", 3)
+        if end < 0:
+            end = content.find("---", 3)
+        if end > 0:
+            try:
+                loaded = yaml.safe_load(content[3:end])
+            except Exception:
+                # Any parse failure (YAMLError, RecursionError on nested
+                # aliases, …) routes to the legacy fallback below rather than
+                # silently dropping the skill's description.
+                loaded = None
+            if isinstance(loaded, dict):
+                name = (
+                    str(loaded["name"]).strip()
+                    if loaded.get("name")
+                    else fallback_name
+                )
+                kw = loaded.get("keywords")
+                if isinstance(kw, (list, tuple)):
+                    keywords = [str(k).strip() for k in kw if str(k).strip()]
+                elif isinstance(kw, str):
+                    keywords = [k.strip() for k in kw.split(",") if k.strip()]
+                else:
+                    keywords = []
+                return {
+                    "name": name,
+                    "description": _normalize_desc(loaded.get("description")),
+                    "keywords": keywords,
+                }
+    # PyYAML unavailable, no frontmatter, or block not a mapping — legacy parse.
+    return _parse_frontmatter_legacy(content, fallback_name)
+
+
+def _parse_frontmatter_legacy(content: str, fallback_name: str = "") -> dict:
+    """Best-effort regex frontmatter parse — the no-PyYAML degraded fallback.
+
+    NOTE: truncates descriptions at apostrophes / escaped quotes / newlines;
+    ``_parse_frontmatter`` is the real parser and should be preferred."""
     name = fallback_name
     description = ""
 

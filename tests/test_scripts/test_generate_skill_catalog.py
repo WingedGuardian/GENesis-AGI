@@ -155,3 +155,85 @@ def test_scan_tier_relative_paths_under_repo_root(tmp_path):
     assert results[0]["path"] == str(
         Path(".claude") / "skills" / "gitnexus" / "gitnexus-cli"
     )
+
+
+def _fm(name: str, body: str) -> str:
+    """A SKILL.md string with the given frontmatter body."""
+    return f"---\nname: {name}\n{body}\n---\n# {name}\n"
+
+
+class TestParseFrontmatter:
+    """Descriptions must be parsed COMPLETELY — the regex parser truncated at
+    apostrophes (unquoted), escaped quotes (double-quoted), and newlines
+    (plain multi-line scalars), losing searchable text (regression: the live
+    catalog cut `genesis-voice` at "user's", `gitnexus-*` at `Examples: \\`,
+    and `code-intelligence`'s continuation line)."""
+
+    def test_unquoted_apostrophe_not_truncated(self):
+        # The genesis-voice failure: an apostrophe in an unquoted scalar.
+        content = _fm(
+            "genesis-voice",
+            "description: Apply when Genesis writes as itself. Not for writing "
+            "in the user's voice (that's voice-master).",
+        )
+        desc = _gen._parse_frontmatter(content)["description"]
+        assert "user's voice" in desc
+        assert "voice-master" in desc
+
+    def test_double_quoted_escaped_quote_not_truncated(self):
+        # The gitnexus-* failure: an escaped quote inside a double-quoted scalar.
+        content = _fm(
+            "gitnexus-cli",
+            'description: "Run CLI commands. Examples: \\"analyze a repo\\", '
+            '\\"check status\\"."',
+        )
+        desc = _gen._parse_frontmatter(content)["description"]
+        assert "analyze a repo" in desc
+        assert "check status" in desc
+
+    def test_plain_multiline_continuation_kept(self):
+        # The code-intelligence failure: a plain scalar wrapped across lines.
+        content = _fm(
+            "code-intelligence",
+            "description: Code understanding tool selection. Use when exploring "
+            "architecture,\n  finding definitions, or tracing execution.",
+        )
+        desc = _gen._parse_frontmatter(content)["description"]
+        assert "finding definitions" in desc
+        assert "tracing execution" in desc
+
+    def test_folded_scalar_joined_single_line(self):
+        content = _fm("x", "description: >\n  Line one\n  line two.")
+        assert _gen._parse_frontmatter(content)["description"] == "Line one line two."
+
+    def test_literal_scalar_normalized_single_line(self):
+        # Literal `|` keeps newlines in YAML; the catalog wants one scannable line.
+        content = _fm("x", "description: |\n  Multi\n  line desc.")
+        assert _gen._parse_frontmatter(content)["description"] == "Multi line desc."
+
+    def test_keywords_list_parsed(self):
+        content = _fm("x", "description: y\nkeywords: [alpha, beta, gamma]")
+        assert _gen._parse_frontmatter(content)["keywords"] == [
+            "alpha",
+            "beta",
+            "gamma",
+        ]
+
+    def test_simple_fields_still_work(self):
+        content = _fm("plain", "description: does a thing")
+        result = _gen._parse_frontmatter(content)
+        assert result["name"] == "plain"
+        assert result["description"] == "does a thing"
+
+    def test_no_frontmatter_uses_fallback_name(self):
+        result = _gen._parse_frontmatter("# just a heading\n", fallback_name="fb")
+        assert result["name"] == "fb"
+        assert result["description"] == ""
+        assert result["keywords"] == []
+
+    def test_falls_back_when_pyyaml_missing(self, monkeypatch):
+        # No-PyYAML degraded path: routes through _parse_frontmatter_legacy and
+        # still returns the correct shape for a simple (untruncatable) scalar.
+        monkeypatch.setattr(_gen, "yaml", None)
+        result = _gen._parse_frontmatter(_fm("x", "description: plain desc"))
+        assert result == {"name": "x", "description": "plain desc", "keywords": []}
