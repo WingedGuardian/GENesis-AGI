@@ -111,11 +111,12 @@ class TestWalkFromSelf:
         assert out["scope"] == "user-1000.slice"
         assert out["max"] == 2400
 
-    def test_binding_is_highest_pct_ancestor(self, tmp_path, monkeypatch):
+    def test_binding_is_highest_pct(self, tmp_path, monkeypatch):
+        # Binding = the level closest to its own ceiling (highest %).
         root, slice_, svc = self._chain(tmp_path, monkeypatch)
         _mk(root, "400", "4000")  # 10%
-        _mk(slice_, "2000", "2400")  # 83% ← binds
-        _mk(svc, "100", "600")  # 17%
+        _mk(slice_, "2000", "2400")  # 83.3% ← nearest its ceiling
+        _mk(svc, "100", "600")  # 16.7%
         out = _collect_pid_budget(str(svc))
         assert out["scope"] == "user-1000.slice"
         assert out["pct"] == 83.3
@@ -141,7 +142,34 @@ class TestWalkFromSelf:
         assert out["scope"] == "container-root"
         assert out["status"] == "error"
 
-    def test_tie_prefers_innermost(self, tmp_path, monkeypatch):
+    def test_saturated_ancestor_not_masked(self, tmp_path, monkeypatch):
+        # THE false-green class: a lightly-loaded inner scope must NOT mask a
+        # saturated ancestor. svc 400/600 (67%, healthy alone) but container-root at
+        # 95% → the status MUST be 'error' and name the root, never a false healthy.
+        # (Asserts STATUS explicitly — the gap that hid the bug before.)
+        root, slice_, svc = self._chain(tmp_path, monkeypatch)
+        _mk(root, "3800", "4000")  # 95% ← saturated
+        _mk(slice_, "100", "2400")  # 4%
+        _mk(svc, "400", "600")  # 66.7%
+        out = _collect_pid_budget(str(svc))
+        assert out["scope"] == "container-root"
+        assert out["pct"] == 95.0
+        assert out["status"] == "error"
+
+    def test_reports_most_full_level(self, tmp_path, monkeypatch):
+        # The level nearest its own ceiling is reported (closest to Cannot fork):
+        # slice 2250/2400 (94%) over service 500/600 (83%).
+        root, slice_, svc = self._chain(tmp_path, monkeypatch)
+        _mk(root, "1000", "max")
+        _mk(slice_, "2250", "2400")  # 93.8% ← nearest its ceiling
+        _mk(svc, "500", "600")  # 83.3%
+        out = _collect_pid_budget(str(svc))
+        assert out["scope"] == "user-1000.slice"
+        assert out["pct"] == 93.8
+        assert out["status"] == "error"
+
+    def test_pct_tie_prefers_innermost(self, tmp_path, monkeypatch):
+        # Equal % → the innermost level wins (max() keeps the first, leaf-first).
         root, slice_, svc = self._chain(tmp_path, monkeypatch)
         _mk(root, "2000", "4000")  # 50%
         _mk(slice_, "1200", "2400")  # 50%
@@ -175,6 +203,19 @@ class TestWalkFromSelf:
     def test_malformed_max_unavailable(self, tmp_path):
         _mk(tmp_path, "5\n", "notanint\n")
         assert _collect_pid_budget(str(tmp_path)) == {"status": "unavailable"}
+
+    def test_ancestor_finite_max_unreadable_current_is_unavailable(self, tmp_path, monkeypatch):
+        # An ancestor with a finite pids.max but an unreadable pids.current has an
+        # UNKNOWABLE % — it might be the saturated binding level, so the whole read
+        # must fail to 'unavailable', never mask it behind the lightly-loaded leaf
+        # (the residual false-green the convergence audit flagged). Distinct from a
+        # level with NO pids.max at all (that one is correctly skipped, below).
+        root, slice_, svc = self._chain(tmp_path, monkeypatch)
+        _mk(root, "500", "max")
+        slice_.mkdir(parents=True, exist_ok=True)
+        (slice_ / "pids.max").write_text("2400\n")  # finite cap, but NO pids.current file
+        _mk(svc, "100", "600")  # leaf lightly loaded (17%) — must NOT be reported
+        assert _collect_pid_budget(str(svc)) == {"status": "unavailable"}
 
     def test_unreadable_ancestor_skipped(self, tmp_path, monkeypatch):
         # A mid-chain dir with no pids files must not abort the walk — the binding

@@ -18,7 +18,7 @@ from genesis.awareness import loop
 
 @pytest.fixture(autouse=True)
 def _reset_cooldown_and_mock_create(monkeypatch):
-    monkeypatch.setattr(loop, "_last_pid_alert", None)
+    monkeypatch.setattr(loop, "_last_pid_alerts", {})
     create = AsyncMock()
     monkeypatch.setattr(loop.observations, "create", create)
     return create
@@ -161,11 +161,34 @@ async def test_same_scope_same_severity_suppressed(_reset_cooldown_and_mock_crea
 
 
 @pytest.mark.asyncio
+async def test_de_escalation_same_scope_suppressed(_reset_cooldown_and_mock_create):
+    # error → degraded on the SAME scope must NOT alert — announcing an improvement
+    # is noise. Only the initial error fires.
+    create = _reset_cooldown_and_mock_create
+    db = object()
+    await loop._check_pid_budget(db, budget=_budget("error", 95.0, scope="user-1000.slice"))
+    await loop._check_pid_budget(db, budget=_budget("degraded", 82.0, scope="user-1000.slice"))
+    assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_scope_oscillation_suppressed(_reset_cooldown_and_mock_create):
+    # Two near-tied levels alternating as the binding scope must NOT re-alert every
+    # tick — each (scope, severity) has its own cooldown, so A→B→A→B fires once per
+    # scope, not four times.
+    create = _reset_cooldown_and_mock_create
+    db = object()
+    for scope in ("user-1000.slice", "container-root", "user-1000.slice", "container-root"):
+        await loop._check_pid_budget(db, budget=_budget("error", 95.0, scope=scope))
+    assert create.await_count == 2  # A and B each alert once; the repeats are suppressed
+
+
+@pytest.mark.asyncio
 async def test_db_none_does_not_write_or_consume_cooldown(_reset_cooldown_and_mock_create):
     create = _reset_cooldown_and_mock_create
     await loop._check_pid_budget(None, budget=_budget("error", 95.0))
     create.assert_not_awaited()
-    assert loop._last_pid_alert is None  # cooldown not consumed
+    assert loop._last_pid_alerts == {}  # cooldown not consumed
     await loop._check_pid_budget(object(), budget=_budget("error", 95.0))
     create.assert_awaited_once()  # a later tick with a live db still alerts
 
@@ -183,5 +206,5 @@ async def test_budget_none_reads_live_without_raising(monkeypatch):
     # return without raising (healthy/unavailable → no alert).
     create = AsyncMock()
     monkeypatch.setattr(loop.observations, "create", create)
-    monkeypatch.setattr(loop, "_last_pid_alert", None)
+    monkeypatch.setattr(loop, "_last_pid_alerts", {})
     await loop._check_pid_budget(object(), budget=None)  # no exception

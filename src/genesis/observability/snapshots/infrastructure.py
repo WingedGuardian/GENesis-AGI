@@ -135,7 +135,8 @@ def memory_status(anon_frac: float, pressure: dict) -> str:
     anon_status = "healthy" if anon_frac < 0.85 else ("degraded" if anon_frac < 0.95 else "down")
     full60 = pressure.get("full_avg60", 0.0)
     psi_status = (
-        "down" if full60 >= _MEM_PSI_ERROR_PCT
+        "down"
+        if full60 >= _MEM_PSI_ERROR_PCT
         else ("degraded" if full60 >= _MEM_PSI_DEGRADED_PCT else "healthy")
     )
     return _worse_status(anon_status, psi_status)
@@ -200,7 +201,7 @@ def _cgroup_path_from_proc(text: str) -> str | None:
         if line.startswith("0::"):
             rel = line[3:].strip()
             if rel.endswith(" (deleted)"):
-                rel = rel[: -len(" (deleted)")]
+                rel = rel[: -len(" (deleted)")].rstrip()
             if not rel.startswith("/"):
                 return None
             return _CGROUP_ROOT if rel == "/" else _CGROUP_ROOT + rel
@@ -224,10 +225,18 @@ def _same_path(a: str, b: str) -> bool:
         return a == b
 
 
-def _read_finite_pids_level(d: str) -> tuple[int, int] | None:
-    """``(current, max_pids)`` for ONE cgroup dir when it carries a FINITE positive
-    ``pids.max``; None otherwise (absent / ``"max"`` / malformed / non-positive /
-    unreadable current) — i.e. "not a binding candidate at this level"."""
+# Sentinel: a level that HAS a finite positive pids.max but whose pids.current is
+# momentarily unreadable/malformed. We cannot know its %, so it might be the
+# saturated binding level — the caller must fail to "unavailable", never silently
+# drop it (that would be a false-green, the exact failure this monitor prevents).
+_PARTIAL_READ = object()
+
+
+def _read_finite_pids_level(d: str) -> tuple[int, int] | object | None:
+    """``(current, max_pids)`` for ONE cgroup dir with a FINITE positive ``pids.max``;
+    ``None`` when the level has no finite cap (absent / ``"max"`` / malformed /
+    non-positive max) — "not a binding candidate"; ``_PARTIAL_READ`` when the max is
+    finite but ``pids.current`` is unreadable — "cap present, % unknowable"."""
     try:
         with open(f"{d}/pids.max") as f:
             raw_max = f.read().strip()
@@ -245,7 +254,7 @@ def _read_finite_pids_level(d: str) -> tuple[int, int] | None:
         with open(f"{d}/pids.current") as f:
             current = int(f.read().strip())
     except (OSError, ValueError):
-        return None
+        return _PARTIAL_READ  # finite cap, unknowable % → force "unavailable" upstream
     return current, max_pids
 
 
@@ -301,13 +310,19 @@ def _collect_pid_budget(base_dir: str | None = None) -> dict:
         except ValueError:
             return {"status": "unavailable"}
 
-    # Walk leaf → cgroup mount root, collecting every finite level.
+    # Walk leaf → cgroup mount root, collecting every finite level as
+    # (pct, current, max, scope).
     candidates: list[tuple[float, int, int, str]] = []
     d = leaf
     while True:
         parsed = _read_finite_pids_level(d)
+        if parsed is _PARTIAL_READ:
+            # A capped level whose % is unknowable → we can't rule out that it is the
+            # saturated binding level. Fail to "unavailable" (never a false-green),
+            # symmetric with the leaf contract; self-heals next tick.
+            return {"status": "unavailable"}
         if parsed is not None:
-            cur, mx = parsed
+            cur, mx = parsed  # type: ignore[misc]
             candidates.append((round(cur / mx * 100, 1), cur, mx, _scope_label(d)))
         if _same_path(d, _CGROUP_ROOT):
             break
@@ -320,9 +335,21 @@ def _collect_pid_budget(base_dir: str | None = None) -> dict:
         # Leaf readable but nothing finite anywhere visible → genuinely uncapped.
         return {"status": "healthy", "current": leaf_current, "max": "max", "pct": None}
 
-    # Binding = highest %; max() keeps the first (innermost) on ties.
+    # Binding = the level closest to `Cannot fork` = the HIGHEST % (nearest its own
+    # pids.max), which is also the level whose % drives the status — so reporting it
+    # can never MASK a saturated ancestor behind a lower-% level (the false-green
+    # this monitor exists to prevent). Ranking by absolute headroom was rejected for
+    # exactly that masking: it answers "how many more forks can THIS process do", a
+    # different question from this %-threshold monitor's "which level is nearest its
+    # ceiling". max() keeps the first (innermost) level on % ties.
     pct, current, max_pids, scope = max(candidates, key=lambda c: c[0])
-    return {"status": _pid_status(pct), "current": current, "max": max_pids, "pct": pct, "scope": scope}
+    return {
+        "status": _pid_status(pct),
+        "current": current,
+        "max": max_pids,
+        "pct": pct,
+        "scope": scope,
+    }
 
 
 # Module-level state for delta-based CPU reading (no blocking sleep)
@@ -362,7 +389,12 @@ def _collect_cpu_usage() -> dict:
             return {"status": "healthy", "used_pct": 0.0, "count": count, "pressure": pressure}
 
         used_pct = round((1.0 - delta_idle / delta_total) * 100, 1)
-        return {"status": _cpu_status(used_pct), "used_pct": used_pct, "count": count, "pressure": pressure}
+        return {
+            "status": _cpu_status(used_pct),
+            "used_pct": used_pct,
+            "count": count,
+            "pressure": pressure,
+        }
     except (OSError, ValueError, IndexError):
         return {"status": "unavailable", "used_pct": None, "count": count, "pressure": pressure}
 
@@ -478,9 +510,7 @@ async def infrastructure(
             infra["scheduler"] = {"status": "error", "error": str(exc)}
     elif db:
         try:
-            cursor = await db.execute(
-                "SELECT MAX(last_run) FROM job_health"
-            )
+            cursor = await db.execute("SELECT MAX(last_run) FROM job_health")
             row = await cursor.fetchone()
             if row and row[0]:
                 last_run = datetime.fromisoformat(row[0])
@@ -488,7 +518,10 @@ async def infrastructure(
                 if age_s < 600:
                     infra["scheduler"] = {"status": "healthy"}
                 else:
-                    infra["scheduler"] = {"status": "degraded", "error": f"last job ran {int(age_s)}s ago"}
+                    infra["scheduler"] = {
+                        "status": "degraded",
+                        "error": f"last job ran {int(age_s)}s ago",
+                    }
             else:
                 infra["scheduler"] = {"status": "unknown", "error": "no job history"}
         except Exception as exc:
@@ -559,7 +592,12 @@ async def infrastructure(
                 "status": memory_status(anon_pct, mem_pressure),
                 "current_gb": round((total_mem[0] if total_mem else anon_kernel) / (1024**3), 1),
                 "limit_gb": round(limit / (1024**3), 1),
-                "used_pct": round((total_mem[0] / limit * 100) if total_mem and total_mem[1] > 0 else anon_pct * 100, 1),
+                "used_pct": round(
+                    (total_mem[0] / limit * 100)
+                    if total_mem and total_mem[1] > 0
+                    else anon_pct * 100,
+                    1,
+                ),
                 "anon_pct": round(anon_pct * 100, 1),
                 "pressure": mem_pressure,
             }
@@ -625,11 +663,7 @@ async def infrastructure(
                 "status": str(result.status),
                 "latency_ms": result.latency_ms,
             }
-            if (
-                routing_config
-                and hasattr(result, "details")
-                and isinstance(result.details, dict)
-            ):
+            if routing_config and hasattr(result, "details") and isinstance(result.details, dict):
                 actual_models = set(result.details.get("models", []))
                 if actual_models:
                     missing = []
@@ -671,10 +705,7 @@ def resilience_state_detail(
     summary = ""
     if breakers:
         try:
-            down = [
-                name for name, cb in breakers._breakers.items()
-                if not cb.is_available()
-            ]
+            down = [name for name, cb in breakers._breakers.items() if not cb.is_available()]
             if down:
                 summary = f"Providers down: {', '.join(sorted(down))}"
         except Exception:
