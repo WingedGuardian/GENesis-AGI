@@ -95,6 +95,18 @@ def test_prompts_carry_cosmetic_vs_semantic_guidance():
         assert "semantic" in low
 
 
+def test_prompts_carry_qualifier_vs_compound_policy():
+    """MW-3 Option-1 policy: a QUALIFIER variant that restates what the thing is
+    merges (same referent), while a compound naming a distinct activity/role/
+    artifact stays distinct. Both prompts must encode this so the containment
+    class (which difflib never surfaced) is judged, not blindly merged."""
+    for prompt in (adj._ADJUDICATION_PROMPT, adj._CHALLENGE_PROMPT):
+        low = prompt.lower()
+        assert "qualifier" in low
+        # merge-same-thing framing AND keep-related-distinct framing both present
+        assert "same" in low and ("related" in low or "distinct thing" in low)
+
+
 @pytest.mark.asyncio
 async def test_adjudicate_merge_requires_both_models():
     router = _router({"entity_adjudication": "merge", "entity_adjudication_challenge": "merge"})

@@ -50,42 +50,75 @@ _NEW_DDL = """
     )
 """
 
-# The pre-0083 (11-type, no card columns) column set — the intersection copied
-# forward. The two new card columns are omitted → they take their DEFAULTs.
-_OLD_COLUMNS = (
-    "entity_id, name, norm_name, entity_type, summary, source, "
-    "status, merged_into, created_at, updated_at"
+# The canonical column set of the rebuild target (must match _NEW_DDL). The row
+# copy is a runtime column-NAME intersection against this — so a legacy/drifted
+# table with an extra column is not silently truncated: any live column absent
+# here raises (drift guard), and the two card columns (dst-only) take DEFAULTs.
+_NEW_COLUMNS = (
+    "entity_id",
+    "name",
+    "norm_name",
+    "entity_type",
+    "summary",
+    "summary_updated_at",
+    "summary_dirty",
+    "source",
+    "status",
+    "merged_into",
+    "created_at",
+    "updated_at",
 )
+# Full-migration signature — ALL new type values AND both card columns. Keying
+# idempotency on any single token would let a partially-upgraded table skip.
+_REQUIRED_TYPE_LITERALS = ("'host'", "'install'", "'project'")
+_CARD_COLUMNS = ("summary_updated_at", "summary_dirty")
 
 
-async def _table_exists(db: aiosqlite.Connection) -> bool:
-    cursor = await db.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'"
-    )
-    return await cursor.fetchone() is not None
-
-
-async def _check_has_host(db: aiosqlite.Connection) -> bool:
+async def _entities_sql(db: aiosqlite.Connection) -> str | None:
     cursor = await db.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'"
     )
     row = await cursor.fetchone()
-    return bool(row and "'host'" in (row[0] or ""))
+    return (row[0] or "") if row else None
+
+
+async def _entities_columns(db: aiosqlite.Connection) -> set[str]:
+    cursor = await db.execute("PRAGMA table_info(entities)")
+    return {r[1] for r in await cursor.fetchall()}
+
+
+async def _is_fully_migrated(db: aiosqlite.Connection, sql: str) -> bool:
+    """True only when BOTH the new type literals AND both card columns exist —
+    a partial upgrade (e.g. CHECK rebuilt but columns missing) is NOT migrated."""
+    if not all(t in sql for t in _REQUIRED_TYPE_LITERALS):
+        return False
+    cols = await _entities_columns(db)
+    return all(c in cols for c in _CARD_COLUMNS)
 
 
 async def up(db: aiosqlite.Connection) -> None:
-    # No table yet (fresh DB) → _tables.py already creates the new shape.
-    if not await _table_exists(db):
-        return
-    # Already migrated (CHECK carries 'host') → exit (idempotent).
-    if await _check_has_host(db):
-        return
+    sql = await _entities_sql(db)
+    if sql is None:
+        return  # fresh DB → _tables.py already creates the new shape
+    if await _is_fully_migrated(db, sql):
+        return  # idempotent — fully migrated already
 
+    live_cols = await _entities_columns(db)
+    drift = live_cols - set(_NEW_COLUMNS)
+    if drift:
+        # Refuse rather than DROP the source and lose that column's data. The
+        # runner's txn rolls the whole migration back on this raise.
+        raise RuntimeError(
+            f"0083: entities has column(s) {sorted(drift)} not in the rebuild "
+            f"target; refusing to copy-and-drop their data. Add them to _NEW_DDL "
+            f"to match the canonical _tables.py schema."
+        )
+    shared = [c for c in _NEW_COLUMNS if c in live_cols]
+    collist = ", ".join(shared)
     await db.execute("DROP TABLE IF EXISTS entities_new")
     await db.execute(_NEW_DDL)
     await db.execute(
-        f"INSERT INTO entities_new ({_OLD_COLUMNS}) "  # noqa: S608
-        f"SELECT {_OLD_COLUMNS} FROM entities"
+        f"INSERT INTO entities_new ({collist}) SELECT {collist} FROM entities"  # noqa: S608
     )
     await db.execute("DROP TABLE entities")
     await db.execute("ALTER TABLE entities_new RENAME TO entities")
@@ -98,10 +131,11 @@ async def down(db: aiosqlite.Connection) -> None:
     LOSSY if any host/install/project rows exist — they violate the old CHECK,
     so this refuses when they are present rather than silently dropping them.
     """
-    if not await _table_exists(db):
+    sql = await _entities_sql(db)
+    if sql is None:
         return
-    if not await _check_has_host(db):
-        return
+    if "'host'" not in sql:
+        return  # already at the old shape
     cursor = await db.execute(
         "SELECT COUNT(*) FROM entities WHERE entity_type IN ('host','install','project')"
     )
@@ -132,9 +166,13 @@ async def down(db: aiosqlite.Connection) -> None:
         )
         """
     )
+    old_cols = (
+        "entity_id, name, norm_name, entity_type, summary, source, "
+        "status, merged_into, created_at, updated_at"
+    )
     await db.execute(
-        f"INSERT INTO entities_old ({_OLD_COLUMNS}) "  # noqa: S608
-        f"SELECT {_OLD_COLUMNS} FROM entities"
+        f"INSERT INTO entities_old ({old_cols}) "  # noqa: S608
+        f"SELECT {old_cols} FROM entities"
     )
     await db.execute("DROP TABLE entities")
     await db.execute("ALTER TABLE entities_old RENAME TO entities")

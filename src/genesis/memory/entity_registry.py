@@ -32,12 +32,13 @@ MECHANICAL_TYPES = frozenset({"code_file", "code_symbol", "pr", "commit"})
 
 # Named types that may share identity across type labels (the LLM may
 # call OMI a "product" in one extraction and a "device" in another).
-# host/install/project (MW-3) join the cluster so typing an existing concept
-# entity as one of them FOLDS onto it (cross-type reuse below) instead of
-# forking a new shard — the load-bearing property of the typing transition.
-_CONCEPT_CLUSTER = frozenset(
-    {"product", "device", "concept", "subsystem", "repo", "host", "install", "project"}
-)
+# NOTE (MW-3): host/install/project are deliberately NOT in this cluster. Blind
+# cross-type folding by NAME cannot tell "the concept being typed" from a
+# coincidental same-name collision (a machine, an install, and a codebase all
+# named "genesis" are distinct things). The concept→typed transition is designed
+# as an EVIDENCE-BASED step in MW-3 PR-3/PR-4 (the adjudicator/backfill decides
+# same-vs-coincidental from mention evidence), not a name-fold here.
+_CONCEPT_CLUSTER = frozenset({"product", "device", "concept", "subsystem", "repo"})
 
 FUZZY_THRESHOLD = 0.85
 

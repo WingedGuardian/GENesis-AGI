@@ -152,6 +152,37 @@ async def test_numbered_up_idempotent():
     await conn.close()
 
 
+async def test_numbered_up_refuses_on_column_drift():
+    """A legacy entities table carrying an EXTRA column the rebuild target lacks
+    must RAISE (drift guard), never copy-a-subset-then-drop and lose that data."""
+    conn = await _legacy_db()
+    await conn.execute("ALTER TABLE entities ADD COLUMN extra_note TEXT")
+    await conn.execute("UPDATE entities SET extra_note = 'keepme' WHERE entity_id='e1'")
+    await conn.commit()
+    with pytest.raises(RuntimeError, match="not in the rebuild target|drift|refusing"):
+        await _mig.up(conn)
+    # The source table (and its data) must be intact after the refusal.
+    cur = await conn.execute("SELECT extra_note FROM entities WHERE entity_id='e1'")
+    assert (await cur.fetchone())[0] == "keepme"
+    await conn.close()
+
+
+async def test_numbered_up_rebuilds_on_partial_migration():
+    """If a table has 'host' in the CHECK but is MISSING a card column (a partial
+    upgrade), the guard must NOT skip — it must complete the rebuild."""
+    conn = await _legacy_db()
+    await _mig.up(conn)  # full migrate
+    await conn.commit()
+    # Simulate a partial state: drop one card column but keep the new CHECK.
+    await conn.execute("ALTER TABLE entities DROP COLUMN summary_dirty")
+    await conn.commit()
+    assert "summary_dirty" not in await _columns(conn, "entities")
+    await _mig.up(conn)  # must detect the partial state and re-add
+    await conn.commit()
+    assert "summary_dirty" in await _columns(conn, "entities")
+    await conn.close()
+
+
 async def test_numbered_up_noop_on_missing_table():
     conn = await aiosqlite.connect(":memory:")
     await _mig.up(conn)  # no entities table → clean no-op (fresh DB path)

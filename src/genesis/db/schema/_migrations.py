@@ -958,59 +958,77 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     # MW-3 (0083) entities: expand the entity_type CHECK with host/install/project
     # (§6.4 first-card classes) + add card-materialization columns
     # (summary_updated_at, summary_dirty). SQLite can't ALTER a CHECK, so rebuild.
-    # Mirrored here because create_all_tables runs _migrate_add_columns but NOT
-    # the numbered runner (schema_both_build_paths). Idempotent via the 'host'
-    # sql-text guard; the old 11-type set is a SUBSET of the new 14-type set, so
-    # no existing row can violate the new CHECK and no dedup is needed. The row
-    # copy is a column-name intersection (_intersection_copy) — the two new card
-    # columns are dst-only and take their DEFAULTs; a drift canary raises if the
-    # live table has a column the rebuild target lacks.
+    # Mirrored here because create_all_tables runs _migrate_add_columns but NOT the
+    # numbered runner (schema_both_build_paths). Idempotency keys on the FULL new
+    # signature (all three type literals AND both card columns) — not one token —
+    # so a partially-upgraded table still completes. The row copy is a column-name
+    # intersection (_intersection_copy): the two card columns are dst-only and take
+    # DEFAULTs; a drift canary raises if the live table has a column the target
+    # lacks. The destructive DROP+RENAME runs inside a SAVEPOINT so a post-DROP
+    # failure ROLLS BACK to the intact table instead of committing its deletion
+    # (this block is OUTSIDE the numbered runner's atomic txn — connection init
+    # commits unconditionally, so without the savepoint a mid-rebuild failure would
+    # permanently lose the table).
     try:
         cursor = await db.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'"
         )
         row = await cursor.fetchone()
-        if row and "'host'" not in (row[0] or ""):
-            await db.execute("DROP TABLE IF EXISTS entities_new")
-            await db.execute("""
-                CREATE TABLE entities_new (
-                    entity_id   TEXT PRIMARY KEY,
-                    name        TEXT NOT NULL,
-                    norm_name   TEXT NOT NULL,
-                    entity_type TEXT NOT NULL CHECK (entity_type IN (
-                        'code_file','code_symbol','pr','commit',
-                        'product','device','repo','subsystem','person','org','concept',
-                        'host','install','project'
-                    )),
-                    summary     TEXT,
-                    summary_updated_at TEXT,
-                    summary_dirty INTEGER NOT NULL DEFAULT 0,
-                    source      TEXT NOT NULL DEFAULT 'extracted',
-                    status      TEXT NOT NULL DEFAULT 'active'
-                                    CHECK (status IN ('active','merged','gone')),
-                    merged_into TEXT,
-                    created_at  TEXT NOT NULL,
-                    updated_at  TEXT NOT NULL,
-                    UNIQUE (norm_name, entity_type)
-                )
-            """)
-            await _intersection_copy(db, src="entities", dst="entities_new")
-            await db.execute("DROP TABLE entities")
-            await db.execute("ALTER TABLE entities_new RENAME TO entities")
-            await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)"
-            )
-            await db.commit()
-            logger.info(
-                "entities table rebuilt: +host/install/project types, +card columns"
-            )
+        table_sql = (row[0] or "") if row else None
+        if table_sql is not None:
+            cursor = await db.execute("PRAGMA table_info(entities)")
+            live_cols = {r[1] for r in await cursor.fetchall()}
+            fully_migrated = all(
+                t in table_sql for t in ("'host'", "'install'", "'project'")
+            ) and {"summary_updated_at", "summary_dirty"} <= live_cols
+            if not fully_migrated:
+                await db.execute("SAVEPOINT entities_rebuild")
+                try:
+                    await db.execute("DROP TABLE IF EXISTS entities_new")
+                    await db.execute("""
+                        CREATE TABLE entities_new (
+                            entity_id   TEXT PRIMARY KEY,
+                            name        TEXT NOT NULL,
+                            norm_name   TEXT NOT NULL,
+                            entity_type TEXT NOT NULL CHECK (entity_type IN (
+                                'code_file','code_symbol','pr','commit',
+                                'product','device','repo','subsystem','person','org','concept',
+                                'host','install','project'
+                            )),
+                            summary     TEXT,
+                            summary_updated_at TEXT,
+                            summary_dirty INTEGER NOT NULL DEFAULT 0,
+                            source      TEXT NOT NULL DEFAULT 'extracted',
+                            status      TEXT NOT NULL DEFAULT 'active'
+                                            CHECK (status IN ('active','merged','gone')),
+                            merged_into TEXT,
+                            created_at  TEXT NOT NULL,
+                            updated_at  TEXT NOT NULL,
+                            UNIQUE (norm_name, entity_type)
+                        )
+                    """)
+                    await _intersection_copy(db, src="entities", dst="entities_new")
+                    await db.execute("DROP TABLE entities")
+                    await db.execute("ALTER TABLE entities_new RENAME TO entities")
+                    await db.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)"
+                    )
+                    await db.execute("RELEASE entities_rebuild")
+                    await db.commit()
+                    logger.info(
+                        "entities table rebuilt: +host/install/project types, +card columns"
+                    )
+                except Exception:
+                    # Restore entities to its pre-rebuild state — never leave the
+                    # table deleted for the unconditional init commit to persist.
+                    with contextlib.suppress(Exception):
+                        await db.execute("ROLLBACK TO entities_rebuild")
+                        await db.execute("RELEASE entities_rebuild")
+                    raise
     except Exception:
         logger.error(
             "entities CHECK/card-column migration failed", exc_info=True
         )
-        # Clear an orphaned scratch table from a mid-rebuild failure so the next
-        # boot's leading DROP-IF-EXISTS + guard self-heals cleanly (mirrors the
-        # ego_proposals rebuild precedent's except-branch cleanup).
         with contextlib.suppress(Exception):
             await db.execute("DROP TABLE IF EXISTS entities_new")
 

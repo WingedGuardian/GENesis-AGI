@@ -74,18 +74,10 @@ async def test_get_by_norm_name_deterministic_oldest_among_active(db):
     assert got["entity_id"] == "old"  # oldest active wins, deterministically
 
 
-async def test_host_folds_onto_existing_concept(db):
-    # Simulate the typing transition: a concept entity exists; extraction now
-    # resolves the same name as `host`. It must fold onto the concept row
-    # (cluster cross-type reuse), NOT create a second entity.
-    cid, _prov = await entity_registry.resolve_entity(db, name="somebox", entity_type="concept")
-    hid, _prov2 = await entity_registry.resolve_entity(db, name="somebox", entity_type="host")
-    assert hid == cid
-    cur = await db.execute("SELECT COUNT(*) FROM entities WHERE norm_name='somebox'")
-    assert (await cur.fetchone())[0] == 1
-
-
-async def test_install_and_project_in_cluster(db):
-    assert "install" in entity_registry._CONCEPT_CLUSTER
-    assert "project" in entity_registry._CONCEPT_CLUSTER
-    assert "host" in entity_registry._CONCEPT_CLUSTER
+async def test_host_install_project_deliberately_not_in_cluster(db):
+    # MW-3: the concept→typed transition is evidence-based (PR-3/PR-4), NOT a
+    # blind name-fold, so these types must stay OUT of the identity cluster —
+    # otherwise a coincidental same-name collision (a machine vs a codebase both
+    # named "genesis") would silently attach mentions to the wrong node.
+    for t in ("host", "install", "project"):
+        assert t not in entity_registry._CONCEPT_CLUSTER

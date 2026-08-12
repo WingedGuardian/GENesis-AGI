@@ -54,30 +54,41 @@ CALL_SITE_CHALLENGE = "entity_adjudication_challenge"
 _MAX_ATTEMPTS = 5
 # Fuzzy-comparison groups mirror entity_registry.resolve_entity: concept-cluster
 # types are compared cross-type within the cluster; person/org each same-type.
-# Keep in lockstep with entity_registry._CONCEPT_CLUSTER (host/install/project
-# added in MW-3).
-_CONCEPT_CLUSTER = frozenset(
-    {"product", "device", "concept", "subsystem", "repo", "host", "install", "project"}
-)
+# Keep in lockstep with entity_registry._CONCEPT_CLUSTER (host/install/project are
+# deliberately excluded — see the note there; their identity is handled evidence-
+# based in MW-3 PR-3/PR-4, not by name-fold).
+_CONCEPT_CLUSTER = frozenset({"product", "device", "concept", "subsystem", "repo"})
 _FUZZY_THRESHOLD = 0.85
 _SNIPPET_CHARS = 300
 _MENTIONS_PER_ENTITY = 3
 
 _ADJUDICATION_PROMPT = """\
-You are deduplicating a knowledge graph's ENTITY NODES. These two entities already
-passed a text-similarity filter, so their names ARE close. Your job is to decide
-WHY they are close:
+You are deduplicating a knowledge graph's ENTITY NODES. These two entities passed a
+name-similarity filter (their names share tokens, or one name's words are contained
+in the other's). Decide WHETHER THE TWO NAMES DENOTE THE SAME REAL-WORLD THING.
+Use the "Mentioned in" snippets as evidence — the names alone are often ambiguous.
 
-- MERGE if the difference is purely COSMETIC — the same words/terms written
-  differently: spacing, hyphenation, underscores, casing, punctuation, delimiters,
-  or word order. These are one real-world thing recorded two ways.
-  Examples to merge: "neural monitor" / "neural-monitor" / "neural_monitor";
-  "dispatch: cli" / "dispatch=cli"; "dream cycle" / "dream-cycle" / "dream cycles".
-- DISTINCT if there is a SEMANTIC difference — a different word, a version/number/
-  letter suffix, or a specific sub-item vs its parent.
-  Examples to keep distinct: "system" vs "systemd" (different program);
-  "safety gate" vs "safety gap" (different word: gate ≠ gap); "PR-1" vs "PR-1a"
-  (different identifiers); a project vs a numbered issue under it.
+MERGE when the two names are the SAME thing recorded two ways:
+- COSMETIC/formatting variants — same terms, different spacing, hyphenation,
+  underscores, casing, punctuation, delimiters, or word order.
+  ("neural monitor" / "neural-monitor" / "neural_monitor"; "dispatch: cli" / "dispatch=cli")
+- QUALIFIER variants that just RESTATE what the thing is — a bare identifier and the
+  same identifier plus a descriptive word for its KIND, or a short form and its
+  fully-qualified / address form. Same referent, one extra descriptive word.
+  ("prod cache" / "prod cache host"; a short name and its full dotted address)
+
+DISTINCT when the names denote DIFFERENT things, even if closely related:
+- A compound naming a distinct ACTIVITY, EVENT, TASK, ROLE, or ARTIFACT about the
+  base thing — not the thing itself. ("prod cache" the store vs "prod cache migration"
+  the task; "gateway" vs "gateway timeout" the error; a machine vs "<machine> handoff"
+  the event vs "<machine> steward" the role).
+- A specific sub-item vs its parent, a numbered/lettered series ("PR-1" vs "PR-1a"),
+  or a genuinely different word — a SEMANTIC difference ("system" vs "systemd";
+  "safety gate" vs "safety gap").
+
+The test: does name B refer to the SAME real-world thing as A, just described with an
+extra word — or does B name a distinct thing (an event/task/role/artifact/part) that
+is merely ABOUT or RELATED TO A? Same thing → merge; related-but-different → distinct.
 
 Entity A:
 {profile_a}
@@ -88,13 +99,14 @@ Entity B:
 Respond with JSON only, no other text:
 {{"verdict": "merge|distinct", "reasoning": "one sentence"}}
 
-If a genuine semantic difference is plausible, choose "distinct" — a wrong merge
-erases a real distinction. But do NOT call a pure formatting difference "distinct"."""
+When in genuine doubt, choose "distinct" — a wrong merge erases a real distinction
+that a wrong split does not."""
 
 _CHALLENGE_PROMPT = """\
-A reviewer judged these two entity nodes to be the SAME real-world thing and wants
+A reviewer judged these two entity nodes to name the SAME real-world thing and wants
 to merge them (one is absorbed into the other, irreversibly). CHALLENGE that — but
-only on SEMANTIC grounds.
+only if the names genuinely denote DIFFERENT things. Use the "Mentioned in" snippets
+as evidence.
 
 Entity A:
 {profile_a}
@@ -102,18 +114,22 @@ Entity A:
 Entity B:
 {profile_b}
 
-The names are already known to be textually similar. A merge is WRONG only if
-there is a genuine MEANING difference — a different word, a distinguishing
-version/number/letter, or a specific sub-item vs its parent (e.g. "system" vs
-"systemd", "safety gate" vs "safety gap", "PR-1" vs "PR-1a"). A mere formatting
-difference (spacing, hyphenation, casing, punctuation, delimiter, word order of the
-SAME terms) is NOT a reason to keep them apart — that is the same thing written two
-ways.
+A merge is WRONG only when B names a DISTINCT thing rather than the same thing:
+- a distinct activity/event/task/role/artifact ABOUT the base ("<name>" vs
+  "<name> migration" / "<name> handoff" / "<name> steward"),
+- a specific sub-item vs its parent, or a numbered/lettered series ("PR-1" vs "PR-1a"),
+- a genuinely different word — a SEMANTIC difference ("system" vs "systemd").
+
+A merge is RIGHT — do NOT challenge — when B is the SAME thing written differently: a
+COSMETIC/formatting variant (spacing, hyphenation, casing, delimiters, word order of
+the SAME terms), or a QUALIFIER variant that just restates what the thing is (a bare
+identifier and the same identifier + a descriptive word for its kind, or a short form
+and its fully-qualified / address form).
 
 Respond with JSON only, no other text:
 {{"verdict": "merge|distinct", "reasoning": "one sentence"}}
 
-Say "distinct" ONLY if you can name a real semantic difference; otherwise "merge"."""
+Say "distinct" ONLY if you can name a real thing-vs-thing difference; otherwise "merge"."""
 
 
 # ── digit-guard ──────────────────────────────────────────────────────────────
@@ -622,6 +638,57 @@ def _fuzzy_group(entity_type: str) -> str:
     return entity_type  # person / org compare same-type; others never fuzzy-match
 
 
+# ── containment blocking (MW-3) ──────────────────────────────────────────────
+# difflib >= 0.85 is blind to the dominant fragmentation class: a bare
+# identifier vs the same identifier + a qualifier word ("foo" vs "foo server"),
+# and a short form vs its fully-qualified/dotted form. Token-set CONTAINMENT +
+# a dotted-numeric suffix rule recover those, blocked by a rare-token index so
+# common words don't nominate thousands of junk pairs (measured on live data:
+# ~2.5k nominations, full alias-pair coverage). The adjudicator (with mention
+# snippets + two-model agreement) decides whether a nominee actually merges.
+_DF_CAP = 10  # a WORD token shared by > this many entities is too common to block on
+_DOTTED_RE = re.compile(r"\d+(?:\.\d+)+")  # address-like token, e.g. "10.20.30"
+
+
+def _tokens(norm: str) -> frozenset[str]:
+    """Token set for containment. Dotted-numeric runs (e.g. addresses) are kept
+    whole; everything else splits to alphanumeric tokens. norm_names are already
+    lowercased."""
+    return frozenset(re.findall(r"\d+(?:\.\d+)+|[a-z0-9]+", norm))
+
+
+def _dotted_tokens(norm: str) -> list[str]:
+    """Dotted-numeric tokens only (an address short form vs its qualified form)."""
+    return _DOTTED_RE.findall(norm)
+
+
+def _rare_token_index(
+    candidates: list[tuple[str, str, str]],
+) -> dict[str, set[str]]:
+    """token -> {entity_id} for tokens that can anchor a containment pair
+    (document-frequency >= 2, length >= 3, not a pure-digit run).
+
+    WORD tokens are additionally capped at _DF_CAP so a common word like
+    "service" doesn't block every "* service" pair together. DOTTED-NUMERIC
+    tokens (addresses) are EXEMPT from that cap: they are inherently specific
+    identifiers, so a heavily-fragmented entity whose core address token appears
+    in many shards (document-frequency > _DF_CAP) must still connect its shards —
+    exactly the fragmentation this generator exists to heal. (Measured: zero
+    dotted tokens currently exceed the cap; acronym tokens like "e2e"/"ws2" DO,
+    and stay capped because they are word-class noise, not identifiers.)"""
+    idx: dict[str, set[str]] = {}
+    for cand_norm, cand_id, _ct in candidates:
+        for tok in _tokens(cand_norm):
+            if len(tok) < 3 or tok.isdigit():
+                continue
+            idx.setdefault(tok, set()).add(cand_id)
+    return {
+        t: ids
+        for t, ids in idx.items()
+        if len(ids) >= 2 and (_DOTTED_RE.fullmatch(t) or len(ids) <= _DF_CAP)
+    }
+
+
 def _compute_sweep_pairs(
     slice_entities: list[tuple[str, str, str]],
     group_candidates: dict[str, list[tuple[str, str, str]]],
@@ -630,32 +697,82 @@ def _compute_sweep_pairs(
 ) -> list[tuple[str, str]]:
     """Pure-CPU pair discovery (runs off the event loop via ``to_thread``).
 
-    For each entity in the slice, find the fuzzy neighbours (difflib ≥ threshold,
-    same comparison group) that are not digit-only differences and not already
-    recorded/pending. Returns up to ``cap`` ``(entity_id, similar_entity_id)`` pairs.
+    For each entity in the slice, nominate same-group neighbours from three
+    blocking sources, unioned: (1) difflib >= threshold (cosmetic variants),
+    (2) token-set CONTAINMENT via a shared rare token (qualifier variants),
+    (3) a dotted-numeric suffix match (short form vs fully-qualified form).
+    Pairs that are digit-only differences or already recorded/pending are
+    dropped. Returns up to ``cap`` ``(entity_id, similar_entity_id)`` pairs.
+    Emission is sorted per slice-entity for determinism.
     """
+    # Per-group blocking structures (built once per call; cheap — entity counts
+    # are small enough to scan, mirroring list_norm_names).
+    rare_idx: dict[str, dict[str, set[str]]] = {}
+    dotted_by_group: dict[str, list[tuple[str, str]]] = {}
+    id_tokens: dict[str, frozenset[str]] = {}
+    id_norm: dict[str, str] = {}
+    for group, cands in group_candidates.items():
+        rare_idx[group] = _rare_token_index(cands)
+        dotted_by_group[group] = [
+            (dt, cid) for cnorm, cid, _ct in cands for dt in _dotted_tokens(cnorm)
+        ]
+        for cnorm, cid, _ct in cands:
+            id_tokens[cid] = _tokens(cnorm)
+            id_norm[cid] = cnorm
+
     out: list[tuple[str, str]] = []
     for norm, eid, etype in slice_entities:
         group = _fuzzy_group(etype)
         candidates = group_candidates.get(group, ())
+        my_tokens = _tokens(norm)
+        my_dotted = _dotted_tokens(norm)
+        matched: set[str] = set()
+
+        # (1) difflib — cosmetic near-matches (existing MATCH SET preserved; the
+        # emission order is now sorted-by-id below, not DB order — idempotent
+        # since seen+pending feed `seen_pair_keys` so every pair enqueues).
         for cand_norm, cand_id, _ct in candidates:
-            # Skip only the SAME entity. Do NOT skip on ``cand_norm == norm``: two
-            # DIFFERENT entities can share a norm_name across types (UNIQUE is on
-            # norm_name+entity_type). Live resolve_entity reuses those cross-type,
-            # but historical/legacy duplicates are only recoverable HERE — an
-            # exact-norm cross-type pair is a legitimate merge candidate.
             if cand_id == eid:
                 continue
+            if difflib.SequenceMatcher(None, norm, cand_norm).ratio() >= _FUZZY_THRESHOLD:
+                matched.add(cand_id)
+
+        # (2) containment — a candidate sharing a rare token whose token set is a
+        # subset of ours or vice versa (one name is the other + a qualifier).
+        ridx = rare_idx.get(group, {})
+        for tok in my_tokens:
+            for cand_id in ridx.get(tok, ()):
+                if cand_id == eid:
+                    continue
+                ct = id_tokens.get(cand_id, frozenset())
+                if my_tokens <= ct or ct <= my_tokens:
+                    matched.add(cand_id)
+
+        # (3) dotted-numeric suffix — "113.7" vs "203.0.113.7" (short form vs full
+        # address; no shared whole-token, so containment above cannot catch it).
+        if my_dotted:
+            for dt, cand_id in dotted_by_group.get(group, ()):
+                if cand_id == eid:
+                    continue
+                for mine in my_dotted:
+                    if dt != mine and (dt.endswith("." + mine) or mine.endswith("." + dt)):
+                        matched.add(cand_id)
+                        break
+
+        # Shared filters + deterministic emission. Skip only the SAME entity; two
+        # DIFFERENT entities can share a norm_name across types (UNIQUE is on
+        # norm_name+entity_type) and those cross-type duplicates are a legitimate
+        # merge candidate recoverable only here.
+        for cand_id in sorted(matched):
             key = f"{min(eid, cand_id)}|{max(eid, cand_id)}"
             if key in seen_pair_keys:
                 continue
-            if digit_only_difference(norm, cand_norm):
+            if digit_only_difference(norm, id_norm.get(cand_id, "")):
                 continue
-            if difflib.SequenceMatcher(None, norm, cand_norm).ratio() >= _FUZZY_THRESHOLD:
-                seen_pair_keys.add(key)  # dedupe within this run too
-                out.append((eid, cand_id))
-                if len(out) >= cap:
-                    return out
+            seen_pair_keys.add(key)  # dedupe within this run too
+            out.append((eid, cand_id))
+            if len(out) >= cap:
+                return out
     return out
 
 
@@ -742,7 +859,11 @@ async def run_reconcile_sweep(
 
     The producer only enqueues newly-created near-duplicates; this recovers the
     historical backlog and heals any install. Slice bounds per-run CPU; the caller
-    advances/persists ``cursor_offset``. Difflib runs off-thread.
+    advances/persists ``cursor_offset``. Pair discovery runs off-thread and unions
+    three blocking sources (difflib cosmetic-match + token-set containment + a
+    dotted-numeric suffix rule — see ``_compute_sweep_pairs``), so qualifier
+    variants and short-vs-fully-qualified forms that difflib cannot reach are
+    recovered too.
 
     Returns ``{"enqueued": int, "next_offset": int, "completed": bool,
     "total": int}``.
