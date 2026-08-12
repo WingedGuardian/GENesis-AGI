@@ -7,7 +7,7 @@ Used by:
 - genesis_stop_hook.py (Stop hook)
 - Claude (after /review + code-reviewer agent complete)
 
-The marker file records a hash of ``git diff --cached --stat`` (staged changes
+The marker file records a hash of ``git diff --cached --numstat`` (staged changes
 only) at the time review was done.  If staged content changes, the marker
 becomes stale and review is required again.  Unstaged working-tree edits
 (e.g. from Codex) do not trigger review enforcement.
@@ -82,11 +82,18 @@ def _state_file(cwd: str | None = None) -> Path:
 
 
 def get_current_diff_hash(cwd: str | None = None) -> str:
-    """SHA-256 of ``git diff --cached --stat`` output (staged changes only).
+    """SHA-256 of ``git diff --cached --numstat`` output (staged changes only).
 
     Only staged changes trigger review enforcement.  Unstaged changes
     (e.g. from Codex or other tools editing the working tree) are ignored
     so they don't cause false-positive review blocks.
+
+    Uses ``--numstat`` (machine format: ``added<TAB>deleted<TAB>path``), NOT
+    ``--stat``: ``--stat`` renders width-dependently (path truncation + bar
+    scaling by ``COLUMNS``/terminal), so the SAME staged content hashes
+    differently when ``mark`` (one width) and the commit gate (another width)
+    run — a systematic false "code changes without review" block. ``--numstat``
+    is width-independent, so the marker is portable across invocation contexts.
 
     Args:
         cwd: Working directory for git commands. When None, uses the
@@ -94,7 +101,7 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--stat"],
+            ["git", "diff", "--cached", "--numstat"],
             capture_output=True,
             text=True,
             timeout=10,
