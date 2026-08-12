@@ -25,6 +25,20 @@ not to confirm:
   and does not break existing behavior; a finding whose "fix" regresses something is
   itself a finding. Verify claims against the code — a stated mechanism can be wrong
   even when the concern is real.
+- **Calibrate severity to the code's DECLARED threat model — do not harden low-stakes
+  code ad infinitum.** Adversarial rigor above stays FULL for high-consequence surfaces
+  (auth, credentials, financial, data-loss, external input, approval gates). But a
+  guard/module often states its own scope — e.g. "accident-prevention on a single-author
+  repo, not adversarial; a deliberate evader already has `python -c 'subprocess…'`,
+  invisible to any string guard." Weigh findings against THAT model: a bypass that
+  requires deliberate multi-step evasion of an *accident-prevention* layer is a **NOTE /
+  P3**, not a P1. **Do not re-flag documented accepted-residue** — a form the code
+  explicitly marks out-of-scope ("accepted residue", "outside the threat model") — as a
+  new blocking finding round after round. When, after ~3 review→fix rounds on one change,
+  the only new findings are adjacent evasion variants on such a surface, say so in the
+  verdict ("remaining items are out-of-threat-model residue, not blocking") instead of
+  continuing to enumerate: over-hardening code whose functionality doesn't warrant it is
+  itself a review failure.
 - **End with a verdict:** `Ready to merge: Yes | No | With fixes` + a one-line reason.
 
 ## GitNexus — Code Intelligence (advisory)
