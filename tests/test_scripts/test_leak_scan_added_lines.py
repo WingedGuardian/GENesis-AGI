@@ -36,9 +36,9 @@ PR_ADDED = "PRADDED_TOKEN_d4e5f6"
 def _git(repo: Path, *args: str) -> str:
     env = {
         "GIT_AUTHOR_NAME": "t",
-        "GIT_AUTHOR_EMAIL": "t@t.invalid",
+        "GIT_AUTHOR_EMAIL": "ci@example.com",
         "GIT_COMMITTER_NAME": "t",
-        "GIT_COMMITTER_EMAIL": "t@t.invalid",
+        "GIT_COMMITTER_EMAIL": "ci@example.com",
         "GIT_CONFIG_NOSYSTEM": "1",
         "HOME": str(repo),
     }
