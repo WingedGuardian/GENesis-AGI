@@ -271,6 +271,44 @@ class TestParseFrontmatter:
         content = _fm("x", "description: y\nkeywords: [python, , web]")
         assert _gen._parse_frontmatter(content)["keywords"] == ["python", "web"]
 
+    def test_numeric_like_scalars_kept_verbatim(self):
+        # Leading-zero / hex / sexagesimal scalars must not be re-typed (YAML 1.1
+        # would give "7"/"16"/"750"); the authored spelling must survive.
+        content = _fm("x", "description: y\nkeywords: [007, 0x10]")
+        assert _gen._parse_frontmatter(content)["keywords"] == ["007", "0x10"]
+
+    def test_non_scalar_description_rejected(self):
+        # A description authored as a LIST is not text — reject it (empty),
+        # never str()/repr it into the catalog.
+        content = "---\nname: x\ndescription:\n  - a\n  - b\n---\n# x\n"
+        assert _gen._parse_frontmatter(content)["description"] == ""
+
+    def test_loader_refuses_yaml_aliases(self):
+        # Skill frontmatter never uses anchors/aliases; the loader refuses them,
+        # closing the alias-multiplication DoS class at the source.
+        import pytest
+        import yaml
+
+        with pytest.raises(yaml.YAMLError):
+            yaml.load("a: &x 1\nb: *x\n", Loader=_gen._FrontmatterLoader)  # noqa: S506
+
+    def test_alias_amplification_falls_back_without_blowup(self):
+        # A crafted alias-amplification frontmatter (many *a pointing at a large
+        # anchored scalar) must NOT materialize quadratically — aliases are
+        # refused, so the parser falls back to the bounded legacy regex.
+        import time
+
+        big = "x" * 2000
+        content = (
+            f"---\nname: y\nanchor: &a {big}\n"
+            "keywords: [*a, *a, *a, *a, *a, *a, *a, *a]\n---\n"
+        )
+        start = time.time()
+        result = _gen._parse_frontmatter(content)
+        assert time.time() - start < 1.0
+        # Legacy keeps only the literal "*a" tokens — never 8x the big scalar.
+        assert sum(len(k) for k in result["keywords"]) < len(big)
+
     def test_base_safeloader_bool_resolver_not_mutated(self):
         # Customizing _FrontmatterLoader must NOT mutate SafeLoader's shared
         # resolver map (a class-attribute footgun).

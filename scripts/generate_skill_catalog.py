@@ -24,21 +24,30 @@ except ImportError:  # pragma: no cover - pyyaml is a declared dependency
 if yaml is not None:
 
     class _FrontmatterLoader(yaml.SafeLoader):
-        """SafeLoader that keeps YAML 1.1 boolean-like scalars as their authored
-        string. Skill name/description/keywords are TEXT, so ``keywords: [off]``
-        must stay ``"off"`` — plain ``yaml.safe_load`` would coerce off/on/yes/
-        no/true/false to Python bools and catalog ``"False"``/``"True"``."""
+        """SafeLoader that loads every plain scalar as a STRING and FORBIDS YAML
+        aliases (a lone anchor with no alias is harmless). Skill frontmatter is flat text (name/description/
+        keywords), so it never legitimately uses anchors — refusing aliases at
+        the composer closes the alias-multiplication DoS class at the source
+        (billion-laughs expansion, and ``*a``-multiplied large scalars in keyword
+        lists — a crafted skill-library/plugin ``SKILL.md`` could otherwise
+        exhaust memory during the hourly catalog refresh). Clearing the implicit
+        resolvers keeps authored spellings verbatim (off/007/0x10/12:30 stay
+        strings); explicit ``!!python/*`` tags are still refused (SafeLoader).
+        Any alias raises → the caller falls back to the bounded legacy parse."""
 
-    # The subclass inherits SafeLoader's SHARED resolver map; give it its own
-    # copy (never mutate the base) with the bool implicit resolver dropped.
-    _FrontmatterLoader.yaml_implicit_resolvers = {
-        _ch: [
-            (_tag, _rx)
-            for (_tag, _rx) in _resolvers
-            if _tag != "tag:yaml.org,2002:bool"
-        ]
-        for _ch, _resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
-    }
+        def compose_node(self, parent, index):
+            if self.check_event(yaml.events.AliasEvent):
+                event = self.peek_event()
+                raise yaml.composer.ComposerError(
+                    None,
+                    None,
+                    "aliases are not allowed in skill frontmatter",
+                    event.start_mark,
+                )
+            return super().compose_node(parent, index)
+
+    # Own (empty) resolver map — never mutate SafeLoader's shared class attr.
+    _FrontmatterLoader.yaml_implicit_resolvers = {}
 else:  # pragma: no cover - pyyaml is a declared dependency
     _FrontmatterLoader = None
 
@@ -101,19 +110,24 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
                 # silently dropping the skill's description.
                 loaded = None
             if isinstance(loaded, dict):
+                # Metadata fields are TEXT. Accept only scalar (str) values and
+                # scalar keyword elements; REJECT non-scalar structures (lists,
+                # maps, alias trees) BEFORE any str() — recursively stringifying
+                # a YAML alias bomb can exhaust CPU/memory in the catalog refresh.
+                raw_name = loaded.get("name")
                 name = (
-                    str(loaded["name"]).strip()
-                    if loaded.get("name")
+                    raw_name.strip()
+                    if isinstance(raw_name, str) and raw_name.strip()
                     else fallback_name
+                )
+                raw_desc = loaded.get("description")
+                description = (
+                    _normalize_desc(raw_desc) if isinstance(raw_desc, str) else ""
                 )
                 kw = loaded.get("keywords")
                 if isinstance(kw, (list, tuple)):
-                    # Drop null/empty flow elements (`[a, , b]` → a None) rather
-                    # than stringifying them into a bogus "None" keyword.
                     keywords = [
-                        str(k).strip()
-                        for k in kw
-                        if k is not None and str(k).strip()
+                        s for k in kw if isinstance(k, str) and (s := k.strip())
                     ]
                 elif isinstance(kw, str):
                     keywords = [k.strip() for k in kw.split(",") if k.strip()]
@@ -121,7 +135,7 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
                     keywords = []
                 return {
                     "name": name,
-                    "description": _normalize_desc(loaded.get("description")),
+                    "description": description,
                     "keywords": keywords,
                 }
     # PyYAML unavailable, no frontmatter, or block not a mapping — legacy parse.
