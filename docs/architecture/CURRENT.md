@@ -1000,14 +1000,19 @@ verified: fbcf8ee4 2026-07-21
   procedural extraction (extract → judge → promote hourly, novelty +
   contradiction gates), weekly skill evolution, daily triage calibration.
   Weekly skill evolution is **propose-only** (autonomous auto-apply retired
-  2026-08-01, #1276): it STAGES MINOR (and larger) SKILL.md edits as proposals
-  for human/CC review past a STRUCTURAL check (`skills/validator.py`) — the
-  autonomy>=2 wiring is retained for the future WS1 `enforce` mode. A shadow
+  2026-08-01, #1276): it STAGES every SKILL.md edit (MINOR and larger) as a
+  `skill_proposal` observation for human/CC review — nothing is written to a
+  skill file, and under propose-only NO cognitive-file-modification ledger
+  pre-image is created (the apply/resolve path that would record one is a
+  deferred follow-up). A STRUCTURAL check (`skills/validator.py`) and a shadow
   **skill-edit Critic** (`skills/skill_edit_critic.py` +
-  `eval/rubrics/skill_edit_regression.py`) now screens each staged proposal for
-  self-modification pathologies via the `judge` call site and LOGS a verdict
-  (`skill_evolution_gate` observations) — it never blocks staging (WS1 shadow).
-  A complementary **held-out replay
+  `eval/rubrics/skill_edit_regression.py`) are ADVISORY — they ride every staged
+  proposal (a proposal that fails validation is still staged, flagged
+  `validated=false`); the Critic screens for self-modification pathologies via
+  the `judge` call site and LOGS a verdict (`skill_evolution_gate` observations).
+  Neither gates staging (WS1 shadow); the `autonomy_level` param + validator
+  wiring are retained as (currently unwired) groundwork for the future WS1
+  `enforce` mode. A complementary **held-out replay
   gate** (`eval/skill_replay/`, tool `skill_replay_run`) goes further — it
   REPLAYS a frozen per-skill golden suite (`~/.genesis/eval/skill_golden/`,
   authored via `eval/skill_golden_set.py`) against OLD vs NEW content in
@@ -1455,8 +1460,10 @@ verified: 9037d45b 2026-07-07
   `~/.genesis/skill_catalog.json`, self-heals hourly), consumed by the
   injection hook and by autonomous-session resources. Skill refinement is
   propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
-  review — the tracked cognitive-file modification is recorded when a reviewer
-  APPLIES a staged proposal, not by the applicator.
+  review and never writes a skill file. Recording it as a tracked
+  cognitive-file modification is DEFERRED — no ledger pre-image is captured
+  under propose-only; the apply/resolve path that would create one is a
+  follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed
