@@ -315,7 +315,7 @@ def test_chained_commits_to_different_dirs_block(repo: Path, home: Path, tmp_pat
     _mark(repo, home)
     res = _run_hook(f"git commit -m ok && git -C {other} commit -m ride", repo, home)
     assert res.returncode == 2, res.stdout + res.stderr
-    assert "DIFFERENT directories" in res.stderr
+    assert "DIFFERENT worktrees" in res.stderr
 
 
 def test_brace_expansion_targets_block(repo: Path, home: Path, tmp_path: Path) -> None:
@@ -1257,7 +1257,7 @@ def test_identical_raw_chained_different_dirs_block(repo: Path, home: Path, tmp_
         home,
     )
     assert res.returncode == 2, res.stdout + res.stderr
-    assert "DIFFERENT directories" in res.stderr
+    assert "DIFFERENT worktrees" in res.stderr
 
 
 def test_cdpath_dot_prefixed_relative_cd_allows(repo: Path, home: Path, tmp_path: Path) -> None:
@@ -1353,6 +1353,153 @@ def test_symlink_alias_same_dir_chain_passes(repo: Path, home: Path, tmp_path: P
     _mark(repo, home)
     res = _run_hook(
         f"cd {repo} && git commit -m a && git -C {alias} commit --amend -m b",
+        repo,
+        home,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ── Codex PR-#1371 re-review (2 P1s + P2): branch/content-binding + worktree id ──
+
+
+def test_switch_to_main_before_commit_blocks(repo: Path, home: Path) -> None:
+    # P1: a `git switch main` before a commit lands it on main, but the hook reads
+    # the branch once (pre-switch). A switch-to-main before a commit → block.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m ok && git switch main && git commit --allow-empty -m x",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_single_switch_to_main_then_commit_blocks(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git switch main && git commit -m x", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_switch_to_variable_branch_before_commit_blocks(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(f'cd {repo} && git switch "$BR" && git commit -m x', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_create_branch_then_commit_still_allowed(repo: Path, home: Path) -> None:
+    # The flow the gate ITSELF recommends — create a NON-main branch and commit —
+    # must NOT be blocked by the branch-mutation guard.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git checkout -b feature/new && git commit --amend --no-edit",
+        repo,
+        home,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_checkout_file_restore_then_commit_allowed(repo: Path, home: Path) -> None:
+    # `git checkout HEAD -- <file>` restores a file; HEAD is not moved, so it must
+    # not trip the branch-mutation guard (the checkout branch-vs-path ambiguity).
+    (repo / "other.txt").write_text("v1\n")
+    _git(repo, "add", "other.txt")
+    _git(repo, "commit", "-qm", "add other")
+    (repo / "other.txt").write_text("v2-uncommitted\n")
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git checkout HEAD -- other.txt && git commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_staging_between_commits_blocks(repo: Path, home: Path) -> None:
+    # P1: a chain that stages new content between commits records unreviewed content
+    # in the 2nd commit under the 1st's marker (git add between → git-between-commits).
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m reviewed && echo x > n.py && git add n.py && "
+        f"git commit -m unseen",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot bind to the reviewed diff" in res.stderr
+
+
+def test_dash_am_second_commit_blocks(repo: Path, home: Path) -> None:
+    # BLOCKER-1 (architect): the 2nd commit stages its OWN content with -a. No `git
+    # add` segment exists to catch, but the impure-later-commit allowlist check does.
+    (repo / "tracked.py").write_text("v = 1\n")
+    _git(repo, "add", "tracked.py")
+    _git(repo, "commit", "-qm", "add tracked")
+    (repo / "f.py").write_text("base = 9\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m reviewed && echo x >> tracked.py && git commit -am quick",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "pure" in res.stderr
+
+
+def test_stash_pop_between_commits_blocks(repo: Path, home: Path) -> None:
+    # SHOULD-FIX-2 (architect): `git stash pop` re-stages the index and would bypass a
+    # staging BLOCKLIST — the allowlist blocks it as a non-commit git segment between.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m a && git stash pop && git commit --amend --no-edit",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "another git command runs between" in res.stderr
+
+
+def test_non_git_command_between_amends_allowed(repo: Path, home: Path) -> None:
+    # A non-git command (a build/echo step) between a commit and a pure --amend is
+    # safe — a pure --amend never stages unstaged working-tree edits.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m wip && echo built && git commit --amend --no-edit",
+        repo,
+        home,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_amend_with_no_intervening_staging_allowed(repo: Path, home: Path) -> None:
+    # `git commit && git commit --amend` (nothing staged between) is content-
+    # preserving and must stay allowed.
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git commit -m wip && git commit --amend -m better", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_add_before_single_commit_still_allowed(repo: Path, home: Path) -> None:
+    # A staging op BEFORE the (single) commit is the normal add-then-commit path.
+    _git(repo, "reset", "-q")
+    (repo / "g.py").write_text("g = 1\n")
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git add -A && git commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_same_worktree_different_subdir_chain_allowed(repo: Path, home: Path) -> None:
+    # P2: two commits addressed from DIFFERENT SUBDIRECTORIES of the SAME worktree
+    # share one index+marker — worktree-identity compare must not false-block them.
+    sub = repo / "pkg"
+    sub.mkdir()
+    (sub / "keep.txt").write_text("k\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "seed subdir")
+    (repo / "f.py").write_text("base = 3\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m a && cd {sub} && git commit --amend --no-edit",
         repo,
         home,
     )

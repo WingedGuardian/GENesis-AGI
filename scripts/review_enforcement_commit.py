@@ -457,6 +457,113 @@ def _commit_may_add_content(segs: list) -> bool:
     return False
 
 
+# ── Chain state-mutation guards (Codex P1 #1371) ─────────────────────────────
+# The Rule-1 branch read and the review marker are both sampled ONCE at hook time,
+# before any segment runs — so a chain that CHANGES the branch or STAGES new content
+# between commits lands a later commit in a state the hook never inspected. Two
+# conservative, fail-closed checks close that (see main()).
+# git_subcommand cannot resolve user ALIASES (they live in git config), so a
+# habitual `co=checkout` (`git co main && git commit`) moves HEAD to main undetected
+# — and it also defeats Rule 1's own hook-time branch read the same way. Accepted
+# residue: resolving aliases would require reading git config, outside this static
+# accident-prevention guard's model (a deliberate evader already has `python -c`).
+_BRANCH_MUTATING_SUBCMDS = frozenset({"switch", "checkout"})
+# Characters that make a branch-target token unresolvable to a literal name (a
+# variable/command-subst/glob/escape) — same intent as _cd_target's set. A target
+# carrying any of these can't be proven ≠ main, so it fails closed.
+_UNRESOLVABLE_TARGET_CHARS = "$`*?[{\\()<>~"
+
+
+def _branch_mutation_risk(argv: list[str]) -> str | None:
+    """Whether a ``git switch``/``git checkout`` could move HEAD toward main/master or
+    an unverifiable branch.
+
+    Returns ``"main"`` if it could land HEAD on main/master, ``"unknown"`` if the
+    target is unresolvable (a variable/subst/glob/``-`` previous-branch), else
+    ``None`` — a literal non-main branch (``checkout -b feature``) carries no
+    direct-to-main risk, and a FILE-RESTORE form moves no branch at all.
+
+    Only HEAD-MOVING forms are assessed, to avoid false-blocking file restores
+    (``git checkout HEAD~1 -- f`` / ``git checkout main f.py``, which leave HEAD put):
+      * ``-c/-C/-b/-B <name>`` → creates+switches to ``<name>`` (HEAD-moving);
+      * bare ``git switch <branch>`` → HEAD-moving;
+      * bare ``git checkout <x>`` → HEAD-moving ONLY as the pure switch form: no
+        ``--`` and exactly ONE operand (``checkout <ref> <path>`` or ``checkout --
+        <path>`` is a restore → not assessed).
+    argv is quote-stripped by shell_parse, so a ``$VAR`` target survives as a literal
+    ``$…`` token and reads as unresolvable."""
+    sub = git_subcommand(argv)
+    # advance past git global options to just after the subcommand token
+    i = 1
+    while i < len(argv):
+        if argv[i] in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if argv[i].startswith("-"):
+            i += 1
+            continue
+        break
+    i += 1
+    new_branch_vals: list[str] = []  # -c/-C/-b/-B values → definitely HEAD-moving
+    positionals: list[str] = []
+    has_dashdash = False
+    while i < len(argv):
+        t = argv[i]
+        if t == "--":
+            has_dashdash = True
+            break
+        if t == "-":  # previous-branch shorthand (a bare positional, not a flag)
+            positionals.append("-")
+            i += 1
+            continue
+        if t in ("-c", "-C", "-b", "-B") and i + 1 < len(argv):
+            new_branch_vals.append(argv[i + 1])
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        positionals.append(t)
+        i += 1
+
+    if new_branch_vals:
+        targets = new_branch_vals
+    elif sub == "switch":
+        targets = positionals
+    elif has_dashdash or len(positionals) != 1:
+        targets = []  # checkout file-restore form → HEAD not moved
+    else:
+        targets = positionals  # bare `git checkout <branch>` → the switch form
+
+    for t in targets:
+        if t in ("main", "master"):
+            return "main"
+        if t == "-" or any(ch in t for ch in _UNRESOLVABLE_TARGET_CHARS):
+            return "unknown"
+    return None
+
+
+def _worktree_root(cwd: str) -> str:
+    """The git worktree ROOT that owns ``cwd`` (canonicalized), or ``realpath(cwd)``
+    as a fallback. Two different SUBDIRECTORIES of one worktree — and a symlink alias
+    of it — resolve to the same root, so a legitimate same-worktree commit chain
+    (which shares ONE index + review marker) is not mistaken for different-directory
+    commits (Codex P2 #1371). Fail-safe: any git error falls back to realpath."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        root = r.stdout.strip()
+        if r.returncode == 0 and root:
+            return os.path.realpath(root)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return os.path.realpath(cwd)
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -537,6 +644,29 @@ def main() -> None:
     # `git commit … && git -C /elsewhere commit …` runs its second commit in a
     # DIFFERENT dir (audit finding 3, 2026-08-11, confirmed by execution).
     all_commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
+
+    # Branch-mutation guard (Codex P1 #1371): get_current_branch() below reads the
+    # branch ONCE at hook time, before any segment runs. A `git switch main` /
+    # `git checkout main` (or an unresolvable target) EARLIER in the chain than a
+    # commit lands that commit on a branch this read cannot see — slipping the
+    # direct-to-main block. Fail closed when a pre-commit branch mutation could reach
+    # main/master or is unresolvable; a literal non-main target (`git checkout -b
+    # feature && git commit`, the flow this gate itself recommends) carries no
+    # direct-to-main risk and stays allowed.
+    if all_commit_segs:
+        last_commit_i = max(i for i, s in enumerate(segs) if git_subcommand(s.argv) == "commit")
+        for i, s in enumerate(segs):
+            if i >= last_commit_i:
+                break
+            if git_subcommand(s.argv) in _BRANCH_MUTATING_SUBCMDS and _branch_mutation_risk(s.argv):
+                _deny(
+                    "BLOCKED: this command switches branches (git switch/checkout to "
+                    "main/master or an unresolvable target) before a commit, so the "
+                    "guard cannot verify which branch the commit lands on. Run the "
+                    "branch switch and the commit as SEPARATE commands."
+                )
+                return
+
     seg_cwds = []
     for seg in all_commit_segs:
         seg_cwd = _effective_diff_cwd(command, payload, segs, commit_seg=seg)
@@ -565,18 +695,56 @@ def main() -> None:
     # command. (Same-dir chains — `git commit … ; git commit --amend` — pass.)
     # ``None`` (no payload cwd → the hook's own cwd) counts as its own dir: it is
     # not provably equal to an explicit path, so a mixed chain fails closed.
-    # Compare by FILESYSTEM identity (realpath), not string: the same worktree
-    # addressed via its real path and a symlink alias is ONE dir sharing one
-    # review marker/index — a string compare false-blocked it (Codex P2, #1371).
-    distinct_dirs = {os.path.realpath(c) if isinstance(c, str) else c for c in seg_cwds}
-    if len(distinct_dirs) > 1:
-        _deny(
-            "BLOCKED: this command chains git commits into DIFFERENT directories, "
-            "which would share a single review gate (the review marker covers only "
-            "the first commit's worktree). Run each commit as its own command so "
-            "each is gated separately."
+    # Compare by GIT WORKTREE IDENTITY, not the raw path: the marker and index are
+    # owned by the worktree ROOT, so two different SUBDIRECTORIES of one worktree —
+    # and a symlink alias of it — are ONE gated unit and must not read as different
+    # dirs (Codex P2, #1371; a bare-realpath compare still false-blocked the
+    # different-subdir case). Only resolved when ≥2 commits actually chain, to avoid
+    # the extra git call on the common single-commit path.
+    if len(all_commit_segs) >= 2:
+        distinct_dirs = {_worktree_root(c) if isinstance(c, str) else c for c in seg_cwds}
+        if len(distinct_dirs) > 1:
+            _deny(
+                "BLOCKED: this command chains git commits into DIFFERENT worktrees, "
+                "which would share a single review gate (the review marker covers only "
+                "the first commit's worktree). Run each commit as its own command so "
+                "each is gated separately."
+            )
+            return
+
+        # Content-binding guard (Codex P1 #1371): a same-worktree chain can record
+        # UNREVIEWED content in a later commit under the first commit's marker — the
+        # marker + index are sampled ONCE at hook time. ALLOWLIST the one shape the
+        # hook can prove records the reviewed diff, and fail closed on everything else:
+        # a blocklist of "dangerous staging subcommands" leaked repeatedly (a `git add`
+        # between, `-am`/pathspec on a later commit, `git stash pop --index`,
+        # cherry-pick) — the architecture signal from
+        # feedback_no_handrolled_shell_parsing_for_guards. Provably safe iff EVERY
+        # commit after the first is a PURE `--amend` (no -a/-i/-o/-p/pathspec, so it
+        # re-records the first commit's content, not new material) AND NO other git
+        # command runs between the first and last commit (a non-commit git segment
+        # could re-stage; an unknown git subcommand fails closed). Non-git commands
+        # (echo/sed/build steps) are fine — a pure `--amend` never stages unstaged
+        # working-tree edits. Anything else → run each commit as a separate command.
+        commit_positions = [i for i, s in enumerate(segs) if git_subcommand(s.argv) == "commit"]
+        impure_later_commit = any(
+            "--amend" not in s.argv or _commit_can_select_content(s.argv)
+            for s in all_commit_segs[1:]
         )
-        return
+        git_between_commits = any(
+            git_subcommand(segs[i].argv) not in (None, "commit")
+            for i in range(commit_positions[0] + 1, commit_positions[-1])
+        )
+        if impure_later_commit or git_between_commits:
+            _deny(
+                "BLOCKED: this chains multiple commits in one worktree in a shape the "
+                "single review gate cannot bind to the reviewed diff — a later commit "
+                "stages its own content (-a/-i/-o/-p or a pathspec), is not a pure "
+                "`--amend`, or another git command runs between the commits. Run each "
+                "commit as a SEPARATE command so each is gated against its own "
+                "reviewed diff."
+            )
+            return
 
     # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP CONSECUTIVE
     # defect-bearing review→fix→re-review rounds on this change (a clean review
