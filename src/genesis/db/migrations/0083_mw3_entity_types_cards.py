@@ -89,7 +89,14 @@ async def _entities_columns(db: aiosqlite.Connection) -> set[str]:
 
 async def _is_fully_migrated(db: aiosqlite.Connection, sql: str) -> bool:
     """True only when BOTH the new type literals AND both card columns exist —
-    a partial upgrade (e.g. CHECK rebuilt but columns missing) is NOT migrated."""
+    a partial upgrade (e.g. CHECK rebuilt but columns missing) is NOT migrated.
+
+    Name-presence (not column CONSTRAINTS) is sufficient here: summary_dirty is
+    only ever created by this rebuild or the canonical _tables.py CREATE, both of
+    which declare it ``NOT NULL DEFAULT 0`` — no code path adds it otherwise, so a
+    name-present-but-mis-constrained state is unreachable (and were it reached, the
+    NOT NULL column in the rebuild target would reject a NULL row on copy, failing
+    loud rather than skipping silently)."""
     if not all(t in sql for t in _REQUIRED_TYPE_LITERALS):
         return False
     cols = await _entities_columns(db)

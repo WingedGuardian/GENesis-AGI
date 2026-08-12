@@ -119,6 +119,21 @@ def test_dotted_core_token_exempt_from_df_cap():
     assert any("bare" in p for p in got)  # not dropped by the cap
 
 
+def test_unicode_identifier_containment():
+    # Non-Latin names must TOKENIZE (the ASCII-only class dropped them entirely).
+    # A >=3-char CJK bare name vs the same + a Latin qualifier — the bare token is
+    # now produced and indexed (the separate len<3 floor is an accepted tradeoff,
+    # applying equally to ASCII "ha"/"db", so use a 3-char name here).
+    a = _ent("東京都", "e1")
+    b = _ent("東京都 server", "e2")
+    got = _pairs([a, b], [a, b])
+    assert frozenset({"e1", "e2"}) in got
+    # The bare non-Latin name tokenizes at all (the core of the P2 fix).
+    assert adj._tokens("東京") == frozenset({"東京"})
+    # underscore still splits (ASCII behaviour preserved)
+    assert adj._tokens("dream_cycle") == frozenset({"dream", "cycle"})
+
+
 def test_cross_type_same_norm_nominated():
     # Two DIFFERENT entities sharing a norm_name across types (UNIQUE is on
     # norm_name+entity_type) are a legitimate merge candidate recoverable only in

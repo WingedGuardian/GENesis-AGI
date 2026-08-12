@@ -652,9 +652,12 @@ _DOTTED_RE = re.compile(r"\d+(?:\.\d+)+")  # address-like token, e.g. "10.20.30"
 
 def _tokens(norm: str) -> frozenset[str]:
     """Token set for containment. Dotted-numeric runs (e.g. addresses) are kept
-    whole; everything else splits to alphanumeric tokens. norm_names are already
-    lowercased."""
-    return frozenset(re.findall(r"\d+(?:\.\d+)+|[a-z0-9]+", norm))
+    whole; everything else splits on underscore/punctuation into word tokens.
+    ``[^\\W_]`` is Unicode word-char minus underscore, so non-Latin identifiers
+    ("東京", "café") tokenize correctly instead of vanishing under an ASCII-only
+    class — while underscore/punct still split (``dream_cycle`` → dream, cycle).
+    norm_names are already lowercased."""
+    return frozenset(re.findall(r"\d+(?:\.\d+)+|[^\W_]+", norm))
 
 
 def _dotted_tokens(norm: str) -> list[str]:
