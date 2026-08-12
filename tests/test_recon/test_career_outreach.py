@@ -21,9 +21,15 @@ from genesis.recon.career_outreach import (
     _LIST_WORKING_PROMPT,
     CareerOutreachMonitor,
     CareerOutreachResult,
+    ModuleError,
+    NoneLeft,
+    ProtocolError,
+    Staged,
+    VerifyFailed,
     _autorun_prompt,
     _nudge_hash,
     _parse_json,
+    classify_autorun_reply,
 )
 
 
@@ -812,6 +818,51 @@ async def test_verify_failed_blank_reason_not_counted_as_staged(db, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_contradictory_multi_signal_reply_is_error(db, monkeypatch):
+    # Class audit: two+ outcome signals in one reply (none_left / error / verify_failed)
+    # is a contradictory malformed reply → protocol error, never a silent swallow where
+    # the first-checked signal wins (e.g. none_left + verify_failed).
+    for combo in (
+        {"none_left": True, "verify_failed": "v", "company": "A"},
+        {"error": "e", "verify_failed": "v", "company": "A"},
+        {"none_left": True, "error": "e"},
+    ):
+        _cfg(monkeypatch, mode="live", cap=3)
+        mon, _ = _mon(db, _FakeModule(autoruns=[combo], working=[]))
+        result = await mon.gather()
+        assert result.errors >= 1 and result.auto_runs == 0 and result.verify_failed == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_dict_reply_is_error(db, monkeypatch):
+    # An empty dict reply is a protocol violation (no outcome) → error, not swallowed.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mon, _ = _mon(db, _FakeModule(autoruns=[{}], working=[]))
+    result = await mon.gather()
+    assert result.errors >= 1 and result.auto_runs == 0
+
+
+def test_parse_json_never_raises_on_deep_nesting():
+    # Class audit NOTE 2: a pathologically-nested reply must NOT propagate a
+    # RecursionError out of the best-effort parser (it would be miscounted as a
+    # job-health failure); it degrades to None/best-effort instead.
+    deep = "[" * 2000 + "]" * 2000  # > the default recursion limit
+    out = _parse_json(deep)  # must not raise
+    assert out is None or isinstance(out, list)
+
+
+@pytest.mark.asyncio
+async def test_verify_failed_missing_company_is_error(db, monkeypatch):
+    # Codex P2: a verify_failed reply with NO company is a protocol violation → error
+    # (parity with the missing-company staged path), not a silent successful tick.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mod = _FakeModule(autoruns=[{"verify_failed": "x"}], working=[])
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    assert result.errors >= 1 and result.auto_runs == 0 and result.verify_failed == 0
+
+
+@pytest.mark.asyncio
 async def test_runner_warns_but_succeeds_on_no_progress_verify_failed(monkeypatch):
     # Review SHOULD-FIX 1: a verify_failed-only tick (0 staged/nudged) records SUCCESS
     # (the gate working, not a failure) BUT emits a WARNING event so a persistently
@@ -852,3 +903,98 @@ def test_parse_json_extracts_dict_from_verdict_led_reply():
     )
     out = _parse_json(reply)
     assert isinstance(out, dict) and out["company"] == "Acme AI"
+
+
+# ── classify_autorun_reply: the closed-outcome contract (the ONE locking table) ──
+
+
+@pytest.mark.parametrize(
+    "reply, expected",
+    [
+        # NoneLeft
+        ('{"none_left": true}', NoneLeft()),
+        # Staged (contact/draft_summary optional → "")
+        (
+            '{"company":"Acme","contact":"c@a.example","draft_summary":"s"}',
+            Staged("Acme", "c@a.example", "s"),
+        ),
+        ('{"company":"Acme"}', Staged("Acme", "", "")),
+        # verdict-line-led + fenced still classify (parse layer)
+        (
+            'GT: pass — claims [a, b]\n{"company":"Acme","contact":"c","draft_summary":"s"}',
+            Staged("Acme", "c", "s"),
+        ),
+        ('```json\n{"none_left": true}\n```', NoneLeft()),
+        # VerifyFailed (blank/null reason → "unspecified")
+        ('{"verify_failed":"dead url","company":"Acme"}', VerifyFailed("Acme", "dead url")),
+        ('{"verify_failed":"","company":"Acme"}', VerifyFailed("Acme", "unspecified")),
+        ('{"verify_failed":null,"company":"Acme"}', VerifyFailed("Acme", "unspecified")),
+        ('{"verify_failed":123,"company":"Acme"}', VerifyFailed("Acme", "123")),  # non-str reason
+        # ModuleError
+        ('{"error":"auth failed"}', ModuleError("auth failed")),
+        # verdict line + FENCED json (a plausible single reply) still classifies
+        (
+            'GT: pass\n```json\n{"company":"Acme","contact":"c","draft_summary":"s"}\n```',
+            Staged("Acme", "c", "s"),
+        ),
+    ],
+)
+def test_classify_autorun_reply_valid_outcomes(reply, expected):
+    assert classify_autorun_reply(reply) == expected
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "not json at all",
+        "",
+        "   ",
+        "[1, 2, 3]",  # array, not an object
+        "42",  # scalar
+        '"a string"',  # scalar
+        "null",  # json null
+        "{}",  # empty object — no outcome
+        '{"none_left": false}',  # present but not literal true
+        '{"none_left": "yes"}',  # wrong type
+        '{"none_left": 1}',  # numeric-truthy, not literal true
+        '{"error": ""}',  # empty error detail
+        '{"error": null}',  # null error detail
+        '{"error": 123}',  # non-string error
+        '{"verify_failed":"x"}',  # verify_failed missing company
+        '{"verify_failed":"x","company":"   "}',  # whitespace company
+        '{"contact":"c","draft_summary":"s"}',  # no company, no signal
+        '{"company": 123}',  # company wrong type
+        '{"none_left":true,"verify_failed":"x","company":"A"}',  # multi-signal
+        '{"error":"e","verify_failed":"v","company":"A"}',  # multi-signal
+        '{"none_left":true,"error":"e"}',  # multi-signal
+    ],
+)
+def test_classify_autorun_reply_protocol_errors(reply):
+    assert isinstance(classify_autorun_reply(reply), ProtocolError)
+
+
+def test_parse_json_tolerates_trailing_content():
+    # Review SHOULD-FIX: trailing content after the payload (a closing ``` fence, a
+    # trailing word/period, or a leading verdict line PLUS a fence) must still recover
+    # the object — the strict consumes-to-end scan falls back to the outermost span.
+    assert _parse_json('{"company":"X"}\nDone.')["company"] == "X"
+    assert _parse_json('{"company":"X"}.')["company"] == "X"
+    assert _parse_json('GT: pass\n```json\n{"company":"X"}\n```')["company"] == "X"
+    # ...while the leading verdict-is-JSON case still resolves to the TRAILING payload.
+    assert _parse_json('{"verdict":"pass"}\n{"company":"X"}')["company"] == "X"
+    # ...and a nested object with trailing content recovers the top-level object.
+    assert _parse_json('{"company":"Y","meta":{"a":1}} trailing')["company"] == "Y"
+
+
+def test_parse_json_handles_json_verdict_and_nested_objects():
+    # Codex P2: a verdict line that is ITSELF JSON must not be mistaken for the payload
+    # (first-{ span bug), and a nested object must not be grabbed (last-{ span bug).
+    # The trailing payload = the value that consumes to the end of the reply.
+    assert _parse_json('{"verdict":"pass"}\n{"company":"X","contact":"c"}')["company"] == "X"
+    nested = _parse_json('note line\n{"company":"Y","meta":{"a":1}}')
+    assert nested["company"] == "Y" and nested["meta"] == {"a": 1}
+    # a clean array (read path, no verdict) still parses
+    assert _parse_json('[{"company":"A"},{"company":"B"}]') == [
+        {"company": "A"},
+        {"company": "B"},
+    ]

@@ -154,12 +154,37 @@ def _parse_json(text: str) -> object | None:
         return json.loads(text)
     except Exception:
         pass
+    # Tolerate a leading verdict line before the compact JSON — INCLUDING a verdict
+    # that is itself brace/bracket-delimited (e.g. `{"verdict":"pass"}`). Scan each
+    # candidate JSON-value start left-to-right, raw_decode a COMPLETE value from it,
+    # and accept only the one that consumes to the end (nothing but whitespace after)
+    # — that is the trailing payload, per the "lead with a verdict line, THEN the
+    # JSON" contract. A first-`{` span would wrongly grab a JSON-shaped verdict; a
+    # last-`{` span would wrongly grab a nested sub-object.
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except (ValueError, RecursionError):
+            # ValueError = not valid JSON at idx; RecursionError = pathologically
+            # nested reply (absurd but possible) — neither should escape this
+            # best-effort parser (a raise would be miscounted as a job-health error).
+            continue
+        if text[end:].strip() == "":
+            return obj
+    # Fallback: the reply has trailing content AFTER the payload — a stray closing
+    # ``` fence, a trailing word/period, a leading verdict line PLUS a fence. Recover
+    # the outermost {..}/[..] span. This runs ONLY when the strict scan above found no
+    # consumes-to-end value, so it never fires for the verdict-is-JSON / nested-object
+    # cases the strict scan already claims — it cannot reintroduce those bugs.
     for open_c, close_c in (("{", "}"), ("[", "]")):
         i, j = text.find(open_c), text.rfind(close_c)
         if 0 <= i < j:
             try:
                 return json.loads(text[i : j + 1])
-            except Exception:
+            except (ValueError, RecursionError):
                 continue
     return None
 
@@ -172,6 +197,116 @@ def _autorun_prompt(conf: dict) -> str:
     the otherwise-clean staged-draft read path."""
     note = cfg.text_knob(conf, "autorun_note")
     return f"{_AUTORUN_PROMPT}\n\n{note}" if note else _AUTORUN_PROMPT
+
+
+# ── auto-run reply: parse-into-a-closed-type (robust by construction) ──────────
+# The engine's auto-run reply is untrusted-SHAPED LLM output. Rather than branch on
+# raw payload keys in the tick loop (which leaks a new edge case per review), the
+# reply is classified ONCE into EXACTLY ONE of these five outcomes; every malformed
+# shape (non-dict, unparseable, missing/blank required field, wrong type, or two
+# outcome signals at once) collapses to ProtocolError, decided HERE. ``_live`` then
+# matches on the outcome TYPE and never inspects a raw payload.
+
+
+@dataclass(frozen=True)
+class NoneLeft:
+    """No eligible target account remains — terminal, not an error."""
+
+
+@dataclass(frozen=True)
+class Staged:
+    """The engine verified + staged a first-touch draft for ``company``."""
+
+    company: str
+    contact: str
+    draft_summary: str
+
+
+@dataclass(frozen=True)
+class VerifyFailed:
+    """The engine drafted but its OWN accuracy gate refused ``company`` — a soft
+    outcome (the gate working), NOT a job-health error."""
+
+    company: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ModuleError:
+    """The engine reported a hard failure (auth, drafting, …) — a job-health error."""
+
+    detail: str
+
+
+@dataclass(frozen=True)
+class ProtocolError:
+    """The reply did not match exactly one valid outcome shape — a job-health error."""
+
+    detail: str
+
+
+AutorunOutcome = NoneLeft | Staged | VerifyFailed | ModuleError | ProtocolError
+
+# The mutually-exclusive OUTCOME-signal keys — a well-formed reply carries EXACTLY ONE
+# (or none, which then must be a `Staged` shape identified by a company).
+_OUTCOME_SIGNAL_KEYS = ("none_left", "error", "verify_failed")
+
+
+def classify_autorun_reply(reply_text: str) -> AutorunOutcome:
+    """Classify a raw auto-run dispatch reply into EXACTLY ONE closed outcome.
+
+    Contract (the shipped ``_AUTORUN_PROMPT``): the engine replies — optionally led by
+    its own verdict line — with a single compact JSON object that is exactly one of:
+      - ``{"none_left": true}``                              → NoneLeft
+      - ``{"company","contact","draft_summary"}``            → Staged   (no signal key)
+      - ``{"verify_failed": <str>, "company": <str>}``       → VerifyFailed
+      - ``{"error": <non-empty str>}``                       → ModuleError
+    Anything else — not a JSON object, unparseable, ≥2 signal keys, a signal key with
+    the wrong value/type, or no recognizable outcome — is a ProtocolError. This is the
+    ONE place raw reply shape is inspected; it is exhaustively table-tested.
+    """
+    payload = _parse_json(reply_text)
+    if not isinstance(payload, dict):
+        return ProtocolError("reply is not a JSON object")
+
+    present = [k for k in _OUTCOME_SIGNAL_KEYS if k in payload]
+    if len(present) > 1:
+        return ProtocolError(f"contradictory multi-signal reply: {sorted(present)}")
+
+    company = (
+        (payload.get("company") or "").strip() if isinstance(payload.get("company"), str) else ""
+    )
+
+    if present == ["none_left"]:
+        if payload.get("none_left") is True:
+            return NoneLeft()
+        return ProtocolError("'none_left' present but not literal true")
+
+    if present == ["error"]:
+        detail = payload.get("error")
+        detail = detail.strip() if isinstance(detail, str) else ""
+        if not detail:
+            return ProtocolError("'error' outcome with empty/non-string detail")
+        return ModuleError(detail[:200])
+
+    if present == ["verify_failed"]:
+        if not company:
+            return ProtocolError("'verify_failed' outcome missing 'company'")
+        raw = payload.get("verify_failed")
+        # None/blank/whitespace → "unspecified"; any other value renders as-is.
+        reason = ("" if raw is None else str(raw).strip()) or "unspecified"
+        return VerifyFailed(company, reason[:100])
+
+    # No outcome signal key → the reply must be a Staged shape (company required).
+    if not company:
+        return ProtocolError(
+            "no recognized outcome (missing none_left/error/verify_failed and 'company')"
+        )
+    contact = payload.get("contact")
+    contact = contact.strip() if isinstance(contact, str) else ""
+    summary = payload.get("draft_summary")
+    summary = summary.strip() if isinstance(summary, str) else ""
+    return Staged(company=company, contact=contact, draft_summary=summary)
 
 
 @dataclass(frozen=True)
@@ -335,49 +470,46 @@ class CareerOutreachMonitor:
                 adapter_error = True
                 details.append(f"auto-run dispatch error: {str(result.get('error'))[:120]}")
                 break
-            payload = _parse_json(_reply_text(result))
-            if not isinstance(payload, dict):
-                errors += 1
-                details.append("auto-run: unparseable reply (protocol failure) — stopping")
-                break
-            if payload.get("none_left"):
+            # Classify the reply ONCE into a closed outcome; match on TYPE. Every
+            # malformed shape is a ProtocolError decided inside classify_autorun_reply,
+            # so this loop never inspects a raw payload (robust by construction).
+            outcome = classify_autorun_reply(_reply_text(result))
+            if isinstance(outcome, NoneLeft):
                 details.append("auto-run: no target accounts left")
                 break
-            if payload.get("error"):
-                # Module-reported failure (e.g. auth/drafting) — COUNT it so a
-                # persistent module error surfaces as a job-health failure, not a
-                # silent green tick; still stop the loop.
+            if isinstance(outcome, ProtocolError):
                 errors += 1
-                details.append(f"auto-run: module error: {str(payload.get('error'))[:120]}")
+                details.append(f"auto-run: {outcome.detail} (protocol failure) — stopping")
                 break
-            company = (payload.get("company") or "").strip()
-            if "verify_failed" in payload:
-                # The engine drafted but its OWN accuracy gate refused the draft (a
-                # claim it could not verify headless). That is the gate WORKING — NOT a
-                # job-health failure. Note it and try the next target. Presence-check
-                # (not truthiness): a blank reason must NOT fall through to the staged
-                # path and miscount a draft that never staged.
-                if not company:
-                    details.append("auto-run: verify_failed without 'company' — stopping")
+            if isinstance(outcome, ModuleError):
+                # Engine-reported hard failure (auth/drafting) — a job-health failure.
+                errors += 1
+                details.append(f"auto-run: module error: {outcome.detail}")
+                break
+            if isinstance(outcome, (Staged, VerifyFailed)):
+                # Both name a (classifier-validated non-empty) company and share the
+                # repeat guard: the self-selecting engine may re-pick a target it already
+                # acted on this tick (no durable "attempted" state) — stop rather than
+                # loop the cap on one account.
+                if outcome.company.lower() in seen_companies:
+                    details.append(f"auto-run: engine re-selected {outcome.company} — stopping")
                     break
-                if company.lower() in seen_companies:
-                    details.append(f"auto-run: engine re-selected {company} — stopping")
-                    break
-                seen_companies.add(company.lower())
-                verify_failed_n += 1
-                reason = (str(payload.get("verify_failed")).strip() or "unspecified")[:100]
-                details.append(f"verify_failed: {company}: {reason}")
+                seen_companies.add(outcome.company.lower())
+                if isinstance(outcome, VerifyFailed):
+                    # Engine drafted but its OWN accuracy gate refused this target — the
+                    # gate WORKING, NOT a job-health failure. Note it, try the next target.
+                    verify_failed_n += 1
+                    details.append(f"verify_failed: {outcome.company}: {outcome.reason}")
+                    continue
+                # Staged: a verified draft was staged for this target.
+                auto_runs += 1
+                details.append(f"staged: {outcome.company}")
                 continue
-            if not company:
-                errors += 1
-                details.append("auto-run: reply missing 'company' (protocol failure) — stopping")
-                break
-            if company.lower() in seen_companies:
-                details.append(f"auto-run: engine re-selected {company} — stopping")
-                break
-            seen_companies.add(company.lower())
-            auto_runs += 1
-            details.append(f"staged: {company}")
+            # Unreachable for the closed AutorunOutcome union — a defensive guard so a
+            # future outcome type can never be silently mishandled (fail loud, not green).
+            errors += 1
+            details.append("auto-run: unhandled outcome type (protocol failure) — stopping")
+            break
 
         # 2. Nudge — RE-DERIVE the nudge list from the current staged-draft set minus
         #    the already-nudged ledger (so an undelivered nudge simply retries next

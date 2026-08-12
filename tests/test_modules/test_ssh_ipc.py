@@ -94,6 +94,15 @@ class TestBuildRemoteCommandMaxTurns:
             cmd = self._adapter()._build_remote_command("sonnet", "high", bad)
             assert "--max-turns 25" in cmd
 
+    def test_max_turns_clamped_to_adapter_ceiling(self):
+        # Codex P2: an absurd override (from any caller, incl. the generic module_call
+        # passthrough) is clamped at the adapter, independent of a caller's config cap.
+        from genesis.modules.external.ipc import _MAX_TURNS_CEILING
+
+        cmd = self._adapter()._build_remote_command("sonnet", "high", 100000)
+        assert f"--max-turns {_MAX_TURNS_CEILING}" in cmd
+        assert "--max-turns 100000" not in cmd
+
     @pytest.mark.asyncio
     async def test_send_cc_forwards_max_turns_from_data(self):
         adapter = self._adapter()
@@ -110,6 +119,37 @@ class TestBuildRemoteCommandMaxTurns:
             await adapter.send("dispatch", data={"prompt": "hi", "max_turns": 80}, method="CC")
         remote_cmd = mock_exec.call_args[0][-1]  # last ssh arg = the remote command
         assert "--max-turns 80" in remote_cmd
+
+    @pytest.mark.asyncio
+    async def test_send_cc_clamps_timeout_to_ceiling(self):
+        # Ceiling-parity with max_turns: an absurd per-call timeout_s (from any caller,
+        # incl. the generic module_call passthrough) is clamped at the adapter.
+        from genesis.modules.external.ipc import _MAX_TIMEOUT_CEILING
+
+        adapter = self._adapter()
+        captured = {}
+
+        async def fake_wait_for(coro, timeout):
+            captured["timeout"] = timeout
+            coro.close()  # avoid "coroutine never awaited"
+            out = json.dumps(
+                {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}
+            )
+            return (out.encode(), b"")
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        with (
+            patch(
+                "genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                return_value=mock_proc,
+            ),
+            patch("genesis.modules.external.ipc.asyncio.wait_for", side_effect=fake_wait_for),
+        ):
+            await adapter.send(
+                "dispatch", data={"prompt": "hi", "timeout_s": 999999}, method="CC"
+            )
+        assert captured["timeout"] == _MAX_TIMEOUT_CEILING
 
 
 class TestSshIPCAdapterSend:

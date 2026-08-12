@@ -525,9 +525,12 @@ verified: 17140a65 2026-08-11
   double-nudges. ONE daily job (`max_instances=1` is per-job; a second would race
   the single remote). Discovery-sweep driving is GROUNDWORK-deferred. The auto-run
   drives the engine's COMPLETE flow INCLUDING its own accuracy/verification gate
-  (never bypassed) under a headless contract; a gate-refused draft returns
-  `verify_failed` (NOT a job-health error), and a same-company re-selection breaks
-  the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
+  (never bypassed) under a headless contract. The reply is classified ONCE into a
+  closed outcome set (`classify_autorun_reply` → NoneLeft/Staged/VerifyFailed/
+  ModuleError/ProtocolError) — every malformed shape collapses to ProtocolError, so
+  the tick loop matches on outcome TYPE and never branches on raw payload (robust by
+  construction). A gate-refused draft is `VerifyFailed` (NOT a job-health error); a
+  same-company re-selection breaks the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
   per-call `max_turns` override; `dispatch_timeout_s` default 900, no fixed SSH cap)
   cover the gated flow (research → draft → verify → stage), MEASURED ~5.5 min live.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
