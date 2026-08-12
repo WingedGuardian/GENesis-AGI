@@ -1,12 +1,16 @@
 """Tests for scripts/ci/leak_scan_added_lines.py — the CI leak-scan range selector.
 
 The range is the security-critical half of the private-pattern gate. These tests
-build scratch git repos that reproduce the exact CI topology (a PR **merge ref**
-= merge(main@ci, PR-head)) and prove:
+build scratch git repos that reproduce the CI topology (a PR **merge ref** =
+merge(main@ci, PR-head), and its awkward cousins) and prove:
   * the stale-base range re-flags a value main added-then-removed (the bug), and
-  * anchoring on HEAD^1 (main@ci) scans the PR's own commits only (the fix),
+  * anchoring on merge-base(origin/main, HEAD) scans the PR's own commits only,
   * a PR-authored add-then-remove is STILL caught (gate not weakened),
-  * an unmergeable PR (single-parent HEAD) fails CLOSED when main is unreachable.
+  * an unmergeable PR whose HEAD is itself a merge commit is STILL fully scanned
+    (parent-count is not a "is this the merge ref" signal — Codex P1),
+  * an unmergeable PR with no reachable main fails CLOSED,
+  * content after a Unicode line separator (U+0085) is preserved (Codex P1), and
+  * a non-UTF-8 byte in a diff does not crash the gate (Codex P2).
 
 Fixture tokens are obviously synthetic and live only in tmp_path scratch repos —
 they are never committed to this repo, so the privacy gate does not see them.
@@ -66,6 +70,11 @@ def _rm_commit(repo: Path, fname: str, msg: str) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _set_origin_main(repo: Path, sha: str) -> None:
+    """Simulate the origin/main remote-tracking ref a real checkout provides."""
+    _git(repo, "update-ref", "refs/remotes/origin/main", sha)
+
+
 @pytest.fixture
 def merge_ref_repo(tmp_path: Path) -> dict:
     """Build main (add-then-remove a secret) + a PR branch, then the CI merge ref.
@@ -73,7 +82,7 @@ def merge_ref_repo(tmp_path: Path) -> dict:
     main:  A ─ B(+secret) ─ C(-secret) ─ D(+maindata)
     pr:    A ─ E(+pr_value)
     HEAD = M = merge(D, E)   (parent1 = D = main@ci, parent2 = E = PR head)
-    base.sha (stale, frozen at PR creation) = A
+    origin/main = D
     """
     repo = tmp_path / "r"
     repo.mkdir()
@@ -82,25 +91,26 @@ def merge_ref_repo(tmp_path: Path) -> dict:
     _commit(repo, "leak.txt", f"{MAIN_SECRET}\n", "B add secret on main")
     _rm_commit(repo, "leak.txt", "C remove secret on main")
     d = _commit(repo, "main2.txt", "maindata\n", "D more main")
-    # PR branch from A
+    _set_origin_main(repo, d)
     _git(repo, "checkout", "-q", "-b", "pr", a)
     e = _commit(repo, "pr.txt", f"{PR_ADDED}\n", "E add pr value")
-    # CI merge ref: first parent = main tip (D), second = PR head (E)
     _git(repo, "checkout", "-q", d)
     _git(repo, "merge", "-q", "--no-ff", "-m", "M merge ref", e)
     m = _git(repo, "rev-parse", "HEAD")
     return {"repo": repo, "A": a, "D": d, "E": e, "M": m}
 
 
-def test_merge_ref_uses_head_first_parent(merge_ref_repo):
+def test_pull_request_resolves_to_merge_base_range(merge_ref_repo):
     repo = str(merge_ref_repo["repo"])
     spec = lsa.resolve_scan_spec("pull_request", "", "", cwd=repo)
-    assert spec == ("range", "HEAD^1..HEAD")
+    # merge-base(origin/main=D, HEAD=M) == D (M's first parent).
+    assert spec == ("range", f"{merge_ref_repo['D']}..HEAD")
 
 
 def test_fix_excludes_main_addthenremove_includes_pr(merge_ref_repo):
     repo = str(merge_ref_repo["repo"])
-    out = lsa.added_lines(("range", "HEAD^1..HEAD"), cwd=repo)
+    spec = lsa.resolve_scan_spec("pull_request", "", "", cwd=repo)
+    out = lsa.added_lines(spec, cwd=repo)
     assert PR_ADDED in out  # the PR's own addition is scanned
     assert MAIN_SECRET not in out  # main's add-then-removed value is NOT re-flagged
 
@@ -127,43 +137,108 @@ def test_pr_authored_add_then_remove_still_caught(tmp_path: Path):
     _git(repo, "init", "-q", "-b", "main")
     a = _commit(repo, "base.txt", "hello\n", "A")
     d = _commit(repo, "main2.txt", "maindata\n", "D main only")
+    _set_origin_main(repo, d)
     _git(repo, "checkout", "-q", "-b", "pr", a)
     _commit(repo, "pr.txt", f"{PR_ADDED}\n", "E add pr value")
-    e2 = _rm_commit(repo, "pr.txt", "F remove pr value within the PR")
+    _rm_commit(repo, "pr.txt", "F remove pr value within the PR")
+    e2 = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", "-q", d)
     _git(repo, "merge", "-q", "--no-ff", "-m", "M", e2)
-    out = lsa.added_lines(("range", "HEAD^1..HEAD"), cwd=str(repo))
+    spec = lsa.resolve_scan_spec("pull_request", "", "", cwd=str(repo))
+    out = lsa.added_lines(spec, cwd=str(repo))
     assert PR_ADDED in out  # add-then-remove-within-PR is still scanned
 
 
-def test_single_parent_head_falls_back_to_merge_base(tmp_path: Path):
-    """Unmergeable PR (PR head checked out): anchor on live main via merge-base."""
+def test_merge_headed_unmergeable_pr_still_fully_scanned(tmp_path: Path):
+    """Codex P1: an unmergeable PR whose HEAD is itself a merge commit.
+
+    Parent-count is NOT a "this is the CI merge ref" signal. The old HEAD^1..HEAD
+    heuristic would exclude the PR's first-parent history and MISS a secret there;
+    merge-base(origin/main, HEAD) scans all of the PR's own commits.
+    """
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    a = _commit(repo, "base.txt", "hello\n", "A")
+    d = _commit(repo, "main2.txt", "maindata\n", "D main tip")
+    _set_origin_main(repo, d)
+    # PR branch from A: first-parent history carries the secret, then the author
+    # merges a side branch, so the PR HEAD is itself a merge commit (2 parents).
+    _git(repo, "checkout", "-q", "-b", "feature", a)
+    _commit(repo, "leak.txt", f"{PR_ADDED}\n", "E1 secret in first-parent history")
+    _git(repo, "checkout", "-q", "-b", "side", a)
+    _commit(repo, "side.txt", "side\n", "S1 side branch")
+    _git(repo, "checkout", "-q", "feature")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "H author merge", "side")
+    # HEAD = feature (a 2-parent merge), checked out as the PR head (unmergeable).
+    spec = lsa.resolve_scan_spec("pull_request", "", "", cwd=str(repo))
+    out = lsa.added_lines(spec, cwd=str(repo))
+    assert PR_ADDED in out  # merge-base catches the first-parent-history secret
+    # Control: the old HEAD^1..HEAD heuristic would have MISSED it.
+    old = lsa.added_lines(("range", "HEAD^1..HEAD"), cwd=str(repo))
+    assert PR_ADDED not in old
+
+
+def test_single_parent_head_uses_merge_base(tmp_path: Path):
+    """Unmergeable PR (linear PR head): merge-base still bounds to PR commits."""
     repo = tmp_path / "r"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
     a = _commit(repo, "base.txt", "hello\n", "A")
     d = _commit(repo, "main2.txt", "maindata\n", "D main")
+    _set_origin_main(repo, d)
     _git(repo, "checkout", "-q", "-b", "pr", a)
     _commit(repo, "pr.txt", f"{PR_ADDED}\n", "E pr value")
-    # Simulate origin/main tracking ref at D; check out the PR head (1 parent).
-    _git(repo, "update-ref", "refs/remotes/origin/main", d)
-    _git(repo, "checkout", "-q", "pr")
     spec = lsa.resolve_scan_spec("pull_request", "", "", cwd=str(repo))
-    assert spec[0] == "range" and spec[1].endswith("..HEAD")
-    assert lsa.head_parent_count(cwd=str(repo)) == 1
-    out = lsa.added_lines(spec, cwd=str(repo))
-    assert PR_ADDED in out
+    assert spec == ("range", f"{a}..HEAD")  # merge-base(D, E) == A (fork point)
+    assert PR_ADDED in lsa.added_lines(spec, cwd=str(repo))
 
 
-def test_single_parent_head_no_main_fails_closed(tmp_path: Path):
-    """No merge ref AND no reachable main → RangeError (fail closed, never empty)."""
+def test_no_reachable_main_fails_closed(tmp_path: Path):
+    """No origin/main ref → merge-base fails → RangeError (fail closed, never empty)."""
     repo = tmp_path / "r"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
     _commit(repo, "base.txt", "hello\n", "A")
-    _commit(repo, "pr.txt", f"{PR_ADDED}\n", "E")  # linear, 1-parent HEAD, no origin/main
+    _commit(repo, "pr.txt", f"{PR_ADDED}\n", "E")  # no origin/main ref set
     with pytest.raises(lsa.RangeError):
         lsa.resolve_scan_spec("pull_request", "", "", cwd=str(repo))
+
+
+def test_unicode_line_separator_content_preserved(tmp_path: Path):
+    """Codex P1: content after U+0085 must NOT be dropped (str.splitlines would)."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    a = _commit(repo, "base.txt", "hello\n", "A")
+    d = _commit(repo, "main2.txt", "x\n", "D")
+    _set_origin_main(repo, d)
+    _git(repo, "checkout", "-q", "-b", "pr", a)
+    # An added line with a U+0085 (NEL) between benign text and the secret token.
+    (repo / "f.txt").write_text(f"safe{PR_ADDED}\n", encoding="utf-8")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "-q", "-m", "E nel line")
+    spec = lsa.resolve_scan_spec("pull_request", "", "", cwd=str(repo))
+    out = lsa.added_lines(spec, cwd=str(repo))
+    assert PR_ADDED in out  # content after U+0085 preserved (split on b"\n" only)
+
+
+def test_non_utf8_byte_does_not_crash(tmp_path: Path):
+    """Codex P2: a non-UTF-8 byte in an added line must not crash the gate."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    a = _commit(repo, "base.txt", "hello\n", "A")
+    d = _commit(repo, "main2.txt", "x\n", "D")
+    _set_origin_main(repo, d)
+    _git(repo, "checkout", "-q", "-b", "pr", a)
+    # Raw 0xff byte (not a NUL, so git treats the blob as text) + ASCII token.
+    (repo / "f.bin").write_bytes(b"prefix\xff " + PR_ADDED.encode() + b"\n")
+    _git(repo, "add", "f.bin")
+    _git(repo, "commit", "-q", "-m", "E non-utf8")
+    spec = lsa.resolve_scan_spec("pull_request", "", "", cwd=str(repo))
+    out = lsa.added_lines(spec, cwd=str(repo))  # must not raise
+    assert PR_ADDED in out  # ASCII content around the bad byte preserved
 
 
 def test_push_path_scans_before_to_head(tmp_path: Path):
@@ -232,6 +307,7 @@ def _merge_ref_with(repo: Path, pr_file: str | None) -> None:
     _commit(repo, "m.txt", "cfg MAINLEAK_42 x\n", "B add mainleak on main")
     _rm_commit(repo, "m.txt", "C remove mainleak on main")
     d = _commit(repo, "main2.txt", "maindata\n", "D main")
+    _set_origin_main(repo, d)
     _git(repo, "checkout", "-q", "-b", "pr", a)
     if pr_file:
         _commit(repo, "pr.txt", pr_file, "E pr change")
