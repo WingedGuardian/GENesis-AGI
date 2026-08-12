@@ -1001,18 +1001,21 @@ verified: fbcf8ee4 2026-07-21
   contradiction gates), weekly skill evolution, daily triage calibration.
   Weekly skill evolution is **propose-only** (autonomous auto-apply retired
   2026-08-01, #1276): it STAGES every SKILL.md edit (MINOR and larger) as a
-  `skill_proposal` observation for human/CC review — nothing is written to a
-  skill file, and under propose-only NO cognitive-file-modification ledger
-  pre-image is created (the apply/resolve path that would record one is a
-  deferred follow-up). A STRUCTURAL check (`skills/validator.py`) and a shadow
+  `skill_proposal` observation for human/CC review and never writes a skill
+  file — no proposal is ever blocked or auto-applied. Under propose-only NO
+  cognitive-file-modification ledger pre-image is created (the apply/resolve
+  path that would record one is a deferred follow-up). Two ADVISORY signals ride
+  the staged proposal for the reviewer, and neither gates staging: a STRUCTURAL
+  check (`skills/validator.py`) whose outcome is recorded as a `validated` flag
+  (for MINOR it reflects the structural result; for MODERATE+ an LLM
+  apply-recommendation) plus `validation_detail` when the structural check
+  fails; and, WHEN ENABLED (gate on, router + baseline available), a shadow
   **skill-edit Critic** (`skills/skill_edit_critic.py` +
-  `eval/rubrics/skill_edit_regression.py`) are ADVISORY — they ride every staged
-  proposal (a proposal that fails validation is still staged, flagged
-  `validated=false`); the Critic screens for self-modification pathologies via
-  the `judge` call site and LOGS a verdict (`skill_evolution_gate` observations).
-  Neither gates staging (WS1 shadow); the `autonomy_level` param + validator
-  wiring are retained as (currently unwired) groundwork for the future WS1
-  `enforce` mode. A complementary **held-out replay
+  `eval/rubrics/skill_edit_regression.py`) that screens for self-modification
+  pathologies via the `judge` call site and logs a `skill_evolution_gate`
+  verdict (WS1 shadow). The `autonomy_level` param + validator wiring are
+  retained as (currently unwired) groundwork for the future WS1 `enforce`
+  mode. A complementary **held-out replay
   gate** (`eval/skill_replay/`, tool `skill_replay_run`) goes further — it
   REPLAYS a frozen per-skill golden suite (`~/.genesis/eval/skill_golden/`,
   authored via `eval/skill_golden_set.py`) against OLD vs NEW content in
