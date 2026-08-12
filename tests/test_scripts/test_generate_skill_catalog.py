@@ -237,3 +237,43 @@ class TestParseFrontmatter:
         monkeypatch.setattr(_gen, "yaml", None)
         result = _gen._parse_frontmatter(_fm("x", "description: plain desc"))
         assert result == {"name": "x", "description": "plain desc", "keywords": []}
+
+    def test_boolean_like_scalars_kept_as_strings(self):
+        # yaml.safe_load coerces YAML 1.1 booleans; the catalog needs the
+        # authored spelling (e.g. an "off" keyword) for matching.
+        content = _fm(
+            "x", "description: y\nkeywords: [off, on, no, yes, true, false]"
+        )
+        assert _gen._parse_frontmatter(content)["keywords"] == [
+            "off",
+            "on",
+            "no",
+            "yes",
+            "true",
+            "false",
+        ]
+
+    def test_boolean_like_description_kept_as_string(self):
+        assert _gen._parse_frontmatter(_fm("x", "description: yes"))["description"] == "yes"
+
+    def test_frontmatter_loader_refuses_python_object_tags(self):
+        # The custom loader is a SafeLoader subclass — arbitrary object
+        # construction (code execution) must still be refused.
+        import pytest
+        import yaml
+
+        payload = "!!python/object/apply:os.system ['echo pwned']"
+        with pytest.raises(yaml.YAMLError):
+            yaml.load(payload, Loader=_gen._FrontmatterLoader)  # noqa: S506
+
+    def test_keywords_drops_null_and_empty_elements(self):
+        # A null/empty flow element must not become a bogus "None" keyword.
+        content = _fm("x", "description: y\nkeywords: [python, , web]")
+        assert _gen._parse_frontmatter(content)["keywords"] == ["python", "web"]
+
+    def test_base_safeloader_bool_resolver_not_mutated(self):
+        # Customizing _FrontmatterLoader must NOT mutate SafeLoader's shared
+        # resolver map (a class-attribute footgun).
+        import yaml
+
+        assert yaml.safe_load("off") is False

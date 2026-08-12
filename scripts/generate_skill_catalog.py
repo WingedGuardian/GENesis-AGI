@@ -21,6 +21,27 @@ try:
 except ImportError:  # pragma: no cover - pyyaml is a declared dependency
     yaml = None  # type: ignore[assignment]
 
+if yaml is not None:
+
+    class _FrontmatterLoader(yaml.SafeLoader):
+        """SafeLoader that keeps YAML 1.1 boolean-like scalars as their authored
+        string. Skill name/description/keywords are TEXT, so ``keywords: [off]``
+        must stay ``"off"`` — plain ``yaml.safe_load`` would coerce off/on/yes/
+        no/true/false to Python bools and catalog ``"False"``/``"True"``."""
+
+    # The subclass inherits SafeLoader's SHARED resolver map; give it its own
+    # copy (never mutate the base) with the bool implicit resolver dropped.
+    _FrontmatterLoader.yaml_implicit_resolvers = {
+        _ch: [
+            (_tag, _rx)
+            for (_tag, _rx) in _resolvers
+            if _tag != "tag:yaml.org,2002:bool"
+        ]
+        for _ch, _resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+else:  # pragma: no cover - pyyaml is a declared dependency
+    _FrontmatterLoader = None
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TIER1_DIR = REPO_ROOT / ".claude" / "skills"
 TIER2_DIRS = [
@@ -71,7 +92,9 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
             end = content.find("---", 3)
         if end > 0:
             try:
-                loaded = yaml.safe_load(content[3:end])
+                # _FrontmatterLoader is a SafeLoader subclass (no arbitrary
+                # object construction) that preserves boolean-like spellings.
+                loaded = yaml.load(content[3:end], Loader=_FrontmatterLoader)  # noqa: S506
             except Exception:
                 # Any parse failure (YAMLError, RecursionError on nested
                 # aliases, …) routes to the legacy fallback below rather than
@@ -85,7 +108,13 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
                 )
                 kw = loaded.get("keywords")
                 if isinstance(kw, (list, tuple)):
-                    keywords = [str(k).strip() for k in kw if str(k).strip()]
+                    # Drop null/empty flow elements (`[a, , b]` → a None) rather
+                    # than stringifying them into a bogus "None" keyword.
+                    keywords = [
+                        str(k).strip()
+                        for k in kw
+                        if k is not None and str(k).strip()
+                    ]
                 elif isinstance(kw, str):
                     keywords = [k.strip() for k in kw.split(",") if k.strip()]
                 else:
