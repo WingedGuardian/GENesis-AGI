@@ -115,6 +115,48 @@ _ALARM_CONFIRMATION_COUNT = 2
 # attempts → alarm recurs → dispatch again (every tick).
 _RESOLVED_COOLDOWN_S = 15 * 60  # 15 minutes
 
+# Tools disallowed when a Sentinel session runs DEGRADED (MCP config
+# unavailable). Without the genesis MCP servers the session cannot call
+# outreach_send_and_wait to self-gate its actions, so under skip_permissions it
+# must not act directly — block every mutation/action tool while keeping read
+# tools (Read/Grep/Glob) for diagnosis. proposed_actions still flow (they are
+# parsed from the session OUTPUT, not an MCP tool) and the parent approval gate
+# executes them. See _dispatch_cc_session / _escalate_mcp_config_unavailable.
+#
+# This is a SUPERSET of the established read-only reflection lockdown
+# (genesis.cc.session_config._REFLECTION_DENY_BUILTINS) plus MultiEdit and the web
+# tools: Read is KEPT for diagnosis, and Read + WebFetch is an exfiltration channel
+# (read a secret, embed it in a fetched URL), so the web tools must be blocked too.
+# Kept as a literal (not an import) to avoid an import cycle;
+# test_dispatcher.TestDegradedMcpConfig enforces the ⊇ _REFLECTION_DENY_BUILTINS
+# invariant so this never silently falls behind the reflection lockdown.
+_DEGRADED_DISALLOWED_TOOLS: tuple[str, ...] = (
+    "Bash",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Task",
+    "Workflow",
+    "Skill",
+    "SendMessage",
+    "ReportFindings",
+    "CronCreate",
+    "CronDelete",
+    "ScheduleWakeup",
+    "Monitor",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskStop",
+    "RemoteTrigger",
+    "PushNotification",
+    "DesignSync",
+    "EnterWorktree",
+    "ExitWorktree",
+    "WebFetch",
+    "WebSearch",
+)
+
 
 def _serialize_request(request: SentinelRequest) -> str:
     """Serialize a SentinelRequest to JSON for state persistence."""
@@ -405,6 +447,49 @@ class SentinelDispatcher:
             )
         except Exception:
             logger.error("Failed to emit sentinel event %s", event_type, exc_info=True)
+
+    async def _escalate_mcp_config_unavailable(self, request: SentinelRequest) -> None:
+        """Surface a Sentinel MCP-config build failure loudly (event + outreach).
+
+        Called when ``build_mcp_config`` yields no config path — whether it
+        raised (import/other error) or returned ``None`` internally (render
+        failure, ``session_config.py``). The session then runs degraded
+        (propose-only), so this makes the config regression VISIBLE instead of
+        silently degrading the remediator to a no-op-ish diagnoser.
+        """
+        await self._emit_event(
+            "ERROR",
+            "sentinel.mcp_config_unavailable",
+            "Sentinel MCP config unavailable — running degraded (propose-only, "
+            "no direct action). Likely a SessionConfigBuilder regression.",
+        )
+        if self._outreach_pipeline is None:
+            return
+        try:
+            from genesis.outreach.pipeline import OutreachCategory, OutreachRequest
+
+            msg = (
+                "⚠️ Sentinel MCP config unavailable — the remediation session is "
+                "running in degraded propose-only mode (it can diagnose and "
+                "propose actions for approval, but cannot act directly). Trigger: "
+                f"{request.trigger_source} — {request.trigger_reason}. Likely a "
+                "SessionConfigBuilder regression; check the logs."
+            )
+            await self._outreach_pipeline.submit_raw(
+                msg,
+                OutreachRequest(
+                    category=OutreachCategory.BLOCKER,
+                    topic="Sentinel MCP config unavailable",
+                    context=msg,
+                    salience_score=1.0,
+                    signal_type="sentinel_mcp_config_unavailable",
+                    source_id=f"sentinel-mcp-unavailable:{int(time.time())}",
+                ),
+            )
+        except Exception:
+            logger.error(
+                "Sentinel MCP-unavailable escalation failed to send", exc_info=True
+            )
 
     async def _gated_dispatch(self, request: SentinelRequest) -> SentinelResult:
         """Gate checks and dispatch, protected by asyncio.Lock."""
@@ -1297,13 +1382,27 @@ class SentinelDispatcher:
         self._active_session_id = session_id
 
         try:
-            # Build MCP config so the CC session has health + outreach tools
+            # Build MCP config so the CC session has health + outreach tools.
+            # build_mcp_config can FAIL (import/other error → except below) OR
+            # return None (internal render failure — session_config.py swallows
+            # its own error and returns None). Guard the RESULT, not just the
+            # except, so both funnel to the same degraded-safe path.
             mcp_path = None
             try:
                 from genesis.cc.session_config import SessionConfigBuilder
                 mcp_path = SessionConfigBuilder().build_mcp_config("sentinel")
             except Exception:
                 logger.warning("Failed to build MCP config for Sentinel", exc_info=True)
+
+            degraded = mcp_path is None
+            if degraded:
+                # No genesis MCP servers → the session cannot call
+                # outreach_send_and_wait to self-gate. Under skip_permissions it
+                # could still mutate via Bash WITHOUT the approval gate, so drop
+                # to a propose-only posture (disallow mutation/action tools) and
+                # surface the failure loudly. Diagnose+propose still works and the
+                # parent-side approval gate governs execution.
+                await self._escalate_mcp_config_unavailable(request)
 
             invocation = CCInvocation(
                 prompt=full_prompt,
@@ -1312,6 +1411,9 @@ class SentinelDispatcher:
                 effort=EffortLevel.HIGH,
                 timeout_s=3600,
                 skip_permissions=True,
+                disallowed_tools=(
+                    list(_DEGRADED_DISALLOWED_TOOLS) if degraded else None
+                ),
                 system_prompt=system_prompt,
                 append_system_prompt=True,
                 output_format="text",
@@ -1321,8 +1423,8 @@ class SentinelDispatcher:
 
             output = await self._invoker.run(invocation)
 
-            # Parse output
-            result = self._parse_output(output, session_id)
+            # Parse output (degraded → don't trust self-reported resolution)
+            result = self._parse_output(output, session_id, degraded=degraded)
             return result
         finally:
             self._active_session_id = None
@@ -1332,8 +1434,17 @@ class SentinelDispatcher:
             except Exception:
                 logger.debug("Failed to end sentinel session", exc_info=True)
 
-    def _parse_output(self, output, session_id: str) -> SentinelResult:
-        """Parse the CC session output into a SentinelResult."""
+    def _parse_output(
+        self, output, session_id: str, degraded: bool = False
+    ) -> SentinelResult:
+        """Parse the CC session output into a SentinelResult.
+
+        ``degraded`` marks a session that ran without action tools (MCP config
+        unavailable → propose-only). Such a session structurally CANNOT have taken
+        action, so its self-reported ``resolved``/``actions_taken`` must not be
+        trusted (that would falsely mark the alarm HEALTHY and suppress
+        re-dispatch); only its ``proposed_actions`` are honoured (parent-gated).
+        """
         import json
         import re
 
@@ -1378,9 +1489,24 @@ class SentinelDispatcher:
         actions_taken = parsed.get("actions_taken", [])
         resolved = parsed.get("resolved", False)
 
+        # A degraded (tool-less) session could not have acted — never trust its
+        # self-reported resolution/actions_taken (fabricated in this mode). Keep
+        # only proposed_actions, which go through the parent approval gate.
+        if degraded:
+            resolved = False
+            actions_taken = []
+
         # Fallback: use the full text as diagnosis
         if not diagnosis and text:
             diagnosis = text[:500]
+
+        reason = (
+            "actions proposed"
+            if proposed_actions
+            else ("resolved" if resolved else "no actions proposed — escalating")
+        )
+        if degraded:
+            reason = f"degraded (propose-only): {reason}"
 
         return SentinelResult(
             dispatched=True,
@@ -1389,7 +1515,7 @@ class SentinelDispatcher:
             actions_taken=actions_taken,
             proposed_actions=proposed_actions,
             resolved=resolved,
-            reason="actions proposed" if proposed_actions else ("resolved" if resolved else "no actions proposed — escalating"),
+            reason=reason,
         )
 
     async def _approve_and_execute_actions(self, result: SentinelResult) -> list[dict]:

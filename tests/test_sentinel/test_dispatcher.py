@@ -11,6 +11,7 @@ import pytest
 from genesis.sentinel.classifier import FireAlarm
 from genesis.sentinel.dispatcher import (
     _BACKOFF_SCHEDULE_S,
+    _DEGRADED_DISALLOWED_TOOLS,
     _ESCALATE_AT_ATTEMPT,
     _RESOLVED_COOLDOWN_S,
     SentinelDispatcher,
@@ -1223,3 +1224,124 @@ class TestShadowClassification:
 
         assert result.dispatched
         assert _shadow_events(mock_log) == []
+
+
+class TestDegradedMcpConfig:
+    """When build_mcp_config yields no path (raises OR returns None), the session
+    runs degraded-safe: propose-only (mutation tools disallowed) + a loud ERROR
+    event + a BLOCKER outreach. proposed_actions still flow (parsed from output)
+    and the parent approval gate governs execution.
+    """
+
+    def _make_with_outreach(self):
+        outreach = AsyncMock()
+        # The dispatch approval gate runs before _dispatch_cc_session: grant it
+        # so the flow reaches the MCP-config build we're testing.
+        outreach.submit_raw_and_wait = AsyncMock(return_value=(MagicMock(), "approve"))
+        outreach.submit_raw = AsyncMock()
+        d = _make_dispatcher(outreach_pipeline=outreach)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        return d, outreach
+
+    async def _run_dispatch(self, d):
+        with patch("genesis.sentinel.dispatcher.write_last_run"), patch(
+            "genesis.sentinel.dispatcher.write_state_for_guardian"
+        ), patch("genesis.sentinel.dispatcher.append_log"):
+            return await d.dispatch(
+                SentinelRequest(
+                    trigger_source="test",
+                    trigger_reason="mcp degraded unit",
+                    tier=2,
+                )
+            )
+
+    def _last_invocation(self, d):
+        assert d._invoker.run.await_count >= 1
+        return d._invoker.run.call_args.args[0]
+
+    def _emitted_event_types(self, d):
+        return [c.args[2] for c in d._event_bus.emit.call_args_list if len(c.args) >= 3]
+
+    @pytest.mark.asyncio
+    async def test_none_config_dispatches_degraded_and_escalates(self):
+        d, outreach = self._make_with_outreach()
+        with patch(
+            "genesis.cc.session_config.SessionConfigBuilder.build_mcp_config",
+            return_value=None,
+        ):
+            await self._run_dispatch(d)
+
+        inv = self._last_invocation(d)
+        # Propose-only posture: mutation tools disallowed, no MCP config, but
+        # read tools remain (skip_permissions stays True) for diagnosis.
+        assert inv.disallowed_tools == list(_DEGRADED_DISALLOWED_TOOLS)
+        assert inv.mcp_config is None
+        assert inv.skip_permissions is True
+        # Loud ERROR event + BLOCKER outreach.
+        assert "sentinel.mcp_config_unavailable" in self._emitted_event_types(d)
+        from genesis.outreach.pipeline import OutreachCategory
+
+        assert outreach.submit_raw.await_count >= 1
+        assert outreach.submit_raw.call_args.args[1].category == OutreachCategory.BLOCKER
+
+    @pytest.mark.asyncio
+    async def test_build_raises_is_also_degraded(self):
+        d, _outreach = self._make_with_outreach()
+        with patch(
+            "genesis.cc.session_config.SessionConfigBuilder.build_mcp_config",
+            side_effect=RuntimeError("boom"),
+        ):
+            await self._run_dispatch(d)
+
+        inv = self._last_invocation(d)
+        assert inv.disallowed_tools == list(_DEGRADED_DISALLOWED_TOOLS)
+        assert "sentinel.mcp_config_unavailable" in self._emitted_event_types(d)
+
+    @pytest.mark.asyncio
+    async def test_healthy_config_is_not_degraded(self):
+        d, outreach = self._make_with_outreach()
+        with patch(
+            "genesis.cc.session_config.SessionConfigBuilder.build_mcp_config",
+            return_value="/tmp/sentinel-mcp.json",
+        ):
+            await self._run_dispatch(d)
+
+        inv = self._last_invocation(d)
+        assert inv.mcp_config == "/tmp/sentinel-mcp.json"
+        assert inv.disallowed_tools is None  # full posture — no degrade
+        assert "sentinel.mcp_config_unavailable" not in self._emitted_event_types(d)
+        assert outreach.submit_raw.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_degraded_session_resolution_not_trusted(self):
+        # A tool-less session cannot have acted; its self-reported resolution /
+        # actions_taken must NOT be trusted (else a real alarm is silently marked
+        # HEALTHY and re-dispatch suppressed). proposed_actions still flow.
+        d, _outreach = self._make_with_outreach()
+        mock_output = MagicMock()
+        mock_output.text = (
+            '{"diagnosis": "looked around", '
+            '"actions_taken": ["restarted svc X"], "resolved": true}'
+        )
+        d._invoker.run = AsyncMock(return_value=mock_output)
+        with patch(
+            "genesis.cc.session_config.SessionConfigBuilder.build_mcp_config",
+            return_value=None,
+        ):
+            result = await self._run_dispatch(d)
+
+        assert result.resolved is False
+        assert result.actions_taken == []
+        assert d._state.state != SentinelState.HEALTHY  # not silently resolved
+
+    def test_degraded_set_is_superset_of_reflection_lockdown(self):
+        # Reuse the codebase's established read-only lockdown rather than a
+        # hand-rolled list — and never silently fall behind it.
+        from genesis.cc.session_config import _REFLECTION_DENY_BUILTINS
+
+        assert set(_REFLECTION_DENY_BUILTINS) <= set(_DEGRADED_DISALLOWED_TOOLS)
+        # Web tools blocked: Read (kept for diagnosis) + WebFetch is exfiltration.
+        assert {"WebFetch", "WebSearch"}.issubset(_DEGRADED_DISALLOWED_TOOLS)
+        # Direct-mutation built-ins.
+        for tool in ("Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Task"):
+            assert tool in _DEGRADED_DISALLOWED_TOOLS
