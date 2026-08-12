@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+import urllib.error  # noqa: F401 - used by the _liveness_probe_refused fixture
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -37,6 +38,23 @@ def _no_deploy_in_progress():
     The IR-2 deploy-guard tests override this to True.
     """
     with patch("genesis.autonomy.watchdog.update_in_progress", return_value=False):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _liveness_probe_refused():
+    """Default the off-loop liveness probe to 'connection refused' (verdict
+    'down') so every existing restart test is insulated from a live localhost:5000
+    — the same insulation pattern as the autouse _is_bridge_active /
+    update_in_progress mocks. 'down' falls through to the normal restart path, i.e.
+    exactly the pre-feature behavior. The liveness-distinguisher tests below
+    override urlopen per-scenario to exercise the other verdicts.
+    """
+
+    def _refused(*_a, **_k):
+        raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    with patch("urllib.request.urlopen", side_effect=_refused):
         yield
 
 
@@ -801,3 +819,238 @@ class TestNetworkSuppression:
         assert c._network_suppresses_restart(
             {"network": {"state": "OFFLINE", "last_probe_at": future}}
         ) is False
+
+
+# --- Down-vs-starved liveness distinguisher --------------------------------------
+
+
+class _FakeResp:
+    """Minimal urlopen() context-manager stand-in."""
+
+    def __init__(self, status: int, payload: dict):
+        self.status = status
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def _urlopen_returning(status: int, payload: dict):
+    def _f(*_a, **_k):
+        return _FakeResp(status, payload)
+
+    return _f
+
+
+def _liveness_checker(tmp_path: Path, status_file: Path, target: str = "genesis-server.service"):
+    """A checker with a DETERMINISTIC target (so _targets_server doesn't depend on
+    the host's real systemd) and config_validation off (so the restart path lands
+    on RESTART, not a validation SKIP)."""
+    c = _make_checker(tmp_path, status_file)
+    c._target_service = target
+    return c
+
+
+class TestProbeLivenessClassification:
+    """The verdict machine, exercised directly by faking urllib.request.urlopen.
+
+    (The autouse _liveness_probe_refused fixture defaults urlopen to refused; each
+    test overrides it for the verdict it exercises.)"""
+
+    def _checker(self, tmp_path: Path) -> WatchdogChecker:
+        return _make_checker(tmp_path, tmp_path / "status.json")
+
+    def test_connection_refused_is_down(self, tmp_path: Path):
+        # The autouse fixture already raises URLError(ConnectionRefusedError).
+        verdict, block = self._checker(tmp_path)._probe_liveness()
+        assert verdict == "down"
+        assert block is None
+
+    def test_timeout_is_unknown(self, tmp_path: Path):
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("slow")):
+            verdict, _ = self._checker(tmp_path)._probe_liveness()
+        assert verdict == "unknown"
+
+    def test_non_200_is_unknown(self, tmp_path: Path):
+        with patch("urllib.request.urlopen", _urlopen_returning(503, {})):
+            verdict, _ = self._checker(tmp_path)._probe_liveness()
+        assert verdict == "unknown"
+
+    def test_null_loop_is_unknown(self, tmp_path: Path):
+        # loop:null (sampler never published) must NOT read as healthy.
+        with patch("urllib.request.urlopen", _urlopen_returning(200, {"loop": None})):
+            verdict, _ = self._checker(tmp_path)._probe_liveness()
+        assert verdict == "unknown"
+
+    def test_fresh_low_lag_is_responsive(self, tmp_path: Path):
+        payload = {"loop": {"lag_ms": 12.0, "sample_age_s": 0.5, "lagging": False}}
+        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+            verdict, _ = self._checker(tmp_path)._probe_liveness()
+        assert verdict == "responsive"
+
+    def test_fresh_high_lag_is_starved(self, tmp_path: Path):
+        payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True}}
+        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+            verdict, block = self._checker(tmp_path)._probe_liveness()
+        assert verdict == "starved"
+        assert block["lag_ms"] == 4200.0
+
+    def test_lagging_flag_alone_is_starved(self, tmp_path: Path):
+        # Below the 1000ms suppress floor but the sticky episode flag is set.
+        payload = {"loop": {"lag_ms": 300.0, "sample_age_s": 1.0, "lagging": True}}
+        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+            verdict, _ = self._checker(tmp_path)._probe_liveness()
+        assert verdict == "starved"
+
+    def test_stale_sample_is_wedged(self, tmp_path: Path):
+        # High lag but the sample itself is old → the sampler stopped → wedged.
+        payload = {"loop": {"lag_ms": 5000.0, "sample_age_s": 500.0, "lagging": True}}
+        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+            verdict, _ = self._checker(tmp_path)._probe_liveness()
+        assert verdict == "wedged"
+
+
+class TestLivenessRestartGate:
+    """check() → _restart_if_allowed consulting the probe. Every verdict except
+    'starved' must still reach the normal restart path (fail-open)."""
+
+    def _stale(self, tmp_path: Path):
+        return _liveness_checker(tmp_path, _stale_file(tmp_path))
+
+    def test_starved_suppresses_stale_restart(self, tmp_path: Path):
+        c = self._stale(tmp_path)
+        payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True,
+                            "executor": {"pending": 30}}}
+        with (
+            patch("urllib.request.urlopen", _urlopen_returning(200, payload)),
+            patch.object(c, "_alert_starved") as alert,
+        ):
+            action = c.check()
+        assert action is WatchdogAction.SKIP
+        alert.assert_called_once()
+        state = json.loads((tmp_path / "watchdog_state.json").read_text())
+        assert state["starved_skips"] == 1
+        # A suppressed cycle must NOT burn the restart/backoff counter.
+        assert state.get("consecutive_failures", 0) == 0
+
+    def test_starved_suppression_is_bounded(self, tmp_path: Path):
+        c = self._stale(tmp_path)
+        # Pre-seed the counter at the cap so the next starved cycle exceeds it.
+        (tmp_path / "watchdog_state.json").write_text(json.dumps({
+            "consecutive_failures": 0, "next_attempt_after": None,
+            "restart_history": [], "starved_skips": 6,
+        }))
+        payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True}}
+        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+            action = c.check()
+        # Past the bound → restart anyway; _record_failure resets the counter.
+        assert action is WatchdogAction.RESTART
+        state = json.loads((tmp_path / "watchdog_state.json").read_text())
+        assert state["starved_skips"] == 0
+
+    def test_non_starved_verdict_resets_skips_even_under_backoff(self, tmp_path: Path):
+        """A non-starved verdict must reset starved_skips (it means CONSECUTIVE
+        starved skips) even when the fall-through lands in a backoff window where
+        _record_failure never runs — otherwise a stale count would accumulate."""
+        c = self._stale(tmp_path)
+        future = time.time() + 9999
+        (tmp_path / "watchdog_state.json").write_text(json.dumps({
+            "consecutive_failures": 1, "next_attempt_after": future,
+            "restart_history": [], "starved_skips": 3,
+        }))
+        payload = {"loop": {"lag_ms": 5.0, "sample_age_s": 0.5, "lagging": False}}
+        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+            action = c.check()
+        assert action is WatchdogAction.BACKOFF  # backoff active → no restart, no _record_failure
+        state = json.loads((tmp_path / "watchdog_state.json").read_text())
+        assert state["starved_skips"] == 0  # reset by the gate, not by _record_failure
+
+    def test_wedged_restarts(self, tmp_path: Path):
+        c = self._stale(tmp_path)
+        payload = {"loop": {"lag_ms": 5000.0, "sample_age_s": 500.0, "lagging": True}}
+        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+            assert c.check() is WatchdogAction.RESTART
+
+    def test_responsive_restarts(self, tmp_path: Path):
+        # status.json stale but loop fine = the status-writer task died; restart.
+        c = self._stale(tmp_path)
+        payload = {"loop": {"lag_ms": 10.0, "sample_age_s": 0.5, "lagging": False}}
+        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+            assert c.check() is WatchdogAction.RESTART
+
+    def test_unknown_restarts(self, tmp_path: Path):
+        c = self._stale(tmp_path)
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("slow")):
+            assert c.check() is WatchdogAction.RESTART
+
+    def test_down_restarts(self, tmp_path: Path):
+        # The autouse fixture already yields 'down' (connection refused).
+        c = self._stale(tmp_path)
+        assert c.check() is WatchdogAction.RESTART
+
+    def test_zombie_starved_suppresses(self, tmp_path: Path):
+        c = _liveness_checker(tmp_path, _zombie_file(tmp_path))
+        payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True}}
+        with (
+            patch("urllib.request.urlopen", _urlopen_returning(200, payload)),
+            patch.object(c, "_alert_starved"),
+        ):
+            assert c.check() is WatchdogAction.SKIP
+
+    def test_bridge_inactive_never_probes(self, tmp_path: Path):
+        # service down = definitionally dead; the probe is not consulted.
+        c = _liveness_checker(tmp_path, _stale_file(tmp_path))
+        with (
+            patch.object(c, "_is_bridge_active", return_value=False),
+            patch.object(c, "_bridge_exited_unconfigured", return_value=False),
+            patch.object(c, "_probe_liveness") as probe,
+        ):
+            action = c.check()
+        probe.assert_not_called()
+        assert action is WatchdogAction.RESTART
+
+    def test_relay_target_never_probes(self, tmp_path: Path):
+        # A legacy relay-only install: the server-loop probe is meaningless.
+        c = _liveness_checker(tmp_path, _stale_file(tmp_path), target="genesis-bridge.service")
+        with patch.object(c, "_probe_liveness") as probe:
+            action = c.check()
+        probe.assert_not_called()
+        assert action is WatchdogAction.RESTART
+
+
+class TestLivenessConfig:
+    def test_from_yaml_loads_liveness_keys(self):
+        # The shipped config/autonomy.yaml carries the liveness knobs.
+        c = WatchdogChecker.from_yaml()
+        assert c._liveness_lag_suppress_ms == 1000
+        assert c._liveness_sample_stale_s == 120
+        assert c._liveness_max_starved_skips == 6
+        assert c._liveness_url.endswith("/api/genesis/liveness")
+
+
+def _stale_file(tmp_path: Path) -> Path:
+    """A stale status.json (20 min old) at a fixed path per tmp_path."""
+    p = tmp_path / "status.json"
+    old = datetime.now(UTC) - timedelta(minutes=20)
+    p.write_text(json.dumps({"timestamp": old.isoformat()}))
+    return p
+
+
+def _zombie_file(tmp_path: Path) -> Path:
+    """Fresh status.json but with a stale scheduler heartbeat (zombie scheduler),
+    past stabilization, no heavy workload, no network suppression."""
+    p = tmp_path / "status.json"
+    now = datetime.now(UTC)
+    old = now - timedelta(minutes=30)
+    p.write_text(json.dumps({
+        "timestamp": now.isoformat(),
+        "uptime_s": 99999,
+        "scheduler_heartbeats": {"surplus": old.isoformat()},
+    }))
+    return p

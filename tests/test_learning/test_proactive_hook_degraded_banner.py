@@ -42,13 +42,16 @@ def test_reason_connect_failures_are_unreachable(exc: Exception):
     assert "connection refused" in reason
 
 
-def test_reason_read_timeout_is_reachable_not_unreachable():
+def test_reason_read_timeout_is_reachable_not_unreachable(monkeypatch):
+    # Stub the live loop-lag probe so this unit stays hermetic (no network I/O).
+    monkeypatch.setattr(hook, "_liveness_detail", lambda: "")
     reason = hook._server_failure_reason(exc=httpx.ReadTimeout("read timed out"))
     assert "unreachable" not in reason
     assert "timed out" in reason and "reachable" in reason
 
 
-def test_reason_503_is_reachable_over_budget():
+def test_reason_503_is_reachable_over_budget(monkeypatch):
+    monkeypatch.setattr(hook, "_liveness_detail", lambda: "")
     reason = hook._server_failure_reason(status=503, detail="recall over budget")
     assert "unreachable" not in reason
     assert "503" in reason and "reachable" in reason
@@ -67,8 +70,9 @@ def test_reason_generic_exception_is_reachable():
     assert "reachable" in reason
 
 
-def test_banner_503_says_reachable_not_unreachable():
+def test_banner_503_says_reachable_not_unreachable(monkeypatch):
     """The core fix: a reachable-but-503 recall must NOT print 'unreachable'."""
+    monkeypatch.setattr(hook, "_liveness_detail", lambda: "")
     results = [{"memory_id": "abc12345", "content": "a recalled fact"}]
     reason = hook._server_failure_reason(status=503, detail="recall over budget")
     out = hook._format_degraded(results, reason=reason)
@@ -100,3 +104,43 @@ def test_banner_none_reason_falls_back_safely():
     banner = hook._format_degraded(results, reason=None).splitlines()[0]
     assert banner.startswith("[Memory recall degraded — ")
     assert "genesis-server unavailable" in banner
+
+
+# --- liveness-detail suffix on the reachable-but-loaded branches -----------------
+
+
+def test_liveness_detail_appended_on_read_timeout(monkeypatch):
+    """A reachable-but-slow recall (read timeout) appends the live loop-lag detail
+    so 'under load' becomes a number, not a guess."""
+    monkeypatch.setattr(hook, "_liveness_detail", lambda: " (loop lag 4200ms, executor backlog 30)")
+    reason = hook._server_failure_reason(exc=httpx.ReadTimeout("t"))
+    assert "under load" in reason
+    assert "loop lag 4200ms" in reason
+
+
+def test_liveness_detail_appended_on_503(monkeypatch):
+    monkeypatch.setattr(hook, "_liveness_detail", lambda: " (loop lag 900ms)")
+    reason = hook._server_failure_reason(status=503, detail="over budget")
+    assert "503" in reason and "over budget" in reason
+    assert "loop lag 900ms" in reason
+
+
+def test_liveness_detail_not_probed_on_connect_refused(monkeypatch):
+    """A down server (connection refused) must NOT be probed — nothing to read."""
+    calls = {"n": 0}
+
+    def _spy():
+        calls["n"] += 1
+        return " (should not appear)"
+
+    monkeypatch.setattr(hook, "_liveness_detail", _spy)
+    reason = hook._server_failure_reason(exc=httpx.ConnectError("refused"))
+    assert "should not appear" not in reason
+    assert calls["n"] == 0
+
+
+def test_liveness_detail_fails_closed_to_empty(monkeypatch):
+    """_liveness_detail never raises and returns '' when the probe is unreachable
+    (points at a dead port so the result is deterministic on any host)."""
+    monkeypatch.setattr(hook, "_SERVER_BASE", "http://127.0.0.1:9")
+    assert hook._liveness_detail() == ""
