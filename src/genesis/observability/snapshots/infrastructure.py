@@ -159,10 +159,11 @@ def _cpu_status(used_pct: float | None) -> str:
     return "healthy"
 
 
-# PID/task-budget % thresholds for the per-user systemd slice. Sustained high
-# occupancy of the slice's pids.max is what precedes `Cannot fork` — it maxes
-# under many concurrent CC sessions (each spawns MCP subprocess trees) while
-# memory/cpu/disk still read green.
+# PID/task-budget % thresholds. Sustained high occupancy of the BINDING cgroup
+# level's pids.max (session scope, user slice, or shared container root — see
+# _collect_pid_budget) is what precedes `Cannot fork`: it maxes under many
+# concurrent CC sessions (each spawns MCP subprocess trees) while memory/cpu/disk
+# still read green.
 _PID_DEGRADED_PCT = 80.0
 _PID_ERROR_PCT = 90.0
 
@@ -178,44 +179,150 @@ def _pid_status(pct: float | None) -> str:
     return "healthy"
 
 
+_CGROUP_ROOT = "/sys/fs/cgroup"
+
+
 def _user_slice_pids_dir() -> str:
-    """cgroup-v2 pids-controller dir for the current user's systemd slice."""
-    return f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice"
+    """cgroup-v2 pids dir for the current user's systemd slice — the fallback
+    starting leaf when ``/proc/self/cgroup`` cannot be parsed."""
+    return f"{_CGROUP_ROOT}/user.slice/user-{os.getuid()}.slice"
 
 
-def _collect_pid_budget(base_dir: str | None = None) -> dict:
-    """Read the per-user systemd slice PID budget (pids.current / pids.max).
+def _cgroup_path_from_proc(text: str) -> str | None:
+    """Map ``/proc/self/cgroup`` contents → this process's sysfs cgroup dir.
 
-    The task/PID budget is the resource that actually maxes under many concurrent
-    CC sessions — each `claude` spawns MCP subprocess trees — yet nothing else in
-    the snapshot tracks it, so a `Cannot fork` can occur while memory/cpu/disk all
-    read green. `pids.max` reflects the *effective* TasksMax (systemd resolves the
-    configured % into the cgroup), so this read is fork-free and honest.
-
-    Returns {status, current, max, pct}. When the slice has no sub-cap
-    (`pids.max == "max"`), pct is None and status is healthy (the slice inherits
-    the container root budget — not a per-slice risk). Unreadable / zero / malformed
-    → {"status": "unavailable"} — never a false "healthy".
+    The cgroup-v2 unified line is ``0::<path>``. Returns ``_CGROUP_ROOT`` + that
+    path (a trailing ``" (deleted)"`` zombie-cgroup marker stripped). Returns None
+    when there is no unified line (legacy/hybrid v1) or the path is not absolute —
+    the caller then falls back to the user-slice path.
     """
-    base = base_dir if base_dir is not None else _user_slice_pids_dir()
-    try:
-        with open(f"{base}/pids.current") as f:
-            current = int(f.read().strip())
-        with open(f"{base}/pids.max") as f:
-            raw_max = f.read().strip()
-    except (OSError, ValueError):
-        return {"status": "unavailable"}
+    for line in text.splitlines():
+        if line.startswith("0::"):
+            rel = line[3:].strip()
+            if rel.endswith(" (deleted)"):
+                rel = rel[: -len(" (deleted)")]
+            if not rel.startswith("/"):
+                return None
+            return _CGROUP_ROOT if rel == "/" else _CGROUP_ROOT + rel
+    return None
 
+
+def _self_cgroup_leaf_dir() -> str | None:
+    """This process's own cgroup pids dir (from ``/proc/self/cgroup``), or None
+    if unparsable/unreadable."""
+    try:
+        with open("/proc/self/cgroup") as f:
+            return _cgroup_path_from_proc(f.read())
+    except OSError:
+        return None
+
+
+def _same_path(a: str, b: str) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return a == b
+
+
+def _read_finite_pids_level(d: str) -> tuple[int, int] | None:
+    """``(current, max_pids)`` for ONE cgroup dir when it carries a FINITE positive
+    ``pids.max``; None otherwise (absent / ``"max"`` / malformed / non-positive /
+    unreadable current) — i.e. "not a binding candidate at this level"."""
+    try:
+        with open(f"{d}/pids.max") as f:
+            raw_max = f.read().strip()
+    except OSError:
+        return None
     if raw_max == "max":
-        return {"status": "healthy", "current": current, "max": "max", "pct": None}
+        return None
     try:
         max_pids = int(raw_max)
     except ValueError:
-        return {"status": "unavailable"}
+        return None
     if max_pids <= 0:
+        return None
+    try:
+        with open(f"{d}/pids.current") as f:
+            current = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return current, max_pids
+
+
+def _scope_label(d: str) -> str:
+    """Label for a cgroup level: ``"container-root"`` for the mount root, else the
+    directory basename (``"genesis-server.service"``, ``"user-1000.slice"``, …)."""
+    return "container-root" if _same_path(d, _CGROUP_ROOT) else os.path.basename(d.rstrip("/"))
+
+
+def _collect_pid_budget(base_dir: str | None = None) -> dict:
+    """Report the EFFECTIVE PID/task budget for this process by walking its cgroup
+    chain and returning the BINDING (highest-utilization) level.
+
+    A fork fails when ANY ancestor cgroup hits its ``pids.max`` (kernel cgroup-v2:
+    nested limits only restrict further, enforced across the subtree). Reading only
+    the user slice is therefore a blind spot — an uncapped slice with a binding
+    ancestor (container root), a bound service-scope BELOW the slice (the server
+    unit holds its own git/subprocess trees), or a busy shared root can each precede
+    ``Cannot fork`` while the slice reads green. This walks from THIS process's own
+    cgroup (``/proc/self/cgroup``) up to the cgroup mount root, considering every
+    level that has a finite ``pids.max``, and reports the one at highest %. Reads are
+    fork-free.
+
+    Returns ``{status, current, max, pct, scope}`` for the binding level. When the
+    whole VISIBLE chain is uncapped (all ``pids.max == "max"``) →
+    ``{status: healthy, current, max: "max", pct: None}`` — genuinely no sub-cap
+    (the container root may still be capped by the LXC host ABOVE our visible root,
+    which is unmonitorable from inside; we surface, never falsely close). An
+    unreadable/malformed LEAF → ``{status: "unavailable"}`` — never a false
+    "healthy".
+
+    ``base_dir`` overrides the starting leaf (tests); production derives it from
+    ``/proc/self/cgroup``, falling back to the user-slice path if that is unparsable.
+    """
+    leaf = base_dir if base_dir is not None else _self_cgroup_leaf_dir()
+    if leaf is None:
+        leaf = _user_slice_pids_dir()
+    leaf = os.path.abspath(leaf)
+
+    # Contract: an unreadable/malformed LEAF is "unavailable" (never false-healthy).
+    # A leaf pids.max of "0"/non-int is a broken read, NOT an uncapped chain.
+    try:
+        with open(f"{leaf}/pids.current") as f:
+            leaf_current = int(f.read().strip())
+        with open(f"{leaf}/pids.max") as f:
+            leaf_raw_max = f.read().strip()
+    except (OSError, ValueError):
         return {"status": "unavailable"}
-    pct = round(current / max_pids * 100, 1)
-    return {"status": _pid_status(pct), "current": current, "max": max_pids, "pct": pct}
+    if leaf_raw_max != "max":
+        try:
+            if int(leaf_raw_max) <= 0:
+                return {"status": "unavailable"}
+        except ValueError:
+            return {"status": "unavailable"}
+
+    # Walk leaf → cgroup mount root, collecting every finite level.
+    candidates: list[tuple[float, int, int, str]] = []
+    d = leaf
+    while True:
+        parsed = _read_finite_pids_level(d)
+        if parsed is not None:
+            cur, mx = parsed
+            candidates.append((round(cur / mx * 100, 1), cur, mx, _scope_label(d)))
+        if _same_path(d, _CGROUP_ROOT):
+            break
+        parent = os.path.dirname(d)
+        if parent == d:  # filesystem root — no cgroup mount boundary (tmp/tests)
+            break
+        d = parent
+
+    if not candidates:
+        # Leaf readable but nothing finite anywhere visible → genuinely uncapped.
+        return {"status": "healthy", "current": leaf_current, "max": "max", "pct": None}
+
+    # Binding = highest %; max() keeps the first (innermost) on ties.
+    pct, current, max_pids, scope = max(candidates, key=lambda c: c[0])
+    return {"status": _pid_status(pct), "current": current, "max": max_pids, "pct": pct, "scope": scope}
 
 
 # Module-level state for delta-based CPU reading (no blocking sleep)
@@ -402,7 +509,8 @@ async def infrastructure(
     except OSError as exc:
         infra["disk"] = {"status": "error", "error": str(exc)}
 
-    # PID/task budget of the per-user systemd slice — the blind spot that let a
+    # PID/task budget of the BINDING cgroup level (walks this process's chain —
+    # session scope / user slice / container root) — the blind spot that let a
     # `Cannot fork` happen while every other axis read green. Fork-free cgroup read.
     # _collect_pid_budget already degrades to {"status": "unavailable"} internally;
     # the guard is defense-in-depth so a future raise here can't kill collection of

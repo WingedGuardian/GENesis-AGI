@@ -3827,8 +3827,8 @@
           const pids = this.health.infrastructure?.pids;
           if (pids && (pids.status === "degraded" || pids.status === "error") && pids.pct != null) {
             pidState = pids.status;
-            pidReason = "PID budget " + pids.status + " (" + pids.pct.toFixed(0)
-              + "%, " + pids.current + "/" + pids.max + " tasks)";
+            pidReason = "PID budget " + pids.status + " (" + (pids.scope ? pids.scope + " " : "")
+              + pids.pct.toFixed(0) + "%, " + pids.current + "/" + pids.max + " tasks)";
           }
 
           // Worst-of — memory, disk, CPU, or PID budget, whichever is worst.

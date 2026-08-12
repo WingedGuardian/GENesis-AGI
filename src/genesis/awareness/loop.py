@@ -1759,21 +1759,25 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
             logger.debug("Failed to create cc_slot alert observation", exc_info=True)
 
 
-_last_pid_budget_alert_at: float | None = None
-_PID_BUDGET_ALERT_COOLDOWN_S = 3600  # one alert per hour (a single slice, one scalar)
+# (ts, status, scope) of the last alert. Keyed on scope+severity — not a single
+# scalar — because the collector now reports whichever cgroup level BINDS (session
+# scope / user slice / container root), so a plain time gate would let a minor
+# alert on one level mask a critical one on another (see _check_pid_budget).
+_last_pid_alert: tuple[float, str, str | None] | None = None
+_PID_BUDGET_ALERT_COOLDOWN_S = 3600  # one alert per (scope, severity) per hour
 
 
 async def _check_pid_budget(db, budget: dict | None = None) -> None:
-    """Alert (explanatorily) when the per-user systemd slice PID/task budget runs low.
+    """Alert (explanatorily) when the BINDING cgroup PID/task budget runs low.
 
     The task budget maxes under many concurrent CC sessions — each `claude` spawns
     MCP subprocess trees — and precedes `Cannot fork`, while memory/cpu/disk still
-    read green (the blind spot this closes). Uses the status the collector already
-    computed: degraded (>=80%) -> 'high'; error (>=90%) -> 'critical'. The content
-    NAMES the sub-cap and the remedy so a cryptic `Cannot fork` becomes actionable.
-    Fork-free cgroup read; best-effort — never raises into the tick. `budget` may be
-    injected (tests); otherwise it reads live."""
-    global _last_pid_budget_alert_at  # noqa: PLW0603
+    read green (the blind spot this closes). The collector walks the cgroup chain and
+    reports whichever level binds (session scope / user slice / container root); this
+    emits a scope-matched remedy at degraded (>=80%) -> 'high'; error (>=90%) ->
+    'critical'. Fork-free cgroup read; best-effort — never raises into the tick.
+    `budget` may be injected (tests); otherwise it reads live."""
+    global _last_pid_alert  # noqa: PLW0603
     try:
         if budget is None:
             from genesis.observability.snapshots.infrastructure import _collect_pid_budget
@@ -1786,20 +1790,59 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     status = budget.get("status")
     if status not in ("degraded", "error"):
         return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+    scope = budget.get("scope")
     now = time.monotonic()
-    if (
-        _last_pid_budget_alert_at is not None
-        and (now - _last_pid_budget_alert_at) < _PID_BUDGET_ALERT_COOLDOWN_S
-    ):
-        return
+    # Scope/severity-aware cooldown: a fresh alert still fires when it ESCALATED
+    # (degraded→error) or the BINDING SCOPE changed — otherwise a minor alert on one
+    # level would swallow the critical one this monitor exists to raise. Same
+    # (scope, severity) within the window is suppressed to avoid an alert storm.
+    if _last_pid_alert is not None:
+        last_ts, last_status, last_scope = _last_pid_alert
+        escalated = status == "error" and last_status != "error"
+        scope_changed = scope != last_scope
+        if (now - last_ts) < _PID_BUDGET_ALERT_COOLDOWN_S and not escalated and not scope_changed:
+            return
     if db is None:
         return  # can't write the observation now; retry next tick (cooldown not consumed)
     pct = budget.get("pct")
     current = budget.get("current")
     maximum = budget.get("max")
     priority = "critical" if status == "error" else "high"
-    # Set before the await so a failed create still cools per-tick retries.
-    _last_pid_budget_alert_at = now
+    # Remedy matched to the BINDING cgroup level (the collector walks the chain and
+    # names it): a service-scope raise, a user-slice raise, and a container-wide
+    # limit are different levers — a generic "raise the user-.slice TasksMax" is
+    # wrong (unactionable) when the server unit or the shared container root binds.
+    if scope == "container-root":
+        where = "Container-wide PID budget"
+        remedy = (
+            "This is the CONTAINER-WIDE task budget, shared with system and any other "
+            "processes, so it can fill from load outside Genesis. Reduce total load or "
+            "raise the container pids.max (a host/incus change)."
+        )
+    elif isinstance(scope, str) and scope.endswith(".service"):
+        where = f"{scope} PID budget"
+        remedy = (
+            f"This is the {scope} unit's TasksMax sub-cap — the server core plus the "
+            f"git/subprocess trees it spawns. Raise its TasksMax or reduce parallel "
+            f"subprocess work."
+        )
+    elif isinstance(scope, str) and scope.endswith(".scope"):
+        where = f"{scope} PID budget"
+        remedy = (
+            "This is a single session scope's TasksMax sub-cap — it bounds one session. "
+            "If it recurs, raise DefaultTasksMax or reduce that session's fan-out."
+        )
+    else:
+        # user slice (a *.slice) or unlabeled — the aggregate per-user budget.
+        where = f"{scope} PID budget" if scope else "User-slice PID budget"
+        remedy = (
+            "This is the per-user systemd TasksMax sub-cap. Raise the user-.slice "
+            "TasksMax (Genesis provisions 60% of the container PID budget by default) "
+            "or reduce concurrent sessions."
+        )
+    # Set before the await so a failed create still cools per-tick retries for the
+    # same (scope, severity).
+    _last_pid_alert = (now, status, scope)
     try:
         await observations.create(
             db,
@@ -1807,18 +1850,16 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
             source="pid_budget_monitor",
             type="infrastructure_alert",
             content=(
-                f"User-slice PID budget at {pct:.0f}% ({current}/{maximum} tasks). "
-                f"This is the per-user systemd TasksMax sub-cap — when it fills, new "
-                f"processes fail with 'Cannot fork' even though memory/CPU/disk are "
-                f"fine. Each Claude Code session spawns MCP subprocess trees, so many "
-                f"concurrent sessions can exhaust it. If resources permit, raise the "
-                f"user-.slice TasksMax (Genesis provisions 60% of the container PID "
-                f"budget by default)."
+                f"{where} at {pct:.0f}% ({current}/{maximum} tasks). When it fills, new "
+                f"processes fail with 'Cannot fork' even though memory/CPU/disk are fine. "
+                f"Each Claude Code session spawns MCP subprocess trees. {remedy}"
             ),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
         )
-        logger.warning("PID budget alert: %s%% (%s/%s, %s)", pct, current, maximum, priority)
+        logger.warning(
+            "PID budget alert: %s%% (%s/%s, scope=%s, %s)", pct, current, maximum, scope, priority
+        )
     except Exception:
         logger.debug("Failed to create pid_budget alert observation", exc_info=True)
 
@@ -2577,9 +2618,10 @@ class AwarenessLoop:
             # db inside the function. Surfaces a single ballooning CC session.
             await _check_cc_slot_memory(self._db)
 
-            # Per-user-slice PID/task-budget check — fork-free cgroup read, guarded
-            # on db internally. The blind spot that let a `Cannot fork` happen while
-            # every other axis read green; the alert explains the sub-cap + remedy.
+            # Binding-cgroup PID/task-budget check (walks the chain: session scope /
+            # user slice / container root) — fork-free cgroup read, guarded on db
+            # internally. The blind spot that let a `Cannot fork` happen while every
+            # other axis read green; the alert explains the binding sub-cap + remedy.
             await _check_pid_budget(self._db)
 
             # CC silent-cap detection — counts recent empty-output cognitive
