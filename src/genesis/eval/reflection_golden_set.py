@@ -173,17 +173,27 @@ async def _grade_observation(
     models = [
         "openrouter/deepseek/deepseek-chat-v3-0324",
         "gemini/gemini-2.0-flash",
-        "groq/llama-3.3-70b-versatile",
+        "groq/openai/gpt-oss-120b",
     ]
+    # litellm's env lookup knows only the native <SVC>_API_KEY spelling;
+    # secrets.env uses the Genesis convention (API_KEY_GROQ etc.), so resolve
+    # and pass the key explicitly or the groq fallback 401s on every install.
+    from genesis.observability.snapshots.api_keys import resolve_api_key
+
+    _service_by_prefix = {"gemini": "google"}
     last_exc = None
     response = None
     used_model = None
     for model in models:
+        prefix = model.split("/", 1)[0]
+        api_key = resolve_api_key(_service_by_prefix.get(prefix, prefix))
+        key_kwargs = {"api_key": api_key} if api_key else {}
         try:
             response = await litellm.acompletion(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
+                **key_kwargs,
             )
             used_model = model
             break

@@ -183,13 +183,26 @@ async def test_unparseable_response_fails_open(monkeypatch):
     assert r.llm_error == "parse_error"
 
 
+# Every env spelling the key resolver accepts, for all three fallback services —
+# tests that need "no key present" must clear ALL of them (a dev shell with
+# secrets.env sourced would otherwise leak API_KEY_GROQ into the test).
+_ALL_KEY_SPELLINGS = tuple(
+    pattern
+    for svc in ("OPENROUTER", "GROQ", "GOOGLE")
+    for pattern in (f"API_KEY_{svc}", f"{svc}_API_KEY", f"{svc}_API_TOKEN")
+)
+
+
+def _clear_all_keys(monkeypatch):
+    for var in _ALL_KEY_SPELLINGS:
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.mark.asyncio
 async def test_no_api_key_fails_open(monkeypatch):
     fake_commits = [{"sha": "x", "subject": "unrelated", "body": ""}]
     monkeypatch.setattr(version_gate, "fetch_upstream_log", lambda *a, **k: fake_commits)
-    # Clear all known keys
-    for var in ("API_KEY_OPENROUTER", "GROQ_API_KEY", "GOOGLE_API_KEY"):
-        monkeypatch.delenv(var, raising=False)
+    _clear_all_keys(monkeypatch)
     r = await version_gate.check_version_gate(
         user_subject="s", user_body="b", user_diff="d",
         user_sha="a", upstream_sha="b",
@@ -197,6 +210,56 @@ async def test_no_api_key_fails_open(monkeypatch):
     assert r.already_fixed is False
     assert r.parse_ok is False
     assert r.llm_error == "no_api_key"
+
+
+def test_genesis_env_spelling_selects_groq(monkeypatch):
+    """Regression: the Genesis convention is API_KEY_GROQ (stt, providers init,
+    onboarding floor) — the old single-name GROQ_API_KEY check made every groq
+    entry silently unselectable on convention-following installs."""
+    _clear_all_keys(monkeypatch)
+    monkeypatch.setenv("API_KEY_GROQ", "gsk-fake-genesis-spelling")
+    # Force the fallback list (config availability varies by test env).
+    monkeypatch.setattr(version_gate, "_load_models_from_config", lambda: [])
+    assert version_gate._select_model(None) == "groq/openai/gpt-oss-120b"
+
+
+def test_litellm_spelling_still_selects_groq(monkeypatch):
+    """The litellm-native spelling must keep working (acceptance, not a swap)."""
+    _clear_all_keys(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-fake-litellm-spelling")
+    monkeypatch.setattr(version_gate, "_load_models_from_config", lambda: [])
+    assert version_gate._select_model(None) == "groq/openai/gpt-oss-120b"
+
+
+@pytest.mark.asyncio
+async def test_call_llm_passes_explicit_api_key(monkeypatch):
+    """litellm's own env lookup knows only GROQ_API_KEY, so _call_llm must pass
+    the resolved key explicitly — otherwise a selected-via-API_KEY_GROQ model
+    401s at call time (the exact failure a live smoke hit on 2026-08-12)."""
+    _clear_all_keys(monkeypatch)
+    monkeypatch.setenv("API_KEY_GROQ", "gsk-fake-explicit")
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+
+        class _Msg:
+            content = "ok"
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    out = await version_gate._call_llm("p", "groq/openai/gpt-oss-120b")
+    assert out == "ok"
+    assert captured.get("api_key") == "gsk-fake-explicit"
 
 
 def test_format_version_string(tmp_path):

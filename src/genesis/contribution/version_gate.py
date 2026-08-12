@@ -17,19 +17,22 @@ threshold of 75 as a safety margin against future prompt-change
 hedging.
 
 Model: Reads from ``contribution_gate`` call site in model_routing.yaml.
-Falls back to hardcoded chain (Claude Haiku 4.5 → Groq Llama → Gemini
-Flash) if config is unavailable. Calls litellm directly (not through the
-router) but records results to the neural monitor for visibility.
+Falls back to hardcoded chain (Claude Haiku 4.5 → Groq gpt-oss-120b →
+Gemini Flash) if config is unavailable. Calls litellm directly (not through
+the router) but records results to the neural monitor for visibility — so
+the API key is resolved via ``resolve_api_key`` (both env spellings) and
+passed explicitly.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import subprocess
 import tomllib
 from pathlib import Path
+
+from genesis.observability.snapshots.api_keys import resolve_api_key
 
 from .findings import VersionGateResult
 
@@ -41,11 +44,18 @@ CONFIDENCE_THRESHOLD = 75
 
 # Fallback model chain when routing config is unavailable.
 # Production can override by passing `model=...` to `check_version_gate()`.
+# Second element = provider SERVICE name for key resolution via
+# `resolve_api_key` (accepts API_KEY_<SVC> and <SVC>_API_KEY spellings —
+# the old single-name GROQ_API_KEY check silently made groq unselectable
+# on installs using the Genesis convention API_KEY_GROQ).
 _FALLBACK_MODELS = [
-    ("openrouter/anthropic/claude-haiku-4.5", "API_KEY_OPENROUTER"),
-    ("groq/llama-3.3-70b-versatile", "GROQ_API_KEY"),
-    ("gemini/gemini-2.0-flash", "GOOGLE_API_KEY"),
+    ("openrouter/anthropic/claude-haiku-4.5", "openrouter"),
+    ("groq/openai/gpt-oss-120b", "groq"),
+    ("gemini/gemini-2.0-flash", "google"),
 ]
+
+# litellm model-string prefix → provider service name where they differ.
+_SERVICE_BY_PREFIX = {"gemini": "google"}
 
 # contribution_gate — gates community contribution submissions (Phase 6 pipeline).
 # Non-numeric ID by intent (predates the numeric scheme).
@@ -302,12 +312,6 @@ def _load_models_from_config() -> list[tuple[str, str]]:
             return []
         # Map provider type to litellm prefix
         _PREFIX = {"openrouter": "openrouter", "groq": "groq", "google": "gemini"}
-        # Map provider type to conventional env var for API key
-        _ENV = {
-            "openrouter": "API_KEY_OPENROUTER",
-            "groq": "GROQ_API_KEY",
-            "google": "GOOGLE_API_KEY",
-        }
         result = []
         for pname in site.chain:
             pcfg = config.providers.get(pname)
@@ -316,8 +320,7 @@ def _load_models_from_config() -> list[tuple[str, str]]:
             ptype = pcfg.provider_type
             prefix = _PREFIX.get(ptype, ptype)
             model_str = f"{prefix}/{pcfg.model_id}" if prefix else pcfg.model_id
-            env_var = _ENV.get(ptype, f"{ptype.upper()}_API_KEY")
-            result.append((model_str, env_var))
+            result.append((model_str, ptype))
         return result
     except Exception:
         logger.debug("Could not load routing config for contribution_gate", exc_info=True)
@@ -329,20 +332,30 @@ def _select_model(override: str | None) -> str | None:
         return override
     # Try routing config first, fall back to hardcoded defaults
     models = _load_models_from_config() or _FALLBACK_MODELS
-    for model, env_var in models:
-        if os.environ.get(env_var):
+    for model, service in models:
+        if resolve_api_key(service):
             return model
     return None
 
 
 async def _call_llm(prompt: str, model: str) -> str:
-    """Call the LLM via litellm.acompletion. Surfaces litellm errors."""
+    """Call the LLM via litellm.acompletion. Surfaces litellm errors.
+
+    The API key is resolved (both env spellings) and passed EXPLICITLY —
+    litellm's own env lookup knows only the native <SVC>_API_KEY name, so a
+    model selected via the Genesis convention (API_KEY_GROQ) would otherwise
+    401 at call time.
+    """
     import litellm  # lazy import; keeps findings/identity light
+    prefix = model.split("/", 1)[0] if "/" in model else model
+    api_key = resolve_api_key(_SERVICE_BY_PREFIX.get(prefix, prefix))
+    kwargs = {"api_key": api_key} if api_key else {}
     response = await litellm.acompletion(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
         max_tokens=500,
+        **kwargs,
     )
     return response.choices[0].message.content or ""
 
