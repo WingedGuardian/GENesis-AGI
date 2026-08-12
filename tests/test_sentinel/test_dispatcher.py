@@ -1342,6 +1342,50 @@ class TestDegradedMcpConfig:
         assert set(_REFLECTION_DENY_BUILTINS) <= set(_DEGRADED_DISALLOWED_TOOLS)
         # Web tools blocked: Read (kept for diagnosis) + WebFetch is exfiltration.
         assert {"WebFetch", "WebSearch"}.issubset(_DEGRADED_DISALLOWED_TOOLS)
+        # Subagent spawn blocked under BOTH names (current "Agent", obsolete "Task")
+        # so a degraded session cannot delegate mutation to a spawned agent.
+        assert {"Agent", "Task"}.issubset(_DEGRADED_DISALLOWED_TOOLS)
         # Direct-mutation built-ins.
-        for tool in ("Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Task"):
+        for tool in ("Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"):
             assert tool in _DEGRADED_DISALLOWED_TOOLS
+
+    @pytest.mark.asyncio
+    async def test_degraded_no_action_phrase_not_auto_resolved(self):
+        # _finalize_dispatch's no-action-phrase heuristic ("false positive" etc.)
+        # must NOT re-resolve a degraded session (the prompt encourages exactly
+        # those phrases; a tool-less session's resolution is untrusted).
+        d, _outreach = self._make_with_outreach()
+        mock_output = MagicMock()
+        mock_output.text = (
+            '{"diagnosis": "This looks like a false positive; no longer active.", '
+            '"actions_taken": [], "resolved": false, "proposed_actions": []}'
+        )
+        d._invoker.run = AsyncMock(return_value=mock_output)
+        with patch(
+            "genesis.cc.session_config.SessionConfigBuilder.build_mcp_config",
+            return_value=None,
+        ):
+            result = await self._run_dispatch(d)
+
+        assert result.degraded is True
+        assert result.resolved is False  # phrase heuristic skipped when degraded
+        assert d._state.state != SentinelState.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_healthy_no_action_phrase_still_auto_resolves(self):
+        # Control: the phrase heuristic still works on a NON-degraded session.
+        d, _outreach = self._make_with_outreach()
+        mock_output = MagicMock()
+        mock_output.text = (
+            '{"diagnosis": "Confirmed false positive — no longer active.", '
+            '"actions_taken": [], "resolved": false, "proposed_actions": []}'
+        )
+        d._invoker.run = AsyncMock(return_value=mock_output)
+        with patch(
+            "genesis.cc.session_config.SessionConfigBuilder.build_mcp_config",
+            return_value="/tmp/sentinel-mcp.json",
+        ):
+            result = await self._run_dispatch(d)
+
+        assert result.degraded is False
+        assert result.resolved is True  # heuristic unchanged for healthy sessions

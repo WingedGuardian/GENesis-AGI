@@ -136,6 +136,11 @@ _DEGRADED_DISALLOWED_TOOLS: tuple[str, ...] = (
     "Edit",
     "MultiEdit",
     "NotebookEdit",
+    # Subagent spawn: "Agent" is the CURRENT CC CLI name (tool_bootstrap.py /
+    # .claude/settings.json); "Task" is the obsolete name kept for parity with
+    # _REFLECTION_DENY_BUILTINS. Block BOTH — a spawned subagent escapes the
+    # propose-only lockdown and could mutate directly.
+    "Agent",
     "Task",
     "Workflow",
     "Skill",
@@ -246,6 +251,11 @@ class SentinelResult:
     observation_id: str = ""
     reason: str = ""  # Why dispatched or skipped
     duration_s: float = 0.0
+    # True when the session ran without action tools (MCP config unavailable →
+    # propose-only). A degraded session cannot have acted, so downstream MUST NOT
+    # trust its self-reported resolution — including the no-action-phrase
+    # heuristic in _finalize_dispatch.
+    degraded: bool = False
 
 
 def _extract_pattern(request: SentinelRequest) -> str:
@@ -895,6 +905,7 @@ class SentinelDispatcher:
         if (
             not resolved
             and result.dispatched
+            and not result.degraded  # a tool-less session's "resolved" is untrusted
             and not result.proposed_actions
             and result.diagnosis
         ):
@@ -1516,6 +1527,7 @@ class SentinelDispatcher:
             proposed_actions=proposed_actions,
             resolved=resolved,
             reason=reason,
+            degraded=degraded,
         )
 
     async def _approve_and_execute_actions(self, result: SentinelResult) -> list[dict]:
