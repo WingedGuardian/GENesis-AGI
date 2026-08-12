@@ -471,7 +471,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 557d3587 2026-08-09
+verified: 17140a65 2026-08-11
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
