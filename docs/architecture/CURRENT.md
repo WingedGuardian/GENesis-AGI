@@ -523,7 +523,13 @@ verified: 557d3587 2026-08-09
   staged-draft state is the source of truth; a `career_outreach_nudged` observation is the
   per-company nudge-dedup ledger so a re-tick / undelivered nudge never
   double-nudges. ONE daily job (`max_instances=1` is per-job; a second would race
-  the single remote). Discovery-sweep driving is GROUNDWORK-deferred.
+  the single remote). Discovery-sweep driving is GROUNDWORK-deferred. The auto-run
+  drives the engine's COMPLETE flow INCLUDING its own accuracy/verification gate
+  (never bypassed) under a headless contract; a gate-refused draft returns
+  `verify_failed` (NOT a job-health error), and a same-company re-selection breaks
+  the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
+  per-call `max_turns` override; `dispatch_timeout_s` default 900, no fixed SSH cap)
+  cover the gated flow (research → draft → verify → stage), MEASURED ~5.5 min live.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.

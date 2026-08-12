@@ -21,4 +21,13 @@ enabled: true
 mode: off
 reasoning_module: ""   # set your career-agent module's name in career_outreach.local.yaml
 max_auto_runs_per_tick: 3
-dispatch_timeout_s: 240
+# Per-dispatch bridge timeout (seconds). No fixed SSH cap — the auto-run drives the
+# engine's COMPLETE gated flow (research -> draft -> verify -> stage), measured ~5.5
+# min live. Default 900 covers it; capped at 1800.
+dispatch_timeout_s: 900
+# Per-dispatch --max-turns for the agentic auto-run (the read dispatch keeps the ipc
+# default of 25). The gated flow needs >25 turns (measured 42). Capped at 200.
+dispatch_max_turns: 80
+# autorun_note: appended to the AUTO-RUN prompt only (never the read prompt). Ships
+# empty; put any install-specific gate guidance in career_outreach.local.yaml.
+autorun_note: ""

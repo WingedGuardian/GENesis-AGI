@@ -202,7 +202,7 @@ class SshIPCAdapter:
         cmd.extend([self._ssh_host, remote_command])
         return cmd
 
-    def _build_remote_command(self, model: str, effort: str) -> str:
+    def _build_remote_command(self, model: str, effort: str, max_turns: int | None = None) -> str:
         """Build the remote ``cd … && claude -p …`` string with every value quoted.
 
         The command runs in the REMOTE shell (it relies on ``cd`` and ``&&``), so
@@ -232,6 +232,15 @@ class SshIPCAdapter:
         )
         effort_seg = f" --effort {shlex.quote(effort)}" if include_effort else ""
 
+        # Per-call turn budget. Default 25 keeps every existing caller unchanged; a
+        # caller driving a long agentic flow (e.g. the career-outreach auto-run)
+        # passes a larger value. A non-positive / non-int / bool value falls back to 25.
+        turns = (
+            max_turns
+            if isinstance(max_turns, int) and not isinstance(max_turns, bool) and max_turns > 0
+            else 25
+        )
+
         parts: list[str] = []
         if self._remote_working_dir:
             parts.append(f"cd {shlex.quote(self._remote_working_dir)} &&")
@@ -240,7 +249,7 @@ class SshIPCAdapter:
             f" --model {shlex.quote(model)}"
             f" --output-format json"
             f"{effort_seg}"
-            f" --max-turns 25"
+            f" --max-turns {turns}"
             f" --dangerously-skip-permissions"
         )
         return " ".join(parts)
@@ -262,10 +271,11 @@ class SshIPCAdapter:
         model = data.get("model", "sonnet")
         effort = data.get("effort", "high")
         timeout_s = data.get("timeout_s", self._timeout)
+        max_turns = data.get("max_turns")
 
         # Build the remote command with every interpolated value shell-quoted
         # (it is re-parsed by the remote shell). See _build_remote_command.
-        remote_cmd = self._build_remote_command(model, effort)
+        remote_cmd = self._build_remote_command(model, effort, max_turns)
         ssh_args = self._build_ssh_args(remote_cmd)
 
         try:

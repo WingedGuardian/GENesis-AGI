@@ -37,6 +37,18 @@ Design notes:
   been nudged for this draft", so a re-tick does not re-nudge. Because the nudge
   list is RE-DERIVED from the staged-draft set each tick minus this ledger, a
   non-delivered nudge simply retries next tick.
+- **Honors the engine's own accuracy gate.** The auto-run prompt drives the
+  engine's COMPLETE first-touch flow INCLUDING its own verification gates (it does
+  not bypass them), under a headless contract; a draft the engine's gate refuses
+  comes back as ``verify_failed`` — that is the gate WORKING (NOT a job-health
+  failure). Turn budget: the flow is agentic and needs > the ipc default of 25
+  turns (measured 42 live), so the auto-run passes ``dispatch_max_turns``.
+- **Timeout + orphan semantics.** The gated flow measured ~5.5 min live; there is
+  NO fixed SSH cap (``ipc.py::_send_cc`` honors ``timeout_s`` with no ceiling), so
+  ``dispatch_timeout_s`` (default 900) bounds a hung run. A timeout kill severs the
+  SSH connection but the REMOTE ``claude -p`` keeps running (orphaned); this is
+  self-healing — the engine's own staged-draft state is the source of truth and the
+  next tick re-derives from it (a late-staged draft is nudged next tick, never lost).
 - **Modes** (``career_outreach_config``): ``off`` (default — inert) / ``observe``
   (seed the nudged-set from the existing backlog, never dispatch a staging run or
   nudge) / ``live`` (drive staging runs + nudge new drafts).
@@ -62,22 +74,43 @@ _SOURCE = "recon"
 _NUDGE_TYPE = "career_outreach_nudged"
 
 # The external reasoning module owns account selection, the per-day cap, drafting,
-# and staging; Genesis only drives the cadence + the owner nudge. Each dispatch
-# instructs the module to do exactly ONE account and reply with ONLY compact JSON
-# (its entire reply is the bridge return value — no prose reaches this side). The
-# phrasing is generic (outcome, not the module's internal schema) so it works with
-# any career-agent module, not one specific implementation.
+# staging, AND its own accuracy/verification gate; Genesis only drives the cadence +
+# the owner nudge. The auto-run prompt tells the engine to run its COMPLETE flow
+# INCLUDING its own verification gates (never bypass them) under a HEADLESS contract
+# (no interactive questions are possible over a `claude -p` dispatch), and — when a
+# claim can't be verified headless — to reword the UNVERIFIABLE claim rather than
+# fabricate a token, loop, or strip substance (which would game the accuracy gate).
+# The engine may lead its reply with its own verdict line; `_parse_json` extracts
+# the trailing compact JSON regardless. The phrasing is GENERIC (outcomes, not any
+# engine's internal schema/vocabulary) so it ships in the public repo and works with
+# any gated career-agent; install-specific gate guidance rides the `autorun_note`
+# overlay knob, appended to THIS prompt only (never the read prompt).
+#
+# (Root cause this replaces: the old "reply with ONLY compact JSON, no prose" fought
+# the engine's own outreach hooks, which — triggered by "outreach"/"draft" wording —
+# inject "run your verify gate + lead with a verdict line" instructions and a
+# headless-impossible confirm, derailing the run. Proven live 2026-08-11.)
 _AUTORUN_PROMPT = (
-    "This is Genesis driving your outreach engine (a timed dispatch under the "
-    "bridge's hard cap). Pick your SINGLE highest-priority target account that you "
-    "have NOT yet drafted a first-touch outreach for, and run your full first-touch "
-    "outreach flow for it (evaluate fit, find the right contact, draft, and stage "
-    "the first-touch draft into the owner's mail Drafts), then mark it as worked in "
-    "your own tracking. NEVER send. Do EXACTLY ONE account. Your ENTIRE reply is "
-    "the return value: reply with ONLY compact JSON, no prose — "
+    "This is Genesis driving your outreach engine on a timed HEADLESS dispatch — "
+    "there is NO human available to answer any interactive question this run. Pick "
+    "your SINGLE highest-priority target account that you have NOT yet staged a "
+    "first-touch outreach draft for, and run your COMPLETE standard first-touch "
+    "outreach flow for it, INCLUDING your own verification/accuracy gates — do not "
+    "skip or bypass them. When your verifier flags a claim it cannot confirm "
+    "headless (e.g. a quoted or attributed line), reword to remove the UNVERIFIABLE "
+    "claim or paraphrase it from a citable source, then re-verify and MOVE ON — do "
+    "NOT loop on the same flag, do NOT fabricate any verification token, and do NOT "
+    "strip real substance just to pass the gate. On a clean verification pass, stage "
+    "the verified first-touch draft into the owner's mail Drafts (NEVER send), then "
+    "mark the target as worked in your own tracking. If after honest rewording the "
+    "draft still cannot verify (or hard-fails), stage NOTHING for it, mark it "
+    "attempted in your tracking, and report verify_failed. Do EXACTLY ONE account. "
+    "If your gates require a verdict line, LEAD your reply with it; then your ENTIRE "
+    "remaining reply must be ONLY compact JSON, no other prose — exactly one of: "
     '{"company":"<name>","contact":"<email-or-name>","draft_summary":"<one line>"} '
-    'if you staged one, or {"none_left":true} if no target account remains, '
-    'or {"error":"<reason>"} if you could not.'
+    'if you staged one, {"verify_failed":"<short reason>","company":"<name>"} if you '
+    'drafted but could not honestly verify, {"none_left":true} if no eligible target '
+    'remains, or {"error":"<short reason>"} if you could not proceed.'
 )
 
 _LIST_WORKING_PROMPT = (
@@ -131,6 +164,16 @@ def _parse_json(text: str) -> object | None:
     return None
 
 
+def _autorun_prompt(conf: dict) -> str:
+    """The auto-run dispatch prompt: the generic gate-honoring base plus the install's
+    optional ``autorun_note`` overlay (install-specific gate guidance). The note is
+    appended to the AUTO-RUN prompt ONLY — never the read prompt — so install-specific
+    outreach/gate vocabulary cannot trip the external engine's own outreach hooks on
+    the otherwise-clean staged-draft read path."""
+    note = cfg.text_knob(conf, "autorun_note")
+    return f"{_AUTORUN_PROMPT}\n\n{note}" if note else _AUTORUN_PROMPT
+
+
 @dataclass(frozen=True)
 class CareerOutreachResult:
     """Summary of one monitor tick."""
@@ -141,6 +184,7 @@ class CareerOutreachResult:
     drafts_working: int = 0  # accounts with a staged first-touch draft
     nudged: int = 0  # newly-staged drafts included in a delivered nudge
     seeded: int = 0  # observe: existing staged-draft accounts seeded into the ledger
+    verify_failed: int = 0  # engine drafted but its own accuracy gate refused (NOT an error)
     errors: int = 0  # unsuccessful operations (→ job-health FAILURE)
     details: list[str] = field(default_factory=list)
 
@@ -259,10 +303,19 @@ class CareerOutreachMonitor:
 
     async def _live(self, mod, conf: dict, timeout: int) -> CareerOutreachResult:
         cap = cfg.knob_int(conf, "max_auto_runs_per_tick")
+        # The gated first-touch flow is agentic (research → draft → verify → stage)
+        # and needs far more than the ipc default of 25 turns (measured 42 live).
+        max_turns = cfg.knob_int(conf, "dispatch_max_turns")
+        autorun_prompt = _autorun_prompt(conf)
         auto_runs = 0
+        verify_failed_n = 0
         errors = 0
         details: list[str] = []
         adapter_error = False
+        # Repeat guard: the engine self-selects its target and may lack a durable
+        # "attempted" state, so it can re-pick a company we already handled this tick.
+        # Re-selecting a seen company → stop (never loop the cap on one account).
+        seen_companies: set[str] = set()
 
         # 1. Drive up to `cap` first-touch draft-staging dispatches — the module
         #    self-selects + self-caps (won't re-pick an already-drafted account).
@@ -271,7 +324,8 @@ class CareerOutreachMonitor:
                 details.append("paused mid-tick — stopping auto-run loop")
                 break
             result = await mod.execute_operation(
-                "dispatch", {"prompt": _AUTORUN_PROMPT, "timeout_s": timeout}
+                "dispatch",
+                {"prompt": autorun_prompt, "timeout_s": timeout, "max_turns": max_turns},
             )
             # Adapter-level failure (disabled / unhealthy / IPC error / timeout)
             # comes back as an error DICT — it does NOT raise. Surface it so the
@@ -297,10 +351,31 @@ class CareerOutreachMonitor:
                 details.append(f"auto-run: module error: {str(payload.get('error'))[:120]}")
                 break
             company = (payload.get("company") or "").strip()
+            if "verify_failed" in payload:
+                # The engine drafted but its OWN accuracy gate refused the draft (a
+                # claim it could not verify headless). That is the gate WORKING — NOT a
+                # job-health failure. Note it and try the next target. Presence-check
+                # (not truthiness): a blank reason must NOT fall through to the staged
+                # path and miscount a draft that never staged.
+                if not company:
+                    details.append("auto-run: verify_failed without 'company' — stopping")
+                    break
+                if company.lower() in seen_companies:
+                    details.append(f"auto-run: engine re-selected {company} — stopping")
+                    break
+                seen_companies.add(company.lower())
+                verify_failed_n += 1
+                reason = (str(payload.get("verify_failed")).strip() or "unspecified")[:100]
+                details.append(f"verify_failed: {company}: {reason}")
+                continue
             if not company:
                 errors += 1
                 details.append("auto-run: reply missing 'company' (protocol failure) — stopping")
                 break
+            if company.lower() in seen_companies:
+                details.append(f"auto-run: engine re-selected {company} — stopping")
+                break
+            seen_companies.add(company.lower())
             auto_runs += 1
             details.append(f"staged: {company}")
 
@@ -388,6 +463,7 @@ class CareerOutreachMonitor:
             auto_runs=auto_runs,
             drafts_working=drafts_working,
             nudged=nudged,
+            verify_failed=verify_failed_n,
             errors=errors,
             details=details,
         )

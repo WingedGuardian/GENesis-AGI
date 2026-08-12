@@ -67,6 +67,51 @@ class TestSshIPCAdapterBuildArgs:
         assert args[-1] == "ls"
 
 
+class TestBuildRemoteCommandMaxTurns:
+    """The per-call --max-turns override (career-outreach's gated flow needs >25)."""
+
+    def _adapter(self):
+        return SshIPCAdapter(
+            IPCConfig(
+                method="ssh",
+                ssh_host="user@host",
+                remote_working_dir="/home/user/project",
+                remote_claude_path="/usr/local/bin/claude",
+            )
+        )
+
+    def test_default_max_turns_is_25(self):
+        cmd = self._adapter()._build_remote_command("sonnet", "high")
+        assert "--max-turns 25" in cmd
+
+    def test_explicit_max_turns_passes_through(self):
+        cmd = self._adapter()._build_remote_command("sonnet", "high", 80)
+        assert "--max-turns 80" in cmd
+        assert "--max-turns 25" not in cmd
+
+    def test_invalid_max_turns_falls_back_to_25(self):
+        for bad in (0, -5, None, True, "x"):
+            cmd = self._adapter()._build_remote_command("sonnet", "high", bad)
+            assert "--max-turns 25" in cmd
+
+    @pytest.mark.asyncio
+    async def test_send_cc_forwards_max_turns_from_data(self):
+        adapter = self._adapter()
+        cc_output = json.dumps(
+            {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}
+        )
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (cc_output.encode(), b"")
+        mock_proc.returncode = 0
+        with patch(
+            "genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+            return_value=mock_proc,
+        ) as mock_exec:
+            await adapter.send("dispatch", data={"prompt": "hi", "max_turns": 80}, method="CC")
+        remote_cmd = mock_exec.call_args[0][-1]  # last ssh arg = the remote command
+        assert "--max-turns 80" in remote_cmd
+
+
 class TestSshIPCAdapterSend:
     @pytest.mark.asyncio
     async def test_send_cc_dispatch(self):

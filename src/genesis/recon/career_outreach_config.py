@@ -65,23 +65,41 @@ DEFAULTS: dict[str, Any] = {
     # public repo — set it in the gitignored career_outreach.local.yaml overlay.
     # Empty (or an absent module) → the monitor no-ops cleanly.
     "reasoning_module": "",
-    # Per-tick cap on draft-staging auto-runs (bounds cost + mirrors the remote
-    # engine's own daily cap). Loud-truncation: excess target accounts wait
+    # Per-tick cap on auto-run DISPATCHES (bounds cost — each is a full ~timeout-long
+    # run — + mirrors the engine's own daily cap). NOTE: this caps dispatches, not
+    # necessarily staged drafts: a dispatch that the engine's gate refuses returns
+    # verify_failed and still consumes one slot. Loud-truncation: excess targets wait
     # for the next tick, never silently dropped.
     "max_auto_runs_per_tick": 3,
-    # Per-dispatch bridge timeout, in seconds. MUST stay under the module's own
-    # SSH CC hard cap (300s) so a slow run is our timeout, cleanly, not the SSH
-    # adapter's opaque one.
-    "dispatch_timeout_s": 240,
+    # Per-dispatch bridge timeout, in seconds. There is NO fixed SSH cap — the SSH
+    # CC adapter honors a per-call ``timeout_s`` override with no ceiling
+    # (``ipc.py::_send_cc``). The default covers the gated career-agent first-touch
+    # flow (research → draft → verify → stage), MEASURED at ~5.5 min live.
+    "dispatch_timeout_s": 900,
+    # Per-dispatch ``--max-turns`` for the auto-run. The gated flow is agentic and
+    # needs far more than the ipc default of 25 (a continue-and-stage run MEASURED
+    # 42 turns; a cold-start research+draft+verify+stage needs more). Passed only on
+    # the heavy auto-run dispatch; the lightweight read dispatch keeps the default.
+    "dispatch_max_turns": 80,
+    # Overlay-only note appended to the AUTO-RUN prompt (NOT the read prompt). Ships
+    # EMPTY; the install's gitignored career_outreach.local.yaml carries any
+    # install-specific gate guidance (e.g. how this engine's own verification gate
+    # behaves headless). Keeps install vocabulary out of the public repo.
+    "autorun_note": "",
 }
 
 # Public: the settings-domain validator imports these to check knobs.
-INT_KNOBS = ("max_auto_runs_per_tick", "dispatch_timeout_s")
+INT_KNOBS = ("max_auto_runs_per_tick", "dispatch_timeout_s", "dispatch_max_turns")
 
 # Key-specific upper bounds — a typo (e.g. max_auto_runs_per_tick: 3000) must not
-# authorize thousands of sequential draft-staging sessions, and dispatch_timeout_s
-# MUST stay under the module's 300s SSH CC hard cap so OUR timeout fires cleanly.
-_MAX_BY_KNOB: dict[str, int] = {"max_auto_runs_per_tick": 10, "dispatch_timeout_s": 290}
+# authorize thousands of sequential draft-staging sessions, an unbounded per-run
+# turn budget, or a runaway timeout. (dispatch_timeout_s has no hard external cap;
+# 1800s is a generous 2x+ over the ~5.5 min measured floor, bounding a hung run.)
+_MAX_BY_KNOB: dict[str, int] = {
+    "max_auto_runs_per_tick": 10,
+    "dispatch_timeout_s": 1800,
+    "dispatch_max_turns": 200,
+}
 
 
 def _base_path() -> Path:
@@ -154,9 +172,16 @@ def knob_int(cfg: dict[str, Any], key: str) -> int:
     return value
 
 
-def module_name(cfg: dict[str, Any], key: str) -> str:
-    """A module-name knob, damage-tolerant (non-str / blank → DEFAULTS)."""
+def text_knob(cfg: dict[str, Any], key: str) -> str:
+    """A string knob, damage-tolerant: a non-blank str passes; anything else
+    (missing / non-str / whitespace-only) degrades to the DEFAULT for ``key``
+    (``""`` when the default is empty, e.g. ``autorun_note``)."""
     value = cfg.get(key)
     if isinstance(value, str) and value.strip():
         return value
-    return str(DEFAULTS[key])
+    return str(DEFAULTS.get(key, ""))
+
+
+def module_name(cfg: dict[str, Any], key: str) -> str:
+    """A module-name knob, damage-tolerant (non-str / blank → DEFAULTS)."""
+    return text_knob(cfg, key)
