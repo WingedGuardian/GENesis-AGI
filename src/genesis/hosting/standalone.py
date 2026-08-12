@@ -191,6 +191,7 @@ class StandaloneAdapter:
         ``GENESIS_LOOP_LAG_SAMPLER`` (0/false/off) — disables the sampler at
         startup. Best-effort: any error ends the sampler without touching serve.
         """
+        from genesis.util import loop_health
         from genesis.util.loop_diag import default_executor_pending
 
         interval = 0.5
@@ -206,6 +207,7 @@ class StandaloneAdapter:
                 t0 = loop.time()
                 await asyncio.sleep(interval)
                 drift_ms = (loop.time() - t0 - interval) * 1000
+                executor = default_executor_pending()
                 if drift_ms > threshold_ms:
                     peak_ms = max(peak_ms, drift_ms)
                     if not lagging:
@@ -218,7 +220,7 @@ class StandaloneAdapter:
                             "executor=%s (further lag suppressed until it clears)",
                             drift_ms,
                             interval * 1000,
-                            default_executor_pending(),
+                            executor,
                         )
                 elif lagging:
                     # Episode cleared — report the peak so the stall's severity is
@@ -230,6 +232,22 @@ class StandaloneAdapter:
                     )
                     lagging = False
                     peak_ms = 0.0
+                # Publish the reading OFF-loop every iteration so a sync Flask
+                # worker (and the watchdog via the HTTP probe) can read loop
+                # health during starvation — exactly when every @_async_route
+                # endpoint hangs on this same loop. If starvation is severe
+                # enough that asyncio.sleep stops returning, publishes cease and
+                # the sample's age grows: that growing age is the WEDGED signal.
+                loop_health.publish(
+                    loop_health.LoopHealthSample(
+                        drift_ms=drift_ms,
+                        peak_ms=peak_ms,
+                        lagging=lagging,
+                        threshold_ms=threshold_ms,
+                        executor=executor,
+                        sampled_monotonic=time.monotonic(),
+                    )
+                )
         except asyncio.CancelledError:
             pass
 
