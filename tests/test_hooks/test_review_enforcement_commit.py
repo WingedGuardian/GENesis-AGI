@@ -148,6 +148,245 @@ def test_override_with_single_quoted_message(repo: Path, home: Path) -> None:
     assert "review-override honored" in res.stderr
 
 
+# ── Unresolvable cwd: accurate teach message, never the branch lie ────────
+#
+# The recurring worktree false-block (root-caused 2026-08-10): `cd "$WT" && git
+# commit` / `git -C "$WT" commit` drove the effective cwd to UNKNOWN and Rule 1
+# printed the MISLEADING "Direct commits to main". The gate still fails closed on
+# an unresolvable cwd — deliberately WITHOUT trying to resolve `$VAR` (four
+# adversarial-review rounds proved static resolution unbounded: source/eval/read,
+# export, functions, $PWD/CDPATH, printf -v, multi -C) — but now says what is
+# actually wrong and teaches the literal-path form.
+
+
+def test_variable_cd_blocks_with_teach_message_not_branch_lie(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(f'WT={repo}; cd "$WT" && git commit -m wip', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+    assert "LITERAL absolute path" in res.stderr
+    assert "Direct commits to main" not in res.stderr
+
+
+def test_variable_dash_C_blocks_with_teach_message(repo: Path, home: Path) -> None:
+    # `git -C "$WT" commit` — same unresolvable class as `cd "$WT"`. (Pre-fix this
+    # joined a bogus literal `<cwd>/$WT` dir instead of classifying UNKNOWN.)
+    _mark(repo, home)
+    res = _run_hook(f'WT={repo}; git -C "$WT" commit -m wip', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+    assert "Direct commits to main" not in res.stderr
+
+
+def test_variable_never_resolved_even_from_literal_assignment(repo: Path, home: Path) -> None:
+    # Pins the TEACH-ONLY decision: even `WT=<literal>; cd "$WT"` is NOT resolved
+    # (bash can mutate WT between binding and use — source/printf -v/functions —
+    # so any static resolution is a false-ALLOW-to-main surface). Must block with
+    # the teach message, never silently allow.
+    _mark(repo, home)
+    res = _run_hook(f'WT={repo}\ncd "$WT" && git commit -m wip', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_literal_absolute_cd_still_allows(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_literal_dash_C_still_allows(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(f"git -C {repo} commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_genuine_main_commit_still_says_direct_commits_to_main(repo: Path, home: Path) -> None:
+    _git(repo, "checkout", "-q", "main")
+    (repo / "f.py").write_text("base = 3\n")
+    _git(repo, "add", "-A")
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "Direct commits to main" in res.stderr
+
+
+# ── Audit findings (2026-08-11, execution-confirmed at base): unexpanded
+# tokens and chained commit segments must not slip past Rule 1 ────────────
+#
+# Positive validation closes the whole unexpanded-token class: a resolved cwd
+# that is not an EXISTING directory is UNKNOWN (a glob/tilde/backslash token we
+# didn't expand joins to a nonexistent literal path; the old branch read against
+# it returned "unknown"/OSError and slipped PAST Rule 1 — and Rule 2's staged
+# check read empty, so the commit went entirely ungated).
+
+
+def _mainrepo(tmp_path: Path) -> Path:
+    """A second repo left ON MAIN with a staged change (the smuggle target)."""
+    r = tmp_path / "mainrepo"
+    r.mkdir()
+    _git(r, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(r, "config", "user.email", "t@e.st")
+    _git(r, "config", "user.name", "tester")
+    (r / "m.py").write_text("m = 1\n")
+    _git(r, "add", "-A")
+    return r
+
+
+def test_glob_dash_C_target_blocks(repo: Path, home: Path, tmp_path: Path) -> None:
+    # `git -C <prefix>*` — bash would glob-expand to the main repo; the guard's
+    # unexpanded join is a nonexistent dir → UNKNOWN → deny (was: ungated ALLOW).
+    main_repo = _mainrepo(tmp_path)
+    prefix = str(main_repo)[:-1]  # strip last char so `<prefix>*` globs to it
+    _mark(repo, home)
+    res = _run_hook(f"git -C {prefix}* commit -m smuggle", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_backslash_cd_target_blocks(repo: Path, home: Path, tmp_path: Path) -> None:
+    # `cd /path/mainrep\o` — bash strips the backslash and enters the main repo;
+    # the guard's literal join (with backslash) is nonexistent → UNKNOWN → deny.
+    main_repo = _mainrepo(tmp_path)
+    escaped = str(main_repo)[:-1] + "\\" + str(main_repo)[-1]
+    _mark(repo, home)
+    res = _run_hook(f"cd {escaped} && git commit -m smuggle", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_second_commit_segment_on_main_blocks(repo: Path, home: Path, tmp_path: Path) -> None:
+    # `git commit … && git -C <mainrepo> commit …` — the SECOND segment lands on
+    # main and must be checked too (was: only the first segment was resolved).
+    main_repo = _mainrepo(tmp_path)
+    _mark(repo, home)
+    res = _run_hook(f"git commit -m ok && git -C {main_repo} commit -m smuggle", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "Direct commits to main" in res.stderr
+
+
+def test_nonexistent_literal_cd_blocks_with_teach_message(repo: Path, home: Path) -> None:
+    # Positive validation: even a clean literal path that doesn't EXIST is
+    # UNKNOWN (we cannot read a branch from a dir that isn't there).
+    _mark(repo, home)
+    res = _run_hook("cd /nonexistent/dir/xyz && git commit -m wip", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_tilde_dash_C_blocks_even_with_shadow_dir(repo: Path, home: Path) -> None:
+    # Codex round-2 "shadow path": a literal dir named `~` under cwd would pass the
+    # isdir validation while bash expands `~` to $HOME — so a `~` (or glob) `-C`
+    # target is categorically UNKNOWN, existence notwithstanding.
+    shadow = repo / "~" / "mainrepo"
+    shadow.mkdir(parents=True)
+    _mark(repo, home)
+    res = _run_hook("git -C ~/mainrepo commit -m smuggle", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_backslash_cd_blocks_even_with_shadow_dir(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Same shadow-path class for cd: plant the literal `mainrep\o` dir — the
+    # backslash metachar rule must deny WITHOUT consulting existence.
+    main_repo = _mainrepo(tmp_path)
+    escaped = str(main_repo)[:-1] + "\\" + str(main_repo)[-1]
+    (tmp_path / "mainrep\\o").mkdir()  # the literal shadow dir (backslash in name)
+    _mark(repo, home)
+    res = _run_hook(f"cd {escaped} && git commit -m smuggle", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_chained_commits_to_different_dirs_block(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Two commits into DIFFERENT (both non-main) dirs share one gate — the review
+    # marker covers only the first worktree. Structural deny, mirroring the push
+    # guard's multiple-publish rule.
+    other = tmp_path / "other"
+    other.mkdir()
+    _git(other, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(other, "config", "user.email", "t@e.st")
+    _git(other, "config", "user.name", "tester")
+    (other / "o.py").write_text("o = 1\n")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "base")
+    _git(other, "checkout", "-q", "-b", "feature/y")
+    (other / "o.py").write_text("o = 2\n")
+    _git(other, "add", "-A")
+    _mark(repo, home)
+    res = _run_hook(f"git commit -m ok && git -C {other} commit -m ride", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "DIFFERENT worktrees" in res.stderr
+
+
+def test_brace_expansion_targets_block(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Codex round-3: `{x..x}` brace expansion transforms the word before cd/-C —
+    # the metachar set is derived from the bash manual's expansion list, and `{`
+    # completes it. Shadow dir planted to prove existence is not consulted.
+    main_repo = _mainrepo(tmp_path)
+    braced = str(main_repo).replace("mainrepo", "mainrep{o..o}")
+    (tmp_path / "mainrep{o..o}").mkdir()  # literal shadow matching the unexpanded word
+    _mark(repo, home)
+    for cmd in (f"cd {braced} && git commit -m smuggle", f"git -C {braced} commit -m smuggle"):
+        res = _run_hook(cmd, repo, home)
+        assert res.returncode == 2, cmd + res.stdout + res.stderr
+        assert "cannot verify which branch" in res.stderr, cmd
+
+
+def test_process_substitution_cd_blocks_even_with_shadow_dir(repo: Path, home: Path) -> None:
+    # Codex round-4: `cd <(x)` — bash treats `<(…)` as process substitution (cd
+    # fails; a `;` chain then commits in the ORIGINAL cwd), while a planted
+    # literal dir named `<(x)` would pass the isdir check. `()<>` metacharacters
+    # deny outright, existence never consulted.
+    (repo / "<(x)").mkdir()
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo}/<(x); git commit -m smuggle", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_relative_cd_with_cdpath_env_blocks(repo: Path, home: Path, tmp_path: Path) -> None:
+    # With CDPATH in the environment, bash's `cd rel` may enter a dir OUTSIDE the
+    # payload-cwd join — unverifiable → UNKNOWN.
+    sub = repo / "sub"
+    sub.mkdir()
+    _mark(repo, home)
+    body = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cd sub && git commit -m wip"},
+        "session_id": "test",
+        "cwd": str(repo),
+    }
+    env = {**os.environ, "HOME": str(home), "CDPATH": str(tmp_path)}
+    res = subprocess.run(
+        [sys.executable, str(_HOOK)],
+        input=json.dumps(body),
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_double_quoted_backslash_cd_blocks(repo: Path, home: Path) -> None:
+    # `cd "main\\repo"` — double quotes collapse the escape (bash sees main\repo);
+    # a literal read is unfaithful → UNKNOWN. Single quotes remain fully literal.
+    _mark(repo, home)
+    res = _run_hook('cd "/tmp/main\\\\repo" && git commit -m x', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot verify which branch" in res.stderr
+
+
+def test_chained_commits_same_dir_still_pass(repo: Path, home: Path) -> None:
+    # A same-dir chain (commit then amend) is one worktree, one review — allowed.
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git commit -m wip && git commit --amend -m better", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
 def test_override_with_trailing_text(repo: Path, home: Path) -> None:
     """A trailing comment may carry text after the sigil (it's commented out)."""
     res = _run_hook('git commit -m "wip"  # review-override: accepted P2s', repo, home)
@@ -974,3 +1213,338 @@ def test_commit_pattern_matches_git_dash_c_and_dash_C() -> None:
         assert checker_pat.search(f), f"checker pattern missed: {f}"
         assert invalidate_pat.search(f), f"invalidator pattern missed: {f}"
     assert checker_pat.pattern == invalidate_pat.pattern, "hook patterns drifted apart"
+
+
+# ── Codex PR-#1371 findings (P1 + three P2s) ─────────────────────────────────
+
+
+def test_identical_raw_chained_commit_on_main_blocks(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    # Codex P1: two commit segments with IDENTICAL raw text — a raw-equality
+    # break resolved BOTH to the first segment's cwd, so the second commit (on
+    # main) inherited the feature worktree's cwd and bypassed Rule 1 AND the
+    # different-dirs check. Occurrence-index matching must catch it.
+    main_repo = _mainrepo(tmp_path)
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m same; cd {main_repo} && git commit -m same",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "Direct commits to main" in res.stderr
+
+
+def test_identical_raw_chained_different_dirs_block(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Same P1 class, both dirs non-main: identical raws must not blind the
+    # structural different-dirs deny either.
+    other = tmp_path / "other"
+    other.mkdir()
+    _git(other, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(other, "config", "user.email", "t@e.st")
+    _git(other, "config", "user.name", "tester")
+    (other / "f.py").write_text("base = 1\n")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "base")
+    _git(other, "checkout", "-q", "-b", "feature/y")
+    (other / "f.py").write_text("base = 2\n")
+    _git(other, "add", "-A")
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m same; cd {other} && git commit -m same",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "DIFFERENT worktrees" in res.stderr
+
+
+def test_cdpath_dot_prefixed_relative_cd_allows(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Codex P2: POSIX cd (verified vs bash 5.2) skips the CDPATH search when the
+    # first pathname component is dot or dot-dot — `cd ./sub` is deterministic
+    # even under CDPATH and must not be denied.
+    sub = repo / "sub"
+    sub.mkdir()
+    _mark(repo, home)
+    body = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cd ./sub && git commit -m wip"},
+        "session_id": "test",
+        "cwd": str(repo),
+    }
+    env = {**os.environ, "HOME": str(home), "CDPATH": str(tmp_path)}
+    res = subprocess.run(
+        [sys.executable, str(_HOOK)],
+        input=json.dumps(body),
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_double_quoted_backslash_before_ordinary_char_allows(home: Path, tmp_path: Path) -> None:
+    # Codex P2: bash consumes a backslash in double quotes ONLY before $ ` " \
+    # or newline (verified vs bash 5.2) — a quoted literal pathname containing a
+    # backslash before an ordinary char must not be denied.
+    weird = tmp_path / "repo\\q"  # a real dir whose name contains a backslash
+    weird.mkdir()
+    _git(weird, "-c", "init.defaultBranch=main", "init", "-q")
+    _git(weird, "config", "user.email", "t@e.st")
+    _git(weird, "config", "user.name", "tester")
+    (weird / "f.py").write_text("base = 1\n")
+    _git(weird, "add", "-A")
+    _git(weird, "commit", "-qm", "base")
+    _git(weird, "checkout", "-q", "-b", "feature/bs")
+    (weird / "f.py").write_text("base = 2\n")
+    _git(weird, "add", "-A")
+    _mark(weird, home)
+    res = _run_hook(f'cd "{weird}" && git commit -m wip', weird, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_diff_hash_stable_across_terminal_widths(repo: Path, tmp_path: Path) -> None:
+    # get_current_diff_hash hashes `git diff --cached --stat`, whose path
+    # truncation follows COLUMNS (honored even without a tty). The mark is
+    # written from one process and checked from the hook process — with
+    # different terminal widths, a LONG staged path hashed differently and the
+    # gate intermittently denied a freshly-marked commit (measured 2026-08-11).
+    # The subprocess env pins COLUMNS, so the hash must be width-independent.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "review_state_widths", _REPO_ROOT / "scripts" / "review_state.py"
+    )
+    rs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rs)
+
+    long_name = "a_deliberately_long_test_module_name_that_git_stat_truncates_at_80_cols.py"
+    (repo / long_name).write_text("x = 1\n")
+    _git(repo, "add", long_name)
+
+    hashes = set()
+    for cols in (None, "80", "120", "200"):
+        env_patch = dict(os.environ)
+        if cols is None:
+            env_patch.pop("COLUMNS", None)
+        else:
+            env_patch["COLUMNS"] = cols
+        old = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(env_patch)
+        try:
+            hashes.add(rs.get_current_diff_hash(cwd=str(repo)))
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+    assert len(hashes) == 1, f"diff hash varies with terminal width: {hashes}"
+
+
+def test_symlink_alias_same_dir_chain_passes(repo: Path, home: Path, tmp_path: Path) -> None:
+    # Codex P2: the same worktree addressed via its real path and a symlink
+    # alias is ONE dir (one marker, one index) — filesystem identity, not
+    # string equality, decides the different-dirs deny.
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m a && git -C {alias} commit --amend -m b",
+        repo,
+        home,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ── Codex PR-#1371 re-review (2 P1s + P2): branch/content-binding + worktree id ──
+
+
+def test_switch_to_main_before_commit_blocks(repo: Path, home: Path) -> None:
+    # P1: a `git switch main` before a commit lands it on main, but the hook reads
+    # the branch once (pre-switch). A switch-to-main before a commit → block.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m ok && git switch main && git commit --allow-empty -m x",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_single_switch_to_main_then_commit_blocks(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git switch main && git commit -m x", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_switch_to_variable_branch_before_commit_blocks(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(f'cd {repo} && git switch "$BR" && git commit -m x', repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_attached_short_branch_create_to_main_blocks(repo: Path, home: Path) -> None:
+    # Codex P1 (round 3): the branch-create value ATTACHED to the short flag
+    # (`git checkout -Bmain` / `git switch -Cmain`) — a bare-token check skipped it,
+    # letting HEAD reach main. Verified vs real git: `checkout -Bmain` lands on main.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git checkout -Bmain && git commit --allow-empty -m bypass",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_clustered_short_branch_create_to_main_blocks(repo: Path, home: Path) -> None:
+    # A boolean short flag clustered before the create flag: `-qB main` → -q + -B main.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git checkout -qB main && git commit --allow-empty -m x", repo, home
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_long_force_create_to_main_blocks(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git switch --force-create=main && git commit --allow-empty -m x",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_attached_short_branch_create_to_feature_allowed(repo: Path, home: Path) -> None:
+    # The attached form to a NON-main branch (`git switch -cfeature`) must stay allowed.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git switch -cfeature/x && git commit --amend --no-edit", repo, home
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_create_branch_then_commit_still_allowed(repo: Path, home: Path) -> None:
+    # The flow the gate ITSELF recommends — create a NON-main branch and commit —
+    # must NOT be blocked by the branch-mutation guard.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git checkout -b feature/new && git commit --amend --no-edit",
+        repo,
+        home,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_checkout_file_restore_then_commit_allowed(repo: Path, home: Path) -> None:
+    # `git checkout HEAD -- <file>` restores a file; HEAD is not moved, so it must
+    # not trip the branch-mutation guard (the checkout branch-vs-path ambiguity).
+    (repo / "other.txt").write_text("v1\n")
+    _git(repo, "add", "other.txt")
+    _git(repo, "commit", "-qm", "add other")
+    (repo / "other.txt").write_text("v2-uncommitted\n")
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git checkout HEAD -- other.txt && git commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_staging_between_commits_blocks(repo: Path, home: Path) -> None:
+    # P1: a chain that stages new content between commits records unreviewed content
+    # in the 2nd commit under the 1st's marker (git add between → git-between-commits).
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m reviewed && echo x > n.py && git add n.py && "
+        f"git commit -m unseen",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "cannot bind to the reviewed diff" in res.stderr
+
+
+def test_dash_am_second_commit_blocks(repo: Path, home: Path) -> None:
+    # BLOCKER-1 (architect): the 2nd commit stages its OWN content with -a. No `git
+    # add` segment exists to catch, but the impure-later-commit allowlist check does.
+    (repo / "tracked.py").write_text("v = 1\n")
+    _git(repo, "add", "tracked.py")
+    _git(repo, "commit", "-qm", "add tracked")
+    (repo / "f.py").write_text("base = 9\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m reviewed && echo x >> tracked.py && git commit -am quick",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "pure" in res.stderr
+
+
+def test_stash_pop_between_commits_blocks(repo: Path, home: Path) -> None:
+    # SHOULD-FIX-2 (architect): `git stash pop` re-stages the index and would bypass a
+    # staging BLOCKLIST — the allowlist blocks it as a non-commit git segment between.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m a && git stash pop && git commit --amend --no-edit",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "another git command runs between" in res.stderr
+
+
+def test_non_git_command_between_amends_allowed(repo: Path, home: Path) -> None:
+    # A non-git command (a build/echo step) between a commit and a pure --amend is
+    # safe — a pure --amend never stages unstaged working-tree edits.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m wip && echo built && git commit --amend --no-edit",
+        repo,
+        home,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_amend_with_no_intervening_staging_allowed(repo: Path, home: Path) -> None:
+    # `git commit && git commit --amend` (nothing staged between) is content-
+    # preserving and must stay allowed.
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git commit -m wip && git commit --amend -m better", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_add_before_single_commit_still_allowed(repo: Path, home: Path) -> None:
+    # A staging op BEFORE the (single) commit is the normal add-then-commit path.
+    _git(repo, "reset", "-q")
+    (repo / "g.py").write_text("g = 1\n")
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && git add -A && git commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_same_worktree_different_subdir_chain_allowed(repo: Path, home: Path) -> None:
+    # P2: two commits addressed from DIFFERENT SUBDIRECTORIES of the SAME worktree
+    # share one index+marker — worktree-identity compare must not false-block them.
+    sub = repo / "pkg"
+    sub.mkdir()
+    (sub / "keep.txt").write_text("k\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "seed subdir")
+    (repo / "f.py").write_text("base = 3\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git commit -m a && cd {sub} && git commit --amend --no-edit",
+        repo,
+        home,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
