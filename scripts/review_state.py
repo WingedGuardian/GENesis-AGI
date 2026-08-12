@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -99,6 +100,16 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
             text=True,
             timeout=10,
             cwd=cwd,
+            # --stat output is TERMINAL-WIDTH sensitive: git truncates long paths
+            # to fit COLUMNS (honored even without a tty). The mark is written from
+            # one process (COLUMNS often unset → width 80) and checked from the
+            # hook process (COLUMNS tracks the live terminal), so a long staged
+            # path hashed differently in the two and the gate intermittently
+            # denied a freshly-marked commit as "without review" (MEASURED
+            # 2026-08-11: identical index → 62e24043 @80/unset, cd67763b @120,
+            # a3966055 @200). Pin the width so the hash is env-independent; 80
+            # matches the unset default, so previously stored markers stay valid.
+            env={**os.environ, "COLUMNS": "80"},
         )
         content = result.stdout.strip()
         if not content:

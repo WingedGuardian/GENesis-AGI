@@ -1307,6 +1307,43 @@ def test_double_quoted_backslash_before_ordinary_char_allows(home: Path, tmp_pat
     assert res.returncode == 0, res.stdout + res.stderr
 
 
+def test_diff_hash_stable_across_terminal_widths(repo: Path, tmp_path: Path) -> None:
+    # get_current_diff_hash hashes `git diff --cached --stat`, whose path
+    # truncation follows COLUMNS (honored even without a tty). The mark is
+    # written from one process and checked from the hook process — with
+    # different terminal widths, a LONG staged path hashed differently and the
+    # gate intermittently denied a freshly-marked commit (measured 2026-08-11).
+    # The subprocess env pins COLUMNS, so the hash must be width-independent.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "review_state_widths", _REPO_ROOT / "scripts" / "review_state.py"
+    )
+    rs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rs)
+
+    long_name = "a_deliberately_long_test_module_name_that_git_stat_truncates_at_80_cols.py"
+    (repo / long_name).write_text("x = 1\n")
+    _git(repo, "add", long_name)
+
+    hashes = set()
+    for cols in (None, "80", "120", "200"):
+        env_patch = dict(os.environ)
+        if cols is None:
+            env_patch.pop("COLUMNS", None)
+        else:
+            env_patch["COLUMNS"] = cols
+        old = os.environ.copy()
+        os.environ.clear()
+        os.environ.update(env_patch)
+        try:
+            hashes.add(rs.get_current_diff_hash(cwd=str(repo)))
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+    assert len(hashes) == 1, f"diff hash varies with terminal width: {hashes}"
+
+
 def test_symlink_alias_same_dir_chain_passes(repo: Path, home: Path, tmp_path: Path) -> None:
     # Codex P2: the same worktree addressed via its real path and a symlink
     # alias is ONE dir (one marker, one index) — filesystem identity, not
