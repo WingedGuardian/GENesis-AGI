@@ -894,6 +894,35 @@ async def test_runner_warns_but_succeeds_on_no_progress_verify_failed(monkeypatc
     )
 
 
+@pytest.mark.asyncio
+async def test_runner_no_progress_warning_suppressed_on_error_tick(monkeypatch):
+    # Codex P2: a MIXED tick (verify_failed>0 AND errors>0) records the hard FAILURE
+    # and must NOT also emit the "verifier refused every attempt" no-progress warning
+    # (two conflicting diagnoses — operators would chase the verifier, not the error).
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+    events: list = []
+
+    class _Bus:
+        async def emit(self, subsystem, severity, code, msg, **kw):
+            events.append(code)
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(mode="live", verify_failed=1, errors=1)
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = _Bus()
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert calls["fail"] and not calls["success"]  # the hard failure is recorded
+    assert "career_outreach.no_progress" not in events  # no second, misleading diagnosis
+
+
 def test_parse_json_extracts_dict_from_verdict_led_reply():
     # The engine may lead with its own verdict line, THEN the JSON — the parser must
     # extract the outermost {..} even past a verdict line containing [..] brackets.
@@ -969,6 +998,9 @@ def test_classify_autorun_reply_valid_outcomes(reply, expected):
         '{"none_left":true,"error":"e"}',  # multi-signal
         '{"none_left":true,"company":"Acme"}',  # terminal signal must not carry company
         '{"error":"e","company":"Acme"}',  # terminal signal must not carry company
+        '{"none_left":true,"company":123}',  # non-string company KEY present → reject
+        '{"none_left":true,"company":"  "}',  # blank company KEY present → reject
+        '{"none_left":true,"company":null}',  # null company KEY present → reject
     ],
 )
 def test_classify_autorun_reply_protocol_errors(reply):

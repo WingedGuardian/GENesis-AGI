@@ -531,8 +531,9 @@ verified: 17140a65 2026-08-11
   the tick loop matches on outcome TYPE and never branches on raw payload (robust by
   construction). A gate-refused draft is `VerifyFailed` (NOT a job-health error); a
   same-company re-selection breaks the loop. Turn/timeout budgets (`dispatch_max_turns` default 80 via the ipc
-  per-call `max_turns` override; `dispatch_timeout_s` default 900, no fixed SSH cap)
-  cover the gated flow (research → draft → verify → stage), MEASURED ~5.5 min live.
+  per-call `max_turns` override; `dispatch_timeout_s` default 900, capped 1800 by
+  config + a 3600 SSH-adapter ceiling) cover the gated flow (research → draft →
+  verify → stage), MEASURED ~5.5 min live.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.

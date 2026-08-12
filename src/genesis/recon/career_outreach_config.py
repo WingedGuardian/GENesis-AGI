@@ -71,10 +71,11 @@ DEFAULTS: dict[str, Any] = {
     # verify_failed and still consumes one slot. Loud-truncation: excess targets wait
     # for the next tick, never silently dropped.
     "max_auto_runs_per_tick": 3,
-    # Per-dispatch bridge timeout, in seconds. There is NO fixed SSH cap — the SSH
-    # CC adapter honors a per-call ``timeout_s`` override with no ceiling
-    # (``ipc.py::_send_cc``). The default covers the gated career-agent first-touch
-    # flow (research → draft → verify → stage), MEASURED at ~5.5 min live.
+    # Per-dispatch bridge timeout, in seconds. The SSH CC adapter clamps a per-call
+    # ``timeout_s`` to a 3600s ceiling (``ipc.py::_MAX_TIMEOUT_CEILING``); this config
+    # caps it further at 1800 (``_MAX_BY_KNOB``). The default covers the gated
+    # career-agent first-touch flow (research → draft → verify → stage), MEASURED at
+    # ~5.5 min live.
     "dispatch_timeout_s": 900,
     # Per-dispatch ``--max-turns`` for the auto-run. The gated flow is agentic and
     # needs far more than the ipc default of 25 (a continue-and-stage run MEASURED

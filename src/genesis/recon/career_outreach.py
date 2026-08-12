@@ -43,8 +43,8 @@ Design notes:
   comes back as ``verify_failed`` — that is the gate WORKING (NOT a job-health
   failure). Turn budget: the flow is agentic and needs > the ipc default of 25
   turns (measured 42 live), so the auto-run passes ``dispatch_max_turns``.
-- **Timeout + orphan semantics.** The gated flow measured ~5.5 min live; there is
-  NO fixed SSH cap (``ipc.py::_send_cc`` honors ``timeout_s`` with no ceiling), so
+- **Timeout + orphan semantics.** The gated flow measured ~5.5 min live; the SSH CC
+  adapter clamps ``timeout_s`` to a 3600s ceiling and this config caps it at 1800, so
   ``dispatch_timeout_s`` (default 900) bounds a hung run. A timeout kill severs the
   SSH connection but the REMOTE ``claude -p`` keeps running (orphaned); this is
   self-healing — the engine's own staged-draft state is the source of truth and the
@@ -268,19 +268,20 @@ def classify_autorun_reply(reply_text: str) -> AutorunOutcome:
         (payload.get("company") or "").strip() if isinstance(payload.get("company"), str) else ""
     )
 
-    # A terminal signal (none_left / error) must NOT also carry a `company`: a company
-    # is the Staged outcome, so its presence alongside a terminal signal is a merged
-    # (contradictory) reply, not "exactly one outcome". verify_failed REQUIRES a
-    # company, so it is handled separately below.
+    # A terminal signal (none_left / error) must NOT also carry a `company` KEY: a
+    # company is the Staged outcome, so its presence alongside a terminal signal is a
+    # merged (contradictory) reply, not "exactly one outcome". Test KEY PRESENCE (not
+    # the normalized value) so a non-string/blank company (`123`, `null`, `"  "`) is
+    # also rejected. verify_failed REQUIRES a company, handled separately below.
     if present == ["none_left"]:
-        if company:
+        if "company" in payload:
             return ProtocolError("'none_left' outcome must not carry a 'company'")
         if payload.get("none_left") is True:
             return NoneLeft()
         return ProtocolError("'none_left' present but not literal true")
 
     if present == ["error"]:
-        if company:
+        if "company" in payload:
             return ProtocolError("'error' outcome must not carry a 'company'")
         detail = payload.get("error")
         detail = detail.strip() if isinstance(detail, str) else ""

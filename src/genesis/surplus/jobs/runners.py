@@ -157,8 +157,15 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         # correctly NOT a job-health failure (the gate working), so a SINGLE such tick
         # is normal; but a PERSISTENT run of them = a possibly-broken verifier that
         # record_success would otherwise hide. Surface it loudly per-tick (WARNING).
-        # Cross-tick threshold alerting (durable counters) is a tracked follow-up.
-        if result.verify_failed and not (result.auto_runs or result.nudged or result.seeded):
+        # Gate on `not errors`: on a MIXED tick (a hard dispatch/read/nudge error also
+        # occurred) the failure is recorded below — a "verifier refused every attempt"
+        # warning would be a second, misleading diagnosis. Cross-tick threshold
+        # alerting (durable counters) is a tracked follow-up.
+        if (
+            result.verify_failed
+            and not result.errors
+            and not (result.auto_runs or result.nudged or result.seeded)
+        ):
             logger.warning(
                 "Career outreach: NO-PROGRESS tick — %d verify_failed, 0 staged/nudged "
                 "(engine drafted but its own gate refused all). Persistent recurrence "
