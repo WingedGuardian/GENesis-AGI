@@ -7,8 +7,8 @@ Used by:
 - genesis_stop_hook.py (Stop hook)
 - Claude (after /review + code-reviewer agent complete)
 
-The marker file records a hash of ``git diff --cached --numstat`` (staged changes
-only) at the time review was done.  If staged content changes, the marker
+The marker file records a hash of ``git diff --cached --raw --no-abbrev`` (staged
+changes only) at the time review was done.  If staged content changes, the marker
 becomes stale and review is required again.  Unstaged working-tree edits
 (e.g. from Codex) do not trigger review enforcement.
 
@@ -82,18 +82,23 @@ def _state_file(cwd: str | None = None) -> Path:
 
 
 def get_current_diff_hash(cwd: str | None = None) -> str:
-    """SHA-256 of ``git diff --cached --numstat`` output (staged changes only).
+    """SHA-256 of ``git diff --cached --raw --no-abbrev`` output (staged only).
 
     Only staged changes trigger review enforcement.  Unstaged changes
     (e.g. from Codex or other tools editing the working tree) are ignored
     so they don't cause false-positive review blocks.
 
-    Uses ``--numstat`` (machine format: ``added<TAB>deleted<TAB>path``), NOT
-    ``--stat``: ``--stat`` renders width-dependently (path truncation + bar
-    scaling by ``COLUMNS``/terminal), so the SAME staged content hashes
-    differently when ``mark`` (one width) and the commit gate (another width)
-    run — a systematic false "code changes without review" block. ``--numstat``
-    is width-independent, so the marker is portable across invocation contexts.
+    Uses ``--raw --no-abbrev`` — a machine format
+    (``:mode mode <src-oid> <dst-oid> status\\tpath``) that is BOTH:
+    - **width-independent**: unlike ``--stat`` (path truncation + change-bar
+      scaling by ``COLUMNS``/terminal), so the SAME staged content no longer
+      hashes differently when ``mark`` (one width) and the commit gate (another
+      width) run — the systematic false "code changes without review" block; and
+    - **content-complete**: the destination blob OID changes on ANY content
+      change, INCLUDING binary (unlike ``--numstat``, which collapses every
+      binary change to ``-\\t-\\t<path>`` and would let a same-path binary
+      swap read as already-reviewed). ``--no-abbrev`` pins full 40-char OIDs so
+      the hash can't shift with git's auto-abbreviation length.
 
     Args:
         cwd: Working directory for git commands. When None, uses the
@@ -101,7 +106,7 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--numstat"],
+            ["git", "diff", "--cached", "--raw", "--no-abbrev"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -143,10 +148,12 @@ def is_review_current(cwd: str | None = None) -> bool:
 def marker_content_current(cwd: str | None = None) -> bool:
     """Whether the marker's recorded FULL-content hash binds the CURRENT staged diff.
 
-    Stricter than :func:`is_review_current` (which compares the stat-only ``diff_hash``,
-    so a same-shape content swap reads as current). Used by the commit depth gate to
-    grant adversarial clearance ONLY when the marked content IS the staged content —
-    an audit of diff A must not clear a different-content diff B of the same shape.
+    A belt-and-suspenders companion to :func:`is_review_current`. Since ``diff_hash``
+    became OID-based (``git diff --cached --raw --no-abbrev``) it is already
+    content-complete — a same-shape content swap changes it too — so this full-patch
+    bind is now redundant defense-in-depth rather than a strictness upgrade. The commit
+    depth gate still uses it to grant adversarial clearance ONLY when the marked content
+    IS the staged content (an audit of diff A must not clear a different diff B).
     Fails CLOSED: a real staged hash that mismatches / is absent / errors → False.
     """
     current = _staged_content_hash(cwd=cwd)
@@ -344,10 +351,10 @@ def mark_reviewed(
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state = {
         "diff_hash": get_current_diff_hash(cwd=cwd),
-        # FULL-content hash of the reviewed diff. diff_hash is stat-only (files + line
-        # counts), so a same-shape content swap collides under it; the depth gate binds
-        # adversarial clearance to THIS instead, so an audit of diff A cannot clear a
-        # different-content diff B that shares A's shape (see marker_content_current).
+        # FULL-patch content hash — a belt-and-suspenders bind for the depth gate (an
+        # audit of diff A must not clear a different diff B). diff_hash is now OID-based
+        # (--raw --no-abbrev) and already content-complete, so this is redundant
+        # defense-in-depth, kept as an independent signal (see marker_content_current).
         "content_hash": _staged_content_hash(cwd=cwd),
         "reviewed_at": datetime.now(UTC).isoformat(),
         "review_evidence": review_msg,  # advisory annotation (gstack corroboration)
@@ -420,12 +427,15 @@ def _round_file(cwd: str | None = None) -> Path:
 
 
 def _staged_content_hash(cwd: str | None = None) -> str:
-    """SHA-256 of the FULL staged diff (``git diff --cached``) — content, not stat.
+    """SHA-256 of the FULL staged patch (``git diff --cached``).
 
-    Round detection must distinguish two genuinely different fixes to the same
-    file: ``get_current_diff_hash`` hashes ``--stat`` (file + line counts only), so
-    ``x = 2`` → ``x = 3`` collide under it. This hashes the actual staged content so
-    any real change since the last mark reads as a new round.
+    A belt-and-suspenders content bind for the depth gate. ``get_current_diff_hash``
+    is now OID-based (``--raw --no-abbrev``) and already distinguishes two different
+    fixes to the same file, so this full-patch hash is redundant defense-in-depth —
+    kept (and wired at the depth gate) as a second, independent content signal. (The
+    patch body carries the actual +/- content, so it is content-sensitive; the
+    abbreviated OID in the ``index`` header is harmless — mark and hook run in the same
+    repo/env, so it never diverges between the two.)
     """
     try:
         result = subprocess.run(
