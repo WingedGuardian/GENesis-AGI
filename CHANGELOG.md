@@ -15,9 +15,12 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   once enabled, drives a configured external career-agent module to stage
   first-touch outreach drafts into your mail Drafts, then sends you a single
   Telegram nudge to review and send them — it never sends mail itself (you click
-  Send). Ships `off`; flip `off → observe → live` in `career_outreach.yaml`
-  (env kill switch: `GENESIS_CAREER_OUTREACH_DISABLED=1`). No-ops cleanly on
-  installs that don't have a career-agent module configured.
+  Send). Each auto-run drives the career-agent's OWN accuracy/verification gate
+  end-to-end, so a draft is staged only if it passes that gate; a draft that
+  can't be verified is skipped, not staged. Ships `off`; flip
+  `off → observe → live` in `career_outreach.yaml` (env kill switch:
+  `GENESIS_CAREER_OUTREACH_DISABLED=1`). No-ops cleanly on installs that don't
+  have a career-agent module configured.
 
 - **cc-tmp blast-radius isolation now converges on its own.** The dedicated,
   size-capped volume that stops a runaway temp write from filling the container

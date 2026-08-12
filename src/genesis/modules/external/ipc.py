@@ -17,6 +17,21 @@ from genesis.modules.external.config import IPCConfig
 
 logger = logging.getLogger(__name__)
 
+# Absolute adapter-level ceiling on a per-call ``--max-turns`` override, independent
+# of any one caller's config validation. `send()` params can flow from the generic
+# `module_call` path (adapter.py) too, so a mistaken/autonomous caller must not be
+# able to request an unbounded turn count that keeps a costly remote agent running.
+# Real flows need far less (the career-outreach gated flow measured ~42 turns; its
+# config caps at 200); 500 is generous headroom that constrains nothing legitimate.
+_MAX_TURNS_CEILING = 500
+
+# Same threat, same defense for the sibling per-call ``timeout_s`` override: an
+# unbounded timeout from the generic ``module_call`` passthrough keeps the remote
+# ``claude -p`` (and the local SSH subprocess) alive arbitrarily long. The config
+# layer caps the one real caller at 1800; 3600 is the adapter backstop for any
+# caller that bypasses config validation. (Parity with _MAX_TURNS_CEILING.)
+_MAX_TIMEOUT_CEILING = 3600
+
 
 class IPCAdapter(Protocol):
     """Protocol for IPC communication with external programs."""
@@ -202,7 +217,7 @@ class SshIPCAdapter:
         cmd.extend([self._ssh_host, remote_command])
         return cmd
 
-    def _build_remote_command(self, model: str, effort: str) -> str:
+    def _build_remote_command(self, model: str, effort: str, max_turns: int | None = None) -> str:
         """Build the remote ``cd … && claude -p …`` string with every value quoted.
 
         The command runs in the REMOTE shell (it relies on ``cd`` and ``&&``), so
@@ -232,6 +247,21 @@ class SshIPCAdapter:
         )
         effort_seg = f" --effort {shlex.quote(effort)}" if include_effort else ""
 
+        # Per-call turn budget. Default 25 keeps every existing caller unchanged; a
+        # caller driving a long agentic flow (e.g. the career-outreach auto-run)
+        # passes a larger value. A non-positive / non-int / bool value falls back to 25.
+        turns = (
+            max_turns
+            if isinstance(max_turns, int) and not isinstance(max_turns, bool) and max_turns > 0
+            else 25
+        )
+        if turns > _MAX_TURNS_CEILING:
+            logger.warning(
+                "SSH CC dispatch: max_turns=%d exceeds the adapter ceiling %d — clamping",
+                turns, _MAX_TURNS_CEILING,
+            )
+            turns = _MAX_TURNS_CEILING
+
         parts: list[str] = []
         if self._remote_working_dir:
             parts.append(f"cd {shlex.quote(self._remote_working_dir)} &&")
@@ -240,7 +270,7 @@ class SshIPCAdapter:
             f" --model {shlex.quote(model)}"
             f" --output-format json"
             f"{effort_seg}"
-            f" --max-turns 25"
+            f" --max-turns {turns}"
             f" --dangerously-skip-permissions"
         )
         return " ".join(parts)
@@ -261,11 +291,30 @@ class SshIPCAdapter:
 
         model = data.get("model", "sonnet")
         effort = data.get("effort", "high")
-        timeout_s = data.get("timeout_s", self._timeout)
+        max_turns = data.get("max_turns")
+
+        # Clamp the per-call timeout to an adapter-level ceiling (parity with the
+        # max_turns ceiling): a caller bypassing config validation must not keep the
+        # remote agent alive without bound. A non-positive / non-numeric / bool value
+        # falls back to the module default (itself clamped).
+        raw_timeout = data.get("timeout_s", self._timeout)
+        if (
+            isinstance(raw_timeout, (int, float))
+            and not isinstance(raw_timeout, bool)
+            and raw_timeout > 0
+        ):
+            timeout_s = min(raw_timeout, _MAX_TIMEOUT_CEILING)
+            if raw_timeout > _MAX_TIMEOUT_CEILING:
+                logger.warning(
+                    "SSH CC dispatch: timeout_s=%s exceeds the adapter ceiling %d — clamping",
+                    raw_timeout, _MAX_TIMEOUT_CEILING,
+                )
+        else:
+            timeout_s = min(self._timeout, _MAX_TIMEOUT_CEILING)
 
         # Build the remote command with every interpolated value shell-quoted
         # (it is re-parsed by the remote shell). See _build_remote_command.
-        remote_cmd = self._build_remote_command(model, effort)
+        remote_cmd = self._build_remote_command(model, effort, max_turns)
         ssh_args = self._build_ssh_args(remote_cmd)
 
         try:
