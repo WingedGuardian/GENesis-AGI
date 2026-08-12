@@ -423,6 +423,17 @@ class TestPostReviewDeltaClassify:
         files = [_code_file(path=f"docs/f{i}.md", additions=1) for i in range(300)]
         assert self._lvl(monkeypatch, _compare_json("ahead", files)) == "substantial"
 
+    def test_unknown_status_fails_closed(self, monkeypatch):
+        # Codex P2 #1373: a MISSING/unknown status (`{status:null,files:[]}` from a
+        # truncated compare) must fail CLOSED (None → caller blocks), NOT fall
+        # through to file classification where empty files would read "inline" and
+        # let a STALE review bind the merge on an unverified delta.
+        import json as _json
+
+        assert self._lvl(monkeypatch, _json.dumps({"status": None, "files": []})) is None
+        assert self._lvl(monkeypatch, _json.dumps({"files": []})) is None  # status absent
+        assert self._lvl(monkeypatch, _json.dumps({"status": "weird", "files": []})) is None
+
     def test_non_dict_payload_unclassifiable(self, monkeypatch):
         assert self._lvl(monkeypatch, "null") is None
 
@@ -640,10 +651,58 @@ class TestCheckPrRepoArg:
     def test_absent(self):
         assert _mod._parse_check_pr_repo([]) is None
 
-    def test_dangling_flag(self):
-        assert _mod._parse_check_pr_repo(["--repo"]) is None
-
     def test_glued_short(self):
         # pflag shorthand `-Rowner/repo` — enforcement accepts it; the report must too
         # (architect F3: unrecognized → silently checked the CWD repo).
         assert _mod._parse_check_pr_repo(["-Rocto/voice"]) == "octo/voice"
+
+    def test_explicit_empty_value_rejected(self):
+        # Codex P2 #1373: an EXPLICITLY empty repo value must be distinguishable from
+        # "no option" (None → cwd repo) so the caller can reject it rather than
+        # silently report the WRONG same-numbered PR.
+        for argv in (["--repo"], ["--repo="], ["-R"], ["-R="]):
+            assert _mod._parse_check_pr_repo(argv) is _mod._CHECK_PR_REPO_EMPTY, argv
+
+    def test_no_option_is_none(self):
+        assert _mod._parse_check_pr_repo(["--squash", "--admin"]) is None
+
+
+class TestCheckPrReportFreshnessLabel:
+    """Codex P2 #1373: the canonical report must not print 'ok (current)' when the
+    review is STALE-but-trivial — the structured stdout would mislead consumers."""
+
+    def _run_report(self, monkeypatch, capsys, reviews, compare):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", reviews)
+        monkeypatch.setenv("_TEST_GH_COMPARE", compare)
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(
+            _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+        )
+        _mod.check_pr_report("5")
+        return capsys.readouterr().out
+
+    def test_stale_trivial_labeled_stale(self, monkeypatch, capsys):
+        out = self._run_report(
+            monkeypatch,
+            capsys,
+            reviews=_reviews_jsonl(STALE),
+            compare=_compare_json("ahead", [_code_file(additions=3)]),
+        )
+        assert "codex-at-head" in out
+        assert "STALE review" in out
+        assert "ok (current)" not in out
+
+    def test_current_labeled_current(self, monkeypatch, capsys):
+        out = self._run_report(
+            monkeypatch,
+            capsys,
+            reviews=_reviews_jsonl(HEAD),
+            compare=_compare_json("identical"),
+        )
+        assert "ok (current)" in out

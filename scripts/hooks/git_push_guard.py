@@ -1008,6 +1008,13 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
     status = data.get("status")
     if status in ("identical", "behind"):
         return "inline"  # HEAD content ⊆ what Codex reviewed → nothing unreviewed
+    if status not in ("ahead", "diverged"):
+        # A MISSING/unknown status (`{status: null, …}` from a truncated or
+        # unexpected compare response) must fail CLOSED — NOT fall through to file
+        # classification, where an empty `files` would read as "inline" and permit
+        # a STALE review to bind the merge on a delta that was never verified
+        # (Codex P2, #1373). Only the documented linear statuses are classifiable.
+        return None
     files = data.get("files")
     if not isinstance(files, list):
         return None
@@ -2563,23 +2570,33 @@ def main() -> int:
     return 0
 
 
-def _parse_check_pr_repo(argv: list[str]) -> str | None:
-    """The target repo named on a ``--check-pr`` invocation's trailing args, or None.
+# Sentinel: `--check-pr` was given a repo option with an EXPLICITLY EMPTY value
+# (`--repo`, `--repo=`, `-R`, `-R=`). Distinct from None ("no repo option → cwd
+# repo"): an empty value is a MISTAKE, and silently falling back to the cwd repo
+# would report an all-clear (and a suggested merge command) for an unrelated
+# same-numbered PR (Codex P2, #1373). The caller rejects it instead.
+_CHECK_PR_REPO_EMPTY = object()
 
+
+def _parse_check_pr_repo(argv: list[str]):
+    """The target repo named on a ``--check-pr`` invocation's trailing args.
+
+    Returns the OWNER/REPO string, ``None`` (no repo option → cwd repo), or
+    ``_CHECK_PR_REPO_EMPTY`` (an option was given with an empty value → reject).
     Accepts every normal gh spelling — ``--repo X``, ``-R X``, ``--repo=X``,
-    ``-R=X`` — not just the separate ``--repo`` form: a ``-R owner/repo`` that
-    went unrecognized silently checked the CWD repo and could print an all-clear
-    (and a suggested merge command) for the WRONG target (Codex P2, #1366).
+    ``-R=X``, glued ``-Rowner/repo`` — not just the separate ``--repo`` form: a
+    form that went unrecognized silently checked the CWD repo (Codex P2, #1366).
     """
     for i, tok in enumerate(argv):
         if tok in ("--repo", "-R"):
-            return argv[i + 1] if i + 1 < len(argv) else None
+            val = argv[i + 1] if i + 1 < len(argv) else ""
+            return val if val else _CHECK_PR_REPO_EMPTY
         if tok.startswith(("--repo=", "-R=")):
-            return tok.split("=", 1)[1] or None
+            return tok.split("=", 1)[1] or _CHECK_PR_REPO_EMPTY
         if tok.startswith("-R") and not tok.startswith("--") and len(tok) > 2:
             # glued pflag shorthand `-Rowner/repo` — enforcement's
             # _merge_target_repo accepts it, so the report must too.
-            return tok[2:] or None
+            return tok[2:]
     return None
 
 
@@ -2616,7 +2633,21 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     print(f"base-branch    : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (default)'}")
     failures += 1 if blocked else 0
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
-    print(f"codex-at-head  : {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (current)'}")
+    if blocked:
+        label = "BLOCK — " + msg.splitlines()[0]
+    else:
+        # Distinguish a genuinely-current review from a stale-but-trivial-delta
+        # allow — both return the same tuple, but the report must NOT assert
+        # "current" when Codex reviewed an older SHA (Codex P2, #1373). Re-derive
+        # the reviewed SHA vs HEAD for an honest label (structured-stdout consumers
+        # read this, not the stderr NOTE).
+        _reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
+        _head = _pr_head_sha(pr_num, repo=repo)
+        if _reviewed and _head and _reviewed != _head.strip().lower():
+            label = f"ok (STALE review of {_reviewed[:12]}, delta since is trivial)"
+        else:
+            label = "ok (current)"
+    print(f"codex-at-head  : {label}")
     if not blocked and verified_head:
         print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
     failures += 1 if blocked else 0
@@ -2641,5 +2672,14 @@ if __name__ == "__main__":
     # Report mode: `git_push_guard.py --check-pr <N> [--repo OWNER/REPO]` — the
     # canonical pre-merge check (same functions as enforcement). No hook payload.
     if len(sys.argv) >= 3 and sys.argv[1] == "--check-pr":
-        sys.exit(check_pr_report(sys.argv[2], repo=_parse_check_pr_repo(sys.argv[3:])))
+        _repo = _parse_check_pr_repo(sys.argv[3:])
+        if _repo is _CHECK_PR_REPO_EMPTY:
+            print(
+                "ERROR: --repo/-R was given an empty value. Specify OWNER/REPO, or "
+                "omit the option to check the current repository — an empty value "
+                "would silently report the WRONG repo.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        sys.exit(check_pr_report(sys.argv[2], repo=_repo))
     run_guard(main, "git_push_guard")
