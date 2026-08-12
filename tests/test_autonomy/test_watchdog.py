@@ -48,13 +48,15 @@ def _liveness_probe_refused():
     — the same insulation pattern as the autouse _is_bridge_active /
     update_in_progress mocks. 'down' falls through to the normal restart path, i.e.
     exactly the pre-feature behavior. The liveness-distinguisher tests below
-    override urlopen per-scenario to exercise the other verdicts.
+    override the opener per-scenario to exercise the other verdicts. (The probe
+    uses a proxy-free build_opener().open(), so the seam is OpenerDirector.open,
+    not urlopen.)
     """
 
     def _refused(*_a, **_k):
         raise urllib.error.URLError(ConnectionRefusedError("refused"))
 
-    with patch("urllib.request.urlopen", side_effect=_refused):
+    with patch("urllib.request.OpenerDirector.open", side_effect=_refused):
         yield
 
 
@@ -825,7 +827,7 @@ class TestNetworkSuppression:
 
 
 class _FakeResp:
-    """Minimal urlopen() context-manager stand-in."""
+    """Minimal opener.open() context-manager stand-in."""
 
     def __init__(self, status: int, payload: dict):
         self.status = status
@@ -841,7 +843,7 @@ class _FakeResp:
         return False
 
 
-def _urlopen_returning(status: int, payload: dict):
+def _opener_returning(status: int, payload: dict):
     def _f(*_a, **_k):
         return _FakeResp(status, payload)
 
@@ -873,45 +875,47 @@ class TestProbeLivenessClassification:
         assert block is None
 
     def test_timeout_is_unknown(self, tmp_path: Path):
-        with patch("urllib.request.urlopen", side_effect=TimeoutError("slow")):
+        with patch("urllib.request.OpenerDirector.open", side_effect=TimeoutError("slow")):
             verdict, _ = self._checker(tmp_path)._probe_liveness()
         assert verdict == "unknown"
 
     def test_non_200_is_unknown(self, tmp_path: Path):
-        with patch("urllib.request.urlopen", _urlopen_returning(503, {})):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(503, {})):
             verdict, _ = self._checker(tmp_path)._probe_liveness()
         assert verdict == "unknown"
 
     def test_null_loop_is_unknown(self, tmp_path: Path):
         # loop:null (sampler never published) must NOT read as healthy.
-        with patch("urllib.request.urlopen", _urlopen_returning(200, {"loop": None})):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, {"loop": None})):
             verdict, _ = self._checker(tmp_path)._probe_liveness()
         assert verdict == "unknown"
 
     def test_fresh_low_lag_is_responsive(self, tmp_path: Path):
         payload = {"loop": {"lag_ms": 12.0, "sample_age_s": 0.5, "lagging": False}}
-        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)):
             verdict, _ = self._checker(tmp_path)._probe_liveness()
         assert verdict == "responsive"
 
     def test_fresh_high_lag_is_starved(self, tmp_path: Path):
         payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True}}
-        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)):
             verdict, block = self._checker(tmp_path)._probe_liveness()
         assert verdict == "starved"
         assert block["lag_ms"] == 4200.0
 
-    def test_lagging_flag_alone_is_starved(self, tmp_path: Path):
-        # Below the 1000ms suppress floor but the sticky episode flag is set.
+    def test_lagging_flag_below_floor_is_responsive(self, tmp_path: Path):
+        # Warn-level lag (sampler's 250ms 'lagging' flag) is BELOW the 1000ms
+        # suppress floor → NOT starved. Suppression honors the configured floor
+        # only, never the sampler's independently-tunable warn flag.
         payload = {"loop": {"lag_ms": 300.0, "sample_age_s": 1.0, "lagging": True}}
-        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)):
             verdict, _ = self._checker(tmp_path)._probe_liveness()
-        assert verdict == "starved"
+        assert verdict == "responsive"
 
     def test_stale_sample_is_wedged(self, tmp_path: Path):
         # High lag but the sample itself is old → the sampler stopped → wedged.
         payload = {"loop": {"lag_ms": 5000.0, "sample_age_s": 500.0, "lagging": True}}
-        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)):
             verdict, _ = self._checker(tmp_path)._probe_liveness()
         assert verdict == "wedged"
 
@@ -928,7 +932,7 @@ class TestLivenessRestartGate:
         payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True,
                             "executor": {"pending": 30}}}
         with (
-            patch("urllib.request.urlopen", _urlopen_returning(200, payload)),
+            patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)),
             patch.object(c, "_alert_starved") as alert,
         ):
             action = c.check()
@@ -947,7 +951,7 @@ class TestLivenessRestartGate:
             "restart_history": [], "starved_skips": 6,
         }))
         payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True}}
-        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)):
             action = c.check()
         # Past the bound → restart anyway; _record_failure resets the counter.
         assert action is WatchdogAction.RESTART
@@ -965,7 +969,7 @@ class TestLivenessRestartGate:
             "restart_history": [], "starved_skips": 3,
         }))
         payload = {"loop": {"lag_ms": 5.0, "sample_age_s": 0.5, "lagging": False}}
-        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)):
             action = c.check()
         assert action is WatchdogAction.BACKOFF  # backoff active → no restart, no _record_failure
         state = json.loads((tmp_path / "watchdog_state.json").read_text())
@@ -974,19 +978,19 @@ class TestLivenessRestartGate:
     def test_wedged_restarts(self, tmp_path: Path):
         c = self._stale(tmp_path)
         payload = {"loop": {"lag_ms": 5000.0, "sample_age_s": 500.0, "lagging": True}}
-        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)):
             assert c.check() is WatchdogAction.RESTART
 
     def test_responsive_restarts(self, tmp_path: Path):
         # status.json stale but loop fine = the status-writer task died; restart.
         c = self._stale(tmp_path)
         payload = {"loop": {"lag_ms": 10.0, "sample_age_s": 0.5, "lagging": False}}
-        with patch("urllib.request.urlopen", _urlopen_returning(200, payload)):
+        with patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)):
             assert c.check() is WatchdogAction.RESTART
 
     def test_unknown_restarts(self, tmp_path: Path):
         c = self._stale(tmp_path)
-        with patch("urllib.request.urlopen", side_effect=TimeoutError("slow")):
+        with patch("urllib.request.OpenerDirector.open", side_effect=TimeoutError("slow")):
             assert c.check() is WatchdogAction.RESTART
 
     def test_down_restarts(self, tmp_path: Path):
@@ -998,7 +1002,7 @@ class TestLivenessRestartGate:
         c = _liveness_checker(tmp_path, _zombie_file(tmp_path))
         payload = {"loop": {"lag_ms": 4200.0, "sample_age_s": 1.0, "lagging": True}}
         with (
-            patch("urllib.request.urlopen", _urlopen_returning(200, payload)),
+            patch("urllib.request.OpenerDirector.open", _opener_returning(200, payload)),
             patch.object(c, "_alert_starved"),
         ):
             assert c.check() is WatchdogAction.SKIP

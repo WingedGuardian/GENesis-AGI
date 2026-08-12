@@ -144,3 +144,50 @@ def test_liveness_detail_fails_closed_to_empty(monkeypatch):
     (points at a dead port so the result is deterministic on any host)."""
     monkeypatch.setattr(hook, "_SERVER_BASE", "http://127.0.0.1:9")
     assert hook._liveness_detail() == ""
+
+
+def _stub_liveness_client(monkeypatch, loop: dict) -> None:
+    """Stub httpx.Client so _liveness_detail parses the given loop block."""
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"loop": loop}
+
+    class _Client:
+        def __init__(self, **_k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def get(self, _url):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+
+
+def test_liveness_detail_fresh_sample_shows_lag(monkeypatch):
+    _stub_liveness_client(
+        monkeypatch,
+        {"lag_ms": 4200, "sample_age_s": 1.0, "executor": {"pending": 30}},
+    )
+    detail = hook._liveness_detail()
+    assert "loop lag 4200ms" in detail
+    assert "executor backlog 30" in detail
+
+
+def test_liveness_detail_stale_sample_reports_staleness(monkeypatch):
+    """A wedged loop returns an old sample with a growing age — the banner must
+    report staleness, not present the historical drift as current load."""
+    _stub_liveness_client(
+        monkeypatch,
+        {"lag_ms": 4200, "sample_age_s": 240.0, "executor": {"pending": 30}},
+    )
+    detail = hook._liveness_detail()
+    assert "stale" in detail
+    assert "4200" not in detail  # the historical drift is NOT presented as current

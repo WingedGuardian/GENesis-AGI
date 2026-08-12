@@ -1006,6 +1006,12 @@ def _liveness_detail() -> str:
         loop = resp.json().get("loop")
         if not isinstance(loop, dict):
             return ""
+        # A wedged loop (or a dead sampler) keeps returning the LAST sample with a
+        # growing sample_age_s — don't present stale drift/executor depth as current
+        # load. Past a freshness window, report the staleness instead of the number.
+        age = loop.get("sample_age_s")
+        if isinstance(age, (int, float)) and age > 30:
+            return f" (loop sample stale {age:.0f}s — possibly wedged)"
         parts: list[str] = []
         lag = loop.get("lag_ms")
         if isinstance(lag, (int, float)):

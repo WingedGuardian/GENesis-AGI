@@ -677,7 +677,13 @@ class WatchdogChecker:
 
         try:
             req = urllib.request.Request(self._liveness_url, method="GET")  # noqa: S310
-            with urllib.request.urlopen(req, timeout=3.0) as resp:  # noqa: S310
+            # Loopback probe must NEVER traverse a proxy: an inherited http_proxy
+            # without a 127.0.0.1 no_proxy entry would route this LOCAL health check
+            # to the proxy — a proxy error → 'unknown' (blind restart returns), or a
+            # proxy-forged 200 → a WRONG 'starved' suppression of a needed restart.
+            # Mirror the proactive hook's trust_env=False with a proxy-free opener.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=3.0) as resp:
                 if resp.status != 200:
                     return "unknown", None
                 body = json.loads(resp.read().decode("utf-8"))
@@ -701,7 +707,11 @@ class WatchdogChecker:
             return "unknown", loop_block
         if age > self._liveness_sample_stale_s:
             return "wedged", loop_block
-        if lag >= self._liveness_lag_suppress_ms or loop_block.get("lagging") is True:
+        # Honor the CONFIGURED suppression floor only — do NOT also suppress on the
+        # sampler's independent warn-level `lagging` flag (default 250ms), which is
+        # below the 1000ms floor: suppressing there would contradict autonomy.yaml
+        # and hold back a restart on a merely-mildly-laggy server (bias to restart).
+        if lag >= self._liveness_lag_suppress_ms:
             return "starved", loop_block
         return "responsive", loop_block
 
