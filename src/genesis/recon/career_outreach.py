@@ -154,14 +154,17 @@ def _parse_json(text: str) -> object | None:
         return json.loads(text)
     except Exception:
         pass
-    # Tolerate a leading verdict line before the compact JSON — INCLUDING a verdict
-    # that is itself brace/bracket-delimited (e.g. `{"verdict":"pass"}`). Scan each
-    # candidate JSON-value start left-to-right, raw_decode a COMPLETE value from it,
-    # and accept only the one that consumes to the end (nothing but whitespace after)
-    # — that is the trailing payload, per the "lead with a verdict line, THEN the
-    # JSON" contract. A first-`{` span would wrongly grab a JSON-shaped verdict; a
-    # last-`{` span would wrongly grab a nested sub-object.
+    # Tolerate a verdict line (prose OR JSON), markdown fences, and trailing content
+    # around the payload. Scan every candidate JSON-value start, decode a COMPLETE
+    # value from each, and return the one whose decode reaches FURTHEST into the text
+    # (largest end index). Per the "lead with a verdict line, THEN the compact JSON"
+    # contract the payload is the TRAILING value, so the rightmost-reaching complete
+    # object is it — ONE rule that handles a leading verdict-is-JSON, a ```-fenced
+    # payload, trailing prose, AND nested objects (a nested value always ends before
+    # its parent, so a top-level object out-reaches its own children).
     decoder = json.JSONDecoder()
+    best: object | None = None
+    best_end = -1
     for idx, ch in enumerate(text):
         if ch not in "{[":
             continue
@@ -172,21 +175,9 @@ def _parse_json(text: str) -> object | None:
             # nested reply (absurd but possible) — neither should escape this
             # best-effort parser (a raise would be miscounted as a job-health error).
             continue
-        if text[end:].strip() == "":
-            return obj
-    # Fallback: the reply has trailing content AFTER the payload — a stray closing
-    # ``` fence, a trailing word/period, a leading verdict line PLUS a fence. Recover
-    # the outermost {..}/[..] span. This runs ONLY when the strict scan above found no
-    # consumes-to-end value, so it never fires for the verdict-is-JSON / nested-object
-    # cases the strict scan already claims — it cannot reintroduce those bugs.
-    for open_c, close_c in (("{", "}"), ("[", "]")):
-        i, j = text.find(open_c), text.rfind(close_c)
-        if 0 <= i < j:
-            try:
-                return json.loads(text[i : j + 1])
-            except (ValueError, RecursionError):
-                continue
-    return None
+        if end > best_end:
+            best, best_end = obj, end
+    return best
 
 
 def _autorun_prompt(conf: dict) -> str:
@@ -277,12 +268,20 @@ def classify_autorun_reply(reply_text: str) -> AutorunOutcome:
         (payload.get("company") or "").strip() if isinstance(payload.get("company"), str) else ""
     )
 
+    # A terminal signal (none_left / error) must NOT also carry a `company`: a company
+    # is the Staged outcome, so its presence alongside a terminal signal is a merged
+    # (contradictory) reply, not "exactly one outcome". verify_failed REQUIRES a
+    # company, so it is handled separately below.
     if present == ["none_left"]:
+        if company:
+            return ProtocolError("'none_left' outcome must not carry a 'company'")
         if payload.get("none_left") is True:
             return NoneLeft()
         return ProtocolError("'none_left' present but not literal true")
 
     if present == ["error"]:
+        if company:
+            return ProtocolError("'error' outcome must not carry a 'company'")
         detail = payload.get("error")
         detail = detail.strip() if isinstance(detail, str) else ""
         if not detail:

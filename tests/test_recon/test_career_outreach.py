@@ -967,6 +967,8 @@ def test_classify_autorun_reply_valid_outcomes(reply, expected):
         '{"none_left":true,"verify_failed":"x","company":"A"}',  # multi-signal
         '{"error":"e","verify_failed":"v","company":"A"}',  # multi-signal
         '{"none_left":true,"error":"e"}',  # multi-signal
+        '{"none_left":true,"company":"Acme"}',  # terminal signal must not carry company
+        '{"error":"e","company":"Acme"}',  # terminal signal must not carry company
     ],
 )
 def test_classify_autorun_reply_protocol_errors(reply):
@@ -982,6 +984,9 @@ def test_parse_json_tolerates_trailing_content():
     assert _parse_json('GT: pass\n```json\n{"company":"X"}\n```')["company"] == "X"
     # ...while the leading verdict-is-JSON case still resolves to the TRAILING payload.
     assert _parse_json('{"verdict":"pass"}\n{"company":"X"}')["company"] == "X"
+    # ...INCLUDING the compound case: a JSON-shaped verdict AND a fenced payload
+    # together (Codex P2 — the largest-end-index rule handles it).
+    assert _parse_json('{"verdict":"pass"}\n```json\n{"company":"X"}\n```')["company"] == "X"
     # ...and a nested object with trailing content recovers the top-level object.
     assert _parse_json('{"company":"Y","meta":{"a":1}} trailing')["company"] == "Y"
 
