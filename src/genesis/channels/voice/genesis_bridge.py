@@ -127,7 +127,7 @@ _ACT_TOOL_DECLARATIONS = [
             "Store a durable fact the user tells you to remember about "
             "themselves, their preferences, people in their life, or their "
             "world — e.g. 'remember I prefer morning meetings', 'remember my "
-            "wife's name is Sarah'. Call this ONLY when the user explicitly asks "
+            "manager's name is Alex'. Call this ONLY when the user explicitly asks "
             "you to remember or note something for later. Do NOT call it for "
             "questions (use ask_genesis) or ordinary chatter."
         ),
@@ -493,7 +493,9 @@ class GenesisBridge:
             return json.dumps({"result": "I couldn't set that reminder right now."})
         return json.dumps({"result": f"Done — I'll remind you to {clean}."})
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(
+        self, *, current_session_id: str | None = None, satellite_id: str | None = None
+    ) -> str:
         """Build the system prompt with curated voice context.
 
         Extracts only the Active Context section from essential knowledge —
@@ -535,6 +537,16 @@ class GenesisBridge:
             ctx_parts.append(
                 f"What the user has been working on recently:\n{voice_ctx}",
             )
+
+        # Cross-session recency resume (gated off by default; reads the prior
+        # transcript directly, so it's independent of extraction lag).
+        from genesis.channels.voice.voice_recency import build_recency_block
+
+        recency = build_recency_block(
+            current_session_id=current_session_id, satellite_id=satellite_id
+        )
+        if recency:
+            ctx_parts.append(recency)
 
         return SYSTEM_INSTRUCTIONS.format(
             voice_context="\n".join(ctx_parts),

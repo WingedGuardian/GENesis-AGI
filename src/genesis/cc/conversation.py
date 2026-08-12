@@ -276,6 +276,10 @@ class ConversationLoop:
                 # WS-3 B4: owner-attended interactive conversation — spare it
                 # from the gate-4 pushed-surfaces enforce drop.
                 supervised=True,
+                # Owner-attended interactive session: keep the full user-scoped
+                # MCP toolset. Opt OUT of secure-by-default strict scoping
+                # (see CCInvocation.strict_mcp_config).
+                strict_mcp_config=False,
                 **resume_overrides,
             )
 
@@ -580,6 +584,10 @@ class ConversationLoop:
                 # WS-3 B4: owner-attended interactive conversation — spare it
                 # from the gate-4 pushed-surfaces enforce drop.
                 supervised=True,
+                # Owner-attended interactive session: keep the full user-scoped
+                # MCP toolset. Opt OUT of secure-by-default strict scoping
+                # (see CCInvocation.strict_mcp_config).
+                strict_mcp_config=False,
                 **resume_overrides,
             )
 
@@ -857,6 +865,10 @@ class ConversationLoop:
             roster_eligible=True,  # fresh retry stays roster-routable (no resume)
             # WS-3 B4: owner-attended interactive conversation (fresh retry).
             supervised=True,
+            # Owner-attended interactive session: keep the full user-scoped MCP
+            # toolset. Opt OUT of secure-by-default strict scoping
+            # (see CCInvocation.strict_mcp_config).
+            strict_mcp_config=False,
         )
 
     @staticmethod

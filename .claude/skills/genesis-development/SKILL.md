@@ -412,6 +412,47 @@ The enforcement hooks (`review_enforcement_prompt.py`,
 safety nets, not the decision-maker. This protocol provides the
 judgment framework.
 
+### Review depth is machine-checked (the front-stop)
+
+The "substantial → adversarial /review-level audit" decision above is no longer
+left to judgment alone (that judgment is exactly what failed on PR #1353 — an
+under-depth inline pass was self-certified as sufficient). The commit gate now
+COMPUTES substantiality from the staged diff
+(`review_scope.classify_change_substantiality`) and BLOCKS a substantial change
+whose review marker is not an ADVERSARIAL audit (`review_enforcement_commit.py`
+Rule 2.5). Substantiality is a surface-area × risk model — ≥50 reviewable lines OR
+>1 code file OR an auth/api/migrations file OR an **executable prompt/agent/skill
+surface** (`.claude/agents|commands|skills/*`, `src/genesis/skills/*`), so the
+"Prompt / LLM behavior → both + extra scrutiny" row above is machine-enforced (a
+trivial edit to one is depth-audited). User-sovereign top-level CAPS docs
+(`SOUL.md`/`USER.md`/`CLAUDE.md`) are exempt. Clearance binds the marker to the
+reviewed diff's FULL content, so re-staging different content after the audit
+re-blocks. A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
+substantial change — not clearance. Depth is override-exempt: a findings
+`# review-override` does NOT waive it; only a loud, logged `# depth-ack` does (the
+audited escape for a genuine format mismatch). "Adversarial" is verified
+STRUCTURALLY — a severity ladder (BLOCKER/SHOULD-FIX/NOTE, CRITICAL/HIGH/LOW,
+P1/P2/P3, or the CODE_AUDITOR JSON contract) + `file:line` engagement + substance —
+so run the real recall-tuned audit (`genesis-architect` / `CODE_AUDITOR.md`); do not
+hand-write a soft prompt.
+
+**Honest enforcement model — where the teeth actually are.** The local hook is
+ADVISORY anti-autopilot friction, NOT tamper-proof: on a single-user-authored repo
+the same actor can edit the hook or hand-write the marker. The enforcing teeth live
+where the author has no control at commit time — the **independent cloud reviewer
+(Codex)** + a **required human approval**, gated by **branch protection**, plus the
+CI `review-depth-check` that recomputes substantiality and flags it loudly on the PR
+(advisory, exit-0-always). The local gate's job is to interrupt autopilot; the real
+gate is external. Do not mistake a green local hook for clearance.
+
+**Close every review with a verdict.** End each review with an explicit
+`Ready to merge: Yes | No | With fixes` + a one-line reason, alongside the
+DONE / DONE_WITH_CONCERNS completion status. And the DON'Ts that keep a review
+honest: never "looks good" without reading the code; never a finding on code you
+did not read; never vague ("improve error handling") — always `file:line` + why it
+matters. (Deliberately NOT a "praise-first / acknowledge strengths" balance: an
+adversarial audit's job is to assume bugs and enumerate the class, not to reassure.)
+
 Two protocol steps apply to every review at "Code-reviewer inline" level or
 above (full definitions in `.claude/agents/genesis-architect.md`):
 
@@ -697,7 +738,29 @@ outlives its incident is a bug.
 
 ## Pre-Merge Gate
 
-`git_push_guard.py` enforces a **hard gate** on review findings:
+**Canonical pre-merge check:** run
+`python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
+BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses
+(mergeable → CI → base-invariant → Codex-freshness → review-body → inline
+findings), so the report and the gate can never disagree — never hand-roll a
+gh/jq review check (a hand-rolled query once used the GraphQL bot login on the
+REST endpoint, matched nothing, and reported "Codex clean" while P2s sat unread).
+When all gates pass it prints the exact atomic merge command to copy
+(`... --match-head-commit <verified-head>`); use that command verbatim.
+
+`git_push_guard.py` enforces a **hard gate** at merge time. Beyond the review
+findings below, a gated `gh pr merge`:
+- must carry `--admin` (explicit approval flag) and be bound to the reviewed head
+  via `--match-head-commit` (GitHub rejects it server-side if the head moved —
+  TOCTOU defense); the `--check-pr` command supplies this;
+- requires Codex to have reviewed the **current head** — Codex does NOT auto-review
+  a later fix-commit, so comment `@codex review` and wait after any push;
+- requires the PR base to equal the repo's default branch (retarget guard);
+- blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
+  does not merge). `# review-override` waives the review/freshness/base gates
+  (not CI — that is `# ci-override`).
+
+The review-findings gate specifically:
 
 1. After CI passes, the merge hook automatically checks PR comments
    for automated review findings (ERROR, [P1], HARD BLOCK).

@@ -492,6 +492,7 @@ async def register_voice_session(
     id: str,
     started_at: str,
     channel: str = "voice_s2s",
+    satellite_id: str | None = None,
 ) -> bool:
     """Register a voice conversation session for memory extraction.
 
@@ -507,10 +508,10 @@ async def register_voice_session(
     cursor = await db.execute(
         "INSERT OR IGNORE INTO cc_sessions "
         "(id, cc_session_id, session_type, channel, model, source_tag, "
-        " status, started_at, last_activity_at) "
+        " status, started_at, last_activity_at, satellite_id) "
         "VALUES (?, ?, 'foreground', ?, 'voice', 'voice', "
-        " 'active', ?, ?)",
-        (id, id, channel, started_at, started_at),
+        " 'active', ?, ?, ?)",
+        (id, id, channel, started_at, started_at, satellite_id),
     )
     await db.commit()
     return cursor.rowcount > 0

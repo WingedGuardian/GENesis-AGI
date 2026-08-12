@@ -66,6 +66,55 @@ _DOWNGRADE_RETRY_BACKOFF_S = 30
 
 _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "identity"
 
+
+def _reflection_lockdown_kwargs(mcp_profile: str) -> dict:
+    """Read-only reflection tool lockdown as CCInvocation kwargs.
+
+    Every reflection entry point (the depth-based ``_reflect_inner`` path, the weekly
+    self-assessment, and the quality-calibration arm) MUST route through this so no
+    arm silently runs unrestricted. Returns a genesis-only ``mcp_config`` (the given
+    profile), the derived read-only ``disallowed_tools`` denylist, and
+    ``strict_mcp_config=True`` so ``--mcp-config`` is authoritative (user-scoped
+    ``~/.claude.json`` servers never leak in — verified additive without strict).
+
+    Fail-closed: on any config-generation error, points ``mcp_config`` at the shipped
+    empty ``config/no_mcp.json`` (never None — avoids the untested bare-strict combo)
+    and denies the built-ins + both reflection MCP servers wholesale.
+    """
+    from genesis.cc.session_config import SessionConfigBuilder
+
+    try:
+        _mcp = SessionConfigBuilder()
+        mcp_path = _mcp.build_mcp_config(mcp_profile)
+        reflection_disallowed = _mcp.build_reflection_disallowed()
+        # Fail-closed: never leave mcp_config None under strict (see docstring).
+        if mcp_path is None:
+            mcp_path = _mcp.build_mcp_config("none")
+    except Exception:
+        logger.warning(
+            "Reflection MCP/tool config generation failed, using fail-closed defaults",
+            exc_info=True,
+        )
+        from genesis.cc.session_config import (
+            _REFLECTION_DENY_BUILTINS,
+            _REFLECTION_MCP_SERVERS,
+        )
+        from genesis.env import repo_root
+
+        try:
+            mcp_path = str(repo_root() / "config" / "no_mcp.json")
+        except Exception:
+            mcp_path = None  # last resort; strict_mcp_config still forces zero servers
+        reflection_disallowed = list(_REFLECTION_DENY_BUILTINS) + [
+            f"mcp__{server}__*" for server, _ in _REFLECTION_MCP_SERVERS
+        ]
+    return {
+        "mcp_config": mcp_path,
+        "disallowed_tools": reflection_disallowed,
+        "strict_mcp_config": True,
+    }
+
+
 _DEPTH_AUTONOMY_LEVEL = {
     Depth.LIGHT: 1,
     Depth.DEEP: 2,
@@ -256,55 +305,16 @@ class CCReflectionBridge:
             prompt_dir=self._prompt_dir,
         )
 
-        # 2. Prepare CLI invocation
-        try:
-            from genesis.cc.session_config import SessionConfigBuilder
-
-            _mcp = SessionConfigBuilder()
-            if depth == Depth.LIGHT:
-                mcp_path = _mcp.build_mcp_config("none")
-            elif depth in (Depth.DEEP, Depth.STRATEGIC):
-                mcp_path = _mcp.build_mcp_config("reflection")
-            else:
-                mcp_path = None
-            # Reflection sessions are READ-ONLY + observation-writing only. The
-            # denylist is the reliable scoping mechanism: --allowedTools is NOT a
-            # strict allowlist under --dangerously-skip-permissions (verified
-            # empirically 2026-08-07 — it left Bash available). Derived so future
-            # write tools are auto-denied; see build_reflection_disallowed.
-            reflection_disallowed = _mcp.build_reflection_disallowed()
-            # Fail-closed: if reflection MCP-config generation returned None, use the
-            # EMPTY config so strict_mcp_config (below) can't fall through to CC's
-            # default (user-scoped) MCP discovery — which would load servers (e.g.
-            # gitnexus, codebase-memory-mcp) whose write tools the genesis-only denylist
-            # does NOT cover.
-            if mcp_path is None:
-                mcp_path = _mcp.build_mcp_config("none")
-        except Exception:
-            logger.warning(
-                "MCP/tool config generation failed, using fail-closed defaults",
-                exc_info=True,
-            )
-            # Fail closed: point at the EMPTY MCP config (with strict_mcp_config no other
-            # server can load) AND reuse the full built-in denylist + wildcard MCP denies
-            # (single source of truth — no drift from a hand-maintained literal).
-            from genesis.cc.session_config import (
-                _REFLECTION_DENY_BUILTINS,
-                _REFLECTION_MCP_SERVERS,
-            )
-            from genesis.env import repo_root
-
-            # Resolve the shipped empty MCP config by PATH (no dependency on the
-            # config builder succeeding), so mcp_config is a real empty config rather
-            # than None — avoids relying on the untested "--strict-mcp-config with no
-            # --mcp-config" combination.
-            try:
-                mcp_path = str(repo_root() / "config" / "no_mcp.json")
-            except Exception:
-                mcp_path = None  # last resort; strict_mcp_config still forces zero servers
-            reflection_disallowed = list(_REFLECTION_DENY_BUILTINS) + [
-                f"mcp__{server}__*" for server, _ in _REFLECTION_MCP_SERVERS
-            ]
+        # 2. Prepare CLI invocation. Read-only tool lockdown via the shared helper
+        # (single source of truth for ALL reflection entry points — this path plus
+        # the weekly-assessment and quality-calibration arms). LIGHT loads no MCP;
+        # DEEP/STRATEGIC load the genesis-only "reflection" profile. The helper
+        # derives the read-only denylist and sets strict so user-scoped
+        # ~/.claude.json servers can't leak in (--mcp-config is additive without it).
+        _reflection_profile = (
+            "reflection" if depth in (Depth.DEEP, Depth.STRATEGIC) else "none"
+        )
+        _lockdown = _reflection_lockdown_kwargs(_reflection_profile)
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (reflection always emits text)
@@ -313,12 +323,9 @@ class CCReflectionBridge:
             timeout_s=_DEPTH_TIMEOUT_S.get(depth, 300),
             system_prompt=self._system_prompt_for_depth(depth),
             skip_permissions=True,
-            disallowed_tools=reflection_disallowed,
-            mcp_config=mcp_path,
-            # ONLY the reflection MCP config's servers load — NOT the user-scoped
-            # servers in ~/.claude.json (--mcp-config is additive without this). Makes
-            # the genesis-only derived denylist authoritative. (Matches eval bench arms.)
-            strict_mcp_config=True,
+            disallowed_tools=_lockdown["disallowed_tools"],
+            mcp_config=_lockdown["mcp_config"],
+            strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
             stream_idle_timeout_ms=(
                 _DEPTH_TIMEOUT_S.get(depth, 300) * 1000
@@ -605,6 +612,9 @@ class CCReflectionBridge:
             "Evaluate each of the 6 dimensions using this data."
         )
 
+        # Read-only reflection lockdown (shared with _reflect_inner + calibration):
+        # genesis health+memory read tools only, strict scoping, no user-scoped leak.
+        _lockdown = _reflection_lockdown_kwargs("reflection")
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (weekly assessment output)
@@ -612,6 +622,9 @@ class CCReflectionBridge:
             effort=EffortLevel.HIGH,
             system_prompt=load_prompt_file("SELF_ASSESSMENT.md", self._prompt_dir),
             skip_permissions=True,
+            disallowed_tools=_lockdown["disallowed_tools"],
+            mcp_config=_lockdown["mcp_config"],
+            strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
         )
         output = await self._invoker.run(invocation)
@@ -682,6 +695,9 @@ class CCReflectionBridge:
             "Evaluate quality drift and identify quarantine candidates."
         )
 
+        # Read-only reflection lockdown (shared with _reflect_inner + assessment):
+        # genesis health+memory read tools only, strict scoping, no user-scoped leak.
+        _lockdown = _reflection_lockdown_kwargs("reflection")
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (quality calibration output)
@@ -689,6 +705,9 @@ class CCReflectionBridge:
             effort=EffortLevel.HIGH,
             system_prompt=load_prompt_file("QUALITY_CALIBRATION.md", self._prompt_dir),
             skip_permissions=True,
+            disallowed_tools=_lockdown["disallowed_tools"],
+            mcp_config=_lockdown["mcp_config"],
+            strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
         )
         output = await self._invoker.run(invocation)

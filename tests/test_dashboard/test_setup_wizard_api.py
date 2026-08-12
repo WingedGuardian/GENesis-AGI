@@ -44,12 +44,21 @@ def wiz(tmp_path, monkeypatch):
     monkeypatch.setattr(floor_mod, "cc_oauth_present", lambda: True)
 
     # The route lazy-imports load_ego_config from its source module — patch it there.
-    # Default: ego loop OFF (so tier hinges on what each test configures).
+    # Default: ego loop OFF (so tier hinges on what each test configures); cadence at the
+    # shipped 60 so the enrichment field is deterministic.
     import genesis.ego.config as ego_config_mod
 
     monkeypatch.setattr(
-        ego_config_mod, "load_ego_config", lambda *a, **k: SimpleNamespace(enabled=False)
+        ego_config_mod,
+        "load_ego_config",
+        lambda *a, **k: SimpleNamespace(enabled=False, cadence_minutes=60),
     )
+
+    # The route also lazy-imports the autonomy default-level reader — patch it at the
+    # source so the enrichment field is hermetic (not coupled to config/autonomy.yaml).
+    import genesis.autonomy.config_read as autonomy_cfg_mod
+
+    monkeypatch.setattr(autonomy_cfg_mod, "read_autonomy_default_level", lambda *a, **k: 1)
 
     return {
         "client": app.test_client(),
@@ -58,6 +67,7 @@ def wiz(tmp_path, monkeypatch):
         "marker": marker,
         "monkeypatch": monkeypatch,
         "ego_config": ego_config_mod,
+        "autonomy_cfg": autonomy_cfg_mod,
     }
 
 
@@ -78,6 +88,11 @@ def test_setup_status_fresh_install(wiz):
         "tier_name": "Bootstrapped",
         "telegram_configured": False,
         "ego_enabled": False,
+        # enrichment fields (additive, non-gating) — nothing configured on a fresh box.
+        "web_search_keyed_providers": [],
+        "voice_configured": False,
+        "ego_cadence_minutes": 60,
+        "autonomy_level": 1,
     }
 
 
@@ -217,6 +232,56 @@ def test_setup_status_ego_config_unreadable_is_failsafe_not_500(wiz):
     body = resp.get_json()
     assert body["ego_enabled"] is False
     assert body["tier"] == 2  # capped at Connected without ego
+    assert body["ego_cadence_minutes"] == 60  # cadence also fails safe to the default
+
+
+def test_setup_status_enrichment_fields_reflect_config(wiz):
+    # A premium web-search key + deliberate voice opt-in + custom ego cadence + a
+    # non-default autonomy level must all surface through the route (non-gating).
+    wiz["secrets"].write_text(
+        _functional_secrets() + "API_KEY_BRAVE=bk\nVOICE_S2S_PROVIDER=openai\nOPENAI_API_KEY=sk\n"
+    )
+    wiz["monkeypatch"].setattr(
+        wiz["ego_config"],
+        "load_ego_config",
+        # A fractional cadence must survive the route + jsonify unchanged (not truncated).
+        lambda *a, **k: SimpleNamespace(enabled=False, cadence_minutes=45.5),
+    )
+    wiz["monkeypatch"].setattr(
+        wiz["autonomy_cfg"], "read_autonomy_default_level", lambda *a, **k: 2
+    )
+    body = wiz["client"].get("/api/genesis/setup-status").get_json()
+    assert body["web_search_keyed_providers"] == ["brave"]
+    assert body["voice_configured"] is True
+    assert body["ego_cadence_minutes"] == 45.5
+    assert body["autonomy_level"] == 2
+    # Enrichment is non-gating: these do not change the floor/tier.
+    assert body["floor_met"] is True
+
+
+def test_setup_status_overflow_cadence_is_failsafe_not_500(wiz):
+    # A user-overridden ego.yaml with `cadence_minutes: .inf` yields a float infinity;
+    # int(inf) raises OverflowError. compute_enrichment runs OUTSIDE the route's ego
+    # try/except, so this must be caught there (never 500 first-run) and fall back to 60.
+    wiz["monkeypatch"].setattr(
+        wiz["ego_config"],
+        "load_ego_config",
+        lambda *a, **k: SimpleNamespace(enabled=True, cadence_minutes=float("inf")),
+    )
+    wiz["secrets"].write_text(_functional_secrets())
+    resp = wiz["client"].get("/api/genesis/setup-status")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ego_cadence_minutes"] == 60
+    assert body["ego_enabled"] is True  # the bad cadence must not disturb ego/tier
+
+
+def test_setup_status_openai_llm_key_alone_is_not_voice(wiz):
+    # Regression guard: s2s_provider() defaults to "openai", so a bare OPENAI_API_KEY
+    # (an LLM key) must NOT read as deliberate voice setup.
+    wiz["secrets"].write_text(_functional_secrets() + "OPENAI_API_KEY=sk\n")
+    body = wiz["client"].get("/api/genesis/setup-status").get_json()
+    assert body["voice_configured"] is False
 
 
 def test_setup_status_readiness_fields_backward_compatible(wiz):
@@ -234,6 +299,13 @@ def test_setup_status_readiness_fields_backward_compatible(wiz):
     ):
         assert key in body
     for key in ("tier", "tier_name", "telegram_configured", "ego_enabled"):
+        assert key in body
+    for key in (
+        "web_search_keyed_providers",
+        "voice_configured",
+        "ego_cadence_minutes",
+        "autonomy_level",
+    ):
         assert key in body
 
 

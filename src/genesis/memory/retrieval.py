@@ -1288,7 +1288,7 @@ class HybridRetriever:
             # Genesis), so offload each blocking search to a worker thread — it
             # must never block the shared event loop while other coroutines (other
             # recalls, the rest of the server) are waiting, which matters under
-            # Jay's 5-7 concurrent-session norm (ac27b693, PR-2). track_operation
+            # the user's 5-7 concurrent-session norm (ac27b693, PR-2). track_operation
             # stays ON the event loop wrapping the await, so per-collection
             # "qdrant.search" telemetry (the provider:qdrant_unreachable signal in
             # mcp/health/errors.py) is byte-identical to the inline version, and

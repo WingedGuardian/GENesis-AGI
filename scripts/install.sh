@@ -71,9 +71,12 @@ set_secret() {
 
 # ── HOME guard ───────────────────────────────────────────────
 # Ensure HOME is set (may be empty in container sessions without login shell)
-# and persisted in /etc/environment so all future sessions inherit it.
+# and persisted in /etc/environment so all future sessions inherit it. Resolve
+# from passwd by uid (robust when the name lookup is missing) and fail closed
+# rather than proceed with HOME="" (which `set -u` would not catch).
 if [ -z "${HOME:-}" ]; then
-    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
 if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
@@ -899,22 +902,11 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  [9/$TOTAL_STEPS] Setting up Claude Code hooks..."
 
-TEMPLATE="$REPO_DIR/config/claude-settings.json.template"
-TARGET="$REPO_DIR/.claude/settings.json"
 VENV_PYTHON="$VENV_PATH/bin/python"
 
-if [ -f "$TEMPLATE" ]; then
-    mkdir -p "$REPO_DIR/.claude"
-    if [ -f "$TARGET" ]; then
-        echo "    . .claude/settings.json already exists (not overwriting)"
-    else
-        sed "s|{{VENV_PYTHON}}|$VENV_PYTHON|g; s|{{GENESIS_ROOT}}|$REPO_DIR|g" \
-            "$TEMPLATE" > "$TARGET"
-        echo "    + Claude Code hooks configured"
-    fi
-else
-    echo "    - Hook template not found (skipping)"
-fi
+# .claude/settings.json ships tracked in the repo — hooks are pre-configured on
+# every clone, so there is no template to render here. (VENV_PYTHON stays defined:
+# the .mcp.json render below still substitutes it.)
 
 # .mcp.json — MCP server configuration for Claude Code
 MCP_TEMPLATE="$REPO_DIR/config/mcp.json.template"
@@ -1171,6 +1163,16 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 echo "    + $timer_name enabled + started" || true
         fi
     done
+fi
+
+# Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
+# timer — the loop above only enables timers). Enable-only (not --now): it is
+# meant to fire in the CC-quiet cold-start window before genesis-server, so
+# arming it for the next boot is correct; the paired timer handles periodic
+# attempts. Without this the cold-start leg would render but never activate.
+if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
+    systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
+        echo "    + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
 fi
 
 # Enable AND start tmp watchgod (OS-level temp protection)

@@ -869,6 +869,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_byte INTEGER",
         "cc_sessions.last_extracted_byte")
+    # Per-device voice-session attribution: the satellite (device) id is hashed
+    # into the uuid5 session id and otherwise dropped. NULLable, NO default —
+    # NULL = unknown device (historical rows / a writer that passed none);
+    # captured on a voice session's FIRST registration. Powers the optional
+    # per_device scope of voice_recency_resume; the default (global) ignores it.
+    await _try_alter(db,
+        "ALTER TABLE cc_sessions ADD COLUMN satellite_id TEXT",
+        "cc_sessions.satellite_id")
 
     # Memory photographic: expand memory_links CHECK constraint to support
     # typed relationships from conversation extraction (discussed_in,
@@ -924,6 +932,28 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         logger.error(
             "memory_links CHECK constraint migration failed", exc_info=True
         )
+
+    # MW-2 (0082) edge-metadata on memory_links — classifier-verdict stamping
+    # location (GROUNDWORK(mw-5-merge-gate)). Mirrored here because
+    # create_all_tables runs _migrate_add_columns but NOT the numbered runner,
+    # so an existing DB upgraded via the base path needs the columns too
+    # (schema_both_build_paths). All NULLable, no backfill; NULL safe_for_boost
+    # = boost-eligible (legacy default).
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN proposed_type TEXT",
+        "memory_links.proposed_type")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN confidence REAL",
+        "memory_links.confidence")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN classifier TEXT",
+        "memory_links.classifier")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN review_state TEXT",
+        "memory_links.review_state")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN safe_for_boost INTEGER",
+        "memory_links.safe_for_boost")
 
     # Bookmark fix: add source column to session_bookmarks
     await _try_alter(db,

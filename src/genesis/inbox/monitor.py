@@ -35,10 +35,6 @@ logger = logging.getLogger(__name__)
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "identity"
 _SYSTEM_PROMPT_FILE = "INBOX_EVALUATE.md"
 
-# Max age before a pending inbox approval is considered abandoned.
-# Approvals with timeout_at=None wait indefinitely by design, but the
-# inbox monitor shouldn't block forever if the user never responds.
-_MAX_APPROVAL_STALENESS = timedelta(hours=4)
 
 _FALLBACK_SYSTEM_PROMPT = (
     "You are Genesis performing an inbox evaluation. "
@@ -685,38 +681,58 @@ class InboxMonitor:
                 )
 
         if pending is not None:
-            # Staleness guard: auto-cancel approvals pending longer than
-            # _MAX_APPROVAL_STALENESS.  Without this, an approval with
-            # timeout_at=None blocks the inbox monitor indefinitely when
-            # the user never responds and no new files arrive.
-            created_str = pending.get("created_at", "")
-            created_dt = parse_utc_iso(created_str)
-            if created_str and created_dt is None:
-                logger.warning(
-                    "Staleness guard: unparseable approval created_at %r; "
-                    "skipping age-check this cycle (guard left intact)",
-                    created_str,
+            # Orphan-recovery guard (replaces the old age-based staleness
+            # cancel). A healthy pending approval is HELD indefinitely — the
+            # user blocks-until-approved with no re-ask, exactly like every
+            # other autonomous-CLI approval. But an approval that NO live inbox
+            # row references can never be dispatched (its rows were invalidated
+            # or superseded while it was left pending); holding it would block
+            # the monitor forever (the indefinite-block failure #329 originally
+            # guarded against). So cancel ONLY when it is genuinely orphaned,
+            # never merely because it is old.
+            pending_id = pending.get("id")
+            live_rows = (
+                await inbox_items.count_live_rows_for_approval(
+                    self._db,
+                    str(pending_id),
                 )
-            if created_dt is not None:
-                age = self._clock() - created_dt
-                if age > _MAX_APPROVAL_STALENESS:
-                    pending_id = pending.get("id")
-                    logger.info(
-                        "Cancelling stale inbox approval %s (%.1fh old, threshold %.1fh)",
+                if pending_id
+                else None  # no id → cannot classify → hold (never cancel a None)
+            )
+            if pending_id and live_rows == 0:
+                logger.info(
+                    "Cancelling orphaned inbox approval %s (no live inbox rows reference it)",
+                    pending_id,
+                )
+                cancelled = False
+                try:
+                    gate = self._autonomous_dispatcher.approval_gate
+                    cancelled = bool(await gate.approval_manager.cancel(pending_id))
+                except Exception:
+                    logger.warning(
+                        "Failed to cancel orphaned approval %s",
                         pending_id,
-                        age.total_seconds() / 3600,
-                        _MAX_APPROVAL_STALENESS.total_seconds() / 3600,
+                        exc_info=True,
                     )
-                    try:
-                        gate = self._autonomous_dispatcher.approval_gate
-                        await gate.approval_manager.cancel(pending_id)
-                    except Exception:
-                        logger.warning(
-                            "Failed to cancel stale approval %s",
-                            pending_id,
-                            exc_info=True,
-                        )
-                    pending = None  # Cleared — proceed normally
+                if cancelled:
+                    pending = None  # Recovered — proceed with normal detection
+                else:
+                    # cancel() returns False (it does not raise) when the row is
+                    # no longer 'pending' — the user APPROVED it between
+                    # find_site_pending() and cancel() (a TOCTOU), or a transient
+                    # DB failure. Do NOT clear the hold and rush into detection:
+                    # a just-approved, content-agnostic stable-key approval would
+                    # otherwise be reused+consumed by unrelated new content in
+                    # this same cycle. Hold now; the next scan re-reads a fresh
+                    # state (an approved request is no longer returned by
+                    # find_site_pending and is consumed via the normal
+                    # resume/dispatch path).
+                    logger.info(
+                        "Orphaned inbox approval %s was not cancellable (raced to "
+                        "resolved, or transient failure) — holding this cycle",
+                        pending_id,
+                    )
+                    return [], []
 
         if pending is not None:
             # Approval pending — scan anyway to detect new content.

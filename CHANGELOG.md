@@ -11,6 +11,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Opt-in career-outreach monitor (off by default).** A new daily monitor that,
+  once enabled, drives a configured external career-agent module to stage
+  first-touch outreach drafts into your mail Drafts, then sends you a single
+  Telegram nudge to review and send them — it never sends mail itself (you click
+  Send). Ships `off`; flip `off → observe → live` in `career_outreach.yaml`
+  (env kill switch: `GENESIS_CAREER_OUTREACH_DISABLED=1`). No-ops cleanly on
+  installs that don't have a career-agent module configured.
+
+- **cc-tmp blast-radius isolation now converges on its own.** The dedicated,
+  size-capped volume that stops a runaway temp write from filling the container
+  root — and taking every Claude Code session down with it — used to attach only
+  during a guardian redeploy that happened to land while no CC session was live,
+  which on a busy install is almost never. A cold-start apply (before the server
+  starts) plus a periodic retry timer now keep trying until a quiet moment is
+  found, and the infrastructure-posture alert tells "converging" apart from
+  "needs attention" so it doesn't nag when it's simply waiting. No action needed;
+  a deliberate container restart closes it immediately.
+
 - **GitHub steward now surfaces responses to your upstream contributions.** Beyond
   the flagship-repo deep-poll, the account-activity monitor gained an account-level
   notifications lane: it pings you when someone @mentions you on any repo, or
@@ -18,6 +36,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   contributions — the flagship deep-poll can't see those). Tunable via the
   `notifications` reason-allowlist in `github_steward.yaml`; respects the same
   `off`/`observe`/`live` lever and pings immediately in `live`.
+
+### Fixed
+
+- **The autonomous-CLI approval gate now ships ON by default.** Every background
+  Claude Code session Genesis dispatches must be rooted in an explicit user
+  approval — but the committed policy config shipped the gate *off*, so a fresh
+  clone would auto-approve autonomous sessions without asking. The shipped default
+  is now `manual_approval_required: true`, and a guardrail test pins the committed
+  config so the loader's file-wins-over-code-default behavior can never silently
+  ship the gate off again.
+
+- **Inbox approvals no longer nag.** A pending "inbox evaluation" approval now
+  holds until you respond — it is asked once and blocks until approved, like
+  every other approval, instead of re-sending a fresh request every few hours
+  for content that hasn't changed. A stuck (orphaned) approval that can never be
+  dispatched is still auto-recovered, so the monitor never wedges.
 
 ### Changed
 
@@ -31,6 +65,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   review rather than directly on the actionable follow-up board — the board stays
   reserved for your (foreground) work. A foreground session can promote a tabled
   item to the board.
+
+- **All autonomous background sessions are now MCP-scoped by default.** Genesis
+  runs many kinds of background Claude Code sessions (reflection, sentinel,
+  inbox/mail triage, autonomy executor, ego gates, research). These are now secure
+  by default: each session loads only the Genesis MCP tools it is explicitly given
+  and no longer additively inherits the operator's user-scoped MCP servers (e.g.
+  code-editing tools) that were never intended for autonomous use. A session that
+  forgets to scope itself now fails closed (no extra tools) rather than open. Your
+  own foreground conversations are unchanged — they keep the full toolset. This
+  closes a latent tool-scope gap; nothing you'd notice day to day, no action needed.
 
 - **Free-tier model refresh.** Groq is retiring Llama 3.3 70B (the model behind
   several of Genesis's free reasoning/extraction/tagging steps) on 2026-08-16, so

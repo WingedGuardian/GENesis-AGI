@@ -107,6 +107,41 @@ class TestOverride:
         assert sp.analyze("git push # review-override: accepted P2s")[0].override
         assert sp.analyze("git push # review-override — notes")[0].override
 
+    def test_independent_sigils_coexist(self):
+        # Codex P2: two INDEPENDENT acks must be able to share one trailing comment —
+        # at escalation round 2 a genuine-but-unrecognized audit needs BOTH audit-ack
+        # (Rule 3) and depth-ack (Rule 2.5). Every whitespace token is scanned, so order
+        # is irrelevant and each sigil matches its own token.
+        for cmd in (
+            "git commit -m x # audit-ack depth-ack",
+            "git commit -m x # depth-ack audit-ack",
+        ):
+            seg = sp.analyze(cmd)[0].raw
+            assert sp.has_trailing_override(seg, sigil="audit-ack"), cmd
+            assert sp.has_trailing_override(seg, sigil="depth-ack"), cmd
+
+    def test_multi_token_still_rejects_prefix_of_longer_token(self):
+        # The multi-token scan must NOT loosen the exact-token guard: a sigil that is a
+        # prefix of a longer token still does not match.
+        seg = sp.analyze("git commit -m x # depth-ack-nope")[0].raw
+        assert not sp.has_trailing_override(seg, sigil="depth-ack")
+
+    def test_prose_mention_does_not_authorize(self):
+        # Regression (self-audit): the multi-token scan must accept a sigil only in the
+        # LEADING run of recognized ack/override tokens — a sigil appearing after prose,
+        # negated or incidental, must NOT waive the gate.
+        for cmd in (
+            "git commit -m x # not a review-override, just cleanup",
+            "git commit -m x # see review-override docs before merging",
+        ):
+            assert not sp.analyze(cmd)[0].override, cmd
+        # depth-ack buried after prose is likewise not honored
+        seg = sp.analyze("git commit -m x # TODO consider depth-ack later")[0].raw
+        assert not sp.has_trailing_override(seg, sigil="depth-ack")
+        # a non-sigil token AHEAD of a real sigil ends the run (the sigil is unreachable)
+        seg2 = sp.analyze("git commit -m x # depth-ack-nope audit-ack")[0].raw
+        assert not sp.has_trailing_override(seg2, sigil="audit-ack")
+
 
 # ── commit hook-skip flag detection ─────────────────────────────────────
 

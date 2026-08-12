@@ -558,6 +558,16 @@ TABLES = {
             ),
             strength    REAL NOT NULL DEFAULT 0.5,
             created_at  TEXT NOT NULL,
+            -- MW-2 (0082) edge-metadata: classifier-verdict stamping location.
+            -- All NULLable, no backfill. NULL safe_for_boost = boost-eligible
+            -- (legacy default). proposed_type carries the classifier's verdict
+            -- label and is deliberately NOT constrained by the link_type CHECK.
+            -- GROUNDWORK(mw-5-merge-gate): MW-5 stamps verdicts here.
+            proposed_type   TEXT,
+            confidence      REAL,
+            classifier      TEXT,
+            review_state    TEXT,
+            safe_for_boost  INTEGER,
             -- link_type is part of the PK (audit DLI-04 / D15): distinct
             -- relationship types between the same pair (e.g. supports AND
             -- contradicts) must coexist, not silently overwrite. Migration

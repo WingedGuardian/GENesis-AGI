@@ -36,7 +36,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 7706dc2f 2026-08-05
+verified: ef6eb541 2026-08-10
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -171,6 +171,32 @@ column stamped at merge (the synthesis's `created_at` is unreliable —
 `store()`'s exact-dedup can return an old pre-existing memory); non-dream
 deprecations leave `deprecated_at` NULL and are never pruned.
 
+**Relationship classifier (MW-2 lean keystone)** —
+`memory/relationship_classifier.py`: coarse relationship judgment
+(`duplicate`/`contradicts`/`succeeded_by`/`distinct` + confidence) between two
+candidate memories, generalizing `entity_resolution.check_semantic_overlap`
+(call site `dream_cycle_relationship_classify`, free-SLM chain, fail-safe
+`distinct@0.0`). This is the function MW-5's merge gate consumes on ≥0.95
+nominees; NOTHING calls it in the runtime yet (probe:
+`scripts/dev/mw2_classifier_probe.py`, read-only vs a DB copy). Migration 0082
+added five NULLable stamping columns to `memory_links` (`proposed_type`,
+`confidence`, `classifier`, `review_state`, `safe_for_boost`) — NULL
+`safe_for_boost` = boost-eligible (legacy default), no backfill, CHECK/PK
+unchanged. Measured 2026-08-11 (n=300 sampled from the FULL ~197k-pair
+similarity population — strength ≥0.75, synthesis-provenance excluded by
+source marker, unordered-pair-deduped, boost-visibility-filtered, 0
+fail-safes): 73.2% distinct / 16.4% duplicate / 10.0% succeeded_by / 0.4%
+contradicts; ~17% of sampled edges had recall-hidden endpoints. `duplicate`
+~80% hand-scored accurate, `contradicts` OVER-CALLED (bug↔fix pairs) — so
+MW-5 must
+challenge contradicts verdicts adversarially before acting, and the deferred
+MW-2b machinery (candidate_similar type + CHECK rebuild + write-path change +
+boost gating) is evidence-parked, not planned. The similarity linkers
+(`linker.py` auto_link 0.90/0.75, `connection_pass.py` 0.80) still write
+`extends`/`supports`/`related_to` — types recall ranking never reads
+(`neighbors_of` is strength-only; type matters only via the `contradicts`
+deny-list).
+
 **Do not touch:** the drain's shadow hardwiring; the dry_run-independent link
 write. **Trap:** with no embedding provider registered, memory silently
 degrades to FTS5-only (see routing-providers entry).
@@ -194,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 5dcd9fd4 2026-08-07
+verified: 437c56c0 2026-08-09
 ```
 
 - **Reflection tool lockdown — read-only + observations only**
@@ -214,6 +240,26 @@ verified: 5dcd9fd4 2026-08-07
   wired) — root cause of a 2026-07-03 fabricated follow-up. Sacred-board companion: an
   autonomous/dispatched session's `follow_up_create` (source=`ego_dispatch`) is routed to
   the cold `tabled` lane, never the hot board (`mcp/health/follow_up_tools.py`).
+
+- **Secure-by-default MCP scoping (ALL autonomous sessions)** — `CCInvocation.
+  strict_mcp_config` defaults to **True** (`cc/types.py`), so `--mcp-config` is
+  authoritative and the operator's user-scoped `~/.claude.json` servers (additive
+  without strict — probe-verified 2026-08-09) never leak into a background session.
+  `_build_args` suppresses the flag under `--bare` (bare+strict exits non-zero,
+  probe-verified). This is the class fix behind the reflection lockdown above:
+  ~15 autonomous `CCInvocation` sites (reflection, sentinel, inbox/mail, direct_session,
+  ego cycle, autonomy executor/research) were leaking user-scoped MCP write tools.
+  Foreground/interactive sites (`cc/conversation.py` ×3, `cc/checkpoint.py`) opt out
+  with `strict_mcp_config=False` to keep the full toolset; a forgotten site fails
+  closed (zero MCP), never open. The weekly reflection arms
+  (`run_weekly_assessment`/`run_quality_calibration`) now route through the shared
+  `_reflection_lockdown_kwargs` helper alongside `_reflect_inner` (they previously ran
+  unrestricted). `autonomy/executor/step_dispatcher` pins CODE/VERIFICATION steps to
+  the genesis-only `reflection` MCP profile (keeps memory/health, drops the
+  arbitrary-source-edit servers; code edits flow through the audited Write/Edit
+  built-ins). Defense-in-depth: `_USER_SCOPED_MCP_WILDCARDS` denied by name in
+  `_UNIVERSAL_DISALLOW` + the reflection denylist. Guards:
+  `tests/test_cc/test_mcp_strict_default.py`, `tests/test_cc/test_invoker.py`.
 
 - `cc/direct_session.py` + `cc/conversation.py` (both >1000 LOC; split
   candidates). Profile machinery: `PROFILES`, `_PROFILE_ADDENDA`,
@@ -425,7 +471,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: d37d2214 2026-08-06
+verified: 557d3587 2026-08-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -437,8 +483,12 @@ verified: d37d2214 2026-08-06
 - **inbox/**: file-drop monitor with approval-gated dispatch; phase order
   resume → detect → create → dispatch; `approval_key_stable=True` (ONE
   site-level approval key). The refresh path folds parked files into the
-  batch so approvals fire once (#914). Coherence + URL-failure heuristics gate
-  dispatch.
+  batch so approvals fire once (#914). A pending approval is HELD until the
+  user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
+  when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
+  still references it (`count_live_rows_for_approval`); this replaced the old
+  4h staleness cancel that re-detected unchanged files and nagged. Coherence +
+  URL-failure heuristics gate dispatch.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -460,6 +510,20 @@ verified: d37d2214 2026-08-06
   notification's `latest_comment_url` and pinging immediately in `live`.
   `off`/`observe`/`live` lever + `notifications` reason-allowlist in
   `github_steward_config`.
+- **recon/career_outreach.py** (`CareerOutreachMonitor`) — the recon entry that
+  not only pushes but ACTS: a daily surplus-cron ACTUATOR driving a configured
+  external career-agent module (SSH CC dispatch, declared in the install's
+  `~/.genesis` module overlay) to stage first-touch outreach drafts into the
+  owner's mail Drafts (the module never sends — owner clicks Send), then pushing
+  ONE Telegram nudge for newly-staged drafts. Ships `off` (`career_outreach_config`
+  `off`/`observe`/`live` + `GENESIS_CAREER_OUTREACH_DISABLED` kill). Bridge
+  lazy-resolved at tick; `execute_operation` returns an error DICT (never raises)
+  so a dispatch error surfaces → job-health failure; `check_health_cached` gates;
+  absent-module → clean no-op (generic installs). The external engine's own
+  staged-draft state is the source of truth; a `career_outreach_nudged` observation is the
+  per-company nudge-dedup ledger so a re-tick / undelivered nudge never
+  double-nudges. ONE daily job (`max_instances=1` is per-job; a second would race
+  the single remote). Discovery-sweep driving is GROUNDWORK-deferred.
 - **web/**: stateless search (SearXNG primary, Brave fallback) + httpx fetch
   (50k-char cap), sanitizer-wrapped; consumed via importers (MCP web tools,
   research, recon, pipeline), not runtime init.
@@ -477,7 +541,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 0eb21377 2026-07-10
+verified: 0017242d 2026-08-11
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -494,7 +558,22 @@ verified: 0eb21377 2026-07-10
   is only the MIT origin of the Telegram transport code. Device/edge-side voice
   software (firmware, esphome, S2S/ambient bridges, edge deploy) lives in the
   separate `GENesis-Voice` repo — `channels/voice/` here is only the in-runtime
-  channel.
+  channel. **Voice memory surface** (verified 2026-08-11): the S2S session is NOT
+  memory-blind — `genesis_bridge.get_system_prompt` injects USER.md identity +
+  essential-knowledge Active Context, exposes an `ask_genesis` pull-recall tool
+  (searches the EXTRACTED long-term index only via `HybridRetriever.recall`, so it
+  lags the 1-2h extraction cycle and has NO recency path), and each conversation
+  lands as a transcript + `cc_sessions(source_tag='voice')` row mined by
+  `memory/extraction_job.py`. **Cross-session recency resume** (`voice_recency.py`,
+  gated by `voice_recency_resume` — ships `off`, armed after live E2E): at session
+  start `get_system_prompt` injects the age-stamped tail of the most-recent prior
+  voice conversation, read DIRECTLY from the transcript via a sync `mode=ro` sqlite
+  lookup keyed on `last_activity_at` (NOT status — the 300s idle reaper coincides
+  with the edge's 300s reconnect cache, so a status filter would miss the just-ended
+  session at the exact moment a new one starts), fail-closed to `""`.
+  `cc_sessions.satellite_id` (added via `_migrate_add_columns`, not the base
+  `CREATE TABLE` — mirrors `last_extracted_*`) persists the device for the optional
+  `per_device` scope; default `global`.
 - **dashboard/**: Flask blueprint at `/genesis` (~45 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
   thread detects degraded-but-alive Flask; web terminal.
@@ -1109,7 +1188,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: b662f3e3 2026-07-17
+verified: 3c514f3e 2026-08-10
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -1133,7 +1212,15 @@ verified: b662f3e3 2026-07-17
   bool (no runtime import on the hot path); web-search/autonomy-posture/surplus are
   enrichment, never tier gates (autonomy has no on/off switch — it's always
   initialised and gated per-action by the mandatory approval gate). `setup-status`
-  emits `tier`/`tier_name`/`telegram_configured`/`ego_enabled` additively.
+  emits `tier`/`tier_name`/`telegram_configured`/`ego_enabled` additively, plus
+  non-gating **enrichment** from `readiness.compute_enrichment` +
+  `autonomy.config_read.read_autonomy_default_level` (fail-safe, presence-based):
+  `web_search_keyed_providers` (premium providers augmenting the keyless SearXNG
+  baseline), `voice_configured` (explicit `VOICE_S2S_PROVIDER` opt-in — a bare
+  OpenAI LLM key does NOT count), `ego_cadence_minutes`, and `autonomy_level`
+  (shipped config default, not the live earned level). The persistent Overview
+  **Readiness panel** that renders the tier rail + these enrichment chips (config-
+  framed, refreshed on return to Overview) is **PR-B2b** — shipped.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Two
   schema paths coexist: base DDL (`schema/_tables.py`, ~113 CREATE TABLE; docs

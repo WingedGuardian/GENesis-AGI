@@ -1,0 +1,32 @@
+[Unit]
+Description=Genesis cc-tmp isolation — opportunistic dedicated-volume apply (cold-start + timer)
+# Run in the ONE deterministically CC-quiet window: after the container is up but
+# BEFORE genesis-server starts (it spawns ego/background CC sessions) and before
+# an interactive session attaches. The host-side apply skips while any CC session
+# is live, so this ordering is what lets it converge on an otherwise-busy install.
+# The script bounds its own SSH (ConnectTimeout=10 + timeout 90) and is a clean
+# no-op without a guardian, so an unreachable host adds only the connect timeout
+# to boot before genesis-server proceeds; a miss is non-fatal (marker + posture
+# nag carry the state) and the timer / next cold-start converge.
+Before=genesis-server.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/cc_tmp_align_host.sh
+# Cap above the script's own 90s SSH bound so a slow host is SIGTERMed rather than
+# blocking boot indefinitely; the common (quiet/unreachable) paths return in seconds.
+TimeoutStartSec=120
+# Needs ssh + flock (/usr/bin) and the venv python (absolute path). No sudo/npm —
+# the host-side cc-tmp-apply verb owns its own incus privilege — so a hardened
+# NoNewPrivileges/ProtectSystem=strict sandbox is safe.
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# Home-scoped: writes only the single-flight lock + the apply marker under ~/.genesis.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h
+
+[Install]
+WantedBy=default.target

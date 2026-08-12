@@ -103,7 +103,7 @@ def _build_operational_brief() -> str:
 _BACKOFF_SCHEDULE_S: tuple[float, ...] = (0.0, 15 * 60, 45 * 60, 2 * 60 * 60)
 _ESCALATE_AT_ATTEMPT = len(_BACKOFF_SCHEDULE_S) + 1  # 5
 
-# Ring buffer size for 2-of-N debouncing. Jay was explicit: "It doesn't need
+# Ring buffer size for 2-of-N debouncing. The user was explicit: "It doesn't need
 # to be two consecutive ticks — it's just two out of three. Consecutive or not."
 _ALARM_RING_SIZE = 3
 _ALARM_CONFIRMATION_COUNT = 2

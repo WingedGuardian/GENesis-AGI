@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from genesis.cc import rate_limit_park, roster
 from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
+from genesis.cc.session_config import _USER_SCOPED_MCP_WILDCARDS
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -151,6 +152,16 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
     "mcp__genesis-memory__knowledge_ingest_source",
+    # ── User-scoped MCP servers (defense-in-depth) ────────────────
+    # strict_mcp_config (CCInvocation default True) already drops these by making
+    # --mcp-config authoritative; deny them by name too so a site that opts out of
+    # strict — or a future CC scoping change — still can't reach their
+    # arbitrary-source-edit / graph-mutation tools (serena replace_symbol_body,
+    # gitnexus rename, codebase-memory delete_project), which bypass the Edit/Write
+    # PreToolUse hooks entirely. NOT exhaustive (a NEW user-scoped server wouldn't be
+    # listed) — strict is the categorical guarantee; this is belt-and-suspenders.
+    # Shared with build_reflection_disallowed via _USER_SCOPED_MCP_WILDCARDS.
+    *_USER_SCOPED_MCP_WILDCARDS,
 ]
 
 _NO_OUTREACH_SEND = [
@@ -1321,6 +1332,14 @@ class DirectSessionRunner:
         # observe/research get health + memory only.
         mcp_profile = _PROFILE_TO_MCP.get(request.profile, "reflection")
         mcp_config = self._config_builder.build_mcp_config(profile=mcp_profile)
+        # Secure-by-default: strict_mcp_config (CCInvocation default True) makes the
+        # generated --mcp-config authoritative, dropping the user-scoped ~/.claude.json
+        # servers. Honor an EXPLICIT mcp_profile="full" (a deliberate, trusted
+        # install-local overlay choice — build_mcp_config returns None there so CC uses
+        # its full default config) by opting that dispatch OUT of strict: "full" must
+        # mean full. Every other profile stays strict, so a None returned for an
+        # unknown/failed profile fails CLOSED to zero servers (never a silent full-leak).
+        strict_mcp = mcp_profile != "full"
 
         # Prepend planning instruction if the caller opted in.
         prompt = request.prompt
@@ -1382,6 +1401,7 @@ class DirectSessionRunner:
             origin=_PROFILE_ORIGIN.get(request.profile),
             claude_code_tmpdir=_bg_session_sandbox(session_id),
             mcp_config=mcp_config,
+            strict_mcp_config=strict_mcp,
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
             roster_eligible=roster_eligible,
             **routing,

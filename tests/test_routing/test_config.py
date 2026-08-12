@@ -167,7 +167,8 @@ def test_load_full_yaml(monkeypatch):
     # added (entity-node merge-vs-distinct drainer).
     # 2026-08-07: 59 → 60 after 41_reflection_json_salvage added (deep-reflection
     # prose-output salvage retry).
-    assert len(cfg.call_sites) == 60
+    assert len(cfg.call_sites) == 61
+    assert "dream_cycle_relationship_classify" in cfg.call_sites  # MW-2 classifier (2026-08-10)
     assert "41_reflection_json_salvage" in cfg.call_sites  # deep-reflection salvage (2026-08-07)
     assert cfg.call_sites["repo_pulse"].dispatch == "cli"
     assert cfg.call_sites["repo_pulse"].chain == []

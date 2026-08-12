@@ -1035,3 +1035,34 @@ def test_local_overlay_overrides_yaml(tmp_path: Path):
     policy = load_autonomous_cli_policy(base)
     assert policy.manual_approval_required is True
     assert policy.source == f"config:{base.name}"
+
+
+def test_committed_policy_ships_manual_approval_required_true():
+    """GUARDRAIL: the COMMITTED config/autonomous_cli_policy.yaml must ship
+    ``manual_approval_required: true`` so a fresh clone with no local overlay is
+    safe-by-default — the autonomous-CLI approval gate ON.
+
+    This reads the committed file DIRECTLY (raw YAML, bypassing
+    ``merge_local_overlay``) so it pins the *shipped artifact* regardless of any
+    machine-local ``*.local.yaml`` override. It is the class-fix that would have
+    caught the 2026-04 drift (commit ``f1ed1949``) which silently shipped the
+    gate OFF for every fresh clone while this host stayed safe only via an
+    untracked overlay.
+
+    The gate is MANDATORY & non-negotiable — see the banner on
+    ``AutonomousCliPolicy`` (cli_policy.py), CLAUDE.md "## Traps", and CC memory
+    ``cli_gate_not_negotiable``. Never ship it default-off.
+    """
+    import yaml
+
+    from genesis.autonomy.cli_policy import _CONFIG_PATH
+
+    assert _CONFIG_PATH.exists(), f"committed policy file missing: {_CONFIG_PATH}"
+    raw = yaml.safe_load(_CONFIG_PATH.read_text())
+    assert isinstance(raw, dict), f"policy file is not a mapping: {_CONFIG_PATH}"
+    assert raw.get("manual_approval_required") is True, (
+        "SECURITY: config/autonomous_cli_policy.yaml must ship "
+        "manual_approval_required: true (safe-by-default). "
+        f"Found {raw.get('manual_approval_required')!r}. The autonomous-CLI "
+        "approval gate is mandatory & non-negotiable; never ship it default-off."
+    )
