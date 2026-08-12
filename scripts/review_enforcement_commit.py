@@ -485,13 +485,19 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
 
     Only HEAD-MOVING forms are assessed, to avoid false-blocking file restores
     (``git checkout HEAD~1 -- f`` / ``git checkout main f.py``, which leave HEAD put):
-      * ``-c/-C/-b/-B <name>`` → creates+switches to ``<name>`` (HEAD-moving);
+      * the branch-create flags ``-c/-C`` (switch) / ``-b/-B`` (checkout) → the name
+        they carry is created+checked-out (HEAD-moving). Their value may be a
+        SEPARATE token (``-B main``), ATTACHED (``-Bmain``), inside a short CLUSTER
+        (``-qBmain`` / ``-qB main``), or a long ``--create=``/``--force-create=``
+        form (Codex P1 #1371 — a bare-token check let ``-Bmain`` reach main);
       * bare ``git switch <branch>`` → HEAD-moving;
       * bare ``git checkout <x>`` → HEAD-moving ONLY as the pure switch form: no
         ``--`` and exactly ONE operand (``checkout <ref> <path>`` or ``checkout --
         <path>`` is a restore → not assessed).
     argv is quote-stripped by shell_parse, so a ``$VAR`` target survives as a literal
-    ``$…`` token and reads as unresolvable."""
+    ``$…`` token and reads as unresolvable. ACCEPTED RESIDUE (deliberate-evasion,
+    outside the accident model — like the alias/symbolic-ref note above): a git long-
+    option ABBREVIATION of the create flags (``--force-c=main``) is not matched."""
     sub = git_subcommand(argv)
     # advance past git global options to just after the subcommand token
     i = 1
@@ -504,9 +510,11 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
             continue
         break
     i += 1
-    new_branch_vals: list[str] = []  # -c/-C/-b/-B values → definitely HEAD-moving
+    new_branch_vals: list[str] = []  # branch-create flag values → definitely HEAD-moving
     positionals: list[str] = []
     has_dashdash = False
+    _CREATE_SHORTS = "bBcC"  # checkout -b/-B, switch -c/-C — all NAME the new branch
+    _CREATE_LONGS = ("--create", "--force-create")  # switch long forms; value = branch
     while i < len(argv):
         t = argv[i]
         if t == "--":
@@ -516,11 +524,32 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
             positionals.append("-")
             i += 1
             continue
-        if t in ("-c", "-C", "-b", "-B") and i + 1 < len(argv):
-            new_branch_vals.append(argv[i + 1])
-            i += 2
+        if t.startswith("--"):
+            name, eq, val = t.partition("=")
+            if name in _CREATE_LONGS:
+                if eq:
+                    new_branch_vals.append(val)  # --force-create=main
+                elif i + 1 < len(argv):
+                    new_branch_vals.append(argv[i + 1])  # --create main
+                    i += 1
+            i += 1
             continue
-        if t.startswith("-"):
+        if t.startswith("-") and len(t) > 1:
+            # Decompose the short cluster letter-wise (pflag semantics — see
+            # feedback_cli_guard_pflag_clustering): a branch-create letter takes the
+            # REST of the token as its value if any (``-Bmain`` / ``-qBmain``), else
+            # the NEXT token (``-B main`` / ``-qB main``). Boolean letters (q/f/…)
+            # before it are consumed in place.
+            letters = t[1:]
+            for j, ch in enumerate(letters):
+                if ch in _CREATE_SHORTS:
+                    rest = letters[j + 1 :]
+                    if rest:
+                        new_branch_vals.append(rest)
+                    elif i + 1 < len(argv):
+                        new_branch_vals.append(argv[i + 1])
+                        i += 1
+                    break
             i += 1
             continue
         positionals.append(t)
@@ -653,6 +682,19 @@ def main() -> None:
     # main/master or is unresolvable; a literal non-main target (`git checkout -b
     # feature && git commit`, the flow this gate itself recommends) carries no
     # direct-to-main risk and stays allowed.
+    #
+    # SCOPE IS CONSCIOUSLY BOUNDED — do NOT keep adding forms one at a time (user
+    # decision 2026-08-12, after the escalation cap fired on this axis). This covers
+    # the COMMON, accident-plausible ways HEAD reaches main before a commit — bare
+    # `switch/checkout main`, `-b/-B/-c/-C main` (separate / attached / clustered /
+    # long `--create=`), `-`/`$VAR` targets. The exotic HEAD-movers — a git long-option
+    # ABBREVIATION (`--force-c=main`), reflog `@{-1}`, a remote-tracking ref resolving
+    # to main, `git symbolic-ref`, and user checkout ALIASES (`co`) — are ACCEPTED
+    # RESIDUE: they are deliberate-evasion, outside this accident-prevention gate's
+    # threat model (a deliberate evader already has `python -c 'subprocess…'`, which no
+    # Bash-string guard can see). A future Codex/architect finding of one of THOSE is
+    # a `tabled` residue record, NOT another patch here (feedback_no_handrolled_shell_
+    # parsing_for_guards / feedback_cli_guard_pflag_clustering).
     if all_commit_segs:
         last_commit_i = max(i for i, s in enumerate(segs) if git_subcommand(s.argv) == "commit")
         for i, s in enumerate(segs):

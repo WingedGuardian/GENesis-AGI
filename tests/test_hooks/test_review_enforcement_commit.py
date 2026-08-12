@@ -1389,6 +1389,50 @@ def test_switch_to_variable_branch_before_commit_blocks(repo: Path, home: Path) 
     assert "switches branches" in res.stderr
 
 
+def test_attached_short_branch_create_to_main_blocks(repo: Path, home: Path) -> None:
+    # Codex P1 (round 3): the branch-create value ATTACHED to the short flag
+    # (`git checkout -Bmain` / `git switch -Cmain`) — a bare-token check skipped it,
+    # letting HEAD reach main. Verified vs real git: `checkout -Bmain` lands on main.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git checkout -Bmain && git commit --allow-empty -m bypass",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_clustered_short_branch_create_to_main_blocks(repo: Path, home: Path) -> None:
+    # A boolean short flag clustered before the create flag: `-qB main` → -q + -B main.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git checkout -qB main && git commit --allow-empty -m x", repo, home
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_long_force_create_to_main_blocks(repo: Path, home: Path) -> None:
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git switch --force-create=main && git commit --allow-empty -m x",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "switches branches" in res.stderr
+
+
+def test_attached_short_branch_create_to_feature_allowed(repo: Path, home: Path) -> None:
+    # The attached form to a NON-main branch (`git switch -cfeature`) must stay allowed.
+    _mark(repo, home)
+    res = _run_hook(
+        f"cd {repo} && git switch -cfeature/x && git commit --amend --no-edit", repo, home
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
 def test_create_branch_then_commit_still_allowed(repo: Path, home: Path) -> None:
     # The flow the gate ITSELF recommends — create a NON-main branch and commit —
     # must NOT be blocked by the branch-mutation guard.
