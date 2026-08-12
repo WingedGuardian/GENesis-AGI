@@ -60,6 +60,21 @@ def _liveness_probe_refused():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_alert_queue():
+    """Insulate the REAL alert queue: _alert_flap/_alert_starved enqueue to a
+    hardcoded ~/.genesis/alerts/queue, so any test reaching them unpatched
+    writes a production alert that the live server drains to the owner's
+    Telegram (this happened — test-generated 'flap-damping' alerts with
+    test-sized backoff values were delivered as if they were real incidents).
+    Both call sites import enqueue_alert at call time, so patching the source
+    module attribute intercepts them; per-test `patch(...)` layers on top for
+    call assertions.
+    """
+    with patch("genesis.guardian.alert.queue.enqueue_alert", return_value=True):
+        yield
+
+
 @pytest.fixture()
 def fresh_status(tmp_path: Path) -> Path:
     """Write a fresh status.json and return the path."""
