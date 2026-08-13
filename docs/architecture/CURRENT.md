@@ -1015,9 +1015,9 @@ verified: fbcf8ee4 2026-07-21
   **skill-edit Critic** (`skills/skill_edit_critic.py` +
   `eval/rubrics/skill_edit_regression.py`) that screens for self-modification
   pathologies via the `judge` call site and logs a `skill_evolution_gate`
-  verdict (WS1 shadow). The `autonomy_level` param + validator wiring are
-  retained as (currently unwired) groundwork for the future WS1 `enforce`
-  mode. A complementary **held-out replay
+  verdict (WS1 shadow). The validator suite above is live (advisory); only the
+  `autonomy_level` param is retained as (currently unread) groundwork for the
+  future WS1 `enforce` mode. A complementary **held-out replay
   gate** (`eval/skill_replay/`, tool `skill_replay_run`) goes further — it
   REPLAYS a frozen per-skill golden suite (`~/.genesis/eval/skill_golden/`,
   authored via `eval/skill_golden_set.py`) against OLD vs NEW content in
