@@ -208,6 +208,10 @@ def _serialize_result(result: SentinelResult) -> str:
         "observation_id": result.observation_id,
         "reason": result.reason,
         "duration_s": result.duration_s,
+        # Persist the degraded marker so a parked-then-resumed run keeps its
+        # propose-only provenance (else resume deserializes degraded=False and
+        # the safety marker is lost). _deserialize_result reads it generically.
+        "degraded": result.degraded,
     })
 
 

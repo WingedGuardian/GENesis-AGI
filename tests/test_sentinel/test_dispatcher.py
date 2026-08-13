@@ -1389,3 +1389,18 @@ class TestDegradedMcpConfig:
 
         assert result.degraded is False
         assert result.resolved is True  # heuristic unchanged for healthy sessions
+
+    def test_degraded_flag_survives_serialize_roundtrip(self):
+        # A parked-then-resumed degraded run must keep its propose-only marker,
+        # else resume_from_approval deserializes degraded=False (safety lost).
+        from genesis.sentinel.dispatcher import _deserialize_result, _serialize_result
+
+        r = SentinelResult(
+            dispatched=True, diagnosis="x", proposed_actions=[{"a": 1}], degraded=True
+        )
+        back = _deserialize_result(_serialize_result(r))
+        assert back is not None
+        assert back.degraded is True
+        # Control: non-degraded round-trips as False.
+        r2 = SentinelResult(dispatched=True, degraded=False)
+        assert _deserialize_result(_serialize_result(r2)).degraded is False
