@@ -229,9 +229,10 @@ verified: 51253c67 2026-08-13
   a fresh, unrestricted toolset. `Agent` is the current CC tool name; `Task` the obsolete
   alias; `Workflow` orchestrates subagents; `Skill` can run in a subagent. The denylists
   had drifted (sentinel-degraded blocked the class, reflection blocked all but `Agent`,
-  surplus/inbox/mail/experimentation blocked only a subset — or none); the read-only sites
-  now all reference `SPAWN_TOOL_NAMES` — reflection (`_REFLECTION_DENY_BUILTINS`), surplus
-  (`_READONLY_DISALLOWED`), the inbox/mail judges, and the experimentation completion.
+  inbox/mail/experimentation blocked only a subset); the read-only CC sessions now all
+  reference `SPAWN_TOOL_NAMES` — reflection (`_REFLECTION_DENY_BUILTINS`), the inbox/mail
+  judges, and the experimentation completion (each asserted against the LIVE
+  `--disallowedTools` value, not an orphaned constant).
   `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS` keeps its own literal (deliberate
   import-cycle avoidance) but is held ⊇ by `tests/test_cc/test_spawn_lockdown.py`, which
   locks the class so a new read-only denylist that forgets spawn-blocking fails CI.

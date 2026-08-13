@@ -4,17 +4,22 @@ A read-only reasoning session escapes its lockdown if it can spawn a child that 
 with a fresh, unrestricted toolset (Bash/Write/Edit). The spawn/escape class is
 Agent (current subagent tool) + Task (obsolete alias) + Workflow (orchestrates
 subagents) + Skill (some run in a subagent) — the full set in ``SPAWN_TOOL_NAMES``.
-The denylists had DRIFTED (reflection blocked all four; surplus/inbox/mail/
-experimentation blocked only a subset — or none). This test locks the class to a
-single source of truth so a new read-only denylist that forgets it fails CI.
+The denylists had DRIFTED (reflection blocked all four; inbox/mail/experimentation
+blocked only a subset). This test locks the class to a single source of truth so a new
+read-only denylist that forgets it fails CI. Each assertion targets what the LIVE
+session actually feeds to ``claude -p``'s ``--disallowedTools`` (reflection via
+``build_reflection_disallowed``; the inbox/mail/experimentation constants ARE the value
+passed to their ``CCInvocation``), not an orphaned constant.
 
-Scope: the strictly READ-ONLY reasoning sessions where spawning is always an escape —
-reflection, surplus, the inbox/mail judges, the experimentation single-turn completion,
-and sentinel-degraded. Deliberately NOT covered here (they legitimately spawn/orchestrate
-or hold broader tools, and need a separate design — tracked follow-up):
-``cc/direct_session`` (its ``research`` profile runs a documented deep-research
-``Workflow``), ``autonomy/executor/research.py`` + ``step_dispatcher``, and the eval
-bench (full builtins by design, for fairness).
+Scope: the strictly READ-ONLY *CC sessions* where spawning is always an escape —
+reflection, the inbox/mail judges, the experimentation single-turn completion, and
+sentinel-degraded. Deliberately NOT covered here:
+- ``surplus`` — NOT a CC session: the live ``SurplusLLMExecutor`` runs via the tool-less
+  Router (no ``claude -p``, no spawn tools to deny), so it is outside this scope.
+- ``cc/direct_session`` (its ``research`` profile runs a documented deep-research
+  ``Workflow``), ``autonomy/executor/research.py`` + ``step_dispatcher`` — legitimately
+  spawn/orchestrate; need a separate design (tracked follow-up).
+- the eval bench — full builtins by design (fairness).
 """
 
 from __future__ import annotations
@@ -35,14 +40,10 @@ def test_spawn_tool_names_pins_the_whole_spawn_class():
 def test_reflection_denies_spawn():
     from genesis.cc.session_config import SessionConfigBuilder
 
+    # Assert the LIVE reflection invocation denylist (build_reflection_disallowed),
+    # not just a constant — this is what reflection_bridge feeds to disallowed_tools.
     disallowed = set(SessionConfigBuilder().build_reflection_disallowed())
     assert disallowed >= _SPAWN, f"reflection must deny {_SPAWN - disallowed}"
-
-
-def test_surplus_readonly_denies_spawn():
-    from genesis.cc.session_config import _READONLY_DISALLOWED
-
-    assert set(_READONLY_DISALLOWED) >= _SPAWN
 
 
 def test_sentinel_degraded_denies_spawn():

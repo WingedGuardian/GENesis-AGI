@@ -9,8 +9,9 @@ from enum import StrEnum
 from pathlib import Path
 
 # CC's spawn/escape-class tool names — the single source of truth for the strictly
-# READ-ONLY reasoning sessions (reflection, surplus, the inbox/mail judges, the
-# experimentation completion, sentinel-degraded), where spawning is ALWAYS an escape.
+# READ-ONLY CC sessions (reflection, the inbox/mail judges, the experimentation
+# completion, sentinel-degraded), where spawning is ALWAYS an escape. (Surplus is NOT
+# here: its live executor runs via the tool-less Router, not a claude -p session.)
 # Each of these lets a CHILD escape the lockdown with a fresh, unrestricted toolset
 # (Bash/Write/Edit):
 #   Agent    — spawns a subagent (the CURRENT Claude Code tool name; registered in

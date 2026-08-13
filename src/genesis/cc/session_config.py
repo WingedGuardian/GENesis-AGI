@@ -21,9 +21,12 @@ _READONLY_DISALLOWED = [
     "Edit",
     "Bash",
     "NotebookEdit",
-    # Spawn tools: a subagent would escape the read-only lockdown (fresh toolset).
-    *SPAWN_TOOL_NAMES,
 ]
+# NOTE: not spawn-locked — the live surplus path (SurplusLLMExecutor) runs via the
+# tool-less Router (surplus/executor.py), NOT a claude -p CC session, so it has no
+# spawn tools to deny; build_surplus_config()'s disallowed_tools is consumed only for
+# its system_prompt (direct_session.py). Surplus is intentionally outside the
+# spawn-lockdown scope (test_cc/test_spawn_lockdown.py).
 
 # NOTE: Destructive git operations (force push, hard reset, clean) are guarded
 # by PreToolUse hooks in .claude/settings.json, NOT by disallowed_tools.

@@ -43,9 +43,9 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 ### Fixed
 
 - **Read-only reasoning sessions can no longer escape their sandbox by spawning.**
-  Genesis's strictly read-only sessions (deep/strategic reflection, surplus
-  brainstorm, the inbox/mail judges, and the experimentation completion) run with a
-  locked-down toolset. That lockdown blocked the obsolete subagent-spawn tool name
+  Genesis's strictly read-only Claude Code sessions (deep/strategic reflection, the
+  inbox/mail judges, and the experimentation completion) run with a locked-down
+  toolset. That lockdown blocked the obsolete subagent-spawn tool name
   but not the current one — nor the `Workflow`/`Skill` spawn paths — so such a
   session could in principle spawn a child that ran with full, unrestricted tools.
   These denylists now deny the whole spawn class (subagent, workflow, and skill
