@@ -8,19 +8,22 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
-# CC's spawn/escape-class tool names — the single source of truth for every
-# restricted-session denylist. A locked-down session (reflection, surplus, the
-# direct-session profiles, the inbox/mail judges, the experimentation completion,
-# sentinel-degraded) MUST deny ALL of these: each lets a CHILD escape the lockdown with
-# a fresh, unrestricted toolset (Bash/Write/Edit). They are:
+# CC's spawn/escape-class tool names — the single source of truth for the strictly
+# READ-ONLY reasoning sessions (reflection, surplus, the inbox/mail judges, the
+# experimentation completion, sentinel-degraded), where spawning is ALWAYS an escape.
+# Each of these lets a CHILD escape the lockdown with a fresh, unrestricted toolset
+# (Bash/Write/Edit):
 #   Agent    — spawns a subagent (the CURRENT Claude Code tool name; registered in
 #              util/tool_bootstrap.py CC_TOOLS, matched by the PreToolUse hook in
 #              .claude/settings.json).
 #   Task     — the OBSOLETE name for Agent, retained so a re-introduction is also denied.
-#   Workflow — orchestrates/spawns subagents (verified reachable INSIDE background
-#              sessions — see docs/.claude/background-sessions.md: a dispatched Workflow
-#              runs to completion there).
+#   Workflow — orchestrates/spawns subagents (reachable inside background sessions —
+#              see .claude/docs/background-sessions.md).
 #   Skill    — invokes a skill, some of which run in a subagent.
+# NOT applied to ``cc/direct_session`` (its ``research`` profile runs a DOCUMENTED
+# deep-research Workflow — .claude/docs/background-sessions.md) or the autonomy-executor
+# sessions; those legitimately spawn/orchestrate and need a separate design (a
+# sandbox-preserving Workflow, or an accepted-porousness decision) — tracked follow-up.
 # Blocking the bare tool name removes it from the model's context entirely — and only
 # --disallowedTools removes a tool (--allowedTools does NOT, under
 # --dangerously-skip-permissions; verified empirically 2026-08-07 via the init-event

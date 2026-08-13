@@ -223,20 +223,22 @@ modules: [cc]
 verified: 51253c67 2026-08-13
 ```
 
-- **Subagent-spawn lockdown — one source of truth across ALL restricted sessions**
-  (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A locked-down
-  session must deny the whole spawn/escape class, or it escapes its lockdown by spawning
-  a child that inherits a fresh, unrestricted toolset. `Agent` is the current CC tool
-  name; `Task` the obsolete alias; `Workflow` orchestrates subagents (reachable in
-  background sessions); `Skill` can run in a subagent. The denylists had drifted (sentinel-degraded blocked both, reflection
-  blocked only `Task`, direct-session + surplus blocked neither); all now reference
-  `SPAWN_TOOL_NAMES` — reflection (`_REFLECTION_DENY_BUILTINS`), surplus
-  (`_READONLY_DISALLOWED`), every direct-session profile (`_UNIVERSAL_DISALLOW` + a
-  per-request `tool_exceptions` discard + `add_profile` inject), the inbox/mail judges,
-  and the experimentation completion. `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS`
-  keeps its own literal (deliberate import-cycle avoidance) but is held ⊇ by
-  `tests/test_cc/test_spawn_lockdown.py`, which locks the whole class so a new
-  restricted-session denylist that forgets spawn-blocking fails CI.
+- **Subagent-spawn lockdown — one source of truth across the READ-ONLY sessions**
+  (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A strictly
+  read-only reasoning session escapes its lockdown if it can spawn a child that inherits
+  a fresh, unrestricted toolset. `Agent` is the current CC tool name; `Task` the obsolete
+  alias; `Workflow` orchestrates subagents; `Skill` can run in a subagent. The denylists
+  had drifted (sentinel-degraded blocked the class, reflection blocked all but `Agent`,
+  surplus/inbox/mail/experimentation blocked only a subset — or none); the read-only sites
+  now all reference `SPAWN_TOOL_NAMES` — reflection (`_REFLECTION_DENY_BUILTINS`), surplus
+  (`_READONLY_DISALLOWED`), the inbox/mail judges, and the experimentation completion.
+  `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS` keeps its own literal (deliberate
+  import-cycle avoidance) but is held ⊇ by `tests/test_cc/test_spawn_lockdown.py`, which
+  locks the class so a new read-only denylist that forgets spawn-blocking fails CI.
+  **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
+  DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
+  the autonomy-executor sessions; those legitimately spawn/orchestrate and need a
+  sandbox-preserving Workflow or an accepted-porousness decision.
 
 - **Reflection tool lockdown — read-only + observations only**
   (`session_config.build_reflection_disallowed`, wired at `reflection_bridge/_bridge.py`

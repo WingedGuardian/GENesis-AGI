@@ -596,9 +596,7 @@ def test_overlay_add_profile_registers_into_all_dicts(overlay_ctx):
         mcp_profile="campaign",
         skills=["voice-master"],
     )
-    # add_profile spawn-locks every overlay profile unconditionally (SPAWN_TOOL_NAMES
-    # prepended), so an install-local overlay can never opt out of spawn denial.
-    assert ds.PROFILES["ztest-profile"] == ["Agent", "Task", "Workflow", "Skill", "Edit", "Bash"]
+    assert ds.PROFILES["ztest-profile"] == ["Edit", "Bash"]
     assert ds._PROFILE_ADDENDA["ztest-profile"] == "hello"
     assert ds._PROFILE_BASH_ALLOWLIST["ztest-profile"] == ("gh",)
     assert ds._PROFILE_TO_MCP["ztest-profile"] == "campaign"
