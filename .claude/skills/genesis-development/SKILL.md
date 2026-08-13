@@ -311,6 +311,22 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   through the server/CRUD path; reserve `immutable=1` for historical
   read-only sampling where a little staleness is fine. (A reconcile UPDATE
   read clean under `mode=ro` but appeared unchanged under `immutable=1`.)
+- **Never hand-roll `gh`/bash/CLI argv parsing inside a hook or security gate.**
+  Re-implementing shell/`gh` command-line semantics by hand (regex, manual token
+  walking) creates an effectively UNBOUNDED adversarial-divergence tail: a good
+  reviewer (Codex especially) will keep surfacing real gaps from true semantics —
+  `--repo`/`-R`/`-Rvalue`, `GH_REPO`, `cd`, `&&`, `||`, `--body-file -`, duplicate
+  flags, URL-vs-branch targets, enterprise hosts, `--help`, nested `bash -c` — and
+  each named fix ships the next round's bug. This is the mechanism behind the
+  measured Codex review-loop (an internal analysis of recent review-looping PRs:
+  first-round findings were real catchable bugs, but later rounds were dominated by
+  fix-churn on the hand-rolled parser itself — no finite pre-push audit bounds that
+  tail). The cure is architectural,
+  not "review harder": bind atomically to the real tool (e.g. `gh pr merge
+  --match-head-commit`), fail CLOSED on any form you cannot parse, and use a
+  canonical parser (`shlex`/`bashlex`) — never bespoke semantics. Same family as
+  the canonical-parser lesson (regex→yaml, #1393). Loci today:
+  `scripts/hooks/shell_parse.py` + `scripts/hooks/git_push_guard.py`.
 
 ### Iterative-Refinement Discipline
 
@@ -471,6 +487,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
 ### Review-loop discipline
 
+- **Run the pre-push adversarial pass with `/deep-review`** (`.claude/commands/deep-review.md`):
+  one command that dispatches a fresh-context `genesis-architect` (+ `genesis-security-reviewer`
+  on security surfaces) over the FULL branch diff with the right SHAPE — fail-open/state/TOCTOU/
+  hand-rolled-parsing hunting, not a lint/secrets scan — and writes the evidence marker. This is
+  the review that catches Round-1 bugs before Codex does; `/audit-changes` is only a light
+  self-check.
 - **One reviewer at a time — NEVER run two review agents simultaneously.** Run
   one reviewer (e.g. Codex), apply/verify its findings, then run the next
   reviewer (e.g. Claude) on the *fixed* code — sequential, never in parallel.
