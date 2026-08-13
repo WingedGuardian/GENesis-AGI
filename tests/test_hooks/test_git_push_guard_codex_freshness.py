@@ -402,8 +402,13 @@ class TestPostReviewDeltaClassify:
     def test_identical_is_inline(self, monkeypatch):
         assert self._lvl(monkeypatch, _compare_json("identical")) == "inline"
 
-    def test_behind_is_inline(self, monkeypatch):
-        assert self._lvl(monkeypatch, _compare_json("behind")) == "inline"
+    def test_behind_fails_closed(self, monkeypatch):
+        # Codex P1 #1373: `behind` (head is an ANCESTOR of the reviewed commit) does
+        # NOT make head a content-subset — if the reviewed commit deleted code and the
+        # PR reset to its parent, head carries code Codex never approved. Must NOT be
+        # inline; it falls to the not-ahead/diverged branch → None → block.
+        assert self._lvl(monkeypatch, _compare_json("behind")) is None
+        assert self._lvl(monkeypatch, _compare_json("behind", [_code_file()])) is None
 
     def test_ahead_substantial(self, monkeypatch):
         assert self._lvl(monkeypatch, _compare_json("ahead", [_code_file()])) == "substantial"
@@ -706,3 +711,53 @@ class TestCheckPrReportFreshnessLabel:
             compare=_compare_json("identical"),
         )
         assert "ok (current)" in out
+
+
+class TestMergeDeadline:
+    """Codex P1 #1373: _gh_timeout bounds the AGGREGATE merge-path gh time under the
+    hook's ~60s wall-clock via a shared deadline, so per-call caps can't sum past it."""
+
+    def test_no_deadline_returns_cap(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
+        assert _mod._gh_timeout(8) == 8
+        assert _mod._gh_timeout(6) == 6
+
+    def test_deadline_clamps_to_remaining(self, monkeypatch):
+        import time as _t
+
+        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() + 3)
+        # remaining ~3s < cap 8 → clamped toward remaining (not the full cap)
+        assert _mod._gh_timeout(8) <= 3.5
+
+    def test_expired_deadline_floors_at_one(self, monkeypatch):
+        import time as _t
+
+        monkeypatch.setattr(_mod, "_merge_deadline", _t.monotonic() - 5)  # already past
+        assert _mod._gh_timeout(8) == 1.0  # fail FAST, never negative/zero
+
+    def test_budget_under_wallclock(self):
+        # The documented worst-case pre-binding aggregate must leave headroom under 60s.
+        assert _mod._MERGE_GATE_BUDGET_S <= 50
+
+
+class TestReportFreshnessUnreadable:
+    """Codex P2 #1373: a failed relabel re-read must not read as 'ok (current)'."""
+
+    def test_failed_reread_labeled_unverified(self, monkeypatch, capsys):
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(
+            _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+        )
+        # freshness gate passes (allowed), but the relabel re-reads fail (None)
+        monkeypatch.setattr(_mod, "_check_codex_reviewed_head", lambda n, repo=None: (False, "", HEAD))
+        monkeypatch.setattr(_mod, "_latest_codex_reviewed_sha", lambda n, repo=None: None)
+        monkeypatch.setattr(_mod, "_pr_head_sha", lambda n, repo=None: None)
+        _mod.check_pr_report("5")
+        out = capsys.readouterr().out
+        assert "unverified" in out
+        assert "ok (current)" not in out

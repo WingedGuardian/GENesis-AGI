@@ -698,6 +698,15 @@ def classify_compare_substantiality(files: list[dict] | None) -> str:
         prev = f.get("previous_filename")  # rename source — domain-sensitivity on either side
         if prev:
             records.append({"path": prev})
+            # Attribute the rename's line count to the SOURCE too (Codex P2 #1373): a
+            # rename FROM code TO an excluded dest (`src/foo.py → docs/foo.md`) would
+            # otherwise contribute NOTHING — the docs dest is excluded and the source
+            # carried no count — so a 200-line code removal/rewrite classified "inline"
+            # and let a stale review pass. ``max`` avoids double-inflation while
+            # ensuring the reviewable side (whichever it is) carries the magnitude;
+            # _substantiality_level only counts reviewable paths, so an excluded prev
+            # is harmless.
+            per_file[prev] = max(per_file.get(prev, 0), lines)
         has_patch = f.get("has_patch")
         if has_patch is None:
             has_patch = "patch" in f

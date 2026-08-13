@@ -51,6 +51,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -335,6 +336,37 @@ def _merge_target_repo(argv: list[str], cmd: str):
     return None
 
 
+# Merge-path SHARED-DEADLINE budget. `.claude/settings.json` kills this PreToolUse
+# hook at ~60s. The gh-pr-merge gates run sequentially, so per-call timeouts alone
+# cannot bound the AGGREGATE: on a degraded API where each call succeeds just under
+# its own cap, the sum exceeds 60s and Claude SIGKILLs the hook MID-GATE — which
+# fails toward "tool runs" and silently disengages the WHOLE gate stack (incl. the
+# TOCTOU binding), the exact bypass the timeouts exist to prevent (Codex P1 #1373).
+# main() computes ONE deadline before the gates and threads it through every
+# merge-path gh helper via `_gh_timeout`, so the total finishes with headroom under
+# 60s and each fail-closed gate reaches its own block/allow decision first.
+_MERGE_GATE_BUDGET_S = 45.0
+# Shared merge-path deadline (a monotonic() instant). main() sets it once before the
+# gh-pr-merge gates; every merge-path gh call reads it via _gh_timeout so the AGGREGATE
+# finishes with headroom under the hook's ~60s wall-clock. A module global is safe:
+# this PreToolUse hook is a SINGLE-SHOT process (one command, no concurrency), and it
+# stays None on every other path (push, the --check-pr report) → those use full caps.
+_merge_deadline: float | None = None
+
+
+def _gh_timeout(cap: float) -> float:
+    """Per-call subprocess timeout under the shared merge-path deadline (``_merge_deadline``).
+
+    ``cap`` when no merge deadline is set (every non-merge caller, and the tests, are
+    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining, floored
+    at 1s so a nearly-expired budget makes the call fail FAST — its caller's existing
+    error path then returns its fail-closed/open value — rather than overrun the
+    wall-clock and get the whole hook SIGKILLed mid-gate. Never raises."""
+    if _merge_deadline is None:
+        return cap
+    return max(1.0, min(cap, _merge_deadline - time.monotonic()))
+
+
 def _derive_repo_from_cwd(cwd: str) -> str | None:
     """The OWNER/REPO gh resolves in directory ``cwd`` (``nameWithOwner``), or None.
 
@@ -355,7 +387,9 @@ def _derive_repo_from_cwd(cwd: str) -> str | None:
                 ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
                 capture_output=True,
                 text=True,
-                timeout=6,  # merge-path budget (see main): pre-gate resolution, fail-closed
+                timeout=_gh_timeout(
+                    6
+                ),  # merge-path budget (see main): pre-gate resolution, fail-closed
                 cwd=cwd,
             )
             raw = result.stdout if result.returncode == 0 else ""
@@ -436,7 +470,9 @@ def _resolve_pr_number(cmd: str, repo: str | None = None, cwd: str | None = None
             ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
             capture_output=True,
             text=True,
-            timeout=6,  # merge-path budget (see main): pre-gate resolution, fail-closed
+            timeout=_gh_timeout(
+                6
+            ),  # merge-path budget (see main): pre-gate resolution, fail-closed
             cwd=cwd,  # None ⇒ the hook's own cwd (legacy path)
         )
         resolved = result.stdout.strip()
@@ -466,7 +502,9 @@ def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
             ],
             capture_output=True,
             text=True,
-            timeout=8,  # merge-path budget (see main): fail-closed → a timeout BLOCKS w/ retry
+            timeout=_gh_timeout(
+                8
+            ),  # merge-path budget (see main): fail-closed → a timeout BLOCKS w/ retry
         )
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
@@ -516,7 +554,7 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
                 ],
                 capture_output=True,
                 text=True,
-                timeout=8,  # merge-path budget (see main): fail-open → "unknown"
+                timeout=_gh_timeout(8),  # merge-path budget (see main): fail-open → "unknown"
             )
             if result.returncode != 0:
                 return "unknown", []
@@ -711,7 +749,7 @@ def _check_inline_review_findings(
             ],
             capture_output=True,
             text=True,
-            timeout=8,  # merge-path budget (see main): advisory scan, fail-open
+            timeout=_gh_timeout(8),  # merge-path budget (see main): advisory scan, fail-open
         )
         if result.returncode != 0:
             return _scan_unreadable(strict, "inline review comments")
@@ -786,7 +824,7 @@ def _check_pr_review_findings(
             ],
             capture_output=True,
             text=True,
-            timeout=8,  # merge-path budget (see main): advisory scan, fail-open
+            timeout=_gh_timeout(8),  # merge-path budget (see main): advisory scan, fail-open
         )
         if result.returncode != 0:
             return _scan_unreadable(strict, "review-body comments")  # gh error
@@ -884,7 +922,9 @@ def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=6,  # merge-path budget (see main): fail-closed → unreadable head BLOCKS
+                timeout=_gh_timeout(
+                    6
+                ),  # merge-path budget (see main): fail-closed → unreadable head BLOCKS
             )
             raw = result.stdout if result.returncode == 0 else ""
         except Exception:
@@ -925,7 +965,7 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
                 # See the merge-path timeout budget note in main(): every gh call on
                 # this path must finish (or fail open/closed on its own) well inside
                 # the hook's 60s wall-clock, or a SIGKILL disengages ALL gates at once.
-                timeout=8,
+                timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
                 return None
@@ -967,8 +1007,9 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
     block — ``None`` blocks like ``"substantial"`` (stale is the default-block state;
     triviality is an exception granted only on positive evidence).
 
-    ``status`` semantics (top-level compare status): ``identical``/``behind`` → HEAD's
-    content is a subset of (or equal to) what Codex reviewed → ``"inline"``. ``ahead``
+    ``status`` semantics (top-level compare status): ``identical`` (trees match) →
+    ``"inline"``. ``behind`` is NOT inline — an ancestor head can still carry code the
+    reviewed commit removed → it fails closed (None). ``ahead``
     (the normal append case) or ``diverged`` (a rebase/force-push rewrite) → classify
     the actual changed ``files`` — a diverged rewrite must NOT be assumed trivial.
     Compare TRUNCATION guard: GitHub caps ``files`` at 300 per comparison; at the cap a
@@ -992,7 +1033,7 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
                 text=True,
                 # Merge-path timeout budget (see main()): one compare round-trip is
                 # fast; 8s keeps the worst case inside the hook's 60s wall-clock.
-                timeout=8,
+                timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
                 return None
@@ -1006,9 +1047,14 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
     if not isinstance(data, dict):  # valid JSON but not an object → unclassifiable
         return None
     status = data.get("status")
-    if status in ("identical", "behind"):
-        return "inline"  # HEAD content ⊆ what Codex reviewed → nothing unreviewed
+    if status == "identical":
+        return "inline"  # trees match exactly → nothing unreviewed
     if status not in ("ahead", "diverged"):
+        # NOTE `behind` is NOT treated as inline (Codex P1 #1373): head being an
+        # ANCESTOR of the reviewed commit does not make head's TREE a content subset
+        # — if the reviewed commit deleted/replaced code and the PR is then reset to
+        # its parent, head carries code Codex never approved (it reviewed the removal).
+        # `behind` falls here → None → fail closed (re-review required).
         # A MISSING/unknown status (`{status: null, …}` from a truncated or
         # unexpected compare response) must fail CLOSED — NOT fall through to file
         # classification, where an empty `files` would read as "inline" and permit
@@ -1149,7 +1195,9 @@ def _pr_base_ref(pr_num: str, repo: str | None = None) -> str | None:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=6,  # merge-path budget (see main): fail-closed → unreadable base BLOCKS
+                timeout=_gh_timeout(
+                    6
+                ),  # merge-path budget (see main): fail-closed → unreadable base BLOCKS
             )
             raw = result.stdout if result.returncode == 0 else ""
         except Exception:
@@ -1182,7 +1230,9 @@ def _repo_default_branch(repo: str | None = None) -> str | None:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=6,  # merge-path budget (see main): fail-closed → unreadable default BLOCKS
+                timeout=_gh_timeout(
+                    6
+                ),  # merge-path budget (see main): fail-closed → unreadable default BLOCKS
             )
             raw = result.stdout if result.returncode == 0 else ""
         except Exception:
@@ -2236,6 +2286,14 @@ def main() -> int:
             # Pass the merge SEGMENT's raw text (not the whole compound command)
             # so an unrelated segment's PR URL cannot select the gated repo
             # (`echo …/other/repo/pull/9 && gh pr merge 12` must gate the cwd repo).
+            #
+            # Arm the SHARED merge-path deadline BEFORE the first gh call: every gate's
+            # gh subprocess (repo/PR resolution → mergeable → CI → base → freshness →
+            # findings) reads it via _gh_timeout so the AGGREGATE finishes under the
+            # hook's ~60s wall-clock, instead of summing per-call caps past it and
+            # getting SIGKILLed mid-gate (Codex P1 #1373). Budget < 60s with headroom.
+            global _merge_deadline
+            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
             merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
             # For a DERIVED (no --repo) merge, the dir gh resolves the repo AND a
             # numberless branch-PR from — threaded to _resolve_pr_number so a
@@ -2643,7 +2701,12 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         # read this, not the stderr NOTE).
         _reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
         _head = _pr_head_sha(pr_num, repo=repo)
-        if _reviewed and _head and _reviewed != _head.strip().lower():
+        if _reviewed is None or _head is None:
+            # A transiently-failed re-read must NOT read as "current" (Codex P2
+            # #1373): the enforcement gate already passed, but the report must not
+            # ASSERT the head was reviewed when it could not confirm it.
+            label = "ok (freshness label unverified — re-read failed)"
+        elif _reviewed != _head.strip().lower():
             label = f"ok (STALE review of {_reviewed[:12]}, delta since is trivial)"
         else:
             label = "ok (current)"

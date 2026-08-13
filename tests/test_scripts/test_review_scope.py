@@ -622,3 +622,17 @@ def test_compare_binary_noncode_asset_still_excluded():
         _cf("src/app.py", additions=4, deletions=1),
     ]
     assert _rs.classify_compare_substantiality(files) == "inline"
+
+
+def test_compare_rename_code_to_docs_counts_source():
+    # Codex P2 #1373: a 200-line rename FROM code TO an excluded docs dest must still
+    # classify substantial — the source (code) carries the magnitude, not the dest.
+    files = [_cf("docs/foo.md", additions=150, deletions=50, status="renamed",
+                 previous_filename="src/foo.py")]
+    assert _rs.classify_compare_substantiality(files) == "substantial"
+
+
+def test_compare_rename_docs_to_docs_still_inline():
+    # A docs->docs rename (neither side reviewable code) stays inline.
+    files = [_cf("docs/b.md", additions=150, status="renamed", previous_filename="docs/a.md")]
+    assert _rs.classify_compare_substantiality(files) == "inline"
