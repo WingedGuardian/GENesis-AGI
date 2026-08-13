@@ -173,13 +173,34 @@ async def down(db: aiosqlite.Connection) -> None:
         )
         """
     )
-    old_cols = (
-        "entity_id, name, norm_name, entity_type, summary, source, "
-        "status, merged_into, created_at, updated_at"
+    # Drift guard (mirror up()): the down-target knows exactly the 10 old columns
+    # plus the 2 card columns it intentionally drops. Any OTHER live column would
+    # be silently discarded by a fixed projection — refuse instead, so a later/
+    # locally-added column can't lose its data on the way down.
+    _OLD_COLUMNS = (
+        "entity_id",
+        "name",
+        "norm_name",
+        "entity_type",
+        "summary",
+        "source",
+        "status",
+        "merged_into",
+        "created_at",
+        "updated_at",
     )
+    live_cols = await _entities_columns(db)
+    drift = live_cols - set(_OLD_COLUMNS) - set(_CARD_COLUMNS)
+    if drift:
+        raise RuntimeError(
+            f"0083 down(): entities has column(s) {sorted(drift)} not in the old "
+            f"shape and not among the card columns being dropped; refusing to "
+            f"copy-and-drop their data."
+        )
+    copy_cols = ", ".join(c for c in _OLD_COLUMNS if c in live_cols)
     await db.execute(
-        f"INSERT INTO entities_old ({old_cols}) "  # noqa: S608
-        f"SELECT {old_cols} FROM entities"
+        f"INSERT INTO entities_old ({copy_cols}) "  # noqa: S608
+        f"SELECT {copy_cols} FROM entities"
     )
     await db.execute("DROP TABLE entities")
     await db.execute("ALTER TABLE entities_old RENAME TO entities")

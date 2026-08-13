@@ -260,6 +260,21 @@ async def test_down_refuses_when_new_type_rows_exist():
     await conn.close()
 
 
+async def test_down_refuses_on_unrecognized_column_drift():
+    """Codex P2 (freshness pass): down() had a FIXED old-column projection, so a
+    later/locally-added column would be silently dropped on the way down (the
+    same class up() was fixed for). It must refuse rather than lose data."""
+    conn = await _legacy_db()
+    await _mig.up(conn)
+    await conn.commit()
+    # Simulate a drifted table: a column the down-target doesn't know about.
+    await conn.execute("ALTER TABLE entities ADD COLUMN extra_note TEXT")
+    await conn.commit()
+    with pytest.raises(RuntimeError, match="extra_note|drift|not in"):
+        await _mig.down(conn)
+    await conn.close()
+
+
 async def test_fresh_create_has_types_and_columns():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row

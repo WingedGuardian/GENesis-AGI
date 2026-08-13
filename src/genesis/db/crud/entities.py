@@ -510,18 +510,31 @@ async def enqueue_adjudication(
         await db.commit()
 
 
+# Canonical PHYSICAL column order of `entities` — matches the CREATE in
+# db/schema/_tables.py and migration 0083's rebuild, which is exactly the order
+# `SELECT *` returns. The tuple fallback zips against this, so a future column
+# addition needs ONLY this list updated — never a hand-indexed map that silently
+# mis-decodes when columns shift (the Codex P2 the two card columns introduced:
+# they land after `summary`, before `source`).
+_ENTITY_COLUMNS = (
+    "entity_id",
+    "name",
+    "norm_name",
+    "entity_type",
+    "summary",
+    "summary_updated_at",
+    "summary_dirty",
+    "source",
+    "status",
+    "merged_into",
+    "created_at",
+    "updated_at",
+)
+
+
 def _row_to_dict(db: aiosqlite.Connection, row) -> dict:
     if isinstance(row, aiosqlite.Row) or hasattr(row, "keys"):
         return dict(row)
-    return {
-        "entity_id": row[0],
-        "name": row[1],
-        "norm_name": row[2],
-        "entity_type": row[3],
-        "summary": row[4],
-        "source": row[5],
-        "status": row[6],
-        "merged_into": row[7],
-        "created_at": row[8],
-        "updated_at": row[9],
-    }
+    # strict=True fails loud on any length mismatch (schema drift) rather than
+    # silently truncating or mis-aligning.
+    return dict(zip(_ENTITY_COLUMNS, row, strict=True))

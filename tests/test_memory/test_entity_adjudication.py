@@ -445,6 +445,28 @@ async def test_sweep_cursor_advances_and_completes(db):
 
 
 @pytest.mark.asyncio
+async def test_sweep_parks_cursor_when_cap_hit_and_drains_across_runs(db):
+    # Codex P2 (freshness pass): a slice producing MORE matches than enqueue_cap
+    # must not silently drop the overflow until the 7-day full cycle. When the
+    # cap is hit the sweep does NOT mark the pass completed (which would stamp
+    # completed_at → 7-day idle); the next run re-scans and the already-enqueued
+    # pairs are excluded via _pending_pair_keys, so the overflow surfaces.
+    await _mk_entity(db, "svc", "svc")
+    for q in ("alpha", "beta", "gamma"):
+        await _mk_entity(db, f"svc {q}", f"svc {q}")
+    # 3 containment pairs (svc ⊂ each qualifier). cap=2 → first run enqueues 2.
+    r1 = await adj.run_reconcile_sweep(db, slice_size=100, enqueue_cap=2, cursor_offset=0)
+    assert r1["enqueued"] == 2
+    assert r1["completed"] is False  # cap hit → do NOT complete (else 7d idle)
+    # Second run re-scans; the 2 pending pairs are excluded → the 3rd surfaces
+    # (pre-fix it was lost because the pass completed and idled).
+    r2 = await adj.run_reconcile_sweep(db, slice_size=100, enqueue_cap=2, cursor_offset=0)
+    assert r2["enqueued"] == 1
+    pending = await dw_crud.query_pending(db, work_type=adj.WORK_TYPE, limit=100)
+    assert len(pending) == 3  # all 3 eventually enqueued, none dropped
+
+
+@pytest.mark.asyncio
 async def test_maybe_run_sweep_low_water_gate(db):
     # Fill the queue past 2×budget so the sweep must skip.
     for i in range(10):

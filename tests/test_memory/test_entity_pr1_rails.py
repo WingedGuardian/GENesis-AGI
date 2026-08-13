@@ -81,3 +81,72 @@ async def test_host_install_project_deliberately_not_in_cluster(db):
     # named "genesis") would silently attach mentions to the wrong node.
     for t in ("host", "install", "project"):
         assert t not in entity_registry._CONCEPT_CLUSTER
+
+
+def test_row_to_dict_tuple_fallback_matches_physical_order():
+    # Codex P2 (freshness pass): the two card columns were inserted after
+    # `summary` and BEFORE `source`, so a hand-indexed positional map that still
+    # read row[5] as `source` would mis-decode every field after `summary` on
+    # any connection yielding plain tuples (row_factory unset). The fallback must
+    # track the CURRENT 12-column physical order.
+    row = (
+        "eid",
+        "Name",
+        "norm",
+        "concept",  # 0-3
+        "card text",  # 4  summary
+        "2026-05-01T00:00:00+00:00",  # 5  summary_updated_at
+        1,  # 6  summary_dirty
+        "extracted",  # 7  source
+        "active",  # 8  status
+        "surv",  # 9  merged_into
+        "2026-01-01T00:00:00+00:00",  # 10 created_at
+        "2026-02-01T00:00:00+00:00",  # 11 updated_at
+    )
+    d = entities_crud._row_to_dict(None, row)
+    assert d["summary"] == "card text"
+    assert d["summary_updated_at"] == "2026-05-01T00:00:00+00:00"
+    assert d["summary_dirty"] == 1
+    assert d["source"] == "extracted"
+    assert d["status"] == "active"
+    assert d["merged_into"] == "surv"
+    assert d["created_at"] == "2026-01-01T00:00:00+00:00"
+    assert d["updated_at"] == "2026-02-01T00:00:00+00:00"
+
+
+async def test_get_entity_decodes_tuple_connection_correctly():
+    # Full-path regression: a connection WITHOUT aiosqlite.Row yields tuples, so
+    # SELECT * + _row_to_dict must decode against the real physical order. Proves
+    # the fallback isn't corrupted by the card columns inserted before `source`.
+    conn = await aiosqlite.connect(":memory:")  # NOTE: no row_factory → tuples
+    try:
+        for table in TABLES:
+            await conn.execute(TABLES[table])
+        await conn.execute(
+            "INSERT INTO entities (entity_id, name, norm_name, entity_type, summary, "
+            "summary_updated_at, summary_dirty, source, status, merged_into, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "e1",
+                "Genesis",
+                "genesis",
+                "concept",
+                "a card",
+                "2026-05-01T00:00:00+00:00",
+                1,
+                "extracted",
+                "active",
+                None,
+                "2026-01-01T00:00:00+00:00",
+                "2026-02-01T00:00:00+00:00",
+            ),
+        )
+        await conn.commit()
+        got = await entities_crud.get_entity(conn, "e1")
+        assert got["source"] == "extracted"
+        assert got["status"] == "active"
+        assert got["summary_dirty"] == 1
+        assert got["summary_updated_at"] == "2026-05-01T00:00:00+00:00"
+        assert got["merged_into"] is None
+    finally:
+        await conn.close()
