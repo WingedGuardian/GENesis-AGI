@@ -75,12 +75,12 @@ _REFLECTION_MCP_SERVERS: tuple[tuple[str, str], ...] = (
 # (Read/Grep/Glob/WebFetch/WebSearch/ToolSearch/CronList/Task{Get,List,Output}/
 # ListMcpResourcesTool/ReadMcpResource*Tool) are left available. CC internals
 # aren't introspectable, so this is an explicit list; the scope test re-checks it.
-# Agent/Task/Workflow/Skill are denied because they SPAWN — a subagent would escape
-# the lockdown (it inherits a fresh, unrestricted toolset). "Agent" is the current CC
-# spawn tool; "Task" is the obsolete name (both via SPAWN_TOOL_NAMES).
+# The spawn/escape-class builtins (Agent/Task/Workflow/Skill) are denied because a
+# child they spawn would escape the lockdown with a fresh, unrestricted toolset — the
+# whole set lives in SPAWN_TOOL_NAMES so every restricted session denies it identically.
 _REFLECTION_DENY_BUILTINS: tuple[str, ...] = (
     "Bash", "Write", "Edit", "NotebookEdit",
-    *SPAWN_TOOL_NAMES, "Workflow", "Skill",
+    *SPAWN_TOOL_NAMES,
     "SendMessage", "ReportFindings",
     "CronCreate", "CronDelete", "ScheduleWakeup", "Monitor",
     "TaskCreate", "TaskUpdate", "TaskStop",

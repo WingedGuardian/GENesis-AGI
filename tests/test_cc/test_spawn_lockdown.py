@@ -6,11 +6,18 @@ the CC subagent-spawn tool. The live spawn tool is ``Agent`` (``Task`` is the
 obsolete name); a session that can spawn a subagent escapes its lockdown, because
 the subagent inherits a fresh, unrestricted toolset (Bash/Write/Edit).
 
-The denylists had DRIFTED — sentinel-degraded blocked both names, reflection blocked
-only ``Task`` (so the live ``Agent`` slipped through), and direct-session + surplus
-blocked NEITHER. This test locks the whole class to a single source of truth
-(``genesis.cc.types.SPAWN_TOOL_NAMES``) so a new restricted-session denylist that
-forgets spawn-blocking fails CI instead of silently reopening the hole.
+The spawn/escape class is Agent (current) + Task (obsolete) + Workflow (orchestrates
+subagents) + Skill (some run in a subagent) — the full set in ``SPAWN_TOOL_NAMES``.
+The denylists had DRIFTED (reflection blocked all four, but surplus/direct-session/
+inbox/mail/experimentation blocked only a subset — or none). This test locks the class
+to a single source of truth so a new denylist that forgets it fails CI.
+
+Scope: the READ-ONLY / restricted-lockdown sessions (reflection, surplus, the
+direct-session profiles, the inbox/mail judges, the experimentation completion,
+sentinel-degraded). The autonomy-executor sessions (``autonomy/executor/research.py``,
+``step_dispatcher``) legitimately hold broader tools and are evaluated separately
+(tracked follow-up); the eval bench intentionally runs full builtins (fairness). Those
+are deliberately NOT asserted here.
 """
 
 from __future__ import annotations
@@ -20,10 +27,12 @@ from genesis.cc.types import SPAWN_TOOL_NAMES
 _SPAWN = set(SPAWN_TOOL_NAMES)
 
 
-def test_spawn_tool_names_pins_current_and_obsolete():
-    # "Agent" is the load-bearing entry (current CC spawn tool); "Task" is legacy parity.
+def test_spawn_tool_names_pins_the_whole_spawn_class():
+    # The full spawn/escape class: Agent (current), Task (obsolete alias), Workflow
+    # (orchestrates subagents), Skill (some run in a subagent). Missing any one leaves
+    # an alternate escape open in every site that relies on the shared set.
     assert "Agent" in SPAWN_TOOL_NAMES
-    assert SPAWN_TOOL_NAMES == ("Agent", "Task")
+    assert SPAWN_TOOL_NAMES == ("Agent", "Task", "Workflow", "Skill")
 
 
 def test_reflection_denies_spawn():

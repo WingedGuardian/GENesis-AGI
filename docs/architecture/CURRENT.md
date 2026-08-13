@@ -224,10 +224,11 @@ verified: 51253c67 2026-08-13
 ```
 
 - **Subagent-spawn lockdown — one source of truth across ALL restricted sessions**
-  (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task")`). A locked-down session must deny the
-  CC subagent-spawn tool, or it escapes its lockdown by spawning a subagent that inherits
-  a fresh, unrestricted toolset. `Agent` is the current CC tool name; `Task` is the
-  obsolete name. The denylists had drifted (sentinel-degraded blocked both, reflection
+  (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A locked-down
+  session must deny the whole spawn/escape class, or it escapes its lockdown by spawning
+  a child that inherits a fresh, unrestricted toolset. `Agent` is the current CC tool
+  name; `Task` the obsolete alias; `Workflow` orchestrates subagents (reachable in
+  background sessions); `Skill` can run in a subagent. The denylists had drifted (sentinel-degraded blocked both, reflection
   blocked only `Task`, direct-session + surplus blocked neither); all now reference
   `SPAWN_TOOL_NAMES` — reflection (`_REFLECTION_DENY_BUILTINS`), surplus
   (`_READONLY_DISALLOWED`), every direct-session profile (`_UNIVERSAL_DISALLOW` + a
