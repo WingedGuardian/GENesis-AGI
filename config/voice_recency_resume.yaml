@@ -2,7 +2,9 @@
 # Reader: src/genesis/channels/voice/voice_recency_resume_config.py
 #
 # Ships DARK (mode: off). Arm to "live" only after a live voice E2E confirms the
-# S2S model actually resumes the prior conversation when the block is injected.
+# S2S model treats the block as REFERENCE-ONLY — it does NOT proactively raise or
+# resume the prior conversation, but DOES answer from it when the user explicitly
+# asks (e.g. "what were we just talking about?").
 # Kill switch: GENESIS_VOICE_RECENCY_RESUME_DISABLED=1 forces off regardless.
 
 enabled: true
@@ -13,5 +15,5 @@ scope: "global"        # "global" = last conversation on ANY device (follows the
                        # person); "per_device" = last for the calling satellite
                        # (needs cc_sessions.satellite_id populated).
 max_turns: 6           # trailing messages to carry into the prompt
-max_chars: 800         # hard cap on the assembled "Where we left off" block
+max_chars: 800         # hard cap on the assembled recency block
 max_age_hours: null    # only resume if newer than this many hours; null = no limit
