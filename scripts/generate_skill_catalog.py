@@ -44,6 +44,103 @@ def _extract_skill_info(skill_dir: Path) -> dict | None:
     return {"name": skill_dir.name, "description": "", "keywords": []}
 
 
+# --- Description scalar extraction ------------------------------------------
+# Replaces a regex that truncated the value at the first apostrophe/quote/
+# newline (dropping searchable text from the catalog). Pure string slicing —
+# builds NO YAML object graph, so there is no alias/mapping-amplification DoS
+# surface; every matcher is linear (disjoint alternatives, single quantifier).
+# Handles the scalar forms real skill frontmatter uses: plain (incl. wrapped
+# multi-line), single/double-quoted (with '' and \\" escapes), and folded/
+# literal blocks (>, |, and their chomping variants). A build-time twin lives
+# in export_agents_md.py (_frontmatter_description, yaml-based) for AGENTS.md.
+_DQ_RE = re.compile(r'"((?:\\.|[^"\\])*)"', re.DOTALL)  # up to the closing "
+_SQ_RE = re.compile(r"'((?:''|[^'])*)'", re.DOTALL)  # up to the closing '
+_DQ_ESCAPES = {'"': '"', "\\": "\\", "n": " ", "t": " "}
+
+
+def _norm_ws(value: str) -> str:
+    """Collapse any run of whitespace to single spaces (one scannable line)."""
+    return " ".join(value.split())
+
+
+def _unescape_double(value: str) -> str:
+    """Resolve the double-quoted escapes that appear in skill frontmatter.
+
+    Handles ``\\"``, ``\\\\``, ``\\n``, ``\\t``; an unknown escape drops the
+    backslash (descriptions are display text, so exotic escapes need not be
+    byte-exact). Linear scan, output bounded by input.
+    """
+    out: list[str] = []
+    i, n = 0, len(value)
+    while i < n:
+        ch = value[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(_DQ_ESCAPES.get(value[i + 1], value[i + 1]))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _collect_indented(
+    lines: list[str], seed: str | None = None, *, block: bool = False
+) -> str:
+    """Fold a seed line plus following more-indented continuation lines.
+
+    ``block=True`` (folded/literal ``>``/``|`` scalars): a blank line is a
+    paragraph break, not the end — only a column-0 line (the next key / dedent)
+    terminates. ``block=False`` (plain scalars): a blank line ends the value —
+    conservatively, we do NOT fold a plain scalar across a blank line (YAML
+    would join the paragraphs), which no corpus skill relies on and which avoids
+    over-capturing following structure. Any leading whitespace counts as
+    indented — YAML only requires MORE indent than the column-0 key, not a fixed
+    width. Column-0 keys (the corpus invariant) always stop the fold, so
+    keywords/name are never absorbed.
+    """
+    parts: list[str] = [] if seed is None else [seed]
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if block:
+                continue  # blank = paragraph break inside a block scalar
+            if parts:
+                break
+            continue
+        if line[:1] in (" ", "\t"):
+            parts.append(stripped)
+        else:
+            break
+    return " ".join(parts)
+
+
+def _extract_description(frontmatter: str) -> str:
+    """Full description value from a frontmatter block, any YAML scalar form."""
+    m = re.search(r"^[ \t]*description:[ \t]*", frontmatter, re.MULTILINE)
+    if not m:
+        return ""
+    region = frontmatter[m.end() :]
+    stripped = region.split("\n", 1)[0].strip()
+    lead = stripped[:1]
+    if lead == '"':
+        q = _DQ_RE.match(region)
+        if q:
+            return _norm_ws(_unescape_double(q.group(1)))
+        return _norm_ws(stripped.strip('"'))
+    if lead == "'":
+        q = _SQ_RE.match(region)
+        if q:
+            return _norm_ws(q.group(1).replace("''", "'"))
+        return _norm_ws(stripped.strip("'"))
+    rest = region.split("\n")[1:]
+    if lead in (">", "|") or stripped == "":
+        # Folded/literal block scalar (>, >-, |, |-, …): fold indented lines,
+        # treating blank lines as paragraph breaks (not terminators).
+        return _norm_ws(_collect_indented(rest, block=True))
+    # Plain scalar: first line + any indented continuation lines.
+    return _norm_ws(_collect_indented(rest, seed=stripped))
+
+
 def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
     """Parse YAML-like frontmatter from a markdown file."""
     name = fallback_name
@@ -57,31 +154,8 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
             name_match = re.search(r'name:\s*["\']?([^"\'\n]+)', frontmatter)
             if name_match:
                 name = name_match.group(1).strip()
-            # Handle YAML folded/literal scalars (> or |) and inline values
-            desc_match = re.search(
-                r'description:\s*["\']?([^"\'\n]+)', frontmatter
-            )
-            if desc_match:
-                val = desc_match.group(1).strip()
-                if val in (">", "|", ">-", "|-"):
-                    # Folded/literal scalar: collect indented continuation lines
-                    desc_start = desc_match.end()
-                    lines = frontmatter[desc_start:].split("\n")
-                    parts = []
-                    for line in lines:
-                        stripped = line.strip()
-                        if not stripped:
-                            if parts:
-                                break  # blank line ends the block
-                            continue
-                        # Continuation lines are indented
-                        if line.startswith("  ") or line.startswith("\t"):
-                            parts.append(stripped)
-                        elif parts:
-                            break
-                    description = " ".join(parts)
-                else:
-                    description = val
+            # Full description across any YAML scalar form (see _extract_description).
+            description = _extract_description(frontmatter)
 
     keywords = []
     if content.startswith("---"):
