@@ -54,7 +54,10 @@ CONFIDENCE_THRESHOLD = 75
 _FALLBACK_MODELS = [
     ("openrouter/anthropic/claude-haiku-4.5", "openrouter", None),
     ("groq/openai/gpt-oss-120b", "groq", {"extra_body": {"reasoning_effort": "low"}}),
-    ("gemini/gemini-3-flash-preview", "google", None),
+    # Mirrors the canonical gemini-free provider in model_routing.yaml: the GA
+    # gemini-3.5-flash (Google's replacement for the deprecated 3-flash-preview)
+    # with thinking suppressed — 3.5 reasons by default, bloating free-tier TPM.
+    ("gemini/gemini-3.5-flash", "google", {"reasoning_effort": "disable"}),
 ]
 
 # litellm model-string prefix → provider service name where they differ.
@@ -366,16 +369,20 @@ async def _call_llm(prompt: str, model: str) -> str:
     import litellm  # lazy import; keeps findings/identity light
     prefix = model.split("/", 1)[0] if "/" in model else model
     api_key = resolve_api_key(_SERVICE_BY_PREFIX.get(prefix, prefix))
-    kwargs: dict = dict(_params_for_model(model) or {})
+    # Provider params form the BASE; the gate's fixed arguments override them —
+    # a provider config carrying temperature/max_tokens must never TypeError
+    # on duplicate keywords (Codex round-2), and the gate's deterministic
+    # temperature=0.0 always wins.
+    call_kwargs: dict = dict(_params_for_model(model) or {})
     if api_key:
-        kwargs["api_key"] = api_key
-    response = await litellm.acompletion(
+        call_kwargs["api_key"] = api_key
+    call_kwargs.update(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
         max_tokens=500,
-        **kwargs,
     )
+    response = await litellm.acompletion(**call_kwargs)
     return response.choices[0].message.content or ""
 
 

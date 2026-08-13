@@ -169,14 +169,14 @@ async def _grade_observation(
         session_context=session_context,
     )
 
-    # Try providers in order: OpenRouter (DeepSeek V4), Gemini 3 Flash, Groq.
-    # Per-model provider params mirror the canonical routing config (gpt-oss
-    # needs reasoning_effort=low to stay under the groq free-tier TPM cap);
-    # gemini pinned to the recommended 3.x (2.0 is "Do not use" per
-    # docs/reference/gemini-routing.md).
+    # Try providers in order: OpenRouter (DeepSeek V4), Gemini, Groq.
+    # Per-model provider params mirror the canonical routing config: gpt-oss
+    # needs reasoning_effort=low (groq free-tier TPM cap); gemini-3.5-flash is
+    # the config's GA choice (replacing the deprecated 3-flash-preview) with
+    # thinking suppressed — it reasons by default, bloating TPM.
     models = [
         ("openrouter/deepseek/deepseek-chat-v3-0324", None),
-        ("gemini/gemini-3-flash-preview", None),
+        ("gemini/gemini-3.5-flash", {"reasoning_effort": "disable"}),
         ("groq/openai/gpt-oss-120b", {"extra_body": {"reasoning_effort": "low"}}),
     ]
     # litellm's env lookup knows only the native <SVC>_API_KEY spelling;

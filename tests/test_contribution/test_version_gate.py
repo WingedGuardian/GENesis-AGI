@@ -232,13 +232,59 @@ def test_litellm_spelling_still_selects_groq(monkeypatch):
 
 
 def test_fallback_chain_has_no_retired_models(monkeypatch):
-    """Codex round-1: the fallback still listed gemini-2.0-flash, which
-    docs/reference/gemini-routing.md marks 'Do not use' (being phased out) —
-    the same dead-model class this PR retires. The chain must carry only
-    currently-recommended models."""
+    """Codex rounds 1+2: the fallback carried gemini-2.0-flash ('Do not use'),
+    then my round-1 fix picked gemini-3-flash-preview from the WRONG authority
+    (the video-analysis doc) — the canonical routing config already replaced
+    that preview with gemini-3.5-flash + reasoning_effort=disable. The chain
+    must mirror the ROUTING CONFIG's current choice, retired families and
+    deprecated previews both rejected."""
     models = [m for m, *_ in version_gate._FALLBACK_MODELS]
-    assert not any("gemini-2.0" in m or "gemini-1.5" in m or "llama-3.3" in m for m in models)
-    assert any("gemini-3-flash-preview" in m for m in models)
+    assert not any(
+        "gemini-2.0" in m or "gemini-1.5" in m or "llama-3.3" in m or "preview" in m
+        for m in models
+    )
+    assert any("gemini-3.5-flash" in m for m in models)
+    # And the gemini entry mirrors the config's thinking-suppression param.
+    gem = next(t for t in version_gate._FALLBACK_MODELS if "gemini" in t[0])
+    assert gem[2] == {"reasoning_effort": "disable"}
+
+
+@pytest.mark.asyncio
+async def test_call_llm_provider_params_never_collide_with_fixed_args(monkeypatch):
+    """Codex round-2: a provider whose config params carry temperature or
+    max_tokens would collide with _call_llm's explicit keywords → TypeError →
+    gate fails open before litellm is even called. Fixed args must WIN over
+    provider params, never collide."""
+    _clear_all_keys(monkeypatch)
+    monkeypatch.setenv("API_KEY_GROQ", "gsk-fake-collide")
+    monkeypatch.setattr(
+        version_gate,
+        "_load_models_from_config",
+        lambda: [("groq/openai/gpt-oss-120b", "groq", {"temperature": 0.9, "max_tokens": 9})],
+    )
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+
+        class _Msg:
+            content = "ok"
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    out = await version_gate._call_llm("p", "groq/openai/gpt-oss-120b")
+    assert out == "ok"  # no TypeError
+    assert captured["temperature"] == 0.0  # fixed args win
+    assert captured["max_tokens"] == 500
 
 
 @pytest.mark.asyncio
