@@ -1031,6 +1031,13 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         )
         with contextlib.suppress(Exception):
             await db.execute("DROP TABLE IF EXISTS entities_new")
+        # LOUD, not swallowed (Codex round-7): every entity read names the card
+        # columns explicitly, so committing init with an unmigrated `entities`
+        # would defer this failure to a runtime 'no such column' crash on the
+        # write path. Match the numbered runner's posture — stop init here with
+        # the actionable drift message; the savepoint above already restored
+        # the pre-rebuild table, so nothing is lost or half-rebuilt.
+        raise
 
     # Bookmark fix: add source column to session_bookmarks
     await _try_alter(db,

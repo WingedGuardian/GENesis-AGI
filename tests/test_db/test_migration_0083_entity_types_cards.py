@@ -211,6 +211,26 @@ async def test_base_path_rebuilds_legacy_entities():
     await conn.close()
 
 
+async def test_base_path_raises_loud_on_entities_drift():
+    """Codex round-7: a failed base-path rebuild (e.g. drift-refused copy) was
+    logged and SWALLOWED, letting init commit an unmigrated table — and since
+    round-6 every entity read names the card columns explicitly, reads would
+    then crash with 'no such column' at runtime. The failure must be LOUD at
+    init (matching the numbered runner's posture), never a deferred read crash."""
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await conn.execute(_LEGACY_DDL)
+    await conn.execute("ALTER TABLE entities ADD COLUMN local_note TEXT")
+    await _insert(conn, "e1", "omi", "device")
+    await conn.commit()
+    with pytest.raises(Exception, match="entities|local_note|drift"):
+        await create_all_tables(conn)
+    # The savepoint kept the original table intact (rows readable, old shape).
+    cur = await conn.execute("SELECT COUNT(*) FROM entities")
+    assert (await cur.fetchone())[0] == 1
+    await conn.close()
+
+
 async def test_base_path_idempotent_on_fresh_schema():
     """On a fresh DB the canonical CREATE already carries the new schema, so the
     base-path rebuild guard (CHECK-text 'host') skips — no double rebuild."""
