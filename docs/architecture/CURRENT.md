@@ -220,15 +220,36 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 437c56c0 2026-08-09
+verified: 51253c67 2026-08-13
 ```
+
+- **Subagent-spawn lockdown — one source of truth across the restricted sessions**
+  (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
+  session escapes its tool restrictions if it can spawn a child that inherits a fresh,
+  unrestricted toolset. `Agent` is the current CC tool name; `Task` the obsolete alias;
+  `Workflow` orchestrates subagents; `Skill` can run in a subagent. The denylists had
+  drifted (sentinel-degraded blocked the class, reflection blocked all but `Agent`,
+  inbox/mail/experimentation blocked only a subset); those sessions now all reference
+  `SPAWN_TOOL_NAMES` — reflection (`_REFLECTION_DENY_BUILTINS`), the inbox/mail judges,
+  and the experimentation completion (each asserted against the LIVE `--disallowedTools`
+  value, not an orphaned constant). `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS` keeps
+  its own literal (deliberate import-cycle avoidance) but is held ⊇ by
+  `tests/test_cc/test_spawn_lockdown.py`, which locks the class so a new denylist that
+  forgets spawn-blocking fails CI. NOTE: the inbox/mail judges are spawn-hardened here but
+  are NOT yet fully read-only — they still leave `Bash` (and, for inbox, memory/settings
+  MCP writes) available on external input; closing that broader boundary is a separate
+  tracked follow-up.
+  **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
+  DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
+  the autonomy-executor sessions; those legitimately spawn/orchestrate and need a
+  sandbox-preserving Workflow or an accepted-porousness decision.
 
 - **Reflection tool lockdown — read-only + observations only**
   (`session_config.build_reflection_disallowed`, wired at `reflection_bridge/_bridge.py`
   into the reflection `CCInvocation.disallowed_tools`). Deep/strategic reflections run
   with a DERIVED denylist = (live `genesis-health` + `genesis-memory` registry − a read
-  allowlist − `observation_write`) + the write/action built-ins (Bash/Write/Edit/Task/
-  Workflow/Skill/…), so a future write tool is auto-denied. `--allowedTools` is NOT a
+  allowlist − `observation_write`) + the write/action built-ins (Bash/Write/Edit/Agent/
+  Task/Workflow/Skill/…), so a future write tool is auto-denied. `--allowedTools` is NOT a
   strict allowlist under `--dangerously-skip-permissions` (verified empirically 2026-08-07
   via the init-event tool list — it left Bash available); only `--disallowedTools` removes
   a tool, so the scoping is a denylist. Guards (`tests/test_cc/test_reflection_tool_scope.py`):

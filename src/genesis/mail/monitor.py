@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from genesis.cc.types import SPAWN_TOOL_NAMES
 from genesis.db.crud import mail_items, observations
 from genesis.mail.parser import parse_email
 from genesis.mail.types import BatchResult, EmailBrief, MailConfig, ParsedEmail
@@ -35,6 +36,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _IDENTITY_DIR = Path(__file__).resolve().parents[1] / "identity"
+
+# The mail judge denies file writes and the whole SPAWN class (SPAWN_TOOL_NAMES =
+# Agent/Task/Workflow/Skill) — no subagent spawn can escape with a fresh toolset. Its MCP
+# config is no_mcp (no memory server). NOTE: spawn-hardening, NOT a full read-only
+# boundary — Bash is still available on external input; closing that is a separate
+# tracked follow-up.
+_JUDGE_DISALLOWED_TOOLS: list[str] = ["Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
 
 
 class MailMonitor:
@@ -512,7 +520,7 @@ class MailMonitor:
                 system_prompt=system_prompt,
                 timeout_s=self._config.timeout_s,
                 skip_permissions=True,
-                disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
+                disallowed_tools=list(_JUDGE_DISALLOWED_TOOLS),
                 mcp_config=_no_mcp,
                 working_dir=background_session_dir(),
                 # WS-3: the judge reads external EMAIL bodies. Belt-and-
