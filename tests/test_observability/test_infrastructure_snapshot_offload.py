@@ -79,8 +79,10 @@ async def test_infrastructure_offloads_host_metrics_and_container_memory(monkeyp
 
     assert infra_mod._collect_host_metrics in dispatched
     assert infra_mod._collect_container_memory in dispatched
-    # The offloaded results still land under their original keys.
-    assert "cpu" in infra and "disk" in infra and "cc_tmp" in infra
+    # The offloaded results still land under their original keys. "pids"
+    # (the #1353 PID-budget read) was folded into _collect_host_metrics at the
+    # merge, so it must also ride the offload rather than block the loop inline.
+    assert "cpu" in infra and "disk" in infra and "pids" in infra and "cc_tmp" in infra
     assert "container_memory" in infra
 
 

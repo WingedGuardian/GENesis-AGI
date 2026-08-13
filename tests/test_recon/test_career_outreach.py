@@ -17,9 +17,19 @@ from genesis.db.crud import observations
 from genesis.outreach.types import OutreachResult, OutreachStatus
 from genesis.recon import career_outreach_config as cfg
 from genesis.recon.career_outreach import (
+    _AUTORUN_PROMPT,
+    _LIST_WORKING_PROMPT,
     CareerOutreachMonitor,
     CareerOutreachResult,
+    ModuleError,
+    NoneLeft,
+    ProtocolError,
+    Staged,
+    VerifyFailed,
+    _autorun_prompt,
     _nudge_hash,
+    _parse_json,
+    classify_autorun_reply,
 )
 
 
@@ -92,11 +102,14 @@ def test_knob_int_damage_tolerant():
 
 
 def test_knob_int_enforces_upper_bounds():
-    # A typo must not authorize an unbounded run; dispatch_timeout_s must stay under
-    # the 300s SSH cap.
-    assert cfg.knob_int({"dispatch_timeout_s": 2400}, "dispatch_timeout_s") == 290
+    # A typo must not authorize an unbounded run. dispatch_timeout_s is capped at
+    # 1800s (the gated career-ops flow measured ~5.5 min; there is NO 300s SSH cap
+    # — ipc.py::_send_cc takes a per-call timeout_s override with no ceiling).
+    assert cfg.knob_int({"dispatch_timeout_s": 5000}, "dispatch_timeout_s") == 1800
     assert cfg.knob_int({"max_auto_runs_per_tick": 3000}, "max_auto_runs_per_tick") == 10
-    assert cfg.knob_int({"dispatch_timeout_s": 120}, "dispatch_timeout_s") == 120  # under cap
+    assert cfg.knob_int({"dispatch_max_turns": 5000}, "dispatch_max_turns") == 200
+    assert cfg.knob_int({"dispatch_timeout_s": 600}, "dispatch_timeout_s") == 600  # under cap
+    assert cfg.knob_int({"dispatch_max_turns": 40}, "dispatch_max_turns") == 40  # under cap
 
 
 def test_module_name_damage_tolerant():
@@ -107,10 +120,32 @@ def test_module_name_damage_tolerant():
     assert cfg.module_name({}, "reasoning_module") == d["reasoning_module"]
 
 
-def test_dispatch_timeout_under_ssh_cap():
-    # Must stay under the module's SSH CC hard cap (300s) so OUR timeout fires
-    # cleanly rather than the adapter's opaque one.
-    assert cfg.DEFAULTS["dispatch_timeout_s"] < 300
+def test_dispatch_timeout_default_covers_gated_flow():
+    # The gated career-ops first-touch flow (research → draft → verify → stage)
+    # measured ~5.5 min live; the default must comfortably cover it and stay within
+    # its own configured cap. (There is NO 300s SSH cap — that was a false premise;
+    # ipc.py::_send_cc honors a per-call timeout_s with no ceiling.)
+    d = cfg.DEFAULTS["dispatch_timeout_s"]
+    assert d == 900
+    assert 0 < d <= cfg._MAX_BY_KNOB["dispatch_timeout_s"]
+
+
+def test_dispatch_max_turns_default_and_cap():
+    # The gated flow needed 42 turns live (> the ipc default of 25); the monitor
+    # passes a generous max_turns so a cold-start (research+draft+verify+stage,
+    # >42 turns) is not truncated. Damage-tolerant + capped.
+    assert cfg.DEFAULTS["dispatch_max_turns"] == 80
+    assert cfg.knob_int({}, "dispatch_max_turns") == 80
+    assert 0 < cfg.DEFAULTS["dispatch_max_turns"] <= cfg._MAX_BY_KNOB["dispatch_max_turns"]
+
+
+def test_text_knob_damage_tolerant():
+    # autorun_note (overlay-only, appended to the auto-run prompt) is a str knob whose
+    # DEFAULT is "" — blank/non-str degrade to "" (no note), a real value passes.
+    assert cfg.text_knob({"autorun_note": "honor your gate"}, "autorun_note") == "honor your gate"
+    assert cfg.text_knob({"autorun_note": "  "}, "autorun_note") == ""
+    assert cfg.text_knob({"autorun_note": 42}, "autorun_note") == ""
+    assert cfg.text_knob({}, "autorun_note") == ""
 
 
 def test_nudge_obs_type_registered_in_both_governance_sets():
@@ -178,6 +213,7 @@ class _FakeModule:
         self._autorun_payload_error = autorun_payload_error  # module-reported {"error"}
         self._autorun_malformed = autorun_malformed  # unparseable auto-run reply
         self.calls: list[str] = []
+        self.param_calls: list[dict] = []  # full params dict per dispatch (max_turns etc.)
 
     async def check_health_cached(self) -> bool:
         return self._healthy
@@ -185,6 +221,7 @@ class _FakeModule:
     async def execute_operation(self, op, params):
         prompt = (params or {}).get("prompt", "")
         self.calls.append(prompt)
+        self.param_calls.append(dict(params or {}))
         if "READ-ONLY: list" in prompt:
             if self._working_error:
                 return {"error": "ssh down"}
@@ -217,7 +254,7 @@ def _autorun_calls(mod: _FakeModule) -> int:
     return sum(1 for c in mod.calls if "READ-ONLY: list" not in c)
 
 
-def _cfg(monkeypatch, *, mode, cap=3):
+def _cfg(monkeypatch, *, mode, cap=3, autorun_note=""):
     monkeypatch.setattr(cfg, "effective_mode", lambda: mode)
     monkeypatch.setattr(
         cfg,
@@ -226,6 +263,8 @@ def _cfg(monkeypatch, *, mode, cap=3):
             "reasoning_module": "test-module",
             "max_auto_runs_per_tick": cap,
             "dispatch_timeout_s": 240,
+            "dispatch_max_turns": 80,
+            "autorun_note": autorun_note,
         },
     )
 
@@ -650,3 +689,349 @@ async def test_runner_records_success_on_clean_tick(monkeypatch):
 
     await runners.run_career_outreach_monitor(_Sched())
     assert calls["success"] == ["career_outreach_monitor"] and not calls["fail"]
+
+
+# ── C3-G: gate-compat auto-run fix (root cause = ground-truth-gate collision) ──
+
+
+def test_autorun_prompt_honors_gate_and_headless():
+    # The reworked auto-run prompt must (a) tell the module to run its OWN
+    # verification gates (never skip/bypass), (b) declare the headless contract
+    # (no interactive questions), (c) forbid gaming the gate (no fabricated token,
+    # no stripping substance), (d) offer the verify_failed outcome, (e) never send.
+    p = _AUTORUN_PROMPT.lower()
+    assert "headless" in p
+    assert "verify_failed" in _AUTORUN_PROMPT  # the new soft-failure outcome
+    assert "never send" in p
+    assert "fabricate" in p  # anti-gaming guard
+    assert "reword" in p  # resolve attribution flags efficiently, don't loop
+    assert "verification" in p or "verify" in p
+    # still a GENERIC prompt — no engine-specific script/file names leak into the
+    # shipped text (install-specific vocabulary rides the gitignored autorun_note).
+    for ext in (".mjs", ".py", ".sh"):
+        assert ext not in _AUTORUN_PROMPT
+    # the read prompt is unchanged and does NOT trip the outreach/draft matcher class
+    assert "READ-ONLY: list" in _LIST_WORKING_PROMPT
+
+
+def test_autorun_note_appended_to_autorun_prompt_only():
+    # The overlay note is appended to the AUTO-RUN prompt when set, and NOT when blank.
+    base = _autorun_prompt({})
+    assert base == _AUTORUN_PROMPT  # blank note → prompt unchanged
+    noted = _autorun_prompt({"autorun_note": "ZZZ_INSTALL_NOTE"})
+    assert noted.startswith(_AUTORUN_PROMPT) and "ZZZ_INSTALL_NOTE" in noted
+
+
+@pytest.mark.asyncio
+async def test_autorun_note_rides_autorun_dispatch_not_list(db, monkeypatch):
+    # Red-team catch: the note must ride the auto-run dispatch but NOT the read
+    # dispatch (a note with "outreach"/"ground-truth" would trip the consult matcher
+    # on the currently-clean read path). Capture the actual dispatched prompts.
+    _cfg(monkeypatch, mode="live", autorun_note="ZZZ_INSTALL_NOTE")
+    mod = _FakeModule(autoruns=[], working=[{"company": "Z", "contact": "z@z.dev"}])
+    mon, _ = _mon(db, mod)
+    await mon.gather()
+    autorun_prompts = [c for c in mod.calls if "READ-ONLY: list" not in c]
+    list_prompts = [c for c in mod.calls if "READ-ONLY: list" in c]
+    assert autorun_prompts and all("ZZZ_INSTALL_NOTE" in c for c in autorun_prompts)
+    assert list_prompts and all("ZZZ_INSTALL_NOTE" not in c for c in list_prompts)
+
+
+@pytest.mark.asyncio
+async def test_verify_failed_is_not_error_and_continues(db, monkeypatch):
+    # A verify_failed outcome = the gate correctly refused an unverifiable draft.
+    # NOT a job-health error; the loop CONTINUES to try the next target.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mod = _FakeModule(
+        autoruns=[
+            {"verify_failed": "dead source url", "company": "A"},
+            {"company": "B", "contact": "b@b.dev", "draft_summary": "s"},
+        ],
+        working=[],
+    )
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    assert result.errors == 0  # verify_failed is not a failure
+    assert result.auto_runs == 1  # only B staged; A correctly did not
+    assert _autorun_calls(mod) == 3  # A(vf) → B(staged) → none_left
+
+
+@pytest.mark.asyncio
+async def test_verify_failed_repeat_guard_breaks(db, monkeypatch):
+    # Same company returned twice (module lacks a durable "attempted" state) → break,
+    # never an unbounded same-target loop burning the whole cap.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mod = _FakeModule(
+        autoruns=[
+            {"verify_failed": "x", "company": "A"},
+            {"verify_failed": "y", "company": "A"},  # re-picked A
+        ],
+        working=[],
+    )
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    assert result.errors == 0 and result.auto_runs == 0
+    assert _autorun_calls(mod) == 2  # broke on the repeat, did not exhaust the cap
+
+
+@pytest.mark.asyncio
+async def test_staged_repeat_guard_breaks(db, monkeypatch):
+    # The guard also covers the staged path: a re-picked already-staged company → break.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mod = _FakeModule(
+        autoruns=[
+            {"company": "A", "contact": "a", "draft_summary": "s"},
+            {"company": "A", "contact": "a", "draft_summary": "s"},  # re-picked A
+        ],
+        working=[],
+    )
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    assert result.auto_runs == 1 and _autorun_calls(mod) == 2
+
+
+@pytest.mark.asyncio
+async def test_autorun_dispatch_passes_max_turns_list_does_not(db, monkeypatch):
+    # The auto-run dispatch carries max_turns (the gated flow needs >25 turns);
+    # the lightweight read dispatch does not (keeps the ipc default).
+    _cfg(monkeypatch, mode="live")
+    mod = _FakeModule(autoruns=[], working=[{"company": "Z", "contact": "z@z.dev"}])
+    mon, _ = _mon(db, mod)
+    await mon.gather()
+    paired = list(zip(mod.param_calls, mod.calls, strict=True))
+    autorun_params = [p for p, c in paired if "READ-ONLY: list" not in c]
+    list_params = [p for p, c in paired if "READ-ONLY: list" in c]
+    assert autorun_params and all(p.get("max_turns") == 80 for p in autorun_params)
+    assert list_params and all("max_turns" not in p for p in list_params)
+
+
+@pytest.mark.asyncio
+async def test_verify_failed_blank_reason_not_counted_as_staged(db, monkeypatch):
+    # Review NOTE 2: an empty-string verify_failed reason must be treated as
+    # verify_failed (presence-check), NOT fall through to the staged path and
+    # miscount a draft that never staged.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mod = _FakeModule(autoruns=[{"verify_failed": "", "company": "A"}], working=[])
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    assert result.auto_runs == 0 and result.verify_failed == 1 and result.errors == 0
+
+
+@pytest.mark.asyncio
+async def test_contradictory_multi_signal_reply_is_error(db, monkeypatch):
+    # Class audit: two+ outcome signals in one reply (none_left / error / verify_failed)
+    # is a contradictory malformed reply → protocol error, never a silent swallow where
+    # the first-checked signal wins (e.g. none_left + verify_failed).
+    for combo in (
+        {"none_left": True, "verify_failed": "v", "company": "A"},
+        {"error": "e", "verify_failed": "v", "company": "A"},
+        {"none_left": True, "error": "e"},
+    ):
+        _cfg(monkeypatch, mode="live", cap=3)
+        mon, _ = _mon(db, _FakeModule(autoruns=[combo], working=[]))
+        result = await mon.gather()
+        assert result.errors >= 1 and result.auto_runs == 0 and result.verify_failed == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_dict_reply_is_error(db, monkeypatch):
+    # An empty dict reply is a protocol violation (no outcome) → error, not swallowed.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mon, _ = _mon(db, _FakeModule(autoruns=[{}], working=[]))
+    result = await mon.gather()
+    assert result.errors >= 1 and result.auto_runs == 0
+
+
+def test_parse_json_never_raises_on_deep_nesting():
+    # Class audit NOTE 2: a pathologically-nested reply must NOT propagate a
+    # RecursionError out of the best-effort parser (it would be miscounted as a
+    # job-health failure); it degrades to None/best-effort instead.
+    deep = "[" * 2000 + "]" * 2000  # > the default recursion limit
+    out = _parse_json(deep)  # must not raise
+    assert out is None or isinstance(out, list)
+
+
+@pytest.mark.asyncio
+async def test_verify_failed_missing_company_is_error(db, monkeypatch):
+    # Codex P2: a verify_failed reply with NO company is a protocol violation → error
+    # (parity with the missing-company staged path), not a silent successful tick.
+    _cfg(monkeypatch, mode="live", cap=3)
+    mod = _FakeModule(autoruns=[{"verify_failed": "x"}], working=[])
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    assert result.errors >= 1 and result.auto_runs == 0 and result.verify_failed == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_warns_but_succeeds_on_no_progress_verify_failed(monkeypatch):
+    # Review SHOULD-FIX 1: a verify_failed-only tick (0 staged/nudged) records SUCCESS
+    # (the gate working, not a failure) BUT emits a WARNING event so a persistently
+    # self-refusing engine is not invisible to job-health.
+    from genesis.observability.types import Severity
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+    events: list = []
+
+    class _Bus:
+        async def emit(self, subsystem, severity, code, msg, **kw):
+            events.append((severity, code))
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(mode="live", verify_failed=2)
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = _Bus()
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert calls["success"] == ["career_outreach_monitor"] and not calls["fail"]
+    assert any(
+        sev == Severity.WARNING and code == "career_outreach.no_progress" for sev, code in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_no_progress_warning_suppressed_on_error_tick(monkeypatch):
+    # Codex P2: a MIXED tick (verify_failed>0 AND errors>0) records the hard FAILURE
+    # and must NOT also emit the "verifier refused every attempt" no-progress warning
+    # (two conflicting diagnoses — operators would chase the verifier, not the error).
+    from genesis.surplus.jobs import runners
+
+    calls = {"fail": [], "success": []}
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
+    events: list = []
+
+    class _Bus:
+        async def emit(self, subsystem, severity, code, msg, **kw):
+            events.append(code)
+
+    class _StubMon:
+        async def gather(self):
+            return CareerOutreachResult(mode="live", verify_failed=1, errors=1)
+
+    class _Sched:
+        _career_outreach_monitor = _StubMon()
+        _event_bus = _Bus()
+
+    await runners.run_career_outreach_monitor(_Sched())
+    assert calls["fail"] and not calls["success"]  # the hard failure is recorded
+    assert "career_outreach.no_progress" not in events  # no second, misleading diagnosis
+
+
+def test_parse_json_extracts_dict_from_verdict_led_reply():
+    # The engine may lead with its own verdict line, THEN the JSON — the parser must
+    # extract the outermost {..} even past a verdict line containing [..] brackets.
+    reply = (
+        "VERDICT: pass — 3 sources verified, claims [role, team], confirmed n/a\n"
+        '{"company":"Acme AI","contact":"founder@acme.example","draft_summary":"cold email"}'
+    )
+    out = _parse_json(reply)
+    assert isinstance(out, dict) and out["company"] == "Acme AI"
+
+
+# ── classify_autorun_reply: the closed-outcome contract (the ONE locking table) ──
+
+
+@pytest.mark.parametrize(
+    "reply, expected",
+    [
+        # NoneLeft
+        ('{"none_left": true}', NoneLeft()),
+        # Staged (contact/draft_summary optional → "")
+        (
+            '{"company":"Acme","contact":"c@a.example","draft_summary":"s"}',
+            Staged("Acme", "c@a.example", "s"),
+        ),
+        ('{"company":"Acme"}', Staged("Acme", "", "")),
+        # verdict-line-led + fenced still classify (parse layer)
+        (
+            'GT: pass — claims [a, b]\n{"company":"Acme","contact":"c","draft_summary":"s"}',
+            Staged("Acme", "c", "s"),
+        ),
+        ('```json\n{"none_left": true}\n```', NoneLeft()),
+        # VerifyFailed (blank/null reason → "unspecified")
+        ('{"verify_failed":"dead url","company":"Acme"}', VerifyFailed("Acme", "dead url")),
+        ('{"verify_failed":"","company":"Acme"}', VerifyFailed("Acme", "unspecified")),
+        ('{"verify_failed":null,"company":"Acme"}', VerifyFailed("Acme", "unspecified")),
+        ('{"verify_failed":123,"company":"Acme"}', VerifyFailed("Acme", "123")),  # non-str reason
+        # ModuleError
+        ('{"error":"auth failed"}', ModuleError("auth failed")),
+        # verdict line + FENCED json (a plausible single reply) still classifies
+        (
+            'GT: pass\n```json\n{"company":"Acme","contact":"c","draft_summary":"s"}\n```',
+            Staged("Acme", "c", "s"),
+        ),
+    ],
+)
+def test_classify_autorun_reply_valid_outcomes(reply, expected):
+    assert classify_autorun_reply(reply) == expected
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "not json at all",
+        "",
+        "   ",
+        "[1, 2, 3]",  # array, not an object
+        "42",  # scalar
+        '"a string"',  # scalar
+        "null",  # json null
+        "{}",  # empty object — no outcome
+        '{"none_left": false}',  # present but not literal true
+        '{"none_left": "yes"}',  # wrong type
+        '{"none_left": 1}',  # numeric-truthy, not literal true
+        '{"error": ""}',  # empty error detail
+        '{"error": null}',  # null error detail
+        '{"error": 123}',  # non-string error
+        '{"verify_failed":"x"}',  # verify_failed missing company
+        '{"verify_failed":"x","company":"   "}',  # whitespace company
+        '{"contact":"c","draft_summary":"s"}',  # no company, no signal
+        '{"company": 123}',  # company wrong type
+        '{"none_left":true,"verify_failed":"x","company":"A"}',  # multi-signal
+        '{"error":"e","verify_failed":"v","company":"A"}',  # multi-signal
+        '{"none_left":true,"error":"e"}',  # multi-signal
+        '{"none_left":true,"company":"Acme"}',  # terminal signal must not carry company
+        '{"error":"e","company":"Acme"}',  # terminal signal must not carry company
+        '{"none_left":true,"company":123}',  # non-string company KEY present → reject
+        '{"none_left":true,"company":"  "}',  # blank company KEY present → reject
+        '{"none_left":true,"company":null}',  # null company KEY present → reject
+    ],
+)
+def test_classify_autorun_reply_protocol_errors(reply):
+    assert isinstance(classify_autorun_reply(reply), ProtocolError)
+
+
+def test_parse_json_tolerates_trailing_content():
+    # Review SHOULD-FIX: trailing content after the payload (a closing ``` fence, a
+    # trailing word/period, or a leading verdict line PLUS a fence) must still recover
+    # the object — the strict consumes-to-end scan falls back to the outermost span.
+    assert _parse_json('{"company":"X"}\nDone.')["company"] == "X"
+    assert _parse_json('{"company":"X"}.')["company"] == "X"
+    assert _parse_json('GT: pass\n```json\n{"company":"X"}\n```')["company"] == "X"
+    # ...while the leading verdict-is-JSON case still resolves to the TRAILING payload.
+    assert _parse_json('{"verdict":"pass"}\n{"company":"X"}')["company"] == "X"
+    # ...INCLUDING the compound case: a JSON-shaped verdict AND a fenced payload
+    # together (Codex P2 — the largest-end-index rule handles it).
+    assert _parse_json('{"verdict":"pass"}\n```json\n{"company":"X"}\n```')["company"] == "X"
+    # ...and a nested object with trailing content recovers the top-level object.
+    assert _parse_json('{"company":"Y","meta":{"a":1}} trailing')["company"] == "Y"
+
+
+def test_parse_json_handles_json_verdict_and_nested_objects():
+    # Codex P2: a verdict line that is ITSELF JSON must not be mistaken for the payload
+    # (first-{ span bug), and a nested object must not be grabbed (last-{ span bug).
+    # The trailing payload = the value that consumes to the end of the reply.
+    assert _parse_json('{"verdict":"pass"}\n{"company":"X","contact":"c"}')["company"] == "X"
+    nested = _parse_json('note line\n{"company":"Y","meta":{"a":1}}')
+    assert nested["company"] == "Y" and nested["meta"] == {"a": 1}
+    # a clean array (read path, no verdict) still parses
+    assert _parse_json('[{"company":"A"},{"company":"B"}]') == [
+        {"company": "A"},
+        {"company": "B"},
+    ]

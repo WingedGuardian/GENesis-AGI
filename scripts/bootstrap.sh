@@ -961,6 +961,12 @@ if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
     # shellcheck source=lib/memory_resilience.sh
     source "$SCRIPT_DIR/lib/memory_resilience.sh"
     memory_resilience_apply
+    # PID/task ceiling: raise the per-user-slice TasksMax above systemd's stock
+    # 33% default (the fork-exhaustion blind spot — many concurrent CC sessions
+    # spawn MCP subprocess trees and hit `Cannot fork` while memory/CPU read
+    # green). Same lib, same never-abort contract; surfaces via the posture check
+    # (pid_ceiling_effective_ok) when sudo/etc is unavailable.
+    pid_budget_apply
 else
     echo "  WARNING: lib/memory_resilience.sh missing — skipping OOM-resilience setup"
 fi

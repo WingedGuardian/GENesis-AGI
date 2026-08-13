@@ -54,6 +54,7 @@ def _profile(
     *,
     swap_max: object = "max",
     oomd: object = True,
+    tasksmax_ok: object = True,
     host_swap_kb: object = 8_000_000,
     knob: object = "true",
     networkd_route: object = True,
@@ -74,6 +75,7 @@ def _profile(
                 "facts": {
                     "cgroup_memory_swap_max": swap_max,
                     "oomd_user_slice_kill": oomd,
+                    "pid_ceiling_effective_ok": tasksmax_ok,
                     # meminfo swap is NOT virtualized: 0 here on a HEALTHY
                     # container (verified live 2026-07-16) — the check must
                     # never key on it.
@@ -121,6 +123,7 @@ def _reset_cooldown():
 _ALL_DEFECTS = dict(
     swap_max=0,
     oomd=False,
+    tasksmax_ok=False,
     host_swap_kb=0,
     knob="false",
     networkd_route=True,  # networkd owns the route, so the network rules apply
@@ -139,7 +142,17 @@ def test_all_defects_detected():
         "network_watchdog_absent",
         "networkd_keepconfig_missing",
         "oomd_pressure_kill_off",
+        "pid_ceiling_unprovisioned",
     ]
+
+
+def test_pid_ceiling_unprovisioned_only_on_explicit_false():
+    # Explicit False (effective ceiling still on systemd's 33% default) → defect.
+    assert "pid_ceiling_unprovisioned" in _infra_missing_protections(_profile(tasksmax_ok=False))
+    # Raised (True) → silent.
+    assert "pid_ceiling_unprovisioned" not in _infra_missing_protections(_profile(tasksmax_ok=True))
+    # Absent / unreadable (None) → silent (explicit-value discipline).
+    assert "pid_ceiling_unprovisioned" not in _infra_missing_protections(_profile(tasksmax_ok=None))
 
 
 def test_healthy_profile_no_defects():
@@ -522,6 +535,7 @@ def test_resilience_facts_are_covered():
     for fact in (
         "cgroup_memory_swap_max",
         "oomd_user_slice_kill",
+        "pid_ceiling_effective_ok",
         "swap_total_kb",
         "limits.memory.swap",
         "networkd_manages_default_route",

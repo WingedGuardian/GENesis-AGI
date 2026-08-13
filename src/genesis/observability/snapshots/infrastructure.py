@@ -136,7 +136,8 @@ def memory_status(anon_frac: float, pressure: dict) -> str:
     anon_status = "healthy" if anon_frac < 0.85 else ("degraded" if anon_frac < 0.95 else "down")
     full60 = pressure.get("full_avg60", 0.0)
     psi_status = (
-        "down" if full60 >= _MEM_PSI_ERROR_PCT
+        "down"
+        if full60 >= _MEM_PSI_ERROR_PCT
         else ("degraded" if full60 >= _MEM_PSI_DEGRADED_PCT else "healthy")
     )
     return _worse_status(anon_status, psi_status)
@@ -158,6 +159,198 @@ def _cpu_status(used_pct: float | None) -> str:
     if used_pct >= _CPU_DEGRADED_PCT:
         return "degraded"
     return "healthy"
+
+
+# PID/task-budget % thresholds. Sustained high occupancy of the BINDING cgroup
+# level's pids.max (session scope, user slice, or shared container root — see
+# _collect_pid_budget) is what precedes `Cannot fork`: it maxes under many
+# concurrent CC sessions (each spawns MCP subprocess trees) while memory/cpu/disk
+# still read green.
+_PID_DEGRADED_PCT = 80.0
+_PID_ERROR_PCT = 90.0
+
+
+def _pid_status(pct: float | None) -> str:
+    """Map PID-budget utilization % → health status. None (no sub-cap) → healthy."""
+    if pct is None:
+        return "healthy"
+    if pct >= _PID_ERROR_PCT:
+        return "error"
+    if pct >= _PID_DEGRADED_PCT:
+        return "degraded"
+    return "healthy"
+
+
+_CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _user_slice_pids_dir() -> str:
+    """cgroup-v2 pids dir for the current user's systemd slice — the fallback
+    starting leaf when ``/proc/self/cgroup`` cannot be parsed."""
+    return f"{_CGROUP_ROOT}/user.slice/user-{os.getuid()}.slice"
+
+
+def _cgroup_path_from_proc(text: str) -> str | None:
+    """Map ``/proc/self/cgroup`` contents → this process's sysfs cgroup dir.
+
+    The cgroup-v2 unified line is ``0::<path>``. Returns ``_CGROUP_ROOT`` + that
+    path (a trailing ``" (deleted)"`` zombie-cgroup marker stripped). Returns None
+    when there is no unified line (legacy/hybrid v1) or the path is not absolute —
+    the caller then falls back to the user-slice path.
+    """
+    for line in text.splitlines():
+        if line.startswith("0::"):
+            rel = line[3:].strip()
+            if rel.endswith(" (deleted)"):
+                rel = rel[: -len(" (deleted)")].rstrip()
+            if not rel.startswith("/"):
+                return None
+            return _CGROUP_ROOT if rel == "/" else _CGROUP_ROOT + rel
+    return None
+
+
+def _self_cgroup_leaf_dir() -> str | None:
+    """This process's own cgroup pids dir (from ``/proc/self/cgroup``), or None
+    if unparsable/unreadable."""
+    try:
+        with open("/proc/self/cgroup") as f:
+            return _cgroup_path_from_proc(f.read())
+    except OSError:
+        return None
+
+
+def _same_path(a: str, b: str) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return a == b
+
+
+# Sentinel: a level that HAS a finite positive pids.max but whose pids.current is
+# momentarily unreadable/malformed. We cannot know its %, so it might be the
+# saturated binding level — the caller must fail to "unavailable", never silently
+# drop it (that would be a false-green, the exact failure this monitor prevents).
+_PARTIAL_READ = object()
+
+
+def _read_finite_pids_level(d: str) -> tuple[int, int] | object | None:
+    """``(current, max_pids)`` for ONE cgroup dir with a FINITE positive ``pids.max``;
+    ``None`` when the level has no finite cap (absent / ``"max"`` / malformed /
+    non-positive max) — "not a binding candidate"; ``_PARTIAL_READ`` when the max is
+    finite but ``pids.current`` is unreadable — "cap present, % unknowable"."""
+    try:
+        with open(f"{d}/pids.max") as f:
+            raw_max = f.read().strip()
+    except OSError:
+        return None
+    if raw_max == "max":
+        return None
+    try:
+        max_pids = int(raw_max)
+    except ValueError:
+        return None
+    if max_pids <= 0:
+        return None
+    try:
+        with open(f"{d}/pids.current") as f:
+            current = int(f.read().strip())
+    except (OSError, ValueError):
+        return _PARTIAL_READ  # finite cap, unknowable % → force "unavailable" upstream
+    return current, max_pids
+
+
+def _scope_label(d: str) -> str:
+    """Label for a cgroup level: ``"container-root"`` for the mount root, else the
+    directory basename (``"genesis-server.service"``, ``"user-1000.slice"``, …)."""
+    return "container-root" if _same_path(d, _CGROUP_ROOT) else os.path.basename(d.rstrip("/"))
+
+
+def _collect_pid_budget(base_dir: str | None = None) -> dict:
+    """Report the EFFECTIVE PID/task budget for this process by walking its cgroup
+    chain and returning the BINDING (highest-utilization) level.
+
+    A fork fails when ANY ancestor cgroup hits its ``pids.max`` (kernel cgroup-v2:
+    nested limits only restrict further, enforced across the subtree). Reading only
+    the user slice is therefore a blind spot — an uncapped slice with a binding
+    ancestor (container root), a bound service-scope BELOW the slice (the server
+    unit holds its own git/subprocess trees), or a busy shared root can each precede
+    ``Cannot fork`` while the slice reads green. This walks from THIS process's own
+    cgroup (``/proc/self/cgroup``) up to the cgroup mount root, considering every
+    level that has a finite ``pids.max``, and reports the one at highest %. Reads are
+    fork-free.
+
+    Returns ``{status, current, max, pct, scope}`` for the binding level. When the
+    whole VISIBLE chain is uncapped (all ``pids.max == "max"``) →
+    ``{status: healthy, current, max: "max", pct: None}`` — genuinely no sub-cap
+    (the container root may still be capped by the LXC host ABOVE our visible root,
+    which is unmonitorable from inside; we surface, never falsely close). An
+    unreadable/malformed LEAF → ``{status: "unavailable"}`` — never a false
+    "healthy".
+
+    ``base_dir`` overrides the starting leaf (tests); production derives it from
+    ``/proc/self/cgroup``, falling back to the user-slice path if that is unparsable.
+    """
+    leaf = base_dir if base_dir is not None else _self_cgroup_leaf_dir()
+    if leaf is None:
+        leaf = _user_slice_pids_dir()
+    leaf = os.path.abspath(leaf)
+
+    # Contract: an unreadable/malformed LEAF is "unavailable" (never false-healthy).
+    # A leaf pids.max of "0"/non-int is a broken read, NOT an uncapped chain.
+    try:
+        with open(f"{leaf}/pids.current") as f:
+            leaf_current = int(f.read().strip())
+        with open(f"{leaf}/pids.max") as f:
+            leaf_raw_max = f.read().strip()
+    except (OSError, ValueError):
+        return {"status": "unavailable"}
+    if leaf_raw_max != "max":
+        try:
+            if int(leaf_raw_max) <= 0:
+                return {"status": "unavailable"}
+        except ValueError:
+            return {"status": "unavailable"}
+
+    # Walk leaf → cgroup mount root, collecting every finite level as
+    # (pct, current, max, scope).
+    candidates: list[tuple[float, int, int, str]] = []
+    d = leaf
+    while True:
+        parsed = _read_finite_pids_level(d)
+        if parsed is _PARTIAL_READ:
+            # A capped level whose % is unknowable → we can't rule out that it is the
+            # saturated binding level. Fail to "unavailable" (never a false-green),
+            # symmetric with the leaf contract; self-heals next tick.
+            return {"status": "unavailable"}
+        if parsed is not None:
+            cur, mx = parsed  # type: ignore[misc]
+            candidates.append((round(cur / mx * 100, 1), cur, mx, _scope_label(d)))
+        if _same_path(d, _CGROUP_ROOT):
+            break
+        parent = os.path.dirname(d)
+        if parent == d:  # filesystem root — no cgroup mount boundary (tmp/tests)
+            break
+        d = parent
+
+    if not candidates:
+        # Leaf readable but nothing finite anywhere visible → genuinely uncapped.
+        return {"status": "healthy", "current": leaf_current, "max": "max", "pct": None}
+
+    # Binding = the level closest to `Cannot fork` = the HIGHEST % (nearest its own
+    # pids.max), which is also the level whose % drives the status — so reporting it
+    # can never MASK a saturated ancestor behind a lower-% level (the false-green
+    # this monitor exists to prevent). Ranking by absolute headroom was rejected for
+    # exactly that masking: it answers "how many more forks can THIS process do", a
+    # different question from this %-threshold monitor's "which level is nearest its
+    # ceiling". max() keeps the first (innermost) level on % ties.
+    pct, current, max_pids, scope = max(candidates, key=lambda c: c[0])
+    return {
+        "status": _pid_status(pct),
+        "current": current,
+        "max": max_pids,
+        "pct": pct,
+        "scope": scope,
+    }
 
 
 # Module-level state for delta-based CPU reading (no blocking sleep)
@@ -209,7 +402,12 @@ def _collect_cpu_usage() -> dict:
             return {"status": "healthy", "used_pct": 0.0, "count": count, "pressure": pressure}
 
         used_pct = round((1.0 - delta_idle / delta_total) * 100, 1)
-        return {"status": _cpu_status(used_pct), "used_pct": used_pct, "count": count, "pressure": pressure}
+        return {
+            "status": _cpu_status(used_pct),
+            "used_pct": used_pct,
+            "count": count,
+            "pressure": pressure,
+        }
     except (OSError, ValueError, IndexError):
         return {"status": "unavailable", "used_pct": None, "count": count, "pressure": pressure}
 
@@ -294,6 +492,17 @@ def _collect_host_metrics() -> dict:
         }
     except OSError as exc:
         metrics["disk"] = {"status": "error", "error": str(exc)}
+
+    # PID/task budget of the BINDING cgroup level (walks this process's chain —
+    # session scope / user slice / container root) — the blind spot that let a
+    # `Cannot fork` happen while every other axis read green. Fork-free cgroup read.
+    # _collect_pid_budget already degrades to {"status": "unavailable"} internally;
+    # the guard is defense-in-depth so a future raise here can't blank the cc_tmp
+    # axis that follows (matching this block's per-section isolation).
+    try:
+        metrics["pids"] = _collect_pid_budget()
+    except Exception as exc:
+        metrics["pids"] = {"status": "error", "error": str(exc)}
 
     try:
         from genesis.observability.service_status import collect_cc_tmp_usage
@@ -404,9 +613,7 @@ async def infrastructure(
             infra["scheduler"] = {"status": "error", "error": str(exc)}
     elif db:
         try:
-            cursor = await db.execute(
-                "SELECT MAX(last_run) FROM job_health"
-            )
+            cursor = await db.execute("SELECT MAX(last_run) FROM job_health")
             row = await cursor.fetchone()
             if row and row[0]:
                 last_run = datetime.fromisoformat(row[0])
@@ -414,7 +621,10 @@ async def infrastructure(
                 if age_s < 600:
                     infra["scheduler"] = {"status": "healthy"}
                 else:
-                    infra["scheduler"] = {"status": "degraded", "error": f"last job ran {int(age_s)}s ago"}
+                    infra["scheduler"] = {
+                        "status": "degraded",
+                        "error": f"last job ran {int(age_s)}s ago",
+                    }
             else:
                 infra["scheduler"] = {"status": "unknown", "error": "no job history"}
         except Exception as exc:
@@ -422,9 +632,9 @@ async def infrastructure(
     else:
         infra["scheduler"] = {"status": "unknown", "error": "no scheduler or DB available"}
 
-    # CPU + disk + cc_tmp are synchronous /proc & /sys reads — collect them off
-    # the event loop in one thread hop (they otherwise contribute a chronic class
-    # of sub-second loop-lag WARNs under memory/CPU pressure).
+    # CPU + disk + pids + cc_tmp are synchronous /proc & /sys reads — collect them
+    # off the event loop in one thread hop (they otherwise contribute a chronic
+    # class of sub-second loop-lag WARNs under memory/CPU pressure).
     infra.update(await asyncio.to_thread(_collect_host_metrics))
 
     try:
@@ -491,11 +701,7 @@ async def infrastructure(
                 "status": str(result.status),
                 "latency_ms": result.latency_ms,
             }
-            if (
-                routing_config
-                and hasattr(result, "details")
-                and isinstance(result.details, dict)
-            ):
+            if routing_config and hasattr(result, "details") and isinstance(result.details, dict):
                 actual_models = set(result.details.get("models", []))
                 if actual_models:
                     missing = []
@@ -537,10 +743,7 @@ def resilience_state_detail(
     summary = ""
     if breakers:
         try:
-            down = [
-                name for name, cb in breakers._breakers.items()
-                if not cb.is_available()
-            ]
+            down = [name for name, cb in breakers._breakers.items() if not cb.is_available()]
             if down:
                 summary = f"Providers down: {', '.join(sorted(down))}"
         except Exception:
