@@ -98,6 +98,28 @@ def test_binary_replacement_changes_hash(tmp_path):
     assert h1 != h2
 
 
+def _hash_of_single_staged_file(tmp_path, name: str, content: str, subdir: str) -> str:
+    repo = tmp_path / subdir / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / name).write_text(content)
+    _git(repo, "add", "-A")
+    return _rs.get_current_diff_hash(cwd=str(repo))
+
+
+def test_trailing_whitespace_path_not_collapsed(tmp_path):
+    # Staging identical content under `foo` vs `foo ` (trailing space) MUST hash
+    # differently — else a reviewed `foo` could be replaced by `foo ` and read as
+    # already-reviewed. Under the old `.strip()` on `--raw` text these collided
+    # (the trailing space was stripped from the last line); `-z` + byte-hashing
+    # (no strip) keeps them distinct.
+    h_plain = _hash_of_single_staged_file(tmp_path, "foo", "same\n", "a")
+    h_space = _hash_of_single_staged_file(tmp_path, "foo ", "same\n", "b")
+    assert h_plain not in ("clean", "unknown")
+    assert h_space not in ("clean", "unknown")
+    assert h_plain != h_space
+
+
 def test_mode_change_changes_hash(tmp_path):
     # chmod +x with identical content must change the hash (the --raw mode field flips).
     repo = tmp_path / "repo"

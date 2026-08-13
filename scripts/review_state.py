@@ -7,7 +7,7 @@ Used by:
 - genesis_stop_hook.py (Stop hook)
 - Claude (after /review + code-reviewer agent complete)
 
-The marker file records a hash of ``git diff --cached --raw --no-abbrev`` (staged
+The marker file records a hash of ``git diff --cached --raw --no-abbrev -z`` (staged
 changes only) at the time review was done.  If staged content changes, the marker
 becomes stale and review is required again.  Unstaged working-tree edits
 (e.g. from Codex) do not trigger review enforcement.
@@ -82,23 +82,27 @@ def _state_file(cwd: str | None = None) -> Path:
 
 
 def get_current_diff_hash(cwd: str | None = None) -> str:
-    """SHA-256 of ``git diff --cached --raw --no-abbrev`` output (staged only).
+    """SHA-256 of ``git diff --cached --raw --no-abbrev -z`` output (staged only).
 
     Only staged changes trigger review enforcement.  Unstaged changes
     (e.g. from Codex or other tools editing the working tree) are ignored
     so they don't cause false-positive review blocks.
 
-    Uses ``--raw --no-abbrev`` — a machine format
-    (``:mode mode <src-oid> <dst-oid> status\\tpath``) that is BOTH:
+    Uses ``--raw --no-abbrev -z`` — a NUL-separated, BYTE-oriented machine format
+    that is:
     - **width-independent**: unlike ``--stat`` (path truncation + change-bar
       scaling by ``COLUMNS``/terminal), so the SAME staged content no longer
       hashes differently when ``mark`` (one width) and the commit gate (another
-      width) run — the systematic false "code changes without review" block; and
+      width) run — the systematic false "code changes without review" block;
     - **content-complete**: the destination blob OID changes on ANY content
       change, INCLUDING binary (unlike ``--numstat``, which collapses every
       binary change to ``-\\t-\\t<path>`` and would let a same-path binary
       swap read as already-reviewed). ``--no-abbrev`` pins full 40-char OIDs so
-      the hash can't shift with git's auto-abbreviation length.
+      the hash can't shift with git's auto-abbreviation length; and
+    - **byte-exact on paths**: ``-z`` NUL-separates records and emits RAW path
+      bytes (no ``core.quotePath`` quoting, no trailing-whitespace loss). The
+      output is hashed as bytes with NO stripping, so a rename ``foo`` → ``foo ``
+      (or any non-UTF8 / whitespace path) cannot collide with the original.
 
     Args:
         cwd: Working directory for git commands. When None, uses the
@@ -106,16 +110,15 @@ def get_current_diff_hash(cwd: str | None = None) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--raw", "--no-abbrev"],
-            capture_output=True,
-            text=True,
+            ["git", "diff", "--cached", "--raw", "--no-abbrev", "-z"],
+            capture_output=True,  # bytes (no text= → no newline/encoding munging)
             timeout=10,
             cwd=cwd,
         )
-        content = result.stdout.strip()
+        content = result.stdout  # raw bytes; do NOT strip (would drop trailing-ws paths)
         if not content:
             return "clean"
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
+        return hashlib.sha256(content).hexdigest()[:16]
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return "unknown"
 
