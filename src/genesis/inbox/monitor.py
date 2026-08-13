@@ -16,6 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.cc.session_config import SessionConfigBuilder
+from genesis.cc.types import SPAWN_TOOL_NAMES
 from genesis.inbox.scanner import (
     compute_hash,
     detect_changes,
@@ -34,6 +35,11 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "identity"
 _SYSTEM_PROMPT_FILE = "INBOX_EVALUATE.md"
+
+# The inbox-eval judge session is read-only + non-spawning: no file writes, and no
+# subagent spawn (a spawned subagent inherits a fresh, unrestricted toolset and
+# escapes the lockdown). SPAWN_TOOL_NAMES = current "Agent" + obsolete "Task".
+_EVAL_DISALLOWED_TOOLS: list[str] = ["Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
 
 
 _FALLBACK_SYSTEM_PROMPT = (
@@ -1330,7 +1336,7 @@ class InboxMonitor:
             system_prompt=system_prompt,
             timeout_s=self._config.timeout_s,
             skip_permissions=True,
-            disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
+            disallowed_tools=list(_EVAL_DISALLOWED_TOOLS),
             working_dir=background_session_dir(),
             mcp_config=mcp_path,
             # WS-3: inbox evaluations process EXTERNAL content by construction,

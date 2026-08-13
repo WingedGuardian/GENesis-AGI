@@ -42,6 +42,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Autonomous background sessions can no longer escape their tool sandbox by
+  spawning a subagent.** Genesis's restricted sessions (reflection, the
+  direct-session profiles, the inbox/mail judges, and others) run with a
+  locked-down toolset — no shell, no file writes. That lockdown blocked the
+  obsolete subagent-spawn tool name but not the current one, so a restricted
+  session could in principle spawn a subagent that ran with full, unrestricted
+  tools. Every restricted-session denylist now denies the subagent-spawn tool
+  from a single shared definition, with a guardrail test so a new one can't
+  silently reopen the gap.
+
 - **The autonomous-CLI approval gate now ships ON by default.** Every background
   Claude Code session Genesis dispatches must be rooted in an explicit user
   approval — but the committed policy config shipped the gate *off*, so a fresh

@@ -8,6 +8,21 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+# CC's subagent-spawn tool names — the single source of truth for every
+# restricted-session denylist. "Agent" is the CURRENT Claude Code tool name
+# (registered in util/tool_bootstrap.py CC_TOOLS; matched by the PreToolUse hook
+# in .claude/settings.json); "Task" is the OBSOLETE name, retained so a re-introduction
+# of the old name is also denied. A locked-down session (reflection, surplus, the
+# direct-session profiles, the inbox/mail judges, the experimentation completion,
+# sentinel-degraded) MUST deny BOTH: a subagent it spawns inherits a fresh,
+# unrestricted toolset (Bash/Write/Edit) and would escape the lockdown. Blocking the
+# bare tool name removes it from the model's context entirely — and only
+# --disallowedTools removes a tool (--allowedTools does NOT, under
+# --dangerously-skip-permissions; verified empirically 2026-08-07 via the init-event
+# tool list). Home is this leaf module so every site can reference it with no new
+# import edge (all denylist sites already import from genesis.cc.types).
+SPAWN_TOOL_NAMES: tuple[str, ...] = ("Agent", "Task")
+
 
 class SessionType(StrEnum):
     FOREGROUND = "foreground"

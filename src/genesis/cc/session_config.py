@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from genesis.cc.types import CCModel, EffortLevel
+from genesis.cc.types import SPAWN_TOOL_NAMES, CCModel, EffortLevel
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -21,6 +21,8 @@ _READONLY_DISALLOWED = [
     "Edit",
     "Bash",
     "NotebookEdit",
+    # Spawn tools: a subagent would escape the read-only lockdown (fresh toolset).
+    *SPAWN_TOOL_NAMES,
 ]
 
 # NOTE: Destructive git operations (force push, hard reset, clean) are guarded
@@ -73,11 +75,12 @@ _REFLECTION_MCP_SERVERS: tuple[tuple[str, str], ...] = (
 # (Read/Grep/Glob/WebFetch/WebSearch/ToolSearch/CronList/Task{Get,List,Output}/
 # ListMcpResourcesTool/ReadMcpResource*Tool) are left available. CC internals
 # aren't introspectable, so this is an explicit list; the scope test re-checks it.
-# Task/Workflow/Skill are denied because they SPAWN — a subagent would escape the
-# lockdown.
+# Agent/Task/Workflow/Skill are denied because they SPAWN — a subagent would escape
+# the lockdown (it inherits a fresh, unrestricted toolset). "Agent" is the current CC
+# spawn tool; "Task" is the obsolete name (both via SPAWN_TOOL_NAMES).
 _REFLECTION_DENY_BUILTINS: tuple[str, ...] = (
     "Bash", "Write", "Edit", "NotebookEdit",
-    "Task", "Workflow", "Skill",
+    *SPAWN_TOOL_NAMES, "Workflow", "Skill",
     "SendMessage", "ReportFindings",
     "CronCreate", "CronDelete", "ScheduleWakeup", "Monitor",
     "TaskCreate", "TaskUpdate", "TaskStop",

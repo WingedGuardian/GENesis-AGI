@@ -34,6 +34,7 @@ from genesis.cc import rate_limit_park, roster
 from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.session_config import _USER_SCOPED_MCP_WILDCARDS
 from genesis.cc.types import (
+    SPAWN_TOOL_NAMES,
     CCInvocation,
     CCModel,
     CCOutput,
@@ -133,6 +134,10 @@ _UNIVERSAL_DISALLOW = [
     "Bash",
     "Edit",
     "NotebookEdit",
+    # Subagent spawn: a background session must never spawn a CC subagent — it would
+    # inherit a fresh, unrestricted toolset (Bash/Write/Edit) and escape the profile
+    # lockdown. "Agent" is the current CC tool; "Task" the obsolete name.
+    *SPAWN_TOOL_NAMES,
     "mcp__genesis-health__task_submit",
     "mcp__genesis-health__settings_update",
     "mcp__genesis-health__direct_session_run",  # No recursive spawn
@@ -491,7 +496,10 @@ class ProfileOverlayContext:
         """
         if name in PROFILES:
             raise ValueError(f"profile overlay may not override built-in profile {name!r}")
-        PROFILES[name] = list(disallow)
+        # Spawn-lock every overlay profile unconditionally: an install-local overlay
+        # cannot opt out of the subagent-spawn denial (robust-by-construction), even
+        # if it hand-rolls its disallow list without composing _UNIVERSAL_DISALLOW.
+        PROFILES[name] = list(dict.fromkeys([*SPAWN_TOOL_NAMES, *disallow]))
         _PROFILE_ADDENDA[name] = addendum
         _PROFILE_BASH_ALLOWLIST[name] = tuple(bash_allowlist)
         _PROFILE_TO_MCP[name] = mcp_profile
@@ -1324,6 +1332,11 @@ class DirectSessionRunner:
             # invariant (GENESIS_SESSION_ID is always a foreground row) depends
             # on direct_session_run staying unreachable from background sessions.
             exceptions.discard("mcp__genesis-health__direct_session_run")
+            # ...and never re-enable CC subagent spawn via a tool_exception: a spawned
+            # subagent inherits a fresh, unrestricted toolset and escapes the lockdown
+            # (same escape the direct_session_run discard above guards against).
+            for _spawn in SPAWN_TOOL_NAMES:
+                exceptions.discard(_spawn)
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile

@@ -220,15 +220,29 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 437c56c0 2026-08-09
+verified: 51253c67 2026-08-13
 ```
+
+- **Subagent-spawn lockdown — one source of truth across ALL restricted sessions**
+  (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task")`). A locked-down session must deny the
+  CC subagent-spawn tool, or it escapes its lockdown by spawning a subagent that inherits
+  a fresh, unrestricted toolset. `Agent` is the current CC tool name; `Task` is the
+  obsolete name. The denylists had drifted (sentinel-degraded blocked both, reflection
+  blocked only `Task`, direct-session + surplus blocked neither); all now reference
+  `SPAWN_TOOL_NAMES` — reflection (`_REFLECTION_DENY_BUILTINS`), surplus
+  (`_READONLY_DISALLOWED`), every direct-session profile (`_UNIVERSAL_DISALLOW` + a
+  per-request `tool_exceptions` discard + `add_profile` inject), the inbox/mail judges,
+  and the experimentation completion. `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS`
+  keeps its own literal (deliberate import-cycle avoidance) but is held ⊇ by
+  `tests/test_cc/test_spawn_lockdown.py`, which locks the whole class so a new
+  restricted-session denylist that forgets spawn-blocking fails CI.
 
 - **Reflection tool lockdown — read-only + observations only**
   (`session_config.build_reflection_disallowed`, wired at `reflection_bridge/_bridge.py`
   into the reflection `CCInvocation.disallowed_tools`). Deep/strategic reflections run
   with a DERIVED denylist = (live `genesis-health` + `genesis-memory` registry − a read
-  allowlist − `observation_write`) + the write/action built-ins (Bash/Write/Edit/Task/
-  Workflow/Skill/…), so a future write tool is auto-denied. `--allowedTools` is NOT a
+  allowlist − `observation_write`) + the write/action built-ins (Bash/Write/Edit/Agent/
+  Task/Workflow/Skill/…), so a future write tool is auto-denied. `--allowedTools` is NOT a
   strict allowlist under `--dangerously-skip-permissions` (verified empirically 2026-08-07
   via the init-event tool list — it left Bash available); only `--disallowedTools` removes
   a tool, so the scoping is a denylist. Guards (`tests/test_cc/test_reflection_tool_scope.py`):
