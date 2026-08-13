@@ -307,7 +307,11 @@ class ContainerMemoryCollector:
             normal_max=0.80,
             warning_threshold=0.85,
             critical_threshold=0.90,
-            baseline_note="Includes page cache; 70-80% is normal for containerized workloads",
+            baseline_note=(
+                "Excludes reclaimable page cache (anon+kernel only) — real memory pressure, "
+                "not cache noise. 70-80% is normal headroom; sustained above ~85% indicates "
+                "genuine OOM risk"
+            ),
         )
 
 
@@ -480,7 +484,11 @@ class SchedulerLivenessCollector:
             return SignalReading(
                 name=self.signal_name, value=0.0, source="runtime",
                 collected_at=now.isoformat(),
-                baseline_note="0.0=scheduler active. Rises if surplus jobs stop running",
+                baseline_note=(
+                    "0.0=surplus scheduler active (checks ONLY the surplus jobs "
+                    "surplus_dispatch/surplus_brainstorm/schedule_code_index, not the "
+                    "awareness loop's own scheduler). Rises if those jobs stop running"
+                ),
             )
 
         return SignalReading(
@@ -488,6 +496,10 @@ class SchedulerLivenessCollector:
             value=min(1.0, len(stale_schedulers) * 0.5),
             source="runtime",
             collected_at=now.isoformat(),
+            baseline_note=(
+                "0.5+=one or more surplus scheduler jobs are stale past the 15-min "
+                "threshold (see metadata.stale for which) — the surplus scheduler may be wedged"
+            ),
             metadata={"stale": stale_schedulers},
         )
 
