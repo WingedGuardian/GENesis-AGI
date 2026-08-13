@@ -323,9 +323,14 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   fix-churn on the hand-rolled parser itself — no finite pre-push audit bounds that
   tail). The cure is architectural,
   not "review harder": bind atomically to the real tool (e.g. `gh pr merge
-  --match-head-commit`), fail CLOSED on any form you cannot parse, and use a
-  canonical parser (`shlex`/`bashlex`) — never bespoke semantics. Same family as
-  the canonical-parser lesson (regex→yaml, #1393). Loci today:
+  --match-head-commit`) and use a canonical parser (`shlex`/`bashlex`) — never
+  bespoke semantics. Choose the fail direction PER BOUNDARY by consequence: the
+  shared parser must DEGRADE gracefully (fail-open, never crash — that is
+  `shell_parse.py`'s stated contract), while each security-critical caller
+  (merge/push authorization) treats an unparseable command as a block (fail-closed
+  THERE). A parser-wide absolute fail-closed is wrong — it would deny legitimate
+  uncommon commands without closing evasion paths. Same family as the
+  canonical-parser lesson (regex→yaml, #1393). Loci today:
   `scripts/hooks/shell_parse.py` + `scripts/hooks/git_push_guard.py`.
 
 ### Iterative-Refinement Discipline

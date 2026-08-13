@@ -10,13 +10,18 @@ right-shape pass the easy default. (It reliably kills the first round; it is NOT
 whole loop — fix-churn and hand-rolled parsing drive the tail. See the Common Traps entry on
 CLI parsing.)
 
-## 1. Scope the FULL branch diff (not just the last commit)
+## 1. Stage everything, then scope the FULL branch diff
 
+- `ROOT="$(git rev-parse --show-toplevel)"` — the repo root. Use `$ROOT/scripts/…` for every
+  `scripts/…` path below: this repo's Bash cwd drifts, so a bare relative `scripts/…` can
+  resolve against the wrong directory and fail. (`git` commands find the root on their own.)
+- **Stage all intended changes first** (`git add …`) and skim `git status`: `git diff` never
+  shows UNTRACKED (never-added) files, so a brand-new source/test/hook/config file is invisible
+  to the review until it is staged. Nothing untracked = the diff is complete.
 - `git diff "$(git merge-base HEAD origin/main)"` — everything the branch changes vs the
-  merge-base, INCLUDING staged AND unstaged work (`git diff <commit>` compares the working
-  tree, so staged content is included). Add `--stat` for the file list. Do NOT use `..HEAD`
-  alone (misses uncommitted work) or plain `git diff` alone (misses STAGED work) — the state
-  you run this in is usually staged-but-uncommitted.
+  merge-base, INCLUDING staged and unstaged tracked work (`git diff <commit>` compares the
+  working tree). Add `--stat` for the file list. Do NOT use `..HEAD` alone (misses uncommitted
+  work) or plain `git diff` alone (misses STAGED work).
 
 ## 2. Dispatch the reviewer(s) — FRESH CONTEXT, sequential, un-anchored
 
@@ -51,16 +56,21 @@ If you're on your 3rd defect-bearing round, STOP at the escalation cap (see SKIL
 
 ## 4. Record evidence, mark, THEN commit (satisfies the commit review-depth gate)
 
-- `EVID="$(python3 scripts/review_state.py evidence-path)"` — the per-worktree evidence file.
-- Write the reviewer's structured findings to `$EVID` — must carry a severity-ladder label
-  (BLOCKER / SHOULD-FIX or CRITICAL/HIGH/MEDIUM/LOW/P1-P3), at least one `file:line`, and ≥400
-  chars, or the gate will not accept it as adversarial.
-- `python3 scripts/review_state.py mark --agent-output "$EVID"` — add `--clean` IFF the pass
-  found NO new BLOCKER/SHOULD-FIX/P1/P2 (resets the escalation streak; a forgotten `--clean` is
-  the safe direction).
-- Run `mark` AFTER the final `git add` and BEFORE `git commit`: the marker binds the *staged*
-  content, so don't restage after marking, and mark + commit within 30 min of writing the
-  evidence (it expires).
+- The marker binds the **final staged content**, not the text the reviewer saw. So after
+  applying §3's fixes: re-inspect the fixes (re-run the reviewer if they are non-trivial) and
+  write the evidence to describe the FINAL staged state — the findings AND that the fixes were
+  applied and verified. Do not let a marker attach a pre-fix review to post-fix code no one
+  re-read.
+- `EVID="$(python3 "$ROOT/scripts/review_state.py" evidence-path)"` — the per-worktree evidence
+  file. Write the findings to `$EVID`: must carry a severity-ladder label (BLOCKER / SHOULD-FIX,
+  or CRITICAL / WARNING from the security reviewer, or CRITICAL/HIGH/MEDIUM/LOW/P1-P3), at least
+  one `file:line`, and ≥400 chars, or the gate rejects it as non-adversarial.
+- `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — add `--clean` IFF the
+  pass found nothing at **should-fix-or-worse**: genesis-architect → no BLOCKER/SHOULD-FIX;
+  genesis-security-reviewer → no CRITICAL/WARNING (WARNING is its "should address" tier); or no
+  P1/P2. A forgotten `--clean` is the safe direction (it counts the round).
+- Run `mark` AFTER the final `git add` and BEFORE `git commit`; don't restage after marking, and
+  mark + commit within 30 min of writing the evidence (it expires).
 
 For a quick self-check of a small change, use `/audit-changes` instead — this command is the
 heavyweight adversarial pass.
