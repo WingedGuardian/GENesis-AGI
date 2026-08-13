@@ -1005,11 +1005,13 @@ verified: fbcf8ee4 2026-07-21
   file — no proposal is ever blocked or auto-applied. Under propose-only NO
   cognitive-file-modification ledger pre-image is created (the apply/resolve
   path that would record one is a deferred follow-up). Two ADVISORY signals ride
-  the staged proposal for the reviewer, and neither gates staging: a STRUCTURAL
-  check (`skills/validator.py`) whose outcome is recorded as a `validated` flag
-  (for MINOR it reflects the structural result; for MODERATE+ an LLM
-  apply-recommendation) plus `validation_detail` when the structural check
-  fails; and, WHEN ENABLED (gate on, router + baseline available), a shadow
+  the staged proposal for the reviewer, and neither gates staging: a deterministic
+  validator suite (`skills/validator.py` — structure, trigger coverage,
+  testability/vague-language, size, examples, and MINOR-content consistency; any
+  hard failure un-passes it) whose outcome is recorded as a `validated` flag
+  (for MINOR it reflects that suite; for MODERATE+ an LLM apply-recommendation)
+  plus `validation_detail` on failure; and, WHEN ENABLED (gate on, router +
+  baseline available), a shadow
   **skill-edit Critic** (`skills/skill_edit_critic.py` +
   `eval/rubrics/skill_edit_regression.py`) that screens for self-modification
   pathologies via the `judge` call site and logs a `skill_evolution_gate`
