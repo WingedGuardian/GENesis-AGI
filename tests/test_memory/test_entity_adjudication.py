@@ -95,6 +95,34 @@ def test_prompts_carry_cosmetic_vs_semantic_guidance():
         assert "semantic" in low
 
 
+def test_prompts_carry_qualifier_vs_compound_policy():
+    """MW-3 Option-1 policy: a QUALIFIER variant that restates what the thing is
+    merges (same referent), while a compound naming a distinct activity/role/
+    artifact stays distinct. Both prompts must encode this so the containment
+    class (which difflib never surfaced) is judged, not blindly merged."""
+    for prompt in (adj._ADJUDICATION_PROMPT, adj._CHALLENGE_PROMPT):
+        low = prompt.lower()
+        assert "qualifier" in low
+        # merge-same-thing framing AND keep-related-distinct framing both present
+        assert "same" in low and ("related" in low or "distinct thing" in low)
+
+
+def test_prompts_treat_version_suffixes_as_distinct():
+    """Codex round-6 P1: the dotted-suffix generator nominates version-like
+    pairs ("3.12" vs "1.3.12"), and an unqualified 'short form of its full
+    address → merge' cue would bias BOTH models toward merging them. Both
+    prompts must (a) call version-like dotted numbers DISTINCT by default and
+    (b) condition the address-merge cue on snippet EVIDENCE of the same
+    host/endpoint."""
+    for prompt in (adj._ADJUDICATION_PROMPT, adj._CHALLENGE_PROMPT):
+        low = prompt.lower()
+        assert "version" in low
+        assert "3.12" in prompt and "1.3.12" in prompt  # the concrete anti-example
+    # The merge cue itself is evidence-conditioned, not unconditional.
+    assert "snippets show" in adj._ADJUDICATION_PROMPT.lower()
+    assert "snippets evidence" in adj._CHALLENGE_PROMPT.lower()
+
+
 @pytest.mark.asyncio
 async def test_adjudicate_merge_requires_both_models():
     router = _router({"entity_adjudication": "merge", "entity_adjudication_challenge": "merge"})
@@ -430,6 +458,30 @@ async def test_sweep_cursor_advances_and_completes(db):
     assert r1["next_offset"] == 2 and r1["completed"] is False
     r2 = await adj.run_reconcile_sweep(db, slice_size=2, enqueue_cap=50, cursor_offset=4)
     assert r2["completed"] is True and r2["next_offset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_cap_overflow_advances_cursor_and_resurfaces_next_pass(db):
+    # Cap-hit overflow is DEFERRED, never lost: the cursor still advances (a
+    # park-on-cap variant was reverted 2026-08-12 — exhausted/`discarded` pairs
+    # are in neither settled nor pending keys, so a parked offset re-nominates
+    # them forever and wedges the sweep). On the next pass over the same slice,
+    # already-pending pairs are excluded and the overflow surfaces.
+    await _mk_entity(db, "svc", "svc")
+    for q in ("alpha", "beta", "gamma"):
+        await _mk_entity(db, f"svc {q}", f"svc {q}")
+    # 3 containment pairs (svc ⊂ each qualifier). cap=2 → first pass enqueues 2
+    # and the cursor ADVANCES normally (no parking).
+    r1 = await adj.run_reconcile_sweep(db, slice_size=100, enqueue_cap=2, cursor_offset=0)
+    assert r1["enqueued"] == 2
+    assert r1["completed"] is True  # slice covered the whole set → pass completes
+    # A later pass re-scans from 0; the 2 pending pairs are excluded → the 3rd
+    # surfaces. Overflow latency (up to one sweep cycle) is the accepted tradeoff;
+    # the convergence redesign is PR-2b's immediate re-enqueue, not cursor tricks.
+    r2 = await adj.run_reconcile_sweep(db, slice_size=100, enqueue_cap=2, cursor_offset=0)
+    assert r2["enqueued"] == 1
+    pending = await dw_crud.query_pending(db, work_type=adj.WORK_TYPE, limit=100)
+    assert len(pending) == 3  # all 3 eventually enqueued, none dropped
 
 
 @pytest.mark.asyncio
