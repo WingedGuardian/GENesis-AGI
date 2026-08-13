@@ -305,6 +305,42 @@ def test_parse_frontmatter_block_scalar_stops_at_col0_key():
     assert r["keywords"] == ["x", "y"]
 
 
+def test_parse_frontmatter_indented_mapping_stops_at_sibling_key():
+    """When the whole frontmatter mapping is indented, a plain description must
+    stop at the SIBLING key (same indent as the description key), not fold it.
+    Matches yaml.safe_load -> 'useful'."""
+    content = "---\n  name: im\n  description: useful\n  keywords: [x]\n---\n"
+    r = _gen._parse_frontmatter(content, "im")
+    assert r["description"] == "useful"
+    assert r["keywords"] == ["x"]
+
+
+def test_parse_frontmatter_plain_scalar_skips_comment_line():
+    """An indented comment line ends a plain scalar (yaml ignores it) -> 'foo'."""
+    content = "---\nname: c\ndescription: foo\n  # a trailing comment\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "c")
+    assert r["description"] == "foo"
+
+
+def test_parse_frontmatter_block_scalar_keeps_hash_as_content():
+    """Inside a block scalar, '#' is literal content, not a comment
+    (yaml.safe_load folds it in)."""
+    content = (
+        "---\nname: h\ndescription: >\n  line one\n  # still content here\n"
+        "keywords: [a]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "h")
+    assert r["description"] == "line one # still content here"
+
+
+def test_parse_frontmatter_deeper_indent_child_then_col0_key():
+    """A more-indented continuation folds; a col-0 sibling key stops it."""
+    content = "---\nname: d\ndescription: foo\n    deeper\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "d")
+    assert r["description"] == "foo deeper"
+    assert r["keywords"] == ["a"]
+
+
 def test_parse_frontmatter_missing_description_is_empty():
     content = "---\nname: n\nkeywords: [a]\n---\n"
     r = _gen._parse_frontmatter(content, "n")

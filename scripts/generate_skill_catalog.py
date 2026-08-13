@@ -83,20 +83,31 @@ def _unescape_double(value: str) -> str:
     return "".join(out)
 
 
+def _line_indent(line: str) -> int:
+    """Number of leading space/tab characters (indentation width)."""
+    return len(line) - len(line.lstrip(" \t"))
+
+
 def _collect_indented(
-    lines: list[str], seed: str | None = None, *, block: bool = False
+    lines: list[str],
+    seed: str | None = None,
+    *,
+    key_indent: int = 0,
+    block: bool = False,
 ) -> str:
-    """Fold a seed line plus following more-indented continuation lines.
+    """Fold a seed line plus continuation lines indented MORE than the key.
+
+    A continuation must be indented strictly deeper than ``key_indent`` (the
+    ``description:`` key's own indentation) — a line at the key's indent or
+    shallower is a SIBLING key / dedent and terminates the value. This is the
+    YAML block/plain continuation rule; without it a uniformly-indented mapping
+    (``  description: x`` / ``  keywords: [y]``) would fold the sibling key.
 
     ``block=True`` (folded/literal ``>``/``|`` scalars): a blank line is a
-    paragraph break, not the end — only a column-0 line (the next key / dedent)
-    terminates. ``block=False`` (plain scalars): a blank line ends the value —
-    conservatively, we do NOT fold a plain scalar across a blank line (YAML
-    would join the paragraphs), which no corpus skill relies on and which avoids
-    over-capturing following structure. Any leading whitespace counts as
-    indented — YAML only requires MORE indent than the column-0 key, not a fixed
-    width. Column-0 keys (the corpus invariant) always stop the fold, so
-    keywords/name are never absorbed.
+    paragraph break (not the end), and ``#`` is literal content. ``block=False``
+    (plain scalars): a blank line ends the value (we do not fold plain scalars
+    across blanks — conservative vs YAML, corpus-irrelevant), and a comment line
+    (``#`` first) ends the scalar, matching yaml.safe_load.
     """
     parts: list[str] = [] if seed is None else [seed]
     for line in lines:
@@ -107,18 +118,20 @@ def _collect_indented(
             if parts:
                 break
             continue
-        if line[:1] in (" ", "\t"):
-            parts.append(stripped)
-        else:
-            break
+        if _line_indent(line) <= key_indent:
+            break  # sibling key or dedent — ends the value
+        if not block and stripped[0] == "#":
+            break  # a comment line ends a plain scalar (yaml ignores it)
+        parts.append(stripped)
     return " ".join(parts)
 
 
 def _extract_description(frontmatter: str) -> str:
     """Full description value from a frontmatter block, any YAML scalar form."""
-    m = re.search(r"^[ \t]*description:[ \t]*", frontmatter, re.MULTILINE)
+    m = re.search(r"^(?P<indent>[ \t]*)description:[ \t]*", frontmatter, re.MULTILINE)
     if not m:
         return ""
+    key_indent = len(m.group("indent"))
     region = frontmatter[m.end() :]
     stripped = region.split("\n", 1)[0].strip()
     lead = stripped[:1]
@@ -134,11 +147,11 @@ def _extract_description(frontmatter: str) -> str:
         return _norm_ws(stripped.strip("'"))
     rest = region.split("\n")[1:]
     if lead in (">", "|") or stripped == "":
-        # Folded/literal block scalar (>, >-, |, |-, …): fold indented lines,
-        # treating blank lines as paragraph breaks (not terminators).
-        return _norm_ws(_collect_indented(rest, block=True))
-    # Plain scalar: first line + any indented continuation lines.
-    return _norm_ws(_collect_indented(rest, seed=stripped))
+        # Folded/literal block scalar (>, >-, |, |-, …): fold lines indented
+        # deeper than the key, treating blanks as paragraph breaks.
+        return _norm_ws(_collect_indented(rest, key_indent=key_indent, block=True))
+    # Plain scalar: first line + continuation lines indented deeper than the key.
+    return _norm_ws(_collect_indented(rest, seed=stripped, key_indent=key_indent))
 
 
 def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
