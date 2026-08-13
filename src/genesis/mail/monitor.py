@@ -37,9 +37,11 @@ logger = logging.getLogger(__name__)
 
 _IDENTITY_DIR = Path(__file__).resolve().parents[1] / "identity"
 
-# The mail judge session is read-only + non-spawning (same rationale as the inbox
-# judge): no file writes, and no subagent spawn (a spawned subagent escapes the
-# lockdown with a fresh toolset). SPAWN_TOOL_NAMES = current "Agent" + obsolete "Task".
+# The mail judge denies file writes and the whole SPAWN class (SPAWN_TOOL_NAMES =
+# Agent/Task/Workflow/Skill) — no subagent spawn can escape with a fresh toolset. Its MCP
+# config is no_mcp (no memory server). NOTE: spawn-hardening, NOT a full read-only
+# boundary — Bash is still available on external input; closing that is a separate
+# tracked follow-up.
 _JUDGE_DISALLOWED_TOOLS: list[str] = ["Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
 
 

@@ -8,10 +8,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
-# CC's spawn/escape-class tool names — the single source of truth for the strictly
-# READ-ONLY CC sessions (reflection, the inbox/mail judges, the experimentation
-# completion, sentinel-degraded), where spawning is ALWAYS an escape. (Surplus is NOT
-# here: its live executor runs via the tool-less Router, not a claude -p session.)
+# CC's spawn/escape-class tool names — the single source of truth for the restricted CC
+# sessions where spawning would escape the parent's tool restrictions: reflection (fully
+# read-only), the inbox/mail judges, the experimentation completion, sentinel-degraded.
+# (The inbox/mail judges are spawn-hardened here but NOT yet fully read-only — they still
+# leave Bash / MCP writes on external input; that boundary is a separate tracked
+# follow-up. Surplus is NOT here: its live executor runs via the tool-less Router, not a
+# claude -p session.)
 # Each of these lets a CHILD escape the lockdown with a fresh, unrestricted toolset
 # (Bash/Write/Edit):
 #   Agent    — spawns a subagent (the CURRENT Claude Code tool name; registered in

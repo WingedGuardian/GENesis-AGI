@@ -36,9 +36,11 @@ logger = logging.getLogger(__name__)
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "identity"
 _SYSTEM_PROMPT_FILE = "INBOX_EVALUATE.md"
 
-# The inbox-eval judge session is read-only + non-spawning: no file writes, and no
-# subagent spawn (a spawned subagent inherits a fresh, unrestricted toolset and
-# escapes the lockdown). SPAWN_TOOL_NAMES = current "Agent" + obsolete "Task".
+# The inbox-eval judge denies file writes and the whole SPAWN class (SPAWN_TOOL_NAMES =
+# Agent/Task/Workflow/Skill) — no subagent spawn can inherit a fresh, unrestricted
+# toolset and escape. NOTE: this is spawn-hardening, NOT a full read-only boundary — the
+# judge still leaves Bash (and this profile's memory/settings MCP writes) available on
+# external input; closing that is a separate tracked follow-up.
 _EVAL_DISALLOWED_TOOLS: list[str] = ["Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
 
 

@@ -42,17 +42,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
-- **Read-only reasoning sessions can no longer escape their sandbox by spawning.**
-  Genesis's strictly read-only Claude Code sessions (deep/strategic reflection, the
-  inbox/mail judges, and the experimentation completion) run with a locked-down
-  toolset. That lockdown blocked the obsolete subagent-spawn tool name
-  but not the current one — nor the `Workflow`/`Skill` spawn paths — so such a
-  session could in principle spawn a child that ran with full, unrestricted tools.
-  These denylists now deny the whole spawn class (subagent, workflow, and skill
-  spawns) from a single shared definition, with a guardrail test so a new read-only
-  session can't silently reopen the gap. (Working background sessions that
-  legitimately orchestrate — e.g. the deep-research `Workflow` path — are
-  intentionally out of scope and tracked separately.)
+- **Restricted reasoning sessions can no longer escape their tool restrictions by
+  spawning.** Several of Genesis's restricted Claude Code sessions (deep/strategic
+  reflection, the inbox/mail judges, and the experimentation completion) could spawn a
+  subagent that ran with full, unrestricted tools — escaping the restrictions placed on
+  the parent. Their denylists blocked the obsolete subagent-spawn tool name but not the
+  current one, nor the `Workflow`/`Skill` spawn paths. These denylists now deny the whole
+  spawn class (subagent, workflow, and skill spawns) from a single shared definition,
+  with a guardrail test so a new session can't silently reopen the gap. (Working
+  background sessions that legitimately orchestrate — e.g. the deep-research `Workflow`
+  path — are intentionally out of scope and tracked separately.)
 
 - **The autonomous-CLI approval gate now ships ON by default.** Every background
   Claude Code session Genesis dispatches must be rooted in an explicit user

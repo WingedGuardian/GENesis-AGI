@@ -1,19 +1,22 @@
-"""Guardrail: every read-only restricted CC session denies the whole spawn class.
+"""Guardrail: restricted CC sessions deny the whole subagent-SPAWN class.
 
-A read-only reasoning session escapes its lockdown if it can spawn a child that runs
-with a fresh, unrestricted toolset (Bash/Write/Edit). The spawn/escape class is
-Agent (current subagent tool) + Task (obsolete alias) + Workflow (orchestrates
-subagents) + Skill (some run in a subagent) — the full set in ``SPAWN_TOOL_NAMES``.
-The denylists had DRIFTED (reflection blocked all four; inbox/mail/experimentation
-blocked only a subset). This test locks the class to a single source of truth so a new
-read-only denylist that forgets it fails CI. Each assertion targets what the LIVE
-session actually feeds to ``claude -p``'s ``--disallowedTools`` (reflection via
-``build_reflection_disallowed``; the inbox/mail/experimentation constants ARE the value
-passed to their ``CCInvocation``), not an orphaned constant.
+A restricted session escapes its lockdown if it can spawn a child that runs with a
+fresh, unrestricted toolset. The spawn/escape class is Agent (current subagent tool) +
+Task (obsolete alias) + Workflow (orchestrates subagents) + Skill (some run in a
+subagent) — the full set in ``SPAWN_TOOL_NAMES``. The denylists had DRIFTED (reflection
+blocked all but ``Agent`` — i.e. Task/Workflow/Skill; the inbox/mail judges + the
+experimentation completion blocked only ``Agent`` or a subset). This test locks the class
+to a single source of truth so a new denylist that forgets it fails CI. Each assertion
+targets what the LIVE session actually feeds to ``claude -p``'s ``--disallowedTools``
+(reflection via ``build_reflection_disallowed``; the inbox/mail/experimentation constants
+ARE the value passed to their ``CCInvocation``), not an orphaned constant.
 
-Scope: the strictly READ-ONLY *CC sessions* where spawning is always an escape —
-reflection, the inbox/mail judges, the experimentation single-turn completion, and
-sentinel-degraded. Deliberately NOT covered here:
+Scope — this guard is about the SPAWN class ONLY, across: reflection (fully read-only),
+the inbox/mail judges, the experimentation single-turn completion, and sentinel-degraded.
+NOTE: the inbox/mail judges are spawn-hardened here but are NOT yet fully read-only —
+they still leave ``Bash`` (and, for inbox, memory/settings MCP writes) available on
+external input; that broader boundary is a separate, tracked follow-up, not this guard's
+concern. Deliberately NOT covered here at all:
 - ``surplus`` — NOT a CC session: the live ``SurplusLLMExecutor`` runs via the tool-less
   Router (no ``claude -p``, no spawn tools to deny), so it is outside this scope.
 - ``cc/direct_session`` (its ``research`` profile runs a documented deep-research
