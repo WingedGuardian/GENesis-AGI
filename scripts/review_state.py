@@ -12,16 +12,19 @@ changes only) at the time review was done.  If staged content changes, the marke
 becomes stale and review is required again.  Unstaged working-tree edits
 (e.g. from Codex) do not trigger review enforcement.
 
-Review evidence: the authoritative signal is the code-reviewer agent output
-(``~/.genesis/last_code_review.txt``). gstack skill-usage telemetry, when
-present, is recorded as advisory corroboration but never gates marking — it is
-not installed on many hosts.
+Review evidence: the authoritative signal is the code-reviewer agent output. It
+defaults to a PER-WORKTREE path (``review_state.py evidence-path``) so concurrent
+sessions don't overwrite each other's audit; ``--agent-output`` overrides it. gstack
+skill-usage telemetry, when present, is recorded as advisory corroboration but never
+gates marking — it is not installed on many hosts.
 
 CLI usage:
-    python3 review_state.py status     # prints current review state
-    python3 review_state.py mark --agent-output <path>          # defect-bearing round
+    python3 review_state.py status         # prints current review state
+    python3 review_state.py evidence-path  # prints this worktree's evidence path
+    python3 review_state.py mark           # evidence read from the per-worktree path
+    python3 review_state.py mark --agent-output <path>          # explicit override
     python3 review_state.py mark --agent-output <path> --clean  # clean round → reset streak
-    python3 review_state.py diff-hash  # prints current diff hash
+    python3 review_state.py diff-hash      # prints current diff hash
 """
 
 from __future__ import annotations
@@ -49,17 +52,27 @@ ESCALATION_ROUND_CAP = 3
 # Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
 # so an in-flight review from before an upgrade isn't lost mid-session.
 _LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
+# Per-worktree review-EVIDENCE (the code-reviewer/genesis-architect audit output the
+# depth gate validates). Per-worktree — like the marker/round — so concurrent
+# sessions don't overwrite each other's evidence (which would validate one session's
+# marker against ANOTHER session's audit). Keyed by the same _worktree_key.
+_EVIDENCE_DIR = Path.home() / ".genesis" / "review_evidence"
 _MAX_EVIDENCE_AGE_SECONDS = 1800  # 30 minutes
 _GSTACK_ANALYTICS = Path.home() / ".gstack" / "analytics" / "skill-usage.jsonl"
 
 
-def _worktree_key(cwd: str | None = None) -> str:
-    """Stable per-worktree key from the git worktree root.
+def _worktree_root(cwd: str | None = None) -> str:
+    """Absolute worktree root used to key per-worktree state.
 
-    Concurrent CC sessions each work in their own git worktree; a single global
-    marker file let them clobber each other's review state (session B's commit
-    reset session A's marker mid-workflow). Keying the marker by worktree root
-    isolates them. Falls back to "default" outside a git repo.
+    Primary: ``git rev-parse --show-toplevel``. Fallback — git missing or timed out,
+    LIKELIEST under the concurrent load this keying exists to survive: walk up from
+    ``cwd`` to the nearest ``.git`` (a directory in the main tree, a FILE in a linked
+    worktree) and use that directory; if none is found, use the resolved ``cwd``.
+
+    CRITICAL: the fallback stays PER-LOCATION — never a single shared constant. The
+    old ``"default"`` fallback meant a transient git hiccup collapsed every concurrent
+    session onto ONE key, reopening the cross-session clobber #1244 fixed (observed as
+    a marker vanishing / round counter resetting mid-workflow).
     """
     try:
         result = subprocess.run(
@@ -71,10 +84,37 @@ def _worktree_key(cwd: str | None = None) -> str:
         )
         root = result.stdout.strip()
         if root:
-            return hashlib.sha256(root.encode()).hexdigest()[:12]
+            # realpath so the git-success key matches the fallback (which resolves
+            # symlinks) for the SAME worktree — otherwise a git-success mark and a
+            # git-failed hook check could compute different keys and disagree.
+            return os.path.realpath(root)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
-    return "default"
+    base = Path(cwd).resolve() if cwd else Path.cwd()
+    for d in (base, *base.parents):
+        if (d / ".git").exists():
+            return str(d)
+    return str(base)
+
+
+def _worktree_key(cwd: str | None = None) -> str:
+    """Stable, per-location key from the worktree root (see ``_worktree_root``).
+
+    Concurrent CC sessions each work in their own git worktree; a single global
+    marker file let them clobber each other's review state (session B's commit reset
+    session A's marker mid-workflow). Keying by worktree root isolates them — and the
+    key stays isolated even when git is briefly unavailable (no shared fallback).
+    """
+    return hashlib.sha256(_worktree_root(cwd).encode()).hexdigest()[:12]
+
+
+def _evidence_file(cwd: str | None = None) -> Path:
+    """Per-worktree review-evidence path (``--agent-output`` default).
+
+    Same worktree key as the marker/round so a session's evidence can't be
+    overwritten by a concurrent session between writing it and marking the review.
+    """
+    return _EVIDENCE_DIR / f"{_worktree_key(cwd)}.txt"
 
 
 def _state_file(cwd: str | None = None) -> Path:
@@ -334,7 +374,7 @@ def mark_reviewed(
     _review_found, review_msg = _verify_review_log()
 
     # Check 2 (authoritative): code-reviewer agent output must exist and be recent.
-    agent_path = agent_output_path or str(Path.home() / ".genesis" / "last_code_review.txt")
+    agent_path = agent_output_path or str(_evidence_file(cwd))
     agent_ok, agent_msg = _verify_agent_output(agent_path)
     if not agent_ok:
         print(f"REFUSED: {agent_msg}", file=sys.stderr)
@@ -605,7 +645,7 @@ def get_current_branch(cwd: str | None = None) -> str:
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: review_state.py [status|mark|diff-hash]", file=sys.stderr)
+        print("Usage: review_state.py [status|mark|diff-hash|evidence-path]", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -624,6 +664,13 @@ def main() -> None:
 
     elif cmd == "diff-hash":
         print(get_current_diff_hash())
+
+    elif cmd == "evidence-path":
+        # Create the dir so a `save-to $(evidence-path)` shell redirect (the flow the
+        # hook/SKILL instructions describe) doesn't fail on a fresh host — otherwise
+        # the evidence write fails, `mark` finds no evidence, and the gate REFUSES.
+        _EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        print(_evidence_file())
 
     elif cmd == "mark":
         # Parse --agent-output <path> and the optional --clean flag.
