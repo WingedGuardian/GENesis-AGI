@@ -963,38 +963,59 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
     return ids[-1] if ids else None
 
 
-def _comment_pr_number(argv: list[str]) -> str | None:
-    """PR number from a ``gh pr comment`` segment's argv (bare number, #N, or
-    PR URL), or None (numberless form — gh would infer the branch's PR, which
-    this advisory deliberately does NOT chase; see the fail-open table)."""
+def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
+    """(pr_number, repo) from a ``gh pr comment`` segment's argv.
+
+    Number from a bare number, #N, or PR URL; a URL target ALSO carries its
+    OWNER/REPO (counting against the hook cwd's repo for a cross-repo URL could
+    produce a wrong count and a FALSE block — Codex round-1 finding). An
+    explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
+    target (non-numeric, non-URL positional) yields (None, …) → fail-open.
+    """
+    pr_num: str | None = None
+    url_repo: str | None = None
     try:
         idx = argv.index("comment")
     except ValueError:
-        return None
+        return None, None
     for tok in argv[idx + 1 :]:
         if tok.startswith("-"):
             continue
-        if tok.isdigit():
-            return tok
-        if tok.startswith("#") and tok[1:].isdigit():
-            return tok[1:]
-        url = re.match(r"\S*/pull/(\d+)\b", tok)
-        if url:
-            return url.group(1)
-    return None
+        if pr_num is None and tok.isdigit():
+            pr_num = tok
+        elif pr_num is None and tok.startswith("#") and tok[1:].isdigit():
+            pr_num = tok[1:]
+        elif pr_num is None:
+            url = re.match(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b", tok)
+            if url:
+                url_repo, pr_num = url.group(1), url.group(2)
+    return pr_num, _comment_repo(argv) or url_repo
 
 
 def _comment_repo(argv: list[str]) -> str | None:
-    """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any."""
+    """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any.
+
+    Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, and glued
+    ``-Ro/r`` forms. A host-qualified ``HOST/OWNER/REPO`` is reduced to its
+    OWNER/REPO tail (the REST path shape this gate queries).
+    """
+    val: str | None = None
     for i, tok in enumerate(argv):
         if tok in ("--repo", "-R") and i + 1 < len(argv):
-            return argv[i + 1]
-        if tok.startswith("--repo="):
-            return tok.split("=", 1)[1]
-    return None
+            val = argv[i + 1]
+        elif tok.startswith("--repo="):
+            val = tok.split("=", 1)[1]
+        elif tok.startswith("-R") and len(tok) > 2 and not tok.startswith("-R="):
+            val = tok[2:]
+        elif tok.startswith("-R=") and len(tok) > 3:
+            val = tok[3:]
+    if val and val.count("/") >= 2:
+        val = "/".join(val.split("/")[-2:])
+    return val
 
 
-def _escalation_advisory(pr_num: str, rounds: int) -> str:
+def _escalation_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
+    repo_arg = f" --repo {repo}" if repo else ""
     return (
         f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
         f"{rounds} rounds already ran (cap {ESCALATION_ROUND_CAP}). Repeated "
@@ -1020,7 +1041,7 @@ def _escalation_advisory(pr_num: str, rounds: int) -> str:
         "a fresh, conscious decision.\n"
         "After doing the above (triage table produced, user consulted), "
         "re-run with a trailing shell comment (outside any quotes):\n"
-        f'  gh pr comment {pr_num} --body "@codex review"  # escalation-ack'
+        f'  gh pr comment {pr_num}{repo_arg} --body "@codex review"  # escalation-ack'
     )
 
 
@@ -1038,31 +1059,39 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
 
     FAIL-OPEN state table (advisory logic must never break workflow — the
     opposite posture from the fail-closed merge gates, on purpose):
-      segment isn't `gh pr comment`            → untouched
-      comment without an '@codex review' body  → untouched
-      trailing '# escalation-ack' on the seg   → allow (the conscious continue)
-      numberless comment (branch-PR inference) → allow (no PR to count against)
-      gh/API/parse error (ids is None)         → allow
-      rounds < ESCALATION_ROUND_CAP            → allow, silently
-      rounds >= cap, no ack                    → BLOCK with the step-back order
+      segment isn't `gh pr comment`               → untouched
+      comment without an '@codex review' body     → untouched (body-file/stdin
+        bodies are unresolvable here — documented coverage limit, fail-open;
+        blocking unresolvable bodies would false-block non-trigger comments)
+      '# escalation-ack' trailing ANY segment     → allow the whole command (a
+        nested `bash -c '…' # escalation-ack` carries the ack on the OUTER
+        segment; the ack is a conscious human-directed act, so one ack licenses
+        the command it trails)
+      numberless/branch target (no PR number)     → that segment allows;
+        SCANNING CONTINUES (an allowed segment must not shield a later one)
+      gh/API/parse error (ids is None)            → that segment allows, scan on
+      rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
+      any segment at rounds >= cap, no ack        → BLOCK with the step-back
+        order (URL targets carry their OWN repo into the count — counting the
+        hook cwd's repo for a cross-repo URL could produce a FALSE block)
     Any unexpected exception → allow (caught here, NOT left to run_guard's
     fail-closed exit-2, which would turn an advisory bug into a hard block).
     """
     try:
+        if any(has_trailing_override(s.raw, "escalation-ack") for s in segs):
+            return False, ""
         for seg in segs:
             if gh_pr_subcommand(seg.argv) != "comment":
                 continue
             if not any("@codex review" in tok.lower() for tok in seg.argv):
                 continue
-            if has_trailing_override(seg.raw, "escalation-ack"):
-                return False, ""
-            pr_num = _comment_pr_number(seg.argv)
+            pr_num, repo = _comment_target(seg.argv)
             if not pr_num:
-                return False, ""
-            ids = _codex_review_commit_ids(pr_num, repo=_comment_repo(seg.argv))
+                continue
+            ids = _codex_review_commit_ids(pr_num, repo=repo)
             if ids is None or len(ids) < ESCALATION_ROUND_CAP:
-                return False, ""
-            return True, _escalation_advisory(pr_num, len(ids))
+                continue
+            return True, _escalation_advisory(pr_num, len(ids), repo)
     except Exception:
         return False, ""
     return False, ""

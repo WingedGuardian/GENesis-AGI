@@ -135,8 +135,79 @@ class TestEscalationGate:
 
     def test_explicit_repo_flag_parsed(self):
         argv = ["gh", "pr", "comment", "7", "--repo", "o/r", "--body", "x"]
+        assert _mod._comment_target(argv) == ("7", "o/r")
+
+    def test_host_qualified_repo_reduced_to_owner_repo(self):
+        argv = ["gh", "pr", "comment", "7", "--repo", "ghe.example.com/o/r", "--body", "x"]
         assert _mod._comment_repo(argv) == "o/r"
-        assert _mod._comment_pr_number(argv) == "7"
+
+
+class TestCodexRound1Fixes:
+    """Codex round-1 findings on the gate itself (compound-scan, URL repo,
+    outer ack, remediation repo) — each witnessed RED before its fix."""
+
+    def test_compound_scans_every_comment_segment(self, monkeypatch):
+        # Finding 2: an allowed FIRST segment must not return for the whole
+        # command — a later at-cap request in the same compound must still block.
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
+        cmd = (
+            'gh pr comment --body "@codex review" && '  # numberless → allowed
+            'gh pr comment 1372 --body "@codex review"'  # at cap → must block
+        )
+        block, _ = _check(cmd)
+        assert block is True
+
+    def test_url_target_carries_its_repo_into_the_count(self, monkeypatch):
+        # Finding 1: a PR-URL target names its repo — the count must query THAT
+        # repo, not the hook cwd's. Capture the api path via a fake subprocess.
+        monkeypatch.delenv("_TEST_GH_CODEX_REVIEWS", raising=False)
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["path"] = next(a for a in argv if a.startswith("repos/"))
+
+            class R:
+                returncode = 0
+                stdout = _reviews_jsonl(*_shas(CAP))
+
+            return R()
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        block, _ = _check(
+            'gh pr comment https://github.com/other/project/pull/7 --body "@codex review"'
+        )
+        assert block is True
+        assert seen["path"] == "repos/other/project/pulls/7/reviews"
+
+    def test_glued_repo_flag_parsed(self):
+        argv = ["gh", "pr", "comment", "7", "-Rother/project", "--body", "x"]
+        assert _mod._comment_repo(argv) == "other/project"
+
+    def test_outer_ack_on_nested_command_honored(self, monkeypatch):
+        # Finding 4: `bash -c '…' # escalation-ack` — the inner gh segment's raw
+        # text lacks the outer trailing comment; a whole-command trailing ack
+        # must still count as the conscious continue (false-block prevention).
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
+        cmd = "bash -c 'gh pr comment 1372 --body \"@codex review\"'  # escalation-ack"
+        block, _ = _check(cmd)
+        assert block is False
+
+    def test_block_message_preserves_repo_flag(self, monkeypatch):
+        # Finding 5: the printed remediation must keep --repo, or copying it
+        # posts the trigger against the wrong repository.
+        monkeypatch.delenv("_TEST_GH_CODEX_REVIEWS", raising=False)
+
+        def fake_run(argv, **kwargs):
+            class R:
+                returncode = 0
+                stdout = _reviews_jsonl(*_shas(CAP))
+
+            return R()
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        block, msg = _check('gh pr comment 7 --repo other/project --body "@codex review"')
+        assert block is True
+        assert "--repo other/project" in msg
 
 
 class TestSoftDependency:
