@@ -70,7 +70,10 @@ from hook_input import field, read_payload, run_guard  # noqa: E402
 # gate in this file (force-push, merge, sqlite) would silently vanish.
 try:
     from review_state import ESCALATION_ROUND_CAP  # noqa: E402
-except ImportError:  # pragma: no cover — exercised via sys.modules stub in tests
+except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError,
+    # read error, top-level runtime error in review_state) must degrade to the
+    # default cap, NEVER propagate: a module-load exception exits 1 (non-blocking)
+    # and silently disables every fail-closed gate in this file (round-6 P1).
     ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
 
 from shell_parse import (  # noqa: E402
@@ -1158,6 +1161,14 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
     try:
         if any(has_trailing_override(s.raw, "escalation-ack") for s in segs):
             return False, ""
+        # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
+        # so a slow API + a compound command can't push the aggregate past the
+        # ~60s hook wall-clock and get the WHOLE hook SIGKILLed — which fails open
+        # on every gate (round-6 P1). Idempotent: a later merge gate reuses this
+        # same deadline (it arms only when None), never resets it.
+        global _merge_deadline
+        if _merge_deadline is None:
+            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
         # Earlier trigger segments in THIS command count toward the total: each
         # segment sees the same pre-execution API count, so `request && request`
         # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
@@ -2494,8 +2505,12 @@ def main() -> int:
             # findings) reads it via _gh_timeout so the AGGREGATE finishes under the
             # hook's ~60s wall-clock, instead of summing per-call caps past it and
             # getting SIGKILLed mid-gate (Codex P1 #1373). Budget < 60s with headroom.
+            # Idempotent: the escalation gate may have already armed it for the same
+            # command (round-6 P1) — reuse that deadline so the two gates share ONE
+            # aggregate budget, never re-extend it here.
             global _merge_deadline
-            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+            if _merge_deadline is None:
+                _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
             merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
             # For a DERIVED (no --repo) merge, the dir gh resolves the repo AND a
             # numberless branch-PR from — threaded to _resolve_pr_number so a

@@ -135,6 +135,36 @@ class TestDismissedRoundCounting:
         assert _check(TRIGGER) == (False, "")
 
 
+class TestEscalationSharedDeadline:
+    """P1 (round 6): the escalation scan's gh (_codex_reviews) calls must be
+    bounded by the shared hook deadline — otherwise a slow API + a compound
+    command can exceed the ~60s hook wall-clock, CC SIGKILLs the hook, and EVERY
+    gate (force-push/merge/sqlite) fails open. The gate must arm _merge_deadline
+    before its first gh call."""
+
+    def test_escalation_scan_arms_shared_deadline_before_gh_calls(self, monkeypatch):
+        seen = {}
+
+        def fake_reviews(pr, repo=None):
+            seen["deadline_armed"] = _mod._merge_deadline is not None
+            return []
+
+        monkeypatch.setattr(_mod, "_codex_reviews", fake_reviews)
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
+        _mod._check_codex_round_escalation(_segs(TRIGGER))
+        assert seen.get("deadline_armed") is True
+
+    def test_escalation_does_not_reset_an_already_armed_deadline(self, monkeypatch):
+        import time as _time
+
+        preset = _time.monotonic() + 5.0
+        monkeypatch.setattr(_mod, "_merge_deadline", preset)
+        monkeypatch.setattr(_mod, "_codex_reviews", lambda pr, repo=None: [])
+        _mod._check_codex_round_escalation(_segs(TRIGGER))
+        # Must not extend a deadline a prior gate already armed (aggregate budget).
+        assert _mod._merge_deadline == preset
+
+
 class TestEscalationGate:
     def test_at_cap_blocks_with_step_back_order(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
@@ -382,6 +412,26 @@ class TestSoftDependency:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)  # must NOT raise
         assert mod.ESCALATION_ROUND_CAP == 3  # documented fallback = the prose cap
+
+    def test_module_loads_when_review_state_import_raises_non_importerror(self, monkeypatch):
+        """P1 (round 6): a BROKEN review_state (SyntaxError / read error, not just
+        absent) raised a NON-ImportError past the `except ImportError`, propagating
+        out of module load → exit 1 (non-blocking) → EVERY fail-closed gate silently
+        gone. Any import failure must degrade to the default cap, not crash."""
+        import sys as _sys
+
+        class _BoomModule:
+            @property
+            def ESCALATION_ROUND_CAP(self):  # simulates a broken review_state
+                raise RuntimeError("broken review_state (SyntaxError/read error)")
+
+        monkeypatch.setitem(_sys.modules, "review_state", _BoomModule())
+        spec = importlib.util.spec_from_file_location(
+            "git_push_guard_boom_review_state", _HOOKS_DIR / "git_push_guard.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # must NOT raise
+        assert mod.ESCALATION_ROUND_CAP == 3
 
 
 class TestMainWiring:
