@@ -192,7 +192,14 @@ def _strip_trailing_comment(seg: str) -> str:
 # together (`# audit-ack depth-ack`), so the leading run of the comment is allowed to
 # contain any of them; the FIRST prose token ends the run. Kept in sync with the
 # sigils actually passed to has_trailing_override across the guard hooks.
-_KNOWN_SIGILS = ("review-override", "depth-ack", "audit-ack", "escalation-ack", "ci-override")
+_KNOWN_SIGILS = (
+    "review-override",
+    "depth-ack",
+    "audit-ack",
+    "escalation-ack",
+    "ci-override",
+    "stale-review-override",
+)
 
 
 def _token_is_sigil(tok: str, sigil: str) -> bool:
@@ -436,13 +443,28 @@ def gh_pr_subcommand(argv: list[str]) -> str | None:
     """For a ``gh`` argv, the subcommand after ``pr`` (create/merge/…), else None.
 
     Scans for the ``pr`` token so a global flag before it
-    (``gh --repo o/r pr merge``) does not evade detection.
+    (``gh --repo o/r pr merge``) does not evade detection. A value-taking flag
+    BETWEEN ``pr`` and the subcommand (``gh pr -R o/r merge``) is consumed WITH
+    its value — the value must never be mistaken for the subcommand, or every
+    downstream gate (merge/create/comment) silently skips that segment: the
+    separated ``-R o/r`` form let ``gh pr -R o/r merge N --admin`` bypass ALL
+    fail-closed merge gates (found 2026-08-13 via the escalation-gate review).
+    Glued (``-Ro/r``) and ``--repo=o/r`` forms are single ``-``-prefixed tokens
+    and were already skipped.
     """
     if not argv or _basename(argv[0]) != "gh":
         return None
+    _VALUE_FLAGS = {"-R", "--repo"}
     for i, t in enumerate(argv[1:], 1):
         if t == "pr":
+            skip_next = False
             for u in argv[i + 1 :]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if u in _VALUE_FLAGS:
+                    skip_next = True
+                    continue
                 if not u.startswith("-"):
                     return u
             return None

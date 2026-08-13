@@ -774,11 +774,23 @@ findings below, a gated `gh pr merge`:
   via `--match-head-commit` (GitHub rejects it server-side if the head moved —
   TOCTOU defense); the `--check-pr` command supplies this;
 - requires Codex to have reviewed the **current head** — Codex does NOT auto-review
-  a later fix-commit, so comment `@codex review` and wait after any push;
+  a later fix-commit, so comment `@codex review` and wait after any push.
+  **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
+  delta (`reviewed...head` via the compare API, classified by `review_scope`
+  substantiality) is provably review-trivial (docs-only / a small single-file
+  touch-up) — the merge is then still bound to the exact head that was
+  classified. A substantial or unclassifiable delta blocks; an ABSENT review
+  always blocks;
 - requires the PR base to equal the repo's default branch (retarget guard);
 - blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
-  does not merge). `# review-override` waives the review/freshness/base gates
-  (not CI — that is `# ci-override`).
+  does not merge).
+- **Override sigils are split by boundary** so one waiver can't silently disarm
+  an unrelated gate: `# review-override` waives ONLY the finding scans
+  (review-body + inline P1s); `# stale-review-override` waives ONLY the
+  review-context gates (Codex-at-head freshness + base-invariant); CI is
+  `# ci-override`. Append several sigils in one trailing comment when several
+  waivers are genuinely intended — but the right fix for a stale review is
+  `@codex review`, not the sigil.
 
 The review-findings gate specifically:
 

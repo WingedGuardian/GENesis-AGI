@@ -290,7 +290,10 @@ class ContainerMemoryCollector:
     async def collect(self) -> SignalReading:
         from genesis.autonomy.watchdog import get_container_anon_memory
 
-        mem = get_container_anon_memory()
+        # Offload the synchronous cgroup reads off the event loop — this runs on
+        # every 5-min awareness tick and the /sys/fs/cgroup reads can stall under
+        # memory pressure (same chronic loop-lag class as the snapshot path).
+        mem = await asyncio.to_thread(get_container_anon_memory)
         if mem is None or mem[1] == 0:
             return _bootstrap_placeholder_reading(self.signal_name, "cgroup")
 

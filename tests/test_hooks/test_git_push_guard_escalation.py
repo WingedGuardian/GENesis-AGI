@@ -137,6 +137,36 @@ class TestEscalationGate:
         argv = ["gh", "pr", "comment", "7", "--repo", "o/r", "--body", "x"]
         assert _mod._comment_target(argv) == ("7", "o/r")
 
+    def test_interposed_repo_flag_does_not_evade_subcommand_parse(self, monkeypatch):
+        # Round-3 finding, UPGRADED in scope: `gh pr -R o/r <sub>` returned the
+        # flag VALUE ('o/r') as the subcommand — bypassing not just this
+        # advisory but EVERY downstream arm keyed on gh_pr_subcommand,
+        # including the fail-closed merge gates ('gh pr -R o/r merge N --admin'
+        # ran ungated on main). The parser must consume the flag's value.
+        from shell_parse import analyze, gh_pr_subcommand
+
+        for cmd, want in (
+            ("gh pr -R o/r merge 7 --squash --admin", "merge"),
+            ("gh pr --repo o/r comment 7 --body x", "comment"),
+            ("gh pr -R o/r create --title t", "create"),
+        ):
+            segs = analyze(cmd)
+            assert gh_pr_subcommand(segs[0].argv) == want, cmd
+        # End-to-end: the interposed form now reaches the escalation gate.
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP)))
+        block, _ = _check('gh pr -R WingedGuardian/GENesis-AGI comment 7 --body "@codex review"')
+        assert block is True
+
+    def test_interposed_repo_flag_merge_still_hits_admin_gate(self, monkeypatch):
+        # The merge arm must fire on the interposed form: without --admin it
+        # blocks on pure parsing (network-free) — previously exit 0 (ungated).
+        monkeypatch.setattr(
+            _mod,
+            "read_payload",
+            lambda: {"tool_input": {"command": "gh pr -R o/r merge 7 --squash"}},
+        )
+        assert _mod.main() == 2
+
     def test_host_qualified_repo_reduced_to_owner_repo(self):
         argv = ["gh", "pr", "comment", "7", "--repo", "ghe.example.com/o/r", "--body", "x"]
         assert _mod._comment_repo(argv) == "o/r"

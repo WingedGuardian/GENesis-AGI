@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import shutil
+import threading
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -354,6 +355,11 @@ def _collect_pid_budget(base_dir: str | None = None) -> dict:
 
 # Module-level state for delta-based CPU reading (no blocking sleep)
 _last_cpu_reading: tuple[int, int, float] | None = None  # (idle, total, monotonic_time)
+# Guards the read-modify-write of _last_cpu_reading. _collect_cpu_usage now runs on
+# a worker thread (offloaded off the event loop via _collect_host_metrics), so the
+# delta baseline's compare-and-swap must be atomic even though snapshot computes are
+# single-flighted in practice (health_data.py coalesces concurrent callers).
+_cpu_lock = threading.Lock()
 
 
 def _collect_cpu_usage() -> dict:
@@ -376,13 +382,20 @@ def _collect_cpu_usage() -> dict:
         total = sum(int(p) for p in parts[1:])
         now = time.monotonic()
 
-        if _last_cpu_reading is None:
-            _last_cpu_reading = (idle, total, now)
+        # Atomic compare-and-swap of the delta baseline (tight lock scope — the
+        # /proc read above touches no shared state, so it stays outside the lock).
+        with _cpu_lock:
+            if _last_cpu_reading is None:
+                _last_cpu_reading = (idle, total, now)
+                prev = None
+            else:
+                prev = _last_cpu_reading
+                _last_cpu_reading = (idle, total, now)
+
+        if prev is None:
             return {"status": "healthy", "used_pct": None, "count": count, "pressure": pressure}
 
-        prev_idle, prev_total, _prev_time = _last_cpu_reading
-        _last_cpu_reading = (idle, total, now)
-
+        prev_idle, prev_total, _prev_time = prev
         delta_idle = idle - prev_idle
         delta_total = total - prev_total
         if delta_total == 0:
@@ -453,6 +466,96 @@ def _internet_probe_entry() -> dict | None:
         msg = f"{label} {dur}" if dur else label
         return {"status": "down" if state == "OFFLINE" else "degraded", "message": msg}
     return {"status": "unknown", "message": f"state {state}"}
+
+
+def _collect_host_metrics() -> dict:
+    """CPU + disk + cc_tmp — the synchronous /proc & /sys reads, collected in one
+    call so ``infrastructure()`` can offload the whole group with a single
+    ``asyncio.to_thread`` hop instead of blocking the event loop on each read.
+
+    These reads are usually sub-millisecond but stall exactly when the box is
+    under CPU/memory pressure (kernel-side contention on PSI / /proc), which is
+    when keeping the loop free matters most. Each section keeps its own
+    try/except so one failing read never blanks the others (identical isolation
+    to the previous inline form).
+    """
+    metrics: dict = {}
+    metrics["cpu"] = _collect_cpu_usage()
+
+    try:
+        usage = shutil.disk_usage("/")
+        free_pct = round(usage.free / usage.total * 100, 1)
+        metrics["disk"] = {
+            "total_gb": round(usage.total / (1024**3), 1),
+            "free_gb": round(usage.free / (1024**3), 1),
+            "free_pct": free_pct,
+        }
+    except OSError as exc:
+        metrics["disk"] = {"status": "error", "error": str(exc)}
+
+    # PID/task budget of the BINDING cgroup level (walks this process's chain —
+    # session scope / user slice / container root) — the blind spot that let a
+    # `Cannot fork` happen while every other axis read green. Fork-free cgroup read.
+    # _collect_pid_budget already degrades to {"status": "unavailable"} internally;
+    # the guard is defense-in-depth so a future raise here can't blank the cc_tmp
+    # axis that follows (matching this block's per-section isolation).
+    try:
+        metrics["pids"] = _collect_pid_budget()
+    except Exception as exc:
+        metrics["pids"] = {"status": "error", "error": str(exc)}
+
+    try:
+        from genesis.observability.service_status import collect_cc_tmp_usage
+
+        metrics["cc_tmp"] = collect_cc_tmp_usage()
+    except (ImportError, OSError) as exc:
+        metrics["cc_tmp"] = {"status": "error", "error": str(exc)}
+
+    return metrics
+
+
+def _collect_container_memory() -> dict:
+    """Container cgroup memory (anon/kernel + PSI + MemAvailable) — the other
+    synchronous /sys/proc block, offloaded off the loop. Returns
+    ``{"container_memory": {...}}`` so the caller merges it in place, preserving
+    the original key ordering in the snapshot.
+    """
+    try:
+        from genesis.autonomy.watchdog import get_container_anon_memory, get_container_memory
+
+        anon_mem = get_container_anon_memory()
+        total_mem = get_container_memory()
+        if anon_mem and anon_mem[1] > 0:
+            anon_kernel, limit = anon_mem
+            anon_pct = anon_kernel / limit
+            mem_pressure = _read_psi(_PSI_MEMORY_PATH)
+            # Status = worse of anon% (OOM guard, non-reclaimable) and sustained
+            # memory PSI. Total cgroup usage (memory.current) is shown for
+            # reference but NOT used for health — it includes reclaimable page
+            # cache that inflates the metric, and whose reclaim is benign.
+            mem_info: dict = {
+                "status": memory_status(anon_pct, mem_pressure),
+                "current_gb": round((total_mem[0] if total_mem else anon_kernel) / (1024**3), 1),
+                "limit_gb": round(limit / (1024**3), 1),
+                "used_pct": round((total_mem[0] / limit * 100) if total_mem and total_mem[1] > 0 else anon_pct * 100, 1),
+                "anon_pct": round(anon_pct * 100, 1),
+                "pressure": mem_pressure,
+            }
+            # MemAvailable from /proc/meminfo — the kernel's estimate of
+            # memory available for new allocations without swapping. This is
+            # the metric that matters for OOM risk, not used_pct (which
+            # includes reclaimable file cache and inflates the number).
+            available_bytes = _read_mem_available()
+            if available_bytes is not None:
+                mem_info["available_gb"] = round(available_bytes / (1024**3), 1)
+                # Cap at 100% — on non-namespaced hosts, MemAvailable may
+                # exceed the cgroup limit, producing a nonsensical ratio.
+                mem_info["available_pct"] = round(min(available_bytes / limit * 100, 100.0), 1)
+            mem_info.update(_read_memory_stat())
+            return {"container_memory": mem_info}
+        return {"container_memory": {"status": "unavailable"}}
+    except Exception as exc:
+        return {"container_memory": {"status": "error", "error": str(exc)}}
 
 
 async def infrastructure(
@@ -529,36 +632,10 @@ async def infrastructure(
     else:
         infra["scheduler"] = {"status": "unknown", "error": "no scheduler or DB available"}
 
-    infra["cpu"] = _collect_cpu_usage()
-
-    try:
-        usage = shutil.disk_usage("/")
-        free_pct = round(usage.free / usage.total * 100, 1)
-        infra["disk"] = {
-            "total_gb": round(usage.total / (1024**3), 1),
-            "free_gb": round(usage.free / (1024**3), 1),
-            "free_pct": free_pct,
-        }
-    except OSError as exc:
-        infra["disk"] = {"status": "error", "error": str(exc)}
-
-    # PID/task budget of the BINDING cgroup level (walks this process's chain —
-    # session scope / user slice / container root) — the blind spot that let a
-    # `Cannot fork` happen while every other axis read green. Fork-free cgroup read.
-    # _collect_pid_budget already degrades to {"status": "unavailable"} internally;
-    # the guard is defense-in-depth so a future raise here can't kill collection of
-    # the cc_tmp/cc_slots axes that follow (matching this block's own convention).
-    try:
-        infra["pids"] = _collect_pid_budget()
-    except Exception as exc:
-        infra["pids"] = {"status": "error", "error": str(exc)}
-
-    try:
-        from genesis.observability.service_status import collect_cc_tmp_usage
-
-        infra["cc_tmp"] = collect_cc_tmp_usage()
-    except (ImportError, OSError) as exc:
-        infra["cc_tmp"] = {"status": "error", "error": str(exc)}
+    # CPU + disk + pids + cc_tmp are synchronous /proc & /sys reads — collect them
+    # off the event loop in one thread hop (they otherwise contribute a chronic
+    # class of sub-second loop-lag WARNs under memory/CPU pressure).
+    infra.update(await asyncio.to_thread(_collect_host_metrics))
 
     try:
         from genesis.observability.cc_slots import enumerate_cc_slots
@@ -575,48 +652,9 @@ async def infrastructure(
     except Exception as exc:
         infra["qdrant_collections"] = {"status": "error", "error": str(exc)}
 
-    try:
-        from genesis.autonomy.watchdog import get_container_anon_memory, get_container_memory
-
-        anon_mem = get_container_anon_memory()
-        total_mem = get_container_memory()
-        if anon_mem and anon_mem[1] > 0:
-            anon_kernel, limit = anon_mem
-            anon_pct = anon_kernel / limit
-            mem_pressure = _read_psi(_PSI_MEMORY_PATH)
-            # Status = worse of anon% (OOM guard, non-reclaimable) and sustained
-            # memory PSI. Total cgroup usage (memory.current) is shown for
-            # reference but NOT used for health — it includes reclaimable page
-            # cache that inflates the metric, and whose reclaim is benign.
-            mem_info: dict = {
-                "status": memory_status(anon_pct, mem_pressure),
-                "current_gb": round((total_mem[0] if total_mem else anon_kernel) / (1024**3), 1),
-                "limit_gb": round(limit / (1024**3), 1),
-                "used_pct": round(
-                    (total_mem[0] / limit * 100)
-                    if total_mem and total_mem[1] > 0
-                    else anon_pct * 100,
-                    1,
-                ),
-                "anon_pct": round(anon_pct * 100, 1),
-                "pressure": mem_pressure,
-            }
-            # MemAvailable from /proc/meminfo — the kernel's estimate of
-            # memory available for new allocations without swapping. This is
-            # the metric that matters for OOM risk, not used_pct (which
-            # includes reclaimable file cache and inflates the number).
-            available_bytes = _read_mem_available()
-            if available_bytes is not None:
-                mem_info["available_gb"] = round(available_bytes / (1024**3), 1)
-                # Cap at 100% — on non-namespaced hosts, MemAvailable may
-                # exceed the cgroup limit, producing a nonsensical ratio.
-                mem_info["available_pct"] = round(min(available_bytes / limit * 100, 100.0), 1)
-            mem_info.update(_read_memory_stat())
-            infra["container_memory"] = mem_info
-        else:
-            infra["container_memory"] = {"status": "unavailable"}
-    except Exception as exc:
-        infra["container_memory"] = {"status": "error", "error": str(exc)}
+    # Container cgroup memory reads (/sys/fs/cgroup + /proc/meminfo) — likewise
+    # offloaded off the loop; kept in its original snapshot position.
+    infra.update(await asyncio.to_thread(_collect_container_memory))
 
     try:
         result = await probe_guardian()
