@@ -445,21 +445,23 @@ async def test_sweep_cursor_advances_and_completes(db):
 
 
 @pytest.mark.asyncio
-async def test_sweep_parks_cursor_when_cap_hit_and_drains_across_runs(db):
-    # Codex P2 (freshness pass): a slice producing MORE matches than enqueue_cap
-    # must not silently drop the overflow until the 7-day full cycle. When the
-    # cap is hit the sweep does NOT mark the pass completed (which would stamp
-    # completed_at → 7-day idle); the next run re-scans and the already-enqueued
-    # pairs are excluded via _pending_pair_keys, so the overflow surfaces.
+async def test_sweep_cap_overflow_advances_cursor_and_resurfaces_next_pass(db):
+    # Cap-hit overflow is DEFERRED, never lost: the cursor still advances (a
+    # park-on-cap variant was reverted 2026-08-12 — exhausted/`discarded` pairs
+    # are in neither settled nor pending keys, so a parked offset re-nominates
+    # them forever and wedges the sweep). On the next pass over the same slice,
+    # already-pending pairs are excluded and the overflow surfaces.
     await _mk_entity(db, "svc", "svc")
     for q in ("alpha", "beta", "gamma"):
         await _mk_entity(db, f"svc {q}", f"svc {q}")
-    # 3 containment pairs (svc ⊂ each qualifier). cap=2 → first run enqueues 2.
+    # 3 containment pairs (svc ⊂ each qualifier). cap=2 → first pass enqueues 2
+    # and the cursor ADVANCES normally (no parking).
     r1 = await adj.run_reconcile_sweep(db, slice_size=100, enqueue_cap=2, cursor_offset=0)
     assert r1["enqueued"] == 2
-    assert r1["completed"] is False  # cap hit → do NOT complete (else 7d idle)
-    # Second run re-scans; the 2 pending pairs are excluded → the 3rd surfaces
-    # (pre-fix it was lost because the pass completed and idled).
+    assert r1["completed"] is True  # slice covered the whole set → pass completes
+    # A later pass re-scans from 0; the 2 pending pairs are excluded → the 3rd
+    # surfaces. Overflow latency (up to one sweep cycle) is the accepted tradeoff;
+    # the convergence redesign is PR-2b's immediate re-enqueue, not cursor tricks.
     r2 = await adj.run_reconcile_sweep(db, slice_size=100, enqueue_cap=2, cursor_offset=0)
     assert r2["enqueued"] == 1
     pending = await dw_crud.query_pending(db, work_type=adj.WORK_TYPE, limit=100)

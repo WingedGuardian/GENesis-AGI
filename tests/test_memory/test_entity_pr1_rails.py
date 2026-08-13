@@ -114,6 +114,66 @@ def test_row_to_dict_tuple_fallback_matches_physical_order():
     assert d["updated_at"] == "2026-02-01T00:00:00+00:00"
 
 
+async def test_tuple_decode_independent_of_physical_column_order():
+    # Codex R5-C: a partial upgrade can leave the card columns ALTER-appended at
+    # the END of the physical order (legacy 10 cols first) while all names are
+    # present. Reads must decode by COLUMN NAME (explicit SELECT list), never by
+    # physical position — order-independence by construction, not by matching a
+    # hand-kept list to one canonical layout.
+    conn = await aiosqlite.connect(":memory:")  # no row_factory → tuples
+    try:
+        await conn.execute(
+            """
+            CREATE TABLE entities (
+                entity_id   TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                norm_name   TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                summary     TEXT,
+                source      TEXT NOT NULL DEFAULT 'extracted',
+                status      TEXT NOT NULL DEFAULT 'active',
+                merged_into TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+            """
+        )
+        # The partial-upgrade shape: names present, physical order DIFFERENT
+        # from the canonical CREATE (appended at the end).
+        await conn.execute("ALTER TABLE entities ADD COLUMN summary_updated_at TEXT")
+        await conn.execute(
+            "ALTER TABLE entities ADD COLUMN summary_dirty INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.execute(
+            "INSERT INTO entities (entity_id, name, norm_name, entity_type, summary, "
+            "source, status, merged_into, created_at, updated_at, "
+            "summary_updated_at, summary_dirty) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "e9",
+                "Appended",
+                "appended",
+                "concept",
+                "card",
+                "extracted",
+                "active",
+                None,
+                "2026-01-01T00:00:00+00:00",
+                "2026-02-01T00:00:00+00:00",
+                "2026-05-01T00:00:00+00:00",
+                1,
+            ),
+        )
+        await conn.commit()
+        got = await entities_crud.get_entity(conn, "e9")
+        assert got["source"] == "extracted"
+        assert got["status"] == "active"
+        assert got["summary_updated_at"] == "2026-05-01T00:00:00+00:00"
+        assert got["summary_dirty"] == 1
+        assert got["created_at"] == "2026-01-01T00:00:00+00:00"
+    finally:
+        await conn.close()
+
+
 async def test_get_entity_decodes_tuple_connection_correctly():
     # Full-path regression: a connection WITHOUT aiosqlite.Row yields tuples, so
     # SELECT * + _row_to_dict must decode against the real physical order. Proves

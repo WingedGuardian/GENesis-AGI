@@ -898,20 +898,16 @@ async def run_reconcile_sweep(
         await entities_crud.enqueue_adjudication(db, entity_id=eid, similar_entity_id=cand_id)
         enqueued += 1
 
-    # When the slice fills the cap, more matches may remain UNDISCOVERED in this
-    # same slice — advancing the cursor would strand them until the 7-day full
-    # cycle (maybe_run_sweep idles once completed_at is stamped). Instead PARK on
-    # the current offset: the next run re-scans this slice, and the pairs already
-    # enqueued this pass are excluded via _pending_pair_keys, so the next cap of
-    # fresh matches surfaces. The low-water gate (pending ≥ 2×budget → skip) still
-    # bounds queue growth, so parking cannot runaway.
-    if enqueued >= enqueue_cap:
-        return {
-            "enqueued": enqueued,
-            "next_offset": cursor_offset,
-            "completed": False,
-            "total": total,
-        }
+    # A slice can hold more matches than enqueue_cap; the overflow surfaces on
+    # the NEXT full weekly pass (already-settled/pending pairs are excluded, so
+    # coverage is monotonic). That latency is a KNOWN, ACCEPTED tradeoff — the
+    # convergence redesign belongs to MW-3 PR-2b (immediate stale re-enqueue),
+    # NOT to cursor tricks here: a park-on-cap variant was tried and REVERTED
+    # (2026-08-12) because pairs whose drain attempts exhaust (`discarded` rows
+    # are in neither settled_pair_keys nor _pending_pair_keys) would be
+    # re-nominated forever at a parked offset, wedging the sweep. Any future
+    # change to this return MUST enumerate every deferred_work_queue status
+    # (pending, processing, completed, discarded, expired) first.
     next_offset = cursor_offset + slice_size
     completed = next_offset >= total
     return {
