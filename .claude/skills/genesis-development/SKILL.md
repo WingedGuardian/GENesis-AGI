@@ -519,7 +519,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   conscious, logged act (like `# review-override`); adding it — or falsely passing
   `--clean` — WITHOUT the honest review result is the same violation as ignoring the
   prose above (the `--clean` flag mirrors the review record you write to
-  `~/.genesis/last_code_review.txt` at the same moment: falsifying one falsifies the
+  the per-worktree evidence path (`review_state.py evidence-path`) at the same moment: falsifying one falsifies the
   other).
   Caveats: **multiple findings in a single pass = one round** (not an
   escalation); the same defect reappearing (an incomplete prior fix) is a

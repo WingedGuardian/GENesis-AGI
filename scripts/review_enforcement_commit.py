@@ -957,8 +957,9 @@ def main() -> None:
                 "inline pass is FALSE CONFIDENCE, not clearance. Dispatch a genesis-architect "
                 "adversarial audit (assume bugs, enumerate the edge/boundary/sentinel/"
                 "hierarchy class, READ authoritative semantics for any domain code), save it "
-                "to ~/.genesis/last_code_review.txt, then re-mark:\n"
-                "  python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt\n"
+                "to the per-worktree path from `python3 scripts/review_state.py evidence-path` "
+                "(concurrent sessions don't clobber it), then re-mark:\n"
+                "  python3 scripts/review_state.py mark\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
             )
@@ -998,7 +999,8 @@ def main() -> None:
         _deny(
             "BLOCKED: Code changes exist without review. "
             "Run /review and dispatch the genesis-architect agent (adversarial audit) first, "
-            "then run: python3 scripts/review_state.py mark --agent-output ~/.genesis/last_code_review.txt\n"
+            "save it to `python3 scripts/review_state.py evidence-path`, "
+            "then run: python3 scripts/review_state.py mark\n"
             "If findings are intentionally accepted, append a trailing shell "
             "comment (outside any quotes): '  # review-override'"
         )
