@@ -140,13 +140,11 @@ def parse_mcp_tools(mcp_root: Path) -> list[dict]:
 def _frontmatter_description(skill_dir: Path) -> str | None:
     """Full, whitespace-normalized description from a skill's frontmatter.
 
-    The shared catalog scanner now returns full descriptions via its own
-    string parser, but a YAML load here stays authoritative for AGENTS.md: it
-    resolves any scalar form (exotic escapes, multi-line quoted) exactly, so a
-    shipped artifact never depends on the scanner's documented edge-case limits.
-    Runs at build time over repo-tracked tiers only. Returns None (so the caller
-    keeps the scanner's value) if yaml is unavailable or the block doesn't parse
-    to a usable string.
+    The shared catalog scanner now parses frontmatter with a bounded YAML loader
+    too, so this build-time re-parse is belt-and-suspenders — both paths resolve
+    any scalar form (escapes, comments, multi-line/folded) exactly. Runs over
+    repo-tracked tiers only. Returns None (so the caller keeps the scanner's
+    value) if yaml is unavailable or the block doesn't parse to a usable string.
     """
     if _yaml is None:
         return None
@@ -178,7 +176,8 @@ def collect_skills(repo_root: Path) -> list[dict]:
     install-specific ``~/.genesis/skill-library`` is intentionally NOT
     scanned (a shipped AGENTS.md must stay generalizable and must not leak
     a user's private skill names). Tier-1 wins on a name collision.
-    Descriptions are re-parsed with YAML for authoritative full-fidelity values.
+    Descriptions are re-parsed with YAML as a build-time safety net (the scanner
+    also YAML-parses now, so this is redundant defense, not the sole source).
     """
     tier1 = _gsc._scan_tier(repo_root / ".claude" / "skills", 1, repo_root)
     seen = {s["name"].lower() for s in tier1}

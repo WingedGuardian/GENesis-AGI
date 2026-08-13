@@ -16,6 +16,42 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover - pyyaml is a declared dependency
+    yaml = None  # type: ignore[assignment]
+
+if yaml is not None:
+
+    class _FrontmatterLoader(yaml.SafeLoader):
+        """SafeLoader that loads every plain scalar as a STRING and FORBIDS YAML
+        aliases (a lone anchor with no alias is harmless). Skill frontmatter is
+        flat text (name/description/keywords) and never legitimately uses
+        anchors — refusing aliases at the composer closes the alias-multiplication
+        DoS class at the source (billion-laughs expansion, and ``*a``-multiplied
+        large scalars — a crafted skill-library/plugin ``SKILL.md`` could
+        otherwise exhaust memory during the hourly catalog refresh). Clearing the
+        implicit resolvers keeps authored spellings verbatim (off/007/0x10/12:30
+        stay strings); explicit ``!!python/*`` tags are still refused
+        (SafeLoader). Any alias raises → the caller falls back to the bounded
+        legacy parse."""
+
+        def compose_node(self, parent, index):
+            if self.check_event(yaml.events.AliasEvent):
+                event = self.peek_event()
+                raise yaml.composer.ComposerError(
+                    None,
+                    None,
+                    "aliases are not allowed in skill frontmatter",
+                    event.start_mark,
+                )
+            return super().compose_node(parent, index)
+
+    # Own (empty) resolver map — never mutate SafeLoader's shared class attr.
+    _FrontmatterLoader.yaml_implicit_resolvers = {}
+else:  # pragma: no cover - pyyaml is a declared dependency
+    _FrontmatterLoader = None
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TIER1_DIR = REPO_ROOT / ".claude" / "skills"
 TIER2_DIRS = [
@@ -23,6 +59,14 @@ TIER2_DIRS = [
     Path.home() / ".genesis" / "skill-library",
 ]
 CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
+
+# Real skill frontmatters are <5 KB. Above this, skip the YAML parse and use the
+# linear legacy regex: a crafted mapping-heavy frontmatter (e.g. 100k `x: y`
+# entries) makes yaml.load materialize a huge object graph (~275x RSS
+# amplification measured), which could OOM the detached hourly catalog refresh.
+# The bound is on `len(block)` — CHARACTERS, a sufficient proxy for graph size
+# (exact byte count is irrelevant to the amplification risk).
+_MAX_FRONTMATTER_CHARS = 65_536
 
 
 def _extract_skill_info(skill_dir: Path) -> dict | None:
@@ -44,122 +88,88 @@ def _extract_skill_info(skill_dir: Path) -> dict | None:
     return {"name": skill_dir.name, "description": "", "keywords": []}
 
 
-# --- Description scalar extraction ------------------------------------------
-# Replaces a regex that truncated the value at the first apostrophe/quote/
-# newline (dropping searchable text from the catalog). Pure string slicing —
-# builds NO YAML object graph, so there is no alias/mapping-amplification DoS
-# surface; every matcher is linear (disjoint alternatives, single quantifier).
-# Handles the scalar forms real skill frontmatter uses: plain (incl. wrapped
-# multi-line), single/double-quoted (with '' and \\" escapes), and folded/
-# literal blocks (>, |, and their chomping variants). A build-time twin lives
-# in export_agents_md.py (_frontmatter_description, yaml-based) for AGENTS.md.
-_DQ_RE = re.compile(r'"((?:\\.|[^"\\])*)"', re.DOTALL)  # up to the closing "
-_SQ_RE = re.compile(r"'((?:''|[^'])*)'", re.DOTALL)  # up to the closing '
-_DQ_ESCAPES = {'"': '"', "\\": "\\", "n": " ", "t": " "}
-
-
-def _norm_ws(value: str) -> str:
-    """Collapse any run of whitespace to single spaces (one scannable line)."""
-    return " ".join(value.split())
-
-
-def _unescape_double(value: str) -> str:
-    """Resolve the double-quoted escapes that appear in skill frontmatter.
-
-    Handles ``\\"``, ``\\\\``, ``\\n``, ``\\t``; an unknown escape drops the
-    backslash (descriptions are display text, so exotic escapes need not be
-    byte-exact). Linear scan, output bounded by input.
-    """
-    out: list[str] = []
-    i, n = 0, len(value)
-    while i < n:
-        ch = value[i]
-        if ch == "\\" and i + 1 < n:
-            out.append(_DQ_ESCAPES.get(value[i + 1], value[i + 1]))
-            i += 2
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _line_indent(line: str) -> int:
-    """Number of leading space/tab characters (indentation width)."""
-    return len(line) - len(line.lstrip(" \t"))
-
-
-def _collect_indented(
-    lines: list[str],
-    seed: str | None = None,
-    *,
-    key_indent: int = 0,
-    block: bool = False,
-) -> str:
-    """Fold a seed line plus continuation lines indented MORE than the key.
-
-    A continuation must be indented strictly deeper than ``key_indent`` (the
-    ``description:`` key's own indentation) — a line at the key's indent or
-    shallower is a SIBLING key / dedent and terminates the value. This is the
-    YAML block/plain continuation rule; without it a uniformly-indented mapping
-    (``  description: x`` / ``  keywords: [y]``) would fold the sibling key.
-
-    ``block=True`` (folded/literal ``>``/``|`` scalars): a blank line is a
-    paragraph break (not the end), and ``#`` is literal content. ``block=False``
-    (plain scalars): a blank line ends the value (we do not fold plain scalars
-    across blanks — conservative vs YAML, corpus-irrelevant), and a comment line
-    (``#`` first) ends the scalar, matching yaml.safe_load.
-    """
-    parts: list[str] = [] if seed is None else [seed]
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if block:
-                continue  # blank = paragraph break inside a block scalar
-            if parts:
-                break
-            continue
-        if _line_indent(line) <= key_indent:
-            break  # sibling key or dedent — ends the value
-        if not block and stripped[0] == "#":
-            break  # a comment line ends a plain scalar (yaml ignores it)
-        parts.append(stripped)
-    return " ".join(parts)
-
-
-def _extract_description(frontmatter: str) -> str:
-    """Full description value from a frontmatter block, any YAML scalar form."""
-    m = re.search(r"^(?P<indent>[ \t]*)description:[ \t]*", frontmatter, re.MULTILINE)
-    if not m:
+def _normalize_desc(value: object) -> str:
+    """Collapse a scalar (folded/literal/plain/quoted) to one scannable line."""
+    if value is None:
         return ""
-    key_indent = len(m.group("indent"))
-    region = frontmatter[m.end() :]
-    stripped = region.split("\n", 1)[0].strip()
-    lead = stripped[:1]
-    if lead == '"':
-        q = _DQ_RE.match(region)
-        if q:
-            return _norm_ws(_unescape_double(q.group(1)))
-        return _norm_ws(stripped.strip('"'))
-    if lead == "'":
-        q = _SQ_RE.match(region)
-        if q:
-            return _norm_ws(q.group(1).replace("''", "'"))
-        return _norm_ws(stripped.strip("'"))
-    rest = region.split("\n")[1:]
-    if lead in (">", "|") or stripped == "":
-        # Folded/literal block scalar (>, >-, |, |-, …): fold lines indented
-        # deeper than the key, treating blanks as paragraph breaks.
-        return _norm_ws(_collect_indented(rest, key_indent=key_indent, block=True))
-    # Plain scalar: first line + continuation lines indented deeper than the key.
-    return _norm_ws(_collect_indented(rest, seed=stripped, key_indent=key_indent))
+    return " ".join(str(value).split())
 
 
 def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
-    """Parse YAML-like frontmatter from a markdown file."""
+    """Parse YAML frontmatter into name/description/keywords.
+
+    Uses a real YAML parser (the bounded, alias-forbidding ``_FrontmatterLoader``)
+    so descriptions with apostrophes, escaped quotes, inline comments, or
+    multi-line/folded scalars are extracted EXACTLY as YAML defines them. The
+    previous regex truncated at the first ``'``/``"``/newline; a hand-rolled
+    string parser cannot match YAML's scalar semantics (blank-line folding,
+    comment stripping, the full escape set), so we defer to yaml itself — the
+    same choice ``export_agents_md.py`` already makes for AGENTS.md.
+
+    A real parser builds an object graph, so the DoS surface is closed two ways
+    instead of "no graph": aliases are refused at the composer
+    (``_FrontmatterLoader``), and an oversized block skips YAML for the linear
+    legacy regex. Falls back to ``_parse_frontmatter_legacy`` when PyYAML is
+    unavailable, the block exceeds the size cap, or it is not a valid YAML
+    mapping.
+    """
+    if content.startswith("---") and yaml is not None:
+        end = content.find("\n---", 3)
+        if end < 0:
+            end = content.find("---", 3)
+        if end > 0:
+            block = content[3:end]
+            if len(block) > _MAX_FRONTMATTER_CHARS:
+                # Pathologically large frontmatter — the linear legacy regex
+                # extracts the fields without building a YAML object graph.
+                return _parse_frontmatter_legacy(content, fallback_name)
+            try:
+                loaded = yaml.load(block, Loader=_FrontmatterLoader)  # noqa: S506
+            except Exception:
+                # Any parse failure (YAMLError, RecursionError, …) routes to the
+                # legacy fallback rather than silently dropping the description.
+                loaded = None
+            if isinstance(loaded, dict):
+                # Metadata fields are TEXT. Accept only scalar (str) values and
+                # scalar keyword elements; REJECT non-scalar structures BEFORE any
+                # str() — recursively stringifying an alias tree can exhaust memory.
+                raw_name = loaded.get("name")
+                name = (
+                    raw_name.strip()
+                    if isinstance(raw_name, str) and raw_name.strip()
+                    else fallback_name
+                )
+                raw_desc = loaded.get("description")
+                description = (
+                    _normalize_desc(raw_desc) if isinstance(raw_desc, str) else ""
+                )
+                kw = loaded.get("keywords")
+                if isinstance(kw, (list, tuple)):
+                    keywords = [
+                        s for k in kw if isinstance(k, str) and (s := k.strip())
+                    ]
+                elif isinstance(kw, str):
+                    keywords = [k.strip() for k in kw.split(",") if k.strip()]
+                else:
+                    keywords = []
+                return {
+                    "name": name,
+                    "description": description,
+                    "keywords": keywords,
+                }
+    # PyYAML unavailable, no frontmatter, oversized, or block not a mapping.
+    return _parse_frontmatter_legacy(content, fallback_name)
+
+
+def _parse_frontmatter_legacy(content: str, fallback_name: str = "") -> dict:
+    """Degraded regex parse — the no-PyYAML / oversized-block / malformed-YAML
+    fallback ONLY. Truncates descriptions at apostrophes/escaped quotes/newlines;
+    ``_parse_frontmatter`` (YAML) is the real parser. Builds no object graph, so
+    a pathologically large frontmatter cannot amplify memory here.
+    """
     name = fallback_name
     description = ""
-
-    # Check for YAML frontmatter (--- delimited)
+    keywords: list[str] = []
     if content.startswith("---"):
         end = content.find("---", 3)
         if end > 0:
@@ -167,25 +177,33 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
             name_match = re.search(r'name:\s*["\']?([^"\'\n]+)', frontmatter)
             if name_match:
                 name = name_match.group(1).strip()
-            # Full description across any YAML scalar form (see _extract_description).
-            description = _extract_description(frontmatter)
-
-    keywords = []
-    if content.startswith("---"):
-        end = content.find("---", 3)
-        if end > 0:
-            frontmatter = content[3:end]
-            kw_match = re.search(
-                r"keywords:\s*\[([^\]]*)\]", frontmatter
-            )
+            desc_match = re.search(r'description:\s*["\']?([^"\'\n]+)', frontmatter)
+            if desc_match:
+                val = desc_match.group(1).strip()
+                if val in (">", "|", ">-", "|-"):
+                    # Folded/literal scalar: collect indented continuation lines.
+                    lines = frontmatter[desc_match.end() :].split("\n")
+                    parts: list[str] = []
+                    for line in lines:
+                        stripped = line.strip()
+                        if not stripped:
+                            if parts:
+                                break
+                            continue
+                        if line.startswith("  ") or line.startswith("\t"):
+                            parts.append(stripped)
+                        elif parts:
+                            break
+                    description = " ".join(parts)
+                else:
+                    description = val
+            kw_match = re.search(r"keywords:\s*\[([^\]]*)\]", frontmatter)
             if kw_match:
-                raw = kw_match.group(1)
                 keywords = [
                     k.strip().strip("'\"")
-                    for k in raw.split(",")
+                    for k in kw_match.group(1).split(",")
                     if k.strip()
                 ]
-
     return {"name": name, "description": description, "keywords": keywords}
 
 

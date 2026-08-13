@@ -361,6 +361,74 @@ def test_parse_frontmatter_keywords_flow_list_unchanged():
     assert r["keywords"] == ["alpha", "beta", "gamma"]
 
 
+def test_parse_frontmatter_plain_scalar_folds_across_blank_line():
+    """A plain scalar spans a blank line (yaml folds the paragraphs) -> both."""
+    content = "---\nname: a\ndescription: first\n\n  second\nkeywords: [x]\n---\n"
+    r = _gen._parse_frontmatter(content, "a")
+    assert r["description"] == "first second"
+
+
+def test_parse_frontmatter_inline_comment_stripped():
+    """An inline ' # comment' suffix on a plain scalar is removed (yaml)."""
+    content = "---\nname: a\ndescription: real text # author note\nkeywords: [x]\n---\n"
+    r = _gen._parse_frontmatter(content, "a")
+    assert r["description"] == "real text"
+
+
+def test_parse_frontmatter_double_quoted_unicode_escape_decoded():
+    r'''A double-quoted \u / \x escape decodes to the real character (yaml).'''
+    content = '---\nname: a\ndescription: "em\\u2014dash \\x20 gap"\nkeywords: [x]\n---\n'
+    r = _gen._parse_frontmatter(content, "a")
+    # — -> em dash, \x20 -> space; whitespace collapsed to single spaces.
+    assert r["description"] == "em—dash gap"
+    assert "—" in r["description"] and "u2014" not in r["description"]
+
+
+def test_parse_frontmatter_alias_bomb_is_refused_and_bounded():
+    """A YAML alias-multiplication payload is refused at the composer and the
+    parse falls back to the linear legacy regex — no object-graph expansion.
+    (Fails without _FrontmatterLoader's alias refusal.)"""
+    payload = ",".join(['"x"'] * 50)
+    refs = ",".join(["*a"] * 50)
+    content = f"---\nname: b\ndescription: &a [{payload}]\nkeywords: [{refs}]\n---\n"
+    r = _gen._parse_frontmatter(content, "b")
+    assert isinstance(r, dict)
+    # No alias expansion: keywords are the literal unexpanded tokens, not a
+    # multiplied structure, and the description stayed a short scalar.
+    assert len(r["keywords"]) <= 60
+    assert len(r["description"]) < 200
+
+
+def test_parse_frontmatter_merge_key_alias_is_refused():
+    """A YAML merge-key alias (`<<: *a`) is refused at the composer and routed to
+    the bounded legacy path — not expanded. (Pins compose_node coverage.)"""
+    content = (
+        "---\nname: m\ndescription: base &a real text\n"
+        "extra:\n  <<: *a\nkeywords: [x]\n---\n"
+    )
+    r = _gen._parse_frontmatter(content, "m")
+    assert isinstance(r, dict)
+    assert len(r["description"]) < 200  # no alias-driven growth
+
+
+def test_parse_frontmatter_alias_as_mapping_key_is_refused():
+    """An alias used as a mapping key (`*a : v`) is refused → bounded legacy."""
+    content = "---\nname: k\ndescription: &a hello\n*a : world\nkeywords: [x]\n---\n"
+    r = _gen._parse_frontmatter(content, "k")
+    assert isinstance(r, dict)
+    assert len(r["description"]) < 200
+
+
+def test_parse_frontmatter_oversized_block_falls_back_bounded():
+    """A frontmatter block over the size cap skips YAML for the linear legacy
+    regex (no object-graph amplification). (Fails without the size cap.)"""
+    huge = "y" * (_gen._MAX_FRONTMATTER_CHARS + 5000)
+    content = f"---\nname: o\ndescription: {huge}\nkeywords: [a]\n---\n"
+    r = _gen._parse_frontmatter(content, "o")
+    assert r["name"] == "o"
+    assert len(r["description"]) <= len(content)
+
+
 def test_parse_frontmatter_pathological_input_is_bounded():
     """Unterminated double-quote + many escapes must complete (no ReDoS/hang)
     and never amplify beyond the input (no object graph)."""
