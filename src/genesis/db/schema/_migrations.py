@@ -1018,9 +1018,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                     logger.info(
                         "entities table rebuilt: +host/install/project types, +card columns"
                     )
-                except Exception:
+                except BaseException:
                     # Restore entities to its pre-rebuild state — never leave the
                     # table deleted for the unconditional init commit to persist.
+                    # BaseException, not Exception (Codex round-8): an
+                    # asyncio.CancelledError landing in the DROP→RENAME window
+                    # would otherwise skip this rollback and leave `entities`
+                    # dropped inside an open savepoint on a caller-owned,
+                    # possibly-reused connection.
                     with contextlib.suppress(Exception):
                         await db.execute("ROLLBACK TO entities_rebuild")
                         await db.execute("RELEASE entities_rebuild")

@@ -231,6 +231,46 @@ async def test_base_path_raises_loud_on_entities_drift():
     await conn.close()
 
 
+async def test_base_path_rebuild_rolls_back_on_cancellation():
+    """Codex round-8: asyncio.CancelledError derives from BaseException, so the
+    rebuild's `except Exception` rollback didn't fire for a cancellation landing
+    in the DROP→RENAME window — on a caller-owned connection later reused,
+    `entities` stayed dropped inside an open savepoint. Cancellation must roll
+    back too. The cancel is injected at the RENAME statement, i.e. AFTER the
+    real `DROP TABLE entities` ran — the exact vulnerable window."""
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await conn.execute(_LEGACY_DDL)
+    await _insert(conn, "e1", "omi", "device")
+    await conn.commit()
+
+    real_execute = conn.execute
+
+    class _CancelLike(BaseException):
+        """BaseException-not-Exception, like asyncio.CancelledError — but
+        without the event-loop cancellation semantics that would tangle the
+        test task itself."""
+
+    def exec_cancel_on_rename(sql, *a, **k):
+        if "RENAME TO entities" in sql:
+            raise _CancelLike()
+        return real_execute(sql, *a, **k)
+
+    conn.execute = exec_cancel_on_rename  # type: ignore[method-assign]
+    try:
+        with pytest.raises(_CancelLike):
+            await create_all_tables(conn)
+        conn.execute = real_execute  # type: ignore[method-assign]
+        # Savepoint rolled back: entities intact and readable on the same conn.
+        cur = await conn.execute("SELECT COUNT(*) FROM entities")
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        # Close even on assertion failure — an unclosed aiosqlite connection's
+        # worker thread hangs the whole pytest session at teardown.
+        conn.execute = real_execute  # type: ignore[method-assign]
+        await conn.close()
+
+
 async def test_base_path_idempotent_on_fresh_schema():
     """On a fresh DB the canonical CREATE already carries the new schema, so the
     base-path rebuild guard (CHECK-text 'host') skips — no double rebuild."""
