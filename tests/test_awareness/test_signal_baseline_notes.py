@@ -33,6 +33,9 @@ async def test_critical_failure_note_describes_health_probes_not_providers():
     assert "providers reachable" not in note.lower(), note
     assert "provider down" not in note.lower(), note
     assert any(k in note.lower() for k in ("probe", "qdrant", "ollama")), note
+    # Must distinguish local infra/service health from CLOUD LLM-provider status
+    # (Ollama, when enabled, IS a local LLM provider whose DOWN fires this signal).
+    assert "cloud" in note.lower(), note
 
 
 async def test_container_memory_note_says_excludes_cache_not_includes():
@@ -96,7 +99,10 @@ async def test_scheduler_liveness_firing_branch_has_baseline_note():
     reading = await collector.collect()
     assert reading.value > 0.0, "expected the firing (stale) branch"
     assert reading.baseline_note, "firing branch must carry a baseline_note"
-    assert "surplus" in (reading.baseline_note or "").lower()
+    note = (reading.baseline_note or "").lower()
+    assert "surplus" in note
+    # The note must not point the LLM at metadata — signal_format.py never renders it.
+    assert "metadata" not in note, note
 
 
 async def test_scheduler_liveness_healthy_note_scopes_to_surplus_only():

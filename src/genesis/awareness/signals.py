@@ -308,9 +308,10 @@ class ContainerMemoryCollector:
             warning_threshold=0.85,
             critical_threshold=0.90,
             baseline_note=(
-                "Excludes reclaimable page cache (anon+kernel only) — real memory pressure, "
-                "not cache noise. 70-80% is normal headroom; sustained above ~85% indicates "
-                "genuine OOM risk"
+                "Anon+kernel memory / cgroup limit (excludes the reclaimable page cache "
+                "that inflates memory.current). A pressure INDICATOR, not a definitive "
+                "OOM/PSI verdict — kernel slab can still include some reclaimable memory. "
+                "70-80% is normal headroom; sustained higher warrants attention."
             ),
         )
 
@@ -497,8 +498,9 @@ class SchedulerLivenessCollector:
             source="runtime",
             collected_at=now.isoformat(),
             baseline_note=(
-                "0.5+=one or more surplus scheduler jobs are stale past the 15-min "
-                "threshold (see metadata.stale for which) — the surplus scheduler may be wedged"
+                "0.5=the surplus scheduler has not run ANY of its jobs "
+                "(surplus_dispatch/surplus_brainstorm/schedule_code_index) in 15+ min "
+                "— it may be wedged"
             ),
             metadata={"stale": stale_schedulers},
         )
