@@ -317,8 +317,9 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="voice_recency_resume",
         description=(
             "Voice cross-session recency resume — inject the tail of the user's "
-            "most-recent prior voice conversation into the S2S system prompt so the "
-            "model proactively resumes the thread. master `enabled` + `mode` off/live "
+            "most-recent prior voice conversation into the S2S system prompt as "
+            "reference-only context (used only when the user asks or directly continues "
+            "it, never proactively resumed). master `enabled` + `mode` off/live "
             "(off = no injection, the default). Tuning: `scope` global/per_device, "
             "`max_turns`, `max_chars`, `max_age_hours` (null = no limit). Ship dark, "
             "arm after live E2E. Read live at every voice session start — no restart."
