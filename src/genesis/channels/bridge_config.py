@@ -59,12 +59,19 @@ def build_bridge_config(
     allowed_users: set[int] = set()
     allowed_raw = secrets.get("TELEGRAM_ALLOWED_USERS", "")
     if allowed_raw:
-        for uid in allowed_raw.split(","):
+        for idx, uid in enumerate(allowed_raw.split(","), start=1):
             uid = uid.strip()
             if uid.isdigit():
                 allowed_users.add(int(uid))
             elif uid and log:
-                log.warning("Invalid UID in TELEGRAM_ALLOWED_USERS: %r", uid)
+                # Never echo the raw entry: a value mis-pasted into this field
+                # (e.g. a bot token, which has the shape "<id>:<secret>") would be
+                # logged in clear text. Report the POSITION only so the user can
+                # locate it in their config without leaking its content.
+                log.warning(
+                    "TELEGRAM_ALLOWED_USERS entry #%d is not a numeric user ID — skipping it",
+                    idx,
+                )
 
     if not allowed_users:
         if log:
