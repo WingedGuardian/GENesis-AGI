@@ -25,6 +25,24 @@ _CC_MANAGED_TYPES: frozenset[str] = frozenset()
 _api_validation_cache: dict[str, dict] = {}
 
 
+def resolve_api_key(service: str) -> str | None:
+    """First non-empty API key for a provider service, accepting every
+    spelling Genesis recognizes: the install convention ``API_KEY_<SERVICE>``
+    plus the litellm/native ``<SERVICE>_API_KEY`` / ``<SERVICE>_API_TOKEN``.
+
+    Single source of truth for the acceptance loop — callers that invoke
+    litellm directly (outside the router) MUST pass the returned value as an
+    explicit ``api_key``: litellm's own env lookup knows only the native
+    spelling, so a convention-following install (``API_KEY_GROQ``) would 401.
+    """
+    svc = service.upper()
+    for pattern in (f"API_KEY_{svc}", f"{svc}_API_KEY", f"{svc}_API_TOKEN"):
+        val = os.environ.get(pattern)
+        if val and val not in ("None", "NA", ""):
+            return val
+    return None
+
+
 def has_api_key(provider_cfg) -> bool:
     """Check if a provider has a non-empty API key in the environment.
 
@@ -37,12 +55,7 @@ def has_api_key(provider_cfg) -> bool:
         return True
     if ptype in _CC_MANAGED_TYPES:
         return True  # CC handles auth — no API key needed
-    service = ptype.upper()
-    for pattern in [f"API_KEY_{service}", f"{service}_API_KEY", f"{service}_API_TOKEN"]:
-        val = os.environ.get(pattern)
-        if val and val not in ("None", "NA", ""):
-            return True
-    return False
+    return resolve_api_key(ptype) is not None
 
 
 def api_key_health(
@@ -138,13 +151,7 @@ def api_key_health(
         if ptype in _CC_MANAGED_TYPES:
             results[name] = {"status": "cc_managed", "provider_type": ptype, "key_health": "green"}
             continue
-        service = ptype.upper()
-        key = None
-        for pattern in [f"API_KEY_{service}", f"{service}_API_KEY", f"{service}_API_TOKEN"]:
-            val = os.environ.get(pattern)
-            if val and val not in ("None", "NA", ""):
-                key = val
-                break
+        key = resolve_api_key(ptype)
         entry: dict = {"provider_type": ptype}
         if not key:
             entry["status"] = "missing"
@@ -412,13 +419,7 @@ async def validate_api_keys(routing_config: RoutingConfig | None) -> None:
         ptype = provider_cfg.provider_type
         if ptype in _LOCAL_TYPES or ptype in _CC_MANAGED_TYPES or ptype in validators:
             continue
-        service = ptype.upper()
-        key = None
-        for pattern in [f"API_KEY_{service}", f"{service}_API_KEY", f"{service}_API_TOKEN"]:
-            val = os.environ.get(pattern)
-            if val and val not in ("None", "NA", ""):
-                key = val
-                break
+        key = resolve_api_key(ptype)
         if not key:
             continue
 
