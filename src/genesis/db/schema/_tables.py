@@ -1983,7 +1983,10 @@ TABLES = {
                             CHECK(status IN ('applied','proposed','confirmed',
                                              'rejected','superseded')),
             resolved_at     TEXT,
-            resolution_ref  TEXT
+            resolution_ref  TEXT,
+            -- 'ledger' | 'follow_up' — which store item_id addresses (a8a4f59e).
+            -- LAST column: ALTER appends here, so fresh/migrated order stays in parity.
+            target_kind     TEXT NOT NULL DEFAULT 'ledger'
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
@@ -2566,7 +2569,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_slse_session ON session_ledger_shadow_events(session_id, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_slse_observed ON session_ledger_shadow_events(observed_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
-    "ON repo_pulse_annotations(tier, item_id, pr_number)",
+    "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_status ON repo_pulse_annotations(status, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_session ON repo_pulse_annotations(item_session_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_rpr_started ON repo_pulse_runs(started_at)",

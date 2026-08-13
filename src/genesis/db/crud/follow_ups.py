@@ -385,6 +385,38 @@ async def update_notes(
     return cursor.rowcount > 0
 
 
+async def absorb_followup(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    evidence: str,
+) -> bool:
+    """Mark a still-open follow_up 'completed' with PR evidence (repo-pulse absorb).
+
+    Conditional by design — only a row still in ``('pending','in_progress')``
+    transitions. The detached repo-pulse worker races ego/foreground writers, so
+    an unconditional ``update_status`` would clobber a concurrent transition (e.g.
+    a user just set it 'blocked'); the WHERE guard makes the absorb
+    lost-update-safe and replay-idempotent (a re-covered enumeration window
+    matches nothing on the second run). Mirrors the ledger absorb and the
+    dashboard's own open-only guard.
+
+    The CALLER scopes to the HOT lane (``kind='follow_up'``) and excludes pinned
+    rows — this enforces only the open-status precondition. ``evidence`` is
+    APPENDED to any existing ``resolution_notes`` (prior context is never lost).
+    Returns True iff a row changed.
+    """
+    cursor = await db.execute(
+        "UPDATE follow_ups SET status = 'completed', completed_at = ?, "
+        "resolution_notes = TRIM("
+        "COALESCE(resolution_notes || char(10) || char(10), '') || ?"
+        ") WHERE id = ? AND status IN ('pending', 'in_progress')",
+        (_now_iso(), evidence, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def link_task(
     db: aiosqlite.Connection,
     id: str,

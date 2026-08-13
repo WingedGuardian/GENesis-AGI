@@ -241,3 +241,68 @@ def test_parse_injected_ids_in_reason_are_inert():
 def test_parse_int_confidence_accepted_and_rounded():
     out = rp.parse_matches(_envelope({"matches": [_good_match(confidence=1)]}), 3, 5)
     assert out[0]["confidence"] == 1.0
+
+
+# ── follow-up lane: exact-marker matching (a8a4f59e) ─────────────────────
+#
+# Standalone follow_up rows have NO source_ref — they match by id only. The
+# `Follow-up: <32-hex>` marker mirrors `Ledger:` for absorb-eligibility; bare
+# hex is proposal-only. Locks the marker contract + the bare-hex de-collision
+# with the ledger lane.
+
+
+def _fu(fu_id=FOLLOWUP, content="ship OfficeCLI deliverables", status="pending"):
+    """A standalone follow_up row as loaded by the worker (no source_ref)."""
+    return {"id": fu_id, "content": content, "status": status, "source_session": "sid-2"}
+
+
+def test_followup_marker_in_body_matches():
+    matches = rp.match_followup([_pr(body=f"Ships it.\n\nFollow-up: {FOLLOWUP}")], [_fu()])
+    assert len(matches) == 1
+    assert matches[0]["via"] == "marker"
+    assert matches[0]["item"]["id"] == FOLLOWUP
+    assert matches[0]["pr"]["number"] == 1080
+
+
+def test_followup_marker_hyphen_optional_and_case_insensitive():
+    for body in (f"Followup: {FOLLOWUP}", f"follow-up: {FOLLOWUP}", f"FOLLOW-UP: {FOLLOWUP}"):
+        matches = rp.match_followup([_pr(body=body)], [_fu()])
+        assert [m["via"] for m in matches] == ["marker"], body
+
+
+def test_followup_bare_hex_is_proposal_only():
+    matches = rp.match_followup([_pr(body=f"relates to {FOLLOWUP} from triage")], [_fu()])
+    assert [m["via"] for m in matches] == ["bare"]
+
+
+def test_followup_marker_swallows_bare_same_pair():
+    body = f"Follow-up: {FOLLOWUP}\n\nalso {FOLLOWUP} again in prose"
+    matches = rp.match_followup([_pr(body=body)], [_fu()])
+    assert [m["via"] for m in matches] == ["marker"]
+
+
+def test_followup_unknown_id_and_empty_no_match():
+    assert rp.match_followup([_pr(body=f"Follow-up: {ITEM_B}")], [_fu()]) == []
+    assert rp.match_followup([_pr(body=""), _pr(body=None)], [_fu()]) == []
+    assert rp.match_followup([_pr(body=f"Follow-up: {FOLLOWUP}")], []) == []
+
+
+def test_followup_40hex_sha_never_matches():
+    body = f"Follow-up: {SHA40}"
+    assert rp.match_followup([_pr(body=body)], [_fu(fu_id=SHA40[:32])]) == []
+
+
+def test_ledger_bare_excludes_followup_marked_id():
+    """De-collision: a `Follow-up: X` in a PR must NOT also raise a ledger
+    bare-hex proposal for a ledger row whose source_ref carries X — the
+    follow-up lane owns that citation."""
+    ledger_row = _item(source_ref=f"tracks follow-up {FOLLOWUP}")
+    matches = rp.match_exact([_pr(body=f"Follow-up: {FOLLOWUP}")], [ledger_row])
+    assert matches == []
+
+
+def test_followup_bare_excludes_ledger_marked_id():
+    """Symmetric: a `Ledger: X` citation is not a follow-up bare proposal even
+    if X coincidentally equals a follow_up id."""
+    matches = rp.match_followup([_pr(body=f"Ledger: {FOLLOWUP}")], [_fu()])
+    assert matches == []

@@ -195,6 +195,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE follow_ups ADD COLUMN dedup_key TEXT",
         "follow_ups.dedup_key")
 
+    # a8a4f59e: which store a repo-pulse annotation's item_id addresses
+    # ('ledger' | 'follow_up'). The index swap to the 4-col dedupe guard is
+    # owned by migration 0084 (SQLite can't ALTER an index); this base-path
+    # ALTER only guarantees the column lands for schema_both_build_paths.
+    await _try_alter(db,
+        "ALTER TABLE repo_pulse_annotations ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'ledger'",
+        "repo_pulse_annotations.target_kind")
+
     # Phase 9: thread_id on cc_sessions (for forum topic multi-session)
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN thread_id TEXT",
