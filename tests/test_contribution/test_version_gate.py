@@ -9,6 +9,15 @@ import pytest
 from genesis.contribution import version_gate
 
 
+def test_resolve_api_key_not_imported_at_module_level():
+    """Import-coupling fix (#1384): version_gate must NOT import
+    genesis.observability at module load — the contribution sanitizer can be
+    loaded via a source-path fallback that lacks health-only deps (aiohttp).
+    resolve_api_key is imported INSIDE the functions that use it, so it must
+    not be a module-level attribute."""
+    assert not hasattr(version_gate, "resolve_api_key")
+
+
 def test_parse_clean_json():
     raw = json.dumps({
         "already_fixed": True,

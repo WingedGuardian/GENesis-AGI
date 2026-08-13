@@ -32,9 +32,12 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from genesis.observability.snapshots.api_keys import resolve_api_key
-
 from .findings import VersionGateResult
+
+# NOTE: ``resolve_api_key`` is imported LAZILY inside the two functions that use
+# it (``_select_model`` / ``_call_llm``) — a top-level import would pull in
+# ``genesis.observability`` at module load, which fails on a source-path fallback
+# of the contribution sanitizer that lacks health-only deps (aiohttp). #1384.
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +341,8 @@ def _load_models_from_config() -> list[tuple[str, str]]:
 def _select_model(override: str | None) -> str | None:
     if override:
         return override
+    from genesis.observability.snapshots.api_keys import resolve_api_key  # lazy — see top
+
     # Try routing config first, fall back to hardcoded defaults
     models = _load_models_from_config() or _FALLBACK_MODELS
     for model, service, _params in models:
@@ -367,6 +372,9 @@ async def _call_llm(prompt: str, model: str) -> str:
     would have made.
     """
     import litellm  # lazy import; keeps findings/identity light
+
+    from genesis.observability.snapshots.api_keys import resolve_api_key  # lazy — see top
+
     prefix = model.split("/", 1)[0] if "/" in model else model
     api_key = resolve_api_key(_SERVICE_BY_PREFIX.get(prefix, prefix))
     # Provider params form the BASE; the gate's fixed arguments override them —
