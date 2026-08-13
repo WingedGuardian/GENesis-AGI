@@ -32,6 +32,13 @@ def _reviews_jsonl(*commit_ids: str, login: str = CODEX) -> str:
     return "\n".join(json.dumps({"login": login, "commit_id": cid}) for cid in commit_ids)
 
 
+def _reviews_jsonl_stated(*pairs: tuple[str, str], login: str = CODEX) -> str:
+    """JSONL with explicit review state, e.g. ("aaa...", "DISMISSED")."""
+    return "\n".join(
+        json.dumps({"login": login, "commit_id": cid, "state": st}) for cid, st in pairs
+    )
+
+
 def _shas(n: int) -> list[str]:
     return [f"{i:x}" * 40 for i in range(1, n + 1)]
 
@@ -73,6 +80,59 @@ class TestCountHelper:
 
         monkeypatch.setattr(_mod.subprocess, "run", boom)
         assert _mod._codex_review_commit_ids("1372") is None
+
+    def test_dismissed_reviews_skipped_for_freshness(self, monkeypatch):
+        # A dismissed review vouches for no commit — freshness ignores it.
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_REVIEWS",
+            _reviews_jsonl_stated(("a" * 40, "DISMISSED"), ("b" * 40, "COMMENTED")),
+        )
+        assert _mod._codex_review_commit_ids("1372") == ["b" * 40]
+        assert _mod._latest_codex_reviewed_sha("1372") == "b" * 40
+
+    def test_freshness_falls_to_earlier_active_when_latest_dismissed(self, monkeypatch):
+        # Realistic shape: an active review, then a LATER dismissed one (re-review
+        # dismissed as stale). Freshness must fall back to the earlier active sha,
+        # NOT the dismissed latest — the merge gate then blocks unless HEAD==that.
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_REVIEWS",
+            _reviews_jsonl_stated(("a" * 40, "COMMENTED"), ("b" * 40, "DISMISSED")),
+        )
+        assert _mod._codex_review_commit_ids("1372") == ["a" * 40]
+        assert _mod._latest_codex_reviewed_sha("1372") == "a" * 40
+
+    def test_freshness_none_when_all_dismissed(self, monkeypatch):
+        # All-dismissed → no vouched commit → None → the #1366 merge gate
+        # fail-CLOSED blocks (a dismissed-only PR is never "reviewed at HEAD").
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_REVIEWS",
+            _reviews_jsonl_stated(("a" * 40, "DISMISSED"), ("b" * 40, "DISMISSED")),
+        )
+        assert _mod._codex_review_commit_ids("1372") == []
+        assert _mod._latest_codex_reviewed_sha("1372") is None
+
+
+class TestDismissedRoundCounting:
+    """Codex round 5 (#1385): dismissed reviews STILL RAN as rounds and consumed
+    the review budget, so the escalation counter must count them — even though
+    freshness skips them."""
+
+    def test_dismissed_reviews_count_toward_escalation_cap(self, monkeypatch):
+        # CAP dismissed Codex reviews = CAP rounds already ran → a new unacked
+        # trigger is round N+1 and must BLOCK (was: allowed, count skipped them).
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_REVIEWS",
+            _reviews_jsonl_stated(*[(f"{i:x}" * 40, "DISMISSED") for i in range(1, CAP + 1)]),
+        )
+        block, _ = _check(TRIGGER)
+        assert block is True
+
+    def test_dismissed_below_cap_still_allows(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_REVIEWS",
+            _reviews_jsonl_stated(*[(f"{i:x}" * 40, "DISMISSED") for i in range(1, CAP)]),
+        )
+        assert _check(TRIGGER) == (False, "")
 
 
 class TestEscalationGate:
@@ -170,6 +230,56 @@ class TestEscalationGate:
     def test_host_qualified_repo_reduced_to_owner_repo(self):
         argv = ["gh", "pr", "comment", "7", "--repo", "ghe.example.com/o/r", "--body", "x"]
         assert _mod._comment_repo(argv) == "o/r"
+
+    def test_url_inside_body_value_not_taken_as_pr_target(self):
+        # Round-5 (#1385): a legit branch-target comment whose --body TEXT
+        # contains a PR URL must NOT resolve to that URL's repo/number — the
+        # gate would otherwise count/block against an unrelated repo. The
+        # positional target is the branch ('feature') → non-numeric → fail-open.
+        argv = [
+            "gh",
+            "pr",
+            "comment",
+            "feature",
+            "--body",
+            "https://github.com/other/project/pull/7 @codex review",
+        ]
+        assert _mod._comment_target(argv) == (None, None)
+
+    def test_url_inside_short_body_flag_not_taken_as_target(self):
+        argv = [
+            "gh",
+            "pr",
+            "comment",
+            "feature",
+            "-b",
+            "https://github.com/o/r/pull/9 @codex review",
+        ]
+        assert _mod._comment_target(argv) == (None, None)
+
+    def test_glued_body_forms_not_taken_as_target(self):
+        # Glued value forms (`--body=…`, `-b…`) are single `-`-prefixed tokens
+        # already skipped by the generic dash-prefix branch — a URL inside them
+        # must not resolve as the target either.
+        assert _mod._comment_target(
+            ["gh", "pr", "comment", "feature", "--body=https://github.com/o/r/pull/9"]
+        ) == (None, None)
+        assert _mod._comment_target(
+            ["gh", "pr", "comment", "feature", "-bhttps://github.com/o/r/pull/9"]
+        ) == (None, None)
+
+    def test_real_url_target_still_resolves_with_body(self):
+        # Guard against over-skipping: a genuine URL TARGET still resolves even
+        # when a --body value is also present.
+        argv = [
+            "gh",
+            "pr",
+            "comment",
+            "https://github.com/o/r/pull/12",
+            "--body",
+            "@codex review",
+        ]
+        assert _mod._comment_target(argv) == ("12", "o/r")
 
 
 class TestCodexRound1Fixes:

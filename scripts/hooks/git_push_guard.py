@@ -948,24 +948,18 @@ def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha or None
 
 
-def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] | None:
-    """FULL commit oids (``.commit_id``) of EVERY Codex review on the PR,
-    oldest-first, or None on any API/parse error (distinct from ``[]`` = the
-    query succeeded and Codex has posted no review).
-
-    Uses GitHub's authoritative per-review ``commit_id`` (the exact 40-char oid
-    the review was submitted against) rather than parsing review bodies — a
-    full-oid identity, immune to short-prefix collisions/grinding. The
-    ``/pulls/N/reviews`` endpoint returns reviews oldest-first. A ``DISMISSED``
-    review is SKIPPED at the source — it neither vouches for a commit (the
-    #1366 freshness gate falls back to the last non-dismissed review, possibly
-    stale → block, or none → block) nor counts as an active round (the
-    escalation gate undercounts by exactly the consciously-dismissed reviews —
-    the safe direction). Tests inject via ``_TEST_GH_CODEX_REVIEWS`` (one JSON
-    object per line: ``{login, commit_id[, state]}``; a missing ``state``
-    counts as active). Fail-safe: None on any API/parse error.
-    Consumers: ``_latest_codex_reviewed_sha`` (reviewed-head gate, last entry)
-    and ``_check_codex_round_escalation`` (round count, len()).
+def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
+    """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
+    or None on any API/parse error (distinct from ``[]`` = query succeeded, no
+    Codex review). INCLUDES ``DISMISSED`` reviews — consumers filter per their
+    need: freshness (``_codex_review_commit_ids``) skips dismissed (a dismissed
+    review vouches for NO commit); the escalation counter COUNTS them (a
+    dismissed round already RAN and consumed the review budget — #1385 round-5:
+    3 dismissed rounds must still trip the 3-round cap). Uses GitHub's
+    authoritative per-review ``commit_id`` (immune to prefix grinding); the
+    ``/pulls/N/reviews`` endpoint returns reviews oldest-first. Tests inject via
+    ``_TEST_GH_CODEX_REVIEWS`` (one JSON object per line: ``{login,
+    commit_id[, state]}``; missing ``state`` = active). Fail-safe: None on error.
     """
     raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
     if raw is None:
@@ -991,7 +985,7 @@ def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] 
             raw = result.stdout
         except Exception:
             return None
-    ids: list[str] = []
+    reviews: list[dict] = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -1000,19 +994,31 @@ def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] 
             obj = json.loads(line)
         except Exception:
             continue
-        # isinstance: a valid-JSON non-object line (`null`, a number) must be
-        # skipped, not raise AttributeError out of the docstring's "None on any
-        # parse error" contract (run_guard would turn that into a hook crash).
         if not isinstance(obj, dict):
             continue
         if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
             continue
-        if (obj.get("state") or "").upper() == "DISMISSED":
-            continue  # a dismissed review does not vouch for any commit
-        cid = (obj.get("commit_id") or "").strip().lower()
-        if cid:
-            ids.append(cid)
-    return ids
+        reviews.append(
+            {
+                "commit_id": (obj.get("commit_id") or "").strip().lower(),
+                "state": (obj.get("state") or "").upper(),
+            }
+        )
+    return reviews
+
+
+def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """NON-DISMISSED Codex review commit oids, oldest-first, or None on error.
+
+    Freshness identity — a dismissed review vouches for no commit, so the #1366
+    reviewed-head gate must not treat its sha as reviewed. For ROUND COUNTING
+    (dismissed rounds still ran) the escalation gate uses ``_codex_reviews``
+    directly. Consumer: ``_latest_codex_reviewed_sha`` (last entry).
+    """
+    reviews = _codex_reviews(pr_num, repo=repo)
+    if reviews is None:
+        return None
+    return [r["commit_id"] for r in reviews if r["state"] != "DISMISSED" and r["commit_id"]]
 
 
 def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | None:
@@ -1038,7 +1044,19 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
         idx = argv.index("comment")
     except ValueError:
         return None, None
+    # Value-taking flags whose SEPARATED value must not be read as the positional
+    # target — a PR URL inside a `--body` text would otherwise redirect the gate
+    # to an unrelated repo (#1385 round-5). Glued forms (`--body=…`, `-b…`,
+    # `-R…`, `--repo=…`) are single `-`-prefixed tokens already skipped below.
+    _VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
+    skip_next = False
     for tok in argv[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _VALUE_FLAGS:
+            skip_next = True
+            continue
         if tok.startswith("-"):
             continue
         if pr_num is None and tok.isdigit():
@@ -1153,11 +1171,14 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
             pr_num, repo = _comment_target(seg.argv)
             if not pr_num:
                 continue
-            ids = _codex_review_commit_ids(pr_num, repo=repo)
-            if ids is None:
+            # Count ALL Codex review rounds — including DISMISSED, which still
+            # ran and consumed the budget (#1385 round-5). Freshness uses the
+            # dismissed-filtered ``_codex_review_commit_ids``; the cap does not.
+            reviews = _codex_reviews(pr_num, repo=repo)
+            if reviews is None:
                 continue
             key = f"{repo or ''}|{pr_num}"
-            effective = len(ids) + in_cmd.get(key, 0)
+            effective = len(reviews) + in_cmd.get(key, 0)
             if effective >= ESCALATION_ROUND_CAP:
                 return True, _escalation_advisory(pr_num, effective, repo)
             in_cmd[key] = in_cmd.get(key, 0) + 1
