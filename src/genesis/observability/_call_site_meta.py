@@ -138,9 +138,9 @@ from __future__ import annotations
 _CALL_SITE_META: dict[str, dict] = {
     # ── WIRED: actively executing, have last_run records ──────────────
     "3_micro_reflection": {
-        "description": "Fast pattern check on the latest signals. Runs every awareness tick using free models.",
+        "description": "Fast LLM pattern check on the latest signals, fired only when a critical operational signal is active (~90% of micro ticks are silent by design; see PR #404). Free models.",
         "category": "reflection",
-        "frequency": "Every 5 min",
+        "frequency": "On critical signals (micro ticks otherwise silent)",
         "cost_policy": "Free primary",
         "model_tier": "slm",
     },

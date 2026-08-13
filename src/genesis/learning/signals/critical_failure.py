@@ -42,5 +42,10 @@ class CriticalFailureCollector:
             value=value,
             source="health_probes",
             collected_at=datetime.now(UTC).isoformat(),
-            baseline_note="0.0=all providers reachable (healthy). 0.5=degraded, 1.0=provider down",
+            baseline_note=(
+                "0.0=DB/Qdrant (+Ollama if enabled) health probes all healthy. "
+                "0.5=a probe DEGRADED, 1.0=a probe DOWN. This tracks LOCAL "
+                "infrastructure/service health (including the local Ollama if "
+                "enabled), NOT cloud LLM-provider availability."
+            ),
         )
