@@ -192,7 +192,14 @@ def _strip_trailing_comment(seg: str) -> str:
 # together (`# audit-ack depth-ack`), so the leading run of the comment is allowed to
 # contain any of them; the FIRST prose token ends the run. Kept in sync with the
 # sigils actually passed to has_trailing_override across the guard hooks.
-_KNOWN_SIGILS = ("review-override", "depth-ack", "audit-ack", "escalation-ack", "ci-override")
+_KNOWN_SIGILS = (
+    "review-override",
+    "depth-ack",
+    "audit-ack",
+    "escalation-ack",
+    "ci-override",
+    "stale-review-override",
+)
 
 
 def _token_is_sigil(tok: str, sigil: str) -> bool:
