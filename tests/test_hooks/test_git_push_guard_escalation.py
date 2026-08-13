@@ -192,6 +192,22 @@ class TestCodexRound1Fixes:
         block, _ = _check(cmd)
         assert block is False
 
+    def test_double_trigger_in_one_command_counts_both(self, monkeypatch):
+        # Round-2 finding: at CAP-1 existing reviews, `request && request` for
+        # the SAME PR must block — each segment previously fetched the same
+        # pre-execution count, so both passed and the second dispatched round
+        # N+1 unacked. The scan must count earlier trigger segments in the
+        # same command toward the round total.
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(*_shas(CAP - 1)))
+        cmd = (
+            'gh pr comment 1372 --body "@codex review" && gh pr comment 1372 --body "@codex review"'
+        )
+        block, _ = _check(cmd)
+        assert block is True
+        # A single trigger at CAP-1 still passes (it IS round CAP, allowed).
+        block, _ = _check('gh pr comment 1372 --body "@codex review"')
+        assert block is False
+
     def test_block_message_preserves_repo_flag(self, monkeypatch):
         # Finding 5: the printed remediation must keep --repo, or copying it
         # posts the trigger against the wrong repository.

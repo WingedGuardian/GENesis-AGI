@@ -1080,6 +1080,11 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
     try:
         if any(has_trailing_override(s.raw, "escalation-ack") for s in segs):
             return False, ""
+        # Earlier trigger segments in THIS command count toward the total: each
+        # segment sees the same pre-execution API count, so `request && request`
+        # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
+        # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
+        in_cmd: dict[str, int] = {}
         for seg in segs:
             if gh_pr_subcommand(seg.argv) != "comment":
                 continue
@@ -1089,9 +1094,13 @@ def _check_codex_round_escalation(segs) -> tuple[bool, str]:
             if not pr_num:
                 continue
             ids = _codex_review_commit_ids(pr_num, repo=repo)
-            if ids is None or len(ids) < ESCALATION_ROUND_CAP:
+            if ids is None:
                 continue
-            return True, _escalation_advisory(pr_num, len(ids), repo)
+            key = f"{repo or ''}|{pr_num}"
+            effective = len(ids) + in_cmd.get(key, 0)
+            if effective >= ESCALATION_ROUND_CAP:
+                return True, _escalation_advisory(pr_num, effective, repo)
+            in_cmd[key] = in_cmd.get(key, 0) + 1
     except Exception:
         return False, ""
     return False, ""
