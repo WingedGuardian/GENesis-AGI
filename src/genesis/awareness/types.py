@@ -24,6 +24,51 @@ USER_FACING_SIGNALS = frozenset(
     }
 )
 
+# Signals expected in EVERY steady-state awareness tick — the canonical set the
+# j9 signal-completeness metric scores against and the collector-parity guard
+# enforces. Every steady-state collector's collect() always returns a
+# SignalReading (value 0.0 when idle), so every name below appears in every tick;
+# a name going MISSING means a collector was dropped from the learning-phase swap
+# (runtime/init/learning.py::build_learning_collectors, installed via
+# AwarenessLoop.replace_collectors — a full replacement of the bootstrap set).
+# Pinned to the actual builder output by
+# tests/test_learning/test_extension_wiring.py — update both together.
+STEADY_STATE_SIGNALS = frozenset(
+    {
+        "conversations_since_reflection",
+        "task_completion_quality",
+        "outreach_engagement_data",
+        "recon_findings_pending",
+        "budget_pct_consumed",
+        "software_error_spike",
+        "critical_failure",
+        "time_since_last_strategic",
+        "container_memory_pct",
+        "stale_pending_items",
+        "micro_count_since_light",
+        "light_count_since_deep",
+        "sentinel_activity",
+        "guardian_activity",
+        "surplus_activity",
+        "autonomy_activity",
+        "genesis_version_changed",
+        "cc_version_changed",
+        "stale_browser_processes",
+        "user_goal_staleness",
+        "user_session_pattern",
+        "scheduled_job_health",
+        "scheduler_liveness",
+    }
+)
+
+# Signals produced by the bootstrap collector set (runtime/init/awareness.py)
+# that are intentionally NOT carried into the steady-state swap. event_loop_latency
+# is deferred: it is spiky (a single >500ms hiccup reads high) and reaches the
+# ungrounded ego/dashboard signal tables, so it is restored WITH grounding as part
+# of the Micro-reflection redesign, not here. The parity guard
+# (tests/test_learning/test_extension_wiring.py) treats these as allowed exceptions.
+BOOTSTRAP_ONLY_SIGNALS = frozenset({"event_loop_latency"})
+
 
 class Depth(StrEnum):
     """Reflection depth levels. Values match DB seed data in signal_weights.feeds_depths."""

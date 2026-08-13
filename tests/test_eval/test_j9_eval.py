@@ -719,8 +719,10 @@ async def test_grade_awareness_from_ticks(db):
     """Awareness grade uses tick_regularity + signal_completeness."""
     import json as _json
 
-    # Build realistic signals_json with 20 distinct signal names
-    signals = [{"name": f"signal_{i}", "value": 0.5} for i in range(20)]
+    from genesis.awareness.types import STEADY_STATE_SIGNALS
+
+    # All steady-state signals present (value 0.0 when idle) → completeness 1.0.
+    signals = [{"name": n, "value": 0.0} for n in sorted(STEADY_STATE_SIGNALS)]
     signals_json = _json.dumps(signals)
 
     for i in range(25):
@@ -737,9 +739,39 @@ async def test_grade_awareness_from_ticks(db):
     assert result["score"] is not None
     assert result["sample_count"] == 25
     assert result["factors"]["classified_count"] == 20
-    # Signal completeness: 20 unique signals vs 18 expected → 1.0 (capped)
+    # All steady-state collectors producing output → completeness 1.0.
     assert result["factors"]["signal_completeness"] == 1.0
-    assert result["factors"]["unique_signals"] == 20
+    assert result["factors"]["unique_signals"] == len(STEADY_STATE_SIGNALS)
+
+
+async def test_grade_awareness_completeness_detects_dropped_collector(db):
+    """A steady-state collector missing from ticks drops completeness below 1.0.
+
+    Regression guard for the collector-drop bug: the old magic-denominator metric
+    (distinct_names / 18) saturated at 1.0 and never detected a dropped collector.
+    Scoring against the canonical STEADY_STATE_SIGNALS set makes a drop visible.
+    """
+    import json as _json
+
+    from genesis.awareness.types import STEADY_STATE_SIGNALS
+
+    # One steady-state signal absent from every tick (collector dropped).
+    present = sorted(STEADY_STATE_SIGNALS - {"scheduled_job_health"})
+    signals_json = _json.dumps([{"name": n, "value": 0.0} for n in present])
+
+    for i in range(25):
+        await db.execute(
+            "INSERT INTO awareness_ticks (id, created_at, source, classified_depth, "
+            "signals_json, scores_json) VALUES (?, ?, 'scheduled', NULL, ?, '[]')",
+            (f"tick-{i}", "2026-05-05T12:00:00Z", signals_json),
+        )
+    await db.commit()
+
+    result = await _grade_awareness(db, "2026-05-01", "2026-05-08", {})
+    n = len(STEADY_STATE_SIGNALS)
+    # factors["signal_completeness"] is round(_, 4) in the aggregator.
+    assert result["factors"]["signal_completeness"] == round((n - 1) / n, 4)
+    assert result["factors"]["signal_completeness"] < 1.0
 
 
 async def test_grade_awareness_empty_signals(db):

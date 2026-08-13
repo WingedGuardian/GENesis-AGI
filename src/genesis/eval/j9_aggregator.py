@@ -25,6 +25,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from genesis.awareness.types import STEADY_STATE_SIGNALS
 from genesis.db.crud import ego as ego_crud
 from genesis.db.crud import j9_eval
 from genesis.db.crud import memory as memory_crud
@@ -1326,8 +1327,13 @@ async def _grade_awareness(
     expected_ticks = 2016  # 7 * 24 * 60 / 5
     tick_regularity = min(total_ticks / expected_ticks, 1.0) if total_ticks else 0.0
 
-    # Signal completeness: are all expected collectors producing output?
-    # Sample recent ticks and count distinct signal names.
+    # Signal completeness: are all expected steady-state collectors producing
+    # output? Every steady-state collector always emits its signal name each tick
+    # (value 0.0 when idle), so a MISSING name means the collector was dropped from
+    # the learning-phase swap. Score against the canonical expected set
+    # (STEADY_STATE_SIGNALS); a magic denominator masks a drop — a too-low count
+    # saturates at 1.0 (the prior `/ 18` never detected two dropped collectors).
+    # Names outside the expected set (bootstrap-only / renamed) don't inflate it.
     cursor = await db.execute(
         "SELECT signals_json FROM awareness_ticks "
         "WHERE created_at >= ? AND created_at < ? "
@@ -1345,9 +1351,12 @@ async def _grade_awareness(
                     signal_names.add(name)
         except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
             pass
-    # 18 expected signals (21 total minus 3 conditional: genesis/cc version, stale items)
-    expected_signals = 18
-    signal_completeness = min(len(signal_names) / expected_signals, 1.0) if expected_signals else 0.0
+    expected_count = len(STEADY_STATE_SIGNALS)
+    signal_completeness = (
+        len(signal_names & STEADY_STATE_SIGNALS) / expected_count
+        if expected_count
+        else 0.0
+    )
 
     # Informational: classification stats (not scored)
     cursor = await db.execute(
