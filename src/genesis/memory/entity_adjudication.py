@@ -74,8 +74,9 @@ MERGE when the two names are the SAME thing recorded two ways:
   ("neural monitor" / "neural-monitor" / "neural_monitor"; "dispatch: cli" / "dispatch=cli")
 - QUALIFIER variants that just RESTATE what the thing is — a bare identifier and the
   same identifier plus a descriptive word for its KIND, or a short form and its
-  fully-qualified / address form. Same referent, one extra descriptive word.
-  ("prod cache" / "prod cache host"; a short name and its full dotted address)
+  fully-qualified / address form WHEN THE SNIPPETS SHOW both denote the same
+  host/endpoint. ("prod cache" / "prod cache host"; a machine's shorthand and its
+  full dotted address, evidenced as the same box)
 
 DISTINCT when the names denote DIFFERENT things, even if closely related:
 - A compound naming a distinct ACTIVITY, EVENT, TASK, ROLE, or ARTIFACT about the
@@ -85,6 +86,11 @@ DISTINCT when the names denote DIFFERENT things, even if closely related:
 - A specific sub-item vs its parent, a numbered/lettered series ("PR-1" vs "PR-1a"),
   or a genuinely different word — a SEMANTIC difference ("system" vs "systemd";
   "safety gate" vs "safety gap").
+- VERSION-like dotted numbers. One dotted number being a suffix of another
+  ("3.12" vs "1.3.12") is NOT evidence of sameness — version strings, release
+  numbers, and section numbers are DISTINCT unless the snippets show both name
+  the very same artifact. Only address-like usage (a host/endpoint) merges on
+  the short-form/full-form pattern, and only with snippet evidence.
 
 The test: does name B refer to the SAME real-world thing as A, just described with an
 extra word — or does B name a distinct thing (an event/task/role/artifact/part) that
@@ -118,13 +124,17 @@ A merge is WRONG only when B names a DISTINCT thing rather than the same thing:
 - a distinct activity/event/task/role/artifact ABOUT the base ("<name>" vs
   "<name> migration" / "<name> handoff" / "<name> steward"),
 - a specific sub-item vs its parent, or a numbered/lettered series ("PR-1" vs "PR-1a"),
-- a genuinely different word — a SEMANTIC difference ("system" vs "systemd").
+- a genuinely different word — a SEMANTIC difference ("system" vs "systemd"),
+- VERSION-like dotted numbers whose only relation is a suffix match ("3.12" vs
+  "1.3.12") — versions/releases/sections are distinct things unless the snippets
+  show both name the very same artifact.
 
 A merge is RIGHT — do NOT challenge — when B is the SAME thing written differently: a
 COSMETIC/formatting variant (spacing, hyphenation, casing, delimiters, word order of
 the SAME terms), or a QUALIFIER variant that just restates what the thing is (a bare
-identifier and the same identifier + a descriptive word for its kind, or a short form
-and its fully-qualified / address form).
+identifier and the same identifier + a descriptive word for its kind, or a short
+address form and its fully-qualified form when the snippets evidence the same
+host/endpoint).
 
 Respond with JSON only, no other text:
 {{"verdict": "merge|distinct", "reasoning": "one sentence"}}

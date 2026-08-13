@@ -107,6 +107,22 @@ def test_prompts_carry_qualifier_vs_compound_policy():
         assert "same" in low and ("related" in low or "distinct thing" in low)
 
 
+def test_prompts_treat_version_suffixes_as_distinct():
+    """Codex round-6 P1: the dotted-suffix generator nominates version-like
+    pairs ("3.12" vs "1.3.12"), and an unqualified 'short form of its full
+    address → merge' cue would bias BOTH models toward merging them. Both
+    prompts must (a) call version-like dotted numbers DISTINCT by default and
+    (b) condition the address-merge cue on snippet EVIDENCE of the same
+    host/endpoint."""
+    for prompt in (adj._ADJUDICATION_PROMPT, adj._CHALLENGE_PROMPT):
+        low = prompt.lower()
+        assert "version" in low
+        assert "3.12" in prompt and "1.3.12" in prompt  # the concrete anti-example
+    # The merge cue itself is evidence-conditioned, not unconditional.
+    assert "snippets show" in adj._ADJUDICATION_PROMPT.lower()
+    assert "snippets evidence" in adj._CHALLENGE_PROMPT.lower()
+
+
 @pytest.mark.asyncio
 async def test_adjudicate_merge_requires_both_models():
     router = _router({"entity_adjudication": "merge", "entity_adjudication_challenge": "merge"})
