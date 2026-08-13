@@ -44,14 +44,17 @@ CONFIDENCE_THRESHOLD = 75
 
 # Fallback model chain when routing config is unavailable.
 # Production can override by passing `model=...` to `check_version_gate()`.
-# Second element = provider SERVICE name for key resolution via
-# `resolve_api_key` (accepts API_KEY_<SVC> and <SVC>_API_KEY spellings —
-# the old single-name GROQ_API_KEY check silently made groq unselectable
-# on installs using the Genesis convention API_KEY_GROQ).
+# Tuple = (litellm model string, provider SERVICE for key resolution via
+# `resolve_api_key`, provider params to mirror on direct calls). The params
+# mirror the model's canonical provider config in model_routing.yaml — e.g.
+# gpt-oss-120b REQUIRES extra_body.reasoning_effort=low to stay under the
+# groq free-tier TPM ceiling; a direct call without it is a different call
+# than the router would make. gemini pinned to the currently-recommended 3.x
+# (docs/reference/gemini-routing.md: 2.0 = "Do not use", being phased out).
 _FALLBACK_MODELS = [
-    ("openrouter/anthropic/claude-haiku-4.5", "openrouter"),
-    ("groq/openai/gpt-oss-120b", "groq"),
-    ("gemini/gemini-2.0-flash", "google"),
+    ("openrouter/anthropic/claude-haiku-4.5", "openrouter", None),
+    ("groq/openai/gpt-oss-120b", "groq", {"extra_body": {"reasoning_effort": "low"}}),
+    ("gemini/gemini-3-flash-preview", "google", None),
 ]
 
 # litellm model-string prefix → provider service name where they differ.
@@ -320,7 +323,9 @@ def _load_models_from_config() -> list[tuple[str, str]]:
             ptype = pcfg.provider_type
             prefix = _PREFIX.get(ptype, ptype)
             model_str = f"{prefix}/{pcfg.model_id}" if prefix else pcfg.model_id
-            result.append((model_str, ptype))
+            # Carry the provider's params (e.g. reasoning_effort caps) so the
+            # direct call mirrors what the router would send.
+            result.append((model_str, ptype, pcfg.params))
         return result
     except Exception:
         logger.debug("Could not load routing config for contribution_gate", exc_info=True)
@@ -332,9 +337,19 @@ def _select_model(override: str | None) -> str | None:
         return override
     # Try routing config first, fall back to hardcoded defaults
     models = _load_models_from_config() or _FALLBACK_MODELS
-    for model, service in models:
+    for model, service, _params in models:
         if resolve_api_key(service):
             return model
+    return None
+
+
+def _params_for_model(model: str) -> dict | None:
+    """Provider params for a model string, from the config-derived chain first,
+    else the fallback chain — so a direct call mirrors the router's call shape
+    (e.g. gpt-oss-120b's reasoning_effort cap). None for unknown/override models."""
+    for m, _service, params in _load_models_from_config() or _FALLBACK_MODELS:
+        if m == model:
+            return params
     return None
 
 
@@ -344,12 +359,16 @@ async def _call_llm(prompt: str, model: str) -> str:
     The API key is resolved (both env spellings) and passed EXPLICITLY —
     litellm's own env lookup knows only the native <SVC>_API_KEY name, so a
     model selected via the Genesis convention (API_KEY_GROQ) would otherwise
-    401 at call time.
+    401 at call time. Provider params (e.g. reasoning-effort caps) are
+    mirrored for the same reason: a direct call must be the call the router
+    would have made.
     """
     import litellm  # lazy import; keeps findings/identity light
     prefix = model.split("/", 1)[0] if "/" in model else model
     api_key = resolve_api_key(_SERVICE_BY_PREFIX.get(prefix, prefix))
-    kwargs = {"api_key": api_key} if api_key else {}
+    kwargs: dict = dict(_params_for_model(model) or {})
+    if api_key:
+        kwargs["api_key"] = api_key
     response = await litellm.acompletion(
         model=model,
         messages=[{"role": "user", "content": prompt}],

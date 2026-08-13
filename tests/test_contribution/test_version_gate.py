@@ -231,6 +231,47 @@ def test_litellm_spelling_still_selects_groq(monkeypatch):
     assert version_gate._select_model(None) == "groq/openai/gpt-oss-120b"
 
 
+def test_fallback_chain_has_no_retired_models(monkeypatch):
+    """Codex round-1: the fallback still listed gemini-2.0-flash, which
+    docs/reference/gemini-routing.md marks 'Do not use' (being phased out) —
+    the same dead-model class this PR retires. The chain must carry only
+    currently-recommended models."""
+    models = [m for m, *_ in version_gate._FALLBACK_MODELS]
+    assert not any("gemini-2.0" in m or "gemini-1.5" in m or "llama-3.3" in m for m in models)
+    assert any("gemini-3-flash-preview" in m for m in models)
+
+
+@pytest.mark.asyncio
+async def test_call_llm_passes_groq_reasoning_params(monkeypatch):
+    """Codex round-1: groq-free's canonical config requires
+    extra_body.reasoning_effort=low (free-tier TPM guard); direct litellm
+    calls must mirror the provider params, not just the key."""
+    _clear_all_keys(monkeypatch)
+    monkeypatch.setenv("API_KEY_GROQ", "gsk-fake-params")
+    monkeypatch.setattr(version_gate, "_load_models_from_config", lambda: [])
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+
+        class _Msg:
+            content = "ok"
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    await version_gate._call_llm("p", "groq/openai/gpt-oss-120b")
+    assert captured.get("extra_body") == {"reasoning_effort": "low"}
+
+
 @pytest.mark.asyncio
 async def test_call_llm_passes_explicit_api_key(monkeypatch):
     """litellm's own env lookup knows only GROQ_API_KEY, so _call_llm must pass
