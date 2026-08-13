@@ -57,7 +57,25 @@ import time
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
 # (importlib does not add the file's dir to sys.path).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
+# the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hook_input import field, read_payload, run_guard  # noqa: E402
+
+# SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
+# import): an unimportable review_state must degrade ONLY the round-escalation
+# advisory to its documented default — never crash this module at load time.
+# A module-load exception exits 1 BEFORE run_guard's fail-closed wrapper can
+# convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
+# gate in this file (force-push, merge, sqlite) would silently vanish.
+try:
+    from review_state import ESCALATION_ROUND_CAP  # noqa: E402
+except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError,
+    # read error, top-level runtime error in review_state) must degrade to the
+    # default cap, NEVER propagate: a module-load exception exits 1 (non-blocking)
+    # and silently disables every fail-closed gate in this file (round-6 P1).
+    ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
+
 from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
@@ -933,20 +951,18 @@ def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha or None
 
 
-def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | None:
-    """The FULL commit oid (``.commit_id``) of Codex's MOST RECENT review, or None
-    if Codex has posted no review (or on any API/parse error).
-
-    Uses GitHub's authoritative per-review ``commit_id`` (the exact 40-char oid
-    the review was submitted against) rather than parsing the review body — so the
-    comparison is a full-oid identity, immune to short-prefix collisions/grinding.
-    The ``/pulls/N/reviews`` endpoint returns reviews oldest-first, so the last
-    Codex entry wins. A ``DISMISSED`` review is SKIPPED — a review the author
-    dismissed must not satisfy the freshness gate (it can even sit at HEAD), so
-    the gate falls back to the last non-dismissed Codex review (possibly stale →
-    block) or none (absent → block). Tests inject via ``_TEST_GH_CODEX_REVIEWS``
-    (one JSON object per line: ``{login, commit_id[, state]}``; a missing
-    ``state`` counts as active). Fail-safe: None on any API/parse error.
+def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
+    """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
+    or None on any API/parse error (distinct from ``[]`` = query succeeded, no
+    Codex review). INCLUDES ``DISMISSED`` reviews — consumers filter per their
+    need: freshness (``_codex_review_commit_ids``) skips dismissed (a dismissed
+    review vouches for NO commit); the escalation counter COUNTS them (a
+    dismissed round already RAN and consumed the review budget — #1385 round-5:
+    3 dismissed rounds must still trip the 3-round cap). Uses GitHub's
+    authoritative per-review ``commit_id`` (immune to prefix grinding); the
+    ``/pulls/N/reviews`` endpoint returns reviews oldest-first. Tests inject via
+    ``_TEST_GH_CODEX_REVIEWS`` (one JSON object per line: ``{login,
+    commit_id[, state]}``; missing ``state`` = active). Fail-safe: None on error.
     """
     raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
     if raw is None:
@@ -972,7 +988,7 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
             raw = result.stdout
         except Exception:
             return None
-    latest: str | None = None
+    reviews: list[dict] = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -981,19 +997,205 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
             obj = json.loads(line)
         except Exception:
             continue
-        # isinstance: a valid-JSON non-object line (`null`, a number) must be
-        # skipped, not raise AttributeError out of the docstring's "None on any
-        # parse error" contract (run_guard would turn that into a hook crash).
         if not isinstance(obj, dict):
             continue
         if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
             continue
-        if (obj.get("state") or "").upper() == "DISMISSED":
-            continue  # a dismissed review does not vouch for any commit
-        cid = (obj.get("commit_id") or "").strip().lower()
-        if cid:
-            latest = cid
-    return latest
+        reviews.append(
+            {
+                "commit_id": (obj.get("commit_id") or "").strip().lower(),
+                "state": (obj.get("state") or "").upper(),
+            }
+        )
+    return reviews
+
+
+def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """NON-DISMISSED Codex review commit oids, oldest-first, or None on error.
+
+    Freshness identity — a dismissed review vouches for no commit, so the #1366
+    reviewed-head gate must not treat its sha as reviewed. For ROUND COUNTING
+    (dismissed rounds still ran) the escalation gate uses ``_codex_reviews``
+    directly. Consumer: ``_latest_codex_reviewed_sha`` (last entry).
+    """
+    reviews = _codex_reviews(pr_num, repo=repo)
+    if reviews is None:
+        return None
+    return [r["commit_id"] for r in reviews if r["state"] != "DISMISSED" and r["commit_id"]]
+
+
+def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The FULL commit oid of Codex's MOST RECENT review, or None if Codex has
+    posted no review (or on any API/parse error). See
+    ``_codex_review_commit_ids`` for the query/identity model."""
+    ids = _codex_review_commit_ids(pr_num, repo=repo)
+    return ids[-1] if ids else None
+
+
+def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
+    """(pr_number, repo) from a ``gh pr comment`` segment's argv.
+
+    Number from a bare number, #N, or PR URL; a URL target ALSO carries its
+    OWNER/REPO (counting against the hook cwd's repo for a cross-repo URL could
+    produce a wrong count and a FALSE block — Codex round-1 finding). An
+    explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
+    target (non-numeric, non-URL positional) yields (None, …) → fail-open.
+    """
+    pr_num: str | None = None
+    url_repo: str | None = None
+    try:
+        idx = argv.index("comment")
+    except ValueError:
+        return None, None
+    # Value-taking flags whose SEPARATED value must not be read as the positional
+    # target — a PR URL inside a `--body` text would otherwise redirect the gate
+    # to an unrelated repo (#1385 round-5). Glued forms (`--body=…`, `-b…`,
+    # `-R…`, `--repo=…`) are single `-`-prefixed tokens already skipped below.
+    _VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
+    skip_next = False
+    for tok in argv[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _VALUE_FLAGS:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        if pr_num is None and tok.isdigit():
+            pr_num = tok
+        elif pr_num is None and tok.startswith("#") and tok[1:].isdigit():
+            pr_num = tok[1:]
+        elif pr_num is None:
+            url = re.match(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b", tok)
+            if url:
+                url_repo, pr_num = url.group(1), url.group(2)
+    return pr_num, _comment_repo(argv) or url_repo
+
+
+def _comment_repo(argv: list[str]) -> str | None:
+    """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any.
+
+    Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, and glued
+    ``-Ro/r`` forms. A host-qualified ``HOST/OWNER/REPO`` is reduced to its
+    OWNER/REPO tail (the REST path shape this gate queries).
+    """
+    val: str | None = None
+    for i, tok in enumerate(argv):
+        if tok in ("--repo", "-R") and i + 1 < len(argv):
+            val = argv[i + 1]
+        elif tok.startswith("--repo="):
+            val = tok.split("=", 1)[1]
+        elif tok.startswith("-R") and len(tok) > 2 and not tok.startswith("-R="):
+            val = tok[2:]
+        elif tok.startswith("-R=") and len(tok) > 3:
+            val = tok[3:]
+    if val and val.count("/") >= 2:
+        val = "/".join(val.split("/")[-2:])
+    return val
+
+
+def _escalation_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
+    repo_arg = f" --repo {repo}" if repo else ""
+    return (
+        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
+        f"{rounds} rounds already ran (cap {ESCALATION_ROUND_CAP}). Repeated "
+        "rounds each finding NEW defects is the whack-a-mole signature: the "
+        "fixes themselves are becoming the bug source. STEP BACK before "
+        "requesting another round:\n"
+        "  1. TRIAGE every open finding FIRST — classify each as {live bug | "
+        "latent trap | hardening | observation}. Only live bugs and "
+        "cheaper-now-than-later traps may change already-reviewed code; "
+        "everything else gets a documented acceptance or routes to the PR that "
+        "owns that area. Findings are inputs to judgment, not a to-do list.\n"
+        "  2. Fix MECHANISMS, not instances — ask 'what made this bug "
+        "possible?' and remove that; patching the named instance leaves the "
+        "class alive for the next round to find.\n"
+        "  3. State-machine/queue/lifecycle code: enumerate EVERY status value "
+        "and trace your change under each one. Your tests encode your own "
+        "model of the states — they cannot catch the states you didn't "
+        "consider.\n"
+        "  4. Consider REVERTING a prior round's fix instead of patching it "
+        "again — less code is often the real fix.\n"
+        "  5. ESCALATE to the user with a minimize-change recommendation — "
+        "past the cap, standing approval is consumed; each extra round needs "
+        "a fresh, conscious decision.\n"
+        "After doing the above (triage table produced, user consulted), "
+        "re-run with a trailing shell comment (outside any quotes):\n"
+        f'  gh pr comment {pr_num}{repo_arg} --body "@codex review"  # escalation-ack'
+    )
+
+
+def _check_codex_round_escalation(segs) -> tuple[bool, str]:
+    """Block a ``gh pr comment … @codex review`` once the PR already carries
+    ``ESCALATION_ROUND_CAP`` Codex reviews, until a trailing ``# escalation-ack``.
+
+    Companion to the commit gate's Rule 3 (review_enforcement_commit.py): that
+    counter tracks LOCAL review→fix rounds and stays asleep when every local
+    review is clean while the loop churns through CODEX rounds on the PR — the
+    exact blind spot of the 2026-08-12 MW-3 #1372 whack-a-mole (5 Codex rounds,
+    local counter at 0). This gate counts the PR's actual Codex reviews from the
+    GitHub API (stateless, authoritative) at the one moment the groove happens:
+    requesting the next round.
+
+    FAIL-OPEN state table (advisory logic must never break workflow — the
+    opposite posture from the fail-closed merge gates, on purpose):
+      segment isn't `gh pr comment`               → untouched
+      comment without an '@codex review' body     → untouched (body-file/stdin
+        bodies are unresolvable here — documented coverage limit, fail-open;
+        blocking unresolvable bodies would false-block non-trigger comments)
+      '# escalation-ack' trailing ANY segment     → allow the whole command (a
+        nested `bash -c '…' # escalation-ack` carries the ack on the OUTER
+        segment; the ack is a conscious human-directed act, so one ack licenses
+        the command it trails)
+      numberless/branch target (no PR number)     → that segment allows;
+        SCANNING CONTINUES (an allowed segment must not shield a later one)
+      gh/API/parse error (ids is None)            → that segment allows, scan on
+      rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
+      any segment at rounds >= cap, no ack        → BLOCK with the step-back
+        order (URL targets carry their OWN repo into the count — counting the
+        hook cwd's repo for a cross-repo URL could produce a FALSE block)
+    Any unexpected exception → allow (caught here, NOT left to run_guard's
+    fail-closed exit-2, which would turn an advisory bug into a hard block).
+    """
+    try:
+        if any(has_trailing_override(s.raw, "escalation-ack") for s in segs):
+            return False, ""
+        # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
+        # so a slow API + a compound command can't push the aggregate past the
+        # ~60s hook wall-clock and get the WHOLE hook SIGKILLed — which fails open
+        # on every gate (round-6 P1). Idempotent: a later merge gate reuses this
+        # same deadline (it arms only when None), never resets it.
+        global _merge_deadline
+        if _merge_deadline is None:
+            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+        # Earlier trigger segments in THIS command count toward the total: each
+        # segment sees the same pre-execution API count, so `request && request`
+        # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
+        # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
+        in_cmd: dict[str, int] = {}
+        for seg in segs:
+            if gh_pr_subcommand(seg.argv) != "comment":
+                continue
+            if not any("@codex review" in tok.lower() for tok in seg.argv):
+                continue
+            pr_num, repo = _comment_target(seg.argv)
+            if not pr_num:
+                continue
+            # Count ALL Codex review rounds — including DISMISSED, which still
+            # ran and consumed the budget (#1385 round-5). Freshness uses the
+            # dismissed-filtered ``_codex_review_commit_ids``; the cap does not.
+            reviews = _codex_reviews(pr_num, repo=repo)
+            if reviews is None:
+                continue
+            key = f"{repo or ''}|{pr_num}"
+            effective = len(reviews) + in_cmd.get(key, 0)
+            if effective >= ESCALATION_ROUND_CAP:
+                return True, _escalation_advisory(pr_num, effective, repo)
+            in_cmd[key] = in_cmd.get(key, 0) + 1
+    except Exception:
+        return False, ""
+    return False, ""
 
 
 # A CLEAN Codex re-review is posted as an ISSUE COMMENT (not a review object): the body
@@ -2192,6 +2394,17 @@ def main() -> int:
             )
             return 2
 
+        # ── Codex round-escalation gate (`gh pr comment … @codex review`) ──
+        # Once a PR already carries ESCALATION_ROUND_CAP Codex reviews,
+        # requesting another round is the whack-a-mole moment — force the
+        # step-back (triage / mechanism / state-space) before round N+1.
+        # Fail-open inside the check; '# escalation-ack' is the conscious
+        # continue after a fresh user decision.
+        esc_block, esc_msg = _check_codex_round_escalation(segs)
+        if esc_block:
+            print(esc_msg, file=sys.stderr)
+            return 2
+
         # An interactive push defers to a native approve/deny dialog at the END
         # of main(), so every hard-block below (merge-into-main, the pr-merge
         # gates, sqlite, --no-verify) still takes precedence — a compound
@@ -2386,8 +2599,12 @@ def main() -> int:
             # findings) reads it via _gh_timeout so the AGGREGATE finishes under the
             # hook's ~60s wall-clock, instead of summing per-call caps past it and
             # getting SIGKILLed mid-gate (Codex P1 #1373). Budget < 60s with headroom.
+            # Idempotent: the escalation gate may have already armed it for the same
+            # command (round-6 P1) — reuse that deadline so the two gates share ONE
+            # aggregate budget, never re-extend it here.
             global _merge_deadline
-            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+            if _merge_deadline is None:
+                _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
             merge_repo = _merge_target_repo(merge_seg.argv, merge_seg.raw)
             # For a DERIVED (no --repo) merge, the dir gh resolves the repo AND a
             # numberless branch-PR from — threaded to _resolve_pr_number so a
