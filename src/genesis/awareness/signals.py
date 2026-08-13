@@ -499,8 +499,8 @@ class SchedulerLivenessCollector:
             collected_at=now.isoformat(),
             baseline_note=(
                 "0.5=the surplus scheduler has not run ANY of its jobs "
-                "(surplus_dispatch/surplus_brainstorm/schedule_code_index) in 15+ min "
-                "— it may be wedged"
+                "(surplus_dispatch/surplus_brainstorm/schedule_code_index) in "
+                f"{self._stale_threshold_s // 60}+ min — it may be wedged"
             ),
             metadata={"stale": stale_schedulers},
         )

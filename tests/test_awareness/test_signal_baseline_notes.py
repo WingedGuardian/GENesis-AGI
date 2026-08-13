@@ -103,6 +103,22 @@ async def test_scheduler_liveness_firing_branch_has_baseline_note():
     assert "surplus" in note
     # The note must not point the LLM at metadata — signal_format.py never renders it.
     assert "metadata" not in note, note
+    # Default threshold (900s) -> "15+ min".
+    assert "15+ min" in note, note
+
+
+async def test_scheduler_liveness_firing_note_derives_threshold_from_config():
+    # The duration in the note must derive from the configured stale_threshold_s, not
+    # a hardcoded "15 min" — else a reconfigured collector feeds the LLM a wrong duration.
+    stale = (datetime.now(UTC) - timedelta(seconds=2000)).isoformat()
+    collector = SchedulerLivenessCollector(
+        runtime=_fake_runtime({"surplus_dispatch": {"last_run": stale}}),
+        stale_threshold_s=120,  # 2 min
+    )
+    reading = await collector.collect()
+    note = (reading.baseline_note or "").lower()
+    assert "2+ min" in note, note
+    assert "15+ min" not in note, note
 
 
 async def test_scheduler_liveness_healthy_note_scopes_to_surplus_only():
