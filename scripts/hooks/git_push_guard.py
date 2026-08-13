@@ -52,7 +52,22 @@ import sys
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
 # (importlib does not add the file's dir to sys.path).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
+# the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hook_input import field, read_payload, run_guard  # noqa: E402
+
+# SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
+# import): an unimportable review_state must degrade ONLY the round-escalation
+# advisory to its documented default — never crash this module at load time.
+# A module-load exception exits 1 BEFORE run_guard's fail-closed wrapper can
+# convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
+# gate in this file (force-push, merge, sqlite) would silently vanish.
+try:
+    from review_state import ESCALATION_ROUND_CAP  # noqa: E402
+except ImportError:  # pragma: no cover — exercised via sys.modules stub in tests
+    ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
+
 from shell_parse import (  # noqa: E402
     analyze,
     commit_skips_hooks,
@@ -889,16 +904,18 @@ def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha or None
 
 
-def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | None:
-    """The FULL commit oid (``.commit_id``) of Codex's MOST RECENT review, or None
-    if Codex has posted no review (or on any API/parse error).
+def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """FULL commit oids (``.commit_id``) of EVERY Codex review on the PR,
+    oldest-first, or None on any API/parse error (distinct from ``[]`` = the
+    query succeeded and Codex has posted no review).
 
     Uses GitHub's authoritative per-review ``commit_id`` (the exact 40-char oid
-    the review was submitted against) rather than parsing the review body — so the
-    comparison is a full-oid identity, immune to short-prefix collisions/grinding.
-    The ``/pulls/N/reviews`` endpoint returns reviews oldest-first, so the last
-    Codex entry wins. Tests inject via ``_TEST_GH_CODEX_REVIEWS`` (one JSON object
-    per line: ``{login, commit_id}``). Fail-safe: None on any API/parse error.
+    the review was submitted against) rather than parsing review bodies — a
+    full-oid identity, immune to short-prefix collisions/grinding. The
+    ``/pulls/N/reviews`` endpoint returns reviews oldest-first. Tests inject via
+    ``_TEST_GH_CODEX_REVIEWS`` (one JSON object per line: ``{login, commit_id}``).
+    Consumers: ``_latest_codex_reviewed_sha`` (the #1366 reviewed-head gate,
+    last entry) and ``_check_codex_round_escalation`` (round count, len()).
     """
     raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
     if raw is None:
@@ -921,7 +938,7 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
             raw = result.stdout
         except Exception:
             return None
-    latest: str | None = None
+    ids: list[str] = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -934,8 +951,121 @@ def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | No
             continue
         cid = (obj.get("commit_id") or "").strip().lower()
         if cid:
-            latest = cid
-    return latest
+            ids.append(cid)
+    return ids
+
+
+def _latest_codex_reviewed_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """The FULL commit oid of Codex's MOST RECENT review, or None if Codex has
+    posted no review (or on any API/parse error). See
+    ``_codex_review_commit_ids`` for the query/identity model."""
+    ids = _codex_review_commit_ids(pr_num, repo=repo)
+    return ids[-1] if ids else None
+
+
+def _comment_pr_number(argv: list[str]) -> str | None:
+    """PR number from a ``gh pr comment`` segment's argv (bare number, #N, or
+    PR URL), or None (numberless form — gh would infer the branch's PR, which
+    this advisory deliberately does NOT chase; see the fail-open table)."""
+    try:
+        idx = argv.index("comment")
+    except ValueError:
+        return None
+    for tok in argv[idx + 1 :]:
+        if tok.startswith("-"):
+            continue
+        if tok.isdigit():
+            return tok
+        if tok.startswith("#") and tok[1:].isdigit():
+            return tok[1:]
+        url = re.match(r"\S*/pull/(\d+)\b", tok)
+        if url:
+            return url.group(1)
+    return None
+
+
+def _comment_repo(argv: list[str]) -> str | None:
+    """Explicit ``--repo``/``-R`` value on a gh pr comment segment, if any."""
+    for i, tok in enumerate(argv):
+        if tok in ("--repo", "-R") and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--repo="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def _escalation_advisory(pr_num: str, rounds: int) -> str:
+    return (
+        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
+        f"{rounds} rounds already ran (cap {ESCALATION_ROUND_CAP}). Repeated "
+        "rounds each finding NEW defects is the whack-a-mole signature: the "
+        "fixes themselves are becoming the bug source. STEP BACK before "
+        "requesting another round:\n"
+        "  1. TRIAGE every open finding FIRST — classify each as {live bug | "
+        "latent trap | hardening | observation}. Only live bugs and "
+        "cheaper-now-than-later traps may change already-reviewed code; "
+        "everything else gets a documented acceptance or routes to the PR that "
+        "owns that area. Findings are inputs to judgment, not a to-do list.\n"
+        "  2. Fix MECHANISMS, not instances — ask 'what made this bug "
+        "possible?' and remove that; patching the named instance leaves the "
+        "class alive for the next round to find.\n"
+        "  3. State-machine/queue/lifecycle code: enumerate EVERY status value "
+        "and trace your change under each one. Your tests encode your own "
+        "model of the states — they cannot catch the states you didn't "
+        "consider.\n"
+        "  4. Consider REVERTING a prior round's fix instead of patching it "
+        "again — less code is often the real fix.\n"
+        "  5. ESCALATE to the user with a minimize-change recommendation — "
+        "past the cap, standing approval is consumed; each extra round needs "
+        "a fresh, conscious decision.\n"
+        "After doing the above (triage table produced, user consulted), "
+        "re-run with a trailing shell comment (outside any quotes):\n"
+        f'  gh pr comment {pr_num} --body "@codex review"  # escalation-ack'
+    )
+
+
+def _check_codex_round_escalation(segs) -> tuple[bool, str]:
+    """Block a ``gh pr comment … @codex review`` once the PR already carries
+    ``ESCALATION_ROUND_CAP`` Codex reviews, until a trailing ``# escalation-ack``.
+
+    Companion to the commit gate's Rule 3 (review_enforcement_commit.py): that
+    counter tracks LOCAL review→fix rounds and stays asleep when every local
+    review is clean while the loop churns through CODEX rounds on the PR — the
+    exact blind spot of the 2026-08-12 MW-3 #1372 whack-a-mole (5 Codex rounds,
+    local counter at 0). This gate counts the PR's actual Codex reviews from the
+    GitHub API (stateless, authoritative) at the one moment the groove happens:
+    requesting the next round.
+
+    FAIL-OPEN state table (advisory logic must never break workflow — the
+    opposite posture from the fail-closed merge gates, on purpose):
+      segment isn't `gh pr comment`            → untouched
+      comment without an '@codex review' body  → untouched
+      trailing '# escalation-ack' on the seg   → allow (the conscious continue)
+      numberless comment (branch-PR inference) → allow (no PR to count against)
+      gh/API/parse error (ids is None)         → allow
+      rounds < ESCALATION_ROUND_CAP            → allow, silently
+      rounds >= cap, no ack                    → BLOCK with the step-back order
+    Any unexpected exception → allow (caught here, NOT left to run_guard's
+    fail-closed exit-2, which would turn an advisory bug into a hard block).
+    """
+    try:
+        for seg in segs:
+            if gh_pr_subcommand(seg.argv) != "comment":
+                continue
+            if not any("@codex review" in tok.lower() for tok in seg.argv):
+                continue
+            if has_trailing_override(seg.raw, "escalation-ack"):
+                return False, ""
+            pr_num = _comment_pr_number(seg.argv)
+            if not pr_num:
+                return False, ""
+            ids = _codex_review_commit_ids(pr_num, repo=_comment_repo(seg.argv))
+            if ids is None or len(ids) < ESCALATION_ROUND_CAP:
+                return False, ""
+            return True, _escalation_advisory(pr_num, len(ids))
+    except Exception:
+        return False, ""
+    return False, ""
 
 
 def _check_codex_reviewed_head(
@@ -1919,6 +2049,17 @@ def main() -> int:
                 "its own command so each is gated separately.",
                 file=sys.stderr,
             )
+            return 2
+
+        # ── Codex round-escalation gate (`gh pr comment … @codex review`) ──
+        # Once a PR already carries ESCALATION_ROUND_CAP Codex reviews,
+        # requesting another round is the whack-a-mole moment — force the
+        # step-back (triage / mechanism / state-space) before round N+1.
+        # Fail-open inside the check; '# escalation-ack' is the conscious
+        # continue after a fresh user decision.
+        esc_block, esc_msg = _check_codex_round_escalation(segs)
+        if esc_block:
+            print(esc_msg, file=sys.stderr)
             return 2
 
         # An interactive push defers to a native approve/deny dialog at the END
