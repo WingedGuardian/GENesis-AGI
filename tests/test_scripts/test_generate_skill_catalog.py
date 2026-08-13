@@ -309,6 +309,20 @@ class TestParseFrontmatter:
         # Legacy keeps only the literal "*a" tokens — never 8x the big scalar.
         assert sum(len(k) for k in result["keywords"]) < len(big)
 
+    def test_oversized_frontmatter_falls_back_without_amplification(self):
+        # A crafted mapping-heavy frontmatter (100k keys) would make yaml.load
+        # materialize a huge object graph (~130 MB / 10 s). Above the size cap it
+        # falls back to the linear legacy parse, which still extracts the fields.
+        import time
+
+        big_map = "\n".join(f"k{i}: v{i}" for i in range(100000))
+        content = f"---\nname: y\ndescription: real desc\n{big_map}\n---\n"
+        start = time.time()
+        result = _gen._parse_frontmatter(content)
+        assert time.time() - start < 1.0
+        assert result["name"] == "y"
+        assert "real desc" in result["description"]
+
     def test_base_safeloader_bool_resolver_not_mutated(self):
         # Customizing _FrontmatterLoader must NOT mutate SafeLoader's shared
         # resolver map (a class-attribute footgun).

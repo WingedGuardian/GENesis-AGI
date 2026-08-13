@@ -59,6 +59,13 @@ TIER2_DIRS = [
 ]
 CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
 
+# Real skill frontmatters are <5 KB. Above this, skip the YAML parse and use the
+# linear legacy regex: a crafted mapping-heavy frontmatter (e.g. 100k `x: y`
+# entries) makes yaml.load materialize a huge object graph — measured ~130 MB /
+# 10 s for ~1.4 MB of input, ~275x RSS amplification — which could OOM the
+# detached hourly catalog refresh.
+_MAX_FRONTMATTER_BYTES = 65_536
+
 
 def _extract_skill_info(skill_dir: Path) -> dict | None:
     """Extract name and description from a skill directory.
@@ -100,10 +107,16 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
         if end < 0:
             end = content.find("---", 3)
         if end > 0:
+            block = content[3:end]
+            if len(block) > _MAX_FRONTMATTER_BYTES:
+                # Pathologically large frontmatter — the linear legacy regex
+                # extracts the three used fields without building a YAML object
+                # graph (see _MAX_FRONTMATTER_BYTES).
+                return _parse_frontmatter_legacy(content, fallback_name)
             try:
                 # _FrontmatterLoader is a SafeLoader subclass (no arbitrary
                 # object construction) that preserves boolean-like spellings.
-                loaded = yaml.load(content[3:end], Loader=_FrontmatterLoader)  # noqa: S506
+                loaded = yaml.load(block, Loader=_FrontmatterLoader)  # noqa: S506
             except Exception:
                 # Any parse failure (YAMLError, RecursionError on nested
                 # aliases, …) routes to the legacy fallback below rather than
