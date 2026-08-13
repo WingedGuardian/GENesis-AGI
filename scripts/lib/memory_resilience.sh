@@ -55,7 +55,7 @@ _memres_install_dropin() {
     fi
     if ! sudo mkdir -p "$(dirname "$path")" 2>/dev/null \
         || ! printf '%s\n' "$content" | sudo tee "$path" >/dev/null 2>&1; then
-        echo "  WARNING: could not write $path (read-only /etc?) — oomd policy NOT applied."
+        echo "  WARNING: could not write $path (read-only /etc?) — drop-in NOT applied."
         _MEMRES_FAILED=1
         return 0
     fi
@@ -142,5 +142,59 @@ memory_resilience_apply() {
     fi
 
     _memres_swap_check
+    return 0
+}
+
+# The per-user-slice PID/task ceiling. systemd's stock default is TasksMax=33%
+# (user-.slice.d/10-defaults.conf) — a conservative multi-user-server default.
+# On a single-user Genesis appliance running many concurrent Claude Code sessions
+# (each spawns MCP subprocess trees), 33% of the box's PID budget is exhausted
+# well before memory/CPU/disk, producing `Cannot fork` while every other axis
+# reads green. We raise it to 60% — a PERCENTAGE, so it self-calibrates to each
+# box's own budget — while deliberately RESERVING ~40% for system.slice so a
+# runaway in the user slice can never starve sshd/systemd/init (the container
+# stays recoverable). A fraction, never an absolute count.
+_MEMRES_TASKSMAX_CONF=$'[Slice]\nTasksMax=60%'
+
+# pid_budget_apply — raise the per-user-slice TasksMax above systemd's stock 33%.
+# Same provision-or-surface contract as memory_resilience_apply: applies the
+# drop-in when sudo is available, else skips with the exact manual remediation
+# (the awareness posture check then surfaces the un-raised ceiling via the
+# pid_ceiling_effective_ok fact). Idempotent. Always returns 0 — must never abort
+# bootstrap.sh/update.sh under `set -e`.
+pid_budget_apply() {
+    echo "--- PID budget (per-user-slice TasksMax) ---"
+
+    if [[ ! -d "$MEMRES_SYSTEMD_RUNTIME_DIR" ]]; then
+        echo "  Skipped: not a systemd system (no $MEMRES_SYSTEMD_RUNTIME_DIR)."
+        return 0
+    fi
+    if ! sudo -n true 2>/dev/null; then
+        echo "  Skipped: sudo unavailable non-interactively. To apply manually:"
+        echo "           sudo bash -c 'source scripts/lib/memory_resilience.sh && pid_budget_apply'"
+        echo "           (the awareness posture check surfaces the un-raised 33% ceiling until then)."
+        return 0
+    fi
+
+    _MEMRES_CHANGED=""
+    _MEMRES_FAILED=""
+    # High-numbered so it wins over systemd's 10-defaults.conf (33%); the
+    # user-.slice TEMPLATE dir applies to every per-user slice regardless of UID.
+    _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user-.slice.d/90-genesis-tasksmax.conf" "$_MEMRES_TASKSMAX_CONF"
+
+    if [[ -n "$_MEMRES_CHANGED" ]]; then
+        # daemon-reload re-reads unit config; TasksMax applies to an already-
+        # running slice on reload and unconditionally at its next (re)start/login.
+        # Best-effort: the drop-in on disk is the durable guarantee — a reload
+        # hiccup must never abort bootstrap/update.
+        sudo systemctl daemon-reload 2>/dev/null || true
+    fi
+    if [[ -n "$_MEMRES_FAILED" ]]; then
+        echo "  TasksMax drop-in NOT applied — see warning above (posture check will surface it)."
+    elif [[ -n "$_MEMRES_CHANGED" ]]; then
+        echo "  PID ceiling raised: user-.slice TasksMax=60% (was systemd's 33% default)."
+    else
+        echo "  PID ceiling already provisioned (user-.slice TasksMax=60%)."
+    fi
     return 0
 }
