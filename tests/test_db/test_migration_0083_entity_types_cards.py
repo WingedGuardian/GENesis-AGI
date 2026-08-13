@@ -190,6 +190,128 @@ async def test_numbered_up_noop_on_missing_table():
     await conn.close()
 
 
+# ── auxiliary-schema preservation (Codex round-8: DROP TABLE auto-drops local
+#    secondary indexes + triggers; the rebuild recreated ONLY idx_entities_norm,
+#    silently losing any locally-added index/trigger on a drifted foreign install) ──
+
+
+async def _add_local_index_and_trigger(conn: aiosqlite.Connection) -> None:
+    """A local secondary index + an AFTER UPDATE trigger (writing to a log table)
+    that SQLite auto-drops on ``DROP TABLE entities`` and the rebuild must replay."""
+    await conn.execute("CREATE INDEX idx_entities_src ON entities(source)")
+    await conn.execute("CREATE TABLE _trig_log (n INTEGER)")
+    await conn.execute(
+        "CREATE TRIGGER trg_entities_au AFTER UPDATE ON entities "
+        "BEGIN INSERT INTO _trig_log(n) VALUES (1); END"
+    )
+    await conn.commit()
+
+
+async def _aux_objects(conn: aiosqlite.Connection) -> set[str]:
+    cur = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE tbl_name='entities' "
+        "AND type IN ('index','trigger') AND sql IS NOT NULL"
+    )
+    return {r[0] for r in await cur.fetchall()}
+
+
+async def test_numbered_up_preserves_local_secondary_index():
+    conn = await _legacy_db()
+    try:
+        await _add_local_index_and_trigger(conn)
+        await _mig.up(conn)
+        await conn.commit()
+        assert "idx_entities_src" in await _aux_objects(conn)
+        # idx_entities_norm is still (re)created too — not lost to the replay logic.
+        assert "idx_entities_norm" in await _aux_objects(conn)
+    finally:
+        await conn.close()
+
+
+async def test_numbered_up_preserves_local_trigger_and_it_fires():
+    conn = await _legacy_db()
+    try:
+        await _add_local_index_and_trigger(conn)
+        await _mig.up(conn)
+        await conn.commit()
+        assert "trg_entities_au" in await _aux_objects(conn)
+        # The trigger must actually FIRE post-rebuild, not just exist as a row.
+        await conn.execute("UPDATE entities SET summary='x' WHERE entity_id='e1'")
+        await conn.commit()
+        cur = await conn.execute("SELECT COUNT(*) FROM _trig_log")
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await conn.close()
+
+
+async def test_base_path_preserves_local_index_and_trigger():
+    conn = await _legacy_db()
+    try:
+        await _add_local_index_and_trigger(conn)
+        await create_all_tables(conn)
+        await conn.commit()
+        objs = await _aux_objects(conn)
+        assert {"idx_entities_src", "trg_entities_au", "idx_entities_norm"} <= objs
+        await conn.execute("UPDATE entities SET summary='y' WHERE entity_id='e1'")
+        await conn.commit()
+        cur = await conn.execute("SELECT COUNT(*) FROM _trig_log")
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await conn.close()
+
+
+async def test_view_referencing_entities_survives_rebuild():
+    """A view over entities is NOT dropped by DROP TABLE (it dangles, then the
+    RENAME restores its referent). Regression-lock for the 'views: accept' call —
+    refuse-on-column-drift guarantees the referenced columns still exist."""
+    conn = await _legacy_db()
+    try:
+        await conn.execute("CREATE VIEW v_entities AS SELECT norm_name FROM entities")
+        await conn.commit()
+        await _mig.up(conn)
+        await conn.commit()
+        cur = await conn.execute("SELECT COUNT(*) FROM v_entities")
+        assert (await cur.fetchone())[0] == 4
+    finally:
+        await conn.close()
+
+
+async def test_base_path_view_referencing_entities_survives_rebuild():
+    """The view half of the Codex finding, on the BASE path: a view over entities
+    must survive create_all_tables' rebuild (legacy_alter_table=ON in the mirror)."""
+    conn = await _legacy_db()
+    try:
+        await conn.execute("CREATE VIEW v_entities AS SELECT norm_name FROM entities")
+        await conn.commit()
+        await create_all_tables(conn)
+        await conn.commit()
+        cur = await conn.execute("SELECT COUNT(*) FROM v_entities")
+        assert (await cur.fetchone())[0] == 4
+    finally:
+        await conn.close()
+
+
+async def test_down_preserves_local_index_and_trigger():
+    """down() (dev-only reverse) must also preserve a local secondary index +
+    trigger through its DROP+RENAME (they are on `source`, not a dropped card col)."""
+    conn = await _legacy_db()
+    try:
+        await _mig.up(conn)  # forward to the new shape (down() needs 'host' present)
+        await conn.commit()
+        await _add_local_index_and_trigger(conn)
+        await _mig.down(conn)
+        await conn.commit()
+        objs = await _aux_objects(conn)
+        assert {"idx_entities_src", "trg_entities_au", "idx_entities_norm"} <= objs
+        # trigger still fires after the reverse rebuild
+        await conn.execute("UPDATE entities SET summary='z' WHERE entity_id='e1'")
+        await conn.commit()
+        cur = await conn.execute("SELECT COUNT(*) FROM _trig_log")
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await conn.close()
+
+
 # ── base path (create_all_tables → _migrate_add_columns) ────────────────────
 
 
@@ -267,6 +389,36 @@ async def test_base_path_rebuild_rolls_back_on_cancellation():
     finally:
         # Close even on assertion failure — an unclosed aiosqlite connection's
         # worker thread hangs the whole pytest session at teardown.
+        conn.execute = real_execute  # type: ignore[method-assign]
+        await conn.close()
+
+
+async def test_base_path_savepoint_failure_does_not_leak_legacy_alter_table():
+    """Reviewer P2: `PRAGMA legacy_alter_table=ON` must be set INSIDE the
+    savepoint-guarded try, so a SAVEPOINT failure can't leak the pragma ON into
+    the later knowledge_units rebuild in the same _migrate_add_columns run.
+    Inject a failure at the SAVEPOINT statement; the pragma must stay OFF."""
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await conn.execute(_LEGACY_DDL)
+    await _insert(conn, "e1", "omi", "device")
+    await conn.commit()
+
+    real_execute = conn.execute
+
+    def exec_fail_on_savepoint(sql, *a, **k):
+        if "SAVEPOINT entities_rebuild" in sql:
+            raise RuntimeError("injected savepoint failure")
+        return real_execute(sql, *a, **k)
+
+    conn.execute = exec_fail_on_savepoint  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="injected savepoint failure"):
+            await create_all_tables(conn)
+        conn.execute = real_execute  # type: ignore[method-assign]
+        cur = await conn.execute("PRAGMA legacy_alter_table")
+        assert (await cur.fetchone())[0] == 0  # OFF — not leaked ON
+    finally:
         conn.execute = real_execute  # type: ignore[method-assign]
         await conn.close()
 

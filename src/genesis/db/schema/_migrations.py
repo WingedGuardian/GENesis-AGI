@@ -128,6 +128,28 @@ async def _intersection_copy(
             )
 
 
+async def _capture_entity_aux(db: aiosqlite.Connection) -> list[str]:
+    """CREATE-SQL of local secondary indexes+triggers on ``entities`` that a
+    table rebuild's ``DROP TABLE`` auto-removes and must replay. Excludes
+    ``idx_entities_norm`` (recreated explicitly) and auto-indexes (``sql IS
+    NULL``, recreated by the new UNIQUE). Mirrors the self-contained copy in
+    migration 0083."""
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE tbl_name='entities' AND type IN ('index','trigger') "
+        "AND sql IS NOT NULL AND name != 'idx_entities_norm'"
+    )
+    return [r[0] for r in await cursor.fetchall()]
+
+
+async def _replay_entity_aux(db: aiosqlite.Connection, captured: list[str]) -> None:
+    """Recreate captured aux objects after the RENAME. A replay failure raises
+    inside the caller's savepoint → the whole rebuild rolls back loud rather
+    than silently losing the object."""
+    for sql in captured:
+        await db.execute(sql)
+
+
 async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     """Idempotent ALTER TABLE migrations for columns added after Phase 0."""
 
@@ -982,8 +1004,19 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                 t in table_sql for t in ("'host'", "'install'", "'project'")
             ) and {"summary_updated_at", "summary_dirty"} <= live_cols
             if not fully_migrated:
+                # `DROP TABLE entities` auto-drops its secondary indexes+triggers
+                # (recreating only idx_entities_norm would silently lose local
+                # ones), and a dependent VIEW makes the RENAME itself fail under
+                # the default legacy_alter_table=OFF. Capture indexes/triggers to
+                # replay after the RENAME, and rename under legacy_alter_table=ON
+                # so a view survives (SQLite's documented table-rebuild procedure).
+                aux = await _capture_entity_aux(db)
                 await db.execute("SAVEPOINT entities_rebuild")
                 try:
+                    # Inside the try so a SAVEPOINT failure can't leak the pragma
+                    # ON into the later knowledge_units rebuild; every exit below
+                    # (success, inner except) restores it OFF.
+                    await db.execute("PRAGMA legacy_alter_table=ON")
                     await db.execute("DROP TABLE IF EXISTS entities_new")
                     await db.execute("""
                         CREATE TABLE entities_new (
@@ -1013,7 +1046,9 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                     await db.execute(
                         "CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)"
                     )
+                    await _replay_entity_aux(db, aux)
                     await db.execute("RELEASE entities_rebuild")
+                    await db.execute("PRAGMA legacy_alter_table=OFF")
                     await db.commit()
                     logger.info(
                         "entities table rebuilt: +host/install/project types, +card columns"
@@ -1029,6 +1064,8 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
                     with contextlib.suppress(Exception):
                         await db.execute("ROLLBACK TO entities_rebuild")
                         await db.execute("RELEASE entities_rebuild")
+                    with contextlib.suppress(Exception):
+                        await db.execute("PRAGMA legacy_alter_table=OFF")
                     raise
     except Exception:
         logger.error(

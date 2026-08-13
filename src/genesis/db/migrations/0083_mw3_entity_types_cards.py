@@ -23,6 +23,8 @@ Runner contract (see ``runner.py``): ``up()`` MUST NOT call ``db.commit()`` /
 
 from __future__ import annotations
 
+import contextlib
+
 import aiosqlite
 
 # The complete new ``entities`` DDL — 14-type CHECK + 2 card columns. Kept in
@@ -73,6 +75,35 @@ _NEW_COLUMNS = (
 _REQUIRED_TYPE_LITERALS = ("'host'", "'install'", "'project'")
 _CARD_COLUMNS = ("summary_updated_at", "summary_dirty")
 
+# `DROP TABLE entities` auto-drops every secondary index and trigger SQLite owns
+# for it; recreating only `idx_entities_norm` (below) silently loses any local
+# one a fork added. And a VIEW referencing `entities` makes the RENAME itself
+# fail ("error in view … no such table") under the default `legacy_alter_table`.
+# So: capture indexes+triggers before the DROP and replay them after the RENAME,
+# and rename under `PRAGMA legacy_alter_table=ON` so a dependent view survives
+# (it is not dropped, and re-resolves once the renamed table reappears). This is
+# SQLite's own documented table-rebuild procedure. Auto-indexes (UNIQUE/PK) have
+# `sql IS NULL` and are recreated by the new DDL, so they are excluded.
+_AUX_CAPTURE_SQL = (
+    "SELECT sql FROM sqlite_master "
+    "WHERE tbl_name='entities' AND type IN ('index','trigger') "
+    "AND sql IS NOT NULL AND name != 'idx_entities_norm'"
+)
+
+
+async def _capture_entity_aux(db: aiosqlite.Connection) -> list[str]:
+    cursor = await db.execute(_AUX_CAPTURE_SQL)
+    return [r[0] for r in await cursor.fetchall()]
+
+
+async def _replay_entity_aux(db: aiosqlite.Connection, captured: list[str]) -> None:
+    # The objects were auto-dropped with the old table, so a plain CREATE
+    # succeeds. A replay failure (e.g. an index on a column this rebuild
+    # intentionally drops) raises inside the caller's txn/savepoint → the whole
+    # rebuild rolls back loud rather than silently losing the object.
+    for sql in captured:
+        await db.execute(sql)
+
 
 async def _entities_sql(db: aiosqlite.Connection) -> str | None:
     cursor = await db.execute(
@@ -122,14 +153,20 @@ async def up(db: aiosqlite.Connection) -> None:
         )
     shared = [c for c in _NEW_COLUMNS if c in live_cols]
     collist = ", ".join(shared)
-    await db.execute("DROP TABLE IF EXISTS entities_new")
-    await db.execute(_NEW_DDL)
-    await db.execute(
-        f"INSERT INTO entities_new ({collist}) SELECT {collist} FROM entities"  # noqa: S608
-    )
-    await db.execute("DROP TABLE entities")
-    await db.execute("ALTER TABLE entities_new RENAME TO entities")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)")
+    aux = await _capture_entity_aux(db)
+    await db.execute("PRAGMA legacy_alter_table=ON")  # dependent views survive RENAME
+    try:
+        await db.execute("DROP TABLE IF EXISTS entities_new")
+        await db.execute(_NEW_DDL)
+        await db.execute(
+            f"INSERT INTO entities_new ({collist}) SELECT {collist} FROM entities"  # noqa: S608
+        )
+        await db.execute("DROP TABLE entities")
+        await db.execute("ALTER TABLE entities_new RENAME TO entities")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)")
+        await _replay_entity_aux(db, aux)
+    finally:
+        await db.execute("PRAGMA legacy_alter_table=OFF")
 
 
 async def down(db: aiosqlite.Connection) -> None:
@@ -198,10 +235,29 @@ async def down(db: aiosqlite.Connection) -> None:
             f"copy-and-drop their data."
         )
     copy_cols = ", ".join(c for c in _OLD_COLUMNS if c in live_cols)
-    await db.execute(
-        f"INSERT INTO entities_old ({copy_cols}) "  # noqa: S608
-        f"SELECT {copy_cols} FROM entities"
-    )
-    await db.execute("DROP TABLE entities")
-    await db.execute("ALTER TABLE entities_old RENAME TO entities")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)")
+    aux = await _capture_entity_aux(db)  # local indexes/triggers (excl. idx_entities_norm)
+    # down() is a MANUAL dev/testing entrypoint — the runner only calls up(), so
+    # there is NO enclosing runner txn here; own atomicity with a savepoint.
+    await db.execute("SAVEPOINT entities_down_rebuild")
+    try:
+        await db.execute("PRAGMA legacy_alter_table=ON")  # dependent views survive RENAME
+        await db.execute(
+            f"INSERT INTO entities_old ({copy_cols}) "  # noqa: S608
+            f"SELECT {copy_cols} FROM entities"
+        )
+        await db.execute("DROP TABLE entities")
+        await db.execute("ALTER TABLE entities_old RENAME TO entities")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)")
+        # A replayed object referencing a card column this down() drops raises
+        # here; the savepoint rollback below then restores the pre-down table
+        # (loud refuse rather than a half-reversed schema).
+        await _replay_entity_aux(db, aux)
+        await db.execute("RELEASE entities_down_rebuild")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await db.execute("ROLLBACK TO entities_down_rebuild")
+            await db.execute("RELEASE entities_down_rebuild")
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            await db.execute("PRAGMA legacy_alter_table=OFF")
