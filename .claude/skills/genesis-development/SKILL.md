@@ -755,6 +755,14 @@ findings below, a gated `gh pr merge`:
   TOCTOU defense); the `--check-pr` command supplies this;
 - requires Codex to have reviewed the **current head** — Codex does NOT auto-review
   a later fix-commit, so comment `@codex review` and wait after any push.
+  **Clean-comment freshness:** a *clean* Codex re-review is posted as an ISSUE
+  COMMENT ("Codex Review: Didn't find any major issues. … **Reviewed commit:**
+  `<sha>`"), not a review object, so the reviews API never sees it. The gate now
+  ALSO accepts that clean comment when its `Reviewed commit` sha names the current
+  head — so a genuinely-clean re-review no longer false-blocks (it used to force a
+  `# stale-review-override`). Fail-closed: the clean marker alone never vouches; a
+  parseable `Reviewed commit` sha at head is required, and the comment must be
+  authored by the Codex bot.
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`
   substantiality) is provably review-trivial (docs-only / a small single-file

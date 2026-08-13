@@ -16,6 +16,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _HOOKS_DIR = _WORKTREE / "scripts" / "hooks"
 _spec = importlib.util.spec_from_file_location("git_push_guard", _HOOKS_DIR / "git_push_guard.py")
@@ -26,9 +28,29 @@ HEAD = "0cd13afeb51025af5dc7bd24df1ffa57cd2babab"
 STALE = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_codex_comments(monkeypatch):
+    """Default: NO Codex issue-comments, so the clean-comment freshness fallback in
+    ``_check_codex_reviewed_head`` is network-free unless a test opts in. Tests override
+    with their own ``monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", …)`` (later wins)."""
+    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
+
+
 def _reviews_jsonl(*commit_ids, login="chatgpt-codex-connector[bot]"):
     """One JSON object per line, matching gh api .../reviews --jq '{login, commit_id}'."""
     return "\n".join(json.dumps({"login": login, "commit_id": cid}) for cid in commit_ids)
+
+
+def _clean_comment_jsonl(
+    short_sha, *, login="chatgpt-codex-connector[bot]", user_type="Bot", flavour="Swish!"
+):
+    """One Codex CLEAN issue-comment, matching the real body shape (variable flavour
+    sentence + a backtick-wrapped abbreviated ``Reviewed commit`` sha)."""
+    body = (
+        f"Codex Review: Didn't find any major issues. {flavour}\n\n"
+        f"**Reviewed commit:** `{short_sha}`\n\n<details>info</details>"
+    )
+    return json.dumps({"login": login, "type": user_type, "body": body})
 
 
 class TestReviewedCommitParsing:
@@ -761,3 +783,141 @@ class TestReportFreshnessUnreadable:
         out = capsys.readouterr().out
         assert "unverified" in out
         assert "ok (current)" not in out
+
+
+class TestCleanCommentParsing:
+    """_latest_codex_clean_comment_sha — parse the real Codex clean-comment shape."""
+
+    @pytest.mark.parametrize(
+        "flavour",
+        ["Swish!", "You're on a roll.", "Keep them coming!", ":rocket:", "What shall we delve into next?"],
+    )
+    def test_parses_all_flavour_variants(self, monkeypatch, flavour):
+        # Anchor is the STABLE prefix "Didn't find any major issues", not the flavour.
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", flavour=flavour))
+        assert _mod._latest_codex_clean_comment_sha("1") == "0cd13afeb5"
+
+    def test_latest_clean_comment_wins(self, monkeypatch):
+        # Comments come oldest-first; the most recent clean comment wins.
+        lines = "\n".join([_clean_comment_jsonl("aaaaaaa"), _clean_comment_jsonl("bbbbbbb")])
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", lines)
+        assert _mod._latest_codex_clean_comment_sha("1") == "bbbbbbb"
+
+    def test_sha_lowercased(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0CD13AFEB5"))
+        assert _mod._latest_codex_clean_comment_sha("1") == "0cd13afeb5"
+
+    def test_clean_marker_without_sha_is_none(self, monkeypatch):
+        body = json.dumps(
+            {"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+             "body": "Codex Review: Didn't find any major issues. Swish!"}
+        )
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", body)
+        assert _mod._latest_codex_clean_comment_sha("1") is None  # fail-closed
+
+    def test_sha_without_clean_marker_is_none(self, monkeypatch):
+        # A FINDINGS comment carries a Reviewed-commit line but no clean marker.
+        body = json.dumps(
+            {"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+             "body": "### Codex Review\n[P1] a real bug\n\n**Reviewed commit:** `0cd13afeb5`"}
+        )
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", body)
+        assert _mod._latest_codex_clean_comment_sha("1") is None
+
+    def test_non_codex_author_ignored(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", login="attacker", user_type="User")
+        )
+        assert _mod._latest_codex_clean_comment_sha("1") is None
+
+    def test_codex_login_but_not_bot_type_ignored(self, monkeypatch):
+        # Belt-and-suspenders: correct login string but user.type != Bot → ignored.
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13afeb5", user_type="User")
+        )
+        assert _mod._latest_codex_clean_comment_sha("1") is None
+
+    def test_short_sha_below_min_length_rejected(self, monkeypatch):
+        # <7 hex is not a usable prefix (the regex floors at 7).
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl("0cd13"))
+        assert _mod._latest_codex_clean_comment_sha("1") is None
+
+
+class TestCleanCommentFreshness:
+    """_check_codex_reviewed_head — a clean Codex ISSUE-COMMENT at head satisfies
+    freshness even when the review-object path can't (absent / stale review)."""
+
+    def test_no_review_object_but_clean_comment_at_head_allows(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")  # no review object → would block
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
+        block, msg, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and msg == "" and head == HEAD  # bound for --match-head-commit
+
+    def test_stale_review_object_but_clean_comment_at_head_allows(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))  # stale → would block
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and head == HEAD
+
+    def test_clean_comment_for_different_sha_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(STALE[:10]))  # not head
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True and "no codex review" in msg.lower()
+
+    def test_clean_marker_without_sha_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS",
+            json.dumps({"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+                        "body": "Codex Review: Didn't find any major issues. Swish!"}),
+        )
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True  # fail-closed: marker alone never vouches
+
+    def test_findings_comment_with_sha_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS",
+            json.dumps({"login": "chatgpt-codex-connector[bot]", "type": "Bot",
+                        "body": f"### Codex Review\n[P1] bug\n\n**Reviewed commit:** `{HEAD[:10]}`"}),
+        )
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+
+    def test_spoofed_author_clean_comment_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_COMMENTS",
+            _clean_comment_jsonl(HEAD[:10], login="attacker", user_type="User"),
+        )
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+
+    def test_current_review_object_does_not_need_comment(self, monkeypatch):
+        # Fast path: a review object at head allows without any comment.
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")  # none needed
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and head == HEAD
+
+    def test_report_labels_clean_comment_at_head(self, monkeypatch, capsys):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
+        # Stub the other gates so the report runs; we only assert the codex-at-head label.
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(_mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, ""))
+        monkeypatch.setattr(_mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, ""))
+        _mod.check_pr_report("1")
+        out = capsys.readouterr().out
+        assert "clean comment at head" in out
