@@ -109,6 +109,74 @@ class StandaloneAdapter:
                 self._loop_lag_sampler(), name="loop-lag-sampler",
             )
 
+        # Off-loop stall-stack sampler: the on-loop lag sampler above can only
+        # MEASURE a stall after it clears, so it never captures the synchronous
+        # frame that blocked the loop. This daemon thread reads the loop-health
+        # heartbeat and, when it goes stale (loop wedged NOW), snapshots the loop
+        # thread's stack — catching the offending frame mid-stall. Diagnostic-only.
+        stall_stop_event = None
+        if os.environ.get("GENESIS_LOOP_STALL_SAMPLER", "1").lower() not in (
+            "0",
+            "false",
+            "off",
+        ):
+            # The sampler is diagnostic-only: any failure to start it (import
+            # error, thread-limit RuntimeError from Thread.start under resource
+            # pressure) must disable only the sampler, never abort serve() before
+            # Flask/Telegram come up.
+            try:
+                if lag_sampler_task is None:
+                    logger.warning(
+                        "loop-stall sampler enabled but its heartbeat publisher "
+                        "(the loop-lag sampler, GENESIS_LOOP_LAG_SAMPLER) is "
+                        "disabled — the stall sampler will no-op until it runs",
+                    )
+                from genesis.util.loop_stall import (
+                    _MIN_STALL_MS,
+                    run_loop_stall_sampler,
+                )
+
+                try:
+                    stall_ms = float(os.environ.get("GENESIS_LOOP_STALL_MS", "1000"))
+                except ValueError:
+                    stall_ms = _MIN_STALL_MS
+                # float() accepts nan/inf/negatives, and a value below the ~500ms
+                # heartbeat cadence flags normal gaps as wedged — surface a
+                # misconfig (the sampler's __init__ also clamps as a backstop).
+                # `not (x > 0)` catches NaN (NaN>0 is False), 0, and negatives.
+                if (
+                    not (stall_ms > 0)
+                    or stall_ms == float("inf")
+                    or stall_ms < _MIN_STALL_MS
+                ):
+                    logger.warning(
+                        "GENESIS_LOOP_STALL_MS=%r invalid or below the %.0fms "
+                        "floor (heartbeat cadence); using %.0fms",
+                        stall_ms,
+                        _MIN_STALL_MS,
+                        _MIN_STALL_MS,
+                    )
+                    stall_ms = _MIN_STALL_MS
+                stall_stop_event = threading.Event()
+                # serve() runs on the event-loop thread, so this ident IS the loop's.
+                loop_thread_id = threading.get_ident()
+                threading.Thread(
+                    target=run_loop_stall_sampler,
+                    kwargs={
+                        "loop_thread_id": loop_thread_id,
+                        "stop_event": stall_stop_event,
+                        "stall_ms": stall_ms,
+                    },
+                    daemon=True,
+                    name="loop-stall-sampler",
+                ).start()
+            except Exception:
+                logger.warning(
+                    "loop-stall sampler failed to start; continuing without it",
+                    exc_info=True,
+                )
+                stall_stop_event = None
+
         # Create shared ConversationLoop for the OpenClaw endpoint.
         # Same pattern as _start_telegram() but without channel-specific
         # wiring (TTS, reply waiter, etc.).
@@ -165,6 +233,8 @@ class StandaloneAdapter:
         heartbeat_task.cancel()
         if lag_sampler_task is not None:
             lag_sampler_task.cancel()
+        if stall_stop_event is not None:
+            stall_stop_event.set()  # daemon thread exits its next wait()
 
     async def _loop_lag_sampler(self) -> None:
         """Sample event-loop scheduling drift; WARN when the loop stalls.
