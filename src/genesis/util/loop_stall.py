@@ -24,6 +24,7 @@ Depends on the loop-lag sampler (the heartbeat publisher); it no-ops while
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 import traceback
@@ -55,6 +56,12 @@ class LoopStallSampler:
         log: logging.Logger = logger,
     ) -> None:
         self._loop_thread_id = loop_thread_id
+        # Reject NaN/inf/zero/negative: inf never dumps, and NaN/non-positive read
+        # a healthy heartbeat as wedged and never reset the episode flag. These
+        # parse as valid floats, so a ValueError guard at the env parser misses
+        # them — clamp at the boundary instead.
+        if not (math.isfinite(stall_ms) and stall_ms > 0):
+            stall_ms = _DEFAULT_STALL_MS
         self._stall_ms = stall_ms
         self._frames_source = frames_source
         self._health_read = health_read

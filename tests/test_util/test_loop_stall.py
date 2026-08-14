@@ -69,6 +69,19 @@ def test_missing_loop_frame_is_safe():
     assert sampler.poll_once() is True  # dumps a placeholder, never raises
 
 
+def test_invalid_stall_ms_falls_back_to_default():
+    # NaN/inf/zero/negative all parse as valid floats but break the sampler
+    # (inf never dumps; NaN/non-positive report a healthy heartbeat as wedged and
+    # never reset). __init__ clamps them to the default. (Codex P2-4.)
+    from genesis.util.loop_stall import _DEFAULT_STALL_MS
+
+    for bad in (float("inf"), float("nan"), 0.0, -5.0):
+        s = LoopStallSampler(loop_thread_id=7, stall_ms=bad)
+        assert s._stall_ms == _DEFAULT_STALL_MS
+    # A valid positive value is kept.
+    assert LoopStallSampler(loop_thread_id=7, stall_ms=500.0)._stall_ms == 500.0
+
+
 def test_runner_exits_when_stop_set():
     stop = threading.Event()
     stop.set()  # already stopped -> the runner returns without polling

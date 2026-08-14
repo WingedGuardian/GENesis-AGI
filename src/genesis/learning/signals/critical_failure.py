@@ -114,19 +114,56 @@ class CriticalFailureCollector:
             if not fresh_lagging and not loop_wedged:
                 return None
             probes_named = ",".join(r.name for r in down)
+            # Preserve a genuine DEGRADED (e.g. a 503 — the service RESPONDED, not
+            # a timeout artifact): recompute the worst status over the results that
+            # are NOT timeout-suppressed. Every DOWN here is timeout-suppressed, so
+            # only HEALTHY/DEGRADED remain -> residual is 0.5 or 0.0. Hard-coding
+            # 0.0 would mask a real degradation coincident with the stall.
+            non_suppressed = [
+                r
+                for r in results
+                if not (r.status == ProbeStatus.DOWN and r.timed_out)
+            ]
+            residual = (
+                0.5
+                if any(r.status == ProbeStatus.DEGRADED for r in non_suppressed)
+                else 0.0
+            )
+            # Accepted residual: if a dependency is GENUINELY timing out
+            # (blackholed/overloaded) at the same instant the loop is wedged, this
+            # suppresses it for this tick. Unresolvable from a single reading
+            # (loop_health proves the loop is starved, never that the dependency is
+            # reachable) and self-healing — the next tick with a healthy loop fires
+            # 1.0. critical_failure is a reflection signal; hard failures are the
+            # status.json watchdog's domain.
             logger.warning(
-                "critical_failure suppressed: all DOWN probes (%s) timed out under "
-                "event-loop starvation (drift=%.0fms, sample_age=%.2fs) — infra "
-                "not down, loop starved",
+                "critical_failure suppressed to %.1f: all DOWN probes (%s) timed "
+                "out under event-loop starvation (drift=%.0fms, sample_age=%.2fs) "
+                "— infra not down, loop starved",
+                residual,
                 probes_named,
                 sample.drift_ms,
                 age,
             )
+            # The suppression explanation goes in baseline_note — the field the
+            # tick serializer + reflection prompt formatter actually retain
+            # (metadata is dropped by both) — so a suppressed reading is never
+            # mistaken for a genuinely-healthy 0.0.
+            remainder = (
+                "a genuinely-degraded probe remains" if residual else "no other fault"
+            )
             return self._reading(
-                0.0,
+                residual,
+                baseline_note=(
+                    f"SUPPRESSED under event-loop starvation: probe(s) "
+                    f"{probes_named} timed out because the loop couldn't schedule "
+                    f"them (drift {sample.drift_ms:.0f}ms), NOT a real outage. "
+                    f"Value {residual} ({remainder})."
+                ),
                 metadata={
                     "starvation_suppressed": True,
                     "suppressed_probes": probes_named,
+                    "residual_value": residual,
                     "loop_drift_ms": round(sample.drift_ms, 1),
                     "loop_sample_age_s": round(age, 2),
                     "loop_executor": sample.executor,
@@ -141,21 +178,25 @@ class CriticalFailureCollector:
             return None
 
     def _reading(
-        self, value: float, *, metadata: dict | None = None
+        self,
+        value: float,
+        *,
+        metadata: dict | None = None,
+        baseline_note: str | None = None,
     ) -> SignalReading:
         return SignalReading(
             name=self.signal_name,
             value=value,
             source="health_probes",
             collected_at=datetime.now(UTC).isoformat(),
-            baseline_note=(
+            baseline_note=baseline_note
+            or (
                 "0.0=DB/Qdrant (+Ollama if enabled) health probes all healthy. "
                 "0.5=a probe DEGRADED, 1.0=a probe DOWN. This tracks LOCAL "
                 "infrastructure/service health (including the local Ollama if "
                 "enabled), NOT cloud LLM-provider availability. A DOWN caused "
                 "purely by probe timeouts while the event loop is starved is "
-                "suppressed to 0.0 (see metadata.starvation_suppressed) — the "
-                "infra is reachable, the loop just couldn't schedule the probe."
+                "suppressed (the reading then carries a SUPPRESSED baseline_note)."
             ),
             metadata=metadata,
         )

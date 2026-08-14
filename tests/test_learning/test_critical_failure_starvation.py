@@ -121,6 +121,39 @@ async def test_wedged_window_lagging_suppresses(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_degraded_preserved_when_timeout_down_suppressed(monkeypatch):
+    # Qdrant times out (a starvation artifact) but Ollama is genuinely DEGRADED
+    # (e.g. HTTP 503 — the service responded, not a timeout). Suppressing the
+    # timeout artifact must NOT flatten the real degradation to 0.0; the residual
+    # worst-status (0.5) must survive. (Codex P2-3.)
+    monkeypatch.setattr(loop_health, "read", lambda: _sample(age_s=2.0, lagging=False))
+    c = CriticalFailureCollector(
+        [
+            _probe("qdrant", ProbeStatus.DOWN, timed_out=True),
+            _probe("ollama", ProbeStatus.DEGRADED),
+        ]
+    )
+    r = await c.collect()
+    assert r.value == 0.5
+
+
+@pytest.mark.asyncio
+async def test_suppressed_reading_note_states_suppression(monkeypatch):
+    # The suppression must be visible in baseline_note (which IS persisted to the
+    # tick and formatted into reflection prompts), not only in metadata (which the
+    # tick serializer drops) — otherwise a suppressed reading is indistinguishable
+    # from a genuinely-healthy 0.0. (Codex P2-2.)
+    monkeypatch.setattr(loop_health, "read", lambda: _sample(age_s=2.0, lagging=False))
+    c = CriticalFailureCollector([_probe("qdrant", ProbeStatus.DOWN, timed_out=True)])
+    r = await c.collect()
+    assert r.value == 0.0
+    assert "suppress" in r.baseline_note.lower() or "starv" in r.baseline_note.lower()
+    healthy = CriticalFailureCollector([_probe("qdrant", ProbeStatus.HEALTHY)])
+    hr = await healthy.collect()
+    assert r.baseline_note != hr.baseline_note
+
+
+@pytest.mark.asyncio
 async def test_no_loop_sample_not_suppressed(monkeypatch):
     # Absent loop-health evidence -> fail-closed, never suppress.
     monkeypatch.setattr(loop_health, "read", lambda: None)
