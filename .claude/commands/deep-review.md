@@ -10,6 +10,11 @@ right-shape pass the easy default. (It reliably kills the first round; it is NOT
 whole loop — fix-churn and hand-rolled parsing drive the tail. See the Common Traps entry on
 CLI parsing.)
 
+Note: `/deep-review` is the LOCAL pre-push adversarial pass (Claude-model reviewers). It does
+NOT replace the independent-model Codex review, which still runs on the PR and is required by the
+merge gate — the two are complementary (Codex catches cross-model blind spots). This command
+clears the local commit review-depth gate; it does not certify the PR by itself.
+
 ## 1. Stage everything, then scope the FULL branch diff
 
 - `ROOT="$(git rev-parse --show-toplevel)"` — the repo root. Use `$ROOT/scripts/…` for every
@@ -62,15 +67,17 @@ If you're on your 3rd defect-bearing round, STOP at the escalation cap (see SKIL
   applied and verified. Do not let a marker attach a pre-fix review to post-fix code no one
   re-read.
 - `EVID="$(python3 "$ROOT/scripts/review_state.py" evidence-path)"` — the per-worktree evidence
-  file. Write the findings to `$EVID`: must carry a severity-ladder label (BLOCKER / SHOULD-FIX,
-  or CRITICAL / WARNING from the security reviewer, or CRITICAL/HIGH/MEDIUM/LOW/P1-P3), at least
-  one `file:line`, and ≥400 chars, or the gate rejects it as non-adversarial.
+  file. Write the findings to `$EVID`: must carry a validator-recognized severity label
+  (BLOCKER / SHOULD-FIX / CRITICAL / HIGH / MEDIUM / LOW / P1-P3 — a security-reviewer WARNING is
+  NOT recognized by the validator, so render it as SHOULD-FIX in the text), at least one
+  `file:line`, and ≥400 chars, or the gate rejects the evidence as non-adversarial.
 - `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — add `--clean` IFF the
   pass found nothing at **should-fix-or-worse**: genesis-architect → no BLOCKER/SHOULD-FIX;
   genesis-security-reviewer → no CRITICAL/WARNING (WARNING is its "should address" tier); or no
   P1/P2. A forgotten `--clean` is the safe direction (it counts the round).
-- Run `mark` AFTER the final `git add` and BEFORE `git commit`; don't restage after marking, and
-  mark + commit within 30 min of writing the evidence (it expires).
+- Run `mark` AFTER the final `git add` and BEFORE `git commit`. The evidence must be recent when
+  you `mark` (its age is checked at mark time), so write-then-mark promptly. Once marked, an
+  unchanged staged diff stays cleared by its diff-hash — if you restage or amend, re-mark.
 
 For a quick self-check of a small change, use `/audit-changes` instead — this command is the
 heavyweight adversarial pass.
