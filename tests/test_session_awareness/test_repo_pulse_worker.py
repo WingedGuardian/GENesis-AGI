@@ -21,11 +21,13 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud import repo_pulse as pulse_crud
+from genesis.db.schema._tables import TABLES
 from genesis.session_awareness import repo_pulse_worker as rpw
 from genesis.session_awareness.repo_pulse_config import DEFAULTS
 
 M58 = importlib.import_module("genesis.db.migrations.0058_session_charters")
 M62 = importlib.import_module("genesis.db.migrations.0062_repo_pulse")
+M84 = importlib.import_module("genesis.db.migrations.0084_repo_pulse_target_kind")
 
 SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
 ITEM = "0123456789abcdef0123456789abcdef"
@@ -56,6 +58,8 @@ async def db_path(tmp_path) -> Path:
     async with aiosqlite.connect(str(path)) as db:
         await M58.up(db)
         await M62.up(db)
+        await M84.up(db)  # target_kind column + widened index
+        await db.execute(TABLES["follow_ups"])  # the follow-up lane reads this
         await db.commit()
     yield path
     pulse_crud._tables_verified = False
@@ -438,9 +442,12 @@ async def test_pre_migration_never_absorbs_ledger(pulse_root, tmp_path, monkeypa
     assert out["status"] == "failed"
     assert out.get("absorbed", []) == []
     assert (await _item_row(bare))["status"] == "open"  # untouched
-    # once the migration lands, the replayed window absorbs normally
+    # once the migration lands, the replayed window absorbs normally.
+    # (follow_ups table intentionally still absent — exercises the follow-up
+    # lane's graceful pre-migration skip, so the ledger absorb still succeeds.)
     async with aiosqlite.connect(str(bare)) as db:
         await M62.up(db)
+        await M84.up(db)  # target_kind — record_run writes it
         await db.commit()
     pulse_crud._tables_verified = False
     out2 = await _run(bare, monkeypatch, gh=_gh([_pr(body=f"Ledger: {ITEM}")]))
@@ -650,3 +657,141 @@ async def test_no_open_items_skips_fuzzy_but_records(pulse_root, db_path, monkey
     runs = await _runs(db_path)
     assert runs[0]["model"] is None  # fuzzy never ran
     assert _cursor(rpw._pulse_root())["last_merged_at"] == MERGED_NEW
+
+
+# ── follow-up lane (a8a4f59e): standalone follow_up reconciliation ────────
+
+FU = "aaaa1111bbbb2222cccc3333dddd4444"
+MERGED_NEXT = "2026-07-17T10:00:00Z"
+
+
+async def _seed_followup(
+    db_path,
+    fu_id=FU,
+    *,
+    content="ship OfficeCLI deliverables",
+    status="pending",
+    pinned=0,
+    kind="follow_up",
+    resolution_notes=None,
+    created="2026-07-10T00:00:00+00:00",
+):
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(
+            "INSERT INTO follow_ups "
+            "(id, source, content, reason, strategy, status, priority, pinned, "
+            "kind, resolution_notes, created_at) "
+            "VALUES (?, 'test', ?, 'r', 'ego_judgment', ?, 'medium', ?, ?, ?, ?)",
+            (fu_id, content, status, pinned, kind, resolution_notes, created),
+        )
+        await db.commit()
+
+
+async def _followup_row(db_path, fu_id=FU) -> dict | None:
+    async with aiosqlite.connect(str(db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM follow_ups WHERE id = ?", (fu_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+@pytest.mark.asyncio
+async def test_followup_marker_absorbs_in_live(pulse_root, db_path, monkeypatch, live_mode):
+    await _seed_followup(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr(body=f"Follow-up: {FU}")]))
+    assert out["status"] == "ok"
+    row = await _followup_row(db_path)
+    assert row["status"] == "completed"
+    assert "PR #1080" in row["resolution_notes"]
+    assert "[repo-pulse follow-up]" in row["resolution_notes"]
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert len(anns) == 1
+    assert anns[0]["status"] == "applied"
+    assert anns[0]["target_kind"] == "follow_up"
+    assert anns[0]["item_text"] == "ship OfficeCLI deliverables"  # content, not text
+    assert anns[0]["rationale"] == "follow-up-marker"
+
+
+@pytest.mark.asyncio
+async def test_followup_pinned_marker_is_proposal(pulse_root, db_path, monkeypatch, live_mode):
+    await _seed_followup(db_path, pinned=1)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr(body=f"Follow-up: {FU}")]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"  # never auto-resolved
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert anns[0]["status"] == "proposed"
+    assert "pinned" in anns[0]["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_followup_bare_hex_is_proposal_in_live(pulse_root, db_path, monkeypatch, live_mode):
+    await _seed_followup(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr(body=f"see {FU} from triage")]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert anns[0]["status"] == "proposed"
+    assert anns[0]["rationale"] == "bare-hex"
+
+
+@pytest.mark.asyncio
+async def test_followup_tabled_lane_excluded(pulse_root, db_path, monkeypatch, live_mode):
+    await _seed_followup(db_path, kind="tabled")
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr(body=f"Follow-up: {FU}")]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"  # tabled never touched
+    assert await _anns(db_path, target_kind="follow_up") == []
+
+
+@pytest.mark.asyncio
+async def test_followup_marker_proposed_in_propose_only(pulse_root, db_path, monkeypatch):
+    monkeypatch.setattr(rpw, "effective_mode", lambda: "propose_only")
+    await _seed_followup(db_path)
+    out = await _run(db_path, monkeypatch, gh=_gh([_pr(body=f"Follow-up: {FU}")]))
+    assert out["status"] == "ok"
+    assert (await _followup_row(db_path))["status"] == "pending"
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert anns[0]["status"] == "proposed"
+    assert "propose_only" in anns[0]["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_followup_proposal_survives_reconcile_while_open(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    """The architect BLOCKER: a follow_up-target proposal must NOT be superseded
+    by the reconcile sweep while its follow_up is still open. A ledger-only
+    reconcile would look the id up in the ledger dict, miss it, and kill the
+    proposal ('item_missing') every run."""
+    await _seed_followup(db_path)
+    await _run(db_path, monkeypatch, gh=_gh([_pr(number=1080, body=f"see {FU}")]))
+    assert (await _anns(db_path, target_kind="follow_up"))[0]["status"] == "proposed"
+    # a later run reconciles at its start; the follow_up is still pending
+    await _run(
+        db_path, monkeypatch, gh=_gh([_pr(number=1081, body="unrelated", merged=MERGED_NEXT)])
+    )
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert len(anns) == 1
+    assert anns[0]["status"] == "proposed"  # SURVIVES — the BLOCKER fix
+
+
+@pytest.mark.asyncio
+async def test_followup_proposal_confirmed_when_completed_with_pr(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    """A follow_up-target proposal → confirmed once the follow_up completes with
+    evidence naming the same PR (the follow-up reconcile mapping)."""
+    await _seed_followup(db_path)
+    await _run(db_path, monkeypatch, gh=_gh([_pr(number=1080, body=f"see {FU}")]))
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(
+            "UPDATE follow_ups SET status='completed', "
+            "resolution_notes='done via PR #1080' WHERE id=?",
+            (FU,),
+        )
+        await db.commit()
+    await _run(
+        db_path, monkeypatch, gh=_gh([_pr(number=1081, body="unrelated", merged=MERGED_NEXT)])
+    )
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert anns[0]["status"] == "confirmed"

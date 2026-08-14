@@ -550,6 +550,44 @@ async def test_pulse_confirm_absorbs_item_with_pr_evidence(db):
     assert "PR #1081" in row["evidence"]
 
 
+async def _seed_followup_proposal(db, *, ann_id="af1", fu_id="fu0", status="proposed"):
+    await db.execute(
+        "INSERT INTO follow_ups (id, source, content, reason, strategy, status, "
+        "priority, kind, created_at) VALUES (?, 'test', 'ship it', 'r', "
+        "'ego_judgment', 'pending', 'medium', 'follow_up', '2026-07-10T00:00:00+00:00')",
+        (fu_id,),
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_runs (run_id, started_at, trigger, status)"
+        " VALUES ('rf1', '2026-07-14T00:00:00+00:00', 'manual', 'ok')"
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_annotations (id, run_id, observed_at, tier, item_id,"
+        " item_session_id, item_text, pr_number, pr_title, status, target_kind)"
+        " VALUES (?, 'rf1', '2026-07-14T00:00:00+00:00', 'exact', ?,"
+        " 'cc-xyz', 'ship it', 1305, 'feat: officecli', ?, 'follow_up')",
+        (ann_id, fu_id, status),
+    )
+    await db.commit()
+
+
+async def test_pulse_confirm_absorbs_followup_target(db):
+    """A follow_up-target annotation confirmed via the dashboard absorbs the
+    FOLLOW_UP (conditional open-only), not a nonexistent ledger row — the
+    reader-dispatch obligation from the foundation audit."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_followup_proposal(db)
+    payload, code = await _resolve_pulse(db, "af1", "confirmed")
+    assert code == 200
+    assert payload["ok"] is True and payload["item_absorbed"] is True
+    assert await _ann_status(db, "af1") == "confirmed"
+    cur = await db.execute("SELECT status, resolution_notes FROM follow_ups WHERE id = 'fu0'")
+    row = await cur.fetchone()
+    assert row[0] == "completed"
+    assert "PR #1305" in row[1]
+
+
 async def test_pulse_reject_leaves_ledger_untouched(db):
     from genesis.dashboard.routes.cc_sessions import _resolve_pulse
 

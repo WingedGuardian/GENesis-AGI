@@ -424,6 +424,7 @@ async def cc_sessions_pulse_resolve(annotation_id: str):
 
 async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int]:
     """Resolve core (extracted so tests exercise it on the fixture loop)."""
+    from genesis.db.crud.follow_ups import absorb_followup
     from genesis.db.crud.repo_pulse import get_annotation, resolve_annotation
     from genesis.db.crud.session_charters import get_ledger_item, ledger_update
 
@@ -447,15 +448,21 @@ async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int
         )
         absorbed = False
         if ok and status == "confirmed":
-            item = await get_ledger_item(db, row["item_id"])
-            if item is not None and item.get("status") in ("open", "in_progress"):
-                absorbed = await ledger_update(
-                    db,
-                    row["item_id"],
-                    status="absorbed",
-                    evidence=f"PR #{row['pr_number']}: {row['pr_title'] or ''} "
-                    f"[pulse confirm via dashboard]",
-                )
+            # Dispatch by store: a follow_up-target annotation absorbs the
+            # follow_up (conditional open-only), NOT a ledger row that doesn't
+            # exist. Defensive default 'ledger' keeps pre-0084 rows correct.
+            target_kind = dict(row).get("target_kind") or "ledger"
+            evidence = (
+                f"PR #{row['pr_number']}: {row['pr_title'] or ''} [pulse confirm via dashboard]"
+            )
+            if target_kind == "follow_up":
+                absorbed = await absorb_followup(db, row["item_id"], evidence=evidence)
+            else:
+                item = await get_ledger_item(db, row["item_id"])
+                if item is not None and item.get("status") in ("open", "in_progress"):
+                    absorbed = await ledger_update(
+                        db, row["item_id"], status="absorbed", evidence=evidence
+                    )
     except (sqlite3.Error, aiosqlite.Error) as exc:
         logger.error("pulse resolve failed: %s", exc)
         return {"error": "pulse store unavailable"}, 503
