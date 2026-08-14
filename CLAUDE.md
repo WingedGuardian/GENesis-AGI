@@ -335,7 +335,11 @@ the working documents — ledger rows are the durable index, not a duplicate.
 `Ledger: <item-id>` (the 32-hex row id) on its own line in the PR body —
 the repo-pulse worker auto-absorbs the row with PR evidence at the next
 session boundary. A bare id without the marker reads as context, not
-completion (proposal only).
+completion (proposal only). The identical convention exists for a **hot
+follow-up** row: cite `Follow-up: <id>` (the 32-hex follow_up id) and the
+worker completes that row with PR evidence the same way (bare id → proposal;
+pinned rows surface as a proposal for human confirmation, never auto-completed;
+`tabled` rows are never touched).
 
 ## Knowledge Ingestion (Conversational Path)
 

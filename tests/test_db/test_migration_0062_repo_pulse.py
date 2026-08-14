@@ -17,6 +17,10 @@ import pytest
 from genesis.db.crud import repo_pulse as crud
 
 M62 = importlib.import_module("genesis.db.migrations.0062_repo_pulse")
+# CRUD now writes target_kind (0084) — the CRUD-exercising tests below apply
+# both migrations; the 0062-isolation tests (columns/idempotent/down/guard)
+# deliberately apply M62 alone.
+M84 = importlib.import_module("genesis.db.migrations.0084_repo_pulse_target_kind")
 
 SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
 ITEM = "0123456789abcdef0123456789abcdef"
@@ -172,6 +176,7 @@ async def test_status_and_tier_checks_enforced(db):
 @pytest.mark.asyncio
 async def test_record_run_with_annotations_roundtrip(db):
     await M62.up(db)
+    await M84.up(db)
     ok = await crud.record_run(db, **_run_kwargs(n_fuzzy=1), annotations=[_annotation()])
     assert ok is True
     runs = await crud.list_runs(db)
@@ -203,6 +208,7 @@ async def test_unique_index_dedupes_recovered_windows(db):
     """A re-covered enumeration window re-observing the same
     (tier, item_id, pr_number) match is absorbed, never duplicated."""
     await M62.up(db)
+    await M84.up(db)
     await crud.record_run(db, **_run_kwargs(run_id="r1"), annotations=[_annotation(id="a1")])
     await crud.record_run(
         db,
@@ -221,6 +227,7 @@ async def test_dedupe_does_not_resurrect_resolved_proposals(db):
     """Once a proposal is rejected, a later run re-observing the same match
     must NOT flip it back to proposed (INSERT OR IGNORE leaves it be)."""
     await M62.up(db)
+    await M84.up(db)
     await crud.record_run(db, **_run_kwargs(run_id="r1"), annotations=[_annotation(id="a1")])
     assert await crud.resolve_annotation(
         db, "a1", status="rejected", resolved_at="2026-07-16T13:00:00+00:00"
@@ -230,6 +237,102 @@ async def test_dedupe_does_not_resurrect_resolved_proposals(db):
     assert len(anns) == 1
     assert anns[0]["id"] == "a1"
     assert anns[0]["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_target_kind_scopes_dedupe_and_existence(db):
+    """The 4-col unique index (0084) scopes the re-absorb guard by store: a
+    ledger and a follow_up annotation sharing the same (tier, item_id,
+    pr_number) BOTH persist — ledger/follow_up ids are the same uuid4.hex shape
+    and must not collide — and annotation_exists isolates by target_kind."""
+    await M62.up(db)
+    await M84.up(db)
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r1"),
+        annotations=[
+            _annotation(id="a1", tier="exact", target_kind="ledger"),
+            _annotation(id="a2", tier="exact", target_kind="follow_up"),
+        ],
+    )
+    anns = await crud.list_annotations(db)
+    assert {a["id"] for a in anns} == {"a1", "a2"}  # NOT deduped across stores
+    assert {a["target_kind"] for a in anns} == {"ledger", "follow_up"}
+    # existence scopes by store: the same pair is present in BOTH lanes
+    assert await crud.annotation_exists(db, "exact", ITEM, 1080, target_kind="ledger")
+    assert await crud.annotation_exists(db, "exact", ITEM, 1080, target_kind="follow_up")
+    # a follow_up-only pair is invisible to the default (ledger) caller
+    other = "ffff0000ffff0000ffff0000ffff0000"
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r2"),
+        annotations=[_annotation(id="a3", tier="exact", item_id=other, target_kind="follow_up")],
+    )
+    assert not await crud.annotation_exists(db, "exact", other, 1080)  # default ledger
+    assert await crud.annotation_exists(db, "exact", other, 1080, target_kind="follow_up")
+    # target_kind filter on list
+    fu = await crud.list_annotations(db, target_kind="follow_up")
+    assert {a["id"] for a in fu} == {"a2", "a3"}
+
+
+@pytest.mark.asyncio
+async def test_0084_down_purges_followup_rows_before_narrowing(db):
+    """down() must not fail when the widened index admitted a ledger+follow_up
+    pair sharing (tier, item_id, pr_number): the follow_up rows are purged before
+    the 3-col UNIQUE is recreated (Codex P2 — the narrower index would otherwise
+    raise UNIQUE constraint failed)."""
+    await M62.up(db)
+    await M84.up(db)
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r1"),
+        annotations=[
+            _annotation(id="a1", tier="exact", target_kind="ledger"),
+            _annotation(id="a2", tier="exact", target_kind="follow_up"),
+        ],
+    )
+    await M84.down(db)  # must NOT raise
+    anns = await crud.list_annotations(db)
+    assert {a["id"] for a in anns} == {"a1"}  # follow_up row purged, ledger kept
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_rpa_dedupe'"
+    )
+    assert await cur.fetchone() is not None  # 3-col unique index recreated
+
+
+@pytest.mark.asyncio
+async def test_insert_annotation_single_row_and_dedup(db):
+    """insert_annotation persists ONE annotation and is INSERT OR IGNORE — a
+    re-insert of the same row (as the end-of-run record_run does) is a no-op."""
+    await M62.up(db)
+    await M84.up(db)
+    await crud.record_run(db, **_run_kwargs(run_id="r1"))  # a run row to reference
+    ann = _annotation(id="s1", tier="exact", target_kind="follow_up", status="applied")
+    assert await crud.insert_annotation(db, ann, run_id="r1") is True
+    assert {a["id"] for a in await crud.list_annotations(db)} == {"s1"}
+    assert await crud.insert_annotation(db, ann, run_id="r1") is True  # OR IGNORE no-op
+    assert len(await crud.list_annotations(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_base_path_migrate_add_columns_swaps_dedupe_index(db):
+    """The create_all_tables base path (_migrate_add_columns) also widens
+    idx_rpa_dedupe to the store-scoped 4-col index — not only migration 0084 — so
+    a legacy DB upgraded WITHOUT the numbered runner is store-correct (Codex P2)."""
+    from genesis.db.schema._migrations import _migrate_add_columns, create_all_tables
+
+    await create_all_tables(db)  # full base-path schema (so _migrate_add_columns has its tables)
+    # simulate a legacy install: force idx_rpa_dedupe back to the old 3-col shape
+    await db.execute("DROP INDEX IF EXISTS idx_rpa_dedupe")
+    await db.execute(
+        "CREATE UNIQUE INDEX idx_rpa_dedupe ON repo_pulse_annotations(tier, item_id, pr_number)"
+    )
+    cur = await db.execute("PRAGMA index_info(idx_rpa_dedupe)")
+    assert len(await cur.fetchall()) == 3
+    # re-running the base path must widen it (not only migration 0084)
+    await _migrate_add_columns(db)
+    cur = await db.execute("PRAGMA index_info(idx_rpa_dedupe)")
+    assert len(await cur.fetchall()) == 4  # widened on the base path
 
 
 @pytest.mark.asyncio
@@ -267,6 +370,7 @@ async def test_validation_rejects_bad_values_before_any_insert(db):
 @pytest.mark.asyncio
 async def test_resolve_annotation_lifecycle(db):
     await M62.up(db)
+    await M84.up(db)
     await crud.record_run(db, **_run_kwargs(), annotations=[_annotation(id="a1")])
     assert await crud.resolve_annotation(
         db,
@@ -288,6 +392,7 @@ async def test_resolve_annotation_lifecycle(db):
 @pytest.mark.asyncio
 async def test_resolve_rejects_applied_rows_and_bad_statuses(db):
     await M62.up(db)
+    await M84.up(db)
     await crud.record_run(
         db,
         **_run_kwargs(),
@@ -309,6 +414,7 @@ async def test_resolve_rejects_applied_rows_and_bad_statuses(db):
 @pytest.mark.asyncio
 async def test_summary_counts_and_precision(db):
     await M62.up(db)
+    await M84.up(db)
     await crud.record_run(
         db,
         **_run_kwargs(run_id="r1"),
@@ -340,6 +446,7 @@ async def test_summary_counts_and_precision(db):
 @pytest.mark.asyncio
 async def test_prune_deletes_old_runs_and_annotations(db):
     await M62.up(db)
+    await M84.up(db)
     await crud.record_run(
         db,
         **_run_kwargs(run_id="old", started_at="2026-05-01T00:00:00+00:00"),
