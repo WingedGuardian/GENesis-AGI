@@ -601,6 +601,25 @@ async def test_pulse_lookup_excludes_followup_proposals(db):
     assert not any(a["id"] == "afx" for a in out["annotations"])
 
 
+async def test_pulse_confirm_followup_not_open_absorb_missed(db):
+    """Resolve-first: confirming a follow_up whose row moved off-open (blocked)
+    confirms the annotation (the race arbiter) but the absorb misses — 200,
+    item_absorbed False, follow_up NOT force-completed. The confirmed-but-absorb-
+    missed residue is accepted (ledger-consistent); absorb-first was reverted as
+    it reopened the worse absorbed-under-a-rejected-annotation residue."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_followup_proposal(db, ann_id="af2", fu_id="fu2")
+    await db.execute("UPDATE follow_ups SET status='blocked' WHERE id='fu2'")
+    await db.commit()
+    payload, code = await _resolve_pulse(db, "af2", "confirmed")
+    assert code == 200
+    assert payload["item_absorbed"] is False
+    assert await _ann_status(db, "af2") == "confirmed"  # resolve-first: annotation is the arbiter
+    cur = await db.execute("SELECT status FROM follow_ups WHERE id='fu2'")
+    assert (await cur.fetchone())[0] == "blocked"  # follow_up untouched (never force-completed)
+
+
 async def test_pulse_reject_leaves_ledger_untouched(db):
     from genesis.dashboard.routes.cc_sessions import _resolve_pulse
 

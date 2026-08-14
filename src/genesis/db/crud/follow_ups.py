@@ -187,6 +187,21 @@ async def get_by_status(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+async def get_open_followups(db: aiosqlite.Connection) -> list[dict]:
+    """Hot follow_up rows still open (pending or in_progress), oldest first.
+
+    ONE statement, so it is a single consistent snapshot: a concurrent writer
+    moving a row in_progress<->pending can never make it fall between two
+    queries (the repo-pulse reconciler's loader must not silently drop such a
+    row and then advance its PR cursor past it). Cold ``tabled``/``idea`` rows
+    are excluded (kind='follow_up')."""
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups WHERE kind = 'follow_up' "
+        "AND status IN ('pending', 'in_progress') ORDER BY created_at ASC"
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
 async def get_actionable(
     db: aiosqlite.Connection,
     *,

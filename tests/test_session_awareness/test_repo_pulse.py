@@ -321,3 +321,15 @@ def test_followup_marker_must_be_line_anchored():
         f"shipped it\nFollow-up: {FOLLOWUP}",
     ):
         assert [m["via"] for m in rp.match_followup([_pr(body=body)], [_fu()])] == ["marker"], body
+    # trailing text after the id → NOT a marker (BOTH ends anchored) — lands as a
+    # non-destructive bare proposal, never a live auto-complete
+    for body in (
+        f"Follow-up: {FOLLOWUP} (already done separately)",
+        f"Follow-up: {FOLLOWUP} # context only",
+        f"Follow-up: {FOLLOWUP}.",
+    ):
+        assert [m["via"] for m in rp.match_followup([_pr(body=body)], [_fu()])] == ["bare"], body
+    # real GitHub PR bodies are CRLF — the line-anchored marker must still fire
+    # (the `\r` before `\n` is normalized away), else auto-absorb silently dies
+    for body in (f"Follow-up: {FOLLOWUP}\r\n", f"done\r\nFollow-up: {FOLLOWUP}\r\nmore\r\n"):
+        assert [m["via"] for m in rp.match_followup([_pr(body=body)], [_fu()])] == ["marker"], body

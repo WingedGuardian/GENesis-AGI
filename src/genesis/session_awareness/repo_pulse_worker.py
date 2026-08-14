@@ -235,8 +235,7 @@ async def _load_open_followups(db_path: Path | str) -> list[dict] | None:
             )
             if not await cur.fetchone():
                 return []  # pre-migration / bare DB — nothing to reconcile, skip
-            rows = await followups_crud.get_pending(db, include_tabled=False)
-            rows += await followups_crud.get_by_status(db, "in_progress", include_tabled=False)
+            rows = await followups_crud.get_open_followups(db)  # ONE consistent snapshot
     except Exception:
         return None
     rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)

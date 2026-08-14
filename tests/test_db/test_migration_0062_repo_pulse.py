@@ -315,6 +315,27 @@ async def test_insert_annotation_single_row_and_dedup(db):
 
 
 @pytest.mark.asyncio
+async def test_base_path_migrate_add_columns_swaps_dedupe_index(db):
+    """The create_all_tables base path (_migrate_add_columns) also widens
+    idx_rpa_dedupe to the store-scoped 4-col index — not only migration 0084 — so
+    a legacy DB upgraded WITHOUT the numbered runner is store-correct (Codex P2)."""
+    from genesis.db.schema._migrations import _migrate_add_columns, create_all_tables
+
+    await create_all_tables(db)  # full base-path schema (so _migrate_add_columns has its tables)
+    # simulate a legacy install: force idx_rpa_dedupe back to the old 3-col shape
+    await db.execute("DROP INDEX IF EXISTS idx_rpa_dedupe")
+    await db.execute(
+        "CREATE UNIQUE INDEX idx_rpa_dedupe ON repo_pulse_annotations(tier, item_id, pr_number)"
+    )
+    cur = await db.execute("PRAGMA index_info(idx_rpa_dedupe)")
+    assert len(await cur.fetchall()) == 3
+    # re-running the base path must widen it (not only migration 0084)
+    await _migrate_add_columns(db)
+    cur = await db.execute("PRAGMA index_info(idx_rpa_dedupe)")
+    assert len(await cur.fetchall()) == 4  # widened on the base path
+
+
+@pytest.mark.asyncio
 async def test_pre_migration_guard_noops(db):
     """Subprocess writer against an un-migrated DB: no-op, no create, and
     the caller can see False (so it must NOT advance its cursor)."""

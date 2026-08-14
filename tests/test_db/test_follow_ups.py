@@ -137,6 +137,20 @@ async def test_absorb_followup_require_unpinned_refuses_pinned(db):
     assert (await follow_ups.get_by_id(db, fid))["status"] == "completed"
 
 
+async def test_get_open_followups_single_snapshot(db):
+    """One consistent snapshot of the hot open lane: pending + in_progress,
+    kind='follow_up' only; tabled and terminal rows excluded."""
+    fp = await follow_ups.create(db, **_BASE)  # pending
+    fi = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fi, status="in_progress")
+    ft = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_kind(db, ft, "tabled")  # cold lane — excluded
+    fc = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fc, status="completed")  # terminal — excluded
+    ids = {r["id"] for r in await follow_ups.get_open_followups(db)}
+    assert ids == {fp, fi}
+
+
 async def test_purge_failed_old(db):
     """Old failed follow-ups are also purged."""
     fid = await follow_ups.create(db, **_BASE)

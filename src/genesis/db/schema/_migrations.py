@@ -196,12 +196,24 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "follow_ups.dedup_key")
 
     # a8a4f59e: which store a repo-pulse annotation's item_id addresses
-    # ('ledger' | 'follow_up'). The index swap to the 4-col dedupe guard is
-    # owned by migration 0084 (SQLite can't ALTER an index); this base-path
-    # ALTER only guarantees the column lands for schema_both_build_paths.
+    # ('ledger' | 'follow_up').
     await _try_alter(db,
         "ALTER TABLE repo_pulse_annotations ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'ledger'",
         "repo_pulse_annotations.target_kind")
+    # ...and widen its dedupe index HERE too, not only in migration 0084: the
+    # INDEXES pass below uses CREATE ... IF NOT EXISTS, which cannot replace an
+    # already-existing 3-col idx_rpa_dedupe. Without this, a legacy DB upgraded
+    # via create_all_tables (whichever runs first vs the numbered runner) keeps
+    # the 3-col UNIQUE and INSERT OR IGNORE silently drops one store's annotation
+    # for a shared (tier,item_id,pr). Safe: a pre-0084 DB has no follow_up-target
+    # rows yet, so the narrower->wider swap can't collide. Best-effort (0084 is
+    # the authoritative swap); runs after the column ALTER so the 4-col ref is valid.
+    with contextlib.suppress(Exception):
+        await db.execute("DROP INDEX IF EXISTS idx_rpa_dedupe")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
+            "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)"
+        )
 
     # Phase 9: thread_id on cc_sessions (for forum topic multi-session)
     await _try_alter(db,

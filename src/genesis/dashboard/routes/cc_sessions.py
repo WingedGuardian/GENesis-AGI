@@ -440,12 +440,16 @@ async def _resolve_pulse(db, annotation_id: str, status: str) -> tuple[dict, int
         row = await get_annotation(db, annotation_id)
         if row is None or row["status"] != "proposed":
             return {"error": "unknown or already-resolved annotation"}, 404
-        # Resolve the annotation FIRST: its conditional proposed→terminal
-        # UPDATE is the race arbiter. Two concurrent resolutions can't both
-        # win it, so the ledger absorb below only ever runs for the winner —
-        # never an absorbed item under a rejected annotation. (The inverse
-        # residue — confirmed annotation, absorb missed — is visible and
-        # human-fixable via the injected hint.)
+        # Resolve the annotation FIRST — the conditional proposed→terminal UPDATE
+        # is the race arbiter: a concurrent confirm+reject can't both win it, so
+        # the absorb below only ever runs for the confirm winner, never under a
+        # rejected annotation. (Absorb-FIRST was tried and REVERTED: it reopened a
+        # WORSE residue — a follow_up completed under a human-REJECTED annotation,
+        # permanent + invisible since reconcile never revisits a terminal row.)
+        # The milder residue this order can leave — a confirmed annotation whose
+        # absorb missed because the row moved off-open — is accepted, consistent
+        # with the ledger path; the follow_up confirm surface is dormant anyway
+        # until the global proposal surface lands.
         ok = await resolve_annotation(
             db,
             annotation_id,
