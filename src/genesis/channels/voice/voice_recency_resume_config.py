@@ -3,8 +3,8 @@
 Clone of ``voice_act_config`` (fresh-read-per-call, MODES tuple + env kill
 switch, degrade-toward-LESS-authority on damage). Gates whether the S2S voice
 system prompt is pre-loaded with the tail of the user's most-recent prior voice
-conversation ("Where we left off …") so the model can proactively resume the
-thread across sessions.
+conversation as REFERENCE-ONLY context — the model must not proactively resume
+it, only use it if the user asks or says something directly connected.
 
 Modes:
   - ``off``  — no recency block is injected (the default). A fresh prompt-shaping
@@ -25,7 +25,7 @@ Tuning keys (read live, each fail-safe to its default):
     the ``cc_sessions.satellite_id`` column to be populated).
   - ``max_turns``      — how many trailing messages to include (default 6).
   - ``max_chars``      — hard cap on the assembled block (default 800).
-  - ``max_age_hours``  — only resume a conversation whose last activity is newer
+  - ``max_age_hours``  — only include a conversation whose last activity is newer
     than this many hours; ``null`` = no age limit (the default).
 
 Dependency rule: stdlib + yaml + genesis.env + genesis._config_overlay only;
