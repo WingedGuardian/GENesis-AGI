@@ -114,6 +114,29 @@ async def test_absorb_followup_idempotent_replay(db):
     assert row["resolution_notes"].count("PR #7") == 1
 
 
+async def test_absorb_followup_refuses_tabled_kind(db):
+    """Atomic kind guard: the cold tabled/idea lane is never absorbed, even when
+    'pending' and even if a caller's snapshot was stale (Codex P2)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_kind(db, fid, "tabled")
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #1") is False
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "pending"
+
+
+async def test_absorb_followup_require_unpinned_refuses_pinned(db):
+    """require_unpinned=True (the worker's auto-absorb) refuses a pinned row
+    atomically — closing the load→UPDATE pin race. The dashboard path
+    (require_unpinned=False) can still complete a pinned row (human override)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_pinned(db, fid, True)
+    assert (
+        await follow_ups.absorb_followup(db, fid, evidence="PR #1", require_unpinned=True)
+    ) is False
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "pending"
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #1") is True
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "completed"
+
+
 async def test_purge_failed_old(db):
     """Old failed follow-ups are also purged."""
     fid = await follow_ups.create(db, **_BASE)

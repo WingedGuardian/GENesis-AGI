@@ -306,3 +306,18 @@ def test_followup_bare_excludes_ledger_marked_id():
     if X coincidentally equals a follow_up id."""
     matches = rp.match_followup([_pr(body=f"Ledger: {FOLLOWUP}")], [_fu()])
     assert matches == []
+
+
+def test_followup_marker_must_be_line_anchored():
+    """`Follow-up:` is only a live marker on its own line — an inline/negated
+    mention falls through to a bare-hex PROPOSAL (non-destructive). 'follow-up'
+    is ordinary English, so an unanchored marker would auto-complete on prose."""
+    inline = f"This is not a follow-up: {FOLLOWUP} in the usual sense."
+    assert [m["via"] for m in rp.match_followup([_pr(body=inline)], [_fu()])] == ["bare"]
+    # own line, optionally indented or preceded by other lines → marker
+    for body in (
+        f"Follow-up: {FOLLOWUP}",
+        f"  Follow-up: {FOLLOWUP}",
+        f"shipped it\nFollow-up: {FOLLOWUP}",
+    ):
+        assert [m["via"] for m in rp.match_followup([_pr(body=body)], [_fu()])] == ["marker"], body

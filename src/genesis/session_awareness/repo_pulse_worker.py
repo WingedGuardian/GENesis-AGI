@@ -699,7 +699,9 @@ async def _run_locked(
                         f"PR #{pr['number']}: {str(pr.get('title') or '')[:120]} "
                         f"(merged {pr.get('mergedAt')}) [repo-pulse follow-up]"
                     )
-                    if await followups_crud.absorb_followup(db, item["id"], evidence=evidence):
+                    if await followups_crud.absorb_followup(
+                        db, item["id"], evidence=evidence, require_unpinned=True
+                    ):
                         annotations.append(
                             _followup_annotation("applied", item, pr, rationale="follow-up-marker")
                         )

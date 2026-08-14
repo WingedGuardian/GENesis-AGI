@@ -588,6 +588,19 @@ async def test_pulse_confirm_absorbs_followup_target(db):
     assert "PR #1305" in row[1]
 
 
+async def test_pulse_lookup_excludes_followup_proposals(db):
+    """The per-session pulse panel is ledger-only — a session-bound follow_up
+    annotation is NOT surfaced here (session-agnostic → separate global surface;
+    avoids the NULL-session gap + the ledger-only confirm command, Codex P2)."""
+    from genesis.dashboard.routes.cc_sessions import _pulse_lookup
+
+    await _seed_followup_proposal(db, ann_id="afx", fu_id="fux")  # item_session_id='cc-xyz'
+    out = await _pulse_lookup(db, "cc-xyz")
+    assert out["available"] is True
+    assert all(a["target_kind"] == "ledger" for a in out["annotations"])
+    assert not any(a["id"] == "afx" for a in out["annotations"])
+
+
 async def test_pulse_reject_leaves_ledger_untouched(db):
     from genesis.dashboard.routes.cc_sessions import _resolve_pulse
 

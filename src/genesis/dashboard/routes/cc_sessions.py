@@ -313,7 +313,14 @@ async def _pulse_lookup(db, cc_session_id: str) -> dict:
     try:
         from genesis.db.crud.repo_pulse import list_annotations, summary
 
-        annotations = await list_annotations(db, session_id=cc_session_id, limit=100)
+        # Ledger-only: this per-session panel keys on item_session_id, which is
+        # a ledger-shaped binding. follow_up-target proposals are session-agnostic
+        # (source_session is often NULL) and get their own global surface (a
+        # tracked follow-up); rendering them here would either hide the NULL ones
+        # or offer a ledger confirm command that can't resolve a follow_up id.
+        annotations = await list_annotations(
+            db, session_id=cc_session_id, target_kind="ledger", limit=100
+        )
         health = await summary(db)
     except Exception as exc:
         logger.debug("pulse tables unavailable (pre-0062 install?): %s", exc)

@@ -276,6 +276,31 @@ async def test_target_kind_scopes_dedupe_and_existence(db):
 
 
 @pytest.mark.asyncio
+async def test_0084_down_purges_followup_rows_before_narrowing(db):
+    """down() must not fail when the widened index admitted a ledger+follow_up
+    pair sharing (tier, item_id, pr_number): the follow_up rows are purged before
+    the 3-col UNIQUE is recreated (Codex P2 — the narrower index would otherwise
+    raise UNIQUE constraint failed)."""
+    await M62.up(db)
+    await M84.up(db)
+    await crud.record_run(
+        db,
+        **_run_kwargs(run_id="r1"),
+        annotations=[
+            _annotation(id="a1", tier="exact", target_kind="ledger"),
+            _annotation(id="a2", tier="exact", target_kind="follow_up"),
+        ],
+    )
+    await M84.down(db)  # must NOT raise
+    anns = await crud.list_annotations(db)
+    assert {a["id"] for a in anns} == {"a1"}  # follow_up row purged, ledger kept
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_rpa_dedupe'"
+    )
+    assert await cur.fetchone() is not None  # 3-col unique index recreated
+
+
+@pytest.mark.asyncio
 async def test_pre_migration_guard_noops(db):
     """Subprocess writer against an un-migrated DB: no-op, no create, and
     the caller can see False (so it must NOT advance its cursor)."""

@@ -390,27 +390,36 @@ async def absorb_followup(
     id: str,
     *,
     evidence: str,
+    require_unpinned: bool = False,
 ) -> bool:
-    """Mark a still-open follow_up 'completed' with PR evidence (repo-pulse absorb).
+    """Mark a still-open HOT follow_up 'completed' with PR evidence (repo-pulse absorb).
 
     Conditional by design — only a row still in ``('pending','in_progress')``
     transitions. The detached repo-pulse worker races ego/foreground writers, so
     an unconditional ``update_status`` would clobber a concurrent transition (e.g.
     a user just set it 'blocked'); the WHERE guard makes the absorb
     lost-update-safe and replay-idempotent (a re-covered enumeration window
-    matches nothing on the second run). Mirrors the ledger absorb and the
-    dashboard's own open-only guard.
+    matches nothing on the second run).
 
-    The CALLER scopes to the HOT lane (``kind='follow_up'``) and excludes pinned
-    rows — this enforces only the open-status precondition. ``evidence`` is
-    APPENDED to any existing ``resolution_notes`` (prior context is never lost).
-    Returns True iff a row changed.
+    Lane invariants are enforced ATOMICALLY here, not from the caller's stale
+    load-time snapshot (a concurrent pin or ``kind``→``tabled`` between load and
+    this UPDATE could otherwise slip past them): ``kind='follow_up'`` is ALWAYS
+    required, so the cold ``tabled``/``idea`` lanes are never absorbed by either
+    caller. ``require_unpinned=True`` (the worker's auto-absorb) additionally
+    refuses pinned rows atomically — honouring "automation never auto-resolves a
+    pinned row"; the dashboard confirm passes ``False`` because a human
+    explicitly confirming a pinned proposal is an intended override. ``evidence``
+    is APPENDED to any existing ``resolution_notes`` (prior context is never
+    lost). Returns True iff a row changed.
     """
+    where = "id = ? AND kind = 'follow_up' AND status IN ('pending', 'in_progress')"
+    if require_unpinned:
+        where += " AND pinned = 0"
     cursor = await db.execute(
         "UPDATE follow_ups SET status = 'completed', completed_at = ?, "
         "resolution_notes = TRIM("
         "COALESCE(resolution_notes || char(10) || char(10), '') || ?"
-        ") WHERE id = ? AND status IN ('pending', 'in_progress')",
+        f") WHERE {where}",  # noqa: S608 — where is composed of string literals only
         (_now_iso(), evidence, id),
     )
     await db.commit()

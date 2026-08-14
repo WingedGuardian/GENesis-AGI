@@ -51,11 +51,14 @@ MARKER_RE = re.compile(r"[Ll]edger:\s*([0-9a-f]{32})(?![0-9a-fA-F])")
 # tokens embedded in longer hex runs (40-hex SHAs).
 BARE_HEX_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-f]{32})(?![0-9a-fA-F])")
 # `Follow-up: <32-hex>` marker — the standalone-follow_up completion citation
-# (a8a4f59e), mirroring `Ledger:`. Two human-typed words, so the PREFIX is fully
-# case-insensitive (`(?i:...)`) and the hyphen optional (Follow-up/follow-up/
-# FOLLOW-UP/Followup); the hex stays lowercase-strict (uuid4.hex) and the
-# trailing lookahead keeps a 40-hex SHA from half-matching.
-FOLLOWUP_MARKER_RE = re.compile(r"(?i:follow-?up):\s*([0-9a-f]{32})(?![0-9a-fA-F])")
+# (a8a4f59e). ANCHORED to line-start (`^[ \t]*`, MULTILINE): "follow-up" is
+# ordinary English, so an inline/negated mention ("this is not a follow-up: …")
+# must NOT trip the destructive live auto-complete — the documented convention
+# is "on its own line", and an unanchored id still lands as a bare-hex PROPOSAL
+# (non-destructive). Prefix case-insensitive, hyphen optional (Follow-up/
+# follow-up/FOLLOW-UP/Followup); hex lowercase-strict (uuid4.hex); trailing
+# lookahead keeps a 40-hex SHA from half-matching.
+FOLLOWUP_MARKER_RE = re.compile(r"(?im:^[ \t]*follow-?up):\s*([0-9a-f]{32})(?![0-9a-fA-F])")
 
 _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$")

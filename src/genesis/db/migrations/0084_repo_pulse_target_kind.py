@@ -54,6 +54,11 @@ async def down(db: aiosqlite.Connection) -> None:
     if not await cursor.fetchone():
         return
     await db.execute("DROP INDEX IF EXISTS idx_rpa_dedupe")
+    # The widened index admitted rows the narrow one can't: a ledger and a
+    # follow_up annotation sharing (tier, item_id, pr_number) would violate the
+    # recreated 3-col UNIQUE. The follow_up-target rows are THIS migration's own
+    # data, so purge them (while the column still exists) before narrowing.
+    await db.execute("DELETE FROM repo_pulse_annotations WHERE target_kind = 'follow_up'")
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
         "ON repo_pulse_annotations(tier, item_id, pr_number)"
