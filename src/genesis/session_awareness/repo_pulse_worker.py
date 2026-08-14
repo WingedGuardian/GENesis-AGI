@@ -700,11 +700,18 @@ async def _run_locked(
                         f"(merged {pr.get('mergedAt')}) [repo-pulse follow-up]"
                     )
                     if await followups_crud.absorb_followup(
-                        db, item["id"], evidence=evidence, require_unpinned=True
+                        db, item["id"], evidence=evidence, require_unpinned=True, commit=False
                     ):
-                        annotations.append(
-                            _followup_annotation("applied", item, pr, rationale="follow-up-marker")
+                        applied = _followup_annotation(
+                            "applied", item, pr, rationale="follow-up-marker"
                         )
+                        # Commit the completion + its audit annotation ATOMICALLY
+                        # (one transaction): a crash before the end-of-run
+                        # _record_run can then never orphan either — no completed
+                        # follow_up without its annotation (Codex P1). The later
+                        # _record_run re-write is an INSERT OR IGNORE no-op.
+                        await pulse_crud.insert_annotation(db, applied, run_id=run_id, commit=True)
+                        annotations.append(applied)
                         continue
                     # Absorb no-op: the row moved off open between load and now
                     # (concurrent writer) — record a proposal, not a false absorb.

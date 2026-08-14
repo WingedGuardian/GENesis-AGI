@@ -391,6 +391,7 @@ async def absorb_followup(
     *,
     evidence: str,
     require_unpinned: bool = False,
+    commit: bool = True,
 ) -> bool:
     """Mark a still-open HOT follow_up 'completed' with PR evidence (repo-pulse absorb).
 
@@ -422,7 +423,11 @@ async def absorb_followup(
         f") WHERE {where}",  # noqa: S608 — where is composed of string literals only
         (_now_iso(), evidence, id),
     )
-    await db.commit()
+    # commit=False lets a caller stage this completion and commit it in the SAME
+    # transaction as a related write (the worker commits the absorb + its audit
+    # annotation together via repo_pulse.insert_annotation).
+    if commit:
+        await db.commit()
     return cursor.rowcount > 0
 
 

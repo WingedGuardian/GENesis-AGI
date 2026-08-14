@@ -49,6 +49,37 @@ async def _tables_available(db: aiosqlite.Connection) -> bool:
     return exists
 
 
+_ANNOTATION_INSERT_SQL = (
+    "INSERT OR IGNORE INTO repo_pulse_annotations "
+    "(id, run_id, observed_at, tier, item_id, item_session_id, "
+    "item_text, pr_number, pr_title, pr_merged_at, confidence, "
+    "rationale, status, resolved_at, resolution_ref, target_kind) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _annotation_params(ann: dict, run_id: str) -> tuple:
+    """Positional params for ``_ANNOTATION_INSERT_SQL`` from an annotation dict."""
+    return (
+        ann["id"],
+        run_id,
+        ann["observed_at"],
+        ann["tier"],
+        ann["item_id"],
+        ann.get("item_session_id"),
+        ann.get("item_text"),
+        ann["pr_number"],
+        ann.get("pr_title"),
+        ann.get("pr_merged_at"),
+        ann.get("confidence"),
+        ann.get("rationale"),
+        ann["status"],
+        ann.get("resolved_at"),
+        ann.get("resolution_ref"),
+        ann.get("target_kind", "ledger"),
+    )
+
+
 async def record_run(
     db: aiosqlite.Connection,
     *,
@@ -129,32 +160,33 @@ async def record_run(
         ),
     )
     for ann in annotations or []:
-        await db.execute(
-            "INSERT OR IGNORE INTO repo_pulse_annotations "
-            "(id, run_id, observed_at, tier, item_id, item_session_id, "
-            "item_text, pr_number, pr_title, pr_merged_at, confidence, "
-            "rationale, status, resolved_at, resolution_ref, target_kind) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                ann["id"],
-                run_id,
-                ann["observed_at"],
-                ann["tier"],
-                ann["item_id"],
-                ann.get("item_session_id"),
-                ann.get("item_text"),
-                ann["pr_number"],
-                ann.get("pr_title"),
-                ann.get("pr_merged_at"),
-                ann.get("confidence"),
-                ann.get("rationale"),
-                ann["status"],
-                ann.get("resolved_at"),
-                ann.get("resolution_ref"),
-                ann.get("target_kind", "ledger"),
-            ),
-        )
+        await db.execute(_ANNOTATION_INSERT_SQL, _annotation_params(ann, run_id))
     await db.commit()
+    return True
+
+
+async def insert_annotation(
+    db: aiosqlite.Connection, ann: dict, *, run_id: str, commit: bool = True
+) -> bool:
+    """Persist ONE annotation (INSERT OR IGNORE), optionally committing.
+
+    Lets the worker record a follow-up ABSORB and its 'applied' audit annotation
+    in a SINGLE transaction: call ``absorb_followup(..., commit=False)`` then this
+    with ``commit=True`` on the same connection, so a crash — or a failed
+    end-of-run ``record_run`` — can't leave a completed follow_up with no
+    annotation. Validates tier/target_kind/status like ``record_run``; a no-op
+    returning False before migration 0062 (tables absent)."""
+    if ann.get("tier") not in TIERS:
+        raise ValueError(f"invalid annotation tier: {ann.get('tier')!r}")
+    if ann.get("target_kind", "ledger") not in TARGET_KINDS:
+        raise ValueError(f"invalid annotation target_kind: {ann.get('target_kind')!r}")
+    if ann.get("status") not in ANNOTATION_STATUSES:
+        raise ValueError(f"invalid annotation status: {ann.get('status')!r}")
+    if not await _tables_available(db):
+        return False
+    await db.execute(_ANNOTATION_INSERT_SQL, _annotation_params(ann, run_id))
+    if commit:
+        await db.commit()
     return True
 
 

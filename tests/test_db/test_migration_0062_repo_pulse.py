@@ -301,6 +301,20 @@ async def test_0084_down_purges_followup_rows_before_narrowing(db):
 
 
 @pytest.mark.asyncio
+async def test_insert_annotation_single_row_and_dedup(db):
+    """insert_annotation persists ONE annotation and is INSERT OR IGNORE — a
+    re-insert of the same row (as the end-of-run record_run does) is a no-op."""
+    await M62.up(db)
+    await M84.up(db)
+    await crud.record_run(db, **_run_kwargs(run_id="r1"))  # a run row to reference
+    ann = _annotation(id="s1", tier="exact", target_kind="follow_up", status="applied")
+    assert await crud.insert_annotation(db, ann, run_id="r1") is True
+    assert {a["id"] for a in await crud.list_annotations(db)} == {"s1"}
+    assert await crud.insert_annotation(db, ann, run_id="r1") is True  # OR IGNORE no-op
+    assert len(await crud.list_annotations(db)) == 1
+
+
+@pytest.mark.asyncio
 async def test_pre_migration_guard_noops(db):
     """Subprocess writer against an un-migrated DB: no-op, no create, and
     the caller can see False (so it must NOT advance its cursor)."""

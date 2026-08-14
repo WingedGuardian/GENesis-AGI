@@ -795,3 +795,24 @@ async def test_followup_proposal_confirmed_when_completed_with_pr(
     )
     anns = await _anns(db_path, target_kind="follow_up")
     assert anns[0]["status"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_followup_absorb_and_annotation_are_atomic(
+    pulse_root, db_path, monkeypatch, live_mode
+):
+    """The absorb + its 'applied' annotation commit in ONE transaction, so even
+    if the end-of-run _record_run never lands, the completed follow_up still has
+    its audit annotation — no orphaned completion (Codex P1)."""
+
+    async def _never_lands(*a, **kw):
+        return False  # simulate record_run not committing (crash/failure window)
+
+    await _seed_followup(db_path)
+    monkeypatch.setattr(rpw, "_record_run", _never_lands)
+    await _run(db_path, monkeypatch, gh=_gh([_pr(body=f"Follow-up: {FU}")]))
+    # both persisted by the atomic absorb, independent of the failed _record_run
+    assert (await _followup_row(db_path))["status"] == "completed"
+    anns = await _anns(db_path, target_kind="follow_up")
+    assert len(anns) == 1
+    assert anns[0]["status"] == "applied"
