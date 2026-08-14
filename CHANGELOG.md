@@ -42,6 +42,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **No more false "critical failure" alarms when the system is briefly busy.** The
+  health signal that watches your local infrastructure (database, vector store, and
+  Ollama if enabled) probes those services with a short timeout. When background work
+  momentarily stalls Genesis's event loop, those probes could time out even though the
+  services were perfectly healthy — firing a spurious "critical failure" that triggered
+  a reflection and a Telegram alert. Genesis now recognizes when a probe timed out
+  because the loop was starved (rather than because a service is actually down) and
+  suppresses the false alarm, while still firing on a genuine outage. A new diagnostic
+  also captures what code was blocking the loop during such a stall, to help track down
+  the underlying cause.
+
 - **Restricted reasoning sessions can no longer escape their tool restrictions by
   spawning.** Several of Genesis's restricted Claude Code sessions (deep/strategic
   reflection, the inbox/mail judges, and the experimentation completion) could spawn a

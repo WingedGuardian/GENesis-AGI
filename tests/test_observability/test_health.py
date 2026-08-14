@@ -81,6 +81,46 @@ class TestProbeOllama:
         assert result.status == ProbeStatus.DOWN
 
 
+class TestProbeTimeoutFlag:
+    """A timeout-caused DOWN is tagged timed_out=True; a hard error is not.
+
+    critical_failure uses this to distinguish a loop-starvation artifact (probe
+    timed out because the event loop couldn't schedule it) from a real outage.
+    """
+
+    @pytest.mark.asyncio
+    async def test_qdrant_timeout_sets_flag(self, aiohttp_mock):
+        # aiohttp's total ClientTimeout raises asyncio.TimeoutError (== builtin
+        # TimeoutError on 3.11+).
+        aiohttp_mock.get("http://localhost:6333/healthz", exception=TimeoutError())
+        result = await probe_qdrant(clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+        assert result.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_qdrant_hard_error_not_flagged(self, aiohttp_mock):
+        # Connection refused / unreachable surfaces as OSError (not a TimeoutError).
+        aiohttp_mock.get("http://localhost:6333/healthz", exception=OSError("refused"))
+        result = await probe_qdrant(clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+        assert result.timed_out is False
+
+    @pytest.mark.asyncio
+    async def test_ollama_timeout_sets_flag(self, aiohttp_mock):
+        url = "http://localhost:11434/api/tags"
+        aiohttp_mock.get(url, exception=TimeoutError())
+        result = await probe_ollama(url=url, clock=FROZEN_CLOCK)
+        assert result.status == ProbeStatus.DOWN
+        assert result.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_probe_result_defaults_not_timed_out(self):
+        # Default is False so probe_db (no timeout) and healthy probes never
+        # accidentally read as timeout-caused.
+        r = ProbeResult(name="x", status=ProbeStatus.HEALTHY, latency_ms=0.0)
+        assert r.timed_out is False
+
+
 class TestProbeScheduler:
     @pytest.mark.asyncio
     async def test_running(self):
