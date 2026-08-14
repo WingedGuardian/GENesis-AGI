@@ -25,7 +25,7 @@ Tuning keys (read live, each fail-safe to its default):
     the ``cc_sessions.satellite_id`` column to be populated).
   - ``max_turns``      — how many trailing messages to include (default 6).
   - ``max_chars``      — hard cap on the assembled block (default 800).
-  - ``max_age_hours``  — only resume a conversation whose last activity is newer
+  - ``max_age_hours``  — only include a conversation whose last activity is newer
     than this many hours; ``null`` = no age limit (the default).
 
 Dependency rule: stdlib + yaml + genesis.env + genesis._config_overlay only;

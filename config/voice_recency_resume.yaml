@@ -16,4 +16,4 @@ scope: "global"        # "global" = last conversation on ANY device (follows the
                        # (needs cc_sessions.satellite_id populated).
 max_turns: 6           # trailing messages to carry into the prompt
 max_chars: 800         # hard cap on the assembled recency block
-max_age_hours: null    # only resume if newer than this many hours; null = no limit
+max_age_hours: null    # only include if newer than this many hours; null = no limit
