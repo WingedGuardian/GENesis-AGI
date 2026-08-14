@@ -78,8 +78,16 @@ def test_invalid_stall_ms_falls_back_to_default():
     for bad in (float("inf"), float("nan"), 0.0, -5.0):
         s = LoopStallSampler(loop_thread_id=7, stall_ms=bad)
         assert s._stall_ms == _DEFAULT_STALL_MS
-    # A valid positive value is kept.
-    assert LoopStallSampler(loop_thread_id=7, stall_ms=500.0)._stall_ms == 500.0
+    # A valid value at/above the heartbeat-cadence floor is kept.
+    assert LoopStallSampler(loop_thread_id=7, stall_ms=1500.0)._stall_ms == 1500.0
+
+
+def test_stall_ms_below_heartbeat_cadence_is_floored():
+    # A finite positive value below the floor (~2x the 500ms publish cadence)
+    # would flag normal heartbeat gaps as wedged — it's raised to the floor.
+    from genesis.util.loop_stall import _MIN_STALL_MS, LoopStallSampler
+
+    assert LoopStallSampler(loop_thread_id=7, stall_ms=300.0)._stall_ms == _MIN_STALL_MS
 
 
 def test_transient_dump_failure_retries_next_poll():

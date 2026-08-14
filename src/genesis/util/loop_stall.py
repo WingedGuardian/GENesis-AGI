@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_STALL_MS = 1000.0
 _POLL_INTERVAL_S = 0.25
+# The loop-health publisher (hosting/standalone.py::_loop_lag_sampler) beats every
+# ~500ms, so a stall threshold below that + jitter tolerance would flag a normal
+# heartbeat gap as WEDGED. Floor the threshold at 2x the cadence.
+_MIN_STALL_MS = 1000.0
 
 
 class LoopStallSampler:
@@ -62,6 +66,10 @@ class LoopStallSampler:
         # them — clamp at the boundary instead.
         if not (math.isfinite(stall_ms) and stall_ms > 0):
             stall_ms = _DEFAULT_STALL_MS
+        elif stall_ms < _MIN_STALL_MS:
+            # A finite positive value below the heartbeat cadence would flag normal
+            # publish gaps as wedged — floor it.
+            stall_ms = _MIN_STALL_MS
         self._stall_ms = stall_ms
         self._frames_source = frames_source
         self._health_read = health_read
