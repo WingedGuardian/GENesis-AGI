@@ -16,6 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.cc.session_config import SessionConfigBuilder
+from genesis.cc.types import SPAWN_TOOL_NAMES
 from genesis.inbox.scanner import (
     compute_hash,
     detect_changes,
@@ -34,6 +35,13 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "identity"
 _SYSTEM_PROMPT_FILE = "INBOX_EVALUATE.md"
+
+# The inbox-eval judge denies file writes and the whole SPAWN class (SPAWN_TOOL_NAMES =
+# Agent/Task/Workflow/Skill) — no subagent spawn can inherit a fresh, unrestricted
+# toolset and escape. NOTE: this is spawn-hardening, NOT a full read-only boundary — the
+# judge still leaves Bash (and this profile's memory/settings MCP writes) available on
+# external input; closing that is a separate tracked follow-up.
+_EVAL_DISALLOWED_TOOLS: list[str] = ["Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
 
 
 _FALLBACK_SYSTEM_PROMPT = (
@@ -1330,7 +1338,7 @@ class InboxMonitor:
             system_prompt=system_prompt,
             timeout_s=self._config.timeout_s,
             skip_permissions=True,
-            disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
+            disallowed_tools=list(_EVAL_DISALLOWED_TOOLS),
             working_dir=background_session_dir(),
             mcp_config=mcp_path,
             # WS-3: inbox evaluations process EXTERNAL content by construction,

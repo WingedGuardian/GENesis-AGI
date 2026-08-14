@@ -20,6 +20,7 @@ import logging
 import os
 
 from genesis.cc.types import (
+    SPAWN_TOOL_NAMES,
     VALID_EFFORT_NAMES,
     VALID_MODEL_NAMES,
     CCModel,
@@ -31,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 _VALID_MODELS = VALID_MODEL_NAMES
 _VALID_EFFORTS = VALID_EFFORT_NAMES
+
+# Force a PURE single-turn completion: disable ALL built-in tools (incl. subagent
+# spawn — SPAWN_TOOL_NAMES) so ``claude -p`` reflects on the given text instead of
+# going agentic. "Task" was already blocked here; "Agent" is the current spawn name.
+_CLI_DISALLOWED_TOOLS: tuple[str, ...] = (
+    "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS",
+    "WebFetch", "WebSearch", "TodoWrite", "NotebookEdit", "NotebookRead",
+    "ExitPlanMode", *SPAWN_TOOL_NAMES,
+)
 
 
 class CCCliRouter:
@@ -67,8 +77,7 @@ class CCCliRouter:
             # goes agentic (explores logs/files) instead of reflecting on the
             # given text — slow + off-task. Disable the built-in tools.
             "--disallowedTools",
-            "Bash,Read,Write,Edit,MultiEdit,Glob,Grep,LS,WebFetch,WebSearch,Task,"
-            "TodoWrite,NotebookEdit,NotebookRead,ExitPlanMode",
+            ",".join(_CLI_DISALLOWED_TOOLS),
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',  # no MCP tools
             # Suppress SessionStart/UserPromptSubmit hooks (gstack/genesis inject
             # skill-lists + preambles that contaminate a bare completion).

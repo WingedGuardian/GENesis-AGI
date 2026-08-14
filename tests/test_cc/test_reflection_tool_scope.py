@@ -49,7 +49,16 @@ _MUST_DENY_MCP = [
     "mcp__genesis-memory__observation_resolve",
     "mcp__genesis-memory__reference_store",
 ]
-_MUST_DENY_BUILTINS = ["Bash", "Write", "Edit", "NotebookEdit", "Task", "Workflow", "Skill"]
+_MUST_DENY_BUILTINS = [
+    "Bash",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Agent",
+    "Task",
+    "Workflow",
+    "Skill",
+]
 
 # Read tools that MUST stay available (absent from the denylist).
 _MUST_ALLOW = [

@@ -51,7 +51,7 @@ async def compare_models(
     """Run a promptfoo A/B comparison between two models.
 
     Args:
-        model_a: First model identifier (litellm format, e.g. "groq/llama-3.3-70b-versatile")
+        model_a: First model identifier (litellm format, e.g. "groq/openai/gpt-oss-120b")
         model_b: Second model identifier
         dataset_path: Path to the eval dataset YAML
         delay_ms: Delay between requests (for rate limiting, e.g. 31000 for 2 RPM)

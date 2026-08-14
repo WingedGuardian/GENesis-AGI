@@ -3456,18 +3456,20 @@ class AwarenessLoop:
         """Replace signal collectors (late-binding upgrade from stubs to real).
 
         WARNING: this is a **full replacement**, not a superset merge. Any
-        collector registered by ``runtime/init/awareness.py`` that should
-        survive the swap MUST be re-added to the new ``collectors`` list
-        passed by ``runtime/init/learning.py``. Otherwise it is silently
-        dropped from the awareness loop and its signal stops being measured.
+        collector produced by ``runtime/init/awareness.py::build_bootstrap_collectors``
+        that should survive the swap MUST also be produced by
+        ``runtime/init/learning.py::build_learning_collectors``. Otherwise it is
+        silently dropped from the awareness loop and its signal stops being
+        measured (the bug that dropped ``scheduled_job_health`` /
+        ``scheduler_liveness`` for months).
 
-        Currently both ``ContainerMemoryCollector`` and ``JobHealthCollector``
-        are registered in awareness init but NOT re-listed in the learning
-        swap, so their signals (`container_memory_pct`, `scheduled_job_health`)
-        are dropped post-bootstrap. This is functionally OK today because
-        neither has a corresponding ``signal_weights`` row, but adding such
-        a row in the future will silently produce 0.0 readings unless the
-        learning swap is updated to re-include them.
+        Invariant, enforced by ``tests/test_learning/test_extension_wiring.py``:
+        the steady-state (learning) signal set is a SUPERSET of the bootstrap
+        signal set, except for names in
+        ``genesis.awareness.types.BOOTSTRAP_ONLY_SIGNALS`` (currently
+        ``event_loop_latency``, a documented deferral). The learning set is
+        additionally pinned to ``STEADY_STATE_SIGNALS``, which the j9
+        signal-completeness metric scores against.
         """
         self._collectors = list(collectors)
 

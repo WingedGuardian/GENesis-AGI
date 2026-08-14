@@ -8,6 +8,33 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+# CC's spawn/escape-class tool names — the single source of truth for the restricted CC
+# sessions where spawning would escape the parent's tool restrictions: reflection (fully
+# read-only), the inbox/mail judges, the experimentation completion, sentinel-degraded.
+# (The inbox/mail judges are spawn-hardened here but NOT yet fully read-only — they still
+# leave Bash / MCP writes on external input; that boundary is a separate tracked
+# follow-up. Surplus is NOT here: its live executor runs via the tool-less Router, not a
+# claude -p session.)
+# Each of these lets a CHILD escape the lockdown with a fresh, unrestricted toolset
+# (Bash/Write/Edit):
+#   Agent    — spawns a subagent (the CURRENT Claude Code tool name; registered in
+#              util/tool_bootstrap.py CC_TOOLS, matched by the PreToolUse hook in
+#              .claude/settings.json).
+#   Task     — the OBSOLETE name for Agent, retained so a re-introduction is also denied.
+#   Workflow — orchestrates/spawns subagents (reachable inside background sessions —
+#              see .claude/docs/background-sessions.md).
+#   Skill    — invokes a skill, some of which run in a subagent.
+# NOT applied to ``cc/direct_session`` (its ``research`` profile runs a DOCUMENTED
+# deep-research Workflow — .claude/docs/background-sessions.md) or the autonomy-executor
+# sessions; those legitimately spawn/orchestrate and need a separate design (a
+# sandbox-preserving Workflow, or an accepted-porousness decision) — tracked follow-up.
+# Blocking the bare tool name removes it from the model's context entirely — and only
+# --disallowedTools removes a tool (--allowedTools does NOT, under
+# --dangerously-skip-permissions; verified empirically 2026-08-07 via the init-event
+# tool list). Home is this leaf module so every site can reference it with no new
+# import edge (all denylist sites already import from genesis.cc.types).
+SPAWN_TOOL_NAMES: tuple[str, ...] = ("Agent", "Task", "Workflow", "Skill")
+
 
 class SessionType(StrEnum):
     FOREGROUND = "foreground"
