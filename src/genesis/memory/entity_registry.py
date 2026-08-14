@@ -21,6 +21,7 @@ rewriting here.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 
 import aiosqlite
@@ -103,7 +104,13 @@ async def resolve_entity(
         else [entity_type]
     )
     candidates = await entities_crud.list_norm_names(db, entity_types=cluster)
-    near = _closest(norm_name, candidates)
+    # _closest runs synchronous O(n*m) difflib fuzzy-matching over every
+    # same-cluster candidate. As the entity registry grew past the "small enough
+    # to scan in-process" assumption this blocked the event loop ~1s+ (measured
+    # via the loop-stall sampler, PR #1398). Offload to a thread so the loop keeps
+    # scheduling — _closest is a pure function over an already-materialized list,
+    # so it is safe to run off-loop.
+    near = await asyncio.to_thread(_closest, norm_name, candidates)
     entity_id = await entities_crud.create_entity(
         db, name=name, norm_name=norm_name, entity_type=entity_type,
         source=source, _commit=False,
