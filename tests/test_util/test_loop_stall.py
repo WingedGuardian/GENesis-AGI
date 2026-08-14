@@ -82,6 +82,29 @@ def test_invalid_stall_ms_falls_back_to_default():
     assert LoopStallSampler(loop_thread_id=7, stall_ms=500.0)._stall_ms == 500.0
 
 
+def test_transient_dump_failure_retries_next_poll():
+    # A dump that raises (a racing frame while format_stack runs) must NOT consume
+    # the episode — the next poll retries and succeeds. (Codex round-2 finding.)
+    s = _Sample()
+    calls = {"n": 0}
+
+    def flaky_frames():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("racing frame")
+        return {7: None}
+
+    sampler = LoopStallSampler(
+        loop_thread_id=7,
+        stall_ms=1000.0,
+        frames_source=flaky_frames,
+        health_read=lambda: s,
+        age_fn=lambda sample, **kw: 2.0,
+    )
+    assert sampler.poll_once() is False  # dump raised -> episode NOT consumed
+    assert sampler.poll_once() is True  # retried -> captured
+
+
 def test_runner_exits_when_stop_set():
     stop = threading.Event()
     stop.set()  # already stopped -> the runner returns without polling

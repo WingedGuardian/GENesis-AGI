@@ -83,11 +83,17 @@ class LoopStallSampler:
         if self._dumped_this_episode:
             # Already dumped for this stall episode — stay quiet until it clears.
             return False
-        self._dumped_this_episode = True
-        self._dump(sample, age_ms)
-        return True
+        # Consume the episode only on a SUCCESSFUL dump: a transient snapshot
+        # failure (a racing frame while format_stack runs) must be retried on the
+        # next poll, not swallow the whole episode with no capture.
+        if self._dump(sample, age_ms):
+            self._dumped_this_episode = True
+            return True
+        return False
 
-    def _dump(self, sample: object, age_ms: float) -> None:
+    def _dump(self, sample: object, age_ms: float) -> bool:
+        """Log the loop thread's stack. Returns True on success, False on a
+        transient snapshot failure (so the caller can retry the episode)."""
         try:
             frame = self._frames_source().get(self._loop_thread_id)
             if frame is None:
@@ -101,10 +107,12 @@ class LoopStallSampler:
                 getattr(sample, "executor", None),
                 stack,
             )
+            return True
         except Exception:
             # Diagnostic-only: a partial/racing frame snapshot must never raise
-            # into the sampler thread.
+            # into the sampler thread; report failure so the episode is retried.
             self._log.warning("loop-stall stack dump failed", exc_info=True)
+            return False
 
 
 def run_loop_stall_sampler(

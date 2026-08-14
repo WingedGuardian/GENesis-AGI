@@ -132,6 +132,16 @@ class StandaloneAdapter:
                 stall_ms = float(os.environ.get("GENESIS_LOOP_STALL_MS", "1000"))
             except ValueError:
                 stall_ms = 1000.0
+            # float() accepts nan/inf/negatives — reject them here so a misconfig
+            # is surfaced (the sampler's __init__ also clamps as a backstop).
+            # `not (x > 0)` catches NaN (NaN>0 is False), 0, and negatives.
+            if not (stall_ms > 0) or stall_ms == float("inf"):
+                logger.warning(
+                    "GENESIS_LOOP_STALL_MS=%r invalid (need a finite positive "
+                    "number); using 1000ms",
+                    stall_ms,
+                )
+                stall_ms = 1000.0
             stall_stop_event = threading.Event()
             # serve() runs on the event-loop thread, so this ident IS the loop's.
             loop_thread_id = threading.get_ident()

@@ -139,7 +139,8 @@ class CriticalFailureCollector:
             logger.warning(
                 "critical_failure suppressed to %.1f: all DOWN probes (%s) timed "
                 "out under event-loop starvation (drift=%.0fms, sample_age=%.2fs) "
-                "— infra not down, loop starved",
+                "— infra health indeterminate (loop couldn't schedule the probe), "
+                "re-checked next tick",
                 residual,
                 probes_named,
                 sample.drift_ms,
@@ -157,8 +158,9 @@ class CriticalFailureCollector:
                 baseline_note=(
                     f"SUPPRESSED under event-loop starvation: probe(s) "
                     f"{probes_named} timed out because the loop couldn't schedule "
-                    f"them (drift {sample.drift_ms:.0f}ms), NOT a real outage. "
-                    f"Value {residual} ({remainder})."
+                    f"them (drift {sample.drift_ms:.0f}ms), so their health is "
+                    f"INDETERMINATE this tick and is not counted as a critical "
+                    f"failure (re-checked next tick). Value {residual} ({remainder})."
                 ),
                 metadata={
                     "starvation_suppressed": True,
