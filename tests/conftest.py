@@ -71,7 +71,7 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
 
 # ── Safety: prevent tests from writing REAL durable alerts ──────────────────
 @pytest.fixture(autouse=True)
-def _isolate_alert_queue(tmp_path, monkeypatch):
+def _isolate_alert_queue(tmp_path):
     """Redirect the durable alert-queue root to tmp for ALL tests.
 
     ``_alert_flap`` / ``_alert_starved`` (watchdog) and the alert-drain init
@@ -82,11 +82,19 @@ def _isolate_alert_queue(tmp_path, monkeypatch):
     delivered as real incidents). Surgical: only the alert-queue root, NOT
     ``GENESIS_HOME`` globally, so config/state reads are untouched. The HOST
     guardian queue (``config.state_path``) is a separate path, unaffected.
+
+    Uses a fixture-OWNED ``MonkeyPatch`` (not the shared ``monkeypatch``
+    fixture) so a test that calls ``monkeypatch.undo()`` mid-body cannot revert
+    this suite-isolation patch and re-expose the real queue — mirrors
+    ``_isolate_user_config_dir``.
     """
-    monkeypatch.setattr(
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
         "genesis.env.alert_queue_root",
         lambda: tmp_path / "alerts" / "queue",
     )
+    yield
+    mp.undo()
 
 
 # ── Safety: isolate tests from the install's config overlays ──
