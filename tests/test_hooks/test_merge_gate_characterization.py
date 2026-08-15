@@ -111,23 +111,41 @@ def _router(
     mergeable_rc: int = 0,
     inline_lines: str = "",
     review_array: str = "[]",
+    calls: list | None = None,
 ):
     """A ``subprocess.run`` stand-in for the three un-seamed gh calls on the merge
-    path. Everything else on this path (git config/rev-parse, and any gh call we do
-    not model) returns a clean no-op, which is correct because an explicit
-    ``--repo`` avoids cwd/PR derivation and CI/base/freshness read their env seams."""
+    path (mergeable / inline / review-body). Everything else (git config/rev-parse,
+    any gh call we do not model) returns a clean no-op — correct because an explicit
+    ``--repo`` avoids cwd/PR derivation and CI/base/freshness read their env seams.
+
+    ``calls`` (when given) records ``(endpoint_label, argv_str)`` per modelled call in
+    FETCH ORDER. Assertions live in the TEST, not here: a wrong-repo/wrong-PR call must
+    surface as a test failure, but asserting inside ``run`` would be SWALLOWED by the
+    production fail-closed/fail-open ``try/except`` around each gh call (Codex #1399).
+    So a test asserts on the recorded log — that every fetch targeted the gated PR/repo,
+    or that findings are NOT fetched when an earlier gate blocks."""
 
     def run(argv, **kwargs):  # noqa: ANN001 - subprocess.run signature
         parts = [str(a) for a in argv]
         joined = " ".join(parts)
-        # gh pr view <N> --json mergeable --jq .mergeable
+
+        def _rec(label: str):
+            if calls is not None:
+                # record argv PARTS (not the joined string) so tests can pin the PR as
+                # an exact token / path segment, not a superstring (Codex #1399 NOTE).
+                calls.append((label, tuple(parts)))
+
+        # gh pr view <pr> --repo <repo> --json mergeable --jq .mergeable
         if "mergeable" in joined:
+            _rec("mergeable")
             return _proc(mergeable_rc, mergeable)
-        # gh api repos/.../pulls/<N>/comments  → INLINE findings (one json obj/line)
+        # gh api repos/<repo>/pulls/<pr>/comments → INLINE findings (one json obj/line)
         if any("/pulls/" in a and a.endswith("/comments") for a in parts):
+            _rec("inline")
             return _proc(0, inline_lines)
-        # gh api repos/.../issues/<N>/comments → REVIEW-BODY findings (json array)
+        # gh api repos/<repo>/issues/<pr>/comments → REVIEW-BODY findings (json array)
         if any("/issues/" in a and a.endswith("/comments") for a in parts):
+            _rec("review-body")
             return _proc(0, review_array)
         return _proc(0, "")
 
@@ -383,6 +401,69 @@ _CASES: list[tuple[str, object, int, str]] = [
         0,
         "[P2]",
     ),
+    # ── Codex #1399 hardening: coverage the round-1/2 reviews missed ──
+    # (Codex-P1) stale-override must NOT waive the FINDINGS scans — the symmetric half
+    # of the review-override cross above: it waives freshness+base, but a review-body
+    # P1 still blocks.
+    (
+        "stale_override_does_NOT_waive_findings_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(match=None, trailer="# stale-review-override"),
+            reviews="",
+            router=_router(review_array=_REVIEW_BODY_P1),
+        ),
+        2,
+        "unresolved review findings",
+    ),
+    # (Codex-P2) CI is the ONE gate deliberately fail-OPEN on unknown — empty/malformed
+    # CI reads must ALLOW, so the unified UNKNOWN->BLOCK aggregation can't regress them.
+    (
+        "ci_empty_unknown_fails_open_allows",
+        lambda mp: _run(mp, _merge_cmd(), ci=""),
+        0,
+        "",
+    ),
+    (
+        "ci_malformed_unknown_fails_open_allows",
+        lambda mp: _run(mp, _merge_cmd(), ci="not-json"),
+        0,
+        "",
+    ),
+    # (Codex-P1) smart-delta NEGATIVE control: the trivial-stale allow must stay BOUND
+    # to head — the same trivial delta with NO --match-head-commit blocks (a refactor
+    # that dropped verified_head on this path would selectively disengage TOCTOU).
+    (
+        "smart_delta_trivial_unbound_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(match=None),
+            reviews=_reviews_jsonl(STALE),
+            compare=_compare_json("identical"),
+        ),
+        2,
+        "bound to the Codex-verified head",
+    ),
+    # (follow-up 535648be) `# review-override` also waives the INLINE P1 scan directly
+    # (not just transitively via the shared force_override).
+    (
+        "inline_override_waives_P1_allows",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# review-override"),
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        0,
+        "",
+    ),
+    # (follow-up 535648be) numberless merge + explicit --repo → fail CLOSED (can't
+    # resolve the PR; a cwd-branch number gated against a named repo = the wrong-PR class).
+    (
+        "pr_num_None_fail_closed_blocks",
+        lambda mp: _run(mp, "gh pr merge --repo owner/repo --squash --admin"),
+        2,
+        "cannot resolve which PR",
+    ),
 ]
 
 
@@ -395,3 +476,52 @@ def test_merge_gate_aggregation(case_id, thunk, expected_rc, expected_msg, monke
     assert rc == expected_rc, f"{case_id}: expected exit {expected_rc}, got {rc}. stderr:\n{err}"
     if expected_msg:
         assert expected_msg in err, f"{case_id}: {expected_msg!r} not in stderr:\n{err}"
+
+
+def test_findings_not_fetched_when_freshness_blocks(monkeypatch):
+    """Fetch-order / TOCTOU (Codex #1399): when the freshness gate blocks, NEITHER
+    finding endpoint is queried. Locks the ordering as a FETCH property (not merely a
+    returned-error priority) — a refactor that fetched findings before confirming a
+    current review would let a review published mid-fetch pass freshness with its own
+    P1 comments unscanned. Proven via the router's call log."""
+    calls: list = []
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(),
+        reviews="",  # no current review → freshness blocks
+        router=_router(inline_lines=_INLINE_P1_LINE, review_array=_REVIEW_BODY_P1, calls=calls),
+    )
+    assert rc == 2
+    labels = [label for label, _argv in calls]
+    assert "inline" not in labels and "review-body" not in labels, (
+        f"findings were fetched despite a freshness block (TOCTOU risk): {labels}"
+    )
+
+
+def test_merge_fetches_target_the_gated_pr_and_repo(monkeypatch):
+    """Repo/PR threading (Codex #1399): on a clean merge, all three un-seamed fetches
+    (mergeable + both finding scanners) run AND every one targets the gated PR+repo.
+    A refactor that dropped ``--repo`` from mergeability, or emitted a finding endpoint
+    for the wrong PR/repo (the 2026-07-26 wrong-repo class), would still receive these
+    fixtures — so the assertion is on the recorded call log, outside the production
+    try/except that would otherwise swallow an in-router assert."""
+    calls: list = []
+    rc = _run(monkeypatch, _merge_cmd(), router=_router(calls=calls))
+    assert rc == 0
+    labels = [label for label, _parts in calls]
+    assert set(labels) >= {
+        "mergeable",
+        "inline",
+        "review-body",
+    }, f"a merge fetch was skipped: {labels}"
+    # Pin the PR as an exact argv token (mergeable) / path segment (the api scanners),
+    # never a loose substring — so a mis-thread to PR 1000 or repo owner/repo-fork fails.
+    pr = "100"
+    for label, parts in calls:
+        if label == "mergeable":
+            ok = pr in parts and REPO in parts
+        elif label == "inline":
+            ok = f"repos/{REPO}/pulls/{pr}/comments" in parts
+        else:  # review-body
+            ok = f"repos/{REPO}/issues/{pr}/comments" in parts
+        assert ok, f"{label} fetch off-target: {parts}"
