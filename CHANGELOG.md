@@ -11,6 +11,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **One-click "lobby" terminal door — reattach the whole CC fleet after a client
+  reboot.** `generate-ssh-config.sh` now emits a dedicated `Host <host>-lobby`
+  block (placed ahead of the numeric-slot wildcard, since ssh takes the first
+  matching `RemoteCommand`) that attaches a stable `lobby` tmux session on the
+  same socket as the `cc-*` slots. One reconnect there brings every live session
+  back — they persist in tmux on the box, only the client died — and `Ctrl-b s`
+  jumps to any slot in the state you left it. `lobby` is not a `cc-N` name, so it
+  never consumes a slot or trips the slot cap, and numeric-slot routing through
+  `cc-slot.sh` is unchanged. Pair with one Windows Terminal shortcut
+  (`wt.exe ssh <host>-lobby`) for a one-double-click return to the whole fleet.
+
 - **Opt-in career-outreach monitor (off by default).** A new daily monitor that,
   once enabled, drives a configured external career-agent module to stage
   first-touch outreach drafts into your mail Drafts, then sends you a single

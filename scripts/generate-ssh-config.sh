@@ -35,6 +35,24 @@ cat << SSHEOF
 # Paste into ~/.ssh/config on your client devices.
 # Usage: ssh ${TS_HOSTNAME}-1, ssh ${TS_HOSTNAME}-2, etc.
 # Each slot maps to a persistent tmux session with claude.
+# Or:    ssh ${TS_HOSTNAME}-lobby  → one landing session; Ctrl-b s to reach any slot.
+
+# One-click "lobby": a stable landing session that sees ALL live cc-* slots.
+# After a client/reboot, ONE reconnect here brings the whole fleet back — the
+# slots never died (they live in tmux on the box). From lobby, press Ctrl-b s
+# (choose-tree) to jump into any running session, in the state you left it.
+#
+# This specific block MUST precede the wildcard below: ssh uses the FIRST
+# matching RemoteCommand, and the wildcard would otherwise route
+# "${TS_HOSTNAME}-lobby" into cc-slot.sh, which rejects the non-numeric slot.
+# 'lobby' is not a cc-N name, so it never consumes a slot or the slot cap.
+Host ${TS_HOSTNAME}-lobby
+    HostName ${TS_DNSNAME}
+    User ${REMOTE_USER}
+    RemoteCommand tmux -u new-session -A -s lobby
+    RequestTTY yes
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
 
 Host ${TS_HOSTNAME}-*
     HostName ${TS_DNSNAME}
@@ -53,4 +71,9 @@ SSHEOF
 
 echo "" >&2
 echo "Copy the above into ~/.ssh/config on your client devices." >&2
-echo "Then: ssh ${TS_HOSTNAME}-1   (or any positive integer)" >&2
+echo "Then: ssh ${TS_HOSTNAME}-1        (a specific slot, or any positive integer)" >&2
+echo "  or: ssh ${TS_HOSTNAME}-lobby    (one landing → Ctrl-b s to jump to any live slot)" >&2
+echo "" >&2
+echo "Windows one-click: create a shortcut whose target is" >&2
+echo "    wt.exe ssh ${TS_HOSTNAME}-lobby     (or:  ssh.exe ${TS_HOSTNAME}-lobby)" >&2
+echo "then pin it to the taskbar — double-click reattaches the whole fleet." >&2
