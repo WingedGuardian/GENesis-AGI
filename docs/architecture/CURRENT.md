@@ -235,10 +235,19 @@ verified: 51253c67 2026-08-13
   value, not an orphaned constant). `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS` keeps
   its own literal (deliberate import-cycle avoidance) but is held ⊇ by
   `tests/test_cc/test_spawn_lockdown.py`, which locks the class so a new denylist that
-  forgets spawn-blocking fails CI. NOTE: the inbox/mail judges are spawn-hardened here but
-  are NOT yet fully read-only — they still leave `Bash` (and, for inbox, memory/settings
-  MCP writes) available on external input; closing that broader boundary is a separate
-  tracked follow-up.
+  forgets spawn-blocking fails CI. The mail judge — whose prompt uses NO tools — now runs
+  an ACT-NOTHING denylist (Bash + all file-edit + spawn + side-effecting actions + web
+  tools, closing the Read+WebFetch exfil path), and its empty-MCP config is resolved via
+  the canonical `build_mcp_config("none")` (the old hand-counted `parents[2]` path pointed
+  at a nonexistent `src/config/no_mcp.json`). The inbox judge denies every genesis MCP
+  *write* (`memory_store`/`settings_update`/`follow_up_create`/…) via
+  `build_reflection_disallowed` minus `Bash`, keeping the reads it needs plus the optional
+  `observation_write`. Two RESIDUALS on the inbox judge, both tracked (follow-up 727a3724),
+  NOT closed here: (1) `Bash` — retained for the `yt-dlp`/`curl` YouTube-fetch path
+  (injection→RCE surface); (2) the retained `observation_write` neither stamps external
+  provenance nor constrains observation `type`, so an injected item could in principle forge
+  a `user_model_delta` — a low-likelihood, curated-input vector whose real fix (a provisional
+  provenance tier + writer type-authorization) belongs in the memory-provenance work.
   **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
   DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
   the autonomy-executor sessions; those legitimately spawn/orchestrate and need a

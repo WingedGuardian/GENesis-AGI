@@ -16,7 +16,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.cc.session_config import SessionConfigBuilder
-from genesis.cc.types import SPAWN_TOOL_NAMES
 from genesis.inbox.scanner import (
     compute_hash,
     detect_changes,
@@ -36,12 +35,36 @@ logger = logging.getLogger(__name__)
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "identity"
 _SYSTEM_PROMPT_FILE = "INBOX_EVALUATE.md"
 
-# The inbox-eval judge denies file writes and the whole SPAWN class (SPAWN_TOOL_NAMES =
-# Agent/Task/Workflow/Skill) — no subagent spawn can inherit a fresh, unrestricted
-# toolset and escape. NOTE: this is spawn-hardening, NOT a full read-only boundary — the
-# judge still leaves Bash (and this profile's memory/settings MCP writes) available on
-# external input; closing that is a separate tracked follow-up.
-_EVAL_DISALLOWED_TOOLS: list[str] = ["Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
+
+def _eval_disallowed_tools() -> list[str]:
+    """Tools denied to the inbox-eval judge (runs skip_permissions on EXTERNAL input).
+
+    This is the reflection read-only denylist (``build_reflection_disallowed``)
+    MINUS ``Bash``. It denies file writes, the whole SPAWN class
+    (Agent/Task/Workflow/Skill — a spawned child would escape with a fresh,
+    unrestricted toolset), the user-scoped MCP servers, and every genesis MCP
+    *write* (``memory_store`` / ``settings_update`` / ``follow_up_create`` / …),
+    while KEEPING the reads the prompt needs (``memory_recall`` /
+    ``procedure_recall`` / genesis-health status reads) and the one write the
+    prompt still uses (``observation_write`` — the OPTIONAL ``user_signal`` digest).
+
+    ``Bash`` is deliberately RETAINED: the prompt shells out to ``yt-dlp`` /
+    ``curl`` to fetch YouTube (and SSL-failing) inbox URLs. Relocating that fetch
+    into Python so ``Bash`` can also be denied is the remaining residual of
+    follow-up 727a3724 (the inbox judge's injection→RCE surface). Deriving from
+    ``build_reflection_disallowed`` (live per call) means a genesis MCP write
+    added in a future PR is auto-denied here with no code change.
+
+    NOTE: the retained ``observation_write`` is a RESIDUAL write surface, not a
+    proven-safe one. Today it neither stamps external provenance (the tool ignores
+    the session origin, unlike the procedural/knowledge writers) nor constrains the
+    observation ``type`` — so an injected item could in principle forge a
+    ``user_model_delta`` that the user-model pipeline auto-accepts. That is a
+    LOW-likelihood, curated-input vector; the real fix (a provisional provenance
+    tier + type-authorization on the writer) is tracked in the memory-provenance
+    work, deliberately NOT bolted onto this tool-denylist change.
+    """
+    return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]
 
 
 _FALLBACK_SYSTEM_PROMPT = (
@@ -1338,12 +1361,14 @@ class InboxMonitor:
             system_prompt=system_prompt,
             timeout_s=self._config.timeout_s,
             skip_permissions=True,
-            disallowed_tools=list(_EVAL_DISALLOWED_TOOLS),
+            disallowed_tools=_eval_disallowed_tools(),
             working_dir=background_session_dir(),
             mcp_config=mcp_path,
-            # WS-3: inbox evaluations process EXTERNAL content by construction,
-            # and this session's MCP profile ("reflection") includes
-            # genesis-memory — its writes must carry external provenance.
+            # WS-3: inbox evaluations process EXTERNAL content by construction, so
+            # stamp the session external — the Python-side eval-memory writes read
+            # this, and any future origin-aware MCP write will too. NOTE: the one
+            # retained MCP write here (observation_write) does NOT currently honor
+            # this stamp (see _eval_disallowed_tools) — tracked, not fixed here.
             origin=ORIGIN_EXTERNAL_UNTRUSTED,
         )
 

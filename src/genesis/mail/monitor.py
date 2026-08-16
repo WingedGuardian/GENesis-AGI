@@ -37,12 +37,40 @@ logger = logging.getLogger(__name__)
 
 _IDENTITY_DIR = Path(__file__).resolve().parents[1] / "identity"
 
-# The mail judge denies file writes and the whole SPAWN class (SPAWN_TOOL_NAMES =
-# Agent/Task/Workflow/Skill) — no subagent spawn can escape with a fresh toolset. Its MCP
-# config is no_mcp (no memory server). NOTE: spawn-hardening, NOT a full read-only
-# boundary — Bash is still available on external input; closing that is a separate
-# tracked follow-up.
-_JUDGE_DISALLOWED_TOOLS: list[str] = ["Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
+# The mail judge reads pre-digested briefs and emits JSON keep/discard decisions —
+# its prompt (MAIL_EVALUATE.md) uses NO tools. So it runs with an ACT-NOTHING denylist on
+# this external-input, skip_permissions session: deny every mutation, file-edit, the whole
+# SPAWN class (SPAWN_TOOL_NAMES = Agent/Task/Workflow/Skill — a spawned child would escape
+# with a fresh toolset), every side-effecting action, and the web tools (the last closes
+# the Read+WebFetch exfiltration path Codex flagged). Reads (Read/Grep/Glob/LS) are
+# harmless with no web/bash/MCP left to exfil through. Mirrors the sentinel-degraded
+# "propose-only" posture (sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS); kept as its own
+# list to avoid a mail->sentinel import — the guardrail test pins the members so the two
+# can't silently drift. Nothing the judge legitimately does is lost (727a3724).
+_JUDGE_DISALLOWED_TOOLS: list[str] = [
+    "Bash",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    *SPAWN_TOOL_NAMES,
+    "SendMessage",
+    "ReportFindings",
+    "CronCreate",
+    "CronDelete",
+    "ScheduleWakeup",
+    "Monitor",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskStop",
+    "RemoteTrigger",
+    "PushNotification",
+    "DesignSync",
+    "EnterWorktree",
+    "ExitWorktree",
+    "WebFetch",
+    "WebSearch",
+]
 
 
 class MailMonitor:
@@ -508,9 +536,14 @@ class MailMonitor:
             )
 
         try:
-            # Judge outputs JSON decisions only — no tools needed.
-            _no_mcp = str(Path(__file__).resolve().parents[2] / "config" / "no_mcp.json")
+            # Judge outputs JSON decisions only — no tools needed. Resolve the empty
+            # MCP profile via the canonical builder rather than a hand-counted
+            # parents[...] path (the old parents[2] resolved to a NONEXISTENT
+            # src/config/no_mcp.json — repo-root is config/no_mcp.json).
+            from genesis.cc.session_config import SessionConfigBuilder
             from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+
+            _no_mcp = SessionConfigBuilder().build_mcp_config("none")
 
             invocation = CCInvocation(
                 prompt=prompt,

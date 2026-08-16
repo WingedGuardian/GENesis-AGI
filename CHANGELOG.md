@@ -64,6 +64,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   background sessions that legitimately orchestrate — e.g. the deep-research `Workflow`
   path — are intentionally out of scope and tracked separately.)
 
+- **Inbox/mail evaluation judges further hardened against adversarial external input.**
+  Both judges reason over untrusted content (emails / dropped inbox items) with
+  permissions skipped. The mail judge — whose prompt uses no tools at all — now runs a
+  full act-nothing denylist (shell, all file-edit, subagent-spawn, side-effecting actions,
+  and web tools), and a stale config-path bug that pointed its empty-MCP profile at a
+  nonexistent file was fixed. The inbox judge now denies every memory/settings write tool
+  (it only ever needed reads plus a single optional observation write), closing a path
+  where injected content could mutate stored memory or settings; the denial is derived from
+  the reflection read-only denylist, so a future write tool is auto-covered. Two narrower
+  residuals on the inbox judge remain tracked (not closed here): it keeps shell access for
+  one job — fetching YouTube links — and its retained observation writer is not yet
+  provenance-stamped or type-constrained; both are handled in follow-up work.
+
 - **The autonomous-CLI approval gate now ships ON by default.** Every background
   Claude Code session Genesis dispatches must be rooted in an explicit user
   approval — but the committed policy config shipped the gate *off*, so a fresh
