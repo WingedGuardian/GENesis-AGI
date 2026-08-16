@@ -45,8 +45,8 @@ def _eval_disallowed_tools() -> list[str]:
     unrestricted toolset), the user-scoped MCP servers, and every genesis MCP
     *write* (``memory_store`` / ``settings_update`` / ``follow_up_create`` / …),
     while KEEPING the reads the prompt needs (``memory_recall`` /
-    ``procedure_recall`` / genesis-health status reads) and its one sanctioned
-    write (``observation_write``).
+    ``procedure_recall`` / genesis-health status reads) and the one write the
+    prompt still uses (``observation_write`` — the OPTIONAL ``user_signal`` digest).
 
     ``Bash`` is deliberately RETAINED: the prompt shells out to ``yt-dlp`` /
     ``curl`` to fetch YouTube (and SSL-failing) inbox URLs. Relocating that fetch
@@ -54,6 +54,15 @@ def _eval_disallowed_tools() -> list[str]:
     follow-up 727a3724 (the inbox judge's injection→RCE surface). Deriving from
     ``build_reflection_disallowed`` (live per call) means a genesis MCP write
     added in a future PR is auto-denied here with no code change.
+
+    NOTE: the retained ``observation_write`` is a RESIDUAL write surface, not a
+    proven-safe one. Today it neither stamps external provenance (the tool ignores
+    the session origin, unlike the procedural/knowledge writers) nor constrains the
+    observation ``type`` — so an injected item could in principle forge a
+    ``user_model_delta`` that the user-model pipeline auto-accepts. That is a
+    LOW-likelihood, curated-input vector; the real fix (a provisional provenance
+    tier + type-authorization on the writer) is tracked in the memory-provenance
+    work, deliberately NOT bolted onto this tool-denylist change.
     """
     return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]
 
@@ -1355,10 +1364,11 @@ class InboxMonitor:
             disallowed_tools=_eval_disallowed_tools(),
             working_dir=background_session_dir(),
             mcp_config=mcp_path,
-            # WS-3: inbox evaluations process EXTERNAL content by construction.
-            # The dangerous genesis MCP writes are now denied (see
-            # _eval_disallowed_tools); the ONE write left — observation_write —
-            # must carry external provenance, so stamp the whole session.
+            # WS-3: inbox evaluations process EXTERNAL content by construction, so
+            # stamp the session external — the Python-side eval-memory writes read
+            # this, and any future origin-aware MCP write will too. NOTE: the one
+            # retained MCP write here (observation_write) does NOT currently honor
+            # this stamp (see _eval_disallowed_tools) — tracked, not fixed here.
             origin=ORIGIN_EXTERNAL_UNTRUSTED,
         )
 

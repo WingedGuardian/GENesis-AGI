@@ -81,10 +81,40 @@ def test_experimentation_completion_denies_spawn():
 # removing any capability either prompt actually uses.
 
 
-def test_mail_judge_denies_bash():
+def test_mail_judge_denies_full_action_class():
+    # The mail prompt (MAIL_EVALUATE.md) uses NO tools, so it runs act-nothing:
+    # deny Bash + all file-edit + spawn + side-effecting actions + web (the last
+    # closes the Read+WebFetch exfiltration path).
     from genesis.mail.monitor import _JUDGE_DISALLOWED_TOOLS
 
-    assert "Bash" in _JUDGE_DISALLOWED_TOOLS
+    d = set(_JUDGE_DISALLOWED_TOOLS)
+    for t in (
+        "Bash",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "CronCreate",
+        "RemoteTrigger",
+        "PushNotification",
+        "SendMessage",
+        "Monitor",
+    ):
+        assert t in d, f"mail judge must deny {t}"
+
+
+def test_mail_judge_no_mcp_config_exists():
+    # Regression for the parents[2] path bug: the mail judge's empty-MCP config
+    # must resolve to a REAL file (strict_mcp_config requires a readable path;
+    # the old hand-counted path pointed at a nonexistent src/config/no_mcp.json).
+    from pathlib import Path
+
+    from genesis.cc.session_config import SessionConfigBuilder
+
+    p = SessionConfigBuilder().build_mcp_config("none")
+    assert p and Path(p).exists(), f"no_mcp config must exist, got {p!r}"
 
 
 def test_inbox_judge_denies_mcp_writes():
