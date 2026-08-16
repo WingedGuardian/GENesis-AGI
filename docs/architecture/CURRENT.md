@@ -235,10 +235,14 @@ verified: 51253c67 2026-08-13
   value, not an orphaned constant). `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS` keeps
   its own literal (deliberate import-cycle avoidance) but is held ⊇ by
   `tests/test_cc/test_spawn_lockdown.py`, which locks the class so a new denylist that
-  forgets spawn-blocking fails CI. NOTE: the inbox/mail judges are spawn-hardened here but
-  are NOT yet fully read-only — they still leave `Bash` (and, for inbox, memory/settings
-  MCP writes) available on external input; closing that broader boundary is a separate
-  tracked follow-up.
+  forgets spawn-blocking fails CI. The mail judge is now fully denied `Bash` (its prompt
+  uses no tools); the inbox judge additionally denies every genesis MCP *write*
+  (`memory_store`/`settings_update`/`follow_up_create`/…) while keeping the reads +
+  `observation_write` its prompt needs (derived from `build_reflection_disallowed` minus
+  `Bash`, so a future write tool is auto-denied). The inbox judge's ONE remaining residual
+  is `Bash` — retained for the `yt-dlp`/`curl` YouTube-fetch path; relocating that fetch
+  into Python so `Bash` can also be denied is tracked separately (follow-up 727a3724, the
+  inbox judge's injection→RCE surface).
   **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
   DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
   the autonomy-executor sessions; those legitimately spawn/orchestrate and need a

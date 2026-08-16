@@ -37,12 +37,13 @@ logger = logging.getLogger(__name__)
 
 _IDENTITY_DIR = Path(__file__).resolve().parents[1] / "identity"
 
-# The mail judge denies file writes and the whole SPAWN class (SPAWN_TOOL_NAMES =
-# Agent/Task/Workflow/Skill) — no subagent spawn can escape with a fresh toolset. Its MCP
-# config is no_mcp (no memory server). NOTE: spawn-hardening, NOT a full read-only
-# boundary — Bash is still available on external input; closing that is a separate
-# tracked follow-up.
-_JUDGE_DISALLOWED_TOOLS: list[str] = ["Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
+# The mail judge reads pre-digested briefs and emits JSON keep/discard decisions —
+# its prompt (MAIL_EVALUATE.md) uses NO tools. So it denies Bash, file writes, and the
+# whole SPAWN class (SPAWN_TOOL_NAMES = Agent/Task/Workflow/Skill — a spawned child would
+# escape with a fresh toolset), and its MCP config is no_mcp (no memory server). This is a
+# full read-only boundary on an external-input, skip_permissions session — nothing the
+# judge legitimately does is lost (727a3724).
+_JUDGE_DISALLOWED_TOOLS: list[str] = ["Bash", "Write", "Edit", "NotebookEdit", *SPAWN_TOOL_NAMES]
 
 
 class MailMonitor:
