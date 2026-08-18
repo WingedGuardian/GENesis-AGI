@@ -86,3 +86,46 @@ def test_scan_diff_end_to_end_blocks_secret():
     result = sanitize.scan_diff(_SECRET_DIFF)
     assert result.ok is False
     assert any(f.kind == FindingKind.SECRET for f in result.blocking())
+
+
+# ── Install-agnostic argv guards (run on CI without the gitleaks binary) ──
+# These spy on subprocess.run so the gitleaks invocation itself is locked even
+# where the real binary is absent (the real-binary tests above skip on CI).
+def _capture_gitleaks_argv(monkeypatch, repo_dir):
+    import subprocess as _sp
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        sanitize.shutil,
+        "which",
+        lambda name: "/fake/gitleaks" if name == "gitleaks" else None,
+    )
+    monkeypatch.setattr("genesis.env.repo_root", lambda: repo_dir)
+
+    def _fake_run(cmd, *a, **k):
+        captured["cmd"] = list(cmd)
+        return _sp.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sanitize.subprocess, "run", _fake_run)
+    sanitize._run_gitleaks(_SECRET_DIFF)
+    return captured["cmd"]
+
+
+def test_gitleaks_argv_no_nogit_and_loads_config(monkeypatch, tmp_path):
+    """gitleaks must be invoked WITHOUT --no-git (it nullifies --pipe) and WITH
+    -c pointing at the repo .gitleaks.toml when the config exists."""
+    (tmp_path / ".gitleaks.toml").write_text("[extend]\nuseDefault = true\n")
+    cmd = _capture_gitleaks_argv(monkeypatch, tmp_path)
+    assert "--no-git" not in cmd, "--no-git must NOT be combined with --pipe"
+    assert "--pipe" in cmd
+    assert "-c" in cmd
+    assert cmd[cmd.index("-c") + 1] == str(tmp_path / ".gitleaks.toml")
+
+
+def test_gitleaks_argv_skips_config_when_absent(monkeypatch, tmp_path):
+    """No .gitleaks.toml → -c is omitted (graceful skip; default rules still apply),
+    and --no-git is still absent."""
+    cmd = _capture_gitleaks_argv(monkeypatch, tmp_path)  # empty dir, no config
+    assert "-c" not in cmd
+    assert "--no-git" not in cmd
+    assert "--pipe" in cmd
