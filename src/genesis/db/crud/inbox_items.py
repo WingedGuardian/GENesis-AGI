@@ -224,38 +224,39 @@ async def get_all_known(
     """
     from pathlib import Path
 
+    # ONE recency-ordered scan over ALL rows — never two passes. The 2026-08
+    # approval storm came from a second (permanently-failed) pass clobbering
+    # the first pass's newest completed hash with an OLDER exhausted row's
+    # hash, unconditionally: known != disk forever → phantom "modified" every
+    # scan → the monitor cancelled + re-sent the pending approval every tick.
+    #
     # ORDER BY created_at ASC, rowid ASC so the per-file dict-overwrite loop
-    # below deterministically keeps the NEWEST row's hash. A file has many rows
-    # (one per batch, plus reused rows), and `reuse_as_pending` resets created_at
-    # to now while KEEPING the old (low) rowid — so insertion/rowid order is NOT
-    # recency. Without this ORDER BY an arbitrary (stale) row's hash could win,
-    # so the file's current hash never matches "known" → phantom "modified"
-    # every scan (the detection storm).
+    # deterministically keeps the NEWEST decisive row's hash. A file has many
+    # rows (one per batch, plus reused rows), and `reuse_as_pending` resets
+    # created_at to now while KEEPING the old (low) rowid — so insertion/rowid
+    # order is NOT recency.
+    #
+    # Rows INVISIBLE to the scan (siblings decide; they never supply a hash):
+    # - retriable failed rows (retry_count < max): the retry lane owns their
+    #   re-queueing; letting one erase the file from "known" would re-classify
+    #   the file as NEW and re-evaluate FULL content.
+    # - completed rows whose response file was deleted: user-initiated re-eval.
     cursor = await db.execute(
         "SELECT file_path, content_hash, status, response_path, retry_count "
-        "FROM inbox_items WHERE status != 'failed' "
+        "FROM inbox_items "
         "ORDER BY created_at ASC, rowid ASC",
     )
     rows = await cursor.fetchall()
     result: dict[str, str] = {}
     for row in rows:
-        file_path, content_hash, status, response_path = (
-            row[0], row[1], row[2], row[3],
+        file_path, content_hash, status, response_path, retry_count = (
+            row[0], row[1], row[2], row[3], row[4],
         )
-        # If completed but response file was deleted, allow reprocessing
+        if status == "failed" and (retry_count or 0) < max_retries:
+            continue
         if status == "completed" and response_path and not Path(response_path).exists():
             continue
         result[file_path] = content_hash
-
-    # Permanently failed items (exhausted retries) should also block reprocessing
-    cursor2 = await db.execute(
-        "SELECT file_path, content_hash FROM inbox_items "
-        "WHERE status = 'failed' AND retry_count >= ? "
-        "ORDER BY created_at ASC, rowid ASC",
-        (max_retries,),
-    )
-    for row in await cursor2.fetchall():
-        result[row[0]] = row[1]
 
     return result
 
