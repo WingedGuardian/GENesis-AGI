@@ -27,8 +27,17 @@ async def conversation_history(
     limit: int = 20,
     search: str | None = None,
     thread_id: int | None = None,
+    chat_id: int | None = None,
+    before: str | None = None,
 ) -> list[dict]:
-    """Retrieve recent conversation messages ("scroll up"). Supports Telegram and CC CLI."""
+    """Retrieve recent conversation messages ("scroll up"). Supports Telegram and CC CLI.
+
+    ``chat_id`` scopes the telegram view to ONE chat — pass your own chat id
+    for a real DM scroll-up (without it, results span ALL chats; that unscoped
+    default is intentional for reflection/cross-chat use). ``before`` (ISO
+    timestamp, exclusive) pages further back: pass the oldest timestamp from
+    the previous page to walk arbitrarily far up the conversation.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -37,16 +46,35 @@ async def conversation_history(
     if channel == "telegram":
         from genesis.db.crud import telegram_messages
         if search:
+            if chat_id is not None:
+                return await telegram_messages.search(
+                    memory_mod._db, chat_id, search, limit=limit,
+                )
             return await telegram_messages.search_all(memory_mod._db, search, limit=limit)
-        if thread_id is not None:
-            rows = await memory_mod._db.execute_fetchall(
-                """SELECT * FROM telegram_messages
-                   WHERE thread_id = ?
-                   ORDER BY timestamp DESC LIMIT ?""",
-                (thread_id, limit),
+        if chat_id is not None:
+            return await telegram_messages.query_recent(
+                memory_mod._db, chat_id,
+                thread_id=thread_id, limit=limit, before=before,
             )
+        if thread_id is not None:
+            if before:
+                rows = await memory_mod._db.execute_fetchall(
+                    """SELECT * FROM telegram_messages
+                       WHERE thread_id = ? AND timestamp < ?
+                       ORDER BY timestamp DESC LIMIT ?""",
+                    (thread_id, before, limit),
+                )
+            else:
+                rows = await memory_mod._db.execute_fetchall(
+                    """SELECT * FROM telegram_messages
+                       WHERE thread_id = ?
+                       ORDER BY timestamp DESC LIMIT ?""",
+                    (thread_id, limit),
+                )
             return [dict(r) for r in reversed(rows)]
-        return await telegram_messages.query_all_recent(memory_mod._db, limit=limit)
+        return await telegram_messages.query_all_recent(
+            memory_mod._db, limit=limit, before=before,
+        )
 
     if channel == "cc":
         jsonl_dir = str(Path.home() / ".claude" / "projects" / cc_project_dir())

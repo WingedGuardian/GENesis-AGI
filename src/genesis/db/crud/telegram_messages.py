@@ -49,22 +49,29 @@ async def query_recent(
     *,
     thread_id: int | None = None,
     limit: int = 20,
+    before: str | None = None,
 ) -> list[dict]:
-    """Return recent messages for a chat, newest first then reversed for readability."""
+    """Return recent messages for a chat, newest first then reversed for readability.
+
+    ``before`` (ISO timestamp, exclusive) pages further back — the scroll-up
+    cursor: pass the oldest timestamp from the previous page to get the next
+    older window.
+    """
+    clauses = ["chat_id = ?"]
+    params: list[object] = [chat_id]
     if thread_id is not None:
-        cursor = await db.execute(
-            """SELECT * FROM telegram_messages
-               WHERE chat_id = ? AND thread_id = ?
-               ORDER BY timestamp DESC LIMIT ?""",
-            (chat_id, thread_id, limit),
-        )
-    else:
-        cursor = await db.execute(
-            """SELECT * FROM telegram_messages
-               WHERE chat_id = ?
-               ORDER BY timestamp DESC LIMIT ?""",
-            (chat_id, limit),
-        )
+        clauses.append("thread_id = ?")
+        params.append(thread_id)
+    if before:
+        clauses.append("timestamp < ?")
+        params.append(before)
+    params.append(limit)
+    cursor = await db.execute(
+        f"""SELECT * FROM telegram_messages
+           WHERE {" AND ".join(clauses)}
+           ORDER BY timestamp DESC LIMIT ?""",  # noqa: S608 — clauses are literals
+        params,
+    )
     rows = await cursor.fetchall()
     # Return in chronological order (oldest first) for readability
     return [dict(r) for r in reversed(rows)]
@@ -74,13 +81,22 @@ async def query_all_recent(
     db: aiosqlite.Connection,
     *,
     limit: int = 20,
+    before: str | None = None,
 ) -> list[dict]:
     """Return recent messages across all chats, newest first then reversed."""
-    cursor = await db.execute(
-        """SELECT * FROM telegram_messages
-           ORDER BY timestamp DESC LIMIT ?""",
-        (limit,),
-    )
+    if before:
+        cursor = await db.execute(
+            """SELECT * FROM telegram_messages
+               WHERE timestamp < ?
+               ORDER BY timestamp DESC LIMIT ?""",
+            (before, limit),
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT * FROM telegram_messages
+               ORDER BY timestamp DESC LIMIT ?""",
+            (limit,),
+        )
     rows = await cursor.fetchall()
     return [dict(r) for r in reversed(rows)]
 
