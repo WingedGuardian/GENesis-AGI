@@ -152,6 +152,42 @@ async def count_live_rows_for_approval(
     return int(row[0]) if row else 0
 
 
+async def supersede_parked_rows(
+    db: aiosqlite.Connection,
+    file_path: str,
+    *,
+    processed_at: str,
+) -> int:
+    """Supersede a file's parked (awaiting-approval) rows in place.
+
+    Used when a file changes while its drop is parked on a pending approval:
+    the freshly-computed delta is a SUPERSET of the parked one (the baseline
+    only advances on completed rows), so the new drop replaces the parked rows
+    ON THE SAME approval request — dispatching both would evaluate the old
+    delta twice. Rows mid-dispatch (``dispatching:``) are deliberately NOT
+    touched: their CC call is in flight and completion advances the baseline.
+
+    This never cancels the approval request itself — under idempotent-approval
+    semantics the pending request absorbs new content; if superseding leaves
+    the request with zero live rows (content removed entirely), the monitor's
+    orphan-recovery guard cancels it on a later scan with no replacement.
+
+    Returns the number of rows superseded.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = 'failed',
+               error_message = ? || 'superseded by newer modification',
+               processed_at = ?
+           WHERE file_path = ? AND status = 'processing'
+             AND error_message LIKE ? || '%'""",
+        (APPROVAL_INVALIDATED_PREFIX, processed_at, file_path,
+         AWAITING_APPROVAL_PREFIX),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def claim_for_dispatch(
     db: aiosqlite.Connection, id: str, *, reqid: str,
 ) -> bool:
