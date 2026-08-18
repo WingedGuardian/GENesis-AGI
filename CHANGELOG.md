@@ -42,6 +42,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Contribution secret-scanning now actually blocks leaked secrets.** The sanitizer
+  that checks community-contribution diffs before opening a public PR ran two secret
+  scanners — detect-secrets (the required floor) and gitleaks — but both were silently
+  finding nothing: detect-secrets' output parser missed every hit because it didn't
+  account for the confidence/entropy suffix in the tool's output, and gitleaks was
+  invoked with a flag combination that made it scan nothing from its input. A diff
+  containing an API token or private key could pass the sanitizer clean. Both scanners
+  now work (gitleaks also loads the repo's custom PII rules), and new tests exercise the
+  real scanner binaries so this can't silently regress. The privacy scanners for IP
+  addresses, emails, and install fingerprints were unaffected.
+
 - **No more false "critical failure" alarms when the system is briefly busy.** The
   health signal that watches your local infrastructure (database, vector store, and
   Ollama if enabled) probes those services with a short timeout. When background work

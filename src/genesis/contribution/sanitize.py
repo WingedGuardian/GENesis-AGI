@@ -521,8 +521,10 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
                 )
             )
             continue
-        # --string prints lines like "<plugin>: True" for positives and
-        # "<plugin>: False" for negatives. Parse for any True.
+        # --string prints lines like "<plugin> : True  (unverified)" /
+        # "<plugin> : True  (4.872)" for positives and "<plugin> : False" for
+        # negatives. The verdict carries a status/entropy SUFFIX, so match with
+        # startswith("true") — an exact `== "true"` silently missed EVERY finding.
         if proc.returncode != 0:
             # Same fail-closed rationale: a nonzero exit means the line was not
             # reliably scanned.
@@ -542,7 +544,7 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
             if ":" not in out_line:
                 continue
             key, _, val = out_line.partition(":")
-            if val.strip().lower() == "true":
+            if val.strip().lower().startswith("true"):
                 hits.append(
                     Finding(
                         kind=FindingKind.SECRET,
@@ -561,19 +563,43 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
 def _run_gitleaks(diff_text: str) -> tuple[bool, list[Finding]]:
     """Optional second-layer scan with gitleaks if installed.
 
-    Runs `gitleaks detect --no-git --pipe` with the diff on stdin
-    (via a temp path, since gitleaks needs a file). Returns
-    (scanner_ran, findings).
+    Runs `gitleaks detect --pipe` with the diff on stdin, loading the repo's
+    `.gitleaks.toml` via `-c` (it extends the default rules — useDefault=true —
+    with the genesis PII rules). Returns (scanner_ran, findings).
+
+    NOTE: `--no-git` must NOT be combined with `--pipe`. That combination makes
+    gitleaks scan nothing from stdin — it silently returned zero findings (even
+    the default rules never fired). `--no-git` only makes sense with `--source`
+    (a directory scan, as CI uses).
+
+    NOTE: the `.gitleaks.toml` `[allowlist] paths` (tests/, sanitize.py, …) does
+    NOT apply here — in `--pipe` mode gitleaks never populates a finding's `File`
+    field, so path-based allowlisting is structurally inert. A contributor cannot
+    hide a secret behind an allowlisted-looking diff path on this scan. (The
+    allowlist only affects CI's separate `--source .` directory scan.)
     """
     gitleaks = shutil.which("gitleaks") or shutil.which("betterleaks")
     if gitleaks is None:
         return False, []
 
-    # gitleaks --pipe reads stdin since 8.x. Use that when available.
+    # gitleaks --pipe reads stdin since 8.x (NOT with --no-git — see docstring).
+    cmd = [gitleaks, "detect", "--pipe", "--report-format", "json",
+           "--report-path", "/dev/stdout"]
+    # Load the repo's .gitleaks.toml so the genesis PII rules fire; skip
+    # gracefully if absent (default rules still apply; a fresh clone ships it).
+    # SECURITY: resolve via the trusted server-side genesis.env.repo_root()
+    # (GENESIS_REPO_ROOT-aware) — deliberately NOT scan_diff()'s caller-supplied
+    # repo_root, which for a contribution could be an untrusted checkout whose
+    # own .gitleaks.toml disables every rule. Do not "simplify" this to thread
+    # the caller's path through.
+    from genesis.env import repo_root
+
+    config = repo_root() / ".gitleaks.toml"
+    if config.is_file():
+        cmd += ["-c", str(config)]
     try:
         proc = subprocess.run(
-            [gitleaks, "detect", "--no-git", "--pipe", "--report-format", "json",
-             "--report-path", "/dev/stdout"],
+            cmd,
             input=diff_text,
             capture_output=True,
             text=True,
