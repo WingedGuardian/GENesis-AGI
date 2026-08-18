@@ -551,3 +551,38 @@ def test_routing_config_reload_endpoint(client):
     load_config.assert_called_once()
     mock_router.reload_config.assert_called_once_with(fake_config)
     mock_router.scan_dlq_orphans_after_reload.assert_awaited_once()
+
+
+def test_settings_put_gate_disable_requires_confirmation(client, tmp_path):
+    """Dashboard PUT disabling the mandatory approval gate without the
+    confirm flag must 409 and write NOTHING; with the flag it applies
+    (2026-08-18: an unconfirmed PUT used to flip it silently)."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+        patch(
+            "genesis.dashboard.routes.settings._notify_gate_disabled",
+            new=AsyncMock(),
+        ) as notify,
+    ):
+        resp = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={"manual_approval_required": False},
+        )
+        assert resp.status_code == 409
+        assert "confirm_disable_approval_gate" in resp.get_json()["details"]
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()
+        notify.assert_not_awaited()
+
+        resp2 = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": True,
+            },
+        )
+        assert resp2.status_code == 200
+        written = (tmp_path / "autonomous_cli_policy.local.yaml").read_text()
+        assert "manual_approval_required: false" in written
+        assert written.startswith("# set-by: user via dashboard PUT")
+        notify.assert_awaited_once()

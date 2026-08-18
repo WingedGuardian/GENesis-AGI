@@ -555,26 +555,101 @@ def _load_yaml_merged(filename: str) -> dict:
 _USER_CONFIG_DIR = Path.home() / ".genesis" / "config"
 
 
-def _atomic_yaml_write(filename: str, data: dict) -> Path:
+# Provenance header lines preserved across rewrites (newest last, capped so
+# the header can't grow unboundedly on a frequently-edited domain).
+_PROVENANCE_HISTORY_MAX = 5
+
+
+def _atomic_yaml_write(
+    filename: str,
+    data: dict,
+    *,
+    provenance: str | None = None,
+) -> Path:
     """Write YAML atomically to user config dir (~/.genesis/config/).
 
     Runtime config writes go to the user directory, not the repo tree,
     so git status stays clean and user settings don't leak into PRs.
+
+    ``provenance`` stamps a ``# set-by: <actor> @ <utc>`` header comment and
+    PRESERVES prior stamps (last ``_PROVENANCE_HISTORY_MAX``). This is the
+    durable answer to "is this user-set config an anomaly?": any future
+    session reading the overlay sees who set it and when, so a deliberate
+    user choice (e.g. disabling the approval gate from the dashboard) is
+    never mistaken for drift and "fixed" back. yaml.safe_load ignores the
+    comments, so readers are unaffected.
     """
+    from datetime import UTC, datetime
+
     _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     path = _USER_CONFIG_DIR / filename
+
+    header_lines: list[str] = []
+    if provenance:
+        # Preserve the ENTIRE leading comment block — hand-written operator
+        # rationale ('# provenance: …' etc.) is exactly the record this
+        # feature exists to protect; only the machine-stamped '# set-by:'
+        # history is capped.
+        set_by: list[str] = []
+        other_comments: list[str] = []
+        try:
+            for line in path.read_text().splitlines():
+                if line.startswith("# set-by: "):
+                    set_by.append(line)
+                elif line.startswith("#"):
+                    other_comments.append(line)
+                elif line.strip():
+                    break
+        except OSError:
+            pass
+        set_by.append(
+            f"# set-by: {provenance} @ {datetime.now(UTC).isoformat()}",
+        )
+        header_lines = other_comments + set_by[-_PROVENANCE_HISTORY_MAX:]
+
     tmp_fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         suffix=".yaml.tmp",
     )
     try:
         with open(tmp_fd, "w") as f:
+            if header_lines:
+                f.write("\n".join(header_lines) + "\n")
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
         Path(tmp_path).replace(path)
     except Exception:
         Path(tmp_path).unlink(missing_ok=True)
         raise
     return path
+
+
+def gate_disable_error(
+    domain: str,
+    changes: dict,
+    *,
+    confirmed: bool,
+) -> str | None:
+    """Error message when disabling the mandatory approval gate unconfirmed.
+
+    ``manual_approval_required: false`` turns off the approval gate for ALL
+    autonomous CC sessions — a single unconfirmed API call must not do that
+    silently (2026-08-18: a dashboard PUT flipped it with zero friction and
+    zero notification). The user remains sovereign: with explicit
+    confirmation the write proceeds (and the caller sends a Telegram notice).
+    """
+    if domain != "autonomous_cli_policy":
+        return None
+    if changes.get("manual_approval_required") is not False:
+        return None
+    if confirmed:
+        return None
+    return (
+        "Disabling manual_approval_required turns OFF the mandatory approval "
+        "gate for ALL autonomous Claude Code sessions. If this is deliberate, "
+        "repeat the request with confirm_disable_approval_gate=true — the "
+        "change is then applied, provenance-stamped, and announced via "
+        "Telegram."
+    )
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -1666,6 +1741,8 @@ async def _impl_settings_update(
     domain: str,
     changes: dict,
     dry_run: bool = False,
+    confirm_disable_approval_gate: bool = False,
+    actor: str = "user via mcp settings_update",
 ) -> dict:
     entry = _DOMAIN_REGISTRY.get(domain)
     if entry is None:
@@ -1699,6 +1776,16 @@ async def _impl_settings_update(
                 "validation_errors": errors,
             }
 
+    # Protected key: disabling the mandatory approval gate needs explicit
+    # confirmation (see gate_disable_error).
+    gate_err = gate_disable_error(
+        domain,
+        changes,
+        confirmed=confirm_disable_approval_gate,
+    )
+    if gate_err:
+        return {"domain": domain, "error": gate_err}
+
     # Merge changes into the local overlay (NOT the base file).
     # The base file stays git-tracked and clean for upstream updates.
     local = _load_yaml_local(entry.config_filename)
@@ -1715,10 +1802,11 @@ async def _impl_settings_update(
             "needs_restart": entry.needs_restart,
         }
 
-    # Atomic write to .local.yaml
+    # Atomic write to .local.yaml (provenance-stamped: user-set config must
+    # never read as an anomaly to a future session).
     local_file = _local_filename(entry.config_filename)
     try:
-        _atomic_yaml_write(local_file, new_local)
+        _atomic_yaml_write(local_file, new_local, provenance=actor)
     except Exception:
         logger.error(
             "Failed to write local settings for %s",
@@ -1736,6 +1824,55 @@ async def _impl_settings_update(
     }
     if entry.needs_restart:
         result["note"] = "Changes saved. Restart genesis-server for them to take effect."
+    if domain == "autonomous_cli_policy" and changes.get("manual_approval_required") is False:
+        result["warning"] = (
+            "The mandatory approval gate is now DISABLED: autonomous Claude "
+            "Code sessions dispatch without per-run approval until "
+            "manual_approval_required is set back to true."
+        )
+        logger.warning(
+            "manual_approval_required disabled via %s (confirmed)",
+            actor,
+        )
+        # Owner-facing loudness from the MCP process (no live outreach
+        # pipeline here): a critical observation — the server's
+        # critical-observations job pages it to Telegram. Best-effort; the
+        # provenance stamp + warning above remain the durable record.
+        try:
+            import hashlib as _hashlib
+            import uuid as _uuid
+            from datetime import UTC as _UTC
+            from datetime import datetime as _datetime
+
+            from genesis.db.connection import get_raw_db
+            from genesis.db.crud import observations as _observations
+            from genesis.env import genesis_db_path
+
+            async with get_raw_db(genesis_db_path()) as db:
+                await _observations.create(
+                    db,
+                    id=str(_uuid.uuid4()),
+                    source="settings_guard",
+                    type="infrastructure_alert",
+                    content=(
+                        f"Approval gate DISABLED via {actor} (confirmed): "
+                        "manual_approval_required is now false — autonomous "
+                        "Claude Code sessions dispatch WITHOUT per-run "
+                        "approval until it is set back to true "
+                        "(Settings → autonomous_cli_policy)."
+                    ),
+                    priority="critical",
+                    created_at=_datetime.now(_UTC).isoformat(),
+                    content_hash=_hashlib.sha256(
+                        b"approval_gate_disabled_alert",
+                    ).hexdigest(),
+                    skip_if_duplicate=True,
+                )
+        except Exception:
+            logger.warning(
+                "Gate-disable critical observation write failed",
+                exc_info=True,
+            )
 
     return result
 
@@ -1770,6 +1907,7 @@ async def settings_update(
     domain: str,
     changes: dict,
     dry_run: bool = False,
+    confirm_disable_approval_gate: bool = False,
 ) -> dict:
     """Update configuration for a settings domain.
 
@@ -1777,6 +1915,15 @@ async def settings_update(
     keys change, existing keys are preserved). Set dry_run=True to
     validate without saving. Read-only domains are rejected.
 
+    Disabling autonomous_cli_policy.manual_approval_required (the mandatory
+    approval gate) additionally requires confirm_disable_approval_gate=True —
+    the change is then provenance-stamped and loudly warned in the result.
+
     Example: settings_update("tts", {"elevenlabs": {"stability": 0.9}})
     """
-    return await _impl_settings_update(domain, changes, dry_run=dry_run)
+    return await _impl_settings_update(
+        domain,
+        changes,
+        dry_run=dry_run,
+        confirm_disable_approval_gate=confirm_disable_approval_gate,
+    )

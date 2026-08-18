@@ -91,6 +91,90 @@ async def _try_tinyfish_fetch(url: str, max_chars: int) -> dict | None:
     return None
 
 
+async def _try_firecrawl_fetch(url: str, max_chars: int) -> dict | None:
+    """Attempt a Firecrawl scrape (PAID). Returns result dict or None."""
+    import os
+    import time as _time
+
+    if not os.environ.get("FIRECRAWL_API_KEY"):
+        return None
+    start = _time.monotonic()
+    try:
+        from genesis.providers import firecrawl_client
+
+        data = await firecrawl_client.scrape(url)
+        markdown = str(data.get("markdown") or "")
+        if not markdown:
+            logger.debug("Firecrawl returned no markdown for %s", url)
+            return None
+        meta = data.get("metadata") or {}
+        return {
+            "url": str(meta.get("sourceURL") or url),
+            "title": str(meta.get("title") or ""),
+            "content": markdown[:max_chars],
+            "backend_used": "firecrawl",
+            "status_code": int(meta.get("statusCode") or 200),
+            "truncated": len(markdown) > max_chars,
+            "error": None,
+            "latency_ms": round((_time.monotonic() - start) * 1000, 1),
+        }
+    except Exception as exc:
+        import httpx as _httpx
+
+        if isinstance(exc, _httpx.HTTPStatusError):
+            # Paid backend: differentiate the operationally-important codes
+            # (401 bad key, 402/429 credits/limits) from transient errors.
+            logger.warning(
+                "Firecrawl fetch HTTP %s for %s",
+                exc.response.status_code,
+                url,
+            )
+        else:
+            logger.debug("Firecrawl fetch failed for %s: %s", url, exc)
+    return None
+
+
+async def _try_firecrawl_search(query: str, max_results: int) -> dict | None:
+    """Attempt a Firecrawl search (PAID). Returns result dict or None."""
+    import os
+
+    if not os.environ.get("FIRECRAWL_API_KEY"):
+        return None
+    try:
+        from genesis.providers import firecrawl_client
+
+        raw = await firecrawl_client.search(query, limit=max_results)
+        results = [
+            {
+                "title": str(r.get("title") or ""),
+                "url": str(r.get("url") or ""),
+                "snippet": str(r.get("description") or r.get("snippet") or ""),
+                "score": max(0.0, 1.0 - idx * 0.1),
+            }
+            for idx, r in enumerate(raw[:max_results])
+        ]
+        return {
+            "query": query,
+            "results": results,
+            "backend_used": "firecrawl",
+            "fallback_used": False,
+            "answer": None,
+            "error": None,
+        }
+    except Exception as exc:
+        import httpx as _httpx
+
+        if isinstance(exc, _httpx.HTTPStatusError):
+            logger.warning(
+                "Firecrawl search HTTP %s for %r",
+                exc.response.status_code,
+                query,
+            )
+        else:
+            logger.debug("Firecrawl search failed for %r: %s", query, exc)
+    return None
+
+
 async def _try_tinyfish_search(query: str, max_results: int) -> dict | None:
     """Attempt TinyFish search. Returns result dict or None on failure."""
     import os
@@ -267,8 +351,21 @@ async def _impl_web_fetch(
             "latency_ms": round(latency, 1),
         }
 
+    elif backend == "firecrawl":
+        # PAID escalation (burns account credits) — deliberately NOT in the
+        # auto chain. Use when the free chain dead-ends on hard anti-bot /
+        # JS / paywalled pages. Explicit-only, like tavily/exa on web_search.
+        fc_result = await _try_firecrawl_fetch(url, max_chars)
+        if fc_result:
+            return fc_result
+        return {
+            "url": url,
+            "error": "Firecrawl fetch failed or unavailable (FIRECRAWL_API_KEY set?)",
+            "backend_used": "firecrawl",
+        }
+
     else:
-        return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, ladder, scrapling, crawl4ai, httpx"}
+        return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, ladder, scrapling, crawl4ai, httpx, firecrawl (paid escalation)"}
 
 
 async def _impl_web_fetch_multi(
@@ -381,6 +478,20 @@ async def _impl_web_search(
             return tf_result
         return {"query": query, "error": "TinyFish search failed or unavailable", "backend_used": "tinyfish"}
 
+    elif backend == "firecrawl":
+        # PAID escalation (burns account credits) — explicit-only, like
+        # tavily/exa; full-page-quality results for hard-to-search targets.
+        fc_result = await _try_firecrawl_search(query, max_results)
+        if fc_result:
+            latency = (time.monotonic() - start) * 1000
+            fc_result["latency_ms"] = round(latency, 1)
+            return fc_result
+        return {
+            "query": query,
+            "error": "Firecrawl search failed or unavailable (FIRECRAWL_API_KEY set?)",
+            "backend_used": "firecrawl",
+        }
+
     elif backend == "tavily":
         try:
             from genesis.providers.tavily_adapter import TavilyAdapter
@@ -468,7 +579,7 @@ async def _impl_web_search(
             return {"query": query, "error": f"Perplexity unavailable: {exc}", "backend_used": "perplexity"}
 
     else:
-        return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, searxng, brave, tavily, exa, perplexity"}
+        return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, searxng, brave, tavily, exa, perplexity, firecrawl (paid escalation)"}
 
 
 @mcp.tool()
@@ -518,12 +629,13 @@ async def web_search(
     """Search the web and return structured results.
 
     Smart fallback chain: TinyFish (fast, free) → SearXNG (self-hosted) → Brave.
-    Paid backends (tavily, exa, perplexity) available via explicit backend param.
+    Paid backends (tavily, exa, perplexity, firecrawl) via explicit backend param.
 
     Args:
         query: Search query string. Supports site: filters with SearXNG.
         backend: "auto" (TinyFish→SearXNG→Brave), "tinyfish", "searxng",
-                 "brave", "tavily", "exa", or "perplexity".
+                 "brave", "tavily", "exa", "perplexity", or "firecrawl"
+                 (paid escalation — burns Firecrawl credits).
         max_results: Maximum results (default 10, max 20).
 
     Returns dict with: query, results (list of title/url/snippet/score),

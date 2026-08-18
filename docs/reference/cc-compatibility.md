@@ -207,6 +207,14 @@ When a new CC version is released, run through this:
    `src/genesis/recon/cc_update_analyzer.py` for the full lens definitions.)
 3. **Flag/API changes:** Are any CLI flags we use modified or deprecated?
 4. **New capabilities:** Does this unlock something we're working around?
+   **Detection → behavior:** for each new skill/command/flag Genesis would
+   plausibly WANT (overlaps an existing workflow, replaces a hand-rolled
+   mechanism, covers a known gap), do not stop at the informational KB note —
+   create a `follow_up_create` row (`work_state="ready"`, low priority) naming
+   the SPECIFIC instruction change that would make Genesis actually reach for
+   it (which skill/CLAUDE.md line to edit, and any precedence decision vs
+   existing skills). A detected-but-unwired capability is never used.
+   (Origin: the 2026-08 `/design` research-preview announcement.)
 5. **Obsolescence check:** Does this make something we built unnecessary?
 6. **Interactive UX check:** Does this change the foreground session experience?
    Rendering, scrollback, terminal behavior, keyboard shortcuts?

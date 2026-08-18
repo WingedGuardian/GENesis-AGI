@@ -550,3 +550,91 @@ class TestAutonomousCliPolicyValidator:
             {"reask_overrides": {"inbox_evaluation": 0.5}},
         )
         assert _validate_autonomous_cli_policy({"reask_overrides": {"x": False}})
+
+
+class TestSettingsProvenanceAndGateFlip:
+    """2026-08-18 user directive: user-set config must never read as an
+    anomaly to future sessions (durable provenance stamped by the WRITER),
+    and disabling the mandatory approval gate needs explicit confirmation."""
+
+    def test_atomic_write_stamps_and_preserves_provenance(self, tmp_path, monkeypatch):
+        import genesis.mcp.health.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        p1 = settings_mod._atomic_yaml_write(
+            "prov_test.yaml", {"a": 1}, provenance="user via dashboard PUT",
+        )
+        text1 = p1.read_text()
+        assert text1.startswith("# set-by: user via dashboard PUT @ ")
+        assert yaml.safe_load(text1) == {"a": 1}
+
+        # A second write by a different actor PRESERVES the first stamp.
+        p2 = settings_mod._atomic_yaml_write(
+            "prov_test.yaml", {"a": 2}, provenance="user via mcp settings_update",
+        )
+        text2 = p2.read_text()
+        assert "user via dashboard PUT" in text2
+        assert "user via mcp settings_update" in text2
+        assert yaml.safe_load(text2) == {"a": 2}
+
+    @pytest.mark.asyncio
+    async def test_gate_disable_requires_confirmation(self, tmp_path, monkeypatch):
+        import genesis.mcp.health.settings as settings_mod
+        from genesis.mcp.health.settings import _impl_settings_update
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        result = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": False},
+        )
+        assert "error" in result
+        assert "confirm_disable_approval_gate" in result["error"]
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()
+
+        confirmed = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": False},
+            confirm_disable_approval_gate=True,
+        )
+        assert confirmed.get("status") == "applied"
+        assert "warning" in confirmed
+        written = (tmp_path / "autonomous_cli_policy.local.yaml").read_text()
+        assert "manual_approval_required: false" in written
+        assert written.startswith("# set-by:")
+
+    @pytest.mark.asyncio
+    async def test_gate_enable_needs_no_confirmation(self, tmp_path, monkeypatch):
+        import genesis.mcp.health.settings as settings_mod
+        from genesis.mcp.health.settings import _impl_settings_update
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        result = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": True},
+        )
+        assert result.get("status") == "applied"
+
+    def test_hand_written_comments_survive_restamp(self, tmp_path, monkeypatch):
+        """Audit lock: the WHOLE leading comment block survives a rewrite —
+        hand-written operator rationale is exactly the record provenance
+        stamping exists to protect; only machine set-by lines are capped."""
+        import genesis.mcp.health.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        (tmp_path / "prov_mixed.yaml").write_text(
+            "# set-by: user (dashboard PUT) @ 2026-08-18T13:44\n"
+            "# provenance: deliberate sovereign choice — do NOT revert\n"
+            "#   future sessions: this is user-intentional\n"
+            "manual_approval_required: false\n",
+        )
+        p = settings_mod._atomic_yaml_write(
+            "prov_mixed.yaml",
+            {"manual_approval_required": False, "reask_interval_hours": 24},
+            provenance="user via mcp settings_update",
+        )
+        text = p.read_text()
+        assert "# provenance: deliberate sovereign choice" in text
+        assert "future sessions: this is user-intentional" in text
+        assert "# set-by: user (dashboard PUT) @ 2026-08-18T13:44" in text
+        assert "user via mcp settings_update" in text
+        assert yaml.safe_load(text) == {
+            "manual_approval_required": False,
+            "reask_interval_hours": 24,
+        }
