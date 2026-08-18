@@ -12,9 +12,10 @@ Why a NEW module rather than more helper tests: the decision *helpers*
 (``_check_mergeable``, ``_check_codex_reviewed_head``, ``_check_pr_review_findings``
 , ...) are already unit-locked in ``test_merge_review_gate.py`` /
 ``test_git_push_guard_codex_freshness.py``. What is NOT locked anywhere is
-``main()``'s **aggregation** — the gate ORDERING (freshness before findings) and
-the ``UNKNOWN -> BLOCK`` boundary at each gate — which is exactly what the
-extraction restructures.
+``main()``'s **aggregation** — the gate ORDERING (freshness before findings), the
+``UNKNOWN -> BLOCK`` boundary at each gate, and the INDEPENDENCE of the override
+sigils (``# ci-override`` / ``# stale-review-override`` / ``# review-override`` must
+each waive only their own gate) — which is exactly what the extraction restructures.
 
 Network-free by construction. Two injection mechanisms are combined, mirroring the
 real code's (fragmented) fetch surface — itself the motivation for the extraction:
@@ -61,9 +62,24 @@ def _reset_merge_deadline():
 # ── injection helpers ────────────────────────────────────────────────
 
 
-def _reviews_jsonl(*commit_ids: str, login: str = "chatgpt-codex-connector[bot]") -> str:
-    """gh .../reviews --jq '{login, commit_id}' shape — one JSON object per line."""
-    return "\n".join(json.dumps({"login": login, "commit_id": c}) for c in commit_ids)
+def _reviews_jsonl(
+    *commit_ids: str,
+    login: str = "chatgpt-codex-connector[bot]",
+    state: str | None = None,
+) -> str:
+    """gh .../reviews --jq '{login, commit_id, state}' shape — one JSON object per line.
+
+    ``state`` mirrors the production injection contract (``_codex_reviews``: "missing
+    ``state`` = active"); omit it (the default) and no ``state`` key is emitted, keeping
+    every pre-existing case byte-identical. Pass ``"DISMISSED"`` to exercise the freshness
+    gate's dismissed-review exclusion (a dismissed review vouches for no commit)."""
+    rows = []
+    for c in commit_ids:
+        obj = {"login": login, "commit_id": c}
+        if state is not None:
+            obj["state"] = state
+        rows.append(json.dumps(obj))
+    return "\n".join(rows)
 
 
 def _ci(conclusion: str = "SUCCESS") -> str:
@@ -416,8 +432,12 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "unresolved review findings",
     ),
-    # (Codex-P2) CI is the ONE gate deliberately fail-OPEN on unknown — empty/malformed
-    # CI reads must ALLOW, so the unified UNKNOWN->BLOCK aggregation can't regress them.
+    # (Codex-P2) CI-unknown is a deliberately fail-OPEN gate — empty/malformed CI reads
+    # must ALLOW, so the unified UNKNOWN->BLOCK aggregation can't regress them. NOTE: CI
+    # is not the ONLY fail-open path — the review-body and inline finding SCANS also fail
+    # open on an unreadable read (git_push_guard.py _scan_unreadable, non-strict). That
+    # scanner-unreadable path is a distinct axis carried to Slice 3 (PrFacts decision
+    # level, follow-up 086bd8e3), not exercised here.
     (
         "ci_empty_unknown_fails_open_allows",
         lambda mp: _run(mp, _merge_cmd(), ci=""),
@@ -463,6 +483,80 @@ _CASES: list[tuple[str, object, int, str]] = [
         lambda mp: _run(mp, "gh pr merge --repo owner/repo --squash --admin"),
         2,
         "cannot resolve which PR",
+    ),
+    # ── Codex #1399 round-2 batch (2026-08-18): complete the sigil-independence
+    #    matrix + the dismissed-review freshness state. Each locks CURRENT behaviour;
+    #    the one-line source mutation that flips it is noted per case (verify-RED). ──
+    #
+    # (Codex-P1 3788128906) stale-override × INLINE P1: the INLINE half of
+    # `stale_override_does_NOT_waive_findings_blocks` (which uses the review-BODY scan).
+    # The two scanners are wired independently, so a refactor could route stale_override
+    # into only ONE of them. `# stale-review-override` waives freshness+base (verified_head
+    # → None, binding skipped), the review-body scan is clean, but the inline P1 still
+    # BLOCKS. verify-RED: pass `force=stale_override` at the inline call site → allows.
+    (
+        "stale_override_does_NOT_waive_inline_findings_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(match=None, trailer="# stale-review-override"),
+            reviews="",
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        2,
+        "INLINE review findings",
+    ),
+    # (Codex-P1 3788128908) `# ci-override` is scoped to the CI gate ALONE — it must not
+    # act as a global force. The existing `ci_red_with_ci_override_continues` case has
+    # every downstream gate green, so it can't tell "CI-scoped" from "global force". These
+    # three bound the consequential downstream gates: with red CI + `# ci-override`, an
+    # inline P1 / a review-body P1 / a missing review must EACH still block. (base-mismatch
+    # and stale-review combos are document-accepted siblings → Slice 3.) verify-RED for the
+    # two findings cases: `force_override = merge_seg.override or ci_override` → they allow.
+    (
+        "ci_override_does_NOT_waive_inline_findings_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override"),
+            ci=_ci("FAILURE"),
+            router=_router(inline_lines=_INLINE_P1_LINE),
+        ),
+        2,
+        "INLINE review findings",
+    ),
+    (
+        "ci_override_does_NOT_waive_review_body_findings_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override"),
+            ci=_ci("FAILURE"),
+            router=_router(review_array=_REVIEW_BODY_P1),
+        ),
+        2,
+        "unresolved review findings",
+    ),
+    (
+        # ci_override must not waive FRESHNESS either (freshness reads stale_override, not
+        # ci_override). verify-RED: `force=ci_override or stale_override` on the freshness
+        # check → this allows.
+        "ci_override_does_NOT_waive_freshness_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(trailer="# ci-override"),
+            ci=_ci("FAILURE"),
+            reviews="",
+        ),
+        2,
+        "has not reviewed the current head",
+    ),
+    # (Codex-P1 3788128914) a DISMISSED review AT the current head does NOT satisfy
+    # freshness — a dismissed review vouches for no commit (_codex_review_commit_ids skips
+    # DISMISSED, :1024). Distinct from the absent/stale cases: the sha MATCHES head, only
+    # the state disqualifies it. verify-RED: drop the `!= "DISMISSED"` filter → allows.
+    (
+        "dismissed_review_at_head_blocks",
+        lambda mp: _run(mp, _merge_cmd(), reviews=_reviews_jsonl(HEAD, state="DISMISSED")),
+        2,
+        "has not reviewed the current head",
     ),
 ]
 
