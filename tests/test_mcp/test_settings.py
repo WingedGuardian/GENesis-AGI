@@ -507,3 +507,46 @@ class TestValidateCcForegroundReaper:
 
         assert "cc_foreground_reaper" in _DOMAIN_REGISTRY
         assert "cc_foreground_reaper" in _DOMAIN_VALIDATORS
+
+
+class TestAutonomousCliPolicyValidator:
+    """reask 0 (= never re-ask) is legal; overrides map is validated."""
+
+    def test_reask_zero_accepted(self):
+        from genesis.mcp.health.settings import _validate_autonomous_cli_policy
+
+        assert _validate_autonomous_cli_policy({"reask_interval_hours": 0}) == []
+
+    def test_reask_negative_rejected(self):
+        from genesis.mcp.health.settings import _validate_autonomous_cli_policy
+
+        errs = _validate_autonomous_cli_policy({"reask_interval_hours": -1})
+        assert errs and "between 0" in errs[0]
+
+    def test_reask_overrides_valid_and_invalid(self):
+        from genesis.mcp.health.settings import _validate_autonomous_cli_policy
+
+        assert (
+            _validate_autonomous_cli_policy(
+                {"reask_overrides": {"inbox_evaluation": 0, "ego_cycle": 12}},
+            )
+            == []
+        )
+        errs = _validate_autonomous_cli_policy(
+            {"reask_overrides": {"inbox_evaluation": 999}},
+        )
+        assert errs and "inbox_evaluation" in errs[0]
+        errs2 = _validate_autonomous_cli_policy({"reask_overrides": "not-a-map"})
+        assert errs2 and "mapping" in errs2[0]
+
+    def test_fractional_and_bool_hours_rejected(self):
+        """int(0.9) would silently truncate to the 0 = never sentinel —
+        fractional and bool values must be rejected outright."""
+        from genesis.mcp.health.settings import _validate_autonomous_cli_policy
+
+        assert _validate_autonomous_cli_policy({"reask_interval_hours": 0.9})
+        assert _validate_autonomous_cli_policy({"reask_interval_hours": True})
+        assert _validate_autonomous_cli_policy(
+            {"reask_overrides": {"inbox_evaluation": 0.5}},
+        )
+        assert _validate_autonomous_cli_policy({"reask_overrides": {"x": False}})

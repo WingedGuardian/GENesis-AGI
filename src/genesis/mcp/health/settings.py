@@ -733,6 +733,7 @@ def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
         "autonomous_cli_fallback_enabled",
         "manual_approval_required",
         "reask_interval_hours",
+        "reask_overrides",
         "approval_channel",
         "shared_export_enabled",
     }
@@ -750,13 +751,40 @@ def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
         if key in changes and not isinstance(changes[key], bool):
             errors.append(f"{key} must be a boolean")
 
+    def _whole_hours(value: object) -> int | None:
+        """Strict whole-hours parse: bools and fractional values are invalid.
+
+        int(0.9) would silently truncate to the 0 = never-re-ask sentinel on
+        an approval-adjacent surface — reject instead of rounding.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
     if "reask_interval_hours" in changes:
-        try:
-            value = int(changes["reask_interval_hours"])
-            if value < 1 or value > 168:
-                errors.append("reask_interval_hours must be between 1 and 168")
-        except (TypeError, ValueError):
-            errors.append("reask_interval_hours must be an integer")
+        value = _whole_hours(changes["reask_interval_hours"])
+        if value is None:
+            errors.append("reask_interval_hours must be a whole number of hours")
+        elif value < 0 or value > 168:
+            errors.append(
+                "reask_interval_hours must be between 0 (never re-ask) and 168",
+            )
+
+    if "reask_overrides" in changes:
+        overrides = changes["reask_overrides"]
+        if not isinstance(overrides, dict):
+            errors.append("reask_overrides must be a mapping of policy_id -> hours")
+        else:
+            for pid, hours in overrides.items():
+                v = _whole_hours(hours)
+                if v is None:
+                    errors.append(
+                        f"reask_overrides.{pid} must be a whole number of hours",
+                    )
+                elif v < 0 or v > 168:
+                    errors.append(
+                        f"reask_overrides.{pid} must be between 0 (never) and 168",
+                    )
 
     if "approval_channel" in changes:
         channel = str(changes["approval_channel"] or "").strip().lower()
