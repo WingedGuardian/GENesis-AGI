@@ -16,8 +16,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
 import shutil
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -37,6 +39,73 @@ _CALL_SITE_PLAN = "27_pre_execution_assessment"
 _CALL_SITE_EXECUTOR_REVIEW = "17_executor_review"
 _CALL_SITE_ADVERSARIAL = "20_adversarial_counterargument"
 _MAX_RETRIES = 2
+
+# Hard timeout (seconds) for the ``codex exec`` adversarial-verify subprocess.
+# _verify_via_codex runs under the autonomy executor semaphore (engine.py calls
+# verify_deliverable while dispatcher.py holds _exec_semaphore — a Semaphore(1)),
+# so a hung codex — e.g. the known upstream model-catalog refresh hang — would
+# block ALL autonomy task execution indefinitely, with no external watchdog to
+# recover it. This bounds that: on timeout the codex process *tree* is killed and
+# this link degrades to None (same as codex-not-installed), so verification falls
+# through to the CC-invoker / API links. The 2h default matches deterministic.py's
+# _HARD_TIMEOUT_S (the justified-exception case in the timeout policy — a raw
+# subprocess holding the executor semaphore). NOTE the *kill* deliberately differs
+# from deterministic.py's direct ``proc.kill()``: codex is a Node launcher that
+# spawns children, so we tree-kill via killpg (see _kill_codex_process_tree).
+# Override via GENESIS_CODEX_REVIEW_TIMEOUT_S for quicker recovery once codex
+# reviews are observed to complete well under it.
+_DEFAULT_CODEX_EXEC_TIMEOUT_S = 7200.0
+
+
+def _read_codex_timeout_s() -> float:
+    """Resolve the codex-exec timeout from env, failing safe to the 2h default.
+
+    Parsed at import time, so a malformed or non-positive override must NOT
+    raise (that would crash the import of the autonomy executor that imports
+    this module) — fall back to the default with a warning instead.
+    """
+    raw = os.environ.get("GENESIS_CODEX_REVIEW_TIMEOUT_S")
+    if raw is None:
+        return _DEFAULT_CODEX_EXEC_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "review: bad GENESIS_CODEX_REVIEW_TIMEOUT_S=%r -- using %ss",
+            raw, _DEFAULT_CODEX_EXEC_TIMEOUT_S,
+        )
+        return _DEFAULT_CODEX_EXEC_TIMEOUT_S
+    if value <= 0:
+        logger.warning(
+            "review: non-positive GENESIS_CODEX_REVIEW_TIMEOUT_S=%r -- using %ss",
+            raw, _DEFAULT_CODEX_EXEC_TIMEOUT_S,
+        )
+        return _DEFAULT_CODEX_EXEC_TIMEOUT_S
+    return value
+
+
+_CODEX_EXEC_TIMEOUT_S = _read_codex_timeout_s()
+
+
+def _kill_codex_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the whole process group led by *proc*.
+
+    codex is a Node launcher that spawns child processes; killing only the
+    direct PID can orphan them. The process is spawned with
+    ``preexec_fn=os.setpgrp`` so it leads its own group, letting us kill the
+    tree via ``killpg`` without touching the Genesis server's own group. The
+    ``pgid <= 1`` guard refuses a group-wide kill that would signal every
+    process in the container. Falls back to killing just the direct child if
+    the group id is unavailable. Mirrors cc/invoker.py's timeout-kill pattern.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+        if pgid <= 1:
+            raise ValueError(f"Refusing killpg with pgid={pgid}")
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, ValueError, TypeError):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +474,9 @@ class TaskReviewer:
             # failed: Permission denied).  --full-auto also fails.
             # Verification is read-only in intent; the bypass only
             # affects the sandbox layer, not the prompt instructions.
+            # preexec_fn=os.setpgrp puts codex in its own process group so a
+            # timeout can kill the whole tree via killpg (see
+            # _kill_codex_process_tree) without touching the server's group.
             proc = await asyncio.create_subprocess_exec(
                 "codex", "exec", "-",
                 "-c", 'model_reasoning_effort="medium"',
@@ -414,11 +486,25 @@ class TaskReviewer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                preexec_fn=os.setpgrp,
             )
-            stdout_bytes, stderr_bytes = await proc.communicate(
-                input=prompt.encode("utf-8"),
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode("utf-8")),
+                timeout=_CODEX_EXEC_TIMEOUT_S,
             )
         except FileNotFoundError:
+            return None
+        except TimeoutError:
+            # Known upstream codex hang (model-catalog refresh). Kill the tree
+            # and degrade — leaving it would wedge the executor semaphore.
+            logger.warning(
+                "review: codex exec exceeded %ss -- killing process tree and "
+                "skipping codex link",
+                _CODEX_EXEC_TIMEOUT_S,
+            )
+            _kill_codex_process_tree(proc)
+            with contextlib.suppress(ProcessLookupError, OSError):
+                await proc.wait()
             return None
         except OSError:
             logger.warning("review: codex exec OS error", exc_info=True)

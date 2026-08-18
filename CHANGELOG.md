@@ -42,6 +42,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Autonomy no longer wedges when its cross-vendor reviewer hangs.** A task's
+  quality gate runs an adversarial verification through a `codex exec` subprocess.
+  That call had no timeout, so a hung codex (a known upstream model-catalog-refresh
+  hang) would hold the autonomy executor's shared execution slot indefinitely —
+  stalling every queued task until a restart. The call is now bounded by a hard
+  timeout (default 2h, override with `GENESIS_CODEX_REVIEW_TIMEOUT_S`); on timeout
+  the codex process tree is killed and verification degrades to the next reviewer in
+  the chain, freeing the executor. Mirrors the existing hard-timeout on deterministic
+  executor subprocesses.
+
 - **No more false "critical failure" alarms when the system is briefly busy.** The
   health signal that watches your local infrastructure (database, vector store, and
   Ollama if enabled) probes those services with a short timeout. When background work
