@@ -177,6 +177,15 @@ def is_blockable(origin_class: str | None) -> bool:
     return effective_origin_class(origin_class) == ORIGIN_EXTERNAL_UNTRUSTED
 
 
+#: The origins trusted to be AUTO-CONSUMED into privileged state (user model,
+#: autonomy dispatch). Single source of truth — used both by
+#: :func:`is_trusted_for_privileged_write` (per-row checks, e.g. the dispatcher)
+#: and as the ``origin_class_in`` SQL filter for privileged READ consumers (the
+#: user-model accept + narrative queries), so a barred row can never crowd a
+#: trusted row out of a LIMITed query window.
+TRUSTED_PRIVILEGED_WRITE_ORIGINS: tuple[str, ...] = (ORIGIN_OWNER, ORIGIN_FIRST_PARTY)
+
+
 def is_trusted_for_privileged_write(origin_class: str | None) -> bool:
     """True ONLY for owner/first_party origins — the gate for AUTO-CONSUMING an
     observation into PRIVILEGED state (the user model, an autonomy dispatch).
@@ -193,7 +202,7 @@ def is_trusted_for_privileged_write(origin_class: str | None) -> bool:
     inside the generic ``observations.query`` (which has many non-privileged
     readers that must stay origin-agnostic).
     """
-    return effective_origin_class(origin_class) in (ORIGIN_OWNER, ORIGIN_FIRST_PARTY)
+    return effective_origin_class(origin_class) in TRUSTED_PRIVILEGED_WRITE_ORIGINS
 
 
 def _overlay_path() -> Path:

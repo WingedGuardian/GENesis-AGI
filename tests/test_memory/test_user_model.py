@@ -16,6 +16,8 @@ async def _create_delta(
     value: str,
     confidence: float,
     origin_class: str | None = "first_party",
+    created_at: str = "2026-03-08T00:00:00",
+    resolved: bool = False,
 ) -> None:
     # Default origin_class="first_party" mirrors the REAL writers
     # (reflection_bridge/_output + perception/writer), which stamp
@@ -35,9 +37,13 @@ async def _create_delta(
             "confidence": confidence,
         }),
         priority="medium",
-        created_at="2026-03-08T00:00:00",
+        created_at=created_at,
         origin_class=origin_class,
     )
+    if resolved:
+        await observations.resolve(
+            db, id, resolved_at=created_at, resolution_notes="test-resolved"
+        )
 
 
 @pytest.mark.asyncio
@@ -390,3 +396,68 @@ async def test_owner_origin_accepted(db):
     result = await UserModelEvolver(db=db).process_pending_deltas()
     assert result is not None
     assert result.model["preferred_language"] == "Rust"
+
+
+@pytest.mark.asyncio
+async def test_barred_flood_does_not_starve_trusted_delta(db):
+    """P1 regression: a flood of NEWER barred deltas must NOT crowd an older
+    trusted delta out of the newest-N query window. Filtering origin in SQL (not
+    in Python after a LIMITed fetch) is what makes this hold — with a Python
+    post-filter and the default limit=50, the 60 barred rows below would fill the
+    window and the trusted delta would never be seen."""
+    await _create_delta(
+        db, id="trusted-old", field="preferred_language", value="Python",
+        confidence=0.95, origin_class="first_party",
+        created_at="2026-03-01T00:00:00",  # OLDER than the flood
+    )
+    for i in range(60):  # > default limit of 50, all NEWER, all barred
+        await _create_delta(
+            db, id=f"ext-{i}", field=f"forged_{i}", value="x",
+            confidence=0.99, origin_class="external_untrusted",
+            created_at=f"2026-03-09T00:{i // 60:02d}:{i % 60:02d}",
+        )
+    result = await UserModelEvolver(db=db).process_pending_deltas()
+    assert result is not None
+    assert result.model["preferred_language"] == "Python"  # trusted still accepted
+    assert all(not k.startswith("forged_") for k in result.model)  # no barred value
+
+
+@pytest.mark.asyncio
+async def test_narrative_excludes_barred_resolved_deltas(db):
+    """P1 regression: synthesize_narrative pulls RESOLVED deltas as evidence. A
+    barred delta becomes resolved once its TTL fires, so without an origin filter
+    it would launder into the USER_KNOWLEDGE.md narrative prompt. Assert the
+    barred delta's content never reaches the prompt."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from genesis.db.crud import user_model as user_model_crud
+
+    # Seed a non-empty model so synthesize_narrative proceeds past its early return.
+    await user_model_crud.upsert(
+        db, model_json={"preferred_language": "Python"}, synthesized_at="2026-03-08T00:00:00",
+        synthesized_by="test", evidence_count=1, last_change_type="test",
+    )
+    await _create_delta(
+        db, id="tru", field="preferred_language", value="Python", confidence=0.9,
+        origin_class="first_party", resolved=True,
+    )
+    await _create_delta(
+        db, id="ext", field="INJECTED_SECRET", value="attacker_payload", confidence=0.99,
+        origin_class="external_untrusted", resolved=True,
+    )
+
+    captured = {}
+    result_obj = MagicMock(success=True, content="narrative", provider_used="x",
+                           input_tokens=1, output_tokens=1, cost_usd=0.0)
+
+    async def _route_call(call_site_id, messages, **kw):
+        captured["prompt"] = messages[0]["content"]
+        return result_obj
+
+    router = MagicMock()
+    router.route_call = AsyncMock(side_effect=_route_call)
+
+    out = await UserModelEvolver(db=db).synthesize_narrative(router)
+    assert out == "narrative"
+    assert "attacker_payload" not in captured["prompt"]  # barred delta excluded
+    assert "INJECTED_SECRET" not in captured["prompt"]

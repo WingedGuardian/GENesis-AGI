@@ -364,26 +364,28 @@ class TaskDispatcher:
             obs_id = obs["id"]
             content = obs.get("content", "")
 
-            # WS-3 poisoning gate: never dispatch an autonomy task from an
+            # WS-3 poisoning gate: never DISPATCH an autonomy task from an
             # observation whose origin isn't trusted-for-privileged-write. A
             # task_detected forged via observation_write from an external-origin
-            # session must not spawn a background CC session. Currently inert —
-            # observations carries no `metadata` column, so plan_path below is
-            # always None and every row skips there anyway — so this gate has NO
-            # live effect today; it is defensive against a future `metadata`
-            # addition re-arming an ungated auto-dispatch surface.
-            # DEPENDENCY (tracked follow-up): the legit owner-initiated producers
+            # session must not spawn a background CC session. SKIP-ONLY (do NOT
+            # resolve): the pickup path is currently inert (no `metadata` column,
+            # so plan_path below is always None and every row skips there anyway),
+            # and — critically — the legit owner-initiated producers
             # (cc/conversation.py `task_detected` writes) do NOT yet stamp
-            # origin_class, so they would ALSO be barred here (fail-closed on
-            # NULL). Producer-side stamping MUST land before this pickup path is
-            # wired (metadata), or legitimate user-requested tasks are dropped.
+            # origin_class, so they arrive NULL and would be barred here too.
+            # Resolving a barred row would HIDE those legitimate rows from the
+            # dashboard/morning-report/L1 context within one cycle; skipping
+            # leaves every row's visibility untouched while still refusing
+            # dispatch. Producer-side stamping (so legit rows dispatch once the
+            # metadata path is wired) is tracked in the memory-provenance
+            # follow-up. Logged at debug — the dispatcher runs frequently.
             if not is_trusted_for_privileged_write(obs.get("origin_class")):
-                logger.warning(
-                    "task_detected %s BARRED from dispatch (origin_class=%r)",
+                logger.debug(
+                    "task_detected %s not dispatched (origin_class=%r not "
+                    "trusted-for-privileged-write)",
                     obs_id,
                     obs.get("origin_class"),
                 )
-                await self._resolve_observation(obs_id, "barred:untrusted_origin")
                 continue
 
             # Dedup: check if already dispatched or task exists

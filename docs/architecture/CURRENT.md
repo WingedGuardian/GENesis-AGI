@@ -244,13 +244,18 @@ verified: d71d1d39 2026-08-18
   `build_reflection_disallowed` minus `Bash`, keeping the reads it needs plus the optional
   `observation_write`. RESIDUALS on the inbox judge: (1) `Bash` — STILL retained for the
   `yt-dlp`/`curl` YouTube-fetch path (injection→RCE surface, open — follow-up 727a3724);
-  (2) the two PRIVILEGED-WRITE consumers of forged observations are now gated (the
+  (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
   memory-provenance work): `observation_write` stamps the session origin
-  (`session_origin_from_env`) so an eval-session write lands `external_untrusted`, and the
-  user-model consumer gate (`UserModelEvolver.process_pending_deltas` via
-  `immunity.is_trusted_for_privileged_write`) plus the autonomy-dispatcher `task_detected`
-  gate bar any untrusted-origin (fail-closed on NULL) delta/task from auto-accept (barred
-  deltas left unresolved for TTL, never discarded). **PARTIAL — the broader
+  (`session_origin_from_env`) so an eval-session write lands `external_untrusted`, and BOTH
+  user-model consumers — `process_pending_deltas` (accept) and `synthesize_narrative`
+  (evidence → USER_KNOWLEDGE.md) — read only trusted-origin deltas via the SQL
+  `origin_class_in=TRUSTED_PRIVILEGED_WRITE_ORIGINS` filter (filtering in-query, not
+  post-LIMIT, so a forged-delta flood can't starve trusted deltas out of the window, and a
+  TTL-resolved barred delta can't launder into the narrative). Fail-closed on NULL; barred
+  rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
+  pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
+  — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
+  stamping is in the follow-up). **PARTIAL — the broader
   observation-content-INJECTION surface is still OPEN** (tracked follow-up): the digest types
   the judge writes (`user_signal`/`architecture_insight`) are surfaced UNFILTERED into LLM
   context by consumers this change did NOT touch — `essential_knowledge._recent_decisions`

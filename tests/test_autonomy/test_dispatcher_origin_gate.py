@@ -46,44 +46,47 @@ async def _dispatcher_with_db():
 
 
 @pytest.mark.asyncio
-async def test_untrusted_task_detected_barred_and_resolved():
+async def test_untrusted_task_detected_not_dispatched_and_left_pending():
+    """SKIP-ONLY: an untrusted-origin task_detected is not dispatched, and — the
+    anti-regression property — is NOT resolved, so it stays visible in the
+    dashboard/L1 exactly as before this gate; only dispatch is refused. The gate
+    is a no-op today (inert pickup path), so the observable guarantee is
+    'nothing dispatched, nothing hidden'."""
     db, disp = await _dispatcher_with_db()
     try:
         await _seed(db, id="ext", origin_class="external_untrusted")
         await _seed(db, id="nul", origin_class=None)  # fail-closed
 
         n = await disp.dispatch_cycle()
-        assert n == 0  # nothing dispatched (inert)
+        assert n == 0  # nothing dispatched
 
         pending = {
             r["id"] for r in await observations.query(db, type="task_detected", resolved=False)
         }
-        assert "ext" not in pending  # barred → resolved
-        assert "nul" not in pending  # NULL fail-closed → barred → resolved
-
-        resolved = {
-            r["id"]: r for r in await observations.query(db, type="task_detected", resolved=True)
-        }
-        assert "barred:untrusted_origin" in (resolved["ext"].get("resolution_notes") or "")
-        assert "barred:untrusted_origin" in (resolved["nul"].get("resolution_notes") or "")
+        assert "ext" in pending  # skip-only: NOT resolved/hidden
+        assert "nul" in pending
+        # Nothing was resolved by the dispatcher — no visibility regression.
+        resolved = await observations.query(db, type="task_detected", resolved=True)
+        assert resolved == []
     finally:
         await db.close()
 
 
 @pytest.mark.asyncio
-async def test_trusted_task_detected_not_barred():
-    """A first_party task_detected is NOT barred by the gate — it proceeds to
-    the (inert) plan_path check and is skipped there, left pending. Proves the
-    gate discriminates on origin, not on everything."""
+async def test_trusted_task_detected_also_left_pending():
+    """A first_party task_detected is likewise not dispatched today (inert
+    plan_path) and stays pending — same observable outcome as the untrusted case
+    while the path is inert. Producer-side stamping + live dispatch behaviour are
+    tracked in the memory-provenance follow-up."""
     db, disp = await _dispatcher_with_db()
     try:
         await _seed(db, id="tru", origin_class="first_party")
         n = await disp.dispatch_cycle()
-        assert n == 0  # still inert (no plan_path)
+        assert n == 0
 
         pending = {
             r["id"] for r in await observations.query(db, type="task_detected", resolved=False)
         }
-        assert "tru" in pending  # skipped at plan_path, NOT barred → still pending
+        assert "tru" in pending
     finally:
         await db.close()
