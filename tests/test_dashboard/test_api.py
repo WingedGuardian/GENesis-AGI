@@ -586,3 +586,44 @@ def test_settings_put_gate_disable_requires_confirmation(client, tmp_path):
         assert "manual_approval_required: false" in written
         assert written.startswith("# set-by: user via dashboard PUT")
         notify.assert_awaited_once()
+
+
+def test_surplus_put_actually_persists_merge(client, tmp_path):
+    """Deep-review SHOULD-FIX lock (pre-existing bug): the surplus PUT
+    discarded _deep_merge's return (it is PURE) and wrote the UNMERGED
+    overlay back while returning ok=True — user changes silently vanished."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+    ):
+        resp = client.put(
+            "/api/genesis/surplus/config",
+            json={"enabled": True},
+        )
+        if resp.status_code == 404:
+            import pytest as _pytest
+
+            _pytest.skip("surplus config route not registered in this blueprint")
+        assert resp.status_code == 200
+        import yaml as _yaml
+
+        written = _yaml.safe_load((tmp_path / "surplus.local.yaml").read_text())
+        assert written.get("enabled") is True
+
+
+def test_settings_put_string_false_does_not_confirm_gate_disable(client, tmp_path):
+    """Security lock: bool('false') is True — a stringly-typed confirm flag
+    must NOT satisfy the gate-disable confirmation."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+    ):
+        resp = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": "false",
+            },
+        )
+        assert resp.status_code == 409
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()

@@ -584,28 +584,32 @@ def _atomic_yaml_write(
     _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     path = _USER_CONFIG_DIR / filename
 
-    header_lines: list[str] = []
+    # Preservation is UNCONDITIONAL — a caller that forgets `provenance` must
+    # never become a delete path for the hand-written operator rationale or
+    # prior stamps this feature exists to protect. Only the machine-stamped
+    # '# set-by:' history is capped; only the NEW stamp is conditional.
+    set_by: list[str] = []
+    other_comments: list[str] = []
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith("# set-by: "):
+                set_by.append(line)
+            elif line.startswith("#"):
+                other_comments.append(line)
+            elif line.strip():
+                break
+    except OSError:
+        pass
     if provenance:
-        # Preserve the ENTIRE leading comment block — hand-written operator
-        # rationale ('# provenance: …' etc.) is exactly the record this
-        # feature exists to protect; only the machine-stamped '# set-by:'
-        # history is capped.
-        set_by: list[str] = []
-        other_comments: list[str] = []
-        try:
-            for line in path.read_text().splitlines():
-                if line.startswith("# set-by: "):
-                    set_by.append(line)
-                elif line.startswith("#"):
-                    other_comments.append(line)
-                elif line.strip():
-                    break
-        except OSError:
-            pass
+        # Defense-in-depth: a newline in the actor string would write raw
+        # lines BELOW the comment prefix — top-level YAML injected above the
+        # real mapping in the same document. All current callers pass fixed
+        # strings; sanitize anyway so a future caller can't become a vector.
+        clean = provenance.replace("\r", " ").replace("\n", " ")
         set_by.append(
-            f"# set-by: {provenance} @ {datetime.now(UTC).isoformat()}",
+            f"# set-by: {clean} @ {datetime.now(UTC).isoformat()}",
         )
-        header_lines = other_comments + set_by[-_PROVENANCE_HISTORY_MAX:]
+    header_lines: list[str] = other_comments + set_by[-_PROVENANCE_HISTORY_MAX:]
 
     tmp_fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),

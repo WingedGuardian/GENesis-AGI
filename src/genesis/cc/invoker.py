@@ -738,6 +738,7 @@ class CCInvoker:
             and (
                 "CLAUDE_CODE_OAUTH_TOKEN" in inv.env_overrides
                 or "CLAUDE_CONFIG_DIR" in inv.env_overrides
+                or "ANTHROPIC_API_KEY" in inv.env_overrides
             )
         ):
             return env

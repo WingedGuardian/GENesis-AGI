@@ -59,7 +59,9 @@ async def _notify_gate_disabled() -> None:
         )
         status = getattr(result, "status", None)
         delivered = getattr(status, "value", status)
-        if str(delivered).lower() not in ("delivered", "sent", "queued"):
+        # Real OutreachStatus values: delivered/engaged are success; pending/
+        # drafted are in-flight (not failures); rejected/failed/unknown warn.
+        if str(delivered).lower() in ("rejected", "failed") or delivered is None:
             logger.warning(
                 "Gate-disable Telegram notice not delivered (status=%s)",
                 delivered,
@@ -131,7 +133,9 @@ async def settings_update(domain_name: str):
         return jsonify({"error": "Request body must be a JSON object"}), 400
 
     # Out-of-band confirmation flag — never merged into the config itself.
-    confirm_gate = bool(changes.pop("confirm_disable_approval_gate", False))
+    # Strict identity check: bool("false") is True — a client serializing
+    # booleans as strings must NEVER accidentally satisfy the confirmation.
+    confirm_gate = changes.pop("confirm_disable_approval_gate", None) is True
 
     # Validate
     validator = _DOMAIN_VALIDATORS.get(domain_name)

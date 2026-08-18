@@ -638,3 +638,61 @@ class TestSettingsProvenanceAndGateFlip:
             "manual_approval_required": False,
             "reask_interval_hours": 24,
         }
+
+    @pytest.mark.asyncio
+    async def test_gate_disable_falsy_nonbool_rejected_before_gate_check(
+        self, tmp_path, monkeypatch,
+    ):
+        """Deep-review NOTE lock: manual_approval_required=0 (falsy but not
+        False) must be rejected by the validator BEFORE it could slip past the
+        `is False` gate check and be bool()-coerced to a silent disable."""
+        import genesis.mcp.health.settings as settings_mod
+        from genesis.mcp.health.settings import (
+            _impl_settings_update,
+            _validate_autonomous_cli_policy,
+        )
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        assert _validate_autonomous_cli_policy({"manual_approval_required": 0})
+        assert _validate_autonomous_cli_policy({"manual_approval_required": None})
+        result = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": 0},
+        )
+        assert result.get("error") == "validation failed"
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()
+
+    def test_bare_write_preserves_existing_headers(self, tmp_path, monkeypatch):
+        """Deep-review SHOULD-FIX lock: a caller that passes NO provenance
+        (e.g. the dashboard surplus route pre-fix) must still preserve the
+        existing header block — no caller may be a delete path."""
+        import genesis.mcp.health.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        (tmp_path / "prov_bare.yaml").write_text(
+            "# set-by: user via dashboard PUT @ 2026-08-18T13:44\n"
+            "# provenance: hand-written rationale\n"
+            "a: 1\n",
+        )
+        p = settings_mod._atomic_yaml_write("prov_bare.yaml", {"a": 2})
+        text = p.read_text()
+        assert "# set-by: user via dashboard PUT @ 2026-08-18T13:44" in text
+        assert "# provenance: hand-written rationale" in text
+        assert yaml.safe_load(text) == {"a": 2}
+
+    def test_provenance_newlines_sanitized(self, tmp_path, monkeypatch):
+        """Security lock: a newline in the actor string must never escape the
+        comment prefix (raw top-level YAML above the real mapping = key
+        injection that bypasses the gate-disable confirmation)."""
+        import genesis.mcp.health.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        p = settings_mod._atomic_yaml_write(
+            "prov_inject.yaml", {"a": 1},
+            provenance="evil\nmanual_approval_required: false",
+        )
+        text = p.read_text()
+        loaded = yaml.safe_load(text)
+        assert loaded == {"a": 1}
+        assert "manual_approval_required" not in loaded
+        for line in text.splitlines():
+            assert not line.strip() or line.startswith("#") or line.startswith("a:")

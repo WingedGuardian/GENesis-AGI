@@ -419,7 +419,9 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
             # ticks indefinitely on that — past the bound, surface a real
             # failure so the next tick dispatches fresh work.
             created = _parse_iso(str(park_row["created_at"] or ""))
-            if created and (datetime.now(UTC) - created) > _PARK_WAIT_BOUND:
+            # Unparseable/missing created_at counts as OVER the bound — a
+            # corrupt row must not reopen the unbounded-wait trajectory.
+            if created is None or (datetime.now(UTC) - created) > _PARK_WAIT_BOUND:
                 return {
                     "success": False,
                     "output_text": (
