@@ -628,10 +628,11 @@ class WatchdogChecker:
         outreach pipeline; the dedupe_key collapses repeats to a single live
         entry per reason. Best-effort — never raises."""
         try:
+            from genesis.env import alert_queue_root
             from genesis.guardian.alert.queue import enqueue_alert
 
             enqueue_alert(
-                Path.home() / ".genesis" / "alerts" / "queue",
+                alert_queue_root(),
                 severity="warning",
                 source="watchdog",
                 title="Watchdog flap-damping repeated restarts",
@@ -721,10 +722,11 @@ class WatchdogChecker:
         (the oneshot watchdog has no outreach pipeline); the awareness tick drains
         it to the owner. Best-effort — never raises."""
         try:
+            from genesis.env import alert_queue_root
             from genesis.guardian.alert.queue import enqueue_alert
 
             enqueue_alert(
-                Path.home() / ".genesis" / "alerts" / "queue",
+                alert_queue_root(),
                 severity="warning",
                 source="watchdog",
                 title="Watchdog suppressed restart — server starved, not down",
