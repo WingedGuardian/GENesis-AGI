@@ -246,3 +246,80 @@ class TestRunSessionParkWiring:
             await runner._run_session(req, "sess-fail")
         runner._deliver_result_to_origin.assert_awaited_once()
         assert await parks.count_open(db) == 0
+
+
+# ── Park→resume round-trip preserves the FULL execution shape (2026-08-18) ──
+# The canonical set of DirectSessionRequest fields that must survive a park:
+# missing any one silently changes the resumed session's behavior (measured:
+# a campaign resume ran WITHOUT its strategy doc because system_prompt was
+# dropped at park time).
+_ROUNDTRIP_FIELDS = {
+    "prompt", "profile", "model", "effort", "timeout_s", "roster_model",
+    "system_prompt", "source_tag", "skills", "tool_exceptions",
+    "planning_instruction",
+}
+
+
+async def test_park_payload_preserves_full_request_shape(db):
+    import json as _json
+
+    req = DirectSessionRequest(
+        prompt="campaign tick prompt",
+        profile="campaign",
+        system_prompt="STRATEGY DOC TEXT",
+        source_tag="campaign",
+        skills=["genesis-voice"],
+        tool_exceptions=("WebFetch",),
+        planning_instruction="think first",
+        caller_context="campaign:c1",
+        notify=False,
+    )
+    exc = CCRateLimitError("limit", raw_text="resets in 30m")
+    pid = await rlp.park_direct_session(db, request=req, exc=exc, now=NOW, mode="live")
+    assert pid is not None
+    payload = _json.loads((await parks.get_by_id(db, pid))["payload_json"])
+    missing = _ROUNDTRIP_FIELDS - set(payload)
+    assert not missing, f"park payload dropped execution fields: {missing}"
+    assert payload["system_prompt"] == "STRATEGY DOC TEXT"
+    assert payload["source_tag"] == "campaign"
+    assert payload["skills"] == ["genesis-voice"]
+    assert list(payload["tool_exceptions"]) == ["WebFetch"]
+    assert payload["planning_instruction"] == "think first"
+
+
+async def test_resume_redispatch_and_consumer_preserve_execution_fields(db):
+    import json as _json
+
+    from genesis.cc import rate_limit_resume as rlr
+    from genesis.runtime.init.direct_session import request_from_payload
+
+    req = DirectSessionRequest(
+        prompt="campaign tick prompt",
+        profile="campaign",
+        system_prompt="STRATEGY DOC TEXT",
+        source_tag="campaign",
+        skills=["genesis-voice"],
+        tool_exceptions=("WebFetch",),
+        planning_instruction="think first",
+    )
+    exc = CCRateLimitError("limit", raw_text="resets in 30m")
+    pid = await rlp.park_direct_session(db, request=req, exc=exc, now=NOW, mode="live")
+    park = await parks.get_by_id(db, pid)
+
+    await rlr._redispatch(db, park)
+    row = await db.execute_fetchall(
+        "SELECT payload_json FROM direct_session_queue ORDER BY rowid DESC LIMIT 1",
+    )
+    qpayload = _json.loads(row[0][0])
+    missing = (_ROUNDTRIP_FIELDS - {"roster_model"}) - {
+        k for k, v in qpayload.items() if v is not None
+    }
+    assert not missing, f"queue payload dropped execution fields: {missing}"
+
+    rebuilt = request_from_payload(qpayload)
+    assert rebuilt.system_prompt == "STRATEGY DOC TEXT"
+    assert rebuilt.source_tag == "campaign"
+    assert rebuilt.skills == ["genesis-voice"]
+    assert tuple(rebuilt.tool_exceptions) == ("WebFetch",)
+    assert rebuilt.planning_instruction == "think first"
+    assert rebuilt.profile == "campaign"

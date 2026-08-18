@@ -367,6 +367,111 @@ def _read_strategy_doc(path: str) -> str:
         return ""
 
 
+# Sentinel: _follow_park could not produce a verdict (no park row / lookup
+# error) — the caller falls through to the session's own failed result.
+_NO_PARK_VERDICT = object()
+
+# How long a campaign will wait on an open (parked/resuming) rate-limit park
+# before treating the work as failed. Generous — real capacity droughts span
+# days — but bounded, so a resume loop stuck on a deterministic non-rate-limit
+# failure (which never increments attempts → never reaches needs_user) cannot
+# stall a campaign forever.
+_PARK_WAIT_BOUND = timedelta(days=7)
+
+
+def _parse_iso(raw: str) -> datetime | None:
+    """Parse an ISO timestamp defensively; naive values are assumed UTC."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+async def _follow_park(db: Any, park_id: str) -> dict | None | object:
+    """Resolve a rate-limit park into a campaign-visible session verdict.
+
+    Returns:
+        None — park open (parked/resuming) or resumed-but-not-yet-delivered:
+            the work is still in flight, keep waiting.
+        dict — a terminal verdict: the delivering session's real result
+            (park resumed + a finished re-dispatched session found), or a
+            failure when the park itself went terminal (needs_user /
+            cancelled / expired).
+        _NO_PARK_VERDICT — park row missing/unreadable: no opinion.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT status, created_at FROM cc_rate_limit_parks WHERE id = ?",
+            (park_id,),
+        )
+        park_row = await cursor.fetchone()
+        if not park_row:
+            return _NO_PARK_VERDICT
+        park_status = str(park_row["status"])
+
+        if park_status in ("parked", "resuming"):
+            # Bounded wait (audit F1): a resume loop stuck on a genuine
+            # (non-rate-limit) failure can cycle parked→resuming forever
+            # without ever reaching needs_user. A campaign must not skip its
+            # ticks indefinitely on that — past the bound, surface a real
+            # failure so the next tick dispatches fresh work.
+            created = _parse_iso(str(park_row["created_at"] or ""))
+            if created and (datetime.now(UTC) - created) > _PARK_WAIT_BOUND:
+                return {
+                    "success": False,
+                    "output_text": (
+                        f"rate-limit park {park_id} still {park_status} after "
+                        f"{_PARK_WAIT_BOUND.days} days — wait bound exceeded; "
+                        "treating the parked campaign work as failed"
+                    ),
+                    "cost_usd": 0.0,
+                }
+            return None  # still in flight — the resume engine owns it
+
+        if park_status == "resumed":
+            # Find the re-dispatched session that delivered (its metadata
+            # carries caller_context "rate_limit_resume:<park_id>"; the
+            # closing quote pins the id boundary inside the JSON string).
+            cursor = await db.execute(
+                """SELECT status, cost_usd, metadata FROM cc_sessions
+                   WHERE metadata LIKE ?
+                   ORDER BY started_at DESC LIMIT 1""",
+                (f'%rate_limit_resume:{park_id}"%',),
+            )
+            deliv_row = await cursor.fetchone()
+            if not deliv_row:
+                return None  # resumed but the new session hasn't landed yet
+            deliv = dict(deliv_row)
+            dstatus = str(deliv.get("status", ""))
+            if dstatus not in ("completed", "failed"):
+                return None  # delivering session still running
+            dmeta = {}
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                dmeta = json.loads(deliv.get("metadata") or "{}")
+            return {
+                "success": dstatus == "completed",
+                "output_text": dmeta.get("output_text", ""),
+                "cost_usd": deliv.get("cost_usd", 0.0) or 0.0,
+            }
+
+        # needs_user / cancelled / expired — genuinely terminal without
+        # delivery: surface as a real failure naming the park state.
+        return {
+            "success": False,
+            "output_text": (
+                f"rate-limit park {park_id} ended {park_status} without "
+                "delivering — the parked campaign work was not completed"
+            ),
+            "cost_usd": 0.0,
+        }
+    except Exception:
+        logger.warning("Failed to follow park %s", park_id, exc_info=True)
+        return _NO_PARK_VERDICT
+
+
 async def _check_session_status(db: Any, session_id: str) -> dict | None:
     """Check if a DirectSession has completed.
 
@@ -402,6 +507,17 @@ async def _check_session_status(db: Any, session_id: str) -> dict | None:
             if raw_meta:
                 with contextlib.suppress(json.JSONDecodeError, TypeError):
                     metadata = json.loads(raw_meta)
+
+            # Rate-limit-park awareness (2026-08-17 incident: a parked
+            # campaign session was captured as outcome=error while its resume
+            # later delivered — the campaign's bookkeeping never learned).
+            # A failed session stamped with a park_id is NOT a real failure:
+            # follow the park.
+            park_id = metadata.get("park_id")
+            if status == "failed" and park_id:
+                park_result = await _follow_park(db, str(park_id))
+                if park_result is not _NO_PARK_VERDICT:
+                    return park_result
 
             return {
                 "success": status == "completed",
