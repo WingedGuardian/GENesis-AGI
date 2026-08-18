@@ -75,14 +75,40 @@ class UserModelEvolver:
         gate-2 — lets the USER_KNOWLEDGE writer aggregate their stored
         origin_class without changing this method's return contract).
         """
-        pending = await observations.query(
+        from genesis.security.immunity import is_trusted_for_privileged_write
+
+        raw_pending = await observations.query(
             self._db, type="user_model_delta", resolved=False
         )
+        # WS-3 poisoning gate: only auto-accept deltas whose STORED origin is
+        # trusted-for-privileged-write (owner/first_party). Fail-closed — a
+        # NULL/external origin (a delta forged via observation_write from an
+        # external-origin session, or a reflection delta written while an
+        # external session overlapped the 60-min window) is skipped, left
+        # UNRESOLVED for the 14-day TTL to reap, and logged. Conservative-safe:
+        # it delays/skips a user-model update, never corrupts it. The gate is an
+        # unconditional invariant (like never-block-owner), NOT wired through the
+        # shadow-clamped gate_mode("identity") — routing it there would make it a
+        # silent no-op. Legit reflection deltas carry first_party in quiet
+        # windows (reflection_window_origin never returns None), so this does not
+        # starve the normal pipeline.
+        pending = []
+        for _delta in raw_pending:
+            if is_trusted_for_privileged_write(_delta.get("origin_class")):
+                pending.append(_delta)
+            else:
+                logger.warning(
+                    "user_model_delta %s BARRED from auto-accept (origin_class="
+                    "%r not trusted-for-privileged-write) — left unresolved for TTL",
+                    _delta.get("id"),
+                    _delta.get("origin_class"),
+                )
         if not pending:
-            # Touch synthesized_at to confirm model is current even when
-            # no new deltas exist.  Without this, the user_goal_staleness
-            # signal's project-staleness path decays to 1.0 whenever the
-            # delta pipeline is idle (no new observations to process).
+            # Touch synthesized_at to confirm model is current even when there
+            # is no TRUSTED pending work — an empty query OR every pending delta
+            # quarantined above. Without this, the user_goal_staleness signal's
+            # project-staleness path decays to 1.0 whenever the delta pipeline is
+            # idle (no new observations to process).
             try:
                 await self._db.execute(
                     "UPDATE user_model_cache SET synthesized_at = ? "

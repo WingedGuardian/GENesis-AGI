@@ -9,8 +9,20 @@ from genesis.memory.user_model import UserModelEvolver
 
 
 async def _create_delta(
-    db, *, id: str, field: str, value: str, confidence: float
+    db,
+    *,
+    id: str,
+    field: str,
+    value: str,
+    confidence: float,
+    origin_class: str | None = "first_party",
 ) -> None:
+    # Default origin_class="first_party" mirrors the REAL writers
+    # (reflection_bridge/_output + perception/writer), which stamp
+    # reflection_window_origin — first_party in a quiet window. The pre-WS-3
+    # NULL default was unrealistic: no live writer produces NULL deltas, and the
+    # poisoning gate fail-closes NULL, so seeding NULL would misrepresent the
+    # legit pipeline. Gate tests pass origin_class explicitly.
     await observations.create(
         db,
         id=id,
@@ -24,6 +36,7 @@ async def _create_delta(
         }),
         priority="medium",
         created_at="2026-03-08T00:00:00",
+        origin_class=origin_class,
     )
 
 
@@ -303,3 +316,77 @@ async def test_accepted_ids_out_untouched_when_nothing_accepted(db):
     out: list[str] = []
     assert await evolver.process_pending_deltas(accepted_ids_out=out) is None
     assert out == []
+
+
+# ── WS-3 poisoning gate: only owner/first_party origins auto-accept ──────────
+
+
+@pytest.mark.asyncio
+async def test_external_origin_delta_barred_from_auto_accept(db):
+    """A high-confidence delta with an external origin (e.g. forged via
+    observation_write from the inbox judge) must NOT reach the user model."""
+    await _create_delta(
+        db, id="ext", field="risk_tolerance", value="maximal",
+        confidence=0.95, origin_class="external_untrusted",
+    )
+    result = await UserModelEvolver(db=db).process_pending_deltas()
+    assert result is None  # nothing accepted
+
+
+@pytest.mark.asyncio
+async def test_null_origin_delta_barred_fail_closed(db):
+    """Fail-closed: a NULL origin (legacy/unstamped) is untrusted, not
+    first-party 'by omission'."""
+    await _create_delta(
+        db, id="nul", field="risk_tolerance", value="maximal",
+        confidence=0.95, origin_class=None,
+    )
+    result = await UserModelEvolver(db=db).process_pending_deltas()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_barred_delta_left_unresolved_for_ttl(db):
+    """Barred deltas are NOT resolved — they stay pending for the 14-day TTL to
+    reap (never silently discarded, in case of a labeling error)."""
+    await _create_delta(
+        db, id="ext", field="editor", value="emacs",
+        confidence=0.95, origin_class="external_untrusted",
+    )
+    await UserModelEvolver(db=db).process_pending_deltas()
+    still_pending = await observations.query(
+        db, type="user_model_delta", resolved=False
+    )
+    assert any(r["id"] == "ext" for r in still_pending)
+
+
+@pytest.mark.asyncio
+async def test_first_party_accepted_external_barred_in_mixed_batch(db):
+    """Positive control + gate together: in a mixed batch only the trusted
+    (first_party) delta lands; the external one is barred. Proves the barred
+    tests above are not vacuously green (the accept path works)."""
+    await _create_delta(
+        db, id="fp", field="editor", value="vim",
+        confidence=0.9, origin_class="first_party",
+    )
+    await _create_delta(
+        db, id="ext", field="editor", value="emacs",
+        confidence=0.95, origin_class="external_untrusted",
+    )
+    out: list[str] = []
+    result = await UserModelEvolver(db=db).process_pending_deltas(accepted_ids_out=out)
+    assert result is not None
+    assert result.model["editor"] == "vim"  # only the trusted origin
+    assert out == ["fp"]
+
+
+@pytest.mark.asyncio
+async def test_owner_origin_accepted(db):
+    """owner is trusted-for-privileged-write (belt with first_party)."""
+    await _create_delta(
+        db, id="own", field="preferred_language", value="Rust",
+        confidence=0.9, origin_class="owner",
+    )
+    result = await UserModelEvolver(db=db).process_pending_deltas()
+    assert result is not None
+    assert result.model["preferred_language"] == "Rust"

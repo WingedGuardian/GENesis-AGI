@@ -220,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 51253c67 2026-08-13
+verified: d71d1d39 2026-08-18
 ```
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
@@ -242,12 +242,23 @@ verified: 51253c67 2026-08-13
   at a nonexistent `src/config/no_mcp.json`). The inbox judge denies every genesis MCP
   *write* (`memory_store`/`settings_update`/`follow_up_create`/…) via
   `build_reflection_disallowed` minus `Bash`, keeping the reads it needs plus the optional
-  `observation_write`. Two RESIDUALS on the inbox judge, both tracked (follow-up 727a3724),
-  NOT closed here: (1) `Bash` — retained for the `yt-dlp`/`curl` YouTube-fetch path
-  (injection→RCE surface); (2) the retained `observation_write` neither stamps external
-  provenance nor constrains observation `type`, so an injected item could in principle forge
-  a `user_model_delta` — a low-likelihood, curated-input vector whose real fix (a provisional
-  provenance tier + writer type-authorization) belongs in the memory-provenance work.
+  `observation_write`. RESIDUALS on the inbox judge: (1) `Bash` — STILL retained for the
+  `yt-dlp`/`curl` YouTube-fetch path (injection→RCE surface, open — follow-up 727a3724);
+  (2) the two PRIVILEGED-WRITE consumers of forged observations are now gated (the
+  memory-provenance work): `observation_write` stamps the session origin
+  (`session_origin_from_env`) so an eval-session write lands `external_untrusted`, and the
+  user-model consumer gate (`UserModelEvolver.process_pending_deltas` via
+  `immunity.is_trusted_for_privileged_write`) plus the autonomy-dispatcher `task_detected`
+  gate bar any untrusted-origin (fail-closed on NULL) delta/task from auto-accept (barred
+  deltas left unresolved for TTL, never discarded). **PARTIAL — the broader
+  observation-content-INJECTION surface is still OPEN** (tracked follow-up): the digest types
+  the judge writes (`user_signal`/`architecture_insight`) are surfaced UNFILTERED into LLM
+  context by consumers this change did NOT touch — `essential_knowledge._recent_decisions`
+  (raw SQL → the always-loaded L1 file), `reflection.gather_evaluation_context` (14-day
+  lookback → deep-reflection prompt → can launder into a `first_party`-stamped delta), and
+  several ego/sentinel raw-`FROM observations` reads. The robust fix is to exclude/wrap
+  external-origin content (`is_blockable`, keeping NULL) at the surfacing points, with a
+  coverage guardrail that also catches raw-SQL consumers.
   **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
   DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
   the autonomy-executor sessions; those legitimately spawn/orchestrate and need a

@@ -356,11 +356,35 @@ class TaskDispatcher:
             logger.error("Failed to query task observations", exc_info=True)
             return dispatched
 
+        from genesis.security.immunity import is_trusted_for_privileged_write
+
         active_descriptions = {t.get("description", "") for t in active}
 
         for obs in pending_obs:
             obs_id = obs["id"]
             content = obs.get("content", "")
+
+            # WS-3 poisoning gate: never dispatch an autonomy task from an
+            # observation whose origin isn't trusted-for-privileged-write. A
+            # task_detected forged via observation_write from an external-origin
+            # session must not spawn a background CC session. Currently inert —
+            # observations carries no `metadata` column, so plan_path below is
+            # always None and every row skips there anyway — so this gate has NO
+            # live effect today; it is defensive against a future `metadata`
+            # addition re-arming an ungated auto-dispatch surface.
+            # DEPENDENCY (tracked follow-up): the legit owner-initiated producers
+            # (cc/conversation.py `task_detected` writes) do NOT yet stamp
+            # origin_class, so they would ALSO be barred here (fail-closed on
+            # NULL). Producer-side stamping MUST land before this pickup path is
+            # wired (metadata), or legitimate user-requested tasks are dropped.
+            if not is_trusted_for_privileged_write(obs.get("origin_class")):
+                logger.warning(
+                    "task_detected %s BARRED from dispatch (origin_class=%r)",
+                    obs_id,
+                    obs.get("origin_class"),
+                )
+                await self._resolve_observation(obs_id, "barred:untrusted_origin")
+                continue
 
             # Dedup: check if already dispatched or task exists
             if obs_id in self._dispatched:

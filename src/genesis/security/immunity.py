@@ -52,6 +52,8 @@ from genesis.env import repo_root
 from genesis.memory.provenance import (
     ORIGIN_CLASSES,
     ORIGIN_EXTERNAL_UNTRUSTED,
+    ORIGIN_FIRST_PARTY,
+    ORIGIN_OWNER,
 )
 
 logger = logging.getLogger(__name__)
@@ -173,6 +175,25 @@ def is_blockable(origin_class: str | None) -> bool:
     block decision through this helper.
     """
     return effective_origin_class(origin_class) == ORIGIN_EXTERNAL_UNTRUSTED
+
+
+def is_trusted_for_privileged_write(origin_class: str | None) -> bool:
+    """True ONLY for owner/first_party origins — the gate for AUTO-CONSUMING an
+    observation into PRIVILEGED state (the user model, an autonomy dispatch).
+
+    Distinct from :func:`is_blockable`, which governs recall drop/wrap and is
+    permissive by design (only ``external_untrusted`` is blocked). This is the
+    STRICTER write-side predicate: fail-closed via
+    :func:`effective_origin_class`, so a NULL/unknown/``external_untrusted``
+    origin returns False and is NEVER auto-accepted into a privileged surface —
+    an unstamped or externally-sourced observation cannot poison the user model
+    or trigger an autonomy dispatch. A future non-owner "derived/provisional"
+    origin would also be untrusted here by construction (it is not
+    owner/first_party). Consult this at the point of the privileged ACTION, not
+    inside the generic ``observations.query`` (which has many non-privileged
+    readers that must stay origin-agnostic).
+    """
+    return effective_origin_class(origin_class) in (ORIGIN_OWNER, ORIGIN_FIRST_PARTY)
 
 
 def _overlay_path() -> Path:
