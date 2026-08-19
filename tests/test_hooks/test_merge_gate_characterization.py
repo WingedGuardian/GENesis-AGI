@@ -619,3 +619,41 @@ def test_merge_fetches_target_the_gated_pr_and_repo(monkeypatch):
         else:  # review-body
             ok = f"repos/{REPO}/issues/{pr}/comments" in parts
         assert ok, f"{label} fetch off-target: {parts}"
+
+
+def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
+    """E3 (2026-08-19) — wrong-PR resolution. gh parses ``gh pr merge --subject 123 5``
+    as subject="123" + PR **5** (the trailing positional), but the old
+    ``_extract_pr_number`` returned **123** (the ``--subject`` VALUE) → every gate
+    then checked the WRONG PR. It is contained on the normal path (the shadow-flag
+    belt refuses ``--subject`` once the head binding engages), so the reachable
+    main()-level observable is under ``# stale-review-override`` — which waives
+    freshness and with it SKIPS the shadow belt + binding, letting the command flow
+    into the finding scanners. An inline P1 seeded on PR 5 (the true gh target) must
+    BLOCK, and the scan must target PR 5, never 123. Old resolver → 123 → clean scan
+    → exit 0. Proven on the router's call log (assert in the TEST frame, Codex #1399)."""
+    calls: list = []
+
+    def router(argv, **kwargs):  # noqa: ANN001 - subprocess.run signature
+        parts = [str(a) for a in argv]
+        if "mergeable" in " ".join(parts):
+            return _proc(0, "MERGEABLE")
+        if any("/pulls/" in a and a.endswith("/comments") for a in parts):
+            calls.append(("inline", tuple(parts)))
+            # P1 lives only on the TRUE target (PR 5); the wrong PR (123) sees nothing.
+            hit = f"repos/{REPO}/pulls/5/comments" in parts
+            return _proc(0, _INLINE_P1_LINE if hit else "")
+        if any("/issues/" in a and a.endswith("/comments") for a in parts):
+            calls.append(("review-body", tuple(parts)))
+            return _proc(0, "[]")
+        return _proc(0, "")
+
+    cmd = "gh pr merge --subject 123 5 --repo owner/repo --squash --admin  # stale-review-override"
+    rc = _run(monkeypatch, cmd, reviews="", router=router)
+    assert rc == 2, f"expected a block on PR 5's inline P1, got exit {rc}"
+    inline = [parts for label, parts in calls if label == "inline"]
+    assert inline, "inline findings were never fetched"
+    assert all(f"repos/{REPO}/pulls/5/comments" in parts for parts in inline), inline
+    assert not any(f"repos/{REPO}/pulls/123/comments" in parts for parts in inline), (
+        f"findings scanned the WRONG PR (123, the --subject value): {inline}"
+    )

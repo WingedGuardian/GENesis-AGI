@@ -1253,6 +1253,11 @@ class TestResolvePrNumber:
             ("gh pr merge 5 | tee 777", "5"),
             ("gh pr merge --admin xyz\necho 456", None),  # newline chain
             ("gh pr merge 123\necho 456", "123"),
+            # A dangling value flag must NOT swallow the separator as its value
+            # and then read a CHAINED command's digits (E3 guard: naive value-
+            # skipping would return 999 here). 2026-08-19.
+            ("gh pr merge --subject ; gh pr merge 999", None),
+            ("gh pr merge -db ; gh pr merge 999", None),
         ],
     )
     def test_stops_at_shell_separator(self, guard_module, cmd, expected):
@@ -1263,6 +1268,58 @@ class TestResolvePrNumber:
         # not resolve as the PR number.
         cmd = 'gh pr merge --subject "fix 123"'
         assert guard_module._extract_pr_number(cmd) is None
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # E3 (2026-08-19): an UNQUOTED numeric value that gh consumes as a
+            # value-flag's argument must NOT be read as the PR number — gh takes
+            # the trailing bare positional as the PR. `gh pr merge --subject 123 5`
+            # merges PR 5 (subject "123"); the old loop returned 123 (the flag
+            # value) → the gates checked the WRONG PR. Long, short, cluster,
+            # and non-shadow (--match-head-commit / --repo) value flags all apply.
+            ("gh pr merge --subject 123 5", "5"),
+            ("gh pr merge -t 123 5", "5"),
+            ("gh pr merge --body 123 5", "5"),
+            ("gh pr merge --match-head-commit 123 5 --admin", "5"),
+            ("gh pr merge --repo 123 5", "5"),
+            ("gh pr merge -db 123 5", "5"),  # -d(bool)+-b(value): -b eats 123
+        ],
+    )
+    def test_unquoted_flag_value_not_pr_number(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # GLUED value flags (sibling of E3, found in adversarial review): a
+            # `--flag=value` long or a `-fvalue` short does NOT consume a next
+            # token, so it falls through to the positional matchers — and the URL
+            # matcher's `\S*` prefix would read a `/pull/N` smuggled INSIDE the
+            # value as the PR while gh merges the trailing positional. A positional
+            # PR ref never starts with '-'; the matchers must skip '-'-prefixed
+            # tokens. gh merges 5 in every case here.
+            ("gh pr merge --body=https://github.com/o/r/pull/999 5", "5"),
+            ("gh pr merge -bhttps://github.com/o/r/pull/999 5", "5"),
+            ("gh pr merge --body-file=/tmp/x/pull/42 5", "5"),
+        ],
+    )
+    def test_glued_flag_value_url_not_pr_number(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # Regression LOCKS (must stay green): a positional BEFORE any flag is
+            # still the PR; a GLUED long value flag never leaks its digits.
+            ("gh pr merge 123 --subject 456", "123"),
+            ("gh pr merge --subject=99 5", "5"),
+            ("gh pr merge -db123 5", "5"),  # glued short value: -b's value is 123
+            ("gh pr merge -- 5", "5"),  # -- end-of-options: the positional still resolves
+        ],
+    )
+    def test_positional_pr_still_resolved(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
 
     def test_resolves_current_branch_pr(self, guard_module):
         with patch.object(
