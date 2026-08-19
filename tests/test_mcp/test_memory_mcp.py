@@ -1922,3 +1922,55 @@ async def test_conversation_history_chat_scoped_and_paginated():
             assert snoise == []
         finally:
             mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
+
+
+async def test_conversation_history_search_honors_scoping_and_cursor():
+    """Codex round-3 lock: the search branch must honor thread_id and before —
+    otherwise paged search repeats the newest matches forever and a topic
+    search leaks other topics."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        from genesis.db.crud.telegram_messages import store
+        for i in range(3):
+            await store(
+                real_db, chat_id=100, message_id=i, sender="user",
+                content=f"needle-{i}", thread_id=7,
+                timestamp=f"2026-08-13T04:0{i}:00",
+            )
+        await store(
+            real_db, chat_id=100, message_id=50, sender="user",
+            content="needle-other-topic", thread_id=8,
+            timestamp="2026-08-13T04:01:30",
+        )
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        try:
+            mod._store, mod._retriever = MagicMock(), MagicMock()
+            mod._db = real_db
+            tools = await _get_tools()
+            fn = tools["conversation_history"].fn
+
+            scoped = await fn(
+                channel="telegram", chat_id=100, thread_id=7, search="needle",
+            )
+            assert [m["content"] for m in scoped] == [
+                "needle-0", "needle-1", "needle-2",
+            ], "topic search must not leak other topics"
+
+            paged = await fn(
+                channel="telegram", chat_id=100, thread_id=7, search="needle",
+                before="2026-08-13T04:01:00",
+            )
+            assert [m["content"] for m in paged] == ["needle-0"], (
+                "search must honor the before cursor"
+            )
+        finally:
+            mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever

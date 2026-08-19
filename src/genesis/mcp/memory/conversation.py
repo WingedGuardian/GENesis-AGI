@@ -48,9 +48,12 @@ async def conversation_history(
         if search:
             if chat_id is not None:
                 return await telegram_messages.search(
-                    memory_mod._db, chat_id, search, limit=limit,
+                    memory_mod._db, chat_id, search,
+                    limit=limit, thread_id=thread_id, before=before,
                 )
-            return await telegram_messages.search_all(memory_mod._db, search, limit=limit)
+            return await telegram_messages.search_all(
+                memory_mod._db, search, limit=limit, before=before,
+            )
         if chat_id is not None:
             return await telegram_messages.query_recent(
                 memory_mod._db, chat_id,

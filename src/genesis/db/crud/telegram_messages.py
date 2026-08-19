@@ -107,14 +107,29 @@ async def search(
     query: str,
     *,
     limit: int = 10,
+    thread_id: int | None = None,
+    before: str | None = None,
 ) -> list[dict]:
-    """Search messages by keyword (LIKE match, wildcards escaped)."""
+    """Search messages by keyword (LIKE match, wildcards escaped).
+
+    ``thread_id`` scopes to one forum topic; ``before`` (ISO, exclusive)
+    pages older matches — the same scroll-up contract as query_recent.
+    """
     escaped = _escape_like(query)
+    clauses = ["chat_id = ?", "content LIKE ? ESCAPE '\\'"]
+    params: list[object] = [chat_id, f"%{escaped}%"]
+    if thread_id is not None:
+        clauses.append("thread_id = ?")
+        params.append(thread_id)
+    if before:
+        clauses.append("timestamp < ?")
+        params.append(before)
+    params.append(limit)
     cursor = await db.execute(
-        """SELECT * FROM telegram_messages
-           WHERE chat_id = ? AND content LIKE ? ESCAPE '\\'
-           ORDER BY timestamp DESC, id DESC LIMIT ?""",
-        (chat_id, f"%{escaped}%", limit),
+        f"""SELECT * FROM telegram_messages
+           WHERE {" AND ".join(clauses)}
+           ORDER BY timestamp DESC, id DESC LIMIT ?""",  # noqa: S608 — literal clauses
+        params,
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in reversed(rows)]
@@ -125,14 +140,23 @@ async def search_all(
     query: str,
     *,
     limit: int = 10,
+    before: str | None = None,
 ) -> list[dict]:
     """Search messages across all chats by keyword (LIKE match, wildcards escaped)."""
     escaped = _escape_like(query)
-    cursor = await db.execute(
-        """SELECT * FROM telegram_messages
-           WHERE content LIKE ? ESCAPE '\\'
-           ORDER BY timestamp DESC, id DESC LIMIT ?""",
-        (f"%{escaped}%", limit),
-    )
+    if before:
+        cursor = await db.execute(
+            """SELECT * FROM telegram_messages
+               WHERE content LIKE ? ESCAPE '\\' AND timestamp < ?
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
+            (f"%{escaped}%", before, limit),
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT * FROM telegram_messages
+               WHERE content LIKE ? ESCAPE '\\'
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
+            (f"%{escaped}%", limit),
+        )
     rows = await cursor.fetchall()
     return [dict(r) for r in reversed(rows)]

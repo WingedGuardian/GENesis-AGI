@@ -377,6 +377,11 @@ _NO_PARK_VERDICT = object()
 # failure (which never increments attempts → never reaches needs_user) cannot
 # stall a campaign forever.
 _PARK_WAIT_BOUND = timedelta(days=7)
+# A resuming park whose claim is younger than this may have a LIVE queued/
+# running delivery attempt — cancelling the row would not stop it, so
+# abandonment holds until the attempt terminates on its own. Matches the
+# resume engine's stale-claim reclaim bound (_STALE_RESUMING_S = 2h).
+_ACTIVE_CLAIM_BOUND = timedelta(hours=2)
 
 
 def _parse_iso(raw: str) -> datetime | None:
@@ -404,7 +409,8 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
     """
     try:
         cursor = await db.execute(
-            "SELECT status, created_at FROM cc_rate_limit_parks WHERE id = ?",
+            "SELECT status, created_at, claimed_at FROM cc_rate_limit_parks "
+            "WHERE id = ?",
             (park_id,),
         )
         park_row = await cursor.fetchone()
@@ -422,6 +428,19 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
             # Unparseable/missing created_at counts as OVER the bound — a
             # corrupt row must not reopen the unbounded-wait trajectory.
             if created is None or (datetime.now(UTC) - created) > _PARK_WAIT_BOUND:
+                # An ACTIVELY-claimed resuming attempt may already have a
+                # queued/live delivery session; cancelling the ROW would not
+                # cancel that session → the exact double-run this bound
+                # prevents. Hold until the attempt terminates on its own
+                # (<= the resume engine's 2h reclaim bound), then abandon on
+                # a later tick.
+                claimed = _parse_iso(str(park_row["claimed_at"] or ""))
+                if (
+                    park_status == "resuming"
+                    and claimed is not None
+                    and (datetime.now(UTC) - claimed) <= _ACTIVE_CLAIM_BOUND
+                ):
+                    return None
                 # Close the park when abandoning it: leaving it open would let
                 # the resume engine execute the SAME campaign action later,
                 # after the campaign has already moved on (double-run). The

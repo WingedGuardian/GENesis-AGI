@@ -558,3 +558,48 @@ async def test_failed_park_cancel_keeps_campaign_attached(db, monkeypatch):
         "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
     )).fetchone()
     assert str(row["status"]) == "parked", "park must remain owned/attached"
+
+
+@pytest.mark.asyncio
+async def test_over_bound_park_with_active_claim_holds(db):
+    """Codex round-3 lock: an over-bound RESUMING park with a FRESH claim may
+    have a live queued delivery — cancelling the row wouldn't stop it, so the
+    campaign must HOLD until the attempt terminates on its own."""
+    from datetime import UTC, datetime
+
+    from genesis.campaigns.runner import _check_session_status
+
+    helper = TestParkAwareSessionStatus()
+    await helper._seed_failed_parked_session(db, "resuming")
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET created_at='2026-08-01T00:00:00+00:00', "
+        "claimed_at=? WHERE id='rlp-test0001'",
+        (datetime.now(UTC).isoformat(),),
+    )
+    await db.commit()
+    assert await _check_session_status(db, "camp-sess-1") is None
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "resuming", "actively-claimed park must survive"
+
+
+@pytest.mark.asyncio
+async def test_over_bound_park_with_stale_claim_abandons(db):
+    """A stale claim (crashed attempt, past the 2h reclaim bound) is safe to
+    abandon — nothing live can execute it."""
+    from genesis.campaigns.runner import _check_session_status
+
+    helper = TestParkAwareSessionStatus()
+    await helper._seed_failed_parked_session(db, "resuming")
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET created_at='2026-08-01T00:00:00+00:00', "
+        "claimed_at='2026-08-01T01:00:00+00:00' WHERE id='rlp-test0001'",
+    )
+    await db.commit()
+    result = await _check_session_status(db, "camp-sess-1")
+    assert result is not None and result["success"] is False
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "cancelled"
