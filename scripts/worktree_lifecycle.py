@@ -4,7 +4,10 @@
 Identifies and trashes worktrees that are:
 1. Not in use by any process (no /proc/*/cwd inside them)
 2. Inactive for 14+ days (no file modifications)
-3. Branch is merged (PR merged on GitHub) OR has zero unique commits
+3. Merged into main — branch merged (PR on GitHub) OR zero unique commits.
+   A detached-HEAD worktree (no branch) is judged by whether its HEAD commit
+   is already in main; without this it would default to branch "unknown" and
+   never be reaped.
 
 Trashed worktrees are recoverable for 7 days. After that, permanently
 deleted along with their branches.
@@ -83,7 +86,9 @@ def _find_processes_in_dir(dir_path: str) -> list[int]:
 def _list_worktrees(repo_root: Path) -> list[dict]:
     """Parse git worktree list --porcelain into structured data.
 
-    Returns list of dicts with keys: path, branch, head.
+    Returns list of dicts with keys: path, head, branch, detached. ``branch`` is
+    absent for a detached HEAD (porcelain emits a bare ``detached`` line instead),
+    in which case ``detached`` is True.
     Excludes the main worktree (bare=True or first entry).
     """
     try:
@@ -111,6 +116,10 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
             # refs/heads/branch-name → branch-name
             ref = line[len("branch "):]
             current["branch"] = ref.removeprefix("refs/heads/")
+        elif line == "detached":
+            # Detached HEAD: porcelain emits a bare "detached" line and NO
+            # "branch " line. Mark it so the merge check keys off the HEAD sha.
+            current["detached"] = True
         elif line == "":
             if current and "path" in current and not is_first:
                 worktrees.append(current)
@@ -155,20 +164,25 @@ def _last_activity_time(worktree_path: str) -> float:
     return latest
 
 
-def _branch_is_merged(branch: str, repo_root: Path) -> bool:
-    """Check if a branch's PR is merged on GitHub.
+def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
+    """Check whether a worktree's work is already in ``main``.
 
-    Three methods tried in order:
-    1. git merge-base --is-ancestor (fast, works for non-squash merges)
-    2. gh pr list --head <branch> --state merged (handles squash merges)
-    3. Zero unique commits vs main (git cherry)
+    ``ref`` is a branch name (``is_branch=True``) or, for a detached-HEAD
+    worktree, its HEAD commit SHA (``is_branch=False``). Three methods in order:
+    1. git merge-base --is-ancestor (fast; works for a branch ref OR a raw SHA)
+    2. gh pr list --head <branch> --state merged (branch only — handles squash
+       merges; a bare SHA is never a PR head, so this is skipped when detached)
+    3. Zero unique commits vs main (git cherry; patch-id, works for either ref)
 
-    Returns False on any error (fail-safe: keep the worktree).
+    Returns False on any error (fail-safe: keep the worktree). Consequence for a
+    detached HEAD: if its commits were squash-merged (so it is neither an ancestor
+    of main nor patch-equivalent) it is kept, never reaped — fail-safe, since the
+    gh-PR method that would catch a squash can't key off a bare SHA.
     """
-    # Method 1: git merge-base
+    # Method 1: git merge-base (branch ref or raw SHA)
     try:
         result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", branch, "main"],
+            ["git", "merge-base", "--is-ancestor", ref, "main"],
             capture_output=True, cwd=str(repo_root), timeout=10,
         )
         if result.returncode == 0:
@@ -176,24 +190,26 @@ def _branch_is_merged(branch: str, repo_root: Path) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # Method 2: gh pr list (handles squash merges)
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "list", "--head", branch, "--state", "merged",
-             "--limit", "1", "--json", "number"],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=30,
-        )
-        if result.returncode == 0:
-            prs = json.loads(result.stdout)
-            if prs:
-                return True
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-        pass
+    # Method 2: gh pr list (handles squash merges) — branch heads only; a bare
+    # commit SHA is never a PR head, so skip it for a detached HEAD.
+    if is_branch:
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "list", "--head", ref, "--state", "merged",
+                 "--limit", "1", "--json", "number"],
+                capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+            )
+            if result.returncode == 0:
+                prs = json.loads(result.stdout)
+                if prs:
+                    return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+            pass
 
-    # Method 3: zero unique commits
+    # Method 3: zero unique commits (patch-id equivalence)
     try:
         result = subprocess.run(
-            ["git", "cherry", "main", branch],
+            ["git", "cherry", "main", ref],
             capture_output=True, text=True, cwd=str(repo_root), timeout=10,
         )
         if result.returncode == 0:
@@ -221,7 +237,8 @@ def _trash_worktree(
     Returns True if trashed (or would be trashed in dry-run).
     """
     wt_path = Path(wt["path"])
-    branch = wt.get("branch", "unknown")
+    branch = wt.get("branch", "")
+    detached = wt.get("detached", False)
     name = wt_path.name
     date_str = datetime.now(UTC).strftime("%Y%m%d")
     trash_name = f"{name}-{date_str}"
@@ -248,6 +265,7 @@ def _trash_worktree(
             "original_path": str(wt_path),
             "branch": branch,
             "commit": wt.get("head", ""),
+            "detached": detached,
             "trashed_at": datetime.now(UTC).isoformat(),
         }
         staging_meta = TRASH_DIR / f".{trash_path.name}.meta.staging"
@@ -266,7 +284,8 @@ def _trash_worktree(
             capture_output=True, cwd=str(repo_root), timeout=10,
         )
 
-        _log(f"TRASH {wt_path}: branch={branch}, recoverable for {TRASH_RETENTION_DAYS}d at {trash_path}")
+        ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
+        _log(f"TRASH {wt_path}: {ref_label}, recoverable for {TRASH_RETENTION_DAYS}d at {trash_path}")
         return True
     except (OSError, shutil.Error) as e:
         _log(f"ERROR trashing {wt_path}: {e}")
@@ -371,8 +390,12 @@ def _recover(name: str, repo_root: Path) -> bool:
     meta = json.loads(meta_path.read_text())
     original_path = meta.get("original_path", "")
     branch = meta.get("branch", "")
+    commit = meta.get("commit", "")
+    detached = meta.get("detached", False)
 
-    if not original_path or not branch:
+    # Recoverable if we have a place to put it AND a ref to recreate it from
+    # (a branch, or — for a detached HEAD — its commit).
+    if not original_path or (not branch and not commit):
         print(f"Incomplete metadata in {meta_path}", file=sys.stderr)
         return False
 
@@ -381,9 +404,13 @@ def _recover(name: str, repo_root: Path) -> bool:
         print(f"Original path already exists: {original_path}", file=sys.stderr)
         return False
 
-    # Try to recreate worktree from the branch
+    # Recreate the worktree: detached at its commit, or checked out on its branch.
+    if detached or not branch:
+        add_cmd = ["git", "worktree", "add", "--detach", original_path, commit]
+    else:
+        add_cmd = ["git", "worktree", "add", original_path, branch]
     result = subprocess.run(
-        ["git", "worktree", "add", original_path, branch],
+        add_cmd,
         capture_output=True, text=True, cwd=str(repo_root), timeout=30,
     )
 
@@ -416,7 +443,8 @@ def _recover(name: str, repo_root: Path) -> bool:
     # Clean up trash entry
     shutil.rmtree(str(trash_path))
 
-    print(f"Recovered to {original_path} (branch: {branch})")
+    ref_label = f"branch: {branch}" if branch else f"detached at {commit[:8]}"
+    print(f"Recovered to {original_path} ({ref_label})")
     if trash_files:
         print(f"Restored {len(trash_files)} uncommitted file(s) from trash")
     return True
@@ -506,7 +534,8 @@ def main() -> int:
 
     for wt in worktrees:
         wt_path = wt.get("path", "")
-        branch = wt.get("branch", "unknown")
+        branch = wt.get("branch")  # None for a detached HEAD
+        head = wt.get("head", "")
 
         if not wt_path or not Path(wt_path).exists():
             _log(f"SKIP {wt_path}: directory does not exist (ghost entry)")
@@ -526,9 +555,12 @@ def main() -> int:
             _log(f"SKIP {wt_path}: activity {age_days:.0f}d ago (< {STALE_DAYS}d)")
             continue
 
-        # Check 3: branch merged
-        if not _branch_is_merged(branch, repo_root):
-            _log(f"SKIP {wt_path}: branch '{branch}' not merged")
+        # Check 3: work already merged into main. A detached HEAD (no branch)
+        # is judged by its HEAD commit, not the missing branch name.
+        ref, is_branch = (branch, True) if branch else (head, False)
+        if not ref or not _is_merged(ref, repo_root, is_branch=is_branch):
+            label = f"branch '{branch}'" if branch else f"detached HEAD {head[:8]}"
+            _log(f"SKIP {wt_path}: {label} not merged")
             continue
 
         # All checks passed — trash it
