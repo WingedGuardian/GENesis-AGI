@@ -42,6 +42,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Model routing repointed off discontinued free NVIDIA NIM models.** NVIDIA NIM
+  end-of-lifed the `deepseek-v4-pro` model (and stopped serving `kimi-k2.6` to some
+  accounts), so ~20 routing chains — including the ones behind evaluation, the dream
+  cycle, and entity reasoning — were silently failing their free primary over to a
+  paid fallback. Chains now use current, verified free NIM models (GLM-5.2 as the
+  best-quality free primary, DeepSeek V4 Flash, MiniMax-M3), every chain keeps a
+  non-NIM fallback so a single NVIDIA-side model pull can't silently degrade a
+  cognitive path, and the eval judge stays on its DeepSeek-V4 model so scoring stays
+  comparable over time. A config test now blocks re-introducing a known-dead model
+  slug. If you don't use NVIDIA NIM (no `API_KEY_NVIDIA_NIM`), nothing changes.
+
 - **No more false "critical failure" alarms when the system is briefly busy.** The
   health signal that watches your local infrastructure (database, vector store, and
   Ollama if enabled) probes those services with a short timeout. When background work

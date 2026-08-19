@@ -120,17 +120,24 @@ providers:
   # ── Phase 2 providers (gated on eval before chain promotion) ──
   nvidia-nim-deepseek:
     type: nvidia_nim
-    model: deepseek-ai/deepseek-v4-pro
-    profile: nvidia-nim-deepseek-v4-pro
+    model: deepseek-ai/deepseek-v4-flash-0731
+    profile: nvidia-nim-deepseek-v4-flash-0731
     free: true
-    rpm_limit: 20  # 40 RPM shared pool — 20 each to stay within aggregate limit
+    rpm_limit: 13  # ~40 RPM NVIDIA free-tier shared across 3 nvidia_nim providers — ~13 each
     open_duration_s: 120
-  nvidia-nim-kimi:
+  nvidia-nim-glm:
     type: nvidia_nim
-    model: moonshotai/kimi-k2.6
-    profile: nvidia-nim-kimi-k2.6
+    model: z-ai/glm-5.2
+    profile: nvidia-nim-glm-5.2
     free: true
-    rpm_limit: 20  # 40 RPM shared pool — 20 each to stay within aggregate limit
+    rpm_limit: 13  # ~40 RPM NVIDIA free-tier shared across 3 nvidia_nim providers — ~13 each
+    open_duration_s: 120
+  nvidia-nim-minimax:
+    type: nvidia_nim
+    model: minimaxai/minimax-m3
+    profile: nvidia-nim-minimax-m3
+    free: true
+    rpm_limit: 13  # ~40 RPM NVIDIA free-tier shared across 3 nvidia_nim providers — ~13 each
     open_duration_s: 120
   # cerebras DISABLED — all models removed from Cerebras as of 2026-05.
   # Only reasoning-only models remain (gpt-oss-120b, zai-glm-4.7) which
@@ -282,7 +289,7 @@ call_sites:
     # paid fallback. Healthy OpenRouter-free models first; NIM last (shared
     # 40 RPM pool, currently flaky).
     - openrouter-gemma4
-    - nvidia-nim-kimi
+    - nvidia-nim-minimax
     - nvidia-nim-deepseek
     retry_profile: background
   4_light_reflection:
@@ -340,7 +347,7 @@ call_sites:
     - groq-free
     - openrouter-free
     - nvidia-nim-deepseek
-    - nvidia-nim-kimi
+    - nvidia-nim-minimax
     never_pays: true
   13_morning_report:
     chain:
@@ -362,6 +369,7 @@ call_sites:
     cc_model: Sonnet
   17_executor_review:
     chain:
+    - nvidia-nim-glm
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
@@ -400,6 +408,7 @@ call_sites:
   # Free-tier only. Separate from 22_tagging (entity extraction).
   dream_cycle_synthesis:
     chain:
+    - nvidia-nim-glm
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     - groq-free
@@ -407,8 +416,10 @@ call_sites:
   # Adversarial challenge of synthesis output. Different provider from
   # synthesis (Kimi challenges DeepSeek) ensures model independence.
   dream_cycle_synthesis_challenge:
+    # Adversarial check of dream_cycle_synthesis — MUST lead with a different
+    # model than that base site (glm) so the two-model gate stays independent.
     chain:
-    - nvidia-nim-kimi
+    - nvidia-nim-minimax
     - groq-free
     # Paid Kimi via OpenRouter as last-resort fallback — same model family as
     # the free NIM primary, so the Kimi-challenges-DeepSeek independence holds
@@ -417,7 +428,8 @@ call_sites:
     retry_profile: background
   dream_cycle_entity_check:
     chain:
-    - nvidia-nim-kimi
+    - nvidia-nim-glm
+    - nvidia-nim-minimax
     - groq-free
     - mistral-small-free
     - openrouter-free
@@ -434,7 +446,8 @@ call_sites:
   # the dial — start on the proven entity-check chain.
   dream_cycle_relationship_classify:
     chain:
-    - nvidia-nim-kimi
+    - nvidia-nim-glm
+    - nvidia-nim-minimax
     - groq-free
     - mistral-small-free
     - openrouter-free
@@ -445,6 +458,8 @@ call_sites:
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
   # DeepSeek challenges Kimi's entity judgments.
   dream_cycle_entity_challenge:
+    # Adversarial check of dream_cycle_entity_check — MUST lead with a different
+    # model than that base site (glm) so the two-model gate stays independent.
     chain:
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
@@ -453,7 +468,8 @@ call_sites:
   # Same free-SLM shape as dream_cycle_entity_check; hourly, small backlog.
   entity_adjudication:
     chain:
-    - nvidia-nim-kimi
+    - nvidia-nim-glm
+    - nvidia-nim-minimax
     - groq-free
     - mistral-small-free
     - openrouter-free
@@ -465,6 +481,9 @@ call_sites:
   # (DeepSeek challenges Kimi) so a single model's mistake cannot merge two
   # distinct entities — both must agree before a merge.
   entity_adjudication_challenge:
+    # Adversarial check of entity_adjudication before a DESTRUCTIVE merge_entity —
+    # MUST lead with a different model than that base site (glm) so "both agree"
+    # is a genuine two-model gate, not glm agreeing with itself.
     chain:
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
@@ -474,7 +493,8 @@ call_sites:
   # Same free background family as the dream-cycle classification sites.
   wing_backfill:
     chain:
-    - nvidia-nim-kimi
+    - nvidia-nim-glm
+    - nvidia-nim-minimax
     - nvidia-nim-deepseek
     - groq-free
     - openrouter-deepseek-v4-flash
@@ -532,10 +552,11 @@ call_sites:
     - groq-free
     - mistral-large-free
     - nvidia-nim-deepseek
-    - nvidia-nim-kimi
+    - nvidia-nim-minimax
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
+    - nvidia-nim-glm
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
@@ -546,8 +567,10 @@ call_sites:
       pipeline candidates
   38a_procedure_novelty_llm:
     chain:
+    - nvidia-nim-glm
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4
+    - groq-free
     default_paid: true
     description: Cross-task_type procedure dedup judgment (is a new procedure
       redundant with existing ones). S-tier only — precision is the safety
@@ -571,6 +594,7 @@ call_sites:
     description: "Unified cognitive loop focus selector — picks ego attention direction from pending signals"
   43_task_retrospective:
     chain:
+    - nvidia-nim-glm
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
@@ -580,6 +604,7 @@ call_sites:
     description: Post-execution retrospective learning extraction
   44_task_premortem:
     chain:
+    - nvidia-nim-glm
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     - openrouter-deepseek-v4
@@ -646,6 +671,7 @@ call_sites:
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
   40_knowledge_distillation:
     chain:
+    - nvidia-nim-glm
     - nvidia-nim-deepseek
     - groq-free
     - gemini-free
@@ -746,8 +772,8 @@ call_sites:
       \ grader is slow/down) and sheds under REDUCED degradation."
   judge:
     chain:
-    - nvidia-nim-deepseek
     - openrouter-deepseek-v4
+    - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     default_paid: true
     retry_profile: background

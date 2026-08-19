@@ -83,7 +83,7 @@ async def test_surplus_never_pays(real_config, breakers, cost_tracker, degradati
         "gemini-free": CallResult(success=False, error="down", status_code=503),
         "openrouter-free": CallResult(success=False, error="down", status_code=503),
         "nvidia-nim-deepseek": CallResult(success=False, error="down", status_code=503),
-        "nvidia-nim-kimi": CallResult(success=False, error="down", status_code=503),
+        "nvidia-nim-minimax": CallResult(success=False, error="down", status_code=503),
     })
     router = Router(
         config=real_config, breakers=breakers, cost_tracker=cost_tracker,

@@ -131,12 +131,18 @@ def test_load_full_yaml(monkeypatch):
     # 2026-08-07: 28 → 26 after removing the redundant groq-oss-120b GROUNDWORK
     # alias (groq-free now serves gpt-oss-120b post-migration) + the dead,
     # unwired openrouter-qwen3coder (delisted qwen/qwen3-coder:free slug).
-    assert len(cfg.providers) == 26
+    # 2026-08-19: 26 → 27 — NIM repoint after NVIDIA EOL'd deepseek-v4-pro (410)
+    # and stopped serving kimi-k2.6 (404): removed nvidia-nim-kimi, added
+    # nvidia-nim-glm (z-ai/glm-5.2) + nvidia-nim-minimax (minimaxai/minimax-m3).
+    assert len(cfg.providers) == 27
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
     assert "groq-oss-120b" not in cfg.providers  # removed 2026-08-07 (redundant w/ groq-free)
     assert "openrouter-qwen3coder" not in cfg.providers  # removed 2026-08-07 (dead slug, unwired)
+    assert "nvidia-nim-kimi" not in cfg.providers  # removed 2026-08-19 (kimi-k2.6 404-for-account)
+    assert "nvidia-nim-glm" in cfg.providers  # z-ai/glm-5.2 (best free NIM reasoning)
+    assert "nvidia-nim-minimax" in cfg.providers  # minimaxai/minimax-m3
     # Call sites evolve — assert actual count matches config, and lock in
     # a few load-bearing ids rather than chasing the total on every edit.
     # 2026-05-10: 44 → 43 after net change (judge added by #304, 2_triage +
@@ -204,11 +210,13 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
     assert cfg.call_sites["36_code_auditor"].never_pays is False
     assert cfg.call_sites["37_infrastructure_monitor"].default_paid is True
-    # judge: LLM-as-judge eval primitive — free NIM v4-pro first, then paid v4-pro,
-    # then v4-flash; paid-by-default
+    # judge: LLM-as-judge eval primitive — deepseek-4 family ONLY (a model swap
+    # shifts the longitudinal eval baseline). NIM's free deepseek-v4-pro was EOL'd
+    # (410, 2026-08-07), so paid OpenRouter deepseek-v4-pro is first to keep the
+    # EXACT judge model, then free NIM deepseek-v4-flash-0731, then paid v4-flash.
     assert cfg.call_sites["judge"].chain == [
-        "nvidia-nim-deepseek",
         "openrouter-deepseek-v4",
+        "nvidia-nim-deepseek",
         "openrouter-deepseek-v4-flash",
     ]
     assert cfg.call_sites["judge"].default_paid is True
