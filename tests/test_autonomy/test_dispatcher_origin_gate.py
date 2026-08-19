@@ -5,8 +5,11 @@ external-origin session must never spawn a background CC session. The pickup
 path is currently INERT (the observations table has no ``metadata`` column, so
 ``plan_path`` is always None and every row skips there) — this gate is
 forward-safe: it ensures that a future ``metadata`` addition cannot silently
-re-arm an ungated auto-dispatch surface. A barred row is resolved
-(``barred:untrusted_origin``) rather than left to re-log every cycle.
+re-arm an ungated auto-dispatch surface. A barred row is SKIP-ONLY: it is not
+dispatched but is left PENDING (not resolved), so legitimate NULL-origin owner
+rows stay visible in the dashboard/L1 exactly as before — only dispatch is
+refused. (Resolving barred rows would hide those legitimate rows; producer-side
+origin stamping is tracked in the memory-provenance follow-up.)
 """
 
 from __future__ import annotations
