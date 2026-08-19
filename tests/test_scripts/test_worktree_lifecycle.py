@@ -312,12 +312,13 @@ def test_is_merged_detached_patch_equal_kept(reaper_repo):
 # ─── recovery preserves uncommitted tracked edits (Codex P1 finding A) ────────
 
 
-def test_recover_preserves_uncommitted_modification(reaper_repo, tmp_path, monkeypatch):
-    """Recovery must not silently drop an uncommitted edit to a TRACKED file.
+def test_recover_restores_untracked_file(reaper_repo, tmp_path, monkeypatch):
+    """Recovery restores UNTRACKED files that the fresh checkout would not recreate.
 
-    The old copy loop only restored files MISSING from the fresh checkout, so a
-    modified tracked file was reverted to its committed content while recovery
-    reported success. The overlay restores files that differ. (Codex finding A.)
+    This is the recovery contract's positive guarantee (copy-only-missing). Full
+    dirty-state reconstruction — uncommitted tracked edits, deletions, mode-only
+    changes, the staged split — is an intentional non-goal (see _recover docstring),
+    since the reaper only trashes worktrees already merged into main.
     """
     trash = tmp_path / "trash"
     trash.mkdir()
@@ -325,12 +326,79 @@ def test_recover_preserves_uncommitted_modification(reaper_repo, tmp_path, monke
     monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
 
     wt = reaper_repo.wt_branch_merged
-    (wt / "a.txt").write_text("LOCALLY MODIFIED\n")  # a.txt is tracked (committed at c0)
+    (wt / "scratch.txt").write_text("untracked scratch\n")  # untracked, absent from the commit
 
     wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
     assert not wt.exists()
 
     assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
-    assert (wt / "a.txt").read_text() == "LOCALLY MODIFIED\n", (
-        "recovery reverted an uncommitted tracked modification"
+    assert (wt / "scratch.txt").read_text() == "untracked scratch\n", (
+        "recovery dropped an untracked file that was in the trash"
     )
+
+
+def test_recover_does_not_reapply_tracked_modification(reaper_repo, tmp_path, monkeypatch):
+    """A trashed uncommitted edit to a TRACKED file is NOT reapplied on recovery.
+
+    copy-only-missing leaves the checked-out (committed) content intact. This LOCKS
+    the overlay->copy-only-missing revert: the old filecmp overlay would have
+    overwritten the tracked file with the trashed modification, so this test fails
+    on the pre-revert code and passes now. (Codex 444/456 non-goal, by design.)
+    """
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+
+    wt = reaper_repo.wt_branch_merged
+    committed = (wt / "a.txt").read_text()  # tracked, committed at c0
+    (wt / "a.txt").write_text("DIRTY EDIT\n")  # uncommitted tracked modification
+
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
+    assert (wt / "a.txt").read_text() == committed, (
+        "recovery reapplied a trashed tracked modification (overlay behavior)"
+    )
+
+
+def test_skip_locked_worktree(reaper_repo, tmp_path, monkeypatch):
+    """A locked (git worktree lock) worktree is never reaped, even when merged."""
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "_repo_root", lambda: reaper_repo.repo)
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    monkeypatch.setattr(sys, "argv", ["worktree_lifecycle.py"])
+
+    # merged branch worktree that would otherwise be reaped → lock it
+    _git(
+        reaper_repo.repo,
+        "worktree",
+        "lock",
+        str(reaper_repo.wt_branch_merged),
+        "--reason",
+        "protected",
+    )
+
+    # sanity: the parser flags it locked
+    assert _wt_by_path(reaper_repo.repo, reaper_repo.wt_branch_merged).get("locked") is True
+
+    assert wl.main() == 0
+    assert reaper_repo.wt_branch_merged.exists(), "locked worktree must not be reaped"
+
+
+def test_skip_in_progress_worktree(reaper_repo, tmp_path, monkeypatch):
+    """A worktree with a paused Git operation (MERGE_HEAD) is never reaped."""
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "_repo_root", lambda: reaper_repo.repo)
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    monkeypatch.setattr(sys, "argv", ["worktree_lifecycle.py"])
+
+    wt = reaper_repo.wt_det_merged  # detached at a merged commit → would be reaped
+    # Simulate an in-progress merge: write MERGE_HEAD into the worktree's admin dir.
+    admin = _git(wt, "rev-parse", "--absolute-git-dir").strip()
+    (Path(admin) / "MERGE_HEAD").write_text(_git(wt, "rev-parse", "HEAD"))
+    assert wl._has_in_progress_op(str(wt)) is True
+
+    assert wl.main() == 0
+    assert wt.exists(), "worktree with an in-progress git op must not be reaped"
