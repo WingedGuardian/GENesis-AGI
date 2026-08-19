@@ -36,10 +36,15 @@ _MAX_RETRIES = 2
 _RETRY_BASE_S = 5.0
 
 # Default offline providers (routing-config names). Generation + judging use
-# DIFFERENT providers to avoid self-judging bias; the judge defaults to the
-# deepseek family (closest available to the golden-set's calibrated judge).
+# DIFFERENT providers to avoid self-judging bias; the judge stays on DeepSeek
+# V4-pro — the golden-set's CALIBRATED judge model. NOTE: this resolves the
+# provider DIRECTLY (offline harnesses: reflection calibration, bench, skill-
+# replay, experiment guards), bypassing the runtime `judge` YAML chain, so it
+# must name a V4-pro provider explicitly. `nvidia-nim-deepseek` now serves
+# V4-flash (NIM EOL'd V4-pro), so use the paid OpenRouter V4-pro to keep the
+# offline eval baseline comparable.
 DEFAULT_GEN_PROVIDER = "groq-free"
-DEFAULT_JUDGE_PROVIDER = "nvidia-nim-deepseek"
+DEFAULT_JUDGE_PROVIDER = "openrouter-deepseek-v4"
 
 
 def _default_config_path() -> Path:

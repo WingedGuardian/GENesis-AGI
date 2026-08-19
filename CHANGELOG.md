@@ -11,6 +11,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Dead NVIDIA NIM models retired from routing (silent free→paid fallback leak
+  closed).** NIM EOL'd `deepseek-ai/deepseek-v4-pro` (HTTP 410) and made
+  `moonshotai/kimi-k2.6` 404-for-account (both confirmed by live probe). Every
+  chain led with a dead free provider, so once its breaker opened those ~14 cognitive
+  call-sites silently fell through to paid OpenRouter fallbacks. `nvidia-nim-deepseek`
+  is repointed to the live free `deepseek-ai/deepseek-v4-flash-0731` (fast, valid JSON);
+  the dead `nvidia-nim-kimi` provider is removed and dropped from every chain (base
+  sites fall to `groq-free`, adversarial `_challenge` sites lead with DeepSeek — model
+  independence preserved). The eval `judge` keeps the calibrated paid V4-pro first (NIM
+  now serves flash, not the calibrated pro), and the `38a` procedure-novelty precision
+  gate is pinned to V4-pro only. A new `test_config_invariants.py` locks the dead-slug
+  denylist, per-chain non-NIM fallback, `_challenge` model-independence, and a
+  deepseek-family judge.
 - **Inbox approval-request storm ended.** A stale-hash defect made the inbox
   monitor see phantom "modified" files every 30-minute scan, each time
   cancelling the pending approval and sending a fresh Telegram request — up to

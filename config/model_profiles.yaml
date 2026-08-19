@@ -813,33 +813,33 @@ profiles:
     last_reviewed: "2026-06-02"
     review_source: openrouter_pricing
 
-  nvidia-nim-deepseek-v4-pro:
-    display_name: "DeepSeek V4 Pro (NIM)"
+  nvidia-nim-deepseek-v4-flash-0731:
+    display_name: "DeepSeek V4 Flash 0731 (NIM)"
     provider: nvidia_nim
-    api_id: "deepseek-ai/deepseek-v4-pro"
-    intelligence_tier: S
-    reasoning: S
+    api_id: "deepseek-ai/deepseek-v4-flash-0731"
+    intelligence_tier: A
+    reasoning: A
     instruction_following: A
     anti_sycophancy: B
     context_window: 131072
     cost_tier: free
     cost_per_mtok_in: 0.0
     cost_per_mtok_out: 0.0
-    latency: moderate
+    latency: low
     strengths:
-      - free tier access to frontier DeepSeek V4
-      - same model quality as paid V4 Pro
+      - fast free flash inference (~5s, valid strict JSON on live probe 2026-08-19)
+      - strong coding and structured extraction
     weaknesses:
-      - rate limited (40 RPM, 5000 credits)
-      - creative writing and conversational tone
-    best_for: [code_work, triage, fallback_reasoning]
-    avoid_for: [foreground_conversation, outreach_draft, high_throughput]
+      - rate limited (~40 RPM per-model free tier)
+      - fast variant, not the frontier deep-reasoning V4 Pro — calibrated judging
+        stays on paid openrouter-deepseek-v4 (V4 Pro)
+    best_for: [code_work, triage, fast_reasoning, fallback_reasoning]
+    avoid_for: [calibrated_judging, foreground_conversation, outreach_draft]
     free_tier:
       available: true
-      credits: 5000
       rpm_limit: 40
-    last_reviewed: "2026-06-02"
-    review_source: nvidia_nim_catalog
+    last_reviewed: "2026-08-19"
+    review_source: nvidia_nim_live_probe
 
   grok-3-mini:
     display_name: "Grok 3 Mini"
@@ -1139,33 +1139,5 @@ profiles:
     avoid_for: [foreground_conversation, creative_writing]
     free_tier:
       available: false
-    last_reviewed: "2026-03-14"
-    review_source: manual
-
-  nvidia-nim-kimi-k2.6:  # carried from kimi-k2.6 (NIM free variant)
-    display_name: "Kimi K2.6 (NIM)"
-    provider: nvidia_nim
-    api_id: "moonshotai/kimi-k2.6"
-    intelligence_tier: A
-    reasoning: A
-    instruction_following: A
-    anti_sycophancy: B
-    context_window: 2097152
-    cost_tier: free
-    cost_per_mtok_in: 0.0
-    cost_per_mtok_out: 0.0
-    latency: moderate
-    strengths:
-      - free NIM access to Kimi K2.6
-      - long-context summarization (2M tokens)
-    weaknesses:
-      - rate limited (40 RPM, 5000 credits, shared NIM pool)
-      - single-thread speed slower than Flash
-    best_for: [research_synthesis, long_context_work, fallback_reasoning]
-    avoid_for: [micro_reflection, math_heavy, high_throughput]
-    free_tier:
-      available: true
-      credits: 5000
-      rpm_limit: 40
     last_reviewed: "2026-03-14"
     review_source: manual
