@@ -560,12 +560,17 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     return True, hits
 
 
-def _run_gitleaks(diff_text: str) -> tuple[bool, list[Finding]]:
-    """Optional second-layer scan with gitleaks if installed.
+def _run_gitleaks(
+    added_lines: list[tuple[str, int, str]],
+) -> tuple[bool, list[Finding]]:
+    """Optional second-layer secret scan with gitleaks if installed.
 
-    Runs `gitleaks detect --pipe` with the diff on stdin, loading the repo's
-    `.gitleaks.toml` via `-c` (it extends the default rules — useDefault=true —
-    with the genesis PII rules). Returns (scanner_ran, findings).
+    Scans ONLY the diff's ADDED lines (like _run_detect_secrets and the other
+    scanners), so a secret on a REMOVED or context line is never flagged — a
+    contribution that DELETES a secret isn't falsely blocked. Runs
+    `gitleaks detect --pipe` over the added-line content on stdin, loading the
+    repo's `.gitleaks.toml` via `-c` (extends the default rules — useDefault=true
+    — with the genesis PII rules). Returns (scanner_ran, findings).
 
     NOTE: `--no-git` must NOT be combined with `--pipe`. That combination makes
     gitleaks scan nothing from stdin — it silently returned zero findings (even
@@ -581,6 +586,15 @@ def _run_gitleaks(diff_text: str) -> tuple[bool, list[Finding]]:
     gitleaks = shutil.which("gitleaks") or shutil.which("betterleaks")
     if gitleaks is None:
         return False, []
+    if not added_lines:
+        return True, []
+
+    # Feed ONLY the added-line texts (one per line). Findings are attributed back
+    # to the source (file, line) by matching the reported secret text below — NOT
+    # by gitleaks' line number, which is unreliable over this header-less --pipe
+    # content (gitleaks emits 0-based line numbers with no diff hunk header, and
+    # the numbering is version-dependent).
+    content = "\n".join(text for _, _, text in added_lines) + "\n"
 
     # gitleaks --pipe reads stdin since 8.x (NOT with --no-git — see docstring).
     cmd = [gitleaks, "detect", "--pipe", "--report-format", "json",
@@ -600,7 +614,7 @@ def _run_gitleaks(diff_text: str) -> tuple[bool, list[Finding]]:
     try:
         proc = subprocess.run(
             cmd,
-            input=diff_text,
+            input=content,
             capture_output=True,
             text=True,
             timeout=30,
@@ -623,15 +637,24 @@ def _run_gitleaks(diff_text: str) -> tuple[bool, list[Finding]]:
             if not isinstance(f, dict):
                 continue
             rule = f.get("RuleID", "unknown")
-            file = f.get("File", "")
-            line = f.get("StartLine", 0)
+            # Attribute by matching the reported secret text back to the added line
+            # that contains it — robust to gitleaks' unreliable line numbers over
+            # header-less --pipe content. If it can't be located (unexpected), leave
+            # (file, line) unset; the finding is still BLOCK either way.
+            match_text = f.get("Secret") or f.get("Match", "")
+            src_file, src_line = None, None
+            if match_text:
+                for fpath, lno, text in added_lines:
+                    if match_text in text:
+                        src_file, src_line = fpath, lno
+                        break
             hits.append(
                 Finding(
                     kind=FindingKind.SECRET,
                     severity=Severity.BLOCK,
                     message=f"Potential secret ({rule})",
-                    file=file or None,
-                    line=int(line) if line else None,
+                    file=src_file,
+                    line=src_line,
                     scanner="gitleaks",
                     detail=f.get("Match", "")[:120],
                 )
@@ -755,7 +778,7 @@ def scan_diff(
         findings.extend(secret_hits)
 
     # 8. gitleaks (optional second layer)
-    ran, gl_hits = _run_gitleaks(diff_text)
+    ran, gl_hits = _run_gitleaks(parsed.added_lines)
     if ran:
         scanners_run.append("gitleaks")
         findings.extend(gl_hits)

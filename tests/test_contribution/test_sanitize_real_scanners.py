@@ -60,7 +60,7 @@ def test_gitleaks_real_binary_scans_stdin():
 
     RED against ``--no-git --pipe`` (that combo scans nothing from stdin).
     """
-    ran, hits = sanitize._run_gitleaks(_SECRET_DIFF)
+    ran, hits = sanitize._run_gitleaks(sanitize.parse_diff(_SECRET_DIFF).added_lines)
     assert ran
     assert any(h.kind == FindingKind.SECRET and h.severity == Severity.BLOCK for h in hits), (
         "gitleaks must flag the github token via --pipe (default rule)"
@@ -73,7 +73,7 @@ def test_gitleaks_loads_repo_config_for_genesis_rules():
 
     Proves the config is actually loaded (extends defaults), not just default rules.
     """
-    ran, hits = sanitize._run_gitleaks(_SECRET_DIFF)
+    ran, hits = sanitize._run_gitleaks(sanitize.parse_diff(_SECRET_DIFF).added_lines)
     assert ran
     assert any(
         "account" in (h.detail or "").lower() or "123456789012" in (h.detail or "") for h in hits
@@ -86,6 +86,53 @@ def test_scan_diff_end_to_end_blocks_secret():
     result = sanitize.scan_diff(_SECRET_DIFF)
     assert result.ok is False
     assert any(f.kind == FindingKind.SECRET for f in result.blocking())
+
+
+@pytest.mark.skipif(shutil.which("gitleaks") is None, reason="gitleaks not installed")
+def test_gitleaks_ignores_secret_on_a_removed_line():
+    """gitleaks scans only ADDED lines — a secret on a REMOVED line must NOT be
+    flagged (a contribution that DELETES a secret is a good change, not a block).
+    RED against the old code, which fed the whole diff to gitleaks."""
+    removal_diff = (
+        "diff --git a/config.py b/config.py\n"
+        "--- a/config.py\n"
+        "+++ b/config.py\n"
+        "@@ -1 +1 @@\n"
+        '-github_token = "ghp_1a2B3c4D5e6F7g8H9i0J1k2L3m4N5o6P7q8R"\n'
+        "+cleaned = true\n"
+    )
+    ran, hits = sanitize._run_gitleaks(sanitize.parse_diff(removal_diff).added_lines)
+    assert ran
+    assert hits == [], "a secret on a removed line must not be flagged"
+
+
+@pytest.mark.skipif(shutil.which("gitleaks") is None, reason="gitleaks not installed")
+def test_gitleaks_attributes_finding_to_correct_file_and_line():
+    """The reported (file, line) must be the TRUE source location of the secret.
+    gitleaks' line numbers over header-less --pipe content are unreliable (0-based,
+    version-dependent), so attribution is by content-match. A multi-file diff with
+    the secret on the 2nd added line of the 2nd file catches off-by-one AND
+    file-boundary errors."""
+    diff = (
+        "diff --git a/a.py b/a.py\n"
+        "--- a/a.py\n"
+        "+++ b/a.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+harmless = 1\n"
+        "diff --git a/b.py b/b.py\n"
+        "--- a/b.py\n"
+        "+++ b/b.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+keep = 2\n"
+        '+token = "ghp_1a2B3c4D5e6F7g8H9i0J1k2L3m4N5o6P7q8R"\n'
+    )
+    ran, hits = sanitize._run_gitleaks(sanitize.parse_diff(diff).added_lines)
+    assert ran
+    secret_hits = [h for h in hits if h.kind == FindingKind.SECRET]
+    assert secret_hits, "the github token must be flagged"
+    h = secret_hits[0]
+    assert h.file == "b.py", f"wrong file attribution: {h.file}"
+    assert h.line == 2, f"wrong line attribution: {h.line} (token is on b.py line 2)"
 
 
 # ── Install-agnostic argv guards (run on CI without the gitleaks binary) ──
@@ -107,7 +154,7 @@ def _capture_gitleaks_argv(monkeypatch, repo_dir):
         return _sp.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(sanitize.subprocess, "run", _fake_run)
-    sanitize._run_gitleaks(_SECRET_DIFF)
+    sanitize._run_gitleaks(sanitize.parse_diff(_SECRET_DIFF).added_lines)
     return captured["cmd"]
 
 
