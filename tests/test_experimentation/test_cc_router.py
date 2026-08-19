@@ -79,17 +79,26 @@ async def test_route_call_subprocess_raises(monkeypatch):
     assert "no claude binary" in (res.error or "")
 
 
-async def test_route_call_timeout_kills_subprocess(monkeypatch):
-    killed = {"v": False}
+async def test_route_call_timeout_group_kills_subprocess(monkeypatch):
+    """Timeout must SIGKILL the whole process GROUP (claude spawns MCP/helper
+    children — a bare proc.kill() orphans them), signalling proc.pid AS the
+    pgid, with the direct kill only as the guard fallback."""
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    direct_killed = {"v": False}
 
     class _HangProc:
         returncode = None
+        pid = 77777  # explicit — never a mock default (killpg(1) trap)
 
         async def communicate(self, input=None):
             await asyncio.sleep(10)  # exceed the tiny timeout
 
         def kill(self):
-            killed["v"] = True
+            direct_killed["v"] = True
 
         async def wait(self):
             self.returncode = -9
@@ -104,4 +113,58 @@ async def test_route_call_timeout_kills_subprocess(monkeypatch):
     )
     assert res.success is False
     assert res.error == "timeout"
-    assert killed["v"] is True  # the orphaned claude proc was reaped
+    assert killpg_calls == [(77777, __import__("signal").SIGKILL)]
+    assert direct_killed["v"] is False  # group kill, not the bare fallback
+
+
+async def test_route_call_timeout_pgid_guard(monkeypatch):
+    """A pid<=1 (mock default / pathological) must never reach killpg —
+    fall back to the direct kill."""
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    direct_killed = {"v": False}
+
+    class _HangProc:
+        returncode = None
+        pid = 1
+
+        async def communicate(self, input=None):
+            await asyncio.sleep(10)
+
+        def kill(self):
+            direct_killed["v"] = True
+
+        async def wait(self):
+            self.returncode = -9
+
+    async def fake_exec(*a, **k):
+        return _HangProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    res = await CCCliRouter("haiku", timeout_s=0.05).route_call(
+        "gen", [{"role": "user", "content": "U"}],
+    )
+    assert res.error == "timeout"
+    assert killpg_calls == []
+    assert direct_killed["v"] is True
+
+
+async def test_spawned_in_new_session_not_preexec(monkeypatch):
+    """claude must be spawned with start_new_session=True (own group so the
+    timeout tree-kill can killpg it) and never via preexec_fn."""
+    captured = {}
+
+    async def fake_exec(*args, **kw):
+        captured.update(kw)
+        return _FakeProc(out=b"fine")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    res = await CCCliRouter("haiku").route_call("gen", [{"role": "user", "content": "U"}])
+    assert res.success is True
+    assert captured.get("start_new_session") is True
+    assert "preexec_fn" not in captured

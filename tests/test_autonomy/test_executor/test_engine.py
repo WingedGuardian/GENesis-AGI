@@ -1580,3 +1580,74 @@ class TestLedgerAndBusEmits:
 
         assert await engine.execute("t-001") is True
         assert await self._predictions(db, "t-001") == []
+
+
+@pytest.mark.asyncio
+class TestRunGitPushBounded:
+    """The delivery `git push` runs under the executor's Semaphore(1) — a
+    network-stalled push with no timeout wedges ALL autonomy (the exact class
+    the scope-gate's 60s bound in this file already guards for local git ops).
+    _run_git_push must bound the wait and group-kill on expiry (git's own
+    ssh/credential child is what actually stalls — killing only git orphans
+    the hung helper)."""
+
+    async def test_success_passthrough(self, tmp_path, monkeypatch):
+        from genesis.autonomy.executor import engine as engine_mod
+
+        async def fake_exec(*args, **kwargs):
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"", b"pushed ok"))
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        rc, err = await engine_mod._run_git_push(tmp_path, "task/abc123")
+        assert rc == 0
+        assert "pushed ok" in err
+
+    async def test_timeout_degrades_and_group_kills(self, tmp_path, monkeypatch):
+        from genesis.autonomy.executor import engine as engine_mod
+
+        killpg_calls = []
+        monkeypatch.setattr(
+            "genesis.util.proc_kill.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+        monkeypatch.setattr(engine_mod, "_GIT_PUSH_TIMEOUT_S", 0.05)
+
+        proc = MagicMock()
+        proc.pid = 88888  # explicit — never a mock default (killpg(1) trap)
+        proc.returncode = None
+
+        async def _hang(*a, **k):
+            await asyncio.sleep(600)
+
+        proc.communicate = _hang
+        proc.wait = AsyncMock(return_value=-9)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        rc, err = await engine_mod._run_git_push(tmp_path, "task/abc123")
+        assert rc != 0
+        assert "timed out" in err
+        assert len(killpg_calls) == 1
+        assert killpg_calls[0][0] == 88888
+
+    async def test_spawned_in_new_session(self, tmp_path, monkeypatch):
+        from genesis.autonomy.executor import engine as engine_mod
+
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        await engine_mod._run_git_push(tmp_path, "task/abc123")
+        assert captured.get("start_new_session") is True
+        assert "preexec_fn" not in captured

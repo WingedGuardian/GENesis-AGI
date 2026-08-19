@@ -489,3 +489,106 @@ class TestInfraSectionIntegration:
         prompt = _build_diagnosis_prompt(_snap(container_status="Running"), "", "genesis")
         assert "Infrastructure Body Schema" not in prompt
         assert "Genesis Guardian" in prompt
+
+
+class TestCCSubprocessTreeKill:
+    """The recovery-brain `claude -p` is an agentic launcher (forks tool/MCP
+    children). Its timeout kill must reap the whole GROUP with a BOUNDED reap
+    — a leaked claude tree on the host has no genesis-server cgroup to clean
+    it. Same for the `claude auth status` pre-flight probe."""
+
+    @pytest.mark.asyncio
+    async def test_diagnosis_timeout_group_kills(self, tmp_path, monkeypatch) -> None:
+        import asyncio as _asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from genesis.guardian.diagnosis import CCDiagnosisError
+
+        killpg_calls = []
+        monkeypatch.setattr(
+            "genesis.util.proc_kill.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+
+        config = GuardianConfig()
+        config.cc.timeout_s = 1
+        config.cc.work_dir = str(tmp_path)
+        engine = DiagnosisEngine(config)
+        # The disk preflight probes the pool via its own subprocess — with
+        # create_subprocess_exec faked below it would "assume full" and refuse
+        # before ever spawning CC. Pin it healthy; the spawn is what we test.
+        monkeypatch.setattr(
+            "genesis.guardian.snapshots.SnapshotManager.check_pool_space",
+            AsyncMock(return_value=10.0),
+        )
+        # The auth pre-flight would also hit the faked hanging exec; pin it
+        # to the inherit-env default so the test reaches the diagnosis spawn.
+        monkeypatch.setattr(
+            "genesis.guardian.diagnosis.DiagnosisEngine._resolve_cc_env",
+            AsyncMock(return_value=None),
+        )
+
+        captured: dict = {}
+        proc = MagicMock()
+        proc.pid = 55555  # explicit — never a mock default (killpg(1) trap)
+        proc.returncode = None
+
+        async def _hang(*a, **k):
+            await _asyncio.sleep(600)
+
+        proc.communicate = _hang
+        proc.wait = AsyncMock(return_value=-9)
+
+        async def fake_exec(*args, **kwargs):
+            captured.update(kwargs)
+            return proc
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+        snap = _snap(container_status="Running")
+        with pytest.raises(CCDiagnosisError, match="timed out"):
+            await engine._diagnose_with_cc(snap, "signal summary")
+        assert len(killpg_calls) == 1
+        assert killpg_calls[0][0] == 55555
+        assert captured.get("start_new_session") is True
+        assert "preexec_fn" not in captured
+
+    @pytest.mark.asyncio
+    async def test_auth_probe_timeout_group_kills(self, tmp_path, monkeypatch) -> None:
+        import asyncio as _asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        killpg_calls = []
+        monkeypatch.setattr(
+            "genesis.util.proc_kill.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+        # shrink the probe's 15s bound so the test is fast
+        monkeypatch.setattr(
+            "genesis.guardian.diagnosis._AUTH_PROBE_TIMEOUT_S", 0.05, raising=True,
+        )
+
+        config = GuardianConfig()
+        engine = DiagnosisEngine(config)
+
+        captured: dict = {}
+        proc = MagicMock()
+        proc.pid = 55556
+        proc.returncode = None
+
+        async def _hang(*a, **k):
+            await _asyncio.sleep(600)
+
+        proc.communicate = _hang
+        proc.wait = AsyncMock(return_value=-9)
+
+        async def fake_exec(*args, **kwargs):
+            captured.update(kwargs)
+            return proc
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+        env = await engine._resolve_cc_env("claude")
+        assert env is None  # ambiguous probe → inherit (unchanged contract)
+        assert len(killpg_calls) == 1
+        assert killpg_calls[0][0] == 55556
+        assert captured.get("start_new_session") is True
+        assert "preexec_fn" not in captured

@@ -10,8 +10,8 @@ extraction and keeps its own). Locked invariants carried over verbatim:
 - ``GENESIS_SESSION_ORIGIN`` popped — WS-3: never leak a session origin
   into the nested subprocess (mirrors ``CCInvoker._build_env``).
 - ONE timeout; on expiry the whole PROCESS GROUP is SIGKILLed (claude
-  spawns MCP children; killing only the parent orphans them) — with the
-  pgid>1 guard from ``cc/invoker.py``.
+  spawns MCP children; killing only the parent orphans them) via the
+  shared guarded helper (``genesis.util.proc_kill``).
 - Never raises: every outcome is a status dict.
 """
 
@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
+
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 
 def build_argv(
@@ -84,7 +85,10 @@ async def run_headless_json(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
-            preexec_fn=os.setpgrp,
+            # Own session/group (setsid in the C helper — never preexec_fn:
+            # post-fork Python can deadlock in the threaded server) so the
+            # timeout below can killpg the whole claude tree.
+            start_new_session=True,
         )
         try:
             stdout, _stderr = await asyncio.wait_for(
@@ -92,16 +96,14 @@ async def run_headless_json(
                 timeout=timeout_s,
             )
         except TimeoutError:
-            # claude spawns MCP/helper children — group-kill is mandatory
-            # (cc/invoker.py pattern, incl. the pgid>1 safety guard).
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                proc.kill()
-            await proc.wait()
+            # claude spawns MCP/helper children — group-kill is mandatory.
+            # kill_process_group signals proc.pid AS the pgid (never
+            # os.getpgid, which raises once the leader is reaped and would
+            # leak the children), with the pgid>1 guard + direct-kill
+            # fallback; the reap is bounded (a paused pipe transport can
+            # stall an unbounded wait()).
+            kill_process_group(proc)
+            await reap_bounded(proc)
             return {"status": "timeout"}
         if proc.returncode != 0:
             return {"status": "failed", "reason": f"exit_{proc.returncode}"}

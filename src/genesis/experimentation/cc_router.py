@@ -15,7 +15,6 @@ Single-completion only (``-p``); no tools, no session resume.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 
@@ -27,6 +26,7 @@ from genesis.cc.types import (
     model_supports_effort,
 )
 from genesis.experimentation.standalone_router import StandaloneRoutingResult
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -113,18 +113,22 @@ class CCCliRouter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                # Own session/group (setsid in the C helper — never
+                # preexec_fn: post-fork Python can deadlock in the threaded
+                # server) so the timeout below can killpg the whole tree.
+                start_new_session=True,
             )
             out, err = await asyncio.wait_for(
                 proc.communicate(input=user.encode()), timeout=self._timeout_s,
             )
         except TimeoutError:
             logger.warning("cc-cli %s timed out after %ss", self._model, self._timeout_s)
-            # Reap the orphaned claude process (else it keeps running + holds a
-            # subscription slot). Mirrors CCInvoker's timeout handling.
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.wait()
+            # claude spawns MCP/helper children — a bare proc.kill() orphans
+            # them (they keep running + hold a subscription slot). Group-kill
+            # via the shared guarded helper (pid-as-pgid, pgid>1 guard,
+            # direct-kill fallback), then a BOUNDED reap.
+            kill_process_group(proc)
+            await reap_bounded(proc)
             return StandaloneRoutingResult(
                 success=False, content=None, model_id=self._model,
                 provider_used="cc-cli", error="timeout",

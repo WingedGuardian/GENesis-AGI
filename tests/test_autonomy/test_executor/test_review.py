@@ -443,7 +443,7 @@ class TestVerifyViaCodex:
 
         killpg_calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.killpg",
+            "genesis.util.proc_kill.os.killpg",
             lambda pgid, sig: killpg_calls.append((pgid, sig)),
         )
 
@@ -493,7 +493,7 @@ class TestVerifyViaCodex:
 
         killpg_calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.killpg",
+            "genesis.util.proc_kill.os.killpg",
             lambda pgid, sig: killpg_calls.append((pgid, sig)),
         )
 
@@ -541,7 +541,7 @@ class TestVerifyViaCodex:
 
         killpg_calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.killpg",
+            "genesis.util.proc_kill.os.killpg",
             lambda pgid, sig: killpg_calls.append((pgid, sig)),
         )
 
@@ -601,10 +601,10 @@ class TestVerifyViaCodex:
             "genesis.autonomy.executor.review._CODEX_EXEC_TIMEOUT_S", 0.05,
         )
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review._CODEX_KILL_REAP_TIMEOUT_S", 0.05,
+            "genesis.util.proc_kill.DEFAULT_REAP_TIMEOUT_S", 0.05,
         )
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.killpg", lambda pgid, sig: None,
+            "genesis.util.proc_kill.os.killpg", lambda pgid, sig: None,
         )
 
         async def _never_returns(*_args, **_kwargs):

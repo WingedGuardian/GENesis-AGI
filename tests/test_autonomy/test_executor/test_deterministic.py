@@ -205,6 +205,38 @@ class TestExecuteDeterministicStep:
         finally:
             det._HARD_TIMEOUT_S = original
 
+    async def test_timeout_reaps_grandchildren(self, tmp_path: Path) -> None:
+        """A step command that FORKS (bash spawning a background child): the
+        timeout kill must reap the whole process group, not just the direct
+        child — otherwise the grandchild reparents to pid 1 and runs forever."""
+        import asyncio
+        import os
+
+        from genesis.autonomy.executor import deterministic as det
+
+        marker = tmp_path / "grandchild_pid"
+        # A project-script step (validate_command allows executables that are
+        # not bare interpreter names) that forks a background child then hangs.
+        forker = tmp_path / "forker"
+        forker.write_text(
+            f"#!/bin/bash\nsleep 600 &\necho $! > {marker}\nsleep 600\n"
+        )
+        forker.chmod(0o755)
+        original = det._HARD_TIMEOUT_S
+        try:
+            det._HARD_TIMEOUT_S = 1
+            step = {"idx": 0, "type": "bash", "command": str(forker)}
+            result = await execute_deterministic_step(step)
+            assert result.status == "failed"
+            assert "timed out" in result.blocker_description.lower()
+            grandchild = int(marker.read_text().strip())
+            assert grandchild > 1  # explicit pid, never a default
+            await asyncio.sleep(0.3)  # let SIGKILL land
+            with pytest.raises(ProcessLookupError):
+                os.kill(grandchild, 0)
+        finally:
+            det._HARD_TIMEOUT_S = original
+
 
 class TestStepTypeProperties:
     """Verify the new StepType properties."""
