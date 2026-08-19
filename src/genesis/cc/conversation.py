@@ -1314,7 +1314,7 @@ class ConversationLoop:
             logger.warning("Context injection skipped", exc_info=True)
         return system_prompt
 
-    # Total byte budget for the recovery recap (env-overridable settings
+    # Total character budget for the recovery recap (env-overridable settings
     # lever: GENESIS_RECOVERY_CONTEXT_BUDGET). Sized so several full-length
     # analytical replies survive — the old per-message 300-char HEAD chop
     # dropped exactly the part that matters (numbered options/conclusions sit
@@ -1349,14 +1349,17 @@ class ConversationLoop:
         except ValueError:
             return ""
         thread_note = f", thread_id={thread_id}" if thread_id else ""
+        # Scope the suggested call to the ACTIVE topic when in a forum thread —
+        # an unscoped group call would pull unrelated topics' messages.
+        thread_arg = f", thread_id={thread_id}" if thread_id else ""
         return (
             "\n\n## Conversation identity\n"
             f"This is the Telegram chat with chat_id={chat_id_str}{thread_note}. "
             "When the user references earlier conversation that is not in your "
             "context, SCROLL UP before claiming it is unavailable: call "
-            f"`conversation_history(channel='telegram', chat_id={chat_id_str}, "
-            "limit=50)` (add `before=<oldest timestamp seen>` to page further "
-            "back). Messages return full-length."
+            f"`conversation_history(channel='telegram', chat_id={chat_id_str}"
+            f"{thread_arg}, limit=50)` (add `before=<oldest timestamp seen>` to "
+            "page further back). Messages return full-length."
         )
 
     async def _build_recovery_context(
@@ -1370,7 +1373,7 @@ class ConversationLoop:
         ``chat_ref``: the real chat id (optionally ``tg-``-prefixed; negative
         for groups) — same contract as ``_conversation_identity_block``.
 
-        Byte-budgeted and TAIL-biased: messages are kept whole newest-first
+        Character-budgeted and TAIL-biased: messages are kept whole newest-first
         until the budget runs low; a message too large for the remaining
         budget keeps its END (marked with a leading ellipsis), because that is
         where long analytical replies put their conclusions and option lists.

@@ -37,7 +37,7 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   on demand: `conversation_history` accepts `chat_id` (scoped to one chat) and
   `before` (page arbitrarily far back, full-length messages), every fresh
   telegram session is told its own chat id, and the session-recovery recap is
-  byte-budgeted and tail-biased so the END of long replies (option lists,
+  character-budgeted and tail-biased so the END of long replies (option lists,
   conclusions) survives instead of being cut at 300 characters.
 - **Firecrawl as an explicit paid escalation backend.**
   `web_fetch(url, backend="firecrawl")` / `web_search(query,

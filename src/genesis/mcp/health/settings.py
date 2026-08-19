@@ -1842,43 +1842,74 @@ async def _impl_settings_update(
         # pipeline here): a critical observation — the server's
         # critical-observations job pages it to Telegram. Best-effort; the
         # provenance stamp + warning above remain the durable record.
-        try:
-            import hashlib as _hashlib
-            import uuid as _uuid
-            from datetime import UTC as _UTC
-            from datetime import datetime as _datetime
-
-            from genesis.db.connection import get_raw_db
-            from genesis.db.crud import observations as _observations
-            from genesis.env import genesis_db_path
-
-            async with get_raw_db(genesis_db_path()) as db:
-                await _observations.create(
-                    db,
-                    id=str(_uuid.uuid4()),
-                    source="settings_guard",
-                    type="infrastructure_alert",
-                    content=(
-                        f"Approval gate DISABLED via {actor} (confirmed): "
-                        "manual_approval_required is now false — autonomous "
-                        "Claude Code sessions dispatch WITHOUT per-run "
-                        "approval until it is set back to true "
-                        "(Settings → autonomous_cli_policy)."
-                    ),
-                    priority="critical",
-                    created_at=_datetime.now(_UTC).isoformat(),
-                    content_hash=_hashlib.sha256(
-                        b"approval_gate_disabled_alert",
-                    ).hexdigest(),
-                    skip_if_duplicate=True,
-                )
-        except Exception:
-            logger.warning(
-                "Gate-disable critical observation write failed",
-                exc_info=True,
-            )
+        await write_gate_disable_alert(actor)
+    elif domain == "autonomous_cli_policy" and changes.get("manual_approval_required") is True:
+        # Gate restored: resolve the standing alert immediately so a stale
+        # "running without approval" critical cannot page after re-enable.
+        await resolve_gate_disable_alert(actor)
 
     return result
+
+
+async def write_gate_disable_alert(actor: str) -> None:
+    """Best-effort critical observation for a confirmed gate disable."""
+    try:
+        import hashlib as _hashlib
+        import uuid as _uuid
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+
+        from genesis.db.connection import get_raw_db
+        from genesis.db.crud import observations as _observations
+        from genesis.env import genesis_db_path
+
+        async with get_raw_db(genesis_db_path()) as db:
+            await _observations.create(
+                db,
+                id=str(_uuid.uuid4()),
+                source="settings_guard",
+                type="infrastructure_alert",
+                content=(
+                    f"Approval gate DISABLED via {actor} (confirmed): "
+                    "manual_approval_required is now false — autonomous "
+                    "Claude Code sessions dispatch WITHOUT per-run "
+                    "approval until it is set back to true "
+                    "(Settings → autonomous_cli_policy)."
+                ),
+                priority="critical",
+                created_at=_datetime.now(_UTC).isoformat(),
+                content_hash=_hashlib.sha256(
+                    b"approval_gate_disabled_alert",
+                ).hexdigest(),
+                skip_if_duplicate=True,
+            )
+    except Exception:
+        logger.warning(
+            "Gate-disable critical observation write failed",
+            exc_info=True,
+        )
+
+
+async def resolve_gate_disable_alert(actor: str) -> None:
+    """Best-effort resolve of the gate-disabled alert when the gate returns."""
+    try:
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+
+        from genesis.db.connection import get_raw_db
+        from genesis.db.crud import observations as _observations
+        from genesis.env import genesis_db_path
+
+        async with get_raw_db(genesis_db_path()) as db:
+            await _observations.resolve_by_source_and_type(
+                db,
+                source="settings_guard",
+                type="infrastructure_alert",
+                resolved_at=_datetime.now(_UTC).isoformat(),
+                resolution_notes=f"gate re-enabled via {actor}",
+            )
+    except Exception:
+        logger.warning("Gate-disable alert resolve failed", exc_info=True)
 
 
 # ── MCP tool wrappers ──────────────────────────────────────────────────

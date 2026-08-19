@@ -2214,14 +2214,27 @@
             }
           } catch (e) { console.warn(`Settings fetch ${domain} failed:`, e); }
         },
-        async saveSettings(domain) {
+        async saveSettings(domain, confirmGateDisable = false) {
           this.settingsSaving = true;
           try {
+            const payload = { ...this.settingsData[domain] };
+            if (confirmGateDisable) { payload.confirm_disable_approval_gate = true; }
             const resp = await fetchApi(`/api/genesis/settings/${domain}`, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(this.settingsData[domain]),
+              body: JSON.stringify(payload),
             });
+            if (resp && resp.status === 409 && !confirmGateDisable) {
+              // Protected key: disabling the mandatory approval gate needs an
+              // explicit human confirmation, then a single retry with the flag.
+              const err = await resp.json().catch(() => ({}));
+              this.settingsSaving = false;
+              const detail = typeof err.details === "string" ? err.details : "This disables the mandatory approval gate for ALL autonomous sessions.";
+              if (window.confirm(detail + "\n\nProceed?")) {
+                return this.saveSettings(domain, true);
+              }
+              return;
+            }
             if (resp && resp.ok) {
               const d = await resp.json();
               this.settingsData[domain] = d.config;
@@ -2232,7 +2245,8 @@
               if (d.needs_restart) { this.settingsRestartMessage = "Settings saved. Restart Genesis server to apply."; }
             } else {
               const err = await resp.json().catch(() => ({}));
-              alert("Save failed: " + (err.details ? err.details.join(", ") : err.error || "Unknown error"));
+              const detail = Array.isArray(err.details) ? err.details.join(", ") : (err.details || err.error || "Unknown error");
+              alert("Save failed: " + detail);
             }
           } catch (e) { alert("Save failed: " + e.message); }
           this.settingsSaving = false;

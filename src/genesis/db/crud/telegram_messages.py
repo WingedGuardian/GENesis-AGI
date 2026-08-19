@@ -69,7 +69,7 @@ async def query_recent(
     cursor = await db.execute(
         f"""SELECT * FROM telegram_messages
            WHERE {" AND ".join(clauses)}
-           ORDER BY timestamp DESC LIMIT ?""",  # noqa: S608 — clauses are literals
+           ORDER BY timestamp DESC, id DESC LIMIT ?""",  # noqa: S608 — clauses are literals
         params,
     )
     rows = await cursor.fetchall()
@@ -88,13 +88,13 @@ async def query_all_recent(
         cursor = await db.execute(
             """SELECT * FROM telegram_messages
                WHERE timestamp < ?
-               ORDER BY timestamp DESC LIMIT ?""",
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
             (before, limit),
         )
     else:
         cursor = await db.execute(
             """SELECT * FROM telegram_messages
-               ORDER BY timestamp DESC LIMIT ?""",
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
             (limit,),
         )
     rows = await cursor.fetchall()
@@ -113,7 +113,7 @@ async def search(
     cursor = await db.execute(
         """SELECT * FROM telegram_messages
            WHERE chat_id = ? AND content LIKE ? ESCAPE '\\'
-           ORDER BY timestamp DESC LIMIT ?""",
+           ORDER BY timestamp DESC, id DESC LIMIT ?""",
         (chat_id, f"%{escaped}%", limit),
     )
     rows = await cursor.fetchall()
@@ -131,7 +131,7 @@ async def search_all(
     cursor = await db.execute(
         """SELECT * FROM telegram_messages
            WHERE content LIKE ? ESCAPE '\\'
-           ORDER BY timestamp DESC LIMIT ?""",
+           ORDER BY timestamp DESC, id DESC LIMIT ?""",
         (f"%{escaped}%", limit),
     )
     rows = await cursor.fetchall()

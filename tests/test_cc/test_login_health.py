@@ -173,3 +173,30 @@ async def test_awareness_check_silent_without_credentials(tmp_path, db):
         "SELECT * FROM observations WHERE source='cc_login_monitor'",
     )
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_awareness_check_preserves_alert_on_unreadable_credentials(
+    tmp_path, db,
+):
+    """Codex P2 lock: a transient unreadable/mid-rewrite credentials file is
+    NO SIGNAL — it must neither create nor RESOLVE a standing alert."""
+    from genesis.awareness.loop import _check_cc_login_expiry
+
+    _write_creds(
+        tmp_path, refresh_expires_ms=_ms(datetime.now(UTC) + timedelta(days=2)),
+    )
+    await _check_cc_login_expiry(db)
+    rows = await db.execute_fetchall(
+        "SELECT id FROM observations WHERE source='cc_login_monitor' "
+        "AND resolved_at IS NULL",
+    )
+    assert len(rows) == 1
+
+    (tmp_path / ".credentials.json").write_text("{mid-rewrite garbage")
+    await _check_cc_login_expiry(db)
+    rows = await db.execute_fetchall(
+        "SELECT id FROM observations WHERE source='cc_login_monitor' "
+        "AND resolved_at IS NULL",
+    )
+    assert len(rows) == 1, "no-signal must not resolve a standing alert"

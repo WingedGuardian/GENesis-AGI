@@ -496,6 +496,12 @@ async def test_open_park_past_wait_bound_reads_as_failure(db):
     assert result is not None
     assert result["success"] is False
     assert "wait bound exceeded" in result["output_text"]
+    # Codex P2 lock: the abandoned park must be CLOSED — an open park would
+    # let the resume engine run the same campaign action again later.
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "cancelled"
 
 
 @pytest.mark.asyncio

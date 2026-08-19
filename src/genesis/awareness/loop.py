@@ -1910,7 +1910,12 @@ async def _check_cc_login_expiry(db) -> None:
 
         expiry = refresh_token_expiry()
         now = datetime.now(UTC)
-        if expiry is None or (expiry - now) > timedelta(days=warn_days):
+        if expiry is None:
+            # No signal (missing/unreadable/mid-rewrite credentials) is NOT a
+            # verdict: neither alert nor resolve — a transient read failure
+            # must not clear a real standing warning.
+            return
+        if (expiry - now) > timedelta(days=warn_days):
             await observations.resolve_by_source_and_type(
                 db,
                 source="cc_login_monitor",

@@ -168,6 +168,13 @@ async def settings_update(domain_name: str):
             and changes.get("manual_approval_required") is False
         ):
             await _notify_gate_disabled()
+        elif (
+            domain_name == "autonomous_cli_policy"
+            and changes.get("manual_approval_required") is True
+        ):
+            from genesis.mcp.health.settings import resolve_gate_disable_alert
+
+            await resolve_gate_disable_alert("user via dashboard PUT")
         # Return the full merged view
         base = _load_yaml(domain.config_filename)
         merged = _deep_merge(base, new_local)

@@ -138,3 +138,16 @@ def test_conversation_identity_block_group_chat_id():
     )
     assert "chat_id=-100999888777" in block
     assert "thread_id=109" in block
+
+
+def test_conversation_identity_block_thread_scoped_suggestion():
+    """Codex P2 lock: in a forum-topic session the SUGGESTED scroll-up call
+    must be thread-scoped, or following it pulls unrelated topics."""
+    block = ConversationLoop._conversation_identity_block(
+        "-100999888777", "telegram", "109",
+    )
+    assert "chat_id=-100999888777, thread_id=109, limit=50" in block
+    dm_block = ConversationLoop._conversation_identity_block(
+        "555000111", "telegram", None,
+    )
+    assert "chat_id=555000111, limit=50" in dm_block

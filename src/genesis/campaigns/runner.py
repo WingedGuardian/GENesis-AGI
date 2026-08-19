@@ -422,6 +422,18 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
             # Unparseable/missing created_at counts as OVER the bound — a
             # corrupt row must not reopen the unbounded-wait trajectory.
             if created is None or (datetime.now(UTC) - created) > _PARK_WAIT_BOUND:
+                # Close the park when abandoning it: leaving it open would let
+                # the resume engine execute the SAME campaign action later,
+                # after the campaign has already moved on (double-run).
+                try:
+                    from genesis.db.crud import cc_rate_limit_parks as _parks
+
+                    await _parks.mark_terminal(db, park_id, "cancelled")
+                except Exception:
+                    logger.warning(
+                        "Failed to cancel over-bound park %s", park_id,
+                        exc_info=True,
+                    )
                 return {
                     "success": False,
                     "output_text": (

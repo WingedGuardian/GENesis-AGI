@@ -97,6 +97,28 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Safety: prevent tests from writing to the REAL genesis.db ────────────────
+@pytest.fixture(autouse=True)
+def _isolate_genesis_db_path(tmp_path):
+    """Redirect ``env.genesis_db_path()`` to tmp for ALL tests.
+
+    Same class as ``_isolate_alert_queue``: code paths that resolve the DB
+    lazily (e.g. the settings gate-disable critical-observation write via
+    ``get_raw_db(genesis_db_path())``) would otherwise write REAL rows the
+    live server pages to the owner's Telegram when tests run from the main
+    tree (from a worktree they silently mint a stray ``data/genesis.db``
+    instead — measured 2026-08-19). Tests that need a DB construct their own
+    in-memory connection; none legitimately resolve the install DB.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        "genesis.env.genesis_db_path",
+        lambda: tmp_path / "isolated-genesis.db",
+    )
+    yield
+    mp.undo()
+
+
 # ── Safety: isolate tests from the install's config overlays ──
 @pytest.fixture(autouse=True)
 def _isolate_user_config_dir(tmp_path):

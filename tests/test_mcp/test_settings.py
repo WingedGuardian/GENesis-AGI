@@ -696,3 +696,50 @@ class TestSettingsProvenanceAndGateFlip:
         assert "manual_approval_required" not in loaded
         for line in text.splitlines():
             assert not line.strip() or line.startswith("#") or line.startswith("a:")
+
+    @pytest.mark.asyncio
+    async def test_gate_disable_alert_writes_and_reenable_resolves(
+        self, tmp_path, monkeypatch,
+    ):
+        """The observation write must actually LAND (the original test never
+        asserted it — the write silently failed into a stray db), and
+        re-enabling the gate must resolve the standing alert (Codex P2)."""
+        import aiosqlite
+
+        import genesis.mcp.health.settings as settings_mod
+        from genesis.db.schema import create_all_tables
+        from genesis.mcp.health.settings import _impl_settings_update
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        dbp = tmp_path / "obs.db"
+        async with aiosqlite.connect(dbp) as db:
+            db.row_factory = aiosqlite.Row
+            await create_all_tables(db)
+            await db.commit()
+        monkeypatch.setattr("genesis.env.genesis_db_path", lambda: dbp)
+
+        result = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": False},
+            confirm_disable_approval_gate=True,
+        )
+        assert result.get("status") == "applied"
+        async with aiosqlite.connect(dbp) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT resolved_at FROM observations WHERE source='settings_guard'",
+            )
+        assert len(rows) == 1 and rows[0]["resolved_at"] is None, (
+            "the gate-disable critical observation must actually land"
+        )
+
+        result2 = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": True},
+        )
+        assert result2.get("status") == "applied"
+        async with aiosqlite.connect(dbp) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT resolved_at FROM observations WHERE source='settings_guard' "
+                "AND resolved_at IS NULL",
+            )
+        assert rows == [], "re-enable must resolve the standing alert"
