@@ -236,9 +236,15 @@ async def park_direct_session(
                 lineage_id,
             )
 
-        # Fresh background park — serialize enough to re-dispatch verbatim.
+        # Fresh background park — serialize the FULL execution shape so the
+        # resume re-dispatches an EQUIVALENT session. Dropping any of these
+        # silently changes the resumed session's behavior (measured 2026-08-17:
+        # a campaign resume ran WITHOUT its strategy doc because system_prompt
+        # was not serialized; source_tag loss also broke attribution).
         prompt = getattr(request, "prompt", "")
         origin = getattr(request, "origin_session_id", None)
+        skills = getattr(request, "skills", None)
+        tool_exceptions = getattr(request, "tool_exceptions", ()) or ()
         payload = {
             "prompt": prompt,
             "profile": getattr(request, "profile", "observe"),
@@ -246,6 +252,11 @@ async def park_direct_session(
             "effort": _enum_str(getattr(request, "effort", None), "high"),
             "timeout_s": int(getattr(request, "timeout_s", 3600)),
             "roster_model": getattr(request, "roster_model", None),
+            "system_prompt": getattr(request, "system_prompt", None),
+            "source_tag": getattr(request, "source_tag", "direct_session"),
+            "skills": list(skills) if skills is not None else None,
+            "tool_exceptions": list(tool_exceptions),
+            "planning_instruction": getattr(request, "planning_instruction", None),
         }
         return await parks.upsert_open_park(
             db,

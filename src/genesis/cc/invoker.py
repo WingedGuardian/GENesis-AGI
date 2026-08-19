@@ -710,9 +710,52 @@ class CCInvoker:
                     span.set_status_error(output.error_message or "CC session error")
             return output
 
+    async def _apply_login_fallback(
+        self,
+        env: dict[str, str],
+        inv: CCInvocation | None,
+    ) -> dict[str, str]:
+        """Inject the stored 1-year setup-token ONLY when the interactive
+        login is hard-expired AND a live probe confirms logged-out
+        (login_health gates — never over a working login, never on
+        ambiguity). Skipped entirely for cleanroom/bare invocations whose
+        env_overrides manage their own auth (overrides win by contract).
+        """
+        if inv is not None and getattr(inv, "bare", False):
+            return env
+        # Peer-routed invocations (third-party ANTHROPIC_BASE_URL/AUTH_TOKEN)
+        # never use the claude.ai login — injecting the Anthropic OAuth
+        # setup-token there is useless at best and violates the roster's
+        # credential-isolation contract (the Anthropic credential must never
+        # travel toward a third-party endpoint).
+        if inv and (
+            getattr(inv, "anthropic_base_url", None) or getattr(inv, "anthropic_auth_token", None)
+        ):
+            return env
+        if (
+            inv
+            and inv.env_overrides
+            and (
+                "CLAUDE_CODE_OAUTH_TOKEN" in inv.env_overrides
+                or "CLAUDE_CONFIG_DIR" in inv.env_overrides
+                or "ANTHROPIC_API_KEY" in inv.env_overrides
+            )
+        ):
+            return env
+        try:
+            from genesis.cc.login_health import fallback_env_if_login_dead
+
+            fb = await fallback_env_if_login_dead(cc_path=self._claude_path)
+            if fb:
+                return {**env, **fb}
+        except Exception:
+            logger.debug("login fallback check failed", exc_info=True)
+        return env
+
     async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
         args = self._build_args(invocation)
         env = self._build_env(invocation)
+        env = await self._apply_login_fallback(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
@@ -901,6 +944,7 @@ class CCInvoker:
         args.insert(1, "--verbose")
 
         env = self._build_env(invocation)
+        env = await self._apply_login_fallback(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort

@@ -367,6 +367,164 @@ def _read_strategy_doc(path: str) -> str:
         return ""
 
 
+# Sentinel: _follow_park could not produce a verdict (no park row / lookup
+# error) — the caller falls through to the session's own failed result.
+_NO_PARK_VERDICT = object()
+
+# How long a campaign will wait on an open (parked/resuming) rate-limit park
+# before treating the work as failed. Generous — real capacity droughts span
+# days — but bounded, so a resume loop stuck on a deterministic non-rate-limit
+# failure (which never increments attempts → never reaches needs_user) cannot
+# stall a campaign forever.
+_PARK_WAIT_BOUND = timedelta(days=7)
+# A resuming park whose claim is younger than this may have a LIVE queued/
+# running delivery attempt — cancelling the row would not stop it, so
+# abandonment holds until the attempt terminates on its own. Matches the
+# resume engine's stale-claim reclaim bound (_STALE_RESUMING_S = 2h).
+_ACTIVE_CLAIM_BOUND = timedelta(hours=2)
+
+
+def _parse_iso(raw: str) -> datetime | None:
+    """Parse an ISO timestamp defensively; naive values are assumed UTC."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+async def _follow_park(db: Any, park_id: str) -> dict | None | object:
+    """Resolve a rate-limit park into a campaign-visible session verdict.
+
+    Returns:
+        None — park open (parked/resuming) or resumed-but-not-yet-delivered:
+            the work is still in flight, keep waiting.
+        dict — a terminal verdict: the delivering session's real result
+            (park resumed + a finished re-dispatched session found), or a
+            failure when the park itself went terminal (needs_user /
+            cancelled / expired).
+        _NO_PARK_VERDICT — park row missing/unreadable: no opinion.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT status, created_at, claimed_at FROM cc_rate_limit_parks "
+            "WHERE id = ?",
+            (park_id,),
+        )
+        park_row = await cursor.fetchone()
+        if not park_row:
+            return _NO_PARK_VERDICT
+        park_status = str(park_row["status"])
+
+        if park_status in ("parked", "resuming"):
+            # Bounded wait (audit F1): a resume loop stuck on a genuine
+            # (non-rate-limit) failure can cycle parked→resuming forever
+            # without ever reaching needs_user. A campaign must not skip its
+            # ticks indefinitely on that — past the bound, surface a real
+            # failure so the next tick dispatches fresh work.
+            created = _parse_iso(str(park_row["created_at"] or ""))
+            # Unparseable/missing created_at counts as OVER the bound — a
+            # corrupt row must not reopen the unbounded-wait trajectory.
+            if created is None or (datetime.now(UTC) - created) > _PARK_WAIT_BOUND:
+                # An ACTIVELY-claimed resuming attempt may already have a
+                # queued/live delivery session; cancelling the ROW would not
+                # cancel that session → the exact double-run this bound
+                # prevents. Hold until the attempt terminates on its own
+                # (<= the resume engine's 2h reclaim bound), then abandon on
+                # a later tick.
+                claimed = _parse_iso(str(park_row["claimed_at"] or ""))
+                if (
+                    park_status == "resuming"
+                    and claimed is not None
+                    and (datetime.now(UTC) - claimed) <= _ACTIVE_CLAIM_BOUND
+                ):
+                    return None
+                # Close the park when abandoning it: leaving it open would let
+                # the resume engine execute the SAME campaign action later,
+                # after the campaign has already moved on (double-run). The
+                # abandonment verdict is returned ONLY when the cancel is
+                # CONFIRMED — on a transient failure the campaign stays
+                # attached and retries next tick (never fail open into a
+                # detached-but-runnable park).
+                try:
+                    from genesis.db.crud import cc_rate_limit_parks as _parks
+
+                    await _parks.mark_terminal(db, park_id, "cancelled")
+                except Exception:
+                    logger.warning(
+                        "Failed to cancel over-bound park %s — staying "
+                        "attached; will retry next tick",
+                        park_id,
+                        exc_info=True,
+                    )
+                    return None
+                return {
+                    "success": False,
+                    "output_text": (
+                        f"rate-limit park {park_id} still {park_status} after "
+                        f"{_PARK_WAIT_BOUND.days} days — wait bound exceeded; "
+                        "treating the parked campaign work as failed"
+                    ),
+                    "cost_usd": 0.0,
+                }
+            return None  # still in flight — the resume engine owns it
+
+        if park_status == "resumed":
+            # Find the re-dispatched session that delivered (its metadata
+            # carries caller_context "rate_limit_resume:<park_id>"; the
+            # closing quote pins the id boundary inside the JSON string).
+            cursor = await db.execute(
+                """SELECT status, cost_usd, metadata FROM cc_sessions
+                   WHERE metadata LIKE ?
+                   ORDER BY started_at DESC LIMIT 1""",
+                (f'%rate_limit_resume:{park_id}"%',),
+            )
+            deliv_row = await cursor.fetchone()
+            if not deliv_row:
+                # A park is marked resumed only AFTER its delivering session
+                # is persisted (mark_resumed_if_lineage runs post-_store_result)
+                # — a missing row means deleted/corrupted, never in-flight.
+                # Returning None here would skip campaign ticks FOREVER.
+                return {
+                    "success": False,
+                    "output_text": (
+                        f"rate-limit park {park_id} is resumed but its "
+                        "delivering session row is missing (deleted or "
+                        "corrupted) — treating the parked campaign work as "
+                        "failed"
+                    ),
+                    "cost_usd": 0.0,
+                }
+            deliv = dict(deliv_row)
+            dstatus = str(deliv.get("status", ""))
+            if dstatus not in ("completed", "failed"):
+                return None  # delivering session still running
+            dmeta = {}
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                dmeta = json.loads(deliv.get("metadata") or "{}")
+            return {
+                "success": dstatus == "completed",
+                "output_text": dmeta.get("output_text", ""),
+                "cost_usd": deliv.get("cost_usd", 0.0) or 0.0,
+            }
+
+        # needs_user / cancelled / expired — genuinely terminal without
+        # delivery: surface as a real failure naming the park state.
+        return {
+            "success": False,
+            "output_text": (
+                f"rate-limit park {park_id} ended {park_status} without "
+                "delivering — the parked campaign work was not completed"
+            ),
+            "cost_usd": 0.0,
+        }
+    except Exception:
+        logger.warning("Failed to follow park %s", park_id, exc_info=True)
+        return _NO_PARK_VERDICT
+
+
 async def _check_session_status(db: Any, session_id: str) -> dict | None:
     """Check if a DirectSession has completed.
 
@@ -402,6 +560,17 @@ async def _check_session_status(db: Any, session_id: str) -> dict | None:
             if raw_meta:
                 with contextlib.suppress(json.JSONDecodeError, TypeError):
                     metadata = json.loads(raw_meta)
+
+            # Rate-limit-park awareness (2026-08-17 incident: a parked
+            # campaign session was captured as outcome=error while its resume
+            # later delivered — the campaign's bookkeeping never learned).
+            # A failed session stamped with a park_id is NOT a real failure:
+            # follow the park.
+            park_id = metadata.get("park_id")
+            if status == "failed" and park_id:
+                park_result = await _follow_park(db, str(park_id))
+                if park_result is not _NO_PARK_VERDICT:
+                    return park_result
 
             return {
                 "success": status == "completed",

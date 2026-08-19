@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -1881,6 +1882,77 @@ _CAP_ALERT_COOLDOWN_S = 3600  # one alert per hour max
 _last_cap_alert_at: float | None = None
 
 
+async def _check_cc_login_expiry(db) -> None:
+    """Warn ahead of the interactive CC login's refresh-token expiry.
+
+    The claude.ai OAuth refresh token has a FIXED lifetime (routine access-
+    token refresh does not extend it); when it lapses, every CC request —
+    including all background autonomy — fails until an interactive /login.
+    CC's own terminal warning is invisible on a headless box, so this raises
+    ONE critical observation (rides the critical-observations job to
+    Telegram) when expiry is inside the warning window, and auto-resolves
+    after the user re-logs in. Missing/unreadable credentials (fresh or
+    API-key-only installs, mid-rewrite reads) are silent — no signal is
+    never treated as expired. Best-effort; never raises into the tick.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.cc.login_health import refresh_token_expiry
+
+        try:
+            warn_days = max(
+                1,
+                int(os.environ.get("GENESIS_CC_LOGIN_EXPIRY_WARN_DAYS", "5")),
+            )
+        except ValueError:
+            warn_days = 5
+
+        expiry = refresh_token_expiry()
+        now = datetime.now(UTC)
+        if expiry is None:
+            # No signal (missing/unreadable/mid-rewrite credentials) is NOT a
+            # verdict: neither alert nor resolve — a transient read failure
+            # must not clear a real standing warning.
+            return
+        if (expiry - now) > timedelta(days=warn_days):
+            await observations.resolve_by_source_and_type(
+                db,
+                source="cc_login_monitor",
+                type="infrastructure_alert",
+                resolved_at=now.isoformat(),
+                resolution_notes=(
+                    "auto-resolved: CC login expiry no longer inside the "
+                    f"{warn_days}-day warning window"
+                ),
+            )
+            return
+
+        days_left = max(0.0, (expiry - now).total_seconds() / 86400)
+        content_hash = hashlib.sha256(b"cc_login_expiry_alert").hexdigest()
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="cc_login_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"CC interactive login expires {expiry.isoformat()} "
+                f"(~{days_left:.1f} days). Routine refresh does NOT extend it — "
+                "run /login in a foreground session before then, or ALL Claude "
+                "Code work (foreground + background autonomy) stops. Durable "
+                "backstop: `claude setup-token` once + scripts/store_cc_token.sh "
+                "stores a 1-year fallback token background sessions can use "
+                "when the login is confirmed dead."
+            ),
+            priority="critical",
+            created_at=now.isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+    except Exception:
+        logger.debug("cc login expiry check failed", exc_info=True)
+
+
 async def _check_cc_cap_detection(db) -> None:
     """Alert when output-expecting cognitive CC invocations return empty in a run.
 
@@ -2753,6 +2825,10 @@ class AwarenessLoop:
                     # 'high' infrastructure_alert; self-resolves on recovery.
                     # Facts change at most ~daily (profile refresh) → hourly.
                     await _check_infra_protection_posture(self._db)
+                    # CC login refresh-token expiry: fixed lifetime, invisible
+                    # on a headless box until everything stops. Day-scale
+                    # signal → hourly; self-resolves after /login.
+                    await _check_cc_login_expiry(self._db)
                     # Memory integrity posture: reads the latest persisted
                     # consistency/recall-probe rows; slow-moving (daily jobs) →
                     # hourly is ample.

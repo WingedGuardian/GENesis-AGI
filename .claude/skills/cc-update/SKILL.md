@@ -69,3 +69,24 @@ the delta touches:
 
 Capture any such change as a follow-up + a doc entry — that is how the next update stays
 execute-not-rediscover.
+
+## Detection → behavior (new-capability adoption path)
+
+The impact eval treats a new feature as *informational* by design ("available"
+is not "required") — correct for alerting, but it left no path from "detected"
+to "Genesis actually starts using it". So, when the changelog review flags a
+NEW skill/command/flag that Genesis would plausibly WANT (it overlaps an
+existing Genesis workflow, replaces a hand-rolled mechanism, or covers a known
+gap), do BOTH:
+
+1. File the informational KB entry as usual (no alert — calibration unchanged).
+2. Create a `follow_up_create` row (`work_state="ready"`, low priority) naming
+   the SPECIFIC instruction change, e.g. "once CC >= vX.Y.Z is pinned: prefer
+   native `/design` over the gstack `design-*` skills for UI drafting; decide
+   precedence and update the relevant skill/CLAUDE.md instruction". A
+   capability nobody wires into an instruction is a capability Genesis never
+   reaches for.
+
+Origin (2026-08-18): the `/design` research-preview announcement had no route
+from detection to adoption; the user asked "how do we make sure you
+automatically leverage this when you should?" — this step is the answer.

@@ -9,7 +9,53 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- **Inbox approval-request storm ended.** A stale-hash defect made the inbox
+  monitor see phantom "modified" files every 30-minute scan, each time
+  cancelling the pending approval and sending a fresh Telegram request — up to
+  48 messages a day. The known-hash map is now a single recency scan (newest
+  decisive row wins), and new/changed inbox content while a request is pending
+  parks onto the SAME request instead of cancelling it: one approval message,
+  ever, per outstanding batch — and approving once evaluates everything
+  outstanding at that moment.
+- **Inbox approvals never re-ask.** Delivered inbox approval requests send no
+  reminders (per-policy `reask_overrides` in `autonomous_cli_policy.yaml`,
+  `0` = never; other approval types keep their 24h re-ask). A request whose
+  Telegram delivery FAILED still retries each scan until one send succeeds —
+  that's recovery, not a reminder.
+- **Rate-limit-parked background sessions resume faithfully.** A parked
+  session's re-dispatch now carries its full execution shape (system prompt /
+  strategy doc, attribution tag, skills) instead of resuming with defaults,
+  and campaign bookkeeping follows the park to the delivering session's real
+  result instead of recording a false failed run (bounded at 7 days so a stuck
+  resume can never stall a campaign forever).
+
 ### Added
+
+- **Telegram DM "scroll-up".** Sessions can now read the conversation archive
+  on demand: `conversation_history` accepts `chat_id` (scoped to one chat) and
+  `before` (page arbitrarily far back, full-length messages), every fresh
+  telegram session is told its own chat id, and the session-recovery recap is
+  character-budgeted and tail-biased so the END of long replies (option lists,
+  conclusions) survives instead of being cut at 300 characters.
+- **Firecrawl as an explicit paid escalation backend.**
+  `web_fetch(url, backend="firecrawl")` / `web_search(query,
+  backend="firecrawl")` reach the Firecrawl cloud API (needs
+  `FIRECRAWL_API_KEY`) — including from Bash-less background sessions. Never
+  part of the automatic chains: it burns credits only when you ask for it.
+- **Claude Code login-expiry warning + background fallback.** The interactive
+  claude.ai login's refresh token has a fixed lifetime that routine use does
+  not extend; Genesis now warns via Telegram days ahead
+  (`GENESIS_CC_LOGIN_EXPIRY_WARN_DAYS`, default 5), and — if the operator has
+  stored a 1-year `claude setup-token` via `scripts/store_cc_token.sh` —
+  background sessions fall back to it when the login is confirmed dead (never
+  over a working login).
+- **Settings writes are provenance-stamped, and disabling the approval gate
+  requires confirmation.** Every settings write records `# set-by: <actor> @
+  <time>` in the overlay file so a deliberate operator choice is never
+  mistaken for drift, and setting `manual_approval_required: false` now needs
+  an explicit confirmation flag and announces itself via Telegram.
 
 - **Opt-in career-outreach monitor (off by default).** A new daily monitor that,
   once enabled, drives a configured external career-agent module to stage
