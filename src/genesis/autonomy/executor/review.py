@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -75,9 +76,12 @@ def _read_codex_timeout_s() -> float:
             raw, _DEFAULT_CODEX_EXEC_TIMEOUT_S,
         )
         return _DEFAULT_CODEX_EXEC_TIMEOUT_S
-    if value <= 0:
+    # Reject inf/nan too: inf would silently remove the hard bound (back to an
+    # unbounded hang), and nan corrupts asyncio's wait_for timer scheduling.
+    if not math.isfinite(value) or value <= 0:
         logger.warning(
-            "review: non-positive GENESIS_CODEX_REVIEW_TIMEOUT_S=%r -- using %ss",
+            "review: non-finite/non-positive GENESIS_CODEX_REVIEW_TIMEOUT_S=%r "
+            "-- using %ss",
             raw, _DEFAULT_CODEX_EXEC_TIMEOUT_S,
         )
         return _DEFAULT_CODEX_EXEC_TIMEOUT_S
@@ -92,8 +96,9 @@ def _kill_codex_process_tree(proc: asyncio.subprocess.Process) -> None:
 
     codex is a Node launcher that spawns child processes; killing only the
     direct PID can orphan them. The process is spawned with
-    ``preexec_fn=os.setpgrp`` so it leads its own group, letting us kill the
-    tree via ``killpg`` without touching the Genesis server's own group. The
+    ``start_new_session=True`` so it leads its own session/group, letting us
+    kill the tree via ``killpg`` without touching the Genesis server's own
+    group. The
     ``pgid <= 1`` guard refuses a group-wide kill that would signal every
     process in the container. Falls back to killing just the direct child if
     the group id is unavailable. Mirrors cc/invoker.py's timeout-kill pattern.
@@ -474,9 +479,14 @@ class TaskReviewer:
             # failed: Permission denied).  --full-auto also fails.
             # Verification is read-only in intent; the bypass only
             # affects the sandbox layer, not the prompt instructions.
-            # preexec_fn=os.setpgrp puts codex in its own process group so a
-            # timeout can kill the whole tree via killpg (see
-            # _kill_codex_process_tree) without touching the server's group.
+            # start_new_session=True puts codex in its own session/process group
+            # so a timeout can kill the whole tree via killpg (see
+            # _kill_codex_process_tree) without touching the server's group. We
+            # use start_new_session rather than preexec_fn=os.setpgrp because the
+            # C subprocess helper performs the setsid() async-signal-safely inside
+            # the child, avoiding the post-fork preexec_fn deadlock risk in this
+            # multi-threaded server (a deadlock there would hang before our
+            # wait_for timeout is even armed).
             proc = await asyncio.create_subprocess_exec(
                 "codex", "exec", "-",
                 "-c", 'model_reasoning_effort="medium"',
@@ -486,7 +496,7 @@ class TaskReviewer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
-                preexec_fn=os.setpgrp,
+                start_new_session=True,
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(input=prompt.encode("utf-8")),

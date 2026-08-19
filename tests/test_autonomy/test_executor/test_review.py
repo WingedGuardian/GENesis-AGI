@@ -592,6 +592,60 @@ class TestCodexTimeoutEnvParse:
         monkeypatch.setenv("GENESIS_CODEX_REVIEW_TIMEOUT_S", "0")
         assert _read_codex_timeout_s() == _DEFAULT_CODEX_EXEC_TIMEOUT_S
 
+    def test_infinity_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """inf parses via float() but would silently remove the hard bound."""
+        from genesis.autonomy.executor.review import (
+            _DEFAULT_CODEX_EXEC_TIMEOUT_S,
+            _read_codex_timeout_s,
+        )
+        monkeypatch.setenv("GENESIS_CODEX_REVIEW_TIMEOUT_S", "inf")
+        assert _read_codex_timeout_s() == _DEFAULT_CODEX_EXEC_TIMEOUT_S
+
+    def test_nan_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """nan parses via float() but corrupts asyncio's wait_for timer."""
+        from genesis.autonomy.executor.review import (
+            _DEFAULT_CODEX_EXEC_TIMEOUT_S,
+            _read_codex_timeout_s,
+        )
+        monkeypatch.setenv("GENESIS_CODEX_REVIEW_TIMEOUT_S", "nan")
+        assert _read_codex_timeout_s() == _DEFAULT_CODEX_EXEC_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+class TestCodexSpawnOptions:
+    async def test_codex_spawned_in_new_session(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """codex must be spawned with start_new_session=True (its own
+        session/group) so the timeout tree-kill can killpg it safely — and
+        NOT via preexec_fn (post-fork deadlock risk in the threaded server)."""
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.shutil.which",
+            lambda name: "/usr/bin/codex",
+        )
+
+        captured: dict[str, object] = {}
+
+        async def _fake_exec(*_args, **kwargs):
+            captured.update(kwargs)
+            fake = MagicMock()
+            fake.returncode = 0
+            fake.communicate = AsyncMock(
+                return_value=(_codex_jsonl_output(json.dumps({"verdict": "pass"})), b""),
+            )
+            return fake
+
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.asyncio.create_subprocess_exec",
+            _fake_exec,
+        )
+        reviewer = TaskReviewer(router=AsyncMock())
+        result = await reviewer._verify_via_codex("deliverable", "reqs")
+
+        assert result is not None
+        assert captured.get("start_new_session") is True
+        assert "preexec_fn" not in captured
+
 
 @pytest.mark.asyncio
 class TestVerifyViaInvoker:
