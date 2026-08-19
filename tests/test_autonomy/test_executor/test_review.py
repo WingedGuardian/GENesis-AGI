@@ -441,11 +441,16 @@ class TestVerifyViaCodex:
         async def _never_returns(*_args, **_kwargs):
             await asyncio.sleep(3600)  # hang well past the timeout
 
+        killpg_calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+
         # MagicMock base so .kill() is synchronous (like real Popen.kill);
-        # .communicate/.wait are async. Nonexistent pid -> os.getpgid raises
-        # ProcessLookupError, exercising the proc.kill() fallback branch.
+        # .communicate/.wait are async. pid == its own pgid (start_new_session).
         fake_proc = MagicMock()
-        fake_proc.pid = 2147483646
+        fake_proc.pid = 424242
         fake_proc.returncode = None
         fake_proc.communicate = _never_returns
         fake_proc.wait = AsyncMock()
@@ -464,16 +469,17 @@ class TestVerifyViaCodex:
             )
 
         assert result is None
-        # The hung subprocess must have been killed and reaped.
-        fake_proc.kill.assert_called_once()
+        # The hung tree must have been group-killed and then reaped.
+        assert killpg_calls == [(424242, signal.SIGKILL)]
         fake_proc.wait.assert_awaited()
 
-    async def test_codex_hang_kills_process_group(
+    async def test_codex_hang_kills_group_by_pid_not_getpgid(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """On timeout with a valid pgid, the whole process GROUP is SIGKILLed
-        (the production path — codex is a Node launcher that spawns children),
-        not just the direct pid."""
+        """The group is signalled by proc.pid DIRECTLY (== pgid under
+        start_new_session), NOT via os.getpgid — so that a reaped group leader
+        (whose descendant still holds the pipe) can't defeat the tree-kill.
+        getpgid must not even be consulted."""
         monkeypatch.setattr(
             "genesis.autonomy.executor.review.shutil.which",
             lambda name: "/usr/bin/codex",
@@ -487,11 +493,14 @@ class TestVerifyViaCodex:
 
         killpg_calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.getpgid", lambda pid: 4242,
-        )
-        monkeypatch.setattr(
             "genesis.autonomy.executor.review.os.killpg",
             lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+
+        def _fail_getpgid(_pid):
+            raise AssertionError("getpgid must not be called (leader may be reaped)")
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.os.getpgid", _fail_getpgid,
         )
 
         fake_proc = MagicMock()
@@ -517,8 +526,8 @@ class TestVerifyViaCodex:
     async def test_codex_hang_pgid_guard_refuses_group_kill(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """If getpgid returns <=1, killpg MUST NOT fire (killpg(1|0, sig) would
-        signal every process in the container); fall back to the direct pid."""
+        """If proc.pid (== pgid) is <=1, killpg MUST NOT fire (killpg(1|0, sig)
+        would signal every process in the container); fall back to proc.kill()."""
         monkeypatch.setattr(
             "genesis.autonomy.executor.review.shutil.which",
             lambda name: "/usr/bin/codex",
@@ -532,15 +541,12 @@ class TestVerifyViaCodex:
 
         killpg_calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.getpgid", lambda pid: 1,
-        )
-        monkeypatch.setattr(
             "genesis.autonomy.executor.review.os.killpg",
             lambda pgid, sig: killpg_calls.append((pgid, sig)),
         )
 
         fake_proc = MagicMock()
-        fake_proc.pid = 777
+        fake_proc.pid = 1  # degenerate pgid -> guard must refuse killpg
         fake_proc.returncode = None
         fake_proc.communicate = _never_returns
         fake_proc.wait = AsyncMock()
@@ -557,6 +563,70 @@ class TestVerifyViaCodex:
         assert result is None
         assert killpg_calls == []            # guard refused the group kill
         fake_proc.kill.assert_called_once()  # fell back to the direct kill
+
+    async def test_codex_spawn_timeout_degrades_not_crash(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A spawn-time TimeoutError (e.g. ETIMEDOUT from execve/chdir, which is
+        an OSError subclass) must degrade to None via the spawn handler — NOT
+        reach the timeout-kill path with an unbound proc (UnboundLocalError)."""
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.shutil.which",
+            lambda name: "/usr/bin/codex",
+        )
+
+        async def _spawn_times_out(*_args, **_kwargs):
+            raise TimeoutError("ETIMEDOUT on spawn")
+
+        with patch(
+            "genesis.autonomy.executor.review.asyncio.create_subprocess_exec",
+            _spawn_times_out,
+        ):
+            reviewer = TaskReviewer(router=AsyncMock())
+            result = await reviewer._verify_via_codex("deliverable", "reqs")
+
+        assert result is None
+
+    async def test_codex_kill_reap_is_bounded(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the post-kill reap (proc.wait) itself hangs (paused pipe transport
+        edge), the bounded wait_for must still let _verify_via_codex return None
+        rather than re-wedging the executor."""
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.shutil.which",
+            lambda name: "/usr/bin/codex",
+        )
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review._CODEX_EXEC_TIMEOUT_S", 0.05,
+        )
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review._CODEX_KILL_REAP_TIMEOUT_S", 0.05,
+        )
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.os.killpg", lambda pgid, sig: None,
+        )
+
+        async def _never_returns(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 555
+        fake_proc.returncode = None
+        fake_proc.communicate = _never_returns
+        fake_proc.wait = _never_returns  # reap hangs too
+
+        with patch(
+            "genesis.autonomy.executor.review.asyncio.create_subprocess_exec",
+            return_value=fake_proc,
+        ):
+            reviewer = TaskReviewer(router=AsyncMock())
+            # Outer guard well above both inner bounds (0.05 + 0.05).
+            result = await asyncio.wait_for(
+                reviewer._verify_via_codex("deliverable", "reqs"), timeout=5,
+            )
+
+        assert result is None
 
 
 class TestCodexTimeoutEnvParse:

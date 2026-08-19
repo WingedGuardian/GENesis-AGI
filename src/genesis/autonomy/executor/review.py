@@ -90,25 +90,40 @@ def _read_codex_timeout_s() -> float:
 
 _CODEX_EXEC_TIMEOUT_S = _read_codex_timeout_s()
 
+# Bound on the post-kill reap. After SIGKILL the process exits ~immediately, so
+# ``proc.wait()`` returns promptly — but the recovery path must not itself be
+# unbounded (a paused pipe transport with buffered data at cancel time is the
+# theoretical edge), or the timeout could re-create the executor wedge it exists
+# to prevent. 30s is far beyond any real SIGKILL-to-exit latency.
+_CODEX_KILL_REAP_TIMEOUT_S = 30.0
+
 
 def _kill_codex_process_tree(proc: asyncio.subprocess.Process) -> None:
     """SIGKILL the whole process group led by *proc*.
 
     codex is a Node launcher that spawns child processes; killing only the
-    direct PID can orphan them. The process is spawned with
-    ``start_new_session=True`` so it leads its own session/group, letting us
-    kill the tree via ``killpg`` without touching the Genesis server's own
-    group. The
-    ``pgid <= 1`` guard refuses a group-wide kill that would signal every
-    process in the container. Falls back to killing just the direct child if
-    the group id is unavailable. Mirrors cc/invoker.py's timeout-kill pattern.
+    direct PID can orphan them. The subprocess is spawned with
+    ``start_new_session=True``, so its process-group id *equals* ``proc.pid``
+    and — crucially — the kernel keeps that pgid reserved while ANY group member
+    is alive. We therefore signal ``proc.pid`` as the pgid **directly** rather
+    than via ``os.getpgid(proc.pid)``: once asyncio reaps the group *leader*
+    (which can happen while a descendant still holds a pipe, keeping
+    ``communicate()`` pending), ``getpgid`` would raise ``ProcessLookupError``
+    and a bare ``proc.kill()`` would no-op — leaking the very descendant this
+    guard exists to reap. The ``pgid <= 1`` guard refuses a container-wide kill.
     """
+    pgid = proc.pid
+    if not pgid or pgid <= 1:
+        # No usable own-group id (should not happen with start_new_session);
+        # fall back to signalling just the direct child.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return
     try:
-        pgid = os.getpgid(proc.pid)
-        if pgid <= 1:
-            raise ValueError(f"Refusing killpg with pgid={pgid}")
         os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, ValueError, TypeError):
+    except ProcessLookupError:
+        pass  # whole group already gone — nothing to reap
+    except (PermissionError, OSError):
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
 
@@ -498,12 +513,23 @@ class TaskReviewer:
                 cwd=cwd,
                 start_new_session=True,
             )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # Spawn failure (incl. ETIMEDOUT, which Python raises as TimeoutError
+            # -- an OSError subclass -- from a failing execve/chdir). proc is
+            # unbound here, so this must NOT reach the timeout-kill path below;
+            # degrade to the next reviewer just like the pre-timeout code did.
+            logger.warning("review: codex exec spawn error", exc_info=True)
+            return None
+
+        # Separate try so the timeout-kill path only runs for a communicate()
+        # timeout (proc is guaranteed bound), never a spawn-time TimeoutError.
+        try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(input=prompt.encode("utf-8")),
                 timeout=_CODEX_EXEC_TIMEOUT_S,
             )
-        except FileNotFoundError:
-            return None
         except TimeoutError:
             # Known upstream codex hang (model-catalog refresh). Kill the tree
             # and degrade — leaving it would wedge the executor semaphore.
@@ -513,11 +539,16 @@ class TaskReviewer:
                 _CODEX_EXEC_TIMEOUT_S,
             )
             _kill_codex_process_tree(proc)
-            with contextlib.suppress(ProcessLookupError, OSError):
-                await proc.wait()
+            # Bounded reap: the process is SIGKILLed so this returns promptly;
+            # the bound guarantees the recovery path can't itself re-wedge on a
+            # paused pipe transport.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    proc.wait(), timeout=_CODEX_KILL_REAP_TIMEOUT_S,
+                )
             return None
         except OSError:
-            logger.warning("review: codex exec OS error", exc_info=True)
+            logger.warning("review: codex exec communicate error", exc_info=True)
             return None
 
         if proc.returncode != 0:
