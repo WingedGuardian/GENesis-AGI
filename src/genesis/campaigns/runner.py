@@ -424,16 +424,23 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
             if created is None or (datetime.now(UTC) - created) > _PARK_WAIT_BOUND:
                 # Close the park when abandoning it: leaving it open would let
                 # the resume engine execute the SAME campaign action later,
-                # after the campaign has already moved on (double-run).
+                # after the campaign has already moved on (double-run). The
+                # abandonment verdict is returned ONLY when the cancel is
+                # CONFIRMED — on a transient failure the campaign stays
+                # attached and retries next tick (never fail open into a
+                # detached-but-runnable park).
                 try:
                     from genesis.db.crud import cc_rate_limit_parks as _parks
 
                     await _parks.mark_terminal(db, park_id, "cancelled")
                 except Exception:
                     logger.warning(
-                        "Failed to cancel over-bound park %s", park_id,
+                        "Failed to cancel over-bound park %s — staying "
+                        "attached; will retry next tick",
+                        park_id,
                         exc_info=True,
                     )
+                    return None
                 return {
                     "success": False,
                     "output_text": (
@@ -457,7 +464,20 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
             )
             deliv_row = await cursor.fetchone()
             if not deliv_row:
-                return None  # resumed but the new session hasn't landed yet
+                # A park is marked resumed only AFTER its delivering session
+                # is persisted (mark_resumed_if_lineage runs post-_store_result)
+                # — a missing row means deleted/corrupted, never in-flight.
+                # Returning None here would skip campaign ticks FOREVER.
+                return {
+                    "success": False,
+                    "output_text": (
+                        f"rate-limit park {park_id} is resumed but its "
+                        "delivering session row is missing (deleted or "
+                        "corrupted) — treating the parked campaign work as "
+                        "failed"
+                    ),
+                    "cost_usd": 0.0,
+                }
             deliv = dict(deliv_row)
             dstatus = str(deliv.get("status", ""))
             if dstatus not in ("completed", "failed"):

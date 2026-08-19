@@ -144,8 +144,9 @@ async def probe_logged_out(cc_path: str = "claude", timeout_s: float = 15.0) -> 
 
 async def fallback_env_if_login_dead(
     *,
-    probe=probe_logged_out,
+    probe=None,
     token_reader=read_fallback_token,
+    cc_path: str = "claude",
 ) -> dict[str, str] | None:
     """Env additions for a background CC invocation, or None (the common case).
 
@@ -155,6 +156,13 @@ async def fallback_env_if_login_dead(
     2. live probe CONFIRMS logged-out (cached _PROBE_CACHE_TTL_S seconds);
     3. a stored setup-token exists.
     """
+    if probe is None:
+        # Bind the probe to the CALLER'S configured executable — probing a
+        # literal PATH `claude` on installs with a non-PATH binary would read
+        # permanently ambiguous and the fallback would never activate.
+        async def probe() -> bool:
+            return await probe_logged_out(cc_path)
+
     global _probe_cache
     expiry = refresh_token_expiry()
     if expiry is None or expiry > datetime.now(UTC):

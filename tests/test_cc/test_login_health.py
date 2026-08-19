@@ -200,3 +200,25 @@ async def test_awareness_check_preserves_alert_on_unreadable_credentials(
         "AND resolved_at IS NULL",
     )
     assert len(rows) == 1, "no-signal must not resolve a standing alert"
+
+
+@pytest.mark.asyncio
+async def test_probe_uses_configured_cc_path(tmp_path, monkeypatch):
+    """Codex P2 lock: the login probe must run the CALLER'S configured
+    executable — a literal PATH `claude` reads permanently ambiguous on
+    installs with a non-PATH binary, so the fallback would never activate."""
+    _write_creds(
+        tmp_path, refresh_expires_ms=_ms(datetime.now(UTC) - timedelta(hours=1)),
+    )
+    seen = []
+
+    async def fake_probe(cc_path="claude", timeout_s=15.0):
+        seen.append(cc_path)
+        return True
+
+    monkeypatch.setattr(login_health, "probe_logged_out", fake_probe)
+    env = await login_health.fallback_env_if_login_dead(
+        token_reader=lambda: "tok-x", cc_path="/opt/custom/claude",
+    )
+    assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok-x"}
+    assert seen == ["/opt/custom/claude"]

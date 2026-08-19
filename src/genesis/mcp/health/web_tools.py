@@ -600,7 +600,10 @@ async def web_fetch(
         urls: Multiple URLs (1-10) for parallel fetch via TinyFish.
         backend: "auto" (smart fallback), "tinyfish" (cloud anti-bot),
                  "ladder" (Googlebot proxy, paywalls), "scrapling" (fast, TLS),
-                 "crawl4ai" (JS-rendered), "httpx".
+                 "crawl4ai" (JS-rendered), "httpx", or "firecrawl" (PAID cloud
+                 scraping — explicit escalation only, never in the auto chain;
+                 use when the free chain dead-ends on hard anti-bot/paywalled/
+                 JS pages; burns Firecrawl credits).
         max_chars: Maximum characters per URL (default 50000 ≈ 12k tokens).
 
     Returns dict with: url, title, content, backend_used, status_code,

@@ -745,7 +745,7 @@ class CCInvoker:
         try:
             from genesis.cc.login_health import fallback_env_if_login_dead
 
-            fb = await fallback_env_if_login_dead()
+            fb = await fallback_env_if_login_dead(cc_path=self._claude_path)
             if fb:
                 return {**env, **fb}
         except Exception:

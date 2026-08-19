@@ -423,13 +423,17 @@ class TestParkAwareSessionStatus:
         assert "digest delivered after resume" in result["output_text"]
 
     @pytest.mark.asyncio
-    async def test_resumed_park_without_delivering_session_still_waits(self, db):
+    async def test_resumed_park_without_delivering_row_fails_closed(self, db):
         from genesis.campaigns.runner import _check_session_status
 
-        # Park marked resumed but the re-dispatched session hasn't been
-        # created/finished yet (queued or mid-run) → keep waiting.
+        # A park is marked resumed only AFTER its delivering session is
+        # persisted — a missing row means deleted/corrupted, never in-flight.
+        # Returning None here would skip campaign ticks forever (Codex P2).
         await self._seed_failed_parked_session(db, "resumed")
-        assert await _check_session_status(db, "camp-sess-1") is None
+        result = await _check_session_status(db, "camp-sess-1")
+        assert result is not None
+        assert result["success"] is False
+        assert "delivering session row is missing" in result["output_text"]
 
     @pytest.mark.asyncio
     async def test_terminal_park_reads_as_failure(self, db):
@@ -526,3 +530,31 @@ async def test_missing_park_row_falls_through_to_session_failure(db):
     result = await _check_session_status(db, "camp-sess-2")
     assert result is not None
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_failed_park_cancel_keeps_campaign_attached(db, monkeypatch):
+    """Codex P2 lock: when the over-bound park's cancel FAILS transiently,
+    the campaign must stay attached (None = retry next tick) — returning the
+    failure verdict would detach it while the park stays runnable."""
+    from genesis.campaigns.runner import _check_session_status
+
+    helper = TestParkAwareSessionStatus()
+    await helper._seed_failed_parked_session(db, "parked")
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET created_at='2026-08-01T00:00:00+00:00' "
+        "WHERE id='rlp-test0001'",
+    )
+    await db.commit()
+
+    async def boom(_db, _pid, _status):
+        raise RuntimeError("db lock")
+
+    monkeypatch.setattr(
+        "genesis.db.crud.cc_rate_limit_parks.mark_terminal", boom,
+    )
+    assert await _check_session_status(db, "camp-sess-1") is None
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "parked", "park must remain owned/attached"
