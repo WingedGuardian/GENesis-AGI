@@ -3,8 +3,9 @@
 
 Identifies and trashes worktrees that are:
 1. Not in use by any process (no /proc/*/cwd inside them)
-2. Not locked (`git worktree lock`) and with no in-progress Git operation
-   (rebase/merge/cherry-pick/revert/bisect) — both signal deliberate work
+2. Not locked (`git worktree lock`), with no in-progress Git operation
+   (rebase/merge/cherry-pick/revert/bisect), and not containing a nested
+   worktree — each signals deliberate/in-progress work to preserve
 3. Inactive for 14+ days (no file modifications)
 4. Merged into main — branch merged (PR on GitHub) OR zero unique commits.
    A detached-HEAD worktree (no branch) is judged by whether its HEAD commit
@@ -260,8 +261,10 @@ def _has_in_progress_op(worktree_path: str) -> bool:
     per-worktree admin dir, discarded by ``git worktree prune``), making
     ``git rebase --continue`` etc. impossible. Resolves each marker via
     ``git rev-parse --git-path`` so it hits the worktree's OWN admin dir, not the
-    shared one. Fail-safe: on any error returns False (treat as not-in-progress,
-    letting the other skip-checks decide) — this never *causes* a reap on its own.
+    shared one. Fail-CLOSED: if the marker paths can't be resolved (git missing,
+    timeout, or the worktree's .git is transiently unreadable/malformed), returns
+    True (unknown → assume in-progress and KEEP the worktree) rather than letting a
+    possibly-mid-operation worktree be reaped.
     """
     for marker in _IN_PROGRESS_MARKERS:
         try:
@@ -270,12 +273,12 @@ def _has_in_progress_op(worktree_path: str) -> bool:
                 capture_output=True, text=True, cwd=worktree_path, timeout=10,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return False
+            return True  # fail-closed: can't verify state → protect the worktree
         if result.returncode != 0:
-            continue
+            return True  # can't resolve marker path (broken/unreadable .git) → protect
         rel = result.stdout.strip()
         if not rel:
-            continue
+            return True  # unexpected empty path → protect rather than assume clean
         p = rel if os.path.isabs(rel) else os.path.join(worktree_path, rel)
         if os.path.exists(p):
             return True
@@ -495,27 +498,41 @@ def _recover(name: str, repo_root: Path) -> bool:
             print(f"Failed to move: {e}", file=sys.stderr)
             return False
 
-    # Restore UNTRACKED files that were in the trash but not recreated by the
-    # fresh checkout (copy-only-missing). We deliberately do NOT overlay files
-    # that already exist in the checkout: overwriting through a checked-out
-    # tracked symlink could write OUTSIDE the worktree, and reconstructing the
-    # full dirty state (uncommitted tracked edits, deletions, mode-only changes,
-    # the staged/unstaged split) is not attempted — see the recovery contract in
-    # the function docstring. Committed content is always safe in main.
+    # Restore UNTRACKED files/symlinks that were in the trash but not recreated by
+    # the fresh checkout (copy-only-missing). Reconstructing the full dirty state
+    # (uncommitted tracked edits, deletions, mode-only changes, the staged/unstaged
+    # split) is not attempted — see the recovery contract in the function docstring;
+    # committed content is always safe in main.
+    #
+    # Two hard safety invariants (a recovery must NEVER write outside the worktree):
+    #  1. copy-only-missing keyed on os.path.lexists (does NOT dereference), so an
+    #     existing OR dangling destination symlink is left untouched — never written
+    #     through to whatever it points at.
+    #  2. the resolved parent of every destination must stay INSIDE the worktree
+    #     root; a symlinked path component that would redirect the write outside is
+    #     refused. Symlinks are recreated AS symlinks (os.symlink), never dereferenced.
+    worktree_root = os.path.realpath(original_path)
     trash_files = set()
     for item in trash_path.rglob("*"):
-        if item.is_file() and ".git" not in item.parts:
-            rel = item.relative_to(trash_path)
-            if rel.name == ".trash_meta.json":
-                continue
-            target = Path(original_path) / rel
-            if not target.exists():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                # follow_symlinks=False: restore an untracked symlink AS a symlink
-                # (don't dereference — avoids materializing its target and avoids a
-                # crash if that target is unreadable).
-                shutil.copy2(str(item), str(target), follow_symlinks=False)
-                trash_files.add(str(rel))
+        if ".git" in item.parts:
+            continue
+        if not (item.is_symlink() or item.is_file()):
+            continue  # dirs are created implicitly; skip FIFOs/sockets/etc.
+        rel = item.relative_to(trash_path)
+        if rel.name == ".trash_meta.json":
+            continue
+        target = Path(original_path) / rel
+        if os.path.lexists(str(target)):
+            continue  # invariant 1: never overwrite / never write through a dest symlink
+        parent_real = os.path.realpath(str(target.parent))
+        if parent_real != worktree_root and not parent_real.startswith(worktree_root + os.sep):
+            continue  # invariant 2: a symlinked path component would escape the worktree
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if item.is_symlink():
+            os.symlink(os.readlink(str(item)), str(target))  # restore the link itself
+        else:
+            shutil.copy2(str(item), str(target))
+        trash_files.add(str(rel))
 
     # Clean up trash entry
     shutil.rmtree(str(trash_path))
@@ -631,7 +648,18 @@ def main() -> int:
             _log(f"SKIP {wt_path}: locked (git worktree lock)")
             continue
         if _has_in_progress_op(wt_path):
-            _log(f"SKIP {wt_path}: in-progress git operation (rebase/merge/cherry-pick)")
+            _log(f"SKIP {wt_path}: in-progress or unresolvable git state (rebase/merge/broken .git)")
+            continue
+
+        # Never reap a worktree that CONTAINS another linked worktree: trashing
+        # moves the whole directory, dragging the nested worktree (and bypassing
+        # ITS locked/in-progress protections, which are checked on its own row).
+        wt_prefix = wt_path.rstrip("/") + os.sep
+        nested = [o["path"] for o in worktrees
+                  if o.get("path") and o["path"] != wt_path
+                  and o["path"].rstrip("/").startswith(wt_prefix)]
+        if nested:
+            _log(f"SKIP {wt_path}: contains nested worktree(s): {', '.join(nested[:3])}")
             continue
 
         # Check 1: active processes

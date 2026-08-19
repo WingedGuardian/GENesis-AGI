@@ -402,3 +402,94 @@ def test_skip_in_progress_worktree(reaper_repo, tmp_path, monkeypatch):
 
     assert wl.main() == 0
     assert wt.exists(), "worktree with an in-progress git op must not be reaped"
+
+
+# ─── final class-closing round: symlink-safe recovery + fail-closed + nested ──
+
+
+def test_recover_restores_untracked_symlink_as_symlink(reaper_repo, tmp_path, monkeypatch):
+    """An untracked symlink is restored AS a symlink, not materialized/dropped."""
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+
+    wt = reaper_repo.wt_branch_merged
+    (wt / "lnk").symlink_to("some/relative/target")  # untracked (dangling) symlink
+
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
+    restored = wt / "lnk"
+    assert restored.is_symlink(), "untracked symlink was not restored as a symlink"
+    assert os.readlink(str(restored)) == "some/relative/target"
+
+
+def test_recover_does_not_write_through_dangling_dest_symlink(tmp_path, monkeypatch):
+    """Recovery must NEVER write outside the worktree via a checked-out dest symlink.
+
+    Committed tree has a dangling symlink `esc` -> OUTSIDE; the dirty worktree
+    replaced it with a regular file (so the trash holds a regular `esc`). On
+    recovery, `git worktree add` restores the committed dangling symlink; the copy
+    loop must NOT write the trashed regular file through it to OUTSIDE. (Codex 512.)
+    """
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git(repo, "config", "user.email", "s@s")
+    _git(repo, "config", "user.name", "s")
+    outside = tmp_path / "OUTSIDE.txt"  # must never be created
+    os.symlink(str(outside), str(repo / "esc"))  # committed symlink -> outside
+    _git(repo, "add", "esc")
+    _git(repo, "commit", "-qm", "add symlink")
+    _git(repo, "branch", "wbr", "HEAD")
+
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", str(wt), "wbr")
+    (wt / "esc").unlink()
+    (wt / "esc").write_text("dirty payload")  # dirty regular file replacing the symlink
+
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    wtdict = next(w for w in wl._list_worktrees(repo) if Path(w["path"]) == wt)
+    wl._trash_worktree(wtdict, repo)
+
+    assert wl._recover("wt", repo) is True
+    assert not outside.exists(), (
+        "recovery wrote through a dangling dest symlink OUTSIDE the worktree"
+    )
+
+
+def test_has_in_progress_op_fails_closed(tmp_path):
+    """When git state can't be resolved (non-repo / broken .git), fail CLOSED (True)."""
+    d = tmp_path / "notgit"
+    d.mkdir()
+    assert wl._has_in_progress_op(str(d)) is True
+
+
+def test_skip_worktree_containing_nested(reaper_repo, tmp_path, monkeypatch):
+    """A worktree that CONTAINS another linked worktree is never reaped."""
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "_repo_root", lambda: reaper_repo.repo)
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    monkeypatch.setattr(sys, "argv", ["worktree_lifecycle.py"])
+
+    parent = reaper_repo.wt_branch_merged  # merged → would be reaped
+    nested = parent / "nested_wt"
+    # nested at an UNMERGED commit so it is never independently reaped (deterministic)
+    _git(reaper_repo.repo, "worktree", "add", "-q", "--detach", str(nested), reaper_repo.c_side)
+    _age_path(parent, 20)
+    # _age_path skips '.git', but the nested worktree's gitdir pointer file
+    # (nested_wt/.git) stays fresh and keeps the PARENT reading as active — which
+    # would mask the guard (the activity check, not the nested guard, would protect
+    # the parent). Backdate the nested worktree fully so ONLY the nested guard can
+    # keep the parent alive → the test REDs if the guard is removed.
+    old = time.time() - 20 * 86400
+    for p in nested.rglob("*"):
+        with contextlib.suppress(OSError):
+            os.utime(p, (old, old), follow_symlinks=False)
+    os.utime(nested / ".git", (old, old))
+
+    assert wl.main() == 0
+    assert parent.exists(), "worktree containing a nested worktree must not be reaped"
