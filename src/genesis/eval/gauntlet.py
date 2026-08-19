@@ -196,8 +196,14 @@ def _release_lock(fh) -> None:
 
 async def _run_pytest(workdir: Path) -> tuple[int, str]:
     """Run the fixture's pytest suite in ``workdir``. Returns (exit_code, output)."""
+    # Pin basetemp under the (already off-cc-tmp) workdir. This foreign fixture
+    # suite has its own rootdir, so the genesis ``tests/conftest.py`` redirect
+    # never loads for it — without this its pytest tmp would default to
+    # ``$TMPDIR`` (= watchgod-policed cc-tmp on a CC session). See
+    # ``genesis.util.tmp.pytest_basetemp_override``.
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "--basetemp", str(workdir / "_pytest_tmp"),
         cwd=str(workdir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,

@@ -60,6 +60,37 @@ def _safe_killpg(pgid: int, sig: int) -> None:
 os.killpg = _safe_killpg  # type: ignore[assignment]
 
 
+# ── Redirect pytest's temp tree OFF the watchgod-policed cc-tmp ───────────
+# A CC session's TMPDIR is ``~/.genesis/cc-tmp`` (set by scripts/cc-slot.sh),
+# and pytest's ``tmp_path``/basetemp default under ``$TMPDIR``. Left alone, a
+# broad suite dumps hundreds of MB of ``pytest-of-<user>/`` into that
+# budget-policed dir and trips ``genesis-tmp-watchgod`` (stuck-ORANGE churn).
+# This steers pytest's own basetemp to ``~/tmp`` (``big_tmp_dir``) instead —
+# WITHOUT touching the process ``TMPDIR`` (which would desync CC's
+# TMPDIR/CLAUDE_CODE_TMPDIR). Runs at config time, before any ``tmp_path``
+# fixture resolves. No-op on CI (TMPDIR unset) and when ``--basetemp`` is
+# passed explicitly. See ``genesis.util.tmp.pytest_basetemp_override``.
+def pytest_configure(config):
+    from genesis.util.tmp import big_tmp_dir, pytest_basetemp_override
+
+    target = pytest_basetemp_override(
+        current_basetemp=config.option.basetemp,
+        tmpdir_env=os.environ.get("TMPDIR"),
+        home=os.path.expanduser("~"),
+        big_tmp=big_tmp_dir(),
+    )
+    if target is not None:
+        # Scope the leaf per-process. pytest CLEARS an explicit basetemp at
+        # session start and roots tmp_path directly under it (no pytest-of-<user>
+        # numbered rotation), so two concurrent runs sharing one path would
+        # rmtree each other's live temp. The CC concurrent-test guard only covers
+        # Bash-tool pytest — autonomy/gauntlet subprocesses bypass it — so the
+        # per-pid leaf is what actually keeps simultaneous runs isolated.
+        target = os.path.join(target, str(os.getpid()))
+        Path(target).mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = target
+
+
 # ── Safety: prevent tests from polluting production circuit breaker state ──
 @pytest.fixture(autouse=True)
 def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
