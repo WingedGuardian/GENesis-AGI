@@ -257,3 +257,80 @@ def test_recover_legacy_branch_entry(reaper_repo, tmp_path, monkeypatch):
     # Restored ON the branch (not detached) — the legacy path is unchanged.
     branch = _git(src, "symbolic-ref", "--short", "HEAD").strip()
     assert branch == "merged-br"
+
+
+# ─── detached reap predicate is ancestor-ONLY (Codex P1 findings B & C) ───────
+
+
+def test_is_merged_detached_merge_commit_kept(reaper_repo):
+    """A detached MERGE commit (both parents in main, unique tree, NOT an
+    ancestor) must be KEPT. `git cherry` omits merges, so the old patch-id path
+    read empty output as "merged" and would wrongly reap unique merge work.
+    Ancestor-only detached detection keeps it. (Codex finding C.)
+    """
+    repo = reaper_repo.repo
+    side_tree = _git(repo, "rev-parse", f"{reaper_repo.c_side}^{{tree}}").strip()
+    merge = _git(
+        repo,
+        "commit-tree",
+        side_tree,
+        "-p",
+        reaper_repo.c1,
+        "-p",
+        reaper_repo.c0,
+        "-m",
+        "unique-merge",
+    ).strip()
+    # Sanity: not an ancestor, and git cherry emits nothing (merge omitted).
+    not_anc = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", merge, "main"],
+        capture_output=True,
+    ).returncode
+    assert not_anc != 0, "merge commit should not be an ancestor of main"
+    assert _git(repo, "cherry", "main", merge).strip() == ""
+    assert wl._is_merged(merge, repo, is_branch=False) is False
+
+
+def test_is_merged_detached_patch_equal_kept(reaper_repo):
+    """A detached commit patch-EQUAL to main but NOT an ancestor must be KEPT.
+    The old patch-id path counted it merged and reaped it, but it is referenced
+    only by the worktree HEAD → GC-fragile in the recovery window. Ancestor-only
+    detached detection keeps it. (Codex finding B.)
+    """
+    repo = reaper_repo.repo
+    c1_tree = _git(repo, "rev-parse", f"{reaper_repo.c1}^{{tree}}").strip()
+    # Same tree as c1, parent c0, distinct message → distinct sha, patch-equal, not an ancestor.
+    patch_equal = _git(
+        repo, "commit-tree", c1_tree, "-p", reaper_repo.c0, "-m", "cherrypicked"
+    ).strip()
+    assert patch_equal != reaper_repo.c1
+    # git cherry marks it patch-equal ('-'), i.e. zero unique '+' → old logic said merged.
+    assert _git(repo, "cherry", "main", patch_equal).strip().startswith("-")
+    assert wl._is_merged(patch_equal, repo, is_branch=False) is False
+
+
+# ─── recovery preserves uncommitted tracked edits (Codex P1 finding A) ────────
+
+
+def test_recover_preserves_uncommitted_modification(reaper_repo, tmp_path, monkeypatch):
+    """Recovery must not silently drop an uncommitted edit to a TRACKED file.
+
+    The old copy loop only restored files MISSING from the fresh checkout, so a
+    modified tracked file was reverted to its committed content while recovery
+    reported success. The overlay restores files that differ. (Codex finding A.)
+    """
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+
+    wt = reaper_repo.wt_branch_merged
+    (wt / "a.txt").write_text("LOCALLY MODIFIED\n")  # a.txt is tracked (committed at c0)
+
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    assert not wt.exists()
+
+    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
+    assert (wt / "a.txt").read_text() == "LOCALLY MODIFIED\n", (
+        "recovery reverted an uncommitted tracked modification"
+    )

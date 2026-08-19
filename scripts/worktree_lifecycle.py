@@ -168,18 +168,28 @@ def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
     """Check whether a worktree's work is already in ``main``.
 
     ``ref`` is a branch name (``is_branch=True``) or, for a detached-HEAD
-    worktree, its HEAD commit SHA (``is_branch=False``). Three methods in order:
-    1. git merge-base --is-ancestor (fast; works for a branch ref OR a raw SHA)
-    2. gh pr list --head <branch> --state merged (branch only — handles squash
-       merges; a bare SHA is never a PR head, so this is skipped when detached)
-    3. Zero unique commits vs main (git cherry; patch-id, works for either ref)
+    worktree, its HEAD commit SHA (``is_branch=False``).
 
-    Returns False on any error (fail-safe: keep the worktree). Consequence for a
-    detached HEAD: if its commits were squash-merged (so it is neither an ancestor
-    of main nor patch-equivalent) it is kept, never reaped — fail-safe, since the
-    gh-PR method that would catch a squash can't key off a bare SHA.
+    For a BRANCH, three methods in order:
+    1. git merge-base --is-ancestor (fast; branch tip is an ancestor of main)
+    2. gh pr list --head <branch> --state merged (handles squash merges)
+    3. Zero unique commits vs main (git cherry; patch-id equivalence)
+
+    For a DETACHED HEAD, ONLY Method 1 (true ancestor of main) is trusted; the
+    patch-id method (3) and the PR method (2) are skipped. This is deliberate: a
+    bare commit referenced only by the worktree HEAD has no branch protecting it,
+    so reaping a merely patch-equivalent (non-ancestor) commit would let a GC
+    collect it inside the recovery window; and ``git cherry`` omits merge commits
+    entirely (no patch id), so a unique merge commit would be mis-read as "no
+    unique work" and wrongly reaped. A true ancestor is both genuinely in main's
+    history AND reachable (GC-safe). The cost is fail-safe: a detached HEAD whose
+    work reached main only by squash/rebase (patch-equal but not an ancestor) is
+    kept, never reaped.
+
+    Returns False on any error (fail-safe: keep the worktree).
     """
-    # Method 1: git merge-base (branch ref or raw SHA)
+    # Method 1: git merge-base (branch ref or raw SHA) — the ONLY method for a
+    # detached HEAD (see docstring: patch-id/PR methods are unsafe for a bare SHA).
     try:
         result = subprocess.run(
             ["git", "merge-base", "--is-ancestor", ref, "main"],
@@ -190,23 +200,24 @@ def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # Method 2: gh pr list (handles squash merges) — branch heads only; a bare
-    # commit SHA is never a PR head, so skip it for a detached HEAD.
-    if is_branch:
-        try:
-            result = subprocess.run(
-                ["gh", "pr", "list", "--head", ref, "--state", "merged",
-                 "--limit", "1", "--json", "number"],
-                capture_output=True, text=True, cwd=str(repo_root), timeout=30,
-            )
-            if result.returncode == 0:
-                prs = json.loads(result.stdout)
-                if prs:
-                    return True
-        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-            pass
+    if not is_branch:
+        return False  # detached HEAD: ancestor-only, no patch-id/PR fallbacks
 
-    # Method 3: zero unique commits (patch-id equivalence)
+    # Method 2: gh pr list (handles squash merges) — branch heads only.
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "list", "--head", ref, "--state", "merged",
+             "--limit", "1", "--json", "number"],
+            capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+        )
+        if result.returncode == 0:
+            prs = json.loads(result.stdout)
+            if prs:
+                return True
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    # Method 3: zero unique commits (patch-id equivalence) — branch heads only.
     try:
         result = subprocess.run(
             ["git", "cherry", "main", ref],
@@ -426,8 +437,13 @@ def _recover(name: str, repo_root: Path) -> bool:
             print(f"Failed to move: {e}", file=sys.stderr)
             return False
 
-    # Worktree recreated from branch — now copy any uncommitted files
-    # that were in the trash but not in the branch
+    # Overlay the trashed WORKING state back onto the fresh checkout. The
+    # checkout only carries committed content, so restore every trashed file
+    # that is missing OR differs — this preserves uncommitted tracked edits and
+    # untracked files (mode via copy2). Note: a file the user had *deleted* in
+    # the dirty worktree, and the staged-vs-unstaged split, are not reconstructed.
+    import filecmp
+
     trash_files = set()
     for item in trash_path.rglob("*"):
         if item.is_file() and ".git" not in item.parts:
@@ -435,7 +451,7 @@ def _recover(name: str, repo_root: Path) -> bool:
             if rel.name == ".trash_meta.json":
                 continue
             target = Path(original_path) / rel
-            if not target.exists():
+            if not target.exists() or not filecmp.cmp(str(item), str(target), shallow=False):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(item), str(target))
                 trash_files.add(str(rel))
