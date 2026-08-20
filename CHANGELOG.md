@@ -11,6 +11,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Subprocess timeouts no longer orphan helper process trees (repo-wide
+  sweep).** Several launchers Genesis runs (the code-review helper, the
+  headless/CLI/recovery-brain `claude` runners, promptfoo/pytest eval
+  scorers, deterministic step commands) fork their own children; on timeout
+  the old kills reached only the direct child, leaving the rest of the tree
+  running until reboot. All eight spawn sites — plus the original autonomy
+  reviewer, migrated off its private copy — now share one hardened guarded
+  group-kill (`genesis.util.proc_kill`): own process group via
+  `start_new_session` (never `preexec_fn` — post-fork deadlock risk in a
+  threaded server), `killpg` on the leader pid directly (immune to the
+  leader-already-reaped race), a `pgid<=1` safety guard, a bounded reap, and
+  a logged fallback when the group kill is refused. The contribution CLI
+  additionally group-kills on Ctrl+C so an interactive abort can't strand
+  its reviewer. The delivery `git push` — which runs under the autonomy
+  executor's single-slot semaphore — also gained a hard 300s bound, closing
+  the last unbounded subprocess wait on that critical path (a
+  network-stalled push could previously wedge all autonomy task execution).
+
 - **Inbox approval-request storm ended.** A stale-hash defect made the inbox
   monitor see phantom "modified" files every 30-minute scan, each time
   cancelling the pending approval and sending a fresh Telegram request — up to

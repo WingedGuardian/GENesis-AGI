@@ -20,10 +20,11 @@ import math
 import os
 import re
 import shutil
-import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
+
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
     from genesis.cc import AgentProvider
@@ -94,38 +95,10 @@ _CODEX_EXEC_TIMEOUT_S = _read_codex_timeout_s()
 # ``proc.wait()`` returns promptly — but the recovery path must not itself be
 # unbounded (a paused pipe transport with buffered data at cancel time is the
 # theoretical edge), or the timeout could re-create the executor wedge it exists
-# to prevent. 30s is far beyond any real SIGKILL-to-exit latency.
-_CODEX_KILL_REAP_TIMEOUT_S = 30.0
-
-
-def _kill_codex_process_tree(proc: asyncio.subprocess.Process) -> None:
-    """SIGKILL the whole process group led by *proc*.
-
-    codex is a Node launcher that spawns child processes; killing only the
-    direct PID can orphan them. The subprocess is spawned with
-    ``start_new_session=True``, so its process-group id *equals* ``proc.pid``
-    and — crucially — the kernel keeps that pgid reserved while ANY group member
-    is alive. We therefore signal ``proc.pid`` as the pgid **directly** rather
-    than via ``os.getpgid(proc.pid)``: once asyncio reaps the group *leader*
-    (which can happen while a descendant still holds a pipe, keeping
-    ``communicate()`` pending), ``getpgid`` would raise ``ProcessLookupError``
-    and a bare ``proc.kill()`` would no-op — leaking the very descendant this
-    guard exists to reap. The ``pgid <= 1`` guard refuses a container-wide kill.
-    """
-    pgid = proc.pid
-    if not pgid or pgid <= 1:
-        # No usable own-group id (should not happen with start_new_session);
-        # fall back to signalling just the direct child.
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        return
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass  # whole group already gone — nothing to reap
-    except (PermissionError, OSError):
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+# to prevent. The tree-kill + bounded-reap machinery itself lives in
+# genesis.util.proc_kill (extracted from this module after PR #1409 — the
+# pid-as-pgid rationale, the pgid<=1 guard, and the leader-reaped race are
+# documented there, and every launcher spawn site now shares one hardened copy).
 
 
 # ---------------------------------------------------------------------------
@@ -538,15 +511,19 @@ class TaskReviewer:
                 "skipping codex link",
                 _CODEX_EXEC_TIMEOUT_S,
             )
-            _kill_codex_process_tree(proc)
+            kill_process_group(proc)
             # Bounded reap: the process is SIGKILLed so this returns promptly;
             # the bound guarantees the recovery path can't itself re-wedge on a
             # paused pipe transport.
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(
-                    proc.wait(), timeout=_CODEX_KILL_REAP_TIMEOUT_S,
-                )
+            await reap_bounded(proc)
             return None
+        except asyncio.CancelledError:
+            # Cancellation mid-verify: the detached codex tree sees no ambient
+            # signal — group-kill before propagating (final-audit F2; the
+            # eighth async site of the cancel sweep).
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
         except OSError:
             logger.warning("review: codex exec communicate error", exc_info=True)
             return None
