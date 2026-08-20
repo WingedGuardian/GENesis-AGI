@@ -119,6 +119,16 @@ class TestOverride:
             seg = sp.analyze(cmd)[0].raw
             assert sp.has_trailing_override(seg, sigil="audit-ack"), cmd
             assert sp.has_trailing_override(seg, sigil="depth-ack"), cmd
+        # Every merge-gate sigil must be in _KNOWN_SIGILS or it ENDS the leading run and
+        # silently breaks combined waivers. scheduled-review-override (newest) combined
+        # with stale-review-override: BOTH must still resolve regardless of order.
+        for cmd in (
+            "gh pr merge 1 --squash --admin # stale-review-override scheduled-review-override",
+            "gh pr merge 1 --squash --admin # scheduled-review-override stale-review-override",
+        ):
+            seg = sp.analyze(cmd)[0].raw
+            assert sp.has_trailing_override(seg, sigil="stale-review-override"), cmd
+            assert sp.has_trailing_override(seg, sigil="scheduled-review-override"), cmd
 
     def test_multi_token_still_rejects_prefix_of_longer_token(self):
         # The multi-token scan must NOT loosen the exact-token guard: a sigil that is a

@@ -82,6 +82,22 @@ def _reviews_jsonl(
     return "\n".join(rows)
 
 
+def _scheduled_marker(
+    head: str = HEAD,
+    *,
+    login: str = "owner",
+    author_association: str = "OWNER",
+) -> str:
+    """_TEST_GH_SCHEDULED_COMMENTS shape — one OWNER-authored comment/review row whose
+    body carries the scheduled-review marker naming ``head``. One JSON object per line.
+
+    ``login``/``author_association`` model the trust check: a row is accepted only when
+    ``login == <repo owner>`` OR ``author_association == "OWNER"``. The repo owner here is
+    ``owner`` (``REPO = "owner/repo"``), so the default satisfies BOTH arms."""
+    body = f"Scheduled review complete.\n<!-- genesis-scheduled-review: head={head} -->"
+    return json.dumps({"login": login, "author_association": author_association, "body": body})
+
+
 def _ci(conclusion: str = "SUCCESS") -> str:
     """_TEST_GH_CI_ROLLUP shape — a JSON array of check-runs."""
     return json.dumps([{"name": "test", "conclusion": conclusion, "status": "COMPLETED"}])
@@ -203,6 +219,7 @@ def _run(
     base: str = "main",
     default: str = "main",
     compare: str | None = None,
+    scheduled: str | None = None,
     router=None,
 ) -> int:
     """Drive ``main()`` in-process: granular seams via env, un-seamed gh via the
@@ -216,6 +233,12 @@ def _run(
     monkeypatch.setenv("_TEST_GH_BASE_REF", base)
     monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", default)
     monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")  # no clean-comment fallback unless asked
+    # Default: a valid OWNER-authored scheduled-review marker AT head, so every
+    # pre-existing case stays behaviour-identical (mirrors the default codex review
+    # above). Scheduled-gate cases pass an explicit ``scheduled=`` to override.
+    monkeypatch.setenv(
+        "_TEST_GH_SCHEDULED_COMMENTS", _scheduled_marker(head) if scheduled is None else scheduled
+    )
     if compare is not None:
         monkeypatch.setenv("_TEST_GH_COMPARE", compare)  # smart-delta seam (opt-in)
     monkeypatch.setattr(_mod.subprocess, "run", router or _router())
@@ -558,6 +581,83 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "has not reviewed the current head",
     ),
+    # ── Scheduled Claude review gate (owner-authored marker at HEAD) ──
+    # An owner marker naming the CURRENT head → the gate is satisfied → merge allowed.
+    (
+        "scheduled_review_at_head_allows",
+        lambda mp: _run(mp, _merge_cmd(), scheduled=_scheduled_marker(HEAD)),
+        0,
+        "",
+    ),
+    # A marker naming a STALE sha does NOT vouch for the current head → block.
+    (
+        "scheduled_review_stale_sha_blocks",
+        lambda mp: _run(mp, _merge_cmd(), scheduled=_scheduled_marker(STALE)),
+        2,
+        "no scheduled Claude review",
+    ),
+    # No scheduled review at all (didn't run / rate-limited) → fail-closed block.
+    (
+        "scheduled_review_absent_blocks",
+        lambda mp: _run(mp, _merge_cmd(), scheduled=""),
+        2,
+        "no scheduled Claude review",
+    ),
+    # A marker from a NON-owner author (login != owner, association != OWNER) is NOT
+    # trusted → treated as absent → block.
+    (
+        "scheduled_review_non_owner_author_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=_scheduled_marker(HEAD, login="randouser", author_association="CONTRIBUTOR"),
+        ),
+        2,
+        "no scheduled Claude review",
+    ),
+    # Owner-login match is case-INSENSITIVE (GitHub logins are canonically cased, but
+    # fold both sides as defense-in-depth): a marker whose login differs only in case
+    # from the repo owner, with a non-OWNER association, is still trusted → allows.
+    (
+        "scheduled_review_owner_login_case_insensitive_allows",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=_scheduled_marker(HEAD, login="OWNER", author_association="NONE"),
+        ),
+        0,
+        "",
+    ),
+    # The # scheduled-review-override sigil consciously waives the gate → an absent
+    # scheduled review still merges.
+    (
+        "scheduled_override_waives_absent_review_allows",
+        lambda mp: _run(mp, _merge_cmd(trailer="# scheduled-review-override"), scheduled=""),
+        0,
+        "",
+    ),
+    # ── sigil INDEPENDENCE: the scheduled sigil and the stale sigil are separate ──
+    # # stale-review-override waives Codex freshness+base, NOT the scheduled gate: an
+    # absent scheduled review still blocks even with a fresh-review waiver.
+    (
+        "stale_override_does_NOT_waive_scheduled_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(match=None, trailer="# stale-review-override"),
+            reviews="",
+            scheduled="",
+        ),
+        2,
+        "no scheduled Claude review",
+    ),
+    # # scheduled-review-override waives ONLY the scheduled gate, NOT Codex freshness:
+    # a no-review PR still blocks on freshness (which runs first).
+    (
+        "scheduled_override_does_NOT_waive_freshness_blocks",
+        lambda mp: _run(mp, _merge_cmd(trailer="# scheduled-review-override"), reviews=""),
+        2,
+        "has not reviewed the current head",
+    ),
 ]
 
 
@@ -657,3 +757,44 @@ def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
     assert not any(f"repos/{REPO}/pulls/123/comments" in parts for parts in inline), (
         f"findings scanned the WRONG PR (123, the --subject value): {inline}"
     )
+
+
+def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
+    """Seed every OTHER gate green so ``check_pr_report`` isolates the scheduled line.
+    The scheduled gate itself runs for real against the ``scheduled`` seam."""
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", head)
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(head))
+    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
+    monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", scheduled)
+    monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+    monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+    monkeypatch.setattr(
+        _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+    )
+    monkeypatch.setattr(
+        _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+    )
+
+
+def test_check_pr_report_includes_scheduled_line_ok(monkeypatch, capsys):
+    """The canonical report prints a ``scheduled-claude`` line and PASSES when an
+    owner marker names the current head (shares the enforcement function, strict mode)."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "scheduled-claude:" in out
+    sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
+    assert "ok (at head)" in sched_line
+    assert rc == 0
+
+
+def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
+    """An absent scheduled review is a FAILURE line and flips the report's verdict —
+    the report must not diverge from the always-fail-closed enforcement gate."""
+    _report_env(monkeypatch, scheduled="")
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
+    assert "BLOCK" in sched_line
+    assert rc == 1
