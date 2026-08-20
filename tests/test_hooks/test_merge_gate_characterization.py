@@ -649,6 +649,47 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "code-review",
     ),
+    # A status-suffixed value (`head=<sha>/failed`, `kind=leaks/failed`) must NOT be
+    # captured as a clean prefix — the value has to be terminated by whitespace or the
+    # marker-block end, else a failed/corrupt routine output would satisfy the gate.
+    (
+        "scheduled_review_suffixed_head_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "body": (
+                        f"<!-- genesis-scheduled-review: head={HEAD}/failed kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "code-review",  # the suffixed code-review head is not captured → missing
+    ),
+    (
+        "scheduled_review_suffixed_kind_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "body": (
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks/failed -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "leaks",  # the suffixed leaks kind is not captured → missing
+    ),
     # The # scheduled-review-override sigil consciously waives the gate → an absent
     # scheduled review still merges.
     (

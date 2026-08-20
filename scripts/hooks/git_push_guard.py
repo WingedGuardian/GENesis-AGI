@@ -1537,8 +1537,12 @@ def _check_codex_reviewed_head(
 _SCHEDULED_REVIEW_BLOCK_RE = re.compile(
     r"<!--\s*genesis-scheduled-review:\s*(.*?)\s*-->", re.DOTALL
 )
-_SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})\b")
-_SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)")
+# The value must be TERMINATED by whitespace or the end of the marker block — NOT a
+# mere word boundary. Otherwise a status-suffixed producer output like `head=<sha>/failed`
+# or `kind=leaks/failed` would have its valid PREFIX captured and counted as a clean marker,
+# violating fail-closed (a failed/corrupt routine run must NOT satisfy the gate).
+_SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
+_SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
 
 # Every scheduled routine whose completion the merge gate requires, by ``kind``. A PR
 # merges only when a valid owner-authored marker for EACH of these names the current
