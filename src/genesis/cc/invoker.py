@@ -35,6 +35,7 @@ from genesis.cc.types import (
     model_supports_effort,
 )
 from genesis.observability.spans import SpanKind, start_span
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -784,7 +785,10 @@ class CCInvoker:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=invocation.working_dir or self._working_dir,
-                preexec_fn=os.setpgrp,
+                # Own session/group (setsid in the C helper — never preexec_fn:
+                # post-fork Python can deadlock in the threaded server) so the
+                # kill paths can killpg the whole claude tree.
+                start_new_session=True,
             )
             reg_key = invocation.session_key or f"pid:{proc.pid}"
             self._register_proc(reg_key, proc)
@@ -816,20 +820,25 @@ class CCInvoker:
             ) from None
         except TimeoutError:
             elapsed_s = time.monotonic() - start
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                proc.kill()
-            await proc.wait()
+            if proc is None:
+                # Spawn-time TimeoutError (ETIMEDOUT is an OSError subclass —
+                # PEP 3151) misroutes here with nothing to kill.
+                raise CCTimeoutError(
+                    f"Timeout after {invocation.timeout_s}s (during spawn)"
+                ) from None
+            # Shared guarded group-kill: signals proc.pid AS the pgid (never
+            # os.getpgid — it raises once the leader is reaped, leaking the
+            # tree), pgid<=1 guard, direct-kill fallback; then a BOUNDED reap.
+            kill_process_group(proc)
+            await reap_bounded(proc)
 
             # Capture stderr for diagnostics (mirrors run_streaming pattern)
             stderr_text = ""
             if proc.stderr:
                 try:
-                    stderr_data = await proc.stderr.read()
+                    # Bounded: a setsid-escaping descendant holding stderr
+                    # could otherwise stall this read past the bounded reap.
+                    stderr_data = await asyncio.wait_for(proc.stderr.read(), 5.0)
                     if isinstance(stderr_data, bytes):
                         stderr_text = stderr_data.decode(errors="replace")[:1000]
                 except Exception:
@@ -849,8 +858,9 @@ class CCInvoker:
                 # Don't leak a still-running proc on an abnormal exit (e.g. task
                 # cancellation); communicate() reaps it on the normal path.
                 if proc is not None and proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError, OSError):
-                        proc.kill()
+                    # Group-kill: a bare proc.kill() would orphan the claude
+                    # tree's MCP/helper children on cancellation.
+                    kill_process_group(proc)
 
         elapsed = int((time.monotonic() - start) * 1000)
         logger.info(
@@ -972,7 +982,10 @@ class CCInvoker:
                 limit=1_048_576,  # 1MB — CC stream-json lines can exceed 64KB default
                 env=env,
                 cwd=invocation.working_dir or self._working_dir,
-                preexec_fn=os.setpgrp,
+                # Own session/group (setsid in the C helper — never preexec_fn:
+                # post-fork Python can deadlock in the threaded server) so the
+                # kill paths can killpg the whole claude tree.
+                start_new_session=True,
             )
         except FileNotFoundError:
             logger.error(
@@ -1010,8 +1023,7 @@ class CCInvoker:
                 proc.stdin.close()
         except BaseException:
             self._unregister_proc(reg_key)
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
+            kill_process_group(proc)
             raise
 
         result_data: dict | None = None
@@ -1080,13 +1092,7 @@ class CCInvoker:
                 time.monotonic() - start,
                 proc.pid,
             )
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                proc.kill()
+            kill_process_group(proc)
         except asyncio.CancelledError:
             # Task cancellation (runtime shutdown cancelling an in-flight
             # session) must not leak the CC child: without this handler the
@@ -1099,25 +1105,39 @@ class CCInvoker:
                 "CC streaming cancelled (PID %s) — killing subprocess",
                 proc.pid,
             )
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.kill()
+            kill_process_group(proc)
+            raise
+        except BaseException:
+            # Any other failure mid-stream (an on_event callback raising, an
+            # over-limit stream-json line) must not leak the live, now-
+            # unregistered tree — it would run detached where even /stop
+            # can't reach it, then wedge when its unread stdout pipe fills.
+            kill_process_group(proc)
             raise
         finally:
             self._unregister_proc(reg_key)
 
-        await proc.wait()
+        # Bounded reap: proc.terminate() on the result path is a GRACEFUL stop
+        # the child can ignore (wedged node flush / MCP teardown) — an
+        # unbounded wait here would hang the dispatch AFTER the result was
+        # already obtained. Bound it; on expiry escalate to the group kill.
+        await reap_bounded(proc)
+        if proc.returncode is None:
+            logger.warning(
+                "CC streaming proc ignored terminate (PID %s) — escalating to "
+                "group kill",
+                proc.pid,
+            )
+            kill_process_group(proc)
+            await reap_bounded(proc)
         elapsed = int((time.monotonic() - start) * 1000)
 
         # Read stderr for diagnostics
         stderr_data = b""
         if proc.stderr:
-            stderr_data = await proc.stderr.read()
+            with contextlib.suppress(TimeoutError):
+                # Bounded for the same reason as the reap above.
+                stderr_data = await asyncio.wait_for(proc.stderr.read(), 5.0)
         stderr_str = stderr_data.decode(errors="replace") if stderr_data else ""
         if stderr_str:
             logger.warning("CC stderr: %s", stderr_str[:500])

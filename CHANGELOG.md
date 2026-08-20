@@ -11,6 +11,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The core Claude Code spawner now uses the shared hardened group-kill.**
+  `cc/invoker.py` — the launcher behind every CC session Genesis runs — carried
+  the patterns the repo-wide sweep retired everywhere else: `preexec_fn` spawns,
+  three `getpgid`-based kill paths (which leak the tree once the leader is
+  reaped), two direct-child-only cleanup kills on cancellation/stdin failure,
+  and an unbounded post-kill wait. All migrated to `genesis.util.proc_kill`.
+  Also hardened: any non-timeout exception escaping the streaming loop (a
+  callback raising, an over-limit stream line) now group-kills instead of
+  leaking a detached, unregistered session; the graceful terminate-after-result
+  stop is bounded and escalates to a group kill if ignored; post-kill stderr
+  reads are bounded.
+
 - **Subprocess timeouts no longer orphan helper process trees (repo-wide
   sweep).** Several launchers Genesis runs (the code-review helper, the
   headless/CLI/recovery-brain `claude` runners, promptfoo/pytest eval
