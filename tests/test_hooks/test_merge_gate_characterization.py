@@ -87,14 +87,18 @@ def _scheduled_marker(
     *,
     login: str = "owner",
     author_association: str = "OWNER",
+    kinds: tuple[str, ...] = ("code-review", "leaks"),
 ) -> str:
     """_TEST_GH_SCHEDULED_COMMENTS shape — one OWNER-authored comment/review row whose
-    body carries the scheduled-review marker naming ``head``. One JSON object per line.
+    body carries one scheduled-review marker per ``kind`` naming ``head``. One JSON object
+    per line. The DEFAULT carries BOTH required kinds (code-review + leaks), so every
+    pre-existing case satisfies the gate; scheduled-gate cases pass explicit ``kinds``.
 
     ``login``/``author_association`` model the trust check: a row is accepted only when
     ``login == <repo owner>`` OR ``author_association == "OWNER"``. The repo owner here is
     ``owner`` (``REPO = "owner/repo"``), so the default satisfies BOTH arms."""
-    body = f"Scheduled review complete.\n<!-- genesis-scheduled-review: head={head} -->"
+    markers = "\n".join(f"<!-- genesis-scheduled-review: head={head} kind={k} -->" for k in kinds)
+    body = "Scheduled review complete.\n" + markers
     return json.dumps({"login": login, "author_association": author_association, "body": body})
 
 
@@ -594,14 +598,14 @@ _CASES: list[tuple[str, object, int, str]] = [
         "scheduled_review_stale_sha_blocks",
         lambda mp: _run(mp, _merge_cmd(), scheduled=_scheduled_marker(STALE)),
         2,
-        "no scheduled Claude review",
+        "scheduled Claude review(s) missing",
     ),
     # No scheduled review at all (didn't run / rate-limited) → fail-closed block.
     (
         "scheduled_review_absent_blocks",
         lambda mp: _run(mp, _merge_cmd(), scheduled=""),
         2,
-        "no scheduled Claude review",
+        "scheduled Claude review(s) missing",
     ),
     # A marker from a NON-owner author (login != owner, association != OWNER) is NOT
     # trusted → treated as absent → block.
@@ -613,7 +617,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             scheduled=_scheduled_marker(HEAD, login="randouser", author_association="CONTRIBUTOR"),
         ),
         2,
-        "no scheduled Claude review",
+        "scheduled Claude review(s) missing",
     ),
     # Owner-login match is case-INSENSITIVE (GitHub logins are canonically cased, but
     # fold both sides as defense-in-depth): a marker whose login differs only in case
@@ -627,6 +631,23 @@ _CASES: list[tuple[str, object, int, str]] = [
         ),
         0,
         "",
+    ),
+    # BOTH required kinds must be present at head: a marker for only code-review (leaks
+    # routine did not run) blocks, naming the missing kind.
+    (
+        "scheduled_review_only_code_review_blocks_missing_leaks",
+        lambda mp: _run(
+            mp, _merge_cmd(), scheduled=_scheduled_marker(HEAD, kinds=("code-review",))
+        ),
+        2,
+        "leaks",
+    ),
+    # ...and only leaks (code-review routine did not run) blocks too.
+    (
+        "scheduled_review_only_leaks_blocks_missing_code_review",
+        lambda mp: _run(mp, _merge_cmd(), scheduled=_scheduled_marker(HEAD, kinds=("leaks",))),
+        2,
+        "code-review",
     ),
     # The # scheduled-review-override sigil consciously waives the gate → an absent
     # scheduled review still merges.
@@ -648,7 +669,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             scheduled="",
         ),
         2,
-        "no scheduled Claude review",
+        "scheduled Claude review(s) missing",
     ),
     # # scheduled-review-override waives ONLY the scheduled gate, NOT Codex freshness:
     # a no-review PR still blocks on freshness (which runs first).

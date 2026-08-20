@@ -819,15 +819,17 @@ findings below, a gated `gh pr merge`:
   touch-up) — the merge is then still bound to the exact head that was
   classified. A substantial or unclassifiable delta blocks; an ABSENT review
   always blocks;
-- requires a **scheduled Claude review at the current head**. A scheduled Claude
-  review (a `/schedule` cloud routine) posts as the repo OWNER's account and must
-  carry the marker `<!-- genesis-scheduled-review: head=<full-40-hex-sha> -->`
-  naming the exact head it reviewed. The gate blocks unless an owner-authored
-  marker names the PR's current head — so a review that never ran, ran on a stale
-  commit, or was rate-limited cannot slip a merge through. If it's pending or rate-
-  limited, wait for it, or append `# scheduled-review-override` to merge anyway
-  (the conscious "merge without a scheduled review" case). Fail-closed: an
-  unreadable comments/reviews fetch BLOCKS (never a false all-clear);
+- requires **every scheduled Claude review at the current head**. Each scheduled
+  Claude review (a `/schedule` cloud routine) posts as the repo OWNER's account and
+  must carry a marker `<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`
+  naming the exact head it reviewed AND which routine it is (`kind`). The gate blocks
+  unless an owner-authored marker for EVERY kind in `_REQUIRED_SCHEDULED_REVIEW_KINDS`
+  (currently `code-review` + `leaks`) names the PR's current head — so if any required
+  routine never ran, ran on a stale commit, or was rate-limited, the merge blocks
+  (naming the missing kinds). If a routine is pending or rate-limited, wait for it, or
+  append `# scheduled-review-override` to merge anyway (the conscious "merge without the
+  scheduled reviews" case). Fail-closed: an unreadable comments/reviews fetch BLOCKS
+  (never a false all-clear);
 - requires the PR base to equal the repo's default branch (retarget guard);
 - blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
   does not merge).

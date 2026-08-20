@@ -43,14 +43,16 @@ review-CONTEXT gates (Codex-at-head freshness + base-is-default),
 ``# ci-override`` waives the CI gate. A session that genuinely needs several
 appends several (one trailing comment may carry multiple sigils).
 
-Scheduled Claude review marker
-------------------------------
-A "scheduled Claude review" runs on the repo OWNER's GitHub account (NOT a bot) and
-must post a comment (issue comment) or PR review whose body contains the marker
-``<!-- genesis-scheduled-review: head=<full-40-hex-sha> -->`` naming the exact head
-commit it reviewed. The merge gate (``_check_scheduled_claude_reviewed_head``) blocks
-unless such a marker, authored by the owner, names the PR's CURRENT head — so a review
-that never ran, ran on a stale commit, or was rate-limited cannot slip a merge through.
+Scheduled Claude review markers
+-------------------------------
+A "scheduled Claude review" runs on the repo OWNER's GitHub account (NOT a bot) and must
+post a comment (issue comment) or PR review whose body contains a marker
+``<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`` naming the exact
+head it reviewed AND which routine it was (``kind``). The merge gate
+(``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
+EVERY kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` (currently code-review + leaks) names
+the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
+was rate-limited, the merge is blocked (naming the missing kinds).
 On the normal path this is ATOMIC: the Codex-freshness gate's ``--match-head-commit``
 binding pins the merge to the very head the marker was verified at, so a race with a new
 push cannot swap in an unreviewed head. Under ``# stale-review-override`` (which waives
@@ -1526,9 +1528,22 @@ def _check_codex_reviewed_head(
 # The marker is the trust anchor (single-author, non-adversarial model): a spoofed
 # marker needs the owner's account. Waived by ``# scheduled-review-override`` (the
 # conscious "merge without a scheduled review" case — it didn't run / is rate-limited).
-_SCHEDULED_REVIEW_MARKER_RE = re.compile(
-    r"<!--\s*genesis-scheduled-review:\s*head=([0-9a-f]{40})\s*-->"
+# A scheduled-review marker is an HTML comment ``<!-- genesis-scheduled-review:
+# head=<40hex> kind=<name> -->``. Each SCHEDULED routine stamps its own ``kind`` so
+# the gate can require that EVERY routine in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` ran
+# on the current head — a single routine's marker no longer satisfies the gate on its
+# own. head/kind are parsed from the marker BLOCK (order-tolerant) and BOTH must be
+# present in the SAME marker to count.
+_SCHEDULED_REVIEW_BLOCK_RE = re.compile(
+    r"<!--\s*genesis-scheduled-review:\s*(.*?)\s*-->", re.DOTALL
 )
+_SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})\b")
+_SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)")
+
+# Every scheduled routine whose completion the merge gate requires, by ``kind``. A PR
+# merges only when a valid owner-authored marker for EACH of these names the current
+# head. Change this tuple to add/remove required routines.
+_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 
 
 def _parse_scheduled_jsonl(raw: str | None) -> list[dict]:
@@ -1595,17 +1610,17 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
     return rows
 
 
-def _scheduled_review_head_shas(pr_num: str, repo: str | None = None) -> set[str] | None:
-    """The SET of full 40-hex head shas named in valid scheduled-review markers on the
-    PR, or ``None`` on an UNREADABLE fetch (the caller fail-closes on both None and an
-    empty set — None only distinguishes "could not read" from "read, no marker").
+def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str, set[str]] | None:
+    """Map of ``head-sha -> {kinds}`` from valid owner-authored scheduled-review markers
+    on the PR, or ``None`` on an UNREADABLE fetch (the caller fail-closes on both None
+    and an empty map — None only distinguishes "could not read" from "read, no marker").
 
     A marker is trusted only when its author is the repo OWNER: ``login == owner`` OR
     ``author_association == "OWNER"`` (belt-and-suspenders — the marker itself is the
     trust anchor in the single-author, non-adversarial model). The owner login is the
     first segment of ``(repo or derived)``; ``derived`` is gh's repo for the cwd when no
-    explicit repo was passed. When the owner cannot be determined the ``login`` arm is
-    simply never satisfied and the ``author_association`` arm still gates.
+    explicit repo was passed. Each marker BLOCK must carry BOTH ``head=<40hex>`` and
+    ``kind=<name>`` to count (order-tolerant); the ``kind`` is recorded under that head.
     """
     rows = _scheduled_review_rows(pr_num, repo=repo)
     if rows is None:
@@ -1615,21 +1630,24 @@ def _scheduled_review_head_shas(pr_num: str, repo: str | None = None) -> set[str
     except Exception:
         owner_repo = repo
     owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
-    shas: set[str] = set()
+    by_head: dict[str, set[str]] = {}
     for row in rows:
         login = (row.get("login") or "").lower()
         assoc = (row.get("author_association") or "").upper()
         if login != owner and assoc != "OWNER":
             continue  # not the repo owner — not a trusted scheduled review
         body = row.get("body") or ""
-        # Defense-in-depth follow-up: for rows sourced from /pulls/N/reviews we could
-        # ALSO cross-check GitHub's authoritative `commit_id` against the marker sha
-        # (issue comments carry no commit_id). Deferred (LOW): the marker sha is already
-        # matched EXACTLY against the authoritative HEAD by the caller, so a stale marker
-        # cannot pass; this would only catch a buggy reviewer templating a wrong sha.
-        for sha in _SCHEDULED_REVIEW_MARKER_RE.findall(body):
-            shas.add(sha.lower())
-    return shas
+        # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
+        # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
+        # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
+        # HEAD by the caller, so a stale marker can't pass; this only catches a buggy reviewer.
+        for block in _SCHEDULED_REVIEW_BLOCK_RE.findall(body):
+            head_m = _SCHEDULED_REVIEW_HEAD_RE.search(block)
+            kind_m = _SCHEDULED_REVIEW_KIND_RE.search(block)
+            if not head_m or not kind_m:
+                continue  # a marker must name both a head AND a kind to count
+            by_head.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
+    return by_head
 
 
 def _check_scheduled_claude_reviewed_head(
@@ -1640,26 +1658,25 @@ def _check_scheduled_claude_reviewed_head(
     force: bool = False,
     strict: bool = False,
 ) -> str | None:
-    """Block a merge unless a scheduled Claude review (by the repo OWNER) has run on
-    the PR's CURRENT head. Returns ``None`` when a valid marker names ``head_sha``
-    exactly (full 40-char), else a BLOCK MESSAGE string.
+    """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
+    has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
+    each kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` names ``head_sha`` exactly (full
+    40-char), else a BLOCK MESSAGE naming the MISSING kinds.
 
     Fail-CLOSED in BOTH modes — this gate never passes on absence of positive
     evidence: if the head cannot be read, or the comment/review fetch errors
-    (``_scheduled_review_head_shas`` → None), the merge is BLOCKED. A read that simply
-    does not name this head (the review didn't run, ran on a stale commit, or was
-    rate-limited) also blocks. ``strict`` is accepted for interface parity with the
-    finding scanners (``check_pr_report`` passes it); the block/pass decision is
-    identical in both modes precisely BECAUSE enforcement already fails closed, so the
-    report can never issue a false all-clear here.
+    (``_scheduled_review_markers`` → None), the merge is BLOCKED. A read that simply
+    does not carry every required kind at this head (a routine didn't run, ran on a
+    stale commit, or was rate-limited) also blocks. ``strict`` is accepted for interface
+    parity with the finding scanners (``check_pr_report`` passes it); the block/pass
+    decision is identical in both modes precisely BECAUSE enforcement already fails
+    closed, so the report can never issue a false all-clear here.
 
     ``head_sha`` (the caller's authoritative head) is used when given; otherwise the
-    head is read via ``_pr_head_sha`` (so ``check_pr_report`` and a stale-review-forced
-    merge can both call it without a head in hand). ``force`` (a
-    ``# scheduled-review-override`` on the merge segment — an INDEPENDENT sigil from
-    ``# stale-review-override``, which waives the Codex freshness gate) waives this gate
-    for the conscious "merge without a scheduled review" case (e.g. it is down / rate
-    limited).
+    head is read via ``_pr_head_sha``. ``force`` (a ``# scheduled-review-override`` on
+    the merge segment — an INDEPENDENT sigil from ``# stale-review-override``) waives
+    this gate for the conscious "merge without the scheduled reviews" case (e.g. a
+    routine is down / rate-limited).
     """
     if force:
         return None  # waived by # scheduled-review-override
@@ -1668,27 +1685,29 @@ def _check_scheduled_claude_reviewed_head(
         head = (_pr_head_sha(pr_num, repo=repo) or "").strip().lower()
     if not head:
         return (
-            f"could not read PR #{pr_num}'s head commit to verify a scheduled Claude "
-            f"review (GitHub query failed).\n"
+            f"could not read PR #{pr_num}'s head commit to verify the scheduled Claude "
+            f"reviews (GitHub query failed).\n"
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
-    shas = _scheduled_review_head_shas(pr_num, repo=repo)
-    if shas is None:
+    markers = _scheduled_review_markers(pr_num, repo=repo)
+    if markers is None:
         return (
-            f"could not read PR #{pr_num}'s comments/reviews to verify a scheduled Claude "
-            f"review at head {head[:12]} — review status UNREADABLE (retry), not clean.\n"
+            f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
+            f"reviews at head {head[:12]} — review status UNREADABLE (retry), not clean.\n"
             f"Retry, or append '# scheduled-review-override' to merge anyway."
         )
-    if head in shas:
+    kinds_here = markers.get(head, set())
+    missing = [k for k in _REQUIRED_SCHEDULED_REVIEW_KINDS if k not in kinds_here]
+    if not missing:
         return None
     return (
-        f"no scheduled Claude review found for PR #{pr_num} at head {head[:12]} (it may be "
-        f"pending or rate-limited).\n"
-        f"The scheduled review posts a comment/review carrying "
-        f"'<!-- genesis-scheduled-review: head=<sha> -->' once it runs on THIS exact commit "
-        f"(Claude does NOT auto-review a later fix-commit) — wait for it to run on the "
-        f"current head, or append '# scheduled-review-override' to merge without a scheduled "
-        f"Claude review."
+        f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
+        f"(required: {', '.join(_REQUIRED_SCHEDULED_REVIEW_KINDS)}; present: "
+        f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
+        f"Each routine posts a comment/review carrying "
+        f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
+        f"exact commit — wait for the missing routine(s) to run on the current head, or "
+        f"append '# scheduled-review-override' to merge without them."
     )
 
 
@@ -3082,7 +3101,8 @@ def main() -> int:
                 )
                 if sched_msg:
                     print(
-                        f"BLOCKED: PR #{pr_num} — no scheduled Claude review at the current head.",
+                        f"BLOCKED: PR #{pr_num} — required scheduled Claude review(s) "
+                        f"missing at the current head.",
                         file=sys.stderr,
                     )
                     print(sched_msg, file=sys.stderr)

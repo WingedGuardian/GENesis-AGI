@@ -42,10 +42,15 @@ def _reviews_jsonl(*commit_ids, login="chatgpt-codex-connector[bot]"):
 
 
 def _scheduled_marker(head=HEAD, *, login="owner", author_association="OWNER"):
-    """_TEST_GH_SCHEDULED_COMMENTS shape — one OWNER-authored row carrying the
-    scheduled-review marker naming ``head`` (author_association=OWNER satisfies the
-    trust check regardless of the derived repo owner)."""
-    body = f"Scheduled review complete.\n<!-- genesis-scheduled-review: head={head} -->"
+    """_TEST_GH_SCHEDULED_COMMENTS shape — one OWNER-authored row carrying a marker for
+    EVERY required kind (code-review + leaks) naming ``head``, so the scheduled gate is
+    satisfied and these freshness/binding cases exercise their own target
+    (author_association=OWNER satisfies the trust check regardless of derived repo owner)."""
+    markers = "\n".join(
+        f"<!-- genesis-scheduled-review: head={head} kind={k} -->"
+        for k in ("code-review", "leaks")
+    )
+    body = "Scheduled review complete.\n" + markers
     return json.dumps({"login": login, "author_association": author_association, "body": body})
 
 
