@@ -222,3 +222,38 @@ async def test_probe_uses_configured_cc_path(tmp_path, monkeypatch):
     )
     assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok-x"}
     assert seen == ["/opt/custom/claude"]
+
+
+async def test_probe_timeout_group_kills_and_returns_false(monkeypatch):
+    """The auth probe spawns the `claude` launcher (node children) — its
+    timeout must group-kill via the shared guarded helper and stay ambiguous
+    (False), mirroring the swept guardian/diagnosis.py probe."""
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    captured: dict = {}
+    proc = MagicMock()
+    proc.pid = 41414  # explicit — never a mock default (killpg(1) trap)
+    proc.returncode = None
+
+    async def _hang(*a, **k):
+        await _asyncio.sleep(600)
+
+    proc.communicate = _hang
+    proc.wait = AsyncMock(return_value=-9)
+
+    async def fake_exec(*args, **kwargs):
+        captured.update(kwargs)
+        return proc
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+    result = await login_health.probe_logged_out("claude", timeout_s=0.05)
+    assert result is False  # ambiguity → never inject
+    assert killpg_calls and killpg_calls[0][0] == 41414
+    assert captured.get("start_new_session") is True
+    assert "preexec_fn" not in captured

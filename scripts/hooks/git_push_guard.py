@@ -436,20 +436,50 @@ def _extract_pr_number(cmd: str) -> str | None:
         tokens = shlex.split(spaced)
     except ValueError:
         tokens = spaced.split()
-    for tok in tokens:
+    seps = {";", "&", "|", "&&", "||"}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
         # Stop at the end of THIS command — tokens after a separator
         # belong to a chained command, and their digits must not be read
         # as this merge's target (`gh pr merge 123; echo 456` merges 123
         # but this loop would otherwise return 456). 2026-07-10 review.
-        if tok in {";", "&", "|", "&&", "||"}:
+        if tok in seps:
             break
-        if tok.isdigit():
-            return tok
-        if tok.startswith("#") and tok[1:].isdigit():
-            return tok[1:]
-        url = re.match(r"\S*/pull/(\d+)\b", tok)
-        if url:
-            return url.group(1)
+        # A value-taking flag consumes the NEXT token as its value, so an
+        # UNQUOTED numeric value is never misread as the PR: gh parses
+        # `gh pr merge --subject 123 5` as subject="123" + PR 5, and the old
+        # loop returned 123 (the flag value) → the gates checked the WRONG PR
+        # (E3, 2026-08-19). Covers long/short-single value flags
+        # (--subject/-t/--body/--match-head-commit/--repo…) and short clusters
+        # whose trailing value-letter has no glued remainder (`-db 123` → -b
+        # eats 123). Mirrors _merge_match_head / _comment_target, which already
+        # skip value flags — this was the one gh-arg parser here that didn't.
+        # NEVER swallow a separator as a value (a dangling `--subject ; gh pr
+        # merge 999` must not leak the chained command's 999): only consume the
+        # next token when it isn't a separator; the break above then ends it.
+        if tok in _GH_MERGE_VALUE_FLAGS or _short_cluster_consumes_next(tok):
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            i += 2 if (nxt is not None and nxt not in seps) else 1
+            continue
+        # The PR is a POSITIONAL — a bare number / #N / /pull/N URL, which never
+        # starts with '-'. Guarding the matchers on that closes the GLUED
+        # value-flag sibling of E3 (adversarial review 2026-08-19): `--body=…`
+        # and `-b…` are single '-'-prefixed tokens that DON'T consume a next
+        # token, so they fall through here — and the URL matcher's `\S*` prefix
+        # would otherwise read a `/pull/N` smuggled inside the flag's VALUE as
+        # the PR while gh merges the trailing positional. (`--` end-of-options
+        # also starts with '-' → skipped; the following bare positional still
+        # resolves, matching gh.)
+        if not tok.startswith("-"):
+            if tok.isdigit():
+                return tok
+            if tok.startswith("#") and tok[1:].isdigit():
+                return tok[1:]
+            url = re.match(r"\S*/pull/(\d+)\b", tok)
+            if url:
+                return url.group(1)
+        i += 1
     return None
 
 

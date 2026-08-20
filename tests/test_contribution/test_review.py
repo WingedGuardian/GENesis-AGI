@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import subprocess
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from genesis.contribution import review
 
@@ -22,6 +24,16 @@ def _mk_codex_output(agent_text: str) -> str:
         json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 100}}),
     ]
     return "\n".join(lines)
+
+
+def _popen_mock(stdout: str = "", returncode: int = 0, pid: int = 54321) -> MagicMock:
+    """A Popen stand-in. pid is EXPLICIT — never rely on a mock default
+    (int(MagicMock().pid) coerces to 1 → the killpg(1) trap)."""
+    m = MagicMock()
+    m.pid = pid
+    m.returncode = returncode
+    m.communicate.return_value = (stdout, "")
+    return m
 
 
 def test_parse_verdict_pass():
@@ -57,12 +69,9 @@ def test_codex_missing_skipped():
 
 def test_codex_success_passed():
     output = _mk_codex_output("All good.\n\nVERDICT: PASS")
-    mock_proc = subprocess.CompletedProcess(
-        args=[], returncode=0, stdout=output, stderr="",
-    )
     with (
         patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
-        patch("genesis.contribution.review.subprocess.run", return_value=mock_proc),
+        patch("genesis.contribution.review.subprocess.Popen", return_value=_popen_mock(output)),
     ):
         r = review._try_codex("diff")
     assert r is not None
@@ -75,12 +84,9 @@ def test_codex_success_failed():
     output = _mk_codex_output(
         "issue: bad import\nconcern: race condition\nVERDICT: FAIL"
     )
-    mock_proc = subprocess.CompletedProcess(
-        args=[], returncode=0, stdout=output, stderr="",
-    )
     with (
         patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
-        patch("genesis.contribution.review.subprocess.run", return_value=mock_proc),
+        patch("genesis.contribution.review.subprocess.Popen", return_value=_popen_mock(output)),
     ):
         r = review._try_codex("diff")
     assert r is not None
@@ -89,38 +95,123 @@ def test_codex_success_failed():
 
 
 def test_codex_nonzero_returncode_returns_none():
-    mock_proc = subprocess.CompletedProcess(
-        args=[], returncode=1, stdout="", stderr="codex error",
-    )
     with (
         patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
-        patch("genesis.contribution.review.subprocess.run", return_value=mock_proc),
+        patch(
+            "genesis.contribution.review.subprocess.Popen",
+            return_value=_popen_mock("", returncode=1),
+        ),
     ):
         r = review._try_codex("diff")
     assert r is None
 
 
 def test_codex_empty_output_returns_none():
-    mock_proc = subprocess.CompletedProcess(
-        args=[], returncode=0, stdout="", stderr="",
-    )
     with (
         patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
-        patch("genesis.contribution.review.subprocess.run", return_value=mock_proc),
+        patch("genesis.contribution.review.subprocess.Popen", return_value=_popen_mock("")),
     ):
         r = review._try_codex("diff")
     assert r is None
 
 
-def test_codex_timeout_returns_none():
-    def raise_timeout(*a, **kw):
-        raise subprocess.TimeoutExpired(cmd="codex", timeout=300)
+def test_codex_spawn_oserror_returns_none():
     with (
         patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
-        patch("genesis.contribution.review.subprocess.run", side_effect=raise_timeout),
+        patch(
+            "genesis.contribution.review.subprocess.Popen",
+            side_effect=OSError("spawn failed"),
+        ),
     ):
         r = review._try_codex("diff")
     assert r is None
+
+
+class TestCodexTimeoutTreeKill:
+    """Timeout must SIGKILL codex's whole process GROUP (codex is a Node
+    launcher — killing only the direct child orphans its workers), signalling
+    proc.pid AS the pgid (never os.getpgid — it raises once the leader is
+    reaped, leaking the tree), then drain with a BOUNDED communicate."""
+
+    def _run_timeout(self, proc: MagicMock):
+        with (
+            patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+            patch("genesis.contribution.review.subprocess.Popen", return_value=proc),
+            patch("genesis.util.proc_kill.os.killpg") as killpg,
+        ):
+            r = review._try_codex("diff")
+        return r, killpg
+
+    def test_timeout_group_kills_by_pid(self):
+        proc = _popen_mock(pid=54321)
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="codex", timeout=300),
+            ("", ""),  # bounded drain
+        ]
+        r, killpg = self._run_timeout(proc)
+        assert r is None
+        killpg.assert_called_once()
+        assert killpg.call_args.args[0] == 54321
+        proc.kill.assert_not_called()
+
+    def test_timeout_pgid_guard_refuses_group_kill(self):
+        proc = _popen_mock(pid=1)
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="codex", timeout=300),
+            ("", ""),
+        ]
+        r, killpg = self._run_timeout(proc)
+        assert r is None
+        killpg.assert_not_called()
+        proc.kill.assert_called_once()
+
+    def test_timeout_drain_is_bounded_and_survives_second_timeout(self):
+        proc = _popen_mock(pid=54321)
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="codex", timeout=300),
+            subprocess.TimeoutExpired(cmd="codex", timeout=30),  # drain times out too
+        ]
+        r, killpg = self._run_timeout(proc)
+        assert r is None  # still degrades, never raises
+        killpg.assert_called_once()
+        # the drain was attempted with a timeout kwarg (bounded, not blocking)
+        drain_call = proc.communicate.call_args_list[1]
+        assert drain_call.kwargs.get("timeout") is not None
+
+    def test_keyboard_interrupt_kills_group_and_propagates(self):
+        """start_new_session detaches codex from the CLI's terminal group, so
+        a human's Ctrl+C never reaches it — the handler must group-kill before
+        propagating, or the interrupt itself orphans the tree."""
+        proc = _popen_mock(pid=54321)
+        proc.communicate.side_effect = [KeyboardInterrupt(), ("", "")]
+        with (
+            patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+            patch("genesis.contribution.review.subprocess.Popen", return_value=proc),
+            patch("genesis.util.proc_kill.os.killpg") as killpg,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            review._try_codex("diff")
+        killpg.assert_called_once()
+        assert killpg.call_args.args[0] == 54321
+
+
+def test_codex_spawned_in_new_session():
+    """codex must be spawned with start_new_session=True (own group for the
+    tree-kill) and NOT via preexec_fn (post-fork Python deadlock risk)."""
+    captured: dict = {}
+
+    def _fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return _popen_mock(_mk_codex_output("ok\nVERDICT: PASS"))
+
+    with (
+        patch("genesis.contribution.review.shutil.which", return_value="/fake/codex"),
+        patch("genesis.contribution.review.subprocess.Popen", side_effect=_fake_popen),
+    ):
+        r = review._try_codex("diff")
+    assert r is not None
+    assert captured.get("start_new_session") is True
+    assert "preexec_fn" not in captured
 
 
 def test_cc_reviewer_always_none():

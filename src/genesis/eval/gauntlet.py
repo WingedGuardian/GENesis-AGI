@@ -58,6 +58,7 @@ from genesis.eval.types import (
     ScorerType,
     TaskCategory,
 )
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -212,14 +213,25 @@ async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
         cwd=str(workdir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        # Own group so the timeout kill reaps forked test children too.
+        start_new_session=True,
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=_PYTEST_TIMEOUT_S)
     except TimeoutError:  # asyncio.TimeoutError is an alias of TimeoutError on 3.11+
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        await proc.wait()
+        # Group-kill (guarded pid-as-pgid) + BOUNDED reap — a bare kill
+        # orphans forked test processes, and an unbounded wait() can hang
+        # the recovery itself.
+        kill_process_group(proc)
+        await reap_bounded(proc)
         return -1, "pytest scoring timed out"
+    except asyncio.CancelledError:
+        # Ctrl+C during scoring (asyncio.run cancels this task): with its own
+        # session pytest never sees the terminal SIGINT — group-kill before
+        # propagating or the tree runs on after the worktree is deleted.
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        raise
     return proc.returncode, out.decode(errors="replace")
 
 
