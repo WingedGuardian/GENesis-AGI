@@ -395,16 +395,19 @@ call_sites:
     - openrouter-deepseek-v4-flash
     - groq-free
     retry_profile: background
-  # Adversarial challenge of synthesis output. A DIFFERENT model from synthesis
-  # (which leads with DeepSeek) ensures independence: groq-free challenges here,
-  # with paid Kimi as the deep fallback (NIM's free Kimi was retired 2026-08 —
-  # 404-for-account).
+  # Adversarial challenge of synthesis output. Must stay model-independent from
+  # synthesis across the WHOLE chain, not just the primary: synthesis falls back
+  # to groq-free, so a groq-led challenge could self-approve under a DeepSeek
+  # outage. This challenge leads with mistral-large-free (disjoint from every
+  # synthesis provider — deepseek-flash / groq) + paid Kimi as the deep fallback.
+  # NIM's free Kimi was retired 2026-08 (404-for-account). Locked by
+  # test_config_invariants::test_adversarial_challenge_sites_are_model_independent.
   dream_cycle_synthesis_challenge:
     chain:
-    - groq-free
-    # Paid Kimi via OpenRouter as last-resort fallback — a non-DeepSeek family,
-    # so the challenge stays model-independent from the DeepSeek synthesis even
-    # when the free tier is down. Only billed during a free-tier outage.
+    - mistral-large-free
+    # Paid Kimi via OpenRouter as last-resort fallback — a non-DeepSeek, non-groq
+    # family, so the challenge stays model-independent from synthesis across the
+    # whole chain even when the free tier is down. Only billed during an outage.
     - kimi-k2.5
     retry_profile: background
   dream_cycle_entity_check:

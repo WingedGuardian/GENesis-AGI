@@ -57,11 +57,13 @@ profiles:
     best_for: [foreground_conversation, research_synthesis, long_context_work]
     avoid_for: [micro_reflection, math_heavy]
     free_tier:
-      available: true
-      provider: nvidia_nim
-      limits: "5000 credits, 40 RPM"
-    last_reviewed: "2026-03-14"
-    review_source: manual
+      # NIM's free Kimi route (moonshotai/kimi-k2.6) was retired 2026-08 —
+      # 404-for-account (live probe). No free route remains; paid only (the
+      # kimi-k2.5 provider bills via OpenRouter). available:false so
+      # match(require_free=True) no longer returns Kimi as a free option.
+      available: false
+    last_reviewed: "2026-08-19"
+    review_source: nvidia_nim_live_probe
 
   glm-5.1:
     display_name: "GLM-5.1"

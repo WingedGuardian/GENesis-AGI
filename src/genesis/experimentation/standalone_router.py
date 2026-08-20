@@ -51,6 +51,24 @@ def _default_config_path() -> Path:
     return Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
 
 
+def default_judge_chain(judge_provider: str | None = None) -> list[str]:
+    """The offline judge fallback chain — mirrors the runtime ``judge`` call
+    site EXACTLY by reading it from the shipped routing config, so it can never
+    drift (calibrated V4-pro first, then NIM V4-flash + paid V4-flash for
+    resilience). Deriving from config (rather than hardcoding
+    ``[DEFAULT_JUDGE_PROVIDER, ...]``) also means the primary can never be
+    duplicated in the chain — a duplicate would make StandaloneLiteLLMRouter
+    re-attempt the same failed provider, potentially costing a second timeout.
+    ``judge_provider`` reorders the chain to lead elsewhere (known-down-primary
+    lever); it is de-duplicated so a lead that already appears can't repeat.
+    """
+    cfg = load_config(_default_config_path())
+    chain = list(cfg.call_sites["judge"].chain)
+    if judge_provider:
+        chain = [judge_provider, *[p for p in chain if p != judge_provider]]
+    return chain
+
+
 @dataclass
 class StandaloneRoutingResult:
     """Minimal RoutingResult shape consumed by `LLMJudgeScorer`."""

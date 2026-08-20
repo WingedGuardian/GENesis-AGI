@@ -58,10 +58,13 @@ def test_every_chain_keeps_a_non_nim_fallback():
 
 
 def test_adversarial_challenge_sites_are_model_independent():
-    """A `_challenge` site adversarially re-checks its base site, so it MUST lead
-    with a different MODEL — otherwise the two-model agreement gate degenerates to
-    one model agreeing with itself (a data-corruption risk for entity_adjudication,
-    which gates a destructive merge_entity)."""
+    """A `_challenge` site adversarially re-checks its base site, so their chains
+    MUST resolve to DISJOINT model sets across the WHOLE chain — not just the
+    primary. Neither dream_cycle.py nor adversarial_review.py compares
+    provider_used, so if a base and its challenge can BOTH fall through to the
+    same model (e.g. both to groq-free under a DeepSeek outage), one model
+    silently approves its own output — collapsing the two-model agreement gate
+    that guards entity_adjudication's destructive merge_entity."""
     cfg = _cfg()
     pairs = [
         ("dream_cycle_synthesis", "dream_cycle_synthesis_challenge"),
@@ -71,12 +74,31 @@ def test_adversarial_challenge_sites_are_model_independent():
     for base, chal in pairs:
         bc, cc = cfg.call_sites[base].chain, cfg.call_sites[chal].chain
         assert bc and cc, f"{base}/{chal} must have non-empty chains"
-        base_model = cfg.providers[bc[0]].model_id
-        chal_model = cfg.providers[cc[0]].model_id
-        assert base_model != chal_model, (
-            f"{chal} leads with the same model as {base} ({base_model}) — "
-            "adversarial model independence collapsed"
+        base_models = {cfg.providers[p].model_id for p in bc}
+        chal_models = {cfg.providers[p].model_id for p in cc}
+        shared = base_models & chal_models
+        assert not shared, (
+            f"{base} and {chal} share model(s) {shared} across their fallback "
+            "chains — an outage could route both to the same model, so the "
+            "challenge could approve its own base output"
         )
+
+
+def test_default_judge_chain_has_no_duplicates_and_mirrors_config():
+    """The offline judge chain (bench / skill-replay) must not duplicate a
+    provider — a duplicate makes StandaloneLiteLLMRouter re-attempt the same
+    failed provider (a second timeout) — and must mirror the runtime judge."""
+    from genesis.experimentation.standalone_router import default_judge_chain
+
+    chain = default_judge_chain()
+    assert len(chain) == len(set(chain)), f"duplicate provider in judge chain: {chain}"
+    assert chain == list(_cfg().call_sites["judge"].chain), (
+        "offline judge chain drifted from the runtime judge call site"
+    )
+    # the known-down-primary lever reorders without duplicating
+    led = default_judge_chain("openrouter-deepseek-v4-flash")
+    assert led[0] == "openrouter-deepseek-v4-flash"
+    assert len(led) == len(set(led)), f"duplicate after reorder: {led}"
 
 
 def test_judge_stays_deepseek_family():
