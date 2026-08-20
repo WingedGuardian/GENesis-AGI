@@ -488,6 +488,11 @@ class CCInvoker:
         # cleanroom). Applied last by contract; see CCInvocation.env_overrides.
         if inv and inv.env_overrides:
             env.update(inv.env_overrides)
+            # Preserve the TMPDIR ≡ CLAUDE_CODE_TMPDIR invariant even if an
+            # override changed CLAUDE_CODE_TMPDIR but not TMPDIR (else the two
+            # silently desync). An explicit TMPDIR override still wins.
+            if "CLAUDE_CODE_TMPDIR" in inv.env_overrides and "TMPDIR" not in inv.env_overrides:
+                env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:

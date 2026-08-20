@@ -70,6 +70,39 @@ os.killpg = _safe_killpg  # type: ignore[assignment]
 # TMPDIR/CLAUDE_CODE_TMPDIR). Runs at config time, before any ``tmp_path``
 # fixture resolves. No-op on CI (TMPDIR unset) and when ``--basetemp`` is
 # passed explicitly. See ``genesis.util.tmp.should_redirect_pytest_basetemp``.
+def _reap_stale_pytest_basetemps(pytest_base: str) -> None:
+    """Remove per-PID basetemp dirs left by runs that exited abnormally (SIGKILL/
+    host crash — ``pytest_unconfigure`` never ran). A leaf is stale iff its name
+    is an integer PID that is no longer alive; LIVE PIDs (concurrent runs) are
+    spared, so this never touches another in-flight suite. Best-effort — this is
+    the safety net that makes cleanup survive abnormal exits (``pytest_unconfigure``
+    handles the normal path)."""
+    import shutil
+
+    try:
+        names = os.listdir(pytest_base)
+    except OSError:
+        return
+    for name in names:
+        # isdecimal (NOT isdigit): isdigit is True for superscripts like '²' whose
+        # int() raises ValueError — this loop must never raise out of
+        # pytest_configure (that would break collection for the WHOLE suite,
+        # strictly worse than the leak it prevents).
+        if not name.isdecimal():
+            continue
+        pid = int(name)
+        if pid <= 1:
+            continue  # our leaf is always our own PID (>1); never signal 0/1
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            shutil.rmtree(os.path.join(pytest_base, name), ignore_errors=True)  # dead → reap
+        except (OSError, OverflowError):
+            # alive-but-not-ours (PermissionError), transient, or an out-of-PID-range
+            # name (os.kill(10**30,0) → OverflowError, which is NOT an OSError) → spare.
+            pass
+
+
 def pytest_configure(config):
     from genesis.util.tmp import big_tmp_dir, should_redirect_pytest_basetemp
 
@@ -87,9 +120,13 @@ def pytest_configure(config):
     # rotation), so two concurrent runs sharing one path would rmtree each other's
     # live temp. The CC concurrent-test guard only covers Bash-tool pytest —
     # autonomy/gauntlet subprocesses bypass it — so the per-pid leaf is what keeps
-    # simultaneous runs isolated. pytest_unconfigure removes it so per-pid dirs
-    # can't accumulate under ~/tmp/pytest indefinitely.
-    target = os.path.join(big_tmp_dir(), "pytest", str(os.getpid()))
+    # simultaneous runs isolated.
+    pytest_base = os.path.join(big_tmp_dir(), "pytest")
+    # Reap dead-PID leaves from prior abnormal exits BEFORE creating ours, so the
+    # ~/tmp/pytest dir can't accumulate (the daily hygiene job only prunes direct
+    # children of ~/tmp, whose mtime every run refreshes — so it never ages out).
+    _reap_stale_pytest_basetemps(pytest_base)
+    target = os.path.join(pytest_base, str(os.getpid()))
     Path(target).mkdir(parents=True, exist_ok=True)
     config.option.basetemp = target
     config._genesis_basetemp_cleanup = target

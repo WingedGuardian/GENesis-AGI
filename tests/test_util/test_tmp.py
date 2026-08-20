@@ -6,6 +6,7 @@ passing dir=big_tmp_dir(). These verify the helper resolves + creates the right 
 and that tempfile actually honors it.
 """
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -111,3 +112,48 @@ def test_pytest_unconfigure_removes_per_pid_basetemp(tmp_path):
     assert not leaf.exists(), "per-pid basetemp not cleaned at unconfigure"
     # No-op safe when nothing was recorded (e.g. the redirect never fired).
     mod.pytest_unconfigure(SimpleNamespace())
+
+
+def test_reap_stale_pytest_basetemps(tmp_path):
+    """The startup sweep reaps per-PID leaves from abnormal exits (dead PID),
+    spares live runs (this process), and ignores non-PID / pid<=1 names — so a
+    SIGKILL/crash can't leak the basetemp (pytest_unconfigure never runs then)."""
+    import importlib.util
+    import subprocess
+
+    conftest_path = Path(__file__).resolve().parents[1] / "conftest.py"
+    spec = importlib.util.spec_from_file_location("_genesis_conftest_probe2", conftest_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    base = tmp_path / "pytest"
+    base.mkdir()
+    # A genuinely-dead PID: spawn + reap a trivial process, then reuse its PID.
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    dead = base / str(proc.pid)
+    dead.mkdir()
+    (dead / "scratch").write_text("x")
+    live = base / str(os.getpid())
+    live.mkdir()
+    non_pid = base / "not-a-pid"
+    non_pid.mkdir()
+    init = base / "1"
+    init.mkdir()
+    # Unexpected on-disk state the reaper must survive without raising (it would
+    # otherwise break collection for the WHOLE suite):
+    superscript = base / "²"  # '²'.isdigit() True but int('²') → ValueError
+    superscript.mkdir()
+    huge = base / ("9" * 40)  # os.kill(10**40, 0) → OverflowError (not an OSError)
+    huge.mkdir()
+
+    mod._reap_stale_pytest_basetemps(str(base))  # must NOT raise
+
+    assert not dead.exists(), "dead-PID leaf must be reaped"
+    assert live.exists(), "live-PID (this process) must be spared"
+    assert non_pid.exists(), "non-PID name must be ignored"
+    assert init.exists(), "pid<=1 must be skipped (never signal 0/1)"
+    assert superscript.exists(), "unicode-digit name must be skipped, not crash"
+    assert huge.exists(), "out-of-range PID name must be spared, not crash"
+    # No crash on a missing base dir.
+    mod._reap_stale_pytest_basetemps(str(tmp_path / "does-not-exist"))
