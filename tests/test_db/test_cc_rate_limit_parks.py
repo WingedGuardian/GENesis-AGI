@@ -235,6 +235,96 @@ async def test_prune_terminal_keeps_needs_user(db):
     assert await parks.get_by_id(db, pid) is None
 
 
+async def test_mark_terminal_if_unchanged_versions_on_status_and_claim(db):
+    """Conditional terminal cancel: fires ONLY when both the read status AND
+    claimed_at still match — the TOCTOU guard for the over-bound campaign cancel.
+    A plain status mismatch must no-op (return False, row untouched)."""
+    pid = await parks.upsert_open_park(
+        db,
+        kind="direct_session",
+        dedup_key="k",
+        payload=_payload(),
+        origin_session_id="s",
+        limit_kind="session",
+        raw_signal=None,
+        reset_at=None,
+        next_attempt_at="2026-07-22T17:00:00+00:00",
+    )
+    # Fresh parked row: status='parked', claimed_at IS NULL.
+    # (1) status mismatch → no-op.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="resuming",
+            expected_claimed_at=None,
+        )
+        is False
+    )
+    assert (await parks.get_by_id(db, pid))["status"] == "parked"
+    # (2) exact match (parked, NULL) → cancels and nulls claimed_at.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="parked",
+            expected_claimed_at=None,
+        )
+        is True
+    )
+    row = await parks.get_by_id(db, pid)
+    assert row["status"] == "cancelled"
+    assert row["claimed_at"] is None
+
+
+async def test_mark_terminal_if_unchanged_detects_refreshed_claim(db):
+    """Red-team case: status can return to 'resuming' after a recover→claim
+    re-entry while claimed_at is FRESH. Versioning on claimed_at (not status
+    alone) makes a stale-claim cancel no-op against a live re-claim."""
+    pid = await parks.upsert_open_park(
+        db,
+        kind="direct_session",
+        dedup_key="k",
+        payload=_payload(),
+        origin_session_id="s",
+        limit_kind="session",
+        raw_signal=None,
+        reset_at=None,
+        next_attempt_at="2026-07-22T17:00:00+00:00",
+    )
+    await parks.claim(db, pid)  # parked→resuming, claimed_at=fresh
+    row = await parks.get_by_id(db, pid)
+    fresh_claim = row["claimed_at"]
+    assert row["status"] == "resuming" and fresh_claim is not None
+    # A cancel that read a STALE claim for the same 'resuming' status must NOT
+    # fire — claimed_at differs even though status matches.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="resuming",
+            expected_claimed_at="2026-08-01T01:00:00+00:00",
+        )
+        is False
+    )
+    assert (await parks.get_by_id(db, pid))["status"] == "resuming"
+    # The correct (status, claimed_at) pair DOES fire.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="resuming",
+            expected_claimed_at=fresh_claim,
+        )
+        is True
+    )
+    assert (await parks.get_by_id(db, pid))["status"] == "cancelled"
+
+
 @pytest.mark.parametrize("bad_status", ["bogus", "PARKED", ""])
 async def test_status_check_constraint(db, bad_status):
     import sqlite3

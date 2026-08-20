@@ -118,6 +118,25 @@ async def conversation_history(
                             continue
             except OSError:
                 continue
+        # Order globally by timestamp: files are read newest-file-first
+        # (files[:2]) and concatenated, so without this the two files' messages
+        # interleave out of chronological order and `[-limit:]` can return
+        # older-file entries. Sorting oldest→newest matches the telegram
+        # branch's contract and makes the `before`/limit window precise. A
+        # missing/empty timestamp sorts oldest (and is dropped once `before`
+        # is set, below).
+        messages.sort(key=lambda m: m.get("timestamp") or "")
+        if before:
+            # Page further back: honor the `before` cursor on CC too (the
+            # telegram branch already does). CC timestamps and `before` share
+            # the same ISO-8601 source (the caller pages by feeding back a
+            # timestamp this tool emitted), so a lexical compare is correct. A
+            # record with no timestamp can't be proven to precede the cursor, so
+            # it is excluded once `before` is set.
+            messages = [
+                m for m in messages
+                if m.get("timestamp") and m["timestamp"] < before
+            ]
         return messages[-limit:]
 
     return []

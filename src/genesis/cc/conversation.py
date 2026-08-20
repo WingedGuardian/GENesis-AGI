@@ -1314,7 +1314,7 @@ class ConversationLoop:
             logger.warning("Context injection skipped", exc_info=True)
         return system_prompt
 
-    # Total character budget for the recovery recap (env-overridable settings
+    # Total BYTE budget for the recovery recap (env-overridable settings
     # lever: GENESIS_RECOVERY_CONTEXT_BUDGET). Sized so several full-length
     # analytical replies survive — the old per-message 300-char HEAD chop
     # dropped exactly the part that matters (numbered options/conclusions sit
@@ -1373,7 +1373,7 @@ class ConversationLoop:
         ``chat_ref``: the real chat id (optionally ``tg-``-prefixed; negative
         for groups) — same contract as ``_conversation_identity_block``.
 
-        Character-budgeted and TAIL-biased: messages are kept whole newest-first
+        Byte-budgeted and TAIL-biased: messages are kept whole newest-first
         until the budget runs low; a message too large for the remaining
         budget keeps its END (marked with a leading ellipsis), because that is
         where long analytical replies put their conclusions and option lists.
@@ -1409,23 +1409,41 @@ class ConversationLoop:
             if not messages:
                 return ""
 
-            # Walk newest → oldest, spending the budget where recency is;
-            # then restore chronological order for readability.
+            def _tail_by_bytes(s: str, max_bytes: int) -> str:
+                """Longest end-slice of ``s`` whose UTF-8 length ≤ max_bytes, cut
+                on a CHARACTER boundary. Slicing raw bytes then decoding with
+                errors='ignore' drops only the leading partial multibyte char, so
+                the result is always valid UTF-8 (never a U+FFFD)."""
+                if max_bytes <= 0:
+                    return ""
+                encoded = s.encode()
+                if len(encoded) <= max_bytes:
+                    return s
+                return encoded[-max_bytes:].decode("utf-8", errors="ignore")
+
+            # Walk newest → oldest, spending the BYTE budget where recency is;
+            # then restore chronological order for readability. Bytes (not chars)
+            # so a multibyte-heavy transcript can't balloon the real payload ~3-4x.
             kept: list[str] = []
-            remaining = budget
+            remaining = budget  # bytes
             for m in reversed(messages):
                 content = str(m.get("content") or "")
                 if not content:
                     continue
                 prefix = "User" if m.get("sender") == "user" else "Genesis"
                 line = f"{prefix}: {content}"
-                if len(line) <= remaining:
+                line_bytes = len(line.encode())
+                if line_bytes <= remaining:
                     kept.append(line)
-                    remaining -= len(line)
+                    remaining -= line_bytes
                 elif remaining > 200:
                     # Tail-keep: the end of a long reply carries its
-                    # conclusions/option lists — never the head alone.
-                    kept.append(f"{prefix}: …{line[-(remaining - 20):]}")
+                    # conclusions/option lists — never the head alone. Measured
+                    # in bytes, cut on a char boundary so the recap stays valid
+                    # UTF-8. Reserve the exact marker cost so the kept entry fits.
+                    marker = f"{prefix}: …"
+                    tail = _tail_by_bytes(content, remaining - len(marker.encode()))
+                    kept.append(marker + tail)
                     remaining = 0
                 else:
                     # Doesn't fit and no room for a meaningful tail — STOP
@@ -1439,10 +1457,10 @@ class ConversationLoop:
             kept.reverse()
             recap = "\n".join(kept)
             logger.info(
-                "Recovery context built for chat %s: %d msgs, %d/%d chars",
+                "Recovery context built for chat %s: %d msgs, %d/%d bytes",
                 chat_id,
                 len(kept),
-                len(recap),
+                len(recap.encode()),
                 budget,
             )
             return recap

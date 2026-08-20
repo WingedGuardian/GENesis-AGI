@@ -547,11 +547,11 @@ async def test_failed_park_cancel_keeps_campaign_attached(db, monkeypatch):
     )
     await db.commit()
 
-    async def boom(_db, _pid, _status):
+    async def boom(_db, _pid, _status, *, expected_status=None, expected_claimed_at=None):
         raise RuntimeError("db lock")
 
     monkeypatch.setattr(
-        "genesis.db.crud.cc_rate_limit_parks.mark_terminal", boom,
+        "genesis.db.crud.cc_rate_limit_parks.mark_terminal_if_unchanged", boom,
     )
     assert await _check_session_status(db, "camp-sess-1") is None
     row = await (await db.execute(
@@ -582,6 +582,54 @@ async def test_over_bound_park_with_active_claim_holds(db):
         "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
     )).fetchone()
     assert str(row["status"]) == "resuming", "actively-claimed park must survive"
+
+
+@pytest.mark.asyncio
+async def test_over_bound_cancel_noops_when_claim_refreshed_in_window(db, monkeypatch):
+    """TOCTOU lock (red-team): if a resume re-claim lands between _follow_park's
+    read and its cancel — status stays 'resuming' but claimed_at refreshes — the
+    (status, claimed_at)-versioned cancel must NO-OP, so a live resume is never
+    clobbered to 'cancelled' (which would double-run its delivery)."""
+    from datetime import UTC, datetime
+
+    from genesis.campaigns.runner import _check_session_status
+    from genesis.db.crud import cc_rate_limit_parks as parks
+
+    helper = TestParkAwareSessionStatus()
+    await helper._seed_failed_parked_session(db, "resuming")
+    # Over-bound + STALE claim → takes the abandon (cancel) path.
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET created_at='2026-08-01T00:00:00+00:00', "
+        "claimed_at='2026-08-01T01:00:00+00:00' WHERE id='rlp-test0001'",
+    )
+    await db.commit()
+
+    real_guard = parks.mark_terminal_if_unchanged
+
+    async def refresh_then_guard(
+        _db, park_id, new_status, *, expected_status, expected_claimed_at,
+    ):
+        # Simulate the concurrent resume re-claim inside the TOCTOU window:
+        # same status, fresh claimed_at.
+        await _db.execute(
+            "UPDATE cc_rate_limit_parks SET claimed_at=? WHERE id=?",
+            (datetime.now(UTC).isoformat(), park_id),
+        )
+        await _db.commit()
+        return await real_guard(
+            _db, park_id, new_status,
+            expected_status=expected_status,
+            expected_claimed_at=expected_claimed_at,
+        )
+
+    monkeypatch.setattr(parks, "mark_terminal_if_unchanged", refresh_then_guard)
+
+    result = await _check_session_status(db, "camp-sess-1")
+    assert result is None, "guard no-op → campaign stays attached, no failure verdict"
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "resuming", "live re-claim must survive the race"
 
 
 @pytest.mark.asyncio

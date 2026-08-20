@@ -209,6 +209,41 @@ async def test_task_lifecycle_notifications_never_deduped(config, db):
 
 
 @pytest.mark.asyncio
+async def test_gate_disabled_alert_never_deduped(config, db):
+    """Disabling the mandatory approval gate is a distinct security event each
+    time — the ALERT must NEVER be dedup-swallowed. ALERT bypasses salience/
+    quiet-hours but STILL runs _is_duplicate; without a 0-window for
+    approval_gate_disabled it falls to the 24h default, so a second disable
+    within a day is silently dropped and the owner never learns."""
+    gate = GovernanceGate(config, db)
+    now = datetime.now(UTC).isoformat()
+    await outreach_crud.create(
+        db,
+        id="prior-gate-1",
+        signal_type="approval_gate_disabled",
+        topic="Approval gate disabled",
+        category="alert",
+        salience_score=1.0,
+        channel="telegram",
+        message_content="manual_approval_required set to FALSE ...",
+        created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "prior-gate-1", delivered_at=now)
+
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT,
+        topic="Approval gate disabled",  # same topic as the prior alert
+        context="manual_approval_required was set to FALSE via the dashboard",
+        salience_score=1.0,
+        signal_type="approval_gate_disabled",
+        verbatim=True,
+    )
+    result = await gate.check(req)
+    assert result.verdict != GovernanceVerdict.DENY
+    assert "dedup" not in result.checks_failed
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_exceeded(config, db):
     gate = GovernanceGate(config, db)
     now = datetime.now(UTC).isoformat()

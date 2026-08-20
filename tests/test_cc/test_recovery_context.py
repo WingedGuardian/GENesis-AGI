@@ -130,6 +130,31 @@ async def test_recovery_context_tail_keeps_oversized_newest_message(db):
     assert "…" in ctx, "truncation must be marked"
 
 
+@pytest.mark.asyncio
+async def test_recovery_context_budget_is_byte_based(db):
+    """The recap budget is BYTES, not characters. A multibyte-heavy transcript
+    under a char budget balloons up to ~3-4x the intended size; the byte budget
+    caps the real payload. The tail cut must stay on a character boundary, so the
+    recap remains valid UTF-8 (no U+FFFD replacement chars)."""
+    # '緑' is 3 UTF-8 bytes; 1500 of them ≈ 4,500 bytes per message.
+    for i in range(30):
+        await store(
+            db,
+            chat_id=100,
+            message_id=i,
+            sender="user",
+            content=f"m{i:02d} " + ("緑" * 1500),
+            timestamp=f"2026-08-13T04:{i:02d}:00",
+        )
+    ctx = await _loop(db)._build_recovery_context("tg-100", "telegram", None)
+    budget = ConversationLoop.RECOVERY_CONTEXT_BUDGET
+    assert len(ctx.encode()) <= budget + 500, (
+        f"recap blew the BYTE budget: {len(ctx.encode())} bytes for a {budget}-byte cap"
+    )
+    assert "�" not in ctx, "tail cut split a multibyte char (invalid UTF-8)"
+    assert "m29" in ctx, "the newest message must always be present"
+
+
 def test_conversation_identity_block_group_chat_id():
     """Group/topic chats have NEGATIVE chat ids and must produce a correct
     block (audit finding: sender-id conflation would name the wrong chat)."""

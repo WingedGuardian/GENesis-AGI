@@ -54,6 +54,13 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "provision_approval": 0,
     "provision_outcome": 0,
     "ambient_health": 0,  # Never dedup — the monitor's state machine gates re-alerts/recovery
+    # Approval-gate disable notice (dashboard _notify_gate_disabled, category
+    # ALERT). Every disable of the mandatory autonomous-CLI gate is a distinct
+    # security event the owner MUST see. ALERT bypasses salience/quiet-hours but
+    # still runs _is_duplicate; without a 0-window this fell to the 24h default
+    # and a 2nd disable within a day was silently dropped. The sole submitter is
+    # the user-confirmed dashboard PUT — no autonomous re-asker, so 0 can't spam.
+    "approval_gate_disabled": 0,
     # Task lifecycle notifications — never dedup. Each is a distinct status
     # event for one task (topic = "Task <id>"), and every _notify call site
     # fires at most once per path. Without this they fell through to the 24h

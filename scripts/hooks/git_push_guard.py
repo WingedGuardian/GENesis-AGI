@@ -570,6 +570,89 @@ _CI_GREEN = {"SUCCESS"}
 _CI_TERMINAL_STATUSES = {"COMPLETED"}
 
 
+def _entry_ci_class(c: dict) -> str:
+    """Classify ONE rollup entry into 'red' | 'green' | 'skip' | 'pending' |
+    'ignore'. 'ignore' = a non-CI-shaped payload (e.g. a review-comment mock)
+    that must not read as red/green. Pure function."""
+    conclusion = c.get("conclusion")  # CheckRun
+    status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
+    state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+    if conclusion in _CI_SKIP_CONCLUSIONS:
+        return "skip"
+    if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
+        return "red"
+    if conclusion in _CI_GREEN or state in _CI_GREEN:
+        return "green"
+    if status in _CI_TERMINAL_STATUSES:
+        # COMPLETED with an unrecognized/None conclusion — done, not red.
+        return "skip"
+    if status is not None or state == "PENDING":
+        # Non-terminal CheckRun status (QUEUED/IN_PROGRESS/WAITING/…) or a
+        # PENDING StatusContext — unfinished.
+        return "pending"
+    return "ignore"  # no status/state/conclusion — unrecognized shape
+
+
+def _group_ci_verdict(entries: list[dict]) -> str:
+    """Verdict for all rollup entries sharing one check identity. Returns
+    'red' | 'green' | 'pending' | 'skip'.
+
+    Core invariant (a MERGE-AUTHORIZATION decision — fail closed everywhere):
+    **a prior red in the group is cleared ONLY by a strictly-later terminal
+    SUCCESS from the SAME workflow identity.** Everything else keeps a red red.
+
+    1. Any non-terminal entry (a re-run in flight) → 'pending'. Short-circuits
+       BEFORE any time-ordering, so a queued re-run (which has no completedAt /
+       startedAt) can never be mis-ranked as oldest and let an older success win
+       (the wrong-green trap).
+    2. The completedAt tiebreak is trusted ONLY when the group is
+       "ordering-trustworthy": every entry has a non-empty STRING completedAt (a
+       non-string/absent value is unorderable — fail closed, never TypeError),
+       those timestamps are unique (a tie has no unambiguous latest), AND the
+       group is a single ``workflowName`` (bare check ``name`` equality is NOT
+       run identity — a different workflow/app posting a same-named entry with a
+       forged completedAt must not be able to override a real red; a re-run of
+       the SAME workflow shares its workflowName, so legitimate supersession is
+       unaffected — verified against real CodeQL concurrency-cancelled runs).
+    3. When trustworthy: the latest-by-completedAt decides, but a latest that is
+       skip/neutral does NOT launder a prior red — only a genuine SUCCESS does.
+    4. Otherwise (unorderable / mixed identity) → fail CLOSED: any red → 'red'.
+
+    Residual (documented, not a live path in Genesis CI): an actor able to
+    create check runs *within the same workflowName* as a real failing job (a
+    workflow with ``checks: write`` that runs attacker-influenced content, e.g.
+    a future ``pull_request_target``-checkout-untrusted pattern) could still
+    supersede a red. Genesis's workflows grant no ``checks: write`` and use no
+    ``pull_request_target`` today; adding either reopens this — keep them out.
+    """
+    classes = [_entry_ci_class(c) for c in entries]
+    if any(cls == "pending" for cls in classes):
+        return "pending"
+    has_red = any(cls == "red" for cls in classes)
+    completed = [c.get("completedAt") for c in entries]
+    workflows = {c.get("workflowName") for c in entries}
+    orderable = (
+        all(isinstance(x, str) and x for x in completed)
+        and len(set(completed)) == len(completed)
+        and len(workflows) == 1
+    )
+    if orderable:
+        latest_cls = _entry_ci_class(max(entries, key=lambda c: c["completedAt"]))
+        if latest_cls == "green":
+            return "green"  # a genuine later pass supersedes an earlier red
+        if latest_cls == "red":
+            return "red"
+        # Latest is skip/neutral — it must NOT launder a prior red.
+        return "red" if has_red else "skip"
+    # Unorderable (missing/tied/non-string completedAt, or mixed run identity)
+    # → fail closed: never coin-flip a red to green.
+    if has_red:
+        return "red"
+    if any(cls == "green" for cls in classes):
+        return "green"
+    return "skip"
+
+
 def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
     """Classify a PR's CI check-runs.
 
@@ -616,43 +699,38 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     if not isinstance(checks, list) or not checks:
         return "unknown", []
 
-    red: list[str] = []
-    pending: list[str] = []
-    saw_recognized = False
+    # Group rollup entries by identity (name for CheckRun, context for
+    # StatusContext), then let each group's LATEST run decide. GitHub's UI and
+    # `gh pr checks` both dedupe latest-per-name; without this a concurrency-
+    # cancelled duplicate run leaves a stale `cancelled` entry that reads red
+    # forever even though the name's newest run is SUCCESS (MEASURED on the
+    # #1408 merge: two `cancelled` + two `success` Analyze entries → red).
+    groups: dict[str, list[dict]] = {}
     for c in checks:
         if not isinstance(c, dict):
             continue
+        if _entry_ci_class(c) == "ignore":
+            continue  # unrecognized shape — doesn't establish CI recognition
         name = c.get("name") or c.get("context") or "check"
-        conclusion = c.get("conclusion")  # CheckRun
-        status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
-        state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
-        if conclusion in _CI_SKIP_CONCLUSIONS:
-            saw_recognized = True
-            continue
-        if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
-            saw_recognized = True
+        groups.setdefault(name, []).append(c)
+
+    if not groups:
+        return "unknown", []  # payload had no CI-shaped entries
+
+    red: list[str] = []
+    pending: list[str] = []
+    for name, entries in groups.items():
+        verdict = _group_ci_verdict(entries)
+        if verdict == "red":
             red.append(name)
-        elif conclusion in _CI_GREEN or state in _CI_GREEN:
-            saw_recognized = True
-        elif status in _CI_TERMINAL_STATUSES:
-            # COMPLETED with an unrecognized/None conclusion — treat as done,
-            # don't fabricate pending; ignore this entry.
-            saw_recognized = True
-        elif status is not None or state == "PENDING":
-            # ANY non-terminal CheckRun status (QUEUED/IN_PROGRESS/PENDING/
-            # WAITING/REQUESTED/…) or a PENDING StatusContext is unfinished →
-            # block. Enumerating "known pending" states would silently miss new
-            # ones (P1 review finding), so we invert: not-terminal ⇒ pending.
-            saw_recognized = True
+        elif verdict == "pending":
             pending.append(name)
-        # else: no status/state/conclusion at all — unrecognized shape, ignore
+        # "green"/"skip" → not blocking
 
     if red:
         return "red", sorted(set(red))
     if pending:
         return "pending", sorted(set(pending))
-    if not saw_recognized:
-        return "unknown", []  # payload had no CI-shaped entries
     return "green", []
 
 
