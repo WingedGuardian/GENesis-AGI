@@ -200,7 +200,7 @@ async def _run_pytest(workdir: Path) -> tuple[int, str]:
     # suite has its own rootdir, so the genesis ``tests/conftest.py`` redirect
     # never loads for it — without this its pytest tmp would default to
     # ``$TMPDIR`` (= watchgod-policed cc-tmp on a CC session). See
-    # ``genesis.util.tmp.pytest_basetemp_override``.
+    # ``genesis.util.tmp.should_redirect_pytest_basetemp``.
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
         "--basetemp", str(workdir / "_pytest_tmp"),

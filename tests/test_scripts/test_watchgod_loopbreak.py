@@ -31,7 +31,7 @@ _TMUX_STUB = r"""#!/usr/bin/env bash
 case "$1" in
   list-sessions)   [[ -n "${STUB_SESSIONS:-}" ]] && printf '%s\n' "$STUB_SESSIONS" ;;
   display-message) echo "${STUB_ACTIVITY:-0}" ;;
-  kill-session)    echo "$3" >> "${STUB_KILLLOG:?}" ;;
+  kill-session)    echo "$3" >> "${STUB_KILLLOG:?}"; exit "${STUB_KILL_RC:-0}" ;;
 esac
 exit 0
 """
@@ -153,6 +153,26 @@ def test_kill_does_not_clear_stuck_flag_no_double_page(tmp_path):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert killlog.exists(), "idle session should still be reaped"
     assert stuck.exists(), "a kill must NOT clear the stuck flag (would re-page next poll)"
+
+
+def test_failed_kill_does_not_count_as_reaped(tmp_path):
+    """If tmux kill-session FAILS (session vanished between listing and killing,
+    or any error), killed_any must stay 0 — nothing was reclaimed — so the stuck
+    marker is still recorded rather than silently skipped on a phantom reap."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    _mb(cctmp / "bigdata" / "blob", 6)  # persists ORANGE
+    killlog = home / "killed.log"
+    env = {
+        "STUB_SESSIONS": "cc-66:0",
+        "STUB_ACTIVITY": "100",
+        "STUB_KILLLOG": str(killlog),
+        "STUB_KILL_RC": "1",  # kill-session fails
+    }
+    proc = _run(home, bind, _PRELUDE + "clean_cc_orange", env)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert killlog.exists(), "kill was attempted"
+    stuck = home / ".genesis" / "alerts" / "tmp_orange_stuck"
+    assert stuck.exists(), "a FAILED kill must not suppress the stuck marker"
 
 
 def test_attached_session_never_killed(tmp_path):

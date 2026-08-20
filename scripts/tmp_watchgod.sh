@@ -204,8 +204,13 @@ clean_cc_orange() {
             local idle_s=$(( now - last_activity ))
             if (( idle_s > 7200 )); then
                 log WARN "Killing idle CC session: $sname (idle ${idle_s}s)"
-                tmux kill-session -t "$sname" 2>/dev/null || true
-                killed_any=1
+                # Count a reap only when tmux actually killed it — if the session
+                # vanished between listing and killing (or the kill fails), we
+                # reclaimed nothing, so killed_any must stay 0 and the stuck
+                # marker must still be recorded rather than silently skipped.
+                if tmux kill-session -t "$sname" 2>/dev/null; then
+                    killed_any=1
+                fi
             fi
         fi
     done < <(tmux list-sessions -F '#{session_name}:#{session_attached}' 2>/dev/null | grep ':0$' || true)
@@ -215,9 +220,10 @@ clean_cc_orange() {
     # only — only RED pages) this does NOT page; it records the stuck state ONCE
     # (dedupe flag) in the log instead of silently re-polling forever, so the
     # condition is discoverable. If cc-tmp keeps filling it escalates to RED,
-    # which DOES page. The flag is cleared ONLY on the green transition (main
-    # loop), never on a kill: reaping an idle session does not reduce cc-tmp, so
-    # a kill that leaves us ORANGE must not re-arm and re-log the same episode.
+    # which DOES page. The flag is cleared (main loop) whenever cc-tmp LEAVES
+    # ORANGE (green/yellow/red) — never on a kill: reaping an idle session does
+    # not reduce cc-tmp, so a kill that leaves us ORANGE keeps cc_tier==orange and
+    # must not re-arm and re-log the same episode.
     if (( killed_any == 0 )) && [[ ! -f "$ALERT_DIR/tmp_orange_stuck" ]]; then
         log WARN "cc-tmp STUCK ORANGE (used=${used_after}MB, budget=${CC_TMP_BUDGET_MB}MB): reclaim freed nothing and no idle (>2h) session is killable — non-reclaimable data is filling cc-tmp (see cc_tmp_top snapshots). Dashboard/log-only per D2; RED will page if it escalates."
         touch "$ALERT_DIR/tmp_orange_stuck"
@@ -481,10 +487,20 @@ main() {
         # Durable OOM capture — snapshot + page on any NEW cgroup OOM kill.
         oom_baseline=$(check_oom_events "$oom_baseline")
 
-        # Clear stale alerts when back to green
+        # Clear the shared cc+sys alert flags only when BOTH zones are green:
+        # tmp_warning/tmp_emergency are touched by both the cc AND sys handlers
+        # (one dedupe key across zones), so a red episode in either zone must
+        # keep them set.
         if [[ "$cc_tier" == "green" && "$sys_tier" == "green" ]]; then
-            rm -f "$ALERT_DIR/tmp_warning" "$ALERT_DIR/tmp_emergency" \
-                  "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
+            rm -f "$ALERT_DIR/tmp_warning" "$ALERT_DIR/tmp_emergency" 2>/dev/null || true
+        fi
+        # tmp_orange_stuck is cc-tmp-SPECIFIC (only clean_cc_orange sets it), so
+        # clear it whenever cc-tmp is no longer ORANGE — independent of the sys
+        # tier. Otherwise a cc episode that falls to YELLOW while /tmp stays
+        # non-green leaves a stale flag that suppresses the once-per-episode STUCK
+        # record of a later, distinct cc-tmp ORANGE episode.
+        if [[ "$cc_tier" != "orange" ]]; then
+            rm -f "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
         fi
 
         # Log rotation — truncate when > 1MB

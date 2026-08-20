@@ -14,6 +14,7 @@ private ``-L`` socket, so the real cc-* sessions are never touched.
 
 import os
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -87,6 +88,28 @@ def test_never_fails_when_home_unwritable(tmp_path):
         stdin=subprocess.DEVNULL,
     )
     assert r.returncode == 0, f"capture must exit 0 even when it cannot log: {r.stderr}"
+
+
+def test_log_is_owner_only(tmp_path):
+    """The captured tail can contain credentials/prompts → the log must be 0600
+    so another local account can't read it."""
+    home = tmp_path / "home"
+    _run_capture(home, "1", "0")
+    mode = stat.S_IMODE(_log_for(home, "1").stat().st_mode)
+    assert mode == 0o600, f"log mode {oct(mode)} (must be 0600)"
+
+
+def test_pre_existing_log_is_tightened(tmp_path):
+    """A log that predates this hardening (mode 0644) is tightened to 0600 on the
+    next append — not left world-readable."""
+    home = tmp_path / "home"
+    log = _log_for(home, "2")
+    log.parent.mkdir(parents=True)
+    log.write_text("older entry\n")
+    os.chmod(log, 0o644)
+    _run_capture(home, "2", "137")
+    mode = stat.S_IMODE(log.stat().st_mode)
+    assert mode == 0o600, f"pre-existing log not tightened: {oct(mode)}"
 
 
 def test_log_self_rotates(tmp_path):

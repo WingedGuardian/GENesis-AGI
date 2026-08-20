@@ -17,6 +17,11 @@
 
 set -u
 
+# The captured pane tail can contain prompts, command output, or credentials, so
+# keep the log owner-only. umask covers newly-created dir/file; the explicit
+# chmod below also tightens a log that predates this hardening.
+umask 077
+
 slot="${1:-unknown}"
 ec="${2:-unknown}"
 
@@ -30,6 +35,9 @@ fi
 log_dir="${HOME}/.genesis/logs"
 log="${log_dir}/cc_exit_${slot}.log"
 mkdir -p "$log_dir" 2>/dev/null || exit 0
+# Enforce owner-only on the log even if it predates this change (umask only
+# affects freshly-created files). Best-effort — never fail the caller.
+[ -e "$log" ] && chmod 600 "$log" 2>/dev/null || true
 
 {
     echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) cc-${slot} claude exited status=${ec} ==="

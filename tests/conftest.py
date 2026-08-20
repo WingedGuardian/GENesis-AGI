@@ -69,26 +69,43 @@ os.killpg = _safe_killpg  # type: ignore[assignment]
 # WITHOUT touching the process ``TMPDIR`` (which would desync CC's
 # TMPDIR/CLAUDE_CODE_TMPDIR). Runs at config time, before any ``tmp_path``
 # fixture resolves. No-op on CI (TMPDIR unset) and when ``--basetemp`` is
-# passed explicitly. See ``genesis.util.tmp.pytest_basetemp_override``.
+# passed explicitly. See ``genesis.util.tmp.should_redirect_pytest_basetemp``.
 def pytest_configure(config):
-    from genesis.util.tmp import big_tmp_dir, pytest_basetemp_override
+    from genesis.util.tmp import big_tmp_dir, should_redirect_pytest_basetemp
 
-    target = pytest_basetemp_override(
+    # Decide FIRST (pure, no I/O) — only touch the filesystem when we actually
+    # redirect, so the no-op / CI / explicit-`--basetemp` path never creates
+    # `~/tmp` (which would break a read-only-home or CI run during config).
+    if not should_redirect_pytest_basetemp(
         current_basetemp=config.option.basetemp,
         tmpdir_env=os.environ.get("TMPDIR"),
         home=os.path.expanduser("~"),
-        big_tmp=big_tmp_dir(),
-    )
-    if target is not None:
-        # Scope the leaf per-process. pytest CLEARS an explicit basetemp at
-        # session start and roots tmp_path directly under it (no pytest-of-<user>
-        # numbered rotation), so two concurrent runs sharing one path would
-        # rmtree each other's live temp. The CC concurrent-test guard only covers
-        # Bash-tool pytest — autonomy/gauntlet subprocesses bypass it — so the
-        # per-pid leaf is what actually keeps simultaneous runs isolated.
-        target = os.path.join(target, str(os.getpid()))
-        Path(target).mkdir(parents=True, exist_ok=True)
-        config.option.basetemp = target
+    ):
+        return
+    # Scope the leaf per-process. pytest CLEARS an explicit basetemp at session
+    # start and roots tmp_path directly under it (no pytest-of-<user> numbered
+    # rotation), so two concurrent runs sharing one path would rmtree each other's
+    # live temp. The CC concurrent-test guard only covers Bash-tool pytest —
+    # autonomy/gauntlet subprocesses bypass it — so the per-pid leaf is what keeps
+    # simultaneous runs isolated. pytest_unconfigure removes it so per-pid dirs
+    # can't accumulate under ~/tmp/pytest indefinitely.
+    target = os.path.join(big_tmp_dir(), "pytest", str(os.getpid()))
+    Path(target).mkdir(parents=True, exist_ok=True)
+    config.option.basetemp = target
+    config._genesis_basetemp_cleanup = target
+
+
+def pytest_unconfigure(config):
+    """Remove the per-process basetemp tree this session created. pytest wipes an
+    explicit basetemp at session START but never at exit, and each run gets a new
+    PID, so without this the ``~/tmp/pytest/<pid>`` dirs would accumulate (the
+    daily hygiene job only prunes direct children of ``~/tmp``, whose mtime every
+    new run refreshes — so it never ages out). Best-effort."""
+    import shutil
+
+    target = getattr(config, "_genesis_basetemp_cleanup", None)
+    if target:
+        shutil.rmtree(target, ignore_errors=True)
 
 
 # ── Safety: prevent tests from polluting production circuit breaker state ──

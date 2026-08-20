@@ -43,6 +43,23 @@ def test_build_args_omits_model_flag_when_override_set():
     assert "--model" not in args
 
 
+def test_build_env_tmpdir_tracks_claude_code_tmpdir(tmp_path):
+    """TMPDIR must stay CONSISTENT with CLAUDE_CODE_TMPDIR (the invariant
+    util/tmp.py protects) — and follow a per-invocation sandbox override, so a
+    headless session's subprocess temp (e.g. the gauntlet agent running the
+    fixture's pytest, whose tmp_path defaults under $TMPDIR) leaves cc-tmp instead
+    of tripping genesis-tmp-watchgod."""
+    invoker = CCInvoker()
+    # default: both resolve to the shared cc-tmp sandbox (consistent, unchanged).
+    env = invoker._build_env(_inv())
+    assert env["TMPDIR"] == env["CLAUDE_CODE_TMPDIR"]
+    # per-invocation override (gauntlet): TMPDIR follows the sandbox off cc-tmp.
+    sandbox = str(tmp_path / "cc-sandbox")
+    env2 = invoker._build_env(_inv(claude_code_tmpdir=sandbox))
+    assert env2["CLAUDE_CODE_TMPDIR"] == sandbox
+    assert env2["TMPDIR"] == sandbox
+
+
 def test_build_args_includes_model_flag_for_claude():
     args = CCInvoker()._build_args(_inv())
     assert "--model" in args
