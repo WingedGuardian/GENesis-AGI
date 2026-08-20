@@ -9,6 +9,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**
+  After the NIM repoint moved the free NIM tier from V4-pro to V4-flash, this
+  deliverable-quality gate now leads with the paid `openrouter-deepseek-v4`
+  (pro-grade) for maximum review quality, with free NIM flash + paid v4-flash +
+  qwen as fallbacks. A deliberate cost-vs-quality lever on a quality-critical
+  gate; the other repointed sites stay on free flash.
+
 ### Fixed
 
 - **Dead NVIDIA NIM models retired from routing (silent free→paid fallback leak
