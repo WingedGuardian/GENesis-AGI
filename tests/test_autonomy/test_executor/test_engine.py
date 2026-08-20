@@ -1651,3 +1651,36 @@ class TestRunGitPushBounded:
         await engine_mod._run_git_push(tmp_path, "task/abc123")
         assert captured.get("start_new_session") is True
         assert "preexec_fn" not in captured
+
+    async def test_cancel_group_kills_and_reraises(self, tmp_path, monkeypatch):
+        from genesis.autonomy.executor import engine as engine_mod
+
+        killpg_calls = []
+        monkeypatch.setattr(
+            "genesis.util.proc_kill.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+        proc = MagicMock()
+        proc.pid = 88889
+        proc.returncode = None
+        started = asyncio.Event()
+
+        async def _hang(*a, **k):
+            started.set()
+            await asyncio.sleep(600)
+
+        proc.communicate = _hang
+        proc.wait = AsyncMock(return_value=-9)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        task = asyncio.get_running_loop().create_task(
+            engine_mod._run_git_push(tmp_path, "task/abc123")
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert killpg_calls and killpg_calls[0][0] == 88889

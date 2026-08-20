@@ -595,6 +595,12 @@ class DiagnosisEngine:
             raise CCDiagnosisError(
                 f"CC timed out after {self._config.cc.timeout_s}s"
             ) from exc
+        except asyncio.CancelledError:
+            # Cancellation: the detached brain tree sees no ambient signal —
+            # group-kill before propagating or it runs on host-side.
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
 
         if proc.returncode != 0:
             stderr_text = stderr.decode("utf-8", errors="replace")[:300]
@@ -661,6 +667,10 @@ class DiagnosisEngine:
                 kill_process_group(proc)
                 await reap_bounded(proc)
                 return None  # ambiguous → inherit; fail-safe covers a real outage
+            except asyncio.CancelledError:
+                kill_process_group(proc)
+                await reap_bounded(proc)
+                raise
             try:
                 logged_in = json.loads(
                     stdout.decode("utf-8", errors="replace"),

@@ -210,7 +210,6 @@ class TestExecuteDeterministicStep:
         timeout kill must reap the whole process group, not just the direct
         child — otherwise the grandchild reparents to pid 1 and runs forever."""
         import asyncio
-        import os
 
         from genesis.autonomy.executor import deterministic as det
 
@@ -232,8 +231,9 @@ class TestExecuteDeterministicStep:
             grandchild = int(marker.read_text().strip())
             assert grandchild > 1  # explicit pid, never a default
             await asyncio.sleep(0.3)  # let SIGKILL land
-            with pytest.raises(ProcessLookupError):
-                os.kill(grandchild, 0)
+            from tests.proc_asserts import process_terminated
+
+            assert process_terminated(grandchild)  # gone-or-zombie
         finally:
             det._HARD_TIMEOUT_S = original
 
@@ -259,3 +259,30 @@ class TestStepTypeProperties:
     def test_deterministic_types_do_not_verify(self) -> None:
         for st in (StepType.BASH, StepType.TEST, StepType.GIT):
             assert st.verify_step is False, f"{st} should not require verification"
+
+
+@pytest.mark.asyncio
+async def test_cancel_reaps_tree_and_reraises(tmp_path: Path) -> None:
+    """Task cancellation mid-step must group-kill the step's tree before
+    propagating — with its own session, no ambient signal reaches it."""
+    import asyncio
+    import time
+
+    from tests.proc_asserts import process_terminated
+
+    marker = tmp_path / "gc_pid"
+    forker = tmp_path / "forker"
+    forker.write_text(f"#!/bin/bash\nsleep 600 &\necho $! > {marker}\nsleep 600\n")
+    forker.chmod(0o755)
+    step = {"idx": 0, "type": "bash", "command": str(forker)}
+    task = asyncio.get_running_loop().create_task(execute_deterministic_step(step))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not (marker.exists() and marker.read_text().strip()):
+        await asyncio.sleep(0.05)
+    grandchild = int(marker.read_text().strip())
+    assert grandchild > 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.3)
+    assert process_terminated(grandchild)

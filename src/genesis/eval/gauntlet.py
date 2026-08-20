@@ -214,6 +214,13 @@ async def _run_pytest(workdir: Path) -> tuple[int, str]:
         kill_process_group(proc)
         await reap_bounded(proc)
         return -1, "pytest scoring timed out"
+    except asyncio.CancelledError:
+        # Ctrl+C during scoring (asyncio.run cancels this task): with its own
+        # session pytest never sees the terminal SIGINT — group-kill before
+        # propagating or the tree runs on after the worktree is deleted.
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        raise
     return proc.returncode, out.decode(errors="replace")
 
 

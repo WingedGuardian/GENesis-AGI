@@ -229,6 +229,12 @@ async def execute_deterministic_step(
                 timeout=_HARD_TIMEOUT_S,
             )
             await proc.wait()
+        except asyncio.CancelledError:
+            # Cancellation mid-step: the detached step tree sees no ambient
+            # signal — group-kill before propagating or it runs on.
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
         except TimeoutError:
             duration = time.monotonic() - start
             # Group-kill the hung tree (guarded pid-as-pgid), bounded reap.

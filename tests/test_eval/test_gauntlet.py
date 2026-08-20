@@ -472,3 +472,41 @@ class TestRunPytestBounded:
         assert rc == 0
         assert captured.get("start_new_session") is True
         assert "preexec_fn" not in captured
+
+    async def test_cancel_group_kills_and_reraises(self, monkeypatch, tmp_path):
+        """Ctrl+C during scoring: asyncio cancels _run_pytest, and with the
+        detached session the terminal SIGINT never reaches pytest — the
+        handler must group-kill before re-raising or the tree leaks
+        (Codex P2, PR #1415)."""
+        import asyncio as _asyncio
+
+        from genesis.eval import gauntlet as g
+
+        killpg_calls = []
+        monkeypatch.setattr(
+            "genesis.util.proc_kill.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+
+        proc = MagicMock()
+        proc.pid = 66667
+        proc.returncode = None
+        started = _asyncio.Event()
+
+        async def _hang(*a, **k):
+            started.set()
+            await _asyncio.sleep(600)
+
+        proc.communicate = _hang
+        proc.wait = AsyncMock(return_value=-9)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+        task = _asyncio.get_running_loop().create_task(g._run_pytest(tmp_path))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(_asyncio.CancelledError):
+            await task
+        assert killpg_calls and killpg_calls[0][0] == 66667

@@ -517,6 +517,13 @@ class TaskReviewer:
             # paused pipe transport.
             await reap_bounded(proc)
             return None
+        except asyncio.CancelledError:
+            # Cancellation mid-verify: the detached codex tree sees no ambient
+            # signal — group-kill before propagating (final-audit F2; the
+            # eighth async site of the cancel sweep).
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
         except OSError:
             logger.warning("review: codex exec communicate error", exc_info=True)
             return None

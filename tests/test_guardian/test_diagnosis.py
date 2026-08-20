@@ -592,3 +592,37 @@ class TestCCSubprocessTreeKill:
         assert killpg_calls[0][0] == 55556
         assert captured.get("start_new_session") is True
         assert "preexec_fn" not in captured
+
+    @pytest.mark.asyncio
+    async def test_auth_probe_cancel_group_kills_and_reraises(self, monkeypatch) -> None:
+        import asyncio as _asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        killpg_calls = []
+        monkeypatch.setattr(
+            "genesis.util.proc_kill.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+        proc = MagicMock()
+        proc.pid = 55557
+        proc.returncode = None
+        started = _asyncio.Event()
+
+        async def _hang(*a, **k):
+            started.set()
+            await _asyncio.sleep(600)
+
+        proc.communicate = _hang
+        proc.wait = AsyncMock(return_value=-9)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+        engine = DiagnosisEngine(GuardianConfig())
+        task = _asyncio.get_running_loop().create_task(engine._resolve_cc_env("claude"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(_asyncio.CancelledError):
+            await task
+        assert killpg_calls and killpg_calls[0][0] == 55557

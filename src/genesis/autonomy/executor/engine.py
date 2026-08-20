@@ -85,6 +85,12 @@ async def _run_git_push(wt_path: Path, branch: str) -> tuple[int, str]:
         kill_process_group(proc)
         await reap_bounded(proc)
         return 128, f"git push timed out after {int(_GIT_PUSH_TIMEOUT_S)}s"
+    except asyncio.CancelledError:
+        # Cancellation mid-push: the detached git/ssh tree sees no ambient
+        # signal — group-kill before propagating or it runs on.
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        raise
     return proc.returncode or 0, stderr.decode(errors="replace")
 
 

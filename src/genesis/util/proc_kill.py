@@ -65,7 +65,12 @@ def kill_process_group(proc, sig: signal.Signals = signal.SIGKILL) -> None:
 
 
 async def reap_bounded(proc, timeout_s: float | None = None) -> None:
-    """Await ``proc.wait()`` with a hard bound; never raises.
+    """Await ``proc.wait()`` with a hard bound; never raises — except a
+    CancelledError arriving MID-reap, which propagates (suppress(Exception)
+    excludes BaseException). That is safe by construction: every call site
+    runs the synchronous ``kill_process_group`` first, so a second cancel
+    abandons only the wait, never the kill, and asyncio's child watcher
+    still reaps the leader.
 
     ``timeout_s=None`` resolves ``DEFAULT_REAP_TIMEOUT_S`` at call time (so
     tests can shrink it via the module attribute).

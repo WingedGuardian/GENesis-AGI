@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from genesis.util.proc_kill import kill_process_group, reap_bounded
+from tests.proc_asserts import process_terminated
 
 
 def _group_alive(pgid: int) -> bool:
@@ -36,16 +37,16 @@ def test_kills_whole_group_while_leader_alive(tmp_path):
     )
     try:
         deadline = time.monotonic() + 5
-        while not marker.exists() and time.monotonic() < deadline:
+        while time.monotonic() < deadline and not (marker.exists() and marker.read_text().strip()):
             time.sleep(0.05)
         child = int(marker.read_text().strip())
         assert child > 1
         kill_process_group(proc)
         proc.wait(timeout=5)
         time.sleep(0.2)
-        assert not _group_alive(proc.pid)
-        with pytest.raises(ProcessLookupError):
-            os.kill(child, 0)
+        # gone-or-zombie: os.kill(pid, 0) succeeds on a zombie, so a bare
+        # ProcessLookupError assertion flakes on minimal-init hosts
+        assert process_terminated(child)
     finally:
         kill_process_group(proc)
 
@@ -61,7 +62,7 @@ def test_kills_survivors_after_leader_reaped(tmp_path):
     )
     proc.wait(timeout=5)  # leader reaped — getpgid(proc.pid) now raises
     deadline = time.monotonic() + 5
-    while not marker.exists() and time.monotonic() < deadline:
+    while time.monotonic() < deadline and not (marker.exists() and marker.read_text().strip()):
         time.sleep(0.05)
     child = int(marker.read_text().strip())
     assert child > 1
@@ -69,8 +70,7 @@ def test_kills_survivors_after_leader_reaped(tmp_path):
         os.getpgid(proc.pid)  # precondition: the trap is armed
     kill_process_group(proc)
     time.sleep(0.3)
-    with pytest.raises(ProcessLookupError):
-        os.kill(child, 0)
+    assert process_terminated(child)  # gone-or-zombie (see tests/proc_asserts)
 
 
 def test_pgid_guard_refuses_low_pid(monkeypatch):

@@ -117,6 +117,15 @@ async def compare_models(
                 success=False,
                 error=f"promptfoo timed out after {timeout_s}s",
             )
+        except BaseException:
+            # subprocess.run() killed the child on ANY exception (incl.
+            # Ctrl+C) — preserve that. With start_new_session the terminal
+            # SIGINT never reaches the detached node tree, so this handler
+            # is the only thing preventing an interrupt from leaking it.
+            kill_process_group(proc)
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=_KILL_DRAIN_S)
+            raise
 
         if proc.returncode != 0:
             return ComparisonReport(

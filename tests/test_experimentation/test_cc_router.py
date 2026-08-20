@@ -168,3 +168,44 @@ async def test_spawned_in_new_session_not_preexec(monkeypatch):
     assert res.success is True
     assert captured.get("start_new_session") is True
     assert "preexec_fn" not in captured
+
+
+async def test_route_call_cancel_group_kills_and_reraises(monkeypatch):
+    """Cancellation mid-call must group-kill the detached claude tree before
+    propagating (same class as the timeout path)."""
+    killpg_calls = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    started = asyncio.Event()
+
+    class _HangProc:
+        returncode = None
+        pid = 77778
+
+        async def communicate(self, input=None):
+            started.set()
+            await asyncio.sleep(600)
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            self.returncode = -9
+
+    async def fake_exec(*a, **k):
+        return _HangProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    router = CCCliRouter("haiku", timeout_s=600)
+    task = asyncio.get_running_loop().create_task(
+        router.route_call("gen", [{"role": "user", "content": "U"}])
+    )
+    await started.wait()
+    task.cancel()
+    import pytest as _pytest
+
+    with _pytest.raises(asyncio.CancelledError):
+        await task
+    assert killpg_calls and killpg_calls[0][0] == 77778

@@ -72,3 +72,24 @@ async def test_spawned_in_new_session_not_preexec(tmp_path: Path):
     assert report.success is False  # rc=1 path — spawn shape is what we assert
     assert captured.get("start_new_session") is True
     assert "preexec_fn" not in captured
+
+
+@pytest.mark.asyncio
+async def test_keyboard_interrupt_kills_group_and_propagates(tmp_path: Path):
+    """subprocess.run killed the child on ANY exception (incl. Ctrl+C); the
+    Popen migration must preserve that — and with start_new_session the
+    terminal SIGINT no longer reaches the tree ambiently, so the handler is
+    the only thing standing between Ctrl+C and a leaked promptfoo tree."""
+    proc = _popen_mock()
+    proc.communicate.side_effect = [KeyboardInterrupt(), ("", "")]
+    with (
+        patch("genesis.eval.promptfoo.subprocess.Popen", return_value=proc),
+        patch("genesis.util.proc_kill.os.killpg") as killpg,
+        pytest.raises(KeyboardInterrupt),
+    ):
+        await compare_models(
+            model_a="a", model_b="b",
+            dataset_path=tmp_path / "ds.yaml", timeout_s=600,
+        )
+    killpg.assert_called_once()
+    assert killpg.call_args.args[0] == 61234

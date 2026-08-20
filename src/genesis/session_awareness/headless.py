@@ -105,6 +105,12 @@ async def run_headless_json(
             kill_process_group(proc)
             await reap_bounded(proc)
             return {"status": "timeout"}
+        except asyncio.CancelledError:
+            # Task cancellation: the detached child sees no ambient signal —
+            # group-kill before propagating or the tree leaks.
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
         if proc.returncode != 0:
             return {"status": "failed", "reason": f"exit_{proc.returncode}"}
         return {"status": "ok", "stdout": stdout.decode(errors="replace")}

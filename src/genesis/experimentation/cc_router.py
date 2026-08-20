@@ -106,6 +106,7 @@ class CCCliRouter:
         # text, not Genesis's project context bleeding into the reflection.
         env["GENESIS_CC_SESSION"] = "1"
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -121,14 +122,25 @@ class CCCliRouter:
             out, err = await asyncio.wait_for(
                 proc.communicate(input=user.encode()), timeout=self._timeout_s,
             )
+        except asyncio.CancelledError:
+            # Cancellation: the detached child sees no ambient signal —
+            # group-kill before propagating or the tree leaks. proc may be
+            # unbound if the cancel landed during the spawn itself.
+            if proc is not None:
+                kill_process_group(proc)
+                await reap_bounded(proc)
+            raise
         except TimeoutError:
             logger.warning("cc-cli %s timed out after %ss", self._model, self._timeout_s)
             # claude spawns MCP/helper children — a bare proc.kill() orphans
             # them (they keep running + hold a subscription slot). Group-kill
             # via the shared guarded helper (pid-as-pgid, pgid>1 guard,
-            # direct-kill fallback), then a BOUNDED reap.
-            kill_process_group(proc)
-            await reap_bounded(proc)
+            # direct-kill fallback), then a BOUNDED reap. proc may be None if
+            # the spawn ITSELF raised ETIMEDOUT (TimeoutError is an OSError
+            # subclass) — degrade without a kill in that case.
+            if proc is not None:
+                kill_process_group(proc)
+                await reap_bounded(proc)
             return StandaloneRoutingResult(
                 success=False, content=None, model_id=self._model,
                 provider_used="cc-cli", error="timeout",
