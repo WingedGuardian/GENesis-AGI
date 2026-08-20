@@ -7,6 +7,7 @@ real on trivial in-test fixtures. Regression + file-lock logic is unit-tested.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -413,3 +414,99 @@ async def test_pass_only_clears_matching_model():
         assert prop["status"] == "pending"
     finally:
         await conn.close()
+
+
+class TestRunPytestBounded:
+    """_run_pytest's timeout kill must reap the whole process GROUP (pytest
+    can fork) with a BOUNDED reap — the old bare proc.kill() + unbounded
+    proc.wait() is the tree-leak/recovery-hang class fixed repo-wide."""
+
+    async def test_timeout_group_kills_and_returns(self, monkeypatch, tmp_path):
+        import asyncio as _asyncio
+
+        from genesis.eval import gauntlet as g
+
+        killpg_calls = []
+        monkeypatch.setattr(
+            "genesis.util.proc_kill.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+        monkeypatch.setattr(g, "_PYTEST_TIMEOUT_S", 0.05)
+
+        proc = MagicMock()
+        proc.pid = 66666  # explicit — never a mock default (killpg(1) trap)
+        proc.returncode = None
+
+        async def _hang(*a, **k):
+            await _asyncio.sleep(600)
+
+        proc.communicate = _hang
+        proc.wait = AsyncMock(return_value=-9)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+        rc, out = await g._run_pytest(tmp_path)
+        assert rc == -1
+        assert "timed out" in out
+        assert len(killpg_calls) == 1
+        assert killpg_calls[0][0] == 66666
+
+    async def test_spawned_in_new_session(self, monkeypatch, tmp_path):
+        import asyncio as _asyncio
+
+        from genesis.eval import gauntlet as g
+
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"1 passed", None))
+            return proc
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+        rc, out = await g._run_pytest(tmp_path)
+        assert rc == 0
+        assert captured.get("start_new_session") is True
+        assert "preexec_fn" not in captured
+
+    async def test_cancel_group_kills_and_reraises(self, monkeypatch, tmp_path):
+        """Ctrl+C during scoring: asyncio cancels _run_pytest, and with the
+        detached session the terminal SIGINT never reaches pytest — the
+        handler must group-kill before re-raising or the tree leaks
+        (Codex P2, PR #1415)."""
+        import asyncio as _asyncio
+
+        from genesis.eval import gauntlet as g
+
+        killpg_calls = []
+        monkeypatch.setattr(
+            "genesis.util.proc_kill.os.killpg",
+            lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        )
+
+        proc = MagicMock()
+        proc.pid = 66667
+        proc.returncode = None
+        started = _asyncio.Event()
+
+        async def _hang(*a, **k):
+            started.set()
+            await _asyncio.sleep(600)
+
+        proc.communicate = _hang
+        proc.wait = AsyncMock(return_value=-9)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+        task = _asyncio.get_running_loop().create_task(g._run_pytest(tmp_path))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(_asyncio.CancelledError):
+            await task
+        assert killpg_calls and killpg_calls[0][0] == 66667

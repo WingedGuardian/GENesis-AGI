@@ -443,7 +443,7 @@ class TestVerifyViaCodex:
 
         killpg_calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.killpg",
+            "genesis.util.proc_kill.os.killpg",
             lambda pgid, sig: killpg_calls.append((pgid, sig)),
         )
 
@@ -493,7 +493,7 @@ class TestVerifyViaCodex:
 
         killpg_calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.killpg",
+            "genesis.util.proc_kill.os.killpg",
             lambda pgid, sig: killpg_calls.append((pgid, sig)),
         )
 
@@ -541,7 +541,7 @@ class TestVerifyViaCodex:
 
         killpg_calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.killpg",
+            "genesis.util.proc_kill.os.killpg",
             lambda pgid, sig: killpg_calls.append((pgid, sig)),
         )
 
@@ -601,10 +601,10 @@ class TestVerifyViaCodex:
             "genesis.autonomy.executor.review._CODEX_EXEC_TIMEOUT_S", 0.05,
         )
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review._CODEX_KILL_REAP_TIMEOUT_S", 0.05,
+            "genesis.util.proc_kill.DEFAULT_REAP_TIMEOUT_S", 0.05,
         )
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.os.killpg", lambda pgid, sig: None,
+            "genesis.util.proc_kill.os.killpg", lambda pgid, sig: None,
         )
 
         async def _never_returns(*_args, **_kwargs):
@@ -969,3 +969,46 @@ class TestFreshEyesPromptScoping:
         low = prompt.lower()
         assert "read the file" in low
         assert "run the tests" in low
+
+
+@pytest.mark.asyncio
+async def test_codex_cancel_group_kills_and_reraises(monkeypatch):
+    """Cancellation mid-verify must group-kill the detached codex tree before
+    propagating — the same class as the timeout path (final-audit F2)."""
+    monkeypatch.setattr(
+        "genesis.autonomy.executor.review.shutil.which",
+        lambda name: "/usr/bin/codex",
+    )
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg",
+        lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+    started = asyncio.Event()
+    fake_proc = MagicMock()
+    fake_proc.pid = 424244  # explicit — never a mock default
+    fake_proc.returncode = None
+
+    async def _hang(*a, **k):
+        started.set()
+        await asyncio.sleep(600)
+
+    fake_proc.communicate = _hang
+    fake_proc.wait = AsyncMock(return_value=-9)
+
+    async def _fake_exec(*_args, **_kwargs):
+        return fake_proc
+
+    monkeypatch.setattr(
+        "genesis.autonomy.executor.review.asyncio.create_subprocess_exec",
+        _fake_exec,
+    )
+    reviewer = TaskReviewer(router=AsyncMock())
+    task = asyncio.get_running_loop().create_task(
+        reviewer._verify_via_codex("deliverable", "reqs")
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert killpg_calls and killpg_calls[0][0] == 424244

@@ -37,6 +37,7 @@ from genesis.autonomy.executor.types import (
     validate_transition,
 )
 from genesis.feedback.bus import SignalType, record_outcome
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
     # Runtime import stays lazy inside _run_scope_gate (executor/__init__ ->
@@ -50,6 +51,47 @@ MAX_REVIEW_ITERATIONS = 2  # Amendment #4
 # Repo root: four parents up from executor/engine.py -> src/genesis/autonomy/executor
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _WORKTREE_BASE = _REPO_ROOT / ".claude" / "worktrees"
+
+# Hard bound for the delivery `git push`. _deliver runs under the executor's
+# Semaphore(1) (dispatcher._guarded_execute), so a network-stalled push with
+# no timeout wedges ALL autonomy — the same class the scope-gate's 60s bound
+# on local git ops (below) already guards. Push is a network op that can
+# legitimately take minutes on a large branch/slow link, hence 300s, and the
+# expiry degrades to the existing "Branch push failed" path (recoverable:
+# the branch can be pushed manually; the task itself is already complete).
+_GIT_PUSH_TIMEOUT_S = 300.0
+
+
+async def _run_git_push(wt_path: Path, branch: str) -> tuple[int, str]:
+    """Run the delivery ``git push`` with a hard timeout + group kill.
+
+    Returns ``(returncode, stderr_text)``; timeout returns ``(128, msg)``.
+    Spawned in its own session/group: when a push stalls it is usually git's
+    ssh/credential CHILD that is stuck — killing only git would orphan the
+    hung helper (the tree-leak class fixed repo-wide in this change).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git", "push", "-u", "origin", branch,
+        cwd=str(wt_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_GIT_PUSH_TIMEOUT_S,
+        )
+    except TimeoutError:
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        return 128, f"git push timed out after {int(_GIT_PUSH_TIMEOUT_S)}s"
+    except asyncio.CancelledError:
+        # Cancellation mid-push: the detached git/ssh tree sees no ambient
+        # signal — group-kill before propagating or it runs on.
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        raise
+    return proc.returncode or 0, stderr.decode(errors="replace")
 
 
 class CCSessionExecutor:
@@ -1435,17 +1477,10 @@ class CCSessionExecutor:
             branch = f"task/{task_id[:8]}"
             pushed = False
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "git", "push", "-u", "origin", branch,
-                    cwd=str(wt_path),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await proc.communicate()
-                if proc.returncode != 0:
+                rc, push_err = await _run_git_push(wt_path, branch)
+                if rc != 0:
                     logger.warning(
-                        "Branch push failed for task %s: %s",
-                        task_id, stderr.decode(errors="replace"),
+                        "Branch push failed for task %s: %s", task_id, push_err,
                     )
                 else:
                     logger.info("Pushed branch %s for task %s", branch, task_id)
