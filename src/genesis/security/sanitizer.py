@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 # any pre-existing boundary markers before (re-)wrapping, so content that was
 # already wrapped at an upstream ingestion point (e.g. WebFetcher) is never
 # double-wrapped into nested tags that blur the data/instruction boundary.
-_BOUNDARY_MARKER_RE = re.compile(r"<external-content[^>]*>|</external-content>")
+# Case-insensitive + whitespace-tolerant: LLMs read markup-ish tags loosely, so
+# a FORGED case/whitespace variant (</EXTERNAL-CONTENT>, </external-content >)
+# embedded in hostile content would otherwise survive the strip and spoof a
+# premature close of the trust boundary inside the wrapper.
+_BOUNDARY_MARKER_RE = re.compile(r"<\s*/?\s*external-content\b[^>]*>", re.IGNORECASE)
 
 
 def strip_boundary_markers(text: str) -> str:

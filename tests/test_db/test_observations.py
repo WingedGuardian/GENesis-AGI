@@ -318,6 +318,75 @@ async def test_count_external_by_ids(db):
     assert await obs.count_external_by_ids(db, ["missing"]) == 0
 
 
+async def _mk_origin_rows(db, rows):
+    """rows: list of (id, origin_class, created_at)."""
+    for oid, oc, ts in rows:
+        await observations.create(
+            db,
+            id=oid,
+            source="s",
+            type="t",
+            content=f"content-{oid}",
+            priority="low",
+            created_at=ts,
+            origin_class=oc,
+        )
+
+
+async def test_exclude_origin_class_keeps_null_drops_external(db):
+    """The surfacing filter drops ONLY the named class; NULL (unstamped
+    internal/legacy writers) and trusted classes keep flowing."""
+    await _mk_origin_rows(
+        db,
+        [
+            ("x-ext", "external_untrusted", "2026-01-01T00:00:03+00:00"),
+            ("x-null", None, "2026-01-01T00:00:02+00:00"),
+            ("x-own", "owner", "2026-01-01T00:00:01+00:00"),
+            ("x-fp", "first_party", "2026-01-01T00:00:00+00:00"),
+        ],
+    )
+    rows = await observations.query(
+        db, type="t", exclude_origin_class=observations.EXTERNAL_UNTRUSTED
+    )
+    ids = [r["id"] for r in rows]
+    assert "x-ext" not in ids
+    assert {"x-null", "x-own", "x-fp"} <= set(ids)
+
+
+async def test_exclude_origin_class_applies_before_limit(db):
+    """The filter must run BEFORE the LIMIT: a flood of newer external rows
+    cannot crowd an older kept row out of the result window."""
+    rows = [(f"x-flood-{i}", "external_untrusted", f"2026-01-02T00:00:{i:02d}+00:00") for i in range(5)]
+    rows.append(("x-kept", None, "2026-01-01T00:00:00+00:00"))
+    await _mk_origin_rows(db, rows)
+    got = await observations.query(
+        db, type="t", exclude_origin_class=observations.EXTERNAL_UNTRUSTED, limit=1
+    )
+    assert [r["id"] for r in got] == ["x-kept"]
+
+
+async def test_exclude_origin_class_mutually_exclusive_with_origin_class_in(db):
+    with pytest.raises(ValueError, match="opposite NULL-origin semantics"):
+        await observations.query(
+            db,
+            origin_class_in=["owner"],
+            exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
+        )
+
+
+def test_exclude_external_constants_pin():
+    """The crud-local literal must track the canonical provenance constant, and
+    the shared raw-SQL fragment must keep KEEP-NULL semantics."""
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+
+    assert observations.EXTERNAL_UNTRUSTED == ORIGIN_EXTERNAL_UNTRUSTED
+    assert observations.EXCLUDE_EXTERNAL_ORIGIN_PARAMS == (ORIGIN_EXTERNAL_UNTRUSTED,)
+    assert "origin_class IS NULL" in observations.EXCLUDE_EXTERNAL_ORIGIN_SQL
+    assert observations.EXCLUDE_EXTERNAL_ORIGIN_SQL.count("?") == len(
+        observations.EXCLUDE_EXTERNAL_ORIGIN_PARAMS
+    )
+
+
 def test_process_reaper_would_kill_ttl_registered(caplog):
     """The dry-run reaper emits `process_reaper_would_kill` (audit-trail
     counterpart to `process_reaper_kill`). It must be explicitly registered in

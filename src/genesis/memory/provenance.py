@@ -537,3 +537,22 @@ def wrap_external_recall(content: str, *, source_pipeline: str | None = None) ->
     except Exception:
         logger.warning("wrap_external_recall failed; returning unwrapped", exc_info=True)
         return content
+
+
+def wrap_if_external(content: str, origin_class: str | None) -> str:
+    """Wrap *content* in ``<external-content>`` markers iff its STORED origin is
+    ``external_untrusted``.
+
+    Read-side companion to the surfacing exclusion policy
+    (``db.crud.observations.EXCLUDE_EXTERNAL_ORIGIN_SQL``): NULL/unknown origin
+    is NOT wrapped — deliberately mirroring that policy's KEEP-NULL semantics
+    (unstamped internal writers, pre-provenance history), NOT the gate-time
+    fail-closed ``effective_origin_class`` (which maps NULL → untrusted; that
+    normalization is for privileged-WRITE gates, not surfacing).
+
+    Call-site contract: truncate BEFORE wrapping — truncating a wrapped string
+    clips the closing marker and breaks the data/instruction boundary.
+    """
+    if origin_class == ORIGIN_EXTERNAL_UNTRUSTED:
+        return wrap_external_recall(content)
+    return content
