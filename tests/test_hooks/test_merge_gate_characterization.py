@@ -59,6 +59,19 @@ def _reset_merge_deadline():
     _mod._merge_deadline = None
 
 
+@pytest.fixture(autouse=True)
+def _pin_canonical_public_repo(monkeypatch):
+    """The scheduled-review gate is scoped to the configured PUBLIC repo, read from
+    ``~/.genesis/config/genesis.yaml`` — which exists on a dev box but NOT in CI,
+    so the gate's SCOPE is environment-dependent unless pinned. Fix the canonical
+    public repo to the corpus's merge target (``REPO``) via the ``_TEST_CANONICAL_
+    PUBLIC_REPO`` seam, so EVERY case deterministically ENGAGES the scheduled gate
+    on every host. The off-public-repo NO-OP is exercised by its own case, which
+    overrides this seam to a different repo."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
+    yield
+
+
 # ── injection helpers ────────────────────────────────────────────────
 
 
@@ -80,6 +93,26 @@ def _reviews_jsonl(
             obj["state"] = state
         rows.append(json.dumps(obj))
     return "\n".join(rows)
+
+
+def _scheduled_marker(
+    head: str = HEAD,
+    *,
+    login: str = "owner",
+    author_association: str = "OWNER",
+    kinds: tuple[str, ...] = ("code-review", "leaks"),
+) -> str:
+    """_TEST_GH_SCHEDULED_COMMENTS shape — one OWNER-authored comment/review row whose
+    body carries one scheduled-review marker per ``kind`` naming ``head``. One JSON object
+    per line. The DEFAULT carries BOTH required kinds (code-review + leaks), so every
+    pre-existing case satisfies the gate; scheduled-gate cases pass explicit ``kinds``.
+
+    ``login``/``author_association`` model the trust check: a row is accepted only when
+    ``login == <repo owner>`` OR ``author_association == "OWNER"``. The repo owner here is
+    ``owner`` (``REPO = "owner/repo"``), so the default satisfies BOTH arms."""
+    markers = "\n".join(f"<!-- genesis-scheduled-review: head={head} kind={k} -->" for k in kinds)
+    body = "Scheduled review complete.\n" + markers
+    return json.dumps({"login": login, "author_association": author_association, "body": body})
 
 
 def _ci(conclusion: str = "SUCCESS") -> str:
@@ -203,6 +236,7 @@ def _run(
     base: str = "main",
     default: str = "main",
     compare: str | None = None,
+    scheduled: str | None = None,
     router=None,
 ) -> int:
     """Drive ``main()`` in-process: granular seams via env, un-seamed gh via the
@@ -216,6 +250,12 @@ def _run(
     monkeypatch.setenv("_TEST_GH_BASE_REF", base)
     monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", default)
     monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")  # no clean-comment fallback unless asked
+    # Default: a valid OWNER-authored scheduled-review marker AT head, so every
+    # pre-existing case stays behaviour-identical (mirrors the default codex review
+    # above). Scheduled-gate cases pass an explicit ``scheduled=`` to override.
+    monkeypatch.setenv(
+        "_TEST_GH_SCHEDULED_COMMENTS", _scheduled_marker(head) if scheduled is None else scheduled
+    )
     if compare is not None:
         monkeypatch.setenv("_TEST_GH_COMPARE", compare)  # smart-delta seam (opt-in)
     monkeypatch.setattr(_mod.subprocess, "run", router or _router())
@@ -558,6 +598,255 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "has not reviewed the current head",
     ),
+    # ── Scheduled Claude review gate (owner-authored marker at HEAD) ──
+    # An owner marker naming the CURRENT head → the gate is satisfied → merge allowed.
+    (
+        "scheduled_review_at_head_allows",
+        lambda mp: _run(mp, _merge_cmd(), scheduled=_scheduled_marker(HEAD)),
+        0,
+        "",
+    ),
+    # A marker naming a STALE sha does NOT vouch for the current head → block.
+    (
+        "scheduled_review_stale_sha_blocks",
+        lambda mp: _run(mp, _merge_cmd(), scheduled=_scheduled_marker(STALE)),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # No scheduled review at all (didn't run / rate-limited) → fail-closed block.
+    (
+        "scheduled_review_absent_blocks",
+        lambda mp: _run(mp, _merge_cmd(), scheduled=""),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # SCOPE: the gate is scoped to the configured PUBLIC repo only. Same absent-marker
+    # scenario as above, but the merge targets a repo OTHER than the canonical public
+    # one → the gate NO-OPS and the merge is ALLOWED (the required routines run only on
+    # the public repo, so they cannot be required elsewhere). Verify-RED: without the
+    # scope guard this blocks exactly like ``scheduled_review_absent_blocks``.
+    (
+        "scheduled_review_absent_off_public_repo_allows",
+        lambda mp: (
+            mp.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo"),
+            _run(mp, _merge_cmd(), scheduled=""),
+        )[1],
+        0,
+        "",
+    ),
+    # SCOPE, converse: an UNDETERMINABLE canonical repo (empty seam → None) fails CLOSED
+    # — the gate ENGAGES rather than silently disarming, so an absent marker still blocks.
+    (
+        "scheduled_review_absent_uncertain_scope_blocks",
+        lambda mp: (
+            mp.setenv("_TEST_CANONICAL_PUBLIC_REPO", ""),
+            _run(mp, _merge_cmd(), scheduled=""),
+        )[1],
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # A marker from a NON-owner author (login != owner, association != OWNER) is NOT
+    # trusted → treated as absent → block.
+    (
+        "scheduled_review_non_owner_author_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=_scheduled_marker(HEAD, login="randouser", author_association="CONTRIBUTOR"),
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # Owner-login match is case-INSENSITIVE (GitHub logins are canonically cased, but
+    # fold both sides as defense-in-depth): a marker whose login differs only in case
+    # from the repo owner, with a non-OWNER association, is still trusted → allows.
+    (
+        "scheduled_review_owner_login_case_insensitive_allows",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=_scheduled_marker(HEAD, login="OWNER", author_association="NONE"),
+        ),
+        0,
+        "",
+    ),
+    # BOTH required kinds must be present at head: a marker for only code-review (leaks
+    # routine did not run) blocks, naming the missing kind.
+    (
+        "scheduled_review_only_code_review_blocks_missing_leaks",
+        lambda mp: _run(
+            mp, _merge_cmd(), scheduled=_scheduled_marker(HEAD, kinds=("code-review",))
+        ),
+        2,
+        "leaks",
+    ),
+    # ...and only leaks (code-review routine did not run) blocks too.
+    (
+        "scheduled_review_only_leaks_blocks_missing_code_review",
+        lambda mp: _run(mp, _merge_cmd(), scheduled=_scheduled_marker(HEAD, kinds=("leaks",))),
+        2,
+        "code-review",
+    ),
+    # A status-suffixed value (`head=<sha>/failed`, `kind=leaks/failed`) must NOT be
+    # captured as a clean prefix — the value has to be terminated by whitespace or the
+    # marker-block end, else a failed/corrupt routine output would satisfy the gate.
+    (
+        "scheduled_review_suffixed_head_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "body": (
+                        f"<!-- genesis-scheduled-review: head={HEAD}/failed kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "code-review",  # the suffixed code-review head is not captured → missing
+    ),
+    (
+        "scheduled_review_suffixed_kind_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "body": (
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks/failed -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "leaks",  # the suffixed leaks kind is not captured → missing
+    ),
+    # A DISMISSED owner review no longer vouches — its marker (even for all kinds at head)
+    # is ignored, so the gate blocks (mirrors the Codex-freshness dismissed handling).
+    (
+        "scheduled_review_dismissed_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "state": "DISMISSED",
+                    "body": (
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # A PENDING review is an unpublished DRAFT — its marker (even for all kinds at head)
+    # must NOT satisfy the gate (a producer that created but never submitted the review).
+    (
+        "scheduled_review_pending_draft_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "state": "PENDING",
+                    "body": (
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # The marker means "ran CLEAN": a review whose body carries a blocking finding
+    # ([P1]/HARD BLOCK/### ERROR) is rejected even with both markers at head → block.
+    (
+        "scheduled_review_with_blocking_finding_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "body": (
+                        "### ERROR\n[P1] null deref in foo()\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # Clean-wins: a body that MENTIONS a blocking token but also carries a clean verdict
+    # (VERDICT: PASS) is treated as clean → the markers count → allow. (Same rule as the
+    # bot finding scanners.)
+    (
+        "scheduled_review_blocking_mention_but_clean_verdict_allows",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "body": (
+                        "Scanned for [P1] issues — VERDICT: PASS\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        0,
+        "",
+    ),
+    # The # scheduled-review-override sigil consciously waives the gate → an absent
+    # scheduled review still merges.
+    (
+        "scheduled_override_waives_absent_review_allows",
+        lambda mp: _run(mp, _merge_cmd(trailer="# scheduled-review-override"), scheduled=""),
+        0,
+        "",
+    ),
+    # ── sigil INDEPENDENCE: the scheduled sigil and the stale sigil are separate ──
+    # # stale-review-override waives Codex freshness+base, NOT the scheduled gate: an
+    # absent scheduled review still blocks even with a fresh-review waiver.
+    (
+        "stale_override_does_NOT_waive_scheduled_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(match=None, trailer="# stale-review-override"),
+            reviews="",
+            scheduled="",
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # # scheduled-review-override waives ONLY the scheduled gate, NOT Codex freshness:
+    # a no-review PR still blocks on freshness (which runs first).
+    (
+        "scheduled_override_does_NOT_waive_freshness_blocks",
+        lambda mp: _run(mp, _merge_cmd(trailer="# scheduled-review-override"), reviews=""),
+        2,
+        "has not reviewed the current head",
+    ),
 ]
 
 
@@ -657,3 +946,139 @@ def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
     assert not any(f"repos/{REPO}/pulls/123/comments" in parts for parts in inline), (
         f"findings scanned the WRONG PR (123, the --subject value): {inline}"
     )
+
+
+def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
+    """Seed every OTHER gate green so ``check_pr_report`` isolates the scheduled line.
+    The scheduled gate itself runs for real against the ``scheduled`` seam."""
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", head)
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(head))
+    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
+    monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", scheduled)
+    monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+    monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+    monkeypatch.setattr(
+        _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+    )
+    monkeypatch.setattr(
+        _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+    )
+
+
+def test_check_pr_report_includes_scheduled_line_ok(monkeypatch, capsys):
+    """The canonical report prints a ``scheduled-claude`` line and PASSES when an
+    owner marker names the current head (shares the enforcement function, strict mode)."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "scheduled-claude:" in out
+    sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
+    assert "ok (at head)" in sched_line
+    assert rc == 0
+
+
+def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
+    """An absent scheduled review is a FAILURE line and flips the report's verdict —
+    the report must not diverge from the always-fail-closed enforcement gate."""
+    _report_env(monkeypatch, scheduled="")
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
+    assert "BLOCK" in sched_line
+    assert rc == 1
+
+
+def test_check_pr_report_no_merge_with_when_scheduled_blocks(monkeypatch, capsys):
+    """The actionable ``merge-with`` command must NOT be printed when a later gate (the
+    scheduled review) would block — otherwise the report suggests a mergeable PR that is
+    not. (Codex P2: merge-with was emitted right after codex-at-head, before this gate.)"""
+    _report_env(monkeypatch, scheduled="")  # scheduled gate blocks
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "merge-with" not in out, "merge-with printed despite a blocking scheduled gate"
+    assert rc == 1
+
+
+def test_check_pr_report_prints_merge_with_when_all_pass(monkeypatch, capsys):
+    """When EVERY gate passes, the report prints the bound merge-with command."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "merge-with" in out
+    assert "--match-head-commit" in out
+    assert rc == 0
+
+
+def test_check_pr_report_scheduled_na_off_public_repo(monkeypatch, capsys):
+    """Off the public repo the report prints an honest ``n/a`` for the scheduled line
+    (not a misleading ``ok``) and the gate does NOT count as a failure — even with NO
+    marker present, since the gate is out of scope there."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo")
+    _report_env(monkeypatch, scheduled="")  # no marker at all
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
+    assert "n/a" in sched_line and "public repo" in sched_line
+    assert "BLOCK" not in sched_line
+    assert rc == 0  # scheduled no-op does not fail the verdict off the public repo
+
+
+# ── scope helpers (unit) ─────────────────────────────────────────────
+def test_scheduled_gate_applies_matches_public_repo(monkeypatch):
+    """The gate ENGAGES iff the merge target IS the canonical public repo."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/public")
+    assert _mod._scheduled_gate_applies("owner/public") is True
+    assert _mod._scheduled_gate_applies("OWNER/PUBLIC") is True  # case-insensitive
+    assert _mod._scheduled_gate_applies("https://github.com/owner/public") is True  # normalized
+    assert _mod._scheduled_gate_applies("owner/other") is False  # a different repo no-ops
+
+
+def test_scheduled_gate_applies_fails_closed_on_uncertainty(monkeypatch):
+    """Undeterminable canonical repo (None) or unknown target → ENGAGE (never silently
+    disarm the gate on the repo it protects)."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")  # → None
+    assert _mod._scheduled_gate_applies("owner/anything") is True
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/public")
+    assert _mod._scheduled_gate_applies(None) is True
+    assert _mod._scheduled_gate_applies("") is True
+
+
+def test_canonical_public_repo_seam(monkeypatch):
+    """The seam yields a normalized owner/repo, or None when empty (the fail-closed
+    branch)."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "WingedGuardian/GENesis-AGI")
+    assert _mod._canonical_public_repo() == "WingedGuardian/GENesis-AGI"
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
+    assert _mod._canonical_public_repo() is None
+
+
+def test_canonical_public_repo_reads_genesis_yaml(monkeypatch, tmp_path):
+    """Direct coverage of the config-file read path (not the seam): the canonical
+    repo is the declared github.user/public_repo, and a missing file fails closed
+    to None."""
+    monkeypatch.delenv("_TEST_CANONICAL_PUBLIC_REPO", raising=False)
+    cfg = tmp_path / "genesis.yaml"
+    cfg.write_text("github:\n  user: WingedGuardian\n  public_repo: GENesis-AGI\n")
+    monkeypatch.setattr(_mod.os.path, "expanduser", lambda p: str(cfg))
+    assert _mod._canonical_public_repo() == "WingedGuardian/GENesis-AGI"
+    # Missing/unreadable config → None (fail-closed → gate engages).
+    monkeypatch.setattr(_mod.os.path, "expanduser", lambda p: str(tmp_path / "absent.yaml"))
+    assert _mod._canonical_public_repo() is None
+    # A github section missing the keys → None too.
+    cfg.write_text("github:\n  user: WingedGuardian\n")  # no public_repo
+    monkeypatch.setattr(_mod.os.path, "expanduser", lambda p: str(cfg))
+    assert _mod._canonical_public_repo() is None
+
+
+def test_enforcement_surfaces_note_on_off_public_repo_no_op(monkeypatch, capsys):
+    """Provision-or-surface: when the scheduled gate no-ops because the merge targets
+    a repo other than the canonical public one, the ENFORCEMENT path emits an advisory
+    stderr NOTE (naming both repos) rather than silently disarming — so a drifted
+    genesis.yaml is visible. The merge still proceeds (exit 0)."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo")
+    rc = _run(monkeypatch, _merge_cmd(), scheduled="")  # no marker, but off-repo → allow
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "scheduled-review gate n/a" in err
+    assert "owner/some-other-public-repo" in err  # names the canonical public repo

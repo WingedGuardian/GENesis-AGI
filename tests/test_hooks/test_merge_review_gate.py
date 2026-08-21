@@ -1527,6 +1527,12 @@ class TestCiGateEndToEnd:
             "_check_base_is_default",
             lambda n, force=False, repo=None: (False, ""),
         )
+        # Scheduled-Claude-review gate is a real network check too — pass-through.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
+        )
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
         monkeypatch.setenv(
@@ -1636,6 +1642,11 @@ class TestMergeableAllowlist:
             "_check_codex_reviewed_head",
             lambda n, force=False, repo=None: (False, "", None),
         )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
+        )
 
     @pytest.mark.parametrize("bad", [None, "", "UNKNOWN", "SOMETHING_NEW"])
     def test_non_mergeable_blocks(self, guard_module, monkeypatch, bad):
@@ -1705,6 +1716,11 @@ class TestRepoDerivationGate:
             guard_module,
             "_check_codex_reviewed_head",
             lambda n, force=False, repo=None: (False, "", None),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
         )
 
     def test_derived_repo_threads_into_gates(self, guard_module, monkeypatch):
@@ -1926,6 +1942,14 @@ class TestGateOrdering:
             guard_module,
             "_check_codex_reviewed_head",
             lambda n, force=False, repo=None: (calls.append("freshness"), (False, "", None))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: (
+                calls.append("scheduled"),
+                None,
+            )[1],
         )
         monkeypatch.setattr(
             guard_module,

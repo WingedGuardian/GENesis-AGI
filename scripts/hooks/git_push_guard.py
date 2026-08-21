@@ -38,9 +38,47 @@ exceed the model (defense-in-depth), which is fine; they are not an invitation t
 chase every argv-shaping edge. Conscious escapes are split by boundary so one
 waiver cannot silently disarm an unrelated gate: ``# review-override`` waives the
 FINDING scans (review-body + inline P1s), ``# stale-review-override`` waives the
-review-CONTEXT gates (Codex-at-head freshness + base-is-default), and
+review-CONTEXT gates (Codex-at-head freshness + base-is-default),
+``# scheduled-review-override`` waives the SCHEDULED-Claude-review-at-head gate, and
 ``# ci-override`` waives the CI gate. A session that genuinely needs several
 appends several (one trailing comment may carry multiple sigils).
+
+Scheduled Claude review markers
+-------------------------------
+A "scheduled Claude review" runs on the repo OWNER's GitHub account (NOT a bot) and must
+post a comment (issue comment) or PR review whose body contains a marker
+``<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`` naming the exact
+head it reviewed AND which routine it was (``kind``). The merge gate
+(``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
+EVERY kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` (currently code-review + leaks) names
+the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
+was rate-limited, the merge is blocked (naming the missing kinds). SCOPE: this gate
+enforces ONLY when the merge targets the configured PUBLIC repo — the declared
+``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
+(``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
+(a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
+routines run only on the public repo. Deployment note: on the public repo the required
+routines ARE configured (the deploy precondition); a clone that runs on its own public
+repo without a producer uses `# scheduled-review-override` (or removes/edits
+`_REQUIRED_SCHEDULED_REVIEW_KINDS`) — the override valve is the escape by design, not an
+opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
+the gate ENGAGES rather than silently disarming.
+A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
+the Codex path. The marker means "ran CLEAN", not merely "ran": a review whose body carries a
+blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker overrides — the same rule
+the finding scanners use) is rejected, so a scheduled reviewer that explicitly BLOCKED cannot
+stamp a passing marker (owner-authored bodies are not seen by the bot-only finding scanners).
+On the normal path this is ATOMIC: the Codex-freshness gate's ``--match-head-commit``
+binding pins the merge to the very head the marker was verified at, so a race with a new
+push cannot swap in an unreviewed head. Under ``# stale-review-override`` (which waives
+that binding for ALL gates — a conscious "merge without current verification" choice) the
+scheduled check is point-in-time, matching the reduced posture the operator already opted
+into; it is not additionally head-bound there.
+The marker is the trust anchor (single-author, non-adversarial threat model): this gate
+defends against a review that did not run at HEAD, NOT against the owner's own review
+automation being manipulated (e.g. prompt-injected by attacker-controlled PR content) into
+posting a false marker — that guarantee lives in the scheduled-review producer, which must
+not treat untrusted PR content as instructions when composing its comment body.
 """
 
 from __future__ import annotations
@@ -1497,6 +1535,281 @@ def _check_codex_reviewed_head(
     return False, "", head
 
 
+# ── Scheduled Claude review FRESHNESS (a review by the repo OWNER, at HEAD) ──
+# A separate, always-fail-closed gate: a "scheduled Claude review" runs on the repo
+# OWNER's account (NOT a bot) and posts a comment/review body carrying the marker
+# ``<!-- genesis-scheduled-review: head=<full-40-hex-sha> -->``. The gate blocks a
+# merge unless such a marker — authored by the owner — names the PR's CURRENT head.
+# The marker is the trust anchor (single-author, non-adversarial model): a spoofed
+# marker needs the owner's account. Waived by ``# scheduled-review-override`` (the
+# conscious "merge without a scheduled review" case — it didn't run / is rate-limited).
+# A scheduled-review marker is an HTML comment ``<!-- genesis-scheduled-review:
+# head=<40hex> kind=<name> -->``. Each SCHEDULED routine stamps its own ``kind`` so
+# the gate can require that EVERY routine in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` ran
+# on the current head — a single routine's marker no longer satisfies the gate on its
+# own. head/kind are parsed from the marker BLOCK (order-tolerant) and BOTH must be
+# present in the SAME marker to count.
+_SCHEDULED_REVIEW_BLOCK_RE = re.compile(
+    r"<!--\s*genesis-scheduled-review:\s*(.*?)\s*-->", re.DOTALL
+)
+# The value must be TERMINATED by whitespace or the end of the marker block — NOT a
+# mere word boundary. Otherwise a status-suffixed producer output like `head=<sha>/failed`
+# or `kind=leaks/failed` would have its valid PREFIX captured and counted as a clean marker,
+# violating fail-closed (a failed/corrupt routine run must NOT satisfy the gate).
+_SCHEDULED_REVIEW_HEAD_RE = re.compile(r"\bhead=([0-9a-f]{40})(?=\s|\Z)")
+_SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)")
+
+# Every scheduled routine whose completion the merge gate requires, by ``kind``. A PR
+# merges only when a valid owner-authored marker for EACH of these names the current
+# head. Change this tuple to add/remove required routines.
+_REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
+
+
+def _canonical_public_repo() -> str | None:
+    """The ONE public repo the scheduled-review gate is scoped to, as ``owner/repo``
+    (normalized, case-preserved), or None if it cannot be determined.
+
+    Source: the DECLARED ``github.user``/``github.public_repo`` in
+    ``~/.genesis/config/genesis.yaml`` — install-agnostic and cwd-independent (the
+    identity of "the public repo" does not depend on which checkout a merge runs
+    from). Read locally (no ``gh``/network call — this is on the merge hot path).
+    Any read/parse failure returns None; the caller then fails CLOSED (see
+    ``_scheduled_gate_applies``). Test seam: ``_TEST_CANONICAL_PUBLIC_REPO`` (an
+    ``owner/repo`` string, or empty to force the undeterminable/None branch) is
+    honored INSTEAD of the config file when set — the config lives outside the repo
+    and is absent in CI, so the gate's scope must be injectable to test
+    deterministically."""
+    override = os.environ.get("_TEST_CANONICAL_PUBLIC_REPO")
+    if override is not None:
+        return _normalize_repo(override) if override.strip() else None
+    path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+    try:
+        import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        gh = cfg.get("github") or {}
+        user = (gh.get("user") or "").strip()
+        repo = (gh.get("public_repo") or "").strip()
+        if user and repo:
+            return _normalize_repo(f"{user}/{repo}")
+    except Exception:
+        return None
+    return None
+
+
+def _scheduled_gate_applies(repo: str | None) -> bool:
+    """Whether the scheduled-review gate ENFORCES for a merge targeting ``repo``.
+
+    The gate is scoped to the configured PUBLIC repo ONLY — the user's directive:
+    "these are ALL only requirements for the genesis public repo — not pushing work
+    anywhere else." The required ``/schedule`` routines run only on that repo, so a
+    ``gh pr merge`` targeting any OTHER repo (a private fork, the voice repo,
+    backups) must NOT be blocked on their markers.
+
+    Fail-CLOSED bias: only a target that RESOLVES to a repo DIFFERENT from the
+    canonical public one no-ops. If the canonical repo is undeterminable, or the
+    target is unknown, ENGAGE — silently skipping on uncertainty would be an
+    evasion path on the very repo the gate protects."""
+    canonical = _canonical_public_repo()
+    if not canonical or not repo:
+        return True  # uncertain → enforce (never silently disarm the gate)
+    target = _normalize_repo(repo)
+    if target is None:
+        return True  # unnormalizable target → enforce (fail-closed; unreachable in
+        # practice — an unresolved merge repo already blocks upstream)
+    return target.strip().lower() == canonical.strip().lower()
+
+
+def _parse_scheduled_jsonl(raw: str | None) -> list[dict]:
+    """Parse the ``{login, author_association, body}`` JSONL shape into a list of
+    dicts, SKIPPING any malformed/non-object line (fail-closed: a dropped line can
+    only make a marker go UNSEEN → a false block, never a false pass). Mirrors
+    ``_codex_reviews``' per-line tolerance."""
+    rows: list[dict] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+    return rows
+
+
+def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] | None:
+    """Combined ``{login, author_association, body}`` rows from BOTH the PR's issue
+    comments AND its review bodies, or ``None`` on any API error (distinct from an
+    empty list = query succeeded, nothing there — the caller fail-closes on both, but
+    the None case is the UNREADABLE one).
+
+    Both endpoints are ``--paginate``d (a marker beyond the first REST page must still
+    count). If EITHER endpoint fails to read, the whole result is ``None``: a marker we
+    could not see must not be assumed absent-and-safe — it is UNREADABLE, and this gate
+    fails closed. Test seam: ``_TEST_GH_SCHEDULED_COMMENTS`` (one JSON object per line,
+    combining both sources) is read INSTEAD of gh when set — mirrors
+    ``_TEST_GH_CODEX_COMMENTS``. Fail-safe: None on any subprocess/exception.
+    """
+    raw = os.environ.get("_TEST_GH_SCHEDULED_COMMENTS")
+    if raw is not None:
+        return _parse_scheduled_jsonl(raw)
+    rows: list[dict] = []
+    for path in (
+        f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
+        f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/reviews",
+    ):
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    path,
+                    "--paginate",
+                    "--jq",
+                    ".[] | {login: .user.login, author_association: .author_association, "
+                    "body: .body, state: .state}",  # .state present on reviews, null on issue comments
+                ],
+                capture_output=True,
+                text=True,
+                # See the merge-path timeout budget note in main(): fail-safe → None.
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+        except Exception:
+            return None
+        rows.extend(_parse_scheduled_jsonl(result.stdout))
+    return rows
+
+
+def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str, set[str]] | None:
+    """Map of ``head-sha -> {kinds}`` from valid owner-authored scheduled-review markers
+    on the PR, or ``None`` on an UNREADABLE fetch (the caller fail-closes on both None
+    and an empty map — None only distinguishes "could not read" from "read, no marker").
+
+    A marker is trusted only when its author is the repo OWNER: ``login == owner`` OR
+    ``author_association == "OWNER"`` (belt-and-suspenders — the marker itself is the
+    trust anchor in the single-author, non-adversarial model). The owner login is the
+    first segment of ``(repo or derived)``; ``derived`` is gh's repo for the cwd when no
+    explicit repo was passed. Each marker BLOCK must carry BOTH ``head=<40hex>`` and
+    ``kind=<name>`` to count (order-tolerant); the ``kind`` is recorded under that head.
+    """
+    rows = _scheduled_review_rows(pr_num, repo=repo)
+    if rows is None:
+        return None
+    try:
+        owner_repo = repo or _derive_repo_from_cwd(os.getcwd())
+    except Exception:
+        owner_repo = repo
+    owner = (owner_repo.split("/")[0] if owner_repo else "").lower() or None
+    by_head: dict[str, set[str]] = {}
+    for row in rows:
+        login = (row.get("login") or "").lower()
+        assoc = (row.get("author_association") or "").upper()
+        if login != owner and assoc != "OWNER":
+            continue  # not the repo owner — not a trusted scheduled review
+        # A DISMISSED review no longer vouches, and a PENDING review is an UNPUBLISHED
+        # draft that never ran publicly — neither should satisfy the gate (mirrors the
+        # Codex-freshness path). `state` is present on /pulls/N/reviews rows and null on
+        # issue comments, so this only drops review rows; issue comments remain state-less.
+        if (row.get("state") or "").upper() in ("DISMISSED", "PENDING"):
+            continue
+        body = row.get("body") or ""
+        # The marker must mean "ran CLEAN", not merely "ran": a scheduled review whose body
+        # CONTAINS a blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker
+        # overrides — same "clean wins" rule the finding scanners use) does NOT satisfy the
+        # gate. Owner-authored review bodies are never seen by _check_pr_review_findings
+        # (bots only), so without this a scheduled reviewer that explicitly BLOCKED would
+        # still stamp its marker and slip the merge through.
+        if any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
+            c.search(body) for c in _CLEAN_PATTERNS
+        ):
+            continue
+        # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
+        # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
+        # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
+        # HEAD by the caller, so a stale marker can't pass; this only catches a buggy reviewer.
+        for block in _SCHEDULED_REVIEW_BLOCK_RE.findall(body):
+            head_m = _SCHEDULED_REVIEW_HEAD_RE.search(block)
+            kind_m = _SCHEDULED_REVIEW_KIND_RE.search(block)
+            if not head_m or not kind_m:
+                continue  # a marker must name both a head AND a kind to count
+            by_head.setdefault(head_m.group(1).lower(), set()).add(kind_m.group(1).lower())
+    return by_head
+
+
+def _check_scheduled_claude_reviewed_head(
+    pr_num: str,
+    head_sha: str | None = None,
+    repo: str | None = None,
+    *,
+    force: bool = False,
+    strict: bool = False,
+) -> str | None:
+    """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
+    has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
+    each kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` names ``head_sha`` exactly (full
+    40-char), else a BLOCK MESSAGE naming the MISSING kinds.
+
+    Fail-CLOSED in BOTH modes — this gate never passes on absence of positive
+    evidence: if the head cannot be read, or the comment/review fetch errors
+    (``_scheduled_review_markers`` → None), the merge is BLOCKED. A read that simply
+    does not carry every required kind at this head (a routine didn't run, ran on a
+    stale commit, or was rate-limited) also blocks. ``strict`` is accepted for interface
+    parity with the finding scanners (``check_pr_report`` passes it); the block/pass
+    decision is identical in both modes precisely BECAUSE enforcement already fails
+    closed, so the report can never issue a false all-clear here.
+
+    SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
+    (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
+    repo (a private fork, the voice repo, backups) returns None (no-op) — the
+    required routines run only on the public repo, so they cannot be required
+    elsewhere.
+
+    ``head_sha`` (the caller's authoritative head) is used when given; otherwise the
+    head is read via ``_pr_head_sha``. ``force`` (a ``# scheduled-review-override`` on
+    the merge segment — an INDEPENDENT sigil from ``# stale-review-override``) waives
+    this gate for the conscious "merge without the scheduled reviews" case (e.g. a
+    routine is down / rate-limited).
+    """
+    if force:
+        return None  # waived by # scheduled-review-override
+    if not _scheduled_gate_applies(repo):
+        return None  # out of scope: merge targets a repo other than the public one
+    head = (head_sha or "").strip().lower()
+    if not head:
+        head = (_pr_head_sha(pr_num, repo=repo) or "").strip().lower()
+    if not head:
+        return (
+            f"could not read PR #{pr_num}'s head commit to verify the scheduled Claude "
+            f"reviews (GitHub query failed).\n"
+            f"Retry, or append '# scheduled-review-override' to merge anyway."
+        )
+    markers = _scheduled_review_markers(pr_num, repo=repo)
+    if markers is None:
+        return (
+            f"could not read PR #{pr_num}'s comments/reviews to verify the scheduled Claude "
+            f"reviews at head {head[:12]} — review status UNREADABLE (retry), not clean.\n"
+            f"Retry, or append '# scheduled-review-override' to merge anyway."
+        )
+    kinds_here = markers.get(head, set())
+    missing = [k for k in _REQUIRED_SCHEDULED_REVIEW_KINDS if k not in kinds_here]
+    if not missing:
+        return None
+    return (
+        f"scheduled Claude review(s) missing at head {head[:12]}: {', '.join(missing)} "
+        f"(required: {', '.join(_REQUIRED_SCHEDULED_REVIEW_KINDS)}; present: "
+        f"{', '.join(sorted(kinds_here)) or 'none'}).\n"
+        f"Each routine posts a comment/review carrying "
+        f"'<!-- genesis-scheduled-review: head=<sha> kind=<name> -->' once it runs on THIS "
+        f"exact commit — wait for the missing routine(s) to run on the current head, or "
+        f"append '# scheduled-review-override' to merge without them."
+    )
+
+
 def _pr_base_ref(pr_num: str, repo: str | None = None) -> str | None:
     """The branch this PR MERGES INTO (``baseRefName``), or None on any error.
 
@@ -1731,6 +2044,44 @@ def _merge_has_shadow_flag(argv: list[str]) -> bool:
                 if ch in _GH_MERGE_VALUE_SHORTS:
                     break  # a value-short (e.g. -R): the rest is its glued value
     return False
+
+
+def _require_match_head(
+    merge_argv: list[str],
+    pr_num: str,
+    bind_head: str,
+    repo: str | None,
+    source: str,
+) -> str | None:
+    """Enforce the TOCTOU binding: the merge must carry ``--match-head-commit`` equal to
+    ``bind_head`` (a race with a new push then merges an UNREVIEWED head, which GitHub
+    rejects server-side). Returns None when bound correctly, else a BLOCK MESSAGE.
+    ``source`` names the gate whose head we bind to (e.g. "Codex-verified",
+    "scheduled-review-verified"). Shared by every gate that verifies a specific head so
+    a passing check is always atomically pinned to the sha it verified.
+    """
+    # Content value-flags can smuggle a --match-head-commit token as their VALUE
+    # (gh takes it as text → no binding) and have no use on a gated squash-merge.
+    if _merge_has_shadow_flag(merge_argv):
+        return (
+            "--body/--subject/--body-file/--author-email are not allowed on a gated "
+            "merge — they can shadow the --match-head-commit binding. Remove them "
+            "(set a squash message via the GitHub UI if needed)."
+        )
+    match_head = _merge_match_head(merge_argv)
+    if match_head is None:
+        return (
+            f"merge must be bound to the {source} head commit so a race with a new "
+            f"push cannot merge an unreviewed head. Re-run with:\n"
+            f"  {_suggested_merge_cmd(pr_num, bind_head, repo)}"
+        )
+    if match_head.strip().lower() != bind_head:
+        return (
+            f"--match-head-commit {match_head[:12]} does not equal the {source} head "
+            f"{bind_head[:12]} — the branch moved (or the sha is stale). Re-verify and "
+            f"use the current verified head."
+        )
+    return None
 
 
 def _is_dispatched() -> bool:
@@ -2825,39 +3176,11 @@ def main() -> int:
                 # nets its own fail-open outcome, but a clipped BINDING would have
                 # re-opened the unbound-merge race this block exists to close.
                 if verified_head:
-                    # Fail-closed belt: content value-flags can smuggle a
-                    # --match-head-commit token as their VALUE (gh takes it as
-                    # text → no binding) and have no use on a gated squash-merge.
-                    if _merge_has_shadow_flag(merge_seg.argv):
-                        print(
-                            "BLOCKED: --body/--subject/--body-file/--author-email are "
-                            "not allowed on a gated merge — they can shadow the "
-                            "--match-head-commit binding. Remove them (set a squash "
-                            "message via the GitHub UI if needed).",
-                            file=sys.stderr,
-                        )
-                        return 2
-                    match_head = _merge_match_head(merge_seg.argv)
-                    if match_head is None:
-                        print(
-                            "BLOCKED: merge must be bound to the Codex-verified head "
-                            "commit so a race with a new push cannot merge an "
-                            "unreviewed head. Re-run with:",
-                            file=sys.stderr,
-                        )
-                        print(
-                            "  " + _suggested_merge_cmd(pr_num, verified_head, merge_repo),
-                            file=sys.stderr,
-                        )
-                        return 2
-                    if match_head.strip().lower() != verified_head:
-                        print(
-                            f"BLOCKED: --match-head-commit {match_head[:12]} does not "
-                            f"equal the Codex-verified head {verified_head[:12]} — the "
-                            f"branch moved (or the sha is stale). Re-verify and use "
-                            f"the current verified head.",
-                            file=sys.stderr,
-                        )
+                    bind_msg = _require_match_head(
+                        merge_seg.argv, pr_num, verified_head, merge_repo, "Codex-verified"
+                    )
+                    if bind_msg:
+                        print("BLOCKED: " + bind_msg, file=sys.stderr)
                         return 2
 
                 # Unresolved review findings (review body) — AFTER freshness +
@@ -2889,6 +3212,43 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(inline_msg, file=sys.stderr)
+                    return 2
+
+                # Scheduled Claude review at HEAD — its OWN always-fail-closed gate with
+                # its OWN sigil (# scheduled-review-override waives ONLY this gate; independent
+                # of # stale-review-override). Deliberately placed LAST — after the review-body
+                # + inline finding scanners, which fail OPEN on a clipped budget. This gate
+                # fails CLOSED, so if the shared merge-gate deadline is exhausted here it BLOCKS
+                # (safe); running it before the scanners could instead starve THEM into their
+                # 1s floor → fail-open → a merge with unresolved findings slipping through. Uses
+                # verified_head from the Codex gate (None under # stale-review-override → re-read).
+                sched_override = has_trailing_override(merge_seg.raw, "scheduled-review-override")
+                # Provision-or-surface: the scheduled gate no-ops off the configured
+                # public repo (by design). A SILENT no-op would hide a drifted
+                # genesis.yaml (canonical != the real public repo) disarming the gate
+                # on the repo it protects — so surface WHY it didn't apply. Advisory
+                # only (never blocks); skipped under the override (already a conscious
+                # waive). The report path shows the same via its "n/a" line.
+                if not sched_override and not _scheduled_gate_applies(merge_repo):
+                    print(
+                        f"NOTE: scheduled-review gate n/a for PR #{pr_num} — merge "
+                        f"targets {merge_repo}, not the configured public repo "
+                        f"({_canonical_public_repo() or 'undetermined'}).",
+                        file=sys.stderr,
+                    )
+                sched_msg = _check_scheduled_claude_reviewed_head(
+                    pr_num,
+                    verified_head,
+                    merge_repo,
+                    force=sched_override,
+                )
+                if sched_msg:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — required scheduled Claude review(s) "
+                        f"missing at the current head.",
+                        file=sys.stderr,
+                    )
+                    print(sched_msg, file=sys.stderr)
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
@@ -3013,6 +3373,10 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     false all-clear.
 
     Prints one line per gate; returns 0 when every gate would pass, 1 otherwise.
+    (Same CHECKS as enforcement, but the internal ORDER may differ — e.g. the merge
+    arm runs the scheduled gate LAST, after the finding scanners, for budget reasons;
+    the report is order-independent because every scan here is strict=True, so a clipped
+    scan is a failure line rather than a fail-open pass regardless of position.)
     """
     failures = 0
     mergeable = _check_mergeable(pr_num, repo=repo)
@@ -3063,9 +3427,24 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         else:
             label = "ok (current)"
     print(f"codex-at-head  : {label}")
-    if not blocked and verified_head:
-        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
     failures += 1 if blocked else 0
+    # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
+    # enforces (shared function, strict mode). It reads the head itself (no head in
+    # hand here). A missing/stale/unreadable scheduled review is a FAILURE line, never a
+    # false all-clear — the report must not diverge from enforcement.
+    # Pass the Codex-verified head (as the enforcement path does) so the report is a
+    # COHERENT snapshot: if the head moved mid-report, the scheduled check binds to the
+    # same head the printed merge-with command does, not an independently re-read newer one.
+    # Scoped to the public repo only (mirrors enforcement) — print an honest n/a rather
+    # than a misleading "ok" when the target is some other repo.
+    if not _scheduled_gate_applies(repo):
+        print("scheduled-claude: n/a (scoped to the public repo only)")
+    else:
+        sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo, strict=True)
+        print(
+            f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
+        )
+        failures += 1 if sched_msg else 0
     # strict=True: a scan that could not be READ (gh error/malformed) must show as
     # a failure here, never as "ok" — the report must not issue a false all-clear.
     blocked, msg = _check_pr_review_findings(pr_num, repo=repo, strict=True)
@@ -3076,6 +3455,11 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
     )
     failures += 1 if blocked else 0
+    # Emit the actionable merge command ONLY when EVERY gate passed — printing it earlier
+    # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
+    # gate below would block. Bound to the Codex-verified head (the TOCTOU pin).
+    if failures == 0 and verified_head:
+        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
     print(
         "verdict        :",
         "MERGEABLE (all gates pass)" if failures == 0 else f"{failures} gate(s) would block",
