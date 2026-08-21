@@ -24,12 +24,13 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _GEN = _REPO_ROOT / "scripts" / "generate-ssh-config.sh"
 
-# DNSName "testbox.tail1234.ts.net." -> TS_HOSTNAME "testbox",
-# TS_DNSNAME "testbox.tail1234.ts.net" (the script's .split('.')[0] / rstrip).
+# DNSName "testbox.tail1234.ts.net." -> TS_HOSTNAME "testbox"; TailscaleIPs ->
+# TS_IP "100.64.1.2" (the script picks the v4, filtering the v6 by ':'). HostName
+# in the emitted config is that IP, NOT the MagicDNS name (DNS-independent).
 _FAKE_TAILSCALE = """#!/usr/bin/env bash
 if [[ "$*" == *--json* ]]; then
   cat <<'JSON'
-{"Self": {"DNSName": "testbox.tail1234.ts.net."}}
+{"Self": {"DNSName": "testbox.tail1234.ts.net.", "TailscaleIPs": ["100.64.1.2", "fd7a:115c:a1e0::1"]}}
 JSON
   exit 0
 fi
@@ -65,8 +66,16 @@ class TestLobbyDoor:
         assert result.returncode == 0, result.stderr
         out = result.stdout
         assert "Host testbox-lobby" in out
-        assert "RemoteCommand tmux -u new-session -A -s lobby" in out
+        # opens the session picker (choose-tree), not a bare shell
+        assert "RemoteCommand tmux -u new-session -A -s lobby \\; choose-tree -Zs" in out
         assert "RequestTTY yes" in out
+
+    def test_hostname_is_tailscale_ip_not_magicdns(self, gen):
+        # HostName must be the stable Tailscale IP (DNS-resolver-independent),
+        # never the MagicDNS name — that dependency is the failure this avoids.
+        out = gen().stdout
+        assert "HostName 100.64.1.2" in out
+        assert "HostName testbox.tail1234.ts.net" not in out
 
     def test_lobby_block_precedes_wildcard(self, gen):
         # The correctness invariant: specific block first, or ssh routes
@@ -110,7 +119,13 @@ class TestSshResolution:
         )
         assert r.returncode == 0, r.stderr
         rc = [ln for ln in r.stdout.splitlines() if ln.lower().startswith("remotecommand ")]
-        assert rc == ["remotecommand tmux -u new-session -A -s lobby"], rc
+        assert len(rc) == 1, rc
+        assert rc[0].startswith("remotecommand tmux -u new-session -A -s lobby") and (
+            "choose-tree" in rc[0]
+        ), rc
+        # HostName resolves to the stable Tailscale IP, not the MagicDNS name.
+        hn = [ln for ln in r.stdout.splitlines() if ln.lower().startswith("hostname ")]
+        assert hn == ["hostname 100.64.1.2"], hn
 
     @pytest.mark.skipif(shutil.which("ssh") is None, reason="ssh not on PATH")
     def test_numeric_slot_still_resolves_to_cc_slot(self, gen, tmp_path):
