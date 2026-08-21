@@ -18,10 +18,11 @@
 #
 # Degrades gracefully: no systemd, no systemd-oomd, no PSI, or no usable
 # sudo each produce a one-line skip note and rc=0 — this must never abort
-# bootstrap.sh/update.sh under `set -e`.
+# install.sh/bootstrap.sh/update.sh under `set -e`.
 #
-# Sourced by scripts/bootstrap.sh (fresh installs) and scripts/update.sh
-# (existing installs retrofit on their next update). Idempotent: unchanged
+# Sourced by scripts/install.sh + scripts/bootstrap.sh (fresh installs) and
+# scripts/update.sh (existing installs retrofit on their next update).
+# Idempotent: unchanged
 # drop-ins are left untouched and produce no systemd churn.
 #
 # Test seams (defaults are the real system paths; pytest overrides these and

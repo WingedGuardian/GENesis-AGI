@@ -10,12 +10,14 @@ invariant check (vantage-aware: container vs bare/VM).
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB = REPO_ROOT / "scripts" / "lib" / "memory_resilience.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
+INSTALL = REPO_ROOT / "scripts" / "install.sh"
 
 _SUDO_STUB = """#!/bin/bash
 # Passthrough sudo: "-n true" honors $SUDO_N_RC (0 = passwordless ok).
@@ -265,6 +267,46 @@ def test_update_sh_wires_the_lib_visibly():
     text = (REPO_ROOT / "scripts" / "update.sh").read_text()
     assert "lib/memory_resilience.sh" in text
     assert text.count("memory_resilience_apply") >= 1
+
+
+def test_install_wires_the_lib():
+    # install.sh (the fresh-container path) must apply memory-resilience too —
+    # bootstrap.sh and update.sh did, but install.sh did not, so a fresh
+    # container install sat unprotected against the OOM/fork wedge with NO
+    # automatic trigger to run update.sh (the salvaged red-team gap).
+    text = INSTALL.read_text()
+    assert 'source "$SCRIPT_DIR/lib/memory_resilience.sh"' in text
+    assert "memory_resilience_apply" in text
+    assert "pid_budget_apply" in text
+
+
+def test_install_provisions_the_oomd_package_with_its_own_idiom():
+    """install.sh must provision systemd-oomd BEFORE applying the lib — using
+    install.sh's OWN package helper (``_install_pkg``), never bootstrap's bare
+    ``install_pkg``.
+
+    install.sh defines ``_install_pkg``/``_PKG_MGR`` (underscore-prefixed); it
+    has no ``install_pkg``. A verbatim copy of bootstrap's block would call an
+    undefined function and hard-abort a fresh install under ``set -euo
+    pipefail``. Lock the idiom and the install→apply ordering.
+    """
+    text = INSTALL.read_text()
+    assert "_install_pkg systemd-oomd" in text
+    # No BARE install_pkg call (not preceded by the underscore) — that function
+    # is undefined in install.sh and would abort the run.
+    assert re.search(r"(?<!_)install_pkg systemd-oomd", text) is None
+    # Ordering: provision must precede sourcing/applying the lib, or the first
+    # run still skips pressure-kill setup (oomd-absent → silent skip).
+    source_line = 'source "$SCRIPT_DIR/lib/memory_resilience.sh"'
+    assert text.index("_install_pkg systemd-oomd") < text.index(source_line)
+
+
+def test_install_guards_the_lib_source():
+    # The block must be guarded so a tree missing the lib degrades (echoes a
+    # warning) instead of aborting install.sh — mirrors bootstrap's guard and
+    # relies on the lib's own never-abort contract.
+    text = INSTALL.read_text()
+    assert '[[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]' in text
 
 
 # ── pid_budget_apply (per-user-slice TasksMax=60% provisioning) ──────────────

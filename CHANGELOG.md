@@ -20,6 +20,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Fresh container installs now get OOM/fork-wedge protection.**
+  `scripts/install.sh` (the fresh-container path) never applied the
+  memory-resilience provisioning (systemd-oomd pressure-kill, swap invariant,
+  raised per-user-slice `TasksMax`) that `bootstrap.sh` and `update.sh` already
+  did — so a freshly installed box sat unprotected against the OOM-thrash /
+  `Cannot fork` wedge until its first `update.sh` run. It now applies the same
+  idempotent, adaptive provisioning at install time.
+
 - **The core Claude Code spawner now uses the shared hardened group-kill.**
   `cc/invoker.py` — the launcher behind every CC session Genesis runs — carried
   the patterns the repo-wide sweep retired everywhere else: `preexec_fn` spawns,
