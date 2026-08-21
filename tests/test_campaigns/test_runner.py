@@ -351,3 +351,255 @@ class TestTickWrapperJobHealth:
             rt_cls.instance.return_value = inst
             # tick raised AND record_job_failure raised — still must not propagate.
             await runner._tick_wrapper("camp-1", "campaign_test")
+
+
+class TestParkAwareSessionStatus:
+    """_check_session_status must understand rate-limit parks (2026-08-17
+    incident: a campaign session that got parked was captured as
+    outcome=error while its resume later delivered successfully — the
+    campaign's bookkeeping never learned)."""
+
+    async def _seed_failed_parked_session(self, db, park_status: str):
+        from genesis.db.crud import cc_sessions
+
+        await cc_sessions.create(
+            db, id="camp-sess-1", session_type="background_task",
+            model="sonnet", effort="medium", source_tag="campaign",
+            started_at="2026-08-17T10:00:00+00:00",
+            last_activity_at="2026-08-17T10:00:00+00:00",
+        )
+        await db.execute(
+            "UPDATE cc_sessions SET status='failed', metadata=? WHERE id=?",
+            (json.dumps({"park_id": "rlp-test0001"}), "camp-sess-1"),
+        )
+        await db.execute(
+            """INSERT INTO cc_rate_limit_parks
+               (id, kind, dedup_key, payload_json, status, created_at, updated_at)
+               VALUES (?, 'direct_session', 'dk1', '{}', ?, ?, ?)""",
+            ("rlp-test0001", park_status,
+             "2026-08-17T10:00:00+00:00", "2026-08-17T10:00:00+00:00"),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_parked_session_reads_as_still_running(self, db):
+        from genesis.campaigns.runner import _check_session_status
+
+        await self._seed_failed_parked_session(db, "parked")
+        assert await _check_session_status(db, "camp-sess-1") is None
+
+    @pytest.mark.asyncio
+    async def test_resuming_session_reads_as_still_running(self, db):
+        from genesis.campaigns.runner import _check_session_status
+
+        await self._seed_failed_parked_session(db, "resuming")
+        assert await _check_session_status(db, "camp-sess-1") is None
+
+    @pytest.mark.asyncio
+    async def test_resumed_park_captures_delivering_session_result(self, db):
+        from genesis.campaigns.runner import _check_session_status
+        from genesis.db.crud import cc_sessions
+
+        await self._seed_failed_parked_session(db, "resumed")
+        # The re-dispatched session that actually delivered:
+        await cc_sessions.create(
+            db, id="resumed-sess-9", session_type="background_task",
+            model="sonnet", effort="medium", source_tag="campaign",
+            started_at="2026-08-17T22:20:00+00:00",
+            last_activity_at="2026-08-17T22:20:00+00:00",
+        )
+        await db.execute(
+            "UPDATE cc_sessions SET status='completed', cost_usd=0.42, metadata=? "
+            "WHERE id=?",
+            (json.dumps({
+                "caller_context": "rate_limit_resume:rlp-test0001",
+                "output_text": "digest delivered after resume",
+            }), "resumed-sess-9"),
+        )
+        await db.commit()
+        result = await _check_session_status(db, "camp-sess-1")
+        assert result is not None
+        assert result["success"] is True
+        assert "digest delivered after resume" in result["output_text"]
+
+    @pytest.mark.asyncio
+    async def test_resumed_park_without_delivering_row_fails_closed(self, db):
+        from genesis.campaigns.runner import _check_session_status
+
+        # A park is marked resumed only AFTER its delivering session is
+        # persisted — a missing row means deleted/corrupted, never in-flight.
+        # Returning None here would skip campaign ticks forever (Codex P2).
+        await self._seed_failed_parked_session(db, "resumed")
+        result = await _check_session_status(db, "camp-sess-1")
+        assert result is not None
+        assert result["success"] is False
+        assert "delivering session row is missing" in result["output_text"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_park_reads_as_failure(self, db):
+        from genesis.campaigns.runner import _check_session_status
+
+        await self._seed_failed_parked_session(db, "needs_user")
+        result = await _check_session_status(db, "camp-sess-1")
+        assert result is not None
+        assert result["success"] is False
+        assert "needs_user" in result["output_text"] or "needs_user" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_store_result_stamps_extra_metadata(db):
+    """The production writer for the park stamp: _store_result(extra_metadata=
+    {"park_id": ...}) must land the key in cc_sessions.metadata — without it
+    the park-aware reaper above has nothing to follow."""
+    from types import SimpleNamespace
+
+    from genesis.cc.direct_session import (
+        DirectSessionRequest,
+        DirectSessionResult,
+        DirectSessionRunner,
+    )
+    from genesis.db.crud import cc_sessions
+
+    await cc_sessions.create(
+        db, id="stamp-sess", session_type="background_task",
+        model="sonnet", effort="medium",
+        started_at="2026-08-17T10:00:00+00:00",
+        last_activity_at="2026-08-17T10:00:00+00:00",
+    )
+    runner = DirectSessionRunner.__new__(DirectSessionRunner)
+    runner._rt = SimpleNamespace(_db=db)
+    await runner._store_result(
+        "stamp-sess",
+        DirectSessionRequest(prompt="p"),
+        DirectSessionResult(
+            session_id="stamp-sess", success=False,
+            error="rate_limited: parked for resume (rlp-x1)", duration_s=1.0,
+        ),
+        extra_metadata={"park_id": "rlp-x1"},
+    )
+    row = await cc_sessions.get_by_id(db, "stamp-sess")
+    assert json.loads(row["metadata"])["park_id"] == "rlp-x1"
+
+
+@pytest.mark.asyncio
+async def test_open_park_past_wait_bound_reads_as_failure(db):
+    """Audit F1: a park stuck open (parked/resuming) past the wait bound must
+    surface as a failure — a stuck resume loop never reaches needs_user, and
+    without the bound the campaign would skip its ticks forever."""
+    from genesis.campaigns.runner import _check_session_status
+
+    helper = TestParkAwareSessionStatus()
+    await helper._seed_failed_parked_session(db, "parked")
+    # Backdate the park's created_at beyond the 7-day bound.
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET created_at='2026-08-01T00:00:00+00:00' "
+        "WHERE id='rlp-test0001'",
+    )
+    await db.commit()
+    result = await _check_session_status(db, "camp-sess-1")
+    assert result is not None
+    assert result["success"] is False
+    assert "wait bound exceeded" in result["output_text"]
+    # Codex P2 lock: the abandoned park must be CLOSED — an open park would
+    # let the resume engine run the same campaign action again later.
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_missing_park_row_falls_through_to_session_failure(db):
+    """Audit F3a: session failed with a park_id whose park row is GONE —
+    the sentinel fallback must return the session's own failure, never a
+    permanent still-running None (that would be an invisible stall)."""
+    from genesis.campaigns.runner import _check_session_status
+    from genesis.db.crud import cc_sessions
+
+    await cc_sessions.create(
+        db, id="camp-sess-2", session_type="background_task",
+        model="sonnet", effort="medium", source_tag="campaign",
+        started_at="2026-08-17T10:00:00+00:00",
+        last_activity_at="2026-08-17T10:00:00+00:00",
+    )
+    await db.execute(
+        "UPDATE cc_sessions SET status='failed', metadata=? WHERE id=?",
+        (json.dumps({"park_id": "rlp-gone", "output_text": "boom"}), "camp-sess-2"),
+    )
+    await db.commit()
+    result = await _check_session_status(db, "camp-sess-2")
+    assert result is not None
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_failed_park_cancel_keeps_campaign_attached(db, monkeypatch):
+    """Codex P2 lock: when the over-bound park's cancel FAILS transiently,
+    the campaign must stay attached (None = retry next tick) — returning the
+    failure verdict would detach it while the park stays runnable."""
+    from genesis.campaigns.runner import _check_session_status
+
+    helper = TestParkAwareSessionStatus()
+    await helper._seed_failed_parked_session(db, "parked")
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET created_at='2026-08-01T00:00:00+00:00' "
+        "WHERE id='rlp-test0001'",
+    )
+    await db.commit()
+
+    async def boom(_db, _pid, _status):
+        raise RuntimeError("db lock")
+
+    monkeypatch.setattr(
+        "genesis.db.crud.cc_rate_limit_parks.mark_terminal", boom,
+    )
+    assert await _check_session_status(db, "camp-sess-1") is None
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "parked", "park must remain owned/attached"
+
+
+@pytest.mark.asyncio
+async def test_over_bound_park_with_active_claim_holds(db):
+    """Codex round-3 lock: an over-bound RESUMING park with a FRESH claim may
+    have a live queued delivery — cancelling the row wouldn't stop it, so the
+    campaign must HOLD until the attempt terminates on its own."""
+    from datetime import UTC, datetime
+
+    from genesis.campaigns.runner import _check_session_status
+
+    helper = TestParkAwareSessionStatus()
+    await helper._seed_failed_parked_session(db, "resuming")
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET created_at='2026-08-01T00:00:00+00:00', "
+        "claimed_at=? WHERE id='rlp-test0001'",
+        (datetime.now(UTC).isoformat(),),
+    )
+    await db.commit()
+    assert await _check_session_status(db, "camp-sess-1") is None
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "resuming", "actively-claimed park must survive"
+
+
+@pytest.mark.asyncio
+async def test_over_bound_park_with_stale_claim_abandons(db):
+    """A stale claim (crashed attempt, past the 2h reclaim bound) is safe to
+    abandon — nothing live can execute it."""
+    from genesis.campaigns.runner import _check_session_status
+
+    helper = TestParkAwareSessionStatus()
+    await helper._seed_failed_parked_session(db, "resuming")
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET created_at='2026-08-01T00:00:00+00:00', "
+        "claimed_at='2026-08-01T01:00:00+00:00' WHERE id='rlp-test0001'",
+    )
+    await db.commit()
+    result = await _check_session_status(db, "camp-sess-1")
+    assert result is not None and result["success"] is False
+    row = await (await db.execute(
+        "SELECT status FROM cc_rate_limit_parks WHERE id='rlp-test0001'",
+    )).fetchone()
+    assert str(row["status"]) == "cancelled"

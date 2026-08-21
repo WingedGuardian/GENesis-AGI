@@ -551,3 +551,79 @@ def test_routing_config_reload_endpoint(client):
     load_config.assert_called_once()
     mock_router.reload_config.assert_called_once_with(fake_config)
     mock_router.scan_dlq_orphans_after_reload.assert_awaited_once()
+
+
+def test_settings_put_gate_disable_requires_confirmation(client, tmp_path):
+    """Dashboard PUT disabling the mandatory approval gate without the
+    confirm flag must 409 and write NOTHING; with the flag it applies
+    (2026-08-18: an unconfirmed PUT used to flip it silently)."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+        patch(
+            "genesis.dashboard.routes.settings._notify_gate_disabled",
+            new=AsyncMock(),
+        ) as notify,
+    ):
+        resp = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={"manual_approval_required": False},
+        )
+        assert resp.status_code == 409
+        assert "confirm_disable_approval_gate" in resp.get_json()["details"]
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()
+        notify.assert_not_awaited()
+
+        resp2 = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": True,
+            },
+        )
+        assert resp2.status_code == 200
+        written = (tmp_path / "autonomous_cli_policy.local.yaml").read_text()
+        assert "manual_approval_required: false" in written
+        assert written.startswith("# set-by: user via dashboard PUT")
+        notify.assert_awaited_once()
+
+
+def test_surplus_put_actually_persists_merge(client, tmp_path):
+    """Deep-review SHOULD-FIX lock (pre-existing bug): the surplus PUT
+    discarded _deep_merge's return (it is PURE) and wrote the UNMERGED
+    overlay back while returning ok=True — user changes silently vanished."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+    ):
+        resp = client.put(
+            "/api/genesis/surplus/config",
+            json={"enabled": True},
+        )
+        if resp.status_code == 404:
+            import pytest as _pytest
+
+            _pytest.skip("surplus config route not registered in this blueprint")
+        assert resp.status_code == 200
+        import yaml as _yaml
+
+        written = _yaml.safe_load((tmp_path / "surplus.local.yaml").read_text())
+        assert written.get("enabled") is True
+
+
+def test_settings_put_string_false_does_not_confirm_gate_disable(client, tmp_path):
+    """Security lock: bool('false') is True — a stringly-typed confirm flag
+    must NOT satisfy the gate-disable confirmation."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+    ):
+        resp = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": "false",
+            },
+        )
+        assert resp.status_code == 409
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()

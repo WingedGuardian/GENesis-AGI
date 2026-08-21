@@ -16,9 +16,58 @@ from genesis.mcp.health.settings import (
     _load_yaml_local,
     _load_yaml_merged,
     _local_filename,
+    gate_disable_error,
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _notify_gate_disabled() -> None:
+    """Owner Telegram notice for a confirmed approval-gate disable.
+
+    Best-effort — a notification failure never fails the settings write
+    (the provenance stamp + warning log remain the durable record). Owner-
+    facing delivery is never egress-gated.
+    """
+    try:
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        pipeline = getattr(rt, "outreach_pipeline", None)
+        if not rt.is_bootstrapped or pipeline is None:
+            logger.warning(
+                "Approval gate disabled but outreach pipeline unavailable — "
+                "no Telegram notice sent",
+            )
+            return
+        result = await pipeline.submit(
+            OutreachRequest(
+                category=OutreachCategory.ALERT,
+                topic="Approval gate disabled",
+                context=(
+                    "manual_approval_required was set to FALSE via the "
+                    "dashboard (confirmed). Autonomous Claude Code sessions "
+                    "now dispatch WITHOUT per-run approval until it is set "
+                    "back to true (Settings → autonomous_cli_policy)."
+                ),
+                salience_score=1.0,
+                signal_type="approval_gate_disabled",
+                channel="telegram",
+                verbatim=True,
+            ),
+        )
+        status = getattr(result, "status", None)
+        delivered = getattr(status, "value", status)
+        # Real OutreachStatus values: delivered/engaged are success; pending/
+        # drafted are in-flight (not failures); rejected/failed/unknown warn.
+        if str(delivered).lower() in ("rejected", "failed") or delivered is None:
+            logger.warning(
+                "Gate-disable Telegram notice not delivered (status=%s)",
+                delivered,
+            )
+    except Exception:
+        logger.warning("Gate-disable Telegram notice failed", exc_info=True)
 
 
 def _strip_hidden(domain, data: dict) -> dict:
@@ -83,6 +132,11 @@ async def settings_update(domain_name: str):
     if not changes or not isinstance(changes, dict):
         return jsonify({"error": "Request body must be a JSON object"}), 400
 
+    # Out-of-band confirmation flag — never merged into the config itself.
+    # Strict identity check: bool("false") is True — a client serializing
+    # booleans as strings must NEVER accidentally satisfy the confirmation.
+    confirm_gate = changes.pop("confirm_disable_approval_gate", None) is True
+
     # Validate
     validator = _DOMAIN_VALIDATORS.get(domain_name)
     if validator:
@@ -90,13 +144,37 @@ async def settings_update(domain_name: str):
         if errors:
             return jsonify({"error": "Validation failed", "details": errors}), 422
 
+    # Protected key: disabling the mandatory approval gate requires explicit
+    # confirmation (2026-08-18: a single unconfirmed PUT used to flip it
+    # silently), and a confirmed disable is announced via Telegram below.
+    gate_err = gate_disable_error(domain_name, changes, confirmed=confirm_gate)
+    if gate_err:
+        return jsonify({
+            "error": "confirmation required",
+            "details": gate_err,
+        }), 409
+
     # Write changes to the local overlay (not the base file)
     try:
         local = _load_yaml_local(domain.config_filename)
         new_local = _deep_merge(local, changes)
         local_file = _local_filename(domain.config_filename)
-        _atomic_yaml_write(local_file, new_local)
+        _atomic_yaml_write(
+            local_file, new_local, provenance="user via dashboard PUT",
+        )
         logger.info("Settings domain '%s' updated via dashboard (local overlay)", domain_name)
+        if (
+            domain_name == "autonomous_cli_policy"
+            and changes.get("manual_approval_required") is False
+        ):
+            await _notify_gate_disabled()
+        elif (
+            domain_name == "autonomous_cli_policy"
+            and changes.get("manual_approval_required") is True
+        ):
+            from genesis.mcp.health.settings import resolve_gate_disable_alert
+
+            await resolve_gate_disable_alert("user via dashboard PUT")
         # Return the full merged view
         base = _load_yaml(domain.config_filename)
         merged = _deep_merge(base, new_local)

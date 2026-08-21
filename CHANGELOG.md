@@ -9,7 +9,131 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**
+  After the NIM repoint moved the free NIM tier from V4-pro to V4-flash, this
+  deliverable-quality gate now leads with the paid `openrouter-deepseek-v4`
+  (pro-grade) for maximum review quality, with free NIM flash + paid v4-flash +
+  qwen as fallbacks. A deliberate cost-vs-quality lever on a quality-critical
+  gate; the other repointed sites stay on free flash.
+
+### Fixed
+
+- **The core Claude Code spawner now uses the shared hardened group-kill.**
+  `cc/invoker.py` — the launcher behind every CC session Genesis runs — carried
+  the patterns the repo-wide sweep retired everywhere else: `preexec_fn` spawns,
+  three `getpgid`-based kill paths (which leak the tree once the leader is
+  reaped), two direct-child-only cleanup kills on cancellation/stdin failure,
+  and an unbounded post-kill wait. All migrated to `genesis.util.proc_kill`.
+  Also hardened: any non-timeout exception escaping the streaming loop (a
+  callback raising, an over-limit stream line) now group-kills instead of
+  leaking a detached, unregistered session; the graceful terminate-after-result
+  stop is bounded and escalates to a group kill if the group survives it;
+  post-kill stderr reads are bounded.
+
+- **Dead NVIDIA NIM models retired from routing (silent free→paid fallback leak
+  closed).** NIM EOL'd `deepseek-ai/deepseek-v4-pro` (HTTP 410) and made
+  `moonshotai/kimi-k2.6` 404-for-account (both confirmed by live probe). Every
+  chain led with a dead free provider, so once its breaker opened those ~14 cognitive
+  call-sites silently fell through to paid OpenRouter fallbacks. `nvidia-nim-deepseek`
+  is repointed to the live free `deepseek-ai/deepseek-v4-flash-0731` (fast, valid JSON);
+  the dead `nvidia-nim-kimi` provider is removed and dropped from every chain (base
+  sites fall to `groq-free`, adversarial `_challenge` sites lead with DeepSeek — model
+  independence preserved). The eval `judge` keeps the calibrated paid V4-pro first (NIM
+  now serves flash, not the calibrated pro), and the `38a` procedure-novelty precision
+  gate is pinned to V4-pro only. A new `test_config_invariants.py` locks the dead-slug
+  denylist, per-chain non-NIM fallback, `_challenge` model-independence, and a
+  deepseek-family judge.
+
+- **Subprocess timeouts no longer orphan helper process trees (repo-wide
+  sweep).** Several launchers Genesis runs (the code-review helper, the
+  headless/CLI/recovery-brain `claude` runners, promptfoo/pytest eval
+  scorers, deterministic step commands) fork their own children; on timeout
+  the old kills reached only the direct child, leaving the rest of the tree
+  running until reboot. All eight spawn sites — plus the original autonomy
+  reviewer, migrated off its private copy — now share one hardened guarded
+  group-kill (`genesis.util.proc_kill`): own process group via
+  `start_new_session` (never `preexec_fn` — post-fork deadlock risk in a
+  threaded server), `killpg` on the leader pid directly (immune to the
+  leader-already-reaped race), a `pgid<=1` safety guard, a bounded reap, and
+  a logged fallback when the group kill is refused. The contribution CLI
+  additionally group-kills on Ctrl+C so an interactive abort can't strand
+  its reviewer. The delivery `git push` — which runs under the autonomy
+  executor's single-slot semaphore — also gained a hard 300s bound, closing
+  the last unbounded subprocess wait on that critical path (a
+  network-stalled push could previously wedge all autonomy task execution).
+
+- **Inbox approval-request storm ended.** A stale-hash defect made the inbox
+  monitor see phantom "modified" files every 30-minute scan, each time
+  cancelling the pending approval and sending a fresh Telegram request — up to
+  48 messages a day. The known-hash map is now a single recency scan (newest
+  decisive row wins), and new/changed inbox content while a request is pending
+  parks onto the SAME request instead of cancelling it: one approval message,
+  ever, per outstanding batch — and approving once evaluates everything
+  outstanding at that moment.
+- **Inbox approvals never re-ask.** Delivered inbox approval requests send no
+  reminders (per-policy `reask_overrides` in `autonomous_cli_policy.yaml`,
+  `0` = never; other approval types keep their 24h re-ask). A request whose
+  Telegram delivery FAILED still retries each scan until one send succeeds —
+  that's recovery, not a reminder.
+- **Rate-limit-parked background sessions resume faithfully.** A parked
+  session's re-dispatch now carries its full execution shape (system prompt /
+  strategy doc, attribution tag, skills) instead of resuming with defaults,
+  and campaign bookkeeping follows the park to the delivering session's real
+  result instead of recording a false failed run (bounded at 7 days so a stuck
+  resume can never stall a campaign forever).
+- **Test runs no longer trip the temp-protection watchdog.** pytest writes its
+  scratch tree under `$TMPDIR`, which on a Claude Code session is the
+  budget-policed `~/.genesis/cc-tmp`; a broad suite could fill it and drive the
+  `genesis-tmp-watchgod` service into a sustained high-pressure state. pytest is
+  now redirected to `~/tmp` (off the budget) for every run rooted in the repo,
+  the dev console, autonomy verification, and the eval gauntlet — CI is
+  unaffected.
+- **Temp watchdog no longer loops on non-reclaimable pressure.** When
+  `~/.genesis/cc-tmp` stays over budget after the watchdog's cache cleanup, it
+  now re-measures before considering any idle-session reap (so it never reaps a
+  session that cleanup already made unnecessary) and, if nothing is reclaimable
+  and nothing is safely reapable, raises a single alert instead of re-evaluating
+  every poll.
+
 ### Added
+
+- **Claude Code session exits are recorded.** When a CC session's process exits
+  — a clean quit, a crash, or an OS/kill signal — its exit status (with a
+  signal-decoded hint) and a tail of the terminal are written to
+  `~/.genesis/logs/cc_exit_<slot>.log`, so a session that vanishes is
+  diagnosable instead of leaving no trace. Self-rotating; no effect on the
+  session lifecycle.
+- **cgroup OOM kills are captured.** The temp watchdog now records any new
+  out-of-memory kill in the container cgroup (timestamp, memory state, top
+  processes) to `~/.genesis/logs/oom_events.log` and alerts once — turning a
+  previously invisible cause of vanished processes into a durable signal.
+  Degrades to a no-op on hosts without the cgroup-v2 interface.
+
+- **Telegram DM "scroll-up".** Sessions can now read the conversation archive
+  on demand: `conversation_history` accepts `chat_id` (scoped to one chat) and
+  `before` (page arbitrarily far back, full-length messages), every fresh
+  telegram session is told its own chat id, and the session-recovery recap is
+  character-budgeted and tail-biased so the END of long replies (option lists,
+  conclusions) survives instead of being cut at 300 characters.
+- **Firecrawl as an explicit paid escalation backend.**
+  `web_fetch(url, backend="firecrawl")` / `web_search(query,
+  backend="firecrawl")` reach the Firecrawl cloud API (needs
+  `FIRECRAWL_API_KEY`) — including from Bash-less background sessions. Never
+  part of the automatic chains: it burns credits only when you ask for it.
+- **Claude Code login-expiry warning + background fallback.** The interactive
+  claude.ai login's refresh token has a fixed lifetime that routine use does
+  not extend; Genesis now warns via Telegram days ahead
+  (`GENESIS_CC_LOGIN_EXPIRY_WARN_DAYS`, default 5), and — if the operator has
+  stored a 1-year `claude setup-token` via `scripts/store_cc_token.sh` —
+  background sessions fall back to it when the login is confirmed dead (never
+  over a working login).
+- **Settings writes are provenance-stamped, and disabling the approval gate
+  requires confirmation.** Every settings write records `# set-by: <actor> @
+  <time>` in the overlay file so a deliberate operator choice is never
+  mistaken for drift, and setting `manual_approval_required: false` now needs
+  an explicit confirmation flag and announces itself via Telegram.
 
 - **Opt-in career-outreach monitor (off by default).** A new daily monitor that,
   once enabled, drives a configured external career-agent module to stage
@@ -51,7 +175,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   containing an API token or private key could pass the sanitizer clean. Both scanners
   now work (gitleaks also loads the repo's custom PII rules), and new tests exercise the
   real scanner binaries so this can't silently regress. The privacy scanners for IP
-  addresses, emails, and install fingerprints were unaffected.
+  addresses, emails, and install fingerprints were unaffected. The gitleaks layer was
+  further hardened after a security review: a scanner error (bad config, unexpected
+  exit) now surfaces a visible warning instead of silently reporting "clean"; the
+  scanner's own rules file is pinned to the committed version and is itself on the
+  contribution-forbidden list, so a contribution can't weaken the gate that scans it.
+- **Autonomy no longer wedges when its cross-vendor reviewer hangs.** A task's
+  quality gate runs an adversarial verification through a `codex exec` subprocess.
+  That call had no timeout, so a hung codex (a known upstream model-catalog-refresh
+  hang) would hold the autonomy executor's shared execution slot indefinitely —
+  stalling every queued task until a restart. The call is now bounded by a hard
+  timeout (default 2h, override with `GENESIS_CODEX_REVIEW_TIMEOUT_S`); on timeout
+  the codex process tree is killed and verification degrades to the next reviewer in
+  the chain, freeing the executor. Mirrors the existing hard-timeout on deterministic
+  executor subprocesses.
 
 - **No more false "critical failure" alarms when the system is briefly busy.** The
   health signal that watches your local infrastructure (database, vector store, and

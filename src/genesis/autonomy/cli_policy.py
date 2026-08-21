@@ -7,7 +7,7 @@ import logging
 import os
 import stat
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -67,9 +67,26 @@ class AutonomousCliPolicy:
     autonomous_cli_fallback_enabled: bool = True
     manual_approval_required: bool = True  # MANDATORY — must stay True (see above)
     reask_interval_hours: int = 24
+    # Per-policy re-ask overrides: policy_id -> hours. 0 = NEVER re-send a
+    # delivered pending request (the reminder cadence only — delivery-failure
+    # recovery in the gate is unaffected and applies to every policy). Policies
+    # not listed use the global reask_interval_hours. Shipped default silences
+    # inbox_evaluation only: its requests are idempotent commands over current
+    # inbox state (approve-once clears everything outstanding), and pending
+    # requests stay visible via the dashboard, morning report, and the
+    # "Approve all N pending" rows of other approval sends.
+    reask_overrides: dict[str, int] = field(default_factory=dict)
     approval_channel: str = "telegram"
     shared_export_enabled: bool = True
     source: str = "defaults"
+
+    def reask_hours_for(self, policy_id: str) -> int:
+        """Effective re-ask interval for a policy (0 = never re-ask)."""
+        try:
+            hours = int(self.reask_overrides.get(policy_id, self.reask_interval_hours))
+        except (TypeError, ValueError):
+            hours = self.reask_interval_hours
+        return max(0, hours)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -85,8 +102,9 @@ def load_autonomous_cli_policy(path: Path | None = None) -> AutonomousCliPolicy:
         manual_approval_required=_env_bool(
             "GENESIS_AUTONOMOUS_CLI_APPROVAL_ENABLED", True,
         ),
+        # 0 is a legal value (= never re-ask); clamp only negatives.
         reask_interval_hours=max(
-            1, _env_int("GENESIS_AUTONOMOUS_CLI_REASK_INTERVAL_HOURS", 24),
+            0, _env_int("GENESIS_AUTONOMOUS_CLI_REASK_INTERVAL_HOURS", 24),
         ),
         approval_channel=(
             os.environ.get("GENESIS_AUTONOMOUS_APPROVAL_CHANNEL", "telegram")
@@ -121,6 +139,29 @@ def load_autonomous_cli_policy(path: Path | None = None) -> AutonomousCliPolicy:
         )
         return defaults
 
+    # 0 = never re-ask is a LEGAL value: a plain `or 24` would swallow it and
+    # max(1, …) would clamp it away, so parse None-aware and clamp only
+    # negatives. (2026-08 storm follow-up: "no reminders" must be expressible.)
+    _reask_raw = raw.get("reask_interval_hours", defaults.reask_interval_hours)
+    try:
+        _reask = max(0, int(_reask_raw)) if _reask_raw is not None else (
+            defaults.reask_interval_hours
+        )
+    except (TypeError, ValueError):
+        _reask = defaults.reask_interval_hours
+
+    _overrides_raw = raw.get("reask_overrides")
+    _overrides: dict[str, int] = {}
+    if isinstance(_overrides_raw, dict):
+        for _pid, _hours in _overrides_raw.items():
+            try:
+                _overrides[str(_pid)] = max(0, int(_hours))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring non-integer reask_overrides entry %r: %r",
+                    _pid, _hours,
+                )
+
     return AutonomousCliPolicy(
         autonomous_cli_fallback_enabled=bool(
             raw.get(
@@ -131,10 +172,8 @@ def load_autonomous_cli_policy(path: Path | None = None) -> AutonomousCliPolicy:
         manual_approval_required=bool(
             raw.get("manual_approval_required", defaults.manual_approval_required),
         ),
-        reask_interval_hours=max(
-            1,
-            int(raw.get("reask_interval_hours", defaults.reask_interval_hours) or 24),
-        ),
+        reask_interval_hours=_reask,
+        reask_overrides=_overrides,
         approval_channel=str(
             raw.get("approval_channel", defaults.approval_channel) or "telegram",
         ).strip().lower() or "telegram",
@@ -170,6 +209,7 @@ class AutonomousCliPolicyExporter:
             "autonomous_cli_fallback_enabled": policy.autonomous_cli_fallback_enabled,
             "manual_approval_required": policy.manual_approval_required,
             "reask_interval_hours": policy.reask_interval_hours,
+            "reask_overrides": dict(policy.reask_overrides),
             "approval_channel": policy.approval_channel,
             "exported_at": datetime.now(UTC).isoformat(),
             "source": policy.source,
