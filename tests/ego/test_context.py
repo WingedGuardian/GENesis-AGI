@@ -32,7 +32,8 @@ async def db():
                 content TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 resolved INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                origin_class TEXT
             )
         """)
         await conn.execute("""

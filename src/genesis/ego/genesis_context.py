@@ -367,7 +367,8 @@ class GenesisEgoContextBuilder:
             # not in _USER_WORLD_CATEGORIES that isn't :user tagged.
             exclude_placeholders = ",".join("?" for _ in _USER_WORLD_CATEGORIES)
             cursor = await self._db.execute(
-                f"SELECT id, source, type, category, content, priority, created_at "  # noqa: S608 - literal SQL fragments; values bound as parameters
+                f"SELECT id, source, type, category, content, priority, created_at, "  # noqa: S608 - literal SQL fragments; values bound as parameters
+                f"origin_class "
                 f"FROM observations "
                 f"WHERE resolved = 0 "
                 f"AND created_at >= datetime('now', '-48 hours') "
@@ -407,10 +408,14 @@ class GenesisEgoContextBuilder:
         except Exception:
             logger.debug("Failed to record observation read-receipts", exc_info=True)
 
+        from genesis.memory.provenance import wrap_if_external
+
         lines.append(f"**{len(rows)} items** (sorted by priority):\n")
-        for _id, source, obs_type, category, content, priority, _created_at in rows:
+        for _id, source, obs_type, category, content, priority, _created_at, origin_class in rows:
             short = content[:200] + "..." if len(content) > 200 else content
             short = short.replace("\n", " ")
+            # WS-3: truncate/flatten FIRST, then wrap external-origin content.
+            short = wrap_if_external(short, origin_class)
             cat_str = f"/{category}" if category else ""
             lines.append(
                 f"- [{priority}] **{source}{cat_str}** ({obs_type}): {short}"
@@ -656,11 +661,21 @@ class GenesisEgoContextBuilder:
         lines = ["## Recent Execution Outcomes (48h)\n"]
 
         try:
+            # WS-3: type/source pins are forgeable via observation_write; this
+            # content lands in the genesis-ego prompt — exclude external origin
+            # (NULL kept; legit ego_dispatch outcomes are server-written).
+            from genesis.db.crud.observations import (
+                EXCLUDE_EXTERNAL_ORIGIN_PARAMS,
+                EXCLUDE_EXTERNAL_ORIGIN_SQL,
+            )
+
             cursor = await self._db.execute(
-                "SELECT content, priority, created_at FROM observations "
+                "SELECT content, priority, created_at FROM observations "  # noqa: S608 - shared constant fragment; values bound as params
                 "WHERE type = 'execution_outcome' AND source = 'ego_dispatch' "
                 "AND created_at >= datetime('now', '-48 hours') "
-                "ORDER BY created_at DESC LIMIT 10"
+                f"AND {EXCLUDE_EXTERNAL_ORIGIN_SQL} "
+                "ORDER BY created_at DESC LIMIT 10",
+                EXCLUDE_EXTERNAL_ORIGIN_PARAMS,
             )
             rows = await cursor.fetchall()
         except Exception:

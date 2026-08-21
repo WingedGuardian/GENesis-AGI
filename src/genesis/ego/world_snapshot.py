@@ -110,11 +110,16 @@ class WorldSnapshot:
 
         # User-world signals (observations)
         if self.user_signals:
+            from genesis.memory.provenance import wrap_if_external
+
             parts.append("### Recent Signals\n")
             for sig in self.user_signals[:10]:
                 priority = sig.get("priority", "medium")
                 content = sig.get("content", "")[:150]
                 content = content.replace("\n", " ")
+                # WS-3: truncate/flatten FIRST, then wrap — external-origin
+                # content renders inside <external-content> markers.
+                content = wrap_if_external(content, sig.get("origin_class"))
                 parts.append(f"- [{priority}] {content}")
             parts.append("")
 
@@ -161,8 +166,13 @@ async def build(db: aiosqlite.Connection) -> WorldSnapshot:
 
     # 4. User-world observation signals (unresolved, last 7 days)
     try:
+        # WS-3: origin_class is carried through so render() can wrap
+        # external_untrusted content in <external-content> markers at render
+        # time (post-truncation — wrapping first would let the [:150] cut clip
+        # the closing marker).
         cursor = await db.execute(
-            "SELECT source, type, category, content, priority, created_at "
+            "SELECT source, type, category, content, priority, created_at, "
+            "origin_class "
             "FROM observations "
             "WHERE resolved = 0 "
             "AND type IN ('user_signal', 'finding', 'interaction_theme') "
@@ -182,6 +192,7 @@ async def build(db: aiosqlite.Connection) -> WorldSnapshot:
             {
                 "source": r[0], "type": r[1], "category": r[2],
                 "content": r[3], "priority": r[4], "created_at": r[5],
+                "origin_class": r[6],
             }
             for r in rows
         ]
