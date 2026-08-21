@@ -285,12 +285,17 @@ class ContextAssembler:
         try:
             # Pass 1: reflection-origin observations (exclude micro — low-value
             # free-model output that adds noise to higher-depth context).
+            # WS-3 (both passes): reflection context is laundering-sensitive —
+            # its outputs become window-origin-stamped deltas — so external
+            # rows are excluded at the query (NULL kept; source pins are not
+            # protection, observation_write takes source as a free param).
             reflection_obs = await observations.query(
                 db,
                 resolved=False,
                 source_in=_REFLECTION_SOURCES,
                 limit=refl_cap,
                 exclude_types=("micro_reflection",),
+                exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
             )
             # Pass 2: everything else
             other_obs = await observations.query(
@@ -298,6 +303,7 @@ class ContextAssembler:
                 resolved=False,
                 limit=other_cap,
                 exclude_types=("micro_reflection",),
+                exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
             )
 
             # Depth-specific age guard — drop observations older than the cutoff
@@ -381,11 +387,16 @@ class ContextAssembler:
             since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
 
         try:
+            # WS-3: type-pin is forgeable via observation_write — exclude
+            # external rows (NULL kept). NOTE this consumer json.loads the
+            # content, so query-level exclusion (not marker-wrapping) is the
+            # only compatible defense here.
             light_obs = await observations.query(
                 db,
                 resolved=False,
                 type="light_reflection",
                 limit=15,
+                exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
             )
             # Filter to observations since last run at this depth
             light_obs = [o for o in light_obs if o.get("created_at", "") >= since]
