@@ -878,6 +878,12 @@ verified: ca875c4b 2026-07-24
   deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
   `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
   only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
+  Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
+  ego with no COMPLETED cycle past a conservative multiple of its current
+  interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
+  `next_fire_at` proxies that stay green through a deadlock) raises one
+  self-superseding `high` `ego_alert` per ego, auto-resolving when a cycle lands;
+  `gated`/`paused`/fresh-install are never stalls.
   Also per-tick (WS-2 M10) the SINGLE designated `alert_events` writer:
   `_persist_health_alerts` recomputes the firing set via the pure
   `mcp/health/errors.py::_compute_alerts()` and reconciles a durable open-set
