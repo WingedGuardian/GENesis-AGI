@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime
 
 from genesis.db.crud import observations
+from genesis.memory.provenance import ORIGIN_FIRST_PARTY, session_origin_from_env
 
 from ..memory import mcp
 
@@ -43,6 +44,14 @@ async def observation_write(
         created_at=datetime.now(UTC).isoformat(),
         category=category,
         speculative=int(speculative),
+        # WS-3: stamp the dispatching session's origin (mirrors memory_store /
+        # procedure_store / knowledge writers), so an external-origin session
+        # (e.g. the inbox judge over untrusted content) can no longer forge a
+        # privileged-looking observation — a NULL origin used to read as
+        # first-party "by omission" and slip past the user-model consumer gate.
+        # Coalesce None → first_party (server/foreground writers); the gate
+        # normalizes adversarially, so a raw None must never be forwarded.
+        origin_class=session_origin_from_env() or ORIGIN_FIRST_PARTY,
         skip_if_duplicate=True,
     )
     return result or "duplicate_skipped"

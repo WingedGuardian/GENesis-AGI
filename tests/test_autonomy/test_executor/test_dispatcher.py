@@ -226,6 +226,9 @@ class TestDispatchCycle:
             "id": "obs-1",
             "content": "Build feature Y",
             "metadata": {"plan_path": str(plan)},
+            # Trusted origin: this fixture exercises the DISPATCH path, which the
+            # WS-3 poisoning gate now allows only for owner/first_party rows.
+            "origin_class": "first_party",
         }
 
         with (
@@ -250,6 +253,8 @@ class TestDispatchCycle:
             "id": "obs-2",
             "content": "Already running",
             "metadata": {"plan_path": "/some/path"},
+            # Trusted origin: exercises the dedup path past the WS-3 origin gate.
+            "origin_class": "first_party",
         }
 
         with (

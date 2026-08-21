@@ -1626,22 +1626,22 @@ async def test_precheck_refreshes_when_new_files_added_while_blocked(
 async def test_refresh_path_with_live_rows_folds_unchanged_sibling(
     monitor, inbox_dir, mock_invoker, db,
 ):
-    """The genuine refresh path (driver B): when an approval with LIVE parked
-    rows is pending and genuinely-new content arrives, the orphan-guard HOLDS
-    (live rows exist) and falls through to the refresh path — which cancels the
-    held approval, folds the unchanged parked sibling into the batch, and
-    re-parks BOTH files under the fresh approval. This proves the orphan-guard
-    does not short-circuit the fold, and that an unchanged sibling is not
-    stranded (the leapfrog the nag was made of)."""
+    """Park-onto-pending (2026-08-18 idempotent-approval semantics): when an
+    approval with LIVE parked rows is pending and genuinely-new content
+    arrives, the orphan-guard HOLDS (live rows exist), the request is NEVER
+    cancelled, the unchanged parked sibling stays parked untouched on the
+    SAME request, and the new file's drop parks alongside it (the gate's
+    stable site key re-attaches it — mocked here as the same decision id).
+    No new approval message is ever produced for content changes."""
     pending_site_row = {
         "id": "req-a",
         "status": "pending",
         "action_type": "autonomous_cli_fallback",
         "_context": {"subsystem": "inbox", "policy_id": "inbox_evaluation"},
     }
-    # A fresh approval id is minted after the refresh-cancel.
+    # The gate's stable key re-attaches new drops to the SAME pending request.
     decision = AutonomousDispatchDecision(
-        mode="blocked", reason="approval requested", approval_request_id="req-b",
+        mode="blocked", reason="approval pending", approval_request_id="req-a",
     )
     monitor._autonomous_dispatcher = _make_wired_dispatcher(
         decision=decision,
@@ -1656,12 +1656,11 @@ async def test_refresh_path_with_live_rows_folds_unchanged_sibling(
     await monitor.check_once()
 
     disp = monitor._autonomous_dispatcher
-    # The held approval was cancelled by the REFRESH path (not left uncancelled),
-    # exactly once, for req-a.
-    disp.approval_gate.approval_manager.cancel.assert_called_once_with("req-a")
+    # The held approval is NEVER cancelled by new content.
+    disp.approval_gate.approval_manager.cancel.assert_not_called()
 
-    # Both the new file AND the folded unchanged sibling are re-parked under the
-    # fresh approval (req-b) — nothing stranded.
+    # Both files are parked on the SAME request — the sibling's original row
+    # untouched, the new file's drop alongside it.
     from genesis.db.crud import inbox_items
 
     rows = [
@@ -1670,16 +1669,18 @@ async def test_refresh_path_with_live_rows_folds_unchanged_sibling(
             await db.execute(
                 "SELECT file_path, status, error_message FROM inbox_items "
                 "WHERE status='processing' AND error_message = ?",
-                (f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-b",),
+                (f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-a",),
             )
         ).fetchall()
     ]
-    reparked = {Path(r["file_path"]).name for r in rows}
-    assert reparked == {"held.md", "arrived.md"}, reparked
+    parked = {Path(r["file_path"]).name for r in rows}
+    assert parked == {"held.md", "arrived.md"}, parked
 
-    # The original parked row for the sibling was superseded (failed), not left live.
+    # The sibling's original parked row is STILL the live one (not superseded —
+    # its file never changed).
     old = await inbox_items.get_by_id(db, "row-req-a")
-    assert old["status"] == "failed"
+    assert old["status"] == "processing"
+    assert (old["error_message"] or "").startswith("awaiting_approval:req-a")
 
 
 @pytest.mark.asyncio

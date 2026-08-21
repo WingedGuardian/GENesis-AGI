@@ -694,6 +694,31 @@ class AutonomousCliApprovalGate:
         invocation: CCInvocation | None,
         api_error: str | None,
     ) -> bool:
+        # Delivery-failure recovery comes FIRST and applies to every policy
+        # regardless of re-ask settings: while no successful delivery is on
+        # record, retry the send each tick — the user never received the one
+        # message they are entitled to. Once delivered, the re-ask policy
+        # below governs.
+        if context.get("delivery_id") is None:
+            await self._send_request(
+                request_id=request_id,
+                context=context,
+                action_label=action_label,
+                invocation=invocation,
+                api_error=api_error,
+            )
+            logger.info(
+                "Retried undelivered approval request %s for %s/%s",
+                request_id, subsystem, policy_id,
+            )
+            return True
+
+        # Re-ask 0 = NEVER remind about a delivered pending request. Checked
+        # BEFORE the stored next_reask_at so legacy rows written pre-deploy
+        # (with an already-elapsed window) cannot resend once.
+        if self._policy().reask_hours_for(policy_id) <= 0:
+            return False
+
         next_reask_at = context.get("next_reask_at")
         if next_reask_at:
             try:
@@ -835,9 +860,17 @@ class AutonomousCliApprovalGate:
         if delivery_id is not None:
             now = datetime.now(UTC)
             context["last_sent_at"] = now.isoformat()
+            # Per-policy re-ask interval; 0 = never remind → no next_reask_at
+            # (and _maybe_resend independently short-circuits on reask 0, so a
+            # legacy value here is harmless).
+            reask_hours = self._policy().reask_hours_for(
+                str(context.get("policy_id") or ""),
+            )
             context["next_reask_at"] = (
-                now + timedelta(hours=max(1, self._policy().reask_interval_hours))
-            ).isoformat()
+                (now + timedelta(hours=reask_hours)).isoformat()
+                if reask_hours > 0
+                else None
+            )
         await self._approval_manager.update_context(
             request_id, context=_context_dump(context),
         )

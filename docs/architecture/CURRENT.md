@@ -220,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 51253c67 2026-08-13
+verified: d71d1d39 2026-08-18
 ```
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
@@ -235,10 +235,35 @@ verified: 51253c67 2026-08-13
   value, not an orphaned constant). `sentinel/dispatcher._DEGRADED_DISALLOWED_TOOLS` keeps
   its own literal (deliberate import-cycle avoidance) but is held ⊇ by
   `tests/test_cc/test_spawn_lockdown.py`, which locks the class so a new denylist that
-  forgets spawn-blocking fails CI. NOTE: the inbox/mail judges are spawn-hardened here but
-  are NOT yet fully read-only — they still leave `Bash` (and, for inbox, memory/settings
-  MCP writes) available on external input; closing that broader boundary is a separate
-  tracked follow-up.
+  forgets spawn-blocking fails CI. The mail judge — whose prompt uses NO tools — now runs
+  an ACT-NOTHING denylist (Bash + all file-edit + spawn + side-effecting actions + web
+  tools, closing the Read+WebFetch exfil path), and its empty-MCP config is resolved via
+  the canonical `build_mcp_config("none")` (the old hand-counted `parents[2]` path pointed
+  at a nonexistent `src/config/no_mcp.json`). The inbox judge denies every genesis MCP
+  *write* (`memory_store`/`settings_update`/`follow_up_create`/…) via
+  `build_reflection_disallowed` minus `Bash`, keeping the reads it needs plus the optional
+  `observation_write`. RESIDUALS on the inbox judge: (1) `Bash` — STILL retained for the
+  `yt-dlp`/`curl` YouTube-fetch path (injection→RCE surface, open — follow-up 727a3724);
+  (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
+  memory-provenance work): `observation_write` stamps the session origin
+  (`session_origin_from_env`) so an eval-session write lands `external_untrusted`, and BOTH
+  user-model consumers — `process_pending_deltas` (accept) and `synthesize_narrative`
+  (evidence → USER_KNOWLEDGE.md) — read only trusted-origin deltas via the SQL
+  `origin_class_in=TRUSTED_PRIVILEGED_WRITE_ORIGINS` filter (filtering in-query, not
+  post-LIMIT, so a forged-delta flood can't starve trusted deltas out of the window, and a
+  TTL-resolved barred delta can't launder into the narrative). Fail-closed on NULL; barred
+  rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
+  pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
+  — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
+  stamping is in the follow-up). **PARTIAL — the broader
+  observation-content-INJECTION surface is still OPEN** (tracked follow-up): the digest types
+  the judge writes (`user_signal`/`architecture_insight`) are surfaced UNFILTERED into LLM
+  context by consumers this change did NOT touch — `essential_knowledge._recent_decisions`
+  (raw SQL → the always-loaded L1 file), `reflection.gather_evaluation_context` (14-day
+  lookback → deep-reflection prompt → can launder into a `first_party`-stamped delta), and
+  several ego/sentinel raw-`FROM observations` reads. The robust fix is to exclude/wrap
+  external-origin content (`is_blockable`, keeping NULL) at the surfacing points, with a
+  coverage guardrail that also catches raw-SQL consumers.
   **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
   DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
   the autonomy-executor sessions; those legitimately spawn/orchestrate and need a
@@ -1435,7 +1460,7 @@ verified: 3c514f3e 2026-08-10
   don't merge them. Memory-resilience invariants are first-class facts:
   container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
-  laid down by `scripts/lib/memory_resilience.sh` from bootstrap/update) and
+  laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
   installs (see docs/reference/memory-resilience.md). Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +

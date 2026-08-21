@@ -58,6 +58,7 @@ from genesis.eval.types import (
     ScorerType,
     TaskCategory,
 )
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -194,21 +195,43 @@ def _release_lock(fh) -> None:
         fh.close()
 
 
-async def _run_pytest(workdir: Path) -> tuple[int, str]:
-    """Run the fixture's pytest suite in ``workdir``. Returns (exit_code, output)."""
+async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
+    """Run the fixture's pytest suite in ``workdir``. Returns (exit_code, output).
+
+    ``basetemp`` MUST live OUTSIDE ``workdir`` (the copied project the model
+    edited): pytest wipes ``--basetemp`` before collection, so a basetemp nested
+    in the project would delete any top-level file/dir of the same name the
+    fixture or the model's solution legitimately created → a false failure. It is
+    also off cc-tmp — this foreign fixture has its own rootdir, so the genesis
+    ``tests/conftest.py`` redirect never loads for it (see
+    ``genesis.util.tmp.should_redirect_pytest_basetemp``); without an explicit
+    basetemp its tmp would default to ``$TMPDIR`` (watchgod-policed cc-tmp).
+    """
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "--basetemp", str(basetemp),
         cwd=str(workdir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        # Own group so the timeout kill reaps forked test children too.
+        start_new_session=True,
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=_PYTEST_TIMEOUT_S)
     except TimeoutError:  # asyncio.TimeoutError is an alias of TimeoutError on 3.11+
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        await proc.wait()
+        # Group-kill (guarded pid-as-pgid) + BOUNDED reap — a bare kill
+        # orphans forked test processes, and an unbounded wait() can hang
+        # the recovery itself.
+        kill_process_group(proc)
+        await reap_bounded(proc)
         return -1, "pytest scoring timed out"
+    except asyncio.CancelledError:
+        # Ctrl+C during scoring (asyncio.run cancels this task): with its own
+        # session pytest never sees the terminal SIGINT — group-kill before
+        # propagating or the tree runs on after the worktree is deleted.
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        raise
     return proc.returncode, out.decode(errors="replace")
 
 
@@ -284,7 +307,9 @@ async def _run_one_fixture(
                 output_tokens=output.output_tokens,
             )
 
-        pyrc, pytest_out = await _run_pytest(workdir)
+        # basetemp under workroot (the temp PARENT of workdir), so it is outside
+        # the copied project and reaped with workroot at line ~319.
+        pyrc, pytest_out = await _run_pytest(workdir, workroot / "_pytest_tmp")
         if "No module named pytest" in pytest_out:
             return _skip(fx, "pytest unavailable in gauntlet environment")
         passed = pyrc == 0

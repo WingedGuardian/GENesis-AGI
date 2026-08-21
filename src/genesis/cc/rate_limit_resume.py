@@ -56,6 +56,15 @@ async def _redispatch(db, park: dict) -> None:
         effort=payload.get("effort", "high"),
         timeout_s=int(payload.get("timeout_s", 3600)),
         roster_model=payload.get("roster_model"),
+        # Preserve the parked request's full execution shape (system prompt,
+        # attribution, skills) — legacy parks without these keys resume with
+        # the old defaults. Delivery is deliberately overridden to
+        # RESULT-to-origin regardless of the original notify flags.
+        system_prompt=payload.get("system_prompt"),
+        source_tag=payload.get("source_tag", "direct_session"),
+        skills=payload.get("skills"),
+        tool_exceptions=payload.get("tool_exceptions"),
+        planning_instruction=payload.get("planning_instruction"),
         notify=False,
         notify_on_failure_only=False,
         delivery_mode="result",

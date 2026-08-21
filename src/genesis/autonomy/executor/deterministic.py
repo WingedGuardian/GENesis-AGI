@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 from genesis.autonomy.executor.types import StepResult, StepType
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,10 @@ async def execute_deterministic_step(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
+            # Own session/group (setsid in the C helper) so the timeout kill
+            # can reap the WHOLE tree — step commands can fork (bash &, tox,
+            # pytest-xdist); killing only the direct child orphans those.
+            start_new_session=True,
         )
         # Read with stream limit to prevent memory exhaustion
         # Hard timeout prevents a hung subprocess from blocking the
@@ -224,14 +229,17 @@ async def execute_deterministic_step(
                 timeout=_HARD_TIMEOUT_S,
             )
             await proc.wait()
+        except asyncio.CancelledError:
+            # Cancellation mid-step: the detached step tree sees no ambient
+            # signal — group-kill before propagating or it runs on.
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
         except TimeoutError:
             duration = time.monotonic() - start
-            # Kill the hung process
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            # Group-kill the hung tree (guarded pid-as-pgid), bounded reap.
+            kill_process_group(proc)
+            await reap_bounded(proc)
             logger.warning(
                 "Deterministic step %d timed out after %.0fs",
                 idx, duration,

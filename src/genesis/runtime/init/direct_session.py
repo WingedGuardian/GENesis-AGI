@@ -49,10 +49,44 @@ async def _recover_stale_claims(db) -> None:
         logger.error("Direct session stale claim recovery failed", exc_info=True)
 
 
-async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
-    """Poll direct_session_queue for pending items, dispatch to runner."""
+def request_from_payload(payload: dict):
+    """Build a DirectSessionRequest from a queue payload — the single mapping
+    between the serialized queue/park shape and the live request.
+
+    Every execution-affecting field must round-trip here: an unmapped field
+    silently reverts to its default on resume (a parked campaign once resumed
+    without its strategy doc because system_prompt was dropped). Legacy
+    payloads without the newer keys keep the old defaults.
+    """
     from genesis.cc.direct_session import DirectSessionRequest
     from genesis.cc.types import CCModel, DeliveryMode, EffortLevel
+
+    delivery_mode_raw = payload.get("delivery_mode")
+    tool_exceptions = payload.get("tool_exceptions")
+    return DirectSessionRequest(
+        prompt=payload["prompt"],
+        profile=payload.get("profile", "observe"),
+        model=CCModel(payload.get("model", "sonnet")),
+        effort=EffortLevel(payload.get("effort", "high")),
+        timeout_s=payload.get("timeout_s", 3600),
+        notify=payload.get("notify", True),
+        notify_on_failure_only=payload.get("notify_on_failure_only", False),
+        caller_context=payload.get("caller_context"),
+        roster_model=payload.get("roster_model"),
+        system_prompt=payload.get("system_prompt"),
+        source_tag=payload.get("source_tag") or "direct_session",
+        skills=payload.get("skills"),
+        tool_exceptions=(tuple(tool_exceptions) if tool_exceptions is not None else ()),
+        planning_instruction=payload.get("planning_instruction"),
+        # Origin-delivery (added by the deliver_to_origin dispatch path);
+        # absent on legacy rows → None → derived legacy behavior.
+        origin_session_id=payload.get("origin_session_id"),
+        delivery_mode=(DeliveryMode(delivery_mode_raw) if delivery_mode_raw else None),
+    )
+
+
+async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
+    """Poll direct_session_queue for pending items, dispatch to runner."""
     from genesis.db.crud import direct_session_queue as dsq
 
     # Crash recovery on boot: reset claims orphaned before a crash/restart.
@@ -83,22 +117,7 @@ async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
             queue_id = row["id"]
             try:
                 payload = json.loads(row["payload_json"])
-                delivery_mode_raw = payload.get("delivery_mode")
-                request = DirectSessionRequest(
-                    prompt=payload["prompt"],
-                    profile=payload.get("profile", "observe"),
-                    model=CCModel(payload.get("model", "sonnet")),
-                    effort=EffortLevel(payload.get("effort", "high")),
-                    timeout_s=payload.get("timeout_s", 3600),
-                    notify=payload.get("notify", True),
-                    notify_on_failure_only=payload.get("notify_on_failure_only", False),
-                    caller_context=payload.get("caller_context"),
-                    roster_model=payload.get("roster_model"),
-                    # Origin-delivery (added by the deliver_to_origin dispatch path);
-                    # absent on legacy rows → None → derived legacy behavior.
-                    origin_session_id=payload.get("origin_session_id"),
-                    delivery_mode=(DeliveryMode(delivery_mode_raw) if delivery_mode_raw else None),
-                )
+                request = request_from_payload(payload)
                 session_id = await runner.spawn(request)
                 await dsq.mark_dispatched(db, queue_id, session_id)
                 logger.info(

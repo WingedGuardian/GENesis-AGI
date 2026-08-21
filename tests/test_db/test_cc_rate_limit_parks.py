@@ -235,6 +235,149 @@ async def test_prune_terminal_keeps_needs_user(db):
     assert await parks.get_by_id(db, pid) is None
 
 
+async def test_mark_terminal_if_unchanged_versions_on_status_and_claim(db):
+    """Conditional terminal cancel: fires ONLY when both the read status AND
+    claimed_at still match — the TOCTOU guard for the over-bound campaign cancel.
+    A plain status mismatch must no-op (return False, row untouched)."""
+    pid = await parks.upsert_open_park(
+        db,
+        kind="direct_session",
+        dedup_key="k",
+        payload=_payload(),
+        origin_session_id="s",
+        limit_kind="session",
+        raw_signal=None,
+        reset_at=None,
+        next_attempt_at="2026-07-22T17:00:00+00:00",
+    )
+    # Fresh parked row: status='parked', claimed_at IS NULL.
+    uat = (await parks.get_by_id(db, pid))["updated_at"]
+    # (1) status mismatch → no-op.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="resuming",
+            expected_claimed_at=None,
+            expected_updated_at=uat,
+        )
+        is False
+    )
+    assert (await parks.get_by_id(db, pid))["status"] == "parked"
+    # (2) exact match (parked, NULL, updated_at) → cancels and nulls claimed_at.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="parked",
+            expected_claimed_at=None,
+            expected_updated_at=uat,
+        )
+        is True
+    )
+    row = await parks.get_by_id(db, pid)
+    assert row["status"] == "cancelled"
+    assert row["claimed_at"] is None
+
+
+async def test_mark_terminal_if_unchanged_detects_refreshed_claim(db):
+    """Red-team case: status can return to 'resuming' after a recover→claim
+    re-entry while claimed_at is FRESH. Versioning on claimed_at (not status
+    alone) makes a stale-claim cancel no-op against a live re-claim."""
+    pid = await parks.upsert_open_park(
+        db,
+        kind="direct_session",
+        dedup_key="k",
+        payload=_payload(),
+        origin_session_id="s",
+        limit_kind="session",
+        raw_signal=None,
+        reset_at=None,
+        next_attempt_at="2026-07-22T17:00:00+00:00",
+    )
+    await parks.claim(db, pid)  # parked→resuming, claimed_at=fresh
+    row = await parks.get_by_id(db, pid)
+    fresh_claim = row["claimed_at"]
+    uat = row["updated_at"]
+    assert row["status"] == "resuming" and fresh_claim is not None
+    # A cancel that read a STALE claim for the same 'resuming' status must NOT
+    # fire — claimed_at differs even though status matches.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="resuming",
+            expected_claimed_at="2026-08-01T01:00:00+00:00",
+            expected_updated_at=uat,
+        )
+        is False
+    )
+    assert (await parks.get_by_id(db, pid))["status"] == "resuming"
+    # The correct (status, claimed_at, updated_at) triple DOES fire.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="resuming",
+            expected_claimed_at=fresh_claim,
+            expected_updated_at=uat,
+        )
+        is True
+    )
+    assert (await parks.get_by_id(db, pid))["status"] == "cancelled"
+
+
+async def test_mark_terminal_if_unchanged_detects_aba_relimit(db):
+    """Codex P2: a concurrent claim→relimit can return the row to the SAME
+    (parked, NULL) the caller read while REFRESHING attempts/schedule. Versioning
+    on updated_at (not just status+claimed_at) makes the stale-snapshot cancel
+    no-op against that freshly re-limited work."""
+    pid = await parks.upsert_open_park(
+        db,
+        kind="direct_session",
+        dedup_key="k",
+        payload=_payload(),
+        origin_session_id="s",
+        limit_kind="session",
+        raw_signal=None,
+        reset_at=None,
+        next_attempt_at="2026-07-22T17:00:00+00:00",
+    )
+    old = await parks.get_by_id(db, pid)  # (parked, NULL, updated_at=U1)
+    assert old["status"] == "parked" and old["claimed_at"] is None
+    # Concurrent resume re-limits it: claim → relimit returns to (parked, NULL)
+    # with a NEW updated_at and refreshed attempts.
+    await parks.claim(db, pid)
+    st = await parks.relimit(
+        db,
+        pid,
+        reset_at=None,
+        next_attempt_at="2026-07-22T20:00:00+00:00",
+        needs_user_at_attempts=3,
+    )
+    assert st == "parked"
+    now_row = await parks.get_by_id(db, pid)
+    assert now_row["claimed_at"] is None and now_row["attempts"] == 1
+    assert now_row["updated_at"] != old["updated_at"]
+    # A cancel versioned on the STALE (U1) snapshot must NOT fire.
+    assert (
+        await parks.mark_terminal_if_unchanged(
+            db,
+            pid,
+            "cancelled",
+            expected_status="parked",
+            expected_claimed_at=None,
+            expected_updated_at=old["updated_at"],
+        )
+        is False
+    )
+    assert (await parks.get_by_id(db, pid))["status"] == "parked"
+
+
 @pytest.mark.parametrize("bad_status", ["bogus", "PARKED", ""])
 async def test_status_check_constraint(db, bad_status):
     import sqlite3
