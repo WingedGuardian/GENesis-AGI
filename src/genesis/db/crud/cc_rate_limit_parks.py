@@ -227,30 +227,36 @@ async def mark_terminal_if_unchanged(
     *,
     expected_status: str,
     expected_claimed_at: str | None,
+    expected_updated_at: str,
 ) -> bool:
     """Force a terminal status ONLY if the row still holds (expected_status,
-    expected_claimed_at) — the atomic guard for a check-then-cancel decision.
+    expected_claimed_at, expected_updated_at) — the atomic guard for a
+    check-then-cancel decision.
 
-    Versions on BOTH status AND claimed_at: a resume tick can advance a park
-    (parked→resuming→resumed, or recover→re-claim) between the caller's read and
-    this write, and claimed_at is the finer signal — a recover_stale_resuming +
-    fresh claim returns status to 'resuming' but with a NEW claimed_at, so a
-    status-only guard would clobber a live resume. NULL-safe on claimed_at.
-    True iff exactly this row was updated (the read was still current)."""
+    Versions on status, claimed_at, AND updated_at. updated_at is a monotonic
+    version bumped by EVERY writer (claim/mark_resumed/relimit/recover), so it
+    closes the ABA hole that (status, claimed_at) alone leaves: a concurrent
+    claim→relimit can return the row to the SAME (parked, NULL) the caller read
+    while refreshing attempts + retry schedule — versioning on updated_at makes
+    the cancel no-op against that freshly re-limited work. NULL-safe on
+    claimed_at. True iff exactly this row was updated (the read was still
+    current)."""
     now = _now()
     if expected_claimed_at is None:
         cursor = await db.execute(
             """UPDATE cc_rate_limit_parks
                SET status = ?, claimed_at = NULL, updated_at = ?
-               WHERE id = ? AND status = ? AND claimed_at IS NULL""",
-            (status, now, park_id, expected_status),
+               WHERE id = ? AND status = ? AND claimed_at IS NULL
+                 AND updated_at = ?""",
+            (status, now, park_id, expected_status, expected_updated_at),
         )
     else:
         cursor = await db.execute(
             """UPDATE cc_rate_limit_parks
                SET status = ?, claimed_at = NULL, updated_at = ?
-               WHERE id = ? AND status = ? AND claimed_at = ?""",
-            (status, now, park_id, expected_status, expected_claimed_at),
+               WHERE id = ? AND status = ? AND claimed_at = ?
+                 AND updated_at = ?""",
+            (status, now, park_id, expected_status, expected_claimed_at, expected_updated_at),
         )
     await db.commit()
     return cursor.rowcount == 1

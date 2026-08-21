@@ -562,135 +562,12 @@ def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
 # Check-run conclusions / statuses that mean the CI is NOT green.
 _CI_RED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 _CI_RED_STATES = {"FAILURE", "ERROR"}  # legacy StatusContext state
-# SKIPPED/NEUTRAL are genuinely non-blocking. STALE is NOT: `gh` (2.96.0,
-# empirically verified) buckets a COMPLETED+STALE CheckRun as `pending`, and a
-# stale run never produced a passing verdict — so it must block. STALE is
-# deliberately ABSENT here so it falls to the terminal catch-all → pending.
-# (Live CheckConclusionState enum, 2026-08: SUCCESS/FAILURE/CANCELLED/TIMED_OUT/
-# ACTION_REQUIRED/STARTUP_FAILURE/SKIPPED/NEUTRAL/STALE — SKIPPED/NEUTRAL skip,
-# SUCCESS green, four red, STALE + any future/unknown value → pending.)
 _CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL"}
 _CI_GREEN = {"SUCCESS"}
 # The only CheckRun.status that means "finished". Everything else
 # (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so
 # a new/renamed non-terminal state can never be silently mistaken for green.
 _CI_TERMINAL_STATUSES = {"COMPLETED"}
-
-
-def _entry_ci_class(c: dict) -> str:
-    """Classify ONE rollup entry into 'red' | 'green' | 'skip' | 'pending' |
-    'ignore'. 'ignore' = a non-CI-shaped payload (e.g. a review-comment mock)
-    that must not read as red/green. Pure function."""
-    conclusion = c.get("conclusion")  # CheckRun
-    status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
-    state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
-    if conclusion in _CI_SKIP_CONCLUSIONS:
-        return "skip"
-    if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
-        return "red"
-    if conclusion in _CI_GREEN or state in _CI_GREEN:
-        return "green"
-    if status in _CI_TERMINAL_STATUSES:
-        # COMPLETED, conclusion not in any recognized set (recognized non-blocking
-        # ones incl. STALE, and SUCCESS/red, were caught above). Two sub-cases:
-        #   - conclusion is None: GitHub's documented "no verdict reported"
-        #     nullable — treated as non-blocking (a deliberate, tested choice;
-        #     a COMPLETED+null is transient/anomalous and resolves on re-poll).
-        #   - a non-null value we don't recognize (a future GitHub enum): could
-        #     be failure-like, so fail toward BLOCKING (pending), mirroring gh's
-        #     own `default: return pending`. A merge gate must not silently pass
-        #     an unknown terminal verdict.
-        return "skip" if conclusion is None else "pending"
-    if status is not None or state is not None:
-        # Non-terminal CheckRun status (QUEUED/IN_PROGRESS/WAITING/REQUESTED/…)
-        # or ANY legacy StatusContext state not already classified red/green —
-        # PENDING and EXPECTED both mean "required check not yet passed", and an
-        # unknown future state defaults to blocking (mirrors gh's reference
-        # classifier). Only a payload with NO status/state/conclusion at all is
-        # a non-CI shape.
-        return "pending"
-    return "ignore"  # no status/state/conclusion — unrecognized shape
-
-
-def _group_ci_verdict(entries: list[dict]) -> str:
-    """Verdict for all rollup entries sharing one check identity. Returns
-    'red' | 'green' | 'pending' | 'skip'.
-
-    Core invariant (a MERGE-AUTHORIZATION decision — fail closed everywhere):
-    **a prior red in the group is cleared ONLY by a strictly-later INVOCATION
-    that terminally SUCCEEDED, under the SAME real workflow identity.**
-
-    1. Any non-terminal entry (a re-run in flight) → 'pending'. Short-circuits
-       BEFORE any ordering, so a queued re-run (no startedAt/completedAt) can
-       never be mis-ranked and let an older success win (the wrong-green trap).
-    2. Supersession by "latest run" is trusted ONLY when the group is
-       "ordering-trustworthy":
-       - a single, NON-EMPTY ``workflowName`` — bare check ``name`` equality is
-         not run identity, and an ABSENT workflowName is not identity either
-         (two different apps both yield None and would collide), so None/'' →
-         unorderable → fail closed;
-       - every entry carries a non-empty STRING ``startedAt`` AND ``completedAt``
-         (a non-string/absent value → unorderable, never a TypeError);
-       - the invocation-order key is unique (no tie for "latest").
-    3. Ordering is by ``startedAt`` (when the run BEGAN — the invocation order),
-       with ``completedAt`` only as a tiebreaker: a superseded run can COMPLETE
-       after its replacement (overlapping runs from different triggers), so
-       ``completedAt`` alone mis-orders them. The unique latest invocation
-       decides; a latest that is skip/neutral does NOT launder a prior red —
-       only a genuine SUCCESS does.
-    4. Anything not ordering-trustworthy → fail CLOSED: any red → 'red'.
-
-    Residual (documented, not a live path in Genesis CI): an actor able to
-    create check runs *within the same non-empty workflowName* as a real failing
-    job (a workflow with ``checks: write`` running attacker-influenced content,
-    e.g. a future ``pull_request_target``-checkout-untrusted pattern) could still
-    supersede a red. Genesis's workflows grant no ``checks: write`` and use no
-    ``pull_request_target`` today; adding either reopens this — keep them out.
-
-    Operational note: an ABSENT ``workflowName`` is also NORMAL for non-Actions
-    GitHub App checks (CodeQL *default setup*, Vercel/Netlify/Codecov-style
-    integrations) — for those, a transient red can only be cleared by a new
-    commit (dedup never fires without an identity). Genesis runs CodeQL via an
-    Actions workflow (workflowName populated), so this doesn't bite today; it
-    would if a non-Actions app check were added as required.
-    """
-    classes = [_entry_ci_class(c) for c in entries]
-    if any(cls == "pending" for cls in classes):
-        return "pending"
-    has_red = any(cls == "red" for cls in classes)
-    workflows = {c.get("workflowName") for c in entries}
-    # A single, real (non-empty) workflow identity.
-    single_identity = len(workflows) == 1 and bool(next(iter(workflows)))
-
-    def _valid_ts(c: dict) -> bool:
-        started, completed = c.get("startedAt"), c.get("completedAt")
-        return bool(
-            isinstance(started, str) and started and isinstance(completed, str) and completed
-        )
-
-    orderable = single_identity and all(_valid_ts(c) for c in entries)
-    if orderable:
-        # Invocation order: startedAt primary, completedAt tiebreaker.
-        keys = [(c["startedAt"], c["completedAt"]) for c in entries]
-        max_key = max(keys)
-        top = [c for c, k in zip(entries, keys, strict=True) if k == max_key]
-        if len(top) == 1:
-            latest_cls = _entry_ci_class(top[0])
-            if latest_cls == "green":
-                return "green"  # a genuine later invocation supersedes a red
-            if latest_cls == "red":
-                return "red"
-            # Latest is skip/neutral — it must NOT launder a prior red.
-            return "red" if has_red else "skip"
-        # Ambiguous latest (tie on the invocation key) → fail closed.
-        return "red" if has_red else "green"
-    # Not ordering-trustworthy (missing/non-string timestamps, or absent/mixed
-    # workflow identity) → fail closed: never coin-flip a red to green.
-    if has_red:
-        return "red"
-    if any(cls == "green" for cls in classes):
-        return "green"
-    return "skip"
 
 
 def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
@@ -739,38 +616,43 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     if not isinstance(checks, list) or not checks:
         return "unknown", []
 
-    # Group rollup entries by identity (name for CheckRun, context for
-    # StatusContext), then let each group's LATEST run decide. GitHub's UI and
-    # `gh pr checks` both dedupe latest-per-name; without this a concurrency-
-    # cancelled duplicate run leaves a stale `cancelled` entry that reads red
-    # forever even though the name's newest run is SUCCESS (MEASURED on the
-    # #1408 merge: two `cancelled` + two `success` Analyze entries → red).
-    groups: dict[str, list[dict]] = {}
+    red: list[str] = []
+    pending: list[str] = []
+    saw_recognized = False
     for c in checks:
         if not isinstance(c, dict):
             continue
-        if _entry_ci_class(c) == "ignore":
-            continue  # unrecognized shape — doesn't establish CI recognition
         name = c.get("name") or c.get("context") or "check"
-        groups.setdefault(name, []).append(c)
-
-    if not groups:
-        return "unknown", []  # payload had no CI-shaped entries
-
-    red: list[str] = []
-    pending: list[str] = []
-    for name, entries in groups.items():
-        verdict = _group_ci_verdict(entries)
-        if verdict == "red":
+        conclusion = c.get("conclusion")  # CheckRun
+        status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
+        state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
+        if conclusion in _CI_SKIP_CONCLUSIONS:
+            saw_recognized = True
+            continue
+        if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
+            saw_recognized = True
             red.append(name)
-        elif verdict == "pending":
+        elif conclusion in _CI_GREEN or state in _CI_GREEN:
+            saw_recognized = True
+        elif status in _CI_TERMINAL_STATUSES:
+            # COMPLETED with an unrecognized/None conclusion — treat as done,
+            # don't fabricate pending; ignore this entry.
+            saw_recognized = True
+        elif status is not None or state == "PENDING":
+            # ANY non-terminal CheckRun status (QUEUED/IN_PROGRESS/PENDING/
+            # WAITING/REQUESTED/…) or a PENDING StatusContext is unfinished →
+            # block. Enumerating "known pending" states would silently miss new
+            # ones (P1 review finding), so we invert: not-terminal ⇒ pending.
+            saw_recognized = True
             pending.append(name)
-        # "green"/"skip" → not blocking
+        # else: no status/state/conclusion at all — unrecognized shape, ignore
 
     if red:
         return "red", sorted(set(red))
     if pending:
         return "pending", sorted(set(pending))
+    if not saw_recognized:
+        return "unknown", []  # payload had no CI-shaped entries
     return "green", []
 
 

@@ -409,8 +409,8 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
     """
     try:
         cursor = await db.execute(
-            "SELECT status, created_at, claimed_at FROM cc_rate_limit_parks "
-            "WHERE id = ?",
+            "SELECT status, created_at, claimed_at, updated_at "
+            "FROM cc_rate_limit_parks WHERE id = ?",
             (park_id,),
         )
         park_row = await cursor.fetchone()
@@ -463,6 +463,7 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
                         "cancelled",
                         expected_status=park_status,
                         expected_claimed_at=park_row["claimed_at"],
+                        expected_updated_at=park_row["updated_at"],
                     )
                 except Exception:
                     logger.warning(

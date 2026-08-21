@@ -547,7 +547,10 @@ async def test_failed_park_cancel_keeps_campaign_attached(db, monkeypatch):
     )
     await db.commit()
 
-    async def boom(_db, _pid, _status, *, expected_status=None, expected_claimed_at=None):
+    async def boom(
+        _db, _pid, _status, *,
+        expected_status=None, expected_claimed_at=None, expected_updated_at=None,
+    ):
         raise RuntimeError("db lock")
 
     monkeypatch.setattr(
@@ -607,7 +610,8 @@ async def test_over_bound_cancel_noops_when_claim_refreshed_in_window(db, monkey
     real_guard = parks.mark_terminal_if_unchanged
 
     async def refresh_then_guard(
-        _db, park_id, new_status, *, expected_status, expected_claimed_at,
+        _db, park_id, new_status, *,
+        expected_status, expected_claimed_at, expected_updated_at,
     ):
         # Simulate the concurrent resume re-claim inside the TOCTOU window:
         # same status, fresh claimed_at.
@@ -620,6 +624,7 @@ async def test_over_bound_cancel_noops_when_claim_refreshed_in_window(db, monkey
             _db, park_id, new_status,
             expected_status=expected_status,
             expected_claimed_at=expected_claimed_at,
+            expected_updated_at=expected_updated_at,
         )
 
     monkeypatch.setattr(parks, "mark_terminal_if_unchanged", refresh_then_guard)
