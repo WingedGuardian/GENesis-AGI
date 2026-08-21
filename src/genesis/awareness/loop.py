@@ -861,7 +861,11 @@ async def _check_ego_liveness(db) -> None:
         from genesis.autonomy.cli_policy import load_autonomous_cli_policy
         from genesis.db.crud import ego as ego_crud
         from genesis.db.crud import job_health as job_health_crud
-        from genesis.ego.liveness import compute_ego_liveness
+        from genesis.ego.config import load_ego_config
+        from genesis.ego.liveness import (
+            compute_ego_liveness,
+            quiet_suppress_floor_minutes,
+        )
         from genesis.runtime import GenesisRuntime
 
         rt = GenesisRuntime.instance()
@@ -869,14 +873,30 @@ async def _check_ego_liveness(db) -> None:
             gate_on = load_autonomous_cli_policy().manual_approval_required
         except Exception:
             gate_on = True
+        # A GLOBAL runtime pause legitimately stops every ego — treat it like a
+        # per-ego pause so a long pause never reads as a stall.
+        globally_paused = bool(getattr(rt, "paused", False))
+        try:
+            _ego_config = load_ego_config()
+        except Exception:
+            _ego_config = None
         managers = (
             ("user_ego_cycle", getattr(rt, "_ego_cadence_manager", None)),
             ("genesis_ego_cycle", getattr(rt, "_genesis_ego_cadence_manager", None)),
         )
         for source_tag, mgr in managers:
-            if mgr is None:
-                continue
             source = _EGO_LIVENESS_SOURCES[source_tag]
+            # A disabled ego (no manager) has no cadence to be overdue against —
+            # clear any standing stall alert rather than leaving it open forever.
+            if mgr is None:
+                await observations.resolve_by_source_and_type(
+                    db,
+                    source=source,
+                    type=_EGO_LIVENESS_TYPE,
+                    resolved_at=datetime.now(UTC).isoformat(),
+                    resolution_notes="auto-resolved: ego disabled (no cadence manager)",
+                )
+                continue
             try:
                 last_success = await job_health_crud.get_job_last_success(
                     db,
@@ -885,11 +905,18 @@ async def _check_ego_liveness(db) -> None:
                 gated = (
                     await ego_crud.has_pending_cli_approval(db, source_tag) if gate_on else False
                 )
+                quiet_floor = quiet_suppress_floor_minutes(
+                    mode=getattr(_ego_config, "quiet_hours_mode", "floor"),
+                    start_hour=getattr(_ego_config, "quiet_hours_start", 0),
+                    end_hour=getattr(_ego_config, "quiet_hours_end", 0),
+                    interval_minutes=mgr.current_interval_minutes,
+                )
                 live = compute_ego_liveness(
                     last_success_at=last_success,
                     current_interval_minutes=mgr.current_interval_minutes,
                     gated=gated,
-                    is_paused=mgr.is_paused,
+                    is_paused=mgr.is_paused or globally_paused,
+                    quiet_floor_minutes=quiet_floor,
                 )
             except Exception:
                 logger.debug(
@@ -900,12 +927,17 @@ async def _check_ego_liveness(db) -> None:
                 continue
 
             if not live.stalled:
+                # Covers a completed cycle OR the ego going gated/paused/globally
+                # paused since the last alert — all legitimately non-stalled.
                 await observations.resolve_by_source_and_type(
                     db,
                     source=source,
                     type=_EGO_LIVENESS_TYPE,
                     resolved_at=datetime.now(UTC).isoformat(),
-                    resolution_notes="auto-resolved: ego completed a cycle",
+                    resolution_notes=(
+                        "auto-resolved: ego no longer stalled "
+                        "(cycle completed, or now gated/paused)"
+                    ),
                 )
                 continue
 

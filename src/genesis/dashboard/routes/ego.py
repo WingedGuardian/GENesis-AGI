@@ -111,17 +111,30 @@ async def ego_status():
         snap["stall_reason"] = None
         try:
             from genesis.db.crud import job_health as job_health_crud
-            from genesis.ego.liveness import compute_ego_liveness
+            from genesis.ego.liveness import (
+                compute_ego_liveness,
+                quiet_suppress_floor_minutes,
+            )
 
             last_success = await job_health_crud.get_job_last_success(
                 rt._db,
                 mgr.source_tag,
             )
+            # A GLOBAL runtime pause (not just this ego's pause) legitimately
+            # stops cycles — treat it as paused so a long pause is not a stall.
+            globally_paused = bool(getattr(rt, "paused", False))
+            quiet_floor = quiet_suppress_floor_minutes(
+                mode=getattr(config, "quiet_hours_mode", "floor"),
+                start_hour=getattr(config, "quiet_hours_start", 0),
+                end_hour=getattr(config, "quiet_hours_end", 0),
+                interval_minutes=mgr.current_interval_minutes,
+            )
             live = compute_ego_liveness(
                 last_success_at=last_success,
                 current_interval_minutes=mgr.current_interval_minutes,
                 gated=bool(snap.get("gated")),
-                is_paused=bool(snap.get("is_paused")),
+                is_paused=bool(snap.get("is_paused")) or globally_paused,
+                quiet_floor_minutes=quiet_floor,
             )
             snap["last_success_at"] = live.last_success_at
             snap["stalled"] = live.stalled

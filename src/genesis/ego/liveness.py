@@ -42,6 +42,34 @@ class EgoLiveness:
     reason: str | None
 
 
+def quiet_suppress_floor_minutes(
+    *,
+    mode: str,
+    start_hour,
+    end_hour,
+    interval_minutes: float,
+) -> float:
+    """Minutes to floor the stall threshold at for a quiet-hours SUPPRESS window.
+
+    Only ``mode == "suppress"`` fully suppresses cycles for the window's span; in
+    "floor" mode ticks still fire (throttled), so cycles keep landing and no
+    floor is needed. Returns the window span plus one interval of slack, or 0.0
+    when suppression does not apply / the config is unusable.
+    """
+    if str(mode) != "suppress":
+        return 0.0
+    try:
+        start = int(start_hour)
+        end = int(end_hour)
+        interval = float(interval_minutes)
+    except (TypeError, ValueError):
+        return 0.0
+    if start == end:
+        return 0.0
+    span_hours = (end - start) % 24
+    return span_hours * 60.0 + max(interval, 0.0)
+
+
 def _parse(iso: str | None) -> datetime | None:
     if not iso:
         return None
@@ -52,13 +80,29 @@ def _parse(iso: str | None) -> datetime | None:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
 
 
-def stall_threshold_minutes(current_interval_minutes: float) -> float:
-    """The conservative overdue threshold for a given current interval."""
+def stall_threshold_minutes(
+    current_interval_minutes: float,
+    quiet_floor_minutes: float = 0.0,
+) -> float:
+    """The conservative overdue threshold for a given current interval.
+
+    ``quiet_floor_minutes`` lets a caller raise the floor to cover a configured
+    quiet-hours *suppress* window (which legitimately suppresses cycles for its
+    whole span) so that window never reads as a stall.
+    """
     try:
         interval = float(current_interval_minutes)
     except (TypeError, ValueError):
         interval = 0.0
-    return max(interval * STALL_INTERVAL_MULTIPLE, float(STALL_FLOOR_MINUTES))
+    try:
+        quiet = float(quiet_floor_minutes)
+    except (TypeError, ValueError):
+        quiet = 0.0
+    return max(
+        interval * STALL_INTERVAL_MULTIPLE,
+        float(STALL_FLOOR_MINUTES),
+        quiet,
+    )
 
 
 def compute_ego_liveness(
@@ -67,17 +111,23 @@ def compute_ego_liveness(
     current_interval_minutes: float,
     gated: bool,
     is_paused: bool,
+    quiet_floor_minutes: float = 0.0,
     now: datetime | None = None,
 ) -> EgoLiveness:
     """Return the liveness verdict for one ego from its last real cycle.
 
     ``last_success_at`` is ``job_health.last_success`` (ISO). ``None`` means no
     completed cycle yet (fresh install) → never stalled. ``gated`` / ``is_paused``
-    → never stalled (legitimate non-running states). Otherwise stalled iff the
-    gap since the last completed cycle exceeds the conservative threshold.
+    (which the caller sets true for a GLOBAL runtime pause too) → never stalled
+    (legitimate non-running states). ``quiet_floor_minutes`` raises the threshold
+    to cover a quiet-hours suppress window. Otherwise stalled iff the gap since
+    the last completed cycle exceeds the conservative threshold.
     """
     now = now or datetime.now(UTC)
-    threshold = stall_threshold_minutes(current_interval_minutes)
+    threshold = stall_threshold_minutes(
+        current_interval_minutes,
+        quiet_floor_minutes,
+    )
     last = _parse(last_success_at)
     if last is None:
         return EgoLiveness(last_success_at, False, None, threshold, None)

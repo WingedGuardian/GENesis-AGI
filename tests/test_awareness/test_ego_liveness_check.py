@@ -35,13 +35,14 @@ def _mgr(interval=90, paused=False):
     return SimpleNamespace(current_interval_minutes=interval, is_paused=paused)
 
 
-def _wire(monkeypatch, *, user_mgr=None, genesis_mgr=None, gate_on=True):
+def _wire(monkeypatch, *, user_mgr=None, genesis_mgr=None, gate_on=True, paused=False):
     from genesis import runtime as rt_mod
     from genesis.autonomy import cli_policy
 
     fake_rt = SimpleNamespace(
         _ego_cadence_manager=user_mgr,
         _genesis_ego_cadence_manager=genesis_mgr,
+        paused=paused,
     )
     monkeypatch.setattr(rt_mod.GenesisRuntime, "instance", lambda: fake_rt)
     monkeypatch.setattr(
@@ -112,6 +113,34 @@ async def test_recent_ego_no_alert(db, monkeypatch):
 
     assert await _open_count(db, USER_SRC) == 0
     assert await _open_count(db, GEN_SRC) == 0
+
+
+@pytest.mark.asyncio
+async def test_global_pause_suppresses_alert(db, monkeypatch):
+    """A global runtime pause legitimately stops cycles → no stall alert even
+    when last_success is old."""
+    _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=None, gate_on=False, paused=True)
+    await _seed_last_success(db, "user_ego_cycle", 3 * 24 * 60)
+
+    await loop._check_ego_liveness(db)
+
+    assert await _open_count(db, USER_SRC) == 0
+
+
+@pytest.mark.asyncio
+async def test_disabled_ego_resolves_open_alert(db, monkeypatch):
+    """An ego that was stalled and is then disabled (manager gone) must clear
+    its standing alert, not leave it open forever."""
+    # First raise an alert with the ego present + stalled.
+    _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=None, gate_on=False)
+    await _seed_last_success(db, "user_ego_cycle", 3 * 24 * 60)
+    await loop._check_ego_liveness(db)
+    assert await _open_count(db, USER_SRC) == 1
+
+    # Now the ego is disabled: manager is None.
+    _wire(monkeypatch, user_mgr=None, genesis_mgr=None, gate_on=False)
+    await loop._check_ego_liveness(db)
+    assert await _open_count(db, USER_SRC) == 0
 
 
 @pytest.mark.asyncio
