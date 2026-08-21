@@ -164,6 +164,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `notifications` reason-allowlist in `github_steward.yaml`; respects the same
   `off`/`observe`/`live` lever and pings immediately in `live`.
 
+### Security
+
+- **Untrusted content can no longer poison your user model or trigger autonomy.**
+  Background sessions that process external material (e.g. the inbox evaluator over
+  the links you drop in) now write observations stamped with their true origin, and
+  the pipelines that would auto-apply an observation into privileged state — your
+  learned user model, and autonomous task dispatch — refuse any update whose origin
+  isn't first-party. A crafted item can no longer smuggle a high-confidence "fact
+  about you" into Genesis's self-model or spawn a task. Refused updates are held
+  (not discarded) and logged, and normal reflection-authored updates are unaffected.
+
 ### Fixed
 
 - **Autonomy no longer wedges when its cross-vendor reviewer hangs.** A task's
