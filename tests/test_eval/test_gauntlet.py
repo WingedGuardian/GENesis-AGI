@@ -447,7 +447,7 @@ class TestRunPytestBounded:
             return proc
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
-        rc, out = await g._run_pytest(tmp_path)
+        rc, out = await g._run_pytest(tmp_path, tmp_path / "_pt_bt")
         assert rc == -1
         assert "timed out" in out
         assert len(killpg_calls) == 1
@@ -468,7 +468,7 @@ class TestRunPytestBounded:
             return proc
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
-        rc, out = await g._run_pytest(tmp_path)
+        rc, out = await g._run_pytest(tmp_path, tmp_path / "_pt_bt")
         assert rc == 0
         assert captured.get("start_new_session") is True
         assert "preexec_fn" not in captured
@@ -504,7 +504,7 @@ class TestRunPytestBounded:
             return proc
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
-        task = _asyncio.get_running_loop().create_task(g._run_pytest(tmp_path))
+        task = _asyncio.get_running_loop().create_task(g._run_pytest(tmp_path, tmp_path / "_pt_bt"))
         await started.wait()
         task.cancel()
         with pytest.raises(_asyncio.CancelledError):

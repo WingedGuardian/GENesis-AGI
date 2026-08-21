@@ -471,6 +471,15 @@ class CCInvoker:
             (inv.claude_code_tmpdir if inv and inv.claude_code_tmpdir else None)
             or self._CC_SANDBOX_TMPDIR
         )
+        # Keep TMPDIR consistent with CLAUDE_CODE_TMPDIR (never inconsistent — the
+        # invariant util/tmp.py protects). This also completes the per-invocation
+        # sandbox isolation above: without it a headless session's *subprocess*
+        # temp (e.g. the gauntlet agent running the fixture's pytest, whose
+        # tmp_path defaults under $TMPDIR) still lands in the inherited cc-tmp and
+        # can trip genesis-tmp-watchgod. For the default sandbox both resolve to
+        # cc-tmp (unchanged); for an override (gauntlet) TMPDIR follows it off
+        # cc-tmp.
+        env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
         # Prevent CC's alt-screen renderer from corrupting terminal scrollback
         # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
@@ -488,6 +497,11 @@ class CCInvoker:
         # cleanroom). Applied last by contract; see CCInvocation.env_overrides.
         if inv and inv.env_overrides:
             env.update(inv.env_overrides)
+            # Preserve the TMPDIR ≡ CLAUDE_CODE_TMPDIR invariant even if an
+            # override changed CLAUDE_CODE_TMPDIR but not TMPDIR (else the two
+            # silently desync). An explicit TMPDIR override still wins.
+            if "CLAUDE_CODE_TMPDIR" in inv.env_overrides and "TMPDIR" not in inv.env_overrides:
+                env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:

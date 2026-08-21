@@ -83,8 +83,33 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   and campaign bookkeeping follows the park to the delivering session's real
   result instead of recording a false failed run (bounded at 7 days so a stuck
   resume can never stall a campaign forever).
+- **Test runs no longer trip the temp-protection watchdog.** pytest writes its
+  scratch tree under `$TMPDIR`, which on a Claude Code session is the
+  budget-policed `~/.genesis/cc-tmp`; a broad suite could fill it and drive the
+  `genesis-tmp-watchgod` service into a sustained high-pressure state. pytest is
+  now redirected to `~/tmp` (off the budget) for every run rooted in the repo,
+  the dev console, autonomy verification, and the eval gauntlet — CI is
+  unaffected.
+- **Temp watchdog no longer loops on non-reclaimable pressure.** When
+  `~/.genesis/cc-tmp` stays over budget after the watchdog's cache cleanup, it
+  now re-measures before considering any idle-session reap (so it never reaps a
+  session that cleanup already made unnecessary) and, if nothing is reclaimable
+  and nothing is safely reapable, raises a single alert instead of re-evaluating
+  every poll.
 
 ### Added
+
+- **Claude Code session exits are recorded.** When a CC session's process exits
+  — a clean quit, a crash, or an OS/kill signal — its exit status (with a
+  signal-decoded hint) and a tail of the terminal are written to
+  `~/.genesis/logs/cc_exit_<slot>.log`, so a session that vanishes is
+  diagnosable instead of leaving no trace. Self-rotating; no effect on the
+  session lifecycle.
+- **cgroup OOM kills are captured.** The temp watchdog now records any new
+  out-of-memory kill in the container cgroup (timestamp, memory state, top
+  processes) to `~/.genesis/logs/oom_events.log` and alerts once — turning a
+  previously invisible cause of vanished processes into a durable signal.
+  Degrades to a no-op on hosts without the cgroup-v2 interface.
 
 - **Telegram DM "scroll-up".** Sessions can now read the conversation archive
   on demand: `conversation_history` accepts `chat_id` (scoped to one chat) and

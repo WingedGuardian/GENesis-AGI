@@ -195,10 +195,21 @@ def _release_lock(fh) -> None:
         fh.close()
 
 
-async def _run_pytest(workdir: Path) -> tuple[int, str]:
-    """Run the fixture's pytest suite in ``workdir``. Returns (exit_code, output)."""
+async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
+    """Run the fixture's pytest suite in ``workdir``. Returns (exit_code, output).
+
+    ``basetemp`` MUST live OUTSIDE ``workdir`` (the copied project the model
+    edited): pytest wipes ``--basetemp`` before collection, so a basetemp nested
+    in the project would delete any top-level file/dir of the same name the
+    fixture or the model's solution legitimately created → a false failure. It is
+    also off cc-tmp — this foreign fixture has its own rootdir, so the genesis
+    ``tests/conftest.py`` redirect never loads for it (see
+    ``genesis.util.tmp.should_redirect_pytest_basetemp``); without an explicit
+    basetemp its tmp would default to ``$TMPDIR`` (watchgod-policed cc-tmp).
+    """
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "--basetemp", str(basetemp),
         cwd=str(workdir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -296,7 +307,9 @@ async def _run_one_fixture(
                 output_tokens=output.output_tokens,
             )
 
-        pyrc, pytest_out = await _run_pytest(workdir)
+        # basetemp under workroot (the temp PARENT of workdir), so it is outside
+        # the copied project and reaped with workroot at line ~319.
+        pyrc, pytest_out = await _run_pytest(workdir, workroot / "_pytest_tmp")
         if "No module named pytest" in pytest_out:
             return _skip(fx, "pytest unavailable in gauntlet environment")
         passed = pyrc == 0

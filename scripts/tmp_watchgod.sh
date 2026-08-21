@@ -28,6 +28,13 @@ STATE_FILE="$HOME/.genesis/watchgod_state.json"
 LOG_FILE="$HOME/.genesis/logs/tmp_watchgod.log"
 ALERT_DIR="$HOME/.genesis/alerts"
 
+# OOM event capture: the container cgroup-v2 cumulative oom_kill counter, and a
+# durable log for the snapshots. OOM_EVENTS_FILE is overridable so tests can
+# point it at a fixture file. OOM_LOG lives beside the watchgod log (NOT in
+# cc-tmp) so it survives cleanup.
+OOM_EVENTS_FILE="${OOM_EVENTS_FILE:-/sys/fs/cgroup/memory.events}"
+OOM_LOG="$(dirname "$LOG_FILE")/oom_events.log"
+
 # Durable alert queue (F.3) — emergency-tier events page Telegram via the
 # container drainer. Guarded: if the lib is ever not co-located, degrade to a
 # no-op so `set -e` can never take the service down over an alert.
@@ -152,7 +159,7 @@ clean_cc_yellow() {
 
 clean_cc_orange() {
     clean_cc_yellow
-    log WARN "Zone A ORANGE — deleting caches, killing idle sessions"
+    log WARN "Zone A ORANGE — deleting caches, then re-measuring before any session kill"
 
     # Delete claude-skills cache (~35MB, CC re-clones on demand)
     find "$CC_TMP_DIR" -type d -name "claude-skills" -exec rm -rf {} + 2>/dev/null || true
@@ -160,7 +167,31 @@ clean_cc_orange() {
     # Delete tsx cache (~1.2MB, rebuilt automatically)
     find "$CC_TMP_DIR" -type d -name "tsx-*" -exec rm -rf {} + 2>/dev/null || true
 
+    mkdir -p "$ALERT_DIR"
+    touch "$ALERT_DIR/tmp_warning"
+
+    # LOOP-BREAK: re-measure AFTER the cleanup above and kill idle sessions ONLY
+    # if we're still over the ORANGE line. This closes the runaway that killed no
+    # session but churned for ~4.5h on 2026-08-19: the tier that dispatched us
+    # here was measured BEFORE cleanup, so without a re-measure the daemon would
+    # re-enter ORANGE every poll and re-run the kill loop forever while the real
+    # filler (a pytest tree the cache-evict never touches) sat untouched. Killing
+    # an idle session cannot reduce cc-tmp anyway (sessions aren't the filler), so
+    # a kill here is at best useless and at worst reaps an innocent bystander.
+    # Use dir_usage_mb (du) — it drops immediately after rm; df can lag on
+    # held-open deleted fds.
+    local used_after threshold_orange
+    used_after=$(dir_usage_mb "$CC_TMP_DIR")
+    threshold_orange=$(( CC_TMP_BUDGET_MB * 75 / 100 ))
+    if (( used_after <= threshold_orange )); then
+        log INFO "ORANGE resolved by cache cleanup (used=${used_after}MB <= ${threshold_orange}MB) — no session kills"
+        rm -f "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
+        return 0
+    fi
+
+    log WARN "ORANGE persists after cleanup (used=${used_after}MB > ${threshold_orange}MB) — evaluating idle sessions"
     # Kill idle CC tmux sessions (unattached, idle > 2h)
+    local killed_any=0
     while IFS= read -r session; do
         [[ -z "$session" ]] && continue
         local sname
@@ -173,14 +204,30 @@ clean_cc_orange() {
             local idle_s=$(( now - last_activity ))
             if (( idle_s > 7200 )); then
                 log WARN "Killing idle CC session: $sname (idle ${idle_s}s)"
-                tmux kill-session -t "$sname" 2>/dev/null || true
+                # Count a reap only when tmux actually killed it — if the session
+                # vanished between listing and killing (or the kill fails), we
+                # reclaimed nothing, so killed_any must stay 0 and the stuck
+                # marker must still be recorded rather than silently skipped.
+                if tmux kill-session -t "$sname" 2>/dev/null; then
+                    killed_any=1
+                fi
             fi
         fi
     done < <(tmux list-sessions -F '#{session_name}:#{session_attached}' 2>/dev/null | grep ':0$' || true)
 
-    # Alert
-    mkdir -p "$ALERT_DIR"
-    touch "$ALERT_DIR/tmp_warning"
+    # Stuck-ORANGE: cleanup didn't resolve it AND nothing was killable → the
+    # daemon has nothing safe left to do. Per design D2 (ORANGE is dashboard/log
+    # only — only RED pages) this does NOT page; it records the stuck state ONCE
+    # (dedupe flag) in the log instead of silently re-polling forever, so the
+    # condition is discoverable. If cc-tmp keeps filling it escalates to RED,
+    # which DOES page. The flag is cleared (main loop) whenever cc-tmp LEAVES
+    # ORANGE (green/yellow/red) — never on a kill: reaping an idle session does
+    # not reduce cc-tmp, so a kill that leaves us ORANGE keeps cc_tier==orange and
+    # must not re-arm and re-log the same episode.
+    if (( killed_any == 0 )) && [[ ! -f "$ALERT_DIR/tmp_orange_stuck" ]]; then
+        log WARN "cc-tmp STUCK ORANGE (used=${used_after}MB, budget=${CC_TMP_BUDGET_MB}MB): reclaim freed nothing and no idle (>2h) session is killable — non-reclaimable data is filling cc-tmp (see cc_tmp_top snapshots). Dashboard/log-only per D2; RED will page if it escalates."
+        touch "$ALERT_DIR/tmp_orange_stuck"
+    fi
 }
 
 clean_cc_red() {
@@ -357,10 +404,71 @@ check_sys_tmp() {
     echo "$tier:$pct"
 }
 
+# ── OOM event capture (best-effort, cgroup v2) ───────────────
+# A cgroup OOM kill silently collapses a CC session (tmux `exec claude` → claude
+# is reaped → the last pane dies → the session ends) and leaves no durable trace:
+# the kernel dmesg ring cycles and the kernel journal is usually unreadable from
+# inside the container. This samples the container cgroup's CUMULATIVE oom_kill
+# counter each poll and, on a NEW kill since the daemon started, records a
+# timestamped snapshot (memory + top-RSS processes) and pages once. Read-only —
+# it never kills or reclaims anything. Degrades to a no-op when the cgroup-v2
+# interface file is absent/unreadable (older layouts / non-cgroup2 hosts).
+
+_read_oom_kill() {
+    # Echo the current cumulative oom_kill count; non-zero return if unavailable.
+    [[ -r "$OOM_EVENTS_FILE" ]] || return 1
+    awk '/^oom_kill /{print $2; found=1} END{exit !found}' "$OOM_EVENTS_FILE" 2>/dev/null
+}
+
+check_oom_events() {
+    # $1 = previous baseline count. Echoes the (possibly-updated) baseline so the
+    # caller can carry it to the next tick. On an increment: durable snapshot +
+    # one dedup'd page. Never touches stdout except the final baseline echo.
+    local prev="$1" cur
+    cur=$(_read_oom_kill) || { printf '%s' "$prev"; return 0; }
+    [[ -z "$cur" ]] && { printf '%s' "$prev"; return 0; }
+    if [[ -n "$prev" ]] && (( cur > prev )); then
+        local n=$(( cur - prev )) stamp
+        stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        {
+            echo "# OOM event ${stamp}: cgroup oom_kill ${prev} -> ${cur} (+${n})"
+            echo "## memory (MB):"; free -m 2>/dev/null | head -2
+            echo "## top RSS:"; ps -eo pid,rss,comm --sort=-rss 2>/dev/null | head -12
+            echo
+        } >> "$OOM_LOG" 2>/dev/null || true
+        log WARN "cgroup OOM kill detected (oom_kill ${prev} -> ${cur}); snapshot → ${OOM_LOG}"
+        # Emergency tier (pages): an OOM kill is a discrete serious event — the
+        # usual reason a CC session vanishes with no crash message — not routine
+        # tier pressure, so unlike ORANGE it warrants a proactive page (per the
+        # 2026-08-19 decision). Deduped per distinct oom_kill total.
+        queue_alert emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
+            "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}). A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
+            "watchgod:oom:${cur}"
+        # Bound the OOM log (retention discipline — matches cc_exit/log rotation);
+        # keep the most recent ~1000 lines so a thrashing container can't leak it.
+        local oom_lines
+        oom_lines=$(wc -l < "$OOM_LOG" 2>/dev/null || echo 0)
+        if (( ${oom_lines:-0} > 1000 )); then
+            tail -n 1000 "$OOM_LOG" > "${OOM_LOG}.tmp" 2>/dev/null && mv "${OOM_LOG}.tmp" "$OOM_LOG" 2>/dev/null || true
+        fi
+    fi
+    printf '%s' "$cur"
+}
+
 # ── Main loop ────────────────────────────────────────────────
 main() {
     mkdir -p "$(dirname "$LOG_FILE")" "$ALERT_DIR"
     log INFO "Watchgod starting (poll=${POLL_INTERVAL}s, budget=${CC_TMP_BUDGET_MB}MB, sacred=${SACRED_GROUND_MB}MB)"
+
+    # Baseline the OOM counter at startup so we only page on NEW kills (never the
+    # cumulative-since-boot history). Empty baseline = monitoring unavailable.
+    local oom_baseline
+    oom_baseline=$(_read_oom_kill) || oom_baseline=""
+    if [[ -z "$oom_baseline" ]]; then
+        log INFO "OOM event capture unavailable (no readable ${OOM_EVENTS_FILE}) — OOM monitoring off"
+    else
+        log INFO "OOM event capture armed (baseline oom_kill=${oom_baseline})"
+    fi
 
     while true; do
         load_config
@@ -376,9 +484,23 @@ main() {
 
         write_state "$cc_tier" "$cc_used" "$sys_tier" "$sys_pct"
 
-        # Clear stale alerts when back to green
+        # Durable OOM capture — snapshot + page on any NEW cgroup OOM kill.
+        oom_baseline=$(check_oom_events "$oom_baseline")
+
+        # Clear the shared cc+sys alert flags only when BOTH zones are green:
+        # tmp_warning/tmp_emergency are touched by both the cc AND sys handlers
+        # (one dedupe key across zones), so a red episode in either zone must
+        # keep them set.
         if [[ "$cc_tier" == "green" && "$sys_tier" == "green" ]]; then
             rm -f "$ALERT_DIR/tmp_warning" "$ALERT_DIR/tmp_emergency" 2>/dev/null || true
+        fi
+        # tmp_orange_stuck is cc-tmp-SPECIFIC (only clean_cc_orange sets it), so
+        # clear it whenever cc-tmp is no longer ORANGE — independent of the sys
+        # tier. Otherwise a cc episode that falls to YELLOW while /tmp stays
+        # non-green leaves a stale flag that suppresses the once-per-episode STUCK
+        # record of a later, distinct cc-tmp ORANGE episode.
+        if [[ "$cc_tier" != "orange" ]]; then
+            rm -f "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
         fi
 
         # Log rotation — truncate when > 1MB
