@@ -351,11 +351,15 @@ call_sites:
     default_paid: true
     dispatch: cli
     cc_model: Sonnet
+  # Executor Gate 2 deliverable-quality review leads with paid V4-pro
+  # (openrouter-deepseek-v4): a user-chosen pro-grade lever for this quality gate,
+  # since NIM's free tier now serves flash (not pro) after the 2026-08 repoint.
+  # Free NIM flash + paid v4-flash + qwen remain as fallbacks.
   17_executor_review:
     chain:
+    - openrouter-deepseek-v4
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
-    - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
     description: "Task executor Gate 2 — cross-vendor quality review of deliverables. Renamed from 17_fresh_eyes_review 2026-05-10 (disambiguates from outreach pre-send check at 23_outreach_review)."
