@@ -64,6 +64,26 @@ def kill_process_group(proc, sig: signal.Signals = signal.SIGKILL) -> None:
             proc.kill()
 
 
+def process_group_alive(proc) -> bool:
+    """True iff the process group led by ``proc`` still has a live member.
+
+    Signal-0 probe on the pid-as-pgid. Used to decide kill ESCALATION after a
+    graceful stop: the LEADER exiting (returncode set) does not mean the group
+    is gone — a descendant can survive it, and gating escalation on the
+    leader's returncode alone leaks that descendant. Non-int/<=1 pids and any
+    probe refusal (vanished, or recycled to a foreign uid) read as not-alive —
+    there is nothing further we could kill in those cases anyway.
+    """
+    pgid = getattr(proc, "pid", None)
+    if not isinstance(pgid, int) or pgid <= 1:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
 async def reap_bounded(proc, timeout_s: float | None = None) -> None:
     """Await ``proc.wait()`` with a hard bound; never raises — except a
     CancelledError arriving MID-reap, which propagates (suppress(Exception)

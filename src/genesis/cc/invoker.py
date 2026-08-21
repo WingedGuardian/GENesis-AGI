@@ -35,7 +35,11 @@ from genesis.cc.types import (
     model_supports_effort,
 )
 from genesis.observability.spans import SpanKind, start_span
-from genesis.util.proc_kill import kill_process_group, reap_bounded
+from genesis.util.proc_kill import (
+    kill_process_group,
+    process_group_alive,
+    reap_bounded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +112,10 @@ _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 # marker) BEFORE our asyncio watchdog kills the process group. One source of truth
 # for the "graceful truncation beats hard kill" invariant.
 _BG_WAIT_HARD_MARGIN_MS = 60_000
+# Grace granted to surviving DESCENDANTS after the leader exits post-terminate,
+# before the group-kill escalation (reap_bounded waits only on the leader, so
+# without this a still-flushing MCP child gets zero grace of its own).
+_ESCALATION_GRACE_S = 2.0
 # Stable prefix of the CLI's headless bg-ceiling message (the numeric duration
 # varies): "Background tasks still running after 600s; terminating." Matching the
 # prefix is version-drift-tolerant — a miss degrades to no truncation notice
@@ -1122,11 +1130,22 @@ class CCInvoker:
         # unbounded wait here would hang the dispatch AFTER the result was
         # already obtained. Bound it; on expiry escalate to the group kill.
         await reap_bounded(proc)
-        if proc.returncode is None:
+        # Escalate on GROUP liveness, not the leader's returncode: after the
+        # graceful terminate the leader can exit (returncode set) while an
+        # MCP/helper child survives in the group — gating on returncode alone
+        # would leak that descendant while we report completion.
+        if process_group_alive(proc):
+            # The leader-only reap gives descendants no grace of their own —
+            # an MCP child mid-flush would be SIGKILLed instantly. Grant a
+            # short beat (stdio children normally exit sub-second on parent
+            # death); costs latency only when a survivor actually exists.
+            await asyncio.sleep(_ESCALATION_GRACE_S)
+        if proc.returncode is None or process_group_alive(proc):
             logger.warning(
-                "CC streaming proc ignored terminate (PID %s) — escalating to "
-                "group kill",
+                "CC streaming group survived graceful stop/kill "
+                "(PID %s, rc=%s) — group-killing",
                 proc.pid,
+                proc.returncode,
             )
             kill_process_group(proc)
             await reap_bounded(proc)

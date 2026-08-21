@@ -1002,9 +1002,13 @@ def test_register_prunes_dead_entries():
 
 
 @pytest.mark.asyncio
-async def test_run_registers_under_session_key_and_clears(invoker):
+async def test_run_registers_under_session_key_and_clears(invoker, monkeypatch):
     """End-to-end: run() registers the proc under invocation.session_key while
     executing, and unregisters it in finally (cc-loop-01)."""
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     result_line = json.dumps(
         {
             "type": "result",
@@ -1040,8 +1044,12 @@ async def test_run_registers_under_session_key_and_clears(invoker):
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_registers_under_session_key_and_clears(invoker):
+async def test_run_streaming_registers_under_session_key_and_clears(invoker, monkeypatch):
     """run_streaming registers under session_key during streaming and clears in finally."""
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
         {
@@ -1848,9 +1856,13 @@ def _bg_result_events():
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_sets_bg_truncated_on_ceiling_marker():
+async def test_run_streaming_sets_bg_truncated_on_ceiling_marker(monkeypatch):
     """The 'Background tasks still running...' stderr marker sets bg_truncated,
     and the partial result is still delivered (not dropped)."""
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     inv = CCInvoker(claude_path="claude")
     data = _make_stream_lines(*_bg_result_events())
     mock_proc = AsyncMock()
@@ -1872,7 +1884,11 @@ async def test_run_streaming_sets_bg_truncated_on_ceiling_marker():
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_no_bg_truncated_without_marker():
+async def test_run_streaming_no_bg_truncated_without_marker(monkeypatch):
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     inv = CCInvoker(claude_path="claude")
     data = _make_stream_lines(*_bg_result_events())
     mock_proc = AsyncMock()
@@ -1894,9 +1910,13 @@ async def test_run_streaming_no_bg_truncated_without_marker():
 
 
 @pytest.mark.asyncio
-async def test_run_streaming_bg_truncated_on_no_result_branch():
+async def test_run_streaming_bg_truncated_on_no_result_branch(monkeypatch):
     """Whole-tree kill before a result line flushes: the no-result branch must
     still mark bg_truncated (review Finding 2)."""
+    def _killpg_gone(*a):
+        raise ProcessLookupError  # vacant group — never live-fire a real probe
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg_gone)
     inv = CCInvoker(claude_path="claude")
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
@@ -1998,11 +2018,6 @@ async def test_run_timeout_group_kills_by_pid_when_leader_reaped(invoker, monkey
         "genesis.util.proc_kill.os.killpg",
         lambda pgid, sig: killpg_calls.append((pgid, sig)),
     )
-
-    def _leader_reaped(pid):
-        raise ProcessLookupError  # the trap: leader already waited on
-
-    monkeypatch.setattr("genesis.cc.invoker.os.getpgid", _leader_reaped, raising=False)
 
     mock_proc = AsyncMock()
     mock_proc.pid = 99998  # explicit — never a mock default (killpg(1) trap)
@@ -2181,3 +2196,53 @@ async def test_streaming_terminate_ignored_escalates_to_group_kill(invoker, monk
         )
     assert output.text == "done"
     assert killpg_calls and killpg_calls[0][0] == 99993  # escalation fired
+
+
+@pytest.mark.asyncio
+async def test_streaming_escalates_when_leader_exits_but_group_survives(
+    invoker, monkeypatch,
+):
+    """Codex P2 (PR #1417): after terminate(), the LEADER can exit (returncode
+    set, e.g. -15) while an MCP/helper child survives in the group. Escalation
+    gated on returncode-None alone would skip the group kill and leak the
+    descendant while Genesis reports completion — the gate must probe GROUP
+    liveness."""
+    calls = []
+
+    def _killpg(pgid, sig):
+        calls.append((pgid, sig))
+        # sig 0 probe: group still ALIVE (a descendant survives) → no raise
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", _killpg)
+    monkeypatch.setattr("genesis.cc.invoker._ESCALATION_GRACE_S", 0.01)
+
+    events = [
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "session_id": "s1",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.pid = 99992
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.terminate = MagicMock()
+    mock_proc.kill = MagicMock()
+    mock_proc.wait = AsyncMock(return_value=-15)
+    mock_proc.returncode = -15  # leader ALREADY exited — the P2's trap
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await invoker.run_streaming(CCInvocation(prompt="hello"))
+    assert output.text == "done"
+    # the SIGKILL escalation must have fired despite returncode being set
+    import signal as _signal
+
+    assert (99992, _signal.SIGKILL) in calls
