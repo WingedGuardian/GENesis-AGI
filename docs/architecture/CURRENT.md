@@ -220,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: d71d1d39 2026-08-18
+verified: 6830dd78 2026-08-21
 ```
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
@@ -254,16 +254,43 @@ verified: d71d1d39 2026-08-18
   TTL-resolved barred delta can't launder into the narrative). Fail-closed on NULL; barred
   rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
   pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
-  — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
-  stamping is in the follow-up). **PARTIAL — the broader
-  observation-content-INJECTION surface is still OPEN** (tracked follow-up): the digest types
-  the judge writes (`user_signal`/`architecture_insight`) are surfaced UNFILTERED into LLM
-  context by consumers this change did NOT touch — `essential_knowledge._recent_decisions`
-  (raw SQL → the always-loaded L1 file), `reflection.gather_evaluation_context` (14-day
-  lookback → deep-reflection prompt → can launder into a `first_party`-stamped delta), and
-  several ego/sentinel raw-`FROM observations` reads. The robust fix is to exclude/wrap
-  external-origin content (`is_blockable`, keeping NULL) at the surfacing points, with a
-  coverage guardrail that also catches raw-SQL consumers.
+  — it refuses dispatch without resolving/hiding the row (the path is inert today;
+  owner-attended producers now stamp `owner` — see below). **The broader
+  observation-content-INJECTION surface is now CLOSED at the surfacing points** (the
+  memory-provenance read-side work): every content-surfacing consumer of the observations
+  table carries an origin policy — the reflection pipeline (`gather_evaluation_context`,
+  `_recent_observations`, calibration, perception's reflection context) and the
+  always-loaded L1 file (`essential_knowledge`) HARD-EXCLUDE `external_untrusted` rows at
+  the query (`exclude_origin_class` / `EXCLUDE_EXTERNAL_ORIGIN_SQL`; NULL rows KEPT —
+  unstamped internal/legacy writers keep flowing, the opposite NULL semantics from the
+  privileged-read `origin_class_in`), while the ego/sentinel/guardian/surplus context
+  builders and the `observation_query` MCP tool WRAP external-origin content in
+  `<external-content>` markers (`provenance.wrap_if_external`, truncate-then-wrap, forged
+  closing tags stripped, plus zero-width/confusable-hyphen normalization). The metadata
+  columns that render OUTSIDE the wrapper (`source`/`type`/`category`/`priority`) are
+  constrained to a short identifier charset for external-origin writers, so injection text
+  cannot ride in a sibling column. Write-side: `observation_write` refuses `user_model_delta`
+  from external-origin sessions (DENYLIST — external campaign/steward sessions keep their
+  other digest types; legit delta writers are server-side with no session env), and
+  `observation_resolve` refuses an external session resolving a NON-external row (the
+  suppression dual of forgery — no hiding internal alerts/escalations). Owner-attended
+  conversation producers (terminal + Telegram) stamp `task_detected` rows `owner`;
+  gateway/ambient channels (WEB/OpenClaw, WhatsApp, voice) deliberately stay NULL —
+  visible, never dispatch-authorized. A discovery-based guardrail
+  (`tests/test_security/test_observation_surface_coverage.py`) AST-enumerates BOTH raw
+  `FROM observations` SQL and `observations.query` callers over git-tracked sources (with
+  a regex evasion net) and fails CI on any consumer lacking a classified
+  EXCLUDED/WRAPPED/GATED/SAFE_INTERNAL/DISPLAY verdict — enforcement tokens are asserted
+  inside each function's own AST. HONEST RESIDUALS: reflection can still recall
+  external-stamped memory-store content (arrives WRAPPED; a deep-reflection prompt rule
+  forbids deriving `user_model_updates` from `<external-content>` material) and delta
+  stamping remains session-window-based, not content-lineage — full closure is the
+  provisional-provenance-tier design (Fix B). The remaining source/type-pinned
+  SAFE_INTERNAL reads (recon markers, version signals, retrospective calibration) are
+  NUMERIC/COUNT parses — an external session could still forge those types, but the
+  content is never rendered as prose into a prompt (the content-into-prompt pins that
+  were — ego escalations/execution-outcomes, prior-light-summary — are now EXCLUDED). A
+  source-namespace write authz is the candidate hardening for the numeric-parse residual.
   **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
   DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
   the autonomy-executor sessions; those legitimately spawn/orchestrate and need a
