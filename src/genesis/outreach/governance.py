@@ -61,6 +61,15 @@ _DEDUP_WINDOWS: dict[str, int] = {
     # and a 2nd disable within a day was silently dropped. The sole submitter is
     # the user-confirmed dashboard PUT — no autonomous re-asker, so 0 can't spam.
     "approval_gate_disabled": 0,
+    # Critical-observations pages (scheduler._critical_observations_job, via
+    # submit_raw with topic="Critical Observations"). Its own state machine —
+    # get_unsurfaced + mark_surfaced + a 30-min in-memory guard — already
+    # prevents re-alerting the SAME observation, so the 24h default here was
+    # pure over-suppression: a fresh critical (incl. a gate-disable paged via
+    # the MCP settings path -> write_gate_disable_alert -> this job) was dropped
+    # for 24h if ANY earlier critical batch shared the fixed topic. 0 = deliver
+    # every distinct batch; the job, not governance, owns de-dup here.
+    "critical_observation": 0,
     # Task lifecycle notifications — never dedup. Each is a distinct status
     # event for one task (topic = "Task <id>"), and every _notify call site
     # fires at most once per path. Without this they fell through to the 24h

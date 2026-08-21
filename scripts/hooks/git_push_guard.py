@@ -562,7 +562,13 @@ def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
 # Check-run conclusions / statuses that mean the CI is NOT green.
 _CI_RED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 _CI_RED_STATES = {"FAILURE", "ERROR"}  # legacy StatusContext state
-_CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL"}
+# SKIPPED/NEUTRAL are genuinely non-blocking. STALE (a run superseded before it
+# could report) is too — listed EXPLICITLY so the catch-all below can fail any
+# *other* unrecognized/future conclusion toward pending (blocking), matching
+# gh's own `default: return pending`. (Live CheckConclusionState enum, 2026-08:
+# SUCCESS/FAILURE/CANCELLED/TIMED_OUT/ACTION_REQUIRED/STARTUP_FAILURE/SKIPPED/
+# NEUTRAL/STALE — 8 classified here, the 9th unknown-future value → pending.)
+_CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL", "STALE"}
 _CI_GREEN = {"SUCCESS"}
 # The only CheckRun.status that means "finished". Everything else
 # (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so
@@ -584,11 +590,23 @@ def _entry_ci_class(c: dict) -> str:
     if conclusion in _CI_GREEN or state in _CI_GREEN:
         return "green"
     if status in _CI_TERMINAL_STATUSES:
-        # COMPLETED with an unrecognized/None conclusion — done, not red.
-        return "skip"
-    if status is not None or state == "PENDING":
-        # Non-terminal CheckRun status (QUEUED/IN_PROGRESS/WAITING/…) or a
-        # PENDING StatusContext — unfinished.
+        # COMPLETED, conclusion not in any recognized set (recognized non-blocking
+        # ones incl. STALE, and SUCCESS/red, were caught above). Two sub-cases:
+        #   - conclusion is None: GitHub's documented "no verdict reported"
+        #     nullable — treated as non-blocking (a deliberate, tested choice;
+        #     a COMPLETED+null is transient/anomalous and resolves on re-poll).
+        #   - a non-null value we don't recognize (a future GitHub enum): could
+        #     be failure-like, so fail toward BLOCKING (pending), mirroring gh's
+        #     own `default: return pending`. A merge gate must not silently pass
+        #     an unknown terminal verdict.
+        return "skip" if conclusion is None else "pending"
+    if status is not None or state is not None:
+        # Non-terminal CheckRun status (QUEUED/IN_PROGRESS/WAITING/REQUESTED/…)
+        # or ANY legacy StatusContext state not already classified red/green —
+        # PENDING and EXPECTED both mean "required check not yet passed", and an
+        # unknown future state defaults to blocking (mirrors gh's reference
+        # classifier). Only a payload with NO status/state/conclusion at all is
+        # a non-CI shape.
         return "pending"
     return "ignore"  # no status/state/conclusion — unrecognized shape
 
@@ -598,54 +616,75 @@ def _group_ci_verdict(entries: list[dict]) -> str:
     'red' | 'green' | 'pending' | 'skip'.
 
     Core invariant (a MERGE-AUTHORIZATION decision — fail closed everywhere):
-    **a prior red in the group is cleared ONLY by a strictly-later terminal
-    SUCCESS from the SAME workflow identity.** Everything else keeps a red red.
+    **a prior red in the group is cleared ONLY by a strictly-later INVOCATION
+    that terminally SUCCEEDED, under the SAME real workflow identity.**
 
     1. Any non-terminal entry (a re-run in flight) → 'pending'. Short-circuits
-       BEFORE any time-ordering, so a queued re-run (which has no completedAt /
-       startedAt) can never be mis-ranked as oldest and let an older success win
-       (the wrong-green trap).
-    2. The completedAt tiebreak is trusted ONLY when the group is
-       "ordering-trustworthy": every entry has a non-empty STRING completedAt (a
-       non-string/absent value is unorderable — fail closed, never TypeError),
-       those timestamps are unique (a tie has no unambiguous latest), AND the
-       group is a single ``workflowName`` (bare check ``name`` equality is NOT
-       run identity — a different workflow/app posting a same-named entry with a
-       forged completedAt must not be able to override a real red; a re-run of
-       the SAME workflow shares its workflowName, so legitimate supersession is
-       unaffected — verified against real CodeQL concurrency-cancelled runs).
-    3. When trustworthy: the latest-by-completedAt decides, but a latest that is
-       skip/neutral does NOT launder a prior red — only a genuine SUCCESS does.
-    4. Otherwise (unorderable / mixed identity) → fail CLOSED: any red → 'red'.
+       BEFORE any ordering, so a queued re-run (no startedAt/completedAt) can
+       never be mis-ranked and let an older success win (the wrong-green trap).
+    2. Supersession by "latest run" is trusted ONLY when the group is
+       "ordering-trustworthy":
+       - a single, NON-EMPTY ``workflowName`` — bare check ``name`` equality is
+         not run identity, and an ABSENT workflowName is not identity either
+         (two different apps both yield None and would collide), so None/'' →
+         unorderable → fail closed;
+       - every entry carries a non-empty STRING ``startedAt`` AND ``completedAt``
+         (a non-string/absent value → unorderable, never a TypeError);
+       - the invocation-order key is unique (no tie for "latest").
+    3. Ordering is by ``startedAt`` (when the run BEGAN — the invocation order),
+       with ``completedAt`` only as a tiebreaker: a superseded run can COMPLETE
+       after its replacement (overlapping runs from different triggers), so
+       ``completedAt`` alone mis-orders them. The unique latest invocation
+       decides; a latest that is skip/neutral does NOT launder a prior red —
+       only a genuine SUCCESS does.
+    4. Anything not ordering-trustworthy → fail CLOSED: any red → 'red'.
 
     Residual (documented, not a live path in Genesis CI): an actor able to
-    create check runs *within the same workflowName* as a real failing job (a
-    workflow with ``checks: write`` that runs attacker-influenced content, e.g.
-    a future ``pull_request_target``-checkout-untrusted pattern) could still
+    create check runs *within the same non-empty workflowName* as a real failing
+    job (a workflow with ``checks: write`` running attacker-influenced content,
+    e.g. a future ``pull_request_target``-checkout-untrusted pattern) could still
     supersede a red. Genesis's workflows grant no ``checks: write`` and use no
     ``pull_request_target`` today; adding either reopens this — keep them out.
+
+    Operational note: an ABSENT ``workflowName`` is also NORMAL for non-Actions
+    GitHub App checks (CodeQL *default setup*, Vercel/Netlify/Codecov-style
+    integrations) — for those, a transient red can only be cleared by a new
+    commit (dedup never fires without an identity). Genesis runs CodeQL via an
+    Actions workflow (workflowName populated), so this doesn't bite today; it
+    would if a non-Actions app check were added as required.
     """
     classes = [_entry_ci_class(c) for c in entries]
     if any(cls == "pending" for cls in classes):
         return "pending"
     has_red = any(cls == "red" for cls in classes)
-    completed = [c.get("completedAt") for c in entries]
     workflows = {c.get("workflowName") for c in entries}
-    orderable = (
-        all(isinstance(x, str) and x for x in completed)
-        and len(set(completed)) == len(completed)
-        and len(workflows) == 1
-    )
+    # A single, real (non-empty) workflow identity.
+    single_identity = len(workflows) == 1 and bool(next(iter(workflows)))
+
+    def _valid_ts(c: dict) -> bool:
+        started, completed = c.get("startedAt"), c.get("completedAt")
+        return bool(
+            isinstance(started, str) and started and isinstance(completed, str) and completed
+        )
+
+    orderable = single_identity and all(_valid_ts(c) for c in entries)
     if orderable:
-        latest_cls = _entry_ci_class(max(entries, key=lambda c: c["completedAt"]))
-        if latest_cls == "green":
-            return "green"  # a genuine later pass supersedes an earlier red
-        if latest_cls == "red":
-            return "red"
-        # Latest is skip/neutral — it must NOT launder a prior red.
-        return "red" if has_red else "skip"
-    # Unorderable (missing/tied/non-string completedAt, or mixed run identity)
-    # → fail closed: never coin-flip a red to green.
+        # Invocation order: startedAt primary, completedAt tiebreaker.
+        keys = [(c["startedAt"], c["completedAt"]) for c in entries]
+        max_key = max(keys)
+        top = [c for c, k in zip(entries, keys, strict=True) if k == max_key]
+        if len(top) == 1:
+            latest_cls = _entry_ci_class(top[0])
+            if latest_cls == "green":
+                return "green"  # a genuine later invocation supersedes a red
+            if latest_cls == "red":
+                return "red"
+            # Latest is skip/neutral — it must NOT launder a prior red.
+            return "red" if has_red else "skip"
+        # Ambiguous latest (tie on the invocation key) → fail closed.
+        return "red" if has_red else "green"
+    # Not ordering-trustworthy (missing/non-string timestamps, or absent/mixed
+    # workflow identity) → fail closed: never coin-flip a red to green.
     if has_red:
         return "red"
     if any(cls == "green" for cls in classes):

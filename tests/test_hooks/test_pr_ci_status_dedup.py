@@ -149,9 +149,10 @@ def test_mixed_shape_group_without_completedat_fails_closed(guard_module, monkey
     assert guard_module._pr_ci_status("1") == ("red", ["CI"])
 
 
-def test_tied_completedat_group_fails_closed(guard_module, monkeypatch):
-    """Two terminal runs of one name with the SAME completedAt can't be ordered
-    (no unique latest) → fail-closed red on a red/green conflict."""
+def test_tied_invocation_key_group_fails_closed(guard_module, monkeypatch):
+    """Two terminal runs of one name+workflow with the SAME (startedAt,
+    completedAt) have no unique latest invocation → fail-closed red on a
+    red/green conflict."""
     _set(
         monkeypatch,
         [
@@ -159,13 +160,17 @@ def test_tied_completedat_group_fails_closed(guard_module, monkeypatch):
                 "name": "Build",
                 "status": "COMPLETED",
                 "conclusion": "SUCCESS",
+                "startedAt": "2026-08-19T16:30:00Z",
                 "completedAt": "2026-08-19T16:40:00Z",
+                "workflowName": "CI",
             },
             {
                 "name": "Build",
                 "status": "COMPLETED",
                 "conclusion": "FAILURE",
+                "startedAt": "2026-08-19T16:30:00Z",
                 "completedAt": "2026-08-19T16:40:00Z",
+                "workflowName": "CI",
             },
         ],
     )
@@ -182,6 +187,7 @@ def test_dedup_is_per_name_independent(guard_module, monkeypatch):
                 "name": "Analyze",
                 "status": "COMPLETED",
                 "conclusion": "CANCELLED",
+                "startedAt": "2026-08-19T16:35:12Z",
                 "completedAt": "2026-08-19T16:35:40Z",
                 "workflowName": "CodeQL",
             },
@@ -189,6 +195,7 @@ def test_dedup_is_per_name_independent(guard_module, monkeypatch):
                 "name": "Analyze",
                 "status": "COMPLETED",
                 "conclusion": "SUCCESS",
+                "startedAt": "2026-08-19T16:35:15Z",
                 "completedAt": "2026-08-19T16:40:00Z",
                 "workflowName": "CodeQL",
             },
@@ -196,6 +203,7 @@ def test_dedup_is_per_name_independent(guard_module, monkeypatch):
                 "name": "unit",
                 "status": "COMPLETED",
                 "conclusion": "FAILURE",
+                "startedAt": "2026-08-19T16:37:00Z",
                 "completedAt": "2026-08-19T16:38:00Z",
                 "workflowName": "CI",
             },
@@ -205,8 +213,8 @@ def test_dedup_is_per_name_independent(guard_module, monkeypatch):
 
 
 def test_same_workflow_success_supersedes_red(guard_module, monkeypatch):
-    """A later SUCCESS under the SAME workflowName legitimately supersedes an
-    earlier red (the real concurrency-cancel/re-run case)."""
+    """A later-INVOCATION SUCCESS under the SAME workflowName legitimately
+    supersedes an earlier red (the real concurrency-cancel/re-run case)."""
     _set(
         monkeypatch,
         [
@@ -214,13 +222,15 @@ def test_same_workflow_success_supersedes_red(guard_module, monkeypatch):
                 "name": "Analyze",
                 "status": "COMPLETED",
                 "conclusion": "CANCELLED",
-                "completedAt": "2026-08-19T10:00:00Z",
+                "startedAt": "2026-08-19T10:00:00Z",
+                "completedAt": "2026-08-19T10:05:00Z",
                 "workflowName": "CodeQL",
             },
             {
                 "name": "Analyze",
                 "status": "COMPLETED",
                 "conclusion": "SUCCESS",
+                "startedAt": "2026-08-19T10:30:00Z",
                 "completedAt": "2026-08-19T11:00:00Z",
                 "workflowName": "CodeQL",
             },
@@ -266,19 +276,123 @@ def test_later_skip_does_not_launder_prior_red(guard_module, monkeypatch):
                 "name": "test",
                 "status": "COMPLETED",
                 "conclusion": "FAILURE",
-                "completedAt": "2026-08-19T10:00:00Z",
+                "startedAt": "2026-08-19T10:00:00Z",
+                "completedAt": "2026-08-19T10:10:00Z",
                 "workflowName": "CI",
             },
             {
                 "name": "test",
                 "status": "COMPLETED",
                 "conclusion": "SKIPPED",
-                "completedAt": "2026-08-19T11:00:00Z",
+                "startedAt": "2026-08-19T10:30:00Z",
+                "completedAt": "2026-08-19T10:35:00Z",
                 "workflowName": "CI",
             },
         ],
     )
     assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+
+def test_none_workflow_entries_do_not_supersede(guard_module, monkeypatch):
+    """SECURITY (Codex P1): an ABSENT workflowName is not a run identity —
+    entries from two different apps both yield None and would collide under a
+    bare `len(workflows)==1` check. A None-identity group is unorderable →
+    fail-closed, so a later same-named SUCCESS can't launder a real FAILURE."""
+    _set(
+        monkeypatch,
+        [
+            {
+                "name": "gate",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-08-19T10:00:00Z",
+                "completedAt": "2026-08-19T10:10:00Z",
+                # no workflowName (app-published check)
+            },
+            {
+                "name": "gate",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-08-19T10:30:00Z",
+                "completedAt": "2026-08-19T10:40:00Z",
+                # no workflowName (different app)
+            },
+        ],
+    )
+    assert guard_module._pr_ci_status("1") == ("red", ["gate"])
+
+
+def test_invocation_order_uses_startedat_not_completedat(guard_module, monkeypatch):
+    """SECURITY (Codex P1): overlapping runs can COMPLETE out of order — a
+    superseded older invocation may finish after its replacement. Ordering must
+    be by startedAt (invocation order), not completedAt: here an OLD success
+    that finishes LAST must not supersede the NEWER failing invocation."""
+    _set(
+        monkeypatch,
+        [
+            {  # older invocation (started first) that happens to finish last
+                "name": "test",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-08-19T10:00:00Z",
+                "completedAt": "2026-08-19T11:00:00Z",
+                "workflowName": "CI",
+            },
+            {  # newer invocation (started later) that finishes first
+                "name": "test",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-08-19T10:30:00Z",
+                "completedAt": "2026-08-19T10:45:00Z",
+                "workflowName": "CI",
+            },
+        ],
+    )
+    # By completedAt the old SUCCESS (11:00) would win → wrong green. By
+    # startedAt the newer FAILURE (10:30) is latest → red.
+    assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+
+def test_expected_legacy_status_blocks_not_vanishes(guard_module, monkeypatch):
+    """SECURITY (audit): a legacy StatusContext state=EXPECTED is a required
+    check that has NOT yet reported. It must count as pending, never be dropped
+    as 'ignore' — otherwise it vanishes and a green sibling authorizes the merge
+    past a still-unsatisfied required check."""
+    # EXPECTED alongside a green check → the merge must still block (pending).
+    _set(
+        monkeypatch,
+        [
+            {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"context": "required-external-ci", "state": "EXPECTED"},
+        ],
+    )
+    assert guard_module._pr_ci_status("1") == ("pending", ["required-external-ci"])
+
+
+def test_completed_with_unknown_conclusion_is_pending(guard_module, monkeypatch):
+    """SECURITY (audit): a COMPLETED run with an unrecognized/future conclusion
+    must fail toward BLOCKING (pending), not silently non-block ('skip')."""
+    _set(
+        monkeypatch,
+        [
+            {"name": "future-check", "status": "COMPLETED", "conclusion": "SOME_NEW_STATE"},
+        ],
+    )
+    assert guard_module._pr_ci_status("1") == ("pending", ["future-check"])
+
+
+def test_stale_conclusion_is_non_blocking(guard_module, monkeypatch):
+    """A STALE conclusion (a run superseded before it reported) is genuinely
+    non-blocking — it must NOT push the group to pending/red the way an unknown
+    conclusion does."""
+    _set(
+        monkeypatch,
+        [
+            {"name": "a", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "b", "status": "COMPLETED", "conclusion": "STALE"},
+        ],
+    )
+    assert guard_module._pr_ci_status("1") == ("green", [])
 
 
 def test_nonstring_completedat_fails_closed(guard_module, monkeypatch):

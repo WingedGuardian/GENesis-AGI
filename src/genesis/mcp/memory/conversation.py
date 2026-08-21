@@ -36,7 +36,11 @@ async def conversation_history(
     for a real DM scroll-up (without it, results span ALL chats; that unscoped
     default is intentional for reflection/cross-chat use). ``before`` (ISO
     timestamp, exclusive) pages further back: pass the oldest timestamp from
-    the previous page to walk arbitrarily far up the conversation.
+    the previous page. On telegram this walks the full DB history. On CC it
+    pages within the recent-sessions read window only (the two newest transcript
+    files, tail-bounded) — a ``before`` older than that window returns empty
+    rather than scanning the entire transcript corpus; CC scroll-up is for
+    recent context, not full-history search.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
