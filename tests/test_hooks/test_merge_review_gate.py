@@ -1449,6 +1449,116 @@ class TestPrCiStatus:
         assert guard_module._pr_ci_status("1") == ("unknown", [])
 
 
+class TestPrCiStatusCancelSibling:
+    """Concurrency-cancel dedup (approach B): a CANCELLED CheckRun is dropped IFF a
+    check of the SAME identity (name + workflowName) also concluded SUCCESS on this
+    head — no time-ordering, so a superseded `cancel-in-progress` duplicate can't
+    stick the gate red while its own re-run passed. Wrong-green-impossible: only
+    CANCELLED (no verdict) is dropped, only for a true same-job re-run, and a cancel
+    with no resolvable identity or no same-identity success stays red."""
+
+    @staticmethod
+    def _set(monkeypatch, checks):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
+
+    def test_cancel_with_success_sibling_is_green(self, guard_module, monkeypatch):
+        # The ec925917 incident: concurrency-cancelled CodeQL dups + their
+        # successful re-runs (same name + workflowName). Must read green.
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_cancel_without_success_sibling_stays_red(self, guard_module, monkeypatch):
+        # A genuine cancel with no same-identity success still blocks the merge.
+        self._set(monkeypatch, [
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["Analyze"])
+
+    def test_cross_workflow_same_name_does_not_drop(self, guard_module, monkeypatch):
+        # SECURITY (HIGH lock): a same-NAME success from a DIFFERENT workflow is
+        # NOT a valid sibling and must not mask a genuinely-cancelled required
+        # check. Identity is (name, workflowName), so this stays red. Under a
+        # bare-name match this would wrongly go green.
+        self._set(monkeypatch, [
+            {"name": "test-suite", "workflowName": "real-ci", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "test-suite", "workflowName": "decoy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test-suite"])
+
+    def test_cancel_without_workflowname_stays_red(self, guard_module, monkeypatch):
+        # Fail-closed: a CANCELLED entry with no resolvable workflowName has no
+        # identity, so even a same-name SUCCESS cannot drop it — stays red.
+        self._set(monkeypatch, [
+            {"name": "x", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "x", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["x"])
+
+    def test_cancel_plus_inflight_rerun_never_green(self, guard_module, monkeypatch):
+        # Cancel + an in-flight re-run of the same identity, no success yet → must
+        # NOT read green (the re-run is still running; nothing has passed).
+        self._set(monkeypatch, [
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "IN_PROGRESS", "conclusion": None},
+        ])
+        assert guard_module._pr_ci_status("1")[0] != "green"
+
+    def test_cancel_sibling_does_not_launder_other_failure(self, guard_module, monkeypatch):
+        # Dropping a cancelled-with-sibling must never hide a DIFFERENT check's
+        # real failure — the core wrong-green guard.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["lint"])
+
+    def test_timed_out_with_success_sibling_still_red(self, guard_module, monkeypatch):
+        # Scope lock: ONLY CANCELLED is laundered. TIMED_OUT carries a real
+        # verdict and still blocks even with a same-identity success.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "TIMED_OUT"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_statuscontext_success_does_not_drop_checkrun_cancel(self, guard_module, monkeypatch):
+        # A legacy StatusContext SUCCESS (no workflowName) has no CheckRun identity
+        # and is NOT a valid sibling for a CheckRun CANCELLED of the same name —
+        # the cancel stays red (closes the cross-shape collision surface).
+        self._set(monkeypatch, [
+            {"context": "ci/legacy", "state": "SUCCESS"},
+            {"name": "ci/legacy", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["ci/legacy"])
+
+    def test_pending_preserved_when_sibling_dropped(self, guard_module, monkeypatch):
+        # Dropping a cancelled-with-sibling must not swallow an UNRELATED pending
+        # check — the merge still blocks on the in-flight one.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "deploy", "workflowName": "CI", "status": "IN_PROGRESS", "conclusion": None},
+        ])
+        assert guard_module._pr_ci_status("1") == ("pending", ["deploy"])
+
+    def test_nameless_cancel_not_dropped_by_nameless_success(self, guard_module, monkeypatch):
+        # Entries with no name/workflowName have no identity (_ci_identity → None)
+        # and are excluded from the sibling set — a nameless SUCCESS can't license
+        # dropping a nameless CANCELLED. Stays red (fail-safe over-block).
+        self._set(monkeypatch, [
+            {"status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["check"])
+
+
 class TestCiOverrideSigil:
     """The `# ci-override` sigil is quote-aware and (at the call site) bound to
     the merge segment — it cannot be spoofed from a quoted --body or a chained
