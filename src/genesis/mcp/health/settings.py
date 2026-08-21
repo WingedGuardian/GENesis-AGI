@@ -1806,6 +1806,19 @@ async def _impl_settings_update(
             "needs_restart": entry.needs_restart,
         }
 
+    # Capture the gate's EFFECTIVE value BEFORE the write, so the disable alert
+    # fires only on a genuine true→false transition (a settings save that still
+    # carries manual_approval_required=false while the gate was already off must
+    # not re-page — especially now that critical_observation has a 0-window).
+    gate_was_off = (
+        domain == "autonomous_cli_policy"
+        and _load_yaml_merged(entry.config_filename).get(
+            "manual_approval_required",
+            True,
+        )
+        is False
+    )
+
     # Atomic write to .local.yaml (provenance-stamped: user-set config must
     # never read as an anomaly to a future session).
     local_file = _local_filename(entry.config_filename)
@@ -1828,7 +1841,11 @@ async def _impl_settings_update(
     }
     if entry.needs_restart:
         result["note"] = "Changes saved. Restart genesis-server for them to take effect."
-    if domain == "autonomous_cli_policy" and changes.get("manual_approval_required") is False:
+    if (
+        domain == "autonomous_cli_policy"
+        and changes.get("manual_approval_required") is False
+        and not gate_was_off  # only on a genuine true→false transition
+    ):
         result["warning"] = (
             "The mandatory approval gate is now DISABLED: autonomous Claude "
             "Code sessions dispatch without per-run approval until "

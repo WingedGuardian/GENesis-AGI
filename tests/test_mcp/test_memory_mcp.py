@@ -1158,6 +1158,60 @@ async def test_conversation_history_search():
             mod._retriever = old_retriever
 
 
+async def test_conversation_history_cc_before_filters_older(tmp_path, monkeypatch):
+    """The CC 'before' cursor must exclude records at/after the timestamp so
+    scroll-up pages further back. Previously the CC branch ignored 'before' and
+    returned the tail regardless — the advertised pagination silently no-oped
+    for CC. A record with no timestamp is excluded once 'before' is set (can't
+    prove it precedes the cursor)."""
+    import json as _json
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.mcp.memory import conversation as conv
+
+    proj = "proj-x"
+    proj_dir = tmp_path / ".claude" / "projects" / proj
+    proj_dir.mkdir(parents=True)
+    # Written OUT of chronological order — the tool must sort globally by
+    # timestamp before applying the cursor/limit (mirrors the real two-file
+    # concatenation scramble).
+    records = [
+        {"type": "assistant", "message": "middle", "timestamp": "2026-08-20T10:05:00Z"},
+        {"type": "user", "message": "oldest", "timestamp": "2026-08-20T10:00:00Z"},
+        {"type": "user", "message": "newest", "timestamp": "2026-08-20T10:10:00Z"},
+        {"type": "user", "message": "notime"},  # missing timestamp
+    ]
+    (proj_dir / "s.jsonl").write_text(
+        "\n".join(_json.dumps(r) for r in records) + "\n",
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conv, "cc_project_dir", lambda: proj)
+
+    old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = MagicMock()
+
+        tools = await _get_tools()
+        result = await tools["conversation_history"].fn(
+            channel="cc", limit=10, before="2026-08-20T10:10:00Z",
+        )
+        contents = [m["content"] for m in result]
+        # at/after the cursor (and undated) excluded; older kept.
+        assert "newest" not in contents
+        assert "notime" not in contents
+        assert "oldest" in contents
+        assert "middle" in contents
+        # Returned chronologically (oldest→newest), regardless of file order.
+        assert contents == ["oldest", "middle"]
+    finally:
+        mod._store = old_store
+        mod._db = old_db
+        mod._retriever = old_retriever
+
+
 async def test_conversation_history_unknown_channel():
     """Unknown channel returns empty list."""
     import genesis.mcp.memory_mcp as mod

@@ -409,8 +409,8 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
     """
     try:
         cursor = await db.execute(
-            "SELECT status, created_at, claimed_at FROM cc_rate_limit_parks "
-            "WHERE id = ?",
+            "SELECT status, created_at, claimed_at, updated_at "
+            "FROM cc_rate_limit_parks WHERE id = ?",
             (park_id,),
         )
         park_row = await cursor.fetchone()
@@ -451,7 +451,20 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
                 try:
                     from genesis.db.crud import cc_rate_limit_parks as _parks
 
-                    await _parks.mark_terminal(db, park_id, "cancelled")
+                    # Conditional cancel (TOCTOU guard): fires only if the row
+                    # still holds the (status, claimed_at) we read above. A resume
+                    # tick that advanced the park in this window (incl. a
+                    # recover→re-claim that lands back on 'resuming' with a fresh
+                    # claim) makes this no-op — return None and stay attached so we
+                    # never clobber a live resume into 'cancelled' (double-run).
+                    cancelled = await _parks.mark_terminal_if_unchanged(
+                        db,
+                        park_id,
+                        "cancelled",
+                        expected_status=park_status,
+                        expected_claimed_at=park_row["claimed_at"],
+                        expected_updated_at=park_row["updated_at"],
+                    )
                 except Exception:
                     logger.warning(
                         "Failed to cancel over-bound park %s — staying "
@@ -459,6 +472,10 @@ async def _follow_park(db: Any, park_id: str) -> dict | None | object:
                         park_id,
                         exc_info=True,
                     )
+                    return None
+                if not cancelled:
+                    # The park moved under us (a resume tick advanced it) — the
+                    # cancel decision is stale. Stay attached; re-evaluate next tick.
                     return None
                 return {
                     "success": False,
