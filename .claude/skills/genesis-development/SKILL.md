@@ -828,8 +828,10 @@ findings below, a gated `gh pr merge`:
   routine never ran, ran on a stale commit, or was rate-limited, the merge blocks
   (naming the missing kinds). If a routine is pending or rate-limited, wait for it, or
   append `# scheduled-review-override` to merge anyway (the conscious "merge without the
-  scheduled reviews" case). Fail-closed: an unreadable comments/reviews fetch BLOCKS
-  (never a false all-clear);
+  scheduled reviews" case). The marker means "ran **clean**", not merely "ran": a
+  review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
+  clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
+  Fail-closed: an unreadable comments/reviews fetch BLOCKS (never a false all-clear);
 - requires the PR base to equal the repo's default branch (retarget guard);
 - blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
   does not merge).

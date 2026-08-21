@@ -734,6 +734,51 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "scheduled Claude review(s) missing",
     ),
+    # The marker means "ran CLEAN": a review whose body carries a blocking finding
+    # ([P1]/HARD BLOCK/### ERROR) is rejected even with both markers at head → block.
+    (
+        "scheduled_review_with_blocking_finding_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "body": (
+                        "### ERROR\n[P1] null deref in foo()\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
+    # Clean-wins: a body that MENTIONS a blocking token but also carries a clean verdict
+    # (VERDICT: PASS) is treated as clean → the markers count → allow. (Same rule as the
+    # bot finding scanners.)
+    (
+        "scheduled_review_blocking_mention_but_clean_verdict_allows",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "body": (
+                        "Scanned for [P1] issues — VERDICT: PASS\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        0,
+        "",
+    ),
     # The # scheduled-review-override sigil consciously waives the gate → an absent
     # scheduled review still merges.
     (

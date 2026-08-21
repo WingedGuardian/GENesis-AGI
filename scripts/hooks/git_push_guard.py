@@ -56,7 +56,11 @@ was rate-limited, the merge is blocked (naming the missing kinds). Deployment no
 gate is scoped to the canonical repo's own merge workflow, where the required `/schedule`
 routines ARE configured (the deploy precondition); a clone that has not set up a producer
 uses `# scheduled-review-override` (or removes/edits `_REQUIRED_SCHEDULED_REVIEW_KINDS`).
-A DISMISSED review no longer vouches (its marker is ignored), mirroring the Codex path.
+A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
+the Codex path. The marker means "ran CLEAN", not merely "ran": a review whose body carries a
+blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker overrides — the same rule
+the finding scanners use) is rejected, so a scheduled reviewer that explicitly BLOCKED cannot
+stamp a passing marker (owner-authored bodies are not seen by the bot-only finding scanners).
 On the normal path this is ATOMIC: the Codex-freshness gate's ``--match-head-commit``
 binding pins the merge to the very head the marker was verified at, so a race with a new
 push cannot swap in an unreviewed head. Under ``# stale-review-override`` (which waives
@@ -1651,6 +1655,16 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
         if (row.get("state") or "").upper() in ("DISMISSED", "PENDING"):
             continue
         body = row.get("body") or ""
+        # The marker must mean "ran CLEAN", not merely "ran": a scheduled review whose body
+        # CONTAINS a blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker
+        # overrides — same "clean wins" rule the finding scanners use) does NOT satisfy the
+        # gate. Owner-authored review bodies are never seen by _check_pr_review_findings
+        # (bots only), so without this a scheduled reviewer that explicitly BLOCKED would
+        # still stamp its marker and slip the merge through.
+        if any(p.search(body) for p in _BLOCKING_PATTERNS) and not any(
+            c.search(body) for c in _CLEAN_PATTERNS
+        ):
+            continue
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
         # carry none). Deferred (LOW): the marker sha is matched EXACTLY vs the authoritative
