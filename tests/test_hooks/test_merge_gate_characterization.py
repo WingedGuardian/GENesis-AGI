@@ -712,6 +712,28 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "scheduled Claude review(s) missing",
     ),
+    # A PENDING review is an unpublished DRAFT — its marker (even for all kinds at head)
+    # must NOT satisfy the gate (a producer that created but never submitted the review).
+    (
+        "scheduled_review_pending_draft_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "state": "PENDING",
+                    "body": (
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
     # The # scheduled-review-override sigil consciously waives the gate → an absent
     # scheduled review still merges.
     (
@@ -882,3 +904,24 @@ def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
     assert "BLOCK" in sched_line
     assert rc == 1
+
+
+def test_check_pr_report_no_merge_with_when_scheduled_blocks(monkeypatch, capsys):
+    """The actionable ``merge-with`` command must NOT be printed when a later gate (the
+    scheduled review) would block — otherwise the report suggests a mergeable PR that is
+    not. (Codex P2: merge-with was emitted right after codex-at-head, before this gate.)"""
+    _report_env(monkeypatch, scheduled="")  # scheduled gate blocks
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "merge-with" not in out, "merge-with printed despite a blocking scheduled gate"
+    assert rc == 1
+
+
+def test_check_pr_report_prints_merge_with_when_all_pass(monkeypatch, capsys):
+    """When EVERY gate passes, the report prints the bound merge-with command."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    assert "merge-with" in out
+    assert "--match-head-commit" in out
+    assert rc == 0

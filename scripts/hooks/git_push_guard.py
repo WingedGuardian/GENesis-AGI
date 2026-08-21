@@ -1644,10 +1644,11 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
         assoc = (row.get("author_association") or "").upper()
         if login != owner and assoc != "OWNER":
             continue  # not the repo owner — not a trusted scheduled review
-        # A DISMISSED review no longer vouches for its commit (mirrors the Codex-freshness
-        # path). `state` is present on /pulls/N/reviews rows and null on issue comments,
-        # so this only drops dismissed reviews; issue comments remain state-less.
-        if (row.get("state") or "").upper() == "DISMISSED":
+        # A DISMISSED review no longer vouches, and a PENDING review is an UNPUBLISHED
+        # draft that never ran publicly — neither should satisfy the gate (mirrors the
+        # Codex-freshness path). `state` is present on /pulls/N/reviews rows and null on
+        # issue comments, so this only drops review rows; issue comments remain state-less.
+        if (row.get("state") or "").upper() in ("DISMISSED", "PENDING"):
             continue
         body = row.get("body") or ""
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
@@ -3097,30 +3098,6 @@ def main() -> int:
                         print("BLOCKED: " + bind_msg, file=sys.stderr)
                         return 2
 
-                # Scheduled Claude review at HEAD — a review by the repo OWNER (NOT a
-                # bot) must carry a marker naming the current head. Runs AFTER the Codex
-                # freshness + TOCTOU binding, and is its OWN always-fail-closed gate with
-                # its OWN sigil: # scheduled-review-override waives ONLY this gate, and is
-                # INDEPENDENT of # stale-review-override (which waives the Codex freshness
-                # + base gates). Pass verified_head when the Codex gate produced one (the
-                # current head); under # stale-review-override that is None, so the gate
-                # re-reads the head itself — this gate is not waived by the stale sigil.
-                sched_override = has_trailing_override(merge_seg.raw, "scheduled-review-override")
-                sched_msg = _check_scheduled_claude_reviewed_head(
-                    pr_num,
-                    verified_head,
-                    merge_repo,
-                    force=sched_override,
-                )
-                if sched_msg:
-                    print(
-                        f"BLOCKED: PR #{pr_num} — required scheduled Claude review(s) "
-                        f"missing at the current head.",
-                        file=sys.stderr,
-                    )
-                    print(sched_msg, file=sys.stderr)
-                    return 2
-
                 # Unresolved review findings (review body) — AFTER freshness +
                 # binding (see the ordering note above). Waived by
                 # # review-override (the FINDINGS sigil — not the stale one).
@@ -3150,6 +3127,30 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(inline_msg, file=sys.stderr)
+                    return 2
+
+                # Scheduled Claude review at HEAD — its OWN always-fail-closed gate with
+                # its OWN sigil (# scheduled-review-override waives ONLY this gate; independent
+                # of # stale-review-override). Deliberately placed LAST — after the review-body
+                # + inline finding scanners, which fail OPEN on a clipped budget. This gate
+                # fails CLOSED, so if the shared merge-gate deadline is exhausted here it BLOCKS
+                # (safe); running it before the scanners could instead starve THEM into their
+                # 1s floor → fail-open → a merge with unresolved findings slipping through. Uses
+                # verified_head from the Codex gate (None under # stale-review-override → re-read).
+                sched_override = has_trailing_override(merge_seg.raw, "scheduled-review-override")
+                sched_msg = _check_scheduled_claude_reviewed_head(
+                    pr_num,
+                    verified_head,
+                    merge_repo,
+                    force=sched_override,
+                )
+                if sched_msg:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — required scheduled Claude review(s) "
+                        f"missing at the current head.",
+                        file=sys.stderr,
+                    )
+                    print(sched_msg, file=sys.stderr)
                     return 2
 
         # ── sqlite3 write operations ────────────────────────────────
@@ -3274,6 +3275,10 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     false all-clear.
 
     Prints one line per gate; returns 0 when every gate would pass, 1 otherwise.
+    (Same CHECKS as enforcement, but the internal ORDER may differ — e.g. the merge
+    arm runs the scheduled gate LAST, after the finding scanners, for budget reasons;
+    the report is order-independent because every scan here is strict=True, so a clipped
+    scan is a failure line rather than a fail-open pass regardless of position.)
     """
     failures = 0
     mergeable = _check_mergeable(pr_num, repo=repo)
@@ -3324,8 +3329,6 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         else:
             label = "ok (current)"
     print(f"codex-at-head  : {label}")
-    if not blocked and verified_head:
-        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
     failures += 1 if blocked else 0
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function, strict mode). It reads the head itself (no head in
@@ -3349,6 +3352,11 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
     )
     failures += 1 if blocked else 0
+    # Emit the actionable merge command ONLY when EVERY gate passed — printing it earlier
+    # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
+    # gate below would block. Bound to the Codex-verified head (the TOCTOU pin).
+    if failures == 0 and verified_head:
+        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
     print(
         "verdict        :",
         "MERGEABLE (all gates pass)" if failures == 0 else f"{failures} gate(s) would block",
