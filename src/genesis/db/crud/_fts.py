@@ -14,6 +14,63 @@ from __future__ import annotations
 
 import aiosqlite
 
+# Ultra-common English stopwords dropped from the OR retry so a verbose query
+# like "where is the nonexistent service" falls back to "nonexistent OR service"
+# instead of "where OR is OR the OR ..." (which matches almost every row). Kept
+# deliberately small — only near-universal function words — so it never strips a
+# meaningful content term. The AND pass is unaffected (it keeps every token).
+_OR_STOPWORDS = frozenset(
+    [
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "being",
+        "but",
+        "by",
+        "for",
+        "from",
+        "he",
+        "how",
+        "i",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "me",
+        "my",
+        "of",
+        "on",
+        "or",
+        "our",
+        "she",
+        "that",
+        "the",
+        "these",
+        "they",
+        "this",
+        "those",
+        "to",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+        "you",
+        "your",
+    ]
+)
+
 
 def or_fallback(escaped: str) -> str | None:
     """The OR-joined form of a cleaned (implicit-AND) FTS5 query.
@@ -22,10 +79,15 @@ def or_fallback(escaped: str) -> str | None:
     A multi-term query becomes ``term1 OR term2 OR ...`` — the lowercase tokens
     are plain search terms and the uppercase ``OR`` is the FTS5 operator
     (``_prepare_fts5`` lowercases its input, so no accidental operators survive
-    the join).
+    the join). Ultra-common stopwords are dropped from the OR join to keep the
+    fallback precise; if EVERY token is a stopword they are all kept (an OR of
+    stopwords still beats returning nothing).
     """
     parts = escaped.split()
-    return " OR ".join(parts) if len(parts) > 1 else None
+    if len(parts) <= 1:
+        return None
+    meaningful = [p for p in parts if p not in _OR_STOPWORDS]
+    return " OR ".join(meaningful or parts)
 
 
 async def fetch_fts(

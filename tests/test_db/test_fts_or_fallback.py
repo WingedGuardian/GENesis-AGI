@@ -35,6 +35,22 @@ def test_or_fallback_empty_is_none():
     assert or_fallback("   ") is None
 
 
+def test_or_fallback_drops_stopwords():
+    # A verbose query OR-joins only the MEANINGFUL terms, not the/is/where noise.
+    assert or_fallback("where is the nonexistent service") == "nonexistent OR service"
+
+
+def test_or_fallback_all_stopwords_kept():
+    # If every token is a stopword, keep them all — an OR still beats nothing.
+    assert or_fallback("the a of") == "the OR a OR of"
+
+
+def test_or_fallback_reduces_to_single_meaningful_term():
+    # Multi-term query reducing to ONE meaningful term -> that term alone
+    # (a valid single-term FTS query, strictly better than the zero-row AND).
+    assert or_fallback("where is the service") == "service"
+
+
 @pytest.mark.skipif(not _fts5_available, reason="FTS5 not available")
 class TestFetchFts:
     @pytest.fixture
