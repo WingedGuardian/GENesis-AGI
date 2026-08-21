@@ -44,10 +44,14 @@ async def _write_and_read_origin(monkeypatch, origin_env: str | None) -> str:
                 monkeypatch.setenv("GENESIS_SESSION_ORIGIN", origin_env)
 
             tools = await _get_tools()
+            # type=user_signal: a PERMITTED external type — the delta type is
+            # now refused outright for external sessions (WS-3 write-side
+            # denylist; see test_security/test_observation_type_authz.py),
+            # and this test's subject is the ORIGIN STAMP, not the type gate.
             obs_id = await tools["observation_write"].fn(
                 content="the user prefers Rust",
                 source="inbox_evaluation",
-                type="user_model_delta",
+                type="user_signal",
             )
             assert obs_id and obs_id != "duplicate_skipped"
             cursor = await real_db.execute(
@@ -63,7 +67,8 @@ async def _write_and_read_origin(monkeypatch, origin_env: str | None) -> str:
 @pytest.mark.asyncio
 async def test_external_session_stamps_external_origin(monkeypatch):
     """The inbox-judge case: origin env → stored external_untrusted, so the
-    consumer gate can bar a forged user_model_delta."""
+    consumer gates can bar/exclude the row (and the write-side denylist
+    refuses the delta type outright)."""
     assert await _write_and_read_origin(monkeypatch, "external_untrusted") == "external_untrusted"
 
 
