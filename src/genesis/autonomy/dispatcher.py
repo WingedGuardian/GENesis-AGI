@@ -369,16 +369,16 @@ class TaskDispatcher:
             # task_detected forged via observation_write from an external-origin
             # session must not spawn a background CC session. SKIP-ONLY (do NOT
             # resolve): the pickup path is currently inert (no `metadata` column,
-            # so plan_path below is always None and every row skips there anyway),
-            # and — critically — the legit owner-initiated producers
-            # (cc/conversation.py `task_detected` writes) do NOT yet stamp
-            # origin_class, so they arrive NULL and would be barred here too.
-            # Resolving a barred row would HIDE those legitimate rows from the
-            # dashboard/morning-report/L1 context within one cycle; skipping
-            # leaves every row's visibility untouched while still refusing
-            # dispatch. Producer-side stamping (so legit rows dispatch once the
-            # metadata path is wired) is tracked in the memory-provenance
-            # follow-up. Logged at debug — the dispatcher runs frequently.
+            # so plan_path below is always None and every row skips there anyway).
+            # The owner-attended producers (cc/conversation.py, terminal +
+            # Telegram) now stamp origin_class="owner" and will dispatch once
+            # the metadata path is wired; rows from gateway/ambient channels
+            # (WEB/OpenClaw, WhatsApp, VOICE) and pre-stamp legacy rows arrive
+            # NULL and are deliberately barred-but-visible. Resolving a barred
+            # row would HIDE those rows from the dashboard/morning-report/L1
+            # context within one cycle; skipping leaves every row's visibility
+            # untouched while still refusing dispatch. Logged at debug — the
+            # dispatcher runs frequently.
             if not is_trusted_for_privileged_write(obs.get("origin_class")):
                 logger.debug(
                     "task_detected %s not dispatched (origin_class=%r not "

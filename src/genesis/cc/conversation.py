@@ -56,6 +56,25 @@ def _bg_notice(output) -> str:
     return _BG_TRUNCATION_NOTICE if getattr(output, "bg_truncated", False) else ""
 
 
+def _task_origin_for_channel(channel: ChannelType | str | None) -> str | None:
+    """origin_class for a ``task_detected`` observation from *channel*.
+
+    Terminal + Telegram are owner-attended (terminal is the local CLI;
+    Telegram is chat-id-gated to the owner) → ``owner``, which the autonomy
+    dispatcher's privileged-write gate accepts once its pickup path is wired.
+    Every other channel (WEB/OpenClaw gateway — which itself fronts
+    WhatsApp/voice/etc. with no endpoint auth here — plus VOICE ambient
+    audio) stays UNSTAMPED (None): those rows remain visible in the
+    dashboard/report exactly as today but are never dispatch-authorized.
+    Widen per-channel deliberately, never by default.
+    """
+    if channel in (ChannelType.TERMINAL, ChannelType.TELEGRAM):
+        from genesis.memory.provenance import ORIGIN_OWNER
+
+        return ORIGIN_OWNER
+    return None
+
+
 # Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
 # durable direct_session lane instead of an inline Workflow, which the CC bg-wait ceiling
 # kills after ~10min with nothing left to report back (the 2026-07-20 silent-death class).
@@ -196,6 +215,10 @@ class ConversationLoop:
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
                     skip_if_duplicate=True,
+                    # WS-3: channel-aware stamp — owner-attended channels get
+                    # dispatch-trusted origin; gateway/ambient channels stay
+                    # NULL (visible, never dispatch-authorized).
+                    origin_class=_task_origin_for_channel(channel),
                 )
             except Exception:
                 logger.error("Could not emit task_detected observation", exc_info=True)
@@ -456,6 +479,10 @@ class ConversationLoop:
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
                     skip_if_duplicate=True,
+                    # WS-3: channel-aware stamp — owner-attended channels get
+                    # dispatch-trusted origin; gateway/ambient channels stay
+                    # NULL (visible, never dispatch-authorized).
+                    origin_class=_task_origin_for_channel(channel),
                 )
             except Exception:
                 logger.error("Could not emit task_detected observation", exc_info=True)
