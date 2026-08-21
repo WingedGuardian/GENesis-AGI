@@ -381,10 +381,10 @@ def test_completed_with_unknown_conclusion_is_pending(guard_module, monkeypatch)
     assert guard_module._pr_ci_status("1") == ("pending", ["future-check"])
 
 
-def test_stale_conclusion_is_non_blocking(guard_module, monkeypatch):
-    """A STALE conclusion (a run superseded before it reported) is genuinely
-    non-blocking — it must NOT push the group to pending/red the way an unknown
-    conclusion does."""
+def test_stale_conclusion_blocks_as_pending(guard_module, monkeypatch):
+    """STALE is NOT non-blocking: gh (2.96.0) buckets a COMPLETED+STALE CheckRun
+    as `pending`, and a stale run never produced a passing verdict — so the gate
+    must block on it, not read the PR green."""
     _set(
         monkeypatch,
         [
@@ -392,7 +392,7 @@ def test_stale_conclusion_is_non_blocking(guard_module, monkeypatch):
             {"name": "b", "status": "COMPLETED", "conclusion": "STALE"},
         ],
     )
-    assert guard_module._pr_ci_status("1") == ("green", [])
+    assert guard_module._pr_ci_status("1") == ("pending", ["b"])
 
 
 def test_nonstring_completedat_fails_closed(guard_module, monkeypatch):

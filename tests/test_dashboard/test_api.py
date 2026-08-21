@@ -588,6 +588,45 @@ def test_settings_put_gate_disable_requires_confirmation(client, tmp_path):
         notify.assert_awaited_once()
 
 
+def test_settings_put_gate_already_off_does_not_realert(client, tmp_path):
+    """Codex P2: the dashboard PUTs the WHOLE config, so a save that still
+    carries manual_approval_required=false while the gate was ALREADY off must
+    NOT re-fire the disable alert — only a genuine true→false transition
+    notifies (otherwise the 0-window path would spam on every autonomous-cli
+    settings save)."""
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", tmp_path),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", tmp_path),
+        patch(
+            "genesis.dashboard.routes.settings._notify_gate_disabled",
+            new=AsyncMock(),
+        ) as notify,
+    ):
+        # First PUT: a genuine disable (transition True→False) → notifies once.
+        r1 = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": True,
+            },
+        )
+        assert r1.status_code == 200
+        notify.assert_awaited_once()
+        notify.reset_mock()
+
+        # Second PUT: gate already off, save still carries false (+confirm) →
+        # NO transition → NO new alert.
+        r2 = client.put(
+            "/api/genesis/settings/autonomous_cli_policy",
+            json={
+                "manual_approval_required": False,
+                "confirm_disable_approval_gate": True,
+            },
+        )
+        assert r2.status_code == 200
+        notify.assert_not_awaited()
+
+
 def test_surplus_put_actually_persists_merge(client, tmp_path):
     """Deep-review SHOULD-FIX lock (pre-existing bug): the surplus PUT
     discarded _deep_merge's return (it is PURE) and wrote the UNMERGED

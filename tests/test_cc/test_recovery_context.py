@@ -148,7 +148,9 @@ async def test_recovery_context_budget_is_byte_based(db):
         )
     ctx = await _loop(db)._build_recovery_context("tg-100", "telegram", None)
     budget = ConversationLoop.RECOVERY_CONTEXT_BUDGET
-    assert len(ctx.encode()) <= budget + 500, (
+    # Exact bound: separators ("\n" between lines) are charged too, so the real
+    # recap size never exceeds the budget.
+    assert len(ctx.encode()) <= budget, (
         f"recap blew the BYTE budget: {len(ctx.encode())} bytes for a {budget}-byte cap"
     )
     assert "�" not in ctx, "tail cut split a multibyte char (invalid UTF-8)"

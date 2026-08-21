@@ -1432,17 +1432,24 @@ class ConversationLoop:
                     continue
                 prefix = "User" if m.get("sender") == "user" else "Genesis"
                 line = f"{prefix}: {content}"
-                line_bytes = len(line.encode())
+                # Charge the "\n" that "\n".join will insert before this line
+                # (one per line after the first) so the budget is enforced on the
+                # ACTUAL recap size, not the sum of lines alone.
+                sep = 1 if kept else 0
+                line_bytes = len(line.encode()) + sep
                 if line_bytes <= remaining:
                     kept.append(line)
                     remaining -= line_bytes
-                elif remaining > 200:
+                elif remaining - sep > 200:
                     # Tail-keep: the end of a long reply carries its
                     # conclusions/option lists — never the head alone. Measured
                     # in bytes, cut on a char boundary so the recap stays valid
-                    # UTF-8. Reserve the exact marker cost so the kept entry fits.
+                    # UTF-8. Reserve the separator + exact marker cost so the kept
+                    # entry (and its joining newline) fits.
                     marker = f"{prefix}: …"
-                    tail = _tail_by_bytes(content, remaining - len(marker.encode()))
+                    tail = _tail_by_bytes(
+                        content, remaining - sep - len(marker.encode()),
+                    )
                     kept.append(marker + tail)
                     remaining = 0
                 else:

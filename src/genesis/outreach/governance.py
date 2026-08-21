@@ -69,6 +69,13 @@ _DEDUP_WINDOWS: dict[str, int] = {
     # the MCP settings path -> write_gate_disable_alert -> this job) was dropped
     # for 24h if ANY earlier critical batch shared the fixed topic. 0 = deliver
     # every distinct batch; the job, not governance, owns de-dup here.
+    # Tradeoff (accepted): 0 also drops the durable outreach_history backstop, so
+    # if mark_surfaced fails AND the process restarts before the obs is surfaced,
+    # that ONE critical can re-page. That is the safe direction for a CRITICAL
+    # path — a rare duplicate on a persistent-DB-failure beats suppressing a real
+    # critical for 24h. (A content-hash/source_id-keyed durable dedup that keeps
+    # same-batch protection while letting distinct batches through is the cleaner
+    # future refinement; it needs a governance change, not a window value.)
     "critical_observation": 0,
     # Task lifecycle notifications — never dedup. Each is a distinct status
     # event for one task (topic = "Task <id>"), and every _notify call site

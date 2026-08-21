@@ -562,13 +562,14 @@ def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
 # Check-run conclusions / statuses that mean the CI is NOT green.
 _CI_RED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 _CI_RED_STATES = {"FAILURE", "ERROR"}  # legacy StatusContext state
-# SKIPPED/NEUTRAL are genuinely non-blocking. STALE (a run superseded before it
-# could report) is too — listed EXPLICITLY so the catch-all below can fail any
-# *other* unrecognized/future conclusion toward pending (blocking), matching
-# gh's own `default: return pending`. (Live CheckConclusionState enum, 2026-08:
-# SUCCESS/FAILURE/CANCELLED/TIMED_OUT/ACTION_REQUIRED/STARTUP_FAILURE/SKIPPED/
-# NEUTRAL/STALE — 8 classified here, the 9th unknown-future value → pending.)
-_CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL", "STALE"}
+# SKIPPED/NEUTRAL are genuinely non-blocking. STALE is NOT: `gh` (2.96.0,
+# empirically verified) buckets a COMPLETED+STALE CheckRun as `pending`, and a
+# stale run never produced a passing verdict — so it must block. STALE is
+# deliberately ABSENT here so it falls to the terminal catch-all → pending.
+# (Live CheckConclusionState enum, 2026-08: SUCCESS/FAILURE/CANCELLED/TIMED_OUT/
+# ACTION_REQUIRED/STARTUP_FAILURE/SKIPPED/NEUTRAL/STALE — SKIPPED/NEUTRAL skip,
+# SUCCESS green, four red, STALE + any future/unknown value → pending.)
+_CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL"}
 _CI_GREEN = {"SUCCESS"}
 # The only CheckRun.status that means "finished". Everything else
 # (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so

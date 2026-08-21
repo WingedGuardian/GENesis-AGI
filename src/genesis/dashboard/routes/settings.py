@@ -154,6 +154,17 @@ async def settings_update(domain_name: str):
             "details": gate_err,
         }), 409
 
+    # Capture the gate's EFFECTIVE value BEFORE the write, so the disable notice
+    # fires only on an actual true→false transition. The dashboard PUTs the whole
+    # config, so editing any autonomous-cli setting while the gate is already off
+    # would otherwise re-fire the alert on every save (spurious with a 0-window).
+    gate_was_off = (
+        domain_name == "autonomous_cli_policy"
+        and _load_yaml_merged(domain.config_filename).get(
+            "manual_approval_required", True,
+        ) is False
+    )
+
     # Write changes to the local overlay (not the base file)
     try:
         local = _load_yaml_local(domain.config_filename)
@@ -166,6 +177,7 @@ async def settings_update(domain_name: str):
         if (
             domain_name == "autonomous_cli_policy"
             and changes.get("manual_approval_required") is False
+            and not gate_was_off  # only on a genuine true→false transition
         ):
             await _notify_gate_disabled()
         elif (
