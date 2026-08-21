@@ -34,6 +34,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from genesis.util.proc_kill import kill_process_group, reap_bounded
+
 logger = logging.getLogger(__name__)
 
 _TOKEN_FILE = Path("~/.genesis/cc_oauth_token.env").expanduser()
@@ -122,14 +124,20 @@ async def probe_logged_out(cc_path: str = "claude", timeout_s: float = 15.0) -> 
             "--json",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            # Own group so the timeout can reap any node children too
+            # (mirrors the swept guardian/diagnosis.py probe).
+            start_new_session=True,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except TimeoutError:
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+            kill_process_group(proc)
+            await reap_bounded(proc)
             return False
+        except asyncio.CancelledError:
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
         try:
             logged_in = json.loads(stdout.decode("utf-8", errors="replace")).get(
                 "loggedIn",

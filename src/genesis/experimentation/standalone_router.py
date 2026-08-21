@@ -36,14 +36,37 @@ _MAX_RETRIES = 2
 _RETRY_BASE_S = 5.0
 
 # Default offline providers (routing-config names). Generation + judging use
-# DIFFERENT providers to avoid self-judging bias; the judge defaults to the
-# deepseek family (closest available to the golden-set's calibrated judge).
+# DIFFERENT providers to avoid self-judging bias; the judge stays on DeepSeek
+# V4-pro — the golden-set's CALIBRATED judge model. NOTE: this resolves the
+# provider DIRECTLY (offline harnesses: reflection calibration, bench, skill-
+# replay, experiment guards), bypassing the runtime `judge` YAML chain, so it
+# must name a V4-pro provider explicitly. `nvidia-nim-deepseek` now serves
+# V4-flash (NIM EOL'd V4-pro), so use the paid OpenRouter V4-pro to keep the
+# offline eval baseline comparable.
 DEFAULT_GEN_PROVIDER = "groq-free"
-DEFAULT_JUDGE_PROVIDER = "nvidia-nim-deepseek"
+DEFAULT_JUDGE_PROVIDER = "openrouter-deepseek-v4"
 
 
 def _default_config_path() -> Path:
     return Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
+
+
+def default_judge_chain(judge_provider: str | None = None) -> list[str]:
+    """The offline judge fallback chain — mirrors the runtime ``judge`` call
+    site EXACTLY by reading it from the shipped routing config, so it can never
+    drift (calibrated V4-pro first, then NIM V4-flash + paid V4-flash for
+    resilience). Deriving from config (rather than hardcoding
+    ``[DEFAULT_JUDGE_PROVIDER, ...]``) also means the primary can never be
+    duplicated in the chain — a duplicate would make StandaloneLiteLLMRouter
+    re-attempt the same failed provider, potentially costing a second timeout.
+    ``judge_provider`` reorders the chain to lead elsewhere (known-down-primary
+    lever); it is de-duplicated so a lead that already appears can't repeat.
+    """
+    cfg = load_config(_default_config_path())
+    chain = list(cfg.call_sites["judge"].chain)
+    if judge_provider:
+        chain = [judge_provider, *[p for p in chain if p != judge_provider]]
+    return chain
 
 
 @dataclass

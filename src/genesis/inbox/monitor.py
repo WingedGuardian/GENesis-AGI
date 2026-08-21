@@ -55,14 +55,21 @@ def _eval_disallowed_tools() -> list[str]:
     ``build_reflection_disallowed`` (live per call) means a genesis MCP write
     added in a future PR is auto-denied here with no code change.
 
-    NOTE: the retained ``observation_write`` is a RESIDUAL write surface, not a
-    proven-safe one. Today it neither stamps external provenance (the tool ignores
-    the session origin, unlike the procedural/knowledge writers) nor constrains the
-    observation ``type`` — so an injected item could in principle forge a
-    ``user_model_delta`` that the user-model pipeline auto-accepts. That is a
-    LOW-likelihood, curated-input vector; the real fix (a provisional provenance
-    tier + type-authorization on the writer) is tracked in the memory-provenance
-    work, deliberately NOT bolted onto this tool-denylist change.
+    NOTE: the retained ``observation_write`` now STAMPS the session origin (WS-3):
+    an eval-session write lands ``origin_class='external_untrusted'`` (like the
+    procedural/knowledge writers). Two PRIVILEGED-WRITE consumers are now gated on
+    that origin — ``UserModelEvolver.process_pending_deltas`` (user model) and the
+    autonomy dispatcher's ``task_detected`` pickup — via
+    ``immunity.is_trusted_for_privileged_write``, so a forged
+    ``user_model_delta`` / ``task_detected`` is rejected at the point of privileged
+    consumption. PARTIAL, NOT the whole vector: the digest types this tool writes
+    (``user_signal`` / ``architecture_insight``) are still surfaced UNFILTERED into
+    LLM context by other consumers (``essential_knowledge._recent_decisions`` → the
+    always-loaded L1 file; ``reflection`` context; several ego/sentinel raw-SQL
+    reads). Closing that broader observation-content-surfacing surface (exclude/wrap
+    external-origin content at the surfacing points) is tracked — see the
+    "external-origin observation content" follow-up. (The ``Bash``/fetch relocation
+    remains the open part of 727a3724, above.)
     """
     return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]
 
@@ -1379,9 +1386,9 @@ class InboxMonitor:
             mcp_config=mcp_path,
             # WS-3: inbox evaluations process EXTERNAL content by construction, so
             # stamp the session external — the Python-side eval-memory writes read
-            # this, and any future origin-aware MCP write will too. NOTE: the one
-            # retained MCP write here (observation_write) does NOT currently honor
-            # this stamp (see _eval_disallowed_tools) — tracked, not fixed here.
+            # this, and the retained MCP write (observation_write) NOW honors it too
+            # (it forwards session_origin_from_env), so a delta forged here is
+            # stamped external and barred by the user-model consumer gate.
             origin=ORIGIN_EXTERNAL_UNTRUSTED,
         )
 
