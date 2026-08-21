@@ -177,6 +177,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Contribution secret-scanning now actually blocks leaked secrets.** The sanitizer
+  that checks community-contribution diffs before opening a public PR ran two secret
+  scanners — detect-secrets (the required floor) and gitleaks — but both were silently
+  finding nothing: detect-secrets' output parser missed every hit because it didn't
+  account for the confidence/entropy suffix in the tool's output, and gitleaks was
+  invoked with a flag combination that made it scan nothing from its input. A diff
+  containing an API token or private key could pass the sanitizer clean. Both scanners
+  now work (gitleaks also loads the repo's custom PII rules), and new tests exercise the
+  real scanner binaries so this can't silently regress. The privacy scanners for IP
+  addresses, emails, and install fingerprints were unaffected. The gitleaks layer was
+  further hardened after a security review: a scanner error (bad config, unexpected
+  exit) now surfaces a visible warning instead of silently reporting "clean"; the
+  scanner's own rules file is pinned to the committed version and is itself on the
+  contribution-forbidden list, so a contribution can't weaken the gate that scans it.
 - **Autonomy no longer wedges when its cross-vendor reviewer hangs.** A task's
   quality gate runs an adversarial verification through a `codex exec` subprocess.
   That call had no timeout, so a hung codex (a known upstream model-catalog-refresh
