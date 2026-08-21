@@ -23,9 +23,9 @@ The fingerprint, if you're diagnosing it live:
 
 ## What Genesis sets up (and what it only warns about)
 
-`scripts/lib/memory_resilience.sh` runs from `bootstrap.sh` on fresh installs
-and from every `update.sh` (which re-runs bootstrap), so existing installs
-retrofit automatically. It is idempotent and **adaptive — every threshold is a
+`scripts/lib/memory_resilience.sh` runs from `install.sh` and `bootstrap.sh` on
+fresh installs and from every `update.sh` (which re-runs bootstrap), so existing
+installs retrofit automatically. It is idempotent and **adaptive — every threshold is a
 pressure percentage, never an absolute byte value**, so the same config
 right-sizes from a small VPS to a large workstation:
 
@@ -106,7 +106,7 @@ budget is exhausted well before memory/CPU/disk, so new processes fail with
 **`Cannot fork`** while every other axis reads green.
 
 `pid_budget_apply` (in `scripts/lib/memory_resilience.sh`, run from
-`bootstrap.sh`/`update.sh` alongside the oomd setup) lays down
+`install.sh`/`bootstrap.sh`/`update.sh` alongside the oomd setup) lays down
 `/etc/systemd/system/user-.slice.d/90-genesis-tasksmax.conf` →
 **`TasksMax=60%`**. Like the pressure thresholds it is a **percentage, not an
 absolute count**, so it self-calibrates to each box's own budget. **60%, not

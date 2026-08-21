@@ -68,6 +68,23 @@ def test_push_remote_compound_command():
     assert hook._push_remote("git push | tee log.txt") == ""
 
 
+def test_push_remote_skips_super_prefix_value():
+    # `git --super-prefix <path> push <remote>`: --super-prefix consumes its
+    # value. If the parser does not skip that value it lands on the path token,
+    # never sees `push`, and misreads the command as "not a push" → the advisory
+    # scan silently SKIPS. The privacy hook's git-global value-flag set was
+    # missing --super-prefix (the guard + shell_parse copies already had it);
+    # locked identical by test_value_flag_consistency.
+    assert hook._push_remote("git --super-prefix /tmp/sp push origin main") == "origin"
+
+
+def test_effective_cwd_skips_super_prefix_to_find_dash_C():
+    # --super-prefix must be consumed WITH its value so a following `-C <dir>` is
+    # still found — otherwise the push is scanned against the wrong cwd.
+    cwd = hook._effective_cwd("git --super-prefix /tmp/sp -C /work push origin main", "/payload")
+    assert cwd == "/work"
+
+
 # ── _scan (reuses the sanitizer's cheap regex scanners) ────────────────
 
 

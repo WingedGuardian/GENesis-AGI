@@ -1158,6 +1158,60 @@ async def test_conversation_history_search():
             mod._retriever = old_retriever
 
 
+async def test_conversation_history_cc_before_filters_older(tmp_path, monkeypatch):
+    """The CC 'before' cursor must exclude records at/after the timestamp so
+    scroll-up pages further back. Previously the CC branch ignored 'before' and
+    returned the tail regardless — the advertised pagination silently no-oped
+    for CC. A record with no timestamp is excluded once 'before' is set (can't
+    prove it precedes the cursor)."""
+    import json as _json
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.mcp.memory import conversation as conv
+
+    proj = "proj-x"
+    proj_dir = tmp_path / ".claude" / "projects" / proj
+    proj_dir.mkdir(parents=True)
+    # Written OUT of chronological order — the tool must sort globally by
+    # timestamp before applying the cursor/limit (mirrors the real two-file
+    # concatenation scramble).
+    records = [
+        {"type": "assistant", "message": "middle", "timestamp": "2026-08-20T10:05:00Z"},
+        {"type": "user", "message": "oldest", "timestamp": "2026-08-20T10:00:00Z"},
+        {"type": "user", "message": "newest", "timestamp": "2026-08-20T10:10:00Z"},
+        {"type": "user", "message": "notime"},  # missing timestamp
+    ]
+    (proj_dir / "s.jsonl").write_text(
+        "\n".join(_json.dumps(r) for r in records) + "\n",
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conv, "cc_project_dir", lambda: proj)
+
+    old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = MagicMock()
+
+        tools = await _get_tools()
+        result = await tools["conversation_history"].fn(
+            channel="cc", limit=10, before="2026-08-20T10:10:00Z",
+        )
+        contents = [m["content"] for m in result]
+        # at/after the cursor (and undated) excluded; older kept.
+        assert "newest" not in contents
+        assert "notime" not in contents
+        assert "oldest" in contents
+        assert "middle" in contents
+        # Returned chronologically (oldest→newest), regardless of file order.
+        assert contents == ["oldest", "middle"]
+    finally:
+        mod._store = old_store
+        mod._db = old_db
+        mod._retriever = old_retriever
+
+
 async def test_conversation_history_unknown_channel():
     """Unknown channel returns empty list."""
     import genesis.mcp.memory_mcp as mod
@@ -1865,3 +1919,112 @@ async def test_memory_core_facts_wraps_external_and_emits(monkeypatch):
     assert kwargs["gate"] == "injection"
     assert kwargs["source_ref"] == "mcp/memory/core.py::memory_core_facts"
     assert kwargs["blockable_count"] == 1
+
+
+async def test_conversation_history_chat_scoped_and_paginated():
+    """chat_id scopes the telegram branch to ONE chat (a DM scroll-up must not
+    leak other chats); `before` pages further back; the unscoped default is
+    unchanged (reflection sessions rely on the cross-chat view)."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        from genesis.db.crud.telegram_messages import store
+        for i in range(4):
+            await store(
+                real_db, chat_id=100, message_id=i, sender="user",
+                content=f"dm-{i}", timestamp=f"2026-08-13T04:0{i}:00",
+            )
+        await store(
+            real_db, chat_id=200, message_id=90, sender="genesis",
+            content="group-noise", timestamp="2026-08-13T04:02:30",
+        )
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        try:
+            mod._store, mod._retriever = MagicMock(), MagicMock()
+            mod._db = real_db
+
+            tools = await _get_tools()
+            fn = tools["conversation_history"].fn
+
+            scoped = await fn(channel="telegram", chat_id=100, limit=10)
+            assert [m["content"] for m in scoped] == [
+                "dm-0", "dm-1", "dm-2", "dm-3",
+            ]
+
+            paged = await fn(
+                channel="telegram", chat_id=100,
+                before="2026-08-13T04:02:00", limit=10,
+            )
+            assert [m["content"] for m in paged] == ["dm-0", "dm-1"]
+
+            unscoped = await fn(channel="telegram", limit=10)
+            assert any(m["content"] == "group-noise" for m in unscoped), (
+                "default must stay unscoped (cross-chat)"
+            )
+
+            sscoped = await fn(channel="telegram", chat_id=100, search="dm-2")
+            assert [m["content"] for m in sscoped] == ["dm-2"]
+            snoise = await fn(channel="telegram", chat_id=100, search="group-noise")
+            assert snoise == []
+        finally:
+            mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever
+
+
+async def test_conversation_history_search_honors_scoping_and_cursor():
+    """Codex round-3 lock: the search branch must honor thread_id and before —
+    otherwise paged search repeats the newest matches forever and a topic
+    search leaks other topics."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        from genesis.db.crud.telegram_messages import store
+        for i in range(3):
+            await store(
+                real_db, chat_id=100, message_id=i, sender="user",
+                content=f"needle-{i}", thread_id=7,
+                timestamp=f"2026-08-13T04:0{i}:00",
+            )
+        await store(
+            real_db, chat_id=100, message_id=50, sender="user",
+            content="needle-other-topic", thread_id=8,
+            timestamp="2026-08-13T04:01:30",
+        )
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        try:
+            mod._store, mod._retriever = MagicMock(), MagicMock()
+            mod._db = real_db
+            tools = await _get_tools()
+            fn = tools["conversation_history"].fn
+
+            scoped = await fn(
+                channel="telegram", chat_id=100, thread_id=7, search="needle",
+            )
+            assert [m["content"] for m in scoped] == [
+                "needle-0", "needle-1", "needle-2",
+            ], "topic search must not leak other topics"
+
+            paged = await fn(
+                channel="telegram", chat_id=100, thread_id=7, search="needle",
+                before="2026-08-13T04:01:00",
+            )
+            assert [m["content"] for m in paged] == ["needle-0"], (
+                "search must honor the before cursor"
+            )
+        finally:
+            mod._store, mod._db, mod._retriever = old_store, old_db, old_retriever

@@ -155,6 +155,92 @@ async def test_get_all_known_reused_row_wins_over_older_completed(db):
 
 
 @pytest.mark.asyncio
+async def test_get_all_known_exhausted_failed_does_not_clobber_newer_completed(db):
+    """THE 2026-08 approval-storm seed (measured live): a permanently-failed row
+    (retry_count >= max) must NOT overwrite the hash of a NEWER completed row
+    for the same file.
+
+    Live specimen: Genesis.md had one exhausted row (hash 1e29dba0, created
+    08-14) and five newer completed rows (hash e77f117f == on-disk). The old
+    two-pass implementation let the exhausted row clobber the completed hash
+    unconditionally -> known != disk -> phantom "modified" every 30-min scan ->
+    the monitor cancelled + re-sent the pending approval every tick for days.
+    """
+    await inbox_items.create(
+        db, id="exhausted", file_path="/inbox/a.md", content_hash="POISON",
+        created_at="2026-08-14T04:00:00+00:00",
+    )
+    await inbox_items.update_status(
+        db, "exhausted", status="failed",
+        error_message="partial_url_failure", retry_count=3,
+    )
+    await inbox_items.create(
+        db, id="done", file_path="/inbox/a.md", content_hash="DISK",
+        status="completed", created_at="2026-08-18T17:00:00+00:00",
+    )
+    known = await inbox_items.get_all_known(db)
+    assert known["/inbox/a.md"] == "DISK"
+
+
+@pytest.mark.asyncio
+async def test_get_all_known_exhausted_failed_newest_still_blocks(db):
+    """When the exhausted-failed row IS the newest row for the file, it still
+    blocks reprocessing with its hash (existing contract, must survive the
+    newest-row-wins rewrite)."""
+    await inbox_items.create(
+        db, id="done", file_path="/inbox/a.md", content_hash="OLDDONE",
+        status="completed", created_at="2026-08-10T00:00:00+00:00",
+    )
+    await inbox_items.create(
+        db, id="exhausted", file_path="/inbox/a.md", content_hash="LASTFAIL",
+        created_at="2026-08-14T00:00:00+00:00",
+    )
+    await inbox_items.update_status(
+        db, "exhausted", status="failed", error_message="boom", retry_count=3,
+    )
+    known = await inbox_items.get_all_known(db)
+    assert known["/inbox/a.md"] == "LASTFAIL"
+
+
+@pytest.mark.asyncio
+async def test_get_all_known_completed_null_response_path_blocks(db):
+    """Completed rows with NULL response_path (empty-delta completing rows —
+    the exact shape the storm minted every tick) block with their hash; only
+    completed rows whose response file EXISTED and was DELETED re-open the
+    file for evaluation (user-initiated re-eval contract)."""
+    await inbox_items.create(
+        db, id="nullresp", file_path="/inbox/a.md", content_hash="H",
+        status="completed", created_at="2026-08-18T00:00:00+00:00",
+    )
+    known = await inbox_items.get_all_known(db)
+    assert known["/inbox/a.md"] == "H"
+
+
+@pytest.mark.asyncio
+async def test_get_all_known_retriable_failed_invisible_even_when_newest(db):
+    """A retriable-failed row (retry_count < max) is INVISIBLE to the
+    newest-row scan even when it is the newest row: terminal/active siblings
+    decide the known hash (per-file), and the retry lane owns re-queueing.
+    Without this, a newest retriable-failed row would erase the file from
+    'known', re-classify it as NEW, and re-evaluate FULL content (regression
+    the 2026-08-18 red-team flagged as F1)."""
+    await inbox_items.create(
+        db, id="done", file_path="/inbox/a.md", content_hash="DONE",
+        status="completed", created_at="2026-08-10T00:00:00+00:00",
+    )
+    await inbox_items.create(
+        db, id="retriable", file_path="/inbox/a.md", content_hash="FAILH",
+        created_at="2026-08-14T00:00:00+00:00",
+    )
+    await inbox_items.update_status(
+        db, "retriable", status="failed", error_message="rate limit",
+        retry_count=1,
+    )
+    known = await inbox_items.get_all_known(db)
+    assert known["/inbox/a.md"] == "DONE"
+
+
+@pytest.mark.asyncio
 async def test_update_status(db):
     await inbox_items.create(
         db, id="i1", file_path="/inbox/a.md",

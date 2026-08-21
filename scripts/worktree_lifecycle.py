@@ -3,11 +3,17 @@
 
 Identifies and trashes worktrees that are:
 1. Not in use by any process (no /proc/*/cwd inside them)
-2. Inactive for 14+ days (no file modifications)
-3. Branch is merged (PR merged on GitHub) OR has zero unique commits
+2. Not locked (`git worktree lock`), with no in-progress Git operation
+   (rebase/merge/cherry-pick/revert/bisect), and not containing a nested
+   worktree — each signals deliberate/in-progress work to preserve
+3. Inactive for 14+ days (no file modifications)
+4. Merged into main — branch merged (PR on GitHub) OR zero unique commits.
+   A detached-HEAD worktree (no branch) is judged by whether its HEAD commit
+   is already in main; without this it would default to branch "unknown" and
+   never be reaped.
 
-Trashed worktrees are recoverable for 7 days. After that, permanently
-deleted along with their branches.
+Trashed worktrees are recoverable for 7 days (see _recover for the recovery
+contract). After that, permanently deleted along with their branches.
 
 Usage:
     worktree_lifecycle.py                    # Run: trash stale, purge old trash
@@ -83,7 +89,10 @@ def _find_processes_in_dir(dir_path: str) -> list[int]:
 def _list_worktrees(repo_root: Path) -> list[dict]:
     """Parse git worktree list --porcelain into structured data.
 
-    Returns list of dicts with keys: path, branch, head.
+    Returns list of dicts with keys: path, head, branch, detached, locked.
+    ``branch`` is absent for a detached HEAD (porcelain emits a bare ``detached``
+    line instead), in which case ``detached`` is True. ``locked`` is True when the
+    worktree is under ``git worktree lock``.
     Excludes the main worktree (bare=True or first entry).
     """
     try:
@@ -111,6 +120,16 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
             # refs/heads/branch-name → branch-name
             ref = line[len("branch "):]
             current["branch"] = ref.removeprefix("refs/heads/")
+        elif line == "detached":
+            # Detached HEAD: porcelain emits a bare "detached" line and NO
+            # "branch " line. Mark it so the merge check keys off the HEAD sha.
+            current["detached"] = True
+        elif line == "locked" or line.startswith("locked "):
+            # Explicit `git worktree lock` — an operator "do not touch" signal.
+            # (Porcelain emits `locked` since git 2.36; on older git the flag is
+            # simply never set and such a worktree falls through to the normal
+            # merged/inactive checks — degrades safe, never a hard error.)
+            current["locked"] = True
         elif line == "":
             if current and "path" in current and not is_first:
                 worktrees.append(current)
@@ -155,20 +174,35 @@ def _last_activity_time(worktree_path: str) -> float:
     return latest
 
 
-def _branch_is_merged(branch: str, repo_root: Path) -> bool:
-    """Check if a branch's PR is merged on GitHub.
+def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
+    """Check whether a worktree's work is already in ``main``.
 
-    Three methods tried in order:
-    1. git merge-base --is-ancestor (fast, works for non-squash merges)
+    ``ref`` is a branch name (``is_branch=True``) or, for a detached-HEAD
+    worktree, its HEAD commit SHA (``is_branch=False``).
+
+    For a BRANCH, three methods in order:
+    1. git merge-base --is-ancestor (fast; branch tip is an ancestor of main)
     2. gh pr list --head <branch> --state merged (handles squash merges)
-    3. Zero unique commits vs main (git cherry)
+    3. Zero unique commits vs main (git cherry; patch-id equivalence)
+
+    For a DETACHED HEAD, ONLY Method 1 (true ancestor of main) is trusted; the
+    patch-id method (3) and the PR method (2) are skipped. This is deliberate: a
+    bare commit referenced only by the worktree HEAD has no branch protecting it,
+    so reaping a merely patch-equivalent (non-ancestor) commit would let a GC
+    collect it inside the recovery window; and ``git cherry`` omits merge commits
+    entirely (no patch id), so a unique merge commit would be mis-read as "no
+    unique work" and wrongly reaped. A true ancestor is both genuinely in main's
+    history AND reachable (GC-safe). The cost is fail-safe: a detached HEAD whose
+    work reached main only by squash/rebase (patch-equal but not an ancestor) is
+    kept, never reaped.
 
     Returns False on any error (fail-safe: keep the worktree).
     """
-    # Method 1: git merge-base
+    # Method 1: git merge-base (branch ref or raw SHA) — the ONLY method for a
+    # detached HEAD (see docstring: patch-id/PR methods are unsafe for a bare SHA).
     try:
         result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", branch, "main"],
+            ["git", "merge-base", "--is-ancestor", ref, "main"],
             capture_output=True, cwd=str(repo_root), timeout=10,
         )
         if result.returncode == 0:
@@ -176,10 +210,13 @@ def _branch_is_merged(branch: str, repo_root: Path) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # Method 2: gh pr list (handles squash merges)
+    if not is_branch:
+        return False  # detached HEAD: ancestor-only, no patch-id/PR fallbacks
+
+    # Method 2: gh pr list (handles squash merges) — branch heads only.
     try:
         result = subprocess.run(
-            ["gh", "pr", "list", "--head", branch, "--state", "merged",
+            ["gh", "pr", "list", "--head", ref, "--state", "merged",
              "--limit", "1", "--json", "number"],
             capture_output=True, text=True, cwd=str(repo_root), timeout=30,
         )
@@ -190,10 +227,10 @@ def _branch_is_merged(branch: str, repo_root: Path) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
         pass
 
-    # Method 3: zero unique commits
+    # Method 3: zero unique commits (patch-id equivalence) — branch heads only.
     try:
         result = subprocess.run(
-            ["git", "cherry", "main", branch],
+            ["git", "cherry", "main", ref],
             capture_output=True, text=True, cwd=str(repo_root), timeout=10,
         )
         if result.returncode == 0:
@@ -205,6 +242,46 @@ def _branch_is_merged(branch: str, repo_root: Path) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
+    return False
+
+
+# Per-worktree admin-dir markers for an in-progress Git operation. Each lives
+# under the worktree's OWN git dir (git resolves them per-worktree), so a paused
+# rebase/merge/cherry-pick/revert/bisect in one worktree is detectable there.
+_IN_PROGRESS_MARKERS = (
+    "rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+    "REVERT_HEAD", "BISECT_LOG", "sequencer",
+)
+
+
+def _has_in_progress_op(worktree_path: str) -> bool:
+    """True if the worktree has a paused Git operation (rebase/merge/…).
+
+    Reaping such a worktree would destroy its sequencer state (it lives in the
+    per-worktree admin dir, discarded by ``git worktree prune``), making
+    ``git rebase --continue`` etc. impossible. Resolves each marker via
+    ``git rev-parse --git-path`` so it hits the worktree's OWN admin dir, not the
+    shared one. Fail-CLOSED: if the marker paths can't be resolved (git missing,
+    timeout, or the worktree's .git is transiently unreadable/malformed), returns
+    True (unknown → assume in-progress and KEEP the worktree) rather than letting a
+    possibly-mid-operation worktree be reaped.
+    """
+    for marker in _IN_PROGRESS_MARKERS:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--git-path", marker],
+                capture_output=True, text=True, cwd=worktree_path, timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return True  # fail-closed: can't verify state → protect the worktree
+        if result.returncode != 0:
+            return True  # can't resolve marker path (broken/unreadable .git) → protect
+        rel = result.stdout.strip()
+        if not rel:
+            return True  # unexpected empty path → protect rather than assume clean
+        p = rel if os.path.isabs(rel) else os.path.join(worktree_path, rel)
+        if os.path.exists(p):
+            return True
     return False
 
 
@@ -221,7 +298,8 @@ def _trash_worktree(
     Returns True if trashed (or would be trashed in dry-run).
     """
     wt_path = Path(wt["path"])
-    branch = wt.get("branch", "unknown")
+    branch = wt.get("branch", "")
+    detached = wt.get("detached", False)
     name = wt_path.name
     date_str = datetime.now(UTC).strftime("%Y%m%d")
     trash_name = f"{name}-{date_str}"
@@ -248,6 +326,7 @@ def _trash_worktree(
             "original_path": str(wt_path),
             "branch": branch,
             "commit": wt.get("head", ""),
+            "detached": detached,
             "trashed_at": datetime.now(UTC).isoformat(),
         }
         staging_meta = TRASH_DIR / f".{trash_path.name}.meta.staging"
@@ -266,7 +345,8 @@ def _trash_worktree(
             capture_output=True, cwd=str(repo_root), timeout=10,
         )
 
-        _log(f"TRASH {wt_path}: branch={branch}, recoverable for {TRASH_RETENTION_DAYS}d at {trash_path}")
+        ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
+        _log(f"TRASH {wt_path}: {ref_label}, recoverable for {TRASH_RETENTION_DAYS}d at {trash_path}")
         return True
     except (OSError, shutil.Error) as e:
         _log(f"ERROR trashing {wt_path}: {e}")
@@ -343,7 +423,18 @@ def _purge_old_trash(repo_root: Path, *, dry_run: bool = False) -> None:
 
 
 def _recover(name: str, repo_root: Path) -> bool:
-    """Recover a worktree from the trash."""
+    """Recover a worktree from the trash.
+
+    Recovery contract: recreates the worktree at its recorded ref (the branch, or
+    for a detached HEAD its commit) and restores untracked files that were in the
+    trash. It does NOT reconstruct the full dirty working state — uncommitted
+    tracked modifications, deletions, mode-only changes, and the staged/unstaged
+    split are not reapplied. This is intentional: the reaper only trashes worktrees
+    already merged into main, so committed content is always recoverable from main,
+    and overlaying arbitrary dirty state risks writing through checked-out symlinks.
+    (Full working-state recovery would require preserving the git admin dir at trash
+    time via ``git worktree move`` instead of ``shutil.move`` + ``git worktree prune``.)
+    """
     if not TRASH_DIR.exists():
         print(f"No trash directory found at {TRASH_DIR}", file=sys.stderr)
         return False
@@ -371,8 +462,12 @@ def _recover(name: str, repo_root: Path) -> bool:
     meta = json.loads(meta_path.read_text())
     original_path = meta.get("original_path", "")
     branch = meta.get("branch", "")
+    commit = meta.get("commit", "")
+    detached = meta.get("detached", False)
 
-    if not original_path or not branch:
+    # Recoverable if we have a place to put it AND a ref to recreate it from
+    # (a branch, or — for a detached HEAD — its commit).
+    if not original_path or (not branch and not commit):
         print(f"Incomplete metadata in {meta_path}", file=sys.stderr)
         return False
 
@@ -381,9 +476,13 @@ def _recover(name: str, repo_root: Path) -> bool:
         print(f"Original path already exists: {original_path}", file=sys.stderr)
         return False
 
-    # Try to recreate worktree from the branch
+    # Recreate the worktree: detached at its commit, or checked out on its branch.
+    if detached or not branch:
+        add_cmd = ["git", "worktree", "add", "--detach", original_path, commit]
+    else:
+        add_cmd = ["git", "worktree", "add", original_path, branch]
     result = subprocess.run(
-        ["git", "worktree", "add", original_path, branch],
+        add_cmd,
         capture_output=True, text=True, cwd=str(repo_root), timeout=30,
     )
 
@@ -399,26 +498,55 @@ def _recover(name: str, repo_root: Path) -> bool:
             print(f"Failed to move: {e}", file=sys.stderr)
             return False
 
-    # Worktree recreated from branch — now copy any uncommitted files
-    # that were in the trash but not in the branch
+    # Restore UNTRACKED files/symlinks that were in the trash but not recreated by
+    # the fresh checkout (copy-only-missing). Reconstructing the full dirty state
+    # (uncommitted tracked edits, deletions, mode-only changes, the staged/unstaged
+    # split) is not attempted — see the recovery contract in the function docstring;
+    # committed content is always safe in main.
+    #
+    # Two hard safety invariants (a recovery must NEVER write outside the worktree):
+    #  1. copy-only-missing keyed on os.path.lexists (does NOT dereference), so an
+    #     existing OR dangling destination symlink is left untouched — never written
+    #     through to whatever it points at.
+    #  2. the resolved parent of every destination must stay INSIDE the worktree
+    #     root; a symlinked path component that would redirect the write outside is
+    #     refused. Symlinks are recreated AS symlinks (os.symlink), never dereferenced.
+    worktree_root = os.path.realpath(original_path)
     trash_files = set()
     for item in trash_path.rglob("*"):
-        if item.is_file() and ".git" not in item.parts:
-            rel = item.relative_to(trash_path)
-            if rel.name == ".trash_meta.json":
-                continue
-            target = Path(original_path) / rel
-            if not target.exists():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(item), str(target))
-                trash_files.add(str(rel))
+        if ".git" in item.parts:
+            continue
+        if not (item.is_symlink() or item.is_file()):
+            continue  # dirs are created implicitly; skip FIFOs/sockets/etc.
+        rel = item.relative_to(trash_path)
+        if rel.name == ".trash_meta.json":
+            continue
+        target = Path(original_path) / rel
+        if os.path.lexists(str(target)):
+            continue  # invariant 1: never overwrite / never write through a dest symlink
+        parent_real = os.path.realpath(str(target.parent))
+        if parent_real != worktree_root and not parent_real.startswith(worktree_root + os.sep):
+            continue  # invariant 2: a symlinked path component would escape the worktree
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if item.is_symlink():
+            os.symlink(os.readlink(str(item)), str(target))  # restore the link itself
+        else:
+            shutil.copy2(str(item), str(target))
+        trash_files.add(str(rel))
 
     # Clean up trash entry
     shutil.rmtree(str(trash_path))
 
-    print(f"Recovered to {original_path} (branch: {branch})")
+    ref_label = f"branch: {branch}" if branch else f"detached at {commit[:8]}"
+    print(f"Recovered to {original_path} ({ref_label})")
     if trash_files:
-        print(f"Restored {len(trash_files)} uncommitted file(s) from trash")
+        print(f"Restored {len(trash_files)} untracked file(s) from trash")
+    print(
+        "Note: committed state restored at the ref plus untracked files; uncommitted "
+        "tracked edits, deletions, mode changes, and staged state are NOT reapplied "
+        "(committed content is always recoverable from main).",
+        file=sys.stderr,
+    )
     return True
 
 
@@ -506,10 +634,32 @@ def main() -> int:
 
     for wt in worktrees:
         wt_path = wt.get("path", "")
-        branch = wt.get("branch", "unknown")
+        branch = wt.get("branch")  # None for a detached HEAD
+        head = wt.get("head", "")
 
         if not wt_path or not Path(wt_path).exists():
             _log(f"SKIP {wt_path}: directory does not exist (ghost entry)")
+            continue
+
+        # Operator protection: never reap a locked worktree or one with a paused
+        # Git operation (rebase/merge/…). Both signal deliberate/in-progress work;
+        # reaping would discard a `git worktree lock` or destroy sequencer state.
+        if wt.get("locked"):
+            _log(f"SKIP {wt_path}: locked (git worktree lock)")
+            continue
+        if _has_in_progress_op(wt_path):
+            _log(f"SKIP {wt_path}: in-progress or unresolvable git state (rebase/merge/broken .git)")
+            continue
+
+        # Never reap a worktree that CONTAINS another linked worktree: trashing
+        # moves the whole directory, dragging the nested worktree (and bypassing
+        # ITS locked/in-progress protections, which are checked on its own row).
+        wt_prefix = wt_path.rstrip("/") + os.sep
+        nested = [o["path"] for o in worktrees
+                  if o.get("path") and o["path"] != wt_path
+                  and o["path"].rstrip("/").startswith(wt_prefix)]
+        if nested:
+            _log(f"SKIP {wt_path}: contains nested worktree(s): {', '.join(nested[:3])}")
             continue
 
         # Check 1: active processes
@@ -526,9 +676,12 @@ def main() -> int:
             _log(f"SKIP {wt_path}: activity {age_days:.0f}d ago (< {STALE_DAYS}d)")
             continue
 
-        # Check 3: branch merged
-        if not _branch_is_merged(branch, repo_root):
-            _log(f"SKIP {wt_path}: branch '{branch}' not merged")
+        # Check 3: work already merged into main. A detached HEAD (no branch)
+        # is judged by its HEAD commit, not the missing branch name.
+        ref, is_branch = (branch, True) if branch else (head, False)
+        if not ref or not _is_merged(ref, repo_root, is_branch=is_branch):
+            label = f"branch '{branch}'" if branch else f"detached HEAD {head[:8]}"
+            _log(f"SKIP {wt_path}: {label} not merged")
             continue
 
         # All checks passed — trash it

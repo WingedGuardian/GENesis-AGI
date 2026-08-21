@@ -141,7 +141,7 @@ The daily drivers for professional productivity and general intelligence.
 - **Intelligence Tier:** A/S (Thoughtful reasoning)
 - **SWE-Bench:** ~62%
 - **Cost:** $1.00/$4.00 per MTok (input/output)
-- **Free Tier:** Available on Nvidia NIM (5,000 credits, 40 RPM); OpenRouter `:free` variant (`moonshotai/kimi-k2.6:free`) removed June 2026
+- **Free Tier:** None currently free — a 2026-08 routing probe found NIM's free Kimi (`moonshotai/kimi-k2.6`) returns 404-for-account and it was retired from Genesis routing; the OpenRouter `:free` variant (`moonshotai/kimi-k2.6:free`) was removed June 2026. Paid access via OpenRouter (`kimi-k2.5` provider) remains a deep fallback.
 
 **Best At:**
 1. Needle in a Haystack: Specialized architecture for searching its own memory — king of long-context retrieval.
@@ -434,6 +434,10 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - **Available models:** Kimi K2.5, Llama 4 Scout, DeepSeek V3.2, GLM-5
 - Best for testing and prototyping only. Not production-ready.
 - Once credits exhausted, must pay or create new account
+- **2026-08 routing probe:** DeepSeek V4-Pro EOL'd (HTTP 410) and free Kimi K2.6
+  404s for our account; Genesis now routes NIM to `deepseek-ai/deepseek-v4-flash-0731`
+  (fast, free, valid JSON on live probe). GLM-5.2 / MiniMax-M3 respond but are too
+  slow (~50-70s) for latency-sensitive primaries.
 
 ### Z.AI / BigModel (GLM-5)
 - **Endpoint:** api.z.ai (international) / open.bigmodel.cn (China)
@@ -685,6 +689,12 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
+**2026-08-19** — NIM routing repoint (live probe): DeepSeek V4-Pro EOL'd on NIM
+(HTTP 410) and free Kimi K2.6 404s for-account, so Genesis retired `nvidia-nim-kimi`
+and repointed `nvidia-nim-deepseek` from `deepseek-ai/deepseek-v4-pro` to
+`deepseek-ai/deepseek-v4-flash-0731` (fast, free, valid JSON). GLM-5.2 / MiniMax-M3
+respond on NIM but are too slow (~50-70s) to be primaries. Updated the Kimi 2.6 and
+Nvidia NIM entries to reflect the probe. No new tiered models this pass.
 **2026-08-02** — Automated free-model inventory now reports 17 OpenRouter free
 variants (scanner re-baselined this run, so it flags all 17 as "new" with 0 removed;
 effective trend ~18→17). Logged newly-visible free models from major providers:

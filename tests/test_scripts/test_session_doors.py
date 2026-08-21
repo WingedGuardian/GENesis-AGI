@@ -176,16 +176,31 @@ class TestManualMode:
         result = run("manual", "--resume", "a b'c")
         assert result.returncode == 0, result.stderr
         # %q-quoted through the tmux command string: the shell inside the
-        # session must receive the original value as ONE argument.
+        # session must receive the original value as ONE argument. Parse only the
+        # claude-args segment — between 'claude ' and the '; __ec=' exit-capture
+        # trailer the inner command now appends.
         line = _new_session_line(log)
         cmd = line.split("LANG=", 1)[1].split(" ", 1)[1]
+        claude_args = cmd.split("claude", 1)[1].split("; __ec=", 1)[0]
         parsed = subprocess.run(
-            ["bash", "-c", f'set -- {cmd.split("claude", 1)[1]}; printf "%s\\n" "$@"'],
+            ["bash", "-c", f'set -- {claude_args}; printf "%s\\n" "$@"'],
             capture_output=True,
             text=True,
             timeout=10,
         )
         assert "a b'c" in parsed.stdout.splitlines()
+
+    def test_inner_command_wires_exit_capture(self, door):
+        """The inner tmux command drops `exec` and records claude's exit via
+        cc_exit_capture.sh before the pane vanishes, preserving claude's code as
+        the pane's exit. Locks the wiring the 2026-08-19 death observability adds."""
+        run, log, _sessions, _listing = door
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        line = _new_session_line(log)
+        assert "cc_exit_capture.sh 1 $__ec" in line, line  # slot 1, deferred code
+        assert "exit $__ec" in line, line  # claude's code reproduced as the pane's
+        assert "exec claude" not in line, "inner exec must be dropped so the trailer runs"
 
 
 class TestHostnameMode:

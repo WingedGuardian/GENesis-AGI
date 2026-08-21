@@ -75,14 +75,53 @@ class UserModelEvolver:
         gate-2 — lets the USER_KNOWLEDGE writer aggregate their stored
         origin_class without changing this method's return contract).
         """
+        from genesis.security.immunity import TRUSTED_PRIVILEGED_WRITE_ORIGINS
+
+        # WS-3 poisoning gate: fetch ONLY trusted-origin (owner/first_party)
+        # unresolved deltas, filtered in SQL. Filtering in the query (not in
+        # Python after a LIMITed fetch) is load-bearing: it stops a flood of
+        # forged/NULL-origin deltas from crowding trusted deltas out of the
+        # newest-N window (a persistent user-model-learning DoS). Fail-closed —
+        # NULL origin is excluded by IN-semantics. Legit reflection deltas carry
+        # first_party in quiet windows (reflection_window_origin never returns
+        # None), so the normal pipeline is unaffected. Barred rows are left
+        # unresolved for the 14-day TTL to reap and are ALSO excluded from
+        # synthesize_narrative's evidence query below, so they can never launder
+        # into USER_KNOWLEDGE.md after TTL-resolution. This is an unconditional
+        # invariant (like never-block-owner), NOT wired through the
+        # shadow-clamped gate_mode("identity") — that would be a silent no-op.
         pending = await observations.query(
-            self._db, type="user_model_delta", resolved=False
+            self._db,
+            type="user_model_delta",
+            resolved=False,
+            origin_class_in=list(TRUSTED_PRIVILEGED_WRITE_ORIGINS),
         )
+        # Observability: surface a poisoning-attempt signal (COUNT only — never
+        # re-fetch untrusted content into the accept path). process_pending_deltas
+        # runs on a multi-hour cadence, so a warning here is a signal, not spam.
+        try:
+            _ph = ",".join("?" for _ in TRUSTED_PRIVILEGED_WRITE_ORIGINS)
+            cur = await self._db.execute(
+                "SELECT COUNT(*) FROM observations "  # noqa: S608 - _ph is only "?" placeholders; values bound as params
+                "WHERE type = 'user_model_delta' AND resolved = 0 "
+                f"AND (origin_class IS NULL OR origin_class NOT IN ({_ph}))",
+                TRUSTED_PRIVILEGED_WRITE_ORIGINS,
+            )
+            row = await cur.fetchone()
+            if row and row[0]:
+                logger.warning(
+                    "%d untrusted user_model_delta(s) present, BARRED from "
+                    "auto-accept (origin not owner/first_party) — left for TTL",
+                    row[0],
+                )
+        except Exception:
+            logger.debug("barred user_model_delta count failed", exc_info=True)
         if not pending:
-            # Touch synthesized_at to confirm model is current even when
-            # no new deltas exist.  Without this, the user_goal_staleness
-            # signal's project-staleness path decays to 1.0 whenever the
-            # delta pipeline is idle (no new observations to process).
+            # Touch synthesized_at to confirm model is current even when there
+            # is no TRUSTED pending work — an empty query OR every pending delta
+            # quarantined above. Without this, the user_goal_staleness signal's
+            # project-staleness path decays to 1.0 whenever the delta pipeline is
+            # idle (no new observations to process).
             try:
                 await self._db.execute(
                     "UPDATE user_model_cache SET synthesized_at = ? "
@@ -210,12 +249,19 @@ class UserModelEvolver:
         if snapshot is None or not snapshot.model:
             return None
 
-        # Pull recent evidence (most recent resolved deltas) for context
+        # Pull recent evidence (most recent resolved deltas) for context.
+        # WS-3: restrict to trusted-origin deltas — a barred external/NULL delta
+        # becomes resolved=True once its 14-day TTL fires (resolve_expired), so
+        # WITHOUT this filter it would launder into the narrative that overwrites
+        # USER_KNOWLEDGE.md. Same trusted set as the accept path above.
+        from genesis.security.immunity import TRUSTED_PRIVILEGED_WRITE_ORIGINS
+
         try:
             recent = await observations.query(
                 self._db,
                 type="user_model_delta",
                 resolved=True,
+                origin_class_in=list(TRUSTED_PRIVILEGED_WRITE_ORIGINS),
                 limit=_NARRATIVE_EVIDENCE_LIMIT,
             )
         except Exception:
