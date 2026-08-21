@@ -833,6 +833,119 @@ async def _resolve_infra_protection_posture(db) -> None:
         logger.debug("Failed to resolve infra posture alerts", exc_info=True)
 
 
+_EGO_LIVENESS_TYPE = "ego_alert"
+_EGO_LIVENESS_SOURCES = {
+    "user_ego_cycle": "ego_liveness:user_ego_cycle",
+    "genesis_ego_cycle": "ego_liveness:genesis_ego_cycle",
+}
+_EGO_LIVENESS_LABELS = {
+    "user_ego_cycle": "User ego (CEO)",
+    "genesis_ego_cycle": "Genesis ego (COO)",
+}
+
+
+async def _check_ego_liveness(db) -> None:
+    """Alert when an ego has completed NO real cycle well past its cadence.
+
+    Reads the durable ``job_health.last_success`` (advanced ONLY on a completed
+    cycle) — never the ``is_running`` / heartbeat / ``next_fire_at`` proxies that
+    stay green while an ego is deadlocked (the 3-day-stall-reads-healthy bug).
+    Conservative thresholds (``ego.liveness``) so a legitimate adaptive backoff
+    or quiet-hours lull never trips; ``gated`` (waiting on the user) and
+    ``is_paused`` (a chosen state) are NOT stalls. One self-superseding 'high'
+    observation PER EGO (its own source), auto-resolved when a cycle completes.
+    Best-effort; never raises into the tick."""
+    if db is None:
+        return
+    try:
+        from genesis.autonomy.cli_policy import load_autonomous_cli_policy
+        from genesis.db.crud import ego as ego_crud
+        from genesis.db.crud import job_health as job_health_crud
+        from genesis.ego.liveness import compute_ego_liveness
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        try:
+            gate_on = load_autonomous_cli_policy().manual_approval_required
+        except Exception:
+            gate_on = True
+        managers = (
+            ("user_ego_cycle", getattr(rt, "_ego_cadence_manager", None)),
+            ("genesis_ego_cycle", getattr(rt, "_genesis_ego_cadence_manager", None)),
+        )
+        for source_tag, mgr in managers:
+            if mgr is None:
+                continue
+            source = _EGO_LIVENESS_SOURCES[source_tag]
+            try:
+                last_success = await job_health_crud.get_job_last_success(
+                    db,
+                    source_tag,
+                )
+                gated = (
+                    await ego_crud.has_pending_cli_approval(db, source_tag) if gate_on else False
+                )
+                live = compute_ego_liveness(
+                    last_success_at=last_success,
+                    current_interval_minutes=mgr.current_interval_minutes,
+                    gated=gated,
+                    is_paused=mgr.is_paused,
+                )
+            except Exception:
+                logger.debug(
+                    "ego liveness compute failed for %s",
+                    source_tag,
+                    exc_info=True,
+                )
+                continue
+
+            if not live.stalled:
+                await observations.resolve_by_source_and_type(
+                    db,
+                    source=source,
+                    type=_EGO_LIVENESS_TYPE,
+                    resolved_at=datetime.now(UTC).isoformat(),
+                    resolution_notes="auto-resolved: ego completed a cycle",
+                )
+                continue
+
+            label = _EGO_LIVENESS_LABELS.get(source_tag, source_tag)
+            overdue_h = (live.overdue_minutes or 0.0) / 60.0
+            content = (
+                f"{label} has completed no autonomous cycle in {overdue_h:.1f}h "
+                f"(expected every ~{int(mgr.current_interval_minutes)}m; stall "
+                f"threshold {live.threshold_minutes / 60:.0f}h). The cycle loop "
+                f"reports alive but is producing no work — check the ego consumer "
+                f"and any dispatch gate in the genesis-server logs."
+            )
+            # Stable per-ego hash: skip_if_duplicate keeps a persisting stall from
+            # re-creating each tick; the row auto-resolves when a cycle lands.
+            content_hash = hashlib.sha256(source.encode()).hexdigest()
+            await observations.supersede_except_hash(
+                db,
+                source=source,
+                type=_EGO_LIVENESS_TYPE,
+                keep_content_hash=content_hash,
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="superseded: ego liveness state changed",
+            )
+            created = await observations.create(
+                db,
+                id=str(uuid.uuid4()),
+                source=source,
+                type=_EGO_LIVENESS_TYPE,
+                content=content,
+                priority="high",
+                created_at=datetime.now(UTC).isoformat(),
+                content_hash=content_hash,
+                skip_if_duplicate=True,
+            )
+            if created is not None:
+                logger.warning("Ego liveness alert: %s stalled", source_tag)
+    except Exception:
+        logger.debug("Failed ego liveness check", exc_info=True)
+
+
 async def _check_memory_integrity_posture(db) -> None:
     """Alert when memory storage consistency or recall health has degraded.
 
@@ -2838,6 +2951,11 @@ class AwarenessLoop:
                     # Day-scale lifecycle signal → hourly; self-resolves when
                     # rows gain a trigger or close.
                     await _check_follow_up_watchdog(self._db)
+                    # Ego liveness: an ego completing NO real cycle well past its
+                    # cadence (job_health.last_success gap), NOT the is_running /
+                    # heartbeat proxies that stay green while deadlocked.
+                    # Conservative threshold; self-resolves when a cycle lands.
+                    await _check_ego_liveness(self._db)
                 await _check_wal_health(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires

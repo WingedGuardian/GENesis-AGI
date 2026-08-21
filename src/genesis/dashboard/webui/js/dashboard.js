@@ -3703,6 +3703,18 @@
                           (geCad?.consecutive_failures >= 3 ? (ueCad?.consecutive_failures >= 3 ? " + COO" : "COO") : "");
             return { state: "error", reason: `circuit open (${which})` };
           }
+          // Truthful liveness: a STALLED ego (no completed cycle well past its
+          // cadence, and not gated/paused) is a genuine fault. It must never read
+          // healthy just because the consumer loop task is alive or next_fire_at
+          // keeps sliding — the exact 3-day-deadlock-shows-green bug. `stalled`
+          // is computed server-side from job_health.last_success (ego.liveness),
+          // conservative thresholds so a legitimate backoff never false-reds.
+          if (ueCad?.stalled || geCad?.stalled) {
+            const which = (ueCad?.stalled ? "CEO" : "") +
+                          (geCad?.stalled ? (ueCad?.stalled ? " + COO" : "COO") : "");
+            const reason = (ueCad?.stalled ? ueCad?.stall_reason : geCad?.stall_reason) || "no recent cycle";
+            return { state: "error", reason: `${which} stalled — ${reason}` };
+          }
           // Fallback to modal cadence if per-ego data not available yet
           const cadence = this.egoModal.cadence;
           if (!ue && cadence?.available) {
@@ -3715,6 +3727,12 @@
           if (ueCad?.is_paused || geCad?.is_paused) {
             const which = ueCad?.is_paused ? "CEO" : "COO";
             return { state: "degraded", reason: `${which} paused` };
+          }
+          // Gated on a pending CLI approval: a legitimate wait on the user (gate
+          // ON), surfaced as a to-do, never healthy and never a fault.
+          if (ueCad?.gated || geCad?.gated) {
+            const which = ueCad?.gated ? "CEO" : "COO";
+            return { state: "needs action", reason: `${which} waiting on CLI approval` };
           }
           // Proposals piling up: this is a review queue awaiting the user, not
           // a fault. Surface it as "needs action" (distinct from degraded) so it

@@ -108,6 +108,10 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "process_reaper_kill": timedelta(days=3),
     "operational_alert": timedelta(days=3),
     "infrastructure_alert": timedelta(days=3),
+    # ego cycle liveness: self-resolving + re-fireable, so a long TTL only delays
+    # the next re-fire; matches infrastructure_alert. Surfaces in the dashboard
+    # observations panel (deliberately NOT in INTERNAL_OBS_TYPES).
+    "ego_alert": timedelta(days=3),
     "cc_cap_empty_event": timedelta(days=3),
     "strategic_reflection": timedelta(days=3),
     # ── 1-day (transient) ──────────────────────────────────────────────

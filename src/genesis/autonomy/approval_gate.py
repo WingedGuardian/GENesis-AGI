@@ -635,7 +635,18 @@ class AutonomousCliApprovalGate:
         Does NOT weaken the gate: the default stays True; with the gate on the
         pending-row scan below is unchanged.
         """
-        if not self._policy().manual_approval_required:
+        try:
+            gate_off = not self._policy().manual_approval_required
+        except Exception:
+            # Fail-safe toward the mandatory gate: a policy-read error keeps the
+            # gate-on pending-row scan (never silently skips a real block). Log
+            # it so a persistent policy misconfiguration is not invisible.
+            logger.debug(
+                "find_site_pending: policy read failed; keeping gate-on scan",
+                exc_info=True,
+            )
+            gate_off = False
+        if gate_off:
             return None
         pending = await self._approval_manager.get_pending()
         for row in pending:
