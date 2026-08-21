@@ -690,6 +690,28 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "leaks",  # the suffixed leaks kind is not captured → missing
     ),
+    # A DISMISSED owner review no longer vouches — its marker (even for all kinds at head)
+    # is ignored, so the gate blocks (mirrors the Codex-freshness dismissed handling).
+    (
+        "scheduled_review_dismissed_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            scheduled=json.dumps(
+                {
+                    "login": "owner",
+                    "author_association": "OWNER",
+                    "state": "DISMISSED",
+                    "body": (
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=code-review -->\n"
+                        f"<!-- genesis-scheduled-review: head={HEAD} kind=leaks -->"
+                    ),
+                }
+            ),
+        ),
+        2,
+        "scheduled Claude review(s) missing",
+    ),
     # The # scheduled-review-override sigil consciously waives the gate → an absent
     # scheduled review still merges.
     (

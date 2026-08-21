@@ -52,7 +52,11 @@ head it reviewed AND which routine it was (``kind``). The merge gate
 (``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
 EVERY kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` (currently code-review + leaks) names
 the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
-was rate-limited, the merge is blocked (naming the missing kinds).
+was rate-limited, the merge is blocked (naming the missing kinds). Deployment note: this
+gate is scoped to the canonical repo's own merge workflow, where the required `/schedule`
+routines ARE configured (the deploy precondition); a clone that has not set up a producer
+uses `# scheduled-review-override` (or removes/edits `_REQUIRED_SCHEDULED_REVIEW_KINDS`).
+A DISMISSED review no longer vouches (its marker is ignored), mirroring the Codex path.
 On the normal path this is ATOMIC: the Codex-freshness gate's ``--match-head-commit``
 binding pins the merge to the very head the marker was verified at, so a race with a new
 push cannot swap in an unreviewed head. Under ``# stale-review-override`` (which waives
@@ -1599,7 +1603,7 @@ def _scheduled_review_rows(pr_num: str, repo: str | None = None) -> list[dict] |
                     "--paginate",
                     "--jq",
                     ".[] | {login: .user.login, author_association: .author_association, "
-                    "body: .body}",
+                    "body: .body, state: .state}",  # .state present on reviews, null on issue comments
                 ],
                 capture_output=True,
                 text=True,
@@ -1640,6 +1644,11 @@ def _scheduled_review_markers(pr_num: str, repo: str | None = None) -> dict[str,
         assoc = (row.get("author_association") or "").upper()
         if login != owner and assoc != "OWNER":
             continue  # not the repo owner — not a trusted scheduled review
+        # A DISMISSED review no longer vouches for its commit (mirrors the Codex-freshness
+        # path). `state` is present on /pulls/N/reviews rows and null on issue comments,
+        # so this only drops dismissed reviews; issue comments remain state-less.
+        if (row.get("state") or "").upper() == "DISMISSED":
+            continue
         body = row.get("body") or ""
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments
@@ -3322,7 +3331,10 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # enforces (shared function, strict mode). It reads the head itself (no head in
     # hand here). A missing/stale/unreadable scheduled review is a FAILURE line, never a
     # false all-clear — the report must not diverge from enforcement.
-    sched_msg = _check_scheduled_claude_reviewed_head(pr_num, None, repo, strict=True)
+    # Pass the Codex-verified head (as the enforcement path does) so the report is a
+    # COHERENT snapshot: if the head moved mid-report, the scheduled check binds to the
+    # same head the printed merge-with command does, not an independently re-read newer one.
+    sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo, strict=True)
     print(
         f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
     )
