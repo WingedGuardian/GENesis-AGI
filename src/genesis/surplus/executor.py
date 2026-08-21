@@ -774,6 +774,11 @@ class SurplusLLMExecutor:
         # and must never be amplified by a generator into an autonomous
         # "self-unblock" action — a stale git-corruption alert did exactly
         # that on 2026-07-16 (false alarm, messaged to the user as fact).
+        # WS-3 (both pulls below): truncate FIRST, then wrap external-origin
+        # content in <external-content> markers before it enters the surplus
+        # generator's LLM prompt.
+        from genesis.memory.provenance import wrap_if_external
+
         try:
             recent_obs = await observations.query(
                 self._db, resolved=False, limit=10,
@@ -783,6 +788,7 @@ class SurplusLLMExecutor:
                 parts.append("## Recent Unresolved Observations")
                 for obs in recent_obs[:7]:
                     content = obs.get("content", "")[:200]
+                    content = wrap_if_external(content, obs.get("origin_class"))
                     parts.append(
                         f"- [{obs.get('type', '?')}] {obs.get('created_at', '?')}: {content}"
                     )
@@ -797,7 +803,8 @@ class SurplusLLMExecutor:
             if past_findings:
                 parts.append("\n## Previous Findings (avoid re-discovering)")
                 for obs in past_findings:
-                    parts.append(f"- {obs.get('content', '')[:150]}")
+                    snippet = obs.get("content", "")[:150]
+                    parts.append(f"- {wrap_if_external(snippet, obs.get('origin_class'))}")
         except Exception:
             pass
 

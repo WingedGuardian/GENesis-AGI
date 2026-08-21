@@ -25,6 +25,19 @@ _PERMANENT_TYPES: frozenset[str] = frozenset(
 # Everything else surfaces by default — new types are user-visible unless
 # explicitly excluded here.  Canonical source — imported by morning_report.py
 # and dashboard routes.
+# WS-3 read-side origin policy for CONTENT-SURFACING consumers (LLM prompts,
+# always-loaded files). Excludes external_untrusted rows while KEEPING NULL —
+# most internal writers are unstamped (all pre-#1407 rows are NULL), so the
+# gate-time fail-closed normalization (effective_origin_class: NULL→untrusted)
+# would wipe legitimate history here. This is deliberately the OPPOSITE NULL
+# semantics from ``origin_class_in`` (privileged reads, NULL excluded). The
+# literal mirrors provenance.ORIGIN_EXTERNAL_UNTRUSTED — kept local so this
+# module stays dependency-free (stdlib + aiosqlite only); equality is pinned by
+# tests/test_security/test_observation_surface_coverage.py.
+EXTERNAL_UNTRUSTED = "external_untrusted"
+EXCLUDE_EXTERNAL_ORIGIN_SQL = "(origin_class IS NULL OR origin_class != ?)"
+EXCLUDE_EXTERNAL_ORIGIN_PARAMS: tuple[str, ...] = (EXTERNAL_UNTRUSTED,)
+
 INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
     {
         # Reflection / awareness lifecycle
@@ -434,10 +447,27 @@ async def query(
     resolved: bool | None = None,
     exclude_types: tuple[str, ...] | frozenset[str] | None = None,
     origin_class_in: list[str] | None = None,
+    exclude_origin_class: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
+    """Query observations.
+
+    Origin filters (mutually exclusive — they encode OPPOSITE NULL semantics):
+
+    - ``origin_class_in``: privileged-read allowlist. NULL origin is EXCLUDED
+      (IN-semantics, fail-closed) — for consumers that auto-accept content into
+      privileged state (user model, autonomy dispatch).
+    - ``exclude_origin_class``: content-surfacing denylist (usually
+      ``EXTERNAL_UNTRUSTED``). NULL origin is KEPT — unstamped internal/legacy
+      rows keep flowing; only the named class is dropped before the LIMIT.
+    """
     if sum(map(bool, (source, source_in, source_prefix))) > 1:
         raise ValueError("Specify at most one of 'source', 'source_in', 'source_prefix'")
+    if origin_class_in and exclude_origin_class:
+        raise ValueError(
+            "Specify at most one of 'origin_class_in', 'exclude_origin_class' — "
+            "they encode opposite NULL-origin semantics"
+        )
     sql = "SELECT * FROM observations WHERE 1=1"
     params: list = []
     if person_id is not None:
@@ -480,6 +510,12 @@ async def query(
         oc_placeholders = ",".join("?" for _ in origin_class_in)
         sql += f" AND origin_class IN ({oc_placeholders})"
         params.extend(origin_class_in)
+    if exclude_origin_class:
+        # Applied BEFORE the LIMIT (same anti-crowding rationale as above) with
+        # the OPPOSITE NULL semantics: NULL rows are KEPT (unstamped internal
+        # writers / pre-provenance history), only the named class is dropped.
+        sql += f" AND {EXCLUDE_EXTERNAL_ORIGIN_SQL}"
+        params.append(exclude_origin_class)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     rows = await db.execute_fetchall(sql, params)

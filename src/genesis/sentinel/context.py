@@ -145,7 +145,8 @@ async def assemble_diagnostic_context(
     if db is not None:
         try:
             cursor = await db.execute(
-                """SELECT id, source, type, content, priority, created_at
+                """SELECT id, source, type, content, priority, created_at,
+                          origin_class
                    FROM observations
                    WHERE resolved = 0
                    ORDER BY created_at DESC
@@ -153,10 +154,15 @@ async def assemble_diagnostic_context(
             )
             rows = await cursor.fetchall()
             if rows:
-                # Column order: id=0, source=1, type=2, content=3, priority=4, created_at=5
+                from genesis.memory.provenance import wrap_if_external
+
+                # Column order: id=0, source=1, type=2, content=3, priority=4,
+                # created_at=5, origin_class=6
                 obs_lines = []
                 for row in rows:
                     content_text = str(row[3] or "")[:80]
+                    # WS-3: truncate FIRST, then wrap external-origin content.
+                    content_text = wrap_if_external(content_text, row[6])
                     obs_lines.append(
                         f"- [{content_text}...] source={row[1]}, type={row[2]}, "
                         f"priority={row[4]}, at={row[5]}",

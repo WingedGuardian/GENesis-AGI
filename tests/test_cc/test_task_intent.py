@@ -165,3 +165,67 @@ async def test_streaming_task_intent_creates_observation(db):
     row = dict(rows[0])
     assert row["source"] == "conversation_intent"
     assert row["content"] == "fix the login bug"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel_name", "expected_origin"),
+    [
+        ("TERMINAL", "owner"),
+        ("TELEGRAM", "owner"),
+        ("WEB", None),
+        ("WHATSAPP", None),
+        ("VOICE", None),
+    ],
+)
+async def test_task_detected_origin_stamp_is_channel_aware(db, channel_name, expected_origin):
+    """WS-3: owner-attended channels (terminal CLI, chat-id-gated Telegram)
+    stamp origin_class='owner' (dispatch-trusted once the pickup path wires);
+    gateway/ambient channels (WEB/OpenClaw fronting WhatsApp/voice, VOICE)
+    stay NULL — visible but never dispatch-authorized."""
+    from genesis.cc.conversation import ConversationLoop
+    from genesis.cc.types import ChannelType, IntentResult
+
+    handler = ConversationLoop.__new__(ConversationLoop)
+    handler._db = db
+    handler._intent_parser = MagicMock()
+    handler._intent_parser.parse.return_value = IntentResult(
+        raw_text="please fix the bug",
+        task_requested=True,
+        cleaned_text="fix the bug",
+    )
+    handler._on_message_callbacks = []
+    handler._session_locks = {}
+
+    with patch("genesis.cc.conversation.cc_sessions") as mock_sessions:
+        mock_sessions.get_active_foreground = AsyncMock(return_value=None)
+        handler._get_lock = MagicMock(return_value=AsyncMock(
+            __aenter__=AsyncMock(), __aexit__=AsyncMock(),
+        ))
+        handler._try_invoke = AsyncMock(side_effect=Exception("stop here"))
+
+        with contextlib.suppress(Exception):
+            await handler.handle_message(
+                text="please fix the bug",
+                user_id="user-1",
+                channel=getattr(ChannelType, channel_name),
+            )
+
+    cursor = await db.execute(
+        "SELECT origin_class FROM observations WHERE type = 'task_detected'"
+    )
+    rows = await cursor.fetchall()
+    assert len(rows) == 1
+    assert rows[0]["origin_class"] == expected_origin
+
+
+def test_task_origin_helper_channel_table():
+    """Direct pin of the channel→origin mapping (both handlers call this)."""
+    from genesis.cc.conversation import _task_origin_for_channel
+    from genesis.cc.types import ChannelType
+
+    assert _task_origin_for_channel(ChannelType.TERMINAL) == "owner"
+    assert _task_origin_for_channel(ChannelType.TELEGRAM) == "owner"
+    for ch in (ChannelType.WEB, ChannelType.WHATSAPP, ChannelType.VOICE):
+        assert _task_origin_for_channel(ch) is None
+    assert _task_origin_for_channel(None) is None

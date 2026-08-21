@@ -216,9 +216,14 @@ class ContextGatherer:
         """Gather data for weekly quality calibration."""
         proc_stats = await self._procedure_stats(db)
 
-        # Get recent self-assessment scores for trend comparison
+        # Get recent self-assessment scores for trend comparison.
+        # WS-3: type-pin is not protection — observation_write takes type as a
+        # free caller param, so an external session can forge self_assessment;
+        # exclude external origin (NULL kept) before the content reaches the
+        # calibration prompt.
         assessments = await observations.query(
             db, type="self_assessment", limit=4,
+            exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
         )
 
         return {
@@ -242,10 +247,14 @@ class ContextGatherer:
             db, source="cc_reflection_deep", limit=1,
         )
         _micro_excl = ("micro_reflection",)
+        # WS-3: deep-reflection context is the laundering-sensitive surface
+        # (outputs become window-origin-stamped deltas) — exclude external
+        # rows at the query (NULL kept; see gather_evaluation_context).
         if last_deep:
             since = last_deep[0].get("created_at", "")
             all_obs = await observations.query(
                 db, resolved=False, limit=100, exclude_types=_micro_excl,
+                exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
             )
             result = [o for o in all_obs if o.get("created_at", "") > since]
         else:
@@ -253,6 +262,7 @@ class ContextGatherer:
             cutoff = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
             all_obs = await observations.query(
                 db, resolved=False, limit=100, exclude_types=_micro_excl,
+                exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
             )
             result = [o for o in all_obs if o.get("created_at", "") >= cutoff]
 
@@ -512,27 +522,41 @@ class ContextGatherer:
         """
         cutoff = (datetime.now(UTC) - timedelta(days=14)).isoformat()
 
+        # WS-3: every pull here HARD-EXCLUDES external_untrusted rows (NULL
+        # kept — unstamped internal writers). This evidence feeds the deep
+        # reflection whose user_model_updates are stamped by SESSION-WINDOW
+        # origin (reflection_window_origin), not content lineage — so external
+        # content admitted here would launder into first_party user_model_delta
+        # rows and clear the privileged-write gate. Excluding at the query is
+        # the only lineage-honest option until a provenance tier exists.
+        # Consequence (intended): inbox-judge digests no longer inform deep
+        # reflection; they remain recallable (wrapped) via the memory store.
+
         # User signals from any channel
         user_signals = await observations.query(
             db, type="user_signal", limit=30,
+            exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
         )
         user_signals = [o for o in user_signals if o.get("created_at", "") >= cutoff]
 
         # Architecture insights
         arch_insights = await observations.query(
             db, type="architecture_insight", limit=20,
+            exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
         )
         arch_insights = [o for o in arch_insights if o.get("created_at", "") >= cutoff]
 
         # Previous interaction themes (from earlier synthesis runs)
         themes = await observations.query(
             db, type="interaction_theme", limit=10,
+            exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
         )
         themes = [o for o in themes if o.get("created_at", "") >= cutoff]
 
         # Inbox-sourced observations specifically
         inbox_obs = await observations.query(
             db, source="inbox_evaluation", limit=20,
+            exclude_origin_class=observations.EXTERNAL_UNTRUSTED,
         )
         inbox_obs = [o for o in inbox_obs if o.get("created_at", "") >= cutoff]
 

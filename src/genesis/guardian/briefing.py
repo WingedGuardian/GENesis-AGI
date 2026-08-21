@@ -153,11 +153,15 @@ async def build_dynamic_briefing(db) -> BriefingContent:
 
     # Active (unresolved) observations — most recent 15
     try:
+        from genesis.memory.provenance import wrap_if_external
+
         obs_rows = await observations.query(db, resolved=False, limit=15)
         for row in obs_rows:
             text = row.get("content", "")
             if len(text) > 200:
                 text = text[:197] + "..."
+            # WS-3: truncate FIRST, then wrap external-origin content.
+            text = wrap_if_external(text, row.get("origin_class"))
             source = row.get("source", "")
             priority = row.get("priority", "")
             content.active_observations.append(

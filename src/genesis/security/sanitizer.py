@@ -20,7 +20,21 @@ logger = logging.getLogger(__name__)
 # any pre-existing boundary markers before (re-)wrapping, so content that was
 # already wrapped at an upstream ingestion point (e.g. WebFetcher) is never
 # double-wrapped into nested tags that blur the data/instruction boundary.
-_BOUNDARY_MARKER_RE = re.compile(r"<external-content[^>]*>|</external-content>")
+# Case-insensitive + whitespace-tolerant: LLMs read markup-ish tags loosely, so
+# a FORGED case/whitespace variant (</EXTERNAL-CONTENT>, </external-content >)
+# embedded in hostile content would otherwise survive the strip and spoof a
+# premature close of the trust boundary inside the wrapper.
+_BOUNDARY_MARKER_RE = re.compile(r"<\s*/?\s*external-content\b[^>]*>", re.IGNORECASE)
+
+# Zero-width / invisible codepoints an attacker could splice INTO a forged
+# marker (e.g. a ZWSP inside "extern<ZWSP>al-content") to dodge the strip:
+# ZWSP..RLM (U+200B-200F), the bidi embeddings/overrides (U+202A-202E), word
+# joiner (U+2060), and BOM/ZWNBSP (U+FEFF). Plus confusable hyphens that render
+# like the ASCII '-' in "external-content" (U+2010-2015, U+2212). Both are
+# normalized away BEFORE the marker regex so a visually-identical forged tag
+# built from look-alike codepoints cannot survive into the wrapper.
+_INVISIBLE_RE = re.compile("[​-‏‪-‮⁠﻿]")
+_CONFUSABLE_HYPHEN_RE = re.compile("[‐-―−]")
 
 
 def strip_boundary_markers(text: str) -> str:
@@ -29,8 +43,12 @@ def strip_boundary_markers(text: str) -> str:
     Idempotent companion to :meth:`ContentSanitizer.wrap_content` — call this
     before wrapping content that may already carry markers from an upstream
     ingestion point, to avoid nested wrappers that confuse the LLM boundary.
+    Normalizes zero-width and confusable-hyphen variants first so a forged
+    marker built from look-alike codepoints cannot slip through the strip.
     """
-    return _BOUNDARY_MARKER_RE.sub("", text)
+    normalized = _INVISIBLE_RE.sub("", text)
+    normalized = _CONFUSABLE_HYPHEN_RE.sub("-", normalized)
+    return _BOUNDARY_MARKER_RE.sub("", normalized)
 
 
 class ContentSource(enum.Enum):

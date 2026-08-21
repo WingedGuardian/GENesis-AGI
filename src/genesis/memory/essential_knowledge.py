@@ -19,6 +19,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from genesis.db.crud import observations
+
 logger = logging.getLogger(__name__)
 
 _OUTPUT_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
@@ -164,13 +166,18 @@ async def _active_session_pivots(db: aiosqlite.Connection) -> list[str]:
     Groups by session, takes most recent pivot per session, returns top 5.
     """
     try:
+        # WS-3: essential_knowledge.md is the always-loaded L1 file — external
+        # rows are hard-excluded (NULL kept; type-pins are forgeable via
+        # observation_write). Shared fragment from db.crud.observations.
         cursor = await db.execute(
-            "SELECT source, content, MAX(created_at) as latest "
+            "SELECT source, content, MAX(created_at) as latest "  # noqa: S608 - only the shared constant fragment is interpolated; values bound as params
             "FROM observations "
             "WHERE type = 'conversation_pivot' "
             "AND created_at > datetime('now', '-4 hours') "
+            f"AND {observations.EXCLUDE_EXTERNAL_ORIGIN_SQL} "
             "GROUP BY source "
-            "ORDER BY latest DESC LIMIT 5"
+            "ORDER BY latest DESC LIMIT 5",
+            observations.EXCLUDE_EXTERNAL_ORIGIN_PARAMS,
         )
         rows = await cursor.fetchall()
         results = []
@@ -251,13 +258,19 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
     )
     placeholders = ",".join("?" * len(_EXCLUDED_TYPES))
     try:
+        # WS-3: this renders verbatim into the always-loaded L1 file, and the
+        # type filter is a DENYLIST (future types surface by default) — so
+        # external_untrusted rows are hard-excluded here (NULL kept; the
+        # inbox judge's user_signal/architecture_insight digests are exactly
+        # the non-denied external types that used to flow through).
         cursor = await db.execute(
             "SELECT content FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
             f"WHERE type NOT IN ({placeholders}) "
             "AND resolved = 0 "
             "AND created_at > datetime('now', ?) "
+            f"AND {observations.EXCLUDE_EXTERNAL_ORIGIN_SQL} "
             "ORDER BY created_at DESC LIMIT 10",
-            (*_EXCLUDED_TYPES, f"-{days} days"),
+            (*_EXCLUDED_TYPES, f"-{days} days", *observations.EXCLUDE_EXTERNAL_ORIGIN_PARAMS),
         )
         rows = await cursor.fetchall()
         return [row[0][:250] for row in rows if row[0]]

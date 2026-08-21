@@ -792,12 +792,22 @@ class UserEgoContextBuilder:
         lines = ["## Genesis Ego Escalations\n"]
 
         try:
+            # WS-3: type='escalation_to_user_ego' is forgeable via
+            # observation_write (type is a free param) and this content lands in
+            # the user-ego (CEO) prompt at priority=critical — exclude external
+            # origin (NULL kept; legit escalations are server-written).
+            from genesis.db.crud.observations import (
+                EXCLUDE_EXTERNAL_ORIGIN_PARAMS,
+                EXCLUDE_EXTERNAL_ORIGIN_SQL,
+            )
+
             cursor = await self._db.execute(
-                "SELECT id, source, content, priority, created_at "
+                "SELECT id, source, content, priority, created_at "  # noqa: S608 - shared constant fragment; values bound as params
                 "FROM observations "
                 "WHERE resolved = 0 "
                 "AND type = 'escalation_to_user_ego' "
                 "AND created_at >= datetime('now', '-48 hours') "
+                f"AND {EXCLUDE_EXTERNAL_ORIGIN_SQL} "
                 "ORDER BY "
                 "  CASE priority "
                 "    WHEN 'critical' THEN 0 "
@@ -807,7 +817,8 @@ class UserEgoContextBuilder:
                 "  END, "
                 "  (retrieved_count > 0), "
                 "  created_at DESC "
-                "LIMIT 10"
+                "LIMIT 10",
+                EXCLUDE_EXTERNAL_ORIGIN_PARAMS,
             )
             rows = await cursor.fetchall()
         except Exception:
@@ -1178,11 +1189,21 @@ class UserEgoContextBuilder:
         lines = ["## Recent Execution Outcomes (48h)\n"]
 
         try:
+            # WS-3: type/source pins are forgeable via observation_write; this
+            # content lands in the user-ego prompt — exclude external origin
+            # (NULL kept; legit ego_dispatch outcomes are server-written).
+            from genesis.db.crud.observations import (
+                EXCLUDE_EXTERNAL_ORIGIN_PARAMS,
+                EXCLUDE_EXTERNAL_ORIGIN_SQL,
+            )
+
             cursor = await self._db.execute(
-                "SELECT content, priority, created_at FROM observations "
+                "SELECT content, priority, created_at FROM observations "  # noqa: S608 - shared constant fragment; values bound as params
                 "WHERE type = 'execution_outcome' AND source = 'ego_dispatch' "
                 "AND created_at >= datetime('now', '-48 hours') "
-                "ORDER BY created_at DESC LIMIT 10"
+                f"AND {EXCLUDE_EXTERNAL_ORIGIN_SQL} "
+                "ORDER BY created_at DESC LIMIT 10",
+                EXCLUDE_EXTERNAL_ORIGIN_PARAMS,
             )
             rows = await cursor.fetchall()
         except Exception:
@@ -1505,7 +1526,7 @@ class UserEgoContextBuilder:
             # performance, maintenance, security are genesis_ego's jurisdiction.
             # NULL categories pass through (ambiguous, not definitively Genesis-internal).
             # Uses canonical INTERNAL_OBS_TYPES from observations.py for type exclusion.
-            from genesis.db.crud.observations import INTERNAL_OBS_TYPES
+            from genesis.db.crud.observations import EXTERNAL_UNTRUSTED, INTERNAL_OBS_TYPES
 
             _GENESIS_CATEGORIES = (
                 "system_health",
@@ -1516,9 +1537,14 @@ class UserEgoContextBuilder:
             )
             cat_placeholders = ",".join("?" for _ in _GENESIS_CATEGORIES)
             type_placeholders = ",".join("?" for _ in INTERNAL_OBS_TYPES)
+            # WS-3: MAX(content) samples across a GROUP — per-row origin is
+            # ambiguous, so any_external conservatively taints the sample when
+            # ANY row in the pattern group is external_untrusted (a wrapped
+            # sample for a mostly-internal group is a cosmetic false positive).
             cursor = await self._db.execute(
                 "SELECT type, category, COUNT(*) AS cnt, "  # noqa: S608 - literal SQL fragments; values bound as parameters
-                "  MAX(content) AS sample, MAX(created_at) AS latest "
+                "  MAX(content) AS sample, MAX(created_at) AS latest, "
+                "  MAX(CASE WHEN origin_class = ? THEN 1 ELSE 0 END) AS any_external "
                 "FROM observations "
                 "WHERE created_at >= datetime('now', '-3 days') "
                 "  AND resolved = 0 "
@@ -1529,7 +1555,11 @@ class UserEgoContextBuilder:
                 "HAVING cnt >= 3 "
                 "ORDER BY cnt DESC "
                 "LIMIT 5",
-                (*_GENESIS_CATEGORIES, *INTERNAL_OBS_TYPES),
+                (
+                    EXTERNAL_UNTRUSTED,
+                    *_GENESIS_CATEGORIES,
+                    *INTERNAL_OBS_TYPES,
+                ),
             )
             rows = await cursor.fetchall()
         except Exception:
@@ -1544,12 +1574,18 @@ class UserEgoContextBuilder:
         if depth == "light":
             return f"## Recurring Patterns (72h)\n{len(rows)} patterns detected.\n"
 
+        from genesis.memory.provenance import wrap_if_external
+
         lines.append(f"**{len(rows)} pattern(s)** appearing 3+ times (may warrant automation):\n")
-        for obs_type, category, cnt, sample, _latest in rows:
+        for obs_type, category, cnt, sample, _latest, any_external in rows:
             cat_str = f"/{category}" if category else ""
             short = (sample or "")[:100].replace("\n", " ")
             if len(sample or "") > 100:
                 short += "\u2026"
+            if any_external:
+                # WS-3: group contained at least one external row \u2014 wrap the
+                # sample (truncated first; see wrap_if_external contract).
+                short = wrap_if_external(short, EXTERNAL_UNTRUSTED)
             lines.append(f"- **[{obs_type}{cat_str}]** \u00d7{cnt} \u2014 {short}")
 
         lines.append("")

@@ -51,7 +51,8 @@ async def db():
                 resolution_notes TEXT,
                 created_at       TEXT NOT NULL,
                 expires_at       TEXT,
-                content_hash     TEXT
+                content_hash     TEXT,
+                origin_class     TEXT
             )
         """)
         await conn.execute("""

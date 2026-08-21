@@ -9,6 +9,44 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Security
+
+- **External-origin observation content is now origin-policed at every
+  surfacing point (read-side memory-provenance work).** Follow-on to the
+  user-model poisoning gate: the observations table's content consumers are
+  now all classified and enforced. The reflection pipeline (deep-reflection
+  evidence, recent-observations funnel, calibration, perception's reflection
+  context) and the always-loaded L1 knowledge file HARD-EXCLUDE
+  `external_untrusted` rows in SQL (new crud `exclude_origin_class` filter +
+  shared `EXCLUDE_EXTERNAL_ORIGIN_SQL` fragment; NULL rows kept — unstamped
+  internal/legacy writers keep flowing, deliberately the opposite NULL
+  semantics from the privileged-read `origin_class_in`). Ego, sentinel,
+  guardian-briefing, and surplus context builders plus the `observation_query`
+  MCP tool WRAP external-origin content in `<external-content>` markers
+  (`provenance.wrap_if_external`; truncate-then-wrap; embedded forged closing
+  tags are stripped so the wrapper can't be escaped). This closes the
+  laundering path where externally-written digests reached the deep-reflection
+  prompt unfiltered and re-emerged as trusted-origin user-model deltas
+  (delta stamping is session-window-based); a deep-reflection prompt rule
+  additionally forbids deriving user-model updates from `<external-content>`
+  material. A discovery-based guardrail
+  (`tests/test_security/test_observation_surface_coverage.py`) AST-enumerates
+  both raw SQL and crud-query consumers (docstrings skipped, regex evasion
+  net, git-tracked sources only) and fails CI on any consumer without a
+  classified verdict, with policy tokens asserted inside each function's AST.
+- **`observation_write` refuses privileged observation types from
+  external-origin sessions.** DENYLIST (`user_model_delta`): external
+  sessions keep their legitimate digest/finding types; the delta type's only
+  legitimate writers are server-side (reflection output, perception writer —
+  no session env), so the refusal closes the injection→user-model write path
+  at zero functional cost. Refusals return a `refused:` string and log a
+  warning — never raise.
+- **`task_detected` conversation producers stamp channel-aware origin.**
+  Terminal + Telegram (owner-attended) stamp `owner`, so legitimate task
+  requests will dispatch once the autonomy pickup path is wired;
+  gateway/ambient channels (web gateway, WhatsApp, voice) deliberately stay
+  unstamped — visible but never dispatch-authorized.
+
 ### Changed
 
 - **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**

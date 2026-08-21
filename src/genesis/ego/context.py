@@ -224,7 +224,8 @@ class EgoContextBuilder:
 
         try:
             cursor = await self._db.execute(
-                "SELECT source, type, category, content, priority, created_at "
+                "SELECT source, type, category, content, priority, created_at, "
+                "origin_class "
                 "FROM observations "
                 "WHERE resolved = 0 "
                 "AND type NOT IN ('micro_reflection', 'awareness_tick') "
@@ -249,11 +250,15 @@ class EgoContextBuilder:
             lines.append("*No unresolved observations in last 48h.*\n")
             return "\n".join(lines)
 
+        from genesis.memory.provenance import wrap_if_external
+
         lines.append(f"**{len(rows)} items** (sorted by priority):\n")
-        for source, obs_type, category, content, priority, _created_at in rows:
+        for source, obs_type, category, content, priority, _created_at, origin_class in rows:
             # Truncate content to keep context manageable
             short = content[:200] + "..." if len(content) > 200 else content
             short = short.replace("\n", " ")
+            # WS-3: truncate/flatten FIRST, then wrap external-origin content.
+            short = wrap_if_external(short, origin_class)
             cat_str = f"/{category}" if category else ""
             lines.append(
                 f"- [{priority}] **{source}{cat_str}** ({obs_type}): "
