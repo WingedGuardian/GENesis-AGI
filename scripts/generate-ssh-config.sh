@@ -55,10 +55,13 @@ cat << SSHEOF
 # matching RemoteCommand, and the wildcard would otherwise route
 # "${TS_HOSTNAME}-lobby" into cc-slot.sh, which rejects the non-numeric slot.
 # 'lobby' is not a cc-N name, so it never consumes a slot or the slot cap.
+# The RemoteCommand sets PATH (an ssh RemoteCommand does NOT source .bashrc), so
+# tmux resolves even where it is user-local — mirrors cc-slot.sh's toolchain PATH
+# so the lobby door matches the numeric-slot door's behavior.
 Host ${TS_HOSTNAME}-lobby
     HostName ${TS_IP}
     User ${REMOTE_USER}
-    RemoteCommand tmux -u new-session -A -s lobby \; choose-tree -Zs
+    RemoteCommand PATH="${REMOTE_HOME}/.n/bin:${REMOTE_HOME}/.bun/bin:${REMOTE_HOME}/.npm-global/bin:${REMOTE_HOME}/.local/bin:\$PATH" tmux -u new-session -A -s lobby \; choose-tree -Zs
     RequestTTY yes
     ServerAliveInterval 30
     ServerAliveCountMax 6
@@ -79,7 +82,9 @@ Host ${TS_HOSTNAME}-*
 SSHEOF
 
 echo "" >&2
-echo "Copy the above into ~/.ssh/config on your client devices." >&2
+echo "Copy the above into ~/.ssh/config on your client devices — REPLACING any" >&2
+echo "earlier Genesis block for ${TS_HOSTNAME} (don't append a second one, or the" >&2
+echo "old block would win by ssh's first-match rule)." >&2
 echo "Then: ssh ${TS_HOSTNAME}-1        (a specific slot, or any positive integer)" >&2
 echo "  or: ssh ${TS_HOSTNAME}-lobby    (opens the session picker → pick any live slot)" >&2
 echo "" >&2
