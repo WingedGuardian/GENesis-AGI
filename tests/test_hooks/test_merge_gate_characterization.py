@@ -59,6 +59,19 @@ def _reset_merge_deadline():
     _mod._merge_deadline = None
 
 
+@pytest.fixture(autouse=True)
+def _pin_canonical_public_repo(monkeypatch):
+    """The scheduled-review gate is scoped to the configured PUBLIC repo, read from
+    ``~/.genesis/config/genesis.yaml`` — which exists on a dev box but NOT in CI,
+    so the gate's SCOPE is environment-dependent unless pinned. Fix the canonical
+    public repo to the corpus's merge target (``REPO``) via the ``_TEST_CANONICAL_
+    PUBLIC_REPO`` seam, so EVERY case deterministically ENGAGES the scheduled gate
+    on every host. The off-public-repo NO-OP is exercised by its own case, which
+    overrides this seam to a different repo."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", REPO)
+    yield
+
+
 # ── injection helpers ────────────────────────────────────────────────
 
 
@@ -607,6 +620,31 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "scheduled Claude review(s) missing",
     ),
+    # SCOPE: the gate is scoped to the configured PUBLIC repo only. Same absent-marker
+    # scenario as above, but the merge targets a repo OTHER than the canonical public
+    # one → the gate NO-OPS and the merge is ALLOWED (the required routines run only on
+    # the public repo, so they cannot be required elsewhere). Verify-RED: without the
+    # scope guard this blocks exactly like ``scheduled_review_absent_blocks``.
+    (
+        "scheduled_review_absent_off_public_repo_allows",
+        lambda mp: (
+            mp.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo"),
+            _run(mp, _merge_cmd(), scheduled=""),
+        )[1],
+        0,
+        "",
+    ),
+    # SCOPE, converse: an UNDETERMINABLE canonical repo (empty seam → None) fails CLOSED
+    # — the gate ENGAGES rather than silently disarming, so an absent marker still blocks.
+    (
+        "scheduled_review_absent_uncertain_scope_blocks",
+        lambda mp: (
+            mp.setenv("_TEST_CANONICAL_PUBLIC_REPO", ""),
+            _run(mp, _merge_cmd(), scheduled=""),
+        )[1],
+        2,
+        "scheduled Claude review(s) missing",
+    ),
     # A marker from a NON-owner author (login != owner, association != OWNER) is NOT
     # trusted → treated as absent → block.
     (
@@ -970,3 +1008,77 @@ def test_check_pr_report_prints_merge_with_when_all_pass(monkeypatch, capsys):
     assert "merge-with" in out
     assert "--match-head-commit" in out
     assert rc == 0
+
+
+def test_check_pr_report_scheduled_na_off_public_repo(monkeypatch, capsys):
+    """Off the public repo the report prints an honest ``n/a`` for the scheduled line
+    (not a misleading ``ok``) and the gate does NOT count as a failure — even with NO
+    marker present, since the gate is out of scope there."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo")
+    _report_env(monkeypatch, scheduled="")  # no marker at all
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
+    assert "n/a" in sched_line and "public repo" in sched_line
+    assert "BLOCK" not in sched_line
+    assert rc == 0  # scheduled no-op does not fail the verdict off the public repo
+
+
+# ── scope helpers (unit) ─────────────────────────────────────────────
+def test_scheduled_gate_applies_matches_public_repo(monkeypatch):
+    """The gate ENGAGES iff the merge target IS the canonical public repo."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/public")
+    assert _mod._scheduled_gate_applies("owner/public") is True
+    assert _mod._scheduled_gate_applies("OWNER/PUBLIC") is True  # case-insensitive
+    assert _mod._scheduled_gate_applies("https://github.com/owner/public") is True  # normalized
+    assert _mod._scheduled_gate_applies("owner/other") is False  # a different repo no-ops
+
+
+def test_scheduled_gate_applies_fails_closed_on_uncertainty(monkeypatch):
+    """Undeterminable canonical repo (None) or unknown target → ENGAGE (never silently
+    disarm the gate on the repo it protects)."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")  # → None
+    assert _mod._scheduled_gate_applies("owner/anything") is True
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/public")
+    assert _mod._scheduled_gate_applies(None) is True
+    assert _mod._scheduled_gate_applies("") is True
+
+
+def test_canonical_public_repo_seam(monkeypatch):
+    """The seam yields a normalized owner/repo, or None when empty (the fail-closed
+    branch)."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "WingedGuardian/GENesis-AGI")
+    assert _mod._canonical_public_repo() == "WingedGuardian/GENesis-AGI"
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
+    assert _mod._canonical_public_repo() is None
+
+
+def test_canonical_public_repo_reads_genesis_yaml(monkeypatch, tmp_path):
+    """Direct coverage of the config-file read path (not the seam): the canonical
+    repo is the declared github.user/public_repo, and a missing file fails closed
+    to None."""
+    monkeypatch.delenv("_TEST_CANONICAL_PUBLIC_REPO", raising=False)
+    cfg = tmp_path / "genesis.yaml"
+    cfg.write_text("github:\n  user: WingedGuardian\n  public_repo: GENesis-AGI\n")
+    monkeypatch.setattr(_mod.os.path, "expanduser", lambda p: str(cfg))
+    assert _mod._canonical_public_repo() == "WingedGuardian/GENesis-AGI"
+    # Missing/unreadable config → None (fail-closed → gate engages).
+    monkeypatch.setattr(_mod.os.path, "expanduser", lambda p: str(tmp_path / "absent.yaml"))
+    assert _mod._canonical_public_repo() is None
+    # A github section missing the keys → None too.
+    cfg.write_text("github:\n  user: WingedGuardian\n")  # no public_repo
+    monkeypatch.setattr(_mod.os.path, "expanduser", lambda p: str(cfg))
+    assert _mod._canonical_public_repo() is None
+
+
+def test_enforcement_surfaces_note_on_off_public_repo_no_op(monkeypatch, capsys):
+    """Provision-or-surface: when the scheduled gate no-ops because the merge targets
+    a repo other than the canonical public one, the ENFORCEMENT path emits an advisory
+    stderr NOTE (naming both repos) rather than silently disarming — so a drifted
+    genesis.yaml is visible. The merge still proceeds (exit 0)."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/some-other-public-repo")
+    rc = _run(monkeypatch, _merge_cmd(), scheduled="")  # no marker, but off-repo → allow
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "scheduled-review gate n/a" in err
+    assert "owner/some-other-public-repo" in err  # names the canonical public repo

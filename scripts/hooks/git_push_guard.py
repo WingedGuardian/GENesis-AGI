@@ -52,10 +52,17 @@ head it reviewed AND which routine it was (``kind``). The merge gate
 (``_check_scheduled_claude_reviewed_head``) blocks unless an owner-authored marker for
 EVERY kind in ``_REQUIRED_SCHEDULED_REVIEW_KINDS`` (currently code-review + leaks) names
 the PR's CURRENT head — so if any required routine never ran, ran on a stale commit, or
-was rate-limited, the merge is blocked (naming the missing kinds). Deployment note: this
-gate is scoped to the canonical repo's own merge workflow, where the required `/schedule`
-routines ARE configured (the deploy precondition); a clone that has not set up a producer
-uses `# scheduled-review-override` (or removes/edits `_REQUIRED_SCHEDULED_REVIEW_KINDS`).
+was rate-limited, the merge is blocked (naming the missing kinds). SCOPE: this gate
+enforces ONLY when the merge targets the configured PUBLIC repo — the declared
+``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
+(``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
+(a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
+routines run only on the public repo. Deployment note: on the public repo the required
+routines ARE configured (the deploy precondition); a clone that runs on its own public
+repo without a producer uses `# scheduled-review-override` (or removes/edits
+`_REQUIRED_SCHEDULED_REVIEW_KINDS`) — the override valve is the escape by design, not an
+opt-in flag. Fail-closed on scope uncertainty: if the canonical repo is undeterminable
+the gate ENGAGES rather than silently disarming.
 A DISMISSED or PENDING (draft) review no longer vouches (its marker is ignored), mirroring
 the Codex path. The marker means "ran CLEAN", not merely "ran": a review whose body carries a
 blocking finding ([P1]/HARD BLOCK/### ERROR, unless a clean marker overrides — the same rule
@@ -1558,6 +1565,62 @@ _SCHEDULED_REVIEW_KIND_RE = re.compile(r"\bkind=([a-z0-9][a-z0-9._-]*)(?=\s|\Z)"
 _REQUIRED_SCHEDULED_REVIEW_KINDS = ("code-review", "leaks")
 
 
+def _canonical_public_repo() -> str | None:
+    """The ONE public repo the scheduled-review gate is scoped to, as ``owner/repo``
+    (normalized, case-preserved), or None if it cannot be determined.
+
+    Source: the DECLARED ``github.user``/``github.public_repo`` in
+    ``~/.genesis/config/genesis.yaml`` — install-agnostic and cwd-independent (the
+    identity of "the public repo" does not depend on which checkout a merge runs
+    from). Read locally (no ``gh``/network call — this is on the merge hot path).
+    Any read/parse failure returns None; the caller then fails CLOSED (see
+    ``_scheduled_gate_applies``). Test seam: ``_TEST_CANONICAL_PUBLIC_REPO`` (an
+    ``owner/repo`` string, or empty to force the undeterminable/None branch) is
+    honored INSTEAD of the config file when set — the config lives outside the repo
+    and is absent in CI, so the gate's scope must be injectable to test
+    deterministically."""
+    override = os.environ.get("_TEST_CANONICAL_PUBLIC_REPO")
+    if override is not None:
+        return _normalize_repo(override) if override.strip() else None
+    path = os.path.expanduser("~/.genesis/config/genesis.yaml")
+    try:
+        import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
+
+        with open(path) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        gh = cfg.get("github") or {}
+        user = (gh.get("user") or "").strip()
+        repo = (gh.get("public_repo") or "").strip()
+        if user and repo:
+            return _normalize_repo(f"{user}/{repo}")
+    except Exception:
+        return None
+    return None
+
+
+def _scheduled_gate_applies(repo: str | None) -> bool:
+    """Whether the scheduled-review gate ENFORCES for a merge targeting ``repo``.
+
+    The gate is scoped to the configured PUBLIC repo ONLY — the user's directive:
+    "these are ALL only requirements for the genesis public repo — not pushing work
+    anywhere else." The required ``/schedule`` routines run only on that repo, so a
+    ``gh pr merge`` targeting any OTHER repo (a private fork, the voice repo,
+    backups) must NOT be blocked on their markers.
+
+    Fail-CLOSED bias: only a target that RESOLVES to a repo DIFFERENT from the
+    canonical public one no-ops. If the canonical repo is undeterminable, or the
+    target is unknown, ENGAGE — silently skipping on uncertainty would be an
+    evasion path on the very repo the gate protects."""
+    canonical = _canonical_public_repo()
+    if not canonical or not repo:
+        return True  # uncertain → enforce (never silently disarm the gate)
+    target = _normalize_repo(repo)
+    if target is None:
+        return True  # unnormalizable target → enforce (fail-closed; unreachable in
+        # practice — an unresolved merge repo already blocks upstream)
+    return target.strip().lower() == canonical.strip().lower()
+
+
 def _parse_scheduled_jsonl(raw: str | None) -> list[dict]:
     """Parse the ``{login, author_association, body}`` JSONL shape into a list of
     dicts, SKIPPING any malformed/non-object line (fail-closed: a dropped line can
@@ -1700,6 +1763,12 @@ def _check_scheduled_claude_reviewed_head(
     decision is identical in both modes precisely BECAUSE enforcement already fails
     closed, so the report can never issue a false all-clear here.
 
+    SCOPE: this gate enforces ONLY for a merge targeting the configured PUBLIC repo
+    (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any other
+    repo (a private fork, the voice repo, backups) returns None (no-op) — the
+    required routines run only on the public repo, so they cannot be required
+    elsewhere.
+
     ``head_sha`` (the caller's authoritative head) is used when given; otherwise the
     head is read via ``_pr_head_sha``. ``force`` (a ``# scheduled-review-override`` on
     the merge segment — an INDEPENDENT sigil from ``# stale-review-override``) waives
@@ -1708,6 +1777,8 @@ def _check_scheduled_claude_reviewed_head(
     """
     if force:
         return None  # waived by # scheduled-review-override
+    if not _scheduled_gate_applies(repo):
+        return None  # out of scope: merge targets a repo other than the public one
     head = (head_sha or "").strip().lower()
     if not head:
         head = (_pr_head_sha(pr_num, repo=repo) or "").strip().lower()
@@ -3152,6 +3223,19 @@ def main() -> int:
                 # 1s floor → fail-open → a merge with unresolved findings slipping through. Uses
                 # verified_head from the Codex gate (None under # stale-review-override → re-read).
                 sched_override = has_trailing_override(merge_seg.raw, "scheduled-review-override")
+                # Provision-or-surface: the scheduled gate no-ops off the configured
+                # public repo (by design). A SILENT no-op would hide a drifted
+                # genesis.yaml (canonical != the real public repo) disarming the gate
+                # on the repo it protects — so surface WHY it didn't apply. Advisory
+                # only (never blocks); skipped under the override (already a conscious
+                # waive). The report path shows the same via its "n/a" line.
+                if not sched_override and not _scheduled_gate_applies(merge_repo):
+                    print(
+                        f"NOTE: scheduled-review gate n/a for PR #{pr_num} — merge "
+                        f"targets {merge_repo}, not the configured public repo "
+                        f"({_canonical_public_repo() or 'undetermined'}).",
+                        file=sys.stderr,
+                    )
                 sched_msg = _check_scheduled_claude_reviewed_head(
                     pr_num,
                     verified_head,
@@ -3351,11 +3435,16 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # Pass the Codex-verified head (as the enforcement path does) so the report is a
     # COHERENT snapshot: if the head moved mid-report, the scheduled check binds to the
     # same head the printed merge-with command does, not an independently re-read newer one.
-    sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo, strict=True)
-    print(
-        f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
-    )
-    failures += 1 if sched_msg else 0
+    # Scoped to the public repo only (mirrors enforcement) — print an honest n/a rather
+    # than a misleading "ok" when the target is some other repo.
+    if not _scheduled_gate_applies(repo):
+        print("scheduled-claude: n/a (scoped to the public repo only)")
+    else:
+        sched_msg = _check_scheduled_claude_reviewed_head(pr_num, verified_head, repo, strict=True)
+        print(
+            f"scheduled-claude: {'BLOCK — ' + sched_msg.splitlines()[0] if sched_msg else 'ok (at head)'}"
+        )
+        failures += 1 if sched_msg else 0
     # strict=True: a scan that could not be READ (gh error/malformed) must show as
     # a failure here, never as "ok" — the report must not issue a false all-clear.
     blocked, msg = _check_pr_review_findings(pr_num, repo=repo, strict=True)
