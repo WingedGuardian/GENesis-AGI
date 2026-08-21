@@ -3697,6 +3697,14 @@
           const ge = ego.egos?.genesis_ego;
           const ueCad = ue?.cadence;
           const geCad = ge?.cadence;
+          // Fail-LOUD, not fail-green: if the liveness/gated read itself errored,
+          // `stalled` defaulted to false — surfacing that as healthy would
+          // recreate the exact false-green this instrumentation exists to kill.
+          // Report unknown so a broken collector never reads as "all good".
+          if (ueCad?.liveness_error || geCad?.liveness_error ||
+              ueCad?.gated_error || geCad?.gated_error) {
+            return { state: "unknown", reason: "ego liveness data unavailable (read error)" };
+          }
           // Circuit breaker on either ego
           if (ueCad?.consecutive_failures >= 3 || geCad?.consecutive_failures >= 3) {
             const which = (ueCad?.consecutive_failures >= 3 ? "CEO" : "") +

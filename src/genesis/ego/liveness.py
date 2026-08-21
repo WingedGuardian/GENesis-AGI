@@ -24,13 +24,24 @@ enumeration, and no false "stalled" for a legitimately-quiet ego. ``gated``
 one non-completing state that IS recorded, so it is excluded explicitly. A fresh
 install (no intent or no completed cycle yet) is never stalled.
 
-**Coverage boundary (deliberate):** this signal detects "trying but not
-completing" — the gate/consumer deadlock. It does NOT detect TOTAL cessation
-(the whole cadence scheduler dying): then both timestamps freeze together, the
-lag never opens, and the verdict stays healthy. That distinct failure mode
-belongs to a fixed-schedule ego-heartbeat staleness monitor (the ``ego_heartbeat``
-pulse keeps beating through a consumer deadlock but stops on scheduler death), so
-the two signals are complementary halves. See follow-up for that monitor.
+**Coverage boundary (deliberate) — narrow edges tracked for the complementary
+ego-heartbeat-staleness monitor (follow-up):**
+
+- Blind to TOTAL cessation (the whole cadence scheduler dying): both timestamps
+  freeze together, the lag never opens, verdict stays healthy. The fixed-schedule
+  ``ego_heartbeat`` pulse keeps beating through a consumer deadlock but stops on
+  scheduler death, so it is the complementary half.
+- Blind to intent-not-recorded-under-queue-saturation: if the signal queue fills
+  with non-expiring critical signals while the consumer is wedged, ``_on_tick``'s
+  proactive push is rejected and ``last_proactive_fire`` never advances (same
+  frozen-intent shape as total cessation). A future fix records the intent on
+  gate-clearance rather than push-success (needs care: the timestamp also drives
+  the quiet-hours floor).
+- A brief TRANSIENT after a >threshold continuous suppression (a marathon active
+  session / long global pause): the first eligible tick records a current intent
+  while the last completion is still old, so the lag reads high for the seconds/
+  minutes until that cycle completes. Self-clears within one cycle; the hourly
+  alert (if it happens to sample that window) self-resolves next tick.
 
 Pure and DB-free so it is trivially unit-testable; callers read the two
 timestamps and pass them in. Shared by the dashboard status endpoint and the
