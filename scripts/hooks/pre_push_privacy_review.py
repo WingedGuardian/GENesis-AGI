@@ -51,7 +51,18 @@ _SRC = Path(__file__).resolve().parents[2] / "src"
 if _SRC.is_dir():
     sys.path.insert(0, str(_SRC))
 
-_GIT_GLOBAL_VALUE_OPTS = ("-C", "-c", "--git-dir", "--work-tree", "--namespace")
+# git global options that consume the FOLLOWING token as their value. Kept
+# identical to the copies in git_push_guard/shell_parse/review_enforcement_commit
+# (locked by tests/test_hooks/test_value_flag_consistency.py) — a missing member
+# here silently skips the advisory scan on that command form.
+_GIT_GLOBAL_VALUE_OPTS = (
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+)
 _PUSH_VALUE_FLAGS = ("-o", "--push-option", "--repo", "--receive-pack", "--exec")
 _MAX_LINES = 20
 # Total wall-clock budget for ALL git calls in one invocation, and a per-call
