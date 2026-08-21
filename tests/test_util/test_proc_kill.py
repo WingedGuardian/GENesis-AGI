@@ -120,3 +120,31 @@ async def test_reap_bounded_returns_despite_hung_wait():
     t0 = time.monotonic()
     await reap_bounded(_Hung(), timeout_s=0.1)
     assert time.monotonic() - t0 < 5
+
+
+def test_process_group_alive_real_group(tmp_path):
+    from genesis.util.proc_kill import process_group_alive
+
+    proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    try:
+        assert process_group_alive(proc) is True
+    finally:
+        kill_process_group(proc)
+        proc.wait(timeout=5)
+    time.sleep(0.2)
+    assert process_group_alive(proc) is False
+
+
+def test_process_group_alive_guards(monkeypatch):
+    from genesis.util.proc_kill import process_group_alive
+
+    probes = []
+    monkeypatch.setattr(
+        "genesis.util.proc_kill.os.killpg", lambda *a: probes.append(a)
+    )
+    bad = MagicMock()
+    bad.pid = 1
+    assert process_group_alive(bad) is False
+    bad2 = MagicMock()  # non-int mock pid
+    assert process_group_alive(bad2) is False
+    assert probes == []  # guard refused the probe both times
