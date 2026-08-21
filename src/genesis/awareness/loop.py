@@ -861,11 +861,7 @@ async def _check_ego_liveness(db) -> None:
         from genesis.autonomy.cli_policy import load_autonomous_cli_policy
         from genesis.db.crud import ego as ego_crud
         from genesis.db.crud import job_health as job_health_crud
-        from genesis.ego.config import load_ego_config
-        from genesis.ego.liveness import (
-            compute_ego_liveness,
-            quiet_suppress_floor_minutes,
-        )
+        from genesis.ego.liveness import compute_ego_liveness
         from genesis.runtime import GenesisRuntime
 
         rt = GenesisRuntime.instance()
@@ -873,13 +869,6 @@ async def _check_ego_liveness(db) -> None:
             gate_on = load_autonomous_cli_policy().manual_approval_required
         except Exception:
             gate_on = True
-        # A GLOBAL runtime pause legitimately stops every ego — treat it like a
-        # per-ego pause so a long pause never reads as a stall.
-        globally_paused = bool(getattr(rt, "paused", False))
-        try:
-            _ego_config = load_ego_config()
-        except Exception:
-            _ego_config = None
         managers = (
             ("user_ego_cycle", getattr(rt, "_ego_cadence_manager", None)),
             ("genesis_ego_cycle", getattr(rt, "_genesis_ego_cadence_manager", None)),
@@ -902,21 +891,18 @@ async def _check_ego_liveness(db) -> None:
                     db,
                     source_tag,
                 )
+                last_intent = await ego_crud.get_state(
+                    db,
+                    f"last_proactive_fire:{source_tag}",
+                )
                 gated = (
                     await ego_crud.has_pending_cli_approval(db, source_tag) if gate_on else False
                 )
-                quiet_floor = quiet_suppress_floor_minutes(
-                    mode=getattr(_ego_config, "quiet_hours_mode", "floor"),
-                    start_hour=getattr(_ego_config, "quiet_hours_start", 0),
-                    end_hour=getattr(_ego_config, "quiet_hours_end", 0),
-                    interval_minutes=mgr.current_interval_minutes,
-                )
                 live = compute_ego_liveness(
                     last_success_at=last_success,
+                    last_intent_at=last_intent,
                     current_interval_minutes=mgr.current_interval_minutes,
                     gated=gated,
-                    is_paused=mgr.is_paused or globally_paused,
-                    quiet_floor_minutes=quiet_floor,
                 )
             except Exception:
                 logger.debug(
@@ -944,11 +930,11 @@ async def _check_ego_liveness(db) -> None:
             label = _EGO_LIVENESS_LABELS.get(source_tag, source_tag)
             overdue_h = (live.overdue_minutes or 0.0) / 60.0
             content = (
-                f"{label} has completed no autonomous cycle in {overdue_h:.1f}h "
-                f"(expected every ~{int(mgr.current_interval_minutes)}m; stall "
-                f"threshold {live.threshold_minutes / 60:.0f}h). The cycle loop "
-                f"reports alive but is producing no work — check the ego consumer "
-                f"and any dispatch gate in the genesis-server logs."
+                f"{label} is actively trying to cycle but has completed none in "
+                f"{overdue_h:.1f}h (expected every ~{int(mgr.current_interval_minutes)}m; "
+                f"stall threshold {live.threshold_minutes / 60:.0f}h). It keeps "
+                f"pushing cycle signals but they never finish — check the ego "
+                f"consumer and any dispatch gate in the genesis-server logs."
             )
             # Stable per-ego hash: skip_if_duplicate keeps a persisting stall from
             # re-creating each tick; the row auto-resolves when a cycle lands.

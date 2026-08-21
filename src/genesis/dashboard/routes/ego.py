@@ -101,40 +101,34 @@ async def ego_status():
                 exc_info=True,
             )
             snap["gated_error"] = True
-        # Truthful liveness: is a real cycle OVERDUE vs the current cadence?
-        # Reads the durable job_health.last_success (advanced only on a completed
-        # cycle), NOT the is_running / next_fire_at proxies that stay green while
-        # the ego is deadlocked. Conservative thresholds (see ego.liveness);
-        # gated/paused are surfaced above, never as a stall. Best-effort.
+        # Truthful liveness: is the ego actively trying to cycle but NOT
+        # completing? Compares last INTENT-to-cycle (_last_proactive_fire_at,
+        # set only after every cadence gate passes) with last COMPLETED cycle
+        # (job_health.last_success) — NOT the is_running / next_fire_at proxies
+        # that stay green while deadlocked. Every legitimate non-running reason
+        # (idle/quiet/paused/global-pause/circuit) prevents an intent from being
+        # recorded, so it is excluded by construction; gated is excluded in the
+        # helper. Best-effort. (see ego.liveness)
         snap["last_success_at"] = None
         snap["stalled"] = False
         snap["stall_reason"] = None
         try:
             from genesis.db.crud import job_health as job_health_crud
-            from genesis.ego.liveness import (
-                compute_ego_liveness,
-                quiet_suppress_floor_minutes,
-            )
+            from genesis.ego.liveness import compute_ego_liveness
 
             last_success = await job_health_crud.get_job_last_success(
                 rt._db,
                 mgr.source_tag,
             )
-            # A GLOBAL runtime pause (not just this ego's pause) legitimately
-            # stops cycles — treat it as paused so a long pause is not a stall.
-            globally_paused = bool(getattr(rt, "paused", False))
-            quiet_floor = quiet_suppress_floor_minutes(
-                mode=getattr(config, "quiet_hours_mode", "floor"),
-                start_hour=getattr(config, "quiet_hours_start", 0),
-                end_hour=getattr(config, "quiet_hours_end", 0),
-                interval_minutes=mgr.current_interval_minutes,
+            last_intent = await ego_crud.get_state(
+                rt._db,
+                f"last_proactive_fire:{mgr.source_tag}",
             )
             live = compute_ego_liveness(
                 last_success_at=last_success,
+                last_intent_at=last_intent,
                 current_interval_minutes=mgr.current_interval_minutes,
                 gated=bool(snap.get("gated")),
-                is_paused=bool(snap.get("is_paused")) or globally_paused,
-                quiet_floor_minutes=quiet_floor,
             )
             snap["last_success_at"] = live.last_success_at
             snap["stalled"] = live.stalled

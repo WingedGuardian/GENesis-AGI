@@ -2,8 +2,9 @@
 
 The pure verdict is tested in tests/ego/test_liveness.py; here the ALERTING
 state machine is under test — one self-superseding 'high' observation per ego,
-gated/paused suppression, and resolve-on-recovery — driven off a seeded
-job_health.last_success and a mocked runtime.
+suppression (no recent intent / gated), disabled-ego resolution, and
+resolve-on-recovery — driven off seeded job_health.last_success + ego_state
+last_proactive_fire and a mocked runtime.
 """
 
 from __future__ import annotations
@@ -31,18 +32,17 @@ async def db():
     await conn.close()
 
 
-def _mgr(interval=90, paused=False):
-    return SimpleNamespace(current_interval_minutes=interval, is_paused=paused)
+def _mgr(interval=90):
+    return SimpleNamespace(current_interval_minutes=interval)
 
 
-def _wire(monkeypatch, *, user_mgr=None, genesis_mgr=None, gate_on=True, paused=False):
+def _wire(monkeypatch, *, user_mgr=None, genesis_mgr=None, gate_on=True):
     from genesis import runtime as rt_mod
     from genesis.autonomy import cli_policy
 
     fake_rt = SimpleNamespace(
         _ego_cadence_manager=user_mgr,
         _genesis_ego_cadence_manager=genesis_mgr,
-        paused=paused,
     )
     monkeypatch.setattr(rt_mod.GenesisRuntime, "instance", lambda: fake_rt)
     monkeypatch.setattr(
@@ -54,12 +54,18 @@ def _wire(monkeypatch, *, user_mgr=None, genesis_mgr=None, gate_on=True, paused=
     )
 
 
-async def _seed_last_success(db, job_name, minutes_ago):
-    iso = (NOW - timedelta(minutes=minutes_ago)).isoformat()
+async def _seed(db, job_name, *, success_min_ago, intent_min_ago=None):
+    s = (NOW - timedelta(minutes=success_min_ago)).isoformat()
     await db.execute(
         "INSERT INTO job_health (job_name, last_run, last_success, updated_at) VALUES (?, ?, ?, ?)",
-        (job_name, iso, iso, iso),
+        (job_name, s, s, s),
     )
+    if intent_min_ago is not None:
+        i = (NOW - timedelta(minutes=intent_min_ago)).isoformat()
+        await db.execute(
+            "INSERT INTO ego_state (key, value, updated_at) VALUES (?, ?, ?)",
+            (f"last_proactive_fire:{job_name}", i, i),
+        )
     await db.commit()
 
 
@@ -91,11 +97,11 @@ def test_ego_alert_type_is_registered():
 
 @pytest.mark.asyncio
 async def test_stalled_ego_raises_alert(db, monkeypatch):
-    """User ego silent 3 days on a 90m cadence, gate off → one alert; the
-    genesis ego (recent) stays clear."""
+    """User ego actively pushing (recent intent) but no completion in 3 days,
+    gate off → one alert; the genesis ego (recent completion) stays clear."""
     _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=_mgr(), gate_on=False)
-    await _seed_last_success(db, "user_ego_cycle", 3 * 24 * 60)
-    await _seed_last_success(db, "genesis_ego_cycle", 20)
+    await _seed(db, "user_ego_cycle", success_min_ago=3 * 24 * 60, intent_min_ago=5)
+    await _seed(db, "genesis_ego_cycle", success_min_ago=20, intent_min_ago=25)
 
     await loop._check_ego_liveness(db)
 
@@ -104,23 +110,17 @@ async def test_stalled_ego_raises_alert(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_recent_ego_no_alert(db, monkeypatch):
-    _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=_mgr(), gate_on=False)
-    await _seed_last_success(db, "user_ego_cycle", 30)
-    await _seed_last_success(db, "genesis_ego_cycle", 30)
-
-    await loop._check_ego_liveness(db)
-
-    assert await _open_count(db, USER_SRC) == 0
-    assert await _open_count(db, GEN_SRC) == 0
-
-
-@pytest.mark.asyncio
-async def test_global_pause_suppresses_alert(db, monkeypatch):
-    """A global runtime pause legitimately stops cycles → no stall alert even
-    when last_success is old."""
-    _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=None, gate_on=False, paused=True)
-    await _seed_last_success(db, "user_ego_cycle", 3 * 24 * 60)
+async def test_suppressed_ego_no_recent_intent_no_alert(db, monkeypatch):
+    """The convergence case: 3 days since a completed cycle, but the ego also
+    stopped TRYING (intent is old too — idle/quiet/paused/global-pause suppressed
+    the push). Lag small → no alert, with no per-condition enumeration."""
+    _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=None, gate_on=False)
+    await _seed(
+        db,
+        "user_ego_cycle",
+        success_min_ago=3 * 24 * 60 + 20,
+        intent_min_ago=3 * 24 * 60,
+    )
 
     await loop._check_ego_liveness(db)
 
@@ -131,13 +131,11 @@ async def test_global_pause_suppresses_alert(db, monkeypatch):
 async def test_disabled_ego_resolves_open_alert(db, monkeypatch):
     """An ego that was stalled and is then disabled (manager gone) must clear
     its standing alert, not leave it open forever."""
-    # First raise an alert with the ego present + stalled.
     _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=None, gate_on=False)
-    await _seed_last_success(db, "user_ego_cycle", 3 * 24 * 60)
+    await _seed(db, "user_ego_cycle", success_min_ago=3 * 24 * 60, intent_min_ago=5)
     await loop._check_ego_liveness(db)
     assert await _open_count(db, USER_SRC) == 1
 
-    # Now the ego is disabled: manager is None.
     _wire(monkeypatch, user_mgr=None, genesis_mgr=None, gate_on=False)
     await loop._check_ego_liveness(db)
     assert await _open_count(db, USER_SRC) == 0
@@ -148,7 +146,7 @@ async def test_gated_ego_not_alerted(db, monkeypatch):
     """A long-silent ego that is GATED on a pending approval (gate ON) is a
     legitimate wait, not a stall — no alert."""
     _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=None, gate_on=True)
-    await _seed_last_success(db, "user_ego_cycle", 3 * 24 * 60)
+    await _seed(db, "user_ego_cycle", success_min_ago=3 * 24 * 60, intent_min_ago=5)
     await _seed_pending_approval(db, "user_ego_cycle")
 
     await loop._check_ego_liveness(db)
@@ -159,15 +157,15 @@ async def test_gated_ego_not_alerted(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_idempotent_then_resolves_on_recovery(db, monkeypatch):
     """Repeated ticks while stalled keep exactly one open alert; once a cycle
-    lands (recent last_success) the alert auto-resolves."""
+    completes (last_success advances past the intent) the alert auto-resolves."""
     _wire(monkeypatch, user_mgr=_mgr(), genesis_mgr=None, gate_on=False)
-    await _seed_last_success(db, "user_ego_cycle", 3 * 24 * 60)
+    await _seed(db, "user_ego_cycle", success_min_ago=3 * 24 * 60, intent_min_ago=5)
 
     await loop._check_ego_liveness(db)
     await loop._check_ego_liveness(db)  # second tick must not duplicate
     assert await _open_count(db, USER_SRC) == 1
 
-    # Ego recovers: advance last_success to now.
+    # Ego recovers: last_success advances to now (past the intent).
     await db.execute(
         "UPDATE job_health SET last_success=? WHERE job_name='user_ego_cycle'",
         (NOW.isoformat(),),
