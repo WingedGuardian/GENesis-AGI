@@ -230,6 +230,19 @@ def test_multiline_session_env_clamped_to_one_prefix(tmp_path):
     assert "ccccdddd" not in body
 
 
+def test_cross_session_amend_replaces_stale_trailer(tmp_path):
+    """On a cross-session --amend, the session that produced the FINAL commit
+    wins: an existing trailer from session A is REPLACED by session B, so
+    provenance never points at a stale earlier session (--if-exists replace)."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("feat(x): subject\n\nGenesis-Session: aaaaaaaa\n")
+    _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": "bbbbbbbb-2222"})
+    body = msg.read_text()
+    assert body.count("Genesis-Session:") == 1
+    assert "Genesis-Session: bbbbbbbb" in body
+    assert "aaaaaaaa" not in body
+
+
 def test_prose_session_line_does_not_suppress_real_trailer(tmp_path):
     """A column-0 ``Genesis-Session:`` line in prose (e.g. a commit documenting
     the format) must NOT prevent the real trailer from being appended."""

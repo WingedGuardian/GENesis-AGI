@@ -92,9 +92,14 @@ _resolve_session_id() {
 }
 
 SESSION_ID="$(_resolve_session_id)"
-# Idempotency + prose-safety via `--if-exists doNothing` (see the Install block).
+# `--if-exists replace` (not doNothing): idempotent for a same-session re-run
+# (replacing A with A is a no-op), prose-safe (only the trailer block is
+# touched), AND correct on a cross-session `--amend` — the session that
+# produced the FINAL commit wins, so provenance never points at a stale
+# earlier session. (Install: stays doNothing — a per-install pseudonym is not
+# expected to change under amend; cross-install amends are out of scope here.)
 if [ -n "$SESSION_ID" ]; then
-    git interpret-trailers --in-place --if-exists doNothing \
+    git interpret-trailers --in-place --if-exists replace \
         --trailer "Genesis-Session: $SESSION_ID" "$MSG_FILE" 2>/dev/null || true
 fi
 
