@@ -147,13 +147,14 @@ class VoiceTranscriptWriter:
         external_session_id: str,
         role: str,
         text: str,
+        satellite_id: str | None = None,
     ) -> None:
         """Append one message to a session's transcript (core per-turn path)."""
         if role not in _ROLES or not text.strip():
             return
         sid = transcript_session_id(external_session_id)
         async with self._lock:
-            await self._ensure_registered(sid)
+            await self._ensure_registered(sid, satellite_id)
             self._append_lines(sid, [(role, text)])
             await self._touch_activity(sid)
 
@@ -161,6 +162,7 @@ class VoiceTranscriptWriter:
         self,
         external_session_id: str,
         turns: list[dict],
+        satellite_id: str | None = None,
     ) -> int:
         """Reconcile a full cumulative turn list against the transcript.
 
@@ -190,7 +192,7 @@ class VoiceTranscriptWriter:
 
             new_turns = [(t["role"], t["text"]) for t in turns[existing:]]
             if new_turns:
-                await self._ensure_registered(sid)
+                await self._ensure_registered(sid, satellite_id)
                 self._append_lines(sid, new_turns)
                 await self._touch_activity(sid)
             return len(new_turns)
@@ -202,7 +204,10 @@ class VoiceTranscriptWriter:
 
     # ── internals ────────────────────────────────────────────────────
 
-    async def _ensure_registered(self, sid: str) -> None:
+    async def _ensure_registered(self, sid: str, satellite_id: str | None = None) -> None:
+        # satellite_id is captured on a session's FIRST registration only (the
+        # cache below + INSERT OR IGNORE) — best-effort device attribution; a
+        # later post can't backfill it. The s2s path always supplies a stable id.
         if sid in self._registered:
             return
         now = datetime.now(UTC).isoformat()
@@ -210,6 +215,7 @@ class VoiceTranscriptWriter:
             self._db,
             id=sid,
             started_at=now,
+            satellite_id=satellite_id,
         )
         self._registered.add(sid)
 

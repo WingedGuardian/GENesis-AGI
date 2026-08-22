@@ -1009,7 +1009,15 @@ class DirectSessionRunner:
                     tools_called=telemetry,
                 )
                 try:
-                    await self._store_result(session_id, request, parked_result)
+                    # Stamp the park id STRUCTURED into the session metadata so
+                    # downstream bookkeeping (campaign reaper) can follow the
+                    # park instead of string-parsing the error message.
+                    await self._store_result(
+                        session_id,
+                        request,
+                        parked_result,
+                        extra_metadata={"park_id": park_id},
+                    )
                     await self._session_manager.fail(
                         session_id,
                         reason="rate_limited_parked",
@@ -1412,8 +1420,15 @@ class DirectSessionRunner:
         session_id: str,
         request: DirectSessionRequest,
         result: DirectSessionResult,
+        *,
+        extra_metadata: dict | None = None,
     ) -> None:
-        """Merge result data into cc_sessions.metadata (read-merge-write)."""
+        """Merge result data into cc_sessions.metadata (read-merge-write).
+
+        ``extra_metadata`` keys merge LAST (e.g. the rate-limit park stamp
+        ``{"park_id": ...}`` that lets campaign bookkeeping follow a parked
+        session to its resumed delivery instead of recording a false error).
+        """
         from genesis.db.crud import cc_sessions
 
         db = getattr(self._rt, "_db", None)
@@ -1467,6 +1482,9 @@ class DirectSessionRunner:
             payload = roster.endpoint_payload(result.roster_model)
             if payload:
                 existing["roster_endpoint"] = payload
+
+        if extra_metadata:
+            existing.update(extra_metadata)
 
         await db.execute(
             "UPDATE cc_sessions SET metadata = ? WHERE id = ?",

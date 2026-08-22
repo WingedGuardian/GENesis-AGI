@@ -39,6 +39,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from genesis.db.crud import follow_ups as followups_crud
 from genesis.db.crud import repo_pulse as pulse_crud
 from genesis.db.crud.session_charters import ledger_all, ledger_update
 from genesis.env import genesis_db_path
@@ -49,6 +50,7 @@ from genesis.session_awareness.repo_pulse import (
     PULSE_TIMEOUT_S,
     build_fuzzy_prompt,
     match_exact,
+    match_followup,
     parse_matches,
 )
 from genesis.session_awareness.repo_pulse_config import (
@@ -210,6 +212,36 @@ async def _load_open_items(db_path: Path | str) -> list[dict] | None:
     return open_rows
 
 
+async def _load_open_followups(db_path: Path | str) -> list[dict] | None:
+    """Open HOT follow_up rows (kind='follow_up', pending/in_progress), newest first.
+
+    The follow-up analogue of _load_open_items. Fail-closed on a genuine read
+    failure (None → keep the cursor, re-cover next run). But a MISSING follow_ups
+    table is a pre-migration/bootstrap state, NOT a read failure — there are no
+    follow-ups to reconcile, so it returns [] (skip the lane) rather than failing
+    an otherwise-good run (mirrors the pulse-store pre-migration guard). Excludes
+    the cold 'tabled' lane and terminal rows; pinned rows ARE loaded (a marker
+    hit on a pinned row is a proposal, never an auto-absorb — the caller
+    enforces that). Union of pending + in_progress matches ``absorb_followup``'s
+    WHERE clause.
+    """
+    import aiosqlite
+
+    try:
+        async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='follow_ups'"
+            )
+            if not await cur.fetchone():
+                return []  # pre-migration / bare DB — nothing to reconcile, skip
+            rows = await followups_crud.get_open_followups(db)  # ONE consistent snapshot
+    except Exception:
+        return None
+    rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return rows
+
+
 async def _reconcile(db_path: Path | str, now_iso: str) -> dict[str, int]:
     """Sweep 'proposed' annotations against the current ledger state.
 
@@ -231,7 +263,15 @@ async def _reconcile(db_path: Path | str, now_iso: str) -> dict[str, int]:
                 return counts
             ledger = {r["id"]: r for r in await ledger_all(db)}
             for ann in proposed:
-                resolution = _resolution_for(ann, ledger.get(ann["item_id"]), now_iso)
+                # Dispatch by store: a follow_up-target proposal must be
+                # resolved against follow_up state, NOT the ledger dict (else it
+                # is 'item_missing' → superseded every run — the architect
+                # BLOCKER). This IS the per-store filter for the ledger read too.
+                if (ann.get("target_kind") or "ledger") == "follow_up":
+                    fu = await followups_crud.get_by_id(db, ann["item_id"])
+                    resolution = _followup_resolution_for(ann, fu, now_iso)
+                else:
+                    resolution = _resolution_for(ann, ledger.get(ann["item_id"]), now_iso)
                 if resolution is None:
                     continue
                 status, ref = resolution
@@ -264,6 +304,33 @@ def _resolution_for(ann: dict, item: dict | None, now_iso: str) -> tuple[str, st
     return None
 
 
+def _followup_resolution_for(ann: dict, item: dict | None, now_iso: str) -> tuple[str, str] | None:
+    """Resolution mapping for a follow_up-target proposal — the follow-up
+    analogue of _resolution_for, reading follow_up state (NOT ledger). Without
+    this, the reconcile sweep looks a follow_up id up in the ledger dict, finds
+    nothing, and supersedes the proposal every run (the architect BLOCKER).
+
+    completed-with-this-PR-evidence → confirmed; completed otherwise →
+    superseded (shipped, not attributed); failed → rejected; deleted → superseded
+    (missing); still-open past STALE_PROPOSAL_DAYS → superseded (stale).
+    """
+    if item is None:
+        return "superseded", "followup_missing"
+    status = item.get("status")
+    if status == "completed":
+        if _evidence_names_pr(item.get("resolution_notes"), ann["pr_number"]):
+            return "confirmed", f"completed with PR #{ann['pr_number']} evidence"
+        return "superseded", "completed_via_other_evidence"
+    if status == "failed":
+        return "rejected", "followup_failed"
+    # pending / in_progress / blocked / scheduled — leave live proposals until stale
+    observed = _parse_iso(ann.get("observed_at") or "")
+    now_dt = _parse_iso(now_iso)
+    if observed and now_dt and (now_dt - observed) > timedelta(days=STALE_PROPOSAL_DAYS):
+        return "superseded", f"stale_{STALE_PROPOSAL_DAYS}d"
+    return None
+
+
 def _annotation(tier: str, status: str, item: dict, pr: dict, **over) -> dict:
     ann = {
         "id": uuid.uuid4().hex,
@@ -280,6 +347,18 @@ def _annotation(tier: str, status: str, item: dict, pr: dict, **over) -> dict:
         "status": status,
     }
     ann.update(over)
+    return ann
+
+
+def _followup_annotation(status: str, item: dict, pr: dict, **over) -> dict:
+    """Build a follow_up-target annotation. Reuses _annotation for the common
+    fields, then stamps target_kind and overrides the item-shape-divergent
+    columns: follow_ups carry ``content``/``source_session``, not
+    ``text``/``session_id``. Follow-up lane is exact-only, so tier is 'exact'."""
+    ann = _annotation("exact", status, item, pr, **over)
+    ann["target_kind"] = "follow_up"
+    ann["item_text"] = str(item.get("content") or "")[:300]
+    ann["item_session_id"] = item.get("source_session")
     return ann
 
 
@@ -569,6 +648,100 @@ async def _run_locked(
                     annotations.append(
                         _annotation("exact", "proposed", item, pr, rationale="bare-hex")
                     )
+
+    # ── follow-up lane (a8a4f59e) ────────────────────────────────────────
+    # Exact-marker reconciliation of standalone HOT follow_up rows, mirroring
+    # the ledger exact tier and riding the SAME already-fetched `prs`. Fuzzy is
+    # deferred (hundreds of open rows x MAX_ITEMS=40 would be a lottery;
+    # marker/bare-hex is self-scoping). A failed follow_up snapshot is
+    # fail-closed like the ledger one: keep the cursor, re-cover next run (the
+    # ledger exact writes already happened and are re-absorb-guarded).
+    followup_items = await _load_open_followups(db_path)
+    if followup_items is None:
+        detail_notes.append("followup_read_failed")
+        recorded = await _record_run(
+            db_path,
+            **_base_row(
+                status="failed",
+                repo=repo,
+                n_prs=len(prs),
+                n_open_items=len(open_items),
+                n_exact=n_exact,
+            ),
+            annotations=annotations,
+        )
+        if recorded:
+            _write_cursor(root, cursor, merged_at=None)
+        await _record_telemetry(db_path, "failed", "followup_read_failed")
+        return {"status": "failed", "detail": "followup_read_failed", "n_exact": n_exact}
+
+    n_followup = 0
+    followup_matches = match_followup(prs, followup_items)
+    if followup_matches:
+        import aiosqlite
+
+        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+            await db.execute("PRAGMA busy_timeout=5000")
+            db.row_factory = aiosqlite.Row
+            if not await pulse_crud.tables_available(db):
+                followup_matches = []
+            for m in followup_matches:
+                item, pr, via = m["item"], m["pr"], m["via"]
+                if await pulse_crud.annotation_exists(
+                    db, "exact", item["id"], pr["number"], target_kind="follow_up"
+                ):
+                    continue  # per-store re-absorb guard
+                n_followup += 1
+                pinned = bool(item.get("pinned"))
+                if via == "marker" and mode == "live" and not pinned:
+                    evidence = (
+                        f"PR #{pr['number']}: {str(pr.get('title') or '')[:120]} "
+                        f"(merged {pr.get('mergedAt')}) [repo-pulse follow-up]"
+                    )
+                    if await followups_crud.absorb_followup(
+                        db, item["id"], evidence=evidence, require_unpinned=True, commit=False
+                    ):
+                        applied = _followup_annotation(
+                            "applied", item, pr, rationale="follow-up-marker"
+                        )
+                        # Commit the completion + its audit annotation ATOMICALLY
+                        # (one transaction): a crash before the end-of-run
+                        # _record_run can then never orphan either — no completed
+                        # follow_up without its annotation (Codex P1). The later
+                        # _record_run re-write is an INSERT OR IGNORE no-op.
+                        await pulse_crud.insert_annotation(db, applied, run_id=run_id, commit=True)
+                        annotations.append(applied)
+                        continue
+                    # Absorb no-op: the row moved off open between load and now
+                    # (concurrent writer) — record a proposal, not a false absorb.
+                    annotations.append(
+                        _followup_annotation(
+                            "proposed", item, pr, rationale="follow-up-marker (absorb missed)"
+                        )
+                    )
+                elif via == "marker" and pinned:
+                    # Pinned invariant: automation never auto-resolves a pinned
+                    # row — a marker hit is a proposal a human confirms.
+                    annotations.append(
+                        _followup_annotation(
+                            "proposed",
+                            item,
+                            pr,
+                            rationale="follow-up-marker (pinned, proposal-only)",
+                        )
+                    )
+                elif via == "marker":  # propose_only mode
+                    annotations.append(
+                        _followup_annotation(
+                            "proposed", item, pr, rationale="follow-up-marker (propose_only)"
+                        )
+                    )
+                else:  # bare hex — context citation, proposal-only
+                    annotations.append(
+                        _followup_annotation("proposed", item, pr, rationale="bare-hex")
+                    )
+    if followup_items:
+        detail_notes.append(f"followup exact={n_followup}/{len(followup_items)} open")
 
     remaining = [i for i in open_items if i["id"] not in absorbed]
     n_fuzzy = 0

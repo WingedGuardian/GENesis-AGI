@@ -169,21 +169,37 @@ async def _grade_observation(
         session_context=session_context,
     )
 
-    # Try providers in order: OpenRouter (DeepSeek V4), Gemini Flash, Groq
+    # Try providers in order: OpenRouter (DeepSeek V4), Gemini, Groq.
+    # Per-model provider params mirror the canonical routing config: gpt-oss
+    # needs reasoning_effort=low (groq free-tier TPM cap); gemini-3.5-flash is
+    # the config's GA choice (replacing the deprecated 3-flash-preview) with
+    # thinking suppressed — it reasons by default, bloating TPM.
     models = [
-        "openrouter/deepseek/deepseek-chat-v3-0324",
-        "gemini/gemini-2.0-flash",
-        "groq/llama-3.3-70b-versatile",
+        ("openrouter/deepseek/deepseek-chat-v3-0324", None),
+        ("gemini/gemini-3.5-flash", {"reasoning_effort": "disable"}),
+        ("groq/openai/gpt-oss-120b", {"extra_body": {"reasoning_effort": "low"}}),
     ]
+    # litellm's env lookup knows only the native <SVC>_API_KEY spelling;
+    # secrets.env uses the Genesis convention (API_KEY_GROQ etc.), so resolve
+    # and pass the key explicitly or the groq fallback 401s on every install.
+    from genesis.observability.snapshots.api_keys import resolve_api_key
+
+    _service_by_prefix = {"gemini": "google"}
     last_exc = None
     response = None
     used_model = None
-    for model in models:
+    for model, params in models:
+        prefix = model.split("/", 1)[0]
+        api_key = resolve_api_key(_service_by_prefix.get(prefix, prefix))
+        call_kwargs = dict(params or {})
+        if api_key:
+            call_kwargs["api_key"] = api_key
         try:
             response = await litellm.acompletion(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
+                **call_kwargs,
             )
             used_model = model
             break

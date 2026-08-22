@@ -27,8 +27,20 @@ async def enqueue(
     roster_model: str | None = None,
     origin_session_id: str | None = None,
     delivery_mode: str | None = None,
+    system_prompt: str | None = None,
+    source_tag: str | None = None,
+    skills: list[str] | None = None,
+    tool_exceptions: list[str] | tuple[str, ...] | None = None,
+    planning_instruction: str | None = None,
 ) -> str:
-    """Insert a new queue item. Returns the queue_id."""
+    """Insert a new queue item. Returns the queue_id.
+
+    The optional execution-shape fields (system_prompt, source_tag, skills,
+    tool_exceptions, planning_instruction) exist so a rate-limit-parked
+    request round-trips VERBATIM — omitting them re-dispatches with defaults,
+    which silently changes behavior (a parked campaign once resumed without
+    its strategy doc).
+    """
     queue_id = f"dsq-{uuid.uuid4().hex[:12]}"
     payload = {
         "prompt": prompt,
@@ -42,6 +54,11 @@ async def enqueue(
         "roster_model": roster_model,
         "origin_session_id": origin_session_id,
         "delivery_mode": delivery_mode,
+        "system_prompt": system_prompt,
+        "source_tag": source_tag,
+        "skills": list(skills) if skills is not None else None,
+        "tool_exceptions": (list(tool_exceptions) if tool_exceptions is not None else None),
+        "planning_instruction": planning_instruction,
     }
     await db.execute(
         """INSERT INTO direct_session_queue

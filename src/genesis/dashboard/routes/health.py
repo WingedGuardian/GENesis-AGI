@@ -94,6 +94,61 @@ async def heartbeat_canary():
     }), 200
 
 
+@blueprint.route("/api/genesis/liveness")
+def liveness_probe():
+    """Off-loop liveness probe — answers even when the event loop is STARVED.
+
+    Deliberately a SYNC route (NO ``@_async_route``): Flask serves it on its own
+    worker thread (``threaded=True``), so it never bounces onto the runtime event
+    loop and therefore still responds when background work has starved that loop —
+    the exact case where ``/api/genesis/heartbeat`` (async) hangs indefinitely,
+    indistinguishable from a dead process. Reads only plain in-memory values (the
+    off-loop loop-health sample + the awareness loop's integer counters); never
+    touches a coroutine, the event bus, or any loop-bound async object.
+
+    Always HTTP 200 when the process + Flask thread are alive — classification
+    (down / starved / wedged / responsive) is the CALLER's job. Fail-closed: any
+    field it cannot read is ``null`` (UNKNOWN), never a healthy-looking default, so
+    a consumer must treat ``loop: null`` as unknown rather than clear.
+    """
+    from genesis.util import loop_health
+
+    loop_block = None
+    sample = loop_health.read()
+    if sample is not None:
+        loop_block = {
+            "lag_ms": round(sample.drift_ms, 1),
+            "peak_ms": round(sample.peak_ms, 1),
+            "lagging": sample.lagging,
+            "threshold_ms": sample.threshold_ms,
+            "executor": sample.executor,
+            # Computed at READ time (see loop_health.age_s) — a growing age under
+            # starvation is the WEDGED signal.
+            "sample_age_s": round(loop_health.age_s(sample), 3),
+        }
+
+    awareness_block = None
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        # peek() — never lazily constructs a blank singleton (this is a read-only
+        # observability path); None before bootstrap → awareness stays null.
+        rt = GenesisRuntime.peek()
+        if rt is not None and rt.is_bootstrapped and rt.awareness_loop is not None:
+            awareness_block = {
+                "tick_count": rt.awareness_loop.tick_count,
+                "last_tick_at": rt.awareness_loop.last_tick_at,
+            }
+    except Exception:
+        awareness_block = None
+
+    return jsonify({
+        "alive": True,
+        "loop": loop_block,
+        "awareness": awareness_block,
+    }), 200
+
+
 @blueprint.route("/api/genesis/provider-activity")
 @_async_route
 async def provider_activity():

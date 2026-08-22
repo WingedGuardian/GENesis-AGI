@@ -89,6 +89,38 @@ async def test_bad_env_threshold_falls_back_to_default(monkeypatch, caplog):
     assert [r for r in caplog.records if "event-loop lag" in r.getMessage()]
 
 
+async def test_publishes_sample_off_loop(monkeypatch):
+    """Each iteration publishes an off-loop-readable LoopHealthSample so a sync
+    consumer (the /liveness route, the watchdog) can read loop health during
+    starvation. RED before the publish() wiring: loop_health.read() stays None."""
+    from genesis.util import loop_health
+
+    monkeypatch.setattr(loop_health, "_latest", None)
+    # drift 450ms > 250ms default → lagging sample.
+    adapter = _adapter_with_fake_clock(monkeypatch, times=[0.0, 0.95])
+    await adapter._loop_lag_sampler()
+
+    sample = loop_health.read()
+    assert sample is not None, "sampler must publish a sample each iteration"
+    assert round(sample.drift_ms) == 450
+    assert sample.lagging is True
+    assert sample.threshold_ms == 250.0
+
+
+async def test_published_sample_reflects_cleared_episode(monkeypatch):
+    """After a stall clears, the published sample reports lagging=False — a
+    consumer must see recovery, not a stuck 'lagging' flag."""
+    from genesis.util import loop_health
+
+    monkeypatch.setattr(loop_health, "_latest", None)
+    # iter1: drift 450 (lagging); iter2: drift 0 (clears).
+    adapter = _adapter_with_fake_clock(monkeypatch, times=[0.0, 0.95, 0.95, 1.45], stop_after=2)
+    await adapter._loop_lag_sampler()
+    sample = loop_health.read()
+    assert sample is not None
+    assert sample.lagging is False
+
+
 async def test_sustained_lag_warns_once_then_reports_clear(monkeypatch, caplog):
     """A multi-sample stall must WARN exactly once (episode debounce), then emit
     an INFO with the peak drift when it clears — not one line per sample."""

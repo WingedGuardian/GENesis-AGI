@@ -68,6 +68,89 @@ async def test_purge_completed_keeps_pending(db):
     assert row["status"] == "pending"
 
 
+# ── absorb_followup: repo-pulse conditional absorb (a8a4f59e) ─────────────
+
+
+async def test_absorb_followup_completes_open_row(db):
+    """A pending row is marked completed with PR evidence + completed_at."""
+    fid = await follow_ups.create(db, **_BASE)
+    changed = await follow_ups.absorb_followup(db, fid, evidence="PR #1305 [repo-pulse exact]")
+    assert changed is True
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "completed"
+    assert row["completed_at"]
+    assert "PR #1305" in row["resolution_notes"]
+
+
+async def test_absorb_followup_appends_not_overwrites_notes(db):
+    """Prior resolution_notes context is preserved (append, never clobber)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_notes(db, fid, resolution_notes="earlier triage note")
+    await follow_ups.absorb_followup(db, fid, evidence="PR #42 evidence")
+    row = await follow_ups.get_by_id(db, fid)
+    assert "earlier triage note" in row["resolution_notes"]
+    assert "PR #42 evidence" in row["resolution_notes"]
+
+
+async def test_absorb_followup_skips_non_open_row(db):
+    """Lost-update safety: a row a concurrent writer moved off open (e.g.
+    'blocked') is NOT clobbered — the absorb no-ops and returns False."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fid, status="blocked", blocked_reason="waiting")
+    changed = await follow_ups.absorb_followup(db, fid, evidence="PR #99")
+    assert changed is False
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["status"] == "blocked"
+    assert "PR #99" not in (row["resolution_notes"] or "")
+
+
+async def test_absorb_followup_idempotent_replay(db):
+    """A re-covered enumeration window absorbing the same row twice: the first
+    transitions it, the second matches nothing (already completed)."""
+    fid = await follow_ups.create(db, **_BASE)
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #7") is True
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #7 again") is False
+    row = await follow_ups.get_by_id(db, fid)
+    assert row["resolution_notes"].count("PR #7") == 1
+
+
+async def test_absorb_followup_refuses_tabled_kind(db):
+    """Atomic kind guard: the cold tabled/idea lane is never absorbed, even when
+    'pending' and even if a caller's snapshot was stale (Codex P2)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_kind(db, fid, "tabled")
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #1") is False
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "pending"
+
+
+async def test_absorb_followup_require_unpinned_refuses_pinned(db):
+    """require_unpinned=True (the worker's auto-absorb) refuses a pinned row
+    atomically — closing the load→UPDATE pin race. The dashboard path
+    (require_unpinned=False) can still complete a pinned row (human override)."""
+    fid = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_pinned(db, fid, True)
+    assert (
+        await follow_ups.absorb_followup(db, fid, evidence="PR #1", require_unpinned=True)
+    ) is False
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "pending"
+    assert await follow_ups.absorb_followup(db, fid, evidence="PR #1") is True
+    assert (await follow_ups.get_by_id(db, fid))["status"] == "completed"
+
+
+async def test_get_open_followups_single_snapshot(db):
+    """One consistent snapshot of the hot open lane: pending + in_progress,
+    kind='follow_up' only; tabled and terminal rows excluded."""
+    fp = await follow_ups.create(db, **_BASE)  # pending
+    fi = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fi, status="in_progress")
+    ft = await follow_ups.create(db, **_BASE)
+    await follow_ups.set_kind(db, ft, "tabled")  # cold lane — excluded
+    fc = await follow_ups.create(db, **_BASE)
+    await follow_ups.update_status(db, fc, status="completed")  # terminal — excluded
+    ids = {r["id"] for r in await follow_ups.get_open_followups(db)}
+    assert ids == {fp, fi}
+
+
 async def test_purge_failed_old(db):
     """Old failed follow-ups are also purged."""
     fid = await follow_ups.create(db, **_BASE)

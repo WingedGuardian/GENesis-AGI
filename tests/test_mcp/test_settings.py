@@ -507,3 +507,239 @@ class TestValidateCcForegroundReaper:
 
         assert "cc_foreground_reaper" in _DOMAIN_REGISTRY
         assert "cc_foreground_reaper" in _DOMAIN_VALIDATORS
+
+
+class TestAutonomousCliPolicyValidator:
+    """reask 0 (= never re-ask) is legal; overrides map is validated."""
+
+    def test_reask_zero_accepted(self):
+        from genesis.mcp.health.settings import _validate_autonomous_cli_policy
+
+        assert _validate_autonomous_cli_policy({"reask_interval_hours": 0}) == []
+
+    def test_reask_negative_rejected(self):
+        from genesis.mcp.health.settings import _validate_autonomous_cli_policy
+
+        errs = _validate_autonomous_cli_policy({"reask_interval_hours": -1})
+        assert errs and "between 0" in errs[0]
+
+    def test_reask_overrides_valid_and_invalid(self):
+        from genesis.mcp.health.settings import _validate_autonomous_cli_policy
+
+        assert (
+            _validate_autonomous_cli_policy(
+                {"reask_overrides": {"inbox_evaluation": 0, "ego_cycle": 12}},
+            )
+            == []
+        )
+        errs = _validate_autonomous_cli_policy(
+            {"reask_overrides": {"inbox_evaluation": 999}},
+        )
+        assert errs and "inbox_evaluation" in errs[0]
+        errs2 = _validate_autonomous_cli_policy({"reask_overrides": "not-a-map"})
+        assert errs2 and "mapping" in errs2[0]
+
+    def test_fractional_and_bool_hours_rejected(self):
+        """int(0.9) would silently truncate to the 0 = never sentinel —
+        fractional and bool values must be rejected outright."""
+        from genesis.mcp.health.settings import _validate_autonomous_cli_policy
+
+        assert _validate_autonomous_cli_policy({"reask_interval_hours": 0.9})
+        assert _validate_autonomous_cli_policy({"reask_interval_hours": True})
+        assert _validate_autonomous_cli_policy(
+            {"reask_overrides": {"inbox_evaluation": 0.5}},
+        )
+        assert _validate_autonomous_cli_policy({"reask_overrides": {"x": False}})
+
+
+class TestSettingsProvenanceAndGateFlip:
+    """2026-08-18 user directive: user-set config must never read as an
+    anomaly to future sessions (durable provenance stamped by the WRITER),
+    and disabling the mandatory approval gate needs explicit confirmation."""
+
+    def test_atomic_write_stamps_and_preserves_provenance(self, tmp_path, monkeypatch):
+        import genesis.mcp.health.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        p1 = settings_mod._atomic_yaml_write(
+            "prov_test.yaml", {"a": 1}, provenance="user via dashboard PUT",
+        )
+        text1 = p1.read_text()
+        assert text1.startswith("# set-by: user via dashboard PUT @ ")
+        assert yaml.safe_load(text1) == {"a": 1}
+
+        # A second write by a different actor PRESERVES the first stamp.
+        p2 = settings_mod._atomic_yaml_write(
+            "prov_test.yaml", {"a": 2}, provenance="user via mcp settings_update",
+        )
+        text2 = p2.read_text()
+        assert "user via dashboard PUT" in text2
+        assert "user via mcp settings_update" in text2
+        assert yaml.safe_load(text2) == {"a": 2}
+
+    @pytest.mark.asyncio
+    async def test_gate_disable_requires_confirmation(self, tmp_path, monkeypatch):
+        import genesis.mcp.health.settings as settings_mod
+        from genesis.mcp.health.settings import _impl_settings_update
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        result = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": False},
+        )
+        assert "error" in result
+        assert "confirm_disable_approval_gate" in result["error"]
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()
+
+        confirmed = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": False},
+            confirm_disable_approval_gate=True,
+        )
+        assert confirmed.get("status") == "applied"
+        assert "warning" in confirmed
+        written = (tmp_path / "autonomous_cli_policy.local.yaml").read_text()
+        assert "manual_approval_required: false" in written
+        assert written.startswith("# set-by:")
+
+    @pytest.mark.asyncio
+    async def test_gate_enable_needs_no_confirmation(self, tmp_path, monkeypatch):
+        import genesis.mcp.health.settings as settings_mod
+        from genesis.mcp.health.settings import _impl_settings_update
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        result = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": True},
+        )
+        assert result.get("status") == "applied"
+
+    def test_hand_written_comments_survive_restamp(self, tmp_path, monkeypatch):
+        """Audit lock: the WHOLE leading comment block survives a rewrite —
+        hand-written operator rationale is exactly the record provenance
+        stamping exists to protect; only machine set-by lines are capped."""
+        import genesis.mcp.health.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        (tmp_path / "prov_mixed.yaml").write_text(
+            "# set-by: user (dashboard PUT) @ 2026-08-18T13:44\n"
+            "# provenance: deliberate sovereign choice — do NOT revert\n"
+            "#   future sessions: this is user-intentional\n"
+            "manual_approval_required: false\n",
+        )
+        p = settings_mod._atomic_yaml_write(
+            "prov_mixed.yaml",
+            {"manual_approval_required": False, "reask_interval_hours": 24},
+            provenance="user via mcp settings_update",
+        )
+        text = p.read_text()
+        assert "# provenance: deliberate sovereign choice" in text
+        assert "future sessions: this is user-intentional" in text
+        assert "# set-by: user (dashboard PUT) @ 2026-08-18T13:44" in text
+        assert "user via mcp settings_update" in text
+        assert yaml.safe_load(text) == {
+            "manual_approval_required": False,
+            "reask_interval_hours": 24,
+        }
+
+    @pytest.mark.asyncio
+    async def test_gate_disable_falsy_nonbool_rejected_before_gate_check(
+        self, tmp_path, monkeypatch,
+    ):
+        """Deep-review NOTE lock: manual_approval_required=0 (falsy but not
+        False) must be rejected by the validator BEFORE it could slip past the
+        `is False` gate check and be bool()-coerced to a silent disable."""
+        import genesis.mcp.health.settings as settings_mod
+        from genesis.mcp.health.settings import (
+            _impl_settings_update,
+            _validate_autonomous_cli_policy,
+        )
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        assert _validate_autonomous_cli_policy({"manual_approval_required": 0})
+        assert _validate_autonomous_cli_policy({"manual_approval_required": None})
+        result = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": 0},
+        )
+        assert result.get("error") == "validation failed"
+        assert not (tmp_path / "autonomous_cli_policy.local.yaml").exists()
+
+    def test_bare_write_preserves_existing_headers(self, tmp_path, monkeypatch):
+        """Deep-review SHOULD-FIX lock: a caller that passes NO provenance
+        (e.g. the dashboard surplus route pre-fix) must still preserve the
+        existing header block — no caller may be a delete path."""
+        import genesis.mcp.health.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        (tmp_path / "prov_bare.yaml").write_text(
+            "# set-by: user via dashboard PUT @ 2026-08-18T13:44\n"
+            "# provenance: hand-written rationale\n"
+            "a: 1\n",
+        )
+        p = settings_mod._atomic_yaml_write("prov_bare.yaml", {"a": 2})
+        text = p.read_text()
+        assert "# set-by: user via dashboard PUT @ 2026-08-18T13:44" in text
+        assert "# provenance: hand-written rationale" in text
+        assert yaml.safe_load(text) == {"a": 2}
+
+    def test_provenance_newlines_sanitized(self, tmp_path, monkeypatch):
+        """Security lock: a newline in the actor string must never escape the
+        comment prefix (raw top-level YAML above the real mapping = key
+        injection that bypasses the gate-disable confirmation)."""
+        import genesis.mcp.health.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        p = settings_mod._atomic_yaml_write(
+            "prov_inject.yaml", {"a": 1},
+            provenance="evil\nmanual_approval_required: false",
+        )
+        text = p.read_text()
+        loaded = yaml.safe_load(text)
+        assert loaded == {"a": 1}
+        assert "manual_approval_required" not in loaded
+        for line in text.splitlines():
+            assert not line.strip() or line.startswith("#") or line.startswith("a:")
+
+    @pytest.mark.asyncio
+    async def test_gate_disable_alert_writes_and_reenable_resolves(
+        self, tmp_path, monkeypatch,
+    ):
+        """The observation write must actually LAND (the original test never
+        asserted it — the write silently failed into a stray db), and
+        re-enabling the gate must resolve the standing alert (Codex P2)."""
+        import aiosqlite
+
+        import genesis.mcp.health.settings as settings_mod
+        from genesis.db.schema import create_all_tables
+        from genesis.mcp.health.settings import _impl_settings_update
+
+        monkeypatch.setattr(settings_mod, "_USER_CONFIG_DIR", tmp_path)
+        dbp = tmp_path / "obs.db"
+        async with aiosqlite.connect(dbp) as db:
+            db.row_factory = aiosqlite.Row
+            await create_all_tables(db)
+            await db.commit()
+        monkeypatch.setattr("genesis.env.genesis_db_path", lambda: dbp)
+
+        result = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": False},
+            confirm_disable_approval_gate=True,
+        )
+        assert result.get("status") == "applied"
+        async with aiosqlite.connect(dbp) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT resolved_at FROM observations WHERE source='settings_guard'",
+            )
+        assert len(rows) == 1 and rows[0]["resolved_at"] is None, (
+            "the gate-disable critical observation must actually land"
+        )
+
+        result2 = await _impl_settings_update(
+            "autonomous_cli_policy", {"manual_approval_required": True},
+        )
+        assert result2.get("status") == "applied"
+        async with aiosqlite.connect(dbp) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT resolved_at FROM observations WHERE source='settings_guard' "
+                "AND resolved_at IS NULL",
+            )
+        assert rows == [], "re-enable must resolve the standing alert"

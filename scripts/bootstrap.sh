@@ -12,9 +12,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# HOME may be unset in some container environments; derive from passwd
+# HOME may be unset in some container environments; derive from passwd (uid,
+# not whoami — robust when the name lookup is missing) and fail closed rather
+# than proceed with HOME="" (which `set -u` would not catch).
 if [[ -z "${HOME:-}" ]]; then
-    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
 
@@ -958,6 +961,12 @@ if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
     # shellcheck source=lib/memory_resilience.sh
     source "$SCRIPT_DIR/lib/memory_resilience.sh"
     memory_resilience_apply
+    # PID/task ceiling: raise the per-user-slice TasksMax above systemd's stock
+    # 33% default (the fork-exhaustion blind spot — many concurrent CC sessions
+    # spawn MCP subprocess trees and hit `Cannot fork` while memory/CPU read
+    # green). Same lib, same never-abort contract; surfaces via the posture check
+    # (pid_ceiling_effective_ok) when sudo/etc is unavailable.
+    pid_budget_apply
 else
     echo "  WARNING: lib/memory_resilience.sh missing — skipping OOM-resilience setup"
 fi

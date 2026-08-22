@@ -71,9 +71,12 @@ set_secret() {
 
 # ── HOME guard ───────────────────────────────────────────────
 # Ensure HOME is set (may be empty in container sessions without login shell)
-# and persisted in /etc/environment so all future sessions inherit it.
+# and persisted in /etc/environment so all future sessions inherit it. Resolve
+# from passwd by uid (robust when the name lookup is missing) and fail closed
+# rather than proceed with HOME="" (which `set -u` would not catch).
 if [ -z "${HOME:-}" ]; then
-    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
 if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
@@ -1201,6 +1204,33 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
             echo "    + genesis-server started" || \
             echo "    WARNING: could not start genesis-server"
     fi
+fi
+
+# --- Memory resilience (systemd-oomd pressure-kill + swap invariant + PID ceiling) ---
+# Fresh-install parity with bootstrap.sh/update.sh: without this block a fresh
+# container install sat unprotected against the OOM-thrash / fork-exhaustion
+# wedge, with NO automatic trigger to run update.sh. Guarded so a tree missing
+# the lib degrades (warns) rather than aborting under `set -euo pipefail` — the
+# lib's own never-abort contract. Uses install.sh's own `_install_pkg` idiom
+# (bootstrap's `install_pkg` is undefined here). See scripts/lib/memory_resilience.sh.
+if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
+    # systemd-oomd is a SEPARATE apt/dnf package; memory_resilience_apply
+    # silently skips pressure-kill setup when it's absent, so provision it
+    # BEFORE sourcing/applying the lib (install → apply order). _install_pkg is
+    # idempotent and degrades to a warning; the lib still guards on PSI/systemd
+    # independently. (dnf: oomd ships inside systemd; the subpackage is
+    # systemd-oomd-defaults.)
+    _install_pkg systemd-oomd systemd-oomd-defaults || echo "  WARNING: Could not install systemd-oomd — if the next step reports 'systemd-oomd not available', pressure-kill protection is off."
+    # shellcheck source=lib/memory_resilience.sh
+    source "$SCRIPT_DIR/lib/memory_resilience.sh"
+    memory_resilience_apply
+    # PID/task ceiling: raise the per-user-slice TasksMax above systemd's stock
+    # 33% default (the fork-exhaustion blind spot). Same lib, same never-abort
+    # contract; surfaces via the posture check (pid_ceiling_effective_ok) when
+    # sudo/etc is unavailable.
+    pid_budget_apply
+else
+    echo "  WARNING: lib/memory_resilience.sh missing — skipping OOM-resilience setup"
 fi
 
 # Infrastructure report

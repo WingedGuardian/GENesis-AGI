@@ -91,6 +91,10 @@ class ProbeResult:
     message: str = ""
     checked_at: str = ""  # ISO datetime
     details: dict | None = None
+    # True when the DOWN was a timeout (vs a hard error like connection-refused).
+    # A timeout under a starved event loop is a scheduling artifact, not a real
+    # outage — critical_failure uses this to avoid firing on loop starvation.
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)

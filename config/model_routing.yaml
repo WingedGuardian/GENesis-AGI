@@ -120,17 +120,10 @@ providers:
   # ── Phase 2 providers (gated on eval before chain promotion) ──
   nvidia-nim-deepseek:
     type: nvidia_nim
-    model: deepseek-ai/deepseek-v4-pro
-    profile: nvidia-nim-deepseek-v4-pro
+    model: deepseek-ai/deepseek-v4-flash-0731
+    profile: nvidia-nim-deepseek-v4-flash-0731
     free: true
-    rpm_limit: 20  # 40 RPM shared pool — 20 each to stay within aggregate limit
-    open_duration_s: 120
-  nvidia-nim-kimi:
-    type: nvidia_nim
-    model: moonshotai/kimi-k2.6
-    profile: nvidia-nim-kimi-k2.6
-    free: true
-    rpm_limit: 20  # 40 RPM shared pool — 20 each to stay within aggregate limit
+    rpm_limit: 20  # NIM free tier ~40 RPM per-model (verified 2026-08); 20 = conservative floor
     open_duration_s: 120
   # cerebras DISABLED — all models removed from Cerebras as of 2026-05.
   # Only reasoning-only models remain (gpt-oss-120b, zai-glm-4.7) which
@@ -279,10 +272,9 @@ call_sites:
     - gemini-free
     # Additional free providers so an essential reflection (3_micro_reflection
     # is in degradation._L3_KEEP) survives a broad free-tier outage without
-    # paid fallback. Healthy OpenRouter-free models first; NIM last (shared
-    # 40 RPM pool, currently flaky).
+    # paid fallback. Healthy OpenRouter-free models first; NIM-flash last
+    # (free ~40 RPM per-model, historically flaky).
     - openrouter-gemma4
-    - nvidia-nim-kimi
     - nvidia-nim-deepseek
     retry_profile: background
   4_light_reflection:
@@ -340,7 +332,6 @@ call_sites:
     - groq-free
     - openrouter-free
     - nvidia-nim-deepseek
-    - nvidia-nim-kimi
     never_pays: true
   13_morning_report:
     chain:
@@ -360,11 +351,15 @@ call_sites:
     default_paid: true
     dispatch: cli
     cc_model: Sonnet
+  # Executor Gate 2 deliverable-quality review leads with paid V4-pro
+  # (openrouter-deepseek-v4): a user-chosen pro-grade lever for this quality gate,
+  # since NIM's free tier now serves flash (not pro) after the 2026-08 repoint.
+  # Free NIM flash + paid v4-flash + qwen remain as fallbacks.
   17_executor_review:
     chain:
+    - openrouter-deepseek-v4
     - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
-    - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
     description: "Task executor Gate 2 — cross-vendor quality review of deliverables. Renamed from 17_fresh_eyes_review 2026-05-10 (disambiguates from outreach pre-send check at 23_outreach_review)."
@@ -404,20 +399,23 @@ call_sites:
     - openrouter-deepseek-v4-flash
     - groq-free
     retry_profile: background
-  # Adversarial challenge of synthesis output. Different provider from
-  # synthesis (Kimi challenges DeepSeek) ensures model independence.
+  # Adversarial challenge of synthesis output. Must stay model-independent from
+  # synthesis across the WHOLE chain, not just the primary: synthesis falls back
+  # to groq-free, so a groq-led challenge could self-approve under a DeepSeek
+  # outage. This challenge leads with mistral-large-free (disjoint from every
+  # synthesis provider — deepseek-flash / groq) + paid Kimi as the deep fallback.
+  # NIM's free Kimi was retired 2026-08 (404-for-account). Locked by
+  # test_config_invariants::test_adversarial_challenge_sites_are_model_independent.
   dream_cycle_synthesis_challenge:
     chain:
-    - nvidia-nim-kimi
-    - groq-free
-    # Paid Kimi via OpenRouter as last-resort fallback — same model family as
-    # the free NIM primary, so the Kimi-challenges-DeepSeek independence holds
-    # even when both free tiers are down. Only billed during a free-tier outage.
+    - mistral-large-free
+    # Paid Kimi via OpenRouter as last-resort fallback — a non-DeepSeek, non-groq
+    # family, so the challenge stays model-independent from synthesis across the
+    # whole chain even when the free tier is down. Only billed during an outage.
     - kimi-k2.5
     retry_profile: background
   dream_cycle_entity_check:
     chain:
-    - nvidia-nim-kimi
     - groq-free
     - mistral-small-free
     - openrouter-free
@@ -427,8 +425,22 @@ call_sites:
     - mistral-large-free
     - openrouter-gemma4
     retry_profile: background
+  # MW-2 relationship classifier — coarse relationship judgment
+  # (duplicate/contradicts/succeeded_by/distinct) between candidate memory pairs.
+  # Same free-SLM shape / task class as dream_cycle_entity_check; batched, on demand
+  # (MW-2 measurement probe now; MW-5 merge-gate nominees later). §6.2 model tier is
+  # the dial — start on the proven entity-check chain.
+  dream_cycle_relationship_classify:
+    chain:
+    - groq-free
+    - mistral-small-free
+    - openrouter-free
+    - gemini-free
+    - mistral-large-free
+    - openrouter-gemma4
+    retry_profile: background
   # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
-  # DeepSeek challenges Kimi's entity judgments.
+  # DeepSeek challenges the entity_check's judgments (which lead with groq-free).
   dream_cycle_entity_challenge:
     chain:
     - nvidia-nim-deepseek
@@ -438,7 +450,6 @@ call_sites:
   # Same free-SLM shape as dream_cycle_entity_check; hourly, small backlog.
   entity_adjudication:
     chain:
-    - nvidia-nim-kimi
     - groq-free
     - mistral-small-free
     - openrouter-free
@@ -447,8 +458,8 @@ call_sites:
     - openrouter-gemma4
     retry_profile: background
   # Adversarial challenge of an entity-node "merge" verdict. Flipped pairing
-  # (DeepSeek challenges Kimi) so a single model's mistake cannot merge two
-  # distinct entities — both must agree before a merge.
+  # (DeepSeek challenges the groq-free-led adjudication) so a single model's
+  # mistake cannot merge two distinct entities — both must agree before a merge.
   entity_adjudication_challenge:
     chain:
     - nvidia-nim-deepseek
@@ -459,7 +470,6 @@ call_sites:
   # Same free background family as the dream-cycle classification sites.
   wing_backfill:
     chain:
-    - nvidia-nim-kimi
     - nvidia-nim-deepseek
     - groq-free
     - openrouter-deepseek-v4-flash
@@ -517,7 +527,6 @@ call_sites:
     - groq-free
     - mistral-large-free
     - nvidia-nim-deepseek
-    - nvidia-nim-kimi
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
@@ -531,7 +540,6 @@ call_sites:
       pipeline candidates
   38a_procedure_novelty_llm:
     chain:
-    - nvidia-nim-deepseek
     - openrouter-deepseek-v4
     default_paid: true
     description: Cross-task_type procedure dedup judgment (is a new procedure
@@ -731,15 +739,16 @@ call_sites:
       \ grader is slow/down) and sheds under REDUCED degradation."
   judge:
     chain:
-    - nvidia-nim-deepseek
     - openrouter-deepseek-v4
+    - nvidia-nim-deepseek
     - openrouter-deepseek-v4-flash
     default_paid: true
     retry_profile: background
     dispatch: api
     description: "LLM-as-judge primitive \u2014 grades outputs against versioned\
       \ rubrics for the eval harness (and, in later phases, CRAG retrieval).\
-      \ Free NIM v4-pro first, then paid v4-pro, then v4-flash for resilience; model_used\
+      \ Paid v4-pro (the calibrated judge model) first, then NIM v4-flash, then paid v4-flash\
+      \ for resilience; model_used\
       \ is logged per judgment for calibration traceability."
   voice_conversation:
     chain:
@@ -764,7 +773,7 @@ call_sites:
       \u2014 this sends the window's household transcript text to an external free LLM; only the
       float verdict is persisted (never the text). Provider bake-off 2026-07-01 over real
       garbled windows: mistral-small-latest (100% clean JSON, ~0.8s) primary + nvidia-nim
-      deepseek-v4-pro (100% clean, different vendor) fallback; both free, so never_pays
+      deepseek-v4-flash-0731 (fast, valid JSON on live probe 2026-08-19; different vendor) fallback; both free, so never_pays
       keeps a valid chain. NON-Groq deliberately \u2014 Groq's 8B is EOL 2026-08-16 and its
       gpt-oss-20b replacement breaks strict JSON.
   ambient_arbiter:

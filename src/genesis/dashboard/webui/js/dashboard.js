@@ -2214,14 +2214,27 @@
             }
           } catch (e) { console.warn(`Settings fetch ${domain} failed:`, e); }
         },
-        async saveSettings(domain) {
+        async saveSettings(domain, confirmGateDisable = false) {
           this.settingsSaving = true;
           try {
+            const payload = { ...this.settingsData[domain] };
+            if (confirmGateDisable) { payload.confirm_disable_approval_gate = true; }
             const resp = await fetchApi(`/api/genesis/settings/${domain}`, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(this.settingsData[domain]),
+              body: JSON.stringify(payload),
             });
+            if (resp && resp.status === 409 && !confirmGateDisable) {
+              // Protected key: disabling the mandatory approval gate needs an
+              // explicit human confirmation, then a single retry with the flag.
+              const err = await resp.json().catch(() => ({}));
+              this.settingsSaving = false;
+              const detail = typeof err.details === "string" ? err.details : "This disables the mandatory approval gate for ALL autonomous sessions.";
+              if (window.confirm(detail + "\n\nProceed?")) {
+                return this.saveSettings(domain, true);
+              }
+              return;
+            }
             if (resp && resp.ok) {
               const d = await resp.json();
               this.settingsData[domain] = d.config;
@@ -2232,7 +2245,8 @@
               if (d.needs_restart) { this.settingsRestartMessage = "Settings saved. Restart Genesis server to apply."; }
             } else {
               const err = await resp.json().catch(() => ({}));
-              alert("Save failed: " + (err.details ? err.details.join(", ") : err.error || "Unknown error"));
+              const detail = Array.isArray(err.details) ? err.details.join(", ") : (err.details || err.error || "Unknown error");
+              alert("Save failed: " + detail);
             }
           } catch (e) { alert("Save failed: " + e.message); }
           this.settingsSaving = false;
@@ -3683,11 +3697,31 @@
           const ge = ego.egos?.genesis_ego;
           const ueCad = ue?.cadence;
           const geCad = ge?.cadence;
+          // Fail-LOUD, not fail-green: if the liveness/gated read itself errored,
+          // `stalled` defaulted to false — surfacing that as healthy would
+          // recreate the exact false-green this instrumentation exists to kill.
+          // Report unknown so a broken collector never reads as "all good".
+          if (ueCad?.liveness_error || geCad?.liveness_error ||
+              ueCad?.gated_error || geCad?.gated_error) {
+            return { state: "unknown", reason: "ego liveness data unavailable (read error)" };
+          }
           // Circuit breaker on either ego
           if (ueCad?.consecutive_failures >= 3 || geCad?.consecutive_failures >= 3) {
             const which = (ueCad?.consecutive_failures >= 3 ? "CEO" : "") +
                           (geCad?.consecutive_failures >= 3 ? (ueCad?.consecutive_failures >= 3 ? " + COO" : "COO") : "");
             return { state: "error", reason: `circuit open (${which})` };
+          }
+          // Truthful liveness: a STALLED ego (no completed cycle well past its
+          // cadence, and not gated/paused) is a genuine fault. It must never read
+          // healthy just because the consumer loop task is alive or next_fire_at
+          // keeps sliding — the exact 3-day-deadlock-shows-green bug. `stalled`
+          // is computed server-side from job_health.last_success (ego.liveness),
+          // conservative thresholds so a legitimate backoff never false-reds.
+          if (ueCad?.stalled || geCad?.stalled) {
+            const which = (ueCad?.stalled ? "CEO" : "") +
+                          (geCad?.stalled ? (ueCad?.stalled ? " + COO" : "COO") : "");
+            const reason = (ueCad?.stalled ? ueCad?.stall_reason : geCad?.stall_reason) || "no recent cycle";
+            return { state: "error", reason: `${which} stalled — ${reason}` };
           }
           // Fallback to modal cadence if per-ego data not available yet
           const cadence = this.egoModal.cadence;
@@ -3701,6 +3735,12 @@
           if (ueCad?.is_paused || geCad?.is_paused) {
             const which = ueCad?.is_paused ? "CEO" : "COO";
             return { state: "degraded", reason: `${which} paused` };
+          }
+          // Gated on a pending CLI approval: a legitimate wait on the user (gate
+          // ON), surfaced as a to-do, never healthy and never a fault.
+          if (ueCad?.gated || geCad?.gated) {
+            const which = ueCad?.gated ? "CEO" : "COO";
+            return { state: "needs action", reason: `${which} waiting on CLI approval` };
           }
           // Proposals piling up: this is a review queue awaiting the user, not
           // a fault. Surface it as "needs action" (distinct from degraded) so it
@@ -3821,9 +3861,19 @@
               + ((cpuFull60 >= 1) ? ", stall " + cpuFull60.toFixed(0) + "%" : "") + ")";
           }
 
-          // Worst-of — memory, disk, or CPU, whichever is worst.
+          // PID budget assessment (per-user slice TasksMax — the 'Cannot fork'
+          // guard). Status is computed server-side; report it when it drives.
+          let pidState = "healthy", pidReason = "";
+          const pids = this.health.infrastructure?.pids;
+          if (pids && (pids.status === "degraded" || pids.status === "error") && pids.pct != null) {
+            pidState = pids.status;
+            pidReason = "PID budget " + pids.status + " (" + (pids.scope ? pids.scope + " " : "")
+              + pids.pct.toFixed(0) + "%, " + pids.current + "/" + pids.max + " tasks)";
+          }
+
+          // Worst-of — memory, disk, CPU, or PID budget, whichever is worst.
           let worst = { state: memState, reason: memReason };
-          for (const c of [{ state: diskState, reason: diskReason }, { state: cpuState, reason: cpuReason }]) {
+          for (const c of [{ state: diskState, reason: diskReason }, { state: cpuState, reason: cpuReason }, { state: pidState, reason: pidReason }]) {
             if ((stateRank[c.state] || 0) > (stateRank[worst.state] || 0)) worst = c;
           }
           return worst;

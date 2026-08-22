@@ -550,6 +550,76 @@ async def test_pulse_confirm_absorbs_item_with_pr_evidence(db):
     assert "PR #1081" in row["evidence"]
 
 
+async def _seed_followup_proposal(db, *, ann_id="af1", fu_id="fu0", status="proposed"):
+    await db.execute(
+        "INSERT INTO follow_ups (id, source, content, reason, strategy, status, "
+        "priority, kind, created_at) VALUES (?, 'test', 'ship it', 'r', "
+        "'ego_judgment', 'pending', 'medium', 'follow_up', '2026-07-10T00:00:00+00:00')",
+        (fu_id,),
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_runs (run_id, started_at, trigger, status)"
+        " VALUES ('rf1', '2026-07-14T00:00:00+00:00', 'manual', 'ok')"
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_annotations (id, run_id, observed_at, tier, item_id,"
+        " item_session_id, item_text, pr_number, pr_title, status, target_kind)"
+        " VALUES (?, 'rf1', '2026-07-14T00:00:00+00:00', 'exact', ?,"
+        " 'cc-xyz', 'ship it', 1305, 'feat: officecli', ?, 'follow_up')",
+        (ann_id, fu_id, status),
+    )
+    await db.commit()
+
+
+async def test_pulse_confirm_absorbs_followup_target(db):
+    """A follow_up-target annotation confirmed via the dashboard absorbs the
+    FOLLOW_UP (conditional open-only), not a nonexistent ledger row — the
+    reader-dispatch obligation from the foundation audit."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_followup_proposal(db)
+    payload, code = await _resolve_pulse(db, "af1", "confirmed")
+    assert code == 200
+    assert payload["ok"] is True and payload["item_absorbed"] is True
+    assert await _ann_status(db, "af1") == "confirmed"
+    cur = await db.execute("SELECT status, resolution_notes FROM follow_ups WHERE id = 'fu0'")
+    row = await cur.fetchone()
+    assert row[0] == "completed"
+    assert "PR #1305" in row[1]
+
+
+async def test_pulse_lookup_excludes_followup_proposals(db):
+    """The per-session pulse panel is ledger-only — a session-bound follow_up
+    annotation is NOT surfaced here (session-agnostic → separate global surface;
+    avoids the NULL-session gap + the ledger-only confirm command, Codex P2)."""
+    from genesis.dashboard.routes.cc_sessions import _pulse_lookup
+
+    await _seed_followup_proposal(db, ann_id="afx", fu_id="fux")  # item_session_id='cc-xyz'
+    out = await _pulse_lookup(db, "cc-xyz")
+    assert out["available"] is True
+    assert all(a["target_kind"] == "ledger" for a in out["annotations"])
+    assert not any(a["id"] == "afx" for a in out["annotations"])
+
+
+async def test_pulse_confirm_followup_not_open_absorb_missed(db):
+    """Resolve-first: confirming a follow_up whose row moved off-open (blocked)
+    confirms the annotation (the race arbiter) but the absorb misses — 200,
+    item_absorbed False, follow_up NOT force-completed. The confirmed-but-absorb-
+    missed residue is accepted (ledger-consistent); absorb-first was reverted as
+    it reopened the worse absorbed-under-a-rejected-annotation residue."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_followup_proposal(db, ann_id="af2", fu_id="fu2")
+    await db.execute("UPDATE follow_ups SET status='blocked' WHERE id='fu2'")
+    await db.commit()
+    payload, code = await _resolve_pulse(db, "af2", "confirmed")
+    assert code == 200
+    assert payload["item_absorbed"] is False
+    assert await _ann_status(db, "af2") == "confirmed"  # resolve-first: annotation is the arbiter
+    cur = await db.execute("SELECT status FROM follow_ups WHERE id='fu2'")
+    assert (await cur.fetchone())[0] == "blocked"  # follow_up untouched (never force-completed)
+
+
 async def test_pulse_reject_leaves_ledger_untouched(db):
     from genesis.dashboard.routes.cc_sessions import _resolve_pulse
 

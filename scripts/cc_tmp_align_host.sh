@@ -31,6 +31,16 @@
 
 set -u
 
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 GENESIS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_PY="$GENESIS_ROOT/.venv/bin/python"
 GUARDIAN_CONFIG="$HOME/.genesis/guardian_remote.yaml"

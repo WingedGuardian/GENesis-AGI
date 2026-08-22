@@ -220,6 +220,48 @@ async def mark_terminal(db: aiosqlite.Connection, park_id: str, status: str) -> 
     await db.commit()
 
 
+async def mark_terminal_if_unchanged(
+    db: aiosqlite.Connection,
+    park_id: str,
+    status: str,
+    *,
+    expected_status: str,
+    expected_claimed_at: str | None,
+    expected_updated_at: str,
+) -> bool:
+    """Force a terminal status ONLY if the row still holds (expected_status,
+    expected_claimed_at, expected_updated_at) — the atomic guard for a
+    check-then-cancel decision.
+
+    Versions on status, claimed_at, AND updated_at. updated_at is a monotonic
+    version bumped by EVERY writer (claim/mark_resumed/relimit/recover), so it
+    closes the ABA hole that (status, claimed_at) alone leaves: a concurrent
+    claim→relimit can return the row to the SAME (parked, NULL) the caller read
+    while refreshing attempts + retry schedule — versioning on updated_at makes
+    the cancel no-op against that freshly re-limited work. NULL-safe on
+    claimed_at. True iff exactly this row was updated (the read was still
+    current)."""
+    now = _now()
+    if expected_claimed_at is None:
+        cursor = await db.execute(
+            """UPDATE cc_rate_limit_parks
+               SET status = ?, claimed_at = NULL, updated_at = ?
+               WHERE id = ? AND status = ? AND claimed_at IS NULL
+                 AND updated_at = ?""",
+            (status, now, park_id, expected_status, expected_updated_at),
+        )
+    else:
+        cursor = await db.execute(
+            """UPDATE cc_rate_limit_parks
+               SET status = ?, claimed_at = NULL, updated_at = ?
+               WHERE id = ? AND status = ? AND claimed_at = ?
+                 AND updated_at = ?""",
+            (status, now, park_id, expected_status, expected_claimed_at, expected_updated_at),
+        )
+    await db.commit()
+    return cursor.rowcount == 1
+
+
 async def get_by_id(db: aiosqlite.Connection, park_id: str) -> dict | None:
     cursor = await db.execute(
         "SELECT * FROM cc_rate_limit_parks WHERE id = ?",

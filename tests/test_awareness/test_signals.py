@@ -1,7 +1,10 @@
 """Tests for signal collectors."""
 
+import threading
+
 from genesis.awareness.signals import (
     BudgetCollector,
+    ContainerMemoryCollector,
     ConversationCollector,
     CriticalFailureCollector,
     ErrorSpikeCollector,
@@ -81,3 +84,29 @@ async def test_collect_all_tolerates_failure():
     values = {r.name: r.value for r in readings}
     assert values["broken"] == 0.0
     assert values["conversations_since_reflection"] == 0.0
+
+
+async def test_container_memory_reads_run_off_the_main_thread(monkeypatch):
+    """RED guard: ContainerMemoryCollector.collect must offload the synchronous
+    cgroup reads via asyncio.to_thread. Reverting the offload to a direct
+    ``get_container_anon_memory()`` call runs it on the main (loop) thread → this
+    fails. Mirrors test_host_metrics_run_off_the_main_thread for the snapshot path.
+
+    The collector imports get_container_anon_memory from genesis.autonomy.watchdog
+    at call time, so patching it there intercepts the real cgroup read (this test
+    stays hermetic regardless of the host's /sys/fs/cgroup layout)."""
+    import genesis.autonomy.watchdog as watchdog_mod
+
+    main = threading.main_thread()
+    seen: dict = {}
+
+    def _record_thread():
+        seen["thread"] = threading.current_thread()
+        return (1024, 4096)  # (anon_kernel bytes, limit bytes) — non-zero, non-None
+
+    monkeypatch.setattr(watchdog_mod, "get_container_anon_memory", _record_thread)
+    reading = await ContainerMemoryCollector().collect()
+
+    assert isinstance(reading, SignalReading)
+    assert seen.get("thread") is not None, "get_container_anon_memory was never called"
+    assert seen["thread"] is not main, "cgroup reads must run off the loop thread"
