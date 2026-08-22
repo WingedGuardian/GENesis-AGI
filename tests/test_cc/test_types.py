@@ -90,6 +90,56 @@ def test_channel_type():
     assert ChannelType.TERMINAL == "terminal"
 
 
+def test_task_detected_origin_owner_vs_gateway():
+    """WS-3: owner-attended channels stamp owner; gateway channels external;
+    unknown/None fail-closed to external."""
+    from genesis.cc.types import task_detected_origin
+
+    # owner-attended
+    assert task_detected_origin(ChannelType.TERMINAL) == "owner"
+    assert task_detected_origin(ChannelType.TELEGRAM) == "owner"
+    assert task_detected_origin("terminal") == "owner"
+    assert task_detected_origin("telegram") == "owner"
+    # gateway (web/OpenClaw, WhatsApp, voice) → external_untrusted
+    for ch in (ChannelType.WEB, ChannelType.WHATSAPP, ChannelType.VOICE):
+        assert task_detected_origin(ch) == "external_untrusted", ch
+    # fail-closed
+    assert task_detected_origin(None) == "external_untrusted"
+    assert task_detected_origin("some_future_channel") == "external_untrusted"
+
+
+def test_is_owner_attended_channel():
+    """WS-3 gate-4: the single owner-attended predicate driving both
+    task_detected origin and the CC supervised flag."""
+    from genesis.cc.types import is_owner_attended_channel
+
+    assert is_owner_attended_channel(ChannelType.TERMINAL) is True
+    assert is_owner_attended_channel(ChannelType.TELEGRAM) is True
+    assert is_owner_attended_channel("terminal") is True
+    assert is_owner_attended_channel("telegram") is True
+    # gateway channels are NOT owner-attended (the gate-4 fix)
+    for ch in (ChannelType.WEB, ChannelType.WHATSAPP, ChannelType.VOICE):
+        assert is_owner_attended_channel(ch) is False, ch
+    # fail-closed on unknown/None
+    assert is_owner_attended_channel(None) is False
+    assert is_owner_attended_channel("some_future_channel") is False
+
+
+def test_session_origin_for_channel():
+    """WS-3 gate-4 producer half: gateway sessions carry external_untrusted so
+    their own writes are stamped untrusted; owner-attended → None (coalesce
+    first_party unchanged)."""
+    from genesis.cc.types import session_origin_for_channel
+
+    assert session_origin_for_channel(ChannelType.TERMINAL) is None
+    assert session_origin_for_channel(ChannelType.TELEGRAM) is None
+    for ch in (ChannelType.WEB, ChannelType.WHATSAPP, ChannelType.VOICE):
+        assert session_origin_for_channel(ch) == "external_untrusted", ch
+    # fail-closed on unknown/None
+    assert session_origin_for_channel(None) == "external_untrusted"
+    assert session_origin_for_channel("some_future_channel") == "external_untrusted"
+
+
 # --- StreamEvent tests ---
 
 

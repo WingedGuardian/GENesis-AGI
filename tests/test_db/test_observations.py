@@ -27,6 +27,53 @@ async def test_get_nonexistent(db):
     assert await observations.get_by_id(db, "nope") is None
 
 
+# ── WS-3 write-boundary origin stamping (fail-closed) ───────────────────────
+
+
+async def test_create_stamps_origin_from_source(db, monkeypatch):
+    """create() derives origin from the source when no env/explicit is set:
+    known-external → external_untrusted, known-first-party → first_party,
+    unknown → NULL (fail-closed)."""
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+    await observations.create(db, id="oc_ext", **{**_COMMON, "source": "recon"})
+    await observations.create(db, id="oc_fp", **{**_COMMON, "source": "awareness_loop"})
+    await observations.create(db, id="oc_null", **{**_COMMON, "source": "brand_new_writer_xyz"})
+    assert (await observations.get_by_id(db, "oc_ext"))["origin_class"] == "external_untrusted"
+    assert (await observations.get_by_id(db, "oc_fp"))["origin_class"] == "first_party"
+    assert (await observations.get_by_id(db, "oc_null"))["origin_class"] is None
+
+
+async def test_create_env_origin_is_forge_proof(db, monkeypatch):
+    """An external-origin session's env outranks a forged internal source."""
+    monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+    await observations.create(db, id="oc_forge", **{**_COMMON, "source": "awareness_loop"})
+    assert (await observations.get_by_id(db, "oc_forge"))["origin_class"] == "external_untrusted"
+
+
+async def test_create_explicit_origin_wins(db, monkeypatch):
+    monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+    await observations.create(
+        db, id="oc_explicit", origin_class="owner", **{**_COMMON, "source": "recon"}
+    )
+    assert (await observations.get_by_id(db, "oc_explicit"))["origin_class"] == "owner"
+
+
+async def test_create_invalid_explicit_origin_raises(db, monkeypatch):
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+    with pytest.raises(ValueError, match="invalid origin_class"):
+        await observations.create(db, id="oc_bad", origin_class="external", **_COMMON)
+
+
+async def test_upsert_stamps_origin_from_source(db, monkeypatch):
+    """upsert() applies the SAME fail-closed derivation as create() (regression
+    guard: a removal of _resolve_origin from upsert must fail CI)."""
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+    await observations.upsert(db, id="ou_ext", **{**_COMMON, "source": "recon"})
+    await observations.upsert(db, id="ou_null", **{**_COMMON, "source": "brand_new_writer_xyz"})
+    assert (await observations.get_by_id(db, "ou_ext"))["origin_class"] == "external_untrusted"
+    assert (await observations.get_by_id(db, "ou_null"))["origin_class"] is None
+
+
 async def test_query_no_filters(db):
     await observations.create(db, id="o2", **_COMMON)
     rows = await observations.query(db)
@@ -428,3 +475,94 @@ async def test_skip_if_duplicate_is_atomic_single_statement(db):
         db, id="atomic3", skip_if_duplicate=True, **_GIT_ALERT
     )
     assert r3 == "atomic3"
+
+
+# ── WS-3 read-side origin gate (SAFE_SURFACING_ORIGINS / SAFE_ORIGIN_SQL) ────
+
+
+def test_safe_surfacing_origins_match_constants():
+    """The read-side trusted set is pinned equal to the provenance constants,
+    and the raw-SQL fragment lists the same two literals (NULL-excluding)."""
+    from genesis.db.crud.observations import (
+        SAFE_ORIGIN_SQL,
+        SAFE_SURFACING_ORIGINS,
+    )
+    from genesis.memory.provenance import ORIGIN_FIRST_PARTY, ORIGIN_OWNER
+
+    assert SAFE_SURFACING_ORIGINS == (ORIGIN_OWNER, ORIGIN_FIRST_PARTY)
+    assert SAFE_ORIGIN_SQL == "origin_class IN ('owner', 'first_party')"
+    # external_untrusted must NOT be in the trusted set.
+    assert "external_untrusted" not in SAFE_SURFACING_ORIGINS
+
+
+async def test_query_origin_gate_excludes_external_and_null(db):
+    """query(origin_class_in=SAFE_SURFACING_ORIGINS) keeps owner/first_party,
+    drops external_untrusted AND NULL (fail-closed)."""
+    from genesis.db.crud.observations import SAFE_SURFACING_ORIGINS
+
+    base = dict(type="user_signal", content="c", priority="low")
+    await observations.create(
+        db, id="g_owner", origin_class="owner", source="s", created_at="2026-01-04", **base
+    )
+    await observations.create(
+        db, id="g_fp", origin_class="first_party", source="s", created_at="2026-01-03", **base
+    )
+    await observations.create(
+        db, id="g_ext", origin_class="external_untrusted", source="s", created_at="2026-01-02", **base
+    )
+    # NULL origin (unknown source, no env/explicit) — must be excluded too.
+    import os
+
+    os.environ.pop("GENESIS_SESSION_ORIGIN", None)
+    await observations.create(
+        db, id="g_null", source="brand_new_writer_xyz", created_at="2026-01-01", **base
+    )
+
+    rows = await observations.query(
+        db, type="user_signal", origin_class_in=list(SAFE_SURFACING_ORIGINS), limit=50
+    )
+    ids = {r["id"] for r in rows}
+    assert ids == {"g_owner", "g_fp"}, ids
+
+
+async def test_safe_origin_sql_fragment_excludes_external_and_null(db):
+    """The raw SAFE_ORIGIN_SQL predicate (used by essential_knowledge) has the
+    same NULL-excluding semantics when embedded in a hand-built query."""
+    from genesis.db.crud.observations import SAFE_ORIGIN_SQL
+
+    base = dict(type="conversation_pivot", content="c", priority="low")
+    await observations.create(
+        db, id="p_owner", origin_class="owner", source="session:x", created_at="2026-01-02", **base
+    )
+    await observations.create(
+        db, id="p_ext", origin_class="external_untrusted", source="session:y", created_at="2026-01-02", **base
+    )
+    import os
+
+    os.environ.pop("GENESIS_SESSION_ORIGIN", None)
+    await observations.create(
+        db, id="p_null", source="brand_new_writer_xyz", created_at="2026-01-02", **base
+    )
+
+    cur = await db.execute(
+        f"SELECT id FROM observations WHERE type='conversation_pivot' AND {SAFE_ORIGIN_SQL}"  # noqa: S608
+    )
+    ids = {r[0] for r in await cur.fetchall()}
+    assert ids == {"p_owner"}, ids
+
+
+async def test_dedup_is_scoped_by_origin(db):
+    """WS-3 P2#5: skip_if_duplicate must not let a less-trusted duplicate suppress
+    a more-trusted one — same source+content but different origin → both kept."""
+    common = dict(type="task_detected", content="fix the login bug", priority="medium",
+                  source="conversation_intent", created_at="2026-01-01T00:00:00",
+                  skip_if_duplicate=True)
+    # Gateway (external) request arrives first.
+    r1 = await observations.create(db, id="dup_ext", origin_class="external_untrusted", **common)
+    # Owner request, identical content+source, arrives second — must be recorded.
+    r2 = await observations.create(db, id="dup_owner", origin_class="owner", **common)
+    assert r1 == "dup_ext"
+    assert r2 == "dup_owner", "owner request suppressed by earlier gateway duplicate"
+    # A THIRD identical owner request IS a duplicate (same origin) → skipped.
+    r3 = await observations.create(db, id="dup_owner2", origin_class="owner", **common)
+    assert r3 is None

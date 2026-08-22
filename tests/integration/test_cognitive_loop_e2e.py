@@ -340,10 +340,14 @@ async def test_task_detected_visible_in_context(db):
     """task_detected observations are retrievable by ContextGatherer.gather()."""
     from genesis.reflection.context_gatherer import ContextGatherer
 
+    # WS-3: an owner-typed task carries `owner` origin in production (via
+    # cc.types.task_detected_origin); a gateway task would be external_untrusted
+    # and correctly excluded from reflection context.
     await observations.create(
         db, id="task-vis-1", source="conversation_intent",
         type="task_detected", content="fix the login bug",
         priority="medium", created_at=datetime.now(UTC).isoformat(),
+        origin_class="owner",
     )
 
     gatherer = ContextGatherer()

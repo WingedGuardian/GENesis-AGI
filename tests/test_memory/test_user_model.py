@@ -342,11 +342,26 @@ async def test_external_origin_delta_barred_from_auto_accept(db):
 @pytest.mark.asyncio
 async def test_null_origin_delta_barred_fail_closed(db):
     """Fail-closed: a NULL origin (legacy/unstamped) is untrusted, not
-    first-party 'by omission'."""
-    await _create_delta(
-        db, id="nul", field="risk_tolerance", value="maximal",
-        confidence=0.95, origin_class=None,
+    first-party 'by omission'.
+
+    WS-3: create() now DERIVES origin (origin_class=None → source map →
+    first_party for source='reflection'), so a genuine NULL row can only exist as
+    a LEGACY pre-chokepoint row. Insert it raw to simulate that and prove the gate
+    still bars it. (Migration 0085 backfills such rows by source; this covers any
+    that remain NULL — unknown source — which stay barred.)"""
+    await db.execute(
+        "INSERT INTO observations (id, source, type, content, priority, "
+        "created_at, resolved, origin_class) VALUES (?,?,?,?,?,?,0,NULL)",
+        (
+            "nul", "reflection", "user_model_delta",
+            json.dumps({
+                "field": "risk_tolerance", "value": "maximal",
+                "evidence": "test evidence", "confidence": 0.95,
+            }),
+            "medium", "2026-03-08T00:00:00",
+        ),
     )
+    await db.commit()
     result = await UserModelEvolver(db=db).process_pending_deltas()
     assert result is None
 

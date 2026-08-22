@@ -30,7 +30,10 @@ from genesis.cc.types import (
     ChannelType,
     EffortLevel,
     StreamEvent,
+    is_owner_attended_channel,
     origin_delivery_supported,
+    session_origin_for_channel,
+    task_detected_origin,
 )
 from genesis.db.crud import cc_sessions
 from genesis.observability.call_site_recorder import record_last_run
@@ -195,6 +198,10 @@ class ConversationLoop:
                     content=prompt_text,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -273,9 +280,16 @@ class ConversationLoop:
                 skip_permissions=True,
                 append_system_prompt=True,
                 roster_eligible=True,
-                # WS-3 B4: owner-attended interactive conversation — spare it
-                # from the gate-4 pushed-surfaces enforce drop.
-                supervised=True,
+                # WS-3 B4/gate-4: spare the pushed-surfaces enforce drop ONLY for
+                # owner-attended channels (terminal/Telegram). A gateway
+                # conversation (web/OpenClaw, WhatsApp, voice) is NOT owner-
+                # authenticated, so it stays unsupervised — fail-closed toward
+                # dropping wrapped-external pushed content, never injecting it.
+                supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
                 # Owner-attended interactive session: keep the full user-scoped
                 # MCP toolset. Opt OUT of secure-by-default strict scoping
                 # (see CCInvocation.strict_mcp_config).
@@ -455,6 +469,10 @@ class ConversationLoop:
                     content=prompt_text,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -594,9 +612,16 @@ class ConversationLoop:
                 append_system_prompt=True,
                 session_key=session_key,
                 roster_eligible=True,
-                # WS-3 B4: owner-attended interactive conversation — spare it
-                # from the gate-4 pushed-surfaces enforce drop.
-                supervised=True,
+                # WS-3 B4/gate-4: spare the pushed-surfaces enforce drop ONLY for
+                # owner-attended channels (terminal/Telegram). A gateway
+                # conversation (web/OpenClaw, WhatsApp, voice) is NOT owner-
+                # authenticated, so it stays unsupervised — fail-closed toward
+                # dropping wrapped-external pushed content, never injecting it.
+                supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
                 # Owner-attended interactive session: keep the full user-scoped
                 # MCP toolset. Opt OUT of secure-by-default strict scoping
                 # (see CCInvocation.strict_mcp_config).
@@ -876,8 +901,11 @@ class ConversationLoop:
             append_system_prompt=True,
             session_key=session_key,  # cc-loop-01: keep /stop working on retry
             roster_eligible=True,  # fresh retry stays roster-routable (no resume)
-            # WS-3 B4: owner-attended interactive conversation (fresh retry).
-            supervised=True,
+            # WS-3 B4/gate-4 (fresh retry): supervised ONLY for owner-attended
+            # channels (terminal/Telegram); gateway conversations stay
+            # unsupervised. Mirrors the primary invocation sites above.
+            supervised=is_owner_attended_channel(channel),
+            origin=session_origin_for_channel(channel),  # WS-3 gate-4 producer half
             # Owner-attended interactive session: keep the full user-scoped MCP
             # toolset. Opt OUT of secure-by-default strict scoping
             # (see CCInvocation.strict_mcp_config).
