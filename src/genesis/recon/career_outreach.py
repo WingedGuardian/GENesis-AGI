@@ -180,6 +180,10 @@ def _parse_json(text: str) -> object | None:
     # object is it — ONE rule that handles a leading verdict-is-JSON, a ```-fenced
     # payload, trailing prose, AND nested objects (a nested value always ends before
     # its parent, so a top-level object out-reaches its own children).
+    # KNOWN LIMIT: a reply with a SECOND standalone JSON object AFTER the payload
+    # would mis-select the trailing one; classify_autorun_reply then fail-closes it as
+    # ProtocolError (job-health error, never a false success or broken nudge). Accepted:
+    # the auto-run prompt forbids any trailing content after the payload.
     decoder = json.JSONDecoder()
     best: object | None = None
     best_end = -1
@@ -333,6 +337,7 @@ class CareerOutreachResult:
 
     mode: str = "off"
     health_ok: bool = True
+    skipped: bool = False  # health-gated clean skip (no dispatch ran) → runner records NEITHER
     auto_runs: int = 0  # dispatches that staged a fresh draft
     drafts_working: int = 0  # == auto_runs: drafts staged THIS tick (no backlog census)
     nudged: int = 0  # newly-staged drafts included in a delivered nudge
@@ -411,7 +416,12 @@ class CareerOutreachMonitor:
             )
         if not healthy:
             logger.info("career outreach: reasoning module unhealthy (remote down?) — clean skip")
-            return CareerOutreachResult(mode=mode, health_ok=False)
+            # A health-gated skip did NOT dispatch anything, so it must record NEITHER
+            # success nor failure (mirrors the `off` early-return). Booking a success here
+            # would permanently bump total_successes ≥ 1 and disqualify the job from the
+            # never-succeeded alarm forever — even after real probe failures accumulate —
+            # masking the exact silent-outage class observe exists to feed (PR #1428).
+            return CareerOutreachResult(mode=mode, health_ok=False, skipped=True)
 
         timeout = cfg.knob_int(conf, "dispatch_timeout_s")
 

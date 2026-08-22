@@ -134,10 +134,13 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         pass
     try:
         result = await sched._career_outreach_monitor.gather()
-        if result.mode == "off":
-            # Disabled-by-config: record NOTHING (neither success nor failure) so the
-            # actuator stays invisible in job-health on installs that never enabled it
-            # (surplus convention — cf. _guard.SKIP).
+        if result.mode == "off" or result.skipped:
+            # Disabled-by-config (mode==off) OR a health-gated clean skip (skipped —
+            # remote down, no dispatch ran): record NOTHING (neither success nor failure).
+            # `off` keeps the actuator invisible on installs that never enabled it; a
+            # skip must not book a false success that would permanently disqualify the
+            # job from the never-succeeded alarm (PR #1428). Surplus convention — cf.
+            # _guard.SKIP.
             return
         if (
             result.auto_runs
