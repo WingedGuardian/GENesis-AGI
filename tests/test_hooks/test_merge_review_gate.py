@@ -1451,24 +1451,25 @@ class TestPrCiStatus:
 
 class TestPrCiStatusCancelSibling:
     """Concurrency-cancel dedup (approach B): a CANCELLED CheckRun is dropped IFF a
-    check of the SAME identity (name + workflowName) also concluded SUCCESS on this
-    head — no time-ordering, so a superseded `cancel-in-progress` duplicate can't
-    stick the gate red while its own re-run passed. Wrong-green-impossible: only
-    CANCELLED (no verdict) is dropped, only for a true same-job re-run, and a cancel
-    with no resolvable identity or no same-identity success stays red."""
+    check of the SAME identity (name + workflowName) concluded SUCCESS AT OR AFTER
+    it — so a superseded `cancel-in-progress` duplicate (cancel older than its
+    re-run's success) drops, but a SUCCESS-then-cancel re-run on an unchanged head
+    still blocks. Both sides are terminal COMPLETED runs (always carry completedAt);
+    every unresolvable case (no identity, no completedAt, no later success) fails
+    closed to red."""
 
     @staticmethod
     def _set(monkeypatch, checks):
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
 
     def test_cancel_with_success_sibling_is_green(self, guard_module, monkeypatch):
-        # The ec925917 incident: concurrency-cancelled CodeQL dups + their
-        # successful re-runs (same name + workflowName). Must read green.
+        # The ec925917 incident: concurrency-cancelled CodeQL dups (older) + their
+        # successful re-runs (newer, same name + workflowName). Must read green.
         self._set(monkeypatch, [
-            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
-            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
-            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
-            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
         ])
         assert guard_module._pr_ci_status("1") == ("green", [])
 
@@ -1486,17 +1487,17 @@ class TestPrCiStatusCancelSibling:
         # check. Identity is (name, workflowName), so this stays red. Under a
         # bare-name match this would wrongly go green.
         self._set(monkeypatch, [
-            {"name": "test-suite", "workflowName": "real-ci", "status": "COMPLETED", "conclusion": "CANCELLED"},
-            {"name": "test-suite", "workflowName": "decoy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "test-suite", "workflowName": "real-ci", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test-suite", "workflowName": "decoy", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
         ])
         assert guard_module._pr_ci_status("1") == ("red", ["test-suite"])
 
     def test_cancel_without_workflowname_stays_red(self, guard_module, monkeypatch):
         # Fail-closed: a CANCELLED entry with no resolvable workflowName has no
-        # identity, so even a same-name SUCCESS cannot drop it — stays red.
+        # identity, so even a later same-name SUCCESS cannot drop it — stays red.
         self._set(monkeypatch, [
-            {"name": "x", "status": "COMPLETED", "conclusion": "CANCELLED"},
-            {"name": "x", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "x", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "x", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
         ])
         assert guard_module._pr_ci_status("1") == ("red", ["x"])
 
@@ -1513,8 +1514,8 @@ class TestPrCiStatusCancelSibling:
         # Dropping a cancelled-with-sibling must never hide a DIFFERENT check's
         # real failure — the core wrong-green guard.
         self._set(monkeypatch, [
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
             {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"},
         ])
         assert guard_module._pr_ci_status("1") == ("red", ["lint"])
@@ -1542,8 +1543,8 @@ class TestPrCiStatusCancelSibling:
         # Dropping a cancelled-with-sibling must not swallow an UNRELATED pending
         # check — the merge still blocks on the in-flight one.
         self._set(monkeypatch, [
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
             {"name": "deploy", "workflowName": "CI", "status": "IN_PROGRESS", "conclusion": None},
         ])
         assert guard_module._pr_ci_status("1") == ("pending", ["deploy"])
@@ -1557,6 +1558,27 @@ class TestPrCiStatusCancelSibling:
             {"status": "COMPLETED", "conclusion": "CANCELLED"},
         ])
         assert guard_module._pr_ci_status("1") == ("red", ["check"])
+
+    def test_success_then_cancel_on_unchanged_head_stays_red(self, guard_module, monkeypatch):
+        # Codex P1: a job passed (older), then was re-run on the UNCHANGED head and
+        # that re-run was CANCELLED (newer). The latest attempt never passed, so the
+        # cancel is NOT superseded by a later success → stays red. Under a bare
+        # set-membership match (no completedAt) this wrongly returned green.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_cancel_without_completedat_stays_red(self, guard_module, monkeypatch):
+        # Fail-closed: a CANCELLED entry with no completedAt can't be proven
+        # superseded (no timestamp to order it), so even a same-identity SUCCESS
+        # does not drop it — stays red.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
 
 
 class TestCiOverrideSigil:
@@ -1697,8 +1719,11 @@ class TestCiGateEndToEnd:
 
 
 class TestCiStatusUnfinishedStates:
-    """P1 fix: ANY non-terminal check status counts as pending (not just
-    QUEUED/IN_PROGRESS) — a new/renamed unfinished state can't read as green."""
+    """Full enumeration of GitHub's status/conclusion/state domains — no
+    unenumerated value may read green: ANY non-terminal status ⇒ pending; an
+    unrecognized *terminal* conclusion (e.g. STALE, or a value GitHub adds later)
+    ⇒ red (fail-closed); a legacy EXPECTED context ⇒ pending. A null conclusion on
+    a COMPLETED run is genuine no-verdict data and stays a benign ignore."""
 
     @staticmethod
     def _set(monkeypatch, checks):
@@ -1722,6 +1747,35 @@ class TestCiStatusUnfinishedStates:
             {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ])
         assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_stale_conclusion_is_red(self, guard_module, monkeypatch):
+        # STALE = a superseded/outdated run (GitHub's own term) — NOT a pass. On a
+        # gate that forces --admin (sole CI enforcement) it must block, not read
+        # green. Under the prior code this silently ignored → green.
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "STALE"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["Analyze (python)"])
+
+    def test_stale_mixed_with_success_still_red(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [
+            {"name": "codeql", "status": "COMPLETED", "conclusion": "STALE"},
+            {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["codeql"])
+
+    def test_unrecognized_terminal_conclusion_fails_closed_red(self, guard_module, monkeypatch):
+        # A COMPLETED run with a conclusion GitHub adds later must fail closed to
+        # red, never silently ignore (the class root cause behind the STALE gap).
+        self._set(monkeypatch, [{"name": "test", "status": "COMPLETED", "conclusion": "SOME_FUTURE_VERDICT"}])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_expected_statuscontext_is_pending(self, guard_module, monkeypatch):
+        # A legacy StatusContext EXPECTED (a required context that hasn't reported
+        # yet) must read pending, not fall through to unknown (which callers treat
+        # as non-blocking).
+        self._set(monkeypatch, [{"context": "ci/required", "state": "EXPECTED"}])
+        assert guard_module._pr_ci_status("1") == ("pending", ["ci/required"])
 
 
 class TestMergeableAllowlist:
