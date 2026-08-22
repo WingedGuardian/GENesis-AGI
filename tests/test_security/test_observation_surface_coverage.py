@@ -170,3 +170,73 @@ def test_crud_chokepoint_resolves_origin() -> None:
             f"observations.{func}() no longer resolves origin — the write "
             "chokepoint is broken; all callers would mint unclassified rows."
         )
+
+
+# ── Source-classification coverage (Codex PR #1431 P1#2) ────────────────────
+# The chokepoint resolving origin is necessary but not sufficient: a writer whose
+# `source` is unknown resolves to NULL → excluded from every laundering-critical
+# read surface. This forces each STATIC observation source literal to be
+# consciously classified (external / first-party / intake) OR listed as a
+# user-content source whose origin is stamped explicitly at the write site.
+
+# Receiver names that alias the observations crud module (observations.create,
+# obs_crud.create, observation_crud.create/upsert).
+_OBS_RECEIVERS = {"observations", "obs_crud", "observation_crud"}
+
+
+def _static_observation_sources() -> dict[str, str]:
+    """Map each STATIC ``source=`` literal on an observations.create/upsert Call
+    to a file, via AST (a regex with ``[^)]`` can't skip the ``)`` in a preceding
+    ``id=str(uuid.uuid4())`` arg — the reason the first version saw only ~9/46).
+    f-strings / variable sources are dynamic and intentionally skipped."""
+    found: dict[str, str] = {}
+    for path in _iter_py_files():
+        try:
+            tree = ast.parse(path.read_text())
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (
+                isinstance(fn, ast.Attribute)
+                and fn.attr in ("create", "upsert")
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id in _OBS_RECEIVERS
+            ):
+                continue
+            for kw in node.keywords:
+                if (
+                    kw.arg == "source"
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)
+                ):
+                    found.setdefault(kw.value.value, _rel(path))
+    return found
+
+
+def test_every_static_observation_source_is_classified() -> None:
+    """Each static source literal classifies to a definite origin, OR is a
+    documented user-content source (origin stamped by channel at the write site).
+    A NEW writer with an unclassified source fails here — add it to the
+    first-party allowlist / external set, or the user-content exceptions."""
+    from genesis.memory.provenance import (
+        _USER_CONTENT_OBS_SOURCES,
+        _origin_from_source,
+    )
+
+    unclassified: list[str] = []
+    for src, rel in _static_observation_sources().items():
+        if src in _USER_CONTENT_OBS_SOURCES:
+            continue  # origin stamped explicitly by channel (task_detected_origin)
+        if src.startswith(("session:", "module:", "intake:")):
+            continue  # resolved dynamically (env / cc_sessions JOIN / intake split)
+        if _origin_from_source(src) is None:
+            unclassified.append(f"{src!r} ({rel})")
+    assert not unclassified, (
+        "Observation source(s) resolve to NULL origin → excluded from reflection/"
+        "L1 surfaces. Classify each in memory.provenance "
+        "(_FIRST_PARTY_OBS_SOURCES / _EXTERNAL_OBS_SOURCES) or, if user-content, "
+        "_USER_CONTENT_OBS_SOURCES:\n  " + "\n  ".join(sorted(unclassified))
+    )

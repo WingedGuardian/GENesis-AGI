@@ -125,6 +125,21 @@ def test_is_owner_attended_channel():
     assert is_owner_attended_channel("some_future_channel") is False
 
 
+def test_session_origin_for_channel():
+    """WS-3 gate-4 producer half: gateway sessions carry external_untrusted so
+    their own writes are stamped untrusted; owner-attended → None (coalesce
+    first_party unchanged)."""
+    from genesis.cc.types import session_origin_for_channel
+
+    assert session_origin_for_channel(ChannelType.TERMINAL) is None
+    assert session_origin_for_channel(ChannelType.TELEGRAM) is None
+    for ch in (ChannelType.WEB, ChannelType.WHATSAPP, ChannelType.VOICE):
+        assert session_origin_for_channel(ch) == "external_untrusted", ch
+    # fail-closed on unknown/None
+    assert session_origin_for_channel(None) == "external_untrusted"
+    assert session_origin_for_channel("some_future_channel") == "external_untrusted"
+
+
 # --- StreamEvent tests ---
 
 

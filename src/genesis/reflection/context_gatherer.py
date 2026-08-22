@@ -66,9 +66,15 @@ class ContextGatherer:
         # Memory consolidation: unresolved observations above threshold
         # Exclude micro_reflection — low-value free-model output that inflates
         # the backlog count without providing consolidation material.
+        # WS-3: gate on origin so the trigger reflects the FIRST-PARTY backlog
+        # reflection can actually consolidate. External/unknown-origin rows are
+        # excluded from every gather path, so counting them here would (a) let a
+        # flood inflate pending-work and (b) re-fire deep reflection every cycle
+        # on rows it then excludes (they never resolve → permanent backlog).
         unresolved = await observations.query(
             db, resolved=False, limit=200,
             exclude_types=("micro_reflection",),
+            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
         )
         obs_backlog = len(unresolved)
         has_memory_work = obs_backlog >= _MIN_OBSERVATIONS_FOR_CONSOLIDATION
@@ -129,7 +135,15 @@ class ContextGatherer:
         # NOT incrementing retrieved_count here (metric read, not prompt input).
         mature_lo = (now - timedelta(days=_REFLECTION_MATURITY_MAX_DAYS)).isoformat()
         mature_hi = (now - timedelta(days=_REFLECTION_MATURITY_MIN_DAYS)).isoformat()
-        deep_obs = await observations.query(db, source="cc_reflection_deep", limit=200)
+        # WS-3: source is forgeable, so gate this self-assessment cohort on origin
+        # too — a forged external cc_reflection_deep row must not skew the
+        # reflection_quality score. (The two whole-corpus volume queries below
+        # are deliberately NOT gated: learning-velocity measures total observation
+        # throughput, first-party and external alike.)
+        deep_obs = await observations.query(
+            db, source="cc_reflection_deep", limit=200,
+            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
+        )
         cohort = [
             o for o in deep_obs
             if mature_lo <= o.get("created_at", "") < mature_hi
@@ -244,6 +258,11 @@ class ContextGatherer:
         """Get observations since last deep reflection (or last 48h)."""
         last_deep = await observations.query(
             db, source="cc_reflection_deep", limit=1,
+            # WS-3: this row's timestamp is the reflection-window cutoff. `source`
+            # is a free observation_write param, so gate on origin — else a forged
+            # external cc_reflection_deep row moves the window and suppresses legit
+            # observations from the next cycle.
+            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
         )
         _micro_excl = ("micro_reflection",)
         if last_deep:
@@ -382,6 +401,11 @@ class ContextGatherer:
         # Get last Deep reflection timestamp
         last_deep = await observations.query(
             db, source="cc_reflection_deep", limit=1,
+            # WS-3: this row's timestamp is the reflection-window cutoff. `source`
+            # is a free observation_write param, so gate on origin — else a forged
+            # external cc_reflection_deep row moves the window and suppresses legit
+            # observations from the next cycle.
+            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
         )
         since = ""
         if last_deep:
@@ -418,6 +442,11 @@ class ContextGatherer:
         """Count intake items since last Deep reflection."""
         last_deep = await observations.query(
             db, source="cc_reflection_deep", limit=1,
+            # WS-3: this row's timestamp is the reflection-window cutoff. `source`
+            # is a free observation_write param, so gate on origin — else a forged
+            # external cc_reflection_deep row moves the window and suppresses legit
+            # observations from the next cycle.
+            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
         )
         since = ""
         if last_deep:

@@ -354,6 +354,11 @@ async def create(
         # schema-level unique index (which would change semantics for every
         # other observation writer).
         cursor = await db.execute(
+            # WS-3: dedup identity includes origin_class (NULL-safe IS) so a
+            # less-trusted duplicate can't suppress a more-trusted one — e.g. a
+            # gateway (external) task_detected must NOT block the owner's identical
+            # Telegram/terminal request from being recorded with owner authority.
+            # Same-origin duplicates still dedup (monitors are single-origin).
             """INSERT INTO observations
                (id, person_id, source, type, category, content, priority,
                 speculative, created_at, expires_at, content_hash, origin_class)
@@ -361,8 +366,9 @@ async def create(
                WHERE NOT EXISTS (
                    SELECT 1 FROM observations
                    WHERE source = ? AND content_hash = ? AND resolved = 0
+                     AND origin_class IS ?
                )""",
-            (*params, source, content_hash),
+            (*params, source, content_hash, origin_class),
         )
         await db.commit()
         if cursor.rowcount == 0:

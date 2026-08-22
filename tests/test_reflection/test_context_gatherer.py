@@ -40,8 +40,9 @@ class TestDetectPendingWork:
         now = datetime.now(UTC).isoformat()
         for _i in range(5):
             await db.execute(
-                "INSERT INTO observations (id, source, type, content, priority, created_at) "
-                "VALUES (?, 'test', 'test', 'content', 'low', ?)",
+                # WS-3: first_party so detect_pending_work (origin-gated) counts them.
+                "INSERT INTO observations (id, source, type, content, priority, created_at, origin_class) "
+                "VALUES (?, 'test', 'test', 'content', 'low', ?, 'first_party')",
                 (str(uuid.uuid4()), now),
             )
         await db.commit()
@@ -55,8 +56,9 @@ class TestDetectPendingWork:
         now = datetime.now(UTC).isoformat()
         for _i in range(12):
             await db.execute(
-                "INSERT INTO observations (id, source, type, content, priority, created_at) "
-                "VALUES (?, 'test', 'test', 'content', 'low', ?)",
+                # WS-3: first_party so detect_pending_work (origin-gated) counts them.
+                "INSERT INTO observations (id, source, type, content, priority, created_at, origin_class) "
+                "VALUES (?, 'test', 'test', 'content', 'low', ?, 'first_party')",
                 (str(uuid.uuid4()), now),
             )
         await db.commit()
@@ -95,8 +97,8 @@ class TestDetectPendingWork:
         """Any unresolved observations → lessons extraction possible."""
         now = datetime.now(UTC).isoformat()
         await db.execute(
-            "INSERT INTO observations (id, source, type, content, priority, created_at) "
-            "VALUES ('obs1', 'test', 'test', 'content', 'low', ?)",
+            "INSERT INTO observations (id, source, type, content, priority, created_at, origin_class) "
+            "VALUES ('obs1', 'test', 'test', 'content', 'low', ?, 'first_party')",
             (now,),
         )
         await db.commit()
@@ -171,10 +173,12 @@ class TestReflectionQualityCohort:
     async def _insert_deep_obs(self, db, *, days_ago, retrieved=0, influenced=0):
         created = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
         await db.execute(
+            # WS-3: first_party so the origin-gated reflection_quality cohort
+            # counts these (a forged external cc_reflection_deep is now excluded).
             "INSERT INTO observations "
             "(id, source, type, content, priority, created_at, "
-            "retrieved_count, influenced_action) "
-            "VALUES (?, 'cc_reflection_deep', 'reflection', 'c', 'medium', ?, ?, ?)",
+            "retrieved_count, influenced_action, origin_class) "
+            "VALUES (?, 'cc_reflection_deep', 'reflection', 'c', 'medium', ?, ?, ?, 'first_party')",
             (str(uuid.uuid4()), created, retrieved, influenced),
         )
 

@@ -549,3 +549,20 @@ async def test_safe_origin_sql_fragment_excludes_external_and_null(db):
     )
     ids = {r[0] for r in await cur.fetchall()}
     assert ids == {"p_owner"}, ids
+
+
+async def test_dedup_is_scoped_by_origin(db):
+    """WS-3 P2#5: skip_if_duplicate must not let a less-trusted duplicate suppress
+    a more-trusted one — same source+content but different origin → both kept."""
+    common = dict(type="task_detected", content="fix the login bug", priority="medium",
+                  source="conversation_intent", created_at="2026-01-01T00:00:00",
+                  skip_if_duplicate=True)
+    # Gateway (external) request arrives first.
+    r1 = await observations.create(db, id="dup_ext", origin_class="external_untrusted", **common)
+    # Owner request, identical content+source, arrives second — must be recorded.
+    r2 = await observations.create(db, id="dup_owner", origin_class="owner", **common)
+    assert r1 == "dup_ext"
+    assert r2 == "dup_owner", "owner request suppressed by earlier gateway duplicate"
+    # A THIRD identical owner request IS a duplicate (same origin) → skipped.
+    r3 = await observations.create(db, id="dup_owner2", origin_class="owner", **common)
+    assert r3 is None

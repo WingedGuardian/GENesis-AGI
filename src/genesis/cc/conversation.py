@@ -32,6 +32,7 @@ from genesis.cc.types import (
     StreamEvent,
     is_owner_attended_channel,
     origin_delivery_supported,
+    session_origin_for_channel,
     task_detected_origin,
 )
 from genesis.db.crud import cc_sessions
@@ -285,6 +286,10 @@ class ConversationLoop:
                 # authenticated, so it stays unsupervised — fail-closed toward
                 # dropping wrapped-external pushed content, never injecting it.
                 supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
                 # Owner-attended interactive session: keep the full user-scoped
                 # MCP toolset. Opt OUT of secure-by-default strict scoping
                 # (see CCInvocation.strict_mcp_config).
@@ -613,6 +618,10 @@ class ConversationLoop:
                 # authenticated, so it stays unsupervised — fail-closed toward
                 # dropping wrapped-external pushed content, never injecting it.
                 supervised=is_owner_attended_channel(channel),
+                # WS-3 gate-4 producer half: gateway → external_untrusted so the
+                # session's own memory/observation_write calls are stamped
+                # untrusted (owner-attended → None → first_party coalesce).
+                origin=session_origin_for_channel(channel),
                 # Owner-attended interactive session: keep the full user-scoped
                 # MCP toolset. Opt OUT of secure-by-default strict scoping
                 # (see CCInvocation.strict_mcp_config).
@@ -896,6 +905,7 @@ class ConversationLoop:
             # channels (terminal/Telegram); gateway conversations stay
             # unsupervised. Mirrors the primary invocation sites above.
             supervised=is_owner_attended_channel(channel),
+            origin=session_origin_for_channel(channel),  # WS-3 gate-4 producer half
             # Owner-attended interactive session: keep the full user-scoped MCP
             # toolset. Opt OUT of secure-by-default strict scoping
             # (see CCInvocation.strict_mcp_config).

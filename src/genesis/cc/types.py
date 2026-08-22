@@ -114,6 +114,26 @@ def is_owner_attended_channel(channel: ChannelType | str | None) -> bool:
     return value in (ChannelType.TERMINAL.value, ChannelType.TELEGRAM.value)
 
 
+def session_origin_for_channel(channel: ChannelType | str | None) -> str | None:
+    """``CCInvocation.origin`` for a CONVERSATION session on *channel*.
+
+    Owner-attended (terminal/Telegram) → ``None``: the invoker leaves
+    ``GENESIS_SESSION_ORIGIN`` unset and the memory/observation chokepoints
+    coalesce server/foreground writes to first_party (unchanged behaviour).
+    Every gateway channel (web/OpenClaw, WhatsApp, voice) → ``external_untrusted``
+    so the session's OWN memory/``observation_write`` calls are stamped untrusted —
+    without this a gateway session runs with no origin env and its writes coalesce
+    to first_party (mcp/memory/observations.py), which the read-side origin gate
+    would then TRUST (the producer half of the gate-4 channel fix). Fail-closed:
+    an unknown/None channel → external_untrusted.
+    """
+    if is_owner_attended_channel(channel):
+        return None
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+
+    return ORIGIN_EXTERNAL_UNTRUSTED
+
+
 def task_detected_origin(channel: ChannelType | str | None) -> str:
     """WS-3 origin_class to stamp on a ``task_detected`` observation, by channel.
 

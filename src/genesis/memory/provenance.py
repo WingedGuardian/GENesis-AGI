@@ -447,8 +447,43 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         "cc_login_monitor",
         "architect_triage",
         "surplus_promotion",
+        # Completed from the full writer census (2026-08-22, Codex PR #1431 P1):
+        # all Genesis-internal monitors/writers whose rows would otherwise
+        # backfill NULL → be excluded from reflection/L1 (cosmetic under Option 1,
+        # but these carry legit health/learning/operational signal).
+        "bootstrap",
+        "cc_cap_monitor",
+        "cc_invoker",
+        "cc_slot_monitor",
+        "cognitive_ledger",
+        "dead_letter_monitor",
+        "dead_letter_storm",
+        "embedding_backlog_monitor",
+        "extraction_calibration",
+        "foreground_reaper",
+        "git_health_monitor",
+        "goal_cascade",
+        "infrastructure_monitor",
+        "nodatacow_monitor",
+        "pid_budget_monitor",
+        "procedure_rebuild",
+        "settings_guard",
+        "stability_monitor",
+        "surplus_monitor",
+        "surplus_scheduler",
+        "task_executor",
+        "wal_health_monitor",
     }
 )
+
+#: User-content sources whose origin is NOT the source string — it depends on the
+#: WRITE CHANNEL/session, stamped explicitly at the write site (never allowlisted,
+#: or a gateway message would read as first-party). ``conversation_intent`` is
+#: stamped by :func:`genesis.cc.types.task_detected_origin`; ``user_reply`` is
+#: currently UNWIRED (no caller) and stays fail-closed NULL until a wiring commit
+#: stamps it channel-aware. Listed here so the source-coverage guardrail treats
+#: them as consciously-classified, not accidentally-omitted.
+_USER_CONTENT_OBS_SOURCES: frozenset[str] = frozenset({"conversation_intent", "user_reply"})
 
 #: Prefix an observation ``source`` carries when it re-labels a surplus/recon
 #: intake finding: ``intake:<IntakeSource.value>``.
