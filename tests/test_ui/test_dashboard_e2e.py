@@ -180,3 +180,11 @@ def test_dashboard_routes_isolated_from_real_home(serve_dashboard):
     assert not _under_real_home(backup._STATUS_FILE), (
         f"backup._STATUS_FILE not isolated: {backup._STATUS_FILE}"
     )
+    # secrets_path() — /setup-status reads it for password_set; it is REPO-root-backed
+    # (not home-backed), redirected via the sanctioned SECRETS_PATH env override.
+    from genesis import env
+
+    real_repo_secrets = Path(__file__).resolve().parents[2] / "secrets.env"
+    assert env.secrets_path() != real_repo_secrets, (
+        f"secrets_path not isolated — still the real repo secrets.env: {env.secrets_path()}"
+    )

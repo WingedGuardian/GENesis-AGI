@@ -121,9 +121,15 @@ def _build_dashboard_app(monkeypatch, tmp_home, *, password: str | None):
     ``/setup-status`` READS. We redirect ``HOME`` (covers request-time
     ``Path.home()`` reads) AND patch every import-bound route global via
     ``_isolate_dashboard_home`` (see it for the full map + root-cause note).
+
+    Secrets isolation: ``/setup-status`` also reads ``secrets_path()`` — which is
+    REPO-root-backed (``<repo>/secrets.env``), NOT home-backed — to compute
+    ``password_set``. Redirect it via the sanctioned ``SECRETS_PATH`` env override
+    (``env.py`` honors it) so the harness never reads the real credential file.
     """
     monkeypatch.setenv("GENESIS_HOME", str(tmp_home))
     monkeypatch.setenv("HOME", str(tmp_home))
+    monkeypatch.setenv("SECRETS_PATH", str(tmp_home / "secrets.env"))
     monkeypatch.setattr("genesis.dashboard.auth._internal_token_cache", None, raising=False)
     monkeypatch.setattr(
         "genesis.dashboard.auth.get_or_create_secret_key",
