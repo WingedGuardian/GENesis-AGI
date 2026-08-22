@@ -27,6 +27,53 @@ async def test_get_nonexistent(db):
     assert await observations.get_by_id(db, "nope") is None
 
 
+# ── WS-3 write-boundary origin stamping (fail-closed) ───────────────────────
+
+
+async def test_create_stamps_origin_from_source(db, monkeypatch):
+    """create() derives origin from the source when no env/explicit is set:
+    known-external → external_untrusted, known-first-party → first_party,
+    unknown → NULL (fail-closed)."""
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+    await observations.create(db, id="oc_ext", **{**_COMMON, "source": "recon"})
+    await observations.create(db, id="oc_fp", **{**_COMMON, "source": "awareness_loop"})
+    await observations.create(db, id="oc_null", **{**_COMMON, "source": "brand_new_writer_xyz"})
+    assert (await observations.get_by_id(db, "oc_ext"))["origin_class"] == "external_untrusted"
+    assert (await observations.get_by_id(db, "oc_fp"))["origin_class"] == "first_party"
+    assert (await observations.get_by_id(db, "oc_null"))["origin_class"] is None
+
+
+async def test_create_env_origin_is_forge_proof(db, monkeypatch):
+    """An external-origin session's env outranks a forged internal source."""
+    monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+    await observations.create(db, id="oc_forge", **{**_COMMON, "source": "awareness_loop"})
+    assert (await observations.get_by_id(db, "oc_forge"))["origin_class"] == "external_untrusted"
+
+
+async def test_create_explicit_origin_wins(db, monkeypatch):
+    monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+    await observations.create(
+        db, id="oc_explicit", origin_class="owner", **{**_COMMON, "source": "recon"}
+    )
+    assert (await observations.get_by_id(db, "oc_explicit"))["origin_class"] == "owner"
+
+
+async def test_create_invalid_explicit_origin_raises(db, monkeypatch):
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+    with pytest.raises(ValueError, match="invalid origin_class"):
+        await observations.create(db, id="oc_bad", origin_class="external", **_COMMON)
+
+
+async def test_upsert_stamps_origin_from_source(db, monkeypatch):
+    """upsert() applies the SAME fail-closed derivation as create() (regression
+    guard: a removal of _resolve_origin from upsert must fail CI)."""
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
+    await observations.upsert(db, id="ou_ext", **{**_COMMON, "source": "recon"})
+    await observations.upsert(db, id="ou_null", **{**_COMMON, "source": "brand_new_writer_xyz"})
+    assert (await observations.get_by_id(db, "ou_ext"))["origin_class"] == "external_untrusted"
+    assert (await observations.get_by_id(db, "ou_null"))["origin_class"] is None
+
+
 async def test_query_no_filters(db):
     await observations.create(db, id="o2", **_COMMON)
     rows = await observations.query(db)

@@ -265,6 +265,20 @@ def _compute_ttl(obs_type: str) -> timedelta | None:
     return _DEFAULT_TTL
 
 
+def _resolve_origin(origin_class: str | None, source: str) -> str | None:
+    """WS-3 write-boundary origin derivation for an observation row.
+
+    Delegates to :func:`genesis.memory.provenance.derive_observation_origin`
+    (explicit → session env → source-string → None/fail-closed). Local import
+    keeps the db.crud layer free of a module-level memory dependency. Returns
+    ``None`` for an unknown source BY DESIGN — the read side treats ``None`` as
+    external, so a missed writer degrades to cosmetically-excluded, never trusted.
+    """
+    from genesis.memory.provenance import derive_observation_origin
+
+    return derive_observation_origin(origin_class=origin_class, source=source)
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -282,6 +296,8 @@ async def create(
     skip_if_duplicate: bool = False,
     origin_class: str | None = None,
 ) -> str | None:
+    origin_class = _resolve_origin(origin_class, source)
+
     # Auto-compute content_hash if not provided
     if content_hash is None and content and content.strip():
         content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -369,6 +385,7 @@ async def upsert(
     origin_class: str | None = None,
 ) -> str:
     """Idempotent write: insert or update on conflict."""
+    origin_class = _resolve_origin(origin_class, source)
     await db.execute(
         """INSERT INTO observations
            (id, person_id, source, type, category, content, priority,
@@ -1052,6 +1069,14 @@ async def count_external_by_ids(
     just-accepted user-model deltas: external iff ANY contributing delta row
     carries ``origin_class='external_untrusted'``. NULL/legacy rows count as
     first-party by omission — pre-substrate rows must not manufacture signal.
+
+    WS-3 CAVEAT: this bare ``= 'external_untrusted'`` predicate treats NULL as
+    first-party, the OPPOSITE of the fail-closed READ contract
+    (``immunity.effective_origin_class(None) -> external``). Safe TODAY only
+    because this feeds the identity gate-2 SHADOW emit (observability, not
+    enforcement). Before that gate flips to ENFORCE, route this through
+    ``effective_origin_class`` (None->external) so a missed-writer / pre-backfill
+    NULL external row is not trusted. Tracked with the WS-3 read-side PR.
     """
     if not ids:
         return 0
