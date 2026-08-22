@@ -492,6 +492,14 @@ def _origin_from_source(source: str | None) -> str | None:
         return ORIGIN_FIRST_PARTY
     if source.startswith(_INTAKE_SOURCE_PREFIX):
         return _intake_observation_origin(source)
+    # module:* / session:* / any unmapped source → None (fail-closed). module:*
+    # is a CONSCIOUS None (not incidental): a capability module is "hands, not
+    # brain" and its output can carry arbitrary external data (cf.
+    # _EXTERNAL_INGEST_TOOLS), so it must NEVER coalesce to first_party;
+    # per-module trust is a possible future refinement. (module:* rows are absent
+    # from the live surfacing pool, so NULL→excluded has no read-surface impact.)
+    # session:* is resolved by the backfill's cc_sessions JOIN and, for new
+    # writes, by session_origin_from_env() at the write boundary.
     return None
 
 

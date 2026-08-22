@@ -99,6 +99,28 @@ def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
     return value == ChannelType.TELEGRAM.value
 
 
+def task_detected_origin(channel: ChannelType | str | None) -> str:
+    """WS-3 origin_class to stamp on a ``task_detected`` observation, by channel.
+
+    Owner-ATTENDED channels (terminal, Telegram) stamp ``owner`` — a task the
+    owner typed legitimately carries dispatch authority. Every gateway channel
+    (web/OpenClaw, WhatsApp, voice) is NOT owner-authenticated at the message
+    boundary, so its detected tasks are ``external_untrusted``: still visible,
+    but never auto-dispatch-authorized (the autonomy dispatcher's origin gate
+    bars them). Fail-closed: an unknown/None channel → external_untrusted.
+
+    Explicit here (not left to source-string derivation) because the write
+    source is the channel-agnostic ``conversation_intent`` — only the channel
+    distinguishes owner from gateway. Local import keeps cc.types dependency-light.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_OWNER
+
+    value = channel.value if isinstance(channel, ChannelType) else str(channel or "")
+    if value in (ChannelType.TERMINAL.value, ChannelType.TELEGRAM.value):
+        return ORIGIN_OWNER
+    return ORIGIN_EXTERNAL_UNTRUSTED
+
+
 class CCModel(StrEnum):
     SONNET = "sonnet"
     OPUS = "opus"

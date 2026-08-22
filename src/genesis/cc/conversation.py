@@ -31,6 +31,7 @@ from genesis.cc.types import (
     EffortLevel,
     StreamEvent,
     origin_delivery_supported,
+    task_detected_origin,
 )
 from genesis.db.crud import cc_sessions
 from genesis.observability.call_site_recorder import record_last_run
@@ -195,6 +196,10 @@ class ConversationLoop:
                     content=prompt_text,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:
@@ -455,6 +460,10 @@ class ConversationLoop:
                     content=prompt_text,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
+                    # WS-3: source is channel-agnostic (conversation_intent), so
+                    # stamp origin by channel — owner-attended (terminal/Telegram)
+                    # carries dispatch authority; gateway channels → external.
+                    origin_class=task_detected_origin(channel),
                     skip_if_duplicate=True,
                 )
             except Exception:

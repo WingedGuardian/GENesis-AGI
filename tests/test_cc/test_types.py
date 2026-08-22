@@ -90,6 +90,24 @@ def test_channel_type():
     assert ChannelType.TERMINAL == "terminal"
 
 
+def test_task_detected_origin_owner_vs_gateway():
+    """WS-3: owner-attended channels stamp owner; gateway channels external;
+    unknown/None fail-closed to external."""
+    from genesis.cc.types import task_detected_origin
+
+    # owner-attended
+    assert task_detected_origin(ChannelType.TERMINAL) == "owner"
+    assert task_detected_origin(ChannelType.TELEGRAM) == "owner"
+    assert task_detected_origin("terminal") == "owner"
+    assert task_detected_origin("telegram") == "owner"
+    # gateway (web/OpenClaw, WhatsApp, voice) → external_untrusted
+    for ch in (ChannelType.WEB, ChannelType.WHATSAPP, ChannelType.VOICE):
+        assert task_detected_origin(ch) == "external_untrusted", ch
+    # fail-closed
+    assert task_detected_origin(None) == "external_untrusted"
+    assert task_detected_origin("some_future_channel") == "external_untrusted"
+
+
 # --- StreamEvent tests ---
 
 
