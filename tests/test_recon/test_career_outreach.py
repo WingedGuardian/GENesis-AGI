@@ -18,7 +18,7 @@ from genesis.outreach.types import OutreachResult, OutreachStatus
 from genesis.recon import career_outreach_config as cfg
 from genesis.recon.career_outreach import (
     _AUTORUN_PROMPT,
-    _LIST_WORKING_PROMPT,
+    _PROBE_PROMPT,
     CareerOutreachMonitor,
     CareerOutreachResult,
     ModuleError,
@@ -187,31 +187,29 @@ class _FakePipeline:
 
 class _FakeModule:
     """Implements the real module contract the monitor drives: check_health_cached
-    + execute_operation returning DICTS (the bridge never raises). Distinguishes
-    the read-only list-working dispatch from an auto-run by the prompt text."""
+    + execute_operation returning DICTS (the bridge never raises). Distinguishes the
+    observe-mode reachability PROBE from an auto-run dispatch by the prompt text."""
 
     def __init__(
         self,
         *,
         healthy=True,
         autoruns=None,
-        working=None,
         autorun_error=None,
-        working_error=False,
-        working_malformed=False,
-        working_empty_text=False,
         autorun_payload_error=None,
         autorun_malformed=False,
+        probe_error=False,
+        probe_empty=False,
+        probe_is_error=False,
     ) -> None:
         self._healthy = healthy
         self._autoruns = list(autoruns or [])
-        self._working = list(working or [])
         self._autorun_error = autorun_error  # adapter-level {"error"} for auto-run
-        self._working_error = working_error  # adapter-level {"error"} for list
-        self._working_malformed = working_malformed  # non-JSON-array list reply
-        self._working_empty_text = working_empty_text  # empty-text list reply
         self._autorun_payload_error = autorun_payload_error  # module-reported {"error"}
         self._autorun_malformed = autorun_malformed  # unparseable auto-run reply
+        self._probe_error = probe_error  # adapter-level {"error"} for the observe probe
+        self._probe_empty = probe_empty  # empty-text probe reply
+        self._probe_is_error = probe_is_error  # payload {"is_error": True} (dead-auth, exit 0)
         self.calls: list[str] = []
         self.param_calls: list[dict] = []  # full params dict per dispatch (max_turns etc.)
 
@@ -222,14 +220,14 @@ class _FakeModule:
         prompt = (params or {}).get("prompt", "")
         self.calls.append(prompt)
         self.param_calls.append(dict(params or {}))
-        if "READ-ONLY: list" in prompt:
-            if self._working_error:
+        if prompt == _PROBE_PROMPT:  # observe-mode reachability probe
+            if self._probe_error:
                 return {"error": "ssh down"}
-            if self._working_malformed:
-                return {"text": "sorry, I could not list them"}
-            if self._working_empty_text:
+            if self._probe_is_error:
+                return {"text": "Invalid API key / OAuth expired", "is_error": True}
+            if self._probe_empty:
                 return {"text": ""}
-            return {"text": json.dumps(self._working)}
+            return {"text": '{"ok":true}'}
         # auto-run dispatch
         if self._autorun_error is not None:
             return {"error": self._autorun_error}
@@ -251,7 +249,8 @@ class _FakeRegistry:
 
 
 def _autorun_calls(mod: _FakeModule) -> int:
-    return sum(1 for c in mod.calls if "READ-ONLY: list" not in c)
+    # Auto-run dispatches = everything except the observe-mode reachability probe.
+    return sum(1 for c in mod.calls if c != _PROBE_PROMPT)
 
 
 def _cfg(monkeypatch, *, mode, cap=3, autorun_note=""):
@@ -336,34 +335,87 @@ async def test_execute_operation_error_dict_surfaces_error(db, monkeypatch):
 async def test_n_zero_no_nudge(db, monkeypatch):
     # No target accounts and no staged drafts → NO "0 drafts" spam nudge.
     _cfg(monkeypatch, mode="live")
-    mod = _FakeModule(autoruns=[], working=[])
+    mod = _FakeModule(autoruns=[])
     mon, pipe = _mon(db, mod)
     result = await mon.gather()
     assert result.nudged == 0 and pipe.sent == []
 
 
 @pytest.mark.asyncio
-async def test_observe_seeds_but_does_not_nudge(db, monkeypatch):
+async def test_observe_probe_reachable_records_success_no_stage_no_nudge(db, monkeypatch):
+    # Observe = a bridge-reachability PROBE, not a seeder. A reachable bridge → errors=0
+    # (runner records job-health SUCCESS, clearing a never-succeeded alarm once alive);
+    # stages nothing, nudges nothing, writes NOTHING to the observations store.
     _cfg(monkeypatch, mode="observe")
-    mod = _FakeModule(working=[{"company": "Acme"}, {"company": "Globex"}])
+    mod = _FakeModule()
     mon, pipe = _mon(db, mod)
     result = await mon.gather()
-    assert result.mode == "observe" and result.seeded == 2
+    assert result.mode == "observe" and result.errors == 0
     assert pipe.sent == []  # observe never nudges
-    # Both seeded into the dedup ledger.
-    for co in ("Acme", "Globex"):
-        assert await observations.exists_by_hash(db, source="recon", content_hash=_nudge_hash(co))
+    assert mod.calls == [_PROBE_PROMPT]  # exactly one dispatch — the probe
+    rows = await (await db.execute("SELECT COUNT(*) FROM observations")).fetchone()
+    assert rows[0] == 0  # nothing seeded
 
 
 @pytest.mark.asyncio
-async def test_live_nudges_only_new_drafts(db, monkeypatch):
-    # Pre-seed one already-nudged account; live must nudge ONLY the new one.
+async def test_observe_probe_adapter_error_records_failure(db, monkeypatch):
+    # A dead bridge (adapter {"error"}) → errors=1 so the daily observe tick records a
+    # job-health FAILURE instead of failing silently (the 8-day-outage class).
+    _cfg(monkeypatch, mode="observe")
+    mon, pipe = _mon(db, _FakeModule(probe_error=True))
+    result = await mon.gather()
+    assert result.mode == "observe" and result.errors == 1
+    assert pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_is_error_payload_records_failure(db, monkeypatch):
+    # A dead-model/OAuth `claude -p` can exit 0 with {"is_error": true, "text": "<auth
+    # error>"} and NO top-level "error" key. The probe must treat is_error as a FAILURE —
+    # else it records a dead bridge as reachable, the exact silent failure it exists to
+    # catch (review finding 1).
+    _cfg(monkeypatch, mode="observe")
+    mon, pipe = _mon(db, _FakeModule(probe_is_error=True))
+    result = await mon.gather()
+    assert result.mode == "observe" and result.errors == 1
+    assert pipe.sent == []
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_empty_reply_records_failure(db, monkeypatch):
+    # An empty-text reply is not proof of reachability (the OAuth hop may have half-failed)
+    # → errors=1. A non-empty reply of ANY content is success (the reachable test above).
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_empty=True))
+    result = await mon.gather()
+    assert result.errors == 1
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_prompt_is_hook_safe(db, monkeypatch):
+    # The probe prompt carries NO outreach/draft/stage vocabulary (which would trip the
+    # external engine's own outreach hooks on the otherwise-clean observe path); observe
+    # dispatches EXACTLY that prompt with a small bounded turn budget.
+    for word in ("outreach", "draft", "stage"):
+        assert word not in _PROBE_PROMPT.lower()
+    _cfg(monkeypatch, mode="observe")
+    mod = _FakeModule()
+    mon, _ = _mon(db, mod)
+    await mon.gather()
+    assert mod.calls == [_PROBE_PROMPT]
+    assert mod.param_calls[0].get("max_turns") == 2  # _PROBE_MAX_TURNS, not the 80 knob
+
+
+@pytest.mark.asyncio
+async def test_live_nudges_only_fresh_staged_drafts(db, monkeypatch):
+    # The nudge derives from THIS tick's staged drafts, deduped against the ledger — no
+    # census. Pre-mark Acme; stage both Acme and Globex this tick → nudge ONLY Globex.
     await observations.create(
         db,
         id="seed1",
         source="recon",
         type="career_outreach_nudged",
-        content="seed:Acme",
+        content="nudged:Acme",
         priority="low",
         created_at="2026-08-10T00:00:00Z",
         content_hash=_nudge_hash("Acme"),
@@ -371,20 +423,63 @@ async def test_live_nudges_only_new_drafts(db, monkeypatch):
     )
     _cfg(monkeypatch, mode="live")
     mod = _FakeModule(
-        autoruns=[{"company": "Globex", "contact": "eng@globex.dev", "draft_summary": "x"}],
-        working=[
-            {"company": "Acme", "contact": "a@acme.dev"},
-            {"company": "Globex", "contact": "eng@globex.dev"},
+        autoruns=[
+            {"company": "Acme", "contact": "a@acme.dev", "draft_summary": "x"},
+            {"company": "Globex", "contact": "eng@globex.dev", "draft_summary": "x"},
         ],
     )
     mon, pipe = _mon(db, mod)
     result = await mon.gather()
-    assert result.auto_runs == 1 and result.nudged == 1
+    assert result.auto_runs == 2  # both staged this tick
+    assert result.nudged == 1  # but only the un-nudged one is surfaced
     assert len(pipe.sent) == 1
     body = pipe.sent[0][0]
     assert "Globex" in body and "Acme" not in body
-    # Globex now marked; Acme still marked (unchanged).
     assert await observations.exists_by_hash(db, source="recon", content_hash=_nudge_hash("Globex"))
+
+
+@pytest.mark.asyncio
+async def test_stage_then_adapter_error_still_nudges_staged(db, monkeypatch):
+    # Architect SHOULD-FIX #1: if the loop stages A then dispatch #2 hits an adapter
+    # error, the nudge for A must STILL go out (the engine won't re-stage A, so skipping
+    # would strand it) — and the adapter error is still counted as a job-health failure.
+    _cfg(monkeypatch, mode="live", cap=3)
+
+    class _StageThenError(_FakeModule):
+        async def execute_operation(self, op, params):
+            prompt = (params or {}).get("prompt", "")
+            self.calls.append(prompt)
+            self.param_calls.append(dict(params or {}))
+            if len(self.calls) == 1:  # first auto-run stages A
+                return {
+                    "text": json.dumps({"company": "A", "contact": "a@a.dev", "draft_summary": "s"})
+                }
+            return {"error": "SSH CC dispatch timed out"}  # second dispatch errors
+
+    mod = _StageThenError()
+    mon, pipe = _mon(db, mod)
+    result = await mon.gather()
+    assert result.auto_runs == 1 and result.errors >= 1  # A staged; the timeout counted
+    assert result.nudged == 1 and len(pipe.sent) == 1  # A still nudged despite the error
+    assert "A" in pipe.sent[0][0]
+    assert await observations.exists_by_hash(db, source="recon", content_hash=_nudge_hash("A"))
+
+
+@pytest.mark.asyncio
+async def test_drafts_working_equals_auto_runs(db, monkeypatch):
+    # drafts_working now counts exactly the drafts staged this tick, so it always equals
+    # auto_runs (the census that once made them diverge is gone).
+    _cfg(monkeypatch, mode="live", cap=3)
+    mod = _FakeModule(
+        autoruns=[
+            {"company": "A", "contact": "a", "draft_summary": "s"},
+            {"company": "B", "contact": "b", "draft_summary": "s"},
+        ],
+    )
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    assert result.auto_runs == 2 and result.drafts_working == 2
+    assert result.drafts_working == result.auto_runs
 
 
 @pytest.mark.asyncio
@@ -396,7 +491,6 @@ async def test_cap_respected(db, monkeypatch):
             {"company": "B", "contact": "b", "draft_summary": "s"},
             {"company": "C", "contact": "c", "draft_summary": "s"},  # would be a 3rd
         ],
-        working=[],
     )
     mon, _ = _mon(db, mod)
     result = await mon.gather()
@@ -405,46 +499,18 @@ async def test_cap_respected(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_undelivered_nudge_not_marked_retries(db, monkeypatch):
-    # Undelivered nudge → account NOT marked, so it re-derives + retries next tick.
+async def test_undelivered_nudge_not_marked_and_counts_as_failure(db, monkeypatch):
+    # A FAILED nudge → account NOT marked and errors≥1 (a delivery failure is a
+    # job-health failure). Drives via the auto-run's Staged outcome (no census).
     _cfg(monkeypatch, mode="live")
-    mod = _FakeModule(autoruns=[], working=[{"company": "Zeta", "contact": "z@zeta.dev"}])
+    mod = _FakeModule(autoruns=[{"company": "Zeta", "contact": "z@zeta.dev", "draft_summary": "s"}])
     mon, pipe = _mon(db, mod, pipe_status=OutreachStatus.FAILED)
     result = await mon.gather()
     assert result.nudged == 0 and len(pipe.sent) == 1  # attempted, not delivered
-    assert result.errors >= 1  # FAILED delivery counts as a job-health failure (B5)
+    assert result.errors >= 1  # FAILED delivery counts as a job-health failure
     assert not await observations.exists_by_hash(
         db, source="recon", content_hash=_nudge_hash("Zeta")
     )
-
-
-@pytest.mark.asyncio
-async def test_nudge_gate_reopens_after_marker_resolved(db, monkeypatch):
-    # unresolved_only=True: a nudged marker blocks re-nudge while unresolved; after
-    # resolve_expired resolves it at TTL, the gate re-opens so a still-working draft
-    # is gently re-nudged (bounded dedup, not permanent).
-    _cfg(monkeypatch, mode="live")
-    mod = _FakeModule(autoruns=[], working=[{"company": "Zeta", "contact": "z@zeta.dev"}])
-    mon, pipe = _mon(db, mod)
-    await observations.create(
-        db,
-        id="z1",
-        source="recon",
-        type="career_outreach_nudged",
-        content="nudged:Zeta",
-        priority="low",
-        created_at="2026-08-10T00:00:00Z",
-        content_hash=_nudge_hash("Zeta"),
-        skip_if_duplicate=True,
-    )
-    r1 = await mon.gather()
-    assert r1.nudged == 0 and pipe.sent == []  # blocked while unresolved
-    await db.execute(
-        "UPDATE observations SET resolved = 1 WHERE content_hash = ?", (_nudge_hash("Zeta"),)
-    )
-    await db.commit()
-    r2 = await mon.gather()
-    assert r2.nudged == 1 and len(pipe.sent) == 1  # gate re-opened → re-nudged
 
 
 @pytest.mark.asyncio
@@ -508,14 +574,14 @@ async def test_runner_skips_health_record_when_off(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pause_midtick_halts_dispatches_and_nudge(db, monkeypatch):
-    # Codex P1: an owner /pause mid-tick stops the remaining dispatches AND the nudge.
+    # Codex P1: an owner /pause mid-tick stops the remaining auto-run dispatches AND the
+    # nudge for what was already staged this tick.
     _cfg(monkeypatch, mode="live", cap=3)
     mod = _FakeModule(
         autoruns=[
             {"company": "A", "contact": "a", "draft_summary": "s"},
             {"company": "B", "contact": "b", "draft_summary": "s"},
         ],
-        working=[{"company": "A", "contact": "a"}],
     )
     mon, pipe = _mon(db, mod)
     state = {"n": 0}
@@ -528,24 +594,6 @@ async def test_pause_midtick_halts_dispatches_and_nudge(db, monkeypatch):
     result = await mon.gather()
     assert result.auto_runs == 1 and _autorun_calls(mod) == 1  # 2nd auto-run blocked
     assert result.nudged == 0 and pipe.sent == []  # nudge skipped while paused
-    # Codex r3 P1: the intervening list-staged read (another dispatch) is ALSO skipped.
-    assert not any("READ-ONLY: list" in c for c in mod.calls)
-
-
-@pytest.mark.asyncio
-async def test_malformed_list_reply_is_error_observe_and_live(db, monkeypatch):
-    # Codex P2: a NON-EMPTY, non-JSON-array list reply is a protocol violation →
-    # errors≥1 (not a silent empty set that would make observe seed nothing, then
-    # live blast the whole backlog).
-    _cfg(monkeypatch, mode="observe")
-    mon, _ = _mon(db, _FakeModule(working_malformed=True))
-    r_obs = await mon.gather()
-    assert r_obs.errors == 1 and r_obs.seeded == 0
-
-    _cfg(monkeypatch, mode="live")
-    mon2, pipe2 = _mon(db, _FakeModule(autoruns=[], working_malformed=True))
-    r_live = await mon2.gather()
-    assert r_live.errors >= 1 and pipe2.sent == []
 
 
 @pytest.mark.asyncio
@@ -553,7 +601,7 @@ async def test_module_reported_error_counts_as_failure(db, monkeypatch):
     # Codex P2: a module-reported {"error"} in the auto-run payload increments errors
     # so a persistent module error surfaces as a job-health failure.
     _cfg(monkeypatch, mode="live")
-    mon, _ = _mon(db, _FakeModule(autorun_payload_error="auth failed", working=[]))
+    mon, _ = _mon(db, _FakeModule(autorun_payload_error="auth failed"))
     result = await mon.gather()
     assert result.errors >= 1
 
@@ -564,7 +612,7 @@ async def test_rejected_nudge_is_not_an_error(db, monkeypatch):
     # REJECTED nudge is pipeline dedup (the owner already got an identical one) — NOT a
     # failure, and not re-marked (a harmless re-derive next tick).
     _cfg(monkeypatch, mode="live")
-    mod = _FakeModule(autoruns=[], working=[{"company": "Zeta", "contact": "z@zeta.dev"}])
+    mod = _FakeModule(autoruns=[{"company": "Zeta", "contact": "z@zeta.dev", "draft_summary": "s"}])
     mon, pipe = _mon(db, mod, pipe_status=OutreachStatus.REJECTED)
     result = await mon.gather()
     assert result.errors == 0 and result.nudged == 0 and len(pipe.sent) == 1
@@ -575,9 +623,9 @@ async def test_rejected_nudge_is_not_an_error(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_missing_pipeline_nudge_counts_as_failure(db, monkeypatch):
-    # Codex P2: no pipeline → the nudge cannot be delivered → a job-health failure.
+    # No pipeline → the nudge cannot be delivered → a job-health failure.
     _cfg(monkeypatch, mode="live")
-    mod = _FakeModule(autoruns=[], working=[{"company": "Zeta", "contact": "z@zeta.dev"}])
+    mod = _FakeModule(autoruns=[{"company": "Zeta", "contact": "z@zeta.dev", "draft_summary": "s"}])
     mon, _ = _mon(db, mod)
     mon._pipeline = lambda: None
     result = await mon.gather()
@@ -613,7 +661,7 @@ async def test_unparseable_autorun_reply_counts_as_failure(db, monkeypatch):
     # Codex r3 P2: an unparseable auto-run reply is a protocol failure → errors≥1
     # (this also surfaces an injection-refusal reply as a job-health failure).
     _cfg(monkeypatch, mode="live")
-    mon, _ = _mon(db, _FakeModule(autorun_malformed=True, working=[]))
+    mon, _ = _mon(db, _FakeModule(autorun_malformed=True))
     result = await mon.gather()
     assert result.errors >= 1 and result.auto_runs == 0
 
@@ -622,37 +670,9 @@ async def test_unparseable_autorun_reply_counts_as_failure(db, monkeypatch):
 async def test_autorun_missing_company_counts_as_failure(db, monkeypatch):
     # Codex r3 P2: an auto-run reply missing 'company' is a protocol failure → errors≥1.
     _cfg(monkeypatch, mode="live")
-    mon, _ = _mon(db, _FakeModule(autoruns=[{"draft_summary": "x"}], working=[]))
+    mon, _ = _mon(db, _FakeModule(autoruns=[{"draft_summary": "x"}]))
     result = await mon.gather()
     assert result.errors >= 1 and result.auto_runs == 0
-
-
-@pytest.mark.asyncio
-async def test_empty_text_list_reply_is_error(db, monkeypatch):
-    # Codex r3 P2: an empty-TEXT list reply (not "[]") is a protocol violation → error,
-    # so observe never silently under-seeds (which would make live over-nudge).
-    _cfg(monkeypatch, mode="observe")
-    mon, _ = _mon(db, _FakeModule(working_empty_text=True))
-    result = await mon.gather()
-    assert result.errors == 1 and result.seeded == 0
-
-
-@pytest.mark.asyncio
-async def test_list_with_no_company_entries_is_error(db, monkeypatch):
-    # Codex r3 P2: a non-empty list whose entries lack 'company' is malformed → error.
-    _cfg(monkeypatch, mode="observe")
-    mon, _ = _mon(db, _FakeModule(working=[{"draft_summary": "x"}]))
-    result = await mon.gather()
-    assert result.errors == 1 and result.seeded == 0
-
-
-@pytest.mark.asyncio
-async def test_valid_empty_array_list_is_not_error(db, monkeypatch):
-    # A valid empty array "[]" = genuinely no staged drafts, NOT an error.
-    _cfg(monkeypatch, mode="observe")
-    mon, _ = _mon(db, _FakeModule(working=[]))
-    result = await mon.gather()
-    assert result.errors == 0 and result.seeded == 0
 
 
 def test_enabled_string_false_degrades_to_off(monkeypatch, tmp_path):
@@ -710,8 +730,6 @@ def test_autorun_prompt_honors_gate_and_headless():
     # shipped text (install-specific vocabulary rides the gitignored autorun_note).
     for ext in (".mjs", ".py", ".sh"):
         assert ext not in _AUTORUN_PROMPT
-    # the read prompt is unchanged and does NOT trip the outreach/draft matcher class
-    assert "READ-ONLY: list" in _LIST_WORKING_PROMPT
 
 
 def test_autorun_note_appended_to_autorun_prompt_only():
@@ -723,18 +741,25 @@ def test_autorun_note_appended_to_autorun_prompt_only():
 
 
 @pytest.mark.asyncio
-async def test_autorun_note_rides_autorun_dispatch_not_list(db, monkeypatch):
-    # Red-team catch: the note must ride the auto-run dispatch but NOT the read
-    # dispatch (a note with "outreach"/"ground-truth" would trip the consult matcher
-    # on the currently-clean read path). Capture the actual dispatched prompts.
+async def test_autorun_note_rides_autorun_dispatch(db, monkeypatch):
+    # The install note rides the auto-run dispatch (live). Capture the dispatched prompts.
     _cfg(monkeypatch, mode="live", autorun_note="ZZZ_INSTALL_NOTE")
-    mod = _FakeModule(autoruns=[], working=[{"company": "Z", "contact": "z@z.dev"}])
+    mod = _FakeModule(autoruns=[{"company": "Z", "contact": "z@z.dev", "draft_summary": "s"}])
     mon, _ = _mon(db, mod)
     await mon.gather()
-    autorun_prompts = [c for c in mod.calls if "READ-ONLY: list" not in c]
-    list_prompts = [c for c in mod.calls if "READ-ONLY: list" in c]
+    autorun_prompts = [c for c in mod.calls if c != _PROBE_PROMPT]
     assert autorun_prompts and all("ZZZ_INSTALL_NOTE" in c for c in autorun_prompts)
-    assert list_prompts and all("ZZZ_INSTALL_NOTE" not in c for c in list_prompts)
+
+
+@pytest.mark.asyncio
+async def test_autorun_note_does_not_ride_observe_probe(db, monkeypatch):
+    # The note must NOT ride the observe probe — the probe path stays clean of any
+    # install-specific outreach/gate vocabulary (which could trip the engine's hooks).
+    _cfg(monkeypatch, mode="observe", autorun_note="ZZZ_INSTALL_NOTE")
+    mod = _FakeModule()
+    mon, _ = _mon(db, mod)
+    await mon.gather()
+    assert mod.calls == [_PROBE_PROMPT]  # only the clean probe, note nowhere near it
 
 
 @pytest.mark.asyncio
@@ -747,7 +772,6 @@ async def test_verify_failed_is_not_error_and_continues(db, monkeypatch):
             {"verify_failed": "dead source url", "company": "A"},
             {"company": "B", "contact": "b@b.dev", "draft_summary": "s"},
         ],
-        working=[],
     )
     mon, _ = _mon(db, mod)
     result = await mon.gather()
@@ -766,7 +790,6 @@ async def test_verify_failed_repeat_guard_breaks(db, monkeypatch):
             {"verify_failed": "x", "company": "A"},
             {"verify_failed": "y", "company": "A"},  # re-picked A
         ],
-        working=[],
     )
     mon, _ = _mon(db, mod)
     result = await mon.gather()
@@ -783,7 +806,6 @@ async def test_staged_repeat_guard_breaks(db, monkeypatch):
             {"company": "A", "contact": "a", "draft_summary": "s"},
             {"company": "A", "contact": "a", "draft_summary": "s"},  # re-picked A
         ],
-        working=[],
     )
     mon, _ = _mon(db, mod)
     result = await mon.gather()
@@ -791,18 +813,16 @@ async def test_staged_repeat_guard_breaks(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_autorun_dispatch_passes_max_turns_list_does_not(db, monkeypatch):
-    # The auto-run dispatch carries max_turns (the gated flow needs >25 turns);
-    # the lightweight read dispatch does not (keeps the ipc default).
+async def test_autorun_dispatch_passes_max_turns(db, monkeypatch):
+    # The auto-run dispatch carries max_turns=80 (the gated flow needs >25 turns).
     _cfg(monkeypatch, mode="live")
-    mod = _FakeModule(autoruns=[], working=[{"company": "Z", "contact": "z@z.dev"}])
+    mod = _FakeModule(autoruns=[{"company": "Z", "contact": "z@z.dev", "draft_summary": "s"}])
     mon, _ = _mon(db, mod)
     await mon.gather()
-    paired = list(zip(mod.param_calls, mod.calls, strict=True))
-    autorun_params = [p for p, c in paired if "READ-ONLY: list" not in c]
-    list_params = [p for p, c in paired if "READ-ONLY: list" in c]
+    autorun_params = [
+        p for p, c in zip(mod.param_calls, mod.calls, strict=True) if c != _PROBE_PROMPT
+    ]
     assert autorun_params and all(p.get("max_turns") == 80 for p in autorun_params)
-    assert list_params and all("max_turns" not in p for p in list_params)
 
 
 @pytest.mark.asyncio
@@ -811,7 +831,7 @@ async def test_verify_failed_blank_reason_not_counted_as_staged(db, monkeypatch)
     # verify_failed (presence-check), NOT fall through to the staged path and
     # miscount a draft that never staged.
     _cfg(monkeypatch, mode="live", cap=3)
-    mod = _FakeModule(autoruns=[{"verify_failed": "", "company": "A"}], working=[])
+    mod = _FakeModule(autoruns=[{"verify_failed": "", "company": "A"}])
     mon, _ = _mon(db, mod)
     result = await mon.gather()
     assert result.auto_runs == 0 and result.verify_failed == 1 and result.errors == 0
@@ -828,7 +848,7 @@ async def test_contradictory_multi_signal_reply_is_error(db, monkeypatch):
         {"none_left": True, "error": "e"},
     ):
         _cfg(monkeypatch, mode="live", cap=3)
-        mon, _ = _mon(db, _FakeModule(autoruns=[combo], working=[]))
+        mon, _ = _mon(db, _FakeModule(autoruns=[combo]))
         result = await mon.gather()
         assert result.errors >= 1 and result.auto_runs == 0 and result.verify_failed == 0
 
@@ -837,7 +857,7 @@ async def test_contradictory_multi_signal_reply_is_error(db, monkeypatch):
 async def test_empty_dict_reply_is_error(db, monkeypatch):
     # An empty dict reply is a protocol violation (no outcome) → error, not swallowed.
     _cfg(monkeypatch, mode="live", cap=3)
-    mon, _ = _mon(db, _FakeModule(autoruns=[{}], working=[]))
+    mon, _ = _mon(db, _FakeModule(autoruns=[{}]))
     result = await mon.gather()
     assert result.errors >= 1 and result.auto_runs == 0
 
@@ -856,7 +876,7 @@ async def test_verify_failed_missing_company_is_error(db, monkeypatch):
     # Codex P2: a verify_failed reply with NO company is a protocol violation → error
     # (parity with the missing-company staged path), not a silent successful tick.
     _cfg(monkeypatch, mode="live", cap=3)
-    mod = _FakeModule(autoruns=[{"verify_failed": "x"}], working=[])
+    mod = _FakeModule(autoruns=[{"verify_failed": "x"}])
     mon, _ = _mon(db, mod)
     result = await mon.gather()
     assert result.errors >= 1 and result.auto_runs == 0 and result.verify_failed == 0

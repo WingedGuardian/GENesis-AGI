@@ -31,12 +31,13 @@ Design notes:
 - **Absent user-module → clean no-op.** On an install without the career-agent
   overlay module, ``module_registry.get()`` returns ``None`` and the tick returns
   silently (never a job-health failure on a generic install).
-- **State: nudge-dedup only.** The external engine's own staged-draft state is the
-  source of truth for which accounts have staged drafts; a ``career_outreach_nudged``
-  observation (content-hashed per company) records only "the owner has already
-  been nudged for this draft", so a re-tick does not re-nudge. Because the nudge
-  list is RE-DERIVED from the staged-draft set each tick minus this ledger, a
-  non-delivered nudge simply retries next tick.
+- **State: this-tick nudge only.** The owner nudge lists the drafts THIS tick's
+  auto-run loop staged (the engine's own ``Staged`` replies are deterministic ground
+  truth for what was staged); a ``career_outreach_nudged`` observation (content-hashed
+  per company) records "the owner has been nudged for this draft" as belt-and-suspenders
+  idempotency. There is NO mailbox census — a bare SSH ``claude -p`` read of the engine's
+  staged-draft set is unreliable (it answers from priors, returning a false-empty list;
+  proven live 2026-08-11).
 - **Honors the engine's own accuracy gate.** The auto-run prompt drives the
   engine's COMPLETE first-touch flow INCLUDING its own verification gates (it does
   not bypass them), under a headless contract; a draft the engine's gate refuses
@@ -45,13 +46,18 @@ Design notes:
   turns (measured 42 live), so the auto-run passes ``dispatch_max_turns``.
 - **Timeout + orphan semantics.** The gated flow measured ~5.5 min live; the SSH CC
   adapter clamps ``timeout_s`` to a 3600s ceiling and this config caps it at 1800, so
-  ``dispatch_timeout_s`` (default 900) bounds a hung run. A timeout kill severs the
-  SSH connection but the REMOTE ``claude -p`` keeps running (orphaned); this is
-  self-healing — the engine's own staged-draft state is the source of truth and the
-  next tick re-derives from it (a late-staged draft is nudged next tick, never lost).
+  ``dispatch_timeout_s`` (default 900) bounds a hung run. A timeout kill severs the SSH
+  connection but the REMOTE ``claude -p`` keeps running (orphaned). A draft the orphan
+  stages AFTER the kill is NOT nudged (its reply never reached us) but is still visible
+  in the owner's Drafts — a conscious limitation. The SAME strand happens when a
+  mid-tick ``/pause`` skips the nudge for drafts already staged this tick: correct (no
+  Telegram send while paused), but that draft is not re-surfaced next tick either.
+  Durable cross-tick nudge retry (covering BOTH the orphan and the pause strand) is a
+  tracked follow-up.
 - **Modes** (``career_outreach_config``): ``off`` (default — inert) / ``observe``
-  (seed the nudged-set from the existing backlog, never dispatch a staging run or
-  nudge) / ``live`` (drive staging runs + nudge new drafts).
+  (a bridge-reachability probe — a minimal dispatch proving the ``claude -p`` hop
+  answers; stages nothing, nudges nothing) / ``live`` (drive staging runs + nudge new
+  drafts).
 """
 
 from __future__ import annotations
@@ -113,13 +119,19 @@ _AUTORUN_PROMPT = (
     'remains, or {"error":"<short reason>"} if you could not proceed.'
 )
 
-_LIST_WORKING_PROMPT = (
-    "This is Genesis. READ-ONLY: list the accounts for which you have already "
-    "staged a first-touch draft (awaiting the owner's send). Stage nothing, change "
-    "nothing. Your ENTIRE reply is the return value: reply with ONLY a compact JSON "
-    'array, no prose — [{"company":"<name>","contact":"<email-or-name>"}, ...] '
-    "(empty array [] if none)."
-)
+# Observe-mode reachability probe: a MINIMAL dispatch that exercises the real
+# `claude -p` OAuth hop end-to-end. `check_health_cached()` passes even when the
+# remote's model auth is dead (it checks the SSH/module, not the model login), so
+# ONLY a real dispatch proves the bridge can actually answer. Kept free of
+# outreach/draft/stage vocabulary so it never trips the engine's own outreach hooks
+# (see the _AUTORUN_PROMPT note above); the reply CONTENT is irrelevant — any
+# non-empty answer proves reachability.
+_PROBE_PROMPT = 'This is Genesis. Reply with exactly this and nothing else: {"ok":true}'
+# A trivial reply returns in ~4s live; these bound a wedged probe without tying up the
+# full agentic dispatch_timeout_s/max_turns budget. (A raw subprocess dispatch with no
+# other watchdog is the justified exception to the no-speculative-timeout policy.)
+_PROBE_TIMEOUT_S = 120
+_PROBE_MAX_TURNS = 2
 
 
 def _now_z() -> str:
@@ -316,9 +328,8 @@ class CareerOutreachResult:
     mode: str = "off"
     health_ok: bool = True
     auto_runs: int = 0  # dispatches that staged a fresh draft
-    drafts_working: int = 0  # accounts with a staged first-touch draft
+    drafts_working: int = 0  # == auto_runs: drafts staged THIS tick (no backlog census)
     nudged: int = 0  # newly-staged drafts included in a delivered nudge
-    seeded: int = 0  # observe: existing staged-draft accounts seeded into the ledger
     verify_failed: int = 0  # engine drafted but its own accuracy gate refused (NOT an error)
     errors: int = 0  # unsuccessful operations (→ job-health FAILURE)
     details: list[str] = field(default_factory=list)
@@ -399,42 +410,41 @@ class CareerOutreachMonitor:
         timeout = cfg.knob_int(conf, "dispatch_timeout_s")
 
         if mode == "observe":
-            return await self._observe_seed(mod, timeout)
+            return await self._observe_probe(mod)
         return await self._live(mod, conf, timeout)
 
-    async def _observe_seed(self, mod, timeout: int) -> CareerOutreachResult:
-        """Seed the nudged-ledger from the pre-existing staged-draft backlog so a
-        later flip to ``live`` does NOT nudge drafts that were staged before the
-        monitor existed. Never dispatches a staging run, never nudges."""
-        working, err = await self._list_working(mod, timeout)
-        if err:
-            return CareerOutreachResult(
-                mode="observe", errors=1, details=["observe: list-staged dispatch error"]
-            )
-        seeded = 0
-        for acct in working:
-            company = (acct.get("company") or "").strip()
-            if not company:
-                continue
-            wrote = await observations.create(
-                self._db,
-                id=uuid.uuid4().hex,
-                source=_SOURCE,
-                type=_NUDGE_TYPE,
-                content=f"seed:{company}",
-                priority="low",
-                created_at=_now_z(),
-                content_hash=_nudge_hash(company),
-                skip_if_duplicate=True,
-            )
-            if wrote:
-                seeded += 1
-        return CareerOutreachResult(
-            mode="observe",
-            drafts_working=len(working),
-            seeded=seeded,
-            details=[f"observe: seeded {seeded} existing staged-draft account(s), no nudge"],
+    async def _observe_probe(self, mod) -> CareerOutreachResult:
+        """Observe mode: a bridge-REACHABILITY probe, NOT a seeder. A minimal dispatch
+        exercises the real ``claude -p`` OAuth hop end-to-end (``check_health_cached``
+        passes even when the remote's model auth is dead, so only a real dispatch proves
+        the bridge answers). Stages nothing, nudges nothing, seeds nothing. A reachable
+        bridge records job-health SUCCESS (which, once the bridge is alive again, clears a
+        never-succeeded-job alarm); an adapter error or an empty reply records a FAILURE so
+        a dead bridge surfaces on the daily tick instead of failing silently."""
+        result = await mod.execute_operation(
+            "dispatch",
+            {"prompt": _PROBE_PROMPT, "timeout_s": _PROBE_TIMEOUT_S, "max_turns": _PROBE_MAX_TURNS},
         )
+        # Reachable = the bridge answered AND did not report its OWN failure, AND the
+        # reply is non-empty. Do NOT require an exact token (a live-but-verbose bridge is
+        # still reachable). Two failure channels: a top-level `error` (the adapter's
+        # transport error, `claude -p` non-zero exit) OR the payload's `is_error` — a
+        # dead-model/OAuth run commonly exits 0 with `{"is_error": true, "text": "<auth
+        # error>"}` and NO top-level `error` key, so checking only `error` would record
+        # that dead bridge as reachable, the exact silent failure this probe exists to
+        # catch. (A `parse_fallback` reply is still reachable — the hop answered.)
+        if isinstance(result, dict) and (result.get("error") or result.get("is_error")):
+            detail = result.get("error") or "claude -p reported is_error"
+            return CareerOutreachResult(
+                mode="observe",
+                errors=1,
+                details=[f"observe: bridge probe failed: {str(detail)[:120]}"],
+            )
+        if not _reply_text(result).strip():
+            return CareerOutreachResult(
+                mode="observe", errors=1, details=["observe: bridge probe returned empty reply"]
+            )
+        return CareerOutreachResult(mode="observe", details=["observe: bridge reachable"])
 
     async def _live(self, mod, conf: dict, timeout: int) -> CareerOutreachResult:
         cap = cfg.knob_int(conf, "max_auto_runs_per_tick")
@@ -446,11 +456,12 @@ class CareerOutreachMonitor:
         verify_failed_n = 0
         errors = 0
         details: list[str] = []
-        adapter_error = False
         # Repeat guard: the engine self-selects its target and may lack a durable
         # "attempted" state, so it can re-pick a company we already handled this tick.
         # Re-selecting a seen company → stop (never loop the cap on one account).
         seen_companies: set[str] = set()
+        # The drafts THIS tick staged — the deterministic nudge source (no census).
+        staged_this_tick: list[dict] = []
 
         # 1. Drive up to `cap` first-touch draft-staging dispatches — the module
         #    self-selects + self-caps (won't re-pick an already-drafted account).
@@ -467,7 +478,6 @@ class CareerOutreachMonitor:
             # runner records a job-health FAILURE, and stop the loop.
             if isinstance(result, dict) and result.get("error"):
                 errors += 1
-                adapter_error = True
                 details.append(f"auto-run dispatch error: {str(result.get('error'))[:120]}")
                 break
             # Classify the reply ONCE into a closed outcome; match on TYPE. Every
@@ -501,8 +511,11 @@ class CareerOutreachMonitor:
                     verify_failed_n += 1
                     details.append(f"verify_failed: {outcome.company}: {outcome.reason}")
                     continue
-                # Staged: a verified draft was staged for this target.
+                # Staged: a verified draft was staged for this target. Record it as the
+                # deterministic nudge source (the engine's own reply is ground truth for
+                # what THIS tick staged — no mailbox census needed).
                 auto_runs += 1
+                staged_this_tick.append({"company": outcome.company, "contact": outcome.contact})
                 details.append(f"staged: {outcome.company}")
                 continue
             # Unreachable for the closed AutorunOutcome union — a defensive guard so a
@@ -511,84 +524,72 @@ class CareerOutreachMonitor:
             details.append("auto-run: unhandled outcome type (protocol failure) — stopping")
             break
 
-        # 2. Nudge — RE-DERIVE the nudge list from the current staged-draft set minus
-        #    the already-nudged ledger (so an undelivered nudge simply retries next
-        #    tick). Skip if the box just errored (avoid a second doomed dispatch).
-        # GROUNDWORK(career-outreach-discovery): before the auto-run loop, drive any
-        # due discovery step here (scoped small, < the 300s cap) to widen the target
-        # set with net-new candidate companies; deferred for the MVP, which runs
-        # against the engine's existing target backlog.
+        # 2. Nudge the owner about the drafts THIS tick staged — from the auto-run's own
+        #    `Staged` outcomes (deterministic), NOT a mailbox census. Nudge REGARDLESS of
+        #    a mid-loop adapter error: the staged drafts are real and the engine won't
+        #    re-stage them, so skipping the nudge would strand them (the error is already
+        #    counted above). The ledger dedup is belt-and-suspenders — the engine won't
+        #    re-pick an already-staged company (see _AUTORUN_PROMPT), so a company enters
+        #    this set at most once; the marker only guards a rare re-stage.
+        # GROUNDWORK(career-outreach-http-read): a future RELIABLE HTTP read of the
+        #    engine's full staged-draft set could reintroduce a census-based nudge that
+        #    ALSO surfaces drafts staged outside this monitor's own auto-runs. A bare SSH
+        #    `claude -p` read of that set is NOT reliable — the engine answers it from
+        #    priors, returning a false-empty list (proven live 2026-08-11); reintroduce a
+        #    `data_module` knob pointing at a structured read op when one exists.
+        # GROUNDWORK(career-outreach-discovery): before the auto-run loop, drive any due
+        #    discovery step here (scoped small, < the dispatch cap) to widen the target
+        #    set with net-new candidate companies; deferred for the MVP, which runs
+        #    against the engine's existing target backlog.
+        drafts_working = len(staged_this_tick)
         nudged = 0
-        drafts_working = 0
-        if not adapter_error and self._is_paused():
-            details.append("paused mid-tick — skipping staged-draft read + nudge")
-        elif not adapter_error:
-            working, err = await self._list_working(mod, timeout)
-            if err:
-                errors += 1
-                details.append("nudge: list-staged dispatch error")
-            else:
-                drafts_working = len(working)
-                fresh = []
-                seen: set[str] = set()
-                for acct in working:
-                    company = (acct.get("company") or "").strip()
-                    if not company or company.lower() in seen:
-                        continue
-                    seen.add(company.lower())
-                    # unresolved_only=True honors the 30d TTL: resolve_expired sweeps the
-                    # marker at TTL, re-opening the gate so a still-unsent draft is gently
-                    # re-nudged (bounded dedup, matching the shipped 30d comment).
-                    if await observations.exists_by_hash(
-                        self._db,
-                        source=_SOURCE,
-                        content_hash=_nudge_hash(company),
-                        unresolved_only=True,
-                    ):
-                        continue
-                    fresh.append(
-                        {"company": company, "contact": (acct.get("contact") or "").strip()}
-                    )
-                # N=0 → NO nudge (never a "0 drafts staged" spam message).
-                if fresh and self._is_paused():
-                    details.append(f"paused — skipping nudge for {len(fresh)} draft(s)")
-                elif fresh:
-                    from genesis.outreach.types import OutreachStatus
+        if self._is_paused():
+            details.append(f"paused — skipping nudge for {len(staged_this_tick)} staged draft(s)")
+        elif staged_this_tick:
+            fresh = []
+            for acct in staged_this_tick:
+                company = acct["company"]  # classifier-validated non-empty
+                # unresolved_only=True honors the 30d TTL on the marker (bounded dedup).
+                if await observations.exists_by_hash(
+                    self._db,
+                    source=_SOURCE,
+                    content_hash=_nudge_hash(company),
+                    unresolved_only=True,
+                ):
+                    continue
+                fresh.append(acct)
+            # N=0 (all already nudged) → NO nudge (never a "0 drafts staged" spam message).
+            if fresh:
+                from genesis.outreach.types import OutreachStatus
 
-                    status = await self._nudge(fresh)
-                    if status == OutreachStatus.DELIVERED:
-                        for acct in fresh:
-                            await observations.create(
-                                self._db,
-                                id=uuid.uuid4().hex,
-                                source=_SOURCE,
-                                type=_NUDGE_TYPE,
-                                content=f"nudged:{acct['company']}",
-                                priority="low",
-                                created_at=_now_z(),
-                                content_hash=_nudge_hash(acct["company"]),
-                                skip_if_duplicate=True,
-                            )
-                        nudged = len(fresh)
-                        details.append(f"nudged {nudged} new staged draft(s)")
-                    elif status == OutreachStatus.REJECTED:
-                        # Pipeline dedup — an identical nudge went out recently, so the
-                        # owner already has it. NOT a failure; not re-marked (a harmless
-                        # re-derive next tick, dampened by the set-hash topic dedup).
-                        details.append(f"nudge deduped (already sent) — {len(fresh)} draft(s)")
-                    else:
-                        # FAILED / None (no pipeline / exception) — a real delivery
-                        # failure. COUNT it so a persistent failure surfaces as a
-                        # job-health failure; not marked, so it retries. (submit_raw skips
-                        # quiet-hours governance, so IGNORED never occurs here — owner
-                        # nudges deliver immediately, which is correct: owner-facing
-                        # delivery is never gated by contract, and the tick runs at 08:00,
-                        # post-quiet.)
-                        errors += 1
-                        details.append(
-                            f"nudge not delivered (status={status}) — "
-                            f"{len(fresh)} draft(s) retry next tick"
+                status = await self._nudge(fresh)
+                if status == OutreachStatus.DELIVERED:
+                    for acct in fresh:
+                        await observations.create(
+                            self._db,
+                            id=uuid.uuid4().hex,
+                            source=_SOURCE,
+                            type=_NUDGE_TYPE,
+                            content=f"nudged:{acct['company']}",
+                            priority="low",
+                            created_at=_now_z(),
+                            content_hash=_nudge_hash(acct["company"]),
+                            skip_if_duplicate=True,
                         )
+                    nudged = len(fresh)
+                    details.append(f"nudged {nudged} new staged draft(s)")
+                elif status == OutreachStatus.REJECTED:
+                    # Pipeline dedup — an identical nudge went out recently, so the owner
+                    # already has it. NOT a failure; not re-marked.
+                    details.append(f"nudge deduped (already sent) — {len(fresh)} draft(s)")
+                else:
+                    # FAILED / None (no pipeline / exception) — a real delivery failure.
+                    # COUNT it so a persistent failure surfaces as a job-health failure.
+                    # (IGNORED/HELD can't reach here: both are EMAIL-channel-only
+                    # terminals in _deliver, and this nudge is telegram + verbatim — so
+                    # the only reachable statuses are DELIVERED / REJECTED / FAILED / None.)
+                    errors += 1
+                    details.append(f"nudge not delivered (status={status}) — {len(fresh)} draft(s)")
 
         return CareerOutreachResult(
             mode="live",
@@ -600,56 +601,13 @@ class CareerOutreachMonitor:
             details=details,
         )
 
-    async def _list_working(self, mod, timeout: int) -> tuple[list[dict], bool]:
-        """Ask the reasoning module for the accounts with an already-staged
-        first-touch draft (the source of truth for staged drafts). Returns
-        ``(accounts, err)`` where ``err`` is True on a dispatch failure OR a
-        NON-EMPTY reply that is not a JSON array (a protocol violation the caller
-        surfaces as a job-health failure); a genuinely empty reply is ``([], False)``."""
-        # GROUNDWORK(career-outreach-http-read): this reads the staged-draft set via an
-        # SSH CC dispatch to the reasoning module (~100s, costs a turn). A future HTTP
-        # op returning that set would be a cheaper/faster read path — reintroduce a
-        # `data_module` config knob pointing at it when it exists.
-        result = await mod.execute_operation(
-            "dispatch", {"prompt": _LIST_WORKING_PROMPT, "timeout_s": timeout}
-        )
-        if isinstance(result, dict) and result.get("error"):
-            logger.info(
-                "career outreach: list-staged dispatch error: %s",
-                str(result.get("error"))[:120],
-            )
-            return [], True
-        text = _reply_text(result)
-        data = _parse_json(text)
-        if isinstance(data, list):
-            valid = [d for d in data if isinstance(d, dict) and (d.get("company") or "").strip()]
-            if data and not valid:
-                # A non-empty list with no schema-valid (company-bearing) entries is a
-                # protocol violation — surface it, don't silently under-seed.
-                logger.warning(
-                    "career outreach: list-staged reply was a list with no company-bearing "
-                    "entries: %r",
-                    str(data)[:160],
-                )
-                return [], True
-            return valid, False
-        # Empty text or a non-array reply is a protocol violation — the module is
-        # contracted to return a JSON array ("[]" for none). Surface it as an error
-        # (err=True → job-health failure) so it is diagnosable and observe NEVER
-        # under-seeds (which would make a later live tick over-nudge the backlog).
-        logger.warning(
-            "career outreach: list-staged reply was not a JSON array (malformed/empty): %r",
-            (text or "")[:160],
-        )
-        return [], True
-
     async def _nudge(self, fresh: list[dict]):
         """Push ONE owner-facing Telegram nudge for the freshly-staged drafts.
         Returns the delivery ``OutreachStatus`` (``None`` if there is no pipeline or
         the send raised) so the caller can distinguish DELIVERED (mark), REJECTED
         (pipeline dedup — already sent, not a failure), and FAILED/None (a job-health
-        failure). ``submit_raw`` skips quiet-hours governance, so IGNORED never occurs
-        — owner-facing delivery is intentionally never gated."""
+        failure). IGNORED/HELD can't occur — both are EMAIL-channel-only terminals in
+        the pipeline, and this owner nudge is telegram + verbatim."""
         from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
 
         pipeline = self._pipeline()

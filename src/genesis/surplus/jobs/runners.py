@@ -142,15 +142,14 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         if (
             result.auto_runs
             or result.nudged
-            or result.seeded
             or result.verify_failed
             or result.errors
         ):
             logger.info(
                 "Career outreach: mode=%s auto_runs=%d working=%d nudged=%d "
-                "seeded=%d verify_failed=%d errors=%d",
+                "verify_failed=%d errors=%d",
                 result.mode, result.auto_runs, result.drafts_working,
-                result.nudged, result.seeded, result.verify_failed, result.errors,
+                result.nudged, result.verify_failed, result.errors,
             )
         # No-progress visibility: the engine drafted but its own accuracy gate refused
         # every attempt (verify_failed) and nothing staged/nudged. verify_failed is
@@ -164,7 +163,7 @@ async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
         if (
             result.verify_failed
             and not result.errors
-            and not (result.auto_runs or result.nudged or result.seeded)
+            and not (result.auto_runs or result.nudged)
         ):
             logger.warning(
                 "Career outreach: NO-PROGRESS tick — %d verify_failed, 0 staged/nudged "
