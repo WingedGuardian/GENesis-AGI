@@ -42,7 +42,7 @@ class TestPytestDetection:
         assert sp.command_runs_pytest("ruff check . && pytest -q")
 
     def test_venv_path_entrypoint(self):
-        seg = sp.analyze("/home/u/genesis/.venv/bin/pytest -q")[0]
+        seg = sp.analyze("/venv/bin/pytest -q")[0]
         assert sp.is_pytest_invocation(seg)
 
     def test_grep_word_not_matched(self):
