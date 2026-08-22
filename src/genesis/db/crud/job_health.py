@@ -55,6 +55,11 @@ async def get_never_succeeded_jobs(
     When set, only rows with ``last_run >= recent_since`` are returned. ``julianday``
     parses both ``+00:00`` and ``Z`` suffixes, so the compare is tz-suffix-safe (a
     lexical string compare is not). Left ``None`` (no bound) for raw-query callers/tests.
+    The ``mcp/health/errors.py`` caller passes ~35d, covering the slowest scheduled
+    cadence (weekly) with wide margin plus a plausible monthly actuator; a job that runs
+    LESS often than the caller's window falls through BOTH this alarm and
+    ``get_stale_jobs`` (which needs a prior success) — an accepted limitation to revisit
+    if a monthly-or-slower actuator is ever added.
 
     CONTRACT: this assumes a healthy job records ``record_job_success`` under the SAME
     job_name on its happy path (bumping ``total_successes``). A job that only ever

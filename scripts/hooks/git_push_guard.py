@@ -597,15 +597,73 @@ def _check_mergeable(pr_num: str, repo: str | None = None) -> str | None:
         return None  # unreadable → caller treats as non-MERGEABLE → blocks
 
 
-# Check-run conclusions / statuses that mean the CI is NOT green.
-_CI_RED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+# Check-run conclusions / statuses that mean the CI is NOT green. STALE is a real
+# GitHub conclusion (a superseded/outdated run — NOT a pass) and is red; any OTHER
+# unrecognized *terminal* conclusion also fails closed to red in the classify loop,
+# so no unenumerated conclusion value can be silently mistaken for green.
+_CI_RED_CONCLUSIONS = {
+    "FAILURE",
+    "CANCELLED",
+    "TIMED_OUT",
+    "ACTION_REQUIRED",
+    "STARTUP_FAILURE",
+    "STALE",
+}
 _CI_RED_STATES = {"FAILURE", "ERROR"}  # legacy StatusContext state
 _CI_SKIP_CONCLUSIONS = {"SKIPPED", "NEUTRAL"}
 _CI_GREEN = {"SUCCESS"}
+# Legacy StatusContext states meaning "not finished" → block as pending. EXPECTED =
+# a required context that has not reported a status yet (not started); it must not
+# read green. (A CheckRun uses `status` for this; a StatusContext uses `state`.)
+_CI_PENDING_STATES = {"PENDING", "EXPECTED"}
+# A CANCELLED check-run carries NO pass/fail verdict — the run was aborted,
+# almost always by a `concurrency: cancel-in-progress` supersession, which leaves
+# the cancelled dup attached to the head commit. It is red BY DEFAULT (it is also
+# in _CI_RED_CONCLUSIONS), and dropped ONLY when a check of the SAME identity
+# (name + workflowName, see _ci_identity) concluded SUCCESS at-or-after it on this
+# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks).
+# Deliberately scoped to CANCELLED alone: FAILURE/TIMED_OUT/ACTION_REQUIRED/
+# STARTUP_FAILURE carry real verdicts and always block, even with a success sibling.
+_CI_CANCEL_CONCLUSIONS = {"CANCELLED"}
 # The only CheckRun.status that means "finished". Everything else
 # (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so
 # a new/renamed non-terminal state can never be silently mistaken for green.
 _CI_TERMINAL_STATUSES = {"COMPLETED"}
+
+# Display label for a rollup entry that has neither a CheckRun `name` nor a
+# StatusContext `context` — used only for the human-facing problem-check list.
+_CI_NAMELESS = "check"
+
+
+def _check_name(c: dict) -> str:
+    """Human-facing display label for one statusCheckRollup entry: a CheckRun
+    ``name`` or a legacy StatusContext ``context``, falling back to _CI_NAMELESS.
+    Used only to build the problem-check list — NOT the sibling-match key (that is
+    _ci_identity, which is stricter)."""
+    return c.get("name") or c.get("context") or _CI_NAMELESS
+
+
+def _ci_identity(c: dict) -> tuple[str, str] | None:
+    """Strict same-check identity for the concurrency-cancel sibling match:
+    ``(name, workflowName)`` for a GitHub Actions CheckRun, or ``None`` when the
+    entry cannot be identity-matched — a legacy StatusContext (no workflowName) or
+    a CheckRun from a non-Actions app (empty workflowName). ``None`` means the
+    entry is NEVER a sibling and NEVER droppable → it fails CLOSED (a cancel with
+    no resolvable identity stays red).
+
+    Keying on name ALONE would be unsafe: this gate forces `--admin`, which
+    bypasses GitHub's server-side required-status-checks, so _pr_ci_status is the
+    SOLE CI enforcement for every merge it allows. A bare-name match would let a
+    same-named SUCCESS from a DIFFERENT workflow (an accidental collision, or a
+    decoy job) mask a genuinely-cancelled required check → wrong-green. Requiring
+    workflowName to match scopes the drop to a true same-job re-run — the only
+    thing `cancel-in-progress` produces. Still pure set-membership: no
+    time-ordering (that surface was the pulled #1420 finding-magnet)."""
+    name = (c.get("name") or "").strip()
+    wf = (c.get("workflowName") or "").strip()
+    if name and wf:
+        return (name, wf)
+    return None
 
 
 def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
@@ -613,7 +671,13 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
 
     Returns ``(state, problem_checks)`` where state is one of:
       * ``"green"``   — every non-skipped check concluded SUCCESS
-      * ``"red"``     — at least one check failed/cancelled/timed-out
+      * ``"red"``     — at least one check failed/timed-out, or was cancelled
+                        with NO same-identity SUCCESS completing at-or-after it.
+                        A CANCELLED CheckRun that a same (name, workflowName)
+                        SUCCESS completed at-or-after is a superseded
+                        `concurrency: cancel-in-progress` duplicate and is dropped
+                        (see _ci_identity + success_latest) — strict identity,
+                        terminal completedAt comparison only, fail-closed.
       * ``"pending"`` — a check is still queued/running (and none are red)
       * ``"unknown"`` — could not determine (API error, no checks, or an
                         unrecognized payload shape) → callers FAIL OPEN, because
@@ -654,33 +718,76 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
     if not isinstance(checks, list) or not checks:
         return "unknown", []
 
+    # First pass: for each strict identity (name, workflowName), the latest
+    # `completedAt` among its SUCCESS CheckRuns on this head. A CANCELLED entry is
+    # a superseded concurrency-cancel duplicate ONLY if a SUCCESS of the same
+    # identity completed AT OR AFTER it (see the drop branch). Only GitHub Actions
+    # CheckRuns with a resolvable identity AND a completedAt contribute; legacy
+    # StatusContexts, non-Actions checks, and timestampless successes never serve
+    # as siblings. This is NOT the #1420 finding-magnet: that sorted the WHOLE set
+    # (incl. QUEUED runs with null startedAt) to pick a global "latest"; here both
+    # sides of the comparison are terminal COMPLETED runs that always carry a
+    # completedAt, and every unresolvable case fails CLOSED (stays red).
+    success_latest: dict[tuple[str, str], str] = {}
+    for c in checks:
+        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
+            continue
+        ident = _ci_identity(c)
+        ts = (c.get("completedAt") or "").strip()
+        if ident is None or not ts:
+            continue
+        if ts > success_latest.get(ident, ""):
+            success_latest[ident] = ts
+
     red: list[str] = []
     pending: list[str] = []
     saw_recognized = False
     for c in checks:
         if not isinstance(c, dict):
             continue
-        name = c.get("name") or c.get("context") or "check"
+        name = _check_name(c)
         conclusion = c.get("conclusion")  # CheckRun
         status = c.get("status")  # CheckRun: QUEUED/IN_PROGRESS/COMPLETED/PENDING/…
         state = c.get("state")  # StatusContext: SUCCESS/FAILURE/PENDING/ERROR
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
+        if conclusion in _CI_CANCEL_CONCLUSIONS:
+            ident = _ci_identity(c)
+            cts = (c.get("completedAt") or "").strip()
+            if ident is not None and cts and success_latest.get(ident, "") >= cts:
+                # Superseded concurrency-cancel duplicate: a SUCCESS of this EXACT
+                # identity (name + workflowName) completed AT OR AFTER this cancel,
+                # so the cancelled entry is a `cancel-in-progress` leftover with no
+                # verdict of its own — drop it. Wrong-green-impossible:
+                # FAILURE/TIMED_OUT are not in _CI_CANCEL_CONCLUSIONS (still red);
+                # an in-flight re-run is a non-terminal entry that still counts
+                # pending below; and a cancel with no identity, no completedAt, or
+                # NO same-identity success at-or-after it (e.g. SUCCESS-then-cancel
+                # on an unchanged head) falls through and stays red.
+                saw_recognized = True
+                continue
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
         elif conclusion in _CI_GREEN or state in _CI_GREEN:
             saw_recognized = True
         elif status in _CI_TERMINAL_STATUSES:
-            # COMPLETED with an unrecognized/None conclusion — treat as done,
-            # don't fabricate pending; ignore this entry.
             saw_recognized = True
-        elif status is not None or state == "PENDING":
+            if conclusion is not None:
+                # A COMPLETED run with a conclusion we DON'T recognize (a value
+                # GitHub adds later) is NOT a pass — fail CLOSED to red, never
+                # silently ignore. This mirrors the not-terminal ⇒ pending
+                # inversion below so no unenumerated *terminal* conclusion can read
+                # green. (conclusion is None ⇒ genuinely no verdict data: keep the
+                # benign ignore — distinct from a named value we simply don't map.)
+                red.append(name)
+        elif status is not None or state in _CI_PENDING_STATES:
             # ANY non-terminal CheckRun status (QUEUED/IN_PROGRESS/PENDING/
-            # WAITING/REQUESTED/…) or a PENDING StatusContext is unfinished →
-            # block. Enumerating "known pending" states would silently miss new
-            # ones (P1 review finding), so we invert: not-terminal ⇒ pending.
+            # WAITING/REQUESTED/…) or an unfinished StatusContext state
+            # (PENDING/EXPECTED) is unfinished → block. Enumerating "known pending"
+            # states would silently miss new ones (P1 review finding), so we
+            # invert: not-terminal ⇒ pending.
             saw_recognized = True
             pending.append(name)
         # else: no status/state/conclusion at all — unrecognized shape, ignore

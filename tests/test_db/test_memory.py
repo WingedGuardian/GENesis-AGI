@@ -71,6 +71,31 @@ async def test_search_ranked_with_collection(db):
     assert all(r["collection"] == "special" for r in results)
 
 
+async def test_search_is_and_only_no_fallback(db):
+    # memory.search is DELIBERATELY AND-only (no OR-fallback): its only caller is
+    # the entity-name resolver, which must not be widened to single-term matches.
+    # A partial-term query returns NOTHING (contrast search_ranked below).
+    await memory.create(db, memory_id="p1", content="alpha beta gamma delta")
+    assert await memory.search(db, query="alpha nonexistentword") == []
+    # A fully-present query still hits (basic AND path intact).
+    assert [r["memory_id"] for r in await memory.search(db, query="alpha beta")] == ["p1"]
+
+
+async def test_search_ranked_or_fallback_on_partial_terms(db):
+    await memory.create(db, memory_id="p3", content="alpha beta gamma delta")
+    results = await memory.search_ranked(db, query="alpha nonexistentword")
+    assert [r["memory_id"] for r in results] == ["p3"]
+
+
+async def test_search_ranked_boolean_true_skips_fallback(db):
+    # Default (raw) query surfaces via OR-fallback; the SAME query with
+    # boolean=True is treated as a structured expression and must NOT fall back,
+    # so it stays empty — proving the guard.
+    await memory.create(db, memory_id="p4", content="alpha beta gamma")
+    assert [r["memory_id"] for r in await memory.search_ranked(db, query="alpha zzz")] == ["p4"]
+    assert await memory.search_ranked(db, query="alpha zzz", boolean=True) == []
+
+
 async def test_get_taxonomy(db):
     await memory.create_metadata(
         db, memory_id="tx1", created_at="2020-01-01T00:00:00+00:00",

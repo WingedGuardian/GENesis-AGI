@@ -24,10 +24,28 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   health alert.** Such a job was invisible to every alarm: the "silently failing"
   check needs a prior success to measure a gap against, and the consecutive-failure
   counter resets on every restart. So a job that failed from its very first run —
-  e.g. a daily actuator whose external login expired on day one — could fail
-  silently for weeks. A new restart-proof check (using the monotonic lifetime
-  run/failure counters) surfaces any job with zero successes and repeated failures.
+  e.g. a daily actuator whose external login expired on day one — could fail silently
+  for weeks. A new restart-proof check (using the monotonic lifetime run/failure
+  counters) surfaces any job with zero successes and repeated failures as a WARNING
+  health alert (dashboard + health surface). It is deliberately out of Sentinel's
+  auto-remediation scope — a never-succeeded job is a config/auth/code defect a
+  service restart cannot fix — and is not auto-escalated to Telegram.
 
+- **FTS5 recall no longer starves on multi-word queries.** `_prepare_fts5` builds a
+  bare space-separated FTS5 MATCH, which SQLite treats as an implicit AND — so a
+  verbose query (`reference_lookup` / `knowledge_recall` natural-language text, and
+  memory recall on its non-expanded fallback path) required *every* token to be
+  present and otherwise returned nothing. A shared `db/crud/_fts.py::fetch_fts` now
+  runs the precise AND query first and, only when it returns zero rows and the query
+  isn't an already-structured boolean expression, retries the terms OR-joined —
+  adding partial matches where there were none while leaving every already-matching
+  query unchanged. Applied to the recall surfaces `knowledge.search_fts` and
+  `memory.search_ranked` (the latter's `boolean=False` path, which the hot recall
+  path falls back to when `expand_query` can't expand, e.g. Qdrant unavailable).
+  `memory.search` is left strict-AND on purpose — its only caller resolves entity
+  names by `results[0]` and must not be widened to single-term matches.
+  Audited-clean: `extraction_job`'s dedup check already OR-joins; `voice/hygiene`'s
+  constant-match sweep is unaffected.
 - **Ego cycles no longer deadlock when the approval gate is disabled, and the
   dashboard stops reporting a stalled ego as healthy.** With
   `manual_approval_required` set to false, a leftover pending approval row
@@ -128,6 +146,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   every poll.
 
 ### Added
+
+- **One-click "lobby" terminal door — reattach the whole CC fleet after a client
+  reboot.** `generate-ssh-config.sh` now emits a dedicated `Host <host>-lobby`
+  block (placed ahead of the numeric-slot wildcard, since ssh takes the first
+  matching `RemoteCommand`) that attaches a stable `lobby` tmux session on the
+  same socket as the `cc-*` slots and opens straight into the session picker
+  (`choose-tree`). One reconnect brings every live session back — they persist in
+  tmux on the box, only the client died — pick any slot and jump in (`Ctrl-b s`
+  reopens the picker). All emitted blocks are keyed on the stable Tailscale IP
+  (not the MagicDNS name), so they keep resolving even when the client's DNS is
+  disrupted. `lobby` is not a `cc-N` name, so it never consumes a slot or trips
+  the slot cap, and numeric-slot routing through `cc-slot.sh` is unchanged. Pair
+  with one Windows Terminal shortcut (`wt.exe ssh <host>-lobby`) for a
+  one-double-click return to the whole fleet.
 
 - **Claude Code session exits are recorded.** When a CC session's process exits
   — a clean quit, a crash, or an OS/kill signal — its exit status (with a

@@ -23,7 +23,7 @@ _RUN = "2026-06-28T00:00:00+00:00"
 _OK_STALE = "2026-06-14T00:00:00+00:00"   # 14.0 days before _RUN  → alerts
 _OK_RECENT = "2026-06-25T00:00:00+00:00"  # 3.0 days before _RUN   → below threshold
 _OK_HEALTHY = _RUN                          # 0.0 days               → healthy
-# A recent last_run (well within the never-succeeded alarm's 7d recency window),
+# A recent last_run (well within the never-succeeded alarm's 35d recency window),
 # computed once at import — always inside the window, so no wall-clock flakiness.
 _RECENT = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 

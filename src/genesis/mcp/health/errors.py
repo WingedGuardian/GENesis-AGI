@@ -868,6 +868,10 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     # job runs without succeeding, so a healthy job reads 0 regardless of
     # cadence — no per-job schedule lookup needed.
     if _service and _service._db:
+        # Two INDEPENDENT detectors in separate try blocks: a raise in one must not
+        # blind the other on the same tick (both query the same always-present table,
+        # so correlated failure is likely, but the split makes it impossible for the
+        # gap detector to swallow the never-succeeded check or vice versa).
         try:
             from genesis.db.crud import job_health as job_health_crud
 
@@ -888,17 +892,31 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                     }
                 )
                 current_ids.add(alert_id)
-            # Never-succeeded jobs: the gap query above filters last_success IS NOT
-            # NULL, so a job that has run + failed repeatedly but never once succeeded
-            # (last_success NULL forever) is invisible to it AND to consecutive_failures
-            # (reset on restart). total_runs/total_failures are monotonic → restart-proof.
-            # (An 8-day OAuth outage on a daily actuator hid here until this was added.)
+        except Exception:
+            # job_health is a core table that always exists — a failure here is a real
+            # operational fault, not an expected-absent-table case, so ERROR.
+            logger.error("Silently-stale job alert check failed", exc_info=True)
+
+        # Never-succeeded jobs: the gap query above filters last_success IS NOT NULL,
+        # so a job that has run + failed repeatedly but never once succeeded
+        # (last_success NULL forever) is invisible to it AND to consecutive_failures
+        # (reset on restart). total_runs/total_failures are monotonic → restart-proof.
+        # (An 8-day OAuth outage on a daily actuator hid here until this was added.)
+        try:
             from datetime import timedelta as _td4
 
-            # Only alarm jobs still running recently — a never-succeeded job that was
-            # disabled/removed leaves a fossil row (nothing auto-purges job_health) that
-            # would otherwise WARNING forever. 7d covers the slowest daily actuator.
-            recent_since = (datetime.now(UTC) - _td4(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            from genesis.db.crud import job_health as job_health_crud
+
+            # Recency bound: only alarm jobs still running recently — a never-succeeded
+            # job that was disabled/removed leaves a fossil row (nothing auto-purges
+            # job_health) that would otherwise WARNING forever. The slowest scheduled
+            # cadence is WEEKLY (verified — no monthly/quarterly jobs exist), so 35d
+            # covers every real job with wide margin (and a plausible future monthly
+            # actuator) while bounding a removed job's fossil WARNING to ≤35d — and this
+            # alert is dashboard/health-only (not escalated), so that lag is harmless.
+            # A job that runs LESS often than 35d would fall through both this and the
+            # gap detector; documented in get_never_succeeded_jobs' CONTRACT.
+            recent_since = (datetime.now(UTC) - _td4(days=35)).strftime("%Y-%m-%dT%H:%M:%SZ")
             for row in await job_health_crud.get_never_succeeded_jobs(
                 _service._db, recent_since=recent_since
             ):
@@ -917,11 +935,9 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
                 )
                 current_ids.add(alert_id)
         except Exception:
-            # job_health is a core table that always exists — a failure here is
-            # a real operational fault, not an expected-absent-table case, so
-            # ERROR (unlike the credit-exhaustion block, which queries the
-            # optionally-absent activity_log).
-            logger.error("Silently-stale / never-succeeded job alert check failed", exc_info=True)
+            # job_health is a core table that always exists — a failure here is a real
+            # operational fault, not an expected-absent-table case, so ERROR.
+            logger.error("Never-succeeded job alert check failed", exc_info=True)
 
     # ── Genesis update available ─────────────────────────────────────
     if _service and _service._db:

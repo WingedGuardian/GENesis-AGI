@@ -187,6 +187,9 @@ RATIFIED_OUT = [
     "cc:quota_exhausted",
     "infra:ollama_model_mismatch",
     "call_site:5_deep_reflection",
+    # A never-succeeded job is a config/auth/code defect, not restart-fixable —
+    # UNMAPPED_BY_DESIGN, so it must drop even if ever emitted at CRITICAL.
+    "job_never_succeeded:career_outreach_monitor",
 ]
 
 

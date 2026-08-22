@@ -80,7 +80,29 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
-    echo "HOME=$HOME" >> /etc/environment 2>/dev/null || true
+    # /etc/environment is root-owned. Persist HOME best-effort: write directly
+    # if it is writable (root installs), else via passwordless sudo. If neither
+    # works, skip silently -- HOME is already exported above, so persistence
+    # here is not required. A plain `>> /etc/environment` as a non-root user
+    # leaks a shell redirection error ("Permission denied") that 2>/dev/null
+    # cannot suppress, because the shell opens the redirect target before
+    # applying redirections.
+    # A missing /etc/environment in a writable /etc is directly creatable — plain
+    # `-w` is false for a nonexistent path, which would otherwise skip creation and
+    # lose the persisted HOME on a minimal/container root image (where the previous
+    # `>>` created the file). Before appending, ensure the file ends in a newline so
+    # an unterminated final assignment isn't concatenated onto (`FOO=barHOME=...`).
+    if [ -w /etc/environment ] || { [ ! -e /etc/environment ] && [ -w /etc ]; }; then
+        if [ -s /etc/environment ] && [ -n "$(tail -c1 /etc/environment 2>/dev/null)" ]; then
+            printf '\n' >> /etc/environment 2>/dev/null || true
+        fi
+        echo "HOME=$HOME" >> /etc/environment 2>/dev/null || true
+    elif command -v sudo >/dev/null 2>&1; then
+        if [ -s /etc/environment ] && [ -n "$(sudo -n tail -c1 /etc/environment 2>/dev/null)" ]; then
+            printf '\n' | sudo -n tee -a /etc/environment >/dev/null 2>&1 || true
+        fi
+        echo "HOME=$HOME" | sudo -n tee -a /etc/environment >/dev/null 2>&1 || true
+    fi
 fi
 
 # ── TMPDIR guard ─────────────────────────────────────────────
