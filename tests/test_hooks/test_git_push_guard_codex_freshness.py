@@ -41,6 +41,19 @@ def _reviews_jsonl(*commit_ids, login="chatgpt-codex-connector[bot]"):
     return "\n".join(json.dumps({"login": login, "commit_id": cid}) for cid in commit_ids)
 
 
+def _scheduled_marker(head=HEAD, *, login="owner", author_association="OWNER"):
+    """_TEST_GH_SCHEDULED_COMMENTS shape — one OWNER-authored row carrying a marker for
+    EVERY required kind (code-review + leaks) naming ``head``, so the scheduled gate is
+    satisfied and these freshness/binding cases exercise their own target
+    (author_association=OWNER satisfies the trust check regardless of derived repo owner)."""
+    markers = "\n".join(
+        f"<!-- genesis-scheduled-review: head={head} kind={k} -->"
+        for k in ("code-review", "leaks")
+    )
+    body = "Scheduled review complete.\n" + markers
+    return json.dumps({"login": login, "author_association": author_association, "body": body})
+
+
 def _clean_comment_jsonl(
     short_sha, *, login="chatgpt-codex-connector[bot]", user_type="Bot", flavour="Swish!"
 ):
@@ -529,6 +542,10 @@ class TestMainLevelIntegration:
         monkeypatch.setenv(
             "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "t", "conclusion": "SUCCESS"}])
         )
+        # A valid OWNER scheduled-review marker AT head, so the scheduled-review merge
+        # gate is satisfied and these cases keep exercising the freshness/binding wiring
+        # they target (not the new gate).
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _scheduled_marker(HEAD))
         monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         monkeypatch.setattr(
             _mod, "_check_pr_review_findings", lambda n, force=False, repo=None: (False, "")
@@ -634,6 +651,9 @@ class TestStaleSigilDoesNotWaiveScanners:
         monkeypatch.setenv(
             "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "t", "conclusion": "SUCCESS"}])
         )
+        # Scheduled review satisfied at head → the stale-override merge reaches the
+        # finding scanner this test is about (not the new scheduled gate).
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _scheduled_marker(HEAD))
         monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         # Scanner stub blocks UNLESS its own force (i.e. # review-override) is set.
         monkeypatch.setattr(

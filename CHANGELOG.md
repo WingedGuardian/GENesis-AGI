@@ -35,6 +35,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   names by `results[0]` and must not be widened to single-term matches.
   Audited-clean: `extraction_job`'s dedup check already OR-joins; `voice/hygiene`'s
   constant-match sweep is unaffected.
+- **Ego cycles no longer deadlock when the approval gate is disabled, and the
+  dashboard stops reporting a stalled ego as healthy.** With
+  `manual_approval_required` set to false, a leftover pending approval row
+  (raised earlier while the gate was on) kept blocking both egos' pre-flight
+  check forever — cycles silently stopped while every status surface still
+  showed "ego active". The pre-flight now honors the gate-off setting (and the
+  gate clears the stale row on the next dispatch), so cycles resume
+  immediately. Separately, the dashboard and a new hourly liveness check now
+  read the ego's last *completed* cycle (not the loop-alive flag), so a stalled
+  ego reads "stalled" / "waiting on approval" instead of green — with a
+  conservative threshold that never false-flags a legitimate slow cadence or
+  quiet-hours lull. The mandatory approval gate itself is unchanged (default
+  stays on; nothing auto-approves when it is on).
 
 - **Fresh container installs now get OOM/fork-wedge protection.**
   `scripts/install.sh` (the fresh-container path) never applied the

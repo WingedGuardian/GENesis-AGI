@@ -878,6 +878,12 @@ verified: ca875c4b 2026-07-24
   deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
   `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
   only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
+  Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
+  ego with no COMPLETED cycle past a conservative multiple of its current
+  interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
+  `next_fire_at` proxies that stay green through a deadlock) raises one
+  self-superseding `high` `ego_alert` per ego, auto-resolving when a cycle lands;
+  `gated`/`paused`/fresh-install are never stalls.
   Also per-tick (WS-2 M10) the SINGLE designated `alert_events` writer:
   `_persist_health_alerts` recomputes the firing set via the pure
   `mcp/health/errors.py::_compute_alerts()` and reconciles a durable open-set
@@ -1055,12 +1061,25 @@ verified: fbcf8ee4 2026-07-21
   discipline is load-bearing here. Loops that actually run: triage pipeline,
   procedural extraction (extract → judge → promote hourly, novelty +
   contradiction gates), weekly skill evolution, daily triage calibration.
-  Weekly skill evolution auto-applies MINOR SKILL.md edits at autonomy>=2 past
-  a STRUCTURAL check (`skills/validator.py`); a shadow **skill-edit Critic**
-  (`skills/skill_edit_critic.py` + `eval/rubrics/skill_edit_regression.py`)
-  now screens each auto-applied edit for self-modification pathologies via the
-  `judge` call site and LOGS a verdict (`skill_evolution_gate` observations) —
-  it never blocks the edit (WS1 shadow). A complementary **held-out replay
+  Weekly skill evolution is **propose-only** (autonomous auto-apply retired
+  2026-08-01, #1276): it STAGES every SKILL.md edit (MINOR and larger) as a
+  `skill_proposal` observation for human/CC review and never writes a skill
+  file — no proposal is ever blocked or auto-applied. Under propose-only NO
+  cognitive-file-modification ledger pre-image is created (the apply/resolve
+  path that would record one is a deferred follow-up). Two ADVISORY signals ride
+  the staged proposal for the reviewer, and neither gates staging: a deterministic
+  validator suite (`skills/validator.py` — structure, trigger coverage,
+  testability/vague-language, size, examples, and MINOR-content consistency; any
+  hard failure un-passes it) whose outcome is recorded as a `validated` flag
+  (for MINOR it reflects that suite; for MODERATE+ an LLM apply-recommendation)
+  plus `validation_detail` on failure; and, WHEN ENABLED (gate on, router +
+  baseline available), a shadow
+  **skill-edit Critic** (`skills/skill_edit_critic.py` +
+  `eval/rubrics/skill_edit_regression.py`) that screens for self-modification
+  pathologies via the `judge` call site and logs a `skill_evolution_gate`
+  verdict (WS1 shadow). The validator suite above is live (advisory); only the
+  `autonomy_level` param is retained as (currently unread) groundwork for the
+  future WS1 `enforce` mode. A complementary **held-out replay
   gate** (`eval/skill_replay/`, tool `skill_replay_run`) goes further — it
   REPLAYS a frozen per-skill golden suite (`~/.genesis/eval/skill_golden/`,
   authored via `eval/skill_golden_set.py`) against OLD vs NEW content in
@@ -1506,8 +1525,12 @@ verified: 9037d45b 2026-07-07
   generation (`scripts/generate_skill_catalog.py` scans `.claude/skills/`,
   `src/genesis/skills/`, `~/.genesis/skill-library/` →
   `~/.genesis/skill_catalog.json`, self-heals hourly), consumed by the
-  injection hook and by autonomous-session resources. Skill refinement is a
-  tracked cognitive-file modification (`learning/skills/applicator.py`).
+  injection hook and by autonomous-session resources. Skill refinement is
+  propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
+  review and never writes a skill file. Recording it as a tracked
+  cognitive-file modification is DEFERRED — no ledger pre-image is captured
+  under propose-only; the apply/resolve path that would create one is a
+  follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed

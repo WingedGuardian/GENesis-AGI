@@ -457,6 +457,85 @@ async def test_find_site_pending_ignores_non_pending(
     assert found is None
 
 
+def _gate_off(runtime, approval_manager):
+    """A gate whose policy has the mandatory approval gate DISABLED."""
+    return AutonomousCliApprovalGate(
+        runtime=runtime,
+        approval_manager=approval_manager,
+        policy_loader=lambda: AutonomousCliPolicy(manual_approval_required=False),
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_site_pending_none_when_gate_disabled(
+    runtime, approval_gate, approval_manager,
+):
+    """Gate off: a LEFTOVER pending row (raised while the gate was on) must not
+    park the caller. The pre-flight reports nothing pending so the cycle
+    proceeds to the auto-approving gate — this is the ego-deadlock fix."""
+    # Seed a pending row under the gate-ON view.
+    await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="user_ego_cycle",
+        action_label="user ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert await approval_gate.find_site_pending(
+        subsystem="ego", policy_id="user_ego_cycle",
+    ) is not None
+    # Same manager, gate flipped OFF → the stale row must not block.
+    gate_off = _gate_off(runtime, approval_manager)
+    assert await gate_off.find_site_pending(
+        subsystem="ego", policy_id="user_ego_cycle",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_approval_gate_off_cancels_stale_site_row(
+    runtime, approval_gate, approval_manager,
+):
+    """Gate off: ensure_approval returns approved AND cancels the leftover
+    pending row for the same site, so the dashboard stops showing a stale
+    'action required'."""
+    _, req_id, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="user_ego_cycle",
+        action_label="user ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert (await approval_manager.get_by_id(req_id))["status"] == "pending"
+
+    gate_off = _gate_off(runtime, approval_manager)
+    status, request_id, _reason = await gate_off.ensure_approval(
+        subsystem="ego", policy_id="user_ego_cycle",
+        action_label="user ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert status == "approved"
+    assert request_id is None
+    assert (await approval_manager.get_by_id(req_id))["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_ensure_approval_gate_off_cleanup_is_site_scoped(
+    runtime, approval_gate, approval_manager,
+):
+    """Gate-off cleanup is scoped to the dispatching site: a pending row for a
+    DIFFERENT (subsystem, policy_id) is left untouched — one ego's dispatch
+    never sweeps the other ego's (or an email/contributor) approval."""
+    _, other_id, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="genesis_ego_cycle",
+        action_label="genesis ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    gate_off = _gate_off(runtime, approval_manager)
+    await gate_off.ensure_approval(
+        subsystem="ego", policy_id="user_ego_cycle",
+        action_label="user ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    # The other site's row is still pending — not swept.
+    assert (await approval_manager.get_by_id(other_id))["status"] == "pending"
+
+
 @pytest.mark.asyncio
 async def test_get_pending_count_counts_only_cli_fallback(
     approval_gate, approval_manager,
