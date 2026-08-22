@@ -20,6 +20,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **FTS5 recall no longer starves on multi-word queries.** `_prepare_fts5` builds a
+  bare space-separated FTS5 MATCH, which SQLite treats as an implicit AND — so a
+  verbose query (`reference_lookup` / `knowledge_recall` natural-language text, and
+  memory recall on its non-expanded fallback path) required *every* token to be
+  present and otherwise returned nothing. A shared `db/crud/_fts.py::fetch_fts` now
+  runs the precise AND query first and, only when it returns zero rows and the query
+  isn't an already-structured boolean expression, retries the terms OR-joined —
+  adding partial matches where there were none while leaving every already-matching
+  query unchanged. Applied to the recall surfaces `knowledge.search_fts` and
+  `memory.search_ranked` (the latter's `boolean=False` path, which the hot recall
+  path falls back to when `expand_query` can't expand, e.g. Qdrant unavailable).
+  `memory.search` is left strict-AND on purpose — its only caller resolves entity
+  names by `results[0]` and must not be widened to single-term matches.
+  Audited-clean: `extraction_job`'s dedup check already OR-joins; `voice/hygiene`'s
+  constant-match sweep is unaffected.
 - **Ego cycles no longer deadlock when the approval gate is disabled, and the
   dashboard stops reporting a stalled ego as healthy.** With
   `manual_approval_required` set to false, a leftover pending approval row
