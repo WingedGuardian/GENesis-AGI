@@ -1,20 +1,41 @@
 #!/bin/bash
-# Genesis prepare-commit-msg hook — stamp an install-identity trailer.
+# Genesis prepare-commit-msg hook — stamp provenance trailers.
 #
 # Both Genesis installs commit under one git identity and one GitHub
-# account, so nothing in a merged PR says WHICH machine authored it.
-# This hook appends an `Install: <id8>` trailer to every commit message.
-# Squash merges on the public repo include commit bodies, and PR commits
-# stay queryable via the API after merge, so the trailer survives both
-# paths and makes cross-install provenance a lookup instead of forensics.
+# account, so nothing in a merged PR says WHICH machine — or WHICH working
+# session — authored it. This hook appends two opaque provenance trailers to
+# every commit message:
 #
-# The id is the first 8 chars of the stable per-install UUID from
-# ~/.genesis/install.json (owned by genesis.contribution.identity — a
-# local pseudonym, never an IP or hostname, so it is safe in public
-# commit messages). Resolution order:
-#   1. GENESIS_INSTALL_ID env (tests / explicit override)
-#   2. ~/.genesis/install.json (GENESIS_HOME honored)
-#   3. absent -> exit 0 silently (never block a commit over identity)
+#   Install: <id8>          — which install authored the commit
+#   Genesis-Session: <id8>  — which CC session built it
+#
+# Squash merges on the public repo include commit bodies, and PR commits stay
+# queryable via the API after merge, so both trailers survive both paths and
+# make provenance a lookup instead of forensics.
+#
+# Both ids are opaque 8-hex prefixes — a per-install pseudonym and a session
+# id — never an IP, hostname, path, or the human-readable session NAME, so
+# they are safe in public commit messages (they clear commit-msg / CI
+# leak-detector / contribution-sanitizer, which match IP/ULA classes,
+# /home/<user> and -home-<user>-genesis path shapes, emails, and fingerprints,
+# none of which a bare hex id resembles).
+#
+#   Install:         first 8 hex of the stable per-install UUID from
+#                    ~/.genesis/install.json (owned by
+#                    genesis.contribution.identity — a local pseudonym).
+#   Genesis-Session: first 8 hex of the CC session id, resolved from env
+#                    (see _resolve_session_id). Maps back — privately, on the
+#                    authoring install only — to cc_sessions.topic:
+#                      gh pr view <N> --json commits    # read the trailer
+#                      sqlite3 ~/genesis/data/genesis.db \
+#                        "SELECT topic FROM cc_sessions
+#                           WHERE id LIKE '<id8>%' OR cc_session_id LIKE '<id8>%'"
+#                    The topic (human-readable name) is NEVER published — only
+#                    the opaque id is. A lookup may return >1 row on an 8-hex
+#                    prefix collision; disambiguate by date/PR.
+#
+# Each trailer is best-effort and independent: a missing id skips only its own
+# trailer and never blocks a commit.
 
 MSG_FILE="$1"
 SOURCE="${2:-}"
@@ -23,7 +44,12 @@ SOURCE="${2:-}"
 # them unstamped so pull/merge flows stay byte-identical to vanilla git.
 [ "$SOURCE" = "merge" ] && exit 0
 
-_resolve_id() {
+# --- Install: trailer ------------------------------------------------------
+# Resolution order:
+#   1. GENESIS_INSTALL_ID env (tests / explicit override)
+#   2. ~/.genesis/install.json (GENESIS_HOME honored)
+#   3. absent -> skip this trailer (never block a commit over identity)
+_resolve_install_id() {
     if [ -n "${GENESIS_INSTALL_ID:-}" ]; then
         printf '%s' "$GENESIS_INSTALL_ID"
         return 0
@@ -35,13 +61,32 @@ _resolve_id() {
         "$install_json" | head -1
 }
 
-ID="$(_resolve_id)"
-[ -n "$ID" ] || exit 0
-
+INSTALL_ID="$(_resolve_install_id)"
 # Already stamped (e.g. commit --amend) — don't double-add.
-grep -qE "^Install: " "$MSG_FILE" && exit 0
+if [ -n "$INSTALL_ID" ] && ! grep -qE "^Install: " "$MSG_FILE"; then
+    git interpret-trailers --in-place --if-exists doNothing \
+        --trailer "Install: $INSTALL_ID" "$MSG_FILE" 2>/dev/null || true
+fi
 
-git interpret-trailers --in-place --if-exists doNothing \
-    --trailer "Install: $ID" "$MSG_FILE" 2>/dev/null || true
+# --- Genesis-Session: trailer ---------------------------------------------
+# Resolution order (first non-empty wins):
+#   1. GENESIS_SESSION_ID       — exported to invoker-dispatched CC sessions
+#   2. CLAUDE_CODE_SESSION_ID   — present in foreground CC sessions
+#   3. CLAUDE_SESSION_ID        — legacy CC env var
+#   4. absent -> skip this trailer (git hooks get no stdin, so env is the only
+#      route; a plain `git commit` outside a CC session simply goes unstamped).
+# The value is a UUID; take its leading 8 hex (first hyphen-group). A value
+# that doesn't start with 8 hex yields empty -> skipped.
+_resolve_session_id() {
+    local raw="${GENESIS_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}}"
+    [ -n "$raw" ] || return 1
+    printf '%s' "$raw" | sed -n 's/^\([0-9a-fA-F]\{8\}\).*/\1/p'
+}
+
+SESSION_ID="$(_resolve_session_id)"
+if [ -n "$SESSION_ID" ] && ! grep -qE "^Genesis-Session: " "$MSG_FILE"; then
+    git interpret-trailers --in-place --if-exists doNothing \
+        --trailer "Genesis-Session: $SESSION_ID" "$MSG_FILE" 2>/dev/null || true
+fi
 
 exit 0

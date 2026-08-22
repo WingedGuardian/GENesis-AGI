@@ -1,13 +1,24 @@
-"""Tests for scripts/hooks/prepare-commit-msg (install-identity trailer).
+"""Tests for scripts/hooks/prepare-commit-msg (provenance trailers).
 
-Both installs commit under one git identity, so the trailer is the only
-durable per-machine provenance marker on a merged PR (squash bodies keep
-commit messages; PR commits stay queryable via the API). Invariants:
+Both installs commit under one git identity, so the trailers are the only
+durable provenance markers on a merged PR (squash bodies keep commit
+messages; PR commits stay queryable via the API). Two independent trailers:
 
-1. Appends `Install: <id8>` exactly once (idempotent on --amend re-runs).
+`Install: <id8>` (per-install pseudonym):
+1. Appended exactly once (idempotent on --amend re-runs).
 2. Resolution order: GENESIS_INSTALL_ID env > install.json (GENESIS_HOME
    honored) > silent no-op — identity must NEVER block a commit.
+
+`Genesis-Session: <id8>` (CC session id → cc_sessions.topic, privately):
+4. Appended exactly once from a session-id env var.
+5. Resolution order: GENESIS_SESSION_ID > CLAUDE_CODE_SESSION_ID >
+   CLAUDE_SESSION_ID > silent no-op.
+6. Value is a bare 8-hex prefix (opaque; no path/IP/email/name shape, so it
+   clears the leak gates); a non-hex id is skipped, never mis-stamped.
+
+Both:
 3. Merge commits are left unstamped.
+7. The two trailers are independent — one id missing skips only its own.
 """
 
 import json
@@ -107,3 +118,96 @@ def test_env_wins_over_install_json(tmp_path):
     body = msg.read_text()
     assert "Install: envwins1" in body
     assert "deadbeef" not in body
+
+
+# --- Genesis-Session: trailer -------------------------------------------------
+
+_SID = "5e551011-0000-4000-8000-000000000000"  # synthetic UUID-shaped session id
+
+
+def test_session_trailer_from_foreground_env(tmp_path):
+    """CLAUDE_CODE_SESSION_ID (the foreground CC var) stamps the 8-hex prefix."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("feat(x): subject\n")
+    proc = _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": _SID})
+    assert proc.returncode == 0
+    assert "Genesis-Session: 5e551011" in msg.read_text()
+
+
+def test_session_trailer_env_precedence(tmp_path):
+    """GENESIS_SESSION_ID (dispatched sessions) wins over CLAUDE_CODE_SESSION_ID."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("fix(y): subject\n")
+    _run(
+        msg,
+        env_extra={
+            "GENESIS_SESSION_ID": "aaaa1111-2222-3333-4444-555566667777",
+            "CLAUDE_CODE_SESSION_ID": _SID,
+        },
+    )
+    body = msg.read_text()
+    assert "Genesis-Session: aaaa1111" in body
+    assert "5e551011" not in body
+
+
+def test_session_trailer_idempotent(tmp_path):
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("feat(x): subject\n")
+    _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": _SID})
+    first = msg.read_text()
+    _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": _SID})
+    assert msg.read_text() == first
+    assert msg.read_text().count("Genesis-Session:") == 1
+
+
+def test_no_session_env_omits_trailer(tmp_path):
+    """No session env: Install still stamps, but no Genesis-Session trailer."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("chore: no session\n")
+    proc = _run(msg, env_extra={"GENESIS_INSTALL_ID": "abc12345"})
+    body = msg.read_text()
+    assert proc.returncode == 0
+    assert "Install: abc12345" in body
+    assert "Genesis-Session:" not in body
+
+
+def test_non_hex_session_id_skipped(tmp_path):
+    """A session id not starting with 8 hex is skipped, never mis-stamped."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("feat(x): subject\n")
+    proc = _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": "not-a-hex-value"})
+    assert proc.returncode == 0
+    assert "Genesis-Session:" not in msg.read_text()
+
+
+def test_both_trailers_coexist(tmp_path):
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("feat(x): subject\n")
+    _run(
+        msg,
+        env_extra={"GENESIS_INSTALL_ID": "abc12345", "CLAUDE_CODE_SESSION_ID": _SID},
+    )
+    body = msg.read_text()
+    assert "Install: abc12345" in body
+    assert "Genesis-Session: 5e551011" in body
+
+
+def test_merge_leaves_session_trailer_off(tmp_path):
+    msg = tmp_path / "MERGE_MSG"
+    original = "Merge branch 'main'\n"
+    msg.write_text(original)
+    proc = _run(msg, source="merge", env_extra={"CLAUDE_CODE_SESSION_ID": _SID})
+    assert proc.returncode == 0
+    assert msg.read_text() == original
+
+
+def test_session_trailer_value_is_bare_hex(tmp_path):
+    """The stamped value must be a bare 8-hex token (sanitizer-safe shape)."""
+    import re
+
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("feat(x): subject\n")
+    _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": _SID})
+    line = next(ln for ln in msg.read_text().splitlines() if ln.startswith("Genesis-Session:"))
+    value = line.split(":", 1)[1].strip()
+    assert re.fullmatch(r"[0-9a-f]{8}", value), value
