@@ -337,7 +337,6 @@ class CareerOutreachResult:
 
     mode: str = "off"
     health_ok: bool = True
-    skipped: bool = False  # health-gated clean skip (no dispatch ran) → runner records NEITHER
     auto_runs: int = 0  # dispatches that staged a fresh draft
     drafts_working: int = 0  # == auto_runs: drafts staged THIS tick (no backlog census)
     nudged: int = 0  # newly-staged drafts included in a delivered nudge
@@ -415,13 +414,24 @@ class CareerOutreachMonitor:
                 mode=mode, health_ok=False, errors=1, details=["health check raised"]
             )
         if not healthy:
-            logger.info("career outreach: reasoning module unhealthy (remote down?) — clean skip")
-            # A health-gated skip did NOT dispatch anything, so it must record NEITHER
-            # success nor failure (mirrors the `off` early-return). Booking a success here
-            # would permanently bump total_successes ≥ 1 and disqualify the job from the
-            # never-succeeded alarm forever — even after real probe failures accumulate —
-            # masking the exact silent-outage class observe exists to feed (PR #1428).
-            return CareerOutreachResult(mode=mode, health_ok=False, skipped=True)
+            logger.info(
+                "career outreach: reasoning module unreachable (health check failed) — recording failure"
+            )
+            # An unreachable bridge is a job-health FAILURE, not a clean skip: observe's
+            # whole purpose is to detect a dead bridge, so a persistent outage must SURFACE.
+            # Recording a failure (a) never books a false success that would permanently
+            # disqualify the job from the never-succeeded alarm, and (b) keeps last_run
+            # fresh + total_failures climbing so the outage stays visible via PR #1428
+            # (after the 3-failure floor) and the gap detector — instead of freezing the
+            # counters and ageing out of the recency window. Non-noisy: the tick is daily,
+            # nothing alarms until 3 consecutive misses, and the alarm is WARNING /
+            # dashboard-only (never auto-remediated). Mirrors the health-check-raised path.
+            return CareerOutreachResult(
+                mode=mode,
+                health_ok=False,
+                errors=1,
+                details=["reasoning module unreachable (health check failed)"],
+            )
 
         timeout = cfg.knob_int(conf, "dispatch_timeout_s")
 

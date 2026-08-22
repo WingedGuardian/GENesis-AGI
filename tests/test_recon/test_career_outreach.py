@@ -306,16 +306,17 @@ async def test_registry_unavailable_is_clean_noop(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unhealthy_module_clean_skip_no_dispatch(db, monkeypatch):
-    # Architect concern #2: remote down → clean skip (health_ok False, errors 0),
-    # and NO dispatch is attempted. Also `skipped=True` (mode=live proves the fix is
-    # mode-independent): a health-gated skip must record NEITHER — a booked success
-    # would permanently disqualify the job from the never-succeeded alarm (PR #1428).
+async def test_unhealthy_module_records_failure_no_dispatch(db, monkeypatch):
+    # An unreachable bridge (check_health_cached False) is a job-health FAILURE, not a
+    # clean skip: observe exists to detect a dead bridge, so a persistent outage must
+    # SURFACE (errors=1 → record_failure → PR #1428 / gap detector). No dispatch is
+    # attempted. mode=live proves it is mode-independent (also fixes the earlier bug
+    # where errors=0 booked a false success that masked the never-succeeded alarm).
     _cfg(monkeypatch, mode="live")
     mod = _FakeModule(healthy=False)
     mon, pipe = _mon(db, mod)
     result = await mon.gather()
-    assert result.health_ok is False and result.errors == 0 and result.skipped is True
+    assert result.health_ok is False and result.errors == 1
     assert mod.calls == [] and pipe.sent == []
 
 
@@ -575,27 +576,32 @@ async def test_runner_skips_health_record_when_off(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_runner_records_neither_on_health_gated_skip(monkeypatch):
-    # SHOULD-FIX (review): a health-gated skip (remote down, no dispatch) records
-    # NEITHER — a booked success would permanently bump total_successes and disqualify
-    # the job from the never-succeeded alarm forever (PR #1428). mode="live" proves the
-    # guard is mode-independent, not observe-only.
+async def test_runner_records_failure_on_unreachable_bridge(monkeypatch):
+    # An unreachable bridge surfaces errors=1 → the runner records a job-health FAILURE
+    # (not a clean skip / false success). Keeps a persistent outage visible via PR #1428
+    # + the gap detector. mode="live" proves it is mode-independent.
     from genesis.surplus.jobs import runners
 
     calls = {"fail": [], "success": []}
-    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append(k))
+    monkeypatch.setattr(runners, "record_failure", lambda k, m=None: calls["fail"].append((k, m)))
     monkeypatch.setattr(runners, "record_success", lambda k: calls["success"].append(k))
 
     class _StubMon:
         async def gather(self):
-            return CareerOutreachResult(mode="live", health_ok=False, skipped=True)
+            return CareerOutreachResult(
+                mode="live",
+                health_ok=False,
+                errors=1,
+                details=["reasoning module unreachable (health check failed)"],
+            )
 
     class _Sched:
         _career_outreach_monitor = _StubMon()
         _event_bus = None
 
     await runners.run_career_outreach_monitor(_Sched())
-    assert not calls["fail"] and not calls["success"]
+    assert calls["fail"] and calls["fail"][0][0] == "career_outreach_monitor"
+    assert not calls["success"]
 
 
 @pytest.mark.asyncio
