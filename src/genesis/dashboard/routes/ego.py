@@ -79,14 +79,69 @@ async def ego_status():
             "gated": False,
         }
         # Display hint: is this ego currently blocked on a pending CLI approval?
-        # Best-effort — a query failure must not 500 the dashboard.
+        # Policy-aware: when the mandatory gate is OFF a leftover pending row no
+        # longer blocks dispatch (see approval_gate), so it must not read as
+        # "gated" here either — otherwise the badge shows a phantom "waiting on
+        # approval". Best-effort — a query failure must not 500 the dashboard.
         try:
-            snap["gated"] = await ego_crud.has_pending_cli_approval(
+            from genesis.autonomy.cli_policy import load_autonomous_cli_policy
+
+            gate_on = load_autonomous_cli_policy().manual_approval_required
+            snap["gated"] = (
+                await ego_crud.has_pending_cli_approval(rt._db, mgr.source_tag)
+                if gate_on
+                else False
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "ego gated-badge query failed for %s",
+                getattr(mgr, "source_tag", "?"),
+                exc_info=True,
+            )
+            snap["gated_error"] = True
+        # Truthful liveness: is the ego actively trying to cycle but NOT
+        # completing? Compares last INTENT-to-cycle (_last_proactive_fire_at,
+        # set only after every cadence gate passes) with last COMPLETED cycle
+        # (job_health.last_success) — NOT the is_running / next_fire_at proxies
+        # that stay green while deadlocked. Every legitimate non-running reason
+        # (idle/quiet/paused/global-pause/circuit) prevents an intent from being
+        # recorded, so it is excluded by construction; gated is excluded in the
+        # helper. Best-effort. (see ego.liveness)
+        snap["last_success_at"] = None
+        snap["stalled"] = False
+        snap["stall_reason"] = None
+        try:
+            from genesis.db.crud import job_health as job_health_crud
+            from genesis.ego.liveness import compute_ego_liveness
+
+            last_success = await job_health_crud.get_job_last_success(
                 rt._db,
                 mgr.source_tag,
             )
+            last_intent = await ego_crud.get_state(
+                rt._db,
+                f"last_proactive_fire:{mgr.source_tag}",
+            )
+            live = compute_ego_liveness(
+                last_success_at=last_success,
+                last_intent_at=last_intent,
+                current_interval_minutes=mgr.current_interval_minutes,
+                gated=bool(snap.get("gated")),
+            )
+            snap["last_success_at"] = live.last_success_at
+            snap["stalled"] = live.stalled
+            snap["stall_reason"] = live.reason
         except Exception:
-            snap["gated_error"] = True
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "ego liveness computation failed for %s",
+                getattr(mgr, "source_tag", "?"),
+                exc_info=True,
+            )
+            snap["liveness_error"] = True
         return snap
 
     user_cadence = await _cadence_snapshot(rt._ego_cadence_manager)
