@@ -33,10 +33,16 @@ checks it contains the registry's filename), so the human-facing doc routes to t
 CI-checked source of truth instead of maintaining a parallel prose consumer list
 that can silently drift — that prose is exactly what drifted in the origin incident.
 
+The guard fails CLOSED: a registry that parses to zero blocks, a duplicate/invalid
+key, an unreadable directory under a scan root, or an unrecognised shape all block
+(exit 1) rather than reporting CLEAN. The consumer scan follows symlinked dirs
+(with a loop guard) so a consumer behind a symlink is not silently missed.
+
 Scope: this guards only ENROLLED artifacts by declared-vs-actual consumer set.
 It is NOT a general prose↔code drift checker (that is unbounded). A prose
 freshness stamp is intentionally out of scope for now (keeps the CI job
-history-free — no fetch-depth: 0).
+history-free — no fetch-depth: 0). SCAN_ROOTS is fixed to src/ + scripts/: an
+artifact whose consumers live outside those roots must extend SCAN_ROOTS too.
 
 Known limitation (accepted): a consumer that reaches an artifact ONLY via an
 alias/wrapper of the loader — containing neither ``match_literal`` — is not seen.
@@ -48,6 +54,7 @@ Usage:  python scripts/check_shared_artifact_consumers.py   (exit 0 = clean, 1 =
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -68,6 +75,26 @@ _GUARD_SELF = f"scripts/{Path(__file__).name}"
 _BLOCK_RE = re.compile(r"^```yaml[ \t]+shared-artifact[ \t]*\n(.*?)^```", re.M | re.S)
 
 
+def _duplicate_top_level_keys(raw: str) -> list[str]:
+    """Top-level mapping keys that appear more than once in a block.
+
+    ``yaml.safe_load`` silently keeps the last value for a repeated key, so a
+    badly-resolved merge conflict (two ``match_literals:`` lines) would silently
+    narrow the literal set and blind the scan. A column-0 ``key:`` scan catches
+    that realistic case without resorting to an unsafe custom yaml Loader.
+    """
+    seen: set[str] = set()
+    dups: list[str] = []
+    for line in raw.splitlines():
+        m = re.match(r"([A-Za-z_][\w-]*):", line)  # column 0 → a top-level key
+        if m:
+            key = m.group(1)
+            if key in seen:
+                dups.append(key)
+            seen.add(key)
+    return dups
+
+
 @dataclass
 class Entry:
     """One ``yaml shared-artifact`` block: an artifact and its declared consumers."""
@@ -84,13 +111,21 @@ def parse_registry(text: str) -> tuple[list[Entry], list[str]]:
     entries: list[Entry] = []
     errors: list[str] = []
     for i, match in enumerate(_BLOCK_RE.finditer(text), start=1):
+        raw = match.group(1)
         try:
-            data = yaml.safe_load(match.group(1))
+            data = yaml.safe_load(raw)
         except yaml.YAMLError as exc:
             errors.append(f"block #{i}: invalid yaml ({exc})".replace("\n", " "))
             continue
         if not isinstance(data, dict):
             errors.append(f"block #{i}: expected a mapping, got {type(data).__name__}")
+            continue
+        dups = _duplicate_top_level_keys(raw)
+        if dups:
+            errors.append(
+                f"block #{i}: duplicate key(s) {sorted(set(dups))} — refusing "
+                f"(safe_load's last-wins would silently drop config)"
+            )
             continue
         artifact = data.get("artifact")
         documented_in = data.get("documented_in")
@@ -106,7 +141,10 @@ def parse_registry(text: str) -> tuple[list[Entry], list[str]]:
         if not literals or not isinstance(literals, list):
             errors.append(f"artifact '{artifact}': missing or empty 'match_literals' list")
             continue
-        if any(str(x) == "" for x in literals):
+        if not all(isinstance(x, str) for x in literals):
+            errors.append(f"artifact '{artifact}': every 'match_literals' entry must be a string")
+            continue
+        if any(x == "" for x in literals):
             errors.append(
                 f"artifact '{artifact}': 'match_literals' has an empty string (matches every file)"
             )
@@ -130,33 +168,46 @@ def parse_registry(text: str) -> tuple[list[Entry], list[str]]:
 
 
 def actual_consumers(
-    base: Path, scan_roots: list[str], literals: list[str], excluded: set[str]
+    base: Path,
+    scan_roots: list[str],
+    literals: list[str],
+    excluded: set[str],
+    on_error=None,
 ) -> set[str]:
     """Repo-relative paths of files under scan_roots containing ANY literal (fixed substring).
 
     ``excluded`` (the writer/doc + allowlist, as posix relpaths) are dropped.
-    Fixed-substring match — a literal is data, never a regex. Unreadable files are
-    skipped, never fatal.
+    Fixed-substring match — a literal is data, never a regex. Follows symlinked
+    directories (with a realpath loop guard) so a consumer behind a symlink is not
+    silently missed. ``on_error`` (if given) is called with the OSError when a
+    directory cannot be listed, so the caller can fail closed instead of going
+    silently blind; unreadable individual files are skipped.
     """
     found: set[str] = set()
+    seen_dirs: set[str] = set()  # realpaths — loop guard for followlinks
+    walk_error = on_error if on_error is not None else (lambda _exc: None)
     for root in scan_roots:
         root_dir = base / root
         if not root_dir.is_dir():
             continue
-        for path in root_dir.rglob("*"):
-            if not path.is_file():
+        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=True, onerror=walk_error):
+            real = os.path.realpath(dirpath)
+            if real in seen_dirs:
+                dirnames[:] = []  # already walked via its real path — don't re-descend/loop
                 continue
-            if any(part in _SKIP_DIRS for part in path.relative_to(base).parts):
-                continue
-            rel = path.relative_to(base).as_posix()
-            if rel in excluded:
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            if any(lit in text for lit in literals):
-                found.add(rel)
+            seen_dirs.add(real)
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for name in filenames:
+                path = Path(dirpath) / name
+                rel = path.relative_to(base).as_posix()
+                if rel in excluded:
+                    continue
+                try:
+                    content = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                if any(lit in content for lit in literals):
+                    found.add(rel)
     return found
 
 
@@ -171,12 +222,30 @@ def main() -> int:
         print(f"::error::shared-artifact guard: {REGISTRY_PATH} not found (run from repo root)")
         return 1
 
-    entries, errors = parse_registry(REGISTRY_PATH.read_text(encoding="utf-8"))
+    try:
+        text = REGISTRY_PATH.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"::error::{REGISTRY_PATH}: could not read the registry ({exc}).")
+        return 1
+
+    entries, errors = parse_registry(text)
     for err in errors:
         print(f"::error::{REGISTRY_PATH}: {err}")
+    if not entries and not errors:
+        # Fail CLOSED: the registry file exists but yielded no blocks — it was
+        # emptied, a fence is malformed/unclosed, or the file has CRLF endings the
+        # block regex does not match. Reporting "CLEAN (0 artifacts)" would be a
+        # wrong-green on the guard.
+        print(
+            f"::error::{REGISTRY_PATH}: no 'yaml shared-artifact' blocks parsed — the registry "
+            f"is empty, a fence is malformed/unclosed, or the file has CRLF line endings. "
+            f"Guard fails closed rather than passing."
+        )
+        return 1
 
     problems = 0
     base = Path.cwd()
+    scan_errors: list[str] = []
     for entry in entries:
         # documented_in must ROUTE to this registry rather than maintain a parallel
         # prose consumer list that CI can't check (that prose is exactly what drifts).
@@ -196,7 +265,9 @@ def main() -> int:
             problems += 1
 
         excluded = set(entry.allowlist) | {entry.documented_in, _GUARD_SELF}
-        actual = actual_consumers(base, SCAN_ROOTS, entry.match_literals, excluded)
+        actual = actual_consumers(
+            base, SCAN_ROOTS, entry.match_literals, excluded, on_error=scan_errors.append
+        )
         undeclared, stale = check_consumers(entry, actual)
         for path in sorted(undeclared):
             print(
@@ -212,6 +283,15 @@ def main() -> int:
                 f"lies; update the entry (and {entry.documented_in})."
             )
             problems += 1
+
+    # Fail CLOSED on any directory the scan could not read — a swallowed dir could
+    # hide an undeclared consumer, which is the exact wrong-green the guard prevents.
+    for exc in scan_errors:
+        print(
+            f"::error::{REGISTRY_PATH}: consumer scan could not read a path ({exc}) — "
+            f"guard fails closed rather than reporting an incomplete-but-clean scan."
+        )
+        problems += 1
 
     if errors or problems:
         return 1

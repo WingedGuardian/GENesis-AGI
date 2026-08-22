@@ -7,9 +7,10 @@
 # synced to the host shared mount by the credential-bridge awareness tick. It is
 # a SHARED fallback, read by consumers on BOTH the host (the Guardian recovery
 # brain, via guardian/diagnosis.py) AND the container itself (its own CC sessions,
-# foreground + background, via cc/login_health.py) — each injecting it ONLY when
-# its own login is confirmed dead; a HEALTHY login is never overridden. It is NOT
-# host-Guardian-only. The authoritative, CI-enforced consumer list lives in
+# foreground + background, via cc/login_health.py) — each injecting it only as a
+# fallback when its own login is down (see those modules for the exact activation
+# gate); a HEALTHY login is never overridden. It is NOT host-Guardian-only. The
+# authoritative, CI-enforced consumer list lives in
 # docs/architecture/shared-artifacts.md (checked by
 # scripts/check_shared_artifact_consumers.py) — update THAT when a consumer changes.
 #
@@ -62,18 +63,26 @@ usage() {
     awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
 }
 
-read_first_token() {
-    # Emit the first non-empty, whitespace-stripped line from stdin (setup-token
-    # prints one token line). A trailing line without a newline is handled by the
-    # `|| [ -n "$line" ]` guard.
-    local line token=""
+read_token() {
+    # Concatenate ALL non-whitespace from stdin into one token. A real setup-token
+    # is a single line, but a copy-paste from a wrapped terminal can inject hard
+    # newlines mid-token — stripping all whitespace rejoins it, instead of silently
+    # storing only the first fragment (which would arm a BROKEN fallback credential
+    # and only fail later, during an outage). Warn (stderr, never stdout, so the
+    # captured token stays clean) if the input spanned >1 non-empty line, so a
+    # genuinely multi-value paste is visible rather than silently merged.
+    local line token="" nonempty=0
     while IFS= read -r line || [ -n "$line" ]; do
         line="$(printf '%s' "$line" | tr -d '[:space:]')"
         if [ -n "$line" ]; then
-            token="$line"
-            break
+            nonempty=$((nonempty + 1))
+            token="$token$line"
         fi
     done
+    if [ "$nonempty" -gt 1 ]; then
+        echo "WARNING: input spanned $nonempty non-empty lines — concatenated into one token." >&2
+        echo "         A setup-token is a single line; verify the stored value is correct." >&2
+    fi
     printf '%s' "$token"
 }
 
@@ -114,11 +123,12 @@ case "${1:-}" in
         # Non-fatal nudge: the source file holds the raw token in plaintext. If it
         # is readable by group/other (e.g. created under the default umask 022) it
         # was an exposure — advise creating it 0600 and removing it after.
-        if [ -n "$(find "$2" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+        src_mode="$(stat -c '%a' -- "$2" 2>/dev/null || true)"
+        if [ -n "$src_mode" ] && [ "$(( 0${src_mode} & 077 ))" -ne 0 ]; then
             echo "WARNING: '$2' is readable by group/other — the token sat there in plaintext." >&2
             echo "         Create it with 'umask 077' (or 'install -m 600') and 'rm' it after storing." >&2
         fi
-        TOKEN="$(read_first_token < "$2")"
+        TOKEN="$(read_token < "$2")"
         ;;
     "")
         if [ -t 0 ]; then
@@ -127,7 +137,7 @@ case "${1:-}" in
             echo "  $0 --file /path/to/token-file" >&2
             exit 1
         fi
-        TOKEN="$(read_first_token)"
+        TOKEN="$(read_token)"
         ;;
     *)
         echo "ERROR: unknown argument '$1'. The token comes from stdin or --file PATH — never a bare argument." >&2

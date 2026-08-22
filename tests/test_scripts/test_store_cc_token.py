@@ -205,6 +205,47 @@ def test_file_intake_quiet_on_0600_source(tmp_path):
     assert "group/other" not in r.stderr.lower()
 
 
+def test_file_intake_leading_dash_path(tmp_path):
+    """A source path with a leading dash must not break the permission check
+    (`find` would misparse `-tok` as an expression; `stat --` handles it)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    dashfile = tmp_path / "-tok"
+    dashfile.write_text(_TOKEN + "\n")
+    dashfile.chmod(0o600)
+    env = {"PATH": _BASE_PATH, "HOME": str(home)}
+    r = subprocess.run(
+        ["/bin/bash", str(_SCRIPT), "--file", "-tok"],
+        env=env,
+        cwd=str(tmp_path),  # so "-tok" is a relative leading-dash path
+        input="",
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, f"stderr={r.stderr!r}"
+    assert (home / ".genesis" / "cc_oauth_token.env").exists()
+    assert "group/other" not in r.stderr.lower()  # 0600 source → no warning, no parse error
+
+
+def test_multiline_token_concatenates_and_warns(tmp_path):
+    """A line-wrapped token (a hard newline mid-token from a wrapped paste) must be
+    rejoined into the full token, not silently truncated to the first line, and the
+    multi-line case must warn."""
+    home = tmp_path / "home"
+    home.mkdir()
+    src = tmp_path / "intoken"
+    src.write_text("sk-ant-oat01-abcdefgh\nijklmnop\n")  # token split across two lines
+    src.chmod(0o600)
+    env = {"PATH": _BASE_PATH, "HOME": str(home)}
+    r = _run(env, "", "--file", str(src))
+    assert r.returncode == 0, r.stderr
+    body = (home / ".genesis" / "cc_oauth_token.env").read_text()
+    assert (
+        "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-abcdefghijklmnop" in body
+    )  # rejoined, not truncated
+    assert "spanned 2 non-empty lines" in r.stderr
+
+
 def test_help_lists_file_option_without_leaking_code(tmp_path):
     """--help prints only the header block (robust to its length), not script code."""
     env = {"PATH": _BASE_PATH, "HOME": str(tmp_path)}

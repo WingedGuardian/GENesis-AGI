@@ -16,8 +16,11 @@ the real repo layout.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _spec = importlib.util.spec_from_file_location(
@@ -316,6 +319,99 @@ def test_flags_documented_in_missing_file(tmp_path):
     assert "does not exist" in out
 
 
+def test_empty_registry_fails_closed(tmp_path):
+    """A registry that parses to zero blocks (emptied) must fail closed, not CLEAN."""
+    _write(
+        tmp_path,
+        "docs/architecture/shared-artifacts.md",
+        "# prose only, no shared-artifact blocks\n",
+    )
+    rc, out = _run_main_over(tmp_path)
+    assert rc == 1
+    assert "no 'yaml shared-artifact' blocks" in out
+
+
+def test_unclosed_fence_fails_closed(tmp_path):
+    """A malformed/unclosed fence matches no block (0 entries, 0 errors) → fail closed."""
+    _write(
+        tmp_path,
+        "docs/architecture/shared-artifacts.md",
+        "```yaml shared-artifact\nartifact: x\ndocumented_in: d\nmatch_literals: [x]\nreaders: []\n",
+    )  # no closing ``` fence
+    rc, out = _run_main_over(tmp_path)
+    assert rc == 1
+
+
+def _registry_and_writer(tmp_path, match_literals="[cc_oauth_token.env]"):
+    _write(
+        tmp_path,
+        "docs/architecture/shared-artifacts.md",
+        "```yaml shared-artifact\nartifact: cc_oauth_token.env\n"
+        "documented_in: scripts/store_cc_token.sh\n"
+        f"match_literals: {match_literals}\nreaders: []\nallowlist: []\n```\n",
+    )
+    _write(
+        tmp_path,
+        "scripts/store_cc_token.sh",
+        "F=cc_oauth_token.env  # docs/architecture/shared-artifacts.md\n",
+    )
+
+
+def test_symlinked_dir_consumer_is_seen(tmp_path):
+    """A consumer reachable only through a symlinked directory under a scan root
+    must still be caught (rglob does not descend into symlinked dirs → fail-open)."""
+    _registry_and_writer(tmp_path)
+    ext = tmp_path / "external"
+    ext.mkdir()
+    (ext / "hidden_consumer.py").write_text("P = 'cc_oauth_token.env'\n")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "linkdir").symlink_to(ext, target_is_directory=True)
+    rc, out = _run_main_over(tmp_path)
+    assert rc == 1
+    assert "hidden_consumer.py" in out
+
+
+def test_unreadable_dir_fails_closed(tmp_path):
+    """A directory the scan cannot read must fail closed (it could hide an undeclared
+    consumer), not be silently skipped."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    _registry_and_writer(tmp_path)
+    secret = tmp_path / "src" / "secret"
+    secret.mkdir(parents=True)
+    (secret / "hidden.py").write_text("cc_oauth_token.env\n")
+    secret.chmod(0o000)
+    try:
+        rc, out = _run_main_over(tmp_path)
+    finally:
+        secret.chmod(0o755)  # restore so tmp cleanup can remove it
+    assert rc == 1
+    assert "fails closed" in out
+
+
+def test_duplicate_top_level_key_errors():
+    """A duplicate top-level key (a merge-conflict artifact) must error, not let
+    safe_load's last-wins silently narrow the literal set."""
+    raw = (
+        "```yaml shared-artifact\nartifact: a\ndocumented_in: d\n"
+        "match_literals: [cc_oauth_token.env, load_cc_oauth_token]\n"
+        "match_literals: [load_cc_oauth_token]\nreaders: []\n```\n"
+    )
+    _, errors = csac.parse_registry(raw)
+    assert len(errors) == 1
+    assert "duplicate" in errors[0].lower()
+
+
+def test_nonstring_literal_errors():
+    raw = (
+        "```yaml shared-artifact\nartifact: a\ndocumented_in: d\n"
+        "match_literals: [[a, b], c]\nreaders: []\n```\n"
+    )
+    _, errors = csac.parse_registry(raw)
+    assert len(errors) == 1
+    assert "string" in errors[0].lower()
+
+
 # --- integration harness: run main() with REGISTRY_PATH + SCAN_ROOTS pointed at tmp_path ---
 
 
@@ -327,7 +423,6 @@ def _run_main_over(base: Path):
     """
     import contextlib
     import io
-    import os
 
     buf = io.StringIO()
     cwd = os.getcwd()
