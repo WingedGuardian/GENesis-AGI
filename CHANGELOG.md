@@ -20,6 +20,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **The career-outreach monitor now nudges reliably from what it staged, and its
+  `observe` mode surfaces a dead career-agent bridge instead of failing silently.**
+  The daily monitor used to re-derive its owner nudge by asking the external
+  career-agent to enumerate its staged drafts — an unreliable read that came back
+  empty, so newly-staged drafts were never surfaced; and `observe` mode could fail
+  silently for days when the agent's login expired. It now nudges directly from the
+  drafts each tick actually staged (deterministic), and `observe` is a lightweight
+  reachability probe that records a job-health failure when the bridge can't answer.
+  Still ships `off`.
+
 - **FTS5 recall no longer starves on multi-word queries.** `_prepare_fts5` builds a
   bare space-separated FTS5 MATCH, which SQLite treats as an implicit AND — so a
   verbose query (`reference_lookup` / `knowledge_recall` natural-language text, and
