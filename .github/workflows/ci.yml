@@ -360,6 +360,23 @@ jobs:
       - name: Subsystem-map drift guard
         run: python scripts/check_subsystem_map.py
 
+  shared-artifact-consumer-check:
+    # Shared-artifact registry guard: docs/architecture/shared-artifacts.md must
+    # declare every code consumer of each registered artifact — a NEW consumer a
+    # documenting file never learned about is a doc that lies → error. The reader
+    # diff is a fixed-string content scan of src/ + scripts/, so no git history is
+    # needed (no fetch-depth: 0). See scripts/check_shared_artifact_consumers.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install checker dependency
+        run: pip install pyyaml
+      - name: Shared-artifact consumer drift guard
+        run: python scripts/check_shared_artifact_consumers.py
+
   hook-versions-check:
     # Completeness backstop for .genesis-hook-versions: every version of a
     # tracked git hook that ever shipped on main must be recorded, or a
