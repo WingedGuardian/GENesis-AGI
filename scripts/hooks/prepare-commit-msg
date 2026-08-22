@@ -35,7 +35,8 @@
 #                    prefix collision; disambiguate by date/PR.
 #
 # Each trailer is best-effort and independent: a missing id skips only its own
-# trailer and never blocks a commit.
+# trailer and never blocks a commit. Merge commits and empty messages are left
+# untouched (see below).
 
 MSG_FILE="$1"
 SOURCE="${2:-}"
@@ -43,6 +44,17 @@ SOURCE="${2:-}"
 # Merge commits are local plumbing that never reaches a PR as-is; leave
 # them unstamped so pull/merge flows stay byte-identical to vanilla git.
 [ "$SOURCE" = "merge" ] && exit 0
+
+# Preserve git's own empty-message abort. If the message has no content after
+# stripping comments and blank lines (git's emptiness rule), do NOT stamp:
+# otherwise a trailer would turn an otherwise-empty message into a real commit,
+# defeating git's rejection of an accidentally/intentionally empty commit (the
+# case that bites is a clone with no install.json but a live CC session, where
+# only the session trailer would stamp). `git stripspace --strip-comments`
+# honors core.commentChar, so this matches git's own emptiness definition.
+if [ -z "$(git stripspace --strip-comments < "$MSG_FILE" 2>/dev/null)" ]; then
+    exit 0
+fi
 
 # --- Install: trailer ------------------------------------------------------
 # Resolution order:
@@ -62,8 +74,11 @@ _resolve_install_id() {
 }
 
 INSTALL_ID="$(_resolve_install_id)"
-# Already stamped (e.g. commit --amend) — don't double-add.
-if [ -n "$INSTALL_ID" ] && ! grep -qE "^Install: " "$MSG_FILE"; then
+# `--if-exists doNothing` IS the idempotency guard: it adds nothing when an
+# `Install:` trailer already sits in the message's trailer block (e.g. on
+# --amend), and — unlike a whole-message grep — it ignores a stray `Install:`
+# line that appears only in prose, so the real trailer is never suppressed.
+if [ -n "$INSTALL_ID" ]; then
     git interpret-trailers --in-place --if-exists doNothing \
         --trailer "Install: $INSTALL_ID" "$MSG_FILE" 2>/dev/null || true
 fi
@@ -75,16 +90,19 @@ fi
 #   3. CLAUDE_SESSION_ID        — legacy CC env var
 #   4. absent -> skip this trailer (git hooks get no stdin, so env is the only
 #      route; a plain `git commit` outside a CC session simply goes unstamped).
-# The value is a UUID; take its leading 8 hex (first hyphen-group). A value
-# that doesn't start with 8 hex yields empty -> skipped.
+# The value is a UUID; take its leading 8 hex (first hyphen-group). `head -1`
+# clamps a multi-line value to a single prefix so it can never emit a second,
+# trailer-breaking line. A value that doesn't start with 8 hex yields empty
+# -> skipped.
 _resolve_session_id() {
     local raw="${GENESIS_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}}"
     [ -n "$raw" ] || return 1
-    printf '%s' "$raw" | sed -n 's/^\([0-9a-fA-F]\{8\}\).*/\1/p'
+    printf '%s' "$raw" | sed -n 's/^\([0-9a-fA-F]\{8\}\).*/\1/p' | head -1
 }
 
 SESSION_ID="$(_resolve_session_id)"
-if [ -n "$SESSION_ID" ] && ! grep -qE "^Genesis-Session: " "$MSG_FILE"; then
+# Idempotency + prose-safety via `--if-exists doNothing` (see the Install block).
+if [ -n "$SESSION_ID" ]; then
     git interpret-trailers --in-place --if-exists doNothing \
         --trailer "Genesis-Session: $SESSION_ID" "$MSG_FILE" 2>/dev/null || true
 fi

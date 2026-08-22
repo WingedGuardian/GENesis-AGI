@@ -211,3 +211,58 @@ def test_session_trailer_value_is_bare_hex(tmp_path):
     line = next(ln for ln in msg.read_text().splitlines() if ln.startswith("Genesis-Session:"))
     value = line.split(":", 1)[1].strip()
     assert re.fullmatch(r"[0-9a-f]{8}", value), value
+
+
+# --- Codex P2 hardening (multiline / prose / empty-message) -------------------
+
+
+def test_multiline_session_env_clamped_to_one_prefix(tmp_path):
+    """A newline-bearing session id must yield exactly one 8-hex prefix, so it
+    can't emit a second line that breaks git's trailer block."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("feat(x): subject\n")
+    _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": "aaaabbbb-1\nccccdddd-2"})
+    body = msg.read_text()
+    assert body.count("Genesis-Session:") == 1
+    assert "Genesis-Session: aaaabbbb" in body
+    # The second prefix must NOT leak as a stray line (which would break the
+    # trailer block); this is the actual regression the head -1 clamp fixes.
+    assert "ccccdddd" not in body
+
+
+def test_prose_session_line_does_not_suppress_real_trailer(tmp_path):
+    """A column-0 ``Genesis-Session:`` line in prose (e.g. a commit documenting
+    the format) must NOT prevent the real trailer from being appended."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("feat: doc the format\n\nWe write\nGenesis-Session: example here.\n")
+    _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": _SID})
+    body = msg.read_text()
+    assert f"Genesis-Session: {_SID[:8]}" in body
+
+
+def test_empty_message_not_stamped(tmp_path):
+    """An empty message stays empty so git's empty-commit abort is preserved."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("")
+    proc = _run(
+        msg,
+        env_extra={"GENESIS_INSTALL_ID": "abc12345", "CLAUDE_CODE_SESSION_ID": _SID},
+    )
+    assert proc.returncode == 0
+    body = msg.read_text()
+    assert "Install:" not in body
+    assert "Genesis-Session:" not in body
+
+
+def test_comment_only_message_not_stamped(tmp_path):
+    """A comment/blank-only message (aborted editor) is treated as empty."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text("# Please enter the commit message.\n#\n\n")
+    proc = _run(
+        msg,
+        env_extra={"GENESIS_INSTALL_ID": "abc12345", "CLAUDE_CODE_SESSION_ID": _SID},
+    )
+    assert proc.returncode == 0
+    body = msg.read_text()
+    assert "Install:" not in body
+    assert "Genesis-Session:" not in body
