@@ -33,6 +33,50 @@ async def get_stale_jobs(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def get_never_succeeded_jobs(
+    db: aiosqlite.Connection, *, min_failures: int = 3, recent_since: str | None = None
+) -> list[dict]:
+    """Jobs that have RUN and FAILED repeatedly but NEVER once succeeded.
+
+    :func:`get_stale_jobs` is structurally BLIND to these: it filters
+    ``last_success IS NOT NULL``, and a never-succeeded job has ``last_success``
+    NULL forever (so its ``last_run − last_success`` gap is undefined). The
+    ``consecutive_failures`` counter also misses them (``clear_stale_job_failures``
+    resets it to 0 on every restart). The lifetime ``total_successes`` /
+    ``total_failures`` counters are MONOTONIC and survive that reset, so
+    ``total_successes = 0 AND total_failures >= min_failures`` is the honest,
+    restart-proof "has been failing since it first ran, never succeeded" signal.
+    ``min_failures`` (default 3) avoids alarming a brand-new job that has failed
+    only once or twice transiently.
+
+    ``recent_since`` (an ISO timestamp) bounds the alarm to jobs still running
+    recently: nothing auto-purges ``job_health`` rows, so a job that failed, never
+    succeeded, then was disabled/removed would otherwise fire this WARNING forever.
+    When set, only rows with ``last_run >= recent_since`` are returned. ``julianday``
+    parses both ``+00:00`` and ``Z`` suffixes, so the compare is tz-suffix-safe (a
+    lexical string compare is not). Left ``None`` (no bound) for raw-query callers/tests.
+
+    CONTRACT: this assumes a healthy job records ``record_job_success`` under the SAME
+    job_name on its happy path (bumping ``total_successes``). A job that only ever
+    records failures (never success) would trip it while running — that job's
+    instrumentation should be fixed, not the alarm. Returns
+    ``{job_name, total_failures, last_error}`` rows, most failures first. (Origin: an
+    8-day OAuth outage on a daily actuator that had never succeeded stayed invisible on
+    every alarm surface, 2026-08.)
+    """
+    query = (
+        "SELECT job_name, total_failures, last_error FROM job_health "
+        "WHERE last_run IS NOT NULL AND total_successes = 0 AND total_failures >= ?"
+    )
+    params: list = [min_failures]
+    if recent_since is not None:
+        query += " AND julianday(last_run) >= julianday(?)"
+        params.append(recent_since)
+    query += " ORDER BY total_failures DESC"
+    cursor = await db.execute(query, params)
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def get_job_last_success(
     db: aiosqlite.Connection, job_name: str
 ) -> str | None:

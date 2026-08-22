@@ -11,6 +11,7 @@ Two surfaces:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -22,6 +23,9 @@ _RUN = "2026-06-28T00:00:00+00:00"
 _OK_STALE = "2026-06-14T00:00:00+00:00"   # 14.0 days before _RUN  → alerts
 _OK_RECENT = "2026-06-25T00:00:00+00:00"  # 3.0 days before _RUN   → below threshold
 _OK_HEALTHY = _RUN                          # 0.0 days               → healthy
+# A recent last_run (well within the never-succeeded alarm's 7d recency window),
+# computed once at import — always inside the window, so no wall-clock flakiness.
+_RECENT = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 async def _make_service_with_jobs(rows):
@@ -38,7 +42,9 @@ async def _make_service_with_jobs(rows):
     await db.execute(
         "CREATE TABLE job_health ("
         "job_name TEXT PRIMARY KEY, last_run TEXT, last_success TEXT, "
-        "last_failure TEXT, last_error TEXT, consecutive_failures INTEGER DEFAULT 0)"
+        "last_failure TEXT, last_error TEXT, consecutive_failures INTEGER DEFAULT 0, "
+        "total_runs INTEGER DEFAULT 0, total_successes INTEGER DEFAULT 0, "
+        "total_failures INTEGER DEFAULT 0)"
     )
     await db.executemany(
         "INSERT INTO job_health (job_name, last_run, last_success) VALUES (?, ?, ?)",
@@ -158,6 +164,135 @@ async def test_get_stale_jobs_crud():
 
     assert [r["job_name"] for r in rows] == ["stale_a", "stale_b"]  # widest gap first
     assert rows[0]["gap_days"] == 14.0
+
+
+# ── never-succeeded jobs (restart-proof; the gap query can't see them) ───────
+
+@pytest.mark.asyncio
+async def test_never_succeeded_job_alerts():
+    """A job that has run + failed >= min_failures but NEVER succeeded (last_success
+    NULL) emits a job_never_succeeded WARNING — the signal get_stale_jobs is
+    structurally blind to (it filters last_success IS NOT NULL) — and NOT a job_stale."""
+    svc = await _make_service_with_jobs([])
+    await svc._db.execute(
+        "INSERT INTO job_health (job_name, last_run, last_success, total_runs, "
+        "total_successes, total_failures, last_error) VALUES (?, ?, NULL, 10, 0, 8, ?)",
+        ("career_outreach_monitor", _RECENT, "observe: bridge probe failed"),
+    )
+    await svc._db.commit()
+    try:
+        alerts = await _run_alerts(svc)
+    finally:
+        await svc._db.close()
+
+    ns = [a for a in alerts if a.get("id", "").startswith("job_never_succeeded:")]
+    assert len(ns) == 1
+    assert ns[0]["id"] == "job_never_succeeded:career_outreach_monitor"
+    assert ns[0]["severity"] == "WARNING"
+    assert "never" in ns[0]["message"].lower() and "8" in ns[0]["message"]
+    # last_success NULL → the gap query skips it, so no duplicate job_stale alert
+    assert not [a for a in alerts if a.get("id", "").startswith("job_stale:")]
+
+
+@pytest.mark.asyncio
+async def test_once_succeeded_then_failing_is_not_never_succeeded():
+    """A job that succeeded at least once (total_successes>0) is NOT flagged by the
+    never-succeeded query — that recurring-failure case is the gap detector's job."""
+    svc = await _make_service_with_jobs([])
+    await svc._db.execute(
+        "INSERT INTO job_health (job_name, last_run, last_success, total_runs, "
+        "total_successes, total_failures) VALUES (?, ?, ?, 10, 2, 8)",
+        ("flaky_job", _RECENT, _OK_RECENT),
+    )
+    await svc._db.commit()
+    try:
+        alerts = await _run_alerts(svc)
+    finally:
+        await svc._db.close()
+    assert not [a for a in alerts if a.get("id", "").startswith("job_never_succeeded:")]
+
+
+@pytest.mark.asyncio
+async def test_single_transient_failure_below_min_not_flagged():
+    """A brand-new job that has failed only once (< min_failures=3) is not yet alarmed."""
+    svc = await _make_service_with_jobs([])
+    await svc._db.execute(
+        "INSERT INTO job_health (job_name, last_run, last_success, total_runs, "
+        "total_successes, total_failures) VALUES (?, ?, NULL, 1, 0, 1)",
+        ("new_job", _RECENT),
+    )
+    await svc._db.commit()
+    try:
+        alerts = await _run_alerts(svc)
+    finally:
+        await svc._db.close()
+    assert not [a for a in alerts if a.get("id", "").startswith("job_never_succeeded:")]
+
+
+@pytest.mark.asyncio
+async def test_get_never_succeeded_jobs_crud():
+    """The crud read returns only run+never-succeeded jobs at/above min_failures, most
+    failures first; a once-succeeded, a below-threshold, and a never-ran row excluded."""
+    from genesis.db.crud import job_health
+
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.execute(
+        "CREATE TABLE job_health (job_name TEXT PRIMARY KEY, last_run TEXT, "
+        "last_success TEXT, last_error TEXT, total_runs INTEGER, "
+        "total_successes INTEGER, total_failures INTEGER)"
+    )
+    await db.executemany(
+        "INSERT INTO job_health (job_name, last_run, last_success, total_runs, "
+        "total_successes, total_failures) VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            ("dead_a", _RUN, None, 12, 0, 12),          # never ok, 12 failures
+            ("dead_b", _RUN, None, 5, 0, 5),            # never ok, 5 failures
+            ("recovered", _RUN, _OK_RECENT, 10, 2, 8),  # succeeded twice → excluded
+            ("fresh", _RUN, None, 2, 0, 2),             # < min_failures → excluded
+            ("never_ran", None, None, 0, 0, 0),         # never ran → excluded
+        ],
+    )
+    await db.commit()
+    try:
+        rows = await job_health.get_never_succeeded_jobs(db, min_failures=3)
+    finally:
+        await db.close()
+    assert [r["job_name"] for r in rows] == ["dead_a", "dead_b"]  # most failures first
+    assert rows[0]["total_failures"] == 12
+
+
+@pytest.mark.asyncio
+async def test_get_never_succeeded_jobs_recency_bound():
+    """recent_since ages out a never-succeeded job that STOPPED running (a fossil row
+    from a disabled/removed job), so it doesn't WARNING forever; a recently-run one is
+    still returned."""
+    from genesis.db.crud import job_health
+
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.execute(
+        "CREATE TABLE job_health (job_name TEXT PRIMARY KEY, last_run TEXT, "
+        "last_success TEXT, last_error TEXT, total_runs INTEGER, total_successes INTEGER, "
+        "total_failures INTEGER)"
+    )
+    await db.executemany(
+        "INSERT INTO job_health (job_name, last_run, last_success, total_runs, "
+        "total_successes, total_failures) VALUES (?, ?, NULL, ?, 0, ?)",
+        [
+            ("still_running", _RECENT, 8, 8),
+            ("retired_fossil", "2026-01-01T00:00:00+00:00", 8, 8),  # stopped running long ago
+        ],
+    )
+    await db.commit()
+    cutoff = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        rows = await job_health.get_never_succeeded_jobs(
+            db, min_failures=3, recent_since=cutoff
+        )
+    finally:
+        await db.close()
+    assert [r["job_name"] for r in rows] == ["still_running"]  # fossil aged out
 
 
 # ── _annotate_staleness (job_health MCP output field) ────────────────────────

@@ -20,6 +20,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A scheduled job that has run repeatedly but never once succeeded now raises a
+  health alert.** Such a job was invisible to every alarm: the "silently failing"
+  check needs a prior success to measure a gap against, and the consecutive-failure
+  counter resets on every restart. So a job that failed from its very first run —
+  e.g. a daily actuator whose external login expired on day one — could fail
+  silently for weeks. A new restart-proof check (using the monotonic lifetime
+  run/failure counters) surfaces any job with zero successes and repeated failures.
+
 - **Ego cycles no longer deadlock when the approval gate is disabled, and the
   dashboard stops reporting a stalled ego as healthy.** With
   `manual_approval_required` set to false, a leftover pending approval row
