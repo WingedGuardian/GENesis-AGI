@@ -64,26 +64,26 @@ usage() {
 }
 
 read_token() {
-    # Concatenate ALL non-whitespace from stdin into one token. A real setup-token
-    # is a single line, but a copy-paste from a wrapped terminal can inject hard
-    # newlines mid-token — stripping all whitespace rejoins it, instead of silently
-    # storing only the first fragment (which would arm a BROKEN fallback credential
-    # and only fail later, during an outage). Warn (stderr, never stdout, so the
-    # captured token stays clean) if the input spanned >1 non-empty line, so a
-    # genuinely multi-value paste is visible rather than silently merged.
-    local line token="" nonempty=0
+    # Read stdin into globals: TOKEN (all non-whitespace concatenated), _nonempty
+    # (count of non-empty lines) and _complete (count of lines that each look like a
+    # WHOLE token). A real setup-token is a single line; a wrapped copy-paste can
+    # inject hard newlines mid-token, so concatenation rejoins it rather than storing
+    # only the first fragment. But two lines that EACH look complete are two distinct
+    # tokens, not a wrap — the caller refuses those (concatenating them would store a
+    # garbage credential). Runs in the current shell (no subshell) so it can set
+    # globals; the token never reaches stdout.
+    TOKEN=""
+    _nonempty=0
+    _complete=0
+    local line
     while IFS= read -r line || [ -n "$line" ]; do
         line="$(printf '%s' "$line" | tr -d '[:space:]')"
         if [ -n "$line" ]; then
-            nonempty=$((nonempty + 1))
-            token="$token$line"
+            _nonempty=$((_nonempty + 1))
+            case "$line" in sk-ant-oat*) _complete=$((_complete + 1)) ;; esac
+            TOKEN="$TOKEN$line"
         fi
     done
-    if [ "$nonempty" -gt 1 ]; then
-        echo "WARNING: input spanned $nonempty non-empty lines — concatenated into one token." >&2
-        echo "         A setup-token is a single line; verify the stored value is correct." >&2
-    fi
-    printf '%s' "$token"
 }
 
 TOKEN=""
@@ -128,7 +128,7 @@ case "${1:-}" in
             echo "WARNING: '$2' is readable by group/other — the token sat there in plaintext." >&2
             echo "         Create it with 'umask 077' (or 'install -m 600') and 'rm' it after storing." >&2
         fi
-        TOKEN="$(read_token < "$2")"
+        read_token < "$2"
         ;;
     "")
         if [ -t 0 ]; then
@@ -137,7 +137,7 @@ case "${1:-}" in
             echo "  $0 --file /path/to/token-file" >&2
             exit 1
         fi
-        TOKEN="$(read_token)"
+        read_token
         ;;
     *)
         echo "ERROR: unknown argument '$1'. The token comes from stdin or --file PATH — never a bare argument." >&2
@@ -147,9 +147,19 @@ case "${1:-}" in
         ;;
 esac
 
+if [ "${_complete:-0}" -gt 1 ]; then
+    echo "ERROR: input has ${_complete} complete tokens (each starts with 'sk-ant-oat') — supply exactly one." >&2
+    exit 1
+fi
+
 if [ -z "$TOKEN" ]; then
     echo "ERROR: no token received (stdin/--file was empty)." >&2
     exit 1
+fi
+
+if [ "${_nonempty:-0}" -gt 1 ]; then
+    echo "WARNING: input spanned ${_nonempty} non-empty lines — concatenated into one token." >&2
+    echo "         A setup-token is a single line; verify the stored value is correct." >&2
 fi
 
 # Sanity-check the shape but do not hard-fail (the CLI format could evolve).

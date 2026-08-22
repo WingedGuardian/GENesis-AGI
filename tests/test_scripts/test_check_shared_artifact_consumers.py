@@ -357,9 +357,10 @@ def _registry_and_writer(tmp_path, match_literals="[cc_oauth_token.env]"):
     )
 
 
-def test_symlinked_dir_consumer_is_seen(tmp_path):
-    """A consumer reachable only through a symlinked directory under a scan root
-    must still be caught (rglob does not descend into symlinked dirs → fail-open)."""
+def test_symlinked_dir_fails_closed(tmp_path):
+    """A symlinked directory under a scan root is not traversed; it must be surfaced
+    as a fail-closed error (a consumer behind it would otherwise be invisible), with
+    no real-vs-symlink path-attribution ambiguity."""
     _registry_and_writer(tmp_path)
     ext = tmp_path / "external"
     ext.mkdir()
@@ -368,7 +369,33 @@ def test_symlinked_dir_consumer_is_seen(tmp_path):
     (tmp_path / "src" / "linkdir").symlink_to(ext, target_is_directory=True)
     rc, out = _run_main_over(tmp_path)
     assert rc == 1
-    assert "hidden_consumer.py" in out
+    assert "symlinked directory" in out
+    assert "src/linkdir" in out
+
+
+def test_malformed_fence_among_valid_fails_closed(tmp_path):
+    """A valid entry followed by an unclosed fence: the malformed block is silently
+    skipped by the regex, so a newly-added artifact would be unguarded. The guard
+    must fail closed (openers != parsed blocks)."""
+    _write(tmp_path, "src/genesis/cc/login_health.py", "T = 'cc_oauth_token.env'\n")
+    _write(
+        tmp_path,
+        "scripts/store_cc_token.sh",
+        "F=cc_oauth_token.env  # docs/architecture/shared-artifacts.md\n",
+    )
+    _write(
+        tmp_path,
+        "docs/architecture/shared-artifacts.md",
+        "```yaml shared-artifact\nartifact: cc_oauth_token.env\n"
+        "documented_in: scripts/store_cc_token.sh\n"
+        "match_literals: [cc_oauth_token.env]\n"
+        "readers:\n  - src/genesis/cc/login_health.py\n"
+        "allowlist: []\n```\n\n"
+        "```yaml shared-artifact\nartifact: other.env\n",  # second opener, never closed
+    )
+    rc, out = _run_main_over(tmp_path)
+    assert rc == 1
+    assert "fence" in out.lower()
 
 
 def test_unreadable_dir_fails_closed(tmp_path):

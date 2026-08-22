@@ -44,10 +44,16 @@ freshness stamp is intentionally out of scope for now (keeps the CI job
 history-free — no fetch-depth: 0). SCAN_ROOTS is fixed to src/ + scripts/: an
 artifact whose consumers live outside those roots must extend SCAN_ROOTS too.
 
-Known limitation (accepted): a consumer that reaches an artifact ONLY via an
-alias/wrapper of the loader — containing neither ``match_literal`` — is not seen.
-Enumerate consumers when enrolling; if such a wrapper appears, add its symbol to
-``match_literals``.
+Known limitations (accepted — both inherent to fixed-substring matching, and both
+FAIL-SAFE, never a wrong-green on an undeclared consumer):
+  * a consumer that reaches an artifact ONLY via an alias/wrapper of the loader —
+    containing neither ``match_literal`` — is not seen. Enumerate consumers when
+    enrolling; if such a wrapper appears, add its symbol to ``match_literals``.
+  * a literal that survives only in a COMMENT (a declared reader kept a comment
+    mention after dropping the real access) reads as still-consuming, so that reader
+    is not flagged stale. Distinguishing code from comments needs per-language
+    parsing (an unbounded surface); the failure direction is benign — a stale reader
+    is retained in the doc, never a real consumer missed.
 
 Usage:  python scripts/check_shared_artifact_consumers.py   (exit 0 = clean, 1 = drift)
 """
@@ -110,7 +116,12 @@ def parse_registry(text: str) -> tuple[list[Entry], list[str]]:
     """Parse every ``yaml shared-artifact`` fenced block → (entries, errors)."""
     entries: list[Entry] = []
     errors: list[str] = []
+    matched = 0
+    # Count fence OPENINGS: an opener with no matching close never becomes a block,
+    # so if any opener is unmatched a malformed/unclosed block was silently skipped.
+    open_fences = len(re.findall(r"(?m)^```yaml[ \t]+shared-artifact\b", text))
     for i, match in enumerate(_BLOCK_RE.finditer(text), start=1):
+        matched += 1
         raw = match.group(1)
         try:
             data = yaml.safe_load(raw)
@@ -164,6 +175,11 @@ def parse_registry(text: str) -> tuple[list[Entry], list[str]]:
                 allowlist=[str(x) for x in allowlist],
             )
         )
+    if open_fences > matched:
+        errors.append(
+            f"{open_fences - matched} 'yaml shared-artifact' fence(s) opened but did not "
+            f"close/parse (malformed or unclosed block) — refusing rather than silently skipping."
+        )
     return entries, errors
 
 
@@ -177,26 +193,25 @@ def actual_consumers(
     """Repo-relative paths of files under scan_roots containing ANY literal (fixed substring).
 
     ``excluded`` (the writer/doc + allowlist, as posix relpaths) are dropped.
-    Fixed-substring match — a literal is data, never a regex. Follows symlinked
-    directories (with a realpath loop guard) so a consumer behind a symlink is not
-    silently missed. ``on_error`` (if given) is called with the OSError when a
-    directory cannot be listed, so the caller can fail closed instead of going
-    silently blind; unreadable individual files are skipped.
+    Fixed-substring match — a literal is data, never a regex. Symlinked directories
+    under a scan root are NOT traversed (os.walk followlinks=False); each is instead
+    reported via ``on_error`` so the caller fails CLOSED — a consumer behind a
+    symlink is surfaced loudly, never silently missed, and there is no real-vs-symlink
+    path-attribution ambiguity. ``on_error`` is also called when a directory cannot be
+    listed; unreadable individual files are skipped.
     """
     found: set[str] = set()
-    seen_dirs: set[str] = set()  # realpaths — loop guard for followlinks
-    walk_error = on_error if on_error is not None else (lambda _exc: None)
+    report = on_error if on_error is not None else (lambda _exc: None)
     for root in scan_roots:
         root_dir = base / root
         if not root_dir.is_dir():
             continue
-        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=True, onerror=walk_error):
-            real = os.path.realpath(dirpath)
-            if real in seen_dirs:
-                dirnames[:] = []  # already walked via its real path — don't re-descend/loop
-                continue
-            seen_dirs.add(real)
+        for dirpath, dirnames, filenames in os.walk(root_dir, onerror=report):
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for d in list(dirnames):
+                if (Path(dirpath) / d).is_symlink():
+                    rel = (Path(dirpath) / d).relative_to(base).as_posix()
+                    report(OSError(f"symlinked directory not traversed: {rel}"))
             for name in filenames:
                 path = Path(dirpath) / name
                 rel = path.relative_to(base).as_posix()

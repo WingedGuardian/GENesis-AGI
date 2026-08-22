@@ -246,6 +246,21 @@ def test_multiline_token_concatenates_and_warns(tmp_path):
     assert "spanned 2 non-empty lines" in r.stderr
 
 
+def test_multiple_complete_tokens_refused(tmp_path):
+    """Two lines that EACH look like a whole token are distinct tokens, not a wrap —
+    refuse rather than concatenate them into a garbage credential."""
+    home = tmp_path / "home"
+    home.mkdir()
+    src = tmp_path / "intoken"
+    src.write_text("sk-ant-oat01-aaaaaa\nsk-ant-oat01-bbbbbb\n")
+    src.chmod(0o600)
+    env = {"PATH": _BASE_PATH, "HOME": str(home)}
+    r = _run(env, "", "--file", str(src))
+    assert r.returncode == 1
+    assert "complete tokens" in r.stderr.lower()
+    assert not (home / ".genesis" / "cc_oauth_token.env").exists()
+
+
 def test_help_lists_file_option_without_leaking_code(tmp_path):
     """--help prints only the header block (robust to its length), not script code."""
     env = {"PATH": _BASE_PATH, "HOME": str(tmp_path)}
