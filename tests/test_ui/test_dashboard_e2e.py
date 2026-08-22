@@ -7,9 +7,10 @@ actually boots, static assets actually load, tab routing actually runs, and the
 cookie login round-trips in a real browser.
 
 Runtime-only. Playwright + Chromium live in the ``.[browser]`` extra and are NOT
-installed in CI, so this module skips there via ``importorskip`` (in conftest);
-the directory is also ``--ignore``d by CI (.github/workflows/ci.yml). Browser
-E2E is a local / on-demand harness, never part of the headless CI run:
+installed in CI, so when it's absent the conftest sets ``collect_ignore_glob`` to
+skip the whole directory cleanly during collection; the directory is also
+``--ignore``d by CI (.github/workflows/ci.yml). Browser E2E is a local /
+on-demand harness, never part of the headless CI run:
 
     pip install -e '.[browser]' && playwright install chromium
     pytest tests/test_ui/ -v

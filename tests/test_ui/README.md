@@ -16,8 +16,9 @@ playwright install chromium
 pytest tests/test_ui/ -v
 ```
 
-If `playwright` isn't installed, the whole directory **skips cleanly**
-(`importorskip`).
+If `playwright` isn't installed, the conftest sets `collect_ignore_glob` so the
+whole directory **skips cleanly** during collection (a module-level `importorskip`
+would instead raise a collection *error*, which is the bug this guard avoids).
 
 ## Why this is not in CI
 

@@ -1,8 +1,9 @@
 """Shared fixtures for browser-level dashboard E2E (Playwright).
 
 See ``test_dashboard_e2e.py`` for the harness rationale. Playwright + Chromium
-are the ``.[browser]`` extra (absent in CI), so the whole ``tests/test_ui/``
-tree skips there via ``importorskip`` and is additionally ``--ignore``d by CI.
+are the ``.[browser]`` extra (absent in CI), so when it's missing this conftest
+sets ``collect_ignore_glob`` to skip the whole ``tests/test_ui/`` tree cleanly
+during collection (CI also ``--ignore``s it, belt-and-suspenders).
 """
 
 from __future__ import annotations
@@ -12,10 +13,17 @@ import threading
 import pytest
 from werkzeug.serving import make_server
 
-# Skip the entire directory cleanly when Playwright isn't installed (CI, or an
-# install without the browser extra).
-pytest.importorskip("playwright", reason="playwright not installed (browser extra)")
-from playwright.sync_api import sync_playwright  # noqa: E402
+# Playwright is the optional ``.[browser]`` extra. A conftest MUST import cleanly
+# even when it's absent, because pytest reads ``collect_ignore_glob`` from the
+# imported module — a module-level ``importorskip`` or ``import playwright`` would
+# instead raise *while loading the conftest*, which pytest surfaces as a COLLECTION
+# ERROR (exit 1), not a skip. So detect the extra here and, when absent, exclude
+# the whole directory; the ``sync_playwright`` import is deferred into the one
+# fixture that needs it.
+try:
+    import playwright  # noqa: F401
+except ImportError:
+    collect_ignore_glob = ["*"]
 
 
 def _build_dashboard_app(monkeypatch, tmp_home, *, password: str | None):
@@ -91,6 +99,11 @@ def serve_dashboard(monkeypatch, tmp_path):
 @pytest.fixture
 def browser_page():
     """Headless Chromium page. Skips if the browser binary can't launch."""
+    # Deferred import: the conftest must load without the optional ``.[browser]``
+    # extra (see the module docstring). This fixture only runs when the directory
+    # was collected, which happens only when playwright is importable.
+    from playwright.sync_api import sync_playwright
+
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch(headless=True)
