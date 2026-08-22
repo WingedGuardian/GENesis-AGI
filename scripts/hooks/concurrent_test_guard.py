@@ -21,22 +21,22 @@ invoked with `-m pytest`.
 from __future__ import annotations
 
 import os
-import re
 import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
+from shell_parse import command_runs_pytest  # noqa: E402
 
 
 def _command_runs_pytest(cmd: str) -> bool:
-    """Check if a shell command will invoke pytest (any variant)."""
-    # Match pytest as a standalone command or as a module invocation.
-    # Covers: pytest, python -m pytest, python3 -m pytest, chained commands,
-    # and env-var prefixed invocations (PYTHONPATH=src pytest ...).
-    # Does NOT match: "grep pytest", "cat pytest.ini", etc. — requires word boundary.
-    # The (?:\w+=\S*\s+)* handles env var assignments before the command.
-    return bool(re.search(r"(?:^|&&|;|\|)\s*(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b", cmd))
+    """Whether a shell command will invoke pytest (any variant), quote-aware.
+
+    Delegates to the canonical shell parser so a ``pytest`` mentioned only inside a
+    quoted argument — e.g. ``grep 'a|pytest' f`` — is NOT treated as a run (the old
+    raw-regex scan matched the ``|pytest`` inside such a grep pattern and false-blocked).
+    """
+    return command_runs_pytest(cmd)
 
 
 def _argv_is_pytest(argv: list[str]) -> bool:

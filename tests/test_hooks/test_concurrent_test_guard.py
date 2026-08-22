@@ -89,7 +89,8 @@ class TestArgvClassifier:
 
 
 class TestCommandMatcher:
-    """The Bash-command matcher is unchanged — spot-check its boundaries."""
+    """The Bash-command matcher now routes through shell_parse.command_runs_pytest
+    (quote-aware) — spot-check its boundaries, incl. the quoted-pipe false-positive."""
 
     def test_plain_pytest(self):
         assert _command_runs_pytest("pytest tests/foo.py")
@@ -108,6 +109,12 @@ class TestCommandMatcher:
 
     def test_cat_ini_not_matched(self):
         assert not _command_runs_pytest("cat pytest.ini")
+
+    def test_pytest_inside_quoted_grep_pattern_not_matched(self):
+        # The bug this fixes: a `|pytest` inside a quoted grep/regex pattern used to
+        # match the raw-regex scan (| read as a shell pipe) and false-block.
+        assert not _command_runs_pytest('grep -rniE "full_suite|pytest|x" file')
+        assert not _command_runs_pytest("rg -n 'a|pytest|b' scripts/")
 
 
 def _run_guard(command: str) -> subprocess.CompletedProcess:

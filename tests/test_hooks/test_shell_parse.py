@@ -25,6 +25,38 @@ def _commit_nv(cmd: str) -> bool:
     return any(sp.commit_skips_hooks(s.argv) for s in sp.analyze(cmd))
 
 
+# ── pytest-invocation detection (shared by the test guards) ─────────────
+
+
+class TestPytestDetection:
+    def test_bare_pytest(self):
+        assert sp.command_runs_pytest("pytest tests/")
+
+    def test_python_m_pytest(self):
+        assert sp.command_runs_pytest("python -m pytest tests/x.py")
+
+    def test_env_prefixed(self):
+        assert sp.command_runs_pytest("PYTHONPATH=src pytest tests/")
+
+    def test_chained(self):
+        assert sp.command_runs_pytest("ruff check . && pytest -q")
+
+    def test_venv_path_entrypoint(self):
+        seg = sp.analyze("/home/u/genesis/.venv/bin/pytest -q")[0]
+        assert sp.is_pytest_invocation(seg)
+
+    def test_grep_word_not_matched(self):
+        assert not sp.command_runs_pytest("grep pytest scripts/foo.py")
+
+    def test_pytest_in_quoted_pipe_pattern_not_matched(self):
+        # the quoted-| false positive: `|pytest` inside a grep pattern is not a run
+        assert not sp.command_runs_pytest('grep -rniE "full_suite|pytest|x" f')
+        assert not sp.command_runs_pytest("rg -n 'a|pytest|b' scripts/")
+
+    def test_pytest_cov_module_not_matched(self):
+        assert not sp.command_runs_pytest("python -m pytest_cov")
+
+
 # ── git subcommand resolution through wrappers ──────────────────────────
 
 

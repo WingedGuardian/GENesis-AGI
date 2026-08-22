@@ -1,105 +1,99 @@
-"""PreToolUse hook: warn when running full pytest suite without a specific path.
+"""PreToolUse hook: BLOCK a full-suite / whole-directory local pytest run.
 
-Running the entire test suite (5900+ tests, ~10 min) during iterative
-development wastes time.  Targeted tests (specific file or directory)
-run in seconds.  This hook detects bare `pytest` or `pytest -v` (no
-test path) and warns the user.
+Running a whole test directory locally on this shared box (let alone ``tests/``)
+duplicates CI's authoritative full run and starves the live Genesis services —
+which repeatedly OOM-killed the run mid-suite. Targeted local testing is a
+SPECIFIC file (or a ``-k``/``-m`` selector); CI runs the full suite on every push.
 
-Allowed without warning:
-  - pytest tests/specific_file.py
-  - pytest tests/some_dir/ -v
-  - ruff check . && pytest -v  (pre-commit pattern — allowed)
-  - Commands with explicit path arguments
+This hook BLOCKS (exit 2) a pytest segment that targets no specific ``.py`` file
+and no ``-k``/``-m`` selector — i.e. bare ``pytest`` / ``pytest -v`` or a bare
+directory like ``tests/`` or ``tests/test_scripts/``. Detection routes through
+``shell_parse.analyze`` (quote-aware), so a ``|pytest`` inside a quoted argument
+is not misread as a run.
 
-Blocked with warning:
-  - pytest -v
-  - python -m pytest -q
-  - pytest --tb=short  (flags only, no path)
+Allowed:
+  - pytest tests/foo/test_bar.py            (a specific file / nodeid)
+  - pytest tests/foo -k test_bar            (a -k/-m selector narrows the run)
+  - pytest tests/ -q  # full-suite-ok       (explicit override)
+Blocked:
+  - pytest -v                               (no path at all)
+  - python -m pytest tests/test_scripts/    (a whole directory)
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import sys
 
-# Self-locate so `from hook_input import …` resolves both when CC runs this as a
-# script and when it is imported as a module for tests (importlib does not add
-# the file's dir to sys.path).
+# Self-locate so the sibling imports resolve whether CC runs this as a script or
+# it is imported as a module for tests.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload  # noqa: E402
-
-# Flags that pytest accepts (non-exhaustive but covers common ones).
-# Used to distinguish "pytest -v" (no path) from "pytest tests/foo.py -v".
-_PYTEST_FLAGS = re.compile(
-    r"^-[a-zA-Z]"  # short flags: -v, -x, -q, -s, etc.
-    r"|^--[a-z]"  # long flags: --verbose, --tb=short, etc.
-    r"|^[0-9]"  # bare numbers (unlikely but safe to skip)
+from shell_parse import (  # noqa: E402
+    Segment,
+    analyze,
+    has_trailing_override,
+    is_pytest_invocation,
 )
 
+_OVERRIDE = "full-suite-ok"
 
-def _is_full_suite(cmd: str) -> bool:
-    """Return True if cmd runs pytest without a specific test path."""
-    # Split on && and ; to handle chained commands
-    parts = re.split(r"&&|;", cmd)
-    for part in parts:
-        part = part.strip()
-        # Find the pytest invocation
-        match = re.search(
-            r"(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b(.*)",
-            part,
-        )
-        if not match:
-            continue
+# pytest flags that consume the FOLLOWING token as their value (so that value is
+# not a positional path). Non-exhaustive but covers the common ones; an unlisted
+# value-flag only risks fail-OPEN (not blocking), never a wrong block.
+_VALUE_FLAGS = {
+    "-p",
+    "--tb",
+    "--timeout",
+    "--rootdir",
+    "-c",
+    "-W",
+    "--override-ini",
+    "-o",
+    "--deselect",
+    "--ignore",
+    "--ignore-glob",
+    "--maxfail",
+    "-n",
+}
 
-        args_str = match.group(1).strip()
-        if not args_str:
-            return True  # bare "pytest" with no args
 
-        # Split remaining args and check if any is a path (not a flag) OR a
-        # -k/-m selector with a value (a targeted subset, NOT the full suite).
-        args = args_str.split()
-        has_path = False
-        has_selector = False
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            if arg in (">", "2>&1", "|"):
-                break  # redirection/pipe — stop parsing
-            if arg.startswith("-"):
-                # A -k/-m selector (separate value or =form) narrows the run to
-                # a named subset — treating it as "full suite" was a cosmetic FP.
-                _sep_val = arg in ("-k", "-m") and i + 1 < len(args)
-                # `--markers=…` is not a real pytest invocation (bare --markers
-                # just lists markers), so it is not a selector; --keyword is the
-                # long form of -k and stays.
-                _eq_form = arg.startswith(("-k", "-m", "--keyword")) and "=" in arg
-                _glued = arg.startswith(("-k", "-m")) and len(arg) > 2 and "=" not in arg
-                if _sep_val or _eq_form or _glued:
-                    has_selector = True
-                # Flag — skip it (and its value if it takes one)
-                if arg in (
-                    "-k",
-                    "-m",
-                    "--tb",
-                    "-p",
-                    "--timeout",
-                    "--rootdir",
-                    "-c",
-                    "--co",
-                    "-W",
-                    "--override-ini",
-                ):
-                    i += 1  # skip the next arg too (flag value)
-            elif "/" in arg or arg.endswith(".py"):
-                has_path = True
-                break
+def _pytest_args(seg: Segment) -> list[str]:
+    """Positional+flag args AFTER the pytest command word (entrypoint stripped)."""
+    argv = seg.argv
+    if seg.exe == "pytest":
+        return argv[1:]  # drop argv[0] entrypoint (may be a /path/to/pytest)
+    for i, tok in enumerate(argv):
+        if tok == "-m" and i + 1 < len(argv) and argv[i + 1] == "pytest":
+            return argv[i + 2 :]
+    return argv  # unreachable when is_pytest_invocation(seg) is True
+
+
+def _targets_specific_test(args: list[str]) -> bool:
+    """True if args name a specific ``.py`` file/nodeid OR carry a -k/-m selector.
+
+    False for a bare run or directory-only args — the case this hook blocks.
+    """
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("-"):
+            # a -k/-m selector (separate value, =form, or glued) narrows the run
+            if arg in ("-k", "-m") or arg.startswith(("-k", "-m", "--keyword")):
+                return True
+            if arg == "--pyargs":  # --pyargs pkg.mod → import-path targeting = a targeted run
+                return True
+            if arg in _VALUE_FLAGS:
+                i += 2  # skip the flag AND its value
+                continue
             i += 1
-
-        if not has_path and not has_selector:
+            continue
+        # A real .py file or nodeid — NOT a mere substring, so a directory like
+        # tests/.pytest_cache/ or foo.python_stuff/ does not defeat the block.
+        if arg.endswith(".py") or ".py::" in arg:
             return True
-
+        # a bare directory / non-file positional path → not targeted; keep scanning
+        i += 1
     return False
 
 
@@ -107,27 +101,30 @@ def main() -> None:
     cmd = field(read_payload(), "command")
     if not cmd:
         return
+    try:
+        segments = analyze(cmd)
+    except Exception:
+        return  # parse failure → fail open; never wrongly block a legit command
 
-    # Only care about commands that run pytest
-    if not re.search(r"(?:^|&&|;|\|)\s*(?:\w+=\S*\s+)*(?:python3?\s+-m\s+)?pytest\b", cmd):
+    pytest_segs = [s for s in segments if is_pytest_invocation(s)]
+    if not pytest_segs:
+        return
+    if any(has_trailing_override(s.raw, _OVERRIDE) for s in segments):
+        return  # explicit opt-in to a local full/dir run
+
+    # Block if ANY pytest segment is a non-targeted (bare or directory) run.
+    if all(_targets_specific_test(_pytest_args(s)) for s in pytest_segs):
         return
 
-    if _is_full_suite(cmd):
-        msg = json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": (
-                        "WARNING: You are about to run the FULL test suite (5900+ tests, ~10 min). "
-                        "During development, run only the specific test files for your changes. "
-                        "The full suite should run ONCE at pre-commit time, not during iteration. "
-                        "If this IS the pre-commit run, proceed. Otherwise, target your tests: "
-                        "pytest tests/path/to/specific_test.py -v"
-                    ),
-                }
-            }
-        )
-        print(msg)
+    print(
+        "BLOCKED: full-suite / whole-directory pytest run. On this shared box the "
+        "full suite duplicates CI and starves the live services (it was OOM-killed "
+        "mid-run). Target a specific file (pytest tests/path/test_x.py) or a -k/-m "
+        "selector, and let CI run the full suite on push. If you truly need the "
+        f"local full run, append '# {_OVERRIDE}' to the command.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 
 if __name__ == "__main__":
