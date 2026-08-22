@@ -116,8 +116,10 @@ class TestGather:
         now = datetime.now(UTC).isoformat()
         for _i in range(3):
             await db.execute(
-                "INSERT INTO observations (id, source, type, content, priority, created_at) "
-                "VALUES (?, 'test', 'test', 'content', 'low', ?)",
+                # WS-3: first-party origin so the fail-closed read gate surfaces
+                # these legit Genesis observations (NULL/external are excluded).
+                "INSERT INTO observations (id, source, type, content, priority, created_at, origin_class) "
+                "VALUES (?, 'test', 'test', 'content', 'low', ?, 'first_party')",
                 (str(uuid.uuid4()), now),
             )
         await db.commit()
@@ -131,14 +133,14 @@ class TestGather:
         # Create 3 unresolved and 2 resolved observations
         for i in range(3):
             await db.execute(
-                "INSERT INTO observations (id, source, type, content, priority, created_at, resolved) "
-                "VALUES (?, 'test', 'test', 'unresolved content', 'low', ?, 0)",
+                "INSERT INTO observations (id, source, type, content, priority, created_at, resolved, origin_class) "
+                "VALUES (?, 'test', 'test', 'unresolved content', 'low', ?, 0, 'first_party')",
                 (f"unresolved-{i}", now),
             )
         for i in range(2):
             await db.execute(
-                "INSERT INTO observations (id, source, type, content, priority, created_at, resolved) "
-                "VALUES (?, 'test', 'test', 'resolved content', 'low', ?, 1)",
+                "INSERT INTO observations (id, source, type, content, priority, created_at, resolved, origin_class) "
+                "VALUES (?, 'test', 'test', 'resolved content', 'low', ?, 1, 'first_party')",
                 (f"resolved-{i}", now),
             )
         await db.commit()
@@ -300,3 +302,50 @@ class TestEngagementByCategoryExcludesOwner:
         result = await gatherer._engagement_by_category(db)
         assert "content" in result
         assert "approval" not in result
+
+
+class TestOriginExclusion:
+    """WS-3: external/unknown-origin observations must not reach the deep-
+    reflection prompt (the laundering path into first-party user_model_updates)."""
+
+    @staticmethod
+    async def _mk(db, oid, typ, origin, source="s", when=None):
+        when = when or datetime.now(UTC).isoformat()
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, "
+            "created_at, origin_class) VALUES (?,?,?,?,?,?,?)",
+            (oid, source, typ, f"content-{oid}", "low", when, origin),
+        )
+        await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_eval_context_excludes_external_and_null(self, db, gatherer):
+        await self._mk(db, "us_owner", "user_signal", "owner")
+        await self._mk(db, "us_fp", "user_signal", "first_party")
+        await self._mk(db, "us_ext", "user_signal", "external_untrusted")
+        await self._mk(db, "us_null", "user_signal", None)
+        await self._mk(db, "ai_ext", "architecture_insight", "external_untrusted")
+        await self._mk(db, "ai_fp", "architecture_insight", "first_party")
+        # inbox digest content is external by construction
+        await self._mk(db, "ib_ext", "finding", "external_untrusted", source="inbox_evaluation")
+
+        ctx = await gatherer.gather_evaluation_context(db)
+
+        us_contents = {s["content"] for s in ctx["user_signals"]}
+        assert us_contents == {"content-us_owner", "content-us_fp"}, us_contents
+        ai_contents = {s["content"] for s in ctx["architecture_insights"]}
+        assert ai_contents == {"content-ai_fp"}, ai_contents
+        # external inbox finding excluded (until Fix B, intended)
+        assert ctx["inbox_findings"] == []
+
+    @pytest.mark.asyncio
+    async def test_recent_observations_excludes_external_and_null(self, db, gatherer):
+        await self._mk(db, "ro_owner", "insight", "owner")
+        await self._mk(db, "ro_ext", "insight", "external_untrusted")
+        await self._mk(db, "ro_null", "insight", None)
+
+        rows = await gatherer._recent_observations(db)
+        ids = {r["id"] for r in rows}
+        assert "ro_owner" in ids
+        assert "ro_ext" not in ids
+        assert "ro_null" not in ids

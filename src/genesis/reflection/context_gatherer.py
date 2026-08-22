@@ -216,9 +216,13 @@ class ContextGatherer:
         """Gather data for weekly quality calibration."""
         proc_stats = await self._procedure_stats(db)
 
-        # Get recent self-assessment scores for trend comparison
+        # Get recent self-assessment scores for trend comparison. WS-3: content
+        # surfaces into the calibration prompt, so exclude external/unknown-origin
+        # rows (type is a free write param — an injected self_assessment must not
+        # reach this prompt).
         assessments = await observations.query(
             db, type="self_assessment", limit=4,
+            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
         )
 
         return {
@@ -246,6 +250,8 @@ class ContextGatherer:
             since = last_deep[0].get("created_at", "")
             all_obs = await observations.query(
                 db, resolved=False, limit=100, exclude_types=_micro_excl,
+                # WS-3: exclude external/unknown-origin from deep-reflection context.
+                origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
             )
             result = [o for o in all_obs if o.get("created_at", "") > since]
         else:
@@ -253,6 +259,8 @@ class ContextGatherer:
             cutoff = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
             all_obs = await observations.query(
                 db, resolved=False, limit=100, exclude_types=_micro_excl,
+                # WS-3: exclude external/unknown-origin from deep-reflection context.
+                origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
             )
             result = [o for o in all_obs if o.get("created_at", "") >= cutoff]
 
@@ -512,27 +520,35 @@ class ContextGatherer:
         """
         cutoff = (datetime.now(UTC) - timedelta(days=14)).isoformat()
 
+        # WS-3: deep reflection synthesizes user_model_updates that get stamped
+        # first_party by run-window origin — so external-origin content reaching
+        # this prompt would LAUNDER past the #1407 user-model gate. Exclude
+        # external/unknown-origin rows at every pull (NULL excluded, fail-closed).
+        # Inbox digests are external by construction → dropped here until Fix B
+        # (intended; see PR body).
+        _safe = list(observations.SAFE_SURFACING_ORIGINS)
+
         # User signals from any channel
         user_signals = await observations.query(
-            db, type="user_signal", limit=30,
+            db, type="user_signal", limit=30, origin_class_in=_safe,
         )
         user_signals = [o for o in user_signals if o.get("created_at", "") >= cutoff]
 
         # Architecture insights
         arch_insights = await observations.query(
-            db, type="architecture_insight", limit=20,
+            db, type="architecture_insight", limit=20, origin_class_in=_safe,
         )
         arch_insights = [o for o in arch_insights if o.get("created_at", "") >= cutoff]
 
         # Previous interaction themes (from earlier synthesis runs)
         themes = await observations.query(
-            db, type="interaction_theme", limit=10,
+            db, type="interaction_theme", limit=10, origin_class_in=_safe,
         )
         themes = [o for o in themes if o.get("created_at", "") >= cutoff]
 
         # Inbox-sourced observations specifically
         inbox_obs = await observations.query(
-            db, source="inbox_evaluation", limit=20,
+            db, source="inbox_evaluation", limit=20, origin_class_in=_safe,
         )
         inbox_obs = [o for o in inbox_obs if o.get("created_at", "") >= cutoff]
 

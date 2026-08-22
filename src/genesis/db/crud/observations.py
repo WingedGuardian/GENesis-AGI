@@ -10,6 +10,22 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# WS-3 read-side origin gate. The origin classes trusted to surface content into
+# laundering-critical LLM context (essential_knowledge L1, the reflection /
+# perception prompt pipeline). NULL is EXCLUDED (fail-closed): after the origin
+# backfill (migration 0085) an unstamped row is an UNKNOWN-origin row, and an
+# unknown-origin observation must never reach a privileged surface.
+#
+# Two forms of the SAME trusted set:
+#  - SAFE_SURFACING_ORIGINS — for observations.query(origin_class_in=...) callers.
+#  - SAFE_ORIGIN_SQL — a raw predicate for the two essential_knowledge readers
+#    that build SQL directly (not via query()).
+# Literals (not imported from memory.provenance) to avoid a crud→memory layering
+# cycle; pinned equal to provenance.ORIGIN_OWNER/ORIGIN_FIRST_PARTY by
+# tests/test_db/test_observations.py::test_safe_surfacing_origins_match_constants.
+SAFE_SURFACING_ORIGINS: tuple[str, str] = ("owner", "first_party")
+SAFE_ORIGIN_SQL = "origin_class IN ('owner', 'first_party')"
+
 # Types that should NEVER expire — the observation IS the authoritative record.
 _PERMANENT_TYPES: frozenset[str] = frozenset(
     {

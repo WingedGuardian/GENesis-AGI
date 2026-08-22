@@ -475,3 +475,77 @@ async def test_skip_if_duplicate_is_atomic_single_statement(db):
         db, id="atomic3", skip_if_duplicate=True, **_GIT_ALERT
     )
     assert r3 == "atomic3"
+
+
+# ── WS-3 read-side origin gate (SAFE_SURFACING_ORIGINS / SAFE_ORIGIN_SQL) ────
+
+
+def test_safe_surfacing_origins_match_constants():
+    """The read-side trusted set is pinned equal to the provenance constants,
+    and the raw-SQL fragment lists the same two literals (NULL-excluding)."""
+    from genesis.db.crud.observations import (
+        SAFE_ORIGIN_SQL,
+        SAFE_SURFACING_ORIGINS,
+    )
+    from genesis.memory.provenance import ORIGIN_FIRST_PARTY, ORIGIN_OWNER
+
+    assert SAFE_SURFACING_ORIGINS == (ORIGIN_OWNER, ORIGIN_FIRST_PARTY)
+    assert SAFE_ORIGIN_SQL == "origin_class IN ('owner', 'first_party')"
+    # external_untrusted must NOT be in the trusted set.
+    assert "external_untrusted" not in SAFE_SURFACING_ORIGINS
+
+
+async def test_query_origin_gate_excludes_external_and_null(db):
+    """query(origin_class_in=SAFE_SURFACING_ORIGINS) keeps owner/first_party,
+    drops external_untrusted AND NULL (fail-closed)."""
+    from genesis.db.crud.observations import SAFE_SURFACING_ORIGINS
+
+    base = dict(type="user_signal", content="c", priority="low")
+    await observations.create(
+        db, id="g_owner", origin_class="owner", source="s", created_at="2026-01-04", **base
+    )
+    await observations.create(
+        db, id="g_fp", origin_class="first_party", source="s", created_at="2026-01-03", **base
+    )
+    await observations.create(
+        db, id="g_ext", origin_class="external_untrusted", source="s", created_at="2026-01-02", **base
+    )
+    # NULL origin (unknown source, no env/explicit) — must be excluded too.
+    import os
+
+    os.environ.pop("GENESIS_SESSION_ORIGIN", None)
+    await observations.create(
+        db, id="g_null", source="brand_new_writer_xyz", created_at="2026-01-01", **base
+    )
+
+    rows = await observations.query(
+        db, type="user_signal", origin_class_in=list(SAFE_SURFACING_ORIGINS), limit=50
+    )
+    ids = {r["id"] for r in rows}
+    assert ids == {"g_owner", "g_fp"}, ids
+
+
+async def test_safe_origin_sql_fragment_excludes_external_and_null(db):
+    """The raw SAFE_ORIGIN_SQL predicate (used by essential_knowledge) has the
+    same NULL-excluding semantics when embedded in a hand-built query."""
+    from genesis.db.crud.observations import SAFE_ORIGIN_SQL
+
+    base = dict(type="conversation_pivot", content="c", priority="low")
+    await observations.create(
+        db, id="p_owner", origin_class="owner", source="session:x", created_at="2026-01-02", **base
+    )
+    await observations.create(
+        db, id="p_ext", origin_class="external_untrusted", source="session:y", created_at="2026-01-02", **base
+    )
+    import os
+
+    os.environ.pop("GENESIS_SESSION_ORIGIN", None)
+    await observations.create(
+        db, id="p_null", source="brand_new_writer_xyz", created_at="2026-01-02", **base
+    )
+
+    cur = await db.execute(
+        f"SELECT id FROM observations WHERE type='conversation_pivot' AND {SAFE_ORIGIN_SQL}"  # noqa: S608
+    )
+    ids = {r[0] for r in await cur.fetchall()}
+    assert ids == {"p_owner"}, ids
