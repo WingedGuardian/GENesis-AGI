@@ -122,11 +122,17 @@ _AUTORUN_PROMPT = (
 # Observe-mode reachability probe: a MINIMAL dispatch that exercises the real
 # `claude -p` OAuth hop end-to-end. `check_health_cached()` passes even when the
 # remote's model auth is dead (it checks the SSH/module, not the model login), so
-# ONLY a real dispatch proves the bridge can actually answer. Kept free of
-# outreach/draft/stage vocabulary so it never trips the engine's own outreach hooks
-# (see the _AUTORUN_PROMPT note above); the reply CONTENT is irrelevant — any
-# non-empty answer proves reachability.
-_PROBE_PROMPT = 'This is Genesis. Reply with exactly this and nothing else: {"ok":true}'
+# ONLY a real dispatch proves the bridge can actually answer. The reply CONTENT is
+# irrelevant — any non-empty answer proves reachability. Deliberately NOT
+# injection-shaped: a self-identifying liveness ping that asks for a plain
+# acknowledgement, NOT a "reply with this opaque blob, nothing else" demand — the
+# latter (verified live 2026-08-21) trips the engine's injection-defense into a
+# refusal. Kept free of outreach/draft/stage vocabulary so it never trips the
+# engine's outreach hooks either (see the _AUTORUN_PROMPT note above).
+_PROBE_PROMPT = (
+    "Genesis bridge liveness check — automated, no action required. Reply with a brief "
+    "'ack' (any short text) to confirm this dispatch channel is reachable."
+)
 # A trivial reply returns in ~4s live; these bound a wedged probe without tying up the
 # full agentic dispatch_timeout_s/max_turns budget. (A raw subprocess dispatch with no
 # other watchdog is the justified exception to the no-speculative-timeout policy.)
