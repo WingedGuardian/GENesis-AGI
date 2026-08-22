@@ -168,8 +168,19 @@ class ConversationLoop:
         channel: ChannelType,
         thread_id: str | None = None,
         chat_id: str | None = None,
+        intent_text: str | None = None,
     ) -> str:
-        """Process a user message and return the response text."""
+        """Process a user message and return the response text.
+
+        ``intent_text`` (WS-3): the OWNER-authored text to scan for slash intents
+        (/task, /model, /effort, /resume) when *text* is a composite the caller
+        built (e.g. a Telegram quote-reply = quoted bot message + owner reply).
+        Quoted bot text can relay external content (inbox digests, recon
+        findings), so scanning it would let that content forge an owner-authorized
+        /task or flip the model. When set, control tokens + task-intent content
+        come ONLY from ``intent_text`` while *text* stays the LLM prompt (so the
+        quoted context is preserved). ``None`` → scan *text* itself (unchanged).
+        """
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
@@ -178,11 +189,18 @@ class ConversationLoop:
         except Exception:
             pass  # Don't let idle tracking break conversation
 
-        # Inline failure detection: scan user input for correction patterns
-        self._fire_user_correction_scan(text)
+        scan_text = intent_text if intent_text is not None else text
+        # Inline failure detection: scan owner-authored input for correction patterns
+        self._fire_user_correction_scan(scan_text)
 
-        intent = self._intent_parser.parse(text)
-        prompt_text = intent.cleaned_text or intent.raw_text
+        intent = self._intent_parser.parse(scan_text)
+        if intent_text is not None:
+            # Composite: keep full context for the LLM; task content is owner-only.
+            prompt_text = text
+            task_content = intent.cleaned_text or intent_text
+        else:
+            prompt_text = intent.cleaned_text or intent.raw_text
+            task_content = prompt_text
 
         if intent.task_requested:
             try:
@@ -195,7 +213,8 @@ class ConversationLoop:
                     id=str(_uuid.uuid4()),
                     source="conversation_intent",
                     type="task_detected",
-                    content=prompt_text,
+                    # WS-3: owner-authored content only (never the quoted composite)
+                    content=task_content,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
                     # WS-3: source is channel-agnostic (conversation_intent), so
@@ -435,11 +454,14 @@ class ConversationLoop:
         thread_id: str | None = None,
         session_key: str | None = None,
         chat_id: str | None = None,
+        intent_text: str | None = None,
     ) -> str:
         """Like handle_message but uses streaming for live progress.
 
         ``session_key`` (opaque) is stamped on the CC invocation so a caller's
         interrupt (Telegram /stop) targets this session's subprocess (cc-loop-01).
+        ``intent_text`` (WS-3): owner-authored text to scan for slash intents when
+        *text* is a composite (quote-reply) — see :meth:`handle_message`.
         """
         try:
             from genesis.runtime import GenesisRuntime
@@ -449,11 +471,18 @@ class ConversationLoop:
         except Exception:
             pass  # Don't let idle tracking break conversation
 
-        # Inline failure detection: scan user input for correction patterns
-        self._fire_user_correction_scan(text)
+        scan_text = intent_text if intent_text is not None else text
+        # Inline failure detection: scan owner-authored input for correction patterns
+        self._fire_user_correction_scan(scan_text)
 
-        intent = self._intent_parser.parse(text)
-        prompt_text = intent.cleaned_text or intent.raw_text
+        intent = self._intent_parser.parse(scan_text)
+        if intent_text is not None:
+            # Composite: keep full context for the LLM; task content is owner-only.
+            prompt_text = text
+            task_content = intent.cleaned_text or intent_text
+        else:
+            prompt_text = intent.cleaned_text or intent.raw_text
+            task_content = prompt_text
 
         if intent.task_requested:
             try:
@@ -466,7 +495,8 @@ class ConversationLoop:
                     id=str(_uuid.uuid4()),
                     source="conversation_intent",
                     type="task_detected",
-                    content=prompt_text,
+                    # WS-3: owner-authored content only (never the quoted composite)
+                    content=task_content,
                     priority="medium",
                     created_at=datetime.now(UTC).isoformat(),
                     # WS-3: source is channel-agnostic (conversation_intent), so

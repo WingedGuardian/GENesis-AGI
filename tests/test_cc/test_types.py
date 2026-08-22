@@ -140,6 +140,23 @@ def test_session_origin_for_channel():
     assert session_origin_for_channel("some_future_channel") == "external_untrusted"
 
 
+def test_observation_origin_for_channel():
+    """WS-3: an observation whose trust follows the analyzed channel. Owner-attended
+    → first_party (EXPLICIT, not None — an observation with NULL origin is excluded
+    from surfacing); every gateway/inbox/unknown channel → external_untrusted."""
+    from genesis.cc.types import observation_origin_for_channel
+
+    assert observation_origin_for_channel(ChannelType.TERMINAL) == "first_party"
+    assert observation_origin_for_channel(ChannelType.TELEGRAM) == "first_party"
+    assert observation_origin_for_channel("terminal") == "first_party"
+    for ch in (ChannelType.WEB, ChannelType.WHATSAPP, ChannelType.VOICE):
+        assert observation_origin_for_channel(ch) == "external_untrusted", ch
+    # the pipeline also passes the literal "inbox"; unknown/None fail-closed
+    assert observation_origin_for_channel("inbox") == "external_untrusted"
+    assert observation_origin_for_channel(None) == "external_untrusted"
+    assert observation_origin_for_channel("some_future_channel") == "external_untrusted"
+
+
 # --- StreamEvent tests ---
 
 

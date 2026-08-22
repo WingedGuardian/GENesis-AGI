@@ -17,7 +17,10 @@ async def _db() -> aiosqlite.Connection:
             content TEXT NOT NULL, priority TEXT NOT NULL, created_at TEXT NOT NULL,
             origin_class TEXT)"""
     )
-    await db.execute("CREATE TABLE cc_sessions (id TEXT PRIMARY KEY, origin_class TEXT)")
+    await db.execute(
+        "CREATE TABLE cc_sessions (id TEXT PRIMARY KEY, channel TEXT, "
+        "source_tag TEXT, origin_class TEXT)"
+    )
     await db.commit()
     return db
 
@@ -66,6 +69,64 @@ async def test_backfill_classifies_by_source_and_session():
         assert await _origin(db, "o_sess_null") is None
         # guard: a row already stamped is never overwritten
         assert await _origin(db, "o_preexist") == "first_party"
+    finally:
+        await db.close()
+
+
+async def test_backfill_new_first_party_sources():
+    """Codex PR #1431 finding C: follow_up_watchdog + ego_domain_redirect: classify
+    (snapshot kept in lockstep with the live classifier). retrospective/cc_debrief
+    are channel-stamped, NOT snapshot-classified → stay NULL (fail-closed)."""
+    db = await _db()
+    try:
+        await _ins(db, "o_fuw", "follow_up_watchdog")
+        await _ins(db, "o_ego", "ego_domain_redirect:ego_cycle")
+        await _ins(db, "o_retro", "retrospective")
+        await _ins(db, "o_debrief", "cc_debrief")
+        await db.commit()
+        await m0085.up(db)
+        assert await _origin(db, "o_fuw") == "first_party"
+        assert await _origin(db, "o_ego") == "first_party"
+        assert await _origin(db, "o_retro") is None  # channel-stamped, not source-derived
+        assert await _origin(db, "o_debrief") is None
+    finally:
+        await db.close()
+
+
+async def test_backfill_grandfathers_gateway_sessions():
+    """Step 0: pre-deploy gateway/voice cc_sessions rows with NULL origin are
+    stamped external_untrusted BEFORE the session-JOIN, so their observations
+    inherit it. NULL-channel adoptee (owner CLI) and telegram stay untouched."""
+    db = await _db()
+    try:
+        # gateway/voice foreground rows that predate the create-time stamp
+        await db.execute(
+            "INSERT INTO cc_sessions (id, channel, source_tag) VALUES "
+            "('W','web','foreground'),('H','whatsapp','foreground'),"
+            "('V','voice_s2s','voice'),('A',NULL,'foreground'),('T','telegram','foreground')"
+        )
+        await _ins(db, "o_web", "session:W")
+        await _ins(db, "o_voice", "session:V")
+        await _ins(db, "o_adopt", "session:A")  # NULL-channel owner CLI → stays NULL
+        await _ins(db, "o_tg", "session:T")  # telegram (owner) → stays NULL
+        await db.commit()
+        await m0085.up(db)
+
+        # cc_sessions themselves were grandfathered
+        cur = await db.execute("SELECT id, origin_class FROM cc_sessions ORDER BY id")
+        got = {r[0]: r[1] for r in await cur.fetchall()}
+        assert got == {
+            "A": None,
+            "H": "external_untrusted",
+            "T": None,
+            "V": "external_untrusted",
+            "W": "external_untrusted",
+        }
+        # and their observations inherited via the session-JOIN
+        assert await _origin(db, "o_web") == "external_untrusted"
+        assert await _origin(db, "o_voice") == "external_untrusted"
+        assert await _origin(db, "o_adopt") is None
+        assert await _origin(db, "o_tg") is None
     finally:
         await db.close()
 

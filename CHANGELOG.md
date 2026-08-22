@@ -36,7 +36,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   coverage guardrail fails CI on any new raw observation-insert that bypasses the
   origin chokepoint. The pushed-surfaces supervision exemption for interactive
   sessions is now restricted to owner-attended channels (terminal/Telegram); gateway
-  conversations no longer receive it.
+  conversations no longer receive it. Gateway and voice conversation sessions carry
+  a durable `external_untrusted` session origin so a reflection overlapping them
+  cannot launder its user-model delta to first-party, and the learning triage
+  pipeline stamps its per-session `retrospective`/`cc_debrief` observations with the
+  analyzed conversation's channel origin (an inbox/mail session's learnings can no
+  longer surface as first-party). The coverage guardrail now also follows the
+  indirect `ObservationWriter` writer and module-constant sources. On Telegram
+  quote-replies, slash-command and task intent are parsed from the owner's own reply
+  only — a `/task` (or `/model`, `/effort`, `/resume`) embedded in quoted bot text
+  can no longer forge an owner-authorized command.
 
 ### Fixed
 

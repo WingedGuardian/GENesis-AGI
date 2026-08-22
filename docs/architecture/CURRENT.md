@@ -274,8 +274,19 @@ verified: d71d1d39 2026-08-18
   `first_party`-stamped-delta laundering path, with a deep-reflection prompt-rule belt and a
   write-side coverage guardrail (`tests/test_security/test_observation_surface_coverage.py`)
   that fails CI on any raw `INSERT INTO observations` bypass. The gate-4 pushed-surfaces
-  `supervised` exemption is now channel-aware (owner-attended only). **STILL PARTIAL (PR-2,
-  tracked follow-up):** the read-side breadth — the ~28 ego/sentinel/guardian/surplus/dashboard/
+  `supervised` exemption is now channel-aware (owner-attended only). Session-origin coverage
+  is durable across the gateway class: `get_or_create_foreground` (web/OpenClaw) and
+  `register_voice_session` (voice) stamp `external_untrusted` on the `cc_sessions` row, so
+  `reflection_window_origin` cannot read a NULL as first-party and launder an overlapping
+  reflection's `user_model_delta` (0085 also grandfathers pre-deploy gateway/voice rows). The
+  learning triage pipeline's per-session `retrospective`/`cc_debrief` observations are stamped
+  with the analyzed conversation's channel origin (`cc.types.observation_origin_for_channel`),
+  forwarded to BOTH the observations row and its memory-store copy — an inbox/mail session's
+  debrief learnings can no longer surface first-party; and the coverage guardrail now follows
+  the indirect `ObservationWriter.write` path + module-constant sources. On Telegram
+  quote-replies, slash-command/task intent is parsed from the owner's own reply only (not the
+  quoted composite), closing the `/task`+`/model`+`/effort`+`/resume` forge via quoted bot
+  text. **STILL PARTIAL (PR-2, tracked follow-up):** the read-side breadth — the ~28 ego/sentinel/guardian/surplus/dashboard/
   MCP reads that should WRAP (not exclude) external content in a shared `render_safe` renderer,
   plus a read-side discovery guardrail and the boundary-marker zero-width normalization on the
   wrap path.

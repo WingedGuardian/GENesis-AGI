@@ -134,6 +134,25 @@ def session_origin_for_channel(channel: ChannelType | str | None) -> str | None:
     return ORIGIN_EXTERNAL_UNTRUSTED
 
 
+def observation_origin_for_channel(channel: ChannelType | str | None) -> str:
+    """WS-3 ``origin_class`` for an OBSERVATION whose trust follows the analyzed
+    conversation's channel (e.g. a retrospective/debrief the learning pipeline
+    writes ABOUT a session on *channel*).
+
+    Owner-attended (terminal/Telegram) → ``first_party``; every other channel
+    (web/OpenClaw, WhatsApp, voice, inbox, or unknown) → ``external_untrusted``
+    (fail-closed). Note the polarity difference from
+    :func:`session_origin_for_channel`, which returns ``None`` for owner-attended:
+    an OBSERVATION with NULL origin is EXCLUDED from surfacing (the read side
+    treats NULL as external), so an owner-attended observation must carry an
+    EXPLICIT ``first_party`` to survive — it cannot rely on a NULL coalesce.
+    Local import keeps cc.types dependency-light.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_FIRST_PARTY
+
+    return ORIGIN_FIRST_PARTY if is_owner_attended_channel(channel) else ORIGIN_EXTERNAL_UNTRUSTED
+
+
 def task_detected_origin(channel: ChannelType | str | None) -> str:
     """WS-3 origin_class to stamp on a ``task_detected`` observation, by channel.
 

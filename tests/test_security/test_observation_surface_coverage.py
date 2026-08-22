@@ -183,36 +183,85 @@ def test_crud_chokepoint_resolves_origin() -> None:
 # obs_crud.create, observation_crud.create/upsert).
 _OBS_RECEIVERS = {"observations", "obs_crud", "observation_crud"}
 
+# Receiver names / attrs for the INDIRECT chokepoint wrapper ObservationWriter
+# (learning/observation_writer.py) and the reflection output_router forwarder.
+# A write through these still lands an observations row (source= forwarded to
+# observations.create), so its source must classify too (Codex PR #1431 finding C).
+_WRITER_RECEIVER_NAMES = {"observation_writer", "obs_writer", "writer"}
+_WRITER_RECEIVER_ATTRS = {"_observation_writer", "_obs_writer"}
+_WRITER_METHODS = {"write", "_write_observation"}
+
+
+def _module_str_constants(tree: ast.AST) -> dict[str, str]:
+    """Map module-level ``NAME = "literal"`` assignments (e.g.
+    ``_FU_WATCHDOG_SOURCE = "follow_up_watchdog"``) so a ``source=<Name>`` arg can
+    be statically resolved to its literal."""
+    consts: dict[str, str] = {}
+    for node in getattr(tree, "body", []):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    consts[tgt.id] = node.value.value
+    return consts
+
+
+def _is_obs_create_call(fn: ast.expr) -> bool:
+    """``observations.create(...)`` / ``obs_crud.upsert(...)`` — direct chokepoint."""
+    return (
+        isinstance(fn, ast.Attribute)
+        and fn.attr in ("create", "upsert")
+        and isinstance(fn.value, ast.Name)
+        and fn.value.id in _OBS_RECEIVERS
+    )
+
+
+def _is_writer_call(fn: ast.expr) -> bool:
+    """``observation_writer.write(...)`` / ``self._observation_writer.write(...)`` /
+    ``self._write_observation(...)`` — the indirect chokepoint forwarders."""
+    if not isinstance(fn, ast.Attribute) or fn.attr not in _WRITER_METHODS:
+        return False
+    recv = fn.value
+    if isinstance(recv, ast.Name) and recv.id in _WRITER_RECEIVER_NAMES:
+        return True
+    if isinstance(recv, ast.Attribute) and recv.attr in _WRITER_RECEIVER_ATTRS:
+        return True
+    # self._write_observation(...) — the method call on self (output_router).
+    return fn.attr == "_write_observation" and isinstance(recv, ast.Name) and recv.id == "self"
+
 
 def _static_observation_sources() -> dict[str, str]:
-    """Map each STATIC ``source=`` literal on an observations.create/upsert Call
-    to a file, via AST (a regex with ``[^)]`` can't skip the ``)`` in a preceding
-    ``id=str(uuid.uuid4())`` arg — the reason the first version saw only ~9/46).
-    f-strings / variable sources are dynamic and intentionally skipped."""
+    """Map each STATIC ``source=`` value on a DIRECT observations.create/upsert
+    OR an INDIRECT ObservationWriter.write/_write_observation Call to a file, via
+    AST. Captures both string literals and ``source=<Name>`` that resolves to a
+    module-level string constant (a regex with ``[^)]`` can't skip the ``)`` in a
+    preceding ``id=str(uuid.uuid4())`` arg — why the first version saw only ~9/46).
+    f-strings and runtime-dynamic sources (``source=x["y"]``, ``source=source``
+    forwarded from a param) are genuinely unresolvable statically and skipped;
+    known dynamic PREFIXES are classified in ``_origin_from_source`` instead."""
     found: dict[str, str] = {}
     for path in _iter_py_files():
         try:
             tree = ast.parse(path.read_text())
         except (SyntaxError, UnicodeDecodeError):
             continue
+        module_consts = _module_str_constants(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             fn = node.func
-            if not (
-                isinstance(fn, ast.Attribute)
-                and fn.attr in ("create", "upsert")
-                and isinstance(fn.value, ast.Name)
-                and fn.value.id in _OBS_RECEIVERS
-            ):
+            if not (_is_obs_create_call(fn) or _is_writer_call(fn)):
                 continue
             for kw in node.keywords:
-                if (
-                    kw.arg == "source"
-                    and isinstance(kw.value, ast.Constant)
-                    and isinstance(kw.value.value, str)
-                ):
+                if kw.arg != "source":
+                    continue
+                if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
                     found.setdefault(kw.value.value, _rel(path))
+                elif isinstance(kw.value, ast.Name) and kw.value.id in module_consts:
+                    found.setdefault(module_consts[kw.value.id], _rel(path))
     return found
 
 
@@ -222,6 +271,7 @@ def test_every_static_observation_source_is_classified() -> None:
     A NEW writer with an unclassified source fails here — add it to the
     first-party allowlist / external set, or the user-content exceptions."""
     from genesis.memory.provenance import (
+        _CHANNEL_STAMPED_OBS_SOURCES,
         _USER_CONTENT_OBS_SOURCES,
         _origin_from_source,
     )
@@ -230,6 +280,8 @@ def test_every_static_observation_source_is_classified() -> None:
     for src, rel in _static_observation_sources().items():
         if src in _USER_CONTENT_OBS_SOURCES:
             continue  # origin stamped explicitly by channel (task_detected_origin)
+        if src in _CHANNEL_STAMPED_OBS_SOURCES:
+            continue  # origin stamped by analyzed channel (observation_origin_for_channel)
         if src.startswith(("session:", "module:", "intake:")):
             continue  # resolved dynamically (env / cc_sessions JOIN / intake split)
         if _origin_from_source(src) is None:

@@ -37,6 +37,17 @@ from genesis.memory.provenance import (
         ("auto_memory_harvest", ORIGIN_FIRST_PARTY),
         ("genesis_version", ORIGIN_FIRST_PARTY),
         ("outreach_recovery", ORIGIN_FIRST_PARTY),
+        # Codex PR #1431 finding C: follow-up watchdog (Genesis hygiene alert)
+        ("follow_up_watchdog", ORIGIN_FIRST_PARTY),
+        # ego_domain_redirect:<tag> — ego cognition is Genesis's own COO/CEO brain.
+        # Prefix rule (source interpolates the ego policy tag).
+        ("ego_domain_redirect:ego_cycle", ORIGIN_FIRST_PARTY),
+        ("ego_domain_redirect:user_ego_cycle", ORIGIN_FIRST_PARTY),
+        # retrospective / cc_debrief are NOT source-classified: their origin is the
+        # analyzed session's channel, stamped explicitly at the write site. Source
+        # derivation must return None (fail-closed) so an un-stamped caller is safe.
+        ("retrospective", None),
+        ("cc_debrief", None),
         # intake: routed through the authoritative _pipeline_for_source split
         ("intake:anticipatory_research", ORIGIN_FIRST_PARTY),  # finding #2: Genesis-authored
         ("intake:user_directed", ORIGIN_FIRST_PARTY),

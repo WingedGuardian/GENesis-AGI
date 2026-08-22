@@ -473,8 +473,19 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         "surplus_scheduler",
         "task_executor",
         "wal_health_monitor",
+        # Follow-up hygiene watchdog (awareness/loop.py _FU_WATCHDOG_SOURCE) — a
+        # Genesis-authored infrastructure alert, in-server first-party monitoring.
+        # (It embeds a truncated follow-up snippet; that snippet's own hygiene is
+        # a content concern, not an origin one — the OBSERVATION is Genesis's.)
+        "follow_up_watchdog",
     }
 )
+
+#: Prefix for ego domain-redirect observations (ego/session.py writes
+#: ``ego_domain_redirect:<source_tag>``). Ego cognition is Genesis's own COO/CEO
+#: brain → first_party. A prefix (not a literal) because the source interpolates
+#: the ego policy tag.
+_EGO_REDIRECT_SOURCE_PREFIX = "ego_domain_redirect:"
 
 #: User-content sources whose origin is NOT the source string — it depends on the
 #: WRITE CHANNEL/session, stamped explicitly at the write site (never allowlisted,
@@ -484,6 +495,18 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
 #: stamps it channel-aware. Listed here so the source-coverage guardrail treats
 #: them as consciously-classified, not accidentally-omitted.
 _USER_CONTENT_OBS_SOURCES: frozenset[str] = frozenset({"conversation_intent", "user_reply"})
+
+#: Genesis-ANALYSIS sources whose trust follows the ANALYZED session's channel,
+#: NOT the source string: the learning triage pipeline writes these ABOUT a
+#: conversation, and that conversation may be an external one (inbox/mail/web/
+#: voice). They are stamped explicitly at the write site via
+#: :func:`genesis.cc.types.observation_origin_for_channel` (learning/pipeline.py +
+#: attribution.py) — NEVER allowlisted, or an inbox/mail retrospective would read
+#: as first-party and launder external-session content into L1/reflection. Listed
+#: here so the source-coverage guardrail treats them as consciously-classified.
+#: (When the pipeline passes no explicit origin they fall to source-derive → None
+#: → fail-closed excluded, so a future un-stamped caller is safe, not trusted.)
+_CHANNEL_STAMPED_OBS_SOURCES: frozenset[str] = frozenset({"retrospective", "cc_debrief"})
 
 #: Prefix an observation ``source`` carries when it re-labels a surplus/recon
 #: intake finding: ``intake:<IntakeSource.value>``.
@@ -524,6 +547,8 @@ def _origin_from_source(source: str | None) -> str | None:
     if source in _EXTERNAL_OBS_SOURCES:
         return ORIGIN_EXTERNAL_UNTRUSTED
     if source in _FIRST_PARTY_OBS_SOURCES:
+        return ORIGIN_FIRST_PARTY
+    if source.startswith(_EGO_REDIRECT_SOURCE_PREFIX):
         return ORIGIN_FIRST_PARTY
     if source.startswith(_INTAKE_SOURCE_PREFIX):
         return _intake_observation_origin(source)

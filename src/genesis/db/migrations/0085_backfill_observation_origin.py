@@ -23,6 +23,20 @@ session-env (which is meaningless at migration time):
 
 Idempotent: every UPDATE is guarded ``WHERE origin_class IS NULL``. No commit —
 the runner owns the transaction.
+
+BOUNDED RESIDUAL (accepted, WS-3): path 2 trusts a historical row's OWN ``source``
+label, which the ``observation_write`` MCP tool lets a caller set freely. So a
+pre-0057 row that an external session forged with a first-party ``source`` would
+backfill first_party. This is bounded and accepted rather than closed: (a) it
+affects ONLY rows written before 0057 added the column (2026-07-14) — no
+provenance was READ before this PR, so there was no pre-existing gate to evade for
+gain; (b) such rows are >5 weeks old and TTL-expired out of the 7–14d surfacing
+windows; (c) going FORWARD every write is stamped at the chokepoint from the live
+session env, which a forged source cannot override. Closing the historical case
+would require per-row content forensics with no signal to key on; the forward
+invariant is the real fix. ``retrospective``/``cc_debrief`` are deliberately NOT
+snapshot-classified here (their origin is the analyzed session's channel, stamped
+live at the write site) — historical rows stay NULL → fail-closed excluded.
 """
 
 from __future__ import annotations
@@ -96,6 +110,7 @@ _SNAP_FIRST_PARTY = frozenset(
         "surplus_scheduler",
         "task_executor",
         "wal_health_monitor",
+        "follow_up_watchdog",
     }
 )
 # intake:<suffix> split — crawled-external vs Genesis-authored surplus.
@@ -122,6 +137,8 @@ def _classify_source_snapshot(source: str) -> str | None:
         return "external_untrusted"
     if source in _SNAP_FIRST_PARTY:
         return "first_party"
+    if source.startswith("ego_domain_redirect:"):
+        return "first_party"  # ego cognition (Genesis COO/CEO); see provenance snapshot
     if source.startswith(_SNAP_INTAKE_PREFIX):
         suffix = source[len(_SNAP_INTAKE_PREFIX) :]
         if suffix in _SNAP_INTAKE_EXTERNAL:
@@ -141,6 +158,25 @@ async def _has_table(db: aiosqlite.Connection, name: str) -> bool:
 async def up(db: aiosqlite.Connection) -> None:
     if not await _has_table(db, "observations"):
         return
+
+    # 0. Grandfather gateway/voice SESSION rows to external_untrusted BEFORE the
+    #    session-JOIN below, so their session-attributed observations inherit the
+    #    right origin. get_or_create_foreground / register_voice_session now stamp
+    #    this at creation, but pre-deploy foreground gateway rows keep NULL forever
+    #    (foreground sessions never auto-expire, and reuse never restamps). Key on
+    #    the ACTUAL stored channel values ('voice_s2s' for voice, NOT the
+    #    ChannelType 'voice'; source_tag='voice' as a belt). NULL-channel rows are
+    #    register_from_filesystem-adopted owner CLI sessions — correctly skipped.
+    if await _has_table(db, "cc_sessions"):
+        await db.execute(
+            """
+            UPDATE cc_sessions
+               SET origin_class = 'external_untrusted'
+             WHERE origin_class IS NULL
+               AND (channel IN ('web', 'whatsapp') OR channel = 'voice_s2s'
+                    OR source_tag = 'voice')
+            """
+        )
 
     # 1. Session-attributed rows inherit their session's origin_class.
     #    'session:' is 8 chars → the id starts at position 9 (SQLite substr is
