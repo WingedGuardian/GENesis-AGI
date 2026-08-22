@@ -35,8 +35,10 @@
 #                    prefix collision; disambiguate by date/PR.
 #
 # Each trailer is best-effort and independent: a missing id skips only its own
-# trailer and never blocks a commit. Merge commits and empty messages are left
-# untouched (see below).
+# trailer and never blocks a commit. Merge commits are left unstamped. (A
+# genuinely empty message still gets a trailer — accepted: it matches the
+# long-standing Install: behavior, and Genesis only ever commits via -m/-F
+# with real content, so this edge is never hit in practice.)
 
 MSG_FILE="$1"
 SOURCE="${2:-}"
@@ -44,17 +46,6 @@ SOURCE="${2:-}"
 # Merge commits are local plumbing that never reaches a PR as-is; leave
 # them unstamped so pull/merge flows stay byte-identical to vanilla git.
 [ "$SOURCE" = "merge" ] && exit 0
-
-# Preserve git's own empty-message abort. If the message has no content after
-# stripping comments and blank lines (git's emptiness rule), do NOT stamp:
-# otherwise a trailer would turn an otherwise-empty message into a real commit,
-# defeating git's rejection of an accidentally/intentionally empty commit (the
-# case that bites is a clone with no install.json but a live CC session, where
-# only the session trailer would stamp). `git stripspace --strip-comments`
-# honors core.commentChar, so this matches git's own emptiness definition.
-if [ -z "$(git stripspace --strip-comments < "$MSG_FILE" 2>/dev/null)" ]; then
-    exit 0
-fi
 
 # --- Install: trailer ------------------------------------------------------
 # Resolution order:

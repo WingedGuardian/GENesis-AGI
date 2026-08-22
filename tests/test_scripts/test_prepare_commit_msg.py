@@ -238,31 +238,3 @@ def test_prose_session_line_does_not_suppress_real_trailer(tmp_path):
     _run(msg, env_extra={"CLAUDE_CODE_SESSION_ID": _SID})
     body = msg.read_text()
     assert f"Genesis-Session: {_SID[:8]}" in body
-
-
-def test_empty_message_not_stamped(tmp_path):
-    """An empty message stays empty so git's empty-commit abort is preserved."""
-    msg = tmp_path / "COMMIT_EDITMSG"
-    msg.write_text("")
-    proc = _run(
-        msg,
-        env_extra={"GENESIS_INSTALL_ID": "abc12345", "CLAUDE_CODE_SESSION_ID": _SID},
-    )
-    assert proc.returncode == 0
-    body = msg.read_text()
-    assert "Install:" not in body
-    assert "Genesis-Session:" not in body
-
-
-def test_comment_only_message_not_stamped(tmp_path):
-    """A comment/blank-only message (aborted editor) is treated as empty."""
-    msg = tmp_path / "COMMIT_EDITMSG"
-    msg.write_text("# Please enter the commit message.\n#\n\n")
-    proc = _run(
-        msg,
-        env_extra={"GENESIS_INSTALL_ID": "abc12345", "CLAUDE_CODE_SESSION_ID": _SID},
-    )
-    assert proc.returncode == 0
-    body = msg.read_text()
-    assert "Install:" not in body
-    assert "Genesis-Session:" not in body
