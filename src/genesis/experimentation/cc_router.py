@@ -15,22 +15,32 @@ Single-completion only (``-p``); no tools, no session resume.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 
 from genesis.cc.types import (
+    SPAWN_TOOL_NAMES,
     VALID_EFFORT_NAMES,
     VALID_MODEL_NAMES,
     CCModel,
     model_supports_effort,
 )
 from genesis.experimentation.standalone_router import StandaloneRoutingResult
+from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
 
 _VALID_MODELS = VALID_MODEL_NAMES
 _VALID_EFFORTS = VALID_EFFORT_NAMES
+
+# Force a PURE single-turn completion: disable ALL built-in tools (incl. subagent
+# spawn — SPAWN_TOOL_NAMES) so ``claude -p`` reflects on the given text instead of
+# going agentic. "Task" was already blocked here; "Agent" is the current spawn name.
+_CLI_DISALLOWED_TOOLS: tuple[str, ...] = (
+    "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS",
+    "WebFetch", "WebSearch", "TodoWrite", "NotebookEdit", "NotebookRead",
+    "ExitPlanMode", *SPAWN_TOOL_NAMES,
+)
 
 
 class CCCliRouter:
@@ -67,8 +77,7 @@ class CCCliRouter:
             # goes agentic (explores logs/files) instead of reflecting on the
             # given text — slow + off-task. Disable the built-in tools.
             "--disallowedTools",
-            "Bash,Read,Write,Edit,MultiEdit,Glob,Grep,LS,WebFetch,WebSearch,Task,"
-            "TodoWrite,NotebookEdit,NotebookRead,ExitPlanMode",
+            ",".join(_CLI_DISALLOWED_TOOLS),
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',  # no MCP tools
             # Suppress SessionStart/UserPromptSubmit hooks (gstack/genesis inject
             # skill-lists + preambles that contaminate a bare completion).
@@ -97,6 +106,7 @@ class CCCliRouter:
         # text, not Genesis's project context bleeding into the reflection.
         env["GENESIS_CC_SESSION"] = "1"
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -104,18 +114,33 @@ class CCCliRouter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                # Own session/group (setsid in the C helper — never
+                # preexec_fn: post-fork Python can deadlock in the threaded
+                # server) so the timeout below can killpg the whole tree.
+                start_new_session=True,
             )
             out, err = await asyncio.wait_for(
                 proc.communicate(input=user.encode()), timeout=self._timeout_s,
             )
+        except asyncio.CancelledError:
+            # Cancellation: the detached child sees no ambient signal —
+            # group-kill before propagating or the tree leaks. proc may be
+            # unbound if the cancel landed during the spawn itself.
+            if proc is not None:
+                kill_process_group(proc)
+                await reap_bounded(proc)
+            raise
         except TimeoutError:
             logger.warning("cc-cli %s timed out after %ss", self._model, self._timeout_s)
-            # Reap the orphaned claude process (else it keeps running + holds a
-            # subscription slot). Mirrors CCInvoker's timeout handling.
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.wait()
+            # claude spawns MCP/helper children — a bare proc.kill() orphans
+            # them (they keep running + hold a subscription slot). Group-kill
+            # via the shared guarded helper (pid-as-pgid, pgid>1 guard,
+            # direct-kill fallback), then a BOUNDED reap. proc may be None if
+            # the spawn ITSELF raised ETIMEDOUT (TimeoutError is an OSError
+            # subclass) — degrade without a kill in that case.
+            if proc is not None:
+                kill_process_group(proc)
+                await reap_bounded(proc)
             return StandaloneRoutingResult(
                 success=False, content=None, model_id=self._model,
                 provider_used="cc-cli", error="timeout",

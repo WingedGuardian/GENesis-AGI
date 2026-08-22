@@ -184,7 +184,14 @@ class TestApplyVerdicts:
         drafts = [_draft("sharper, better text")]
         survivors = await sess._apply_reconcile_verdicts(
             drafts,
-            {0: {"verdict": "revise", "target_id": "rv11rv11rv11", "reason": "sharper"}},
+            {
+                0: {
+                    "verdict": "revise",
+                    "target_id": "rv11rv11rv11",
+                    "reason": "sharper",
+                    "scope": "operate",
+                }
+            },
             [board_row],
         )
         assert survivors == []  # dropped
@@ -279,7 +286,9 @@ class TestFailSafe:
         await _board_item(db, id="other1other10000", content="already pending text")
         drafts = [_draft("already pending text")]
         survivors = await sess._apply_reconcile_verdicts(
-            drafts, {0: {"verdict": "revise", "target_id": "tgt1tgt1tgt1"}}, [board_row]
+            drafts,
+            {0: {"verdict": "revise", "target_id": "tgt1tgt1tgt1", "scope": "operate"}},
+            [board_row],
         )
         assert survivors == drafts  # kept as new; revise skipped
         row = await ego_crud.get_proposal(db, "tgt1tgt1tgt10000")
@@ -296,7 +305,9 @@ class TestFailSafe:
         await db.commit()
         drafts = [_draft("new content")]
         survivors = await sess._apply_reconcile_verdicts(
-            drafts, {0: {"verdict": "revise", "target_id": "appr1appr1appr"}}, [board_row]
+            drafts,
+            {0: {"verdict": "revise", "target_id": "appr1appr1appr", "scope": "operate"}},
+            [board_row],
         )
         assert survivors == drafts  # kept
         row = await ego_crud.get_proposal(db, "appr1appr1appr00")
@@ -352,10 +363,10 @@ class TestFailSafe:
 
         real_reaffirm = ego_crud.reaffirm_proposal
 
-        async def flaky_reaffirm(dbc, pid):
+        async def flaky_reaffirm(dbc, pid, **kwargs):
             if pid == "boom1boom1boom00":
                 raise RuntimeError("boom")
-            return await real_reaffirm(dbc, pid)
+            return await real_reaffirm(dbc, pid, **kwargs)
 
         monkeypatch.setattr(ego_crud, "reaffirm_proposal", flaky_reaffirm)
 

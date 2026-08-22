@@ -181,13 +181,35 @@ class EgoConfig:
     # Genesis ego (COO) independent scheduling — defaults match user ego
     genesis_cadence_minutes: int = 90  # base interval for genesis ego
     genesis_max_interval_minutes: int = 240  # backoff ceiling for genesis ego
-    max_pending_proposals: int = 15  # auto-table oldest unranked when exceeded
+    max_pending_proposals: int = 15  # TOTAL across both egos — auto-table oldest unranked when exceeded
+    # Roadmap flag: Genesis developing itself (writing/refactoring its own code,
+    # reviewing PRs, scoping refactors) is OFF until explicitly unlocked. While
+    # False, the genesis ego's develop-scope proposals are deterministically
+    # tabled (never deleted) by the domain-boundary gate. Flip to True to unlock
+    # self-development when that capability is earned; the gate then passes
+    # develop-class proposals through to normal approval.
+    genesis_self_development_enabled: bool = False
     # Revalidation cadence (PR-6a): per-urgency hours after which a pending
     # proposal's premises are flagged "due for re-check" by the reconcile
     # stage. NEVER a kill path — overdue only queues verification (locked
     # decision #2: user latency never kills a proposal). Config-derived.
     revalidation_interval_hours: dict = field(
         default_factory=lambda: {"critical": 6, "high": 48, "normal": 72, "low": 168}
+    )
+    # Auto-table staleness window, per-urgency HOURS (critical 240=10d, high
+    # 336=14d, normal 504=21d, low 720=30d): how long a pending proposal may sit
+    # before auto_table_stale_proposals moves it to the recoverable 'tabled'
+    # cold lane (NOT deleted — the ego can un-table, and a still-relevant
+    # proposal is re-derived fresh next cycle). This is a BACKSTOP behind the
+    # reconcile cycle (which already withdraws stale/invalid proposals each
+    # pass), NOT the primary staleness mechanism — so windows sit generously
+    # ABOVE observed user decision-latency (median ~1-2d, tail to ~12d;
+    # 2026-08-06 review) to catch only the truly-abandoned, never to amputate the
+    # normal-cadence tail. Defaults-COMPLETE mapping (merged over defaults on
+    # load). Unranked proposals (never boarded) age out via a shorter floor (see
+    # the sweep's unranked_cap_hours).
+    auto_table_ttl_hours: dict = field(
+        default_factory=lambda: {"critical": 240, "high": 336, "normal": 504, "low": 720}
     )
     # Additive ego autonomy — cap on ACTIVE goals in the genesis ego's OWN
     # lane (origin='genesis_ego'). Pausing frees a slot; the paused tail is

@@ -10,6 +10,7 @@ import dataclasses
 import logging
 import os
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -59,21 +60,19 @@ def load_ego_config(path: Path | None = None) -> EgoConfig:
             ):
                 continue
             kwargs[field_name] = value
-    # revalidation_interval_hours is a defaults-COMPLETE mapping: consumers
-    # .get(urgency) and fall back to normal/72 only for MISSING keys, so a
-    # partial YAML override like {"high": 12} must merge OVER the declared
-    # defaults — wholesale replacement silently collapses omitted urgencies
-    # to 72h (critical 6→72, low 168→72). Other dict fields (e.g.
+    # revalidation_interval_hours and auto_table_ttl_hours are defaults-COMPLETE
+    # mappings: consumers .get(urgency) and fall back to normal only for
+    # MISSING keys, so a partial YAML override like {"high": 12} must merge
+    # OVER the declared defaults — wholesale replacement silently collapses
+    # omitted urgencies (critical 6→72, low 168→72). Other dict fields (e.g.
     # dispatch_model_overrides) are empty-by-default override maps where
     # wholesale assignment IS the semantics — do not blanket-merge those.
-    if "revalidation_interval_hours" in kwargs:
-        _reval_defaults = EgoConfig.__dataclass_fields__[
-            "revalidation_interval_hours"
-        ].default_factory()
-        kwargs["revalidation_interval_hours"] = {
-            **_reval_defaults,
-            **kwargs["revalidation_interval_hours"],
-        }
+    for _complete_field in ("revalidation_interval_hours", "auto_table_ttl_hours"):
+        if _complete_field in kwargs:
+            _defaults = EgoConfig.__dataclass_fields__[
+                _complete_field
+            ].default_factory()
+            kwargs[_complete_field] = {**_defaults, **kwargs[_complete_field]}
     return EgoConfig(**kwargs)
 
 
@@ -184,10 +183,30 @@ def validate_ego_config(changes: dict) -> list[str]:
                     errors.append(
                         f"revalidation_interval_hours[{_urg}] must be a positive number"
                     )
+    if "auto_table_ttl_hours" in changes:
+        v = changes["auto_table_ttl_hours"]
+        if not isinstance(v, dict):
+            errors.append("auto_table_ttl_hours must be a dict")
+        else:
+            _valid_urg = {"critical", "high", "normal", "low"}
+            for _urg, _hours in v.items():
+                if _urg not in _valid_urg:
+                    errors.append(
+                        f"auto_table_ttl_hours: unknown urgency {_urg!r} "
+                        f"(must be one of {sorted(_valid_urg)})"
+                    )
+                elif not isinstance(_hours, (int, float)) or isinstance(_hours, bool) or _hours <= 0:
+                    errors.append(
+                        f"auto_table_ttl_hours[{_urg}] must be a positive number"
+                    )
     if "calibration_injection_enabled" in changes and not isinstance(
         changes["calibration_injection_enabled"], bool
     ):
         errors.append("calibration_injection_enabled must be a boolean")
+    if "genesis_self_development_enabled" in changes and not isinstance(
+        changes["genesis_self_development_enabled"], bool
+    ):
+        errors.append("genesis_self_development_enabled must be a boolean")
     if "outcome_bus_capability_feed" in changes and not isinstance(
         changes["outcome_bus_capability_feed"], bool
     ):
@@ -232,3 +251,17 @@ def validate_ego_config(changes: dict) -> list[str]:
         if not isinstance(v, int) or isinstance(v, bool) or v < 1:
             errors.append("capability_improvement_max_signals must be integer >= 1")
     return errors
+
+
+def next_revalidate_at(urgency: str, *, from_dt: datetime | None = None) -> str:
+    """Next premise-recheck timestamp for a proposal of *urgency*.
+
+    One home for the revalidation-cadence math: ``create_batch`` uses it for
+    the initial stamp and the reconcile live-apply uses it to advance the
+    clock on reaffirm/revise (a just-revalidated item must not stay ⚠due).
+    Config-derived; degrades to the EgoConfig defaults.
+    """
+    intervals = load_ego_config().revalidation_interval_hours
+    hours = intervals.get(urgency, intervals.get("normal", 72))
+    base = from_dt if from_dt is not None else datetime.now(UTC)
+    return (base + timedelta(hours=hours)).isoformat()

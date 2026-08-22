@@ -13,7 +13,7 @@ def test_all_chains_are_non_empty():
 def test_get_chain_known():
     chain = get_chain("web_fetch")
     assert chain is not None
-    assert chain[0] == "firecrawl"
+    assert chain[0] == "live_auto_chain"
 
 
 def test_get_chain_unknown():
@@ -22,17 +22,17 @@ def test_get_chain_unknown():
 
 def test_get_next_method_first():
     method = get_next_method("web_fetch", [])
-    assert method == "firecrawl"
+    assert method == "live_auto_chain"
 
 
 def test_get_next_method_skips_failed():
-    method = get_next_method("web_fetch", ["firecrawl"])
-    assert method == "playwright"
+    method = get_next_method("web_fetch", ["live_auto_chain"])
+    assert method == "firecrawl_backend"
 
 
 def test_get_next_method_skips_multiple_failed():
-    method = get_next_method("web_fetch", ["firecrawl", "playwright"])
-    assert method == "requests_fallback"
+    method = get_next_method("web_fetch", ["live_auto_chain", "firecrawl_backend"])
+    assert method == "cache_lookup"
 
 
 def test_get_next_method_exhausted():

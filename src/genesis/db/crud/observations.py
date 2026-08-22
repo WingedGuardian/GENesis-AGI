@@ -72,6 +72,18 @@ INTERNAL_OBS_TYPES: frozenset[str] = frozenset(
         # aggregate infrastructure_alert (raised by the awareness cap detector when
         # a run of these accumulates) surfaces to the user.
         "cc_cap_empty_event",
+        # GitHub account-activity monitor — the Telegram ping (priority) and the
+        # 6h digest campaign are the delivery paths; these rows must NOT surface
+        # via the generic observation surfacers (would double-notify).
+        "github_account_activity",
+        "github_actor_seen",
+        # Owed first-time ping the monitor retries each tick until delivered —
+        # internal retry state, never a user-facing surface.
+        "github_ping_pending",
+        # Career-outreach monitor — per-draft "already nudged the owner" dedup
+        # marker. The owner nudge (Telegram) is the delivery path; these rows must
+        # NOT surface via the generic observation surfacers (would double-notify).
+        "career_outreach_nudged",
     }
 )
 
@@ -96,6 +108,10 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "process_reaper_kill": timedelta(days=3),
     "operational_alert": timedelta(days=3),
     "infrastructure_alert": timedelta(days=3),
+    # ego cycle liveness: self-resolving + re-fireable, so a long TTL only delays
+    # the next re-fire; matches infrastructure_alert. Surfaces in the dashboard
+    # observations panel (deliberately NOT in INTERNAL_OBS_TYPES).
+    "ego_alert": timedelta(days=3),
     "cc_cap_empty_event": timedelta(days=3),
     "strategic_reflection": timedelta(days=3),
     # ── 1-day (transient) ──────────────────────────────────────────────
@@ -154,6 +170,24 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "test_isolation_gap": timedelta(days=30),
     "operational_gap": timedelta(days=30),
     "interaction_theme": timedelta(days=30),
+    # ── GitHub steward (account-activity monitor) ──────────────────────
+    # Activity events kept 30d for the 6h digest campaign to consume. The
+    # per-actor "seen" marker is written once (first sighting) and never
+    # deleted — the expiry sweep only flips resolved=1, it does not purge rows,
+    # and exists_by_hash checks all rows regardless of resolved state, so a
+    # contributor never decays back to "first-time". If a real purge job is ever
+    # added, give this type a no-expiry TTL to preserve that invariant.
+    "github_account_activity": timedelta(days=30),
+    "github_actor_seen": timedelta(days=90),
+    # Owed first-time ping, retried each ~2h tick. 7d cap: if a ping cannot be
+    # delivered for a week something is badly wrong and the 30d activity row is
+    # the backstop; short so an abandoned marker cannot linger.
+    "github_ping_pending": timedelta(days=7),
+    # Career-outreach monitor — per-draft "already nudged" dedup marker. 30d:
+    # long enough that a still-open staged draft is not re-nudged, bounded so an
+    # abandoned marker cannot linger. The external engine's own staged-draft state is
+    # the source of truth for draft counts; this row only records "owner already nudged".
+    "career_outreach_nudged": timedelta(days=30),
     # cognitive self-mod rollback audit (operator-visible correction event)
     "self_mod_rollback": timedelta(days=30),
     # skill-edit Critic shadow verdicts (WS1) — kept 30d (vs 14d for the
@@ -403,6 +437,7 @@ async def query(
     category: str | None = None,
     resolved: bool | None = None,
     exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+    origin_class_in: list[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
     if sum(map(bool, (source, source_in, source_prefix))) > 1:
@@ -440,6 +475,15 @@ async def query(
         type_placeholders = ",".join("?" for _ in exclude_types)
         sql += f" AND type NOT IN ({type_placeholders})"
         params.extend(exclude_types)
+    if origin_class_in:
+        # SQL-level origin filter — applied BEFORE the LIMIT so barred rows can
+        # never crowd trusted rows out of the result window (the user-model
+        # poisoning-gate consumers pass the trusted set here). NULL origin_class
+        # is excluded by SQL IN-semantics (fail-closed), which is the intended
+        # behaviour for the privileged-read consumers.
+        oc_placeholders = ",".join("?" for _ in origin_class_in)
+        sql += f" AND origin_class IN ({oc_placeholders})"
+        params.extend(origin_class_in)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     rows = await db.execute_fetchall(sql, params)

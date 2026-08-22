@@ -23,9 +23,9 @@ The fingerprint, if you're diagnosing it live:
 
 ## What Genesis sets up (and what it only warns about)
 
-`scripts/lib/memory_resilience.sh` runs from `bootstrap.sh` on fresh installs
-and from every `update.sh` (which re-runs bootstrap), so existing installs
-retrofit automatically. It is idempotent and **adaptive — every threshold is a
+`scripts/lib/memory_resilience.sh` runs from `install.sh` and `bootstrap.sh` on
+fresh installs and from every `update.sh` (which re-runs bootstrap), so existing
+installs retrofit automatically. It is idempotent and **adaptive — every threshold is a
 pressure percentage, never an absolute byte value**, so the same config
 right-sizes from a small VPS to a large workstation:
 
@@ -95,6 +95,37 @@ mechanically instead of leaving the warning above as the only output.
 - The host-plane `swap_total_kb` fact (table above) picks the device up
   automatically, and `_memres_swap_check` stops warning once it's active.
 
+## The PID/task budget (fork-exhaustion guard)
+
+Memory isn't the only slice-level budget that wedges. systemd's stock
+`user-.slice.d/10-defaults.conf` caps every per-user slice at **`TasksMax=33%`**
+— a conservative multi-user-server default. On a single-user Genesis appliance
+running many concurrent Claude Code sessions (each spawns MCP subprocess trees:
+codebase-memory, serena, gitnexus, the codex broker), 33% of the box's PID
+budget is exhausted well before memory/CPU/disk, so new processes fail with
+**`Cannot fork`** while every other axis reads green.
+
+`pid_budget_apply` (in `scripts/lib/memory_resilience.sh`, run from
+`install.sh`/`bootstrap.sh`/`update.sh` alongside the oomd setup) lays down
+`/etc/systemd/system/user-.slice.d/90-genesis-tasksmax.conf` →
+**`TasksMax=60%`**. Like the pressure thresholds it is a **percentage, not an
+absolute count**, so it self-calibrates to each box's own budget. **60%, not
+unlimited, is deliberate:** reserving ~40% keeps `system.slice`
+(sshd/systemd/dbus/init) alive so a runaway in the user slice can never wedge
+the whole container — it stays recoverable. `90-` sorts after systemd's `10-`
+default so last-assignment-wins makes 60% the effective cap. Same graceful
+degradation as the oomd setup (no systemd / no non-interactive sudo → one-line
+skip); when it can't apply, the posture check below surfaces the un-raised
+ceiling rather than letting the box run silently capped.
+
+**Raising or lowering it.** 60% is the shipped default; adjust in consultation
+with your own Genesis if your box's resources or session count differ — drop a
+higher-numbered override (e.g. `/etc/systemd/system/user-.slice.d/95-local.conf`
+with a different `TasksMax=`), or `sudo systemctl set-property user-<uid>.slice
+TasksMax=<value>` for a runtime change. The live PID budget is on the dashboard
+Container panel (amber ≥ 80%, red ≥ 90%), and the awareness loop raises an
+explanatory alert on approach.
+
 ## How the body schema surfaces it
 
 The infrastructure profile (`INFRASTRUCTURE.md`, `infra_profile` package)
@@ -105,6 +136,7 @@ flags unprotected installs:
 |---|---|---|---|
 | `cgroup_memory_swap_max` | container | `"max"` (or an int) | `0` |
 | `oomd_user_slice_kill` | container | `true` | `false` |
+| `pid_ceiling_effective_ok` | container | `true` | `false` |
 | `swap_total_kb` | host | > 0 | `0` |
 | `container_limits["limits.memory.swap"]` | host_virt | `"true"`/absent | `"false"` |
 
@@ -119,7 +151,11 @@ wedge-defect value in the table above raises one non-paging `high`
 protections and their remediation, auto-resolving when the profile shows them
 restored. Only *explicit* defect values alert — absent/`None` facts stay
 silent (no guardian host plane, cgroup v1, fresh install), so partial installs
-never false-alarm. A profile older than 3 days raises a distinct
+never false-alarm. The `pid_ceiling_unprovisioned` rule rides the same check:
+`pid_ceiling_effective_ok` reflects the *effective* slice `pids.max` (so a
+runtime `set-property` override is judged correctly, not just the drop-in file),
+and `false` — the ceiling still on systemd's 33% default — raises the alert with
+the remedy above. A profile older than 3 days raises a distinct
 "posture UNKNOWN — refresh broken" alert instead of asserting from dead facts.
 The same check also covers the **network plane** (KeepConfiguration + the
 networkd watchdog), gated so it only fires on networkd-managed boxes — see

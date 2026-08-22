@@ -53,26 +53,15 @@ class TestExtractionValidAt:
 
 @pytest.fixture
 async def meta_db():
-    """In-memory SQLite with memory_metadata table."""
+    """In-memory SQLite with memory_metadata table (canonical DDL — never
+    drifts when columns are added, e.g. the MW-1 judgment axes)."""
     import aiosqlite
+
+    from genesis.db.schema import TABLES
+
     db = await aiosqlite.connect(":memory:")
     db.row_factory = aiosqlite.Row
-    await db.execute("""
-        CREATE TABLE memory_metadata (
-            memory_id        TEXT PRIMARY KEY,
-            created_at       TEXT NOT NULL,
-            collection       TEXT NOT NULL DEFAULT 'episodic_memory',
-            confidence       REAL,
-            embedding_status TEXT NOT NULL DEFAULT 'embedded',
-            memory_class     TEXT DEFAULT 'fact',
-            wing             TEXT,
-            room             TEXT,
-            valid_at         TEXT,
-            invalid_at       TEXT,
-            source_subsystem TEXT,
-            origin_class     TEXT
-        )
-    """)
+    await db.execute(TABLES["memory_metadata"])
     await db.commit()
     yield db
     await db.close()

@@ -216,6 +216,18 @@ class AutonomousCliApprovalGate:
             # and must stay True — never flip the default, and never add a code
             # path that reaches this branch implicitly. See AutonomousCliPolicy
             # (cli_policy.py) and CC memory `cli_gate_not_negotiable`.
+            #
+            # Clear any LEFTOVER pending row for THIS exact site (raised while
+            # the gate was on): with the gate off it will never be delivered to
+            # or resolved by the user, and the pre-flights (`_approval_pending`,
+            # `find_site_pending`) now ignore it — so without this it would sit
+            # pending forever, showing a stale "action required" on the
+            # dashboard. Scoped strictly to this action_type + (subsystem,
+            # policy_id); never touches email-gate / contributor-issue rows.
+            # Best-effort — a cleanup failure must never block dispatch.
+            await self._cancel_stale_site_approvals(
+                subsystem=subsystem, policy_id=policy_id, action_type=action_type,
+            )
             return ("approved", None, "manual approval disabled by config")
 
         # Serialize per (subsystem, policy_id) — prevents duplicate rows
@@ -487,16 +499,24 @@ class AutonomousCliApprovalGate:
     async def approve_all_pending(self, *, resolved_by: str) -> int:
         """Approve every pending approval request.  Returns count approved.
 
-        WS-8 email capability-gate holds are EXCLUDED: each held email is an
-        independent send decision and must be approved individually, never
-        swept by a batch "approve all".
+        Per-item-only action types are EXCLUDED from the batch sweep — each is
+        an independent, irreversible external decision that must be approved
+        individually, never swept by a single "approve all" click (dashboard
+        button OR Telegram ``cli_approve_all``, which both funnel here):
+
+        - WS-8 email capability-gate holds (each held email is one send).
+        - Contributor Work-Log issue holds (each is one public-repo post).
         """
+        from genesis.autonomy.contributor_worklog_config import (
+            CONTRIBUTOR_ISSUE_ACTION_TYPE,
+        )
         from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
 
+        excluded = {EMAIL_GATE_ACTION_TYPE, CONTRIBUTOR_ISSUE_ACTION_TYPE}
         pending = await self._approval_manager.get_pending()
         count = 0
         for req in pending:
-            if req.get("action_type") == EMAIL_GATE_ACTION_TYPE:
+            if req.get("action_type") in excluded:
                 continue
             ok = await self._approval_manager.resolve(
                 req["id"], status="approved", resolved_by=resolved_by,
@@ -606,7 +626,28 @@ class AutonomousCliApprovalGate:
         *not* returned — their state has already been resolved and the
         caller should dispatch normally (which will hit ``ensure_approval``
         and get the resolved status).
+
+        Policy-aware: when ``manual_approval_required`` is False (the user's
+        sovereign gate-off choice), the authoritative gate auto-approves and
+        creates NO new pending row. A LEFTOVER pending row (raised while the
+        gate was on) must not keep the caller parked, so report nothing pending
+        - the caller dispatches, and ``ensure_approval`` clears the stale row.
+        Does NOT weaken the gate: the default stays True; with the gate on the
+        pending-row scan below is unchanged.
         """
+        try:
+            gate_off = not self._policy().manual_approval_required
+        except Exception:
+            # Fail-safe toward the mandatory gate: a policy-read error keeps the
+            # gate-on pending-row scan (never silently skips a real block). Log
+            # it so a persistent policy misconfiguration is not invisible.
+            logger.debug(
+                "find_site_pending: policy read failed; keeping gate-on scan",
+                exc_info=True,
+            )
+            gate_off = False
+        if gate_off:
+            return None
         pending = await self._approval_manager.get_pending()
         for row in pending:
             if row.get("action_type") != "autonomous_cli_fallback":
@@ -620,6 +661,55 @@ class AutonomousCliApprovalGate:
             ):
                 return row
         return None
+
+    async def _cancel_stale_site_approvals(
+        self, *, subsystem: str, policy_id: str, action_type: str,
+    ) -> int:
+        """Cancel pending approvals for one call site (gate-off cleanup).
+
+        Scoped strictly to rows whose ``action_type`` AND context
+        ``(subsystem, policy_id)`` match this site, so a per-item type that is
+        deliberately excluded from batch-approve (email gate, contributor
+        issue) is never swept here either. Best-effort: returns the count
+        cancelled and never raises into the dispatch path.
+        """
+        cancelled = 0
+        try:
+            pending = await self._approval_manager.get_pending()
+        except Exception:
+            logger.warning(
+                "gate-off cleanup: get_pending failed for %s/%s",
+                subsystem, policy_id, exc_info=True,
+            )
+            return 0
+        for row in pending:
+            if row.get("action_type") != action_type:
+                continue
+            context = _json_loads(row.get("context"))
+            if (
+                context.get("subsystem") != subsystem
+                or context.get("policy_id") != policy_id
+            ):
+                continue
+            try:
+                ok = await self._approval_manager.resolve(
+                    str(row["id"]),
+                    status="cancelled",
+                    resolved_by="approval_gate_disabled",
+                )
+                if ok:
+                    cancelled += 1
+            except Exception:
+                logger.warning(
+                    "gate-off cleanup: failed to cancel approval %s",
+                    row.get("id"), exc_info=True,
+                )
+        if cancelled:
+            logger.info(
+                "Gate off: cancelled %d stale pending approval(s) for %s/%s",
+                cancelled, subsystem, policy_id,
+            )
+        return cancelled
 
     async def find_recently_approved(
         self, *, subsystem: str, policy_id: str,
@@ -686,6 +776,31 @@ class AutonomousCliApprovalGate:
         invocation: CCInvocation | None,
         api_error: str | None,
     ) -> bool:
+        # Delivery-failure recovery comes FIRST and applies to every policy
+        # regardless of re-ask settings: while no successful delivery is on
+        # record, retry the send each tick — the user never received the one
+        # message they are entitled to. Once delivered, the re-ask policy
+        # below governs.
+        if context.get("delivery_id") is None:
+            await self._send_request(
+                request_id=request_id,
+                context=context,
+                action_label=action_label,
+                invocation=invocation,
+                api_error=api_error,
+            )
+            logger.info(
+                "Retried undelivered approval request %s for %s/%s",
+                request_id, subsystem, policy_id,
+            )
+            return True
+
+        # Re-ask 0 = NEVER remind about a delivered pending request. Checked
+        # BEFORE the stored next_reask_at so legacy rows written pre-deploy
+        # (with an already-elapsed window) cannot resend once.
+        if self._policy().reask_hours_for(policy_id) <= 0:
+            return False
+
         next_reask_at = context.get("next_reask_at")
         if next_reask_at:
             try:
@@ -827,9 +942,17 @@ class AutonomousCliApprovalGate:
         if delivery_id is not None:
             now = datetime.now(UTC)
             context["last_sent_at"] = now.isoformat()
+            # Per-policy re-ask interval; 0 = never remind → no next_reask_at
+            # (and _maybe_resend independently short-circuits on reask 0, so a
+            # legacy value here is harmless).
+            reask_hours = self._policy().reask_hours_for(
+                str(context.get("policy_id") or ""),
+            )
             context["next_reask_at"] = (
-                now + timedelta(hours=max(1, self._policy().reask_interval_hours))
-            ).isoformat()
+                (now + timedelta(hours=reask_hours)).isoformat()
+                if reask_hours > 0
+                else None
+            )
         await self._approval_manager.update_context(
             request_id, context=_context_dump(context),
         )

@@ -29,6 +29,28 @@ PROVENANCE_WEIGHTS = {"EXTRACTED": 1.0, "INFERRED": 0.8, "AMBIGUOUS": 0.5}
 _SLUG_RE = re.compile(r"[^a-z0-9_]+")
 _MAX_LINK_TYPE_LEN = 40
 
+# The entity read set, SELECTed by NAME everywhere in this module — never
+# `SELECT *`. The tuple-decode fallback in `_row_to_dict` zips against this
+# same list, so decode order == SELECT order BY CONSTRUCTION, independent of
+# the table's physical column layout (Codex R5-C: a partial upgrade can leave
+# the card columns ALTER-appended at the END while a rebuilt table has them
+# mid-list — name-driven reads are correct under both).
+_ENTITY_COLUMNS = (
+    "entity_id",
+    "name",
+    "norm_name",
+    "entity_type",
+    "summary",
+    "summary_updated_at",
+    "summary_dirty",
+    "source",
+    "status",
+    "merged_into",
+    "created_at",
+    "updated_at",
+)
+_SELECT_COLS = ", ".join(_ENTITY_COLUMNS)
+
 
 def slugify_link_type(raw: str) -> str:
     """Lowercase-snake a (possibly LLM-emitted) relation name.
@@ -77,12 +99,19 @@ async def get_by_norm_name(
     """Exact norm_name lookup, optionally type-filtered. Follows merges."""
     if entity_type is not None:
         rows = await db.execute_fetchall(
-            "SELECT * FROM entities WHERE norm_name = ? AND entity_type = ?",
+            f"SELECT {_SELECT_COLS} FROM entities "  # noqa: S608 — constant col list
+            "WHERE norm_name = ? AND entity_type = ?",
             (norm_name, entity_type),
         )
     else:
+        # Deterministic when a norm_name exists under >1 type: prefer an
+        # active row (so we return a live entity when one exists), then the
+        # oldest — never an arbitrary rows[0]. A merged top row still redirects
+        # below; ordering only decides WHICH row we start from.
         rows = await db.execute_fetchall(
-            "SELECT * FROM entities WHERE norm_name = ?",
+            f"SELECT {_SELECT_COLS} FROM entities WHERE norm_name = ? "  # noqa: S608
+            "ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'merged' THEN 1 "
+            "ELSE 2 END, created_at ASC, entity_id ASC",
             (norm_name,),
         )
     if not rows:
@@ -96,7 +125,7 @@ async def get_by_norm_name(
 
 async def get_entity(db: aiosqlite.Connection, entity_id: str) -> dict | None:
     rows = await db.execute_fetchall(
-        "SELECT * FROM entities WHERE entity_id = ?",
+        f"SELECT {_SELECT_COLS} FROM entities WHERE entity_id = ?",  # noqa: S608
         (entity_id,),
     )
     return _row_to_dict(db, rows[0]) if rows else None
@@ -348,6 +377,12 @@ async def merge_entity(
     higher-confidence row wins — a merge must never discard the
     strongest evidence (the loser is often the better-attested record).
     """
+    # Self-merge guard: writing ``merged_into = self`` makes the entity
+    # unresolvable (the _resolve_active seen-set walk dead-ends), so a caller
+    # that resolved both sides to the same row (easy via merge-following
+    # get_by_norm_name) must fail loud, not silently corrupt the row.
+    if loser_id == survivor_id:
+        raise ValueError(f"merge_entity: self-merge refused (loser == survivor == {loser_id!r})")
     now = datetime.now(UTC).isoformat()
     await db.execute(
         "INSERT INTO entity_mentions "
@@ -499,17 +534,13 @@ async def enqueue_adjudication(
 
 
 def _row_to_dict(db: aiosqlite.Connection, row) -> dict:
+    """Decode a row from a `SELECT {_SELECT_COLS}` query (module-top constant).
+
+    Tuple rows zip against _ENTITY_COLUMNS — correct by construction because
+    every SELECT in this module names its columns in that same order; physical
+    table layout is irrelevant. strict=True fails loud on any length mismatch
+    (a SELECT that doesn't use _SELECT_COLS) rather than silently mis-aligning.
+    """
     if isinstance(row, aiosqlite.Row) or hasattr(row, "keys"):
         return dict(row)
-    return {
-        "entity_id": row[0],
-        "name": row[1],
-        "norm_name": row[2],
-        "entity_type": row[3],
-        "summary": row[4],
-        "source": row[5],
-        "status": row[6],
-        "merged_into": row[7],
-        "created_at": row[8],
-        "updated_at": row[9],
-    }
+    return dict(zip(_ENTITY_COLUMNS, row, strict=True))

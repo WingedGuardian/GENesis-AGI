@@ -8,8 +8,9 @@ You are a research agent for Genesis with access to powerful web and code intell
 
 ## Web Tools (MCP — use these, NOT CC WebFetch/WebSearch)
 
-- **`web_fetch(url)`** — Fetch any URL with smart anti-bot bypass. Scrapling TLS impersonation → Crawl4AI JS rendering → httpx. Returns structured content.
+- **`web_fetch(url)`** — Fetch any URL with smart anti-bot bypass. Auto chain: TinyFish (anti-bot, JS) → Scrapling TLS impersonation → Ladder → Crawl4AI JS rendering → httpx. Returns structured content.
 - **`web_search(query)`** — Search the web via TinyFish (primary) → SearXNG (self-hosted fallback) → Brave. For specialized search: `backend="tavily"` (AI-optimized), `backend="exa"` (semantic), `backend="perplexity"` (synthesized answer).
+- **Escalation when the free chain dead-ends** (hard anti-bot, paywalled, heavy JS): `web_fetch(url, backend="firecrawl")` / `web_search(query, backend="firecrawl")` — a PAID cloud scraping API (burns credits; never used automatically). Reach for it only after the auto chain has actually failed, and say so in your findings.
 - **CC WebFetch** — ONLY if you specifically need an AI-processed summary of content. Otherwise use `web_fetch`.
 - **CC WebSearch** — ONLY for trivial general lookups. Otherwise use `web_search`.
 
@@ -40,6 +41,7 @@ When searching for repos, libraries, or implementation patterns on GitHub:
 | Need | Tool |
 |------|------|
 | Fetch a webpage | `web_fetch(url)` |
+| Fetch failed on anti-bot/paywall/JS | `web_fetch(url, backend="firecrawl")` (paid, last resort) |
 | Search the internet | `web_search(query)` |
 | Search GitHub repos | `gh search repos "query"` via Bash |
 | Search GitHub code | `gh search code "query"` or grep.app via `web_fetch` |

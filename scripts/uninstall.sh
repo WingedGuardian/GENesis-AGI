@@ -23,6 +23,16 @@
 
 set -euo pipefail
 
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 # ── Globals ──────────────────────────────────────────────────
 MODE="default"          # default | genesis-only | guardian-only | full
 DRY_RUN=false
@@ -406,6 +416,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # Stop all Genesis services (timer first, then service, to prevent restart)
         for unit in genesis-watchdog.timer genesis-watchdog.service \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
+                    genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
@@ -473,9 +484,11 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             # Stop all services (timers first to prevent restart races)
             container_exec "
                 systemctl --user stop genesis-watchdog.timer genesis-watchdog.service 2>/dev/null || true;
+                systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
                 systemctl --user disable genesis-server.service genesis-bridge.service \
-                    genesis-watchdog.timer genesis-watchdog.service qdrant.service 2>/dev/null || true
+                    genesis-watchdog.timer genesis-watchdog.service \
+                    genesis-cc-tmp-align.timer genesis-cc-tmp-align.service qdrant.service 2>/dev/null || true
             "
             ok "Stopped Genesis services"
 

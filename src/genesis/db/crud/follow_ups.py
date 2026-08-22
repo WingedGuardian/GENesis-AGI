@@ -119,6 +119,21 @@ async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
     return dict(row) if row else None
 
 
+async def resolve_id(db: aiosqlite.Connection, id_or_prefix: str) -> tuple[list[str], str]:
+    """Resolve a full id OR a short hex prefix to the follow_up row(s).
+
+    Thin wrapper over the shared resolver so ``follow_up_update`` accepts the
+    same short handles the proactive hook / memory_expand hand out. Returns
+    ``(matches, outcome)`` — see ``crud/_id_resolve``. follow_up ids are
+    ``uuid4().hex`` (32-char, no dashes).
+    """
+    from genesis.db.crud._id_resolve import resolve_unique_prefix
+
+    return await resolve_unique_prefix(
+        db, table="follow_ups", id_column="id", raw_id=id_or_prefix, full_len=32
+    )
+
+
 async def get_pending(
     db: aiosqlite.Connection,
     *,
@@ -172,6 +187,21 @@ async def get_by_status(
     return [dict(row) for row in await cursor.fetchall()]
 
 
+async def get_open_followups(db: aiosqlite.Connection) -> list[dict]:
+    """Hot follow_up rows still open (pending or in_progress), oldest first.
+
+    ONE statement, so it is a single consistent snapshot: a concurrent writer
+    moving a row in_progress<->pending can never make it fall between two
+    queries (the repo-pulse reconciler's loader must not silently drop such a
+    row and then advance its PR cursor past it). Cold ``tabled``/``idea`` rows
+    are excluded (kind='follow_up')."""
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups WHERE kind = 'follow_up' "
+        "AND status IN ('pending', 'in_progress') ORDER BY created_at ASC"
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
 async def get_actionable(
     db: aiosqlite.Connection,
     *,
@@ -217,6 +247,50 @@ async def get_scheduled_due(
         "AND scheduled_at IS NOT NULL "
         "AND datetime(scheduled_at) <= datetime('now') "
         "ORDER BY scheduled_at ASC",
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_orphaned_scheduled(db: aiosqlite.Connection) -> list[dict]:
+    """Hot-lane rows stuck in status='scheduled' with NO linked_task_id.
+
+    status='scheduled' is only legitimate when set by ``link_task`` atomically
+    with a ``linked_task_id`` (so ``get_linked_active`` surfaces it). A scheduled
+    row missing the link is INVISIBLE to every surface — not in ``get_actionable``
+    (excludes 'scheduled'), not in ``get_scheduled_due`` (needs status='pending' +
+    scheduled_at), not in ``get_linked_active`` (needs linked_task_id). This is the
+    black hole the follow_up_update H2 gate now prevents; this reader catches any
+    that pre-date the gate or were written programmatically. Hot lane only.
+    """
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups "
+        "WHERE status = 'scheduled' AND linked_task_id IS NULL AND kind = 'follow_up' "
+        "ORDER BY created_at ASC",
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_past_due_scheduled(db: aiosqlite.Connection, *, grace_hours: int) -> list[dict]:
+    """Hot-lane scheduled_task rows the dispatcher never actuated, >grace_hours past due.
+
+    The dispatcher consumes EXACTLY ``get_scheduled_due``'s set — strategy=
+    'scheduled_task' AND status='pending' AND scheduled_at<=now — and on dispatch
+    the row moves to in_progress then to status='scheduled' with a linked_task_id
+    (tracked thereafter by ``get_linked_active``). So the ONLY state that means
+    "never actuated" is a row STILL in status='pending' with no linked_task_id whose
+    scheduled_at is now >grace_hours old. Narrowing to that avoids false-positiving on
+    healthy dispatched rows simply waiting on idle-gated surplus compute (they are
+    status='scheduled'+linked with a frozen scheduled_at) and avoids double-counting
+    genuine orphans (status='scheduled', caught by get_orphaned_scheduled). Reuses the
+    ``datetime(scheduled_at) <= datetime('now', '-N hours')`` shape. Hot lane only.
+    """
+    cursor = await db.execute(
+        "SELECT * FROM follow_ups "
+        "WHERE strategy = 'scheduled_task' AND status = 'pending' AND linked_task_id IS NULL "
+        "AND kind = 'follow_up' AND scheduled_at IS NOT NULL "
+        "AND datetime(scheduled_at) <= datetime('now', ?) "
+        "ORDER BY scheduled_at ASC",
+        (f"-{int(grace_hours)} hours",),
     )
     return [dict(row) for row in await cursor.fetchall()]
 
@@ -323,6 +397,52 @@ async def update_notes(
         params,
     )
     await db.commit()
+    return cursor.rowcount > 0
+
+
+async def absorb_followup(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    evidence: str,
+    require_unpinned: bool = False,
+    commit: bool = True,
+) -> bool:
+    """Mark a still-open HOT follow_up 'completed' with PR evidence (repo-pulse absorb).
+
+    Conditional by design — only a row still in ``('pending','in_progress')``
+    transitions. The detached repo-pulse worker races ego/foreground writers, so
+    an unconditional ``update_status`` would clobber a concurrent transition (e.g.
+    a user just set it 'blocked'); the WHERE guard makes the absorb
+    lost-update-safe and replay-idempotent (a re-covered enumeration window
+    matches nothing on the second run).
+
+    Lane invariants are enforced ATOMICALLY here, not from the caller's stale
+    load-time snapshot (a concurrent pin or ``kind``→``tabled`` between load and
+    this UPDATE could otherwise slip past them): ``kind='follow_up'`` is ALWAYS
+    required, so the cold ``tabled``/``idea`` lanes are never absorbed by either
+    caller. ``require_unpinned=True`` (the worker's auto-absorb) additionally
+    refuses pinned rows atomically — honouring "automation never auto-resolves a
+    pinned row"; the dashboard confirm passes ``False`` because a human
+    explicitly confirming a pinned proposal is an intended override. ``evidence``
+    is APPENDED to any existing ``resolution_notes`` (prior context is never
+    lost). Returns True iff a row changed.
+    """
+    where = "id = ? AND kind = 'follow_up' AND status IN ('pending', 'in_progress')"
+    if require_unpinned:
+        where += " AND pinned = 0"
+    cursor = await db.execute(
+        "UPDATE follow_ups SET status = 'completed', completed_at = ?, "
+        "resolution_notes = TRIM("
+        "COALESCE(resolution_notes || char(10) || char(10), '') || ?"
+        f") WHERE {where}",  # noqa: S608 — where is composed of string literals only
+        (_now_iso(), evidence, id),
+    )
+    # commit=False lets a caller stage this completion and commit it in the SAME
+    # transaction as a related write (the worker commits the absorb + its audit
+    # annotation together via repo_pulse.insert_annotation).
+    if commit:
+        await db.commit()
     return cursor.rowcount > 0
 
 

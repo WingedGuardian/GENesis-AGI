@@ -67,6 +67,10 @@ class WatchdogChecker:
         flap_window_s: int = 21600,
         flap_threshold: int = 3,
         flap_backoff_max_s: int = 7200,
+        liveness_url: str = "http://127.0.0.1:5000/api/genesis/liveness",
+        liveness_lag_suppress_ms: float = 1000.0,
+        liveness_sample_stale_s: float = 120.0,
+        liveness_max_starved_skips: int = 6,
         remediation_registry: RemediationRegistry | None = None,
         outreach_fn: OutreachFn | None = None,
     ) -> None:
@@ -84,6 +88,10 @@ class WatchdogChecker:
         self._flap_window_s = flap_window_s
         self._flap_threshold = flap_threshold
         self._flap_backoff_max_s = flap_backoff_max_s
+        self._liveness_url = liveness_url
+        self._liveness_lag_suppress_ms = liveness_lag_suppress_ms
+        self._liveness_sample_stale_s = liveness_sample_stale_s
+        self._liveness_max_starved_skips = liveness_max_starved_skips
         self._remediation_registry = remediation_registry
         self._outreach_fn = outreach_fn
         self._target_service = self._detect_target_service()
@@ -126,6 +134,12 @@ class WatchdogChecker:
                 flap_window_s=wd.get("flap_window_seconds", 21600),
                 flap_threshold=wd.get("flap_threshold", 3),
                 flap_backoff_max_s=wd.get("flap_backoff_max_seconds", 7200),
+                liveness_url=wd.get(
+                    "liveness_url", "http://127.0.0.1:5000/api/genesis/liveness"
+                ),
+                liveness_lag_suppress_ms=wd.get("liveness_lag_suppress_ms", 1000.0),
+                liveness_sample_stale_s=wd.get("liveness_sample_stale_s", 120.0),
+                liveness_max_starved_skips=wd.get("liveness_max_starved_skips", 6),
             )
         except (yaml.YAMLError, OSError, AttributeError):
             logger.warning("Failed to load watchdog config — using defaults", exc_info=True)
@@ -275,6 +289,64 @@ class WatchdogChecker:
                 "Deploy in progress — deferring %s restart until it completes", reason,
             )
             return WatchdogAction.SKIP
+
+        # Down-vs-starved gate: for a genesis-server staleness/zombie restart,
+        # consult the OFF-loop liveness probe before restarting. A fresh, high-lag
+        # sample means the event loop is STARVED (background work saturating it),
+        # not dead — and a restart re-triggers the boot extraction backlog that
+        # caused the starvation (the mutual false-positive storm). Suppress the
+        # restart (BOUNDED, so a genuinely-stuck loop still recovers) and alert
+        # instead. Every ambiguous / dead / wedged verdict falls through to the
+        # normal restart path below: suppression requires a POSITIVE starved
+        # reading, so a truly-dead server is never left unrestarted. Runs BEFORE
+        # _record_failure so a suppressed cycle never trips backoff/flap counters.
+        if reason in ("stale_status_restart", "zombie_scheduler") and self._targets_server():
+            verdict, detail = self._probe_liveness()
+            d = detail or {}
+            if verdict == "starved":
+                skips = int(state.get("starved_skips", 0)) + 1
+                if skips <= self._liveness_max_starved_skips:
+                    state["starved_skips"] = skips
+                    self._save_state(state)
+                    self._alert_starved(reason, d, skips)
+                    logger.warning(
+                        "Liveness probe: server UP but event loop STARVED "
+                        "(lag %sms, sample %ss old, executor=%s) — suppressing "
+                        "'%s' restart (%d/%d); a restart would re-trigger the "
+                        "starvation. Alerting instead.",
+                        d.get("lag_ms", "?"), d.get("sample_age_s", "?"),
+                        d.get("executor"), reason, skips,
+                        self._liveness_max_starved_skips,
+                    )
+                    return WatchdogAction.SKIP
+                # Past the suppression bound: stop suppressing and proceed to the
+                # restart path. Deliberately do NOT reset starved_skips here (that
+                # would re-enable suppression next cycle) — it stays pinned so we
+                # keep pressing to restart. Flap-damping/backoff below may still
+                # defer the actual restart, so this is "proceed", not a guarantee.
+                logger.error(
+                    "Liveness probe: loop still STARVED past the suppression bound "
+                    "(%d skips, bound %d) — no longer suppressing; proceeding to the "
+                    "restart path (flap-damping/backoff may still defer it).",
+                    skips - 1, self._liveness_max_starved_skips,
+                )
+                # fall through to restart
+            else:
+                # Any NON-starved verdict breaks the consecutive-starved run, so
+                # reset the counter (it means CONSECUTIVE starved skips) — else a
+                # responsive/unknown cycle that lands in a backoff window (no
+                # _record_failure) would leave a stale count to accumulate against.
+                if verdict == "wedged":
+                    logger.error(
+                        "Liveness probe: server reachable but loop-health sample is "
+                        "STALE (%ss old) — loop fully wedged (awareness/status/"
+                        "telegram all dead); restarting.",
+                        d.get("sample_age_s", "?"),
+                    )
+                if state.get("starved_skips"):
+                    state["starved_skips"] = 0
+                    self._save_state(state)
+                # down / unknown / wedged / responsive → normal restart logic below
 
         # Flap damping: a SLOW recurring same-reason restart (spaced beyond the
         # 120s stabilization window, so consecutive_failures keeps resetting to
@@ -525,6 +597,10 @@ class WatchdogChecker:
         state["consecutive_failures"] += 1
         state["last_reason"] = reason
         state["last_restart_at"] = now
+        # An actual restart ends the current run of suppressed-starved cycles —
+        # the counter tracks CONSECUTIVE starved skips, so reset it here (a
+        # healthy reset via _reset_state also clears it by writing a fresh dict).
+        state["starved_skips"] = 0
         # Rolling per-reason restart history for flap damping. Recorded on
         # every actual restart decision (never on a backoff-skip), pruned to
         # the flap window. Deliberately survives _reset_state so SLOW
@@ -552,10 +628,11 @@ class WatchdogChecker:
         outreach pipeline; the dedupe_key collapses repeats to a single live
         entry per reason. Best-effort — never raises."""
         try:
+            from genesis.env import alert_queue_root
             from genesis.guardian.alert.queue import enqueue_alert
 
             enqueue_alert(
-                Path.home() / ".genesis" / "alerts" / "queue",
+                alert_queue_root(),
                 severity="warning",
                 source="watchdog",
                 title="Watchdog flap-damping repeated restarts",
@@ -569,6 +646,104 @@ class WatchdogChecker:
             )
         except Exception:
             logger.debug("flap alert enqueue failed", exc_info=True)
+
+    def _targets_server(self) -> bool:
+        """True when this watchdog monitors genesis-server (not the legacy relay).
+
+        The liveness probe reflects the SERVER process's event loop; consulting it
+        for a relay-only legacy install would be meaningless, so the down-vs-starved
+        gate only engages when genesis-server is the target.
+        """
+        return "genesis-server" in self._target_service
+
+    def _probe_liveness(self) -> tuple[str, dict | None]:
+        """Classify the server's loop health via the OFF-loop sync probe.
+
+        Returns ``(verdict, loop_block)``. Verdicts:
+          - ``"down"``       — connection refused (nothing listening on the port)
+          - ``"unknown"``    — timeout / non-200 / unparseable / no loop sample
+          - ``"wedged"``     — 200 but the loop-health sample is STALE (sampler stopped)
+          - ``"starved"``    — 200, fresh sample, lag at/over the suppress threshold
+          - ``"responsive"`` — 200, fresh sample, low lag
+
+        Fail-closed: every ambiguous outcome is ``"unknown"``, which the caller
+        treats as "restart still allowed" — suppression requires a POSITIVE
+        ``"starved"`` reading. Never raises. Uses stdlib ``urllib`` (the watchdog
+        is a minimal oneshot; no httpx dependency). The 3s timeout bounds only a
+        hung TCP connect — the sync route reads memory and answers in milliseconds
+        even under full loop starvation, so this is not a speculative work-timeout.
+        """
+        import urllib.error
+        import urllib.request
+
+        try:
+            req = urllib.request.Request(self._liveness_url, method="GET")  # noqa: S310
+            # Loopback probe must NEVER traverse a proxy: an inherited http_proxy
+            # without a 127.0.0.1 no_proxy entry would route this LOCAL health check
+            # to the proxy — a proxy error → 'unknown' (blind restart returns), or a
+            # proxy-forged 200 → a WRONG 'starved' suppression of a needed restart.
+            # Mirror the proactive hook's trust_env=False with a proxy-free opener.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=3.0) as resp:
+                if resp.status != 200:
+                    return "unknown", None
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            # Connection refused (port not listening) is the unambiguous DOWN
+            # signal; everything else here (timeout, DNS, HTTP error) is unknown.
+            if isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+                return "down", None
+            return "unknown", None
+        except (TimeoutError, OSError, ValueError):
+            # ValueError = JSON parse failure; TimeoutError/OSError = socket-level
+            # failures not wrapped in URLError. All ambiguous → unknown.
+            return "unknown", None
+
+        loop_block = body.get("loop") if isinstance(body, dict) else None
+        if not isinstance(loop_block, dict):
+            return "unknown", None
+        age = loop_block.get("sample_age_s")
+        lag = loop_block.get("lag_ms")
+        if not isinstance(age, (int, float)) or not isinstance(lag, (int, float)):
+            return "unknown", loop_block
+        if age > self._liveness_sample_stale_s:
+            return "wedged", loop_block
+        # Honor the CONFIGURED suppression floor only — do NOT also suppress on the
+        # sampler's independent warn-level `lagging` flag (default 250ms), which is
+        # below the 1000ms floor: suppressing there would contradict autonomy.yaml
+        # and hold back a restart on a merely-mildly-laggy server (bias to restart).
+        if lag >= self._liveness_lag_suppress_ms:
+            return "starved", loop_block
+        return "responsive", loop_block
+
+    def _alert_starved(self, reason: str, detail: dict, count: int) -> None:
+        """Surface ONE durable alert that a restart was suppressed because the
+        server is up-but-starved. Same queue + dedupe mechanism as ``_alert_flap``
+        (the oneshot watchdog has no outreach pipeline); the awareness tick drains
+        it to the owner. Best-effort — never raises."""
+        try:
+            from genesis.env import alert_queue_root
+            from genesis.guardian.alert.queue import enqueue_alert
+
+            enqueue_alert(
+                alert_queue_root(),
+                severity="warning",
+                source="watchdog",
+                title="Watchdog suppressed restart — server starved, not down",
+                body=(
+                    f"'{reason}' restart suppressed ({count}/"
+                    f"{self._liveness_max_starved_skips}): the liveness probe reports "
+                    f"the server UP but its event loop starved (lag "
+                    f"{detail.get('lag_ms', '?')}ms, sample "
+                    f"{detail.get('sample_age_s', '?')}s old, executor "
+                    f"{detail.get('executor')}). Restarting would re-trigger the boot "
+                    f"backlog that caused the starvation. Investigate loop/executor "
+                    f"load; the watchdog restarts anyway if it does not clear."
+                ),
+                dedupe_key="watchdog:starved",
+            )
+        except Exception:
+            logger.debug("starved alert enqueue failed", exc_info=True)
 
     def _reset_state(self) -> None:
         if not self._state_path.exists():

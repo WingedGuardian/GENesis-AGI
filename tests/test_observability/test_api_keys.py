@@ -10,6 +10,33 @@ from genesis.observability.snapshots.api_keys import (
 # --- _compute_alert_severity: critical ONLY when an essential is uncovered ---
 
 
+def test_resolve_api_key_accepts_genesis_spelling(monkeypatch):
+    from genesis.observability.snapshots.api_keys import resolve_api_key
+
+    for var in ("API_KEY_GROQ", "GROQ_API_KEY", "GROQ_API_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("API_KEY_GROQ", "gsk-genesis")
+    assert resolve_api_key("groq") == "gsk-genesis"
+
+
+def test_resolve_api_key_accepts_native_spelling(monkeypatch):
+    from genesis.observability.snapshots.api_keys import resolve_api_key
+
+    for var in ("API_KEY_GROQ", "GROQ_API_KEY", "GROQ_API_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-native")
+    assert resolve_api_key("groq") == "gsk-native"
+
+
+def test_resolve_api_key_rejects_placeholders(monkeypatch):
+    from genesis.observability.snapshots.api_keys import resolve_api_key
+
+    for var in ("API_KEY_GROQ", "GROQ_API_KEY", "GROQ_API_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("API_KEY_GROQ", "None")
+    assert resolve_api_key("groq") is None
+
+
 def test_quota_exhaustion_silent_when_essentials_covered():
     """OpenRouter-style outage: paid + systemic + out of credits, but the
     essentials are still covered by free providers → SILENT (info), no banner.

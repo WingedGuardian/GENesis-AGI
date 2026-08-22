@@ -343,6 +343,50 @@ async def query_by_skill_tag(
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def dispatch_info_for_proposals(
+    db: aiosqlite.Connection,
+    proposal_ids: list[str],
+) -> dict[str, dict]:
+    """Map ``proposal_id -> {session_id, transcript_path, output_excerpt}`` for
+    ego-dispatch sessions whose ``metadata.caller_context`` is
+    ``ego_proposal:<id>`` (set by ``direct_session._store_result``).
+
+    One bounded query over the passed id set (the caller caps it). Newest session
+    wins per proposal (retries re-dispatch under the same caller_context). The
+    excerpt is capped so the dashboard payload stays small — the full text lives
+    in ``metadata.output_text`` and the CC transcript at ``transcript_path``.
+    Filters on ``json_extract(metadata,'$.caller_context')`` — an unindexed scan
+    of cc_sessions, acceptable for an on-demand dashboard read.
+    """
+    if not proposal_ids:
+        return {}
+    keys = [f"ego_proposal:{pid}" for pid in proposal_ids]
+    placeholders = ",".join("?" * len(keys))
+    cursor = await db.execute(
+        f"""SELECT id AS session_id,
+                   json_extract(metadata, '$.caller_context') AS caller_context,
+                   json_extract(metadata, '$.transcript_path') AS transcript_path,
+                   json_extract(metadata, '$.output_text') AS output_text
+            FROM cc_sessions
+            WHERE json_valid(metadata)
+              AND json_extract(metadata, '$.caller_context') IN ({placeholders})
+            ORDER BY started_at DESC""",
+        tuple(keys),
+    )
+    out: dict[str, dict] = {}
+    for r in await cursor.fetchall():
+        cc = r["caller_context"] or ""
+        pid = cc.split(":", 1)[1] if ":" in cc else ""
+        if not pid or pid in out:  # newest wins (DESC order above)
+            continue
+        out[pid] = {
+            "session_id": r["session_id"],
+            "transcript_path": r["transcript_path"],
+            "output_excerpt": (r["output_text"] or "")[:4000],
+        }
+    return out
+
+
 async def get_by_session_types(
     db: aiosqlite.Connection,
     session_types: set[str],
@@ -448,6 +492,7 @@ async def register_voice_session(
     id: str,
     started_at: str,
     channel: str = "voice_s2s",
+    satellite_id: str | None = None,
 ) -> bool:
     """Register a voice conversation session for memory extraction.
 
@@ -463,10 +508,10 @@ async def register_voice_session(
     cursor = await db.execute(
         "INSERT OR IGNORE INTO cc_sessions "
         "(id, cc_session_id, session_type, channel, model, source_tag, "
-        " status, started_at, last_activity_at) "
+        " status, started_at, last_activity_at, satellite_id) "
         "VALUES (?, ?, 'foreground', ?, 'voice', 'voice', "
-        " 'active', ?, ?)",
-        (id, id, channel, started_at, started_at),
+        " 'active', ?, ?, ?)",
+        (id, id, channel, started_at, started_at, satellite_id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -507,7 +552,7 @@ async def get_extractable(
     status_ph = ",".join("?" for _ in statuses)
     cursor = await db.execute(
         f"SELECT id, cc_session_id, source_tag, last_extracted_at, "
-        f"       last_extracted_line, started_at "
+        f"       last_extracted_line, last_extracted_byte, started_at "
         f"FROM cc_sessions "
         f"WHERE source_tag IN ({tag_ph}) "
         f"  AND status IN ({status_ph}) "
@@ -524,12 +569,26 @@ async def update_extraction_watermark(
     *,
     last_extracted_line: int,
     last_extracted_at: str,
+    last_extracted_byte: int | None = None,
 ) -> bool:
-    """Update the extraction watermark for a session."""
-    cursor = await db.execute(
-        "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? WHERE id = ?",
-        (last_extracted_at, last_extracted_line, id),
-    )
+    """Update the extraction watermark for a session.
+
+    ``last_extracted_byte`` is the incremental-resume hint (byte offset of the
+    START of line ``last_extracted_line``). When None the column is left
+    untouched, preserving any prior value — callers that computed a byte offset
+    pass it; legacy/reference paths omit it.
+    """
+    if last_extracted_byte is None:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? WHERE id = ?",
+            (last_extracted_at, last_extracted_line, id),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ?, "
+            "last_extracted_byte = ? WHERE id = ?",
+            (last_extracted_at, last_extracted_line, last_extracted_byte, id),
+        )
     await db.commit()
     return cursor.rowcount > 0
 

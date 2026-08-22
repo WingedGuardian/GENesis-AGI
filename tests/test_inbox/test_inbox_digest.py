@@ -254,3 +254,22 @@ class TestFormatDigest:
 
         output = _format_digest([], [], [], 7)
         assert "No inbox activity" in output
+
+    def test_format_escapes_pipe_and_newline(self):
+        from genesis.mcp.health.inbox_digest import _format_digest
+
+        pending = [
+            {
+                "priority": "high",
+                "content": "Compare X | Y\nsecond line",
+                "strategy": "ego_judgment",
+            }
+        ]
+
+        output = _format_digest(pending, [], [], 7)
+
+        assert "Compare X \\| Y second line" in output
+
+        body = output.split("|----------|------|----------|")[1]
+
+        assert body.strip().count("\n| ") == 0

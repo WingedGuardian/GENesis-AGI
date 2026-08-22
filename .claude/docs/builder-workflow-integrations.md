@@ -39,6 +39,16 @@ Output a structured report. If any issues found, fix them before proceeding.
 If no issues found, state "AUDIT CLEAN" explicitly.
 ```
 
+**Scope:** `/audit-changes` is the LIGHTWEIGHT self-check — a fast, same-session pass over
+your own diff, used by the deliverable-builder before a commit. It is deliberately NOT an
+adversarial audit. For a substantial change, a hook/gate/parser, or any security surface, run
+**`/deep-review`** (`.claude/commands/deep-review.md`) instead: it dispatches a fresh-context
+`genesis-architect` (+ `genesis-security-reviewer`) over the full branch diff with the
+right SHAPE (fail-open/state/TOCTOU/hand-rolled-parsing hunting) and writes the review-depth
+marker. An internal review-loop analysis found self-shaped reviews miss first-round bugs that
+an adversarial pass catches — `/deep-review` is the pass that catches them before the cloud
+reviewer does.
+
 ### 2. `/drift` Custom Command — Plan vs Reality Tracker
 
 **Source:** Vin's `/drift` command (Obsidian + Claude Code suite)

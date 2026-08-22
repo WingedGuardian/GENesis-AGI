@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 
 import aiosqlite
 
+from genesis.db.crud._fts import fetch_fts
+
 
 def _prepare_fts5(query: str) -> str | None:
     """Prepare a query string for FTS5 MATCH.
@@ -302,7 +304,10 @@ async def search_fts(
         params.append(domain)
     sql += " ORDER BY f.rank LIMIT ?"
     params.append(limit)
-    rows = await db.execute_fetchall(sql, params)
+    # AND-first, OR-fallback on zero rows: FTS5's implicit-AND otherwise starves
+    # multi-word queries (every token must match). knowledge_fts has no boolean
+    # mode, so the fallback always applies here.
+    rows = await fetch_fts(db, sql, params)
     return [
         {
             "unit_id": r[0], "concept": r[1], "body": r[2],

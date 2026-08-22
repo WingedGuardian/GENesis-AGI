@@ -237,6 +237,35 @@ async def test_process_pending_observations_no_files(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_process_pending_offloads_walkers(tmp_path, monkeypatch):
+    """MW-0 A2: both synchronous filesystem walks (stale-recovery + file scan)
+    run OFF the event loop via asyncio.to_thread, in order."""
+    import genesis.memory.session_observer as so
+
+    monkeypatch.setattr(so, "_sessions_dir", lambda: tmp_path)
+    recover = MagicMock()
+    find = MagicMock(return_value=[])
+    monkeypatch.setattr(so, "_recover_stale_processing_files", recover)
+    monkeypatch.setattr(so, "_find_observation_files", find)
+
+    dispatched = []
+    real_to_thread = so.asyncio.to_thread
+
+    async def spy(fn, *a, **k):
+        dispatched.append(fn)
+        return await real_to_thread(fn, *a, **k)
+
+    monkeypatch.setattr(so.asyncio, "to_thread", spy)
+
+    result = await process_pending_observations(store=AsyncMock(), router=AsyncMock())
+    assert result.files_processed == 0  # no files → early return
+    # Both walks were dispatched through to_thread, recovery before the scan.
+    assert dispatched == [recover, find]
+    recover.assert_called_once()
+    find.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_process_pending_observations_stores_notes(tmp_path, monkeypatch):
     """Observations are read, LLM is called, notes are stored."""
     # Keep the stale-recovery scan off the real ~/.genesis/sessions

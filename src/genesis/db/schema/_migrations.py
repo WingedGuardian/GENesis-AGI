@@ -128,6 +128,28 @@ async def _intersection_copy(
             )
 
 
+async def _capture_entity_aux(db: aiosqlite.Connection) -> list[str]:
+    """CREATE-SQL of local secondary indexes+triggers on ``entities`` that a
+    table rebuild's ``DROP TABLE`` auto-removes and must replay. Excludes
+    ``idx_entities_norm`` (recreated explicitly) and auto-indexes (``sql IS
+    NULL``, recreated by the new UNIQUE). Mirrors the self-contained copy in
+    migration 0083."""
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE tbl_name='entities' AND type IN ('index','trigger') "
+        "AND sql IS NOT NULL AND name != 'idx_entities_norm'"
+    )
+    return [r[0] for r in await cursor.fetchall()]
+
+
+async def _replay_entity_aux(db: aiosqlite.Connection, captured: list[str]) -> None:
+    """Recreate captured aux objects after the RENAME. A replay failure raises
+    inside the caller's savepoint → the whole rebuild rolls back loud rather
+    than silently losing the object."""
+    for sql in captured:
+        await db.execute(sql)
+
+
 async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     """Idempotent ALTER TABLE migrations for columns added after Phase 0."""
 
@@ -172,6 +194,26 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE follow_ups ADD COLUMN dedup_key TEXT",
         "follow_ups.dedup_key")
+
+    # a8a4f59e: which store a repo-pulse annotation's item_id addresses
+    # ('ledger' | 'follow_up').
+    await _try_alter(db,
+        "ALTER TABLE repo_pulse_annotations ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'ledger'",
+        "repo_pulse_annotations.target_kind")
+    # ...and widen its dedupe index HERE too, not only in migration 0084: the
+    # INDEXES pass below uses CREATE ... IF NOT EXISTS, which cannot replace an
+    # already-existing 3-col idx_rpa_dedupe. Without this, a legacy DB upgraded
+    # via create_all_tables (whichever runs first vs the numbered runner) keeps
+    # the 3-col UNIQUE and INSERT OR IGNORE silently drops one store's annotation
+    # for a shared (tier,item_id,pr). Safe: a pre-0084 DB has no follow_up-target
+    # rows yet, so the narrower->wider swap can't collide. Best-effort (0084 is
+    # the authoritative swap); runs after the column ALTER so the 4-col ref is valid.
+    with contextlib.suppress(Exception):
+        await db.execute("DROP INDEX IF EXISTS idx_rpa_dedupe")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
+            "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)"
+        )
 
     # Phase 9: thread_id on cc_sessions (for forum topic multi-session)
     await _try_alter(db,
@@ -863,6 +905,20 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE cc_sessions ADD COLUMN last_extracted_line INTEGER DEFAULT 0",
         "cc_sessions.last_extracted_line")
+    # Incremental transcript resume: byte offset of the START of line
+    # last_extracted_line. NULLable, NO default — NULL means "never computed"
+    # → the reader falls back to a full scan from byte 0 once, then populates.
+    await _try_alter(db,
+        "ALTER TABLE cc_sessions ADD COLUMN last_extracted_byte INTEGER",
+        "cc_sessions.last_extracted_byte")
+    # Per-device voice-session attribution: the satellite (device) id is hashed
+    # into the uuid5 session id and otherwise dropped. NULLable, NO default —
+    # NULL = unknown device (historical rows / a writer that passed none);
+    # captured on a voice session's FIRST registration. Powers the optional
+    # per_device scope of voice_recency_resume; the default (global) ignores it.
+    await _try_alter(db,
+        "ALTER TABLE cc_sessions ADD COLUMN satellite_id TEXT",
+        "cc_sessions.satellite_id")
 
     # Memory photographic: expand memory_links CHECK constraint to support
     # typed relationships from conversation extraction (discussed_in,
@@ -918,6 +974,132 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         logger.error(
             "memory_links CHECK constraint migration failed", exc_info=True
         )
+
+    # MW-2 (0082) edge-metadata on memory_links — classifier-verdict stamping
+    # location (GROUNDWORK(mw-5-merge-gate)). Mirrored here because
+    # create_all_tables runs _migrate_add_columns but NOT the numbered runner,
+    # so an existing DB upgraded via the base path needs the columns too
+    # (schema_both_build_paths). All NULLable, no backfill; NULL safe_for_boost
+    # = boost-eligible (legacy default).
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN proposed_type TEXT",
+        "memory_links.proposed_type")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN confidence REAL",
+        "memory_links.confidence")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN classifier TEXT",
+        "memory_links.classifier")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN review_state TEXT",
+        "memory_links.review_state")
+    await _try_alter(db,
+        "ALTER TABLE memory_links ADD COLUMN safe_for_boost INTEGER",
+        "memory_links.safe_for_boost")
+
+    # MW-3 (0083) entities: expand the entity_type CHECK with host/install/project
+    # (§6.4 first-card classes) + add card-materialization columns
+    # (summary_updated_at, summary_dirty). SQLite can't ALTER a CHECK, so rebuild.
+    # Mirrored here because create_all_tables runs _migrate_add_columns but NOT the
+    # numbered runner (schema_both_build_paths). Idempotency keys on the FULL new
+    # signature (all three type literals AND both card columns) — not one token —
+    # so a partially-upgraded table still completes. The row copy is a column-name
+    # intersection (_intersection_copy): the two card columns are dst-only and take
+    # DEFAULTs; a drift canary raises if the live table has a column the target
+    # lacks. The destructive DROP+RENAME runs inside a SAVEPOINT so a post-DROP
+    # failure ROLLS BACK to the intact table instead of committing its deletion
+    # (this block is OUTSIDE the numbered runner's atomic txn — connection init
+    # commits unconditionally, so without the savepoint a mid-rebuild failure would
+    # permanently lose the table).
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entities'"
+        )
+        row = await cursor.fetchone()
+        table_sql = (row[0] or "") if row else None
+        if table_sql is not None:
+            cursor = await db.execute("PRAGMA table_info(entities)")
+            live_cols = {r[1] for r in await cursor.fetchall()}
+            fully_migrated = all(
+                t in table_sql for t in ("'host'", "'install'", "'project'")
+            ) and {"summary_updated_at", "summary_dirty"} <= live_cols
+            if not fully_migrated:
+                # `DROP TABLE entities` auto-drops its secondary indexes+triggers
+                # (recreating only idx_entities_norm would silently lose local
+                # ones), and a dependent VIEW makes the RENAME itself fail under
+                # the default legacy_alter_table=OFF. Capture indexes/triggers to
+                # replay after the RENAME, and rename under legacy_alter_table=ON
+                # so a view survives (SQLite's documented table-rebuild procedure).
+                aux = await _capture_entity_aux(db)
+                await db.execute("SAVEPOINT entities_rebuild")
+                try:
+                    # Inside the try so a SAVEPOINT failure can't leak the pragma
+                    # ON into the later knowledge_units rebuild; every exit below
+                    # (success, inner except) restores it OFF.
+                    await db.execute("PRAGMA legacy_alter_table=ON")
+                    await db.execute("DROP TABLE IF EXISTS entities_new")
+                    await db.execute("""
+                        CREATE TABLE entities_new (
+                            entity_id   TEXT PRIMARY KEY,
+                            name        TEXT NOT NULL,
+                            norm_name   TEXT NOT NULL,
+                            entity_type TEXT NOT NULL CHECK (entity_type IN (
+                                'code_file','code_symbol','pr','commit',
+                                'product','device','repo','subsystem','person','org','concept',
+                                'host','install','project'
+                            )),
+                            summary     TEXT,
+                            summary_updated_at TEXT,
+                            summary_dirty INTEGER NOT NULL DEFAULT 0,
+                            source      TEXT NOT NULL DEFAULT 'extracted',
+                            status      TEXT NOT NULL DEFAULT 'active'
+                                            CHECK (status IN ('active','merged','gone')),
+                            merged_into TEXT,
+                            created_at  TEXT NOT NULL,
+                            updated_at  TEXT NOT NULL,
+                            UNIQUE (norm_name, entity_type)
+                        )
+                    """)
+                    await _intersection_copy(db, src="entities", dst="entities_new")
+                    await db.execute("DROP TABLE entities")
+                    await db.execute("ALTER TABLE entities_new RENAME TO entities")
+                    await db.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_entities_norm ON entities(norm_name)"
+                    )
+                    await _replay_entity_aux(db, aux)
+                    await db.execute("RELEASE entities_rebuild")
+                    await db.execute("PRAGMA legacy_alter_table=OFF")
+                    await db.commit()
+                    logger.info(
+                        "entities table rebuilt: +host/install/project types, +card columns"
+                    )
+                except BaseException:
+                    # Restore entities to its pre-rebuild state — never leave the
+                    # table deleted for the unconditional init commit to persist.
+                    # BaseException, not Exception (Codex round-8): an
+                    # asyncio.CancelledError landing in the DROP→RENAME window
+                    # would otherwise skip this rollback and leave `entities`
+                    # dropped inside an open savepoint on a caller-owned,
+                    # possibly-reused connection.
+                    with contextlib.suppress(Exception):
+                        await db.execute("ROLLBACK TO entities_rebuild")
+                        await db.execute("RELEASE entities_rebuild")
+                    with contextlib.suppress(Exception):
+                        await db.execute("PRAGMA legacy_alter_table=OFF")
+                    raise
+    except Exception:
+        logger.error(
+            "entities CHECK/card-column migration failed", exc_info=True
+        )
+        with contextlib.suppress(Exception):
+            await db.execute("DROP TABLE IF EXISTS entities_new")
+        # LOUD, not swallowed (Codex round-7): every entity read names the card
+        # columns explicitly, so committing init with an unmigrated `entities`
+        # would defer this failure to a runtime 'no such column' crash on the
+        # write path. Match the numbered runner's posture — stop init here with
+        # the actionable drift message; the savepoint above already restored
+        # the pre-rebuild table, so nothing is lost or half-rebuilt.
+        raise
 
     # Bookmark fix: add source column to session_bookmarks
     await _try_alter(db,
@@ -1179,6 +1361,31 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE memory_metadata ADD COLUMN room TEXT",
         "memory_metadata.room")
+
+    # MW-1 Tier-0 extraction judgment axes (0081_mw1_extraction_judgment).
+    # These MUST be mirrored here (the base create_all_tables path) and not only
+    # in the numbered migration: create_all_tables runs _migrate_add_columns but
+    # NOT the numbered runner, so on an existing DB the CREATE TABLE is a no-op
+    # and a create_all_tables→MemoryStore.store→create_metadata INSERT (e.g.
+    # scripts/migrate_faiss_to_qdrant.py) would hit 'no such column: speech_act'
+    # AFTER the Qdrant+FTS writes commit — a cross-store partial record. The
+    # columns are unindexed, so the INDEXES-parity guard cannot catch this;
+    # test_memory_metadata_base_path_upgrade does. schema_both_build_paths.
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN speech_act TEXT",
+        "memory_metadata.speech_act")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN speech_act_confidence REAL",
+        "memory_metadata.speech_act_confidence")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN assertion_provenance TEXT",
+        "memory_metadata.assertion_provenance")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN durability TEXT",
+        "memory_metadata.durability")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN expires_at TEXT",
+        "memory_metadata.expires_at")
 
     # Bi-temporal columns for temporal fact tracking (0010_bitemporal_memory)
     await _try_alter(db,
@@ -1617,6 +1824,18 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN last_validated_at TEXT",
         "ego_proposals.last_validated_at")
 
+    # Scope stamp (operate|develop): base path + numbered migration 0078,
+    # same dual-idempotent pattern as the PR-4 columns above.
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN scope TEXT",
+        "ego_proposals.scope")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN scope_revision INTEGER",
+        "ego_proposals.scope_revision")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposal_revisions ADD COLUMN scope TEXT",
+        "ego_proposal_revisions.scope")
+
     # surplus_tasks.not_before — existed in CREATE TABLE DDL but lacked
     # ALTER TABLE migration for installs created before the column was added.
     await _try_alter(db,
@@ -1954,7 +2173,9 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
                 expected_outputs TEXT,
                 revision_num      INTEGER DEFAULT 1,
                 revalidate_at     TEXT,
-                last_validated_at TEXT
+                last_validated_at TEXT,
+                scope             TEXT,
+                scope_revision    INTEGER
             )
         """)
         await _intersection_copy(db, src="ego_proposals", dst="ego_proposals_rebuild")

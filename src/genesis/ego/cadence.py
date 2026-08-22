@@ -456,7 +456,7 @@ class EgoCadenceManager:
             )
             if auto_tabled:
                 logger.info(
-                    "Pre-sweep auto-table: %d proposal(s) tabled (>14d)",
+                    "Pre-sweep auto-table: %d proposal(s) tabled (urgency-stale)",
                     auto_tabled,
                 )
         except Exception:
@@ -960,8 +960,21 @@ class EgoCadenceManager:
         resolves. Fail-open — a query error falls through to the authoritative
         dispatch gate (backed by the requeue safety net below), never silently
         suppresses a cycle.
+
+        Policy-aware: when ``manual_approval_required`` is False (the user's
+        sovereign gate-off choice), the authoritative gate auto-approves and
+        creates NO new pending row, so a LEFTOVER pending row (raised while the
+        gate was on) must not keep parking the cycle. Report not-gated so the
+        cycle proceeds to the gate, which clears the stale row on dispatch. This
+        does NOT weaken the gate: the default stays True, and with the gate on
+        the pending-row check below is unchanged.
         """
         try:
+            from genesis.autonomy.cli_policy import load_autonomous_cli_policy
+
+            if not load_autonomous_cli_policy().manual_approval_required:
+                return False
+
             from genesis.db.crud import ego as ego_crud
 
             return await ego_crud.has_pending_cli_approval(
@@ -1086,7 +1099,7 @@ class EgoCadenceManager:
                 return "ran"
             except Exception as exc:
                 logger.error("Unified cycle failed", exc_info=True)
-                self._record_failure(str(exc))
+                self._record_failure(str(exc), exc=exc)
                 return "ran"
 
             if cycle is None:
@@ -1291,8 +1304,15 @@ class EgoCadenceManager:
         except Exception:
             logger.debug("Failed to record ego job success", exc_info=True)
 
-    def _record_failure(self, error: str) -> None:
-        """Increment circuit breaker, record job failure."""
+    def _record_failure(self, error: str, *, exc: BaseException | None = None) -> None:
+        """Increment circuit breaker, record job failure.
+
+        When an exception caused the failure, pass it as *exc*: ``record_job_failure``
+        then derives ``error_type``/``error_frames`` and emits the throttled
+        ``job.failed`` reflex event (ingested since #1304). Semantic failures with no
+        exception behind them (e.g. "cycle produced no usable output") pass ``exc=None``
+        and stay off the reflex bus — they are not Genesis bugs the reflex arc can act on.
+        """
         self._consecutive_failures += 1
 
         if self._consecutive_failures >= self._config.consecutive_failure_limit:
@@ -1312,6 +1332,7 @@ class EgoCadenceManager:
             GenesisRuntime.instance().record_job_failure(
                 self._session._source_tag,
                 error,
+                exc=exc,
             )
         except ImportError:
             pass

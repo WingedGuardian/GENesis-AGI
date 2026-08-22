@@ -65,6 +65,17 @@ watchdog:
   flap_window_seconds: 21600             # 6h rolling per-reason window
   flap_threshold: 3                      # same-reason restarts before damping kicks in
   flap_backoff_max_seconds: 7200         # cap escalating flap backoff at 2h
+  # Down-vs-starved distinguisher: before restarting genesis-server for a
+  # staleness/zombie reason, the watchdog queries the off-loop liveness probe
+  # (a SYNC Flask route that answers even when the event loop is starved). A
+  # fresh, high-lag reading = UP-but-starved, not dead — a restart there just
+  # re-triggers the boot backlog that caused the starvation. Suppress + alert,
+  # bounded by max_starved_skips so a genuinely-stuck loop still recovers. Port
+  # matches the shipped server default (5000); change both together if relocated.
+  liveness_url: "http://127.0.0.1:5000/api/genesis/liveness"
+  liveness_lag_suppress_ms: 1000         # suppress restart only above this loop lag (well over the 250ms warn floor)
+  liveness_sample_stale_s: 120           # sample older than this = loop fully wedged → restart, don't suppress
+  liveness_max_starved_skips: 6          # max consecutive suppressed restarts (~30 min at 300s cadence) before restarting anyway
 
 # CC rate limit detection patterns
 # These are parsed from CC CLI stderr/stdout when rate limits are hit.

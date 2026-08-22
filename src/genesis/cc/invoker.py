@@ -35,6 +35,11 @@ from genesis.cc.types import (
     model_supports_effort,
 )
 from genesis.observability.spans import SpanKind, start_span
+from genesis.util.proc_kill import (
+    kill_process_group,
+    process_group_alive,
+    reap_bounded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +112,10 @@ _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 # marker) BEFORE our asyncio watchdog kills the process group. One source of truth
 # for the "graceful truncation beats hard kill" invariant.
 _BG_WAIT_HARD_MARGIN_MS = 60_000
+# Grace granted to surviving DESCENDANTS after the leader exits post-terminate,
+# before the group-kill escalation (reap_bounded waits only on the leader, so
+# without this a still-flushing MCP child gets zero grace of its own).
+_ESCALATION_GRACE_S = 2.0
 # Stable prefix of the CLI's headless bg-ceiling message (the numeric duration
 # varies): "Background tasks still running after 600s; terminating." Matching the
 # prefix is version-drift-tolerant — a miss degrades to no truncation notice
@@ -343,7 +352,12 @@ class CCInvoker:
             args += ["--resume", inv.resume_session_id]
         if inv.mcp_config:
             args += ["--mcp-config", inv.mcp_config]
-        if inv.strict_mcp_config:
+        # --bare already disables ALL MCP discovery; combining it with
+        # --strict-mcp-config makes CC exit non-zero (probe-verified, CC 2.1.x),
+        # so skip strict under bare. strict is safe with any other config state:
+        # with a --mcp-config it pins to those servers; with none it yields zero
+        # servers cleanly (probe-verified) — the secure-by-default posture.
+        if inv.strict_mcp_config and not inv.bare:
             args.append("--strict-mcp-config")
         # Register the span-capture PostToolUse hook for this dispatched session.
         # Dispatched sessions run with a cwd outside any git repo, so CC never
@@ -457,6 +471,15 @@ class CCInvoker:
             (inv.claude_code_tmpdir if inv and inv.claude_code_tmpdir else None)
             or self._CC_SANDBOX_TMPDIR
         )
+        # Keep TMPDIR consistent with CLAUDE_CODE_TMPDIR (never inconsistent — the
+        # invariant util/tmp.py protects). This also completes the per-invocation
+        # sandbox isolation above: without it a headless session's *subprocess*
+        # temp (e.g. the gauntlet agent running the fixture's pytest, whose
+        # tmp_path defaults under $TMPDIR) still lands in the inherited cc-tmp and
+        # can trip genesis-tmp-watchgod. For the default sandbox both resolve to
+        # cc-tmp (unchanged); for an override (gauntlet) TMPDIR follows it off
+        # cc-tmp.
+        env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
         # Prevent CC's alt-screen renderer from corrupting terminal scrollback
         # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
@@ -474,6 +497,11 @@ class CCInvoker:
         # cleanroom). Applied last by contract; see CCInvocation.env_overrides.
         if inv and inv.env_overrides:
             env.update(inv.env_overrides)
+            # Preserve the TMPDIR ≡ CLAUDE_CODE_TMPDIR invariant even if an
+            # override changed CLAUDE_CODE_TMPDIR but not TMPDIR (else the two
+            # silently desync). An explicit TMPDIR override still wins.
+            if "CLAUDE_CODE_TMPDIR" in inv.env_overrides and "TMPDIR" not in inv.env_overrides:
+                env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
@@ -705,9 +733,52 @@ class CCInvoker:
                     span.set_status_error(output.error_message or "CC session error")
             return output
 
+    async def _apply_login_fallback(
+        self,
+        env: dict[str, str],
+        inv: CCInvocation | None,
+    ) -> dict[str, str]:
+        """Inject the stored 1-year setup-token ONLY when the interactive
+        login is hard-expired AND a live probe confirms logged-out
+        (login_health gates — never over a working login, never on
+        ambiguity). Skipped entirely for cleanroom/bare invocations whose
+        env_overrides manage their own auth (overrides win by contract).
+        """
+        if inv is not None and getattr(inv, "bare", False):
+            return env
+        # Peer-routed invocations (third-party ANTHROPIC_BASE_URL/AUTH_TOKEN)
+        # never use the claude.ai login — injecting the Anthropic OAuth
+        # setup-token there is useless at best and violates the roster's
+        # credential-isolation contract (the Anthropic credential must never
+        # travel toward a third-party endpoint).
+        if inv and (
+            getattr(inv, "anthropic_base_url", None) or getattr(inv, "anthropic_auth_token", None)
+        ):
+            return env
+        if (
+            inv
+            and inv.env_overrides
+            and (
+                "CLAUDE_CODE_OAUTH_TOKEN" in inv.env_overrides
+                or "CLAUDE_CONFIG_DIR" in inv.env_overrides
+                or "ANTHROPIC_API_KEY" in inv.env_overrides
+            )
+        ):
+            return env
+        try:
+            from genesis.cc.login_health import fallback_env_if_login_dead
+
+            fb = await fallback_env_if_login_dead(cc_path=self._claude_path)
+            if fb:
+                return {**env, **fb}
+        except Exception:
+            logger.debug("login fallback check failed", exc_info=True)
+        return env
+
     async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
         args = self._build_args(invocation)
         env = self._build_env(invocation)
+        env = await self._apply_login_fallback(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
@@ -736,7 +807,10 @@ class CCInvoker:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=invocation.working_dir or self._working_dir,
-                preexec_fn=os.setpgrp,
+                # Own session/group (setsid in the C helper — never preexec_fn:
+                # post-fork Python can deadlock in the threaded server) so the
+                # kill paths can killpg the whole claude tree.
+                start_new_session=True,
             )
             reg_key = invocation.session_key or f"pid:{proc.pid}"
             self._register_proc(reg_key, proc)
@@ -768,20 +842,25 @@ class CCInvoker:
             ) from None
         except TimeoutError:
             elapsed_s = time.monotonic() - start
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                proc.kill()
-            await proc.wait()
+            if proc is None:
+                # Spawn-time TimeoutError (ETIMEDOUT is an OSError subclass —
+                # PEP 3151) misroutes here with nothing to kill.
+                raise CCTimeoutError(
+                    f"Timeout after {invocation.timeout_s}s (during spawn)"
+                ) from None
+            # Shared guarded group-kill: signals proc.pid AS the pgid (never
+            # os.getpgid — it raises once the leader is reaped, leaking the
+            # tree), pgid<=1 guard, direct-kill fallback; then a BOUNDED reap.
+            kill_process_group(proc)
+            await reap_bounded(proc)
 
             # Capture stderr for diagnostics (mirrors run_streaming pattern)
             stderr_text = ""
             if proc.stderr:
                 try:
-                    stderr_data = await proc.stderr.read()
+                    # Bounded: a setsid-escaping descendant holding stderr
+                    # could otherwise stall this read past the bounded reap.
+                    stderr_data = await asyncio.wait_for(proc.stderr.read(), 5.0)
                     if isinstance(stderr_data, bytes):
                         stderr_text = stderr_data.decode(errors="replace")[:1000]
                 except Exception:
@@ -801,8 +880,9 @@ class CCInvoker:
                 # Don't leak a still-running proc on an abnormal exit (e.g. task
                 # cancellation); communicate() reaps it on the normal path.
                 if proc is not None and proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError, OSError):
-                        proc.kill()
+                    # Group-kill: a bare proc.kill() would orphan the claude
+                    # tree's MCP/helper children on cancellation.
+                    kill_process_group(proc)
 
         elapsed = int((time.monotonic() - start) * 1000)
         logger.info(
@@ -896,6 +976,7 @@ class CCInvoker:
         args.insert(1, "--verbose")
 
         env = self._build_env(invocation)
+        env = await self._apply_login_fallback(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
@@ -923,7 +1004,10 @@ class CCInvoker:
                 limit=1_048_576,  # 1MB — CC stream-json lines can exceed 64KB default
                 env=env,
                 cwd=invocation.working_dir or self._working_dir,
-                preexec_fn=os.setpgrp,
+                # Own session/group (setsid in the C helper — never preexec_fn:
+                # post-fork Python can deadlock in the threaded server) so the
+                # kill paths can killpg the whole claude tree.
+                start_new_session=True,
             )
         except FileNotFoundError:
             logger.error(
@@ -961,8 +1045,7 @@ class CCInvoker:
                 proc.stdin.close()
         except BaseException:
             self._unregister_proc(reg_key)
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
+            kill_process_group(proc)
             raise
 
         result_data: dict | None = None
@@ -1031,13 +1114,7 @@ class CCInvoker:
                 time.monotonic() - start,
                 proc.pid,
             )
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                proc.kill()
+            kill_process_group(proc)
         except asyncio.CancelledError:
             # Task cancellation (runtime shutdown cancelling an in-flight
             # session) must not leak the CC child: without this handler the
@@ -1050,25 +1127,50 @@ class CCInvoker:
                 "CC streaming cancelled (PID %s) — killing subprocess",
                 proc.pid,
             )
-            try:
-                pgid = os.getpgid(proc.pid)
-                if pgid <= 1:
-                    raise ValueError(f"Refusing killpg with pgid={pgid}")
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError, TypeError):
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.kill()
+            kill_process_group(proc)
+            raise
+        except BaseException:
+            # Any other failure mid-stream (an on_event callback raising, an
+            # over-limit stream-json line) must not leak the live, now-
+            # unregistered tree — it would run detached where even /stop
+            # can't reach it, then wedge when its unread stdout pipe fills.
+            kill_process_group(proc)
             raise
         finally:
             self._unregister_proc(reg_key)
 
-        await proc.wait()
+        # Bounded reap: proc.terminate() on the result path is a GRACEFUL stop
+        # the child can ignore (wedged node flush / MCP teardown) — an
+        # unbounded wait here would hang the dispatch AFTER the result was
+        # already obtained. Bound it; on expiry escalate to the group kill.
+        await reap_bounded(proc)
+        # Escalate on GROUP liveness, not the leader's returncode: after the
+        # graceful terminate the leader can exit (returncode set) while an
+        # MCP/helper child survives in the group — gating on returncode alone
+        # would leak that descendant while we report completion.
+        if process_group_alive(proc):
+            # The leader-only reap gives descendants no grace of their own —
+            # an MCP child mid-flush would be SIGKILLed instantly. Grant a
+            # short beat (stdio children normally exit sub-second on parent
+            # death); costs latency only when a survivor actually exists.
+            await asyncio.sleep(_ESCALATION_GRACE_S)
+        if proc.returncode is None or process_group_alive(proc):
+            logger.warning(
+                "CC streaming group survived graceful stop/kill "
+                "(PID %s, rc=%s) — group-killing",
+                proc.pid,
+                proc.returncode,
+            )
+            kill_process_group(proc)
+            await reap_bounded(proc)
         elapsed = int((time.monotonic() - start) * 1000)
 
         # Read stderr for diagnostics
         stderr_data = b""
         if proc.stderr:
-            stderr_data = await proc.stderr.read()
+            with contextlib.suppress(TimeoutError):
+                # Bounded for the same reason as the reap above.
+                stderr_data = await asyncio.wait_for(proc.stderr.read(), 5.0)
         stderr_str = stderr_data.decode(errors="replace") if stderr_data else ""
         if stderr_str:
             logger.warning("CC stderr: %s", stderr_str[:500])

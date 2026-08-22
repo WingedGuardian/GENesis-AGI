@@ -88,6 +88,124 @@ async def run_recon_gather(sched: SchedulerContext) -> None:
         record_failure("recon_gather", str(exc))
 
 
+async def run_account_activity_monitor(sched: SchedulerContext) -> None:
+    """Poll owner repos for EXTERNAL GitHub activity; ping first-time contributors."""
+    if sched._account_activity_monitor is None:
+        record_failure("account_activity_monitor", "monitor not wired")
+        return
+    try:
+        result = await sched._account_activity_monitor.gather()
+        if result.new_events or result.pinged or result.errors:
+            logger.info(
+                "GitHub steward: mode=%s repos=%d new=%d pinged=%d errors=%d",
+                result.mode, result.checked_repos, result.new_events,
+                result.pinged, result.errors,
+            )
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.DEBUG,
+                "heartbeat", "account_activity_monitor completed",
+            )
+        record_success("account_activity_monitor")
+    except Exception as exc:
+        logger.exception("Account activity monitor failed")
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.ERROR,
+                "account_activity_monitor.failed",
+                "Account activity monitor failed with exception",
+                **failure_details(exc=exc),
+            )
+        record_failure("account_activity_monitor", str(exc))
+
+
+async def run_career_outreach_monitor(sched: SchedulerContext) -> None:
+    """Drive the external career-agent engine to stage outreach drafts; nudge owner."""
+    if sched._career_outreach_monitor is None:
+        record_failure("career_outreach_monitor", "monitor not wired")
+        return
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        if GenesisRuntime.instance().paused:
+            logger.debug("Career outreach monitor skipped (Genesis paused)")
+            return
+    except Exception:
+        pass
+    try:
+        result = await sched._career_outreach_monitor.gather()
+        if result.mode == "off":
+            # Disabled-by-config: record NOTHING (neither success nor failure) so the
+            # actuator stays invisible in job-health on installs that never enabled it
+            # (surplus convention — cf. _guard.SKIP).
+            return
+        if (
+            result.auto_runs
+            or result.nudged
+            or result.seeded
+            or result.verify_failed
+            or result.errors
+        ):
+            logger.info(
+                "Career outreach: mode=%s auto_runs=%d working=%d nudged=%d "
+                "seeded=%d verify_failed=%d errors=%d",
+                result.mode, result.auto_runs, result.drafts_working,
+                result.nudged, result.seeded, result.verify_failed, result.errors,
+            )
+        # No-progress visibility: the engine drafted but its own accuracy gate refused
+        # every attempt (verify_failed) and nothing staged/nudged. verify_failed is
+        # correctly NOT a job-health failure (the gate working), so a SINGLE such tick
+        # is normal; but a PERSISTENT run of them = a possibly-broken verifier that
+        # record_success would otherwise hide. Surface it loudly per-tick (WARNING).
+        # Gate on `not errors`: on a MIXED tick (a hard dispatch/read/nudge error also
+        # occurred) the failure is recorded below — a "verifier refused every attempt"
+        # warning would be a second, misleading diagnosis. Cross-tick threshold
+        # alerting (durable counters) is a tracked follow-up.
+        if (
+            result.verify_failed
+            and not result.errors
+            and not (result.auto_runs or result.nudged or result.seeded)
+        ):
+            logger.warning(
+                "Career outreach: NO-PROGRESS tick — %d verify_failed, 0 staged/nudged "
+                "(engine drafted but its own gate refused all). Persistent recurrence "
+                "signals a possibly-broken verifier job-health cannot see.",
+                result.verify_failed,
+            )
+            if sched._event_bus:
+                await sched._event_bus.emit(
+                    Subsystem.RECON, Severity.WARNING,
+                    "career_outreach.no_progress",
+                    f"{result.verify_failed} verify_failed, 0 staged this tick",
+                )
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.DEBUG,
+                "heartbeat", "career_outreach_monitor completed",
+            )
+        # An adapter-level dispatch failure is surfaced as result.errors (NOT an
+        # exception — execute_operation returns an error dict), so a bare
+        # record_success would lie on every failed dispatch. Record failure when
+        # a dispatch errored; an unhealthy remote (health_ok=False, errors=0) is a
+        # clean skip and records success.
+        if result.errors:
+            record_failure(
+                "career_outreach_monitor", "; ".join(result.details) or "dispatch error"
+            )
+        else:
+            record_success("career_outreach_monitor")
+    except Exception as exc:
+        logger.exception("Career outreach monitor failed")
+        if sched._event_bus:
+            await sched._event_bus.emit(
+                Subsystem.RECON, Severity.ERROR,
+                "career_outreach_monitor.failed",
+                "Career outreach monitor failed with exception",
+                **failure_details(exc=exc),
+            )
+        record_failure("career_outreach_monitor", str(exc))
+
+
 async def run_model_intelligence(sched: SchedulerContext) -> None:
     """Run model intelligence scan (weekly)."""
     if sched._model_intelligence_job is None:

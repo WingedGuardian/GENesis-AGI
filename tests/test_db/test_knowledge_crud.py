@@ -143,6 +143,28 @@ async def test_fts_search(db):
     assert results[0]["concept"] == "VPC"
 
 
+async def test_fts_search_or_fallback_on_partial_terms(db):
+    # A term absent from the doc makes FTS5's implicit-AND return nothing; the
+    # OR-fallback surfaces the row on the term(s) that DO match.
+    await knowledge.insert(
+        db, project_type="cloud", domain="aws", source_doc="m1",
+        concept="VPC", body="Virtual Private Cloud for network isolation",
+    )
+    results = await knowledge.search_fts(db, "network nonexistentword")
+    assert len(results) == 1
+    assert results[0]["concept"] == "VPC"
+
+
+async def test_fts_search_and_precise_when_all_present(db):
+    # All terms present: the AND path already hits; fallback never fires.
+    await knowledge.insert(
+        db, project_type="cloud", domain="aws", source_doc="m1",
+        concept="VPC", body="Virtual Private Cloud for network isolation",
+    )
+    results = await knowledge.search_fts(db, "network isolation")
+    assert results[0]["concept"] == "VPC"
+
+
 async def test_fts_search_with_project_filter(db):
     await knowledge.insert(
         db, project_type="cloud", domain="aws", source_doc="m1",
@@ -295,12 +317,12 @@ async def test_delete_nonexistent(db):
 async def test_find_by_unique_key_hit(db):
     uid = await knowledge.insert(
         db, project_type="reference", domain="reference.credentials",
-        source_doc="manual", concept="ScarletAndRage login",
+        source_doc="manual", concept="HobbyForum login",
         body="forum creds",
     )
     row = await knowledge.find_by_unique_key(
         db, project_type="reference", domain="reference.credentials",
-        concept="ScarletAndRage login",
+        concept="HobbyForum login",
     )
     assert row is not None
     assert row["id"] == uid
@@ -321,14 +343,14 @@ async def test_find_by_unique_key_miss(db):
 async def test_upsert_insert_path(db):
     uid, inserted = await knowledge.upsert(
         db, project_type="reference", domain="reference.urls",
-        source_doc="session-a", concept="ScarletAndRage forum",
-        body="https://forum.thescarletandrage.com — Ohio State fan forum",
+        source_doc="session-a", concept="HobbyForum forum",
+        body="https://forum.example-community.org — hobby community forum",
     )
     assert inserted is True
     assert uid
     row = await knowledge.get(db, uid)
     assert row is not None
-    assert row["body"] == "https://forum.thescarletandrage.com — Ohio State fan forum"
+    assert row["body"] == "https://forum.example-community.org — hobby community forum"
 
 
 async def test_upsert_update_path_preserves_id(db):
@@ -380,7 +402,10 @@ async def test_upsert_fts_shadow_row_updated(db):
         source_doc="m1", concept="test url",
         body="first body text for full-text search",
     )
-    results_before = await knowledge.search_fts(db, "first body")
+    # Probe a term UNIQUE to the old content ("first"; "body" survives into the
+    # new content). Single-term so the OR-fallback can't resurface it — this
+    # tests upsert-replacement precisely, not FTS AND/OR semantics.
+    results_before = await knowledge.search_fts(db, "first")
     assert any(r["unit_id"] == uid for r in results_before)
 
     await knowledge.upsert(
@@ -388,8 +413,8 @@ async def test_upsert_fts_shadow_row_updated(db):
         source_doc="m1", concept="test url",
         body="replacement body content indexed fresh",
     )
-    results_old = await knowledge.search_fts(db, "first body")
-    # Old content no longer indexed
+    results_old = await knowledge.search_fts(db, "first")
+    # Old content no longer indexed (the unique old term is gone)
     assert not any(r["unit_id"] == uid for r in results_old)
     results_new = await knowledge.search_fts(db, "replacement body")
     assert any(r["unit_id"] == uid for r in results_new)

@@ -213,9 +213,9 @@ class TestVoiceTranscriptWriter:
         """
         orig_register = writer._ensure_registered
 
-        async def _slow_register(sid: str) -> None:
+        async def _slow_register(sid: str, satellite_id: str | None = None) -> None:
             await asyncio.sleep(0)  # force a yield at the critical point
-            await orig_register(sid)
+            await orig_register(sid, satellite_id)
 
         writer._ensure_registered = _slow_register
 

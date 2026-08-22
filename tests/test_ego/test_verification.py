@@ -42,6 +42,24 @@ def test_parse_json_with_empty_files():
     assert parse_expected_outputs(json.dumps({"files": []})) is None
 
 
+def test_parse_non_list_files_returns_none():
+    """A non-list 'files' (e.g. int) is not a usable spec — None, not a crash."""
+    assert parse_expected_outputs(json.dumps({"files": 123})) is None
+    assert parse_expected_outputs(json.dumps({"files": "report.md"})) is None
+
+
+def test_parse_malformed_optional_fields_coerce_safely():
+    """Non-numeric min_size_bytes / non-list required_strings must not raise —
+    they coerce to safe defaults so the spec is still usable, never a crash."""
+    result = parse_expected_outputs(
+        json.dumps({"files": ["a.md"], "min_size_bytes": "big", "required_strings": 123})
+    )
+    assert result is not None
+    assert result.files == ["a.md"]
+    assert result.min_size_bytes == 0
+    assert result.required_strings == []
+
+
 def test_parse_valid_minimal():
     """Minimal valid expected_outputs with only files."""
     raw = json.dumps({"files": ["/tmp/test.md"]})

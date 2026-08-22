@@ -82,8 +82,10 @@ class TestOperateVsDevelopRule:
         prompt = _build_realist_prompt(
             _props("Refactor the router"), [], ego_source="genesis_ego_cycle"
         )
-        assert "Operate vs develop" in prompt
-        assert "Develop, not operate" in prompt
+        # Rule 8 now stamps a structured scope rather than rejecting outright.
+        assert "Scope stamp" in prompt
+        assert "operate" in prompt and "develop" in prompt
+        assert '"scope": "operate|develop"' in prompt
 
     def test_user_ego_has_no_operate_rule(self):
         prompt = _build_realist_prompt(

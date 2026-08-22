@@ -128,10 +128,17 @@ def test_load_full_yaml(monkeypatch):
     # 2026-06-23: 28 → 29 after groq-oss-120b added (free reasoning option,
     # not yet wired into any chain).
     # 2026-06-23 (WS2b): 29 → 28 after removing expired openrouter-trinity-free.
-    assert len(cfg.providers) == 28
+    # 2026-08-07: 28 → 26 after removing the redundant groq-oss-120b GROUNDWORK
+    # alias (groq-free now serves gpt-oss-120b post-migration) + the dead,
+    # unwired openrouter-qwen3coder (delisted qwen/qwen3-coder:free slug).
+    # 2026-08-19: 26 → 25 after removing dead nvidia-nim-kimi (moonshotai/kimi-k2.6
+    # 404-for-account on NIM); nvidia-nim-deepseek repointed v4-pro → v4-flash-0731.
+    assert len(cfg.providers) == 25
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
+    assert "groq-oss-120b" not in cfg.providers  # removed 2026-08-07 (redundant w/ groq-free)
+    assert "openrouter-qwen3coder" not in cfg.providers  # removed 2026-08-07 (dead slug, unwired)
     # Call sites evolve — assert actual count matches config, and lock in
     # a few load-bearing ids rather than chasing the total on every edit.
     # 2026-05-10: 44 → 43 after net change (judge added by #304, 2_triage +
@@ -160,7 +167,11 @@ def test_load_full_yaml(monkeypatch):
     # matcher neural-monitor registration).
     # 2026-07-17: 57 → 59 after entity_adjudication + entity_adjudication_challenge
     # added (entity-node merge-vs-distinct drainer).
-    assert len(cfg.call_sites) == 59
+    # 2026-08-07: 59 → 60 after 41_reflection_json_salvage added (deep-reflection
+    # prose-output salvage retry).
+    assert len(cfg.call_sites) == 61
+    assert "dream_cycle_relationship_classify" in cfg.call_sites  # MW-2 classifier (2026-08-10)
+    assert "41_reflection_json_salvage" in cfg.call_sites  # deep-reflection salvage (2026-08-07)
     assert cfg.call_sites["repo_pulse"].dispatch == "cli"
     assert cfg.call_sites["repo_pulse"].chain == []
     assert cfg.call_sites["repo_pulse"].never_pays is True
@@ -195,11 +206,13 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
     assert cfg.call_sites["36_code_auditor"].never_pays is False
     assert cfg.call_sites["37_infrastructure_monitor"].default_paid is True
-    # judge: LLM-as-judge eval primitive — free NIM v4-pro first, then paid v4-pro,
-    # then v4-flash; paid-by-default
+    # judge: LLM-as-judge eval primitive — paid V4-pro (the calibrated judge model)
+    # first, then NIM v4-flash, then paid v4-flash for resilience; paid-by-default.
+    # (Reordered 2026-08-19: NIM now serves flash, not the calibrated pro, so the
+    # calibrated openrouter-deepseek-v4 leads to keep the eval baseline stable.)
     assert cfg.call_sites["judge"].chain == [
-        "nvidia-nim-deepseek",
         "openrouter-deepseek-v4",
+        "nvidia-nim-deepseek",
         "openrouter-deepseek-v4-flash",
     ]
     assert cfg.call_sites["judge"].default_paid is True
@@ -223,6 +236,46 @@ def test_load_full_yaml(monkeypatch):
     ml = cfg.providers["mistral-large-free"]
     assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"
+
+    # groq-free provider — MIGRATED 2026-08-06: Groq deprecated
+    # llama-3.3-70b-versatile (shutdown 2026-08-16) → openai/gpt-oss-120b, its
+    # recommended free-tier replacement. The alias name is kept deliberately so
+    # all 32 call-site chains + 8 code refs resolve the repoint in place.
+    # reasoning_effort=low caps reasoning-token volume under the free-tier TPM
+    # ceiling; no reasoning-suppression param is needed (Groq returns reasoning
+    # in a separate field, so content stays clean JSON — benchmarked 10/10).
+    gf = cfg.providers["groq-free"]
+    assert gf.is_free is True
+    assert gf.provider_type == "groq"
+    assert gf.model_id == "openai/gpt-oss-120b"
+    assert gf.profile == "gpt-oss-120b"
+    assert gf.params == {"extra_body": {"reasoning_effort": "low"}}
+
+    # openrouter-free provider — REPOINTED 2026-08-07 off the bare (paid)
+    # qwen/qwen-2.5-72b-instruct slug (flagged free:true but bills at OpenRouter)
+    # to a curated OpenRouter :free pool: gemma-4-26b-a4b primary +
+    # nemotron-3-super-120b failover via extra_body.models. Both :free ⇒ $0.
+    orf = cfg.providers["openrouter-free"]
+    assert orf.is_free is True
+    assert orf.provider_type == "openrouter"
+    assert orf.model_id == "google/gemma-4-26b-a4b-it:free"
+    assert orf.model_id.endswith(":free")  # the mislabel guard must pass on it
+    assert orf.profile == "gemma-4-26b"
+    assert orf.params == {
+        "extra_body": {
+            "models": [
+                "google/gemma-4-26b-a4b-it:free",
+                "nvidia/nemotron-3-super-120b-a12b:free",
+            ]
+        }
+    }
+    # The shipped config must be clean per the mislabel guard — no OpenRouter
+    # free-flagged provider pointing at a paid (non-:free) slug. Regression lock:
+    # reintroducing the openrouter-free bug (or a paid slug in a curated pool)
+    # fails here.
+    from genesis.routing.config import _detect_mislabeled_free_openrouter
+
+    assert _detect_mislabeled_free_openrouter(cfg.providers) == []
 
 
 def test_retry_profiles_under_watchdog_threshold():
@@ -609,3 +662,58 @@ def test_sanitize_drops_local_call_site_absent_from_base():
     result = _sanitize_local_overlay(base, local)
     assert "7_ego_cycle" not in (result.get("call_sites") or {})
     assert "live_site" in result["call_sites"]
+
+
+def test_detect_mislabeled_free_openrouter_flags_paid_slug_marked_free():
+    """Class-fix guard: a `type:openrouter` provider flagged free:true whose slug
+    (or any curated `params.extra_body.models` member) is not `:free` is a
+    paid-slug-mislabeled-free billing leak (the openrouter-free bug). The guard
+    must flag it while NOT flagging genuine `:free` slugs, the `openrouter/free`
+    meta-router, or non-openrouter free providers (which are free-by-account-tier
+    and legitimately carry list prices in their profiles)."""
+    from genesis.routing.config import _detect_mislabeled_free_openrouter
+    from genesis.routing.types import ProviderConfig
+
+    def pc(name, ptype, model, free, params=None):
+        return ProviderConfig(
+            name=name,
+            provider_type=ptype,
+            model_id=model,
+            is_free=free,
+            rpm_limit=None,
+            open_duration_s=120,
+            params=params,
+        )
+
+    providers = {
+        # THE BUG: paid OpenRouter slug (no :free) flagged free -> silent billing
+        "or-paid-as-free": pc("or-paid-as-free", "openrouter", "qwen/qwen-2.5-72b-instruct", True),
+        # OK: genuine :free slug
+        "or-free-ok": pc("or-free-ok", "openrouter", "google/gemma-4-26b-a4b-it:free", True),
+        # OK: the free-pool meta-router (allowlisted — genuinely $0, no :free suffix)
+        "or-meta": pc("or-meta", "openrouter", "openrouter/free", True),
+        # OK: non-openrouter free provider (free-by-account-tier; :free convention N/A)
+        "groq-ok": pc("groq-ok", "groq", "openai/gpt-oss-120b", True),
+        # OK: not free -> paid providers legitimately bill
+        "or-paid": pc("or-paid", "openrouter", "anthropic/claude-opus-4.6", False),
+        # THE BUG hiding in a curated pool: a paid slug in extra_body.models
+        "or-curated-bad": pc(
+            "or-curated-bad",
+            "openrouter",
+            "google/gemma-4-26b-a4b-it:free",
+            True,
+            params={
+                "extra_body": {
+                    "models": [
+                        "google/gemma-4-26b-a4b-it:free",  # ok
+                        "qwen/qwen-2.5-72b-instruct",  # paid, no :free -> must be caught
+                    ]
+                }
+            },
+        ),
+    }
+    flagged = _detect_mislabeled_free_openrouter(providers)
+    # findings are "<name>: <reason>" — compare the leading names as a set
+    # (substring checks collide: "or-paid" is inside "or-paid-as-free").
+    flagged_names = {f.split(":", 1)[0] for f in flagged}
+    assert flagged_names == {"or-paid-as-free", "or-curated-bad"}, flagged

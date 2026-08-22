@@ -1001,10 +1001,19 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
                     # Repo-pulse proposals (PR-4a) — own guard: pre-0062
                     # installs have no pulse tables and the charter block
                     # must render byte-identically without them.
+                    # Ledger-only: the rendered confirm command is
+                    # session_ledger_update(...), which can only resolve a
+                    # ledger id. follow_up-target proposals (target_kind added by
+                    # migration 0084) are session-agnostic and get their own
+                    # global surface — never surface them here with a confirm
+                    # command that can't find them. Pre-0084 DBs lack the column;
+                    # the enclosing try/except then renders the block empty (same
+                    # graceful degradation as the pre-0062 no-tables case).
                     cur = await db.execute(
                         "SELECT item_id, item_text, pr_number, pr_title"
                         " FROM repo_pulse_annotations"
                         " WHERE item_session_id = ? AND status = 'proposed'"
+                        " AND target_kind = 'ledger'"
                         " AND (confidence IS NULL OR confidence >= ?)"
                         " ORDER BY observed_at DESC LIMIT 3",
                         (session_id, _pulse_floor()),

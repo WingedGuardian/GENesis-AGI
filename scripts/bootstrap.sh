@@ -12,9 +12,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# HOME may be unset in some container environments; derive from passwd
+# HOME may be unset in some container environments; derive from passwd (uid,
+# not whoami — robust when the name lookup is missing) and fail closed rather
+# than proceed with HOME="" (which `set -u` would not catch).
 if [[ -z "${HOME:-}" ]]; then
-    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
 
@@ -958,6 +961,12 @@ if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
     # shellcheck source=lib/memory_resilience.sh
     source "$SCRIPT_DIR/lib/memory_resilience.sh"
     memory_resilience_apply
+    # PID/task ceiling: raise the per-user-slice TasksMax above systemd's stock
+    # 33% default (the fork-exhaustion blind spot — many concurrent CC sessions
+    # spawn MCP subprocess trees and hit `Cannot fork` while memory/CPU read
+    # green). Same lib, same never-abort contract; surfaces via the posture check
+    # (pid_ceiling_effective_ok) when sudo/etc is unavailable.
+    pid_budget_apply
 else
     echo "  WARNING: lib/memory_resilience.sh missing — skipping OOM-resilience setup"
 fi
@@ -1053,6 +1062,16 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                 echo "  + $timer_name enabled + started" || true
         fi
     done
+
+    # Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
+    # timer — the loop above only enables timers). Enable-only (not --now): it is
+    # meant to fire in the CC-quiet cold-start window before genesis-server, so
+    # arming it for the next boot is correct; the paired timer handles periodic
+    # attempts. Without this an existing install would render but never activate it.
+    if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
+        systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
+            echo "  + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
+    fi
 else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
 fi

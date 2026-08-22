@@ -97,6 +97,74 @@
       </div>
     </template>
 
+    <!-- Persistent Readiness panel [Tab: overview]. Stays visible after floor_met (the
+         first-run Setup card does not), surfacing tier, next-tier guidance, and enrichment.
+         Renders the already-loaded setupStatus (no new fetch). Copy is config-framed: the
+         payload is presence-based, so chips describe configuration, not live behavior. -->
+    <div class="panel" id="readiness-panel" x-data="{s: $store.genesisDashboard}"
+         x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;"
+           @click="s.toggleReadinessPanel()">
+        <span style="display:flex;align-items:center;gap:0.3rem;">
+          <span class="material-symbols-outlined" :style="s.readinessPanelOpen ? 'transform:rotate(90deg)' : ''" style="transition:transform 0.2s">chevron_right</span>
+          <span class="material-symbols-outlined">insights</span> Readiness
+        </span>
+        <template x-if="s.setupStatus">
+          <span style="display:inline-flex;gap:0.3rem;align-items:center;">
+            <span class="chip chip--stale" x-show="s.setupStatusStale"
+                  title="The last setup-status refresh failed — this snapshot may be out of date.">stale</span>
+            <span class="chip" :class="'chip--' + (s.setupStatus.tier >= 3 ? 'ok' : (s.setupStatus.tier <= 0 ? 'warn' : 'info'))"
+                  x-text="'Tier ' + (s.setupStatus.tier ?? 0) + ' · ' + (s.setupStatus.tier_name ?? '—')"></span>
+          </span>
+        </template>
+      </div>
+      <div class="panel-body" x-show="s.readinessPanelOpen" x-transition>
+        <template x-if="!s.setupStatus">
+          <div class="empty-state">Readiness status not loaded yet.</div>
+        </template>
+        <template x-if="s.setupStatus">
+          <div style="font-size:0.82rem;">
+            <!-- Tier rail: cumulative T0→T3. Surpassed/ceiling = ✓ ok; current-below-ceiling
+                 = ◆ action (a real next step exists, matching the callout); ahead = ○ off.
+                 T3 is the ceiling (tier_names 0..3), so the current tier AT T3 reads as
+                 achieved, not "needs action". -->
+            <div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:0.6rem;">
+              <template x-for="seg in [{n:0,label:'Bootstrapped'},{n:1,label:'Functional'},{n:2,label:'Connected'},{n:3,label:'Autonomous'}]" :key="seg.n">
+                <span class="chip"
+                      :class="'chip--' + (((s.setupStatus.tier ?? 0) > seg.n || ((s.setupStatus.tier ?? 0) >= 3 && seg.n === 3)) ? 'ok' : ((s.setupStatus.tier ?? 0) === seg.n ? 'action' : 'off'))">
+                  <span x-text="(((s.setupStatus.tier ?? 0) > seg.n || ((s.setupStatus.tier ?? 0) >= 3 && seg.n === 3)) ? '✓' : ((s.setupStatus.tier ?? 0) === seg.n ? '◆' : '○')) + ' T' + seg.n + ' ' + seg.label"></span>
+                </span>
+              </template>
+            </div>
+            <!-- Next-step callout -->
+            <div style="margin-bottom:0.7rem;"
+                 :style="s.readinessNextStep.reached ? 'color:#5cb85c;' : 'color:var(--color-text-secondary,#aaa);'"
+                 x-text="(s.readinessNextStep.reached ? '✓ ' : '→ ') + s.readinessNextStep.text"></div>
+            <!-- Enrichment chips (config-framed, non-gating) -->
+            <div style="display:flex;flex-wrap:wrap;gap:0.4rem;">
+              <!-- Only keyed PREMIUM providers are knowable from the payload; the keyless
+                   SearXNG primary is not bootstrap-provisioned, so we do not assert it. -->
+              <span class="chip" :class="s.setupStatus.web_search_keyed_providers?.length ? 'chip--info' : 'chip--off'"
+                    x-text="'Web search premium: ' + ((s.setupStatus.web_search_keyed_providers?.length)
+                              ? s.setupStatus.web_search_keyed_providers.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(', ')
+                              : 'none keyed')"></span>
+              <span class="chip" :class="s.setupStatus.voice_configured ? 'chip--ok' : 'chip--off'"
+                    x-text="s.setupStatus.voice_configured ? 'Voice: configured' : 'Voice: not configured'"></span>
+              <span class="chip" :class="s.setupStatus.ego_enabled ? 'chip--ok' : 'chip--off'"
+                    x-text="s.setupStatus.ego_enabled ? ('Ego loop: on · ' + (s.setupStatus.ego_cadence_minutes ?? '—') + ' min (config)') : 'Ego loop: off (config)'"></span>
+              <span class="chip chip--info"
+                    x-text="'Autonomy default: L' + (s.setupStatus.autonomy_level ?? 1) + ' · direct_session'"
+                    title="The shipped config default for direct sessions — not a live earned autonomy level."></span>
+              <span class="chip" :class="s.setupStatus.password_set ? 'chip--ok' : 'chip--action'"
+                    :style="s.setupStatus.password_set ? '' : 'cursor:pointer;'"
+                    @click="!s.setupStatus.password_set && s.navigateTo('config', 'provider-keys')"
+                    x-text="s.setupStatus.password_set ? 'Dashboard password: set' : '◆ Set a dashboard password'"></span>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
     <!-- Panel 1: System Health [Tab: overview] -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'overview'">
       <div class="panel-header">
@@ -751,23 +819,39 @@
                         x-text="($store.genesisDashboard.health.infrastructure.disk.total_gb - $store.genesisDashboard.health.infrastructure.disk.free_gb).toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.disk.total_gb.toFixed(0) + ' GB'"></span>
                 </div>
               </template>
+              <!-- PID budget row (per-user systemd slice TasksMax — 'Cannot fork' guard) -->
+              <template x-if="$store.genesisDashboard.health.infrastructure?.pids?.pct != null">
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;"
+                     :title="'PID/task budget for the BINDING cgroup level (' + ($store.genesisDashboard.health.infrastructure.pids.scope || 'user slice') + '): the walk reports whichever of the session scope, user slice, or shared container root is closest to its pids.max — that is what precedes \'Cannot fork\' while memory/CPU/disk read fine. Amber ≥ 80%, red ≥ 90%.'">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">PIDs</span>
+                  <span style="width:3rem; text-align:right; font-weight:600;"
+                        :style="`color: ${$store.genesisDashboard.health.infrastructure.pids.pct >= 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct >= 80 ? '#f0ad4e' : '#4caf50'}`"
+                        x-text="$store.genesisDashboard.health.infrastructure.pids.pct.toFixed(0) + '%'"></span>
+                  <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
+                    <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                         :style="'width:' + $store.genesisDashboard.health.infrastructure.pids.pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.pids.pct >= 90 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.pids.pct >= 80 ? '#f0ad4e' : '#4caf50')"></div>
+                  </div>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        x-text="$store.genesisDashboard.health.infrastructure.pids.current + '/' + $store.genesisDashboard.health.infrastructure.pids.max + ($store.genesisDashboard.health.infrastructure.pids.scope ? ' · ' + $store.genesisDashboard.health.infrastructure.pids.scope : '')"></span>
+                </div>
+              </template>
               <!-- Claude Code sessions row (per-session RSS — leak detection) -->
               <template x-if="($store.genesisDashboard.health.infrastructure?.cc_slots || []).length">
                 <div style="display:flex; flex-direction:column; gap:0.3rem; font-size:0.8rem;">
                   <span style="color:var(--color-text-secondary);"
                         title="Memory (RSS) used by each concurrent Claude Code worker session — leak detection. Green = healthy, amber ≥ 4 GB, red ≥ 6 GB.">Claude Code Sessions</span>
                   <div style="display:flex; flex-wrap:wrap; gap:0.35rem;">
-                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.slot">
+                    <template x-for="slot in $store.genesisDashboard.health.infrastructure.cc_slots" :key="slot.pid">
                       <span style="font-size:0.7rem; padding:0.05rem 0.3rem; border-radius:3px; background:var(--color-background); white-space:nowrap;"
                             :style="`color: ${slot.status === 'error' ? '#d9534f' : slot.status === 'degraded' ? '#f0ad4e' : '#4caf50'}`"
-                            :title="'Session ' + slot.slot + ' (pid ' + slot.pid + '): ' + (slot.rss_mb / 1024).toFixed(2) + ' GB RSS'"
-                            x-text="'#' + slot.slot + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
+                            :title="(slot.slot ? 'Session ' + slot.slot : 'Unregistered session') + ' (pid ' + slot.pid + '): ' + (slot.rss_mb / 1024).toFixed(2) + ' GB RSS'"
+                            x-text="(slot.slot ? '#' + slot.slot : 'pid ' + slot.pid) + ' ' + (slot.rss_mb / 1024).toFixed(1) + 'G'"></span>
                     </template>
                   </div>
                 </div>
               </template>
               <!-- Fallback when no data -->
-              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk">
+              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk && $store.genesisDashboard.health.infrastructure?.pids?.pct == null">
                 <span style="color: #666; font-size: 0.82rem;">no data</span>
               </template>
             </div>

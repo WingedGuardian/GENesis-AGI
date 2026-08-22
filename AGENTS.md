@@ -4,6 +4,43 @@ Cross-tool agent entry point (Codex, Cursor, OpenCode, …). The canonical
 project instructions live in **CLAUDE.md** — read it first; everything below
 is supplementary.
 
+## Code Review Mandate (adversarial)
+
+When reviewing a diff or PR (including automated PR review), review ADVERSARIALLY,
+not to confirm:
+
+- **Assume there are latent bugs and enumerate the CLASS.** For each concern, find
+  EVERY instance, not one example — edge/boundary/sentinel/hierarchy/error cases,
+  empty/None/zero/single-element inputs, rename/binary/unicode paths. A single
+  spot-check is not a review. Do not confidence-filter to "no findings"; a
+  precision-filtered "looks good" on a substantial change is false confidence.
+- **READ the authoritative semantics before judging domain code** (cgroup/systemd,
+  SQLite/WAL, async/cancellation, timezones, git plumbing, cryptography). Reason from
+  the spec/source, not assumption — assumption is what produces serial defects.
+- **Quote `file:line` for every finding**, state why it matters in THIS codebase, and
+  rank by real severity: **P1** (bug/security/data-loss) · **P2** (wrong under edge
+  conditions, missing handling) · **P3** (quality/nit). Generic advice ("validate
+  input") without a specific code path is not P1.
+- **Check the fix does not REMOVE constraints** (validation, guards, type enforcement)
+  and does not break existing behavior; a finding whose "fix" regresses something is
+  itself a finding. Verify claims against the code — a stated mechanism can be wrong
+  even when the concern is real.
+- **Calibrate severity to the code's DECLARED threat model — do not harden low-stakes
+  code ad infinitum.** Adversarial rigor above stays FULL for high-consequence surfaces
+  (auth, credentials, financial, data-loss, external input, approval gates). But a
+  guard/module often states its own scope — e.g. "accident-prevention on a single-author
+  repo, not adversarial; a deliberate evader already has `python -c 'subprocess…'`,
+  invisible to any string guard." Weigh findings against THAT model: a bypass that
+  requires deliberate multi-step evasion of an *accident-prevention* layer is a **NOTE /
+  P3**, not a P1. **Do not re-flag documented accepted-residue** — a form the code
+  explicitly marks out-of-scope ("accepted residue", "outside the threat model") — as a
+  new blocking finding round after round. When, after ~3 review→fix rounds on one change,
+  the only new findings are adjacent evasion variants on such a surface, say so in the
+  verdict ("remaining items are out-of-threat-model residue, not blocking") instead of
+  continuing to enumerate: over-hardening code whose functionality doesn't warrant it is
+  itself a review failure.
+- **End with a verdict:** `Ready to merge: Yes | No | With fixes` + a one-line reason.
+
 ## GitNexus — Code Intelligence (advisory)
 
 This repo is indexed by GitNexus. The MCP tools (`impact`, `query`,

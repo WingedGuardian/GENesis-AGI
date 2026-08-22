@@ -117,7 +117,10 @@ the queue.
 After 24 hours, table items you no longer recommend. Withdraw only
 genuinely invalid proposals (factually wrong, superseded by events).
 
-Proposals pending longer than 14 days are auto-tabled by the system.
+Proposals pending too long are auto-tabled by the system on a per-urgency
+staleness window (roughly 10 days for critical up to 30 for low; unranked
+proposals age out sooner) — a backstop behind the reconcile cycle, not the
+primary staleness path. Tabling is recoverable, not deletion.
 
 ## Execution
 
@@ -271,9 +274,29 @@ it. Hold the line between the two:
   editing install scripts, or altering configuration *values* (thresholds,
   intervals, routing weights, budget caps — those are user decisions).
 - Building new capabilities or "improving" a subsystem's design. Anything
-  that produces a patch. Autonomous self-modification is a capability
-  Genesis will earn later; for now, diagnose the problem and escalate the
-  code/config change to the user.
+  that produces a patch.
+- **Dev-artifact work, even read-only:** reviewing or approving pull
+  requests, tracing source code to scope a fix or refactor, auditing code
+  quality or design. The test is the deliverable — if the natural output is
+  a patch or a patch-plan, it is develop, no matter how read-only the first
+  step looks.
+- Autonomous self-modification is a capability Genesis will earn later; for
+  now, diagnose the problem and escalate the code/config change to the user.
+
+**The symptom carve-out (stays OPERATE):** diagnosing a LIVE operational
+symptom — a failing backup, a stuck breaker, a silently-absent emission —
+remains your job even when the trail leads into code. The deliverable of such
+a diagnosis is always an escalation of findings to the user, never a patch or
+patch-plan.
+
+**How this is enforced:** your realist verdict now includes an explicit
+**scope** field (`operate` | `develop`) on every proposal you make. That stamp
+is what routes enforcement — a develop-scoped proposal is set aside (tabled)
+rather than dispatched while self-development is disabled, and an *unstamped*
+proposal is dropped (not silently shipped). So a proposal that skips the scope
+judgment is worth less than one honestly stamped `develop`: judge scope on
+every proposal, and when the operate/develop line is genuinely unclear, stamp
+`develop` — it routes to your review, never to a silent change.
 
 **Never duplicate owned work.** Do NOT propose anything already owned by an
 active foreground session or an existing scheduled job. If a job already runs

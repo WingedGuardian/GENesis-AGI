@@ -271,6 +271,128 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
     )
 
 
+def build_learning_collectors(rt: GenesisRuntime) -> list:
+    """Build the steady-state signal-collector set installed after learning init.
+
+    This is the AUTHORITATIVE steady-state collector list — swapped in via
+    ``AwarenessLoop.replace_collectors`` (a FULL replacement of the bootstrap set
+    from ``runtime/init/awareness.py::build_bootstrap_collectors``). Any collector
+    that must keep being measured post-bootstrap MUST appear here, or its signal
+    stops being collected. The parity guard in
+    ``tests/test_learning/test_extension_wiring.py`` enforces that every bootstrap
+    signal (minus ``BOOTSTRAP_ONLY_SIGNALS``) is covered here, and pins the emitted
+    name set to ``genesis.awareness.types.STEADY_STATE_SIGNALS``.
+
+    Imports are kept function-local (lazy) to preserve init-order/cycle safety —
+    the outreach/memory getters resolve dependencies that may not be ready when
+    the learning subsystem is constructed.
+    """
+    from genesis.awareness.signals import (
+        ContainerMemoryCollector,
+        JobHealthCollector,
+        ProcessHealthCollector,
+        SchedulerLivenessCollector,
+        StrategicTimerCollector,
+    )
+    from genesis.env import ollama_enabled
+    from genesis.learning.signals.autonomy_activity import (
+        AutonomyActivityCollector,
+    )
+    from genesis.learning.signals.budget import BudgetCollector
+    from genesis.learning.signals.conversation import ConversationCollector
+    from genesis.learning.signals.critical_failure import (
+        CriticalFailureCollector,
+    )
+    from genesis.learning.signals.error_spike import ErrorSpikeCollector
+    from genesis.learning.signals.guardian_activity import (
+        GuardianActivityCollector,
+    )
+    from genesis.learning.signals.light_cascade import LightCascadeCollector
+    from genesis.learning.signals.micro_cascade import MicroCascadeCollector
+    from genesis.learning.signals.outreach_engagement import (
+        OutreachEngagementCollector,
+    )
+    from genesis.learning.signals.pending_items import (
+        PendingItemCollector,
+    )
+    from genesis.learning.signals.recon_findings import (
+        ReconFindingsCollector,
+    )
+    from genesis.learning.signals.sentinel_activity import (
+        SentinelActivityCollector,
+    )
+    from genesis.learning.signals.surplus_activity import (
+        SurplusActivityCollector,
+    )
+    from genesis.learning.signals.task_quality import TaskQualityCollector
+    from genesis.learning.signals.user_goal_staleness import (
+        UserGoalStalenessCollector,
+    )
+    from genesis.learning.signals.user_session_pattern import (
+        UserSessionPatternCollector,
+    )
+    from genesis.observability.health import (
+        probe_db,
+        probe_ollama,
+        probe_qdrant,
+    )
+
+    # DB and Qdrant are non-optional — Genesis cannot function
+    # without them, so their absence is a critical_failure. Ollama
+    # is opt-in (cloud-primary architecture): only treat its
+    # absence as critical when the install configures it as
+    # enabled. Without this gate, every cloud-only install would
+    # fire critical_failure=1.0 forever on a service that was
+    # never required, polluting reflections and observation
+    # writes with phantom emergencies.
+    probes = [
+        partial(probe_db, rt._db),
+        probe_qdrant,
+    ]
+    if ollama_enabled():
+        probes.append(probe_ollama)
+
+    from genesis.learning.signals.cc_version import CCVersionCollector
+    from genesis.learning.signals.genesis_version import GenesisVersionCollector
+
+    return [
+        ConversationCollector(rt._db),
+        TaskQualityCollector(rt._db),
+        OutreachEngagementCollector(rt._db),
+        ReconFindingsCollector(rt._db),
+        BudgetCollector(rt._db),
+        ErrorSpikeCollector(rt._db),
+        CriticalFailureCollector(probes),
+        StrategicTimerCollector(rt._db),
+        ContainerMemoryCollector(),
+        # Restored to the steady-state swap (were bootstrap-only → dropped
+        # post-bootstrap). event_loop_latency is intentionally NOT restored here
+        # (deferred — see BOOTSTRAP_ONLY_SIGNALS).
+        JobHealthCollector(runtime=rt),
+        SchedulerLivenessCollector(runtime=rt),
+        PendingItemCollector(rt._db),
+        MicroCascadeCollector(rt._db),
+        LightCascadeCollector(rt._db),
+        SentinelActivityCollector(),
+        GuardianActivityCollector(),
+        SurplusActivityCollector(rt._db),
+        AutonomyActivityCollector(rt._db),
+        GenesisVersionCollector(
+            rt._db,
+            pipeline_getter=lambda: rt._outreach_pipeline,
+        ),
+        CCVersionCollector(
+            rt._db,
+            router=rt._router,
+            pipeline_getter=lambda: rt._outreach_pipeline,
+            memory_store_getter=lambda: rt._memory_store,
+        ),
+        ProcessHealthCollector(),
+        UserGoalStalenessCollector(rt._db),
+        UserSessionPatternCollector(rt._db),
+    ]
+
+
 async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""
     if rt._db is None or rt._router is None:
@@ -283,103 +405,7 @@ async def init(rt: GenesisRuntime) -> None:
 
     try:
         if rt._awareness_loop is not None:
-            from genesis.awareness.signals import (
-                ContainerMemoryCollector,
-                ProcessHealthCollector,
-                StrategicTimerCollector,
-            )
-            from genesis.env import ollama_enabled
-            from genesis.learning.signals.autonomy_activity import (
-                AutonomyActivityCollector,
-            )
-            from genesis.learning.signals.budget import BudgetCollector
-            from genesis.learning.signals.conversation import ConversationCollector
-            from genesis.learning.signals.critical_failure import (
-                CriticalFailureCollector,
-            )
-            from genesis.learning.signals.error_spike import ErrorSpikeCollector
-            from genesis.learning.signals.guardian_activity import (
-                GuardianActivityCollector,
-            )
-            from genesis.learning.signals.light_cascade import LightCascadeCollector
-            from genesis.learning.signals.micro_cascade import MicroCascadeCollector
-            from genesis.learning.signals.outreach_engagement import (
-                OutreachEngagementCollector,
-            )
-            from genesis.learning.signals.pending_items import (
-                PendingItemCollector,
-            )
-            from genesis.learning.signals.recon_findings import (
-                ReconFindingsCollector,
-            )
-            from genesis.learning.signals.sentinel_activity import (
-                SentinelActivityCollector,
-            )
-            from genesis.learning.signals.surplus_activity import (
-                SurplusActivityCollector,
-            )
-            from genesis.learning.signals.task_quality import TaskQualityCollector
-            from genesis.learning.signals.user_goal_staleness import (
-                UserGoalStalenessCollector,
-            )
-            from genesis.learning.signals.user_session_pattern import (
-                UserSessionPatternCollector,
-            )
-            from genesis.observability.health import (
-                probe_db,
-                probe_ollama,
-                probe_qdrant,
-            )
-
-            # DB and Qdrant are non-optional — Genesis cannot function
-            # without them, so their absence is a critical_failure. Ollama
-            # is opt-in (cloud-primary architecture): only treat its
-            # absence as critical when the install configures it as
-            # enabled. Without this gate, every cloud-only install would
-            # fire critical_failure=1.0 forever on a service that was
-            # never required, polluting reflections and observation
-            # writes with phantom emergencies.
-            probes = [
-                partial(probe_db, rt._db),
-                probe_qdrant,
-            ]
-            if ollama_enabled():
-                probes.append(probe_ollama)
-
-            from genesis.learning.signals.cc_version import CCVersionCollector
-            from genesis.learning.signals.genesis_version import GenesisVersionCollector
-
-            collectors = [
-                ConversationCollector(rt._db),
-                TaskQualityCollector(rt._db),
-                OutreachEngagementCollector(rt._db),
-                ReconFindingsCollector(rt._db),
-                BudgetCollector(rt._db),
-                ErrorSpikeCollector(rt._db),
-                CriticalFailureCollector(probes),
-                StrategicTimerCollector(rt._db),
-                ContainerMemoryCollector(),
-                PendingItemCollector(rt._db),
-                MicroCascadeCollector(rt._db),
-                LightCascadeCollector(rt._db),
-                SentinelActivityCollector(),
-                GuardianActivityCollector(),
-                SurplusActivityCollector(rt._db),
-                AutonomyActivityCollector(rt._db),
-                GenesisVersionCollector(
-                    rt._db,
-                    pipeline_getter=lambda: rt._outreach_pipeline,
-                ),
-                CCVersionCollector(
-                    rt._db,
-                    router=rt._router,
-                    pipeline_getter=lambda: rt._outreach_pipeline,
-                    memory_store_getter=lambda: rt._memory_store,
-                ),
-                ProcessHealthCollector(),
-                UserGoalStalenessCollector(rt._db),
-                UserSessionPatternCollector(rt._db),
-            ]
+            collectors = build_learning_collectors(rt)
             rt._awareness_loop.replace_collectors(collectors)
             logger.info("Installed %d signal collectors", len(collectors))
 
@@ -482,6 +508,42 @@ async def init(rt: GenesisRuntime) -> None:
             _email_gate_drain,
             CronTrigger(minute="*/5", timezone=user_timezone()),
             id="email_gate_drain",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+
+        # Contributor Work-Log poster — the resolution watcher for held public
+        # GitHub-issue drafts. Drains pending_issue_posts: approved + live → post
+        # via `gh issue create`; approved + propose_only → dry-run terminal;
+        # rejected/expired/orphaned → close out. Mode read live each tick; `off`
+        # short-circuits. max_instances=1 ⇒ no in-drain races.
+        from genesis.autonomy.contributor_issue_watcher import (
+            drain_pending_issue_posts,
+        )
+
+        async def _contributor_issue_drain() -> None:
+            try:
+                if rt.paused:
+                    return
+            except Exception:
+                logger.warning(
+                    "Pause check failed — skipping contributor issue drain",
+                    exc_info=True,
+                )
+                return
+            try:
+                n = await drain_pending_issue_posts(rt)
+                rt.record_job_success("contributor_issue_drain")
+                if n:
+                    logger.info("Contributor issue drain resolved %d held draft(s)", n)
+            except Exception as exc:
+                rt.record_job_failure("contributor_issue_drain", exc=exc)
+                raise
+
+        rt._learning_scheduler.add_job(
+            _contributor_issue_drain,
+            CronTrigger(minute="*/5", timezone=user_timezone()),
+            id="contributor_issue_drain",
             max_instances=1,
             misfire_grace_time=300,
         )

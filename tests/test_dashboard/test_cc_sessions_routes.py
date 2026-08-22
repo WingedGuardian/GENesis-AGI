@@ -12,7 +12,7 @@ The charter tables are created with inline DDL matching migration 0058
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from flask import Flask
@@ -139,7 +139,7 @@ def _patch_spawn(monkeypatch, mapping: dict):
     spawn_at)} map; the dashboard cross-checks pid internally."""
     import genesis.dashboard.routes.cc_sessions as mod
 
-    def fake(slot, live_pid):
+    def fake(slot, live_pid, proc_start=None):
         return mapping.get((slot, live_pid))
 
     monkeypatch.setattr(mod, "read_spawn_identity", fake)
@@ -162,6 +162,44 @@ def test_detail_503_when_not_bootstrapped(client):
 def test_route_registered_on_dashboard_blueprint(app):
     rules = {rule.rule for rule in app.url_map.iter_rules()}
     assert "/api/genesis/cc-sessions/detail" in rules
+
+
+async def test_detail_route_offloads_slot_enumeration(app, db, monkeypatch):
+    """MW-0 A2: the detail route's ~1s /proc enumeration runs OFF the event loop
+    (asyncio.to_thread), never inline on the request/server loop."""
+    import genesis.dashboard.routes.cc_sessions as mod
+    import genesis.observability.cc_slots as cc_slots_mod
+
+    await _seed_charter_tables(db)
+    _patch_spawn(monkeypatch, {})  # hermetic — never read the real ~/.genesis
+
+    monkeypatch.setattr("genesis.runtime.GenesisRuntime", MagicMock(instance=lambda: _mock_rt(db)))
+    # Deploy resolution is orthogonal to this offload — stub it out.
+    monkeypatch.setattr(
+        "genesis.db.crud.update_history.last_successful_update",
+        AsyncMock(return_value=None),
+    )
+    enum = MagicMock(return_value=[])
+    monkeypatch.setattr(cc_slots_mod, "enumerate_cc_slots", enum)
+
+    dispatched = []
+    real_to_thread = mod.asyncio.to_thread
+
+    async def spy(fn, *a, **k):
+        dispatched.append(fn)
+        return await real_to_thread(fn, *a, **k)
+
+    monkeypatch.setattr(mod.asyncio, "to_thread", spy)
+
+    # The blueprint decorator wraps async views in a run_until_complete sync
+    # shim; await the raw coroutine (__wrapped__) directly on the test's loop so
+    # the aiosqlite db stays on one loop.
+    raw_view = mod.cc_sessions_detail.__wrapped__
+    with app.test_request_context():
+        await raw_view()
+
+    assert enum in dispatched  # enumeration dispatched through to_thread
+    enum.assert_called_once()
 
 
 # ── Helper level (real db fixture, injected slots) ───────────────────────────
@@ -510,6 +548,76 @@ async def test_pulse_confirm_absorbs_item_with_pr_evidence(db):
     row = await _ledger_row(db)
     assert row["status"] == "absorbed"
     assert "PR #1081" in row["evidence"]
+
+
+async def _seed_followup_proposal(db, *, ann_id="af1", fu_id="fu0", status="proposed"):
+    await db.execute(
+        "INSERT INTO follow_ups (id, source, content, reason, strategy, status, "
+        "priority, kind, created_at) VALUES (?, 'test', 'ship it', 'r', "
+        "'ego_judgment', 'pending', 'medium', 'follow_up', '2026-07-10T00:00:00+00:00')",
+        (fu_id,),
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_runs (run_id, started_at, trigger, status)"
+        " VALUES ('rf1', '2026-07-14T00:00:00+00:00', 'manual', 'ok')"
+    )
+    await db.execute(
+        "INSERT INTO repo_pulse_annotations (id, run_id, observed_at, tier, item_id,"
+        " item_session_id, item_text, pr_number, pr_title, status, target_kind)"
+        " VALUES (?, 'rf1', '2026-07-14T00:00:00+00:00', 'exact', ?,"
+        " 'cc-xyz', 'ship it', 1305, 'feat: officecli', ?, 'follow_up')",
+        (ann_id, fu_id, status),
+    )
+    await db.commit()
+
+
+async def test_pulse_confirm_absorbs_followup_target(db):
+    """A follow_up-target annotation confirmed via the dashboard absorbs the
+    FOLLOW_UP (conditional open-only), not a nonexistent ledger row — the
+    reader-dispatch obligation from the foundation audit."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_followup_proposal(db)
+    payload, code = await _resolve_pulse(db, "af1", "confirmed")
+    assert code == 200
+    assert payload["ok"] is True and payload["item_absorbed"] is True
+    assert await _ann_status(db, "af1") == "confirmed"
+    cur = await db.execute("SELECT status, resolution_notes FROM follow_ups WHERE id = 'fu0'")
+    row = await cur.fetchone()
+    assert row[0] == "completed"
+    assert "PR #1305" in row[1]
+
+
+async def test_pulse_lookup_excludes_followup_proposals(db):
+    """The per-session pulse panel is ledger-only — a session-bound follow_up
+    annotation is NOT surfaced here (session-agnostic → separate global surface;
+    avoids the NULL-session gap + the ledger-only confirm command, Codex P2)."""
+    from genesis.dashboard.routes.cc_sessions import _pulse_lookup
+
+    await _seed_followup_proposal(db, ann_id="afx", fu_id="fux")  # item_session_id='cc-xyz'
+    out = await _pulse_lookup(db, "cc-xyz")
+    assert out["available"] is True
+    assert all(a["target_kind"] == "ledger" for a in out["annotations"])
+    assert not any(a["id"] == "afx" for a in out["annotations"])
+
+
+async def test_pulse_confirm_followup_not_open_absorb_missed(db):
+    """Resolve-first: confirming a follow_up whose row moved off-open (blocked)
+    confirms the annotation (the race arbiter) but the absorb misses — 200,
+    item_absorbed False, follow_up NOT force-completed. The confirmed-but-absorb-
+    missed residue is accepted (ledger-consistent); absorb-first was reverted as
+    it reopened the worse absorbed-under-a-rejected-annotation residue."""
+    from genesis.dashboard.routes.cc_sessions import _resolve_pulse
+
+    await _seed_followup_proposal(db, ann_id="af2", fu_id="fu2")
+    await db.execute("UPDATE follow_ups SET status='blocked' WHERE id='fu2'")
+    await db.commit()
+    payload, code = await _resolve_pulse(db, "af2", "confirmed")
+    assert code == 200
+    assert payload["item_absorbed"] is False
+    assert await _ann_status(db, "af2") == "confirmed"  # resolve-first: annotation is the arbiter
+    cur = await db.execute("SELECT status FROM follow_ups WHERE id='fu2'")
+    assert (await cur.fetchone())[0] == "blocked"  # follow_up untouched (never force-completed)
 
 
 async def test_pulse_reject_leaves_ledger_untouched(db):

@@ -10,6 +10,7 @@ import re
 
 import aiosqlite
 
+from genesis.db.crud._fts import fetch_fts
 from genesis.db.timeutil import canonical_iso
 
 
@@ -137,6 +138,11 @@ async def search(
         params.append(collection)
     sql += " LIMIT ?"
     params.append(limit)
+    # DELIBERATELY no OR-fallback here (unlike search_ranked / knowledge.search_fts).
+    # memory.search's only callers are the entity-name resolver
+    # (linker._find_entity_by_name), which picks results[0] and must NOT be
+    # widened to single-term OR matches — that would bypass its difflib quality
+    # gate and create spurious graph links. Keep this path strict AND.
     rows = await db.execute_fetchall(sql, params)
     return [
         {"memory_id": r[0], "content": r[1], "source_type": r[2], "collection": r[3]} for r in rows
@@ -214,7 +220,10 @@ async def search_ranked(
         params.extend(include_only_subsystems)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
-    rows = await db.execute_fetchall(sql, params)
+    # AND-first, OR-fallback on zero rows (see _fts.fetch_fts). Skipped when the
+    # query is already a structured boolean expression (expand_query output),
+    # since re-tokenising a parenthesised OR/AND query would corrupt it.
+    rows = await fetch_fts(db, sql, params, boolean=boolean)
     return [
         {
             "memory_id": r[0],
@@ -339,6 +348,11 @@ async def create_metadata(
     invalid_at: str | None = None,
     source_subsystem: str | None = None,
     origin_class: str | None = None,
+    speech_act: str | None = None,
+    speech_act_confidence: float | None = None,
+    assertion_provenance: str | None = None,
+    durability: str | None = None,
+    expires_at: str | None = None,
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id.
 
@@ -352,6 +366,12 @@ async def create_metadata(
     (owner/first_party/external_untrusted), derived in
     ``MemoryStore.store()``; NULL = legacy/unclassified (gates treat it
     fail-closed at gate time).
+    ``speech_act`` / ``speech_act_confidence`` / ``assertion_provenance`` /
+    ``durability`` / ``expires_at`` are the MW-1 Tier-0 extraction judgment
+    axes — WRITE-ONLY (no reader yet). NULL = unclassified; expiry is opt-in
+    (``durability='temporary'`` + an elapsed canonicalized ``expires_at``
+    only). Contract in ``memory/judgment.py``.
+    # GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl / mw-5-speech-act-protection)
     """
     # Bitemporal columns are raw TEXT-compared everywhere — canonicalize
     # at the write gate. Unparseable valid_at (LLM temporal strings like
@@ -363,8 +383,9 @@ async def create_metadata(
         "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
         "memory_class, wing, room, valid_at, invalid_at, source_subsystem, "
-        "origin_class) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "origin_class, speech_act, speech_act_confidence, assertion_provenance, "
+        "durability, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             memory_id,
             created_at,
@@ -378,6 +399,11 @@ async def create_metadata(
             canonical_iso(invalid_at),
             source_subsystem,
             origin_class,
+            speech_act,
+            speech_act_confidence,
+            assertion_provenance,
+            durability,
+            canonical_iso(expires_at),
         ),
     )
     await db.commit()

@@ -378,7 +378,7 @@ perception pipeline actually perceive.
     Draft after Phase 4 implementation. Pull from v2 USER.md: timezone (EST),
     communication preferences ("brief first, detailed as context deepens", "don't offer
     next steps by default"), philosophical/first-principles thinking style, "critic when
-    Jay locks onto one track" instruction. Omit: v2-specific tool references, v2 action
+    the user locks onto one track" instruction. Omit: v2-specific tool references, v2 action
     policy (superseded by L1-L4 autonomy), relationship section (superseded by SOUL.md).
   - Context assembly must position identity docs early (high attention region)
 - **Context assembly principles** (learned from v2 + design discussion):
@@ -502,7 +502,7 @@ LLM, you're testing the wrong thing.
 - **User model evolution**: v2 had a static USER.md (~300 tokens) injected every prompt.
   v3's user model is richer — it lives in the user model cache (Phase 0 schema) and gets
   synthesized by Light reflection (#11). Phase 5 builds the retrieval side: when Genesis
-  needs user preferences (e.g., "does Jay prefer brief or detailed here?"), it pulls from
+  needs user preferences (e.g., "does the user prefer brief or detailed here?"), it pulls from
   the user model store, not a static file. user.md is the seed; the user model is the
   living version. v2 items to seed: timezone, communication style, autonomy preferences,
   thinking style, relationship expectations.

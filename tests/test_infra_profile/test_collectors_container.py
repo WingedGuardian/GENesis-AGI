@@ -150,6 +150,55 @@ async def test_oomd_policy_fact_from_dropins(proc_root, sys_root, tmp_path):
     assert result.facts["oomd_user_slice_kill"] is False
 
 
+def test_pid_ceiling_effective_ok(sys_root):
+    # Reflects the EFFECTIVE cgroup pids.max (systemd resolves the configured %
+    # AND any set-property override into it) vs the container root budget — NOT a
+    # drop-in string-match, so a runtime override is judged correctly.
+    from genesis.infra_profile.collectors.container import _pid_ceiling_effective_ok
+
+    cg = sys_root / "fs/cgroup"
+    slice_dir = cg / "user.slice/user-4242.slice"
+    slice_dir.mkdir(parents=True)
+
+    # root=4000 (fixture writes pids.max=15000 → overwrite for determinism)
+    cg.joinpath("pids.max").write_text("4000\n")
+
+    # raised to 60% (2400) → well above the 33% default → ok
+    slice_dir.joinpath("pids.max").write_text("2400\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # a DELIBERATE lower operator override (40% = 1600) is a conscious choice, not
+    # an unprovisioned box — must read as ok, not falsely nagged (Codex P2 regress).
+    slice_dir.joinpath("pids.max").write_text("1600\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # just above the stock default + rounding margin (35% = 1400) → still ok
+    slice_dir.joinpath("pids.max").write_text("1400\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # still on systemd's stock 33% default (1320) → NOT ok (the defect we surface)
+    slice_dir.joinpath("pids.max").write_text("1320\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is False
+
+    # no sub-cap on the slice → ok (inherits the root budget)
+    slice_dir.joinpath("pids.max").write_text("max\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # no container root cap → the % default is huge, not a risk → ok
+    slice_dir.joinpath("pids.max").write_text("1320\n")
+    cg.joinpath("pids.max").write_text("max\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is True
+
+    # root unreadable → can't determine → None (posture check stays silent)
+    cg.joinpath("pids.max").unlink()
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is None
+
+    # slice file absent → None
+    slice_dir.joinpath("pids.max").unlink()
+    cg.joinpath("pids.max").write_text("4000\n")
+    assert _pid_ceiling_effective_ok(sys_root, uid=4242) is None
+
+
 async def test_storage_mounts_sorted_and_filtered(proc_root, sys_root):
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
     mounts = result.facts["mounts"]
@@ -444,3 +493,114 @@ async def test_storage_cc_tmp_fact_absent_when_missing(proc_root, sys_root, tmp_
     monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
     result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
     assert "cc_tmp_isolated" not in result.facts
+
+
+def _write_marker(home, **fields):
+    (home / ".genesis" / "state").mkdir(parents=True, exist_ok=True)
+    (home / ".genesis" / "state" / "cc_tmp_apply.json").write_text(json.dumps(fields))
+
+
+def _fresh_now() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat()
+
+
+async def test_storage_cc_tmp_apply_volatile_fields_are_metrics_not_facts(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    # The raw reason/timestamp are volatile (change as CC sessions come/go) → they
+    # MUST live in metrics (never hashed), not facts, or they spam infra drift.
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    _write_marker(home, last_attempt_at=_fresh_now(), last_reason="live-cc", claude_procs=5)
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    # derived + freshness-bounded → FACT
+    assert result.facts["cc_tmp_apply_blocked_on_cc"] is True
+    # raw volatile fields → METRICS, and NOT duplicated into facts
+    assert result.metrics["cc_tmp_apply_last_reason"] == "live-cc"
+    assert "cc_tmp_apply_last_attempt_at" in result.metrics
+    assert "cc_tmp_apply_last_reason" not in result.facts
+    assert "cc_tmp_apply_last_attempt_at" not in result.facts
+
+
+async def test_storage_cc_tmp_apply_stale_marker_not_converging(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    # A live-cc marker whose attempt is OLD (dead/disabled timer, lock/write
+    # failure) must NOT read as converging — the freshness bound flips it.
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    _write_marker(home, last_attempt_at="2020-01-01T00:00:00+00:00", last_reason="live-cc")
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert result.facts["cc_tmp_apply_blocked_on_cc"] is False
+
+
+async def test_storage_cc_tmp_apply_terminal_reason_not_blocked(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    _write_marker(home, last_attempt_at=_fresh_now(), last_reason="unsupported-pool")
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert result.facts["cc_tmp_apply_blocked_on_cc"] is False  # not live-cc
+    assert result.metrics["cc_tmp_apply_last_reason"] == "unsupported-pool"
+
+
+async def test_storage_cc_tmp_apply_marker_absent_silent(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)  # no state/ marker
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert "cc_tmp_apply_blocked_on_cc" not in result.facts
+    assert "cc_tmp_apply_last_reason" not in result.metrics
+
+
+async def test_storage_cc_tmp_apply_marker_corrupt_silent(
+    proc_root, sys_root, tmp_path, monkeypatch
+):
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    (home / ".genesis" / "state").mkdir(parents=True)
+    (home / ".genesis" / "state" / "cc_tmp_apply.json").write_text("not valid json {{{")
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    result = await collect_storage(proc_root=proc_root, sys_root=sys_root)  # must not raise
+    assert "cc_tmp_apply_blocked_on_cc" not in result.facts
+
+
+async def test_storage_marker_does_not_churn_facts_hash(proc_root, sys_root, tmp_path, monkeypatch):
+    # Cluster-A regression guard: the SAME converging state sampled at two
+    # different times (different last_attempt_at) must produce IDENTICAL facts, so
+    # section_hash is stable and no spurious infrastructure_drift fires — only the
+    # metrics differ.
+    home = tmp_path / "h"
+    (home / ".genesis" / "cc-tmp").mkdir(parents=True)
+    monkeypatch.setattr(_container.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(_container, "_cc_tmp_marker_fresh", lambda _at: True)
+    _write_marker(home, last_attempt_at="2026-08-09T10:00:00+00:00", last_reason="live-cc")
+    first = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    _write_marker(home, last_attempt_at="2026-08-09T10:02:00+00:00", last_reason="live-cc")
+    second = await collect_storage(proc_root=proc_root, sys_root=sys_root)
+    assert first.facts == second.facts  # hashed surface stable across marker churn
+    assert (
+        first.metrics["cc_tmp_apply_last_attempt_at"]
+        != second.metrics["cc_tmp_apply_last_attempt_at"]
+    )
+
+
+def test_cc_tmp_marker_fresh_helper():
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    assert _container._cc_tmp_marker_fresh((now - timedelta(minutes=30)).isoformat()) is True
+    assert _container._cc_tmp_marker_fresh((now - timedelta(hours=12)).isoformat()) is False
+    assert _container._cc_tmp_marker_fresh("2020-01-01T00:00:00+00:00") is False
+    assert _container._cc_tmp_marker_fresh("not-a-timestamp") is False
+    assert _container._cc_tmp_marker_fresh(None) is False
+    # a naive (tz-less) timestamp is treated as UTC, not crashed
+    assert _container._cc_tmp_marker_fresh(now.replace(tzinfo=None).isoformat()) is True

@@ -1,5 +1,17 @@
 autonomous_cli_fallback_enabled: true
-manual_approval_required: false
+manual_approval_required: true
+# Reminder cadence for a DELIVERED pending approval (hours). 0 = never re-ask.
+# Delivery-failure recovery is separate and always on: a request whose Telegram
+# send never succeeded retries each tick regardless of these values.
 reask_interval_hours: 24
+# Per-policy overrides (policy_id -> hours, 0 = never). Inbox evaluation is
+# idempotent (approve-once clears everything outstanding; new content parks
+# onto the same pending request), so repeated reminders carry no information —
+# pending requests stay visible via the dashboard and morning report.
+# Overlay note: nested maps DEEP-MERGE — deleting a key in your .local.yaml
+# does not remove this default. To restore inbox reminders, explicitly set
+# `reask_overrides: {inbox_evaluation: 24}` in your .local.yaml.
+reask_overrides:
+  inbox_evaluation: 0
 approval_channel: telegram
 shared_export_enabled: true

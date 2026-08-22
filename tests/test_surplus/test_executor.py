@@ -65,7 +65,7 @@ async def test_post_to_telegram_keeps_quotes_raw():
     renders &quot;/&#x27; literally), while &/</> stay escaped for HTML safety."""
     ex = object.__new__(SurplusLLMExecutor)
     ex._topic_manager = AsyncMock()
-    content = "{\"title\": \"Jay's plan & <next> steps\"}"
+    content = "{\"title\": \"the user's plan & <next> steps\"}"
     await ex._post_to_telegram(_make_task(), content)
 
     ex._topic_manager.send_to_category.assert_called_once()
@@ -119,7 +119,7 @@ def test_humanize_multiple_findings():
 def test_humanize_non_findings_json_unchanged():
     # A JSON object without a findings list is returned verbatim — protects the
     # keeps-quotes-raw regression and avoids mangling other structured output.
-    raw = '{"title": "Jay\'s plan & <next> steps"}'
+    raw = '{"title": "the user\'s plan & <next> steps"}'
     assert _humanize_surplus_content(raw) == raw
 
 

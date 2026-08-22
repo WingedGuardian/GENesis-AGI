@@ -200,7 +200,7 @@ async def test_numbered_ego_rebuilds_stay_inert_on_current_db():
             await mod.up(conn)  # guards early-return; must not shrink the table
         after = await _schema(conn, "ego_proposals")
         assert after == before
-        assert len(after) == 30
+        assert len(after) == 32  # +scope, +scope_revision (migration 0078)
     finally:
         await conn.close()
 

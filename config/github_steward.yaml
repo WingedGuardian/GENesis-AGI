@@ -1,0 +1,48 @@
+# GitHub account-activity monitor ("github steward").
+# See src/genesis/recon/github_steward_config.py for the full contract.
+#
+# Every ~2h a deterministic (no-LLM) poll checks the owner's repos for activity
+# by EXTERNAL humans (not the owner, not bots/orgs) — a new PR/issue, a comment,
+# a discussion. Genuine external activity is recorded for the digest campaign; a
+# FIRST-TIME external contributor additionally triggers an immediate Telegram
+# ping. Owner login and repos are resolved LIVE — no install-specific names here.
+
+enabled: true
+
+# off | observe | live
+#   off     — the monitor does not run.
+#   observe — poll + record + seed the seen-actor set, but NEVER ping.
+#             First-deploy default: prevents a cold-start ping-storm. Flip to
+#             'live' (in a github_steward.local.yaml overlay) once seeded.
+#   live    — observe + ping on genuine first-time external activity.
+mode: observe
+
+# Repos deep-polled for full, actor-bearing activity. EMPTY here (no install-
+# specific names ship in the public repo). When empty, the monitor resolves the
+# owner's public, non-fork repos most-recently pushed, capped at auto_select_cap.
+# Pin specific repos in a gitignored github_steward.local.yaml overlay, e.g.:
+#   flagship_repos: ["your-org/your-repo"]
+flagship_repos: []
+
+# Auto-selection bounds when flagship_repos is empty.
+auto_select_cap: 5
+auto_select_days: 60
+
+# Logins to always treat as automation even if they're plain User/Org accounts
+# (e.g. a review bot that posts under a user account). Not a hardcoded literal —
+# an operator lever. Example: ["some-review-bot"]
+automation_denylist: []
+
+# Loud-truncation cap: activity events processed per tick.
+max_events_per_tick: 100
+
+# Account-level notifications lane — surfaces activity BEYOND the flagship repos:
+# @mentions of the owner anywhere, and responses on issues/PRs the owner authored
+# on OTHER people's repos (their outbound contributions). The flagship deep-poll
+# already covers the owner's own repos, so `author`/`subscribed` reasons are
+# filtered to NON-owned repos. `reasons` is the GitHub notification-`reason`
+# allowlist; everything else (ci_activity, subscribed-to-own, ...) is dropped.
+# Both mentions and author-responses ping immediately in `live` mode.
+notifications:
+  enabled: true
+  reasons: ["mention", "team_mention", "author"]

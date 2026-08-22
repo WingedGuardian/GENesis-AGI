@@ -129,6 +129,37 @@ async def init(rt: GenesisRuntime) -> None:
             await _degraded(rt, "ReconGatherer")
 
         try:
+            # GitHub account-activity monitor (2h external-activity watch). No
+            # pipeline injected here — surplus init runs BEFORE outreach init, so
+            # the monitor lazy-resolves the pipeline at tick time.
+            from genesis.recon.account_activity import AccountActivityMonitor
+            account_monitor = AccountActivityMonitor(db=rt._db)
+            rt._surplus_scheduler.set_account_activity_monitor(account_monitor)
+            logger.info("AccountActivityMonitor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire AccountActivityMonitor", exc_info=True)
+            await _degraded(rt, "AccountActivityMonitor")
+        except Exception:
+            logger.error("Unexpected error wiring AccountActivityMonitor", exc_info=True)
+            await _degraded(rt, "AccountActivityMonitor")
+
+        try:
+            # Career-outreach monitor (daily actuator — drives the external
+            # career-agent engine to stage drafts + nudge the owner). No pipeline
+            # or module registry injected here — both are lazy-resolved at tick
+            # time. No-ops cleanly on installs without the career-agent module.
+            from genesis.recon.career_outreach import CareerOutreachMonitor
+            career_monitor = CareerOutreachMonitor(db=rt._db)
+            rt._surplus_scheduler.set_career_outreach_monitor(career_monitor)
+            logger.info("CareerOutreachMonitor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire CareerOutreachMonitor", exc_info=True)
+            await _degraded(rt, "CareerOutreachMonitor")
+        except Exception:
+            logger.error("Unexpected error wiring CareerOutreachMonitor", exc_info=True)
+            await _degraded(rt, "CareerOutreachMonitor")
+
+        try:
             from genesis.recon.model_intelligence import ModelIntelligenceJob
             mi_job = ModelIntelligenceJob(
                 db=rt._db,

@@ -188,6 +188,28 @@ def _strip_trailing_comment(seg: str) -> str:
     return "".join(out)
 
 
+# The recognized ack/override sigils. A trailing comment may carry several of these
+# together (`# audit-ack depth-ack`), so the leading run of the comment is allowed to
+# contain any of them; the FIRST prose token ends the run. Kept in sync with the
+# sigils actually passed to has_trailing_override across the guard hooks.
+_KNOWN_SIGILS = (
+    "review-override",
+    "depth-ack",
+    "audit-ack",
+    "escalation-ack",
+    "ci-override",
+    "stale-review-override",
+    "scheduled-review-override",
+)
+
+
+def _token_is_sigil(tok: str, sigil: str) -> bool:
+    """Whether ``tok`` IS the sigil token — the sigil optionally followed by
+    punctuation (``review-override:``), but NOT a prefix of a longer word-token
+    (``review-override-x``)."""
+    return bool(re.match(re.escape(sigil) + r"(?![-\w])", tok))
+
+
 def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     """Whether the segment carries a genuine ``# <sigil>`` comment.
 
@@ -195,8 +217,15 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     so a token buried in a quoted message word does not count. ``sigil`` selects
     which override token to detect (``review-override`` by default; the CI-status
     merge gate passes ``ci-override``).
+
+    The sigil must appear in the LEADING contiguous run of recognized ack/override
+    tokens: `# review-override: accepted P2s` (sigil first, prose follows) and
+    `# audit-ack depth-ack` (a run of two sigils — each satisfies its own check)
+    both count, but `# not a review-override` / `# see review-override docs` do NOT
+    — a prose token ahead of the sigil ends the run. This keeps independent acks
+    able to coexist without letting an incidental or negated prose mention waive
+    the gate.
     """
-    token = re.compile(re.escape(sigil) + r"(?![-\w])")
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -217,11 +246,13 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
             i += 1
             continue
         if c == "#" and prev_ws:
-            rest = seg[i + 1 :].strip()
-            # The sigil must be the token, optionally followed by punctuation /
-            # comment text (`# review-override: accepted P2s`), but NOT be a
-            # prefix of a longer token (`review-override-x`, `review-overridexyz`).
-            return bool(token.match(rest))
+            for tok in seg[i + 1 :].split():
+                if _token_is_sigil(tok, sigil):
+                    return True  # the queried sigil, reached within the leading run
+                if not any(_token_is_sigil(tok, s) for s in _KNOWN_SIGILS):
+                    return False  # a prose token ends the leading run of sigils
+                # else: a DIFFERENT recognized sigil — still in the run, keep scanning
+            return False
         prev_ws = c.isspace()
         i += 1
     return False
@@ -413,13 +444,28 @@ def gh_pr_subcommand(argv: list[str]) -> str | None:
     """For a ``gh`` argv, the subcommand after ``pr`` (create/merge/…), else None.
 
     Scans for the ``pr`` token so a global flag before it
-    (``gh --repo o/r pr merge``) does not evade detection.
+    (``gh --repo o/r pr merge``) does not evade detection. A value-taking flag
+    BETWEEN ``pr`` and the subcommand (``gh pr -R o/r merge``) is consumed WITH
+    its value — the value must never be mistaken for the subcommand, or every
+    downstream gate (merge/create/comment) silently skips that segment: the
+    separated ``-R o/r`` form let ``gh pr -R o/r merge N --admin`` bypass ALL
+    fail-closed merge gates (found 2026-08-13 via the escalation-gate review).
+    Glued (``-Ro/r``) and ``--repo=o/r`` forms are single ``-``-prefixed tokens
+    and were already skipped.
     """
     if not argv or _basename(argv[0]) != "gh":
         return None
+    _VALUE_FLAGS = {"-R", "--repo"}
     for i, t in enumerate(argv[1:], 1):
         if t == "pr":
+            skip_next = False
             for u in argv[i + 1 :]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if u in _VALUE_FLAGS:
+                    skip_next = True
+                    continue
                 if not u.startswith("-"):
                     return u
             return None

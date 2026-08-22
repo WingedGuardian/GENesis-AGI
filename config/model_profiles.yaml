@@ -57,11 +57,13 @@ profiles:
     best_for: [foreground_conversation, research_synthesis, long_context_work]
     avoid_for: [micro_reflection, math_heavy]
     free_tier:
-      available: true
-      provider: nvidia_nim
-      limits: "5000 credits, 40 RPM"
-    last_reviewed: "2026-03-14"
-    review_source: manual
+      # NIM's free Kimi route (moonshotai/kimi-k2.6) was retired 2026-08 —
+      # 404-for-account (live probe). No free route remains; paid only (the
+      # kimi-k2.5 provider bills via OpenRouter). available:false so
+      # match(require_free=True) no longer returns Kimi as a free option.
+      available: false
+    last_reviewed: "2026-08-19"
+    review_source: nvidia_nim_live_probe
 
   glm-5.1:
     display_name: "GLM-5.1"
@@ -693,47 +695,25 @@ profiles:
     last_reviewed: "2026-06-22"
     review_source: manual
 
-  qwen-2.5-72b:
-    display_name: "Qwen 2.5 72B Instruct"
-    provider: alibaba
-    api_id: "qwen/qwen-2.5-72b-instruct"
-    intelligence_tier: B
-    reasoning: B
-    instruction_following: A
-    anti_sycophancy: B
-    context_window: 131072
-    cost_tier: free
-    cost_per_mtok_in: 0.0
-    cost_per_mtok_out: 0.0
-    latency: moderate
-    strengths:
-      - structured output (reliable JSON)
-      - multilingual capability
-      - free tier on OpenRouter
-    weaknesses:
-      - reasoning depth vs frontier models
-      - creative tasks
-    best_for: [memory_consolidation, fact_extraction, triage, surplus_brainstorm]
-    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation]
-    free_tier:
-      available: true
-      provider: openrouter
-      limits: "free tier variant"
-    last_reviewed: "2026-03-26"
-    review_source: manual
+  # NOTE (2026-08-07): the qwen-2.5-72b profile was removed — openrouter-free no
+  # longer points at qwen/qwen-2.5-72b-instruct (repointed to a curated gemma /
+  # nemotron :free pool), leaving this profile orphaned. See gemma-4-26b below.
 
-  mimo-v2-pro:
-    display_name: "MiMo V2 Pro"
+  mimo-v2.5-pro:
+    display_name: "MiMo V2.5 Pro"
     provider: xiaomi
-    api_id: "xiaomi/mimo-v2-pro"
+    api_id: "xiaomi/mimo-v2.5-pro"
     intelligence_tier: A
     reasoning: A
     instruction_following: A
     anti_sycophancy: B
     context_window: 131072
     cost_tier: cheap
-    cost_per_mtok_in: 0.60
-    cost_per_mtok_out: 2.40
+    # OpenRouter endpoints range ~$0.35-$1.00 in / ~$0.70-$3.00 out per MTok
+    # (2026-08-07). litellm's own DB prices this model, so completion_cost handles
+    # it directly; these are the cost-fallback figures (conservative upper end).
+    cost_per_mtok_in: 1.0
+    cost_per_mtok_out: 3.0
     latency: moderate
     strengths:
       - mathematical reasoning (strong chain-of-thought)
@@ -747,7 +727,7 @@ profiles:
     avoid_for: [foreground_conversation, outreach_draft, creative_writing]
     free_tier:
       available: false
-    last_reviewed: "2026-03-26"
+    last_reviewed: "2026-08-07"
     review_source: manual
 
   deepseek-v3:
@@ -835,33 +815,33 @@ profiles:
     last_reviewed: "2026-06-02"
     review_source: openrouter_pricing
 
-  nvidia-nim-deepseek-v4-pro:
-    display_name: "DeepSeek V4 Pro (NIM)"
+  nvidia-nim-deepseek-v4-flash-0731:
+    display_name: "DeepSeek V4 Flash 0731 (NIM)"
     provider: nvidia_nim
-    api_id: "deepseek-ai/deepseek-v4-pro"
-    intelligence_tier: S
-    reasoning: S
+    api_id: "deepseek-ai/deepseek-v4-flash-0731"
+    intelligence_tier: A
+    reasoning: A
     instruction_following: A
     anti_sycophancy: B
     context_window: 131072
     cost_tier: free
     cost_per_mtok_in: 0.0
     cost_per_mtok_out: 0.0
-    latency: moderate
+    latency: low
     strengths:
-      - free tier access to frontier DeepSeek V4
-      - same model quality as paid V4 Pro
+      - fast free flash inference (~5s, valid strict JSON on live probe 2026-08-19)
+      - strong coding and structured extraction
     weaknesses:
-      - rate limited (40 RPM, 5000 credits)
-      - creative writing and conversational tone
-    best_for: [code_work, triage, fallback_reasoning]
-    avoid_for: [foreground_conversation, outreach_draft, high_throughput]
+      - rate limited (~40 RPM per-model free tier)
+      - fast variant, not the frontier deep-reasoning V4 Pro — calibrated judging
+        stays on paid openrouter-deepseek-v4 (V4 Pro)
+    best_for: [code_work, triage, fast_reasoning, fallback_reasoning]
+    avoid_for: [calibrated_judging, foreground_conversation, outreach_draft]
     free_tier:
       available: true
-      credits: 5000
       rpm_limit: 40
-    last_reviewed: "2026-06-02"
-    review_source: nvidia_nim_catalog
+    last_reviewed: "2026-08-19"
+    review_source: nvidia_nim_live_probe
 
   grok-3-mini:
     display_name: "Grok 3 Mini"
@@ -1045,34 +1025,36 @@ profiles:
     last_reviewed: "2026-04-14"
     review_source: manual
 
-  qwen3-coder:
-    display_name: "Qwen3-Coder 480B"
-    provider: alibaba
-    api_id: "qwen/qwen3-coder:free"
+  # gemma-4-26b — primary of the curated openrouter-free :free pool (2026-08-07).
+  # Replaced the orphaned qwen3-coder profile (its qwen/qwen3-coder:free slug was
+  # delisted; the provider was unwired and removed from model_routing.yaml).
+  gemma-4-26b:
+    display_name: "Gemma 4 26B A4B (MoE)"
+    provider: google
+    api_id: "google/gemma-4-26b-a4b-it:free"
     intelligence_tier: B
     reasoning: B
     instruction_following: B
-    anti_sycophancy: C
+    anti_sycophancy: B
     context_window: 262144
     cost_tier: free
     cost_per_mtok_in: 0.0
     cost_per_mtok_out: 0.0
     latency: moderate
     strengths:
-      - code-specialized (SWE-bench 69.6)
-      - large MoE architecture (480B params, 35B active)
-      - 256k context window
+      - reliable structured output / JSON (10/10 on the structured_output golden set, 2026-08-07)
+      - token-efficient (no reasoning-token bloat, clean JSON at tight max_tokens)
+      - genuinely free (:free OpenRouter endpoint)
     weaknesses:
-      - code-focused, weaker on general reasoning
-      - benchmark data sparse (no GPQA/MMLU-Pro scores)
-      - quality unverified for Genesis tasks
-    best_for: [code_work, code_audit]
-    avoid_for: [deep_reflection, strategic_reflection, triage]
+      - smaller MoE, less nuance than 70B+ dense models
+      - creative writing
+    best_for: [extraction, classification, tagging, fact_extraction, surplus_brainstorm]
+    avoid_for: [deep_reflection, strategic_reflection]
     free_tier:
       available: true
       provider: openrouter
-      limits: "OpenRouter free tier (20 RPM, 200-1000 RPD)"
-    last_reviewed: "2026-04-14"
+      limits: "OpenRouter :free endpoint (curated openrouter-free primary; nemotron-3-super-120b:free failover)"
+    last_reviewed: "2026-08-07"
     review_source: manual
 
   deepseek-r1:
@@ -1159,33 +1141,5 @@ profiles:
     avoid_for: [foreground_conversation, creative_writing]
     free_tier:
       available: false
-    last_reviewed: "2026-03-14"
-    review_source: manual
-
-  nvidia-nim-kimi-k2.6:  # carried from kimi-k2.6 (NIM free variant)
-    display_name: "Kimi K2.6 (NIM)"
-    provider: nvidia_nim
-    api_id: "moonshotai/kimi-k2.6"
-    intelligence_tier: A
-    reasoning: A
-    instruction_following: A
-    anti_sycophancy: B
-    context_window: 2097152
-    cost_tier: free
-    cost_per_mtok_in: 0.0
-    cost_per_mtok_out: 0.0
-    latency: moderate
-    strengths:
-      - free NIM access to Kimi K2.6
-      - long-context summarization (2M tokens)
-    weaknesses:
-      - rate limited (40 RPM, 5000 credits, shared NIM pool)
-      - single-thread speed slower than Flash
-    best_for: [research_synthesis, long_context_work, fallback_reasoning]
-    avoid_for: [micro_reflection, math_heavy, high_throughput]
-    free_tier:
-      available: true
-      credits: 5000
-      rpm_limit: 40
     last_reviewed: "2026-03-14"
     review_source: manual

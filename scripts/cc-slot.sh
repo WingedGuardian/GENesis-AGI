@@ -16,6 +16,16 @@
 
 set -euo pipefail
 
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 # SSH RemoteCommand doesn't source .bashrc (interactive guard) — set PATH explicitly
 export PATH="$HOME/.n/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
 
@@ -157,10 +167,23 @@ if [[ ${#CLAUDE_EXTRA_ARGS[@]} -gt 0 ]]; then
     CLAUDE_ARGS_Q=$(printf ' %q' "${CLAUDE_EXTRA_ARGS[@]}")
 fi
 
-# -u: force UTF-8 output even if a future client's locale detection fails
+# -u: force UTF-8 output even if a future client's locale detection fails.
+#
+# The inner command drops the old `exec claude` so that when claude EXITS we can
+# record why before the pane vanishes: cc_exit_capture.sh logs the exit status
+# (signal-decoded) + a pane-scrollback tail to ~/.genesis/logs/cc_exit_<slot>.log.
+# Without this a dying session (V8 abort, OOM kill, clean exit) leaves no trace —
+# the 2026-08-19 death was undiagnosable for exactly that reason. `exit $__ec`
+# reproduces claude's exit code as the pane's, so tmux sees the same dead-status
+# and the `-A` attach-or-create behaviour (this runs only on CREATE) is unchanged.
+# Captures when claude EXITS on its own (crash/OOM-of-claude/clean quit — the
+# cases we care about); a SIGHUP to the pane itself (tmux kill-session / unit
+# stop) may reap the wrapper before the trailer runs — the watchgod OOM sampler
+# covers that subset. Capture is best-effort and never alters the exit code.
+# `\$` defers expansion to the pane's shell; the `${...}` expand here in cc-slot.sh.
 exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
     -e "LANG=$LANG" \
-    "cd ${GENESIS_ROOT} && exec claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}"
+    "cd ${GENESIS_ROOT} && claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${GENESIS_ROOT}/scripts/cc_exit_capture.sh ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

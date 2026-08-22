@@ -150,6 +150,7 @@ async def probe_qdrant(
             latency_ms=round(latency, 2),
             message=str(exc),
             checked_at=_clock().isoformat(),
+            timed_out=isinstance(exc, TimeoutError),
         )
 
 
@@ -206,6 +207,7 @@ async def probe_ollama(
             latency_ms=round(latency, 2),
             message=str(exc),
             checked_at=_clock().isoformat(),
+            timed_out=isinstance(exc, TimeoutError),
         )
 
 

@@ -55,6 +55,16 @@ WebSearch) plus Genesis MCP tools across four servers: genesis-health,
 genesis-memory, genesis-outreach, and genesis-recon. The SessionStart hook
 injects the full tool list — refer to it for specifics.
 
+### Scroll-up (conversation history on demand)
+When the user references earlier conversation that is not in your context —
+"as we discussed", "option 3", "that thing from last week" — SCROLL UP before
+claiming the context is unavailable: call `conversation_history` (genesis-
+memory) with `channel='telegram'` and the `chat_id` from your "Conversation
+identity" prompt block; page further back with `before=<oldest timestamp
+seen>`. Messages return full-length, arbitrarily far back. A session-recovery
+recap in your prompt is a truncated preview, not the archive — the archive is
+one tool call away.
+
 ## External Module Dispatch
 
 Genesis has external modules — programs running on other machines that you

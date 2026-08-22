@@ -18,12 +18,36 @@ async def create(
     link_type: str,
     strength: float = 0.5,
     created_at: str,
+    proposed_type: str | None = None,
+    confidence: float | None = None,
+    classifier: str | None = None,
+    review_state: str | None = None,
+    safe_for_boost: int | None = None,
 ) -> tuple[str, str]:
-    """Insert a memory link. Returns (source_id, target_id)."""
+    """Insert a memory link. Returns (source_id, target_id).
+
+    The five trailing kwargs are the MW-2 (0082) edge-metadata columns — the
+    classifier-verdict stamping location (GROUNDWORK(mw-5-merge-gate)). All
+    default ``None``, which preserves legacy semantics exactly: NULL
+    ``safe_for_boost`` = boost-eligible, NULL ``review_state`` = the
+    ``link_type`` stands as written. No production caller passes them yet.
+    """
     await db.execute(
-        "INSERT INTO memory_links (source_id, target_id, link_type, strength, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (source_id, target_id, link_type, strength, created_at),
+        "INSERT INTO memory_links (source_id, target_id, link_type, strength, created_at, "
+        "proposed_type, confidence, classifier, review_state, safe_for_boost) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            source_id,
+            target_id,
+            link_type,
+            strength,
+            created_at,
+            proposed_type,
+            confidence,
+            classifier,
+            review_state,
+            safe_for_boost,
+        ),
     )
     await db.commit()
     return (source_id, target_id)

@@ -9,6 +9,14 @@ on:
   schedule:
     - cron: "0 6 * * 1"  # weekly Mon 06:00 UTC — surface new CVEs even without repo activity
 
+# One in-flight CI run per branch: a new push cancels the superseded run so it
+# stops holding runner slots. Many active branches fanning out full CI with no
+# cancellation was saturating the shared runner budget (queue starvation). Never
+# cancel main's post-merge run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 permissions:
   contents: read
 
@@ -263,7 +271,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
         run: |
@@ -277,25 +284,22 @@ jobs:
           pf="$(mktemp)"
           printf '%s' "$PRIV" > "$pf"
 
-          # Collect ADDED lines across EVERY commit's patch in the range — NOT
-          # the net tree-to-tree diff. A value added in one commit and removed in
-          # a later commit of the same PR/push leaves the net diff clean, yet the
-          # value stays in published Git history and becomes an ancestor of main
-          # (Codex P1). `git log -p --no-merges` emits each non-merge commit's
-          # patch; pre-existing legit content is still out of scope (only commits
-          # in this range are shown). Keep all '^+' lines INCLUDING the
-          # '+++ b/path' headers (repo-relative paths never match an exact install
-          # value, and a '^+++' filter would drop added content beginning '++').
-          added=""
+          # Collect the ADDED lines across EVERY commit's patch in range — NOT
+          # the net tree-to-tree diff (a value added then removed within the same
+          # PR/push leaves the net diff clean yet stays in published history).
+          # RANGE SELECTION is security-critical and lives in tested Python:
+          # scripts/ci/leak_scan_added_lines.py. For a pull_request it anchors on
+          # the merge ref's first parent (HEAD^1 = main@ci), NOT the stale
+          # github.event.pull_request.base.sha — base.sha lags main, so
+          # base.sha..HEAD used to re-sweep (and re-flag) values main itself
+          # added-then-removed since the PR was opened. The helper keeps every
+          # '^+' line incl. '+++ b/path' headers, and fails CLOSED (nonzero exit)
+          # on an unresolvable range rather than emitting empty (a fail-OPEN).
+          # See tests/test_scripts/test_leak_scan_added_lines.py.
+          added="$(python3 scripts/ci/leak_scan_added_lines.py)"
           body=""
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            added="$(git log -p --no-merges "${PR_BASE_SHA}..HEAD" 2>/dev/null | grep -E '^\+' || true)"
             body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
-          elif git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
-            added="$(git log -p --no-merges "${PUSH_BEFORE}..${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
-          else
-            # New branch / unknown base — scan the tip commit's patch (best effort).
-            added="$(git show "${HEAD_SHA}" 2>/dev/null | grep -E '^\+' || true)"
           fi
 
           printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
@@ -386,6 +390,30 @@ jobs:
           python-version: "3.12"
       - name: CC↔Node pin-lockstep guard
         run: python scripts/check_cc_node_lockstep.py
+
+  review-depth-check:
+    # Advisory review-DEPTH visibility: recompute substantiality on the PR range
+    # (base...HEAD, so it needs full history — fetch-depth: 0) and emit a LOUD
+    # ::warning:: annotation when the change is substantial, so the human reviewer
+    # + the independent cloud reviewer apply an adversarial /review-level audit
+    # rather than a lean pass. Advisory BY DESIGN (exit 0 always): a committed audit
+    # artifact is forgeable and the local hook is editable by the same author, so
+    # the enforcing teeth are the independent reviewer + a required human approval
+    # (branch protection), not this check. Stdlib-only. See scripts/check_review_depth.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Review-depth advisory
+        env:
+          # Event base SHA (trusted-format) — robust vs origin/* ref materialization,
+          # matching the leak-detector job. Passed via env (not interpolated into run).
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/check_review_depth.py
 
   test:
     runs-on: ubuntu-latest

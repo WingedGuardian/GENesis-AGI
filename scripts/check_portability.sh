@@ -17,6 +17,16 @@
 
 set -euo pipefail
 
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
+
 # --warn: NON-gating advisory sweep for the contributor-facing CI. It also
 # covers tests/ and ALWAYS exits 0 (fixtures may carry in-class placeholder
 # addresses — surfaced as warnings, never a hard block). Default (no flag)

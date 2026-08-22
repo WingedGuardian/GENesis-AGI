@@ -82,5 +82,9 @@ class PendingItemCollector:
             value=value,
             source=source,
             collected_at=datetime.now(UTC).isoformat(),
-            baseline_note="0.0=no stale pending items. Rises when follow-ups/tasks age past 3 days without resolution",
+            baseline_note=(
+                "0.0=no stale pending items; rises 3d->7d+ as follow-ups/tasks age unresolved. "
+                "NOTE: 1.0 can also mean the cognitive_state row is missing or unreadable, "
+                "not genuine staleness"
+            ),
         )

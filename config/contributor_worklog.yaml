@@ -1,0 +1,35 @@
+# Contributor Work-Log poster — public-issue supply for contributors.
+#
+# The poster drain re-reads the merged config (this file +
+# ~/.genesis/config/contributor_worklog.local.yaml) on EVERY tick, so a
+# settings_update("contributor_worklog", {...}) or a hand edit takes effect at
+# the next drain (no restart). The `contributor_issue_propose` MCP tool reads
+# the same lever.
+#
+# Master switch: false forces `off` from both consumers.
+enabled: true
+
+# Mode: off | propose_only | live
+#   off          — the tool refuses to propose; the drain does nothing.
+#   propose_only — (default, shipped posture) the tool proposes issues + holds
+#                  each for owner approval; on approval the drain shadow-observes
+#                  the egress ONCE and marks the hold `dry_run` (TERMINAL — never
+#                  posted). Flipping to `live` does NOT retro-post dry_run rows;
+#                  re-run the curator under `live` to actually post.
+#   live         — on approval the drain calls `gh issue create` on the public
+#                  repo, captures the issue number, and marks `posted`.
+#
+# An INVALID mode degrades to propose_only — never a silent `live` to a public
+# repo. Kill switch (separate lever): GENESIS_CONTRIBUTOR_WORKLOG_DISABLED=1
+# forces `off` regardless of this file.
+mode: propose_only
+
+# Terminal rows (posted / rejected / expired / dry_run) older than this are
+# pruned by scripts/disk_hygiene.sh. Held rows are NEVER pruned (they await
+# owner action).
+retention_days: 30
+
+# Backpressure: the `contributor_issue_propose` tool refuses a new proposal once
+# this many rows are still `held` (awaiting owner review). Keeps the approval
+# queue bounded so drafts don't pile up faster than they're reviewed.
+max_held: 25

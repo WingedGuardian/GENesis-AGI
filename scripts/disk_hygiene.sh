@@ -21,6 +21,9 @@
 #      (WS2-0 retrieval-efficacy report; dated md per run — file-age prune)
 #  10. Retention prune of ego_proposal_revisions (ego_reconcile config window)
 #      → scripts/prune_proposal_revisions.py (PR-5 reconcile revision audit)
+#  11. Retention prune of pending_issue_posts terminal rows (>30d)
+#      → scripts/prune_contributor_issue_posts.py (Contributor Work-Log hold
+#      store; held rows never pruned)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -29,6 +32,16 @@
 # Structured as functions + a guarded main() so tests can `source` this file to
 # exercise a single step (e.g. prune_tmp) without running the whole groom.
 set -uo pipefail
+
+# Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
+# HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
+# to the passwd entry for the current uid (same source Path.home() uses); fail
+# closed if unresolvable. See CC memory sandbox_shell_no_home.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+    export HOME
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -125,6 +138,10 @@ main() {
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
         || echo "prune_repo_pulse exited $?"
+
+    echo "--- contributor work-log terminal-row prune (>30d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_contributor_issue_posts.py" --days 30 \
+        || echo "prune_contributor_issue_posts exited $?"
 
     echo "--- ego proposal-revision audit retention prune (ego_reconcile config) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_proposal_revisions.py" \

@@ -23,6 +23,7 @@ from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.cc.reflection_bridge._output import (
     format_topic_summary,
     route_deep_output,
+    salvage_deep_reflection_json,
     send_to_topic,
     store_reflection_output,
 )
@@ -31,6 +32,7 @@ from genesis.cc.reflection_bridge._prompts import (
     load_prompt_file,
     system_prompt_for_depth,
 )
+from genesis.cc.reflection_bridge.reflection_models_config import effort_for_depth, model_for_depth
 from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType, background_session_dir
 from genesis.db.crud import cc_sessions as cc_sessions_crud
 from genesis.observability.call_site_recorder import record_last_run
@@ -48,12 +50,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEPTH_MODEL = {
-    Depth.LIGHT: CCModel.HAIKU,
-    Depth.DEEP: CCModel.SONNET,
-    Depth.STRATEGIC: CCModel.OPUS,
-}
-
 _DEPTH_TIMEOUT_S = {
     Depth.LIGHT: 600,
     Depth.DEEP: 1800,
@@ -69,6 +65,55 @@ _DEPTH_CALL_SITE = {
 _DOWNGRADE_RETRY_BACKOFF_S = 30
 
 _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "identity"
+
+
+def _reflection_lockdown_kwargs(mcp_profile: str) -> dict:
+    """Read-only reflection tool lockdown as CCInvocation kwargs.
+
+    Every reflection entry point (the depth-based ``_reflect_inner`` path, the weekly
+    self-assessment, and the quality-calibration arm) MUST route through this so no
+    arm silently runs unrestricted. Returns a genesis-only ``mcp_config`` (the given
+    profile), the derived read-only ``disallowed_tools`` denylist, and
+    ``strict_mcp_config=True`` so ``--mcp-config`` is authoritative (user-scoped
+    ``~/.claude.json`` servers never leak in — verified additive without strict).
+
+    Fail-closed: on any config-generation error, points ``mcp_config`` at the shipped
+    empty ``config/no_mcp.json`` (never None — avoids the untested bare-strict combo)
+    and denies the built-ins + both reflection MCP servers wholesale.
+    """
+    from genesis.cc.session_config import SessionConfigBuilder
+
+    try:
+        _mcp = SessionConfigBuilder()
+        mcp_path = _mcp.build_mcp_config(mcp_profile)
+        reflection_disallowed = _mcp.build_reflection_disallowed()
+        # Fail-closed: never leave mcp_config None under strict (see docstring).
+        if mcp_path is None:
+            mcp_path = _mcp.build_mcp_config("none")
+    except Exception:
+        logger.warning(
+            "Reflection MCP/tool config generation failed, using fail-closed defaults",
+            exc_info=True,
+        )
+        from genesis.cc.session_config import (
+            _REFLECTION_DENY_BUILTINS,
+            _REFLECTION_MCP_SERVERS,
+        )
+        from genesis.env import repo_root
+
+        try:
+            mcp_path = str(repo_root() / "config" / "no_mcp.json")
+        except Exception:
+            mcp_path = None  # last resort; strict_mcp_config still forces zero servers
+        reflection_disallowed = list(_REFLECTION_DENY_BUILTINS) + [
+            f"mcp__{server}__*" for server, _ in _REFLECTION_MCP_SERVERS
+        ]
+    return {
+        "mcp_config": mcp_path,
+        "disallowed_tools": reflection_disallowed,
+        "strict_mcp_config": True,
+    }
+
 
 _DEPTH_AUTONOMY_LEVEL = {
     Depth.LIGHT: 1,
@@ -105,6 +150,8 @@ class CCReflectionBridge:
         self._context_assembler: ContextAssembler | None = None
         self._topic_manager = None
         self._autonomous_dispatcher = None
+        # Model router (route_call) for the deep-reflection JSON salvage retry.
+        self._router = None
 
     # ── Injection setters (for late binding) ──────────────────────────
 
@@ -132,22 +179,22 @@ class CCReflectionBridge:
         """Set the API-first autonomous dispatch router."""
         self._autonomous_dispatcher = dispatcher
 
+    def set_router(self, router: object) -> None:
+        """Set the model router (route_call) used for the deep-reflection JSON
+        salvage retry. Optional — salvage no-ops when unset."""
+        self._router = router
+
     # ── Main reflection entry point ───────────────────────────────────
 
     def _model_for_depth(self, depth: Depth) -> CCModel:
-        return _DEPTH_MODEL.get(depth, CCModel.SONNET)
+        return model_for_depth(depth)
 
     def _effort_for_context(self, depth: Depth, tick=None, escalation_source: str | None = None) -> EffortLevel:
-        """Effort level per depth."""
-        if depth == Depth.STRATEGIC:
-            return EffortLevel.MAX
-        if depth == Depth.LIGHT:
-            return EffortLevel.LOW
-        # Deep: fixed HIGH. Adaptive effort is a V4 executor concern.
+        """Effort level per depth — config-driven via the reflection_models domain."""
         # GROUNDWORK(v4-executor): escalation_source will drive executor effort.
-        if escalation_source:
-            logger.debug("Deep reflection triggered by %s (effort fixed at HIGH)", escalation_source)
-        return EffortLevel.HIGH
+        if depth == Depth.DEEP and escalation_source:
+            logger.debug("Deep reflection triggered by %s", escalation_source)
+        return effort_for_depth(depth) or EffortLevel.MEDIUM
 
     async def _check_throttle(self, priority: int, work_type: str) -> ReflectionResult | None:
         """Check CC budget throttling. Returns a deferred result if throttled, None otherwise."""
@@ -258,20 +305,16 @@ class CCReflectionBridge:
             prompt_dir=self._prompt_dir,
         )
 
-        # 2. Prepare CLI invocation
-        try:
-            from genesis.cc.session_config import SessionConfigBuilder
-
-            _mcp = SessionConfigBuilder()
-            if depth == Depth.LIGHT:
-                mcp_path = _mcp.build_mcp_config("none")
-            elif depth in (Depth.DEEP, Depth.STRATEGIC):
-                mcp_path = _mcp.build_mcp_config("reflection")
-            else:
-                mcp_path = None
-        except Exception:
-            logger.warning("MCP config generation failed, using defaults", exc_info=True)
-            mcp_path = None
+        # 2. Prepare CLI invocation. Read-only tool lockdown via the shared helper
+        # (single source of truth for ALL reflection entry points — this path plus
+        # the weekly-assessment and quality-calibration arms). LIGHT loads no MCP;
+        # DEEP/STRATEGIC load the genesis-only "reflection" profile. The helper
+        # derives the read-only denylist and sets strict so user-scoped
+        # ~/.claude.json servers can't leak in (--mcp-config is additive without it).
+        _reflection_profile = (
+            "reflection" if depth in (Depth.DEEP, Depth.STRATEGIC) else "none"
+        )
+        _lockdown = _reflection_lockdown_kwargs(_reflection_profile)
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (reflection always emits text)
@@ -280,7 +323,9 @@ class CCReflectionBridge:
             timeout_s=_DEPTH_TIMEOUT_S.get(depth, 300),
             system_prompt=self._system_prompt_for_depth(depth),
             skip_permissions=True,
-            mcp_config=mcp_path,
+            disallowed_tools=_lockdown["disallowed_tools"],
+            mcp_config=_lockdown["mcp_config"],
+            strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
             stream_idle_timeout_ms=(
                 _DEPTH_TIMEOUT_S.get(depth, 300) * 1000
@@ -450,12 +495,36 @@ class CCReflectionBridge:
         except Exception:
             logger.debug("Corpus recording failed (table may not exist yet)", exc_info=True)
 
+        # 4c. Salvage: a DEEP session that ended in PROSE (no fenced JSON) fails
+        # both parse sites and silently discards its cognitive output (~40% of
+        # runs). Re-derive the structured JSON via one routed LLM call and use it
+        # for BOTH routing and the topic summary. The RAW output.text is kept in
+        # the corpus above for audit. Strictly additive: when no salvage is needed
+        # (already parseable) or salvage fails, deep_text stays output.text and
+        # behavior is unchanged.
+        deep_text = output.text
+        if depth == Depth.DEEP:
+            salvaged = await salvage_deep_reflection_json(output.text, self._router)
+            if salvaged is not None:
+                deep_text = salvaged
+                logger.info(
+                    "Deep reflection ended in prose — structured JSON re-derived via salvage"
+                )
+                if self._event_bus:
+                    from genesis.observability.types import Severity, Subsystem
+                    await self._event_bus.emit(
+                        Subsystem.REFLECTION, Severity.WARNING,
+                        "deep_reflection.salvaged",
+                        "Deep reflection ended in prose; structured JSON re-derived via salvage",
+                        depth=depth.value,
+                    )
+
         # 5. Route output
         routing_failed = False
         if self._output_router and depth == Depth.DEEP:
             try:
                 routing_summary = await route_deep_output(
-                    output.text, db=db, output_router=self._output_router,
+                    deep_text, db=db, output_router=self._output_router,
                     gathered_obs_ids=gathered_obs_ids,
                     gathered_surplus_ids=gathered_surplus_ids,
                     tick_signal_names=(
@@ -481,9 +550,11 @@ class CCReflectionBridge:
                 except Exception:
                     logger.warning("Failed to mark influenced observations", exc_info=True)
 
-        # 6. Send to topic — parsed-fields summary only, never raw output.text
+        # 6. Send to topic — parsed-fields summary only, never raw output.text.
+        # Use the salvaged JSON (deep_text) so a prose-ended deep reflection shows
+        # a real summary instead of the "not parseable" stub.
         await send_to_topic(
-            session_id, depth, format_topic_summary(depth, output),
+            session_id, depth, format_topic_summary(depth, output, text=deep_text),
             topic_manager=self._topic_manager,
         )
 
@@ -541,6 +612,9 @@ class CCReflectionBridge:
             "Evaluate each of the 6 dimensions using this data."
         )
 
+        # Read-only reflection lockdown (shared with _reflect_inner + calibration):
+        # genesis health+memory read tools only, strict scoping, no user-scoped leak.
+        _lockdown = _reflection_lockdown_kwargs("reflection")
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (weekly assessment output)
@@ -548,6 +622,9 @@ class CCReflectionBridge:
             effort=EffortLevel.HIGH,
             system_prompt=load_prompt_file("SELF_ASSESSMENT.md", self._prompt_dir),
             skip_permissions=True,
+            disallowed_tools=_lockdown["disallowed_tools"],
+            mcp_config=_lockdown["mcp_config"],
+            strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
         )
         output = await self._invoker.run(invocation)
@@ -618,6 +695,9 @@ class CCReflectionBridge:
             "Evaluate quality drift and identify quarantine candidates."
         )
 
+        # Read-only reflection lockdown (shared with _reflect_inner + assessment):
+        # genesis health+memory read tools only, strict scoping, no user-scoped leak.
+        _lockdown = _reflection_lockdown_kwargs("reflection")
         invocation = CCInvocation(
             prompt=prompt,
             expect_output=True,  # silent-cap detection (quality calibration output)
@@ -625,6 +705,9 @@ class CCReflectionBridge:
             effort=EffortLevel.HIGH,
             system_prompt=load_prompt_file("QUALITY_CALIBRATION.md", self._prompt_dir),
             skip_permissions=True,
+            disallowed_tools=_lockdown["disallowed_tools"],
+            mcp_config=_lockdown["mcp_config"],
+            strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
         )
         output = await self._invoker.run(invocation)

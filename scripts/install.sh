@@ -71,13 +71,38 @@ set_secret() {
 
 # ── HOME guard ───────────────────────────────────────────────
 # Ensure HOME is set (may be empty in container sessions without login shell)
-# and persisted in /etc/environment so all future sessions inherit it.
+# and persisted in /etc/environment so all future sessions inherit it. Resolve
+# from passwd by uid (robust when the name lookup is missing) and fail closed
+# rather than proceed with HOME="" (which `set -u` would not catch).
 if [ -z "${HOME:-}" ]; then
-    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
 if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
-    echo "HOME=$HOME" >> /etc/environment 2>/dev/null || true
+    # /etc/environment is root-owned. Persist HOME best-effort: write directly
+    # if it is writable (root installs), else via passwordless sudo. If neither
+    # works, skip silently -- HOME is already exported above, so persistence
+    # here is not required. A plain `>> /etc/environment` as a non-root user
+    # leaks a shell redirection error ("Permission denied") that 2>/dev/null
+    # cannot suppress, because the shell opens the redirect target before
+    # applying redirections.
+    # A missing /etc/environment in a writable /etc is directly creatable — plain
+    # `-w` is false for a nonexistent path, which would otherwise skip creation and
+    # lose the persisted HOME on a minimal/container root image (where the previous
+    # `>>` created the file). Before appending, ensure the file ends in a newline so
+    # an unterminated final assignment isn't concatenated onto (`FOO=barHOME=...`).
+    if [ -w /etc/environment ] || { [ ! -e /etc/environment ] && [ -w /etc ]; }; then
+        if [ -s /etc/environment ] && [ -n "$(tail -c1 /etc/environment 2>/dev/null)" ]; then
+            printf '\n' >> /etc/environment 2>/dev/null || true
+        fi
+        echo "HOME=$HOME" >> /etc/environment 2>/dev/null || true
+    elif command -v sudo >/dev/null 2>&1; then
+        if [ -s /etc/environment ] && [ -n "$(sudo -n tail -c1 /etc/environment 2>/dev/null)" ]; then
+            printf '\n' | sudo -n tee -a /etc/environment >/dev/null 2>&1 || true
+        fi
+        echo "HOME=$HOME" | sudo -n tee -a /etc/environment >/dev/null 2>&1 || true
+    fi
 fi
 
 # ── TMPDIR guard ─────────────────────────────────────────────
@@ -899,22 +924,11 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  [9/$TOTAL_STEPS] Setting up Claude Code hooks..."
 
-TEMPLATE="$REPO_DIR/config/claude-settings.json.template"
-TARGET="$REPO_DIR/.claude/settings.json"
 VENV_PYTHON="$VENV_PATH/bin/python"
 
-if [ -f "$TEMPLATE" ]; then
-    mkdir -p "$REPO_DIR/.claude"
-    if [ -f "$TARGET" ]; then
-        echo "    . .claude/settings.json already exists (not overwriting)"
-    else
-        sed "s|{{VENV_PYTHON}}|$VENV_PYTHON|g; s|{{GENESIS_ROOT}}|$REPO_DIR|g" \
-            "$TEMPLATE" > "$TARGET"
-        echo "    + Claude Code hooks configured"
-    fi
-else
-    echo "    - Hook template not found (skipping)"
-fi
+# .claude/settings.json ships tracked in the repo — hooks are pre-configured on
+# every clone, so there is no template to render here. (VENV_PYTHON stays defined:
+# the .mcp.json render below still substitutes it.)
 
 # .mcp.json — MCP server configuration for Claude Code
 MCP_TEMPLATE="$REPO_DIR/config/mcp.json.template"
@@ -1173,6 +1187,16 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     done
 fi
 
+# Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
+# timer — the loop above only enables timers). Enable-only (not --now): it is
+# meant to fire in the CC-quiet cold-start window before genesis-server, so
+# arming it for the next boot is correct; the paired timer handles periodic
+# attempts. Without this the cold-start leg would render but never activate.
+if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
+    systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
+        echo "    + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
+fi
+
 # Enable AND start tmp watchgod (OS-level temp protection)
 WATCHGOD_SRC="$REPO_DIR/config/genesis-tmp-watchgod.service"
 if [ -f "$WATCHGOD_SRC" ]; then
@@ -1191,6 +1215,33 @@ if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
             echo "    + genesis-server started" || \
             echo "    WARNING: could not start genesis-server"
     fi
+fi
+
+# --- Memory resilience (systemd-oomd pressure-kill + swap invariant + PID ceiling) ---
+# Fresh-install parity with bootstrap.sh/update.sh: without this block a fresh
+# container install sat unprotected against the OOM-thrash / fork-exhaustion
+# wedge, with NO automatic trigger to run update.sh. Guarded so a tree missing
+# the lib degrades (warns) rather than aborting under `set -euo pipefail` — the
+# lib's own never-abort contract. Uses install.sh's own `_install_pkg` idiom
+# (bootstrap's `install_pkg` is undefined here). See scripts/lib/memory_resilience.sh.
+if [[ -f "$SCRIPT_DIR/lib/memory_resilience.sh" ]]; then
+    # systemd-oomd is a SEPARATE apt/dnf package; memory_resilience_apply
+    # silently skips pressure-kill setup when it's absent, so provision it
+    # BEFORE sourcing/applying the lib (install → apply order). _install_pkg is
+    # idempotent and degrades to a warning; the lib still guards on PSI/systemd
+    # independently. (dnf: oomd ships inside systemd; the subpackage is
+    # systemd-oomd-defaults.)
+    _install_pkg systemd-oomd systemd-oomd-defaults || echo "  WARNING: Could not install systemd-oomd — if the next step reports 'systemd-oomd not available', pressure-kill protection is off."
+    # shellcheck source=lib/memory_resilience.sh
+    source "$SCRIPT_DIR/lib/memory_resilience.sh"
+    memory_resilience_apply
+    # PID/task ceiling: raise the per-user-slice TasksMax above systemd's stock
+    # 33% default (the fork-exhaustion blind spot). Same lib, same never-abort
+    # contract; surfaces via the posture check (pid_ceiling_effective_ok) when
+    # sudo/etc is unavailable.
+    pid_budget_apply
+else
+    echo "  WARNING: lib/memory_resilience.sh missing — skipping OOM-resilience setup"
 fi
 
 # Infrastructure report

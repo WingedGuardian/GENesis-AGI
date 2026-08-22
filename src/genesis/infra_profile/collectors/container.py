@@ -25,6 +25,7 @@ import platform
 import shutil
 import socket
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.infra_profile.types import SectionResult
@@ -32,6 +33,28 @@ from genesis.infra_profile.types import SectionResult
 logger = logging.getLogger(__name__)
 
 _CMD_TIMEOUT = 15.0
+
+# A cc-tmp apply marker is trusted as "converging" only while its attempt
+# timestamp is within this bound — ~3x the genesis-cc-tmp-align timer's 2h
+# (OnUnitInactiveSec=7200) retry cadence. Beyond it the timer is plausibly
+# dead/disabled or a run couldn't update the marker, so a stale "live-cc" must
+# read as actionable rather than "converging forever". This one freshness rule
+# subsumes the dead-timer, lock-open-failure, and marker-write-failure paths.
+_CC_TMP_MARKER_FRESH_S = 6 * 3600
+
+
+def _cc_tmp_marker_fresh(at: object) -> bool:
+    """True if a cc-tmp apply marker's ``last_attempt_at`` is recent enough that
+    the retry timer is plausibly still running. Non-str / unparseable → not fresh."""
+    if not isinstance(at, str) or not at:
+        return False
+    try:
+        ts = datetime.fromisoformat(at)
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - ts).total_seconds() < _CC_TMP_MARKER_FRESH_S
 
 # Filesystem types worth recording as real mounts. Kernel plumbing
 # (proc/sysfs/cgroup2/…) is noise; tmpfs is deliberately IN — tmpfs sizes
@@ -158,6 +181,56 @@ def _oomd_user_slice_kill(etc_root: Path) -> bool:
             if sep and key.strip() == "ManagedOOMMemoryPressure":
                 effective = value.strip()
     return effective == "kill"
+
+
+# systemd's stock per-user-slice default is TasksMax=33% (user-.slice.d/
+# 10-defaults.conf), which it resolves against the container root cgroup's
+# pids.max (verified live: 33% of a 4000 root budget = 1320). The 1.05 factor is
+# a rounding margin above that default: it absorbs systemd's %→count rounding so a
+# slice sitting exactly on the stock default reads as un-raised, while ANY
+# deliberate operator override above ~35% (the docs allow lowering below the 60%
+# floor in consultation) reads as provisioned — the posture check must not nag a
+# conscious choice, only a silent stock default.
+_STOCK_TASKSMAX_FRACTION = 0.33
+_RAISED_TASKSMAX_MARGIN = 1.05
+
+
+def _pid_ceiling_effective_ok(sys_root: Path, uid: int | None = None) -> bool | None:
+    """Whether the per-user systemd slice's EFFECTIVE PID/task ceiling is raised
+    above systemd's stock 33% default (user-.slice.d/10-defaults.conf).
+
+    Reflects the EFFECTIVE cgroup value — systemd resolves the configured % AND
+    any runtime `set-property` override into the slice's pids.max — NOT a drop-in
+    string-match, so it is correct even when a system.control override coexists
+    with the provisioned user-.slice drop-in. True when the slice has no sub-cap
+    (`pids.max == "max"`), or the container root budget is uncapped (the % default
+    then resolves huge, not a risk), or the effective cap is above the stock 33%
+    default by the rounding margin — so ANY deliberate raise (the genesis 60% floor
+    OR a lower operator override, e.g. 40%) reads as provisioned. False ONLY when
+    the slice is still on the stock 33% default. None when it can't be determined
+    (unreadable / malformed) — the posture check treats None as silent."""
+    if uid is None:
+        uid = os.getuid()
+    slice_raw = _read(sys_root / f"fs/cgroup/user.slice/user-{uid}.slice/pids.max")
+    if slice_raw is None:
+        return None
+    if slice_raw == "max":
+        return True  # no per-slice sub-cap
+    root_raw = _read(sys_root / "fs/cgroup/pids.max")
+    if root_raw is None:
+        return None  # can't judge "raised vs default" without the root budget
+    if root_raw == "max":
+        return True  # no container cap → the 33% default resolves huge, not a risk
+    try:
+        slice_max = int(slice_raw)
+        root_max = int(root_raw)
+    except ValueError:
+        return None
+    if root_max <= 0:
+        return None
+    # Raised = above systemd's stock 33% default (not "at the genesis 60% floor"):
+    # a deliberate lower override is a conscious choice, not an unprovisioned box.
+    return slice_max > root_max * _STOCK_TASKSMAX_FRACTION * _RAISED_TASKSMAX_MARGIN
 
 
 def _keepconf_effective_in_dir(dropin_dir: Path) -> bool:
@@ -370,6 +443,7 @@ async def collect_memory(
     facts["cgroup_memory_max"] = _read_cgroup_memory_max(sys_root)
     facts["cgroup_memory_swap_max"] = _read_cgroup_memory_swap_max(sys_root)
     facts["oomd_user_slice_kill"] = _oomd_user_slice_kill(etc_root)
+    facts["pid_ceiling_effective_ok"] = _pid_ceiling_effective_ok(sys_root)
 
     meminfo = _read(proc_root / "meminfo") or ""
     mem: dict[str, int] = {}
@@ -471,6 +545,32 @@ async def collect_storage(
         _parent_dev = os.stat(cc_tmp_path.parent).st_dev
         facts["cc_tmp_isolated"] = _cc_dev != _parent_dev
     except OSError:
+        pass
+
+    # cc-tmp apply OUTCOME — the container-side opportunistic apply
+    # (scripts/cc_tmp_align_host.sh) records its last result in
+    # ~/.genesis/state/cc_tmp_apply.json. The raw reason + timestamp are VOLATILE
+    # scheduling artifacts (they change as CC sessions come and go), so they go in
+    # METRICS — rendered but NEVER hashed, so they can't spam infrastructure_drift
+    # or churn the posture alert. Only the DERIVED cc_tmp_apply_blocked_on_cc is a
+    # FACT, and it is FRESHNESS-BOUNDED (see _cc_tmp_marker_fresh): a "live-cc"
+    # marker reads as "converging" ONLY while recent, so a stale marker (dead
+    # timer, lock-open failure, write failure) falls back to the actionable nag
+    # instead of "converging forever". Best-effort; absent/unreadable → silent.
+    try:
+        _marker = Path.home() / ".genesis" / "state" / "cc_tmp_apply.json"
+        _m = json.loads(_marker.read_text())
+        if isinstance(_m, dict):
+            _reason = _m.get("last_reason")
+            _at = _m.get("last_attempt_at")
+            if isinstance(_reason, str) and _reason:
+                metrics["cc_tmp_apply_last_reason"] = _reason
+            if isinstance(_at, str) and _at:
+                metrics["cc_tmp_apply_last_attempt_at"] = _at
+            facts["cc_tmp_apply_blocked_on_cc"] = (
+                _reason == "live-cc" and _cc_tmp_marker_fresh(_at)
+            )
+    except (OSError, ValueError):
         pass
 
     return SectionResult(name="storage", facts=facts, metrics=metrics)

@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -79,10 +80,10 @@ async def _sqlite_wal_truncate(db) -> None:
 # a read snapshot from an unclosed/cancelled cursor) makes the WAL file grow
 # unbounded. Alert on abnormal WAL size so a stuck reader is caught in minutes,
 # not days. Surfaces via the critical-observations job (Telegram) + morning report.
-_WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024   # 100 MB → "high" (morning report)
-_WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024   # 500 MB → "critical" (Telegram now)
-_WAL_ALERT_COOLDOWN_S = 3600               # one alert per hour max
-_WAL_TRUNCATE_EVERY_N_TICKS = 12           # hourly TRUNCATE (tick ≈ 5 min)
+_WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024  # 100 MB → "high" (morning report)
+_WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024  # 500 MB → "critical" (Telegram now)
+_WAL_ALERT_COOLDOWN_S = 3600  # one alert per hour max
+_WAL_TRUNCATE_EVERY_N_TICKS = 12  # hourly TRUNCATE (tick ≈ 5 min)
 # None = "never alerted". Must NOT be 0.0: time.monotonic() is since boot, so on a
 # freshly-booted host `now - 0.0` is small and would wrongly suppress the first alert.
 _last_wal_alert_at: float | None = None
@@ -94,8 +95,8 @@ async def _check_wal_health(db) -> None:
     Best-effort; never raises into the tick."""
     global _last_wal_alert_at
     try:
-
         from genesis.env import genesis_db_path
+
         wal_path = Path(f"{genesis_db_path()}-wal")
         if not wal_path.exists():
             return
@@ -183,25 +184,36 @@ async def _persist_health_alerts(db) -> None:
 # tunable module constants. NOTE: 'pending' (self-healing) is context in the
 # alert text only; a sustained-pending stuck-worker signal is a separate
 # recovery-worker health concern, tracked as a follow-up, not alerted here.
-_EMBED_BACKLOG_LOW = 50            # below this: quiet (+ resolve any prior alert)
-_EMBED_BACKLOG_HIGH = 1000         # at/above this: 'critical' (pages); else 'high'
-_EMBED_BACKLOG_COOLDOWN_S = 3600   # one alert per band per hour max
+_EMBED_BACKLOG_LOW = 50  # below this: quiet (+ resolve any prior alert)
+_EMBED_BACKLOG_HIGH = 1000  # at/above this: 'critical' (pages); else 'high'
+_EMBED_BACKLOG_COOLDOWN_S = 3600  # one alert per band per hour max
 # Safe as 0.0/"" (unlike _check_wal_health): the band guard below means a fresh
 # boot never matches the empty band, so the first real backlog always alerts.
 _last_embed_backlog_alert_at: float = 0.0
 _last_embed_backlog_band: str = ""
 
 # WS-2 M7 — user-model-delta stream staleness. The reflection user-impact path
-# writes deltas to observations(type='user_model_delta'); the stream flatlined
-# ~Mar–Jul 2026 (only 2 deltas ever under the v3 pipeline). Diagnosis
-# (2026-07-15): the 0.90 per-delta confidence gate in reflection_bridge/_output.py
-# sits above the light-reflection model's median output confidence, so almost
-# nothing passes — a THRESHOLD throttle, not a plumbing bug. The behavioral fix
-# (revisit the gate/prompt/model) is a separate PR; this only UN-BLINDS the
-# silence so a future recurrence is caught in days, not months.
-_USER_MODEL_STALE_DAYS = 14
-_USER_MODEL_STALE_COOLDOWN_S = 86400  # at most one alert per day while stale
-_last_user_model_stale_alert_at: float = 0.0
+# writes deltas to observations(type='user_model_delta'). The stream is honestly
+# SPARSE by design: deltas are emitted only when the model of the user genuinely
+# changes (the anti-confabulation prompt returns "no change" otherwise). The
+# 2026-08-06 diagnosis confirmed the pipeline is healthy — a 288-delta burst in
+# an intense March session, then ~3 deltas across 4 months of heavy interaction,
+# all correct. So silence is NOT a defect on its own; the alarm must not flap.
+#   - 45d threshold: well clear of observed honest gaps (19d with heavy use).
+#   - Interaction gate: alert only if foreground sessions ran in the window —
+#     silence during a genuine user absence is expected.
+#   - Episode-scoped DB dedup: one alert per silence episode, immune to the
+#     3-day infrastructure_alert TTL that used to re-mint the same alert every
+#     few days (each re-mint re-triggered a paid ego investigation).
+#   - 'medium' priority: a slow user-model stream is never urgent.
+_USER_MODEL_STALE_DAYS = 45
+# Minimum foreground (interactive CC + voice) sessions ACTIVE since the last
+# delta for a silence to count as a possible defect rather than an expected quiet
+# stretch. Counted by last_activity_at (reused long-lived sessions advance it), so
+# 1 is the meaningful floor: a single persistently-reused topic session is enough
+# to mean "the user was present." The 45d threshold + episode dedup keep this from
+# over-firing (at most one medium alert per drought episode).
+_USER_MODEL_MIN_INTERACTION_SESSIONS = 1
 
 
 def _embed_backlog_band(failed: int) -> str:
@@ -252,9 +264,7 @@ async def _check_embedding_backlog(db) -> None:
 
         priority = "critical" if failed >= _EMBED_BACKLOG_HIGH else "high"
         pending = counts.get("pending", 0)
-        content_hash = hashlib.sha256(
-            f"embedding_backlog:{band}".encode()
-        ).hexdigest()
+        content_hash = hashlib.sha256(f"embedding_backlog:{band}".encode()).hexdigest()
         # Keep exactly ONE active alert = the current band. Resolve any
         # stale other-band rows so a worsening (high->critical) OR a partial
         # recovery (critical->high) transition leaves only the current-band
@@ -323,8 +333,7 @@ async def _resolve_embedding_backlog(db) -> None:
             type="infrastructure_alert",
             resolved_at=datetime.now(UTC).isoformat(),
             resolution_notes=(
-                f"auto-resolved: failed-embedding backlog back under "
-                f"{_EMBED_BACKLOG_LOW}"
+                f"auto-resolved: failed-embedding backlog back under {_EMBED_BACKLOG_LOW}"
             ),
         )
         if resolved:
@@ -339,13 +348,15 @@ async def _resolve_embedding_backlog(db) -> None:
 
 
 async def _check_user_model_staleness(db) -> None:
-    """WS-2 M7: alert (non-paging 'high') when the user_model_delta stream is silent >14d.
+    """WS-2 M7: alert (non-paging 'medium') when the user_model_delta stream is
+    silent for >= _USER_MODEL_STALE_DAYS DESPITE recent user interaction.
 
-    Surfaced via the established infrastructure_alert observation idiom (dashboard
-    + morning report), NOT alert_events — alert_events has no reader UI in PR-0, so
-    routing the alarm only there would be built-but-blind. Auto-resolves when a
-    fresh delta lands. Best-effort; the whole body never raises into the tick."""
-    global _last_user_model_stale_alert_at
+    The stream is sparse BY DESIGN, so silence alone is not a defect (see the
+    module-level rationale). This is a false-positive-reduced "worth a look"
+    nudge, not a "broken" claim: it requires foreground activity in the window,
+    fires at most once per silence episode, and is medium priority. Surfaced via
+    the infrastructure_alert observation idiom (dashboard + morning report).
+    Auto-resolves when a fresh delta lands. Best-effort; never raises into tick."""
     if db is None:
         return
     try:
@@ -368,11 +379,54 @@ async def _check_user_model_staleness(db) -> None:
             await _resolve_user_model_staleness(db)
             return
 
-        now = time.monotonic()
-        if (
-            _last_user_model_stale_alert_at
-            and now - _last_user_model_stale_alert_at < _USER_MODEL_STALE_COOLDOWN_S
-        ):
+        # Episode-scoped dedup (DB-backed → restart- and TTL-proof): surface a
+        # given silence episode only ONCE.
+        #  - Has a last delta: the episode is "silence since that delta" → an
+        #    alert created after it means already surfaced.
+        #  - No delta EVER: the whole history is one standing episode → ANY prior
+        #    alert (regardless of when) means already surfaced. Anchoring on
+        #    `now - window` here would slide, re-firing every ~window days.
+        if last is not None:
+            dedup_sql = (
+                "SELECT 1 FROM observations WHERE source = 'user_model_staleness_monitor' "
+                "AND type = 'infrastructure_alert' AND created_at > ? LIMIT 1"
+            )
+            dedup_args: tuple = (last,)
+        else:
+            dedup_sql = (
+                "SELECT 1 FROM observations WHERE source = 'user_model_staleness_monitor' "
+                "AND type = 'infrastructure_alert' LIMIT 1"
+            )
+            dedup_args = ()
+        async with db.execute(dedup_sql, dedup_args) as cur:
+            if await cur.fetchone() is not None:
+                return
+
+        # Interaction gate: alert only if the user was actually interacting in the
+        # window (foreground = interactive CC + voice sessions). Silence during a
+        # genuine absence is expected, not a defect. The window is the silence
+        # since the last delta, or (never-delta) the recent staleness window — so
+        # a long-idle install with no recent sessions stays quiet.
+        #
+        # Match on last_activity_at, NOT started_at: a foreground row can be REUSED
+        # across day boundaries (Telegram supergroup topics keep one session and
+        # only advance last_activity_at), so a heavily-used but long-lived session
+        # that STARTED before the anchor would otherwise be miscounted as no
+        # activity — permanently suppressing the alert. last_activity_at reflects
+        # real recent use of both fresh and reused sessions.
+        interaction_since = (
+            last
+            if last is not None
+            else (now_dt - timedelta(days=_USER_MODEL_STALE_DAYS)).isoformat()
+        )
+        async with db.execute(
+            "SELECT COUNT(*) FROM cc_sessions "
+            "WHERE session_type = 'foreground' AND last_activity_at > ?",
+            (interaction_since,),
+        ) as cur:
+            irow = await cur.fetchone()
+        interaction = irow[0] if irow and irow[0] is not None else 0
+        if interaction < _USER_MODEL_MIN_INTERACTION_SESSIONS:
             return
 
         detail = (
@@ -387,23 +441,26 @@ async def _check_user_model_staleness(db) -> None:
             source="user_model_staleness_monitor",
             type="infrastructure_alert",
             content=(
-                f"The user-model learning stream is stale: {detail}. Reflection "
-                f"user-impact deltas (observations type='user_model_delta') feed the "
-                f"user-model evolution job, so a silent stream means Genesis has stopped "
-                f"updating its model of the user. Check the per-delta confidence gate "
-                f"(MIN_DELTA_CONFIDENCE, perception/types.py) against the light model's "
-                f"actual output confidence, and the user_impact rotation's emission "
-                f"volume (how many deltas reflections propose at all)."
+                f"User-model learning stream: {detail}, despite {interaction} "
+                f"foreground session(s) since. Reflection user-impact deltas "
+                f"(observations type='user_model_delta') feed the user-model "
+                f"evolution job. NOTE: this stream is sparse BY DESIGN — deltas are "
+                f"emitted only when the model of the user genuinely changes, so "
+                f"silence is often correct; treat this as a 'worth a look' nudge, "
+                f"not a confirmed defect. Do NOT lower MIN_DELTA_CONFIDENCE or "
+                f"loosen the user_impact prompt to force emissions — that "
+                f"confabulates deltas and corrupts the measured signal. If "
+                f"investigating, trace the user_impact rotation's emission path "
+                f"(reflection proposes a delta -> observations write), not the gate."
             ),
-            priority="high",
+            priority="medium",
             created_at=now_dt.isoformat(),
             content_hash=content_hash,
             skip_if_duplicate=True,
         )
         if created is None:
             return  # An unresolved staleness alert already exists.
-        _last_user_model_stale_alert_at = now
-        logger.warning("User-model staleness alert: %s", detail)
+        logger.info("User-model staleness alert (medium): %s", detail)
     except Exception:
         logger.debug("Failed user-model staleness check", exc_info=True)
 
@@ -412,8 +469,8 @@ async def _resolve_user_model_staleness(db) -> None:
     """Resolve a standing user-model staleness alert once a fresh delta lands.
 
     Unconditional (no in-memory guard) so it survives restart; a cheap no-op when
-    nothing matches. Clears the cooldown so a recovery -> re-staleness re-alerts."""
-    global _last_user_model_stale_alert_at
+    nothing matches. Episode dedup is DB-backed (keyed on the last delta), so a
+    recovery -> re-staleness naturally re-alerts once against the new anchor."""
     if db is None:
         return
     try:
@@ -425,7 +482,6 @@ async def _resolve_user_model_staleness(db) -> None:
             resolution_notes="auto-resolved: a fresh user_model_delta arrived within the window",
         )
         if resolved:
-            _last_user_model_stale_alert_at = 0.0
             logger.info("Auto-resolved %d user-model staleness alert(s)", resolved)
     except Exception:
         logger.debug("Failed to resolve user-model staleness alerts", exc_info=True)
@@ -479,6 +535,14 @@ _INFRA_POSTURE_DETAIL = {
         "scripts/bootstrap.sh (installs systemd-oomd and lays the user.slice "
         "drop-in via lib/memory_resilience.sh)"
     ),
+    "pid_ceiling_unprovisioned": (
+        "the per-user systemd slice PID/task ceiling is still on systemd's stock "
+        "33% default (user-.slice.d/10-defaults.conf) — many concurrent Claude "
+        "Code sessions (each spawns MCP subprocess trees) can exhaust it and hit "
+        "'Cannot fork' while memory/CPU read green. Re-run scripts/bootstrap.sh "
+        "(lib/memory_resilience.sh's pid_budget_apply lays a user-.slice "
+        "TasksMax=60% drop-in), or raise TasksMax manually if resources permit"
+    ),
     "host_swap_absent": (
         "the host has no swap — the container's swap allowance has nowhere to "
         "spill, so it is protection on paper only. Add host swap "
@@ -513,6 +577,15 @@ _INFRA_POSTURE_DETAIL = {
         "when no CC session is live (moves cc-tmp onto a dedicated storage "
         "volume, size-capped so a runaway can never reach the rootfs; requires "
         "a block/CoW-backed storage pool — lvm/zfs/btrfs/ceph)"
+    ),
+    "cc_tmp_apply_blocked_on_cc": (
+        "the Claude Code scratch dir (~/.genesis/cc-tmp) still shares a filesystem "
+        "with the container root, but the dedicated-volume apply is CONVERGING: its "
+        "last attempt skipped only because a CC session was live (attaching would "
+        "shadow open temp files). It re-attempts on the next CC-quiet cold-start and "
+        "on a periodic timer (genesis-cc-tmp-align) — no action needed unless this "
+        "persists across many quiet windows. To close it immediately, a deliberate "
+        "container restart runs the apply in the guaranteed-quiet boot window"
     ),
 }
 
@@ -566,6 +639,11 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # pressure-kill policy cannot work, so False there is not actionable.
     if swap_max is not None and memory.get("oomd_user_slice_kill") is False:
         missing.append("oomd_pressure_kill_off")
+    # PID/task ceiling still on systemd's stock 33% default. Explicit False only
+    # (the collector reports the EFFECTIVE cap vs the container root budget);
+    # None/absent (unreadable / no container cap) stays silent.
+    if memory.get("pid_ceiling_effective_ok") is False:
+        missing.append("pid_ceiling_unprovisioned")
     # host_system comes from the guardian host plane; absent = no guardian =
     # no signal. NOT memory.facts.swap_total — that reads 0 on a HEALTHY
     # container (meminfo swap isn't virtualized; verified live 2026-07-16).
@@ -596,7 +674,16 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         _facts("virt").get("container") == "lxc"
         and _facts("storage").get("cc_tmp_isolated") is False
     ):
-        missing.append("cc_tmp_shared_fs")
+        # cc-tmp is on the rootfs either way (fact stays False), but distinguish
+        # the CONVERGING state — the opportunistic apply skipped only because a CC
+        # session was live, and will attach on the next quiet cold-start/lull —
+        # from a state that needs a human (unsupported pool, verify-failed, or
+        # never-attempted). Only the surfaced detail differs; the alert still fires
+        # so the posture stays honest that isolation is not yet in place.
+        if _facts("storage").get("cc_tmp_apply_blocked_on_cc") is True:
+            missing.append("cc_tmp_apply_blocked_on_cc")
+        else:
+            missing.append("cc_tmp_shared_fs")
     return sorted(missing)
 
 
@@ -744,6 +831,137 @@ async def _resolve_infra_protection_posture(db) -> None:
             logger.info("Auto-resolved %d infra protection posture alert(s)", resolved)
     except Exception:
         logger.debug("Failed to resolve infra posture alerts", exc_info=True)
+
+
+_EGO_LIVENESS_TYPE = "ego_alert"
+_EGO_LIVENESS_SOURCES = {
+    "user_ego_cycle": "ego_liveness:user_ego_cycle",
+    "genesis_ego_cycle": "ego_liveness:genesis_ego_cycle",
+}
+_EGO_LIVENESS_LABELS = {
+    "user_ego_cycle": "User ego (CEO)",
+    "genesis_ego_cycle": "Genesis ego (COO)",
+}
+
+
+async def _check_ego_liveness(db) -> None:
+    """Alert when an ego has completed NO real cycle well past its cadence.
+
+    Reads the durable ``job_health.last_success`` (advanced ONLY on a completed
+    cycle) — never the ``is_running`` / heartbeat / ``next_fire_at`` proxies that
+    stay green while an ego is deadlocked (the 3-day-stall-reads-healthy bug).
+    Conservative thresholds (``ego.liveness``) so a legitimate adaptive backoff
+    or quiet-hours lull never trips; ``gated`` (waiting on the user) and
+    ``is_paused`` (a chosen state) are NOT stalls. One self-superseding 'high'
+    observation PER EGO (its own source), auto-resolved when a cycle completes.
+    Best-effort; never raises into the tick."""
+    if db is None:
+        return
+    try:
+        from genesis.autonomy.cli_policy import load_autonomous_cli_policy
+        from genesis.db.crud import ego as ego_crud
+        from genesis.db.crud import job_health as job_health_crud
+        from genesis.ego.liveness import compute_ego_liveness
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        try:
+            gate_on = load_autonomous_cli_policy().manual_approval_required
+        except Exception:
+            gate_on = True
+        managers = (
+            ("user_ego_cycle", getattr(rt, "_ego_cadence_manager", None)),
+            ("genesis_ego_cycle", getattr(rt, "_genesis_ego_cadence_manager", None)),
+        )
+        for source_tag, mgr in managers:
+            source = _EGO_LIVENESS_SOURCES[source_tag]
+            # A disabled ego (no manager) has no cadence to be overdue against —
+            # clear any standing stall alert rather than leaving it open forever.
+            if mgr is None:
+                await observations.resolve_by_source_and_type(
+                    db,
+                    source=source,
+                    type=_EGO_LIVENESS_TYPE,
+                    resolved_at=datetime.now(UTC).isoformat(),
+                    resolution_notes="auto-resolved: ego disabled (no cadence manager)",
+                )
+                continue
+            try:
+                last_success = await job_health_crud.get_job_last_success(
+                    db,
+                    source_tag,
+                )
+                last_intent = await ego_crud.get_state(
+                    db,
+                    f"last_proactive_fire:{source_tag}",
+                )
+                gated = (
+                    await ego_crud.has_pending_cli_approval(db, source_tag) if gate_on else False
+                )
+                live = compute_ego_liveness(
+                    last_success_at=last_success,
+                    last_intent_at=last_intent,
+                    current_interval_minutes=mgr.current_interval_minutes,
+                    gated=gated,
+                )
+            except Exception:
+                logger.debug(
+                    "ego liveness compute failed for %s",
+                    source_tag,
+                    exc_info=True,
+                )
+                continue
+
+            if not live.stalled:
+                # Covers a completed cycle OR the ego going gated/paused/globally
+                # paused since the last alert — all legitimately non-stalled.
+                await observations.resolve_by_source_and_type(
+                    db,
+                    source=source,
+                    type=_EGO_LIVENESS_TYPE,
+                    resolved_at=datetime.now(UTC).isoformat(),
+                    resolution_notes=(
+                        "auto-resolved: ego no longer stalled "
+                        "(cycle completed, or now gated/paused)"
+                    ),
+                )
+                continue
+
+            label = _EGO_LIVENESS_LABELS.get(source_tag, source_tag)
+            overdue_h = (live.overdue_minutes or 0.0) / 60.0
+            content = (
+                f"{label} is actively trying to cycle but has completed none in "
+                f"{overdue_h:.1f}h (expected every ~{int(mgr.current_interval_minutes)}m; "
+                f"stall threshold {live.threshold_minutes / 60:.0f}h). It keeps "
+                f"pushing cycle signals but they never finish — check the ego "
+                f"consumer and any dispatch gate in the genesis-server logs."
+            )
+            # Stable per-ego hash: skip_if_duplicate keeps a persisting stall from
+            # re-creating each tick; the row auto-resolves when a cycle lands.
+            content_hash = hashlib.sha256(source.encode()).hexdigest()
+            await observations.supersede_except_hash(
+                db,
+                source=source,
+                type=_EGO_LIVENESS_TYPE,
+                keep_content_hash=content_hash,
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="superseded: ego liveness state changed",
+            )
+            created = await observations.create(
+                db,
+                id=str(uuid.uuid4()),
+                source=source,
+                type=_EGO_LIVENESS_TYPE,
+                content=content,
+                priority="high",
+                created_at=datetime.now(UTC).isoformat(),
+                content_hash=content_hash,
+                skip_if_duplicate=True,
+            )
+            if created is not None:
+                logger.warning("Ego liveness alert: %s stalled", source_tag)
+    except Exception:
+        logger.debug("Failed ego liveness check", exc_info=True)
 
 
 async def _check_memory_integrity_posture(db) -> None:
@@ -936,8 +1154,6 @@ async def _resolve_memory_integrity_posture(db) -> None:
             logger.info("Auto-resolved %d memory integrity posture alert(s)", resolved)
     except Exception:
         logger.debug("Failed to resolve memory integrity posture alerts", exc_info=True)
-
-
 
 
 # Deploy staleness (WS-B): merged ≠ deployed. A bare git-merge between
@@ -1138,6 +1354,160 @@ async def _resolve_deploy_staleness(db) -> None:
         logger.debug("Failed to resolve deploy staleness alerts", exc_info=True)
 
 
+# ── Follow-up hygiene watchdog ────────────────────────────────────────────────
+# Flags hot-lane follow_ups that fell into an invisible/stuck state (the failure
+# class behind the July-2026 graph-bake-off loss): status='scheduled' with no
+# linked_task_id (invisible to every surface — the follow_up_update H2 gate now
+# prevents new ones; this catches pre-gate/programmatic strays), and scheduled_task
+# rows the dispatcher never actuated. Read-and-alert only — one deduped,
+# self-resolving infrastructure_alert (→ morning report). Slow-moving → hourly.
+_FU_WATCHDOG_SOURCE = "follow_up_watchdog"
+_FU_WATCHDOG_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
+_last_fu_watchdog_alert_at: float = 0.0
+_last_fu_watchdog_alert_key: str = ""
+
+
+def _created_before(row: dict, cutoff: datetime) -> bool:
+    """True if the row's created_at is older than cutoff (grace boundary).
+
+    Un-parseable/missing created_at → treat as old (flag it) rather than hide it.
+    """
+    raw = row.get("created_at")
+    if not raw:
+        return True
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt <= cutoff
+    except (ValueError, TypeError):
+        return True
+
+
+async def _check_follow_up_watchdog(db) -> None:
+    """Alert when hot-lane follow-ups are stuck invisible/undispatched.
+
+    Best-effort — the whole body is guarded and never raises into the tick."""
+    global _last_fu_watchdog_alert_at, _last_fu_watchdog_alert_key
+    if db is None:
+        return
+    try:
+        from genesis.awareness import follow_up_watchdog_config as cfg_mod
+
+        if not cfg_mod.is_enabled():
+            # Turning the watchdog off must not strand an already-open alert as
+            # permanently unresolved (every other check reaches its _resolve_*).
+            # Clear its own alerts, then stay quiet.
+            await _resolve_follow_up_watchdog(db)
+            return
+        cfg = cfg_mod.load_config()
+        grace_hours = cfg_mod.knob_int(cfg, "grace_hours")
+        max_listed = cfg_mod.knob_int(cfg, "max_listed")
+        base_priority = cfg_mod.alert_priority(cfg)
+
+        from genesis.db.crud import follow_ups as fu_crud
+
+        cutoff = datetime.now(UTC) - timedelta(hours=grace_hours)
+        orphaned = [
+            r for r in await fu_crud.get_orphaned_scheduled(db) if _created_before(r, cutoff)
+        ]
+        past_due = await fu_crud.get_past_due_scheduled(db, grace_hours=grace_hours)
+
+        findings: list[tuple[str, dict]] = [("orphaned_scheduled", r) for r in orphaned]
+        findings += [("past_due_scheduled", r) for r in past_due]
+        if not findings:
+            await _resolve_follow_up_watchdog(db)
+            return
+
+        classes = sorted({c for c, _ in findings})
+        critical = any(r.get("priority") == "critical" for _, r in findings)
+        priority = "critical" if critical else base_priority
+        # Key on the FULL offender id set (ALL findings, not the display slice) as well
+        # as class + priority. When the offender set changes but class + priority don't,
+        # a class-only key leaves the stale alert deduped forever with its original
+        # ids/count while the newly-stuck row stays hidden — defeating the watchdog (P1).
+        offender_key = ",".join(sorted(r["id"] for _, r in findings))
+        alert_key = ",".join(classes) + ":" + priority + "|" + offender_key
+        now = time.monotonic()
+        if (
+            now - _last_fu_watchdog_alert_at < _FU_WATCHDOG_COOLDOWN_S
+            and alert_key == _last_fu_watchdog_alert_key
+        ):
+            return
+
+        content_hash = hashlib.sha256(f"follow_up_watchdog:{alert_key}".encode()).hexdigest()
+        # Keep exactly ONE active alert = the current state.
+        await observations.supersede_except_hash(
+            db,
+            source=_FU_WATCHDOG_SOURCE,
+            type="infrastructure_alert",
+            keep_content_hash=content_hash,
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="superseded by a new follow-up watchdog alert state",
+        )
+
+        listed = findings[:max_listed]
+        rows = " | ".join(
+            f"{r['id'][:8]} · {(r.get('content') or '')[:80]} · {cls}" for cls, r in listed
+        )
+        more = len(findings) - len(listed)
+        content = (
+            f"{len(findings)} hot-lane follow-up(s) are stuck invisible/undispatched: "
+            f"{len(orphaned)} orphaned-scheduled (status='scheduled' with no linked task — "
+            f"in NO surface: not actionable, not dispatched, not linked-active), "
+            f"{len(past_due)} past-due scheduled (scheduled_at elapsed, dispatcher never "
+            f"actuated). Fix each via follow_up_update (the 8-char id prefix now resolves): "
+            f"set status='blocked' with a blocked_reason (+ a revisit_condition), or "
+            f"complete/fail it. NOTE: work_state alone changes the lane/kind, NOT status — "
+            f"an orphan left status='scheduled' stays invisible. [{rows}"
+            + (f" | (+{more} more)]" if more else "]")
+        )
+        created = await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source=_FU_WATCHDOG_SOURCE,
+            type="infrastructure_alert",
+            content=content,
+            priority=priority,
+            created_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+        if created is None:
+            return  # An unresolved alert for this exact state already exists.
+        _last_fu_watchdog_alert_at = now
+        _last_fu_watchdog_alert_key = alert_key
+        logger.warning(
+            "Follow-up watchdog alert (%s): %d orphaned-scheduled, %d past-due",
+            priority,
+            len(orphaned),
+            len(past_due),
+        )
+    except Exception:
+        logger.debug("Failed follow-up watchdog check", exc_info=True)
+
+
+async def _resolve_follow_up_watchdog(db) -> None:
+    """Resolve outstanding follow-up watchdog alerts once no findings remain."""
+    global _last_fu_watchdog_alert_at, _last_fu_watchdog_alert_key
+    if db is None:
+        return
+    try:
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source=_FU_WATCHDOG_SOURCE,
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes="auto-resolved: follow-up hygiene cleared",
+        )
+        if resolved:
+            _last_fu_watchdog_alert_at = 0.0
+            _last_fu_watchdog_alert_key = ""
+            logger.info("Auto-resolved %d follow-up watchdog alert observation(s)", resolved)
+    except Exception:
+        logger.debug("Failed to resolve follow-up watchdog alerts", exc_info=True)
+
+
 # nodatacow (chattr +C) drift detection: on btrfs, a CoW SQLite DB suffers WAL
 # write-amplification + chronic fragmentation. The install sets +C on data/;
 # this catches regressions (a restore/recreate that dropped the flag). Static
@@ -1161,7 +1531,9 @@ def _fs_type_for(path) -> str | None:
                 if len(parts) < 3:
                     continue
                 mnt, typ = parts[1], parts[2]
-                if (target == mnt or target.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best):
+                if (target == mnt or target.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(
+                    best
+                ):
                     best, fstype = mnt, typ
         return fstype
     except OSError:
@@ -1179,6 +1551,7 @@ async def _check_db_nodatacow(db) -> None:
         import struct
 
         from genesis.env import genesis_db_path
+
         db_path = genesis_db_path()
         if not db_path.exists() or _fs_type_for(db_path) != "btrfs":
             return
@@ -1457,18 +1830,35 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
             SLOT_RSS_WARN_MB,
             enumerate_cc_slots,
         )
+
         if slots is None:
-            slots = enumerate_cc_slots()
+            # /proc scan is ~1s of sync syscalls — keep it off the event loop.
+            slots = await asyncio.to_thread(enumerate_cc_slots)
     except Exception:
         logger.debug("cc_slot memory check: enumeration failed", exc_info=True)
         return
 
     now = time.monotonic()
+    # Evict expired cooldown entries so the pid-keyed map stays bounded to
+    # currently-cooling sessions. Keys are pids (unbounded over the loop's
+    # lifetime); an entry older than the cooldown no longer suppresses anything,
+    # so dropping it is behaviour-neutral and prevents slow growth on a
+    # long-running server.
+    for k in [k for k, t in _last_slot_alert_at.items() if now - t >= _SLOT_ALERT_COOLDOWN_S]:
+        del _last_slot_alert_at[k]
     for slot in slots:
         rss = slot.get("rss_mb", 0.0)
         if rss < SLOT_RSS_WARN_MB:
             continue
-        key = str(slot.get("slot", "?"))
+        # Key the cooldown by PID (unique per process), never the slot label: rows
+        # are pid-keyed and two live claude procs can share a label (or have none),
+        # so a label key would let one process suppress another's alert for an hour.
+        # (Cognitive `claude -p` calls are excluded upstream, so every row here is a
+        # real session.) The display label still prefers the slot when known.
+        raw_slot = slot.get("slot")
+        pid = slot.get("pid")
+        key = f"pid:{pid}"
+        label = f"slot cc-{raw_slot}" if raw_slot is not None else f"pid {pid}"
         last = _last_slot_alert_at.get(key)
         if last is not None and (now - last) < _SLOT_ALERT_COOLDOWN_S:
             continue
@@ -1485,17 +1875,128 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
                 source="cc_slot_monitor",
                 type="infrastructure_alert",
                 content=(
-                    f"CC slot cc-{key} (pid {slot.get('pid')}) is using "
+                    f"CC {label} (pid {pid}) is using "
                     f"{rss / 1024:.1f} GB RAM (warn {SLOT_RSS_WARN_MB // 1024} GB, "
                     f"crit {SLOT_RSS_CRIT_MB // 1024} GB). A single Claude Code "
-                    f"session may be leaking — consider restarting slot cc-{key}."
+                    f"session may be leaking — consider restarting {label}."
                 ),
                 priority=priority,
                 created_at=datetime.now(UTC).isoformat(),
             )
-            logger.warning("CC slot memory alert: cc-%s %.1f GB (%s)", key, rss / 1024, priority)
+            logger.warning("CC slot memory alert: %s %.1f GB (%s)", label, rss / 1024, priority)
         except Exception:
             logger.debug("Failed to create cc_slot alert observation", exc_info=True)
+
+
+# scope -> (severity_rank, last-alert monotonic ts). A per-SCOPE map, not a single
+# slot: the collector reports whichever cgroup level BINDS, and that scope can
+# oscillate between near-tied levels. Keyed on scope (not scope+severity) with the
+# last severity stored, so we fire on a NEW scope or an ESCALATION (degraded→error)
+# but suppress a same-or-LOWER severity within the window — no storm, no A→B→A
+# oscillation flood, and no alert announcing a de-escalation (an improvement).
+_last_pid_alerts: dict[str | None, tuple[int, float]] = {}
+_PID_BUDGET_ALERT_COOLDOWN_S = 3600  # one alert per scope per hour unless it escalates
+_PID_SEVERITY_RANK = {"degraded": 1, "error": 2}
+
+
+async def _check_pid_budget(db, budget: dict | None = None) -> None:
+    """Alert (explanatorily) when the BINDING cgroup PID/task budget runs low.
+
+    The task budget maxes under many concurrent CC sessions — each `claude` spawns
+    MCP subprocess trees — and precedes `Cannot fork`, while memory/cpu/disk still
+    read green (the blind spot this closes). The collector walks the cgroup chain and
+    reports whichever level binds (session scope / user slice / container root); this
+    emits a scope-matched remedy at degraded (>=80%) -> 'high'; error (>=90%) ->
+    'critical'. Fork-free cgroup read; best-effort — never raises into the tick.
+    `budget` may be injected (tests); otherwise it reads live."""
+    global _last_pid_alerts  # noqa: PLW0603
+    try:
+        if budget is None:
+            from genesis.observability.snapshots.infrastructure import _collect_pid_budget
+
+            budget = _collect_pid_budget()
+    except Exception:
+        logger.debug("pid budget check: read failed", exc_info=True)
+        return
+
+    status = budget.get("status")
+    if status not in ("degraded", "error"):
+        return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+    scope = budget.get("scope")
+    now = time.monotonic()
+    # Per-scope cooldown with escalation bypass: fire when the scope is new, its
+    # window expired, or it ESCALATED to a higher severity; suppress a same-or-lower
+    # severity within the window — that covers a repeat, an A→B→A oscillation (each
+    # scope cools independently), AND a de-escalation error→degraded (never alert
+    # because things improved).
+    rank = _PID_SEVERITY_RANK[status]
+    prev = _last_pid_alerts.get(scope)
+    if prev is not None and (now - prev[1]) < _PID_BUDGET_ALERT_COOLDOWN_S and rank <= prev[0]:
+        return
+    if db is None:
+        return  # can't write the observation now; retry next tick (cooldown not consumed)
+    pct = budget.get("pct")
+    current = budget.get("current")
+    maximum = budget.get("max")
+    priority = "critical" if status == "error" else "high"
+    # Remedy matched to the BINDING cgroup level (the collector walks the chain and
+    # names it): a service-scope raise, a user-slice raise, and a container-wide
+    # limit are different levers — a generic "raise the user-.slice TasksMax" is
+    # wrong (unactionable) when the server unit or the shared container root binds.
+    if scope == "container-root":
+        where = "Container-wide PID budget"
+        remedy = (
+            "This is the CONTAINER-WIDE task budget, shared with system and any other "
+            "processes, so it can fill from load outside Genesis. Reduce total load or "
+            "raise the container pids.max (a host/incus change)."
+        )
+    elif isinstance(scope, str) and scope.endswith(".service"):
+        where = f"{scope} PID budget"
+        remedy = (
+            f"This is the {scope} unit's TasksMax sub-cap — the server core plus the "
+            f"git/subprocess trees it spawns. Raise its TasksMax or reduce parallel "
+            f"subprocess work."
+        )
+    elif isinstance(scope, str) and scope.endswith(".scope"):
+        where = f"{scope} PID budget"
+        remedy = (
+            "This is a single session scope's TasksMax sub-cap — it bounds one session. "
+            "If it recurs, raise DefaultTasksMax or reduce that session's fan-out."
+        )
+    else:
+        # user slice (a *.slice) or unlabeled — the aggregate per-user budget.
+        where = f"{scope} PID budget" if scope else "User-slice PID budget"
+        remedy = (
+            "This is the per-user systemd TasksMax sub-cap. Raise the user-.slice "
+            "TasksMax (Genesis provisions 60% of the container PID budget by default) "
+            "or reduce concurrent sessions."
+        )
+    # Set before the await so a failed create still cools per-tick retries for the
+    # same scope+severity. Prune scopes older than the cooldown to bound the map
+    # (the server's own chain is a small fixed set, but keep it tidy regardless).
+    _last_pid_alerts[scope] = (rank, now)
+    _last_pid_alerts = {
+        s: v for s, v in _last_pid_alerts.items() if now - v[1] < _PID_BUDGET_ALERT_COOLDOWN_S
+    }
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="pid_budget_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"{where} at {pct:.0f}% ({current}/{maximum} tasks). When it fills, new "
+                f"processes fail with 'Cannot fork' even though memory/CPU/disk are fine. "
+                f"Each Claude Code session spawns MCP subprocess trees. {remedy}"
+            ),
+            priority=priority,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        logger.warning(
+            "PID budget alert: %s%% (%s/%s, scope=%s, %s)", pct, current, maximum, scope, priority
+        )
+    except Exception:
+        logger.debug("Failed to create pid_budget alert observation", exc_info=True)
 
 
 # CC silent-cap detection. A capped Anthropic subscription makes `claude -p`
@@ -1506,10 +2007,81 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
 # CCInvocation.expect_output; see runtime/init/cc_relay._on_cc_empty_output). This
 # check aggregates a run of them into a single critical alert. Same monotonic-
 # since-boot caveat as WAL/slot: None = "never alerted", never 0.0.
-_CAP_EMPTY_WINDOW_MIN = 60          # look back this many minutes for empties
-_CAP_EMPTY_THRESHOLD = 3           # ≥ this many empties in the window → alert
-_CAP_ALERT_COOLDOWN_S = 3600       # one alert per hour max
+_CAP_EMPTY_WINDOW_MIN = 60  # look back this many minutes for empties
+_CAP_EMPTY_THRESHOLD = 3  # ≥ this many empties in the window → alert
+_CAP_ALERT_COOLDOWN_S = 3600  # one alert per hour max
 _last_cap_alert_at: float | None = None
+
+
+async def _check_cc_login_expiry(db) -> None:
+    """Warn ahead of the interactive CC login's refresh-token expiry.
+
+    The claude.ai OAuth refresh token has a FIXED lifetime (routine access-
+    token refresh does not extend it); when it lapses, every CC request —
+    including all background autonomy — fails until an interactive /login.
+    CC's own terminal warning is invisible on a headless box, so this raises
+    ONE critical observation (rides the critical-observations job to
+    Telegram) when expiry is inside the warning window, and auto-resolves
+    after the user re-logs in. Missing/unreadable credentials (fresh or
+    API-key-only installs, mid-rewrite reads) are silent — no signal is
+    never treated as expired. Best-effort; never raises into the tick.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.cc.login_health import refresh_token_expiry
+
+        try:
+            warn_days = max(
+                1,
+                int(os.environ.get("GENESIS_CC_LOGIN_EXPIRY_WARN_DAYS", "5")),
+            )
+        except ValueError:
+            warn_days = 5
+
+        expiry = refresh_token_expiry()
+        now = datetime.now(UTC)
+        if expiry is None:
+            # No signal (missing/unreadable/mid-rewrite credentials) is NOT a
+            # verdict: neither alert nor resolve — a transient read failure
+            # must not clear a real standing warning.
+            return
+        if (expiry - now) > timedelta(days=warn_days):
+            await observations.resolve_by_source_and_type(
+                db,
+                source="cc_login_monitor",
+                type="infrastructure_alert",
+                resolved_at=now.isoformat(),
+                resolution_notes=(
+                    "auto-resolved: CC login expiry no longer inside the "
+                    f"{warn_days}-day warning window"
+                ),
+            )
+            return
+
+        days_left = max(0.0, (expiry - now).total_seconds() / 86400)
+        content_hash = hashlib.sha256(b"cc_login_expiry_alert").hexdigest()
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="cc_login_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"CC interactive login expires {expiry.isoformat()} "
+                f"(~{days_left:.1f} days). Routine refresh does NOT extend it — "
+                "run /login in a foreground session before then, or ALL Claude "
+                "Code work (foreground + background autonomy) stops. Durable "
+                "backstop: `claude setup-token` once + scripts/store_cc_token.sh "
+                "stores a 1-year fallback token background sessions can use "
+                "when the login is confirmed dead."
+            ),
+            priority="critical",
+            created_at=now.isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+    except Exception:
+        logger.debug("cc login expiry check failed", exc_info=True)
 
 
 async def _check_cc_cap_detection(db) -> None:
@@ -1533,7 +2105,10 @@ async def _check_cc_cap_detection(db) -> None:
     try:
         cutoff = (datetime.now(UTC) - timedelta(minutes=_CAP_EMPTY_WINDOW_MIN)).isoformat()
         count = await observations.count_recent_unresolved_by_type_and_source(
-            db, type="cc_cap_empty_event", source="cc_cap_monitor", since=cutoff,
+            db,
+            type="cc_cap_empty_event",
+            source="cc_cap_monitor",
+            since=cutoff,
         )
 
         if count < _CAP_EMPTY_THRESHOLD:
@@ -1585,7 +2160,8 @@ async def _check_cc_cap_detection(db) -> None:
             return  # an unresolved cap alert already exists — don't duplicate
         logger.warning(
             "CC cap detection alert: %d empty cognitive completions in %d min",
-            count, _CAP_EMPTY_WINDOW_MIN,
+            count,
+            _CAP_EMPTY_WINDOW_MIN,
         )
     except Exception:
         logger.debug("cc_cap detection failed — skipping this tick", exc_info=True)
@@ -1654,7 +2230,10 @@ async def perform_tick(
                 # Fix 3A: expire stale escalations (>8h) before checking
                 _STALE_ESCALATION_HOURS = 8
                 all_pending = await observations.query(
-                    db, type="light_escalation_pending", resolved=False, limit=10,
+                    db,
+                    type="light_escalation_pending",
+                    resolved=False,
+                    limit=10,
                 )
                 for stale in all_pending:
                     stale_created = stale.get("created_at", "")
@@ -1666,15 +2245,21 @@ async def perform_tick(
                         stale_age = 999
                     if stale_age >= _STALE_ESCALATION_HOURS:
                         await observations.resolve(
-                            db, stale["id"],
+                            db,
+                            stale["id"],
                             resolved_at=now,
                             resolution_notes=f"Expired (age {stale_age:.1f}h > {_STALE_ESCALATION_HOURS}h TTL)",
                         )
-                        logger.info("Auto-resolved stale escalation %s (%.1fh old)", stale["id"], stale_age)
+                        logger.info(
+                            "Auto-resolved stale escalation %s (%.1fh old)", stale["id"], stale_age
+                        )
 
                 # Re-query after cleanup
                 pending_escalations = await observations.query(
-                    db, type="light_escalation_pending", resolved=False, limit=1,
+                    db,
+                    type="light_escalation_pending",
+                    resolved=False,
+                    limit=1,
                 )
                 if pending_escalations:
                     esc_created = pending_escalations[0].get("created_at", "")
@@ -1689,7 +2274,9 @@ async def perform_tick(
                         # Fix 2A: daily escalation budget (max 2 per 24h)
                         _ESCALATION_BUDGET_PER_DAY = 2
                         resolved_recent = await observations.query(
-                            db, type="light_escalation_resolved", limit=20,
+                            db,
+                            type="light_escalation_resolved",
+                            limit=20,
                         )
                         resolved_24h_count = 0
                         resolved_2h_count = 0
@@ -1708,21 +2295,30 @@ async def perform_tick(
 
                         # Check emergency bypass -- critical signals override budget
                         esc_content = pending_escalations[0].get("content", "").lower()
-                        is_emergency = any(kw in esc_content for kw in (
-                            "critical_failure", "data_loss", "security_breach",
-                            "all providers", "container memory critical",
-                        ))
+                        is_emergency = any(
+                            kw in esc_content
+                            for kw in (
+                                "critical_failure",
+                                "data_loss",
+                                "security_breach",
+                                "all providers",
+                                "container memory critical",
+                            )
+                        )
 
                         if resolved_2h_count >= 1 and not is_emergency:
                             logger.info("Light escalation cooldown active (2h), skipping")
                         elif resolved_24h_count >= _ESCALATION_BUDGET_PER_DAY and not is_emergency:
                             logger.info(
                                 "Escalation budget exhausted (%d/%d in 24h), skipping",
-                                resolved_24h_count, _ESCALATION_BUDGET_PER_DAY,
+                                resolved_24h_count,
+                                _ESCALATION_BUDGET_PER_DAY,
                             )
                         else:
                             if is_emergency:
-                                logger.warning("Emergency escalation bypassing budget: %s", esc_content[:100])
+                                logger.warning(
+                                    "Emergency escalation bypassing budget: %s", esc_content[:100]
+                                )
                             classified_depth = Depth.DEEP
                             escalation_source = "light_escalation"
                             trigger_reason = f"light escalation: {pending_escalations[0].get('content', 'unknown')}"
@@ -1738,21 +2334,34 @@ async def perform_tick(
             db,
             id=tick_id,
             source=source,
-            signals_json=json.dumps([
-                {"name": s.name, "value": s.value, "source": s.source,
-                 "collected_at": s.collected_at,
-                 # Additive: ground-truth context (e.g. "Baseline: 4.0/day,
-                 # Recent: 27.0/day") so downstream consumers can't misread
-                 # a symmetric deviation score's direction.
-                 **({"baseline_note": s.baseline_note} if s.baseline_note else {})}
-                for s in signals
-            ]),
-            scores_json=json.dumps([
-                {"depth": s.depth.value, "raw_score": s.raw_score,
-                 "time_multiplier": s.time_multiplier, "final_score": s.final_score,
-                 "threshold": s.threshold, "triggered": s.triggered}
-                for s in scores
-            ]),
+            signals_json=json.dumps(
+                [
+                    {
+                        "name": s.name,
+                        "value": s.value,
+                        "source": s.source,
+                        "collected_at": s.collected_at,
+                        # Additive: ground-truth context (e.g. "Baseline: 4.0/day,
+                        # Recent: 27.0/day") so downstream consumers can't misread
+                        # a symmetric deviation score's direction.
+                        **({"baseline_note": s.baseline_note} if s.baseline_note else {}),
+                    }
+                    for s in signals
+                ]
+            ),
+            scores_json=json.dumps(
+                [
+                    {
+                        "depth": s.depth.value,
+                        "raw_score": s.raw_score,
+                        "time_multiplier": s.time_multiplier,
+                        "final_score": s.final_score,
+                        "threshold": s.threshold,
+                        "triggered": s.triggered,
+                    }
+                    for s in scores
+                ]
+            ),
             classified_depth=classified_depth.value if classified_depth else None,
             trigger_reason=trigger_reason,
             created_at=now,
@@ -1760,15 +2369,21 @@ async def perform_tick(
 
         # 5. If triggered, also create an observation (with content-hash dedup)
         if decision is not None:
-            obs_content = json.dumps({
-                "tick_id": tick_id,
-                "depth": classified_depth.value,
-                "reason": trigger_reason,
-                "scores": {s.depth.value: s.final_score for s in scores},
-            }, sort_keys=True)
+            obs_content = json.dumps(
+                {
+                    "tick_id": tick_id,
+                    "depth": classified_depth.value,
+                    "reason": trigger_reason,
+                    "scores": {s.depth.value: s.final_score for s in scores},
+                },
+                sort_keys=True,
+            )
             content_hash = hashlib.sha256(obs_content.encode()).hexdigest()
             is_dup = await observations.exists_by_hash(
-                db, source="awareness_loop", content_hash=content_hash, unresolved_only=True,
+                db,
+                source="awareness_loop",
+                content_hash=content_hash,
+                unresolved_only=True,
             )
             if not is_dup:
                 obs_id = str(uuid.uuid4())
@@ -1778,7 +2393,9 @@ async def perform_tick(
                     source="awareness_loop",
                     type="awareness_tick",
                     content=obs_content,
-                    priority="high" if classified_depth in (Depth.DEEP, Depth.STRATEGIC) else "medium",
+                    priority="high"
+                    if classified_depth in (Depth.DEEP, Depth.STRATEGIC)
+                    else "medium",
                     created_at=now,
                     content_hash=content_hash,
                     skip_if_duplicate=True,
@@ -1788,7 +2405,8 @@ async def perform_tick(
         db_available = False
         logger.warning(
             "Tick DB operations failed — degraded tick (signals collected, "
-            "scoring/persistence skipped): %s", db_exc,
+            "scoring/persistence skipped): %s",
+            db_exc,
         )
 
     result = TickResult(
@@ -1829,7 +2447,11 @@ async def perform_tick(
             except Exception:
                 logger.warning("Failed to enqueue deferred reflection")
 
-    if classified_depth == Depth.LIGHT and cc_reflection_bridge is None and reflection_engine is not None:
+    if (
+        classified_depth == Depth.LIGHT
+        and cc_reflection_bridge is None
+        and reflection_engine is not None
+    ):
         try:
             await reflection_engine.reflect(classified_depth, result, db=db)
         except Exception:
@@ -1847,7 +2469,11 @@ async def perform_tick(
                     )
                 except Exception:
                     logger.warning("Failed to enqueue deferred reflection")
-    elif cc_reflection_bridge is not None and classified_depth in (Depth.LIGHT, Depth.DEEP, Depth.STRATEGIC):
+    elif cc_reflection_bridge is not None and classified_depth in (
+        Depth.LIGHT,
+        Depth.DEEP,
+        Depth.STRATEGIC,
+    ):
         try:
             ref_result = await cc_reflection_bridge.reflect(
                 classified_depth,
@@ -1862,14 +2488,16 @@ async def perform_tick(
             if ref_result is not None and not ref_result.success:
                 logger.info(
                     "%s reflection deferred for tick %s: %s",
-                    classified_depth.value, tick_id,
+                    classified_depth.value,
+                    tick_id,
                     ref_result.reason or "unknown",
                 )
             # Resolve escalation after successful dispatch
             if escalation_pending_id and classified_depth == Depth.DEEP:
                 try:
                     await observations.resolve(
-                        db, escalation_pending_id,
+                        db,
+                        escalation_pending_id,
                         resolved_at=now,
                         resolution_notes="Escalation consumed by deep reflection",
                     )
@@ -1883,7 +2511,9 @@ async def perform_tick(
                         created_at=now,
                     )
                 except Exception:
-                    logger.warning("Failed to resolve escalation %s", escalation_pending_id, exc_info=True)
+                    logger.warning(
+                        "Failed to resolve escalation %s", escalation_pending_id, exc_info=True
+                    )
         except Exception:
             logger.exception("CC reflection failed for tick %s", tick_id)
             if deferred_queue and classified_depth:
@@ -1994,7 +2624,8 @@ class AwarenessLoop:
                 down = []
                 if self._circuit_breakers:
                     down = [
-                        name for name, cb in self._circuit_breakers._breakers.items()
+                        name
+                        for name, cb in self._circuit_breakers._breakers.items()
                         if not cb.is_available()
                     ]
                 detail = f"Providers down: {', '.join(sorted(down))}" if down else ""
@@ -2008,7 +2639,9 @@ class AwarenessLoop:
                 generated_by="awareness_loop",
                 created_at=now,
             )
-            logger.info("Resilience cognitive state updated: %s → %s", self._last_degradation_level, level)
+            logger.info(
+                "Resilience cognitive state updated: %s → %s", self._last_degradation_level, level
+            )
         except Exception:
             logger.warning("Failed to update resilience cognitive state", exc_info=True)
 
@@ -2038,7 +2671,8 @@ class AwarenessLoop:
             )
         except Exception:
             logger.warning(
-                "Failed to register scheduler job-event listener", exc_info=True,
+                "Failed to register scheduler job-event listener",
+                exc_info=True,
             )
         self._scheduler.start()
         logger.info("Awareness Loop started (interval=%dm, immediate first tick)", self._interval)
@@ -2067,10 +2701,7 @@ class AwarenessLoop:
             return
         if event_code == EVENT_JOB_MAX_INSTANCES:
             event_type = "tick.max_instances"
-            message = (
-                "Awareness tick dropped: previous tick still running "
-                "(max_instances=1)"
-            )
+            message = "Awareness tick dropped: previous tick still running (max_instances=1)"
         elif event_code == EVENT_JOB_MISSED:
             event_type = "tick.missed"
             message = "Awareness tick missed (past misfire grace time)"
@@ -2098,8 +2729,10 @@ class AwarenessLoop:
         async with self._tick_lock:
             logger.info("Force tick triggered: %s", reason)
             result = await perform_tick(
-                self._db, self._collectors,
-                source="critical_bypass", reason=reason,
+                self._db,
+                self._collectors,
+                source="critical_bypass",
+                reason=reason,
                 reflection_engine=self._reflection_engine,
                 cc_reflection_bridge=self._cc_reflection_bridge,
                 deferred_queue=self._deferred_queue,
@@ -2123,7 +2756,9 @@ class AwarenessLoop:
         async with self._tick_lock:
             try:
                 result = await perform_tick(
-                    self._db, self._collectors, source="scheduled",
+                    self._db,
+                    self._collectors,
+                    source="scheduled",
                     reflection_engine=self._reflection_engine,
                     cc_reflection_bridge=self._cc_reflection_bridge,
                     deferred_queue=self._deferred_queue,
@@ -2138,14 +2773,18 @@ class AwarenessLoop:
                 logger.exception("Awareness tick failed unexpectedly")
                 if self._event_bus:
                     await self._event_bus.emit(
-                        Subsystem.AWARENESS, Severity.ERROR,
+                        Subsystem.AWARENESS,
+                        Severity.ERROR,
                         "tick.failed",
                         "Awareness tick failed with exception",
                         **failure_details(exc=exc),
                     )
                 try:
                     from genesis.runtime import GenesisRuntime
-                    GenesisRuntime.instance().record_job_failure("awareness_tick", exc=exc, emit_event=False)
+
+                    GenesisRuntime.instance().record_job_failure(
+                        "awareness_tick", exc=exc, emit_event=False
+                    )
                 except Exception:
                     pass
                 # Even on unexpected failure, don't leave _last_tick_at stale
@@ -2161,7 +2800,8 @@ class AwarenessLoop:
                 if result.classified_depth:
                     logger.info(
                         "Tick triggered %s: %s",
-                        result.classified_depth.value, result.trigger_reason,
+                        result.classified_depth.value,
+                        result.trigger_reason,
                     )
 
                 if not result.db_available:
@@ -2173,24 +2813,28 @@ class AwarenessLoop:
                 # Heartbeat — lets health MCP detect silent death
                 if self._event_bus:
                     await self._event_bus.emit(
-                        Subsystem.AWARENESS, Severity.DEBUG,
+                        Subsystem.AWARENESS,
+                        Severity.DEBUG,
                         "heartbeat",
                         "awareness_loop tick completed"
                         + (" (degraded)" if not result.db_available else ""),
                     )
                 try:
                     from genesis.runtime import GenesisRuntime
+
                     if result.db_available:
                         GenesisRuntime.instance().record_job_success("awareness_tick")
                     else:
                         GenesisRuntime.instance().record_job_failure(
-                            "awareness_tick", "DB unavailable (degraded tick)")
+                            "awareness_tick", "DB unavailable (degraded tick)"
+                        )
                 except Exception:
                     pass  # Runtime may not be available in tests
 
             # Update resilience memory axis based on DB availability
             if self._resilience_state_machine and result is not None:
                 from genesis.resilience.state import MemoryStatus
+
                 if result.db_available:
                     self._resilience_state_machine.update_memory(MemoryStatus.NORMAL)
                 else:
@@ -2252,6 +2896,12 @@ class AwarenessLoop:
             # db inside the function. Surfaces a single ballooning CC session.
             await _check_cc_slot_memory(self._db)
 
+            # Binding-cgroup PID/task-budget check (walks the chain: session scope /
+            # user slice / container root) — fork-free cgroup read, guarded on db
+            # internally. The blind spot that let a `Cannot fork` happen while every
+            # other axis read green; the alert explains the binding sub-cap + remedy.
+            await _check_pid_budget(self._db)
+
             # CC silent-cap detection — counts recent empty-output cognitive
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
@@ -2295,9 +2945,10 @@ class AwarenessLoop:
                     # signal → hourly; self-resolves on recovery. Best-effort
                     # (guarded internally); collectors never do network I/O.
                     await _check_deploy_staleness(self._db)
-                    # User-model-delta stream staleness (WS-2 M7) — a >14d silent
-                    # stream means Genesis stopped updating its model of the user.
-                    # Slow (14d) signal → hourly; self-resolves on a fresh delta.
+                    # User-model-delta stream staleness (WS-2 M7) — flap-resistant:
+                    # alerts (medium) only when silent >=45d DESPITE recent
+                    # foreground interaction, once per episode (DB dedup, TTL-proof);
+                    # self-resolves on a fresh delta. Slow signal → hourly.
                     await _check_user_model_staleness(self._db)
                     # Infra protection posture (silent-skip closure, Phase 3) —
                     # a stable-unprotected box must never be silent: a missing
@@ -2305,10 +2956,24 @@ class AwarenessLoop:
                     # 'high' infrastructure_alert; self-resolves on recovery.
                     # Facts change at most ~daily (profile refresh) → hourly.
                     await _check_infra_protection_posture(self._db)
+                    # CC login refresh-token expiry: fixed lifetime, invisible
+                    # on a headless box until everything stops. Day-scale
+                    # signal → hourly; self-resolves after /login.
+                    await _check_cc_login_expiry(self._db)
                     # Memory integrity posture: reads the latest persisted
                     # consistency/recall-probe rows; slow-moving (daily jobs) →
                     # hourly is ample.
                     await _check_memory_integrity_posture(self._db)
+                    # Follow-up hygiene: hot-lane rows stuck invisible
+                    # (orphaned-scheduled) or undispatched (past-due scheduled).
+                    # Day-scale lifecycle signal → hourly; self-resolves when
+                    # rows gain a trigger or close.
+                    await _check_follow_up_watchdog(self._db)
+                    # Ego liveness: an ego completing NO real cycle well past its
+                    # cadence (job_health.last_success gap), NOT the is_running /
+                    # heartbeat proxies that stay green while deadlocked.
+                    # Conservative threshold; self-resolves when a cycle lands.
+                    await _check_ego_liveness(self._db)
                 await _check_wal_health(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires
@@ -2332,6 +2997,7 @@ class AwarenessLoop:
             if self._remediation_registry:
                 try:
                     from genesis.observability.health import collect_probe_results
+
                     probe_results = await collect_probe_results(self._db)
                     outcomes = await self._remediation_registry.check_and_remediate(
                         probe_results,
@@ -2425,6 +3091,7 @@ class AwarenessLoop:
         # Kill switch — tick/heartbeats still run but no dispatches when paused
         try:
             from genesis.runtime import GenesisRuntime
+
             if GenesisRuntime.instance().paused:
                 logger.debug("Skipping reflection dispatch (Genesis paused)")
                 return
@@ -2482,7 +3149,8 @@ class AwarenessLoop:
                 if obs_result and obs_result.notes_stored > 0:
                     logger.info(
                         "Session observer: %d notes from %d observations",
-                        obs_result.notes_stored, obs_result.observations_read,
+                        obs_result.notes_stored,
+                        obs_result.observations_read,
                     )
             except Exception:
                 logger.warning("Session observer processing failed", exc_info=True)
@@ -2506,8 +3174,10 @@ class AwarenessLoop:
             return
         with contextlib.suppress(Exception):
             await self._event_bus.emit(
-                Subsystem.REFLECTION, Severity.DEBUG,
-                "heartbeat", "reflection idle (no depth triggered)",
+                Subsystem.REFLECTION,
+                Severity.DEBUG,
+                "heartbeat",
+                "reflection idle (no depth triggered)",
             )
 
     async def _dispatch_reflection(self, result: TickResult) -> None:
@@ -2519,7 +3189,8 @@ class AwarenessLoop:
         db = self._db
         logger.info(
             "Dispatch reflection: depth=%s, tick=%s, bridge=%s, engine=%s",
-            depth.value, tick_id[:8],
+            depth.value,
+            tick_id[:8],
             self._cc_reflection_bridge is not None,
             self._reflection_engine is not None,
         )
@@ -2528,10 +3199,10 @@ class AwarenessLoop:
             # Check for critical operational signals that warrant LLM analysis.
             # Routine micro ticks are silent (counted for escalation cascade only).
             critical_active = any(
-                s.value > 0 for s in result.signals
-                if s.name in _MICRO_CRITICAL_SIGNALS
+                s.value > 0 for s in result.signals if s.name in _MICRO_CRITICAL_SIGNALS
             ) or any(
-                s.value >= _SENTINEL_ANOMALY_THRESHOLD for s in result.signals
+                s.value >= _SENTINEL_ANOMALY_THRESHOLD
+                for s in result.signals
                 if s.name == "sentinel_activity"
             )
 
@@ -2546,8 +3217,10 @@ class AwarenessLoop:
                 if ref_result and ref_result.success and self._event_bus:
                     try:
                         await self._event_bus.emit(
-                            Subsystem.REFLECTION, Severity.DEBUG,
-                            "heartbeat", "micro-reflection completed",
+                            Subsystem.REFLECTION,
+                            Severity.DEBUG,
+                            "heartbeat",
+                            "micro-reflection completed",
                         )
                     except Exception:
                         logger.warning("Failed to emit reflection heartbeat", exc_info=True)
@@ -2566,7 +3239,8 @@ class AwarenessLoop:
                         await self._topic_manager.send_to_category("reflection_micro", text)
                         logger.info(
                             "Posted micro reflection to Telegram (tick=%s, salience=%.2f)",
-                            tick_id[:8], micro.salience,
+                            tick_id[:8],
+                            micro.salience,
                         )
                     except Exception:
                         logger.warning("Failed to post micro reflection to topic", exc_info=True)
@@ -2598,8 +3272,10 @@ class AwarenessLoop:
                 if self._event_bus:
                     with contextlib.suppress(Exception):
                         await self._event_bus.emit(
-                            Subsystem.REFLECTION, Severity.DEBUG,
-                            "heartbeat", "reflection idle (no critical signals)",
+                            Subsystem.REFLECTION,
+                            Severity.DEBUG,
+                            "heartbeat",
+                            "reflection idle (no critical signals)",
                         )
 
             # Always mark dispatched — cascade counting works on ticks
@@ -2609,7 +3285,11 @@ class AwarenessLoop:
                 logger.warning("Failed to mark tick %s dispatched", tick_id[:8])
             return
 
-        if depth == Depth.LIGHT and self._cc_reflection_bridge is None and self._reflection_engine is not None:
+        if (
+            depth == Depth.LIGHT
+            and self._cc_reflection_bridge is None
+            and self._reflection_engine is not None
+        ):
             try:
                 await self._reflection_engine.reflect(depth, result, db=db)
                 # Emit reflection heartbeat so subsystem_heartbeats doesn't
@@ -2617,8 +3297,10 @@ class AwarenessLoop:
                 if self._event_bus:
                     with contextlib.suppress(Exception):
                         await self._event_bus.emit(
-                            Subsystem.REFLECTION, Severity.DEBUG,
-                            "heartbeat", "light-reflection completed (API)",
+                            Subsystem.REFLECTION,
+                            Severity.DEBUG,
+                            "heartbeat",
+                            "light-reflection completed (API)",
                         )
             except Exception:
                 logger.exception("Light reflection fallback (API) failed for tick %s", tick_id)
@@ -2637,7 +3319,11 @@ class AwarenessLoop:
                         logger.warning("Failed to enqueue deferred reflection")
             return
 
-        if self._cc_reflection_bridge is not None and depth in (Depth.LIGHT, Depth.DEEP, Depth.STRATEGIC):
+        if self._cc_reflection_bridge is not None and depth in (
+            Depth.LIGHT,
+            Depth.DEEP,
+            Depth.STRATEGIC,
+        ):
             try:
                 ref_result = await self._cc_reflection_bridge.reflect(
                     depth,
@@ -2661,7 +3347,8 @@ class AwarenessLoop:
                     if self._event_bus:
                         with contextlib.suppress(Exception):
                             await self._event_bus.emit(
-                                Subsystem.REFLECTION, Severity.DEBUG,
+                                Subsystem.REFLECTION,
+                                Severity.DEBUG,
                                 "heartbeat",
                                 f"{depth.value.lower()}-reflection completed",
                             )
@@ -2746,14 +3433,20 @@ class AwarenessLoop:
                     continue  # Another tick already consumed it
                 logger.info(
                     "Resuming %s reflection from approved request %s",
-                    depth_name, approved["id"][:8],
+                    depth_name,
+                    approved["id"][:8],
                 )
                 await self._cc_reflection_bridge.reflect(
-                    depth, tick, db=self._db, skip_approval=True,
+                    depth,
+                    tick,
+                    db=self._db,
+                    skip_approval=True,
                 )
             except Exception:
                 logger.error(
-                    "Failed to resume %s reflection", depth_name, exc_info=True,
+                    "Failed to resume %s reflection",
+                    depth_name,
+                    exc_info=True,
                 )
 
     async def _resume_approved_sentinel_dispatches(self) -> None:
@@ -2825,7 +3518,9 @@ class AwarenessLoop:
         await self._deferred_queue.mark_processing(item_id)
         logger.info(
             "Retrying deferred reflection: id=%s depth=%s attempt=%d",
-            item_id, depth.value, attempts + 1,
+            item_id,
+            depth.value,
+            attempts + 1,
         )
 
         try:
@@ -2835,7 +3530,8 @@ class AwarenessLoop:
                 result = await self._reflection_engine.reflect(depth, current_tick, db=self._db)
             else:
                 logger.warning(
-                    "No reflection handler for depth=%s — leaving pending", depth.value,
+                    "No reflection handler for depth=%s — leaving pending",
+                    depth.value,
                 )
                 await self._deferred_queue.reset_to_pending(item_id)
                 return
@@ -2849,13 +3545,18 @@ class AwarenessLoop:
                 await self._deferred_queue.reset_to_pending(item_id)
                 logger.info(
                     "Deferred reflection not ready: id=%s depth=%s reason=%s — will retry",
-                    item_id, depth.value, result.reason or "unknown",
+                    item_id,
+                    depth.value,
+                    result.reason or "unknown",
                 )
         except Exception:
             new_attempts = attempts + 1  # mark_processing already incremented in DB
             logger.warning(
                 "Deferred reflection retry failed: id=%s depth=%s attempt=%d",
-                item_id, depth.value, new_attempts, exc_info=True,
+                item_id,
+                depth.value,
+                new_attempts,
+                exc_info=True,
             )
             if new_attempts >= 3:
                 await self._deferred_queue.mark_discarded(
@@ -2864,7 +3565,8 @@ class AwarenessLoop:
                 )
                 if self._event_bus:
                     await self._event_bus.emit(
-                        Subsystem.AWARENESS, Severity.WARNING,
+                        Subsystem.AWARENESS,
+                        Severity.WARNING,
                         "deferred.max_attempts",
                         f"Deferred {depth.value} reflection failed after {new_attempts} attempts",
                     )
@@ -2878,7 +3580,8 @@ class AwarenessLoop:
 
         try:
             await observations.resolve(
-                self._db, pending_id,
+                self._db,
+                pending_id,
                 resolved_at=now,
                 resolution_notes="Escalation consumed by deep reflection",
             )
@@ -2965,18 +3668,20 @@ class AwarenessLoop:
         """Replace signal collectors (late-binding upgrade from stubs to real).
 
         WARNING: this is a **full replacement**, not a superset merge. Any
-        collector registered by ``runtime/init/awareness.py`` that should
-        survive the swap MUST be re-added to the new ``collectors`` list
-        passed by ``runtime/init/learning.py``. Otherwise it is silently
-        dropped from the awareness loop and its signal stops being measured.
+        collector produced by ``runtime/init/awareness.py::build_bootstrap_collectors``
+        that should survive the swap MUST also be produced by
+        ``runtime/init/learning.py::build_learning_collectors``. Otherwise it is
+        silently dropped from the awareness loop and its signal stops being
+        measured (the bug that dropped ``scheduled_job_health`` /
+        ``scheduler_liveness`` for months).
 
-        Currently both ``ContainerMemoryCollector`` and ``JobHealthCollector``
-        are registered in awareness init but NOT re-listed in the learning
-        swap, so their signals (`container_memory_pct`, `scheduled_job_health`)
-        are dropped post-bootstrap. This is functionally OK today because
-        neither has a corresponding ``signal_weights`` row, but adding such
-        a row in the future will silently produce 0.0 readings unless the
-        learning swap is updated to re-include them.
+        Invariant, enforced by ``tests/test_learning/test_extension_wiring.py``:
+        the steady-state (learning) signal set is a SUPERSET of the bootstrap
+        signal set, except for names in
+        ``genesis.awareness.types.BOOTSTRAP_ONLY_SIGNALS`` (currently
+        ``event_loop_latency``, a documented deferral). The learning set is
+        additionally pinned to ``STEADY_STATE_SIGNALS``, which the j9
+        signal-completeness metric scores against.
         """
         self._collectors = list(collectors)
 

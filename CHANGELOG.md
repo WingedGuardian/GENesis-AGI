@@ -9,7 +9,388 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Executor Gate 2 (`17_executor_review`) leads with paid DeepSeek V4-pro.**
+  After the NIM repoint moved the free NIM tier from V4-pro to V4-flash, this
+  deliverable-quality gate now leads with the paid `openrouter-deepseek-v4`
+  (pro-grade) for maximum review quality, with free NIM flash + paid v4-flash +
+  qwen as fallbacks. A deliberate cost-vs-quality lever on a quality-critical
+  gate; the other repointed sites stay on free flash.
+
 ### Fixed
+
+- **FTS5 recall no longer starves on multi-word queries.** `_prepare_fts5` builds a
+  bare space-separated FTS5 MATCH, which SQLite treats as an implicit AND — so a
+  verbose query (`reference_lookup` / `knowledge_recall` natural-language text, and
+  memory recall on its non-expanded fallback path) required *every* token to be
+  present and otherwise returned nothing. A shared `db/crud/_fts.py::fetch_fts` now
+  runs the precise AND query first and, only when it returns zero rows and the query
+  isn't an already-structured boolean expression, retries the terms OR-joined —
+  adding partial matches where there were none while leaving every already-matching
+  query unchanged. Applied to the recall surfaces `knowledge.search_fts` and
+  `memory.search_ranked` (the latter's `boolean=False` path, which the hot recall
+  path falls back to when `expand_query` can't expand, e.g. Qdrant unavailable).
+  `memory.search` is left strict-AND on purpose — its only caller resolves entity
+  names by `results[0]` and must not be widened to single-term matches.
+  Audited-clean: `extraction_job`'s dedup check already OR-joins; `voice/hygiene`'s
+  constant-match sweep is unaffected.
+- **Ego cycles no longer deadlock when the approval gate is disabled, and the
+  dashboard stops reporting a stalled ego as healthy.** With
+  `manual_approval_required` set to false, a leftover pending approval row
+  (raised earlier while the gate was on) kept blocking both egos' pre-flight
+  check forever — cycles silently stopped while every status surface still
+  showed "ego active". The pre-flight now honors the gate-off setting (and the
+  gate clears the stale row on the next dispatch), so cycles resume
+  immediately. Separately, the dashboard and a new hourly liveness check now
+  read the ego's last *completed* cycle (not the loop-alive flag), so a stalled
+  ego reads "stalled" / "waiting on approval" instead of green — with a
+  conservative threshold that never false-flags a legitimate slow cadence or
+  quiet-hours lull. The mandatory approval gate itself is unchanged (default
+  stays on; nothing auto-approves when it is on).
+
+- **Fresh container installs now get OOM/fork-wedge protection.**
+  `scripts/install.sh` (the fresh-container path) never applied the
+  memory-resilience provisioning (systemd-oomd pressure-kill, swap invariant,
+  raised per-user-slice `TasksMax`) that `bootstrap.sh` and `update.sh` already
+  did — so a freshly installed box sat unprotected against the OOM-thrash /
+  `Cannot fork` wedge until its first `update.sh` run. It now applies the same
+  idempotent, adaptive provisioning at install time.
+
+- **The core Claude Code spawner now uses the shared hardened group-kill.**
+  `cc/invoker.py` — the launcher behind every CC session Genesis runs — carried
+  the patterns the repo-wide sweep retired everywhere else: `preexec_fn` spawns,
+  three `getpgid`-based kill paths (which leak the tree once the leader is
+  reaped), two direct-child-only cleanup kills on cancellation/stdin failure,
+  and an unbounded post-kill wait. All migrated to `genesis.util.proc_kill`.
+  Also hardened: any non-timeout exception escaping the streaming loop (a
+  callback raising, an over-limit stream line) now group-kills instead of
+  leaking a detached, unregistered session; the graceful terminate-after-result
+  stop is bounded and escalates to a group kill if the group survives it;
+  post-kill stderr reads are bounded.
+
+- **Dead NVIDIA NIM models retired from routing (silent free→paid fallback leak
+  closed).** NIM EOL'd `deepseek-ai/deepseek-v4-pro` (HTTP 410) and made
+  `moonshotai/kimi-k2.6` 404-for-account (both confirmed by live probe). Every
+  chain led with a dead free provider, so once its breaker opened those ~14 cognitive
+  call-sites silently fell through to paid OpenRouter fallbacks. `nvidia-nim-deepseek`
+  is repointed to the live free `deepseek-ai/deepseek-v4-flash-0731` (fast, valid JSON);
+  the dead `nvidia-nim-kimi` provider is removed and dropped from every chain (base
+  sites fall to `groq-free`, adversarial `_challenge` sites lead with DeepSeek — model
+  independence preserved). The eval `judge` keeps the calibrated paid V4-pro first (NIM
+  now serves flash, not the calibrated pro), and the `38a` procedure-novelty precision
+  gate is pinned to V4-pro only. A new `test_config_invariants.py` locks the dead-slug
+  denylist, per-chain non-NIM fallback, `_challenge` model-independence, and a
+  deepseek-family judge.
+
+- **Subprocess timeouts no longer orphan helper process trees (repo-wide
+  sweep).** Several launchers Genesis runs (the code-review helper, the
+  headless/CLI/recovery-brain `claude` runners, promptfoo/pytest eval
+  scorers, deterministic step commands) fork their own children; on timeout
+  the old kills reached only the direct child, leaving the rest of the tree
+  running until reboot. All eight spawn sites — plus the original autonomy
+  reviewer, migrated off its private copy — now share one hardened guarded
+  group-kill (`genesis.util.proc_kill`): own process group via
+  `start_new_session` (never `preexec_fn` — post-fork deadlock risk in a
+  threaded server), `killpg` on the leader pid directly (immune to the
+  leader-already-reaped race), a `pgid<=1` safety guard, a bounded reap, and
+  a logged fallback when the group kill is refused. The contribution CLI
+  additionally group-kills on Ctrl+C so an interactive abort can't strand
+  its reviewer. The delivery `git push` — which runs under the autonomy
+  executor's single-slot semaphore — also gained a hard 300s bound, closing
+  the last unbounded subprocess wait on that critical path (a
+  network-stalled push could previously wedge all autonomy task execution).
+
+- **Inbox approval-request storm ended.** A stale-hash defect made the inbox
+  monitor see phantom "modified" files every 30-minute scan, each time
+  cancelling the pending approval and sending a fresh Telegram request — up to
+  48 messages a day. The known-hash map is now a single recency scan (newest
+  decisive row wins), and new/changed inbox content while a request is pending
+  parks onto the SAME request instead of cancelling it: one approval message,
+  ever, per outstanding batch — and approving once evaluates everything
+  outstanding at that moment.
+- **Inbox approvals never re-ask.** Delivered inbox approval requests send no
+  reminders (per-policy `reask_overrides` in `autonomous_cli_policy.yaml`,
+  `0` = never; other approval types keep their 24h re-ask). A request whose
+  Telegram delivery FAILED still retries each scan until one send succeeds —
+  that's recovery, not a reminder.
+- **Rate-limit-parked background sessions resume faithfully.** A parked
+  session's re-dispatch now carries its full execution shape (system prompt /
+  strategy doc, attribution tag, skills) instead of resuming with defaults,
+  and campaign bookkeeping follows the park to the delivering session's real
+  result instead of recording a false failed run (bounded at 7 days so a stuck
+  resume can never stall a campaign forever).
+- **Test runs no longer trip the temp-protection watchdog.** pytest writes its
+  scratch tree under `$TMPDIR`, which on a Claude Code session is the
+  budget-policed `~/.genesis/cc-tmp`; a broad suite could fill it and drive the
+  `genesis-tmp-watchgod` service into a sustained high-pressure state. pytest is
+  now redirected to `~/tmp` (off the budget) for every run rooted in the repo,
+  the dev console, autonomy verification, and the eval gauntlet — CI is
+  unaffected.
+- **Temp watchdog no longer loops on non-reclaimable pressure.** When
+  `~/.genesis/cc-tmp` stays over budget after the watchdog's cache cleanup, it
+  now re-measures before considering any idle-session reap (so it never reaps a
+  session that cleanup already made unnecessary) and, if nothing is reclaimable
+  and nothing is safely reapable, raises a single alert instead of re-evaluating
+  every poll.
+
+### Added
+
+- **Claude Code session exits are recorded.** When a CC session's process exits
+  — a clean quit, a crash, or an OS/kill signal — its exit status (with a
+  signal-decoded hint) and a tail of the terminal are written to
+  `~/.genesis/logs/cc_exit_<slot>.log`, so a session that vanishes is
+  diagnosable instead of leaving no trace. Self-rotating; no effect on the
+  session lifecycle.
+- **cgroup OOM kills are captured.** The temp watchdog now records any new
+  out-of-memory kill in the container cgroup (timestamp, memory state, top
+  processes) to `~/.genesis/logs/oom_events.log` and alerts once — turning a
+  previously invisible cause of vanished processes into a durable signal.
+  Degrades to a no-op on hosts without the cgroup-v2 interface.
+
+- **Telegram DM "scroll-up".** Sessions can now read the conversation archive
+  on demand: `conversation_history` accepts `chat_id` (scoped to one chat) and
+  `before` (page arbitrarily far back, full-length messages), every fresh
+  telegram session is told its own chat id, and the session-recovery recap is
+  character-budgeted and tail-biased so the END of long replies (option lists,
+  conclusions) survives instead of being cut at 300 characters.
+- **Firecrawl as an explicit paid escalation backend.**
+  `web_fetch(url, backend="firecrawl")` / `web_search(query,
+  backend="firecrawl")` reach the Firecrawl cloud API (needs
+  `FIRECRAWL_API_KEY`) — including from Bash-less background sessions. Never
+  part of the automatic chains: it burns credits only when you ask for it.
+- **Claude Code login-expiry warning + background fallback.** The interactive
+  claude.ai login's refresh token has a fixed lifetime that routine use does
+  not extend; Genesis now warns via Telegram days ahead
+  (`GENESIS_CC_LOGIN_EXPIRY_WARN_DAYS`, default 5), and — if the operator has
+  stored a 1-year `claude setup-token` via `scripts/store_cc_token.sh` —
+  background sessions fall back to it when the login is confirmed dead (never
+  over a working login).
+- **Settings writes are provenance-stamped, and disabling the approval gate
+  requires confirmation.** Every settings write records `# set-by: <actor> @
+  <time>` in the overlay file so a deliberate operator choice is never
+  mistaken for drift, and setting `manual_approval_required: false` now needs
+  an explicit confirmation flag and announces itself via Telegram.
+
+- **Opt-in career-outreach monitor (off by default).** A new daily monitor that,
+  once enabled, drives a configured external career-agent module to stage
+  first-touch outreach drafts into your mail Drafts, then sends you a single
+  Telegram nudge to review and send them — it never sends mail itself (you click
+  Send). Each auto-run drives the career-agent's OWN accuracy/verification gate
+  end-to-end, so a draft is staged only if it passes that gate; a draft that
+  can't be verified is skipped, not staged. Ships `off`; flip
+  `off → observe → live` in `career_outreach.yaml` (env kill switch:
+  `GENESIS_CAREER_OUTREACH_DISABLED=1`). No-ops cleanly on installs that don't
+  have a career-agent module configured.
+
+- **cc-tmp blast-radius isolation now converges on its own.** The dedicated,
+  size-capped volume that stops a runaway temp write from filling the container
+  root — and taking every Claude Code session down with it — used to attach only
+  during a guardian redeploy that happened to land while no CC session was live,
+  which on a busy install is almost never. A cold-start apply (before the server
+  starts) plus a periodic retry timer now keep trying until a quiet moment is
+  found, and the infrastructure-posture alert tells "converging" apart from
+  "needs attention" so it doesn't nag when it's simply waiting. No action needed;
+  a deliberate container restart closes it immediately.
+
+- **GitHub steward now surfaces responses to your upstream contributions.** Beyond
+  the flagship-repo deep-poll, the account-activity monitor gained an account-level
+  notifications lane: it pings you when someone @mentions you on any repo, or
+  responds on an issue/PR you filed on another project's repo (your outbound
+  contributions — the flagship deep-poll can't see those). Tunable via the
+  `notifications` reason-allowlist in `github_steward.yaml`; respects the same
+  `off`/`observe`/`live` lever and pings immediately in `live`.
+
+### Security
+
+- **Untrusted content can no longer poison your user model or trigger autonomy.**
+  Background sessions that process external material (e.g. the inbox evaluator over
+  the links you drop in) now write observations stamped with their true origin, and
+  the pipelines that would auto-apply an observation into privileged state — your
+  learned user model, and autonomous task dispatch — refuse any update whose origin
+  isn't first-party. A crafted item can no longer smuggle a high-confidence "fact
+  about you" into Genesis's self-model or spawn a task. Refused updates are held
+  (not discarded) and logged, and normal reflection-authored updates are unaffected.
+
+### Fixed
+
+- **Contribution secret-scanning now actually blocks leaked secrets.** The sanitizer
+  that checks community-contribution diffs before opening a public PR ran two secret
+  scanners — detect-secrets (the required floor) and gitleaks — but both were silently
+  finding nothing: detect-secrets' output parser missed every hit because it didn't
+  account for the confidence/entropy suffix in the tool's output, and gitleaks was
+  invoked with a flag combination that made it scan nothing from its input. A diff
+  containing an API token or private key could pass the sanitizer clean. Both scanners
+  now work (gitleaks also loads the repo's custom PII rules), and new tests exercise the
+  real scanner binaries so this can't silently regress. The privacy scanners for IP
+  addresses, emails, and install fingerprints were unaffected. The gitleaks layer was
+  further hardened after a security review: a scanner error (bad config, unexpected
+  exit) now surfaces a visible warning instead of silently reporting "clean"; the
+  scanner's own rules file is pinned to the committed version and is itself on the
+  contribution-forbidden list, so a contribution can't weaken the gate that scans it.
+- **Autonomy no longer wedges when its cross-vendor reviewer hangs.** A task's
+  quality gate runs an adversarial verification through a `codex exec` subprocess.
+  That call had no timeout, so a hung codex (a known upstream model-catalog-refresh
+  hang) would hold the autonomy executor's shared execution slot indefinitely —
+  stalling every queued task until a restart. The call is now bounded by a hard
+  timeout (default 2h, override with `GENESIS_CODEX_REVIEW_TIMEOUT_S`); on timeout
+  the codex process tree is killed and verification degrades to the next reviewer in
+  the chain, freeing the executor. Mirrors the existing hard-timeout on deterministic
+  executor subprocesses.
+
+- **No more false "critical failure" alarms when the system is briefly busy.** The
+  health signal that watches your local infrastructure (database, vector store, and
+  Ollama if enabled) probes those services with a short timeout. When background work
+  momentarily stalls Genesis's event loop, those probes could time out even though the
+  services were perfectly healthy — firing a spurious "critical failure" that triggered
+  a reflection and a Telegram alert. Genesis now recognizes when a probe timed out
+  because the loop was starved (rather than because a service is actually down) and
+  suppresses the false alarm, while still firing on a genuine outage. A new diagnostic
+  also captures what code was blocking the loop during such a stall, to help track down
+  the underlying cause.
+
+- **Restricted reasoning sessions can no longer escape their tool restrictions by
+  spawning.** Several of Genesis's restricted Claude Code sessions (deep/strategic
+  reflection, the inbox/mail judges, and the experimentation completion) could spawn a
+  subagent that ran with full, unrestricted tools — escaping the restrictions placed on
+  the parent. Their denylists blocked the obsolete subagent-spawn tool name but not the
+  current one, nor the `Workflow`/`Skill` spawn paths. These denylists now deny the whole
+  spawn class (subagent, workflow, and skill spawns) from a single shared definition,
+  with a guardrail test so a new session can't silently reopen the gap. (Working
+  background sessions that legitimately orchestrate — e.g. the deep-research `Workflow`
+  path — are intentionally out of scope and tracked separately.)
+
+- **Inbox/mail evaluation judges further hardened against adversarial external input.**
+  Both judges reason over untrusted content (emails / dropped inbox items) with
+  permissions skipped. The mail judge — whose prompt uses no tools at all — now runs a
+  full act-nothing denylist (shell, all file-edit, subagent-spawn, side-effecting actions,
+  and web tools), and a stale config-path bug that pointed its empty-MCP profile at a
+  nonexistent file was fixed. The inbox judge now denies every memory/settings write tool
+  (it only ever needed reads plus a single optional observation write), closing a path
+  where injected content could mutate stored memory or settings; the denial is derived from
+  the reflection read-only denylist, so a future write tool is auto-covered. Two narrower
+  residuals on the inbox judge remain tracked (not closed here): it keeps shell access for
+  one job — fetching YouTube links — and its retained observation writer is not yet
+  provenance-stamped or type-constrained; both are handled in follow-up work.
+
+- **The autonomous-CLI approval gate now ships ON by default.** Every background
+  Claude Code session Genesis dispatches must be rooted in an explicit user
+  approval — but the committed policy config shipped the gate *off*, so a fresh
+  clone would auto-approve autonomous sessions without asking. The shipped default
+  is now `manual_approval_required: true`, and a guardrail test pins the committed
+  config so the loader's file-wins-over-code-default behavior can never silently
+  ship the gate off again.
+
+- **Inbox approvals no longer nag.** A pending "inbox evaluation" approval now
+  holds until you respond — it is asked once and blocks until approved, like
+  every other approval, instead of re-sending a fresh request every few hours
+  for content that hasn't changed. A stuck (orphaned) approval that can never be
+  dispatched is still auto-recovered, so the monitor never wedges.
+
+### Changed
+
+- **Reflection sessions are now strictly read-only.** Genesis's autonomous
+  background reflections (deep/strategic) can read freely to investigate, but can
+  no longer call any write or action tool — their only output is observations (and
+  the structured reflection result the system parses). Previously reflections ran
+  with unrestricted tool access and could, in rare cases, mint a follow-up or other
+  write from ungrounded reasoning. Relatedly, any follow-up created by an
+  autonomous/dispatched session now lands in the recoverable *tabled* lane for
+  review rather than directly on the actionable follow-up board — the board stays
+  reserved for your (foreground) work. A foreground session can promote a tabled
+  item to the board.
+
+- **All autonomous background sessions are now MCP-scoped by default.** Genesis
+  runs many kinds of background Claude Code sessions (reflection, sentinel,
+  inbox/mail triage, autonomy executor, ego gates, research). These are now secure
+  by default: each session loads only the Genesis MCP tools it is explicitly given
+  and no longer additively inherits the operator's user-scoped MCP servers (e.g.
+  code-editing tools) that were never intended for autonomous use. A session that
+  forgets to scope itself now fails closed (no extra tools) rather than open. Your
+  own foreground conversations are unchanged — they keep the full toolset. This
+  closes a latent tool-scope gap; nothing you'd notice day to day, no action needed.
+
+- **Free-tier model refresh.** Groq is retiring Llama 3.3 70B (the model behind
+  several of Genesis's free reasoning/extraction/tagging steps) on 2026-08-16, so
+  those steps now use Groq's recommended replacement, gpt-oss-120b. Structured-output
+  and extraction quality are unchanged; triage-depth labeling may shift by about one
+  level on some items. No action needed on your end.
+
+- **Stale ego proposals get tabled on a generous backstop.** Ego proposals you
+  haven't acted on move to the recoverable *tabled* lane on a per-urgency
+  schedule (roughly 10 days for critical up to 30 for low) — a backstop behind
+  the ego's ongoing reconcile review, tuned to sit well past normal decision
+  time so it only clears the genuinely-forgotten. Tabling is reversible, never
+  deletion.
+
+### Fixed
+
+- **A "free" fallback model that was quietly a paid one.** An OpenRouter fallback
+  used by several background steps was labeled free but pointed at a paid model, so
+  on the rare occasions it was reached it could incur spend that Genesis recorded as
+  $0. It now uses a curated pool of genuinely-free models with automatic failover,
+  and Genesis warns at startup if any provider marked "free" actually points at a
+  paid model — so cost tracking can't silently miss real spend. No action needed on
+  your end.
+
+### Added
+
+- **Contributor Work-Log — a curated supply of newcomer-friendly public issues.**
+  Genesis can now turn items from its own backlog or a codebase scan into public
+  GitHub issues for contributors to pick up — but never on its own say-so. Each
+  draft is sanitized server-side (a fail-closed scan of the title, body, *and*
+  labels blocks anything that looks like a private address, path, or secret) and
+  then held for your per-item approval on the dashboard; batch "approve all"
+  deliberately skips these, so every public post is an individual decision. It
+  ships in `propose_only` mode: drafts are proposed and approved but never
+  actually posted (dry-run) until you flip `mode: live` in a
+  `config/contributor_worklog.local.yaml` overlay. Once live, an approved draft
+  posts via `gh issue create`, de-duplicated against already-open issues so a
+  retry can't double-post. Kill switch: `GENESIS_CONTRIBUTOR_WORKLOG_DISABLED=1`.
+
+- **GitHub activity notifications.** Genesis now watches your active GitHub repos
+  every couple of hours and pings you on Telegram when an *external* contributor
+  opens their first PR/issue, comments, starts a discussion, or replies on one —
+  filtering out your own activity, bots, and CI so you only hear about real
+  people. It keys on when things were actually *created*, so an old issue that's
+  merely edited or closed never masquerades as new activity; and if a ping can't
+  be delivered, it's retried until it lands rather than lost. Off by default on a
+  fresh install (it baselines quietly first); enable pings by setting
+  `mode: live` in a `config/github_steward.local.yaml` overlay once it has run.
+  Kill switch: `GENESIS_GITHUB_STEWARD_DISABLED=1`. A companion campaign
+  pre-check (`github_activity_pending`) lets an opt-in digest campaign batch the
+  non-urgent activity into a periodic Telegram summary while only spending on
+  ticks that actually have new activity — quiet windows spawn nothing.
+
+### Fixed
+
+- **Replying "yes" to an approval topic no longer starts a confused new chat.**
+  If you replied "yes"/"approve" to the *topic itself* (the forum topic header)
+  instead of the specific approval/proposal/content message, Genesis got no
+  context and spun up a fresh conversation that answered "I don't have anything
+  to confirm — what are you saying yes to?". It now recognizes that case and
+  asks you to reply to the specific message (or tap its ✅ button) rather than
+  guessing — it deliberately won't act on an ambiguous topic-level reply.
+
+- **Deep reflections no longer silently lose their output.** When a deep
+  reflection ended its session with a plain-prose wrap-up instead of the
+  required structured JSON (~40% of runs), both parsers failed: the Telegram
+  topic showed a "not parseable" stub and — worse — that cycle's cognitive
+  output (updated context summary, observations, memory consolidations, and
+  follow-up research it wanted to queue) was discarded. Genesis now re-derives
+  the structured result from the prose in one follow-up model call, so the
+  reflection's findings are kept and the topic shows a real summary. If the
+  salvage can't recover valid output, behavior is unchanged from before.
+
+- **Engagement rate now measures real outreach, not your own approval pings.**
+  The "N sent / X% engagement" figure counted every internal Telegram message
+  Genesis sends *you* — approval prompts, the morning digest, blockers, alerts,
+  surplus research posts — as "outreach," so the denominator filled with
+  housekeeping and the engagement rate read near-zero even when genuine posts got
+  normal reactions. It now counts only messages sent to the outside world (your
+  external channels — Discord, email, and the like — rather than your own
+  Telegram), so the rate (on the dashboard, in the awareness signal, and in
+  reflection) reflects how your actual outreach is landing.
 
 - **Email replies now count as engagement.** When someone replies to an email
   Genesis sent (outreach pitch, follow-up), the reply was recorded for thread
@@ -22,6 +403,25 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   are filtered out, so they can't inflate the reply rate.
 
 ### Added
+
+- **The operations ego stays out of development work.** Genesis's COO ego no
+  longer proposes Genesis-development tasks (reviewing pull requests, scoping
+  refactors, patch-planning) — those are deterministically moved to the tabled
+  lane instead of reaching your approval queue, while genuine operational
+  diagnosis (a failing backup, a stuck provider) still flows normally. When you
+  later choose to unlock self-development, one config flag
+  (`genesis_self_development_enabled`) turns the guardrail off.
+- **One proposal queue of 15, not 15 per ego.** The pending-proposal cap now
+  counts both egos together, so the approval board can no longer grow to ~30
+  items.
+- **Stale proposals get premise re-checks.** Older pending proposals were
+  invisible to the premise-revalidation cadence (the field was never
+  backfilled) and re-validated items stayed flagged as overdue forever; both
+  are fixed, so dead proposals stop lingering on the board.
+- **Every ego investigation names its deliverable.** Investigation dispatches
+  from the operations ego now always carry a concrete output file that
+  post-dispatch verification checks, and both dispatch paths tell the session
+  exactly where to write it.
 
 - **Real spreadsheets and polished decks from the deliverable builder.** When the
   optional OfficeCLI tool is present, Genesis now produces genuine `.xlsx` files
@@ -299,6 +699,19 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   other half of the 2026-07-20 disappearance.)
 
 ### Changed
+
+- **Reflection model and effort are now editable from the dashboard, and Deep
+  reflection thinks harder by default.** The model and reasoning effort behind
+  each reflection depth — light, deep, and strategic — used to be fixed in code.
+  They're now a settings domain you can edit live from the dashboard Config tab
+  (a new **Reflection Models** panel), with no restart. These govern reflections
+  running on the Claude Code CLI path: Deep and Strategic run on the CLI by
+  design, so this is their primary model/effort; Light runs primarily via the API
+  free-model chain and uses its value only when it falls back to the CLI. An
+  effort control appears only for effort-capable models — switch a depth off Haiku
+  and an effort setting surfaces (Haiku ignores effort at dispatch). The defaults
+  also move to the new `xhigh` reasoning tier: Deep steps up from `high`, and
+  Strategic settles at `xhigh` (from `max`).
 
 - **`git push` in an interactive Claude Code session now asks for your approval
   instead of hard-stopping.** This safety hook used to block the command outright

@@ -199,23 +199,21 @@ class TestGateThreading:
 
 
 class TestResolvePrNumberFallback:
-    """The no-arg fallback must honor --repo (red-team finding 5): resolving
-    the CWD branch's PR number and gating it against ANOTHER repo would
-    re-create the wrong-PR bug through the fix itself."""
+    """The no-arg fallback must NOT resolve a CWD-branch PR and gate it against a
+    user-named --repo (red-team finding 5): that re-creates the wrong-PR bug. With
+    an explicit --repo and no number it fails CLOSED (None). Round 5 makes this a
+    short-circuit — no pointless gh call that would only error anyway (gh: "argument
+    required when using the --repo flag"). A DERIVED cwd (F3) instead resolves the
+    branch PR in that same dir with no --repo (see TestGetPushRemoteAndBranch's
+    sibling coverage in test_merge_review_gate.py)."""
 
-    def test_fallback_carries_repo_flag(self):
-        calls: list[list[str]] = []
-
-        def fake_run(args, **kwargs):
-            calls.append(list(args))
-            # gh errors when --repo is given without a PR selector — the
-            # coherent outcome is None → the caller fails CLOSED.
-            return _FakeResult(returncode=1, stderr="argument required when using --repo")
+    def test_explicit_repo_numberless_fails_closed_no_gh_call(self):
+        def fake_run(args, **kwargs):  # pragma: no cover — must not be reached
+            raise AssertionError("gh must not be called for explicit --repo + numberless")
 
         with patch.object(_mod.subprocess, "run", fake_run):
             result = _mod._resolve_pr_number("gh pr merge --repo octo/voice", repo="octo/voice")
         assert result is None
-        assert calls and "--repo" in calls[0]
 
     def test_explicit_number_needs_no_gh_call(self):
         calls: list[list[str]] = []
@@ -259,6 +257,6 @@ class TestMainFailsClosedOnUnresolvableRepo:
             env=env,
         )
         assert r.returncode == 2, f"variable --repo merge must block: {r.stdout}{r.stderr}"
-        assert "cannot resolve the target repo" in r.stderr
+        assert "cannot determine which repository" in r.stderr
         # And it must NOT have gated the cwd repo (no gh mergeable/review calls).
         assert not called.exists(), "no gh gate call should run for an unresolvable repo"

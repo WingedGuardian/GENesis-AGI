@@ -100,6 +100,21 @@ changes: verify the notification actually arrives. Ask: "If the system
 restarts right now, will this actually work?" If you can't answer yes
 with evidence, you're not done.
 
+**Verify in the REAL runtime context, not a shell proxy.** "Works when I
+run it" is not "works where it runs." Same code + same uid ≠ same context:
+a long-running systemd service (genesis-server, guardian) differs from your
+interactive shell in mount namespace, seccomp, `NoNewPrivileges`, dropped
+caps, and — the one that bites — **ptrace/`/proc` access**. Anything that
+reads `/proc/<other-pid>/{environ,mem,stat}`, another process's env, sockets,
+or namespaced/hardened resources MUST be verified by hitting the **live
+endpoint** (`curl` the real server) or running inside the real service — not
+`python -c` in your shell. (Origin, 2026-08: the CC-slot stale-code badge
+read `/proc/<pid>/environ`, which succeeds in a shell but returns EACCES
+under the server's `ProtectSystem=strict` sandbox — so `enumerate_cc_slots()`
+returned 0 in-server and **three** features shipped green but inert since
+July; the module's docstring claim "same-uid reads succeed" was a shell-tested
+falsehood. The fix routed around the ptrace-gated read entirely.)
+
 ### Instance-Fix vs Class-Fix Gate
 
 When a mechanism failed to write or propagate something (a memory, a
@@ -151,6 +166,18 @@ these are the GATES that make it enforceable:
   review loop runs 7 rounds. (Origin: PR #1281 — the onboarding floor's key
   list was wrong three times until it was derived from the router's own
   `load_config` + call-site chains.)
+- **Spec required-sets: enforce the WHOLE set at once, and lock it with ONE
+  test.** The spec-facing corollary of the rule above. When a change must make
+  code satisfy a canonical spec's *required-set* — a prompt's required JSON
+  fields, a validator's mandatory keys, an allow-list — read the spec's required
+  list in full and enforce ALL of it in one move; then write a single test
+  asserting the required block == the complete canonical set (not one assertion
+  per field). Adding only the field a reviewer just flagged leaves the next one
+  for the next round, and a per-field test goes green while the next missing
+  field ships. (Origin: PR #1333 — `_SALVAGE_PROMPT`'s Required block was
+  completed one field at a time across three Codex rounds — cognitive_state_update
+  → confidence → observations — for what `REFLECTION_DEEP.md` declares as one
+  closed set `{observations, confidence, cognitive_state_update}`.)
 - **Condition-based waiting.** When a fix or test must wait for a state change,
   poll the CONDITION (with a bounded deadline), never sleep an arbitrary
   duration — arbitrary sleeps are flaky under load and slow everywhere else.
@@ -284,6 +311,27 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   through the server/CRUD path; reserve `immutable=1` for historical
   read-only sampling where a little staleness is fine. (A reconcile UPDATE
   read clean under `mode=ro` but appeared unchanged under `immutable=1`.)
+- **Never hand-roll `gh`/bash/CLI argv parsing inside a hook or security gate.**
+  Re-implementing shell/`gh` command-line semantics by hand (regex, manual token
+  walking) creates an effectively UNBOUNDED adversarial-divergence tail: a good
+  reviewer (Codex especially) will keep surfacing real gaps from true semantics —
+  `--repo`/`-R`/`-Rvalue`, `GH_REPO`, `cd`, `&&`, `||`, `--body-file -`, duplicate
+  flags, URL-vs-branch targets, enterprise hosts, `--help`, nested `bash -c` — and
+  each named fix ships the next round's bug. This is the mechanism behind the
+  measured Codex review-loop (an internal analysis of recent review-looping PRs:
+  first-round findings were real catchable bugs, but later rounds were dominated by
+  fix-churn on the hand-rolled parser itself — no finite pre-push audit bounds that
+  tail). The cure is architectural,
+  not "review harder": bind atomically to the real tool (e.g. `gh pr merge
+  --match-head-commit`) and use a canonical parser (`shlex`/`bashlex`) — never
+  bespoke semantics. Choose the fail direction PER BOUNDARY by consequence: the
+  shared parser must DEGRADE gracefully (fail-open, never crash — that is
+  `shell_parse.py`'s stated contract), while each security-critical caller
+  (merge/push authorization) treats an unparseable command as a block (fail-closed
+  THERE). A parser-wide absolute fail-closed is wrong — it would deny legitimate
+  uncommon commands without closing evasion paths. Same family as the
+  canonical-parser lesson (regex→yaml, #1393). Loci today:
+  `scripts/hooks/shell_parse.py` + `scripts/hooks/git_push_guard.py`.
 
 ### Iterative-Refinement Discipline
 
@@ -323,6 +371,7 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "The user already said proceed, so I can keep looping" | The escalation/fix-attempt caps CONSUME standing approval. Round 4+ (or fix #4) on an old instruction is a violation, not obedience. |
 | "I can read the summary instead of the source" | Summaries lose context. If you're about to change code, read the code, not the description of it. |
 | "The missing data was the problem — I wrote it, so it's fixed" | The mechanism that failed to write it is the problem. Hand-written artifacts are data repair, not a fix (see Instance-Fix vs Class-Fix Gate). |
+| "I'll just add the field the reviewer flagged" | A spec's required-set is closed — derive and enforce ALL of it at once, with one test locking the whole set, or the next round finds the next missing field (see Debugging Discipline: spec required-sets). |
 
 ### Code Discovery
 
@@ -384,6 +433,47 @@ The enforcement hooks (`review_enforcement_prompt.py`,
 safety nets, not the decision-maker. This protocol provides the
 judgment framework.
 
+### Review depth is machine-checked (the front-stop)
+
+The "substantial → adversarial /review-level audit" decision above is no longer
+left to judgment alone (that judgment is exactly what failed on PR #1353 — an
+under-depth inline pass was self-certified as sufficient). The commit gate now
+COMPUTES substantiality from the staged diff
+(`review_scope.classify_change_substantiality`) and BLOCKS a substantial change
+whose review marker is not an ADVERSARIAL audit (`review_enforcement_commit.py`
+Rule 2.5). Substantiality is a surface-area × risk model — ≥50 reviewable lines OR
+>1 code file OR an auth/api/migrations file OR an **executable prompt/agent/skill
+surface** (`.claude/agents|commands|skills/*`, `src/genesis/skills/*`), so the
+"Prompt / LLM behavior → both + extra scrutiny" row above is machine-enforced (a
+trivial edit to one is depth-audited). User-sovereign top-level CAPS docs
+(`SOUL.md`/`USER.md`/`CLAUDE.md`) are exempt. Clearance binds the marker to the
+reviewed diff's FULL content, so re-staging different content after the audit
+re-blocks. A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
+substantial change — not clearance. Depth is override-exempt: a findings
+`# review-override` does NOT waive it; only a loud, logged `# depth-ack` does (the
+audited escape for a genuine format mismatch). "Adversarial" is verified
+STRUCTURALLY — a severity ladder (BLOCKER/SHOULD-FIX/NOTE, CRITICAL/HIGH/LOW,
+P1/P2/P3, or the CODE_AUDITOR JSON contract) + `file:line` engagement + substance —
+so run the real recall-tuned audit (`genesis-architect` / `CODE_AUDITOR.md`); do not
+hand-write a soft prompt.
+
+**Honest enforcement model — where the teeth actually are.** The local hook is
+ADVISORY anti-autopilot friction, NOT tamper-proof: on a single-user-authored repo
+the same actor can edit the hook or hand-write the marker. The enforcing teeth live
+where the author has no control at commit time — the **independent cloud reviewer
+(Codex)** + a **required human approval**, gated by **branch protection**, plus the
+CI `review-depth-check` that recomputes substantiality and flags it loudly on the PR
+(advisory, exit-0-always). The local gate's job is to interrupt autopilot; the real
+gate is external. Do not mistake a green local hook for clearance.
+
+**Close every review with a verdict.** End each review with an explicit
+`Ready to merge: Yes | No | With fixes` + a one-line reason, alongside the
+DONE / DONE_WITH_CONCERNS completion status. And the DON'Ts that keep a review
+honest: never "looks good" without reading the code; never a finding on code you
+did not read; never vague ("improve error handling") — always `file:line` + why it
+matters. (Deliberately NOT a "praise-first / acknowledge strengths" balance: an
+adversarial audit's job is to assume bugs and enumerate the class, not to reassure.)
+
 Two protocol steps apply to every review at "Code-reviewer inline" level or
 above (full definitions in `.claude/agents/genesis-architect.md`):
 
@@ -402,6 +492,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
 ### Review-loop discipline
 
+- **Run the pre-push adversarial pass with `/deep-review`** (`.claude/commands/deep-review.md`):
+  one command that dispatches a fresh-context `genesis-architect` (+ `genesis-security-reviewer`
+  on security surfaces) over the FULL branch diff with the right SHAPE — fail-open/state/TOCTOU/
+  hand-rolled-parsing hunting, not a lint/secrets scan — and writes the evidence marker. This is
+  the review that catches Round-1 bugs before Codex does; `/audit-changes` is only a light
+  self-check.
 - **One reviewer at a time — NEVER run two review agents simultaneously.** Run
   one reviewer (e.g. Codex), apply/verify its findings, then run the next
   reviewer (e.g. Claude) on the *fixed* code — sequential, never in parallel.
@@ -450,7 +546,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   conscious, logged act (like `# review-override`); adding it — or falsely passing
   `--clean` — WITHOUT the honest review result is the same violation as ignoring the
   prose above (the `--clean` flag mirrors the review record you write to
-  `~/.genesis/last_code_review.txt` at the same moment: falsifying one falsifies the
+  the per-worktree evidence path (`review_state.py evidence-path`) at the same moment: falsifying one falsifies the
   other).
   Caveats: **multiple findings in a single pass = one round** (not an
   escalation); the same defect reappearing (an incomplete prior fix) is a
@@ -459,6 +555,26 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   trigger when the class won't lock within ≤3 rounds. (Origin: PR #1281 ran ~7
   reviewer rounds because a standing "proceed once clean" silently carried
   through rounds 4–6.)
+
+  **The Codex-round twin of the cap** (`git_push_guard.py`
+  `_check_codex_round_escalation`): the local counter above is BLIND to a loop
+  that churns through CODEX rounds while every local review is clean — the
+  2026-08-12 MW-3 #1372 whack-a-mole shape (5 Codex rounds, local counter at 0,
+  and the round-4 "fix" of a non-bug introduced the only genuine liveness bug).
+  So `gh pr comment … "@codex review"` HARD-BLOCKS once the PR already carries
+  `ESCALATION_ROUND_CAP` Codex reviews (counted live from the GitHub API;
+  fail-open on any API error), until a trailing `# escalation-ack`. Before
+  acking, DO THE STEP-BACK the block prints: (1) triage every open finding —
+  {live bug | latent trap | hardening | observation}; only live bugs and
+  cheaper-now-than-later traps may change already-reviewed code, the rest get a
+  documented acceptance or route to the PR that owns the area; (2) fix
+  MECHANISMS, not instances; (3) for state-machine/queue code, enumerate EVERY
+  status value and trace the change under each (your tests encode your own
+  state model — they can't catch states you didn't consider); (4) consider
+  REVERTING a prior round's fix rather than patching it again; (5) escalate to
+  the user with a minimize-change recommendation. The ack asserts that
+  step-back happened — appending it without doing the work is the same
+  violation as falsifying `--clean`.
 - **External review feedback is a set of claims to VERIFY, not orders.** For
   every bot/external finding: check it against the actual code (its stated
   mechanism may be wrong even when the underlying concern is real — quote the
@@ -669,7 +785,66 @@ outlives its incident is a bug.
 
 ## Pre-Merge Gate
 
-`git_push_guard.py` enforces a **hard gate** on review findings:
+**Canonical pre-merge check:** run
+`python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
+BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses
+(mergeable → CI → base-invariant → Codex-freshness → scheduled-Claude-review →
+review-body → inline findings), so the report and the gate can never disagree —
+this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
+the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
+before any merge** — never hand-roll a
+gh/jq review check (a hand-rolled query once used the GraphQL bot login on the
+REST endpoint, matched nothing, and reported "Codex clean" while P2s sat unread).
+When all gates pass it prints the exact atomic merge command to copy
+(`... --match-head-commit <verified-head>`); use that command verbatim.
+
+`git_push_guard.py` enforces a **hard gate** at merge time. Beyond the review
+findings below, a gated `gh pr merge`:
+- must carry `--admin` (explicit approval flag) and be bound to the reviewed head
+  via `--match-head-commit` (GitHub rejects it server-side if the head moved —
+  TOCTOU defense); the `--check-pr` command supplies this;
+- requires Codex to have reviewed the **current head** — Codex does NOT auto-review
+  a later fix-commit, so comment `@codex review` and wait after any push.
+  **Clean-comment freshness:** a *clean* Codex re-review is posted as an ISSUE
+  COMMENT ("Codex Review: Didn't find any major issues. … **Reviewed commit:**
+  `<sha>`"), not a review object, so the reviews API never sees it. The gate now
+  ALSO accepts that clean comment when its `Reviewed commit` sha names the current
+  head — so a genuinely-clean re-review no longer false-blocks (it used to force a
+  `# stale-review-override`). Fail-closed: the clean marker alone never vouches; a
+  parseable `Reviewed commit` sha at head is required, and the comment must be
+  authored by the Codex bot.
+  **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
+  delta (`reviewed...head` via the compare API, classified by `review_scope`
+  substantiality) is provably review-trivial (docs-only / a small single-file
+  touch-up) — the merge is then still bound to the exact head that was
+  classified. A substantial or unclassifiable delta blocks; an ABSENT review
+  always blocks;
+- requires **every scheduled Claude review at the current head**. Each scheduled
+  Claude review (a `/schedule` cloud routine) posts as the repo OWNER's account and
+  must carry a marker `<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`
+  naming the exact head it reviewed AND which routine it is (`kind`). The gate blocks
+  unless an owner-authored marker for EVERY kind in `_REQUIRED_SCHEDULED_REVIEW_KINDS`
+  (currently `code-review` + `leaks`) names the PR's current head — so if any required
+  routine never ran, ran on a stale commit, or was rate-limited, the merge blocks
+  (naming the missing kinds). If a routine is pending or rate-limited, wait for it, or
+  append `# scheduled-review-override` to merge anyway (the conscious "merge without the
+  scheduled reviews" case). The marker means "ran **clean**", not merely "ran": a
+  review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
+  clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
+  Fail-closed: an unreadable comments/reviews fetch BLOCKS (never a false all-clear);
+- requires the PR base to equal the repo's default branch (retarget guard);
+- blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
+  does not merge).
+- **Override sigils are split by boundary** so one waiver can't silently disarm
+  an unrelated gate: `# review-override` waives ONLY the finding scans
+  (review-body + inline P1s); `# stale-review-override` waives ONLY the
+  review-context gates (Codex-at-head freshness + base-invariant);
+  `# scheduled-review-override` waives ONLY the scheduled-Claude-review gate; CI is
+  `# ci-override`. Append several sigils in one trailing comment when several
+  waivers are genuinely intended — but the right fix for a stale review is
+  `@codex review`, not the sigil.
+
+The review-findings gate specifically:
 
 1. After CI passes, the merge hook automatically checks PR comments
    for automated review findings (ERROR, [P1], HARD BLOCK).

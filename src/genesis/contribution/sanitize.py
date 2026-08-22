@@ -16,7 +16,7 @@ Scanners (all run when inputs are available):
    per finding.
 5. Secrets via `gitleaks detect` if binary is on PATH → BLOCK
    (optional second-layer, MVP-advisory).
-6. Portability patterns — IPs, /home/ubuntu/ paths, hardcoded
+6. Portability patterns — IPs, /home/<user>/ paths, hardcoded
    usernames, known private hostnames → BLOCK.
 7. Fingerprint scan — user-defined strings from
    ~/.genesis/release-fingerprints.txt → BLOCK.
@@ -29,11 +29,13 @@ user's "why was this rejected?" explanation.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
@@ -55,6 +57,9 @@ DEFAULT_FORBIDDEN_GLOBS: tuple[str, ...] = (
     "secrets.env",
     "*/secrets.env",
     ".env",
+    # Sanitizer's own secret-scan rules — a contribution must not weaken the gate
+    # that scans it (else a merged edit silently disables detection downstream).
+    ".gitleaks.toml",
     "config/research-profiles/*",
     "config/research-profiles/**",
     "config/external-modules/*",
@@ -504,17 +509,47 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
                 timeout=5,
                 check=False,
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            # Fail CLOSED: the REQUIRED secret-scan floor could not run on this
+            # line, so we cannot assert it is secret-free — BLOCK rather than
+            # let an unscanned line pass (the old `continue` was a fail-OPEN hole
+            # through a fail-CLOSED component).
+            hits.append(
+                Finding(
+                    kind=FindingKind.SECRET,
+                    severity=Severity.BLOCK,
+                    message=f"detect-secrets could not scan a line ({type(exc).__name__}) — failing closed",
+                    file=file,
+                    line=line_no,
+                    scanner="detect-secrets",
+                    detail="scan_error",
+                )
+            )
             continue
-        # --string prints lines like "<plugin>: True" for positives and
-        # "<plugin>: False" for negatives. Parse for any True.
+        # --string prints lines like "<plugin> : True  (unverified)" /
+        # "<plugin> : True  (4.872)" for positives and "<plugin> : False" for
+        # negatives. The verdict carries a status/entropy SUFFIX, so match with
+        # startswith("true") — an exact `== "true"` silently missed EVERY finding.
         if proc.returncode != 0:
+            # Same fail-closed rationale: a nonzero exit means the line was not
+            # reliably scanned.
+            hits.append(
+                Finding(
+                    kind=FindingKind.SECRET,
+                    severity=Severity.BLOCK,
+                    message=f"detect-secrets exited {proc.returncode} on a line — failing closed",
+                    file=file,
+                    line=line_no,
+                    scanner="detect-secrets",
+                    detail="nonzero_exit",
+                )
+            )
             continue
         for out_line in proc.stdout.splitlines():
             if ":" not in out_line:
                 continue
             key, _, val = out_line.partition(":")
-            if val.strip().lower() == "true":
+            if val.strip().lower().startswith("true"):
                 hits.append(
                     Finding(
                         kind=FindingKind.SECRET,
@@ -530,59 +565,186 @@ def _run_detect_secrets(parsed: _ParsedDiff) -> tuple[bool, list[Finding]]:
     return True, hits
 
 
-def _run_gitleaks(diff_text: str) -> tuple[bool, list[Finding]]:
-    """Optional second-layer scan with gitleaks if installed.
+def _stderr_tail(proc: subprocess.CompletedProcess) -> str:
+    """Last non-empty stderr line, capped + single-line — safe in a finding
+    message. gitleaks logs errors (FTL/…) to stderr; it is log text, never the
+    scanned secret."""
+    lines = [ln for ln in (proc.stderr or "").splitlines() if ln.strip()]
+    return lines[-1].strip()[:100] if lines else ""
 
-    Runs `gitleaks detect --no-git --pipe` with the diff on stdin
-    (via a temp path, since gitleaks needs a file). Returns
+
+def _gitleaks_skipped(reason: str) -> Finding:
+    """The OPTIONAL gitleaks layer was present but did NOT complete a scan —
+    surface a WARN so an operator sees the second layer was skipped rather than a
+    silent clean pass. The REQUIRED detect-secrets floor is unaffected and still
+    ran; this never blocks on its own."""
+    return Finding(
+        kind=FindingKind.SECRET,
+        severity=Severity.WARN,
+        message=(
+            f"gitleaks second-layer scan did not complete ({reason}); its "
+            "PII/secret rules were NOT applied this run. The required "
+            "detect-secrets floor still ran — repair gitleaks or its config "
+            "before relying on the second layer."
+        ),
+        scanner="gitleaks",
+        detail=reason,
+    )
+
+
+def _pinned_gitleaks_config() -> str | None:
+    """Materialize the COMMITTED `.gitleaks.toml` (`git show HEAD:`) to a temp file
+    and return its path, or None to fall back to gitleaks' default rules.
+
+    Reads the config from the trusted server-side install (genesis.env.repo_root())
+    at the committed HEAD — NEVER the mutable working tree, and NEVER
+    scan_diff()'s caller repo_root — so neither an uncommitted local edit nor an
+    untrusted candidate checkout can silently weaken the rules. (`.gitleaks.toml`
+    is also on the contribution-forbidden path list, which is the PRIMARY defense:
+    a contribution can't merge a change to it; this git-show pin is belt-and-
+    suspenders.) The caller unlinks the returned path.
+    """
+    from genesis.env import repo_root
+
+    try:
+        show = subprocess.run(
+            ["git", "-C", str(repo_root()), "show", "HEAD:.gitleaks.toml"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if show.returncode != 0 or not show.stdout.strip():
+        return None  # not committed / git unavailable -> gitleaks default rules
+    fd, path = tempfile.mkstemp(suffix=".gitleaks.toml")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(show.stdout)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        return None
+    return path
+
+
+def _run_gitleaks(
+    added_lines: list[tuple[str, int, str]],
+) -> tuple[bool, list[Finding]]:
+    """Optional second-layer secret scan with gitleaks if installed.
+
+    Scans ONLY the diff's ADDED lines (like _run_detect_secrets and the other
+    scanners), so a secret on a REMOVED or context line is never flagged — a
+    contribution that DELETES a secret isn't falsely blocked. Runs
+    `gitleaks detect --pipe` over the added-line content on stdin, loading the
+    genesis PII rules from the COMMITTED `.gitleaks.toml`. Returns
     (scanner_ran, findings).
+
+    gitleaks is the OPTIONAL second layer (detect-secrets is the REQUIRED floor).
+    An ABSENT binary → (False, []) — quiet, the layer simply isn't installed. But
+    a binary that IS present and ERRORS (bad config, unexpected exit, unparseable
+    report) → (True, [WARN]) — VISIBLE, never a silent "ran clean". Empirical
+    gitleaks 8.x contract (verified 2026-08):
+        exit 0             -> scanned clean (stdout "[]")
+        exit 1 + JSON body -> scanned, leaks found
+        exit 1 + no report -> ERROR (e.g. a .gitleaks.toml parse failure) — the
+                              scan did NOT run. This is the silent-no-scan hole:
+                              exit 1 is also the "leaks found" code, so an errored
+                              run with empty stdout must WARN, not report clean.
+        any other exit     -> ERROR
+    Config is pinned to the committed `.gitleaks.toml` (see _pinned_gitleaks_config)
+    so a local/uncommitted edit can't weaken the rules; `.gitleaks.toml` is also
+    contribution-forbidden so a change to it can't be merged in the first place.
+
+    NOTE: `--no-git` must NOT be combined with `--pipe` — that combination makes
+    gitleaks scan nothing from stdin (silent zero findings). NOTE: in `--pipe`
+    mode gitleaks never populates a finding's `File`, so `.gitleaks.toml`'s
+    `[allowlist] paths` is structurally inert here — a contributor cannot hide a
+    secret behind an allowlisted-looking diff path (locked by a regression test).
     """
     gitleaks = shutil.which("gitleaks") or shutil.which("betterleaks")
     if gitleaks is None:
-        return False, []
-
-    # gitleaks --pipe reads stdin since 8.x. Use that when available.
-    try:
-        proc = subprocess.run(
-            [gitleaks, "detect", "--no-git", "--pipe", "--report-format", "json",
-             "--report-path", "/dev/stdout"],
-            input=diff_text,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False, []
-
-    hits: list[Finding] = []
-    # gitleaks exits 1 when findings exist. Parse JSON from stdout.
-    stdout = proc.stdout.strip()
-    if not stdout:
+        return False, []  # optional layer absent — not an error, stay quiet
+    if not added_lines:
         return True, []
+
+    # Feed ONLY the added-line texts (one per line). Findings are attributed back
+    # to the source (file, line) by matching the reported secret text below — NOT
+    # by gitleaks' line number, which is unreliable over this header-less --pipe
+    # content (0-based, no diff hunk header, version-dependent).
+    content = "\n".join(text for _, _, text in added_lines) + "\n"
+    # gitleaks --pipe reads stdin since 8.x (NOT with --no-git — see docstring).
+    cmd = [gitleaks, "detect", "--pipe", "--report-format", "json",
+           "--report-path", "/dev/stdout"]
+
+    tmp_config: str | None = None
     try:
-        findings = json.loads(stdout)
-    except json.JSONDecodeError:
-        return True, []
-    if isinstance(findings, list):
-        for f in findings:
-            if not isinstance(f, dict):
-                continue
-            rule = f.get("RuleID", "unknown")
-            file = f.get("File", "")
-            line = f.get("StartLine", 0)
-            hits.append(
-                Finding(
-                    kind=FindingKind.SECRET,
-                    severity=Severity.BLOCK,
-                    message=f"Potential secret ({rule})",
-                    file=file or None,
-                    line=int(line) if line else None,
-                    scanner="gitleaks",
-                    detail=f.get("Match", "")[:120],
-                )
+        tmp_config = _pinned_gitleaks_config()
+        if tmp_config is not None:
+            cmd += ["-c", tmp_config]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=content,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
             )
-    return True, hits
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            return True, [_gitleaks_skipped(type(exc).__name__)]
+
+        rc = proc.returncode
+        stdout = proc.stdout.strip()
+        # Only exit 0 (clean) and exit 1 WITH a JSON body (leaks) are successful
+        # scans. Everything else means gitleaks did not actually scan — surface a
+        # WARN, never report clean (the exit-1/empty-stdout case is the hole).
+        if rc not in (0, 1):
+            return True, [_gitleaks_skipped(f"exit {rc}: {_stderr_tail(proc)}")]
+        if not stdout:
+            if rc == 1:
+                return True, [_gitleaks_skipped(f"exit 1 with no report: {_stderr_tail(proc)}")]
+            return True, []  # exit 0, no body -> nothing found
+        try:
+            findings = json.loads(stdout)
+        except json.JSONDecodeError:
+            return True, [_gitleaks_skipped("report was not valid JSON")]
+
+        hits: list[Finding] = []
+        if isinstance(findings, list):
+            for f in findings:
+                if not isinstance(f, dict):
+                    continue
+                rule = f.get("RuleID", "unknown")
+                # Attribute by matching the reported secret text back to the added
+                # line that contains it — robust to gitleaks' unreliable --pipe
+                # line numbers. If it can't be located, leave (file, line) unset;
+                # the finding is BLOCK either way.
+                match_text = f.get("Secret") or f.get("Match", "")
+                src_file, src_line = None, None
+                if match_text:
+                    for fpath, lno, text in added_lines:
+                        if match_text in text:
+                            src_file, src_line = fpath, lno
+                            break
+                hits.append(
+                    Finding(
+                        kind=FindingKind.SECRET,
+                        severity=Severity.BLOCK,
+                        message=f"Potential secret ({rule})",
+                        file=src_file,
+                        line=src_line,
+                        scanner="gitleaks",
+                        detail=f.get("Match", "")[:120],
+                    )
+                )
+        return True, hits
+    finally:
+        if tmp_config is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_config)
 
 
 def scan_diff(
@@ -701,10 +863,110 @@ def scan_diff(
         findings.extend(secret_hits)
 
     # 8. gitleaks (optional second layer)
-    ran, gl_hits = _run_gitleaks(diff_text)
+    ran, gl_hits = _run_gitleaks(parsed.added_lines)
     if ran:
         scanners_run.append("gitleaks")
         findings.extend(gl_hits)
+
+    ok = not any(f.severity == Severity.BLOCK for f in findings)
+    return SanitizerResult(ok=ok, findings=findings, scanners_run=scanners_run)
+
+
+def _parse_prose(text: str) -> _ParsedDiff:
+    """Wrap plain prose as a ``_ParsedDiff`` whose ``added_lines`` are EVERY
+    line of the text.
+
+    ``parse_diff`` only keeps ``+``-prefixed lines under a ``+++ b/<path>``
+    header, so it sees NOTHING in plain prose (an issue body, a comment) and a
+    scan of it fails OPEN. This wrapper hands every line to the raw-string
+    detectors instead. ``file`` is a synthetic ``"<prose>"`` label; line
+    numbers are 1-based to match a human reading the text.
+    """
+    added: list[tuple[str, int, str]] = [
+        ("<prose>", i, line) for i, line in enumerate(text.splitlines(), start=1)
+    ]
+    return _ParsedDiff(
+        file_paths=[],
+        added_lines=added,
+        is_binary=False,
+        size_bytes=len(text.encode("utf-8")),
+    )
+
+
+def scan_prose(
+    text: str,
+    *,
+    fingerprint_file: Path | None = None,
+) -> SanitizerResult:
+    """Fail-closed sanitizer for free TEXT (a drafted issue body, a comment) —
+    the prose analog of :func:`scan_diff`.
+
+    Runs ONLY the raw-string detectors that are meaningful on prose, over
+    EVERY line of *text*: portability classes (IPs, ``/home/<user>`` paths, CC
+    slugs), personal emails outside the allowlist, user fingerprints, and the
+    required ``detect-secrets`` floor. The diff-STRUCTURAL scanners
+    (forbidden-path, gitignore, binary, size) are deliberately skipped — they
+    describe a unified diff's shape, not prose content.
+
+    Do NOT reach for :func:`scan_diff` on prose: it routes through
+    :func:`parse_diff`, which drops every non-``+`` line, so plain text yields
+    zero ``added_lines`` and the scan returns ``ok=True`` regardless of what it
+    contains — a fail-OPEN hole through a fail-CLOSED component. This function
+    closes it.
+
+    Same contract as :func:`scan_diff`: ``ok`` is True iff no BLOCK finding.
+    Fail-closed on BOTH required guards: a missing ``detect-secrets`` binary
+    BLOCKs, and — because prose is the TERMINAL egress guard with no CI backstop
+    (unlike scan_diff, whose PR output CI re-scans) — a missing fingerprint file
+    also BLOCKs rather than surfacing a soft WARN.
+    """
+    if fingerprint_file is None:
+        env_path = os.environ.get("GENESIS_RELEASE_FINGERPRINTS")
+        if env_path:
+            fingerprint_file = Path(env_path)
+        else:
+            fingerprint_file = Path.home() / ".genesis" / "release-fingerprints.txt"
+
+    parsed = _parse_prose(text)
+    findings: list[Finding] = []
+    scanners_run: list[str] = []
+
+    # Portability (IPs, /home/<user> paths, CC slugs)
+    findings.extend(_check_portability(parsed))
+    scanners_run.append("portability")
+
+    # Personal emails outside the allowlist
+    findings.extend(_check_emails(parsed))
+    scanners_run.append("email_allowlist")
+
+    # Fingerprints. Unlike scan_diff (whose output is a PR that CI re-scans
+    # against the private-pattern superset), scan_prose is the TERMINAL guard for
+    # a runtime `gh issue create` egress — no downstream backstop. So a missing
+    # fingerprint file fails CLOSED (BLOCK), not a soft WARN.
+    if fingerprint_file and fingerprint_file.is_file():
+        findings.extend(_check_fingerprints(parsed, fingerprint_file))
+        scanners_run.append("fingerprint")
+    else:
+        findings.append(
+            Finding(
+                kind=FindingKind.FINGERPRINT,
+                severity=Severity.BLOCK,
+                message=(
+                    "Release fingerprint file not found — this install's exact "
+                    "private identifiers cannot be scanned, and prose egresses "
+                    "with no CI backstop. Failing closed. Run bootstrap (or "
+                    "`python -m genesis.contribution.fingerprints --write`)."
+                ),
+                scanner="fingerprint",
+                detail=str(fingerprint_file),
+            )
+        )
+
+    # detect-secrets (required floor — a missing binary BLOCKs, fail-closed)
+    ran, secret_hits = _run_detect_secrets(parsed)
+    if ran:
+        scanners_run.append("detect-secrets")
+        findings.extend(secret_hits)
 
     ok = not any(f.severity == Severity.BLOCK for f in findings)
     return SanitizerResult(ok=ok, findings=findings, scanners_run=scanners_run)

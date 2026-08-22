@@ -558,6 +558,16 @@ TABLES = {
             ),
             strength    REAL NOT NULL DEFAULT 0.5,
             created_at  TEXT NOT NULL,
+            -- MW-2 (0082) edge-metadata: classifier-verdict stamping location.
+            -- All NULLable, no backfill. NULL safe_for_boost = boost-eligible
+            -- (legacy default). proposed_type carries the classifier's verdict
+            -- label and is deliberately NOT constrained by the link_type CHECK.
+            -- GROUNDWORK(mw-5-merge-gate): MW-5 stamps verdicts here.
+            proposed_type   TEXT,
+            confidence      REAL,
+            classifier      TEXT,
+            review_state    TEXT,
+            safe_for_boost  INTEGER,
             -- link_type is part of the PK (audit DLI-04 / D15): distinct
             -- relationship types between the same pair (e.g. supports AND
             -- contradicts) must coexist, not silently overwrite. Migration
@@ -752,6 +762,35 @@ TABLES = {
                                     CHECK (status IN ('held', 'sent', 'rejected', 'expired')),
             sent_at             TEXT,
             rejected_at         TEXT
+        )
+    """,
+    # Contributor Work-Log hold store — a curator-drafted, sanitized public
+    # GitHub issue held for owner approval (paired with an approval_requests
+    # row); the resolution watcher posts it on approval. Mirrors
+    # pending_email_sends (WS-8). Migration 0079.
+    "pending_issue_posts": """
+        CREATE TABLE IF NOT EXISTS pending_issue_posts (
+            id                  TEXT PRIMARY KEY,
+            request_id          TEXT NOT NULL UNIQUE,
+            repo                TEXT NOT NULL,
+            title               TEXT NOT NULL,
+            body                TEXT NOT NULL,
+            labels              TEXT,
+            source              TEXT NOT NULL,
+            source_ref          TEXT,
+            cell_domain         TEXT NOT NULL,
+            cell_verb           TEXT NOT NULL,
+            cell_risk_class     TEXT NOT NULL,
+            held_at             TEXT NOT NULL,
+            mode                TEXT NOT NULL DEFAULT 'propose_only'
+                                    CHECK (mode IN ('propose_only', 'live')),
+            status              TEXT NOT NULL DEFAULT 'held'
+                                    CHECK (status IN ('held', 'posted', 'rejected', 'expired', 'dry_run')),
+            issue_number        INTEGER,
+            issue_url           TEXT,
+            posted_at           TEXT,
+            rejected_at         TEXT,
+            dry_run_at          TEXT
         )
     """,
     # WS-8 PR-D autonomous-send ledger — one row per email sent autonomously
@@ -1032,7 +1071,9 @@ TABLES = {
             expected_outputs TEXT,                    -- JSON: post-dispatch verification criteria (files, min_size, required_strings)
             revision_num      INTEGER DEFAULT 1,      -- PR-4 dark: current revision number; PR-5 reconcile bumps on revise
             revalidate_at     TEXT,                   -- PR-4 dark: when the premise is next due for re-validation (set in PR-6)
-            last_validated_at TEXT                    -- PR-4 dark: when the premise was last reaffirmed (set in PR-5)
+            last_validated_at TEXT,                   -- PR-4 dark: when the premise was last reaffirmed (set in PR-5)
+            scope             TEXT,                   -- operate|develop (NULL=unjudged); realist/reconcile-stamped, genesis-ego only
+            scope_revision    INTEGER                 -- revision_num the scope was stamped against (staleness on re-revise)
         )
     """,
     # PR-4 (ego proposal-lifecycle redesign): prior-value audit trail for
@@ -1052,7 +1093,8 @@ TABLES = {
             expected_outputs TEXT,                    -- prior post-dispatch verification criteria (JSON)
             revised_at       TEXT NOT NULL,           -- when the superseding revision was made
             revised_by       TEXT,                    -- ego_source / reconcile stage that made the revision
-            reason           TEXT                     -- why the revision was made
+            reason           TEXT,                    -- why the revision was made
+            scope            TEXT                     -- prior scope (operate|develop) snapshot at this revision
         )
     """,
     "ego_state": """
@@ -1206,7 +1248,19 @@ TABLES = {
             trust_level      TEXT,
             attribution      TEXT,
             origin_ref       TEXT,
-            capture_clarity  REAL
+            capture_clarity  REAL,
+            -- GROUNDWORK(mw-4-provenance-weight / mw-4-durability-ttl /
+            -- mw-5-speech-act-protection): MW-1 Tier-0 extraction judgment axes,
+            -- written WRITE-ONLY at extraction time — NOTHING reads them yet.
+            -- All NULLable with NO default: expiry is strictly opt-in
+            -- (durability='temporary' + an elapsed expires_at only), so an
+            -- unclassified row NEVER expires. Contract in memory/judgment.py;
+            -- added to existing DBs by migration 0079.
+            speech_act            TEXT,
+            speech_act_confidence REAL,
+            assertion_provenance  TEXT,
+            durability            TEXT,
+            expires_at            TEXT
         )
     """,
     "graduation_events": """
@@ -1707,9 +1761,16 @@ TABLES = {
             norm_name   TEXT NOT NULL,
             entity_type TEXT NOT NULL CHECK (entity_type IN (
                 'code_file','code_symbol','pr','commit',
-                'product','device','repo','subsystem','person','org','concept'
+                'product','device','repo','subsystem','person','org','concept',
+                -- MW-3 §6.4 first-card classes: host = a machine, install = a
+                -- Genesis deployment on a host, project = a user project.
+                'host','install','project'
             )),
             summary     TEXT,
+            -- MW-3 B3 card-materialization state (NULL/0 = never carded =
+            -- today's behavior; refresh job dirties + regenerates).
+            summary_updated_at TEXT,
+            summary_dirty INTEGER NOT NULL DEFAULT 0,
             source      TEXT NOT NULL DEFAULT 'extracted',
             status      TEXT NOT NULL DEFAULT 'active'
                             CHECK (status IN ('active','merged','gone')),
@@ -1922,7 +1983,10 @@ TABLES = {
                             CHECK(status IN ('applied','proposed','confirmed',
                                              'rejected','superseded')),
             resolved_at     TEXT,
-            resolution_ref  TEXT
+            resolution_ref  TEXT,
+            -- 'ledger' | 'follow_up' — which store item_id addresses (a8a4f59e).
+            -- LAST column: ALTER appends here, so fresh/migrated order stays in parity.
+            target_kind     TEXT NOT NULL DEFAULT 'ledger'
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────
@@ -2355,6 +2419,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_capability_grants_domain ON capability_grants(domain, state)",
     # WS-8 email gate hold store (drain queries WHERE status='held')
     "CREATE INDEX IF NOT EXISTS idx_pending_email_sends_status ON pending_email_sends(status)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_issue_posts_status ON pending_issue_posts(status)",
     # WS-8 PR-D autonomous-send ledger — per-cell rate-limit window + ledger ordering
     "CREATE INDEX IF NOT EXISTS idx_autonomous_email_sends_cell "
     "ON autonomous_email_sends(cell_domain, cell_verb, cell_risk_class, sent_at)",
@@ -2504,7 +2569,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_slse_session ON session_ledger_shadow_events(session_id, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_slse_observed ON session_ledger_shadow_events(observed_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_rpa_dedupe "
-    "ON repo_pulse_annotations(tier, item_id, pr_number)",
+    "ON repo_pulse_annotations(tier, target_kind, item_id, pr_number)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_status ON repo_pulse_annotations(status, observed_at)",
     "CREATE INDEX IF NOT EXISTS idx_rpa_session ON repo_pulse_annotations(item_session_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_rpr_started ON repo_pulse_runs(started_at)",

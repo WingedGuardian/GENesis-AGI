@@ -207,7 +207,7 @@
                 <div style="display:flex; justify-content:space-between;"><span>CLI fallback</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.autonomous_cli_fallback_enabled ? 'enabled' : 'disabled'"></span></div>
                 <div style="display:flex; justify-content:space-between;"><span>Manual approval</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.manual_approval_required ? 'required' : 'not required'"></span></div>
                 <div style="display:flex; justify-content:space-between;"><span>Channel</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.approval_channel || 'telegram'"></span></div>
-                <div style="display:flex; justify-content:space-between;"><span>Re-ask</span><span x-text="(($store.genesisDashboard.autonomousCliPolicy.effective_policy?.reask_interval_hours || 24) + 'h')"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Re-ask</span><span x-text="((($store.genesisDashboard.autonomousCliPolicy.effective_policy?.reask_interval_hours ?? 24) === 0 ? 'never' : ($store.genesisDashboard.autonomousCliPolicy.effective_policy?.reask_interval_hours ?? 24) + 'h'))"></span></div>
                 <div style="display:flex; justify-content:space-between;"><span>Source</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.source || 'unknown'"></span></div>
               </div>
             </div>
@@ -518,7 +518,7 @@
     </div>
 
     <!-- Panel: Provider Keys [Tab: config] -->
-    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'config'">
+    <div class="panel" id="provider-keys" x-show="$store.genesisDashboard.activeTab === 'config'">
       <div class="panel-header">
         <span class="material-symbols-outlined">key</span>
         Provider Keys

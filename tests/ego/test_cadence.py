@@ -1625,7 +1625,7 @@ class TestJobHealthKeyPerEgo:
             classmethod(lambda cls: mock_rt),
         )
         cadence._record_failure("boom")
-        mock_rt.record_job_failure.assert_called_once_with(source_tag, "boom")
+        mock_rt.record_job_failure.assert_called_once_with(source_tag, "boom", exc=None)
 
     async def test_two_egos_write_distinct_keys(
         self,
@@ -2143,6 +2143,56 @@ class TestPendingCliApproval:
         )
         await db.commit()
         assert await ego_crud.has_pending_cli_approval(db, "user_ego_cycle") is True
+
+
+class TestApprovalPendingPolicyAware:
+    """_approval_pending is policy-aware: a LEFTOVER pending row must not park
+    the ego when the mandatory gate is disabled (the deadlock fix)."""
+
+    async def _seed_pending(self, db, source_tag="user_ego_cycle"):
+        await db.execute(TABLES["approval_requests"])
+        await db.execute(
+            "INSERT INTO approval_requests "
+            "(id, action_type, action_class, description, context, status) "
+            "VALUES ('appol1', 'autonomous_cli_fallback', 'costly_reversible', "
+            "'Approve Claude Code session for user ego cycle?', "
+            f'\'{{"policy_id": "{source_tag}", "subsystem": "ego"}}\', '
+            "'pending')",
+        )
+        await db.commit()
+
+    async def test_gate_on_pending_row_blocks(self, cadence, db, monkeypatch):
+        from genesis.autonomy import cli_policy
+
+        cadence._session._source_tag = "user_ego_cycle"
+        await self._seed_pending(db)
+        monkeypatch.setattr(
+            cli_policy,
+            "load_autonomous_cli_policy",
+            lambda *a, **k: cli_policy.AutonomousCliPolicy(
+                manual_approval_required=True,
+            ),
+        )
+        assert await cadence._approval_pending() is True
+
+    async def test_gate_off_pending_row_does_not_block(
+        self,
+        cadence,
+        db,
+        monkeypatch,
+    ):
+        from genesis.autonomy import cli_policy
+
+        cadence._session._source_tag = "user_ego_cycle"
+        await self._seed_pending(db)
+        monkeypatch.setattr(
+            cli_policy,
+            "load_autonomous_cli_policy",
+            lambda *a, **k: cli_policy.AutonomousCliPolicy(
+                manual_approval_required=False,
+            ),
+        )
+        assert await cadence._approval_pending() is False
 
 
 # ---------------------------------------------------------------------------

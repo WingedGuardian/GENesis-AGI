@@ -1253,6 +1253,11 @@ class TestResolvePrNumber:
             ("gh pr merge 5 | tee 777", "5"),
             ("gh pr merge --admin xyz\necho 456", None),  # newline chain
             ("gh pr merge 123\necho 456", "123"),
+            # A dangling value flag must NOT swallow the separator as its value
+            # and then read a CHAINED command's digits (E3 guard: naive value-
+            # skipping would return 999 here). 2026-08-19.
+            ("gh pr merge --subject ; gh pr merge 999", None),
+            ("gh pr merge -db ; gh pr merge 999", None),
         ],
     )
     def test_stops_at_shell_separator(self, guard_module, cmd, expected):
@@ -1263,6 +1268,58 @@ class TestResolvePrNumber:
         # not resolve as the PR number.
         cmd = 'gh pr merge --subject "fix 123"'
         assert guard_module._extract_pr_number(cmd) is None
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # E3 (2026-08-19): an UNQUOTED numeric value that gh consumes as a
+            # value-flag's argument must NOT be read as the PR number — gh takes
+            # the trailing bare positional as the PR. `gh pr merge --subject 123 5`
+            # merges PR 5 (subject "123"); the old loop returned 123 (the flag
+            # value) → the gates checked the WRONG PR. Long, short, cluster,
+            # and non-shadow (--match-head-commit / --repo) value flags all apply.
+            ("gh pr merge --subject 123 5", "5"),
+            ("gh pr merge -t 123 5", "5"),
+            ("gh pr merge --body 123 5", "5"),
+            ("gh pr merge --match-head-commit 123 5 --admin", "5"),
+            ("gh pr merge --repo 123 5", "5"),
+            ("gh pr merge -db 123 5", "5"),  # -d(bool)+-b(value): -b eats 123
+        ],
+    )
+    def test_unquoted_flag_value_not_pr_number(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # GLUED value flags (sibling of E3, found in adversarial review): a
+            # `--flag=value` long or a `-fvalue` short does NOT consume a next
+            # token, so it falls through to the positional matchers — and the URL
+            # matcher's `\S*` prefix would read a `/pull/N` smuggled INSIDE the
+            # value as the PR while gh merges the trailing positional. A positional
+            # PR ref never starts with '-'; the matchers must skip '-'-prefixed
+            # tokens. gh merges 5 in every case here.
+            ("gh pr merge --body=https://github.com/o/r/pull/999 5", "5"),
+            ("gh pr merge -bhttps://github.com/o/r/pull/999 5", "5"),
+            ("gh pr merge --body-file=/tmp/x/pull/42 5", "5"),
+        ],
+    )
+    def test_glued_flag_value_url_not_pr_number(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            # Regression LOCKS (must stay green): a positional BEFORE any flag is
+            # still the PR; a GLUED long value flag never leaks its digits.
+            ("gh pr merge 123 --subject 456", "123"),
+            ("gh pr merge --subject=99 5", "5"),
+            ("gh pr merge -db123 5", "5"),  # glued short value: -b's value is 123
+            ("gh pr merge -- 5", "5"),  # -- end-of-options: the positional still resolves
+        ],
+    )
+    def test_positional_pr_still_resolved(self, guard_module, cmd, expected):
+        assert guard_module._extract_pr_number(cmd) == expected
 
     def test_resolves_current_branch_pr(self, guard_module):
         with patch.object(
@@ -1289,6 +1346,28 @@ class TestResolvePrNumber:
             ),
         ):
             assert guard_module._resolve_pr_number("gh pr merge --squash") is None
+
+    def test_explicit_repo_numberless_fails_closed_without_gh(self, guard_module):
+        # explicit user --repo + no number + no cwd → None WITHOUT touching gh
+        # (gh pr view --repo errors without a selector; resolving a cwd-branch PR
+        # and gating it against a DIFFERENT repo is the wrong-PR bug).
+        with patch.object(guard_module.subprocess, "run", side_effect=AssertionError):
+            assert guard_module._resolve_pr_number("gh pr merge --squash", repo="o/r") is None
+
+    def test_derived_cwd_numberless_resolves_without_repo_flag(self, guard_module):
+        # A merge whose repo was DERIVED from cwd (F3): the numberless branch PR
+        # resolves by running gh IN that cwd with NO --repo — so it doesn't hit
+        # the `--repo needs a selector` error the previous line guards against.
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="88\n"),
+        ) as run:
+            got = guard_module._resolve_pr_number("gh pr merge --squash", repo="o/r", cwd="/wt")
+        assert got == "88"
+        argv = run.call_args_list[0].args[0]
+        assert "--repo" not in argv
+        assert run.call_args_list[0].kwargs.get("cwd") == "/wt"
 
 
 # ── CI-status merge gate (_pr_ci_status / _has_ci_override) ───────────────
@@ -1370,6 +1449,138 @@ class TestPrCiStatus:
         assert guard_module._pr_ci_status("1") == ("unknown", [])
 
 
+class TestPrCiStatusCancelSibling:
+    """Concurrency-cancel dedup (approach B): a CANCELLED CheckRun is dropped IFF a
+    check of the SAME identity (name + workflowName) concluded SUCCESS AT OR AFTER
+    it — so a superseded `cancel-in-progress` duplicate (cancel older than its
+    re-run's success) drops, but a SUCCESS-then-cancel re-run on an unchanged head
+    still blocks. Both sides are terminal COMPLETED runs (always carry completedAt);
+    every unresolvable case (no identity, no completedAt, no later success) fails
+    closed to red."""
+
+    @staticmethod
+    def _set(monkeypatch, checks):
+        monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
+
+    def test_cancel_with_success_sibling_is_green(self, guard_module, monkeypatch):
+        # The ec925917 incident: concurrency-cancelled CodeQL dups (older) + their
+        # successful re-runs (newer, same name + workflowName). Must read green.
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_cancel_without_success_sibling_stays_red(self, guard_module, monkeypatch):
+        # A genuine cancel with no same-identity success still blocks the merge.
+        self._set(monkeypatch, [
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["Analyze"])
+
+    def test_cross_workflow_same_name_does_not_drop(self, guard_module, monkeypatch):
+        # SECURITY (HIGH lock): a same-NAME success from a DIFFERENT workflow is
+        # NOT a valid sibling and must not mask a genuinely-cancelled required
+        # check. Identity is (name, workflowName), so this stays red. Under a
+        # bare-name match this would wrongly go green.
+        self._set(monkeypatch, [
+            {"name": "test-suite", "workflowName": "real-ci", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test-suite", "workflowName": "decoy", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test-suite"])
+
+    def test_cancel_without_workflowname_stays_red(self, guard_module, monkeypatch):
+        # Fail-closed: a CANCELLED entry with no resolvable workflowName has no
+        # identity, so even a later same-name SUCCESS cannot drop it — stays red.
+        self._set(monkeypatch, [
+            {"name": "x", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "x", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["x"])
+
+    def test_cancel_plus_inflight_rerun_never_green(self, guard_module, monkeypatch):
+        # Cancel + an in-flight re-run of the same identity, no success yet → must
+        # NOT read green (the re-run is still running; nothing has passed).
+        self._set(monkeypatch, [
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"name": "Analyze", "workflowName": "CodeQL", "status": "IN_PROGRESS", "conclusion": None},
+        ])
+        assert guard_module._pr_ci_status("1")[0] != "green"
+
+    def test_cancel_sibling_does_not_launder_other_failure(self, guard_module, monkeypatch):
+        # Dropping a cancelled-with-sibling must never hide a DIFFERENT check's
+        # real failure — the core wrong-green guard.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["lint"])
+
+    def test_timed_out_with_success_sibling_still_red(self, guard_module, monkeypatch):
+        # Scope lock: ONLY CANCELLED is laundered. TIMED_OUT carries a real
+        # verdict and still blocks even with a same-identity success.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "TIMED_OUT"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_statuscontext_success_does_not_drop_checkrun_cancel(self, guard_module, monkeypatch):
+        # A legacy StatusContext SUCCESS (no workflowName) has no CheckRun identity
+        # and is NOT a valid sibling for a CheckRun CANCELLED of the same name —
+        # the cancel stays red (closes the cross-shape collision surface).
+        self._set(monkeypatch, [
+            {"context": "ci/legacy", "state": "SUCCESS"},
+            {"name": "ci/legacy", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["ci/legacy"])
+
+    def test_pending_preserved_when_sibling_dropped(self, guard_module, monkeypatch):
+        # Dropping a cancelled-with-sibling must not swallow an UNRELATED pending
+        # check — the merge still blocks on the in-flight one.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "deploy", "workflowName": "CI", "status": "IN_PROGRESS", "conclusion": None},
+        ])
+        assert guard_module._pr_ci_status("1") == ("pending", ["deploy"])
+
+    def test_nameless_cancel_not_dropped_by_nameless_success(self, guard_module, monkeypatch):
+        # Entries with no name/workflowName have no identity (_ci_identity → None)
+        # and are excluded from the sibling set — a nameless SUCCESS can't license
+        # dropping a nameless CANCELLED. Stays red (fail-safe over-block).
+        self._set(monkeypatch, [
+            {"status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["check"])
+
+    def test_success_then_cancel_on_unchanged_head_stays_red(self, guard_module, monkeypatch):
+        # Codex P1: a job passed (older), then was re-run on the UNCHANGED head and
+        # that re-run was CANCELLED (newer). The latest attempt never passed, so the
+        # cancel is NOT superseded by a later success → stays red. Under a bare
+        # set-membership match (no completedAt) this wrongly returned green.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:00:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:05:00Z"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_cancel_without_completedat_stays_red(self, guard_module, monkeypatch):
+        # Fail-closed: a CANCELLED entry with no completedAt can't be proven
+        # superseded (no timestamp to order it), so even a same-identity SUCCESS
+        # does not drop it — stays red.
+        self._set(monkeypatch, [
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+
 class TestCiOverrideSigil:
     """The `# ci-override` sigil is quote-aware and (at the call site) bound to
     the merge segment — it cannot be spoofed from a quoted --body or a chained
@@ -1433,6 +1644,27 @@ class TestCiGateEndToEnd:
             "_check_inline_review_findings",
             lambda n, force=False, repo=None: (False, ""),
         )
+        # The Codex review-freshness gate (PR #1366) is a real network check —
+        # mock it pass-through (None verified_head also disengages the
+        # --match-head-commit binding) so this suite stays offline-hermetic.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
+        # Base-branch invariant (PR #1366) also makes real gh calls — mock it
+        # pass-through so this suite stays offline-hermetic.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_base_is_default",
+            lambda n, force=False, repo=None: (False, ""),
+        )
+        # Scheduled-Claude-review gate is a real network check too — pass-through.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
+        )
 
     def test_red_ci_blocks_exit_2(self, guard_module, monkeypatch, capsys):
         monkeypatch.setenv(
@@ -1487,8 +1719,11 @@ class TestCiGateEndToEnd:
 
 
 class TestCiStatusUnfinishedStates:
-    """P1 fix: ANY non-terminal check status counts as pending (not just
-    QUEUED/IN_PROGRESS) — a new/renamed unfinished state can't read as green."""
+    """Full enumeration of GitHub's status/conclusion/state domains — no
+    unenumerated value may read green: ANY non-terminal status ⇒ pending; an
+    unrecognized *terminal* conclusion (e.g. STALE, or a value GitHub adds later)
+    ⇒ red (fail-closed); a legacy EXPECTED context ⇒ pending. A null conclusion on
+    a COMPLETED run is genuine no-verdict data and stays a benign ignore."""
 
     @staticmethod
     def _set(monkeypatch, checks):
@@ -1512,6 +1747,421 @@ class TestCiStatusUnfinishedStates:
             {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ])
         assert guard_module._pr_ci_status("1") == ("green", [])
+
+    def test_stale_conclusion_is_red(self, guard_module, monkeypatch):
+        # STALE = a superseded/outdated run (GitHub's own term) — NOT a pass. On a
+        # gate that forces --admin (sole CI enforcement) it must block, not read
+        # green. Under the prior code this silently ignored → green.
+        self._set(monkeypatch, [
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "STALE"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["Analyze (python)"])
+
+    def test_stale_mixed_with_success_still_red(self, guard_module, monkeypatch):
+        self._set(monkeypatch, [
+            {"name": "codeql", "status": "COMPLETED", "conclusion": "STALE"},
+            {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        assert guard_module._pr_ci_status("1") == ("red", ["codeql"])
+
+    def test_unrecognized_terminal_conclusion_fails_closed_red(self, guard_module, monkeypatch):
+        # A COMPLETED run with a conclusion GitHub adds later must fail closed to
+        # red, never silently ignore (the class root cause behind the STALE gap).
+        self._set(monkeypatch, [{"name": "test", "status": "COMPLETED", "conclusion": "SOME_FUTURE_VERDICT"}])
+        assert guard_module._pr_ci_status("1") == ("red", ["test"])
+
+    def test_expected_statuscontext_is_pending(self, guard_module, monkeypatch):
+        # A legacy StatusContext EXPECTED (a required context that hasn't reported
+        # yet) must read pending, not fall through to unknown (which callers treat
+        # as non-blocking).
+        self._set(monkeypatch, [{"context": "ci/required", "state": "EXPECTED"}])
+        assert guard_module._pr_ci_status("1") == ("pending", ["ci/required"])
+
+
+class TestMergeableAllowlist:
+    """F2: the mergeability gate is an ALLOWLIST — block unless status is a
+    definite MERGEABLE. The old `== UNKNOWN` check let None/'' (a FAILED query;
+    _check_mergeable fails OPEN to None) sail through and merge. Both the
+    enforcement arm and the report close this."""
+
+    def _payload(self, cmd):
+        return {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+        }
+
+    def _patch_downstream(self, guard_module, monkeypatch):
+        # Everything AFTER mergeability passes, so only mergeability decides.
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+        )
+        for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
+        )
+
+    @pytest.mark.parametrize("bad", [None, "", "UNKNOWN", "SOMETHING_NEW"])
+    def test_non_mergeable_blocks(self, guard_module, monkeypatch, bad):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: bad)
+        self._patch_downstream(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        assert guard_module.main() == 2
+
+    def test_conflicting_blocks_with_specific_message(self, guard_module, monkeypatch, capsys):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "CONFLICTING")
+        self._patch_downstream(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        assert guard_module.main() == 2
+        assert "merge conflicts" in capsys.readouterr().err
+
+    def test_mergeable_passes(self, guard_module, monkeypatch):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        self._patch_downstream(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        assert guard_module.main() == 0
+
+    def test_report_counts_none_as_failure(self, guard_module, monkeypatch, capsys):
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: None)
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
+        for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
+            monkeypatch.setattr(guard_module, name, lambda n, repo=None, strict=False: (False, ""))
+        assert guard_module.check_pr_report("5") == 1
+        assert "would block" in capsys.readouterr().out
+
+
+class TestRepoDerivationGate:
+    """F3: a bare (no --repo) merge is gated against the repo gh will ACTUALLY
+    target — derived from the merge's effective cwd — not the hook process's cwd.
+    Fail-closed when that cwd is ambiguous or gh can't resolve a repo there."""
+
+    def _payload(self, cmd, cwd=None):
+        p = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}}
+        if cwd is not None:
+            p["cwd"] = cwd
+        return p
+
+    def _patch_ok(self, guard_module, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+        )
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None: (False, ""))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", None),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: None,
+        )
+
+    def test_derived_repo_threads_into_gates(self, guard_module, monkeypatch):
+        seen = {}
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+
+        def rec_mergeable(n, repo=None):
+            seen["repo"] = repo
+            return "MERGEABLE"
+
+        monkeypatch.setattr(guard_module, "_check_mergeable", rec_mergeable)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin", cwd="/some/other/checkout"),
+        )
+        assert guard_module.main() == 0
+        assert seen["repo"] == "octo/other"
+
+    def test_explicit_repo_skips_derivation(self, guard_module, monkeypatch):
+        seen = {}
+        # Seam would derive octo/other, but --repo must win (no derivation).
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+
+        def rec_mergeable(n, repo=None):
+            seen["repo"] = repo
+            return "MERGEABLE"
+
+        monkeypatch.setattr(guard_module, "_check_mergeable", rec_mergeable)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload(
+                "gh pr merge 5 --repo real/repo --squash --admin", cwd="/some/other/checkout"
+            ),
+        )
+        assert guard_module.main() == 0
+        assert seen["repo"] == "real/repo"
+
+    def test_unresolvable_cwd_repo_blocks(self, guard_module, monkeypatch):
+        # cwd resolves but gh can't name a repo there (seam empty) → fail-closed.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "")
+        self._patch_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin", cwd="/not/a/repo"),
+        )
+        assert guard_module.main() == 2
+
+    def test_ambiguous_cd_blocks(self, guard_module, monkeypatch):
+        # A `cd` to an unresolvable target (shell var) → _CWD_UNKNOWN → fail-closed,
+        # even though a derivation seam is set.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("cd $HOME && gh pr merge 5 --squash --admin", cwd="/repo"),
+        )
+        assert guard_module.main() == 2
+
+    def test_numberless_merge_threads_derived_cwd_to_resolver(self, guard_module, monkeypatch):
+        # Regression (architect audit, round 5): F3 derives an explicit repo for a
+        # numberless merge; _resolve_pr_number must get the DERIVED cwd so the
+        # branch PR still resolves (an explicit --repo would error). Without the
+        # cwd thread, a numberless `gh pr merge` that worked pre-F3 would block.
+        seen = {}
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+
+        def rec_resolve(cmd, repo=None, cwd=None):
+            seen["repo"] = repo
+            seen["cwd"] = cwd
+            return "5"
+
+        monkeypatch.setattr(guard_module, "_resolve_pr_number", rec_resolve)
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge --squash --admin", cwd="/some/other/checkout"),
+        )
+        assert guard_module.main() == 0
+        assert seen["repo"] == "octo/other"
+        assert seen["cwd"] == "/some/other/checkout"
+
+    def test_no_cwd_info_keeps_cwd_behavior(self, guard_module, monkeypatch):
+        # Payload without cwd (older CC / test harness): nothing to derive from →
+        # merge_repo stays None (today's cwd-based behavior), NOT a block.
+        seen = {}
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "octo/other")
+        self._patch_ok(guard_module, monkeypatch)
+
+        def rec_mergeable(n, repo=None):
+            seen["repo"] = repo
+            return "MERGEABLE"
+
+        monkeypatch.setattr(guard_module, "_check_mergeable", rec_mergeable)
+        monkeypatch.setattr(
+            guard_module, "read_payload", lambda: self._payload("gh pr merge 5 --squash --admin")
+        )
+        assert guard_module.main() == 0
+        assert seen["repo"] is None  # not derived → cwd repo (unchanged behavior)
+
+
+class TestStrictScanMode:
+    """F-report (Codex P2, round 6): a finding scan that could not be READ (gh
+    error/timeout/malformed) must not be reported as clean. Report mode passes
+    strict=True → an unreadable scan blocks/fails; enforcement (default) stays
+    fail-open for Codex-quota/outage tolerance. An EMPTY result (quota) is clean
+    in both modes."""
+
+    def test_body_error_fails_closed_when_strict(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+        ):
+            block, msg = guard_module._check_pr_review_findings("1", strict=True)
+        assert block is True and "unreadable" in msg.lower()
+
+    def test_body_error_fails_open_by_default(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+        ):
+            block, _ = guard_module._check_pr_review_findings("1")
+        assert block is False
+
+    def test_body_empty_is_clean_even_when_strict(self, guard_module):
+        # Empty (quota / no comments) is NOT an error — clean in both modes.
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="[]"),
+        ):
+            block, _ = guard_module._check_pr_review_findings("1", strict=True)
+        assert block is False
+
+    def test_inline_error_fails_closed_when_strict(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+        ):
+            block, msg = guard_module._check_inline_review_findings("1", strict=True)
+        assert block is True and "unreadable" in msg.lower()
+
+    def test_inline_error_fails_open_by_default(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+        ):
+            block, _ = guard_module._check_inline_review_findings("1")
+        assert block is False
+
+    def test_report_counts_unreadable_scan_as_failure(self, guard_module, monkeypatch, capsys):
+        # The canonical report must not print "all gates pass" when a scan errored.
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", "h"),
+        )
+        # Body scan errors (strict → block); inline clean.
+        monkeypatch.setattr(
+            guard_module,
+            "_check_pr_review_findings",
+            lambda n, repo=None, strict=False: (True, "could not read review-body comments")
+            if strict
+            else (False, ""),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, repo=None, strict=False: (False, ""),
+        )
+        assert guard_module.check_pr_report("5") == 1
+        out = capsys.readouterr().out
+        assert "would block" in out and "all gates pass" not in out
+
+
+class TestGateOrdering:
+    """F1: Codex freshness must be established BEFORE the finding scans.
+
+    If a review is published between the finding scans and the freshness check,
+    its matching commit_id passes freshness while any P1 comments published with
+    it were never scanned — the merge proceeds with unread findings. Ordering:
+    mergeable → CI → base-invariant → freshness → body findings → inline findings.
+    """
+
+    def _payload(self, cmd):
+        return {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+        }
+
+    def test_freshness_precedes_finding_scans(self, guard_module, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP", json.dumps([{"name": "test", "conclusion": "SUCCESS"}])
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_base_is_default",
+            lambda n, force=False, repo=None: (calls.append("base"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (calls.append("freshness"), (False, "", None))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_scheduled_claude_reviewed_head",
+            lambda n, head=None, repo=None, force=False, strict=False: (
+                calls.append("scheduled"),
+                None,
+            )[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_pr_review_findings",
+            lambda n, force=False, repo=None: (calls.append("body"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, force=False, repo=None: (calls.append("inline"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "read_payload",
+            lambda: self._payload("gh pr merge 5 --squash --admin"),
+        )
+        assert guard_module.main() == 0
+        assert "freshness" in calls and "body" in calls and "inline" in calls
+        assert calls.index("freshness") < calls.index("body")
+        assert calls.index("freshness") < calls.index("inline")
+
+    def test_report_freshness_precedes_finding_scans(self, guard_module, monkeypatch, capsys):
+        calls: list[str] = []
+        monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(guard_module, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(
+            guard_module,
+            "_check_base_is_default",
+            lambda n, force=False, repo=None: (calls.append("base"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (calls.append("freshness"), (False, "", "h"))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_pr_review_findings",
+            lambda n, repo=None, strict=False: (calls.append("body"), (False, ""))[1],
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, repo=None, strict=False: (calls.append("inline"), (False, ""))[1],
+        )
+        guard_module.check_pr_report("5")
+        assert calls.index("freshness") < calls.index("body")
+        assert calls.index("freshness") < calls.index("inline")
 
 
 class TestMultiMergeBlocked:

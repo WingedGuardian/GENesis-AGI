@@ -14,10 +14,10 @@ from genesis.cc.types import CCInvocation, CCModel, CCOutput
 
 class TestFromFullName:
     def test_opus(self):
-        assert CCModel.from_full_name("claude-opus-4-6") == CCModel.OPUS
+        assert CCModel.from_full_name("claude-opus-4-8") == CCModel.OPUS
 
     def test_sonnet(self):
-        assert CCModel.from_full_name("claude-sonnet-4-6") == CCModel.SONNET
+        assert CCModel.from_full_name("claude-sonnet-5") == CCModel.SONNET
 
     def test_haiku(self):
         assert CCModel.from_full_name("claude-haiku-4-5-20251001") == CCModel.HAIKU
@@ -29,7 +29,7 @@ class TestFromFullName:
         assert CCModel.from_full_name("") is None
 
     def test_case_insensitive(self):
-        assert CCModel.from_full_name("Claude-OPUS-4-6") == CCModel.OPUS
+        assert CCModel.from_full_name("Claude-OPUS-4-8") == CCModel.OPUS
 
 
 # ── _detect_downgrade ───────────────────────────────────────────────
@@ -37,7 +37,7 @@ class TestFromFullName:
 
 class TestDetectDowngrade:
     def test_opus_to_sonnet_is_downgrade(self):
-        assert CCInvoker._detect_downgrade(CCModel.OPUS, "claude-sonnet-4-6") is True
+        assert CCInvoker._detect_downgrade(CCModel.OPUS, "claude-sonnet-5") is True
 
     def test_opus_to_haiku_is_downgrade(self):
         assert CCInvoker._detect_downgrade(CCModel.OPUS, "claude-haiku-4-5") is True
@@ -46,10 +46,10 @@ class TestDetectDowngrade:
         assert CCInvoker._detect_downgrade(CCModel.SONNET, "claude-haiku-4-5") is True
 
     def test_same_model_not_downgrade(self):
-        assert CCInvoker._detect_downgrade(CCModel.OPUS, "claude-opus-4-6") is False
+        assert CCInvoker._detect_downgrade(CCModel.OPUS, "claude-opus-4-8") is False
 
     def test_upgrade_not_downgrade(self):
-        assert CCInvoker._detect_downgrade(CCModel.HAIKU, "claude-sonnet-4-6") is False
+        assert CCInvoker._detect_downgrade(CCModel.HAIKU, "claude-sonnet-5") is False
 
     def test_unknown_model_fails_open(self):
         assert CCInvoker._detect_downgrade(CCModel.OPUS, "unknown-model") is False
@@ -70,7 +70,7 @@ class TestCCOutputFields:
 
     def test_explicit_values(self):
         output = CCOutput(
-            session_id="s1", text="hi", model_used="claude-sonnet-4-6",
+            session_id="s1", text="hi", model_used="claude-sonnet-5",
             cost_usd=0.0, input_tokens=0, output_tokens=0,
             duration_ms=0, exit_code=0,
             model_requested="opus", downgraded=True,
@@ -92,12 +92,12 @@ class TestParseResultDictDowngrade:
             "result": "response text",
             "total_cost_usd": 0.1,
             "usage": {"input_tokens": 100, "output_tokens": 50},
-            "modelUsage": {"claude-sonnet-4-6": {"input_tokens": 100}},
+            "modelUsage": {"claude-sonnet-5": {"input_tokens": 100}},
         }
         output = invoker._parse_result_dict(result_data, inv, 1000)
         assert output.downgraded is True
         assert output.model_requested == "opus"
-        assert output.model_used == "claude-sonnet-4-6"
+        assert output.model_used == "claude-sonnet-5"
 
     def test_no_downgrade_when_model_matches(self):
         invoker = CCInvoker()
@@ -108,7 +108,7 @@ class TestParseResultDictDowngrade:
             "result": "response text",
             "total_cost_usd": 0.1,
             "usage": {"input_tokens": 100, "output_tokens": 50},
-            "modelUsage": {"claude-opus-4-6": {"input_tokens": 100}},
+            "modelUsage": {"claude-opus-4-8": {"input_tokens": 100}},
         }
         output = invoker._parse_result_dict(result_data, inv, 1000)
         assert output.downgraded is False
@@ -125,13 +125,13 @@ class TestDowngradeCallback:
         invoker = CCInvoker(on_model_downgrade=callback)
 
         output = CCOutput(
-            session_id="s1", text="hi", model_used="claude-sonnet-4-6",
+            session_id="s1", text="hi", model_used="claude-sonnet-5",
             cost_usd=0.0, input_tokens=0, output_tokens=0,
             duration_ms=0, exit_code=0,
             model_requested="opus", downgraded=True,
         )
         await invoker._fire_downgrade_callback(output)
-        callback.assert_awaited_once_with("opus", "claude-sonnet-4-6", "s1")
+        callback.assert_awaited_once_with("opus", "claude-sonnet-5", "s1")
 
     @pytest.mark.asyncio
     async def test_callback_not_fired_when_no_downgrade(self):
@@ -139,7 +139,7 @@ class TestDowngradeCallback:
         invoker = CCInvoker(on_model_downgrade=callback)
 
         output = CCOutput(
-            session_id="s1", text="hi", model_used="claude-opus-4-6",
+            session_id="s1", text="hi", model_used="claude-opus-4-8",
             cost_usd=0.0, input_tokens=0, output_tokens=0,
             duration_ms=0, exit_code=0,
             model_requested="opus", downgraded=False,
@@ -153,7 +153,7 @@ class TestDowngradeCallback:
         invoker = CCInvoker(on_model_downgrade=callback)
 
         output = CCOutput(
-            session_id="s1", text="hi", model_used="claude-sonnet-4-6",
+            session_id="s1", text="hi", model_used="claude-sonnet-5",
             cost_usd=0.0, input_tokens=0, output_tokens=0,
             duration_ms=0, exit_code=0,
             model_requested="opus", downgraded=True,
@@ -166,7 +166,7 @@ class TestDowngradeCallback:
     async def test_no_callback_configured(self):
         invoker = CCInvoker()  # no on_model_downgrade
         output = CCOutput(
-            session_id="s1", text="hi", model_used="claude-sonnet-4-6",
+            session_id="s1", text="hi", model_used="claude-sonnet-5",
             cost_usd=0.0, input_tokens=0, output_tokens=0,
             duration_ms=0, exit_code=0,
             model_requested="opus", downgraded=True,

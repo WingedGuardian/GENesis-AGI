@@ -7,12 +7,18 @@ not-bootstrapped guards, and the retire (resolve) contract incl. 400/404/503.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from flask import Flask
 
 from genesis.dashboard.api import blueprint
+
+# Dates relative to now so the resolved-history recency window (14 days) is
+# pinned on BOTH sides without a fixed calendar date that rots after 14 days.
+_RECENT_RESOLVED = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+_STALE_RESOLVED = (datetime.now(UTC) - timedelta(days=30)).isoformat()
 
 
 @pytest.fixture()
@@ -71,7 +77,12 @@ def _grow(id_, origin):
 def _list_directives_side_effect(db, *, statuses=("active",), limit=20, **_kw):
     if "active" in statuses:
         return [_drow("c60", "genesis_ego", "active"), _drow("u1", "user_ego", "active")]
-    return [_drow("old", "user_ego", "completed", resolved_at="2026-07-19T00:00:00+00:00")]
+    # Two resolved rows: one inside the 14-day recency window, one outside.
+    # The route surfaces only the recent one.
+    return [
+        _drow("recent", "user_ego", "completed", resolved_at=_RECENT_RESOLVED),
+        _drow("stale", "user_ego", "completed", resolved_at=_STALE_RESOLVED),
+    ]
 
 
 class TestEgoDirectives:
@@ -86,7 +97,8 @@ class TestEgoDirectives:
             MockRT.instance.return_value = _rt()
             data = client.get("/api/genesis/ego/directives").get_json()
             assert [d["id"] for d in data["active"]] == ["c60", "u1"]
-            assert [d["id"] for d in data["resolved"]] == ["old"]
+            # Recency window drops resolved rows older than 14 days.
+            assert [d["id"] for d in data["resolved"]] == ["recent"]
             # payload projection carries priority/target/reaffirm for the panel
             assert data["active"][0]["ego_target"] == "genesis_ego"
             assert data["active"][0]["reaffirm_count"] == 0

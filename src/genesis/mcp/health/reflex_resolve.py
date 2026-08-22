@@ -4,7 +4,7 @@ The afferent nerve ingests signals but, until the diagnose/fix lanes ship, a
 signal has no way to LEAVE the ``new`` lane — it sits on the dashboard forever.
 This tool is the human exit: it moves a signal to a terminal status and, for a
 dismissal, records the judgment as a taste-corpus verdict (the spec's "a signal
-Jay dismisses is a verdict, not just deleted").
+the user dismisses is a verdict, not just deleted").
 
 Three dispositions, mapped to the schema's constrained vocabularies:
 
