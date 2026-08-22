@@ -543,7 +543,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 17140a65 2026-08-11
+verified: e425b35c 2026-08-21
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -591,10 +591,14 @@ verified: 17140a65 2026-08-11
   `off`/`observe`/`live` + `GENESIS_CAREER_OUTREACH_DISABLED` kill). Bridge
   lazy-resolved at tick; `execute_operation` returns an error DICT (never raises)
   so a dispatch error surfaces → job-health failure; `check_health_cached` gates;
-  absent-module → clean no-op (generic installs). The external engine's own
-  staged-draft state is the source of truth; a `career_outreach_nudged` observation is the
-  per-company nudge-dedup ledger so a re-tick / undelivered nudge never
-  double-nudges. ONE daily job (`max_instances=1` is per-job; a second would race
+  absent-module → clean no-op (generic installs). The owner nudge lists the drafts
+  THIS tick's auto-run staged (the engine's own `Staged` replies — no mailbox census,
+  which is unreliable: a bare SSH `claude -p` read answers from priors, returning a
+  false-empty list); a `career_outreach_nudged` observation is the per-company
+  nudge-dedup ledger. Observe mode is a bridge-REACHABILITY probe (a minimal dispatch
+  proving the `claude -p` hop answers — module `check_health_cached` alone does not,
+  it passes even when the remote's model auth is dead), NOT a seeder. ONE daily job
+  (`max_instances=1` is per-job; a second would race
   the single remote). Discovery-sweep driving is GROUNDWORK-deferred. The auto-run
   drives the engine's COMPLETE flow INCLUDING its own accuracy/verification gate
   (never bypassed) under a headless contract. The reply is classified ONCE into a

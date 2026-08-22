@@ -49,6 +49,26 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **A scheduled job that has run repeatedly but never once succeeded now raises a
+  health alert.** Such a job was invisible to every alarm: the "silently failing"
+  check needs a prior success to measure a gap against, and the consecutive-failure
+  counter resets on every restart. So a job that failed from its very first run —
+  e.g. a daily actuator whose external login expired on day one — could fail silently
+  for weeks. A new restart-proof check (using the monotonic lifetime run/failure
+  counters) surfaces any job with zero successes and repeated failures as a WARNING
+  health alert (dashboard + health surface). It is deliberately out of Sentinel's
+  auto-remediation scope — a never-succeeded job is a config/auth/code defect a
+  service restart cannot fix — and is not auto-escalated to Telegram.
+- **The career-outreach monitor now nudges reliably from what it staged, and its
+  `observe` mode surfaces a dead career-agent bridge instead of failing silently.**
+  The daily monitor used to re-derive its owner nudge by asking the external
+  career-agent to enumerate its staged drafts — an unreliable read that came back
+  empty, so newly-staged drafts were never surfaced; and `observe` mode could fail
+  silently for days when the agent's login expired. It now nudges directly from the
+  drafts each tick actually staged (deterministic), and `observe` is a lightweight
+  reachability probe that records a job-health failure when the bridge can't answer.
+  Still ships `off`.
+
 - **FTS5 recall no longer starves on multi-word queries.** `_prepare_fts5` builds a
   bare space-separated FTS5 MATCH, which SQLite treats as an implicit AND — so a
   verbose query (`reference_lookup` / `knowledge_recall` natural-language text, and
@@ -164,6 +184,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   every poll.
 
 ### Added
+
+- **One-click "lobby" terminal door — reattach the whole CC fleet after a client
+  reboot.** `generate-ssh-config.sh` now emits a dedicated `Host <host>-lobby`
+  block (placed ahead of the numeric-slot wildcard, since ssh takes the first
+  matching `RemoteCommand`) that attaches a stable `lobby` tmux session on the
+  same socket as the `cc-*` slots and opens straight into the session picker
+  (`choose-tree`). One reconnect brings every live session back — they persist in
+  tmux on the box, only the client died — pick any slot and jump in (`Ctrl-b s`
+  reopens the picker). All emitted blocks are keyed on the stable Tailscale IP
+  (not the MagicDNS name), so they keep resolving even when the client's DNS is
+  disrupted. `lobby` is not a `cc-N` name, so it never consumes a slot or trips
+  the slot cap, and numeric-slot routing through `cc-slot.sh` is unchanged. Pair
+  with one Windows Terminal shortcut (`wt.exe ssh <host>-lobby`) for a
+  one-double-click return to the whole fleet.
 
 - **Claude Code session exits are recorded.** When a CC session's process exits
   — a clean quit, a crash, or an OS/kill signal — its exit status (with a

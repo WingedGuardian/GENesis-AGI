@@ -99,18 +99,28 @@ Two mechanisms make this observable and survivable without host access:
    only booleans and an age.
 
 2. **Fallback setup-token (optional, lazy).** Mint a 1-year token from ANY
-   machine with `claude setup-token` and pipe it to `scripts/store_cc_token.sh`
-   in the container (stdin only — never an argument). The credential-bridge
-   awareness tick syncs it to the host shared mount
-   (`~/.local/state/genesis-guardian/shared/guardian/cc_oauth_token.env`), and
-   `diagnosis.py` injects it via `CLAUDE_CODE_OAUTH_TOKEN` **only** when a
-   pre-flight `claude auth status` confirms the host's own login is dead — a
-   working login is never overridden. Remove it with
-   `scripts/store_cc_token.sh --remove`.
+   machine with `claude setup-token` and give it to `scripts/store_cc_token.sh`
+   in the container — pipe it on stdin, or (the interactive `setup-token` makes
+   piping awkward) write it to a file and pass `--file /path/to/token`, never a
+   bare argument. Create that file `0600` — e.g. `(umask 077; claude setup-token
+   > tok)` — and `rm` it after storing; it holds the raw token in plaintext (the
+   script warns if the source is group/other-readable). The credential-bridge awareness tick
+   syncs it to the host shared mount
+   (`~/.local/state/genesis-guardian/shared/guardian/cc_oauth_token.env`). It is
+   a **shared fallback** read by two consumers, each of which injects it via
+   `CLAUDE_CODE_OAUTH_TOKEN` **only** when its own login is confirmed dead: the
+   **host** Guardian recovery brain (`diagnosis.py`, gated on a pre-flight
+   `claude auth status`) and the **container's own** CC sessions
+   (`cc/login_health.py`, wired at `cc/invoker.py`). A healthy login is never
+   overridden. Remove it with `scripts/store_cc_token.sh --remove`. The
+   authoritative consumer list is CI-enforced in
+   `docs/architecture/shared-artifacts.md`.
 
    The token lives in a **dedicated** file, never `secrets.env` (which is
-   `load_dotenv`'d with `override=True` and would hijack the *container's* own
-   CC auth). It is a subscription-OAuth token, **not** an `ANTHROPIC_API_KEY` —
+   `load_dotenv`'d with `override=True` and would *unconditionally* set
+   `CLAUDE_CODE_OAUTH_TOKEN` for every process that loads it, hijacking a
+   *healthy* container login; the dedicated file is injected conditionally
+   instead). It is a subscription-OAuth token, **not** an `ANTHROPIC_API_KEY` —
    the no-API-key posture is unchanged.
 
 You can mint the token proactively at install, or defer it entirely: the first
