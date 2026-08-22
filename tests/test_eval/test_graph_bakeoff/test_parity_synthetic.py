@@ -172,6 +172,44 @@ def test_resolve_anchors_on_synthetic(fixture_db):
     assert a["q2_decision_chain"]["contradicts_edges"] == 2
 
 
+def test_q3_anchor_none_when_no_source_has_three_valid_neighbors(tmp_path):
+    """q3's frozen anchor_sql carries ``HAVING count(*) >= 3``: on a snapshot where
+    the best source has only two validity-bearing out-neighbors, the anchor MUST
+    resolve to None rather than fall back to a 1-or-2-link source (which would
+    silently benchmark an easier workload than the preregistered query)."""
+    path = tmp_path / "sub3.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE memory_links (source_id TEXT, target_id TEXT, link_type TEXT, strength REAL);
+        CREATE TABLE memory_metadata (memory_id TEXT, valid_at TEXT, invalid_at TEXT,
+            deprecated INTEGER, deprecated_at TEXT, created_at TEXT);
+        CREATE TABLE entity_mentions (memory_id TEXT, entity_id TEXT);
+        CREATE TABLE entities (entity_id TEXT, name TEXT);
+        CREATE TABLE entity_links (source_id TEXT, target_id TEXT, link_type TEXT,
+            valid_at TEXT, invalid_at TEXT);
+        """
+    )
+    # s1 has three out-links, but only t1/t2 carry validity data; t3's valid_at is
+    # NULL, so the qualifying count is 2 (< 3) → q3 must resolve to None.
+    conn.executemany(
+        "INSERT INTO memory_links VALUES (?,?,?,?)",
+        [("s1", "t1", "rel", 1.0), ("s1", "t2", "rel", 1.0), ("s1", "t3", "rel", 1.0)],
+    )
+    conn.executemany(
+        "INSERT INTO memory_metadata VALUES (?,?,?,?,?,?)",
+        [
+            ("t1", "2026-01-01", None, 0, None, "2026-01-01"),
+            ("t2", "2026-01-02", None, 0, None, "2026-01-02"),
+            ("t3", None, None, 0, None, "2026-01-03"),  # NULL valid_at → excluded
+        ],
+    )
+    conn.commit()
+    conn.close()
+    a = resolve_anchors(str(path))
+    assert a["q3_as_of_neighborhood"]["memory_id"] is None
+
+
 def _bfs_supports_reachable(edges, start, targets, max_depth):
     """Independent re-implementation for q2 cross-check (avoid mirroring the impl)."""
     adj = {}

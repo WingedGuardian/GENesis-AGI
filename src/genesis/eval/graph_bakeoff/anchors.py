@@ -49,12 +49,16 @@ def resolve_anchors(snapshot_path: str) -> dict:
         )
         q1 = {"entity_id": r[0] if r else None, "mention_count": r[1] if r else 0}
 
-        # q3: a memory with >=3 out-neighbors carrying validity data + pinned date D
+        # q3: a memory with >=3 out-neighbors carrying validity data + pinned date D.
+        # The HAVING count(*) >= 3 is the FROZEN qualification from queries.py's
+        # q3 anchor_sql — without it a snapshot with no >=3-neighbor source would
+        # anchor on a 1-or-2-link source, silently benchmarking an easier workload
+        # than the preregistered query (anchor must resolve to None instead).
         r = _one(
             conn,
             "SELECT ml.source_id, count(*) c FROM memory_links ml JOIN memory_metadata mm "
             "ON mm.memory_id = ml.target_id WHERE mm.valid_at IS NOT NULL "
-            "GROUP BY ml.source_id ORDER BY c DESC LIMIT 1",
+            "GROUP BY ml.source_id HAVING count(*) >= 3 ORDER BY c DESC LIMIT 1",
         )
         q3 = {"memory_id": r[0] if r else None, "as_of": _median_created_at(conn)}
 

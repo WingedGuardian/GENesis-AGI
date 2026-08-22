@@ -48,10 +48,15 @@ def cmd_export(args) -> int:
 
 def cmd_anchors(args) -> int:
     snap = Path(args.snapshot) if args.snapshot else _default_snapshot(args.stamp)
-    manifest = (
-        json.loads((OUT / "manifest.json").read_text()) if (OUT / "manifest.json").exists() else {}
-    )
-    sha = manifest.get("sha256", "unknown")
+    if not snap.exists():
+        print(f"snapshot not found: {snap} (run `export` first)", file=sys.stderr)
+        return 1
+    # Derive the hash from the SELECTED snapshot, never from OUT/manifest.json:
+    # `--snapshot` may point at an older/external snapshot while manifest.json
+    # holds the LATEST export's sha, which would mislabel anchors resolved from a
+    # different DB (defeating the per-snapshot reproducibility guarantee). Reuse
+    # export's canonical hasher rather than reinventing it.
+    sha = export_mod._sha256(snap)
     dest = write_anchors(str(snap), sha, OUT)
     print(f"anchors -> {dest}")
     print(dest.read_text())
