@@ -169,9 +169,10 @@ REMEDIATION_PREFIX_MAP: dict[str, frozenset[str]] = {
 
 # Alert ids/prefixes (a trailing ":" marks a prefix) deliberately excluded
 # from Sentinel scope, with the reason. These stay user-visible: the alerts
-# still appear on the dashboard and health digest, and the ids below are on
-# the outreach immediate-escalation whitelist (outreach/config.py) so real
-# failures still ping the user — they just never wake the firefighter.
+# still appear on the dashboard and health digest, and MANY of the ids below are
+# on the outreach immediate-escalation whitelist (outreach/config.py) so those
+# failures still ping the user; others (e.g. job_never_succeeded:, ledger:*) are
+# dashboard/health-only by decision — either way they never wake the firefighter.
 UNMAPPED_BY_DESIGN: dict[str, str] = {
     "backup:": (
         "Backup targets are external (remote git repo / S3 / NAS) — both "
@@ -261,6 +262,14 @@ UNMAPPED_BY_DESIGN: dict[str, str] = {
         "escalation note. A code bug for the developer/ego to fix at the "
         "source (same posture as the other ledger alarms). WARNING-level "
         "observability."
+    ),
+    "job_never_succeeded:": (
+        "A scheduled job that has run and failed repeatedly but never once "
+        "succeeded is failing on a config/auth/code defect (e.g. an expired "
+        "external login) — NOT a recoverable process wedge, so a "
+        "container.services restart cannot fix it (contrast job_stale:, which "
+        "IS restartable). It stays a user-visible WARNING health alert for a "
+        "human to fix at the source; the firefighter is never woken for it."
     ),
 }
 
