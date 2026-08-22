@@ -99,6 +99,21 @@ def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
     return value == ChannelType.TELEGRAM.value
 
 
+def is_owner_attended_channel(channel: ChannelType | str | None) -> bool:
+    """Whether a conversation on *channel* is owner-authenticated at the message
+    boundary — the single owner-ATTENDED channel set (terminal, Telegram).
+
+    Every gateway channel (web/OpenClaw, WhatsApp, voice) is NOT owner-
+    authenticated when a message arrives, and an unknown/None channel is treated
+    as not-attended (fail-closed). This is the one predicate for owner-vs-gateway
+    trust at the conversation boundary; both :func:`task_detected_origin` (what
+    origin a detected task carries) and the CC ``supervised`` flag (gate-4
+    pushed-surfaces enforce exemption) derive from it, so they can never diverge.
+    """
+    value = channel.value if isinstance(channel, ChannelType) else str(channel or "")
+    return value in (ChannelType.TERMINAL.value, ChannelType.TELEGRAM.value)
+
+
 def task_detected_origin(channel: ChannelType | str | None) -> str:
     """WS-3 origin_class to stamp on a ``task_detected`` observation, by channel.
 
@@ -115,10 +130,7 @@ def task_detected_origin(channel: ChannelType | str | None) -> str:
     """
     from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_OWNER
 
-    value = channel.value if isinstance(channel, ChannelType) else str(channel or "")
-    if value in (ChannelType.TERMINAL.value, ChannelType.TELEGRAM.value):
-        return ORIGIN_OWNER
-    return ORIGIN_EXTERNAL_UNTRUSTED
+    return ORIGIN_OWNER if is_owner_attended_channel(channel) else ORIGIN_EXTERNAL_UNTRUSTED
 
 
 class CCModel(StrEnum):

@@ -108,6 +108,23 @@ def test_task_detected_origin_owner_vs_gateway():
     assert task_detected_origin("some_future_channel") == "external_untrusted"
 
 
+def test_is_owner_attended_channel():
+    """WS-3 gate-4: the single owner-attended predicate driving both
+    task_detected origin and the CC supervised flag."""
+    from genesis.cc.types import is_owner_attended_channel
+
+    assert is_owner_attended_channel(ChannelType.TERMINAL) is True
+    assert is_owner_attended_channel(ChannelType.TELEGRAM) is True
+    assert is_owner_attended_channel("terminal") is True
+    assert is_owner_attended_channel("telegram") is True
+    # gateway channels are NOT owner-attended (the gate-4 fix)
+    for ch in (ChannelType.WEB, ChannelType.WHATSAPP, ChannelType.VOICE):
+        assert is_owner_attended_channel(ch) is False, ch
+    # fail-closed on unknown/None
+    assert is_owner_attended_channel(None) is False
+    assert is_owner_attended_channel("some_future_channel") is False
+
+
 # --- StreamEvent tests ---
 
 
