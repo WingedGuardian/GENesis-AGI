@@ -131,3 +131,52 @@ def test_wrong_password_is_rejected(serve_dashboard, browser_page):
     # And a fresh load still gates — no session was created by the bad login.
     browser_page.goto(f"{base}/genesis", wait_until="load")
     assert "/genesis/login" in browser_page.url, "bad login must not authenticate"
+
+
+def test_dashboard_routes_isolated_from_real_home(serve_dashboard):
+    """Regression (Codex P1 + review sweep): dashboard route modules bind host paths
+    from ``Path.home()`` AT IMPORT (not ``GENESIS_HOME``). The shell polls several on
+    load — ``/updates/status`` WRITES the real prod DB, ``/files`` READS the real home
+    tree (and exposes write/delete routes), ``/setup-status`` READS. Building the
+    dashboard MUST redirect ALL of them off the real home. No browser needed — this
+    asserts the isolation invariant directly, across the whole swept class.
+    """
+    import os
+    from pathlib import Path
+
+    # Capture the REAL home BEFORE serve_dashboard() patches HOME.
+    real_home = Path(os.path.expanduser("~"))
+
+    serve_dashboard()  # builds the dashboard app → applies the isolation
+
+    from genesis.dashboard.routes import backup, files, setup, updates
+
+    def _under_real_home(p) -> bool:
+        return (
+            str(p).startswith(str(real_home / "genesis"))
+            or str(p).startswith(str(real_home / ".genesis"))
+            or str(p).startswith(str(real_home / ".claude"))
+        )
+
+    # updates.py — the original P1 WRITE target, plus its sibling state files.
+    assert not _under_real_home(updates._DB_PATH), (
+        f"updates._DB_PATH not isolated: {updates._DB_PATH}"
+    )
+    assert not _under_real_home(updates._FAILURE_FILE), (
+        f"updates._FAILURE_FILE not isolated: {updates._FAILURE_FILE}"
+    )
+    # files.py — the BLOCKER: /files reads _ALLOWED_ROOTS, write/delete routes use them.
+    assert all(not _under_real_home(r) for r in files._ALLOWED_ROOTS), (
+        f"files._ALLOWED_ROOTS not isolated: {files._ALLOWED_ROOTS}"
+    )
+    assert not _under_real_home(files._UPLOAD_DIR), (
+        f"files._UPLOAD_DIR not isolated: {files._UPLOAD_DIR}"
+    )
+    # setup.py — polled every load.
+    assert not _under_real_home(setup._SETUP_COMPLETE_MARKER), (
+        f"setup._SETUP_COMPLETE_MARKER not isolated: {setup._SETUP_COMPLETE_MARKER}"
+    )
+    # backup.py — /backup/config writes secrets + toggles the real timer.
+    assert not _under_real_home(backup._STATUS_FILE), (
+        f"backup._STATUS_FILE not isolated: {backup._STATUS_FILE}"
+    )
