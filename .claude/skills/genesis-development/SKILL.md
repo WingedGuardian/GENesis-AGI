@@ -788,8 +788,11 @@ outlives its incident is a bug.
 **Canonical pre-merge check:** run
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
 BEFORE proposing a merge. It runs the SAME functions the enforcement gate uses
-(mergeable → CI → base-invariant → Codex-freshness → review-body → inline
-findings), so the report and the gate can never disagree — never hand-roll a
+(mergeable → CI → base-invariant → Codex-freshness → scheduled-Claude-review →
+review-body → inline findings), so the report and the gate can never disagree —
+this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
+the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
+before any merge** — never hand-roll a
 gh/jq review check (a hand-rolled query once used the GraphQL bot login on the
 REST endpoint, matched nothing, and reported "Codex clean" while P2s sat unread).
 When all gates pass it prints the exact atomic merge command to copy
@@ -816,13 +819,27 @@ findings below, a gated `gh pr merge`:
   touch-up) — the merge is then still bound to the exact head that was
   classified. A substantial or unclassifiable delta blocks; an ABSENT review
   always blocks;
+- requires **every scheduled Claude review at the current head**. Each scheduled
+  Claude review (a `/schedule` cloud routine) posts as the repo OWNER's account and
+  must carry a marker `<!-- genesis-scheduled-review: head=<full-40-hex-sha> kind=<name> -->`
+  naming the exact head it reviewed AND which routine it is (`kind`). The gate blocks
+  unless an owner-authored marker for EVERY kind in `_REQUIRED_SCHEDULED_REVIEW_KINDS`
+  (currently `code-review` + `leaks`) names the PR's current head — so if any required
+  routine never ran, ran on a stale commit, or was rate-limited, the merge blocks
+  (naming the missing kinds). If a routine is pending or rate-limited, wait for it, or
+  append `# scheduled-review-override` to merge anyway (the conscious "merge without the
+  scheduled reviews" case). The marker means "ran **clean**", not merely "ran": a
+  review whose body carries a blocking finding (`[P1]`/`HARD BLOCK`/`### ERROR`, unless a
+  clean verdict overrides) is rejected, and DISMISSED/PENDING(draft) reviews don't count.
+  Fail-closed: an unreadable comments/reviews fetch BLOCKS (never a false all-clear);
 - requires the PR base to equal the repo's default branch (retarget guard);
 - blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
   does not merge).
 - **Override sigils are split by boundary** so one waiver can't silently disarm
   an unrelated gate: `# review-override` waives ONLY the finding scans
   (review-body + inline P1s); `# stale-review-override` waives ONLY the
-  review-context gates (Codex-at-head freshness + base-invariant); CI is
+  review-context gates (Codex-at-head freshness + base-invariant);
+  `# scheduled-review-override` waives ONLY the scheduled-Claude-review gate; CI is
   `# ci-override`. Append several sigils in one trailing comment when several
   waivers are genuinely intended — but the right fix for a stale review is
   `@codex review`, not the sigil.

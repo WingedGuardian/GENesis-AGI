@@ -457,6 +457,85 @@ async def test_find_site_pending_ignores_non_pending(
     assert found is None
 
 
+def _gate_off(runtime, approval_manager):
+    """A gate whose policy has the mandatory approval gate DISABLED."""
+    return AutonomousCliApprovalGate(
+        runtime=runtime,
+        approval_manager=approval_manager,
+        policy_loader=lambda: AutonomousCliPolicy(manual_approval_required=False),
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_site_pending_none_when_gate_disabled(
+    runtime, approval_gate, approval_manager,
+):
+    """Gate off: a LEFTOVER pending row (raised while the gate was on) must not
+    park the caller. The pre-flight reports nothing pending so the cycle
+    proceeds to the auto-approving gate — this is the ego-deadlock fix."""
+    # Seed a pending row under the gate-ON view.
+    await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="user_ego_cycle",
+        action_label="user ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert await approval_gate.find_site_pending(
+        subsystem="ego", policy_id="user_ego_cycle",
+    ) is not None
+    # Same manager, gate flipped OFF → the stale row must not block.
+    gate_off = _gate_off(runtime, approval_manager)
+    assert await gate_off.find_site_pending(
+        subsystem="ego", policy_id="user_ego_cycle",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_approval_gate_off_cancels_stale_site_row(
+    runtime, approval_gate, approval_manager,
+):
+    """Gate off: ensure_approval returns approved AND cancels the leftover
+    pending row for the same site, so the dashboard stops showing a stale
+    'action required'."""
+    _, req_id, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="user_ego_cycle",
+        action_label="user ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert (await approval_manager.get_by_id(req_id))["status"] == "pending"
+
+    gate_off = _gate_off(runtime, approval_manager)
+    status, request_id, _reason = await gate_off.ensure_approval(
+        subsystem="ego", policy_id="user_ego_cycle",
+        action_label="user ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert status == "approved"
+    assert request_id is None
+    assert (await approval_manager.get_by_id(req_id))["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_ensure_approval_gate_off_cleanup_is_site_scoped(
+    runtime, approval_gate, approval_manager,
+):
+    """Gate-off cleanup is scoped to the dispatching site: a pending row for a
+    DIFFERENT (subsystem, policy_id) is left untouched — one ego's dispatch
+    never sweeps the other ego's (or an email/contributor) approval."""
+    _, other_id, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="genesis_ego_cycle",
+        action_label="genesis ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    gate_off = _gate_off(runtime, approval_manager)
+    await gate_off.ensure_approval(
+        subsystem="ego", policy_id="user_ego_cycle",
+        action_label="user ego cycle", invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    # The other site's row is still pending — not swept.
+    assert (await approval_manager.get_by_id(other_id))["status"] == "pending"
+
+
 @pytest.mark.asyncio
 async def test_get_pending_count_counts_only_cli_fallback(
     approval_gate, approval_manager,
@@ -797,6 +876,224 @@ async def test_failed_delivery_does_not_advance_reask_window(
     # and never retry.
     assert context["last_sent_at"] is None
     assert context["next_reask_at"] is None
+
+
+def test_load_policy_reask_zero_and_overrides(tmp_path: Path, monkeypatch):
+    """reask_interval_hours: 0 (= never re-ask) must survive loading — the old
+    parser swallowed 0 via `or 24` then clamped via max(1, …). Per-policy
+    overrides map policy_id -> hours, 0 allowed; unlisted policies use the
+    global value. (2026-08-18 user directive: inbox never re-asks; ego /
+    reflection behavior unchanged.)"""
+    monkeypatch.setattr("genesis._config_overlay._user_config_dir", lambda: tmp_path)
+    path = tmp_path / "autonomous_cli_policy.yaml"
+    path.write_text(
+        "reask_interval_hours: 0\n"
+        "reask_overrides:\n"
+        "  inbox_evaluation: 0\n"
+        "  ego_cycle: 12\n",
+    )
+    policy = load_autonomous_cli_policy(path)
+    assert policy.reask_interval_hours == 0
+    assert policy.reask_hours_for("inbox_evaluation") == 0
+    assert policy.reask_hours_for("ego_cycle") == 12
+    # Unlisted policy falls back to the global value.
+    assert policy.reask_hours_for("reflection_deep") == 0
+
+    # Global default without the key stays 24; negative values clamp to 0.
+    path2 = tmp_path / "p2" / "autonomous_cli_policy.yaml"
+    path2.parent.mkdir()
+    path2.write_text("reask_overrides:\n  inbox_evaluation: -5\n")
+    policy2 = load_autonomous_cli_policy(path2)
+    assert policy2.reask_interval_hours == 24
+    assert policy2.reask_hours_for("inbox_evaluation") == 0
+
+
+def test_shipped_config_silences_inbox_reask(tmp_path: Path, monkeypatch):
+    """Lock the SHIPPED config artifact, not just the code paths: a yaml typo
+    in config/autonomous_cli_policy.yaml would silently revert inbox to 24h
+    reminders with every synthetic-yaml test still green."""
+    import genesis.autonomy.cli_policy as cli_policy_mod
+
+    # Keep a developer's real ~/.genesis overlay from masking the shipped file.
+    monkeypatch.setattr("genesis._config_overlay._user_config_dir", lambda: tmp_path)
+    shipped = (
+        Path(cli_policy_mod.__file__).resolve().parents[3]
+        / "config"
+        / "autonomous_cli_policy.yaml"
+    )
+    policy = load_autonomous_cli_policy(shipped)
+    assert policy.reask_hours_for("inbox_evaluation") == 0
+    assert policy.reask_hours_for("sentinel_dispatch") == 24
+    assert policy.manual_approval_required is True
+
+
+@pytest.mark.asyncio
+async def test_positive_override_sets_next_reask_window(runtime, approval_manager):
+    """A nonzero per-policy override must flow through _send_request into the
+    stored next_reask_at window (not just the loader)."""
+    import json as _json
+    from datetime import UTC, datetime
+
+    gate = AutonomousCliApprovalGate(
+        runtime=runtime,
+        approval_manager=approval_manager,
+        policy_loader=lambda: AutonomousCliPolicy(
+            manual_approval_required=True,
+            reask_overrides={"ego_cycle": 12},
+        ),
+    )
+    _, request_id, _ = await gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=_invocation(),
+        api_call_site_id="7_ego_cycle", api_error="api down",
+    )
+    row = await approval_manager.get_by_id(request_id)
+    context = _json.loads(row["context"])
+    next_dt = datetime.fromisoformat(context["next_reask_at"])
+    delta_hours = (next_dt - datetime.now(UTC)).total_seconds() / 3600
+    assert 11.5 < delta_hours <= 12.5
+
+
+def _gate_with_inbox_never_reask(runtime, approval_manager):
+    return AutonomousCliApprovalGate(
+        runtime=runtime,
+        approval_manager=approval_manager,
+        policy_loader=lambda: AutonomousCliPolicy(
+            manual_approval_required=True,
+            reask_overrides={"inbox_evaluation": 0},
+        ),
+    )
+
+
+async def _backdate_reask(approval_manager, request_id: str) -> None:
+    """Simulate a legacy pre-deploy row whose next_reask_at already passed."""
+    import json as _json
+
+    row = await approval_manager.get_by_id(request_id)
+    context = _json.loads(row["context"])
+    context["next_reask_at"] = "2020-01-01T00:00:00+00:00"
+    await approval_manager._db.execute(
+        "UPDATE approval_requests SET context = ? WHERE id = ?",
+        (_json.dumps(context), request_id),
+    )
+    await approval_manager._db.commit()
+
+
+@pytest.mark.asyncio
+async def test_reask_zero_no_resend_even_past_legacy_window(
+    runtime, approval_manager,
+):
+    """With reask 0 for a policy, a DELIVERED pending approval is never
+    re-sent — including legacy rows whose stored next_reask_at (written
+    before the reask-0 deploy) is already in the past."""
+    gate = _gate_with_inbox_never_reask(runtime, approval_manager)
+    status, request_id, _ = await gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert status == "pending"
+    assert len(runtime.pipeline.sent) == 1
+
+    await _backdate_reask(approval_manager, request_id)
+
+    status2, request_id2, reason2 = await gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert status2 == "pending"
+    assert request_id2 == request_id
+    assert len(runtime.pipeline.sent) == 1, (
+        "reask=0 must never send a reminder for a delivered request"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reask_zero_still_retries_failed_delivery(
+    runtime, approval_manager,
+):
+    """reask=0 removes REMINDERS, not delivery-failure recovery: while no
+    successful delivery is on record (delivery_id None), the next tick
+    retries the send for any approval type."""
+    gate = _gate_with_inbox_never_reask(runtime, approval_manager)
+
+    real_submit = runtime.pipeline.submit_raw
+
+    async def _fail_submit(text, request, *, reply_markup=None):
+        runtime.pipeline.sent.append((text, request, reply_markup))
+        return OutreachResult(
+            outreach_id="outreach-failed",
+            status=OutreachStatus.FAILED,
+            channel="telegram",
+            message_content=text,
+            error="simulated delivery failure",
+        )
+
+    runtime.pipeline.submit_raw = _fail_submit
+    status, request_id, _ = await gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert status == "pending"
+    assert len(runtime.pipeline.sent) == 1
+
+    # Delivery works again — the retry must fire despite reask=0 …
+    runtime.pipeline.submit_raw = real_submit
+    status2, request_id2, _ = await gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert request_id2 == request_id
+    assert len(runtime.pipeline.sent) == 2, (
+        "a never-delivered approval must retry its send even with reask=0"
+    )
+
+    # … and once delivered, it goes silent for good.
+    status3, _, _ = await gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert len(runtime.pipeline.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_reask_override_scoped_per_policy(runtime, approval_manager):
+    """The inbox override must not change other policies: with the global
+    24h interval, an ego approval whose reask window has elapsed still
+    re-sends (current, user-liked behavior preserved)."""
+    gate = _gate_with_inbox_never_reask(runtime, approval_manager)
+    status, request_id, _ = await gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=_invocation(),
+        api_call_site_id="7_ego_cycle", api_error="api down",
+    )
+    assert status == "pending"
+    assert len(runtime.pipeline.sent) == 1
+
+    await _backdate_reask(approval_manager, request_id)
+
+    status2, request_id2, reason2 = await gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=_invocation(),
+        api_call_site_id="7_ego_cycle", api_error="api down",
+    )
+    assert request_id2 == request_id
+    assert len(runtime.pipeline.sent) == 2, (
+        "non-overridden policies keep the 24h re-ask behavior"
+    )
+    assert "reminder" in reason2
 
 
 @pytest.mark.asyncio

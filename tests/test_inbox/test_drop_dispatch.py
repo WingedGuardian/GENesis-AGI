@@ -806,22 +806,46 @@ async def test_watch_bookmark_route_to_tabled_lane(
 
 
 @pytest.mark.asyncio
-async def test_consume_approval_returns_bool(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path):
+async def test_consume_approval_tri_state(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, caplog,
+):
+    """_consume_approval distinguishes the three outcomes (F5, red-team
+    2026-08-18): consumed-now, already-consumed (sibling drop this pass OR
+    cross-tick crash recovery — both proceed; the row claim is the at-most-once
+    gate), and transient FAILURE (retried once, then ERROR — a stale
+    approved-unconsumed request is rideable by a later NEW drop)."""
+    import logging
+
     mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
-    # No dispatcher wired → nothing to consume → True (proceed).
-    assert await mon._consume_approval("req") is True
-    # mark_consumed returns False (already consumed) → False.
+    # No dispatcher wired → nothing to consume → "no_gate" (proceed).
+    assert await mon._consume_approval("req") == "no_gate"
+    # First consume wins → "consumed".
+    mon._autonomous_dispatcher = SimpleNamespace(
+        approval_gate=SimpleNamespace(mark_consumed=AsyncMock(return_value=True)),
+    )
+    assert await mon._consume_approval("req") == "consumed"
+    # mark_consumed returns False → "already_consumed" (normal multi-drop
+    # fanout / crash recovery — NOT an error).
     mon._autonomous_dispatcher = SimpleNamespace(
         approval_gate=SimpleNamespace(mark_consumed=AsyncMock(return_value=False)),
     )
-    assert await mon._consume_approval("req") is False
-    # mark_consumed raises (transient) → False (not swallowed silently).
+    assert await mon._consume_approval("req") == "already_consumed"
+    # Transient raise then success → retried once → "consumed".
+    flaky = AsyncMock(side_effect=[RuntimeError("db lock"), True])
     mon._autonomous_dispatcher = SimpleNamespace(
-        approval_gate=SimpleNamespace(
-            mark_consumed=AsyncMock(side_effect=RuntimeError("db lock")),
-        ),
+        approval_gate=SimpleNamespace(mark_consumed=flaky),
     )
-    assert await mon._consume_approval("req") is False
+    assert await mon._consume_approval("req") == "consumed"
+    assert flaky.await_count == 2
+    # Persistent failure → "failed" + ERROR (loud: rideable-approval risk).
+    with caplog.at_level(logging.ERROR):
+        mon._autonomous_dispatcher = SimpleNamespace(
+            approval_gate=SimpleNamespace(
+                mark_consumed=AsyncMock(side_effect=RuntimeError("db lock")),
+            ),
+        )
+        assert await mon._consume_approval("req") == "failed"
+    assert any("rideable" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -905,17 +929,17 @@ def _stateful_dispatcher(clock):
 
 
 @pytest.mark.asyncio
-async def test_refresh_folds_parked_files_no_oscillation(
+async def test_edit_while_pending_parks_on_same_request_no_churn(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):
-    """Two files parked on one approval + one file edited → the refresh must
-    cancel ONCE and re-park BOTH files on the fresh request.
+    """Idempotent-approval semantics (2026-08-18 user directive): an inbox
+    approval covers everything outstanding at approval time, so new/changed
+    content while the request is pending PARKS ONTO THE SAME REQUEST — no
+    cancel, no fresh request, no new Telegram message, ever.
 
-    Without folding the parked files into the refresh batch, the
-    not-refreshed file's rows are invalidated but never re-dispatched, so it
-    re-surfaces as phantom-"new" next scan and the two files leapfrog:
-    cancel + recreate every scan (a Telegram message each time) with NO disk
-    change — the 30-minute approval nag.
+    (Replaces the old cancel-once-and-refold behavior, which still sent one
+    new message per genuine edit and — via the phantom-modified storm seed —
+    one every 30 minutes when the known-hash map went stale.)
     """
     mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
     disp, gate = _stateful_dispatcher(mon._clock)
@@ -934,22 +958,75 @@ async def test_refresh_folds_parked_files_no_oscillation(
     # The user edits B while the approval is pending.
     file_b.write_text("https://example.com/b9")
 
-    # Scan 2: ONE cancel, and the refreshed request covers BOTH files.
+    # Scan 2: NO cancel, NO new request — B's old parked rows are superseded
+    # and its fresh delta parks on the SAME request; A stays parked untouched.
     await mon.check_once()
-    assert gate.cancel_calls == ["req-1"]
+    assert gate.cancel_calls == [], "edit-while-pending must not cancel"
+    assert gate.request_count == 1, "edit-while-pending must not re-request"
     parked = await inbox_items.get_awaiting_approval(db)
-    assert {p["file_path"] for p in parked} == {str(file_a), str(file_b)}, (
-        "parked files must fold into the refresh batch"
+    assert {p["file_path"] for p in parked} == {str(file_a), str(file_b)}
+    b_parked = [p for p in parked if p["file_path"] == str(file_b)]
+    # Supersession lock (F2, mutation-proven gap): exactly ONE live parked row
+    # for the edited file — a surviving pre-edit row would double-evaluate on
+    # approve.
+    assert len(b_parked) == 1, (
+        f"edited file must have exactly one parked row, got {len(b_parked)}"
     )
-    assert gate.request_count == 2
+    assert all("req-1" in (p["error_message"] or "") for p in parked)
+    assert "b9" in (b_parked[0]["batch_items"] or ""), (
+        "the re-parked drop must carry the recomputed delta"
+    )
 
-    # Scans 3-4, disk unchanged: detection stays quiet — no cancel, no new
-    # request, no dispatch. (Unfixed: A and B alternate forever.)
+    # Scans 3-4, disk unchanged: fully quiet.
     await mon.check_once()
     await mon.check_once()
-    assert gate.cancel_calls == ["req-1"], "approval churned on unchanged disk"
-    assert gate.request_count == 2
+    assert gate.cancel_calls == []
+    assert gate.request_count == 1
     assert mock_invoker.run.call_count == 0
+
+    # Approve once → everything outstanding dispatches — the fresh delta only,
+    # never the superseded pre-edit one.
+    gate.approve()
+    await mon.check_once()
+    assert mock_invoker.run.call_count >= 1
+    prompts = " ".join(c.args[0].prompt for c in mock_invoker.run.call_args_list)
+    assert "https://example.com/b9" in prompts
+    assert "https://example.com/b0" not in prompts, (
+        "superseded pre-edit delta must not dispatch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sole_file_edit_while_pending_no_cancel_no_new_request(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """F3 lock: the SINGLE-file edit-while-pending case. If the resume pass
+    ever goes back to invalidating a still-pending changed row, this file's
+    live-row count hits 0 → the orphan guard cancels → a fresh request (one
+    Telegram message per edit — the residual storm seed). With hold+supersede
+    the request survives and the fresh delta re-parks on it."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    disp, gate = _stateful_dispatcher(mon._clock)
+    mon._autonomous_dispatcher = disp
+    file_a = inbox_dir / "Genesis.md"
+    file_a.write_text(_urls(1))  # a0
+
+    await mon.check_once()  # parks on req-1
+    assert gate.request_count == 1
+
+    file_a.write_text(_urls(2))  # edit while pending: a0 + a1
+
+    await mon.check_once()
+    assert gate.cancel_calls == [], "sole-file edit must not cancel the request"
+    assert gate.request_count == 1, "sole-file edit must not mint a new request"
+    parked = await inbox_items.get_awaiting_approval(db)
+    assert len(parked) == 1
+    assert "req-1" in (parked[0]["error_message"] or "")
+    assert "a1" in (parked[0]["batch_items"] or ""), "fresh delta must be parked"
+
+    await mon.check_once()  # unchanged disk: quiet
+    assert gate.request_count == 1
+    assert gate.cancel_calls == []
 
 
 @pytest.mark.asyncio
@@ -975,24 +1052,25 @@ async def test_refresh_does_not_resurrect_deleted_parked_file(
     file_a.unlink()
     file_b.write_text("https://example.com/b9")
 
-    await mon.check_once()  # refresh: only B re-parks
+    await mon.check_once()  # A's rows invalidated (vanished); B re-parks on req-1
     parked = await inbox_items.get_awaiting_approval(db)
     assert {p["file_path"] for p in parked} == {str(file_b)}
 
-    await mon.check_once()  # deleted file stays gone; no churn
+    await mon.check_once()  # deleted file stays gone; no churn, no new request
     parked = await inbox_items.get_awaiting_approval(db)
     assert {p["file_path"] for p in parked} == {str(file_b)}
-    assert gate.request_count == 2
+    assert gate.request_count == 1, "no fresh request may be minted"
+    assert gate.cancel_calls == [], "B still live — the request must survive"
 
 
 @pytest.mark.asyncio
-async def test_fold_skips_parked_path_missing_from_disk(
+async def test_detect_leaves_parked_rows_alone_no_cancel(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):
-    """Isolates the fold's exists() guard in _phase_detect_changes: a parked
-    row whose file is gone by the time the refresh folds (deleted mid-cycle,
-    after the resume phase's own vanished-file check already ran) must be
-    invalidated but NOT folded into the refresh batch."""
+    """_phase_detect_changes with a pending approval + new content must NOT
+    cancel the request nor touch parked rows — it returns the new files for
+    normal record creation, and the resume phase alone owns vanished-file
+    invalidation. (The old cancel+invalidate+fold block is gone.)"""
     mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
     disp, gate = _stateful_dispatcher(mon._clock)
     mon._autonomous_dispatcher = disp
@@ -1010,7 +1088,7 @@ async def test_fold_skips_parked_path_missing_from_disk(
         error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-1",
     )
     live = inbox_dir / "Live.md"
-    live.write_text("https://example.com/n0")  # triggers the refresh
+    live.write_text("https://example.com/n0")
 
     new_files, modified_files = await mon._phase_detect_changes(
         inbox_dir, resumed_paths=set(),
@@ -1018,19 +1096,22 @@ async def test_fold_skips_parked_path_missing_from_disk(
 
     returned = {str(p) for p in [*new_files, *modified_files]}
     assert str(live) in returned
-    assert str(ghost) not in returned, "vanished parked file was folded"
+    assert str(ghost) not in returned
     row = await inbox_items.get_by_id(db, "row-g")
-    assert row["status"] == "failed"  # still invalidated, just not re-dispatched
-    assert gate.cancel_calls == ["req-1"]
+    assert row["status"] == "processing", (
+        "detect must not invalidate parked rows (resume owns vanish checks)"
+    )
+    assert (row["error_message"] or "").startswith("awaiting_approval:")
+    assert gate.cancel_calls == [], "detect must never cancel a live request"
 
 
 @pytest.mark.asyncio
-async def test_folded_file_reevaluates_only_unprocessed_delta(
+async def test_new_file_while_pending_joins_request_delta_only(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):
-    """A folded parked file must go through the same delta batching as any
-    modified file: URLs already evaluated in a prior approved run are NOT
-    re-evaluated when the file is folded into a refresh batch."""
+    """A new file arriving while a request is pending parks on the SAME
+    request (no cancel, no new message), and delta batching still applies:
+    URLs already evaluated in a prior approved run are NOT re-evaluated."""
     mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
     disp, gate = _stateful_dispatcher(mon._clock)
     mon._autonomous_dispatcher = disp
@@ -1047,15 +1128,17 @@ async def test_folded_file_reevaluates_only_unprocessed_delta(
     await mon.check_once()
     assert gate.request_count == 2
 
-    # A second file arrives while req-2 is pending -> refresh folds A.
+    # A second file arrives while req-2 is pending -> joins req-2. No cancel.
     file_b = inbox_dir / "Capabilities.md"
     file_b.write_text("https://example.com/b0")
     await mon.check_once()
-    assert gate.cancel_calls == ["req-2"]
+    assert gate.cancel_calls == []
+    assert gate.request_count == 2, "new file must join the pending request"
     parked = await inbox_items.get_awaiting_approval(db)
     assert {p["file_path"] for p in parked} == {str(file_a), str(file_b)}
+    assert all("req-2" in (p["error_message"] or "") for p in parked)
 
-    # Approve the merged request: only the delta + the new file are evaluated.
+    # Approve once: only the delta + the new file are evaluated.
     gate.approve()
     await mon.check_once()
     prompts = " ".join(
@@ -1065,6 +1148,38 @@ async def test_folded_file_reevaluates_only_unprocessed_delta(
     assert "https://example.com/a3" in prompts
     assert "https://example.com/b0" in prompts
     assert "https://example.com/a0" not in prompts, "re-evaluated processed URL"
+
+
+@pytest.mark.asyncio
+async def test_content_removed_while_pending_orphans_quietly(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """If the user empties a parked file while its approval is pending, the
+    parked rows are superseded, the baseline advances, and the now-orphaned
+    request is cancelled by the orphan guard — with NO replacement request
+    and NO dispatch (nothing left to evaluate)."""
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    disp, gate = _stateful_dispatcher(mon._clock)
+    mon._autonomous_dispatcher = disp
+    file_a = inbox_dir / "Genesis.md"
+    file_a.write_text(_urls(1))
+
+    await mon.check_once()  # parks on req-1
+    assert gate.request_count == 1
+
+    file_a.write_text("")   # user removes everything
+
+    await mon.check_once()  # superseded + hash advanced (+ orphan may cancel)
+    await mon.check_once()  # orphan guard has certainly run by now
+    assert gate.pending_id is None, "orphaned request must be cancelled"
+    assert gate.cancel_calls == ["req-1"]
+    assert gate.request_count == 1, "no replacement request may be minted"
+    parked = await inbox_items.get_awaiting_approval(db)
+    assert parked == []
+    assert mock_invoker.run.call_count == 0
+
+    await mon.check_once()  # and it stays quiet
+    assert gate.request_count == 1
 
 
 # ── Build-lane hook end-to-end (real monitor -> handle_eval -> greenlight) ──

@@ -199,6 +199,7 @@ _KNOWN_SIGILS = (
     "escalation-ack",
     "ci-override",
     "stale-review-override",
+    "scheduled-review-override",
 )
 
 

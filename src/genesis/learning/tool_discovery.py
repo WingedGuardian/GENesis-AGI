@@ -31,10 +31,14 @@ KNOWN_TOOLS: list[dict[str, str | None]] = [
     {
         "name": "firecrawl",
         "category": "web",
-        "description": "Web scraping and content extraction",
-        "tool_type": "mcp",
+        "description": (
+            "Web scraping and content extraction (paid cloud API; reachable "
+            "as web_fetch backend='firecrawl' or the foreground Bash CLI — "
+            "there is NO Firecrawl MCP server)"
+        ),
+        "tool_type": "provider",
         "provider": "firecrawl",
-        "cost_tier": "cheap",
+        "cost_tier": "paid",
     },
     {
         "name": "playwright",

@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -830,6 +831,137 @@ async def _resolve_infra_protection_posture(db) -> None:
             logger.info("Auto-resolved %d infra protection posture alert(s)", resolved)
     except Exception:
         logger.debug("Failed to resolve infra posture alerts", exc_info=True)
+
+
+_EGO_LIVENESS_TYPE = "ego_alert"
+_EGO_LIVENESS_SOURCES = {
+    "user_ego_cycle": "ego_liveness:user_ego_cycle",
+    "genesis_ego_cycle": "ego_liveness:genesis_ego_cycle",
+}
+_EGO_LIVENESS_LABELS = {
+    "user_ego_cycle": "User ego (CEO)",
+    "genesis_ego_cycle": "Genesis ego (COO)",
+}
+
+
+async def _check_ego_liveness(db) -> None:
+    """Alert when an ego has completed NO real cycle well past its cadence.
+
+    Reads the durable ``job_health.last_success`` (advanced ONLY on a completed
+    cycle) — never the ``is_running`` / heartbeat / ``next_fire_at`` proxies that
+    stay green while an ego is deadlocked (the 3-day-stall-reads-healthy bug).
+    Conservative thresholds (``ego.liveness``) so a legitimate adaptive backoff
+    or quiet-hours lull never trips; ``gated`` (waiting on the user) and
+    ``is_paused`` (a chosen state) are NOT stalls. One self-superseding 'high'
+    observation PER EGO (its own source), auto-resolved when a cycle completes.
+    Best-effort; never raises into the tick."""
+    if db is None:
+        return
+    try:
+        from genesis.autonomy.cli_policy import load_autonomous_cli_policy
+        from genesis.db.crud import ego as ego_crud
+        from genesis.db.crud import job_health as job_health_crud
+        from genesis.ego.liveness import compute_ego_liveness
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        try:
+            gate_on = load_autonomous_cli_policy().manual_approval_required
+        except Exception:
+            gate_on = True
+        managers = (
+            ("user_ego_cycle", getattr(rt, "_ego_cadence_manager", None)),
+            ("genesis_ego_cycle", getattr(rt, "_genesis_ego_cadence_manager", None)),
+        )
+        for source_tag, mgr in managers:
+            source = _EGO_LIVENESS_SOURCES[source_tag]
+            # A disabled ego (no manager) has no cadence to be overdue against —
+            # clear any standing stall alert rather than leaving it open forever.
+            if mgr is None:
+                await observations.resolve_by_source_and_type(
+                    db,
+                    source=source,
+                    type=_EGO_LIVENESS_TYPE,
+                    resolved_at=datetime.now(UTC).isoformat(),
+                    resolution_notes="auto-resolved: ego disabled (no cadence manager)",
+                )
+                continue
+            try:
+                last_success = await job_health_crud.get_job_last_success(
+                    db,
+                    source_tag,
+                )
+                last_intent = await ego_crud.get_state(
+                    db,
+                    f"last_proactive_fire:{source_tag}",
+                )
+                gated = (
+                    await ego_crud.has_pending_cli_approval(db, source_tag) if gate_on else False
+                )
+                live = compute_ego_liveness(
+                    last_success_at=last_success,
+                    last_intent_at=last_intent,
+                    current_interval_minutes=mgr.current_interval_minutes,
+                    gated=gated,
+                )
+            except Exception:
+                logger.debug(
+                    "ego liveness compute failed for %s",
+                    source_tag,
+                    exc_info=True,
+                )
+                continue
+
+            if not live.stalled:
+                # Covers a completed cycle OR the ego going gated/paused/globally
+                # paused since the last alert — all legitimately non-stalled.
+                await observations.resolve_by_source_and_type(
+                    db,
+                    source=source,
+                    type=_EGO_LIVENESS_TYPE,
+                    resolved_at=datetime.now(UTC).isoformat(),
+                    resolution_notes=(
+                        "auto-resolved: ego no longer stalled "
+                        "(cycle completed, or now gated/paused)"
+                    ),
+                )
+                continue
+
+            label = _EGO_LIVENESS_LABELS.get(source_tag, source_tag)
+            overdue_h = (live.overdue_minutes or 0.0) / 60.0
+            content = (
+                f"{label} is actively trying to cycle but has completed none in "
+                f"{overdue_h:.1f}h (expected every ~{int(mgr.current_interval_minutes)}m; "
+                f"stall threshold {live.threshold_minutes / 60:.0f}h). It keeps "
+                f"pushing cycle signals but they never finish — check the ego "
+                f"consumer and any dispatch gate in the genesis-server logs."
+            )
+            # Stable per-ego hash: skip_if_duplicate keeps a persisting stall from
+            # re-creating each tick; the row auto-resolves when a cycle lands.
+            content_hash = hashlib.sha256(source.encode()).hexdigest()
+            await observations.supersede_except_hash(
+                db,
+                source=source,
+                type=_EGO_LIVENESS_TYPE,
+                keep_content_hash=content_hash,
+                resolved_at=datetime.now(UTC).isoformat(),
+                resolution_notes="superseded: ego liveness state changed",
+            )
+            created = await observations.create(
+                db,
+                id=str(uuid.uuid4()),
+                source=source,
+                type=_EGO_LIVENESS_TYPE,
+                content=content,
+                priority="high",
+                created_at=datetime.now(UTC).isoformat(),
+                content_hash=content_hash,
+                skip_if_duplicate=True,
+            )
+            if created is not None:
+                logger.warning("Ego liveness alert: %s stalled", source_tag)
+    except Exception:
+        logger.debug("Failed ego liveness check", exc_info=True)
 
 
 async def _check_memory_integrity_posture(db) -> None:
@@ -1881,6 +2013,77 @@ _CAP_ALERT_COOLDOWN_S = 3600  # one alert per hour max
 _last_cap_alert_at: float | None = None
 
 
+async def _check_cc_login_expiry(db) -> None:
+    """Warn ahead of the interactive CC login's refresh-token expiry.
+
+    The claude.ai OAuth refresh token has a FIXED lifetime (routine access-
+    token refresh does not extend it); when it lapses, every CC request —
+    including all background autonomy — fails until an interactive /login.
+    CC's own terminal warning is invisible on a headless box, so this raises
+    ONE critical observation (rides the critical-observations job to
+    Telegram) when expiry is inside the warning window, and auto-resolves
+    after the user re-logs in. Missing/unreadable credentials (fresh or
+    API-key-only installs, mid-rewrite reads) are silent — no signal is
+    never treated as expired. Best-effort; never raises into the tick.
+    """
+    if db is None:
+        return
+    try:
+        from genesis.cc.login_health import refresh_token_expiry
+
+        try:
+            warn_days = max(
+                1,
+                int(os.environ.get("GENESIS_CC_LOGIN_EXPIRY_WARN_DAYS", "5")),
+            )
+        except ValueError:
+            warn_days = 5
+
+        expiry = refresh_token_expiry()
+        now = datetime.now(UTC)
+        if expiry is None:
+            # No signal (missing/unreadable/mid-rewrite credentials) is NOT a
+            # verdict: neither alert nor resolve — a transient read failure
+            # must not clear a real standing warning.
+            return
+        if (expiry - now) > timedelta(days=warn_days):
+            await observations.resolve_by_source_and_type(
+                db,
+                source="cc_login_monitor",
+                type="infrastructure_alert",
+                resolved_at=now.isoformat(),
+                resolution_notes=(
+                    "auto-resolved: CC login expiry no longer inside the "
+                    f"{warn_days}-day warning window"
+                ),
+            )
+            return
+
+        days_left = max(0.0, (expiry - now).total_seconds() / 86400)
+        content_hash = hashlib.sha256(b"cc_login_expiry_alert").hexdigest()
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="cc_login_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"CC interactive login expires {expiry.isoformat()} "
+                f"(~{days_left:.1f} days). Routine refresh does NOT extend it — "
+                "run /login in a foreground session before then, or ALL Claude "
+                "Code work (foreground + background autonomy) stops. Durable "
+                "backstop: `claude setup-token` once + scripts/store_cc_token.sh "
+                "stores a 1-year fallback token background sessions can use "
+                "when the login is confirmed dead."
+            ),
+            priority="critical",
+            created_at=now.isoformat(),
+            content_hash=content_hash,
+            skip_if_duplicate=True,
+        )
+    except Exception:
+        logger.debug("cc login expiry check failed", exc_info=True)
+
+
 async def _check_cc_cap_detection(db) -> None:
     """Alert when output-expecting cognitive CC invocations return empty in a run.
 
@@ -2753,6 +2956,10 @@ class AwarenessLoop:
                     # 'high' infrastructure_alert; self-resolves on recovery.
                     # Facts change at most ~daily (profile refresh) → hourly.
                     await _check_infra_protection_posture(self._db)
+                    # CC login refresh-token expiry: fixed lifetime, invisible
+                    # on a headless box until everything stops. Day-scale
+                    # signal → hourly; self-resolves after /login.
+                    await _check_cc_login_expiry(self._db)
                     # Memory integrity posture: reads the latest persisted
                     # consistency/recall-probe rows; slow-moving (daily jobs) →
                     # hourly is ample.
@@ -2762,6 +2969,11 @@ class AwarenessLoop:
                     # Day-scale lifecycle signal → hourly; self-resolves when
                     # rows gain a trigger or close.
                     await _check_follow_up_watchdog(self._db)
+                    # Ego liveness: an ego completing NO real cycle well past its
+                    # cadence (job_health.last_success gap), NOT the is_running /
+                    # heartbeat proxies that stay green while deadlocked.
+                    # Conservative threshold; self-resolves when a cycle lands.
+                    await _check_ego_liveness(self._db)
                 await _check_wal_health(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires

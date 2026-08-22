@@ -555,26 +555,105 @@ def _load_yaml_merged(filename: str) -> dict:
 _USER_CONFIG_DIR = Path.home() / ".genesis" / "config"
 
 
-def _atomic_yaml_write(filename: str, data: dict) -> Path:
+# Provenance header lines preserved across rewrites (newest last, capped so
+# the header can't grow unboundedly on a frequently-edited domain).
+_PROVENANCE_HISTORY_MAX = 5
+
+
+def _atomic_yaml_write(
+    filename: str,
+    data: dict,
+    *,
+    provenance: str | None = None,
+) -> Path:
     """Write YAML atomically to user config dir (~/.genesis/config/).
 
     Runtime config writes go to the user directory, not the repo tree,
     so git status stays clean and user settings don't leak into PRs.
+
+    ``provenance`` stamps a ``# set-by: <actor> @ <utc>`` header comment and
+    PRESERVES prior stamps (last ``_PROVENANCE_HISTORY_MAX``). This is the
+    durable answer to "is this user-set config an anomaly?": any future
+    session reading the overlay sees who set it and when, so a deliberate
+    user choice (e.g. disabling the approval gate from the dashboard) is
+    never mistaken for drift and "fixed" back. yaml.safe_load ignores the
+    comments, so readers are unaffected.
     """
+    from datetime import UTC, datetime
+
     _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     path = _USER_CONFIG_DIR / filename
+
+    # Preservation is UNCONDITIONAL — a caller that forgets `provenance` must
+    # never become a delete path for the hand-written operator rationale or
+    # prior stamps this feature exists to protect. Only the machine-stamped
+    # '# set-by:' history is capped; only the NEW stamp is conditional.
+    set_by: list[str] = []
+    other_comments: list[str] = []
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith("# set-by: "):
+                set_by.append(line)
+            elif line.startswith("#"):
+                other_comments.append(line)
+            elif line.strip():
+                break
+    except OSError:
+        pass
+    if provenance:
+        # Defense-in-depth: a newline in the actor string would write raw
+        # lines BELOW the comment prefix — top-level YAML injected above the
+        # real mapping in the same document. All current callers pass fixed
+        # strings; sanitize anyway so a future caller can't become a vector.
+        clean = provenance.replace("\r", " ").replace("\n", " ")
+        set_by.append(
+            f"# set-by: {clean} @ {datetime.now(UTC).isoformat()}",
+        )
+    header_lines: list[str] = other_comments + set_by[-_PROVENANCE_HISTORY_MAX:]
+
     tmp_fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         suffix=".yaml.tmp",
     )
     try:
         with open(tmp_fd, "w") as f:
+            if header_lines:
+                f.write("\n".join(header_lines) + "\n")
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
         Path(tmp_path).replace(path)
     except Exception:
         Path(tmp_path).unlink(missing_ok=True)
         raise
     return path
+
+
+def gate_disable_error(
+    domain: str,
+    changes: dict,
+    *,
+    confirmed: bool,
+) -> str | None:
+    """Error message when disabling the mandatory approval gate unconfirmed.
+
+    ``manual_approval_required: false`` turns off the approval gate for ALL
+    autonomous CC sessions — a single unconfirmed API call must not do that
+    silently (2026-08-18: a dashboard PUT flipped it with zero friction and
+    zero notification). The user remains sovereign: with explicit
+    confirmation the write proceeds (and the caller sends a Telegram notice).
+    """
+    if domain != "autonomous_cli_policy":
+        return None
+    if changes.get("manual_approval_required") is not False:
+        return None
+    if confirmed:
+        return None
+    return (
+        "Disabling manual_approval_required turns OFF the mandatory approval "
+        "gate for ALL autonomous Claude Code sessions. If this is deliberate, "
+        "repeat the request with confirm_disable_approval_gate=true — the "
+        "change is then applied, provenance-stamped, and announced via "
+        "Telegram."
+    )
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -733,6 +812,7 @@ def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
         "autonomous_cli_fallback_enabled",
         "manual_approval_required",
         "reask_interval_hours",
+        "reask_overrides",
         "approval_channel",
         "shared_export_enabled",
     }
@@ -750,13 +830,40 @@ def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
         if key in changes and not isinstance(changes[key], bool):
             errors.append(f"{key} must be a boolean")
 
+    def _whole_hours(value: object) -> int | None:
+        """Strict whole-hours parse: bools and fractional values are invalid.
+
+        int(0.9) would silently truncate to the 0 = never-re-ask sentinel on
+        an approval-adjacent surface — reject instead of rounding.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
     if "reask_interval_hours" in changes:
-        try:
-            value = int(changes["reask_interval_hours"])
-            if value < 1 or value > 168:
-                errors.append("reask_interval_hours must be between 1 and 168")
-        except (TypeError, ValueError):
-            errors.append("reask_interval_hours must be an integer")
+        value = _whole_hours(changes["reask_interval_hours"])
+        if value is None:
+            errors.append("reask_interval_hours must be a whole number of hours")
+        elif value < 0 or value > 168:
+            errors.append(
+                "reask_interval_hours must be between 0 (never re-ask) and 168",
+            )
+
+    if "reask_overrides" in changes:
+        overrides = changes["reask_overrides"]
+        if not isinstance(overrides, dict):
+            errors.append("reask_overrides must be a mapping of policy_id -> hours")
+        else:
+            for pid, hours in overrides.items():
+                v = _whole_hours(hours)
+                if v is None:
+                    errors.append(
+                        f"reask_overrides.{pid} must be a whole number of hours",
+                    )
+                elif v < 0 or v > 168:
+                    errors.append(
+                        f"reask_overrides.{pid} must be between 0 (never) and 168",
+                    )
 
     if "approval_channel" in changes:
         channel = str(changes["approval_channel"] or "").strip().lower()
@@ -1638,6 +1745,8 @@ async def _impl_settings_update(
     domain: str,
     changes: dict,
     dry_run: bool = False,
+    confirm_disable_approval_gate: bool = False,
+    actor: str = "user via mcp settings_update",
 ) -> dict:
     entry = _DOMAIN_REGISTRY.get(domain)
     if entry is None:
@@ -1671,6 +1780,16 @@ async def _impl_settings_update(
                 "validation_errors": errors,
             }
 
+    # Protected key: disabling the mandatory approval gate needs explicit
+    # confirmation (see gate_disable_error).
+    gate_err = gate_disable_error(
+        domain,
+        changes,
+        confirmed=confirm_disable_approval_gate,
+    )
+    if gate_err:
+        return {"domain": domain, "error": gate_err}
+
     # Merge changes into the local overlay (NOT the base file).
     # The base file stays git-tracked and clean for upstream updates.
     local = _load_yaml_local(entry.config_filename)
@@ -1687,10 +1806,24 @@ async def _impl_settings_update(
             "needs_restart": entry.needs_restart,
         }
 
-    # Atomic write to .local.yaml
+    # Capture the gate's EFFECTIVE value BEFORE the write, so the disable alert
+    # fires only on a genuine true→false transition (a settings save that still
+    # carries manual_approval_required=false while the gate was already off must
+    # not re-page — especially now that critical_observation has a 0-window).
+    gate_was_off = (
+        domain == "autonomous_cli_policy"
+        and _load_yaml_merged(entry.config_filename).get(
+            "manual_approval_required",
+            True,
+        )
+        is False
+    )
+
+    # Atomic write to .local.yaml (provenance-stamped: user-set config must
+    # never read as an anomaly to a future session).
     local_file = _local_filename(entry.config_filename)
     try:
-        _atomic_yaml_write(local_file, new_local)
+        _atomic_yaml_write(local_file, new_local, provenance=actor)
     except Exception:
         logger.error(
             "Failed to write local settings for %s",
@@ -1708,8 +1841,92 @@ async def _impl_settings_update(
     }
     if entry.needs_restart:
         result["note"] = "Changes saved. Restart genesis-server for them to take effect."
+    if (
+        domain == "autonomous_cli_policy"
+        and changes.get("manual_approval_required") is False
+        and not gate_was_off  # only on a genuine true→false transition
+    ):
+        result["warning"] = (
+            "The mandatory approval gate is now DISABLED: autonomous Claude "
+            "Code sessions dispatch without per-run approval until "
+            "manual_approval_required is set back to true."
+        )
+        logger.warning(
+            "manual_approval_required disabled via %s (confirmed)",
+            actor,
+        )
+        # Owner-facing loudness from the MCP process (no live outreach
+        # pipeline here): a critical observation — the server's
+        # critical-observations job pages it to Telegram. Best-effort; the
+        # provenance stamp + warning above remain the durable record.
+        await write_gate_disable_alert(actor)
+    elif domain == "autonomous_cli_policy" and changes.get("manual_approval_required") is True:
+        # Gate restored: resolve the standing alert immediately so a stale
+        # "running without approval" critical cannot page after re-enable.
+        await resolve_gate_disable_alert(actor)
 
     return result
+
+
+async def write_gate_disable_alert(actor: str) -> None:
+    """Best-effort critical observation for a confirmed gate disable."""
+    try:
+        import hashlib as _hashlib
+        import uuid as _uuid
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+
+        from genesis.db.connection import get_raw_db
+        from genesis.db.crud import observations as _observations
+        from genesis.env import genesis_db_path
+
+        async with get_raw_db(genesis_db_path()) as db:
+            await _observations.create(
+                db,
+                id=str(_uuid.uuid4()),
+                source="settings_guard",
+                type="infrastructure_alert",
+                content=(
+                    f"Approval gate DISABLED via {actor} (confirmed): "
+                    "manual_approval_required is now false — autonomous "
+                    "Claude Code sessions dispatch WITHOUT per-run "
+                    "approval until it is set back to true "
+                    "(Settings → autonomous_cli_policy)."
+                ),
+                priority="critical",
+                created_at=_datetime.now(_UTC).isoformat(),
+                content_hash=_hashlib.sha256(
+                    b"approval_gate_disabled_alert",
+                ).hexdigest(),
+                skip_if_duplicate=True,
+            )
+    except Exception:
+        logger.warning(
+            "Gate-disable critical observation write failed",
+            exc_info=True,
+        )
+
+
+async def resolve_gate_disable_alert(actor: str) -> None:
+    """Best-effort resolve of the gate-disabled alert when the gate returns."""
+    try:
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+
+        from genesis.db.connection import get_raw_db
+        from genesis.db.crud import observations as _observations
+        from genesis.env import genesis_db_path
+
+        async with get_raw_db(genesis_db_path()) as db:
+            await _observations.resolve_by_source_and_type(
+                db,
+                source="settings_guard",
+                type="infrastructure_alert",
+                resolved_at=_datetime.now(_UTC).isoformat(),
+                resolution_notes=f"gate re-enabled via {actor}",
+            )
+    except Exception:
+        logger.warning("Gate-disable alert resolve failed", exc_info=True)
 
 
 # ── MCP tool wrappers ──────────────────────────────────────────────────
@@ -1742,6 +1959,7 @@ async def settings_update(
     domain: str,
     changes: dict,
     dry_run: bool = False,
+    confirm_disable_approval_gate: bool = False,
 ) -> dict:
     """Update configuration for a settings domain.
 
@@ -1749,6 +1967,15 @@ async def settings_update(
     keys change, existing keys are preserved). Set dry_run=True to
     validate without saving. Read-only domains are rejected.
 
+    Disabling autonomous_cli_policy.manual_approval_required (the mandatory
+    approval gate) additionally requires confirm_disable_approval_gate=True —
+    the change is then provenance-stamped and loudly warned in the result.
+
     Example: settings_update("tts", {"elevenlabs": {"stability": 0.9}})
     """
-    return await _impl_settings_update(domain, changes, dry_run=dry_run)
+    return await _impl_settings_update(
+        domain,
+        changes,
+        dry_run=dry_run,
+        confirm_disable_approval_gate=confirm_disable_approval_gate,
+    )

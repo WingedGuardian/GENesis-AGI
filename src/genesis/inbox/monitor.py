@@ -55,14 +55,21 @@ def _eval_disallowed_tools() -> list[str]:
     ``build_reflection_disallowed`` (live per call) means a genesis MCP write
     added in a future PR is auto-denied here with no code change.
 
-    NOTE: the retained ``observation_write`` is a RESIDUAL write surface, not a
-    proven-safe one. Today it neither stamps external provenance (the tool ignores
-    the session origin, unlike the procedural/knowledge writers) nor constrains the
-    observation ``type`` — so an injected item could in principle forge a
-    ``user_model_delta`` that the user-model pipeline auto-accepts. That is a
-    LOW-likelihood, curated-input vector; the real fix (a provisional provenance
-    tier + type-authorization on the writer) is tracked in the memory-provenance
-    work, deliberately NOT bolted onto this tool-denylist change.
+    NOTE: the retained ``observation_write`` now STAMPS the session origin (WS-3):
+    an eval-session write lands ``origin_class='external_untrusted'`` (like the
+    procedural/knowledge writers). Two PRIVILEGED-WRITE consumers are now gated on
+    that origin — ``UserModelEvolver.process_pending_deltas`` (user model) and the
+    autonomy dispatcher's ``task_detected`` pickup — via
+    ``immunity.is_trusted_for_privileged_write``, so a forged
+    ``user_model_delta`` / ``task_detected`` is rejected at the point of privileged
+    consumption. PARTIAL, NOT the whole vector: the digest types this tool writes
+    (``user_signal`` / ``architecture_insight``) are still surfaced UNFILTERED into
+    LLM context by other consumers (``essential_knowledge._recent_decisions`` → the
+    always-loaded L1 file; ``reflection`` context; several ego/sentinel raw-SQL
+    reads). Closing that broader observation-content-surfacing surface (exclude/wrap
+    external-origin content at the surfacing points) is tracked — see the
+    "external-origin observation content" follow-up. (The ``Bash``/fetch relocation
+    remains the open part of 727a3724, above.)
     """
     return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]
 
@@ -464,8 +471,11 @@ class InboxMonitor:
         Rows stay in 'processing' state with an
         ``awaiting_approval:<request_id>`` marker in error_message.
         The resume pass ONLY dispatches on the pending→approved state
-        transition.  Hash validation happens FIRST so a file that
-        vanished or was edited while pending is invalidated immediately.
+        transition.  A VANISHED file is invalidated immediately regardless of
+        approval state; a file EDITED while the approval is still pending is
+        HELD (the detection phase supersedes it onto the same request this
+        tick) — the edit check applies only at dispatch time (approved), where
+        a stale delta is invalidated and the approval consumed.
 
         Invariant: resume items are ALWAYS dispatched as singleton
         batches to preserve the original content-stable approval key.
@@ -512,8 +522,16 @@ class InboxMonitor:
 
             p = Path(file_path)
 
-            # Hash check FIRST — vanished/changed files invalidate
-            # regardless of approval state.
+            # Vanish check FIRST — a deleted file invalidates regardless of
+            # approval state (nothing left to evaluate; the orphan guard
+            # cancels the request if no other rows remain).
+            #
+            # A CHANGED file is handled per approval state below: while the
+            # approval is still PENDING the row is HELD — the detection phase
+            # supersedes it with the recomputed delta on the SAME request in
+            # this very tick (invalidating here instead would zero the
+            # request's live rows and make the orphan guard cancel + re-request
+            # → a new Telegram message per edit, the residual storm seed).
             try:
                 current_hash = compute_hash(p)
             except (FileNotFoundError, PermissionError):
@@ -524,15 +542,6 @@ class InboxMonitor:
                     error_message=(
                         f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file vanished"
                     ),
-                    processed_at=now_iso,
-                )
-                continue
-            if current_hash != stored_hash:
-                await inbox_items.update_status(
-                    self._db,
-                    row_id,
-                    status="failed",
-                    error_message=(f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}content changed"),
                     processed_at=now_iso,
                 )
                 continue
@@ -600,7 +609,27 @@ class InboxMonitor:
                 )
                 continue
 
-            # approved or legacy fall-through: load content for dispatch
+            # approved or legacy fall-through: about to dispatch — a file
+            # changed since parking must NOT dispatch its stale delta (the
+            # user may have removed that content). Invalidate AND consume the
+            # approval: an approved-UNconsumed request stays reusable via the
+            # gate's `_find_existing` for its staleness window, so without the
+            # consume the re-detected post-approval content would ride the old
+            # grant this same tick instead of getting a fresh approval.
+            # Tri-state consume keeps sibling drops safe (their consume
+            # returns "already_consumed" and they proceed on their row
+            # claims). A vanished file needs no consume — nothing re-detects.
+            if current_hash != stored_hash:
+                await inbox_items.update_status(
+                    self._db,
+                    row_id,
+                    status="failed",
+                    error_message=(f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}content changed"),
+                    processed_at=now_iso,
+                )
+                if request_id:
+                    await self._consume_approval(request_id)
+                continue
             try:
                 content = read_content(p)
             except (FileNotFoundError, PermissionError):
@@ -778,72 +807,23 @@ class InboxMonitor:
                 )
                 return [], []
 
-            # New content while approval pending — cancel the stale
-            # approval so a fresh one with updated content is created.
-            pending_id = pending.get("id")
+            # New content while approval pending: PARK IT ON THE SAME REQUEST.
+            # Inbox approval requests are idempotent commands over current
+            # inbox state (approve-once clears everything outstanding), so a
+            # new/modified file never cancels the pending request and never
+            # produces a new Telegram message: the new drop flows through the
+            # normal record path below, the gate's stable site key re-attaches
+            # it to the existing pending request, and _phase_create_records
+            # supersedes any now-stale parked rows for the same file (their
+            # delta is a subset of the fresh one). This replaces the old
+            # cancel-and-recreate refresh, which sent a fresh approval message
+            # per edit — and, when the known-hash map went stale, one every
+            # scan (the 2026-08 approval storm).
             logger.info(
-                "New inbox files detected while approval %s pending — "
-                "cancelling stale approval to refresh",
-                pending_id,
+                "New inbox content while approval %s pending — parking onto "
+                "the existing request (no new approval message)",
+                pending.get("id"),
             )
-            try:
-                gate = self._autonomous_dispatcher.approval_gate
-                await gate.approval_manager.cancel(pending_id)
-            except Exception:
-                logger.warning(
-                    "Failed to cancel stale inbox approval %s; "
-                    "proceeding with new detection anyway",
-                    pending_id,
-                    exc_info=True,
-                )
-
-            # Invalidate inbox_items parked on the cancelled approval and
-            # fold their files into THIS refresh. Invalidated rows are
-            # excluded from get_all_known and from retry by design ("fresh
-            # rows with fresh approvals"), so a parked file that is not
-            # re-dispatched here re-surfaces as phantom-new next scan and
-            # cancels the fresh approval in turn — two parked files then
-            # leapfrog forever: a cancel + a new request (a Telegram
-            # message) every scan with no disk change.
-            parked_paths: list[str] = []
-            try:
-                awaiting = await inbox_items.get_awaiting_approval(self._db)
-                for row in awaiting:
-                    marker = str(row.get("error_message") or "")
-                    if marker == (f"{inbox_items.AWAITING_APPROVAL_PREFIX}{pending_id}"):
-                        await inbox_items.update_status(
-                            self._db,
-                            str(row["id"]),
-                            status="failed",
-                            error_message=(
-                                f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}"
-                                "superseded by new inbox scan"
-                            ),
-                            processed_at=self._clock().isoformat(),
-                        )
-                        parked_paths.append(str(row["file_path"]))
-            except Exception:
-                logger.warning(
-                    "Failed to invalidate parked inbox items for %s",
-                    pending_id,
-                    exc_info=True,
-                )
-
-            detected = {str(p) for p in new_files}
-            detected |= {str(p) for p in modified_files}
-            folded = [
-                Path(fp)
-                for fp in dict.fromkeys(parked_paths)
-                if fp not in detected and Path(fp).exists()
-            ]
-            if folded:
-                modified_files = [*modified_files, *folded]
-                logger.info(
-                    "Folded %d parked file(s) into the refresh batch: %s",
-                    len(folded),
-                    ", ".join(p.name for p in folded),
-                )
-
             return new_files, modified_files
 
         # Normal path: no approval pending.
@@ -934,6 +914,14 @@ class InboxMonitor:
                 continue
             if not content.strip():
                 logger.debug("Skipping empty modified file: %s", f)
+                # The user emptied the file: any parked rows reference content
+                # that no longer exists — supersede them (the orphan guard
+                # cancels the request later if nothing else is parked on it).
+                await inbox_items.supersede_parked_rows(
+                    self._db,
+                    str(f),
+                    processed_at=now_iso,
+                )
                 await inbox_items.create(
                     self._db,
                     id=item_id,
@@ -999,11 +987,36 @@ class InboxMonitor:
                     status="failed",
                     error_message="superseded_by_modification",
                 )
+            # Likewise supersede rows PARKED on a pending approval for this
+            # file: the fresh delta below is a superset of the parked one (the
+            # baseline advances only on completed rows), and the new drop
+            # re-parks on the SAME request — dispatching both on approval
+            # would evaluate the old delta twice. Never cancels the request.
+            superseded = await inbox_items.supersede_parked_rows(
+                self._db,
+                str(f),
+                processed_at=now_iso,
+            )
+            if superseded:
+                logger.info(
+                    "Superseded %d parked row(s) for %s with the fresh delta "
+                    "(same approval request)",
+                    superseded,
+                    f.name,
+                )
             if is_empty_delta:
                 # No new content vs the baseline: write a completing row to
                 # ADVANCE the known hash (no evaluation). This runs regardless
-                # of cooldown — it is the storm fix.
-                logger.debug("No new content in modified file: %s", f)
+                # of cooldown — it is the storm fix. INFO with the hash delta:
+                # silent baselining is how a mis-computed delta would eat items
+                # unobserved (the disproven-but-costly BUG-3 suspicion).
+                logger.info(
+                    "Empty delta for %s — advancing baseline hash to %s with "
+                    "no evaluation (byte-level change only: tracking params, "
+                    "whitespace, or already-evaluated lines)",
+                    f.name,
+                    h[:8],
+                )
                 await inbox_items.create(
                     self._db,
                     id=item_id,
@@ -1019,6 +1032,11 @@ class InboxMonitor:
             # site missing it. Instead of dropping, write a completing row to
             # ADVANCE the known hash (stopping re-detection), exactly like the
             # empty-delta branch above.
+            # NOTE (deliberate): any rows already PARKED for this file were
+            # superseded above and get NO replacement here — the parked delta
+            # is exactly the repeatedly-failing content the guard exists to
+            # stop re-chewing. The now-orphaned request is cancelled quietly
+            # by the orphan guard; the WARNING below is the operator trace.
             url_fail_count = await inbox_items.count_url_failures(
                 self._db,
                 str(f),
@@ -1264,10 +1282,12 @@ class InboxMonitor:
             ]
             if not claimed:
                 continue
-            # Consume the drop's approval (best-effort). The row-state claim above
-            # is the real gate, so a consume failure neither strands the drop nor
-            # bypasses at-most-once; it only leaves the content-agnostic approval
-            # rideable until the gate's 24h staleness window (WARNING-logged).
+            # Consume the drop's approval. Tri-state (see _consume_approval):
+            # consumed / already_consumed both proceed — the row-state claim
+            # above is the at-most-once dispatch gate, and already-consumed is
+            # NORMAL for sibling drops of an approve-once fanout and for
+            # cross-tick crash recovery. A persistent failure is ERROR-logged
+            # there (stale rideable approval) and still proceeds on the claim.
             reqid = claimed[0].approval_reqid
             if reqid:
                 await self._consume_approval(reqid)
@@ -1366,9 +1386,9 @@ class InboxMonitor:
             mcp_config=mcp_path,
             # WS-3: inbox evaluations process EXTERNAL content by construction, so
             # stamp the session external — the Python-side eval-memory writes read
-            # this, and any future origin-aware MCP write will too. NOTE: the one
-            # retained MCP write here (observation_write) does NOT currently honor
-            # this stamp (see _eval_disallowed_tools) — tracked, not fixed here.
+            # this, and the retained MCP write (observation_write) NOW honors it too
+            # (it forwards session_origin_from_env), so a delta forged here is
+            # stamped external and barred by the user-model consumer gate.
             origin=ORIGIN_EXTERNAL_UNTRUSTED,
         )
 
@@ -1519,41 +1539,59 @@ class InboxMonitor:
             )
         return "approved"
 
-    async def _consume_approval(self, request_id: str) -> bool:
-        """Consume a resume drop's approval so the next drop cannot ride the
+    async def _consume_approval(self, request_id: str) -> str:
+        """Consume a resume drop's approval so a LATER NEW drop cannot ride the
         same (content-agnostic, stable-key) approval.
 
-        Returns True if the approval was consumed (or there is no gate to
-        consume against), False if the consume failed or the approval was
-        already consumed. A failure is logged at WARNING (it was previously
-        swallowed at debug) because a non-consumed approval can be ridden by a
-        later inbox drop until the gate's 24h staleness window expires.
+        Returns one of:
 
-        NOTE: the resume caller currently dispatches regardless of this result.
-        Acting on a False — skip-and-retry on transient failure, or fail-and-
-        re-detect when the approval is already consumed — requires the
-        at-most-once dispatch state machine tracked in follow-up 0b68d341.
+        - ``"consumed"`` — this call closed the approval (first drop this pass;
+          includes one transparent retry after a transient failure).
+        - ``"already_consumed"`` — a sibling drop consumed it earlier this pass,
+          or a prior tick consumed it before a crash left rows claimed
+          (``dispatching:``). NORMAL under approve-once/multi-drop fanout — the
+          per-row ``claim_for_dispatch`` is the at-most-once dispatch gate, so
+          callers proceed.
+        - ``"failed"`` — consume failed twice (e.g. DB lock). ERROR-logged: the
+          approval stays approved-unconsumed and IS rideable by a later new
+          drop via the gate's reuse path until its staleness window lapses.
+          Callers still proceed (the row claim gates dispatch); the loud log is
+          the containment.
+        - ``"no_gate"`` — no dispatcher/gate wired (gate-off/test path).
         """
         gate = getattr(self._autonomous_dispatcher, "approval_gate", None)
         consume = getattr(gate, "mark_consumed", None)
         if consume is None:
-            return True
-        try:
-            ok = bool(await consume(request_id))
-        except Exception:
-            logger.warning(
-                "Inbox resume: failed to consume approval %s — it may remain "
-                "rideable by a later drop until the 24h staleness window",
+            return "no_gate"
+        last_exc: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                ok = bool(await consume(request_id))
+            except Exception as exc:
+                last_exc = exc
+                logger.debug(
+                    "Inbox resume: consume attempt %d for approval %s failed",
+                    attempt,
+                    request_id,
+                    exc_info=True,
+                )
+                continue
+            if ok:
+                return "consumed"
+            logger.debug(
+                "Inbox resume: approval %s already consumed (sibling drop or "
+                "crash recovery) — proceeding on the row claim",
                 request_id,
-                exc_info=True,
             )
-            return False
-        if not ok:
-            logger.warning(
-                "Inbox resume: approval %s was already consumed",
-                request_id,
-            )
-        return ok
+            return "already_consumed"
+        logger.error(
+            "Inbox resume: failed to consume approval %s after retry (%s) — it "
+            "remains rideable by a later inbox drop until the gate's staleness "
+            "window expires",
+            request_id,
+            last_exc,
+        )
+        return "failed"
 
     async def _dispatch_one_batch(
         self,

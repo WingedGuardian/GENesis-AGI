@@ -108,6 +108,10 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "process_reaper_kill": timedelta(days=3),
     "operational_alert": timedelta(days=3),
     "infrastructure_alert": timedelta(days=3),
+    # ego cycle liveness: self-resolving + re-fireable, so a long TTL only delays
+    # the next re-fire; matches infrastructure_alert. Surfaces in the dashboard
+    # observations panel (deliberately NOT in INTERNAL_OBS_TYPES).
+    "ego_alert": timedelta(days=3),
     "cc_cap_empty_event": timedelta(days=3),
     "strategic_reflection": timedelta(days=3),
     # ── 1-day (transient) ──────────────────────────────────────────────
@@ -433,6 +437,7 @@ async def query(
     category: str | None = None,
     resolved: bool | None = None,
     exclude_types: tuple[str, ...] | frozenset[str] | None = None,
+    origin_class_in: list[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
     if sum(map(bool, (source, source_in, source_prefix))) > 1:
@@ -470,6 +475,15 @@ async def query(
         type_placeholders = ",".join("?" for _ in exclude_types)
         sql += f" AND type NOT IN ({type_placeholders})"
         params.extend(exclude_types)
+    if origin_class_in:
+        # SQL-level origin filter — applied BEFORE the LIMIT so barred rows can
+        # never crowd trusted rows out of the result window (the user-model
+        # poisoning-gate consumers pass the trusted set here). NULL origin_class
+        # is excluded by SQL IN-semantics (fail-closed), which is the intended
+        # behaviour for the privileged-read consumers.
+        oc_placeholders = ",".join("?" for _ in origin_class_in)
+        sql += f" AND origin_class IN ({oc_placeholders})"
+        params.extend(origin_class_in)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     rows = await db.execute_fetchall(sql, params)

@@ -532,7 +532,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "see_also": ["dream_cycle_entity_check"],
     },
     "dream_cycle_synthesis_challenge": {
-        "description": "Adversarial challenge of dream cycle synthesis output. Different provider from synthesis (Kimi challenges DeepSeek) to ensure model independence. Blocks deprecation when information loss detected.",
+        "description": "Adversarial challenge of dream cycle synthesis output. A different model from synthesis (which leads with DeepSeek) to ensure model independence: groq-free challenges, with paid Kimi as a deep fallback. Blocks deprecation when information loss detected.",
         "category": "consolidation",
         "frequency": "Daily drain slices (8am, one per cluster synthesized; live-gated)",
         "model_tier": "slm",
@@ -540,7 +540,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "see_also": ["dream_cycle_synthesis"],
     },
     "dream_cycle_entity_challenge": {
-        "description": "Adversarial second opinion on entity 'duplicate' verdicts. Flipped provider pairing (DeepSeek challenges Kimi). Both must agree for deprecation to proceed.",
+        "description": "Adversarial second opinion on entity 'duplicate' verdicts. Flipped pairing: DeepSeek challenges the entity_check (which leads with groq-free). Both must agree for deprecation to proceed.",
         "category": "consolidation",
         "frequency": "Weekly batch (Sunday 4am, fired on duplicate verdicts only)",
         "model_tier": "slm",
@@ -556,7 +556,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "see_also": ["entity_adjudication_challenge"],
     },
     "entity_adjudication_challenge": {
-        "description": "Adversarial second opinion on an entity-node 'merge' verdict. Flipped provider pairing (DeepSeek challenges Kimi). Both must agree before two entities are merged.",
+        "description": "Adversarial second opinion on an entity-node 'merge' verdict. Flipped pairing: DeepSeek challenges the groq-free-led adjudication. Both must agree before two entities are merged.",
         "category": "consolidation",
         "frequency": "Hourly drain (:25), fired on merge verdicts only",
         "model_tier": "slm",

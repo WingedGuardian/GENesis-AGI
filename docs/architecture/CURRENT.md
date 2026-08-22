@@ -220,7 +220,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 51253c67 2026-08-13
+verified: d71d1d39 2026-08-18
 ```
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
@@ -242,12 +242,28 @@ verified: 51253c67 2026-08-13
   at a nonexistent `src/config/no_mcp.json`). The inbox judge denies every genesis MCP
   *write* (`memory_store`/`settings_update`/`follow_up_create`/…) via
   `build_reflection_disallowed` minus `Bash`, keeping the reads it needs plus the optional
-  `observation_write`. Two RESIDUALS on the inbox judge, both tracked (follow-up 727a3724),
-  NOT closed here: (1) `Bash` — retained for the `yt-dlp`/`curl` YouTube-fetch path
-  (injection→RCE surface); (2) the retained `observation_write` neither stamps external
-  provenance nor constrains observation `type`, so an injected item could in principle forge
-  a `user_model_delta` — a low-likelihood, curated-input vector whose real fix (a provisional
-  provenance tier + writer type-authorization) belongs in the memory-provenance work.
+  `observation_write`. RESIDUALS on the inbox judge: (1) `Bash` — STILL retained for the
+  `yt-dlp`/`curl` YouTube-fetch path (injection→RCE surface, open — follow-up 727a3724);
+  (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
+  memory-provenance work): `observation_write` stamps the session origin
+  (`session_origin_from_env`) so an eval-session write lands `external_untrusted`, and BOTH
+  user-model consumers — `process_pending_deltas` (accept) and `synthesize_narrative`
+  (evidence → USER_KNOWLEDGE.md) — read only trusted-origin deltas via the SQL
+  `origin_class_in=TRUSTED_PRIVILEGED_WRITE_ORIGINS` filter (filtering in-query, not
+  post-LIMIT, so a forged-delta flood can't starve trusted deltas out of the window, and a
+  TTL-resolved barred delta can't launder into the narrative). Fail-closed on NULL; barred
+  rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
+  pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
+  — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
+  stamping is in the follow-up). **PARTIAL — the broader
+  observation-content-INJECTION surface is still OPEN** (tracked follow-up): the digest types
+  the judge writes (`user_signal`/`architecture_insight`) are surfaced UNFILTERED into LLM
+  context by consumers this change did NOT touch — `essential_knowledge._recent_decisions`
+  (raw SQL → the always-loaded L1 file), `reflection.gather_evaluation_context` (14-day
+  lookback → deep-reflection prompt → can launder into a `first_party`-stamped delta), and
+  several ego/sentinel raw-`FROM observations` reads. The robust fix is to exclude/wrap
+  external-origin content (`is_blockable`, keeping NULL) at the surfacing points, with a
+  coverage guardrail that also catches raw-SQL consumers.
   **Out of scope (tracked follow-up):** `cc/direct_session` (its `research` profile runs a
   DOCUMENTED deep-research `Workflow` — blocking the class there would break that path) and
   the autonomy-executor sessions; those legitimately spawn/orchestrate and need a
@@ -862,6 +878,12 @@ verified: ca875c4b 2026-07-24
   deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
   `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
   only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
+  Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
+  ego with no COMPLETED cycle past a conservative multiple of its current
+  interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
+  `next_fire_at` proxies that stay green through a deadlock) raises one
+  self-superseding `high` `ego_alert` per ego, auto-resolving when a cycle lands;
+  `gated`/`paused`/fresh-install are never stalls.
   Also per-tick (WS-2 M10) the SINGLE designated `alert_events` writer:
   `_persist_health_alerts` recomputes the firing set via the pure
   `mcp/health/errors.py::_compute_alerts()` and reconciles a durable open-set
@@ -1039,12 +1061,25 @@ verified: fbcf8ee4 2026-07-21
   discipline is load-bearing here. Loops that actually run: triage pipeline,
   procedural extraction (extract → judge → promote hourly, novelty +
   contradiction gates), weekly skill evolution, daily triage calibration.
-  Weekly skill evolution auto-applies MINOR SKILL.md edits at autonomy>=2 past
-  a STRUCTURAL check (`skills/validator.py`); a shadow **skill-edit Critic**
-  (`skills/skill_edit_critic.py` + `eval/rubrics/skill_edit_regression.py`)
-  now screens each auto-applied edit for self-modification pathologies via the
-  `judge` call site and LOGS a verdict (`skill_evolution_gate` observations) —
-  it never blocks the edit (WS1 shadow). A complementary **held-out replay
+  Weekly skill evolution is **propose-only** (autonomous auto-apply retired
+  2026-08-01, #1276): it STAGES every SKILL.md edit (MINOR and larger) as a
+  `skill_proposal` observation for human/CC review and never writes a skill
+  file — no proposal is ever blocked or auto-applied. Under propose-only NO
+  cognitive-file-modification ledger pre-image is created (the apply/resolve
+  path that would record one is a deferred follow-up). Two ADVISORY signals ride
+  the staged proposal for the reviewer, and neither gates staging: a deterministic
+  validator suite (`skills/validator.py` — structure, trigger coverage,
+  testability/vague-language, size, examples, and MINOR-content consistency; any
+  hard failure un-passes it) whose outcome is recorded as a `validated` flag
+  (for MINOR it reflects that suite; for MODERATE+ an LLM apply-recommendation)
+  plus `validation_detail` on failure; and, WHEN ENABLED (gate on, router +
+  baseline available), a shadow
+  **skill-edit Critic** (`skills/skill_edit_critic.py` +
+  `eval/rubrics/skill_edit_regression.py`) that screens for self-modification
+  pathologies via the `judge` call site and logs a `skill_evolution_gate`
+  verdict (WS1 shadow). The validator suite above is live (advisory); only the
+  `autonomy_level` param is retained as (currently unread) groundwork for the
+  future WS1 `enforce` mode. A complementary **held-out replay
   gate** (`eval/skill_replay/`, tool `skill_replay_run`) goes further — it
   REPLAYS a frozen per-skill golden suite (`~/.genesis/eval/skill_golden/`,
   authored via `eval/skill_golden_set.py`) against OLD vs NEW content in
@@ -1444,7 +1479,7 @@ verified: 3c514f3e 2026-08-10
   don't merge them. Memory-resilience invariants are first-class facts:
   container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
-  laid down by `scripts/lib/memory_resilience.sh` from bootstrap/update) and
+  laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
   installs (see docs/reference/memory-resilience.md). Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
@@ -1490,8 +1525,12 @@ verified: 9037d45b 2026-07-07
   generation (`scripts/generate_skill_catalog.py` scans `.claude/skills/`,
   `src/genesis/skills/`, `~/.genesis/skill-library/` →
   `~/.genesis/skill_catalog.json`, self-heals hourly), consumed by the
-  injection hook and by autonomous-session resources. Skill refinement is a
-  tracked cognitive-file modification (`learning/skills/applicator.py`).
+  injection hook and by autonomous-session resources. Skill refinement is
+  propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
+  review and never writes a skill file. Recording it as a tracked
+  cognitive-file modification is DEFERRED — no ledger pre-image is captured
+  under propose-only; the apply/resolve path that would create one is a
+  follow-up (future WS1 `enforce`).
   Voice-master exemplars are on the contribution FORBIDDEN list.
   Cross-tool export: `scripts/export_agents_md.py` writes a body-scope
   inventory (skills + action tools, never memory/brain) into a managed
