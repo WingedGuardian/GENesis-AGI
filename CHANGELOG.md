@@ -136,6 +136,20 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **One-click "lobby" terminal door — reattach the whole CC fleet after a client
+  reboot.** `generate-ssh-config.sh` now emits a dedicated `Host <host>-lobby`
+  block (placed ahead of the numeric-slot wildcard, since ssh takes the first
+  matching `RemoteCommand`) that attaches a stable `lobby` tmux session on the
+  same socket as the `cc-*` slots and opens straight into the session picker
+  (`choose-tree`). One reconnect brings every live session back — they persist in
+  tmux on the box, only the client died — pick any slot and jump in (`Ctrl-b s`
+  reopens the picker). All emitted blocks are keyed on the stable Tailscale IP
+  (not the MagicDNS name), so they keep resolving even when the client's DNS is
+  disrupted. `lobby` is not a `cc-N` name, so it never consumes a slot or trips
+  the slot cap, and numeric-slot routing through `cc-slot.sh` is unchanged. Pair
+  with one Windows Terminal shortcut (`wt.exe ssh <host>-lobby`) for a
+  one-double-click return to the whole fleet.
+
 - **Claude Code session exits are recorded.** When a CC session's process exits
   — a clean quit, a crash, or an OS/kill signal — its exit status (with a
   signal-decoded hint) and a tail of the terminal are written to
