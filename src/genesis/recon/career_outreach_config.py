@@ -16,14 +16,16 @@ bounded loop.
 Modes (increasing authority):
   - ``off``     — the monitor does not run. SHIPPED DEFAULT: an actuator does
     nothing on a fresh install until the owner opts in.
-  - ``observe`` — resolve state + seed the already-nudged set, but NEVER dispatch
-    a draft-staging run and NEVER nudge. The seed step prevents a cold-start nudge
-    over a pre-existing draft backlog; the operator flips ``off → observe → live``.
+  - ``observe`` — a bridge-REACHABILITY probe: a minimal dispatch that proves the
+    external module's ``claude -p`` hop actually answers (module health alone does
+    not — it passes even when the remote's model auth is dead), recording job-health
+    success/failure. It NEVER dispatches a draft-staging run and NEVER nudges. The
+    operator flips ``off → observe → live``.
   - ``live``    — drive due discovery + up to ``max_auto_runs_per_tick``
     draft-staging runs, then push ONE owner nudge when NEW drafts were staged.
 
 A missing/corrupt config degrades to DEFAULTS (mode ``off``); an invalid ``mode``
-value degrades to ``observe`` (record/seed safely, never a silent authority
+value degrades to ``observe`` (a reachability probe only — never a silent authority
 grant, never hide the feature entirely). Env kill switch
 ``GENESIS_CAREER_OUTREACH_DISABLED=1`` forces ``off``.
 
