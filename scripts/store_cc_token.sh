@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
-# store_cc_token.sh — intake a `claude setup-token` OAuth token for the host
-# Guardian recovery brain's FALLBACK authentication.
+# store_cc_token.sh — intake a `claude setup-token` OAuth token used as a
+# FALLBACK CC credential, by two consumers, when a primary `claude login` dies.
 #
-# The host Guardian's `claude -p` recovery brain authenticates via a one-time
-# manual `claude login` (no refresh). If that login dies, the brain goes dark.
-# A `claude setup-token` 1-year OAuth token (used via CLAUDE_CODE_OAUTH_TOKEN —
-# NOT an ANTHROPIC_API_KEY) stored here is synced to the host by the
-# credential-bridge awareness tick and injected by diagnosis.py ONLY as a
-# fallback when the host's own login is dead (a working login is never touched).
+# The token (a 1-year `claude setup-token`, used via CLAUDE_CODE_OAUTH_TOKEN —
+# NOT an ANTHROPIC_API_KEY) is stored 0600 to a DEDICATED container file and
+# synced to the host shared mount by the credential-bridge awareness tick. It is
+# a SHARED fallback, read by consumers on BOTH the host (the Guardian recovery
+# brain, via guardian/diagnosis.py) AND the container itself (its own CC sessions,
+# foreground + background, via cc/login_health.py) — each injecting it ONLY when
+# its own login is confirmed dead; a HEALTHY login is never overridden. It is NOT
+# host-Guardian-only. The authoritative, CI-enforced consumer list lives in
+# docs/architecture/shared-artifacts.md (checked by
+# scripts/check_shared_artifact_consumers.py) — update THAT when a consumer changes.
 #
-# The token is read from STDIN ONLY (never argv — no shell-history / ps leak),
-# written 0600 to a DEDICATED file (NOT secrets.env, which is load_dotenv'd with
-# override=True and would hijack the container's own CC auth — see
-# credential_bridge.py), and stamped with its creation epoch. This script prints
-# ZERO token material.
+# The token is read from STDIN or a --file PATH (never a bare argv token — no
+# shell-history / ps leak); with --file, create the source 0600 (`umask 077`) and
+# `rm` it after, since it holds the raw token in plaintext. It is written 0600 to
+# a DEDICATED file — NOT secrets.env,
+# which is load_dotenv'd with override=True and would UNCONDITIONALLY set
+# CLAUDE_CODE_OAUTH_TOKEN for every process that loads it, hijacking a HEALTHY
+# container login (the dedicated file is instead injected conditionally by
+# cc/login_health.py). This script prints ZERO token material.
 #
 # Usage:
-#   claude setup-token | scripts/store_cc_token.sh     # store (stdin only)
-#   scripts/store_cc_token.sh --remove                 # remove everywhere
+#   claude setup-token | scripts/store_cc_token.sh      # store (stdin)
+#   scripts/store_cc_token.sh --file /path/to/token      # store from a file
+#   scripts/store_cc_token.sh --remove                  # remove everywhere
 #   scripts/store_cc_token.sh --help
 
 set -euo pipefail
@@ -48,9 +56,28 @@ TOKEN_FILE="${HOME}/.genesis/cc_oauth_token.env"
 SHARED_FILE="${HOME}/.genesis/shared/guardian/cc_oauth_token.env"
 
 usage() {
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the leading comment block (the header, after the shebang) up to the
+    # first non-comment line — robust to the header's length (do NOT hardcode a
+    # line range; that silently over-reads into code when the header grows).
+    awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
 }
 
+read_first_token() {
+    # Emit the first non-empty, whitespace-stripped line from stdin (setup-token
+    # prints one token line). A trailing line without a newline is handled by the
+    # `|| [ -n "$line" ]` guard.
+    local line token=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="$(printf '%s' "$line" | tr -d '[:space:]')"
+        if [ -n "$line" ]; then
+            token="$line"
+            break
+        fi
+    done
+    printf '%s' "$token"
+}
+
+TOKEN=""
 case "${1:-}" in
     -h|--help)
         usage
@@ -72,35 +99,46 @@ case "${1:-}" in
         fi
         exit 0
         ;;
+    --file)
+        # Read from a file instead of stdin. The token never touches argv (only
+        # the PATH does), so there is no shell-history / ps leak.
+        if [ -z "${2:-}" ]; then
+            echo "ERROR: --file requires a PATH argument." >&2
+            echo "  $0 --file /path/to/token-file" >&2
+            exit 1
+        fi
+        if [ ! -f "$2" ] || [ ! -r "$2" ]; then
+            echo "ERROR: --file: '$2' is not a readable regular file." >&2
+            exit 1
+        fi
+        # Non-fatal nudge: the source file holds the raw token in plaintext. If it
+        # is readable by group/other (e.g. created under the default umask 022) it
+        # was an exposure — advise creating it 0600 and removing it after.
+        if [ -n "$(find "$2" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+            echo "WARNING: '$2' is readable by group/other — the token sat there in plaintext." >&2
+            echo "         Create it with 'umask 077' (or 'install -m 600') and 'rm' it after storing." >&2
+        fi
+        TOKEN="$(read_first_token < "$2")"
+        ;;
     "")
-        : # fall through to stdin intake
+        if [ -t 0 ]; then
+            echo "ERROR: token must be piped via stdin or supplied with --file, e.g.:" >&2
+            echo "  claude setup-token | $0" >&2
+            echo "  $0 --file /path/to/token-file" >&2
+            exit 1
+        fi
+        TOKEN="$(read_first_token)"
         ;;
     *)
-        echo "ERROR: unknown argument '$1'. Token must be piped via stdin — never passed as an argument." >&2
+        echo "ERROR: unknown argument '$1'. The token comes from stdin or --file PATH — never a bare argument." >&2
         echo "  claude setup-token | $0" >&2
+        echo "  $0 --file /path/to/token-file" >&2
         exit 1
         ;;
 esac
 
-if [ -t 0 ]; then
-    echo "ERROR: token must be piped via stdin (never an argument), e.g.:" >&2
-    echo "  claude setup-token | $0" >&2
-    exit 1
-fi
-
-# Read the first non-empty line (setup-token prints one token line). Trailing
-# no-newline is handled by the `|| [ -n "$line" ]` guard.
-TOKEN=""
-while IFS= read -r line || [ -n "$line" ]; do
-    line="$(printf '%s' "$line" | tr -d '[:space:]')"
-    if [ -n "$line" ]; then
-        TOKEN="$line"
-        break
-    fi
-done
-
 if [ -z "$TOKEN" ]; then
-    echo "ERROR: no token received on stdin." >&2
+    echo "ERROR: no token received (stdin/--file was empty)." >&2
     exit 1
 fi
 
