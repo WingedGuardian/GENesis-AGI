@@ -1017,8 +1017,23 @@
             this.fileUpload.success = uploaded.length === 1
               ? `Uploaded ${uploaded[0]} → ${dest}`
               : `Uploaded ${uploaded.length} files → ${dest} (${uploaded.join(", ")})`;
-            // Stay put — refresh the current directory in place (no jump to uploads).
-            if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
+            // Navigate the browser to WHERE the upload landed (was: stay put). For a
+            // folder upload, jump INTO the new top-level folder (uploadRoot/<name>),
+            // not its parent; a single loose file → its own directory; multiple loose
+            // files → the uploads root. Fall back to refreshing the current dir.
+            let navTarget;
+            if (droppedFolder) {
+              // Derive the folder from the SERVER-sanitized relpath (uploaded[0] =
+              // data.filename), NOT the raw client path: the backend rewrites unsafe
+              // chars (e.g. "Q3 (final)" → "Q3 _final_"), so navigating to the raw name
+              // would 404 and silently no-op — the very "can't see where it went" bug.
+              const firstSeg = (uploaded[0] || "").split("/")[0];
+              navTarget = (firstSeg && uploaded[0].includes("/")) ? `${uploadRoot}/${firstSeg}` : uploadRoot;
+            } else {
+              navTarget = uploaded.length === 1 ? lastDir : uploadRoot;
+            }
+            if (navTarget) { this.fetchFiles(navTarget); }
+            else if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
           }
           if (failures.length) {
             this.fileUpload.error = `${failures.length} failed — ${failures.join("; ")}`;
