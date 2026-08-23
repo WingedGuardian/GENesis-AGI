@@ -353,6 +353,7 @@
 
         // Polling interval IDs
         _healthInterval: null,
+        _backupInterval: null,
         _activityInterval: null,
 
         _sessionsInterval: null,
@@ -656,6 +657,12 @@
 
           this.loading = false;
 
+          // Fire-and-forget: drives the page-top backup banner. Must NOT gate initial
+          // paint — the /backup/status route shells out to git + systemctl, and
+          // backupBanner() is null-safe until backupStatus resolves (banner just
+          // appears once it does).
+          this.fetchBackupStatus();
+
           // Always-on polling: health snapshot drives the attention strip on all tabs.
           // Uses probabilistic skip when server is failing to reduce load during
           // recovery (exponential backoff is in api.js; this reduces poll frequency).
@@ -671,10 +678,17 @@
             this.fetchEgoStatus();
             this.fetchObservationsSummary();
           }, 15000);
+
+          // Backup status changes slowly (6h cadence) and its route shells out to
+          // systemctl, so refresh the banner on a slow, separate cadence rather than
+          // the 15s health poll — catches an unattended scheduled-backup failure
+          // without a reload, at negligible cost.
+          this._backupInterval = setInterval(() => this.fetchBackupStatus(), 180000);
         },
 
         cleanup() {
           if (this._healthInterval) clearInterval(this._healthInterval);
+          if (this._backupInterval) clearInterval(this._backupInterval);
           for (const tab of ["overview", "chat", "internals", "config", "work", "observations", "traces", "autonomy"]) {
             this._stopTabIntervals(tab);
           }
@@ -1907,6 +1921,21 @@
           // start) — the timer won't fire, so "Active" would misreport. Say so.
           if (!active) return { text: 'Scheduled, but the timer is not running', color: '#ffb74d' };
           return { text: 'Active', color: '#81c784' };
+        },
+        // Page-top banner: surface a barren/failed backup state on every tab so it
+        // isn't invisible. Returns a styled {text,color,bg,border} for a problem
+        // state (unconfigured / never-run / last run failed), or null when backups
+        // are healthy (banner hidden). Reads /api/genesis/backup/status.
+        backupBanner() {
+          const bs = this.backupStatus;
+          if (!bs) return null;  // not loaded yet — no banner
+          const lb = bs.last_backup;
+          const warn = { color: '#f0ad4e', bg: 'rgba(240,173,78,0.15)', border: '#f0ad4e' };
+          const crit = { color: '#d9534f', bg: 'rgba(217,83,79,0.15)', border: '#d9534f' };
+          if (!bs.repo) return { ...warn, text: 'Backups are not configured — your data is not being backed up. Set one up on the Backup tab.' };
+          if (!lb) return { ...warn, text: 'Backups are configured but have never run — check the Backup tab.' };
+          if (!lb.success) return { ...crit, text: 'The last backup run failed' + (lb.failure_reason ? ' (' + lb.failure_reason + ')' : '') + ' — check the Backup tab.' };
+          return null;  // healthy (active / scheduled / on-demand) — no banner
         },
         // "every 6 hours · last 12:10 PM ✓ · next 6:10 PM" — the at-a-glance line.
         backupScheduleLine() {

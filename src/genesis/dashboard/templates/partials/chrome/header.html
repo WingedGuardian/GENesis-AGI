@@ -148,3 +148,9 @@
         <button @click="$store.genesisDashboard.pwNudgeDismissed = true" title="Dismiss" style="background:none;border:none;color:var(--color-text-secondary,#888);cursor:pointer;font-size:1rem;line-height:1;">✕</button>
       </div>
     </template>
+    <!-- Backup-status banner: shows when backups are unconfigured, have never run, or
+         the last run failed; hidden when healthy. Source: /api/genesis/backup/status. -->
+    <template x-if="$store.genesisDashboard.backupBanner()">
+      <div :style="`background:${$store.genesisDashboard.backupBanner().bg}; border:1px solid ${$store.genesisDashboard.backupBanner().border}; border-radius:6px; padding:0.5rem 1rem; margin:0.25rem 0.5rem; font-size:0.82rem; font-weight:600; color:${$store.genesisDashboard.backupBanner().color}; text-align:center;`"
+           x-text="'💾 ' + $store.genesisDashboard.backupBanner().text"></div>
+    </template>
