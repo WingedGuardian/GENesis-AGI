@@ -3,9 +3,12 @@
 PR-Guards removed the force-push and worktree-remove arms from this inline blob
 (they are duplicated by the tracked project guards git_push_guard.py and
 worktree_cwd_guard.py, and the force-push arm carried a whole-command substring
-FP: `git push origin main && rm -f x` false-matched). reset --hard / clean -f /
-nohup stay here because they have NO tracked python-guard backstop (only this
-blob + the install-local bash_safety_hook.sh).
+FP: `git push origin main && rm -f x` false-matched). The 2026-08 git-discard
+consolidation then removed reset --hard / clean -f too: they now have a tracked
+python-guard backstop (git_discard_guard.py — precise, with a `# discard-override`
+escape and NEW git checkout/restore coverage), wired in the Bash matcher and
+delegated to by bash_safety_hook.sh. Only nohup / genesis-serve-worktree stay in
+this inline blob (no dedicated python guard yet).
 
 The test extracts the inline command straight from the tracked settings.json and
 runs it, so it fails if the FP-prone arm is ever reintroduced.
@@ -54,12 +57,6 @@ def test_guard_is_syntactically_valid():
 class TestKeptArms:
     """These have no tracked python backstop — they MUST stay in the inline blob."""
 
-    def test_reset_hard_blocks(self):
-        assert _run("git reset --hard HEAD~1").returncode == 2
-
-    def test_clean_f_blocks(self):
-        assert _run("git clean -fd").returncode == 2
-
     def test_nohup_runtime_blocks(self):
         assert _run("nohup python -m genesis serve &").returncode == 2
 
@@ -84,6 +81,15 @@ class TestRemovedArms:
         # worktree_cwd_guard.py (tracked project hook) blocks ALL `git worktree
         # remove`; the inline --force arm was redundant.
         assert _run("git worktree remove --force /tmp/wt").returncode == 0
+
+    def test_reset_hard_not_inline_blocked(self):
+        # git_discard_guard.py (tracked project hook + bash_safety delegation) now
+        # owns reset --hard; the inline blob no longer duplicates it.
+        assert _run("git reset --hard HEAD~1").returncode == 0
+
+    def test_clean_f_not_inline_blocked(self):
+        # git_discard_guard.py now owns git clean -f/--force; inline no longer does.
+        assert _run("git clean -fd").returncode == 0
 
 
 class TestUnrelatedAllowed:

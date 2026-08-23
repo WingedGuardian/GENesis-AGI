@@ -160,16 +160,41 @@ case "$CMD" in
         ;;
 esac
 
-# Other hard-blocked destructive commands — checked BEFORE the softer push/PR
-# warnings below, because the generic "git push" warning (exit 0) would
-# otherwise short-circuit a force-push before this block could hard-block it.
+# git-discard safety — DELEGATE to the Python guard (git_discard_guard.py: one
+# parser, zero divergence with the project-level hook). It blocks reset --hard and
+# clean -f/--force UNCONDITIONALLY (discard/delete-intent), and checkout/restore
+# ONLY when git confirms the operand is a dirty tracked path — all with a
+# `# discard-override` escape. Checked BEFORE the softer push/PR warnings
+# below (a "git push" warning exits 0 and would short-circuit a hard-block).
+# Pre-filtered so the python spawn cost is paid only for discard-shaped git ops.
+# On guard-unavailable/crash, fall back to the legacy reset/clean globs (degraded,
+# NEVER open — same policy as the rm delegation above). checkout/restore had no
+# prior guard, so they get no degraded fallback (nothing to preserve).
 case "$CMD" in
-    *"git reset --hard"*)
-        echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
-        exit 2;;
-    *"git clean -f"*)  # substring also covers -fd
-        echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
-        exit 2;;
+    *"git checkout"*|*"git restore"*|*"git reset"*|*"git clean"*)
+        _gd_delegated=0
+        _py=$(command -v python3 2>/dev/null || true)
+        if [ -n "$_py" ] && [ -f "$SCRIPT_DIR/hooks/git_discard_guard.py" ]; then
+            _gd_delegated=1
+            _rc=0
+            printf '%s' "$RAW" | "$_py" "$SCRIPT_DIR/hooks/git_discard_guard.py" >&2 || _rc=$?
+            if [ "$_rc" -eq 2 ]; then
+                exit 2
+            elif [ "$_rc" -ne 0 ]; then
+                _gd_delegated=0  # guard crashed/unusable — legacy fallback below
+            fi
+        fi
+        if [ "$_gd_delegated" -eq 0 ]; then
+            case "$CMD" in
+                *"git reset --hard"*)
+                    echo "BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user." >&2
+                    exit 2;;
+                *"git clean -f"*)  # substring also covers -fd
+                    echo "BLOCKED: git clean removes untracked files permanently. Ask the user first." >&2
+                    exit 2;;
+            esac
+        fi
+        ;;
 esac
 
 # Force push — hard-block. MUST precede the soft "git push" warning below
