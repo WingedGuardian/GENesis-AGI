@@ -1192,7 +1192,13 @@
 
         <!-- Capability Modules -->
         <h4 style="margin: 0 0 0.5rem 0; color: #ccc; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em;">Capability Modules</h4>
-        <template x-if="$store.genesisDashboard.modules.length === 0">
+        <template x-if="$store.genesisDashboard.panelState('modules') === 'loading'">
+          <div class="empty-state">Loading…</div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('modules') === 'error'">
+          <div class="empty-state" style="color:#f0ad4e;">Couldn't load modules — will keep retrying.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.modules.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('modules'))">
           <div class="empty-state">No modules loaded.</div>
         </template>
         <template x-for="mod in $store.genesisDashboard.modules" :key="mod.name">
@@ -1241,7 +1247,13 @@
 
         <!-- Tool Providers -->
         <h4 style="margin: 1rem 0 0.5rem 0; color: #ccc; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em;">Tool Providers</h4>
-        <template x-if="$store.genesisDashboard.providersDetail.length === 0">
+        <template x-if="$store.genesisDashboard.panelState('providersDetail') === 'loading'">
+          <div class="empty-state">Loading…</div>
+        </template>
+        <template x-if="$store.genesisDashboard.panelState('providersDetail') === 'error'">
+          <div class="empty-state" style="color:#f0ad4e;">Couldn't load providers — will keep retrying.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.providersDetail.length === 0 && !['loading','error'].includes($store.genesisDashboard.panelState('providersDetail'))">
           <div class="empty-state">No providers registered.</div>
         </template>
         <div style="display: grid; gap: 0.3rem;">

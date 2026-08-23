@@ -349,6 +349,9 @@
           comms: { state: "idle", lastSuccess: null, error: null },
           autonomyGrants: { state: "idle", lastSuccess: null, error: null },
           autonomySends: { state: "idle", lastSuccess: null, error: null },
+          campaigns: { state: "idle", lastSuccess: null, error: null },
+          watchlist: { state: "idle", lastSuccess: null, error: null },
+          knowledgeRecent: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
@@ -432,13 +435,20 @@
 
         // ── Campaigns ──
         async fetchCampaigns() {
+          this.startFetch("campaigns");
           try {
             const resp = await fetchApi("/api/genesis/campaigns/list");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.campaignsList = data.campaigns || [];
+              this.finishFetch("campaigns");
+            } else {
+              this.failFetch("campaigns", "Campaigns endpoint returned an error");
             }
-          } catch (e) { console.warn("fetchCampaigns failed:", e); }
+          } catch (e) {
+            console.warn("fetchCampaigns failed:", e);
+            this.failFetch("campaigns", "Failed to fetch campaigns");
+          }
         },
         async openCampaignDetail(name) {
           try {
@@ -1569,13 +1579,20 @@
 
         // ── Knowledge tab fetches ──────────────────────────────────
         async fetchKnowledgeRecent() {
+          this.startFetch("knowledgeRecent");
           try {
             const resp = await fetchApi("/api/genesis/knowledge/recent?limit=50");
             if (resp && resp.ok) {
               const data = await resp.json();
               this.knowledgeRecent = data.units || [];
+              this.finishFetch("knowledgeRecent");
+            } else {
+              this.failFetch("knowledgeRecent", "Knowledge-recent endpoint returned an error");
             }
-          } catch (e) { console.warn("Knowledge recent failed:", e); }
+          } catch (e) {
+            console.warn("Knowledge recent failed:", e);
+            this.failFetch("knowledgeRecent", "Failed to fetch recent knowledge");
+          }
         },
         async fetchKnowledgeStats() {
           try {
@@ -1585,10 +1602,19 @@
         },
         // ── Tracked repositories (recon watchlist) ──────────────────
         async fetchWatchlist() {
+          this.startFetch("watchlist");
           try {
             const resp = await fetchApi("/api/genesis/recon/watchlist");
-            if (resp && resp.ok) { this.watchlistEntries = (await resp.json()).entries || []; }
-          } catch (e) { console.warn("Watchlist fetch failed:", e); }
+            if (resp && resp.ok) {
+              this.watchlistEntries = (await resp.json()).entries || [];
+              this.finishFetch("watchlist");
+            } else {
+              this.failFetch("watchlist", "Watchlist endpoint returned an error");
+            }
+          } catch (e) {
+            console.warn("Watchlist fetch failed:", e);
+            this.failFetch("watchlist", "Failed to fetch watchlist");
+          }
         },
         async addWatchlistRepo() {
           this.watchlistSaving = true; this.watchlistMsg = null;
