@@ -10,6 +10,22 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# WS-3 read-side origin gate. The origin classes trusted to surface content into
+# laundering-critical LLM context (essential_knowledge L1, the reflection /
+# perception prompt pipeline). NULL is EXCLUDED (fail-closed): after the origin
+# backfill (migration 0085) an unstamped row is an UNKNOWN-origin row, and an
+# unknown-origin observation must never reach a privileged surface.
+#
+# Two forms of the SAME trusted set:
+#  - SAFE_SURFACING_ORIGINS — for observations.query(origin_class_in=...) callers.
+#  - SAFE_ORIGIN_SQL — a raw predicate for the two essential_knowledge readers
+#    that build SQL directly (not via query()).
+# Literals (not imported from memory.provenance) to avoid a crud→memory layering
+# cycle; pinned equal to provenance.ORIGIN_OWNER/ORIGIN_FIRST_PARTY by
+# tests/test_db/test_observations.py::test_safe_surfacing_origins_match_constants.
+SAFE_SURFACING_ORIGINS: tuple[str, str] = ("owner", "first_party")
+SAFE_ORIGIN_SQL = "origin_class IN ('owner', 'first_party')"
+
 # Types that should NEVER expire — the observation IS the authoritative record.
 _PERMANENT_TYPES: frozenset[str] = frozenset(
     {
@@ -265,6 +281,20 @@ def _compute_ttl(obs_type: str) -> timedelta | None:
     return _DEFAULT_TTL
 
 
+def _resolve_origin(origin_class: str | None, source: str) -> str | None:
+    """WS-3 write-boundary origin derivation for an observation row.
+
+    Delegates to :func:`genesis.memory.provenance.derive_observation_origin`
+    (explicit → session env → source-string → None/fail-closed). Local import
+    keeps the db.crud layer free of a module-level memory dependency. Returns
+    ``None`` for an unknown source BY DESIGN — the read side treats ``None`` as
+    external, so a missed writer degrades to cosmetically-excluded, never trusted.
+    """
+    from genesis.memory.provenance import derive_observation_origin
+
+    return derive_observation_origin(origin_class=origin_class, source=source)
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -282,6 +312,8 @@ async def create(
     skip_if_duplicate: bool = False,
     origin_class: str | None = None,
 ) -> str | None:
+    origin_class = _resolve_origin(origin_class, source)
+
     # Auto-compute content_hash if not provided
     if content_hash is None and content and content.strip():
         content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -322,6 +354,11 @@ async def create(
         # schema-level unique index (which would change semantics for every
         # other observation writer).
         cursor = await db.execute(
+            # WS-3: dedup identity includes origin_class (NULL-safe IS) so a
+            # less-trusted duplicate can't suppress a more-trusted one — e.g. a
+            # gateway (external) task_detected must NOT block the owner's identical
+            # Telegram/terminal request from being recorded with owner authority.
+            # Same-origin duplicates still dedup (monitors are single-origin).
             """INSERT INTO observations
                (id, person_id, source, type, category, content, priority,
                 speculative, created_at, expires_at, content_hash, origin_class)
@@ -329,8 +366,9 @@ async def create(
                WHERE NOT EXISTS (
                    SELECT 1 FROM observations
                    WHERE source = ? AND content_hash = ? AND resolved = 0
+                     AND origin_class IS ?
                )""",
-            (*params, source, content_hash),
+            (*params, source, content_hash, origin_class),
         )
         await db.commit()
         if cursor.rowcount == 0:
@@ -369,6 +407,7 @@ async def upsert(
     origin_class: str | None = None,
 ) -> str:
     """Idempotent write: insert or update on conflict."""
+    origin_class = _resolve_origin(origin_class, source)
     await db.execute(
         """INSERT INTO observations
            (id, person_id, source, type, category, content, priority,
@@ -1052,6 +1091,14 @@ async def count_external_by_ids(
     just-accepted user-model deltas: external iff ANY contributing delta row
     carries ``origin_class='external_untrusted'``. NULL/legacy rows count as
     first-party by omission — pre-substrate rows must not manufacture signal.
+
+    WS-3 CAVEAT: this bare ``= 'external_untrusted'`` predicate treats NULL as
+    first-party, the OPPOSITE of the fail-closed READ contract
+    (``immunity.effective_origin_class(None) -> external``). Safe TODAY only
+    because this feeds the identity gate-2 SHADOW emit (observability, not
+    enforcement). Before that gate flips to ENFORCE, route this through
+    ``effective_origin_class`` (None->external) so a missed-writer / pre-backfill
+    NULL external row is not trusted. Tracked with the WS-3 read-side PR.
     """
     if not ids:
         return 0

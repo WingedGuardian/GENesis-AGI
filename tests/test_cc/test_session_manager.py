@@ -265,3 +265,16 @@ async def test_foreground_origin_stays_null(db, manager):
     )
     row = await cc_sessions.get_by_id(db, sess["id"])
     assert row["origin_class"] is None  # owner-supervised, read first_party
+
+
+async def test_foreground_gateway_origin_external(db, manager):
+    """WS-3 (Codex PR #1431 finding A): a gateway (web/OpenClaw) foreground
+    session is stamped external_untrusted durably, so reflection_window_origin
+    (which reads cc_sessions.origin_class) treats a reflection overlapping it as
+    external and does not launder its user_model_delta to first_party."""
+    sess = await manager.get_or_create_foreground(
+        user_id="u1",
+        channel=ChannelType.WEB,
+    )
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["origin_class"] == "external_untrusted"

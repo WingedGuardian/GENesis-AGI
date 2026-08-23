@@ -358,6 +358,30 @@ def _is_harness_envelope(prompt: str) -> bool:
     return prompt.lstrip().startswith(_HARNESS_ENVELOPE_PREFIXES)
 
 
+# WS-3 observation provenance. Literals mirror memory.provenance.ORIGIN_* — kept
+# stdlib-only here so the never-block write path takes no genesis import.
+_VALID_ORIGIN_CLASSES = frozenset({"owner", "first_party", "external_untrusted"})
+
+
+def _pivot_origin_class() -> str:
+    """origin_class for a conversation_pivot row written by THIS hook.
+
+    This hook ``sys.exit(0)``s at the top of the module when
+    ``GENESIS_CC_SESSION == "1"``, so it only ever runs in a user-launched
+    INTERACTIVE terminal session — i.e. the owner. Every Genesis-dispatched or
+    external session sets ``GENESIS_CC_SESSION=1`` (cc/invoker.py:396,
+    session_awareness/headless.py:78) and never reaches here; and
+    ``GENESIS_SESSION_ORIGIN`` is only ever set ALONGSIDE that guard
+    (invoker.py:412), so it cannot be present past the exit. The origin is
+    therefore ``owner``. The env read below is belt-and-suspenders for a
+    hypothetical future spawn path that sets an origin without the CC_SESSION
+    guard; it cannot fire today (fail-closed to owner is safe — the read side
+    keeps owner/first_party and this surface is the owner's own pivot trail).
+    """
+    origin = os.environ.get("GENESIS_SESSION_ORIGIN")
+    return origin if origin in _VALID_ORIGIN_CLASSES else "owner"
+
+
 def _record_pivot_observation(
     db_path: Path,
     session_id: str,
@@ -374,8 +398,9 @@ def _record_pivot_observation(
         try:
             conn.execute(
                 "INSERT INTO observations"
-                " (id, source, type, content, priority, created_at, expires_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " (id, source, type, content, priority, created_at, expires_at,"
+                " origin_class)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _uuid.uuid4().hex,
                     f"session:{session_id}",
@@ -384,6 +409,7 @@ def _record_pivot_observation(
                     "low",
                     now.isoformat(),
                     expires_at,
+                    _pivot_origin_class(),
                 ),
             )
             conn.commit()

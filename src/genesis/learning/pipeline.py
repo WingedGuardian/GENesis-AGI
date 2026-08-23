@@ -126,6 +126,18 @@ def build_triage_pipeline(
             raise
 
     async def _run_pipeline(output: Any, user_text: str, channel: str) -> None:
+        # WS-3: origin for the observations this pipeline writes ABOUT the session.
+        # retrospective/cc_debrief content characterizes the analyzed conversation,
+        # so it must inherit THAT conversation's channel trust — owner-attended
+        # (terminal/Telegram) → first_party; every gateway/inbox channel →
+        # external_untrusted (fail-closed). Without this an inbox/mail session's
+        # debrief "learnings" would stamp first_party and launder external content
+        # into L1/reflection. Stamped explicitly here (not source-derived: the
+        # source strings are channel-agnostic).
+        from genesis.cc.types import observation_origin_for_channel
+
+        obs_origin = observation_origin_for_channel(channel)
+
         # 1. Summarise
         summary = build_summary(
             output,
@@ -189,8 +201,11 @@ def build_triage_pipeline(
                 content=f"Outcome: {outcome.value}\n{triage.rationale}",
                 priority="medium",
                 category="learning",
+                origin_class=obs_origin,
             )
-            await route_learning_signals(db, delta, outcome, observation_writer)
+            await route_learning_signals(
+                db, delta, outcome, observation_writer, origin_class=obs_origin
+            )
 
             # 6.1. Drive adaptation (error-isolated — must not crash pipeline)
             try:
@@ -291,6 +306,7 @@ def build_triage_pipeline(
                 content=learning,
                 priority="low",
                 category="learning",
+                origin_class=obs_origin,
             )
 
     def _extract_steering_rule(

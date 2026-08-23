@@ -223,7 +223,8 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
         # conversation handler.
         prompt_text = msg.text
         replied = getattr(msg.reply_to_message, "text", None) if msg.reply_to_message else None
-        if isinstance(replied, str) and replied:
+        composite = isinstance(replied, str) and bool(replied)
+        if composite:
             if len(replied) > 2000:
                 replied = replied[:2000] + "…"
             prompt_text = (
@@ -239,6 +240,10 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             thread_id=tid,
             session_key=interrupt_key(*ikey),
             chat_id=str(msg.chat.id),
+            # WS-3: on a quote-reply the prompt is a composite (quoted bot text +
+            # owner reply); the quoted text can relay external content, so scan
+            # slash intents (/task, /model, …) from the OWNER's reply only.
+            intent_text=msg.text if composite else None,
         )
         log.info("Response to %s (%d chars)", user.id, len(response or ""))
 

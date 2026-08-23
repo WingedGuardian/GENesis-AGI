@@ -99,6 +99,79 @@ def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
     return value == ChannelType.TELEGRAM.value
 
 
+def is_owner_attended_channel(channel: ChannelType | str | None) -> bool:
+    """Whether a conversation on *channel* is owner-authenticated at the message
+    boundary — the single owner-ATTENDED channel set (terminal, Telegram).
+
+    Every gateway channel (web/OpenClaw, WhatsApp, voice) is NOT owner-
+    authenticated when a message arrives, and an unknown/None channel is treated
+    as not-attended (fail-closed). This is the one predicate for owner-vs-gateway
+    trust at the conversation boundary; both :func:`task_detected_origin` (what
+    origin a detected task carries) and the CC ``supervised`` flag (gate-4
+    pushed-surfaces enforce exemption) derive from it, so they can never diverge.
+    """
+    value = channel.value if isinstance(channel, ChannelType) else str(channel or "")
+    return value in (ChannelType.TERMINAL.value, ChannelType.TELEGRAM.value)
+
+
+def session_origin_for_channel(channel: ChannelType | str | None) -> str | None:
+    """``CCInvocation.origin`` for a CONVERSATION session on *channel*.
+
+    Owner-attended (terminal/Telegram) → ``None``: the invoker leaves
+    ``GENESIS_SESSION_ORIGIN`` unset and the memory/observation chokepoints
+    coalesce server/foreground writes to first_party (unchanged behaviour).
+    Every gateway channel (web/OpenClaw, WhatsApp, voice) → ``external_untrusted``
+    so the session's OWN memory/``observation_write`` calls are stamped untrusted —
+    without this a gateway session runs with no origin env and its writes coalesce
+    to first_party (mcp/memory/observations.py), which the read-side origin gate
+    would then TRUST (the producer half of the gate-4 channel fix). Fail-closed:
+    an unknown/None channel → external_untrusted.
+    """
+    if is_owner_attended_channel(channel):
+        return None
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
+
+    return ORIGIN_EXTERNAL_UNTRUSTED
+
+
+def observation_origin_for_channel(channel: ChannelType | str | None) -> str:
+    """WS-3 ``origin_class`` for an OBSERVATION whose trust follows the analyzed
+    conversation's channel (e.g. a retrospective/debrief the learning pipeline
+    writes ABOUT a session on *channel*).
+
+    Owner-attended (terminal/Telegram) → ``first_party``; every other channel
+    (web/OpenClaw, WhatsApp, voice, inbox, or unknown) → ``external_untrusted``
+    (fail-closed). Note the polarity difference from
+    :func:`session_origin_for_channel`, which returns ``None`` for owner-attended:
+    an OBSERVATION with NULL origin is EXCLUDED from surfacing (the read side
+    treats NULL as external), so an owner-attended observation must carry an
+    EXPLICIT ``first_party`` to survive — it cannot rely on a NULL coalesce.
+    Local import keeps cc.types dependency-light.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_FIRST_PARTY
+
+    return ORIGIN_FIRST_PARTY if is_owner_attended_channel(channel) else ORIGIN_EXTERNAL_UNTRUSTED
+
+
+def task_detected_origin(channel: ChannelType | str | None) -> str:
+    """WS-3 origin_class to stamp on a ``task_detected`` observation, by channel.
+
+    Owner-ATTENDED channels (terminal, Telegram) stamp ``owner`` — a task the
+    owner typed legitimately carries dispatch authority. Every gateway channel
+    (web/OpenClaw, WhatsApp, voice) is NOT owner-authenticated at the message
+    boundary, so its detected tasks are ``external_untrusted``: still visible,
+    but never auto-dispatch-authorized (the autonomy dispatcher's origin gate
+    bars them). Fail-closed: an unknown/None channel → external_untrusted.
+
+    Explicit here (not left to source-string derivation) because the write
+    source is the channel-agnostic ``conversation_intent`` — only the channel
+    distinguishes owner from gateway. Local import keeps cc.types dependency-light.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_OWNER
+
+    return ORIGIN_OWNER if is_owner_attended_channel(channel) else ORIGIN_EXTERNAL_UNTRUSTED
+
+
 class CCModel(StrEnum):
     SONNET = "sonnet"
     OPUS = "opus"

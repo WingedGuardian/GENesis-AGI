@@ -18,6 +18,35 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   qwen as fallbacks. A deliberate cost-vs-quality lever on a quality-critical
   gate; the other repointed sites stay on free flash.
 
+### Security
+
+- **Observation content can no longer launder untrusted origin into privileged
+  cognitive surfaces.** Observation rows now carry a definite origin stamped at the
+  write boundary: the CRUD chokepoint classifies every writer (explicit origin →
+  dispatching-session origin → source classification → NULL fail-closed), so an
+  unknown/novel writer's rows degrade to excluded rather than silently trusted.
+  Owner-attended `task_detected` writes stamp `owner`; gateway ones stamp
+  `external_untrusted`. The two stdlib-only hook writers that bypass the CRUD layer
+  (the conversation-pivot writer and the post-commit audit writer) stamp origin
+  inline, and a one-time migration backfills historical rows. On the read side, the
+  laundering-critical surfaces — the always-loaded essential-knowledge file and the
+  deep-reflection / perception prompt pipeline — now exclude external/unknown-origin
+  content (fail-closed; unknown-origin excluded), severing the path by which external
+  content could reach reflection and re-enter the user model as a trusted delta. A
+  coverage guardrail fails CI on any new raw observation-insert that bypasses the
+  origin chokepoint. The pushed-surfaces supervision exemption for interactive
+  sessions is now restricted to owner-attended channels (terminal/Telegram); gateway
+  conversations no longer receive it. Gateway and voice conversation sessions carry
+  a durable `external_untrusted` session origin so a reflection overlapping them
+  cannot launder its user-model delta to first-party, and the learning triage
+  pipeline stamps its per-session `retrospective`/`cc_debrief` observations with the
+  analyzed conversation's channel origin (an inbox/mail session's learnings can no
+  longer surface as first-party). The coverage guardrail now also follows the
+  indirect `ObservationWriter` writer and module-constant sources. On Telegram
+  quote-replies, slash-command and task intent are parsed from the owner's own reply
+  only — a `/task` (or `/model`, `/effort`, `/resume`) embedded in quoted bot text
+  can no longer forge an owner-authorized command.
+
 ### Fixed
 
 - **A scheduled job that has run repeatedly but never once succeeded now raises a

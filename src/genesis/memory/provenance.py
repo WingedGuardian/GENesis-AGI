@@ -383,6 +383,222 @@ def derive_origin_class(
     return ORIGIN_FIRST_PARTY
 
 
+# ── Observation-table origin classification (WS-3) ─────────────────────────
+# The ``observations`` table's ``source`` is an UNCURATED, free-form field (200+
+# distinct live values, new ones minted freely by any writer) — UNLIKE the
+# memory/KB ``source_pipeline`` (a small curated set that :func:`derive_origin_class`
+# classifies). So its classifier DEFAULTS an unknown source to ``None`` —
+# FAIL-CLOSED — NOT ``first_party``: the read side treats ``None`` as external
+# (via ``immunity.effective_origin_class``), so a missed/novel FUTURE external
+# writer degrades to cosmetically-excluded, never silently trusted. That is the
+# property that makes writer-enumeration NON-load-bearing (user-approved
+# "Option 1", 2026-08-22). Known-EXTERNAL is authoritative (reuses the pipeline
+# registry); the known-FIRST_PARTY allowlist is NON-load-bearing for security (a
+# miss → ``None`` → excluded → cosmetic). A later commit in this PR adds a
+# coverage guardrail (``tests/test_security/test_observation_surface_coverage.py``)
+# to force new ``observations.create``/``upsert`` call sites to classify their
+# source; until it lands, an unclassified new writer is still fail-closed to
+# ``None`` (safe), just not yet CI-enforced.
+
+#: Observation sources whose CONTENT is text pulled off the world. ``recon`` is
+#: the mail/monitor + recon crawlers; ``email_recon`` a surplus intake label
+#: that also appears bare. Keep in lockstep with :data:`_EXTERNAL_PIPELINES`.
+_EXTERNAL_OBS_SOURCES: frozenset[str] = frozenset({"recon", "email_recon"})
+
+#: Genesis-AUTHORED operational/cognitive observation sources (curated allowlist,
+#: NON-load-bearing — a miss excludes cosmetically, never leaks). Built from the
+#: live source census (2026-08-22). New internal writers add their source here or
+#: the coverage guardrail fails CI.
+_FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
+    {
+        "awareness_loop",
+        "reflection",
+        "deep_reflection",
+        "strategic_reflection",
+        "cc_reflection_light",
+        "cc_reflection_strategic",
+        "cc_reflection_deep",
+        "dream_cycle",
+        "genesis_version",
+        "cc_version",
+        "auto_memory_harvest",
+        "post_commit_hook",
+        "entity_adjudication",
+        "process_reaper",
+        "cc_memory_staleness",
+        "infra_profile",
+        "deploy_staleness_monitor",
+        "quality_calibration",
+        "weekly_assessment",
+        "outreach_recovery",
+        "genesis_ego",
+        "ego_cycle",
+        "ego_dispatch",
+        "routing",
+        "guardian",
+        "sentinel",
+        "skill_evolution",
+        "skill_evolution_gate",
+        "research_evaluation",
+        "memory_integrity_posture_monitor",
+        "infra_protection_posture_monitor",
+        "duplicate_session_monitor",
+        "user_model_staleness_monitor",
+        "cc_login_monitor",
+        "architect_triage",
+        "surplus_promotion",
+        # Completed from the full writer census (2026-08-22, Codex PR #1431 P1):
+        # all Genesis-internal monitors/writers whose rows would otherwise
+        # backfill NULL → be excluded from reflection/L1 (cosmetic under Option 1,
+        # but these carry legit health/learning/operational signal).
+        "bootstrap",
+        "cc_cap_monitor",
+        "cc_invoker",
+        "cc_slot_monitor",
+        "cognitive_ledger",
+        "dead_letter_monitor",
+        "dead_letter_storm",
+        "embedding_backlog_monitor",
+        "extraction_calibration",
+        "foreground_reaper",
+        "git_health_monitor",
+        "goal_cascade",
+        "infrastructure_monitor",
+        "nodatacow_monitor",
+        "pid_budget_monitor",
+        "procedure_rebuild",
+        "settings_guard",
+        "stability_monitor",
+        "surplus_monitor",
+        "surplus_scheduler",
+        "task_executor",
+        "wal_health_monitor",
+        # Follow-up hygiene watchdog (awareness/loop.py _FU_WATCHDOG_SOURCE) — a
+        # Genesis-authored infrastructure alert, in-server first-party monitoring.
+        # (It embeds a truncated follow-up snippet; that snippet's own hygiene is
+        # a content concern, not an origin one — the OBSERVATION is Genesis's.)
+        "follow_up_watchdog",
+    }
+)
+
+#: Prefix for ego domain-redirect observations (ego/session.py writes
+#: ``ego_domain_redirect:<source_tag>``). Ego cognition is Genesis's own COO/CEO
+#: brain → first_party. A prefix (not a literal) because the source interpolates
+#: the ego policy tag.
+_EGO_REDIRECT_SOURCE_PREFIX = "ego_domain_redirect:"
+
+#: User-content sources whose origin is NOT the source string — it depends on the
+#: WRITE CHANNEL/session, stamped explicitly at the write site (never allowlisted,
+#: or a gateway message would read as first-party). ``conversation_intent`` is
+#: stamped by :func:`genesis.cc.types.task_detected_origin`; ``user_reply`` is
+#: currently UNWIRED (no caller) and stays fail-closed NULL until a wiring commit
+#: stamps it channel-aware. Listed here so the source-coverage guardrail treats
+#: them as consciously-classified, not accidentally-omitted.
+_USER_CONTENT_OBS_SOURCES: frozenset[str] = frozenset({"conversation_intent", "user_reply"})
+
+#: Genesis-ANALYSIS sources whose trust follows the ANALYZED session's channel,
+#: NOT the source string: the learning triage pipeline writes these ABOUT a
+#: conversation, and that conversation may be an external one (inbox/mail/web/
+#: voice). They are stamped explicitly at the write site via
+#: :func:`genesis.cc.types.observation_origin_for_channel` (learning/pipeline.py +
+#: attribution.py) — NEVER allowlisted, or an inbox/mail retrospective would read
+#: as first-party and launder external-session content into L1/reflection. Listed
+#: here so the source-coverage guardrail treats them as consciously-classified.
+#: (When the pipeline passes no explicit origin they fall to source-derive → None
+#: → fail-closed excluded, so a future un-stamped caller is safe, not trusted.)
+_CHANNEL_STAMPED_OBS_SOURCES: frozenset[str] = frozenset({"retrospective", "cc_debrief"})
+
+#: Prefix an observation ``source`` carries when it re-labels a surplus/recon
+#: intake finding: ``intake:<IntakeSource.value>``.
+_INTAKE_SOURCE_PREFIX = "intake:"
+
+
+def _intake_observation_origin(source: str) -> str | None:
+    """Origin for an ``intake:<IntakeSource.value>`` observation source, else None.
+
+    Reuses ``surplus.intake._pipeline_for_source`` — the AUTHORITY that splits
+    crawled-external intake (model/github/web/email recon) from Genesis-authored
+    insight (anticipatory_research/user_directed/... → "surplus"/first-party) —
+    then :func:`derive_origin_class`. An unknown suffix → ``None`` (fail-closed).
+    Local import defers the surplus→memory dependency to call time (cycle-safe).
+    """
+    suffix = source[len(_INTAKE_SOURCE_PREFIX) :]
+    try:
+        from genesis.surplus.intake import IntakeSource, _pipeline_for_source
+
+        src = IntakeSource(suffix)
+    except (ImportError, ValueError):
+        return None
+    return derive_origin_class(source_pipeline=_pipeline_for_source(src))
+
+
+def _origin_from_source(source: str | None) -> str | None:
+    """Best-effort observation origin from its ``source`` string; ``None`` if unknown.
+
+    ``None`` is the FAIL-CLOSED sentinel — the read side treats it as external.
+    ``session:<uuid>`` and ``module:<name>`` and any unmapped source return
+    ``None`` deliberately: session-attributed rows are resolved by the backfill
+    migration via a ``cc_sessions.origin_class`` JOIN (and new in-session writes
+    are caught earlier by :func:`session_origin_from_env` at the write boundary),
+    while genuinely-unknown sources must stay fail-closed.
+    """
+    if not source:
+        return None
+    if source in _EXTERNAL_OBS_SOURCES:
+        return ORIGIN_EXTERNAL_UNTRUSTED
+    if source in _FIRST_PARTY_OBS_SOURCES:
+        return ORIGIN_FIRST_PARTY
+    if source.startswith(_EGO_REDIRECT_SOURCE_PREFIX):
+        return ORIGIN_FIRST_PARTY
+    if source.startswith(_INTAKE_SOURCE_PREFIX):
+        return _intake_observation_origin(source)
+    # module:* / session:* / any unmapped source → None (fail-closed). module:*
+    # is a CONSCIOUS None (not incidental): a capability module is "hands, not
+    # brain" and its output can carry arbitrary external data (cf.
+    # _EXTERNAL_INGEST_TOOLS), so it must NEVER coalesce to first_party;
+    # per-module trust is a possible future refinement. (module:* rows are absent
+    # from the live surfacing pool, so NULL→excluded has no read-surface impact.)
+    # session:* is resolved by the backfill's cc_sessions JOIN and, for new
+    # writes, by session_origin_from_env() at the write boundary.
+    return None
+
+
+def derive_observation_origin(
+    *, origin_class: str | None = None, source: str | None = None
+) -> str | None:
+    """Store-time origin for an ``observations`` row — FAIL-CLOSED (may return None).
+
+    Precedence (each short-circuits):
+      1. explicit ``origin_class`` (validated) — wins outright.
+      2. ``session_origin_from_env()`` — the dispatching session's origin. Read
+         BEFORE ``source`` so an external-judge session's env can't be overridden
+         by a forged internal ``source`` (forge-proof for external SESSIONS).
+      3. :func:`_origin_from_source` — source-string classification.
+      4. ``None`` — unknown source, fail-closed (read treats None as external).
+
+    Forge-proofing is DIRECTIONAL: env-before-source stops a forged internal
+    ``source`` from downgrading an EXTERNAL session (the threat). The reverse
+    (an ``owner``/``first_party`` env overriding a known-external ``source``) is
+    NOT guarded here — it is safe only because ``owner``/``first_party`` origins
+    are stamped exclusively at trusted dispatch sites (see cc/types.py); a benign
+    session leaves the env unset and falls through to ``source``.
+
+    Contrast :func:`derive_origin_class` (curated pipeline space, defaults
+    first_party). The backfill migration reuses :func:`_origin_from_source` (the
+    env-free part) plus a session JOIN — it must NOT read the live env.
+    """
+    if origin_class is not None:
+        if origin_class not in ORIGIN_CLASSES:
+            raise ValueError(
+                f"invalid origin_class {origin_class!r}; expected one of {sorted(ORIGIN_CLASSES)}"
+            )
+        return origin_class
+    env = session_origin_from_env()
+    if env is not None:
+        return env
+    return _origin_from_source(source)
+
+
 def is_external(collection: str | None) -> bool:
     """True when the memory came from the external-world knowledge base.
 
