@@ -660,8 +660,12 @@
           // Fire-and-forget: drives the page-top backup banner. Must NOT gate initial
           // paint — the /backup/status route shells out to git + systemctl, and
           // backupBanner() is null-safe until backupStatus resolves (banner just
-          // appears once it does).
+          // appears once it does). fetchBackupConfig() runs here too (not only on the
+          // Backup tab) so the banner's "configured" check can see the SAVED repo
+          // setting (backupConfig.repo) on every tab — otherwise a saved-but-not-yet-
+          // cloned repo would read as unconfigured until the Backup tab is opened.
           this.fetchBackupStatus();
+          this.fetchBackupConfig();
 
           // Always-on polling: health snapshot drives the attention strip on all tabs.
           // Uses probabilistic skip when server is failing to reduce load during
@@ -1923,10 +1927,11 @@
           return { text: 'Active', color: '#81c784' };
         },
         // Page-top banner: surface a barren/failed backup state on every tab so it
-        // isn't invisible. Returns a styled {text,color,bg,border} for a problem
-        // state, or null when backups are healthy (banner hidden). Mirrors the
-        // states backupHeadline() models, with correct precedence (a recorded
-        // FAILURE outranks "unconfigured"). Reads /api/genesis/backup/{status,config}.
+        // isn't invisible. Returns a styled {text,color,bg,border} for a problem state
+        // (failure, unconfigured, never-run, stopped/overdue timer, stale backup,
+        // incomplete off-site), or null when the backup is healthy or a deliberate
+        // on-demand run is recent. Precedence: a recorded FAILURE outranks
+        // "unconfigured". Reads /api/genesis/backup/{status,config}.
         backupBanner() {
           const bs = this.backupStatus;
           if (!bs) return null;  // status not loaded yet — no banner
@@ -1965,15 +1970,22 @@
             return { ...warn, text: 'Backups are scheduled but the timer is not running — unattended backups have stopped. Check the Backup tab.' };
           }
 
-          // 5. Scheduled and active, but the last success is far past the interval —
-          //    the timer is wedged / not firing. Conservative threshold (2 missed
-          //    cycles + 1h grace); skipped when the interval is unknown so a custom
-          //    schedule never false-alarms.
+          // 5. Staleness floor: the last successful backup is too old. This does NOT
+          //    require an enabled schedule — an abandoned backup on a disabled or
+          //    custom schedule is exactly the silent-failure state the banner targets.
+          //    (backupHeadline shows "on demand only" for a disabled schedule; a
+          //    banner would over-nag every unscheduled install, so we warn ONLY once
+          //    genuinely stale.) Floor = 2 missed cycles + 1h grace for a known
+          //    interval, else a conservative 7-day floor (unscheduled / custom /
+          //    unknown interval). Also subsumes the wedged-active-timer case.
           const intervalHours = { '3h': 3, '6h': 6, '12h': 12, daily: 24 }[sch && sch.interval];
-          if (sch && sch.enabled && intervalHours && lb.timestamp) {
+          if (lb.timestamp) {
             const ageH = (Date.now() - new Date(lb.timestamp).getTime()) / 3600000;
-            if (ageH > intervalHours * 2 + 1) {
-              return { ...warn, text: 'Backups are overdue — the last successful backup was about ' + Math.round(ageH) + 'h ago, well past the ' + intervalHours + 'h schedule. Check the Backup tab.' };
+            const scheduled = !!(sch && sch.enabled && intervalHours);
+            const floorH = scheduled ? intervalHours * 2 + 1 : 24 * 7;
+            if (ageH > floorH) {
+              const detail = scheduled ? ', well past the ' + intervalHours + 'h schedule' : '';
+              return { ...warn, text: 'Backups are overdue — the last successful backup was about ' + Math.round(ageH) + 'h ago' + detail + '. Check the Backup tab.' };
             }
           }
 
@@ -1989,9 +2001,15 @@
 
           // 7. Off-site (Tier-2) copy is configured but the last run did not complete
           //    it: the local backup succeeded but the off-site recovery copy is
-          //    incomplete (tier2_status != 'ok' or offsite_confirmed === false).
-          if (lb.tier2_backend && lb.tier2_backend !== 'none' &&
-              (lb.tier2_status !== 'ok' || lb.offsite_confirmed === false)) {
+          //    incomplete. Read the RESOLVED destination (bs.destinations.tier2, whose
+          //    backend falls back to _resolved_backend() in backup.py), NOT the raw
+          //    last_backup.tier2_backend — a legacy status file predating that field
+          //    would otherwise skip the warning even while a configured NAS is
+          //    incomplete. Require an explicit incompleteness signal (a non-ok status
+          //    or offsite_confirmed === false) so an info-less legacy record stays quiet.
+          const t2 = bs.destinations && bs.destinations.tier2;
+          if (t2 && t2.backend && t2.backend !== 'none' &&
+              ((t2.status && t2.status !== 'ok') || t2.confirmed === false)) {
             return { ...warn, text: 'The off-site backup copy is incomplete — your local backup succeeded but the off-site copy did not finish. Check the Backup tab.' };
           }
 
