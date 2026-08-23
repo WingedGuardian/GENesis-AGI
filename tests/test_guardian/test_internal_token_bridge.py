@@ -10,7 +10,29 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
+
 import genesis.guardian.credential_bridge as cb
+
+
+@pytest.fixture(autouse=True)
+def _isolate_credential_sources(tmp_path: Path):
+    """Fail-closed default for EVERY test here: point all three host credential
+    sources at absent tmp paths so no combined-bridge invocation escrows a real
+    host token. A positive-contract test overrides ONLY its intended source in-body.
+    (Twin of the fixture in test_credential_bridge.py — kept local to each file so
+    the isolation is scoped exactly to the two credential-bridge test modules and
+    never perturbs other guardian tests via a shared conftest.)
+
+    Fixture-OWNED ``MonkeyPatch`` (see the twin's docstring): a mid-body
+    ``monkeypatch.undo()`` must not revert this isolation and re-expose real tokens.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("HOME", str(tmp_path / "isolated-home"))
+    mp.setattr(cb, "_CC_TOKEN_SOURCE", tmp_path / "cc_oauth_token.env")
+    mp.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
+    yield
+    mp.undo()
 
 
 def test_propagate_then_load_roundtrip(tmp_path: Path) -> None:
@@ -72,4 +94,10 @@ def test_combined_bridge_includes_internal_token(tmp_path: Path, monkeypatch) ->
     written = cb.propagate_guardian_credentials(
         shared_dir=tmp_path / "state" / "shared", secrets_path=secrets
     )
-    assert "internal_api_token.env" in sorted(p.name for p in written)
+    names = sorted(p.name for p in written)
+    assert "internal_api_token.env" in names
+    # Regression guard: this test overrides ONLY its intended source (GENESIS_HOME).
+    # The CC-OAuth leg must stay isolated by _isolate_credential_sources, so no real
+    # host CC token is escrowed here. (RED before the fixture — the import-frozen
+    # _CC_TOKEN_SOURCE leaked cc_oauth_token.env.)
+    assert "cc_oauth_token.env" not in names
