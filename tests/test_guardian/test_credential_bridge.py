@@ -299,6 +299,19 @@ class TestCombinedBridge:
         # HOME to a clone-free sandbox so these telegram/proxmox assertions stay
         # deterministic regardless of the host having a real backup clone.
         monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+        # The CC-OAuth leg reads a dedicated, import-frozen module constant
+        # (_CC_TOKEN_SOURCE = ~/.genesis/cc_oauth_token.env) — NOT HOME or
+        # secrets_path — so on an install that has a real token file it would be
+        # escrowed here, adding a stray cc_oauth_token.env that breaks the
+        # exact-name assertions. Point it at an absent tmp path so the leg no-ops.
+        from genesis.guardian import credential_bridge as cb
+        monkeypatch.setattr(cb, "_CC_TOKEN_SOURCE", tmp_path / "cc_oauth_token.env")
+        # Same hazard class, second leg: propagate_internal_api_token sources
+        # GENESIS_HOME/internal_api_token (falling back to ~/.genesis). HOME is
+        # patched above, but an absolute GENESIS_HOME would bypass that patch and
+        # escrow a real host token file, adding a stray internal_api_token.env.
+        # Point GENESIS_HOME at an absent tmp dir so the leg no-ops on any install.
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
 
     def test_writes_both_when_present(self, tmp_path: Path) -> None:
         from genesis.guardian.credential_bridge import propagate_guardian_credentials
@@ -366,12 +379,19 @@ class TestBackupPassphraseEscrow:
         assert load_backup_passphrase(str(tmp_path / "nope")) == {}
 
     def test_combined_bridge_includes_passphrase(self, tmp_path: Path, monkeypatch) -> None:
+        from genesis.guardian import credential_bridge as cb
         from genesis.guardian.credential_bridge import propagate_guardian_credentials
         # Isolate HOME so the mirror leg (which defaults its source to
         # ~/backups/genesis-backups) is a deterministic no-op here — no clone in
         # the sandbox home means no "creds-mirror" entry. Mirror is covered by
         # TestMirrorCredentialBackup below.
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        # Isolate the import-frozen CC-OAuth token source too (see TestCombinedBridge
+        # ._isolate_home) so a real host token file doesn't add a stray
+        # cc_oauth_token.env that breaks the exact-name assertion below.
+        monkeypatch.setattr(cb, "_CC_TOKEN_SOURCE", tmp_path / "cc_oauth_token.env")
+        # Isolate the internal-api-token leg too (see TestCombinedBridge._isolate_home).
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
         secrets = tmp_path / "secrets.env"
         secrets.write_text(
             "TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_FORUM_CHAT_ID=chat\n"
