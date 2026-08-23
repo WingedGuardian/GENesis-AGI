@@ -16,7 +16,7 @@ import genesis.guardian.credential_bridge as cb
 
 
 @pytest.fixture(autouse=True)
-def _isolate_credential_sources(tmp_path: Path):
+def _isolate_credential_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail-closed default for EVERY test here: point all three host credential
     sources at absent tmp paths so no combined-bridge invocation escrows a real
     host token. A positive-contract test overrides ONLY its intended source in-body.
@@ -24,15 +24,17 @@ def _isolate_credential_sources(tmp_path: Path):
     the isolation is scoped exactly to the two credential-bridge test modules and
     never perturbs other guardian tests via a shared conftest.)
 
-    Fixture-OWNED ``MonkeyPatch`` (see the twin's docstring): a mid-body
-    ``monkeypatch.undo()`` must not revert this isolation and re-expose real tokens.
+    Uses the SHARED ``monkeypatch`` fixture, NOT a fixture-owned ``MonkeyPatch`` (see
+    the twin's docstring): tests here override HOME and GENESIS_HOME in-body, so a
+    fixture-owned instance over the same keys restores in the wrong order at teardown
+    and leaks HOME to a deleted tmp dir, reddening unrelated suites in full-suite CI.
+    One shared instance → correct LIFO teardown. Same INVARIANT as the twin: no test
+    here may call ``monkeypatch.undo()`` / ``delenv`` / ``delattr`` on the three
+    isolated keys mid-body.
     """
-    mp = pytest.MonkeyPatch()
-    mp.setenv("HOME", str(tmp_path / "isolated-home"))
-    mp.setattr(cb, "_CC_TOKEN_SOURCE", tmp_path / "cc_oauth_token.env")
-    mp.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
-    yield
-    mp.undo()
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+    monkeypatch.setattr(cb, "_CC_TOKEN_SOURCE", tmp_path / "cc_oauth_token.env")
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
 
 
 def test_propagate_then_load_roundtrip(tmp_path: Path) -> None:

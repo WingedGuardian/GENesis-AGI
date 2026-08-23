@@ -15,7 +15,7 @@ from genesis.guardian.credential_bridge import (
 
 
 @pytest.fixture(autouse=True)
-def _isolate_credential_sources(tmp_path: Path):
+def _isolate_credential_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail-closed default for EVERY test in this module: point all three host
     credential sources at absent tmp paths so NO combined-bridge invocation can
     escrow a real host token into pytest's output dirs. (Reproduced on a live
@@ -23,8 +23,8 @@ def _isolate_credential_sources(tmp_path: Path):
     ``~/.genesis/cc_oauth_token.env`` into the shared dir.)
 
     A positive-contract test overrides ONLY its intended source IN-BODY (the test
-    body runs after this fixture, so its shared-``monkeypatch`` write layers on top
-    and wins during the test, and is restored at teardown):
+    body runs after this fixture, so its ``monkeypatch`` write layers on top and
+    wins during the test, and is restored at teardown):
       - HOME             → the mirror leg's ~/backups/genesis-backups clone source
       - _CC_TOKEN_SOURCE → the CC-OAuth leg's import-frozen dedicated file
       - GENESIS_HOME     → the internal-api-token leg's source dir
@@ -34,20 +34,26 @@ def _isolate_credential_sources(tmp_path: Path):
     lived outside the old per-class fixture). A test that never touches the bridge
     just gets three harmless env patches — a miss is cosmetic, never a leak.
 
-    Uses a fixture-OWNED ``MonkeyPatch`` (not the shared ``monkeypatch`` fixture),
-    mirroring ``tests/conftest.py``'s secret-isolation fixtures: a test that calls
-    ``monkeypatch.undo()`` mid-body must NOT be able to revert this isolation and
-    re-expose the real host tokens — which would silently re-open exactly the
-    escrow class this guards against.
+    Uses the SHARED ``monkeypatch`` fixture, NOT a fixture-owned ``MonkeyPatch``.
+    Several positive-contract tests override the SAME keys in-body (HOME on the
+    mirror-leg tests, _CC_TOKEN_SOURCE on the CC-OAuth leg); a fixture-owned instance
+    patching those same keys creates TWO MonkeyPatch stacks over one key that restore
+    in the wrong order at teardown, leaking HOME to a deleted tmp dir and reddening
+    unrelated test_hooks/test_scripts files in the full-suite CI run (green in
+    isolation). One shared instance → correct LIFO teardown.
+
+    INVARIANT: no test in this module may call ``monkeypatch.undo()`` or
+    ``monkeypatch.delenv``/``delattr`` on HOME / GENESIS_HOME / _CC_TOKEN_SOURCE
+    mid-body — that would pop this isolation off the shared stack and could escrow a
+    REAL host token. (The fixture-owned form blocked that at the cost of the leak
+    above; the shared form trades it for the ban here plus the positive-contract
+    ``... not in names`` escrow assertions, which fail loudly if isolation is defeated.)
     """
     from genesis.guardian import credential_bridge as cb
 
-    mp = pytest.MonkeyPatch()
-    mp.setenv("HOME", str(tmp_path / "isolated-home"))
-    mp.setattr(cb, "_CC_TOKEN_SOURCE", tmp_path / "cc_oauth_token.env")
-    mp.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
-    yield
-    mp.undo()
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+    monkeypatch.setattr(cb, "_CC_TOKEN_SOURCE", tmp_path / "cc_oauth_token.env")
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "genesis-home"))
 
 
 class TestPropagateTelegramCredentials:
