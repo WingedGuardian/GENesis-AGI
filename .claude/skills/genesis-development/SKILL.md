@@ -333,6 +333,30 @@ tool-selection decision matrix: `.claude/docs/code-intelligence.md`
   canonical-parser lesson (regex→yaml, #1393). Loci today:
   `scripts/hooks/shell_parse.py` + `scripts/hooks/git_push_guard.py`.
 
+  **The boundary of the class — read this BEFORE you reason yourself out of it.**
+  The tar pit is NOT "who tokenizes the string." Delegating tokenization to
+  `shell_parse` and asking git for repo state does NOT exempt a guard: if the
+  guard's CORRECTNESS depends on modeling what a git command WILL DO — which
+  flags force, which operands are paths vs refs, which modes destroy, which
+  repo is targeted — it is argv→EFFECT mapping, and that mapping is the same
+  unbounded open-set surface as raw string parsing. This was reasoned around
+  once already (2026-08-23, PR #1432): the guard used the canonical tokenizer
+  and probed live git state, the author concluded "so it's not hand-rolling,"
+  and Codex returned **13 real findings (10 P1) — every one of them living in
+  the argv→effect layer**. The first architect finding of that shape (a
+  separated global value-flag bypass) was the CLASS signal and got
+  instance-patched; the next round found the rest of the class. n=1 IS the
+  signal: any reviewer finding that exposes a semantic-modeling gap in a guard
+  means STOP and re-architect — never patch the named instance.
+
+  **Decision test (verbatim, apply before shipping any guard):** could a git
+  flag you've never heard of change your guard's verdict? If yes, your claim
+  is open-set — redesign to closed-set token claims (exact-form whitelists /
+  literal token blocks) or to RECOVERABILITY (snapshot-then-allow, where a
+  miss degrades to the status quo instead of a broken guarantee). Do not ship
+  the open-set version and plan to harden it later; the review loop IS the
+  hardening loop, one bug per round, and it does not converge.
+
 ### Iterative-Refinement Discipline
 
 AI refinement cycles degrade code they were asked to "improve" — validation
@@ -498,6 +522,26 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   hand-rolled-parsing hunting, not a lint/secrets scan — and writes the evidence marker. This is
   the review that catches Round-1 bugs before Codex does; `/audit-changes` is only a light
   self-check.
+- **PR review-findings status = `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
+  — ONLY.** This runs the SAME code path as the merge gate (strict fail-closed: a
+  failed scan is never reported clean). NEVER hand-roll a `gh api pulls/N/comments`
+  query to decide whether a PR is review-clean: a wrong filter's EMPTY result reads
+  exactly like "clean". Origin (2026-08-23, #1431/#1432): inline findings are authored
+  by `chatgpt-codex-connector[bot]` — WITH the `[bot]` suffix — while the review-summary
+  author has no suffix; a no-suffix filter returned empty and 13 real findings (10 P1)
+  were reported to the user as "review-clean" until the merge gate blocked. An empty
+  result from your own query is "my query found nothing", never "no findings exist".
+  Reviewed-SHA must equal the PR's current HEAD (the report checks this too).
+- **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
+  A PR touching the enforcement-hook surface (`scripts/hooks/**`,
+  `scripts/bash_safety_hook.sh`, `scripts/review_scope.py`, `scripts/review_state.py`,
+  `.claude/settings.json`, `.claude/hooks/**`) is the guard code itself: the merge gate
+  (1) never classifies its stale-review delta as "review-trivial", and (2) refuses
+  `# stale-review-override` unless recorded fallback-review evidence exists for the
+  EXACT head sha (`~/.genesis/override_review_evidence/<sha>.txt`). The override
+  procedure requires the user's explicit authorization, then a fallback adversarial
+  review (local `codex exec` when quota allows, else genesis-architect), evidence
+  recorded, then the merge re-run — the gate's block message walks through it.
 - **One reviewer at a time — NEVER run two review agents simultaneously.** Run
   one reviewer (e.g. Codex), apply/verify its findings, then run the next
   reviewer (e.g. Claude) on the *fixed* code — sequential, never in parallel.

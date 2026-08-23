@@ -43,6 +43,14 @@ review-CONTEXT gates (Codex-at-head freshness + base-is-default),
 ``# ci-override`` waives the CI gate. A session that genuinely needs several
 appends several (one trailing comment may carry multiple sigils).
 
+Hook-surface merge teeth (2026-08-23): a PR whose diff touches the
+ENFORCEMENT-HOOK surface (``_HOOK_SURFACE_PREFIXES``/``_HOOK_SURFACE_FILES`` —
+the code these gates themselves run on) gets stricter freshness handling: its
+stale-review delta is never "review-trivial", and ``# stale-review-override``
+alone cannot merge it — recorded fallback-review evidence keyed to the exact
+head sha is additionally required (``_hook_surface_override_check``; the block
+message documents the user-authorized fallback procedure).
+
 Scheduled Claude review markers
 -------------------------------
 A "scheduled Claude review" runs on the repo OWNER's GitHub account (NOT a bot) and must
@@ -1455,6 +1463,228 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
     return latest
 
 
+# ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
+# The ENFORCEMENT-HOOK surface is the code the merge/push/commit gates themselves
+# run on: an unreviewed change here disarms every other gate, so it gets stricter
+# review teeth than ordinary code. Two rules, both scoped to these paths:
+#   1. A stale-review delta touching this surface is NEVER "review-trivial"
+#      (_classify_post_review_delta): a "small single-file touch-up" to a guard
+#      is exactly the change that must not skip re-review.
+#   2. `# stale-review-override` alone cannot merge a hook-surface PR without a
+#      current GitHub Codex review — it additionally requires recorded
+#      fallback-review evidence keyed to the EXACT head sha
+#      (_hook_surface_override_check). The GitHub Codex review is the required
+#      evidence class (user decision, 2026-08-23); the fallback procedure
+#      (user-authorized local codex / Claude Code adversarial review) is the
+#      documented exception path, not a self-serve bypass.
+# WHY this exists (the origin story — keep it, it is the anti-rationalization):
+# on PR #1432 a hand-rolled findings query returned empty and was reported as
+# "review-clean" while 13 real Codex findings (10 P1) sat on the PR; only this
+# file's merge gate caught it. The lesson: the human-facing claim and the gate
+# MUST run the same code path, and the gate's own code must never merge
+# unreviewed. Tests: tests/test_hooks/test_git_push_guard_hook_surface.py.
+_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/")
+# EVERY hook wired in .claude/settings.json is fence surface — not only the
+# blocking gates: any script auto-executing inside sessions is enforcement-
+# adjacent (architect SHOULD-FIX 2026-08-23: the named-list-as-sample trap this
+# PR itself documents — review_enforcement_commit.py et al. lived outside the
+# original 4-file fence). Over-fencing costs only stricter review; a guardrail
+# test (test_git_push_guard_hook_surface.py) parses settings.json and FAILS CI
+# if a wired hook ever falls outside this fence, so the set is self-maintaining.
+_HOOK_SURFACE_FILES = frozenset(
+    {
+        "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
+        "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
+        "scripts/review_state.py",  # escalation counter + review markers
+        ".claude/settings.json",  # hook wiring (inline blob + matchers)
+        # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
+        # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
+        # covered by the prefix above.
+        "scripts/behavioral_linter.py",
+        "scripts/check_stale_pending.py",
+        "scripts/content_safety_hook.py",
+        "scripts/contribution_offer_hook.py",
+        "scripts/edit_failure_sensor.py",
+        "scripts/file_context_hook.py",
+        "scripts/file_modification_audit_hook.py",
+        "scripts/genesis_precompact.py",
+        "scripts/genesis_session_context.py",
+        "scripts/genesis_session_end.py",
+        "scripts/genesis_stop_hook.py",
+        "scripts/genesis_urgent_alerts.py",
+        "scripts/plan_bookmark_hook.py",
+        "scripts/pretool_check.py",
+        "scripts/proactive_memory_hook.py",
+        "scripts/procedure_advisor.py",
+        "scripts/review_enforcement_commit.py",
+        "scripts/review_enforcement_prompt.py",
+        "scripts/review_invalidate_on_commit.py",
+        "scripts/surface_pr_updates.py",
+    }
+)
+
+
+def _is_hook_surface_path(path: str) -> bool:
+    """True iff ``path`` (repo-relative, as GitHub reports it) is enforcement-hook
+    surface. Prefix matches are real path segments (``scripts/hooks/x``), never
+    substrings (``scripts/hooks_readme.md`` does not match)."""
+    return path in _HOOK_SURFACE_FILES or any(path.startswith(p) for p in _HOOK_SURFACE_PREFIXES)
+
+
+def _override_evidence_dir() -> str:
+    """Directory holding fallback-review evidence files (``<head-sha>.txt``).
+
+    ``GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR`` overrides (config knob + test seam);
+    default lives outside the repo so evidence survives worktree removal and is
+    never committed."""
+    return os.environ.get("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR") or os.path.expanduser(
+        "~/.genesis/override_review_evidence"
+    )
+
+
+def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """Every filename the PR touches (including rename SOURCES via
+    ``previous_filename`` — a guard renamed OUT of scripts/hooks/ is a hook
+    change), or None on any API/parse error. GitHub caps ``pulls/N/files`` at
+    3000 entries; at the cap a hook file may sit beyond it → None (the caller
+    fails closed). Tests inject via ``_TEST_GH_PR_FILES`` (one JSON object per
+    line: ``{filename, previous_filename}``; the literal ``__error__`` simulates
+    an API error)."""
+    raw = os.environ.get("_TEST_GH_PR_FILES")
+    if raw == "__error__":
+        return None
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {filename: .filename, previous_filename: .previous_filename}",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge-path timeout budget (see main()): this runs ONLY on the
+                # rare `# stale-review-override` path, so one paginated read
+                # stays inside the hook's wall-clock.
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
+        except Exception:
+            return None
+    files: list[str] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None  # malformed page → cannot vouch for the full file set
+        if not isinstance(obj, dict):
+            return None
+        for key in ("filename", "previous_filename"):
+            val = obj.get(key)
+            if val:
+                files.append(str(val))
+    if len(files) >= 3000:
+        return None  # pagination cap — a hook file may be hidden beyond it
+    return files
+
+
+def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
+    """Gate the ``# stale-review-override`` escape on hook-surface PRs.
+
+    Returns ``(should_block, message)``. Fail direction is CLOSED throughout:
+    an unreadable diff or head sha blocks — this path exists precisely because
+    the normal review evidence is absent, so uncertainty must not widen the
+    escape. Non-hook-surface PRs pass untouched (the sigil keeps its normal
+    meaning there)."""
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return (
+            True,
+            (
+                f"could not read PR #{pr_num}'s changed files to scope the "
+                f"stale-review-override (hook-surface PRs need fallback-review "
+                f"evidence). Retry when GitHub answers — this read failing "
+                f"closed is deliberate."
+            ),
+        )
+    touched = sorted({f for f in files if _is_hook_surface_path(f)})
+    if not touched:
+        return False, ""
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return (
+            True,
+            (
+                f"PR #{pr_num} touches the enforcement-hook surface "
+                f"({', '.join(touched[:4])}) but its head sha could not be read, "
+                f"so fallback-review evidence cannot be verified. Retry."
+            ),
+        )
+    head = head.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        # A network-sourced string becomes a path component below — validate the
+        # exact oid shape (mirrors _SCHEDULED_REVIEW_HEAD_RE) so garbage blocks
+        # EXPLICITLY instead of via an accidental unmatchable filename.
+        return (
+            True,
+            (
+                f"PR #{pr_num}'s head sha read back malformed ({head[:24]!r}) — "
+                f"cannot key fallback-review evidence. Retry."
+            ),
+        )
+    evidence_path = os.path.join(_override_evidence_dir(), f"{head}.txt")
+    try:
+        has_evidence = os.path.getsize(evidence_path) > 0
+    except OSError:
+        has_evidence = False
+    if has_evidence:
+        # Residual TOCTOU, accepted as part of the force path's documented
+        # "conscious unbound merge" contract: a push landing between this head
+        # read and the merge would merge a head the evidence does not name. The
+        # window is seconds, re-running re-reads the head, and binding here
+        # would force --match-head-commit onto override merges — declined.
+        print(
+            f"NOTE: hook-surface override on PR #{pr_num} backed by fallback-review "
+            f"evidence at {evidence_path} (head {head[:12]}).",
+            file=sys.stderr,
+        )
+        return False, ""
+    return (
+        True,
+        (
+            f"'# stale-review-override' is NOT sufficient by itself here: PR "
+            f"#{pr_num}'s diff touches the ENFORCEMENT-HOOK surface "
+            f"({', '.join(touched[:4])}{', …' if len(touched) > 4 else ''}) — the "
+            f"code the merge/push gates themselves run on. Merging it without a "
+            f"current GitHub Codex review additionally requires recorded "
+            f"fallback-review evidence for the EXACT head {head[:12]}.\n"
+            f"Procedure (requires the user's explicit authorization — never "
+            f"self-serve):\n"
+            f"  1. Get the user's go-ahead for the override.\n"
+            f"  2. Run a fallback adversarial review of the full PR diff: local "
+            f"`codex exec` when quota allows, else a Claude Code adversarial "
+            f"review (genesis-architect).\n"
+            f"  3. Record reviewer + findings + dispositions in:\n"
+            f"       {evidence_path}\n"
+            f"  4. Re-run this merge (same sigil). A new push changes the head "
+            f"sha — re-review and re-key.\n"
+            f"WHY: 2026-08-23 — an unreviewed merge on this surface disarms every "
+            f"other gate; the GitHub Codex review is the required evidence class "
+            f"(user decision), and this file's own history (#1432: 13 findings "
+            f"invisible to a hand-rolled query) is the proof the gate must not "
+            f"trust the author's claim of cleanliness."
+        ),
+    )
+
+
 def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | None) -> str | None:
     """Substantiality of what HEAD adds OVER the Codex-reviewed SHA, via the compare API.
 
@@ -1525,6 +1755,17 @@ def _classify_post_review_delta(reviewed_sha: str, head_sha: str, repo: str | No
         return None
     if len(files) >= 300:
         return "substantial"  # compare file cap hit → can't rule out substantial code
+    # Hook-surface teeth rule 1: a delta touching the enforcement-hook surface is
+    # NEVER review-trivial, no matter how small — see the block above
+    # _is_hook_surface_path for the why. Rename sources count (previous_filename):
+    # a guard renamed/moved out of scripts/hooks/ IS a hook change.
+    for f in files:
+        if not isinstance(f, dict):
+            return None
+        for key in ("filename", "previous_filename"):
+            val = f.get(key)
+            if val and _is_hook_surface_path(str(val)):
+                return "substantial"
     try:
         # review_scope lives in scripts/ (parent of scripts/hooks/). Lazy import ON
         # PURPOSE: an import failure must degrade THIS classification to None (the
@@ -1569,6 +1810,14 @@ def _check_codex_reviewed_head(
     cannot smuggle an unreviewed head through (TOCTOU — Codex P1, PR #1366).
     """
     if force:
+        # Hook-surface teeth rule 2: the sigil alone is not enough when the PR
+        # touches the enforcement-hook surface — recorded fallback-review
+        # evidence for the exact head is additionally required (fail-closed).
+        # verified_head stays None on the pass path: the force path keeps its
+        # documented "conscious unbound merge" contract (no --match-head bind).
+        blocked, msg = _hook_surface_override_check(pr_num, repo=repo)
+        if blocked:
+            return True, msg, None
         return False, "", None
     head = _pr_head_sha(pr_num, repo=repo)
     if not head:
@@ -3151,7 +3400,9 @@ def main() -> int:
                 # pre-gate repo/PR resolution above (6s each) — carries a tight
                 # per-call timeout (6-8s): pre-gates + fail-closed gates
                 # (derive 6 + resolve 6 + mergeable 8 + ci 8 + base 6+6 +
-                # freshness 6+8 + delta 8 = 62s absolute worst) each reach
+                # freshness 6+8 + delta 8 = 62s absolute worst; the FORCE
+                # branch swaps freshness+delta for its hook-surface evidence
+                # reads, files 8 + head 6 = strictly less) each reach
                 # their own block/allow decision at or inside the budget, and
                 # any ONE of them timing out fail-closes IMMEDIATELY (the
                 # additive worst case needs every call slow-but-successful);
