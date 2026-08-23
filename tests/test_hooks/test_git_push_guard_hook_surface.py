@@ -156,7 +156,7 @@ class TestOverrideEvidenceGate:
     def test_hook_pr_force_with_evidence_passes(self, monkeypatch, capsys):
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
         self.dir.mkdir(parents=True)
-        (self.dir / f"{HEAD}.txt").write_text(
+        (self.dir / f"local__1__{HEAD}.txt").write_text(
             "reviewer: claude-code adversarial (codex quota-dead)\nfindings: none\n"
         )
         should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
@@ -165,14 +165,14 @@ class TestOverrideEvidenceGate:
     def test_hook_pr_force_with_empty_evidence_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
         self.dir.mkdir(parents=True)
-        (self.dir / f"{HEAD}.txt").write_text("")
+        (self.dir / f"local__1__{HEAD}.txt").write_text("")
         should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
         assert should_block
 
     def test_hook_pr_force_evidence_for_wrong_sha_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
         self.dir.mkdir(parents=True)
-        (self.dir / f"{STALE}.txt").write_text("evidence for an older head\n")
+        (self.dir / f"local__1__{STALE}.txt").write_text("evidence for an older head\n")
         should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
         assert should_block
 
@@ -270,3 +270,76 @@ class TestWiredHooksFenceGuardrail:
             f"hooks wired in .claude/settings.json but OUTSIDE the merge-teeth "
             f"fence — add them to _HOOK_SURFACE_FILES in git_push_guard.py: {outside}"
         )
+
+
+class TestRound1P2Regressions:
+    """Codex round-1 P2s: record validation, row-count cap, config fence."""
+
+    def test_null_filename_record_fails_closed(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", '{"filename": null, "previous_filename": null}'
+        )
+        assert _mod._pr_changed_files("1") is None
+
+    def test_empty_filename_record_fails_closed(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", '{"filename": "", "previous_filename": null}'
+        )
+        assert _mod._pr_changed_files("1") is None
+
+    def test_non_string_previous_filename_fails_closed(self, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", '{"filename": "a.py", "previous_filename": 7}'
+        )
+        assert _mod._pr_changed_files("1") is None
+
+    def test_cap_counts_rows_not_expanded_paths(self, monkeypatch):
+        # 1500 renames = 3000 expanded paths but only 1500 API rows — must NOT
+        # trip the 3000-row cap (the old expanded-path count false-closed here).
+        lines = "\n".join(
+            json.dumps({"filename": f"new{i}.py", "previous_filename": f"old{i}.py"})
+            for i in range(1500)
+        )
+        monkeypatch.setenv("_TEST_GH_PR_FILES", lines)
+        files = _mod._pr_changed_files("1")
+        assert files is not None
+        assert len(files) == 3000
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "config/protected_paths.yaml",
+            "config/repo_topology.yaml",
+            "config/behavioral_rules/no_hide_problems.yaml",
+            "config/behavioral_rules/some_future_rule.yaml",
+        ],
+    )
+    def test_hook_owned_config_is_fenced(self, path):
+        # Decision-driving config IS enforcement surface: the ordinary
+        # substantiality classifier treats YAML as review-trivial, so a
+        # rewrite removing blocking patterns could otherwise merge stale.
+        assert _mod._is_hook_surface_path(path)
+
+    def test_unrelated_config_not_fenced(self):
+        assert not _mod._is_hook_surface_path("config/genesis.yaml.example")
+
+    def test_evidence_identity_includes_repo_and_pr(self, tmp_path, monkeypatch):
+        # Codex P2: sha-only evidence would vouch across PRs/repos sharing a
+        # head. Evidence written for (repo A, PR 1) must NOT pass (repo B, PR 2).
+        d = tmp_path / "ev"
+        d.mkdir()
+        monkeypatch.setenv("GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR", str(d))
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py")
+        )
+        (d / f"ownera_repoa__1__{HEAD}.txt").write_text("evidence for repo A PR 1\n")
+        blocked, msg, _ = _mod._check_codex_reviewed_head(
+            "2", force=True, repo="ownerb/repob"
+        )
+        assert blocked
+        blocked, msg, _ = _mod._check_codex_reviewed_head(
+            "1", force=True, repo="ownera/repoa"
+        )
+        assert not blocked

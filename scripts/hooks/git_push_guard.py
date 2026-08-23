@@ -1020,6 +1020,12 @@ def _check_pr_review_findings(
                 "gh",
                 "api",
                 f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
+                # --paginate (Codex P2, round 1): without it only the FIRST page
+                # (30 comments) is read — a blocking bot finding on a later page
+                # of a long PR thread would scan as "ok". With the array-form
+                # --jq, gh emits ONE array PER page (concatenated), which the
+                # raw_decode loop below parses.
+                "--paginate",
                 "--jq",
                 "[.[] | {login: .user.login, type: .user.type, body: .body}]",
             ],
@@ -1032,14 +1038,26 @@ def _check_pr_review_findings(
     except Exception:
         return _scan_unreadable(strict, "review-body comments")
 
-    output = result.stdout.strip()
+    output = (result.stdout or "").strip()
     if not output or output == "[]":
         return False, ""  # No comments at all — allow (quota-exhausted case)
 
-    # Parse JSON array of comments
+    # Parse comments: one JSON array per page, concatenated (`[..][..]` /
+    # newline-separated). raw_decode walks every array; a single-page (or
+    # test-injected) payload is just the one-array case of the same loop.
+    raw_comments: list = []
+    decoder = json.JSONDecoder()
+    pos = 0
     try:
-        raw_comments = json.loads(output)
-    except json.JSONDecodeError:
+        while pos < len(output):
+            chunk, end = decoder.raw_decode(output, pos)
+            if not isinstance(chunk, list):
+                return _scan_unreadable(strict, "review-body comments")
+            raw_comments.extend(chunk)
+            pos = end
+            while pos < len(output) and output[pos] in " \t\r\n":
+                pos += 1
+    except ValueError:  # includes json.JSONDecodeError
         return _scan_unreadable(strict, "review-body comments")  # malformed JSON
 
     # GitHub API can return "body": null for deleted comments —
@@ -1483,7 +1501,10 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
 # file's merge gate caught it. The lesson: the human-facing claim and the gate
 # MUST run the same code path, and the gate's own code must never merge
 # unreviewed. Tests: tests/test_hooks/test_git_push_guard_hook_surface.py.
-_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/")
+# config/behavioral_rules/ rides as a prefix: behavioral_linter.py loads every
+# YAML under it (decision config = enforcement surface, see the note in
+# _HOOK_SURFACE_FILES).
+_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
 # EVERY hook wired in .claude/settings.json is fence surface — not only the
 # blocking gates: any script auto-executing inside sessions is enforcement-
 # adjacent (architect SHOULD-FIX 2026-08-23: the named-list-as-sample trap this
@@ -1520,6 +1541,13 @@ _HOOK_SURFACE_FILES = frozenset(
         "scripts/review_enforcement_prompt.py",
         "scripts/review_invalidate_on_commit.py",
         "scripts/surface_pr_updates.py",
+        # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
+        # determine what the wired hooks enforce, and the ordinary
+        # substantiality classifier treats YAML as docs/config (review-trivial)
+        # — so a rewrite that removes blocking patterns could merge on a stale
+        # review. Config that drives enforcement is enforcement surface.
+        "config/protected_paths.yaml",  # pretool_check.py
+        "config/repo_topology.yaml",  # repo_routing_guard.py
     }
 )
 
@@ -1532,7 +1560,8 @@ def _is_hook_surface_path(path: str) -> bool:
 
 
 def _override_evidence_dir() -> str:
-    """Directory holding fallback-review evidence files (``<head-sha>.txt``).
+    """Directory holding fallback-review evidence files
+    (``<repo>__<pr>__<head-sha>.txt``).
 
     ``GENESIS_OVERRIDE_REVIEW_EVIDENCE_DIR`` overrides (config knob + test seam);
     default lives outside the repo so evidence survives worktree removal and is
@@ -1577,6 +1606,7 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
         except Exception:
             return None
     files: list[str] = []
+    rows = 0
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -1587,12 +1617,26 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
             return None  # malformed page → cannot vouch for the full file set
         if not isinstance(obj, dict):
             return None
-        for key in ("filename", "previous_filename"):
-            val = obj.get(key)
-            if val:
-                files.append(str(val))
-    if len(files) >= 3000:
-        return None  # pagination cap — a hook file may be hidden beyond it
+        rows += 1
+        # Strict record shape (Codex P2, round 1): a null/empty/non-string
+        # filename means the record did NOT parse into a usable path — treating
+        # it as parsed could hide a hook file behind a degenerate row. Require
+        # a nonempty string filename; previous_filename may be None (no rename)
+        # or a nonempty string. Anything else → None → caller fails closed.
+        fname = obj.get("filename")
+        if not isinstance(fname, str) or not fname:
+            return None
+        files.append(fname)
+        prev = obj.get("previous_filename")
+        if prev is not None:
+            if not isinstance(prev, str) or not prev:
+                return None
+            files.append(prev)
+    if rows >= 3000:
+        # The cap applies to API ROWS, not the expanded path list (renames
+        # contribute two paths per row — Codex P2, round 1): at the documented
+        # 3000-entry endpoint cap a hook file may be hidden beyond it.
+        return None
     return files
 
 
@@ -1640,7 +1684,13 @@ def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[
                 f"cannot key fallback-review evidence. Retry."
             ),
         )
-    evidence_path = os.path.join(_override_evidence_dir(), f"{head}.txt")
+    # Evidence identity = repo + PR + head (Codex P2, round 1): a commit sha
+    # alone does not identify the PR/base whose FULL diff the fallback review
+    # covered — the same head can appear on another PR or in a fork, and
+    # sha-only evidence would silently vouch there too. An unresolvable repo
+    # degrades to the "local" namespace (still PR- and head-bound).
+    repo_slug = (_normalize_repo(repo) or "local").replace("/", "_")
+    evidence_path = os.path.join(_override_evidence_dir(), f"{repo_slug}__{pr_num}__{head}.txt")
     try:
         has_evidence = os.path.getsize(evidence_path) > 0
     except OSError:

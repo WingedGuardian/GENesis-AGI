@@ -16,6 +16,17 @@ from unittest.mock import patch
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _hermetic_pr_files(monkeypatch):
+    """Hermetic default for the hook-surface override gate's changed-files read:
+    without this, force-path tests hit a LIVE `gh api pulls/N/files` call —
+    green locally (gh authenticated; PR "1" of the cwd repo answers) and red in
+    CI (call fails -> fail-closed block). Tests override per-case."""
+    monkeypatch.setenv(
+        "_TEST_GH_PR_FILES", '{"filename": "src/benign.py", "previous_filename": null}'
+    )
+
 # Resolve the hook script path
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
 _GUARD = _SCRIPTS / "git_push_guard.py"

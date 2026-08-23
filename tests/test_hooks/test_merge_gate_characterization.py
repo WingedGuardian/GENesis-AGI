@@ -35,6 +35,17 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _hermetic_pr_files(monkeypatch):
+    """Hermetic default for the hook-surface override gate's changed-files read:
+    without this, force-path tests hit a LIVE `gh api pulls/N/files` call —
+    green locally (gh authenticated; PR "1" of the cwd repo answers) and red in
+    CI (call fails -> fail-closed block). Tests override per-case."""
+    monkeypatch.setenv(
+        "_TEST_GH_PR_FILES", '{"filename": "src/benign.py", "previous_filename": null}'
+    )
+
 # Load the hook module directly from THIS worktree (mirrors the freshness suite),
 # so the corpus locks the behaviour of the code under test in-tree.
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
