@@ -1,45 +1,77 @@
 #!/usr/bin/env python3
-"""PreToolUse hook (Bash): block git commands that SILENTLY discard uncommitted work.
+"""PreToolUse hook (Bash): stop git from SILENTLY destroying uncommitted work.
 
-`git checkout <path>`, `git restore <path>`, `git reset --hard`, and `git clean -f`
-throw away working-tree changes with no confirmation and no reflog for unstaged
-edits — a single fat-fingered path wipes hours of un-committed work. (Origin:
-2026-08-22 — a verify-RED experiment restored a temporarily-broken file with
-`git checkout <file>`, silently discarding the session's real uncommitted edits to
-that file. A memory only helps the session that recalls it; this guard fires
-unconditionally.)
+Origin: 2026-08-22 — a verify-RED experiment restored a temporarily-broken file
+with ``git checkout <file>``, silently discarding the session's real uncommitted
+edits (no confirmation, no reflog for unstaged changes). A memory only helps the
+session that recalls it; this guard fires unconditionally.
 
-DESIGN — ask git, never parse git's ref-vs-path semantics. The hard part of
-"is this checkout a branch switch or a file discard?" is delegated to git itself:
-for each operand we run `git -C <cwd> status --porcelain -- <operand>` and block
-ONLY when git reports that operand as a modified/dirty TRACKED path. A branch
-name is not a dirty path, so `git checkout fix/foo` (even a slash-y branch, even
-a dirty tree) never false-blocks. This is the canonical-parser discipline
-(scripts/hooks/shell_parse.py for tokenization + cwd) applied to a data-loss
-guard: shell_parse tokenizes/segments; git adjudicates path-vs-ref and dirtiness.
+DESIGN — recoverability, not classification (2026-08-23 redesign)
+=================================================================
+The first version of this guard classified argv→effect: which flags force, which
+operands are dirty paths, which modes destroy. That is the hand-rolled-parser
+tar pit in a new coat — Codex returned 13 real findings (10 P1), every one in
+the argv→effect layer, regardless of the canonical tokenizer underneath.
+Decision test (genesis-development skill): *could a git flag you've never heard
+of change this guard's verdict?* The redesign makes the answer NO by shrinking
+the claim to two provable pieces:
 
-Two block classes:
-  * UNCONDITIONAL (unambiguously discard/delete-intent — block regardless of tree
-    state, matching the prior crude guards, deterministic, with the override):
-      git reset --hard [<ref>]
-      git clean -f / -fd / -fdx / -xf / --force   (closes the old substring bypass)
-  * CONDITIONAL (usually a branch switch / index-only op — block ONLY when git
-    confirms the operand is a dirty tracked path that would be overwritten):
-      git checkout foo.py  |  git checkout -- foo.py   (foo.py has unstaged changes)
-      git restore foo.py   |  git restore --worktree foo.py
-Allows:
-  git checkout <branch> / -b <new> / <clean-path>  ·  git restore --staged foo.py
-  (staged-only, no worktree loss)  ·  git reset --soft/--mixed  ·  git clean -n
+1. COARSE BLOCKS — closed sets of literal tokens, per-subcommand, pure argv,
+   zero repo/operand semantics. An unknown flag cannot flip a verdict because
+   verdicts depend only on closed-set membership:
+     * ``reset`` carrying literal ``--hard`` or ``--merge`` (NOT ``--keep`` —
+       it aborts rather than overwrite local changes) → BLOCK.
+     * ``clean`` → ALLOW only the exact dry-run shape: every token after the
+       subcommand ∈ {-n, --dry-run, -nd, -dn, -d, -x, -X} AND a dry-run token
+       present; ANYTHING else (force, paths, exclude flags, unknown flags,
+       other clusters) → BLOCK.
+       Exotic-but-safe forms over-block by construction — the override is the
+       escape, and over-block is the fail direction this boundary wants.
+     * ``checkout``/``switch`` carrying literal ``--force``/``--discard-changes``
+       or a short cluster containing ``f`` (``-f``, ``-fb`` …) → BLOCK.
+2. SNAPSHOT-THEN-ALLOW — every other ``checkout``/``restore``/``switch``
+   segment is ALLOWED, but first ``git stash create`` snapshots the worktree +
+   index (it mutates NOTHING — no ref, no stash list entry, no tree change) and
+   the sha is logged to ``~/.genesis/git_discard_snapshots.jsonl`` with a
+   recovery note on stderr. If the command then discards work, recovery is
+   ``git stash apply <sha>``. A MISS (unresolvable cwd, non-repo, git error,
+   clean tree) silently allows — degrading exactly to the status quo, never to
+   a false block and never to a false guarantee.
 
 Escape hatch: append ``# discard-override`` to the git segment (a deliberate,
-auditable "yes, discard it"). Fail-OPEN by contract: an unparseable command, an
-unresolvable cwd, a non-repo, or any git error → ALLOW (this guard must never
-block legitimate work on uncertainty; a missed discard is the status quo, a false
-block is a regression). Stdlib-only.
+auditable "yes, discard it") — it waives the coarse blocks; snapshots still run
+(they cost nothing and never block). Fail-OPEN by contract everywhere: an
+unparseable command, an unknown subcommand, any subprocess trouble → ALLOW.
+
+DOCUMENTED RESIDUALS (honest claim — the snapshot is a best-effort net):
+  * ``git stash create`` excludes UNTRACKED files: a checkout that overwrites an
+    untracked path is not covered by the snapshot (the coarse blocks still cover
+    forced forms).
+  * cwd resolution is deliberately simple (payload cwd + a leading ``git -C``):
+    a cd-chain or exotic repo selector (``--git-dir``/``--work-tree``) may
+    snapshot the wrong repo or none — a missed snapshot, i.e. the status quo.
+  * Snapshot commits are unreferenced; ``git gc`` prunes them after the
+    unreachable horizon (default ~2 weeks). Recovery is for "just happened",
+    not archaeology.
+  * ``assume-unchanged``/``skip-worktree`` modifications are INVISIBLE to
+    ``git stash create`` (measured: empty output with a hidden modification
+    present) — a checkout over them is allowed and unrecovered.
+  * An UNMERGED (conflict) worktree makes ``stash create`` error → silent
+    miss for ``checkout --ours/--theirs`` flows.
+  * The override sigil binds to the git SEGMENT: on a nested form
+    (``bash -c 'git reset --hard' # discard-override``) the outer comment is
+    not on the inner segment → still blocks (over-block; put the sigil inside
+    the inner script, or run the git command directly).
+  * In-project, BOTH the settings.json wiring and the global
+    bash_safety_hook delegation run this guard per Bash call → a dirty
+    checkout may log two snapshot rows (harmless; the wider dedup is the
+    all-hooks-review follow-up).
 """
 
 from __future__ import annotations
 
+import contextlib
+import datetime
 import json
 import os
 import subprocess
@@ -47,183 +79,228 @@ import sys
 
 # Self-locate so sibling hook modules resolve whether run as a script or imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# Canonical cwd resolution (cd-chains, `git -C`, worktree) currently lives in the
-# push guard; reuse it rather than hand-roll a second resolver. (Its natural home
-# is shell_parse — consolidating it there is tracked in the hook-review follow-up.)
-from git_push_guard import _CWD_UNKNOWN, _effective_cwd  # noqa: E402
 from hook_input import field, read_payload, run_guard  # noqa: E402
-from shell_parse import (  # noqa: E402
-    _GIT_OPTS_WITH_ARG,
-    analyze,
-    git_subcommand,
-    has_trailing_override,
-)
+from shell_parse import analyze, has_trailing_override  # noqa: E402
 
 _OVERRIDE_SIGIL = "discard-override"
-# Substrings that gate the (slightly) expensive parse+git path. If none is present
-# the command cannot be a discard op, so we return instantly.
-_TRIGGER_SUBSTRINGS = ("checkout", "restore", "reset", "clean")
-# Bound the git probe so a hung/huge repo can never wedge the tool call.
-_GIT_TIMEOUT_S = 5
+# Substrings that gate the parse path; absent all of them the command cannot be
+# a discard-shaped git op, so we return instantly.
+_TRIGGER_SUBSTRINGS = ("checkout", "restore", "reset", "clean", "switch")
+# Bound the snapshot subprocess so a hung/huge repo can never wedge the tool
+# call. 3s (not 5): the USER-LEVEL bash_safety_hook wiring runs under a 5s hook
+# budget, and blocks are decided argv-only BEFORE any snapshot — so the only
+# thing a timeout can cost is the advisory recovery note, and it must fit the
+# tightest wiring's budget (adversarial-review F9).
+_GIT_TIMEOUT_S = 3
+# Self-trim the snapshot JSONL when it grows past this (no external consumer or
+# rotation exists — adversarial-review F8); keep the most recent half.
+_SNAPSHOT_LOG_MAX_BYTES = 1_000_000
+# The exact-form dry-run whitelist for `git clean` — closed set BY CONSTRUCTION:
+# membership here is the ONLY thing that can allow a clean, so requireForce
+# configs, -e's value-taking ambiguity, and flags we have never heard of all
+# land on BLOCK (over-block + override, never under-block). The two canonical
+# preview CLUSTERS (-nd/-dn) are explicit LITERAL members — never decomposed
+# (cluster decomposition is flag semantics, the tar pit this design removed);
+# any other cluster over-blocks with the override as the escape.
+_CLEAN_DRY_RUN_TOKENS = frozenset({"-n", "--dry-run", "-nd", "-dn", "-d", "-x", "-X"})
+_CLEAN_DRY_RUN_REQUIRED = frozenset({"-n", "--dry-run", "-nd", "-dn"})
+# Literal force tokens for checkout/switch (long forms; short clusters are
+# handled structurally by _has_force_cluster).
+_CHECKOUT_FORCE_TOKENS = frozenset({"--force", "--discard-changes"})
 
 
-def _git(cwd: str, *args: str) -> tuple[int, str]:
-    """Run ``git -C <cwd> <args>`` fail-open. Returns (returncode, stdout);
-    (-1, "") on any error/timeout so callers treat trouble as "cannot confirm
-    loss" → allow."""
+def _snapshot_log_path() -> str:
+    """JSONL recovery log. ``GENESIS_DISCARD_SNAPSHOT_LOG`` overrides (test seam
+    + config knob); default lives outside any repo so it survives worktree
+    removal and is never committed."""
+    return os.environ.get("GENESIS_DISCARD_SNAPSHOT_LOG") or os.path.expanduser(
+        "~/.genesis/git_discard_snapshots.jsonl"
+    )
+
+
+def _has_force_cluster(argv: list[str]) -> bool:
+    """A short-flag cluster containing ``f`` (``-f``, ``-fb``, ``-qf`` …).
+    Structural, not semantic: we do not ask what the OTHER letters mean, only
+    whether the literal letter ``f`` rides in a short cluster."""
+    return any(t.startswith("-") and not t.startswith("--") and "f" in t[1:] for t in argv[1:])
+
+
+def _tokens_after_subcommand(argv: list[str], sub: str) -> list[str]:
+    """Every token after the first literal occurrence of ``sub``. Positional:
+    no flag/value modeling (that would be the tar pit) — callers make only
+    closed-set membership claims about these tokens. Direction proof: the first
+    occurrence is at or before the real subcommand (e.g. ``git -C clean clean``
+    anchors on the -C VALUE), so the returned tail is a SUPERSET of the real
+    tail — a whitelist check over a superset can only OVER-block (+ override),
+    never under-block."""
+    try:
+        idx = argv.index(sub)
+    except ValueError:
+        return []
+    return argv[idx + 1 :]
+
+
+def _has_abbrev_of(argv: list[str], long_flags: tuple[str, ...]) -> bool:
+    """git parse-options accepts any unambiguous long-flag PREFIX (``--har`` ==
+    ``--hard``), so literal membership alone under-blocks (adversarial-review
+    F2, executed: ``git reset --har`` hard-resets unblocked). Closed PREFIX-set
+    check, over-block direction: any ``--``-token of length >= 4 that prefixes a
+    blocked long flag counts (ambiguous prefixes over-block — git errors on
+    them anyway)."""
+    return any(
+        t.startswith("--") and len(t) >= 4 and any(f.startswith(t) for f in long_flags)
+        for t in argv[1:]
+    )
+
+
+def _coarse_violations(cmd: str) -> list[str]:
+    """The closed-set token blocks. PURE ARGV — no subprocess, no repo state, no
+    operand semantics — so the verdict is deterministic and cannot be starved by
+    a slow probe under the hook's wall-clock budget.
+
+    Block classes gate on LITERAL VERB MEMBERSHIP in the segment argv, NOT on
+    positional subcommand resolution: resolution depends on skipping git's
+    value-taking global flags — an OPEN set (adversarial-review F1, executed:
+    ``git --attr-source HEAD reset --hard`` shifted the resolved subcommand to
+    the flag's value and flipped the verdict to ALLOW). ``"reset" in argv`` has
+    no such dependency; a pathological ``git checkout reset --hard`` over-blocks
+    with the override as the escape — the direction this boundary wants."""
+    reasons: list[str] = []
+    for seg in analyze(cmd):
+        if seg.exe != "git":
+            continue
+        argv_set = set(seg.argv[1:])
+        if not argv_set & {"reset", "clean", "checkout", "switch"}:
+            continue
+        if has_trailing_override(seg.raw, _OVERRIDE_SIGIL):
+            continue
+        if "reset" in argv_set and (
+            {"--hard", "--merge"} & argv_set or _has_abbrev_of(seg.argv, ("--hard", "--merge"))
+        ):
+            reasons.append(
+                "`git reset --hard/--merge` overwrites uncommitted work with no "
+                "reflog for unstaged changes. Stash or commit first, or append "
+                "`# discard-override` if you truly mean it. (`--keep` aborts on "
+                "local changes and is allowed.)"
+            )
+        if "clean" in argv_set:
+            tail = _tokens_after_subcommand(seg.argv, "clean")
+            is_exact_dry_run = (
+                bool(set(tail) & _CLEAN_DRY_RUN_REQUIRED) and set(tail) <= _CLEAN_DRY_RUN_TOKENS
+            )
+            if not is_exact_dry_run:
+                reasons.append(
+                    "`git clean` permanently deletes files. Only the exact dry-run "
+                    "form is allowed (-n/-nd/--dry-run with -d/-x/-X); anything "
+                    "else — including path arguments — needs `# discard-override`. "
+                    "Preview with `git clean -nd` first."
+                )
+        if argv_set & {"checkout", "switch"} and (
+            _CHECKOUT_FORCE_TOKENS & argv_set
+            or _has_force_cluster(seg.argv)
+            or _has_abbrev_of(seg.argv, tuple(_CHECKOUT_FORCE_TOKENS))
+        ):
+            reasons.append(
+                "`git checkout/switch` with force (`-f`/`--force`/"
+                "`--discard-changes`) throws away local changes. Stash or commit "
+                "first, or append `# discard-override` if intended."
+            )
+    return reasons
+
+
+def _segment_cwd(seg, payload: dict) -> str | None:
+    """DELIBERATELY simple cwd model for the best-effort snapshot: the payload
+    cwd, adjusted by a leading ``git -C <dir>`` on this segment. No cd-chain
+    walking, no --git-dir modeling — a shape this misses yields a missed
+    snapshot (status quo), never a block, so the model does not need to be
+    complete (see DOCUMENTED RESIDUALS)."""
+    base = payload.get("cwd") or os.getcwd()
+    argv = seg.argv
+    for i, tok in enumerate(argv[1:], start=1):
+        if tok == "-C" and i + 1 < len(argv):
+            return os.path.normpath(os.path.join(base, argv[i + 1]))
+        if not tok.startswith("-"):
+            break  # subcommand reached — no leading -C
+    return base
+
+
+def _snapshot_worktree(cwd: str) -> str | None:
+    """``git stash create`` — capture worktree+index WITHOUT mutating anything.
+    Returns the snapshot sha, or None (clean tree / non-repo / any error) —
+    every failure is a silent allow by contract."""
     try:
         proc = subprocess.run(
-            ["git", "-C", cwd, *args],
+            ["git", "-C", cwd, "stash", "create", "git-discard-guard snapshot"],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
             check=False,
         )
-        return proc.returncode, proc.stdout
     except (OSError, subprocess.SubprocessError):
-        return -1, ""
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = proc.stdout.strip()
+    return sha or None
 
 
-def _operands_have_worktree_changes(cwd: str, paths: list[str]) -> list[str]:
-    """Return *paths* if any is a tracked file with UNSTAGED worktree modifications
-    a checkout/restore would overwrite, else []. ONE batched
-    ``git status --porcelain -- p1 p2 …`` (never one call per operand — M2). Uses
-    porcelain's XY status: column Y (worktree) non-space and not '?' = unstaged
-    loss. A branch name / clean path / untracked path never shows dirty (no false
-    block on branch switches). Fail-open: git error / no output → [] (allow)."""
-    if not paths:
-        return []
-    rc, out = _git(cwd, "status", "--porcelain", "--", *paths)
-    if rc != 0 or not out.strip():
-        return []
-    for line in out.splitlines():
-        if len(line) < 2:
-            continue
-        # Y (worktree) column: ' ' clean, '?' untracked (checkout won't overwrite a
-        # tracked file for those); anything else (M/D/R/C/U) = unstaged loss.
-        if line[1] not in (" ", "?"):
-            # Any dirty match within the requested pathspec set blocks the op; a
-            # requested dir can expand to files, so report the requested operands.
-            return paths
-    return []
-
-
-def _is_force_cluster(tok: str) -> bool:
-    """A short-flag cluster that includes force (``-f``, ``-fd``, ``-xf``…)."""
-    return tok.startswith("-") and not tok.startswith("--") and "f" in tok[1:]
-
-
-def _is_force_cluster_present(argv: list[str]) -> bool:
-    """Whether any ``git clean`` token carries force (``-f``/``-fd``/``--force``)."""
-    return "--force" in argv or any(_is_force_cluster(t) for t in argv[1:])
-
-
-def _operands_after_subcommand(argv: list[str]) -> list[str]:
-    """Operands of a checkout/restore (paths + tree-ish). LOCATES the subcommand by
-    skipping git global options and their values via the canonical
-    ``_GIT_OPTS_WITH_ARG`` (so ``git --git-dir X checkout`` finds 'checkout', not
-    'X'), then collects tokens after it, dropping option flags and stopping
-    flag-parsing at ``--``. The tree-ish is harmless (git status of a ref reports
-    nothing). ``--source``/``-s`` take a non-path value that is skipped."""
-    i = 1
-    while i < len(argv):  # advance to the subcommand
-        t = argv[i]
-        if t in _GIT_OPTS_WITH_ARG:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        i += 1  # this token IS the subcommand — operands follow
-        break
-    out: list[str] = []
-    flags_done = False
-    skip_next = False
-    for tok in argv[i:]:
-        if skip_next:
-            skip_next = False
-            continue
-        if not flags_done and tok == "--":
-            flags_done = True
-            continue
-        if not flags_done and tok.startswith("-"):
-            if tok in ("--source", "-s"):
-                skip_next = True
-            continue
-        out.append(tok)
-    return out
-
-
-def _restore_touches_worktree(argv: list[str]) -> bool:
-    """``git restore`` writes the worktree unless it targets ONLY the index.
-    Worktree is restored if ``--worktree``/``-W`` is present, OR neither
-    ``--staged`` nor ``--worktree`` is given (default target is the worktree)."""
-    has_staged = "--staged" in argv or "-S" in argv
-    has_worktree = "--worktree" in argv or "-W" in argv
-    return has_worktree or not has_staged
-
-
-def _unconditional_violations(cmd: str) -> list[str]:
-    """`reset --hard` / `clean -f` — UNAMBIGUOUSLY discard/delete-intent, blocked
-    regardless of tree state (deterministic; matches the prior crude guards; the
-    escape is `# discard-override`). PURE ARGV, NO subprocess — so this decision can
-    never be starved by a slow git probe under the hook's wall-clock budget (main
-    acts on it BEFORE running any conditional probe — M2). Uses the canonical
-    ``git_subcommand`` so a separated global value-flag (``git --git-dir X reset
-    --hard``) cannot bypass it (M1)."""
-    reasons: list[str] = []
+def _record_snapshots(cmd: str, payload: dict) -> None:
+    """Best-effort recovery net for allowed checkout/restore/switch segments.
+    NEVER blocks, never raises past its own boundary; one snapshot per distinct
+    resolved cwd (two segments in the same repo share one snapshot)."""
+    seen_cwds: set[str] = set()
     for seg in analyze(cmd):
         if seg.exe != "git":
             continue
-        sub = git_subcommand(seg.argv)
-        if sub not in ("reset", "clean"):
+        # Literal verb membership, mirroring _coarse_violations (F1: positional
+        # resolution is an open set). "reset" is included (F3): an OVERRIDDEN
+        # `git reset --hard # discard-override` — the sanctioned discard path —
+        # is exactly where a recovery sha is most valuable, and stash create
+        # captures precisely what reset --hard destroys. Over-matching (a
+        # pathological argv containing these verbs) costs one harmless
+        # snapshot. "clean" is excluded: stash create never captures untracked
+        # files, which is all clean deletes.
+        if not set(seg.argv[1:]) & {"checkout", "restore", "switch", "reset"}:
             continue
-        if has_trailing_override(seg.raw, _OVERRIDE_SIGIL):
+        cwd = _segment_cwd(seg, payload)
+        if not cwd or cwd in seen_cwds or not os.path.isdir(cwd):
             continue
-        if sub == "reset" and "--hard" in seg.argv:
-            reasons.append(
-                "`git reset --hard` discards uncommitted work. Stash/commit first, "
-                "or append `# discard-override` if you truly mean it."
-            )
-        elif sub == "clean" and _is_force_cluster_present(seg.argv):
-            reasons.append(
-                "`git clean` with -f/--force permanently deletes untracked files. "
-                "Append `# discard-override` if intended."
-            )
-    return reasons
+        seen_cwds.add(cwd)
+        sha = _snapshot_worktree(cwd)
+        if not sha:
+            continue
+        row = {
+            "ts": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+            "cwd": cwd,
+            "cmd": cmd[:500],
+            "sha": sha,
+        }
+        try:
+            log_path = _snapshot_log_path()
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+            # Self-trim: no external rotation/consumer exists (F8). Keep the
+            # newest half when the file outgrows the cap.
+            if os.path.getsize(log_path) > _SNAPSHOT_LOG_MAX_BYTES:
+                with open(log_path, encoding="utf-8") as fh:
+                    lines = fh.readlines()
+                with open(log_path, "w", encoding="utf-8") as fh:
+                    fh.writelines(lines[len(lines) // 2 :])
+        except OSError:
+            pass  # the stderr note below still carries the recovery sha
+        print(
+            f"[git-discard-guard] uncommitted state in {cwd} snapshotted as "
+            f"{sha[:12]} — if this command discarded work you needed: "
+            f"git stash apply {sha}  (log: {_snapshot_log_path()})",
+            file=sys.stderr,
+        )
 
 
-def _conditional_violations(cmd: str, payload: dict) -> list[str]:
-    """`checkout`/`restore` of a DIRTY tracked path — blocked ONLY when git confirms
-    the loss (a branch switch / clean path / `--staged`-only restore passes). One
-    batched ``git status`` per segment. Runs only after the unconditional pass is
-    clean, so its subprocess latency cannot starve that pass."""
-    reasons: list[str] = []
-    for seg in analyze(cmd):
-        if seg.exe != "git":
-            continue
-        sub = git_subcommand(seg.argv)
-        if sub not in ("checkout", "restore"):
-            continue
-        if has_trailing_override(seg.raw, _OVERRIDE_SIGIL):
-            continue
-        if sub == "restore" and not _restore_touches_worktree(seg.argv):
-            continue  # --staged-only: index change, no worktree loss
-        cwd = _effective_cwd(cmd, payload, seg)
-        if cwd is _CWD_UNKNOWN or not cwd or not os.path.isdir(cwd):
-            continue  # cannot locate the repo → cannot confirm loss → allow
-        for path in _operands_have_worktree_changes(cwd, _operands_after_subcommand(seg.argv)):
-            reasons.append(
-                f"`git {sub} {path}` would discard your unstaged changes to "
-                f"{path} (this is not a branch switch)."
-            )
-    return reasons
-
-
-def _violations(cmd: str, payload: dict) -> list[str]:
-    """Combined view (used by tests). ``main`` runs the two phases separately so the
-    unconditional block is decided with zero subprocess risk."""
-    return _unconditional_violations(cmd) + _conditional_violations(cmd, payload)
+def _violations(cmd: str) -> list[str]:
+    """Test-facing view of the coarse blocks (snapshots are separate on purpose:
+    they never contribute to a verdict)."""
+    return _coarse_violations(cmd)
 
 
 def main() -> int:
@@ -235,27 +312,31 @@ def main() -> int:
         if not any(s in cmd for s in _TRIGGER_SUBSTRINGS):
             return 0
 
-        # Phase 1 — unconditional (argv-only, no subprocess): decided and acted on
-        # BEFORE any git probe, so a slow conditional probe can never SIGKILL-starve
-        # the block for reset --hard / clean -f (M2).
-        reasons = _unconditional_violations(cmd)
-        # Phase 2 — conditional probes (subprocess) only if phase 1 is clean.
-        if not reasons:
-            reasons = _conditional_violations(cmd, payload)
+        # NO blanket except around the verdict (adversarial-review F4): a crash
+        # in analyze/_coarse_violations propagates to run_guard, which converts
+        # it to a VISIBLE fail-closed block — aligning all three artifacts (this
+        # guard, hook_input's fail-closed wiring, bash_safety_hook's
+        # "degraded, NEVER open" delegation contract, whose legacy fallback
+        # engages on rc∉{0,2}). Only discard-shaped commands reach here (the
+        # pre-filters above), so a parser crash can never block unrelated work.
+        reasons = _coarse_violations(cmd)
         if reasons:
             for r in reasons:
                 print(f"BLOCKED: {r}", file=sys.stderr)
             print(
-                "This git command discards uncommitted work. Stage it (`git add`), "
-                "stash it (`git stash`), or commit first. If you truly mean to "
+                "This git command discards work with no recovery path. Stage "
+                "(`git add`), stash, or commit first. If you truly mean to "
                 "discard, append `# discard-override` to the git segment.",
                 file=sys.stderr,
             )
             return 2
+        # Allowed path: best-effort snapshot so a checkout/restore/switch that
+        # DOES overwrite uncommitted work leaves a recovery sha behind. The
+        # net is ADVISORY — its own crash must never block an allowed command.
+        with contextlib.suppress(Exception):
+            _record_snapshots(cmd, payload)
     except (json.JSONDecodeError, KeyError):
-        pass  # Fail-open
-    except Exception:
-        pass  # Any unexpected error → fail-open (never block legitimate work)
+        pass  # Malformed payload → fail-open (cannot even tell what would run)
     return 0
 
 

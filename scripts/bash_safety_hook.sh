@@ -161,17 +161,23 @@ case "$CMD" in
 esac
 
 # git-discard safety — DELEGATE to the Python guard (git_discard_guard.py: one
-# parser, zero divergence with the project-level hook). It blocks reset --hard and
-# clean -f/--force UNCONDITIONALLY (discard/delete-intent), and checkout/restore
-# ONLY when git confirms the operand is a dirty tracked path — all with a
+# parser, zero divergence with the project-level hook). Closed-set coarse blocks
+# (reset --hard/--merge; clean unless the exact dry-run whitelist; checkout/
+# switch with force) + snapshot-then-allow (other checkout/restore/switch get a
+# `git stash create` recovery sha logged before running) — all with a
 # `# discard-override` escape. Checked BEFORE the softer push/PR warnings
 # below (a "git push" warning exits 0 and would short-circuit a hard-block).
 # Pre-filtered so the python spawn cost is paid only for discard-shaped git ops.
 # On guard-unavailable/crash, fall back to the legacy reset/clean globs (degraded,
 # NEVER open — same policy as the rm delegation above). checkout/restore had no
 # prior guard, so they get no degraded fallback (nothing to preserve).
+# Pre-filter mirrors the guard's _TRIGGER_SUBSTRINGS: non-contiguous (`git -C
+# dir checkout`, `git --git-dir /x reset`) and `switch` shapes must reach the
+# python guard too (adversarial-review F5 — the old contiguous "git checkout"
+# globs silently skipped them). The guard re-filters precisely; this only
+# bounds the python spawn cost.
 case "$CMD" in
-    *"git checkout"*|*"git restore"*|*"git reset"*|*"git clean"*)
+    *git*checkout*|*git*restore*|*git*reset*|*git*clean*|*git*switch*)
         _gd_delegated=0
         _py=$(command -v python3 2>/dev/null || true)
         if [ -n "$_py" ] && [ -f "$SCRIPT_DIR/hooks/git_discard_guard.py" ]; then
