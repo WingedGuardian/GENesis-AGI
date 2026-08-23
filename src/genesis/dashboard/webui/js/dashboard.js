@@ -1948,12 +1948,15 @@
             return { ...crit, text: 'The last backup run failed' + (lb.failure_reason ? ' (' + lb.failure_reason + ')' : '') + ' — check the Backup tab.' };
           }
 
-          // 2. Not configured. Key on the SAVED repo setting (backupConfig.repo),
-          //    an existing clone, or a prior run — NOT status.repo alone (null until
-          //    a clone exists, so a saved-but-not-yet-cloned repo would wrongly read
-          //    as unconfigured), and NOT status.configured (that is just "the backup
+          // 2. Not configured. Key on the SAVED repo setting (backupConfig.repo) or
+          //    an existing clone (status.repo_configured / status.repo) — CURRENT
+          //    configuration signals only. NOT a prior run (last_backup): a stale
+          //    successful record survives clone/secrets removal, and backup.sh cannot
+          //    recreate the clone without the repo setting, so a lingering run must not
+          //    mask the unconfigured state (Codex P2, round 4). NOT status.repo alone
+          //    (null until a clone exists), and NOT status.configured (just "the backup
           //    script is installed" — true on every install, so it never fires).
-          const configured = !!((cfg && cfg.repo) || bs.repo_configured || bs.repo || lb);
+          const configured = !!((cfg && cfg.repo) || bs.repo_configured || bs.repo);
           if (!configured) {
             return { ...warn, text: 'Backups are not configured — your data is not being backed up. Set one up on the Backup tab.' };
           }
@@ -2058,27 +2061,39 @@
           } catch (e) { alert("Trigger failed: " + e.message); }
         },
         async fetchBackupConfig() {
-          try {
-            const resp = await fetchApi("/api/genesis/backup/config");
-            if (resp && resp.ok) {
-              const c = await resp.json();
-              this.backupConfig = c;
-              const f = this.backupConfigForm;
-              f.repo = c.repo || '';
-              f.tier2_backend = c.tier2_backend || 'none';
-              f.local_path = c.local_path || '';
-              f.nas = c.nas || '';
-              f.nas_user = c.nas_user || '';
-              // A "custom"/null server interval can't be a preset dropdown value;
-              // default the control to 6h but DON'T mark dirty, so a plain Save
-              // never rewrites a hand-edited schedule (scheduleDirty gates it).
-              f.schedule_interval = (c.schedule_interval && c.schedule_interval !== 'custom')
-                ? c.schedule_interval : '6h';
-              f.schedule_enabled = c.schedule_enabled !== false;
-              this.scheduleDirty = false;   // loaded state is not a user change
-              // passphrase / nas_pass are write-only — never populated.
-            }
-          } catch (e) { console.warn("Backup config fetch failed:", e); }
+          // Single-flight guard: onOpen() (every page open) and Backup-tab activation
+          // both call this, so two responses can be in flight at once. Each rewrites
+          // every form field and resets scheduleDirty below, so a slower duplicate
+          // landing after the user starts editing would silently discard those edits.
+          // Coalesce concurrent callers onto one in-flight request → the form hydrates
+          // exactly once per open. Does NOT cache: the guard clears on completion, so a
+          // later explicit refresh (e.g. post-save re-fetch) still runs fresh.
+          if (this._backupConfigFetch) return this._backupConfigFetch;
+          this._backupConfigFetch = (async () => {
+            try {
+              const resp = await fetchApi("/api/genesis/backup/config");
+              if (resp && resp.ok) {
+                const c = await resp.json();
+                this.backupConfig = c;
+                const f = this.backupConfigForm;
+                f.repo = c.repo || '';
+                f.tier2_backend = c.tier2_backend || 'none';
+                f.local_path = c.local_path || '';
+                f.nas = c.nas || '';
+                f.nas_user = c.nas_user || '';
+                // A "custom"/null server interval can't be a preset dropdown value;
+                // default the control to 6h but DON'T mark dirty, so a plain Save
+                // never rewrites a hand-edited schedule (scheduleDirty gates it).
+                f.schedule_interval = (c.schedule_interval && c.schedule_interval !== 'custom')
+                  ? c.schedule_interval : '6h';
+                f.schedule_enabled = c.schedule_enabled !== false;
+                this.scheduleDirty = false;   // loaded state is not a user change
+                // passphrase / nas_pass are write-only — never populated.
+              }
+            } catch (e) { console.warn("Backup config fetch failed:", e); }
+            finally { this._backupConfigFetch = null; }
+          })();
+          return this._backupConfigFetch;
         },
         async saveBackupConfig() {
           this.backupConfigSaving = true;
