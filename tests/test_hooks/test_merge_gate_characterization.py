@@ -129,9 +129,11 @@ _INLINE_P1_LINE = json.dumps(
         "body": "![P1 Badge](x) something is broken",
     }
 )
-# A review-BODY comment carrying a blocking [P1] marker (issues/N/comments; JSON array).
+# A review-BODY comment carrying a blocking [P1] marker (issues/N/comments). The code
+# now fetches this endpoint with `--paginate --jq '.[] | {…}'`, so gh emits one compact
+# JSON object per line (JSONL), NOT a JSON array — mirror that here.
 _REVIEW_BODY_P1 = json.dumps(
-    [{"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": "[P1] real defect"}]
+    {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": "[P1] real defect"}
 )
 # An inline P2 badge comment — warns but does NOT block.
 _INLINE_P2_LINE = json.dumps(
@@ -159,7 +161,7 @@ def _router(
     mergeable: str = "MERGEABLE",
     mergeable_rc: int = 0,
     inline_lines: str = "",
-    review_array: str = "[]",
+    review_lines: str = "",
     calls: list | None = None,
 ):
     """A ``subprocess.run`` stand-in for the three un-seamed gh calls on the merge
@@ -192,10 +194,10 @@ def _router(
         if any("/pulls/" in a and a.endswith("/comments") for a in parts):
             _rec("inline")
             return _proc(0, inline_lines)
-        # gh api repos/<repo>/issues/<pr>/comments → REVIEW-BODY findings (json array)
+        # gh api repos/<repo>/issues/<pr>/comments → REVIEW-BODY findings (one json obj/line)
         if any("/issues/" in a and a.endswith("/comments") for a in parts):
             _rec("review-body")
-            return _proc(0, review_array)
+            return _proc(0, review_lines)
         return _proc(0, "")
 
     return run
@@ -407,7 +409,7 @@ _CASES: list[tuple[str, object, int, str]] = [
     #    BEFORE the inline scan — a reorder the extraction could make undetected) ──
     (
         "review_body_P1_finding_blocks",
-        lambda mp: _run(mp, _merge_cmd(), router=_router(review_array=_REVIEW_BODY_P1)),
+        lambda mp: _run(mp, _merge_cmd(), router=_router(review_lines=_REVIEW_BODY_P1)),
         2,
         "unresolved review findings",
     ),
@@ -427,7 +429,7 @@ _CASES: list[tuple[str, object, int, str]] = [
         lambda mp: _run(
             mp,
             _merge_cmd(trailer="# review-override"),
-            router=_router(review_array=_REVIEW_BODY_P1),
+            router=_router(review_lines=_REVIEW_BODY_P1),
         ),
         0,
         "",
@@ -467,7 +469,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             mp,
             _merge_cmd(match=None, trailer="# stale-review-override"),
             reviews="",
-            router=_router(review_array=_REVIEW_BODY_P1),
+            router=_router(review_lines=_REVIEW_BODY_P1),
         ),
         2,
         "unresolved review findings",
@@ -569,7 +571,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             mp,
             _merge_cmd(trailer="# ci-override"),
             ci=_ci("FAILURE"),
-            router=_router(review_array=_REVIEW_BODY_P1),
+            router=_router(review_lines=_REVIEW_BODY_P1),
         ),
         2,
         "unresolved review findings",
@@ -872,7 +874,7 @@ def test_findings_not_fetched_when_freshness_blocks(monkeypatch):
         monkeypatch,
         _merge_cmd(),
         reviews="",  # no current review → freshness blocks
-        router=_router(inline_lines=_INLINE_P1_LINE, review_array=_REVIEW_BODY_P1, calls=calls),
+        router=_router(inline_lines=_INLINE_P1_LINE, review_lines=_REVIEW_BODY_P1, calls=calls),
     )
     assert rc == 2
     labels = [label for label, _argv in calls]
@@ -934,7 +936,7 @@ def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
             return _proc(0, _INLINE_P1_LINE if hit else "")
         if any("/issues/" in a and a.endswith("/comments") for a in parts):
             calls.append(("review-body", tuple(parts)))
-            return _proc(0, "[]")
+            return _proc(0, "")  # no review-body comments (JSONL: empty output)
         return _proc(0, "")
 
     cmd = "gh pr merge --subject 123 5 --repo owner/repo --squash --admin  # stale-review-override"

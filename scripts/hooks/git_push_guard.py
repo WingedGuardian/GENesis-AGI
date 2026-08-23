@@ -1006,14 +1006,20 @@ def _check_pr_review_findings(
         return False, ""
 
     try:
-        # Fetch comments as JSON array with author info
+        # --paginate: a review-body finding beyond the first REST page (30
+        # comments) must still gate — without it a [P1]/ERROR on page 2+ was
+        # silently dropped and the merge sailed through (a live fail-open: this
+        # scan runs on the merge path with strict=False). With a per-element jq
+        # filter, gh emits one compact JSON object per line across ALL pages
+        # (mirrors _check_inline_review_findings, which already paginates).
         result = subprocess.run(
             [
                 "gh",
                 "api",
                 f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
+                "--paginate",
                 "--jq",
-                "[.[] | {login: .user.login, type: .user.type, body: .body}]",
+                ".[] | {login: .user.login, type: .user.type, body: .body}",
             ],
             capture_output=True,
             text=True,
@@ -1021,18 +1027,16 @@ def _check_pr_review_findings(
         )
         if result.returncode != 0:
             return _scan_unreadable(strict, "review-body comments")  # gh error
+        raw_comments = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     except Exception:
-        return _scan_unreadable(strict, "review-body comments")
+        return _scan_unreadable(strict, "review-body comments")  # gh error / malformed JSONL
 
-    output = result.stdout.strip()
-    if not output or output == "[]":
-        return False, ""  # No comments at all — allow (quota-exhausted case)
-
-    # Parse JSON array of comments
-    try:
-        raw_comments = json.loads(output)
-    except json.JSONDecodeError:
-        return _scan_unreadable(strict, "review-body comments")  # malformed JSON
+    # An empty result is clean either way. The freshness gate
+    # (_check_codex_reviewed_head) separately requires a CURRENT review to EXIST
+    # at head, so "no comments here" is not the merge-safety rationale — it just
+    # means there is no finding to block on.
+    if not raw_comments:
+        return False, ""
 
     # GitHub API can return "body": null for deleted comments —
     # use `or ""` to coerce None to empty string (get's default only

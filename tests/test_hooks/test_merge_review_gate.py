@@ -759,9 +759,12 @@ class TestCheckPrReviewFindings:
     """Unit tests for _check_pr_review_findings()."""
 
     def _make_gh_output(self, comments: list[tuple[str, str, str]]) -> str:
-        """Build mock gh api JSON output: [{login, type, body}, ...]."""
-        return json.dumps(
-            [{"login": login, "type": utype, "body": body} for login, utype, body in comments]
+        """Build mock ``gh api --paginate --jq '.[] | {…}'`` output: one compact
+        JSON object per line (JSONL), matching the per-element jq the code now
+        uses. An empty list yields "" (gh emits nothing for zero comments)."""
+        return "\n".join(
+            json.dumps({"login": login, "type": utype, "body": body})
+            for login, utype, body in comments
         )
 
     def test_no_comments_allows_merge(self, guard_module):
@@ -776,6 +779,34 @@ class TestCheckPrReviewFindings:
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
         assert msg == ""
+
+    def test_paginated_multiline_findings_parsed_and_blocked(self, guard_module):
+        """Regression: issues/N/comments must be fetched with --paginate and
+        parsed as per-line JSONL.
+
+        Without --paginate a [P1]/ERROR beyond the first REST page (30 comments)
+        was silently dropped and the merge — this scan runs on the live merge
+        path with strict=False — sailed through; the old whole-body json.loads
+        also choked on the JSONL that --paginate emits (→ _scan_unreadable →
+        fail-open). Feed a multi-line JSONL response whose most-recent comment
+        carries an ERROR and assert the gate blocks AND that --paginate is
+        actually requested.
+        """
+        output = self._make_gh_output(
+            [
+                ("chatgpt-codex-connector[bot]", "Bot", "## Structural Review\n\nEarlier note."),
+                ("chatgpt-codex-connector[bot]", "Bot", "### ERROR — raw SQL in production code"),
+            ]
+        )
+        assert "\n" in output  # guard: genuinely multi-line JSONL, not a single array blob
+        with patch.object(guard_module.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=output, stderr="",
+            )
+            should_block, _ = guard_module._check_pr_review_findings("100")
+            gh_argv = mock_run.call_args.args[0]
+        assert should_block
+        assert "--paginate" in gh_argv
 
     def test_clean_review_allows_merge(self, guard_module):
         """Review comment with CLEAN verdict → allow."""
@@ -1023,10 +1054,10 @@ class TestCheckPrReviewFindings:
 
     def test_null_body_fails_open(self, guard_module):
         """GitHub API returning body: null should not crash."""
+        # JSONL (one object per line) to match the per-element --jq the code uses;
+        # body: null must coerce to "" rather than crash.
         output = json.dumps(
-            [
-                {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": None},
-            ]
+            {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": None}
         )
         with patch.object(guard_module.subprocess, "run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
@@ -2019,10 +2050,12 @@ class TestStrictScanMode:
 
     def test_body_empty_is_clean_even_when_strict(self, guard_module):
         # Empty (quota / no comments) is NOT an error — clean in both modes.
+        # Under `--paginate --jq '.[] | {…}'` gh emits nothing (not "[]") for
+        # zero comments, so the empty output is an empty string.
         with patch.object(
             guard_module.subprocess,
             "run",
-            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="[]"),
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=""),
         ):
             block, _ = guard_module._check_pr_review_findings("1", strict=True)
         assert block is False
