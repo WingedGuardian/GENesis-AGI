@@ -1924,18 +1924,78 @@
         },
         // Page-top banner: surface a barren/failed backup state on every tab so it
         // isn't invisible. Returns a styled {text,color,bg,border} for a problem
-        // state (unconfigured / never-run / last run failed), or null when backups
-        // are healthy (banner hidden). Reads /api/genesis/backup/status.
+        // state, or null when backups are healthy (banner hidden). Mirrors the
+        // states backupHeadline() models, with correct precedence (a recorded
+        // FAILURE outranks "unconfigured"). Reads /api/genesis/backup/{status,config}.
         backupBanner() {
           const bs = this.backupStatus;
-          if (!bs) return null;  // not loaded yet — no banner
+          if (!bs) return null;  // status not loaded yet — no banner
           const lb = bs.last_backup;
+          const sch = bs.schedule;
+          const cfg = this.backupConfig;
           const warn = { color: '#f0ad4e', bg: 'rgba(240,173,78,0.15)', border: '#f0ad4e' };
           const crit = { color: '#d9534f', bg: 'rgba(217,83,79,0.15)', border: '#d9534f' };
-          if (!bs.repo) return { ...warn, text: 'Backups are not configured — your data is not being backed up. Set one up on the Backup tab.' };
-          if (!lb) return { ...warn, text: 'Backups are configured but have never run — check the Backup tab.' };
-          if (!lb.success) return { ...crit, text: 'The last backup run failed' + (lb.failure_reason ? ' (' + lb.failure_reason + ')' : '') + ' — check the Backup tab.' };
-          return null;  // healthy (active / scheduled / on-demand) — no banner
+
+          // 1. A recorded FAILURE outranks everything — a failed run (including a
+          //    failed initial clone) is the most urgent state and must not be
+          //    masked by the "unconfigured" check below.
+          if (lb && lb.success === false) {
+            return { ...crit, text: 'The last backup run failed' + (lb.failure_reason ? ' (' + lb.failure_reason + ')' : '') + ' — check the Backup tab.' };
+          }
+
+          // 2. Not configured. Key on the SAVED repo setting (backupConfig.repo),
+          //    an existing clone, or a prior run — NOT status.repo alone (null until
+          //    a clone exists, so a saved-but-not-yet-cloned repo would wrongly read
+          //    as unconfigured), and NOT status.configured (that is just "the backup
+          //    script is installed" — true on every install, so it never fires).
+          const configured = !!((cfg && cfg.repo) || bs.repo_configured || bs.repo || lb);
+          if (!configured) {
+            return { ...warn, text: 'Backups are not configured — your data is not being backed up. Set one up on the Backup tab.' };
+          }
+
+          // 3. Configured, but no backup has ever run.
+          if (!lb) {
+            return { ...warn, text: 'Backups are configured but have never run — check the Backup tab.' };
+          }
+
+          // 4. Scheduled but the timer is not running (stopped out-of-band / failed
+          //    to start): unattended backups have silently stopped even though the
+          //    last run succeeded.
+          if (sch && sch.enabled && !sch.active) {
+            return { ...warn, text: 'Backups are scheduled but the timer is not running — unattended backups have stopped. Check the Backup tab.' };
+          }
+
+          // 5. Scheduled and active, but the last success is far past the interval —
+          //    the timer is wedged / not firing. Conservative threshold (2 missed
+          //    cycles + 1h grace); skipped when the interval is unknown so a custom
+          //    schedule never false-alarms.
+          const intervalHours = { '3h': 3, '6h': 6, '12h': 12, daily: 24 }[sch && sch.interval];
+          if (sch && sch.enabled && intervalHours && lb.timestamp) {
+            const ageH = (Date.now() - new Date(lb.timestamp).getTime()) / 3600000;
+            if (ageH > intervalHours * 2 + 1) {
+              return { ...warn, text: 'Backups are overdue — the last successful backup was about ' + Math.round(ageH) + 'h ago, well past the ' + intervalHours + 'h schedule. Check the Backup tab.' };
+            }
+          }
+
+          // 6. Tier-1 (GitHub) push did not complete — the last run's local backup
+          //    succeeded but commits are not replicated to the remote. Reachable with
+          //    success === true: a prior run's push failed, and today's run had
+          //    nothing new to commit, so no failure_reason is set (backup.sh). The
+          //    primary off-site replica is stale. Strict === false so a legacy status
+          //    file lacking the field never false-fires.
+          if (lb.tier1_pushed === false) {
+            return { ...warn, text: 'Backups are not fully replicated to GitHub — the last run succeeded locally but commits are not pushed to the remote. Check the Backup tab.' };
+          }
+
+          // 7. Off-site (Tier-2) copy is configured but the last run did not complete
+          //    it: the local backup succeeded but the off-site recovery copy is
+          //    incomplete (tier2_status != 'ok' or offsite_confirmed === false).
+          if (lb.tier2_backend && lb.tier2_backend !== 'none' &&
+              (lb.tier2_status !== 'ok' || lb.offsite_confirmed === false)) {
+            return { ...warn, text: 'The off-site backup copy is incomplete — your local backup succeeded but the off-site copy did not finish. Check the Backup tab.' };
+          }
+
+          return null;  // healthy — no banner
         },
         // "every 6 hours · last 12:10 PM ✓ · next 6:10 PM" — the at-a-glance line.
         backupScheduleLine() {
