@@ -1006,7 +1006,11 @@
               const resp = await fetchApi("/api/genesis/files/upload", { method: "POST", body: form });
               if (resp && resp.ok) {
                 const data = await resp.json();
-                uploaded.push(data.filename);
+                // Only count a real string relpath: keeps uploaded.length honest for
+                // the success message AND guarantees uploaded.every(...) below never
+                // dereferences a non-string (defense-in-depth, matching the uploadRoot
+                // typeof guard on the next line — the backend always returns a string).
+                if (typeof data.filename === "string") uploaded.push(data.filename);
                 lastDir = data.path.substring(0, data.path.lastIndexOf("/"));
                 if (uploadRoot === null && typeof data.filename === "string") {
                   uploadRoot = data.path.slice(0, data.path.length - data.filename.length).replace(/\/$/, "");
@@ -1027,8 +1031,28 @@
             this.fileUpload.success = uploaded.length === 1
               ? `Uploaded ${uploaded[0]} → ${dest}`
               : `Uploaded ${uploaded.length} files → ${dest} (${uploaded.join(", ")})`;
-            // Stay put — refresh the current directory in place (no jump to uploads).
-            if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
+            // Navigate the browser to WHERE the upload landed (was: stay put). For a
+            // folder upload, jump INTO the new top-level folder (uploadRoot/<name>),
+            // not its parent; a single loose file → its own directory; multiple loose
+            // files → the uploads root. Fall back to refreshing the current dir.
+            let navTarget;
+            if (droppedFolder) {
+              // Derive the folder from the SERVER-sanitized relpath (uploaded[] hold
+              // data.filename), NOT the raw client path: the backend rewrites unsafe
+              // chars (e.g. "Q3 (final)" → "Q3 _final_"), so navigating to the raw name
+              // would 404 and silently no-op — the very "can't see where it went" bug.
+              // Enter the top-level folder only when EVERY successful upload shares it
+              // (a single-folder drop). A multi-root drop — several folders, or a folder
+              // plus loose files — has no single destination, so land on the uploads
+              // root rather than hiding the rest of the upload inside one folder.
+              const seg = (uploaded[0] || "").split("/")[0];
+              const allShare = !!seg && uploaded.every((p) => p.includes("/") && p.split("/")[0] === seg);
+              navTarget = allShare ? `${uploadRoot}/${seg}` : uploadRoot;
+            } else {
+              navTarget = uploaded.length === 1 ? lastDir : uploadRoot;
+            }
+            if (navTarget) { this.fetchFiles(navTarget); }
+            else if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
           }
           if (failures.length) {
             this.fileUpload.error = `${failures.length} failed — ${failures.join("; ")}`;
