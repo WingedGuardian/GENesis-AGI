@@ -110,11 +110,14 @@ async def test_no_runtime_reports_liveness_error(db, runtime_singleton):
 
 
 @pytest.mark.asyncio
-async def test_never_succeeded_not_stalled(db, runtime_singleton):
-    """No job_health row (never once succeeded / fresh install) → not stalled and
-    NOT a liveness_error (the job_never_succeeded alarm owns that case)."""
+async def test_never_pulsed_reports_unavailable(db, runtime_singleton):
+    """No completed cycle EVER (no job_health row) → UNAVAILABLE, not green. A
+    scheduler that crashed before its first heartbeat is not owned by the
+    job_never_succeeded alarm (it needs last_run + >=3 failures), so a live handle
+    would otherwise read healthy. Must be liveness_error (dashboard → unknown),
+    never stalled and never green."""
     _install_runtime(paused=False)
     result = await surplus_status(db, _fake_surplus())
+    assert result["liveness_error"] is True
     assert result["stalled"] is False
-    assert result["liveness_error"] is False
     assert result["last_success_at"] is None

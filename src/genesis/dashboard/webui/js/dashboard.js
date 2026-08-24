@@ -3734,10 +3734,12 @@
         surplusSemantic() {
           const surplus = this.health.surplus;
           if (!surplus || surplus.status === "unknown") return { state: "unknown", reason: "surplus scheduler data unavailable" };
-          // Fail-LOUD (mirror egoSemantic): if the liveness read itself errored,
-          // `stalled` defaulted to false — surfacing that as healthy would recreate
-          // the exact false-green this instrumentation exists to kill.
-          if (surplus.liveness_error) return { state: "unknown", reason: "surplus liveness data unavailable (read error)" };
+          // Fail-LOUD (mirror egoSemantic): if the liveness read errored, or the
+          // scheduler has never recorded a single completed cycle (crashed before
+          // its first pulse / never started — NOT owned by the job_never_succeeded
+          // alarm), `stalled` is false but the tile must NOT read green — surfacing
+          // either as healthy would recreate the false-green this exists to kill.
+          if (surplus.liveness_error) return { state: "unknown", reason: "surplus liveness unavailable (read error or no completed cycle on record)" };
           // Truthful wedged-detector: surplus_dispatch pulses success every ~5 min,
           // so a stale last_success (past the conservative threshold, and not paused)
           // means the dispatch loop stopped firing — a genuine fault the idle-proxy

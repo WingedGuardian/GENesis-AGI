@@ -94,15 +94,29 @@ async def surplus_status(
         rt = GenesisRuntime.peek()
         if rt is None:
             raise RuntimeError("no live runtime — cannot read pause state")
-        interval = getattr(surplus, "_dispatch_interval", 5) if surplus is not None else 5
-        live = compute_pulse_liveness(
-            last_success_at=await get_job_last_success(db, "surplus_dispatch"),
-            expected_interval_minutes=interval,
-            paused=bool(rt.paused),
-        )
-        last_success_at = live.last_success_at
-        stalled = live.stalled
-        stall_reason = live.reason
+        last_success = await get_job_last_success(db, "surplus_dispatch")
+        if last_success is None:
+            # Never a completed cycle. Either fresh-booting (the initial heartbeat
+            # lands within seconds — scheduler.py:553) or the scheduler crashed
+            # before its first pulse / never started (that init exception is
+            # swallowed at scheduler.py:549-556). The job_never_succeeded alarm does
+            # NOT own this case (it needs last_run + >=3 failures), so a live
+            # scheduler handle would otherwise let the tile read green forever.
+            # Cannot confirm liveness without a single pulse → unavailable (unknown),
+            # never green. Self-clears the instant the first success lands.
+            liveness_error = True
+        else:
+            interval = (
+                getattr(surplus, "_dispatch_interval", 5) if surplus is not None else 5
+            )
+            live = compute_pulse_liveness(
+                last_success_at=last_success,
+                expected_interval_minutes=interval,
+                paused=bool(rt.paused),
+            )
+            last_success_at = live.last_success_at
+            stalled = live.stalled
+            stall_reason = live.reason
     except Exception:
         logger.debug("surplus liveness computation failed", exc_info=True)
         liveness_error = True

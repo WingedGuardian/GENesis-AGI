@@ -89,10 +89,13 @@ def compute_pulse_liveness(
 
     Stalled iff (not ``paused``) and ``last_success`` is set and older than
     ``stall_threshold_minutes(expected_interval_minutes)``. ``last_success`` None
-    (never succeeded) → never stalled. Callers pass ``paused`` from live runtime
-    state; an inability to determine it must be handled by the caller as UNKNOWN
-    (fail-loud), never by passing ``paused=False`` (which would false-RED a stale
-    but legitimately-suppressed job).
+    (never succeeded) → never *stalled* — but a job that never pulsed cannot be
+    confirmed alive, so the CALLER must treat a None ``last_success`` as UNAVAILABLE
+    (unknown), NEVER as healthy: a scheduler that crashed before its first success
+    would otherwise read green (see genesis/observability/snapshots/surplus.py).
+    Callers pass ``paused`` from live runtime state; an inability to determine it
+    must likewise be handled by the caller as UNKNOWN (fail-loud), never by passing
+    ``paused=False`` (which would false-RED a stale but legitimately-suppressed job).
     """
     now = now or datetime.now(UTC)
     threshold = stall_threshold_minutes(expected_interval_minutes)
