@@ -365,7 +365,7 @@ _CASES: list[tuple[str, object, int, str]] = [
         "inline_P1_finding_blocks",
         lambda mp: _run(mp, _merge_cmd(), router=_router(inline_lines=_INLINE_P1_LINE)),
         2,
-        "INLINE review findings",
+        "inline review gate did not pass",
     ),
     # ── ORDERING: freshness runs BEFORE the finding scans. With BOTH a missing
     #    review AND a would-be inline P1, the block message must be the FRESHNESS
@@ -411,7 +411,7 @@ _CASES: list[tuple[str, object, int, str]] = [
         "review_body_P1_finding_blocks",
         lambda mp: _run(mp, _merge_cmd(), router=_router(review_lines=_REVIEW_BODY_P1)),
         2,
-        "unresolved review findings",
+        "review-body gate did not pass",
     ),
     # ── override-sigil INDEPENDENCE (F3 — highest-risk gap: the extraction's
     #    unified force-plumbing must NOT collapse the two sigils into one) ──
@@ -472,7 +472,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             router=_router(review_lines=_REVIEW_BODY_P1),
         ),
         2,
-        "unresolved review findings",
+        "review-body gate did not pass",
     ),
     # (Codex-P2) CI-unknown is a deliberately fail-OPEN gate — empty/malformed CI reads
     # must ALLOW, so the unified UNKNOWN->BLOCK aggregation can't regress them. NOTE: CI
@@ -545,7 +545,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             router=_router(inline_lines=_INLINE_P1_LINE),
         ),
         2,
-        "INLINE review findings",
+        "inline review gate did not pass",
     ),
     # (Codex-P1 3788128908) `# ci-override` is scoped to the CI gate ALONE — it must not
     # act as a global force. The existing `ci_red_with_ci_override_continues` case has
@@ -563,7 +563,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             router=_router(inline_lines=_INLINE_P1_LINE),
         ),
         2,
-        "INLINE review findings",
+        "inline review gate did not pass",
     ),
     (
         "ci_override_does_NOT_waive_review_body_findings_blocks",
@@ -574,7 +574,7 @@ _CASES: list[tuple[str, object, int, str]] = [
             router=_router(review_lines=_REVIEW_BODY_P1),
         ),
         2,
-        "unresolved review findings",
+        "review-body gate did not pass",
     ),
     (
         # ci_override must not waive FRESHNESS either (freshness reads stale_override, not
@@ -961,10 +961,10 @@ def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
     monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
     monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
     monkeypatch.setattr(
-        _mod, "_check_pr_review_findings", lambda n, repo=None, strict=False: (False, "")
+        _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
     )
     monkeypatch.setattr(
-        _mod, "_check_inline_review_findings", lambda n, repo=None, strict=False: (False, "")
+        _mod, "_check_inline_review_findings", lambda n, repo=None, force=False: (False, "")
     )
 
 
