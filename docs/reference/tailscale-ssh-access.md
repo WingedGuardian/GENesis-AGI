@@ -94,9 +94,10 @@ PowerShell on the client:
 ```
 
 It derives peers live from `tailscale status`, so it hardcodes nothing about your
-tailnet. Logs to `C:\ProgramData\GenesisNet\ts-selfheal.log`. Test without
-rebooting: `Start-ScheduledTask -TaskName GenesisTailscaleSelfHeal`, then read the
-log.
+tailnet. Logs to `C:\ProgramData\GenesisNet\<TaskName>.log` (by default
+`GenesisTailscaleSelfHeal.log` — the installer prints the exact path on the `Log:`
+line). Test without rebooting: `Start-ScheduledTask -TaskName GenesisTailscaleSelfHeal`,
+then read that log.
 
 ### The battery gotcha (why a hand-rolled task may silently do nothing)
 
