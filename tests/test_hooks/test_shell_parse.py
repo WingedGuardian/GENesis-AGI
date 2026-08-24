@@ -25,6 +25,50 @@ def _commit_nv(cmd: str) -> bool:
     return any(sp.commit_skips_hooks(s.argv) for s in sp.analyze(cmd))
 
 
+# ── pytest-invocation detection (shared by the test guards) ─────────────
+
+
+class TestPytestDetection:
+    def test_bare_pytest(self):
+        assert sp.command_runs_pytest("pytest tests/")
+
+    def test_python_m_pytest(self):
+        assert sp.command_runs_pytest("python -m pytest tests/x.py")
+
+    def test_env_prefixed(self):
+        assert sp.command_runs_pytest("PYTHONPATH=src pytest tests/")
+
+    def test_chained(self):
+        assert sp.command_runs_pytest("ruff check . && pytest -q")
+
+    def test_venv_path_entrypoint(self):
+        seg = sp.analyze("/venv/bin/pytest -q")[0]
+        assert sp.is_pytest_invocation(seg)
+
+    def test_grep_word_not_matched(self):
+        assert not sp.command_runs_pytest("grep pytest scripts/foo.py")
+
+    def test_pytest_in_quoted_pipe_pattern_not_matched(self):
+        # the quoted-| false positive: `|pytest` inside a grep pattern is not a run
+        assert not sp.command_runs_pytest('grep -rniE "full_suite|pytest|x" f')
+        assert not sp.command_runs_pytest("rg -n 'a|pytest|b' scripts/")
+
+    def test_pytest_cov_module_not_matched(self):
+        assert not sp.command_runs_pytest("python -m pytest_cov")
+
+    def test_python_script_with_m_pytest_args_not_matched(self):
+        # `-m pytest` here are the SCRIPT's own args, not python's — not a pytest run
+        assert not sp.command_runs_pytest("python script.py -m pytest")
+
+    def test_python_running_pytest_entrypoint_matched(self):
+        # python executing the pytest console-script (a /path/.../pytest) IS a run
+        seg = sp.analyze("python /venv/bin/pytest -q")[0]
+        assert sp.is_pytest_invocation(seg)
+
+    def test_python_flags_before_m_pytest_matched(self):
+        assert sp.command_runs_pytest("python -X faulthandler -m pytest tests/x.py")
+
+
 # ── git subcommand resolution through wrappers ──────────────────────────
 
 

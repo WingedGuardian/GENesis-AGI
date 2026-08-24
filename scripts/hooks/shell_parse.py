@@ -352,6 +352,44 @@ def analyze(command: str) -> list[Segment]:
     return out
 
 
+def is_pytest_invocation(seg: Segment) -> bool:
+    """Whether a parsed Segment IS a pytest run (not a mere textual mention).
+
+    True for the ``pytest`` entrypoint (``pytest …``, ``/venv/bin/pytest …``) or a
+    python interpreter invoked with ``-m pytest``. Because ``analyze`` splits
+    quote-aware, a ``|pytest`` inside a quoted argument — e.g. ``grep 'a|pytest' f``
+    — is NOT a pytest segment here, unlike a raw-regex scan of the command string.
+    """
+    if seg.exe == "pytest":
+        return True
+    if seg.exe.startswith("python"):
+        argv = seg.argv
+        i = 1
+        while i < len(argv):
+            tok = argv[i]
+            if tok == "-m":  # `python -m pytest …`
+                return i + 1 < len(argv) and argv[i + 1] == "pytest"
+            if tok in ("-c", "-W", "-X"):  # flags that consume the next token
+                i += 2
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            # First non-flag = the program python runs. Only a pytest console-script
+            # entrypoint (a /path/.../pytest) is a pytest run; `python script.py …`
+            # is NOT, even if `-m pytest` appears later as the SCRIPT's own args.
+            return "/" in tok and _basename(tok) == "pytest"
+    return False
+
+
+def command_runs_pytest(command: str) -> bool:
+    """Whether any executed segment of ``command`` is a pytest run (quote-aware)."""
+    try:
+        return any(is_pytest_invocation(s) for s in analyze(command))
+    except Exception:
+        return False  # parse failure → fail open (a convenience check, never a gate)
+
+
 def _substitutions(text: str) -> list[str]:
     """Command-substitution bodies — ``$(…)`` and ``` `…` ``` — which also run.
 
