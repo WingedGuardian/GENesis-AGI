@@ -98,6 +98,7 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.parse
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -1169,12 +1170,19 @@ def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
         ref = _pr_base_ref(pr_num, repo=repo)
         if not ref or any(c.isspace() for c in ref):
             return None
+        # URL-encode the ref before it becomes an API path component (Codex P2,
+        # round 2): a base branch name can carry characters that are structural in
+        # a URL path (`#` fragment, `?` query, `%`), and the ref is network-sourced
+        # (gh's baseRefName), so encode defensively. safe="/" preserves the slash
+        # in hierarchical branch names (`release/2.0`), which the commits/{ref}
+        # endpoint resolves directly.
+        ref_enc = urllib.parse.quote(ref, safe="/")
         try:
             result = subprocess.run(
                 [
                     "gh",
                     "api",
-                    f"repos/{repo or ':owner/:repo'}/commits/{ref}",
+                    f"repos/{repo or ':owner/:repo'}/commits/{ref_enc}",
                     "--jq",
                     ".sha",
                 ],
@@ -1598,6 +1606,18 @@ def _is_hook_surface_path(path: str) -> bool:
     return path in _HOOK_SURFACE_FILES or any(path.startswith(p) for p in _HOOK_SURFACE_PREFIXES)
 
 
+# A real fallback review (reviewer + findings + dispositions) is substantive; this
+# floor rejects a rubber-stamp / stray/boilerplate file at the evidence path (Codex
+# P2 round 2). Note the filename already binds repo+PR+base+head, so the content
+# check's marginal value is specifically catching a stale body copied to a correctly
+# named file. Anti-autopilot floor, NOT tamper-proof — the teeth are the human merge
+# + cloud reviewer (same threat model as review_state's evidence check).
+_MIN_OVERRIDE_EVIDENCE_CHARS = 200
+# Bound the read on the merge-gate hot path (the floor is 200 chars; any real review
+# fits easily) so an oversized file in the evidence dir can't be slurped into memory.
+_MAX_OVERRIDE_EVIDENCE_READ = 65536
+
+
 def _override_evidence_dir() -> str:
     """Directory holding fallback-review evidence files
     (``<repo>__<pr>__<base-tip-12>__<head-sha>.txt``).
@@ -1749,9 +1769,19 @@ def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[
         _override_evidence_dir(), f"{repo_slug}__{pr_num}__{base[:12]}__{head}.txt"
     )
     try:
-        has_evidence = os.path.getsize(evidence_path) > 0
+        with open(evidence_path, encoding="utf-8", errors="replace") as _ef:
+            evidence_text = _ef.read(_MAX_OVERRIDE_EVIDENCE_READ)
     except OSError:
-        has_evidence = False
+        evidence_text = ""
+    # Validate the CONTENT, not just presence (Codex P2, round 2): a stray or
+    # rubber-stamp file at the right path must not waive the gate. Require a
+    # substantive review that NAMES the exact head it vouches for — the 12-hex
+    # head prefix must appear in the body (the procedure below instructs this),
+    # and the body must clear a minimum length. Fail-closed on a short/unbound file.
+    has_evidence = (
+        len(evidence_text.strip()) >= _MIN_OVERRIDE_EVIDENCE_CHARS
+        and head[:12] in evidence_text.lower()
+    )
     if has_evidence:
         # Residual TOCTOU, accepted as part of the force path's documented
         # "conscious unbound merge" contract: a push landing between this head
@@ -1779,7 +1809,8 @@ def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[
             f"  2. Run a fallback adversarial review of the full PR diff: local "
             f"`codex exec` when quota allows, else a Claude Code adversarial "
             f"review (genesis-architect).\n"
-            f"  3. Record reviewer + findings + dispositions in:\n"
+            f"  3. Record reviewer + findings + dispositions — and reference the "
+            f"head sha {head[:12]} in the body — in:\n"
             f"       {evidence_path}\n"
             f"  4. Re-run this merge (same sigil). A new push changes the head "
             f"sha, and a base-branch change (retarget OR base advancing) "

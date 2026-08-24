@@ -36,6 +36,18 @@ STALE = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 BASE = "b" * 40
 
 
+def _valid_evidence(head: str = HEAD) -> str:
+    """A conforming fallback-review evidence body: substantive (>= the guard's
+    _MIN_OVERRIDE_EVIDENCE_CHARS floor) and NAMING the head it vouches for."""
+    return (
+        "reviewer: claude-code adversarial review (genesis-architect; codex quota-dead).\n"
+        f"head reviewed: {head}\n"
+        "findings: P2 x2 — base-ref encoding, evidence content validation. "
+        "dispositions: both fixed and verified end-to-end; no BLOCKER/P1 remaining. "
+        "scope: full PR diff over scripts/hooks/git_push_guard.py.\n"
+    )
+
+
 def _compare_json(*filenames, status="ahead", previous=None):
     """_TEST_GH_COMPARE shape: the object _classify_post_review_delta fetches."""
     files = []
@@ -158,9 +170,7 @@ class TestOverrideEvidenceGate:
     def test_hook_pr_force_with_evidence_passes(self, monkeypatch, capsys):
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
         self.dir.mkdir(parents=True)
-        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text(
-            "reviewer: claude-code adversarial (codex quota-dead)\nfindings: none\n"
-        )
+        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text(_valid_evidence())
         should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
         assert not should_block
 
@@ -168,6 +178,26 @@ class TestOverrideEvidenceGate:
         monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
         self.dir.mkdir(parents=True)
         (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text("")
+        should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
+        assert should_block
+
+    def test_hook_pr_force_short_evidence_blocks(self, monkeypatch):
+        # Content validation (Codex P2 round 2): a nonempty-but-trivial file at the
+        # right path (a rubber stamp) must not waive the gate.
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
+        self.dir.mkdir(parents=True)
+        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text(f"ok {HEAD}\n")
+        should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
+        assert should_block
+
+    def test_hook_pr_force_evidence_not_naming_head_blocks(self, monkeypatch):
+        # Substantive length but the body does not name the head it vouches for →
+        # the content is not bound to this head → blocks (Codex P2 round 2).
+        monkeypatch.setenv("_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py"))
+        self.dir.mkdir(parents=True)
+        body = "reviewer: genesis-architect. findings: none. dispositions: n/a. " * 6
+        assert HEAD[:12] not in body.lower()
+        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text(body)
         should_block, msg, verified = _mod._check_codex_reviewed_head("1", force=True)
         assert should_block
 
@@ -337,7 +367,7 @@ class TestRound1P2Regressions:
         monkeypatch.setenv(
             "_TEST_GH_PR_FILES", _files_jsonl("scripts/hooks/git_push_guard.py")
         )
-        (d / f"ownera_repoa__1__{BASE[:12]}__{HEAD}.txt").write_text("evidence for repo A PR 1\n")
+        (d / f"ownera_repoa__1__{BASE[:12]}__{HEAD}.txt").write_text(_valid_evidence())
         blocked, msg, _ = _mod._check_codex_reviewed_head(
             "2", force=True, repo="ownerb/repob"
         )
@@ -371,10 +401,11 @@ class TestBaseBoundEvidence:
         assert blocked
 
     def test_evidence_for_current_base_passes(self, monkeypatch):
-        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text("reviewed\n")
+        (self.dir / f"local__1__{BASE[:12]}__{HEAD}.txt").write_text(_valid_evidence())
         monkeypatch.setenv("_TEST_GH_BASE_OID", BASE)
         blocked, msg, _ = _mod._check_codex_reviewed_head("1", force=True)
         assert not blocked
+
 
     def test_unreadable_base_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_BASE_OID", "")
@@ -385,3 +416,39 @@ class TestBaseBoundEvidence:
         monkeypatch.setenv("_TEST_GH_BASE_OID", "not-a-sha")
         blocked, msg, _ = _mod._check_codex_reviewed_head("1", force=True)
         assert blocked
+
+
+class TestBaseRefEncoding:
+    """Round-2 P2: the base ref becomes an API path component in _pr_base_sha, so
+    it must be URL-encoded (safe='/' preserves hierarchical branch slashes)."""
+
+    def _capture(self, monkeypatch, ref):
+        monkeypatch.delenv("_TEST_GH_BASE_OID", raising=False)  # force the ref path
+        monkeypatch.setenv("_TEST_GH_BASE_REF", ref)
+        captured = {}
+
+        def fake_run(argv, *a, **k):
+            captured["argv"] = argv
+
+            class _R:
+                returncode = 0
+                stdout = "a" * 40
+
+            return _R()
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        sha = _mod._pr_base_sha("1")
+        url = next(a for a in captured["argv"] if "commits/" in a)
+        return url, sha
+
+    def test_hierarchical_branch_slash_preserved(self, monkeypatch):
+        url, sha = self._capture(monkeypatch, "release/2.0")
+        assert url.endswith("commits/release/2.0")
+        assert sha == "a" * 40
+
+    def test_special_char_ref_encoded(self, monkeypatch):
+        # a '#' in a ref must not inject a fragment into the API path
+        url, _ = self._capture(monkeypatch, "feat/x#y")
+        path = url.split("commits/", 1)[1]
+        assert path == "feat/x%23y"
+        assert "#" not in path
