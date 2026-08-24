@@ -1266,19 +1266,20 @@ class TestCheckInlineReviewFindings:
         assert "per_page=100" in argv
         assert "page=1" in argv
 
-    def test_inline_fetch_requests_newest_first(self, guard_module):
-        # pulls/comments honors sort/direction; fetching newest-first means a partial
-        # read (later page fails) still sees the most recent findings first.
+    def test_inline_fetch_uses_default_ascending_order(self, guard_module):
+        # The inline scan fetches in the endpoint's DEFAULT ascending (oldest-first)
+        # order — NO sort/direction params. Descending (newest-first) page-number paging
+        # would never revisit page 1, so a P1 appended mid-scan on a >100-comment PR
+        # could go unseen (Codex P2). Ascending puts an appended comment on the last
+        # page, which sequential pagination reaches.
         with self._mock(guard_module, []) as run_mock:
             guard_module._check_inline_review_findings("100")
         argv = run_mock.call_args[0][0]
-        assert "sort=created" in argv
-        assert "direction=desc" in argv
-        # …on the pulls (inline) endpoint specifically.
+        assert "sort=created" not in argv
+        assert "direction=desc" not in argv
         assert any("pulls/100/comments" in tok for tok in argv)
 
-    def test_body_fetch_does_not_request_sort(self, guard_module):
-        # issues/comments IGNORES sort/direction — don't send params it won't honor.
+    def test_body_fetch_uses_default_ascending_order(self, guard_module):
         with patch.object(
             guard_module.subprocess, "run",
             return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),

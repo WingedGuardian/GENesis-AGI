@@ -935,21 +935,17 @@ def _fetch_comments_paged(
     pr_num: str,
     repo: str | None,
     jq: str,
-    extra_params: list[str] | None = None,
 ) -> tuple[list[dict] | None, bool]:
     """Fetch ALL pages of a PR comments endpoint as parsed JSON objects.
 
     Pages through ``gh api repos/<repo>/<endpoint> -X GET -f per_page=100 -f page=N
     --jq <jq>`` (query params via ``-f``; the endpoint token keeps its ``…/comments``
     suffix so the char-router's ``endswith("/comments")`` still matches). ``gh --jq``
-    emits one compact JSON object per line — JSONL — across the page.
-
-    ``extra_params`` — additional ``-f key=value`` query args (already tokenized as a
-    flat list) merged into every page request. Used to fetch newest-first
-    (``sort=created direction=desc``) on the ``pulls/*/comments`` endpoint, which honors
-    it, so a partially-read scan sees the most recent findings first. The
-    ``issues/*/comments`` endpoint IGNORES sort/direction, so this stays opt-in per
-    caller rather than a blanket default.
+    emits one compact JSON object per line — JSONL — across the page. Pages are fetched
+    in the endpoint's default ASCENDING (oldest-first) order — both callers accumulate
+    ALL pages, so order does not affect the verdict, and ascending means a comment
+    appended during the scan lands on the last page (reached) rather than shifting a
+    never-revisited first page under descending paging.
 
     Returns ``(objects, complete)``:
       - ``(None, False)``  — the FIRST page could not be read (gh error/exception):
@@ -998,7 +994,6 @@ def _fetch_comments_paged(
                     f"per_page={_COMMENTS_PER_PAGE}",
                     "-f",
                     f"page={page}",
-                    *(extra_params or []),
                     "--jq",
                     jq,
                 ],
@@ -1056,16 +1051,17 @@ def _check_inline_review_findings(
         return False, ""  # override NOTE already printed by the body gate
     # Paginate via the shared helper (findings beyond the first REST page must still
     # gate); it accumulates ALL pages as parsed dicts, NEL-safe. ``raw is None`` = the
-    # first page was unreadable; ``complete`` False = a later page failed. Newest-first
-    # (pulls/comments honors sort/direction) so a partial read sees recent findings
-    # first. ``assoc`` = author_association, for the maintainer-reply engagement check.
+    # first page was unreadable; ``complete`` False = a later page failed. Fetch in the
+    # endpoint's default ASCENDING (oldest-first) order: a P1 appended DURING the scan
+    # lands on the last page, which sequential ascending pagination reaches — descending
+    # (newest-first) page-number paging would never revisit page 1 to see it on a >100-
+    # comment PR. ``assoc`` = author_association, for the maintainer-reply engagement check.
     raw, complete = _fetch_comments_paged(
         f"pulls/{pr_num}/comments",
         pr_num,
         repo,
         ".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, "
         "type: .user.type, assoc: .author_association, body: .body}",
-        ["-f", "sort=created", "-f", "direction=desc"],
     )
     if raw is None:
         return _scan_unreadable("inline review comments")
